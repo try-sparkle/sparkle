@@ -377,6 +377,25 @@ export interface ConciergeSparkleMessage {
    */
   settled?: true;
   /**
+   * This bubble's stream is OVER, but it never became an answer.
+   *
+   * Set when a turn ends without reaching `done` — it failed, or the user's next send superseded it
+   * mid-stream. The text already painted stays on screen (see the ABANDONED FRAGMENT case above), so
+   * the bubble is finished growing even though nothing settled it.
+   *
+   * ── WHY THIS IS NOT `settled` (roborev 62935) ───────────────────────────────────────────────────
+   * `settled` means "this is the previous real ANSWER" and `replyAnchors` walks back to it. A dead
+   * fragment that claimed that role would both end the burst and claim the messages the real reply
+   * went on to answer — the exact defect the paragraph above records. So a second field, read by the
+   * consumers that need "has it stopped changing" rather than "did it answer".
+   *
+   * `conciergeHistoryCapture` is the first such consumer: it waits for a brain bubble to stop
+   * growing before indexing it, and without this marker a reply the founder can still scroll back to
+   * would never be searchable — the "did you never ask / we never captured" confusion the concierge
+   * history exists to remove, reintroduced on the failure path.
+   */
+  streamEnded?: true;
+  /**
    * This reply is HELD by a blocking lint finding while a correction turn runs.
    *
    * The row stays in the thread with its text blanked rather than being spliced out, because the

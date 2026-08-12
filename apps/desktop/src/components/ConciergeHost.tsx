@@ -106,8 +106,19 @@ import {
 } from "../services/conciergeFeed";
 import { agentToNudge, NUDGE_OPEN_ACTION } from "../engine/conciergeNudges";
 import { buildSnapshot } from "../engine/conciergeSnapshot";
+import { buildContinuityBlock } from "../engine/conciergeContinuity";
+import { useConciergeThreadSummaryStore } from "../stores/conciergeThreadSummaryStore";
+import { maybeRefreshThreadSummary } from "../services/conciergeThreadSummary";
+// ONE concierge-history writer, not two (sparkle-yd1ud × sparkle-s7rfc). Both merged branches
+// indexed this conversation — main by hand-placed `recordConciergePrompt`/`recordConciergeReply`
+// calls on the dispatch and reply paths, this branch by a subscriber on the thread store. Wiring
+// both would have written every message TWICE, and git resolves that cleanly because it is not a
+// textual conflict. The subscriber survives: the history row id IS the bubble id, so `INSERT OR
+// IGNORE` makes duplicates structurally impossible, and it sits downstream of every path that
+// reaches the screen (normal, held, corrected, proactive) rather than three call sites that each
+// have to be remembered. See services/conciergeHistoryCapture.ts.
+import { startConciergeHistoryCapture } from "../services/conciergeHistoryCapture";
 import { captureAsksFrom, openAsksNow, startAskQueue } from "../services/conciergeAskQueue";
-import { recordConciergePrompt, recordConciergeReply } from "../services/conciergeHistory";
 import { createResearchDrain, withResearchPreamble } from "../services/research/drain";
 import {
   allTasksNow as allResearchTasks,
@@ -276,7 +287,13 @@ import { resolveMode, usePresenceStore, type PresenceMode } from "../stores/pres
 // keeps `react-hooks/exhaustive-deps` from demanding it in five dependency arrays below (a store
 // setter isn't on the rule's known-stable list the way `useState`'s is, even though this one never
 // changes identity). See the store for the full reasoning.
-import { useConciergeThread, setConciergeChat as setChat } from "../stores/conciergeThreadStore";
+import {
+  useConciergeThread,
+  setConciergeChat as setChat,
+  useConciergeThreadStore,
+  BRAIN_ID_PREFIX,
+  endStreamsThrough,
+} from "../stores/conciergeThreadStore";
 import {
   buildRecap,
   recapSummary,
@@ -1790,9 +1807,18 @@ export function ConciergeHost({
     };
   }, []);
 
+  // Index the conversation for search. Mounted once, deliberately SEPARATE from the brain
+  // subscription below: it watches the thread (what the human ends up seeing) rather than the turn
+  // events, so a reply held by the lint policy — which never reaches the normal render path — is
+  // still captured. See services/conciergeHistoryCapture for why that seam and not `onConciergeDone`.
+  useEffect(() => startConciergeHistoryCapture(), []);
+
   // Stream the brain into the thread: deltas append to a bubble keyed by the turn id; done finalizes.
   useEffect(() => {
-    const key = (id: string) => `brain-${id}`;
+    // The prefix is SHARED, not spelled here: `conciergeHistoryCapture` has to recognise a bubble
+    // built by this line as one that is still streaming, and a second copy of the literal is how the
+    // two drift. See BRAIN_ID_PREFIX's own note.
+    const key = (id: string) => `${BRAIN_ID_PREFIX}${id}`;
     // TRUE when this event belongs to a turn the user has already moved past. NOT a pure
     // predicate: on the way to `false` it also adopts a newer turn (advancing `latestTurnRef`) and
     // retires its predecessors' accumulated text. Named for what it RETURNS — an `admitTurn` that
@@ -1939,6 +1965,26 @@ export function ConciergeHost({
         return next;
       });
     };
+    /** Record that this turn's stream is OVER WITHOUT an answer — it failed, or a newer send
+     *  superseded it mid-stream. The partial text stays on screen either way, so something has to
+     *  say it has stopped growing; `settled` cannot, because it means "the previous real ANSWER" and
+     *  a dead fragment claiming that role is a defect `replyAnchors` already fixed (roborev 62935).
+     *
+     *  Same no-op discipline as `markSettled`: returns `prev` untouched when there is no bubble
+     *  (a correction streams silently, and a turn can fail before any delta), and never overwrites a
+     *  bubble that did settle. */
+    const markStreamEnded = (id: string) => {
+      setChat((prev) => {
+        const k = key(id);
+        const i = prev.findIndex((m) => m.id === k);
+        if (i === -1) return prev;
+        const cur = prev[i]!;
+        if (cur.kind !== "sparkle" || cur.settled || cur.streamEnded) return prev;
+        const next = prev.slice();
+        next[i] = { ...cur, streamEnded: true };
+        return next;
+      });
+    };
     /** Take one turn's violating TEXT off screen while its correction runs — WITHOUT moving its row.
      *
      *  ONLY the block path uses this, and it is not optional there. Deltas paint live into the same
@@ -2059,9 +2105,11 @@ export function ConciergeHost({
       // `markSettled` returns `prev` untouched for a turn with no bubble, so the other order would
       // silently never stamp it and every later reply would claim this one's questions.
       markSettled(held.turnId);
-      // Indexed here too — see the sibling call on the non-blocked path. A reply the founder read is
-      // a reply he may later ask about, whichever path produced it.
-      recordConciergeReply(text);
+      // NOT indexed here (sparkle-yd1ud × sparkle-s7rfc). A reply the founder read is a reply he may
+      // later ask about, whichever path produced it — and that is exactly why the capture is no
+      // longer a call on each path: `startConciergeHistoryCapture` observes the thread store, which
+      // is downstream of this settle, of the plain `done` handler, and of `finishCorrection` alike.
+      // See the import block's note.
       // THE LEDGER READS WHAT THE USER WAS ACTUALLY TOLD. Running it at `done` on a reply that was
       // then replaced would record a promise out of text nobody ever saw — and the ledger's whole
       // value is that the founder can check it against what he read.
@@ -2327,7 +2375,20 @@ export function ConciergeHost({
       if (supersededTurn(e.id)) return;
       noteConciergeNativeToolCall(e.name, e.input);
     });
-    const offDone = onConciergeDone((e) => {
+    // ══ EVERY EXIT FROM `done` ENDS THE BUBBLE'S LIFE — ONE PLACE, NOT FOUR (roborev 62936) ═══════
+    // `offError` marks above every gate for a stated reason ("a fifth exit added later cannot
+    // silently miss it"), and this handler has FOUR early returns that can each leave a painted
+    // bubble on screen forever. Marking them one by one repeats the miss-prone shape, and the first
+    // attempt did exactly that — it covered the supersede return and left the silenced one, which is
+    // reachable with a bubble: `isCorrectionTurn` reads a ref that is `null` for the whole window
+    // between dispatching a correction and `startConciergeTurn` resolving, and the correction's
+    // deltas paint during it.
+    //
+    // AFTER the body, never before — this is the ordering the whole fix turns on. `markStreamEnded`
+    // no-ops on a bubble that settled, so on the normal path the `markSettled` below wins and the
+    // capture indexes the FINAL text. Running it first would mark the bubble final while it still
+    // held its streamed text, which is the exact defect (roborev 62934) this sequence exists to fix.
+    const onDoneEvent = (e: { id: string; text: string; toolCalls?: ConciergeToolCall[] }) => {
       // A correction its hold already gave up on. Dropped whole — rendering it now would append a
       // SECOND answer, to a prompt the user never sent, under the reply that replaced it.
       if (isSilencedTurn(e.id)) {
@@ -2358,6 +2419,11 @@ export function ConciergeHost({
         // have destroyed them at exactly this moment, which is the ordinary outcome of two fast
         // sends rather than an edge case.
         researchDrain.abandon(e.id);
+        // NOTE the comment above is about the ACCUMULATOR, which really is dropped unrendered. The
+        // BUBBLE is a different object and may already hold text: `offDelta`'s supersede gate only
+        // stops deltas from the moment the displacement is KNOWN, so anything earlier is painted and
+        // stays. It is marked ended by this handler's `finally`, not here — and for the ordinary
+        // double-send, where no `done` arrives at all, by `endStreamsThrough` at send time.
         delete brainTextRef.current[e.id];
         return;
       }
@@ -2507,11 +2573,10 @@ export function ConciergeHost({
       // reply for such a turn lives in `brainTextRef`. Reading only `e.text` silently skipped promise
       // DETECTION for every one of those turns, which is a promise the ledger can never later report.
       const replyText = e.text || brainTextRef.current[e.id] || "";
-      // Index the reply so `search_history` can answer questions about this conversation, not just
-      // about build-agent traffic (bead sparkle-yd1ud). Same seam as the promise ledger deliberately:
-      // both want THE TEXT THE FOUNDER WAS ACTUALLY SHOWN, including turns whose `done` carries no
-      // text of its own.
-      recordConciergeReply(replyText);
+      // The reply is indexed for `search_history` — but by the thread-store subscriber, not from
+      // here (sparkle-yd1ud × sparkle-s7rfc; see the import block). The subscriber reads THE TEXT
+      // THE FOUNDER WAS ACTUALLY SHOWN by construction, including turns whose `done` carries no text
+      // of its own, because it reads the bubble rather than the event.
       try {
         for (const p of noteConciergeTurnForPromises({
           id: e.id,
@@ -2546,6 +2611,25 @@ export function ConciergeHost({
       // it rendered. Re-deriving `linted?.text ?? full` here would be the same value by a second
       // route. Pinned instead by a test on the live region, so the coupling cannot quietly break.
       if (full) announce(full);
+    };
+    const offDone = onConciergeDone((e) => {
+      try {
+        onDoneEvent(e);
+      } finally {
+        // EXCEPT A HELD REPLY, whose text is the one thing here that is NOT decided yet (roborev
+        // 62937). `takeHold` returns without rendering precisely because the correction turn may
+        // still replace this bubble's words, and `settleHold` is its real terminal marker — it
+        // renders whichever text finally wins and calls `markSettled`. Stamping `streamEnded` here
+        // would tell the history capture the VIOLATING draft is final, which is the exact defect
+        // (roborev 62934) the marker exists to prevent, on the exact path its header names as worst.
+        //
+        // NOT left to `blankHeldBubble`'s empty text to save us. That works today only because a
+        // blank bubble yields no entry, which is an invariant of a DIFFERENT function — and one
+        // straggling delta landing on `brain-<n>` between this stamp and `settleHold` (a shape this
+        // file codes for elsewhere, and which `offDelta` does not gate for the original turn) would
+        // record the draft and dedupe the correction away forever.
+        if (lintHoldRef.current?.turnId !== e.id) markStreamEnded(e.id);
+      }
     });
     const offError = onConciergeError((e) => {
       // ══ AN ERRORED TURN CLAIMS NOTHING ═════════════════════════════════════════════════════════
@@ -2554,6 +2638,14 @@ export function ConciergeHost({
       // the findings stay unread and ride the next turn. One call above every gate, because there
       // is no error path on which claiming would be correct.
       researchDrain.abandon(e.id);
+      // AND NEITHER DOES ONE GROW ANY FURTHER — same reasoning, same placement (roborev 62935).
+      // Whatever a failed turn had already painted is the last text that bubble will ever hold, on
+      // every branch below, so the marker goes above every gate rather than being repeated at the
+      // four exits that can leave one on screen (superseded, superseded-detail, proactive, and the
+      // real failure). A fifth exit added later would otherwise silently miss it — and what it would
+      // miss is a reply the founder can still scroll back to never becoming searchable. No-op where
+      // there is no bubble, which is the silenced and correction cases.
+      markStreamEnded(e.id);
       // Likewise for an abandoned correction's failure: there is no hold left to settle, and it must
       // not raise the user-facing failure bubble below.
       if (isSilencedTurn(e.id)) {
@@ -3662,6 +3754,17 @@ export function ConciergeHost({
     // are belt to concierge.rs's braces, which stops a superseded reader emitting at all
     // (roborev 53088/53105/53130).
     retireThroughRef.current = latestTurnRef.current;
+    // AND THIS IS WHERE AN ABANDONED FRAGMENT IS DECLARED DEAD (roborev 62936). A killed reader
+    // emits nothing, so a displaced turn's bubble gets no `done` and no `error` to hang a marker on
+    // — dispatching is the only moment the frontend learns those bubbles have stopped growing.
+    // Whatever they had already painted stays on screen, so it must become searchable here or never.
+    //
+    // NOT the ordinary double-send (roborev 62937): a user send arriving while a user turn is in
+    // flight is QUEUED by `conciergeTurnQueue`, never dispatched, so it does not reach this line at
+    // all. What it catches is a turn holding no queue slot — a proactive/push turn, or a correction
+    // painting in the `correctionTurnId === null` window. See `endStreamsThrough`'s own note.
+    // No-op (and no re-render) when nothing is streaming, which is the common case.
+    setChat((prev) => endStreamsThrough(prev, retireThroughRef.current));
     // BUILT NOW, NOT AT ENQUEUE. A queued entry deliberately carries no snapshot: the fleet picture
     // is read at dispatch so a turn that waited behind three others still describes the app as it
     // is when it actually runs, rather than as it looked when the user typed.
@@ -3711,22 +3814,41 @@ export function ConciergeHost({
         }
       }),
     );
-    // HIS RAW MESSAGE, not the composed prompt — `buildSnapshot` wraps it in a roster dump and the
-    // open-ask block, and indexing that would bury one sentence of his under a page of generated
-    // context that every search would match.
-    bookkeep("history capture", () => recordConciergePrompt(entry.text));
+    // NO `bookkeep("history capture", …)` HERE, deliberately (sparkle-yd1ud × sparkle-s7rfc). His
+    // raw message is indexed — never the composed prompt, which would bury one sentence of his under
+    // a roster dump every search would match — but by the thread-store subscriber, which sees the
+    // bubble he actually sent. That also takes the capture OFF this dispatch path entirely, so it
+    // can no longer be a synchronous throw that costs the send; see the import block's note and
+    // services/conciergeHistoryCapture.ts.
     const research = researchDrain.peek();
+    // THE CONVERSATION, alongside the fleet picture. Read here for the same reason the feed is:
+    // this is the moment the turn actually runs. `chat` is the visible thread, so what the brain is
+    // told matches what the human is looking at — which is precisely what breaks when the resumed
+    // session is lost underneath a thread that survived (see engine/conciergeContinuity).
+    const continuity = buildContinuityBlock({
+      chat: useConciergeThreadStore.getState().chat,
+      summary: useConciergeThreadSummaryStore.getState().text,
+      // This turn's own bubble is ALREADY in the thread (it is appended at send, and the snapshot is
+      // built here at dispatch), so exclude it — otherwise the message being asked appears twice in
+      // its own prompt.
+      excludeId: entry.bubbleId,
+    });
+    // Fire-and-forget, AFTER the block above is built so this turn is never delayed by it and never
+    // sees a half-written summary. Resolves false and keeps the old summary on any failure.
+    void maybeRefreshThreadSummary(useConciergeThreadStore.getState().chat);
+    // The two compose: research findings lead (they are what came back while he was away), then the
+    // fleet + thread snapshot, then his new message last.
     void startConciergeTurn(
-      // MERGE NOTE (sparkle-yd1ud × sparkle-s7rfc): both branches rewrote this call, and the two
+      // MERGE NOTE (sparkle-yd1ud × sparkle-s7rfc): both branches rewrote this call, and the three
       // additions compose rather than compete — research findings are what CAME BACK, open asks are
-      // what is still OWED. Taking either side verbatim would have silently dropped the other's
-      // argument, which is the conflict git resolves cleanly and wrongly. `openAsksNow()` is read
-      // synchronously from the queue's cache, for the same reason the fleet picture is read at
-      // dispatch rather than at enqueue: the prompt should describe what is outstanding when the
-      // turn actually runs.
+      // what is still OWED, continuity is what was already SAID. Taking either side verbatim would
+      // have silently dropped the other's argument, which is the conflict git resolves cleanly and
+      // wrongly. `openAsksNow()` is read synchronously from the queue's cache, for the same reason
+      // the fleet picture is read at dispatch rather than at enqueue: the prompt should describe
+      // what is outstanding when the turn actually runs.
       withResearchPreamble(
         research.preamble,
-        buildSnapshot(feedRef.current, entry.text, openAsksNow()),
+        buildSnapshot(feedRef.current, entry.text, openAsksNow(), continuity),
       ),
     ).then(
       (id) => {

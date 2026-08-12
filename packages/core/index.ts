@@ -1,4 +1,5 @@
 export * from "./risk";
+export * from "./historyScope";
 export * from "./classifier";
 export * from "./analytics";
 export * from "./goalGate";

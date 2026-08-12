@@ -64,6 +64,7 @@ import { quitApp as quitAppNative } from "../attention";
 import { ensureProjectRepo, moveProjectFolder } from "../worktree";
 import { searchHistory as searchHistoryBackend, type HistoryHit } from "../history";
 import { defaultJumpDeps, jumpToHit } from "../../components/Concierge/paletteJump";
+import { WIDE_HISTORY_SCOPE, type HistorySearchScope } from "@sparkle/core";
 import type { Project } from "../../types";
 
 // ---------------------------------------------------------------------------------------------
@@ -132,6 +133,15 @@ export type RiskClass = "read-only" | "routine" | "disruptive" | "irreversible";
  *    a cross-domain override to the same effect; this is the domain saying it in its own voice, so
  *    the `risk` stamped on the RESULT the concierge reads is honest too — the override never
  *    reaches that.
+ *
+ * ONE ENTRY IS NOT THE WHOLE STORY. `search_history` is `read-only` here and stays that way,
+ * because the OPERATION observes and changes nothing — but how much it observes depends on its
+ * `scope` argument, and `scope: "all"` reaches the founder's private concierge transcripts. A
+ * `Record<WorkspaceOp, RiskClass>` is keyed by op NAME and structurally cannot express "this call
+ * is riskier than that one", so that half lives in policy.ts's `perCallRiskFor`, which escalates a
+ * `scope: "all"` call to `privacy-sensitive` and therefore to an approval card. See
+ * {@link HistorySearchScope}. Do NOT "fix" this row to `privacy-sensitive`: that would make every
+ * search ask first, including the narrow default the concierge runs constantly.
  */
 export const WORKSPACE_OP_RISK: Record<WorkspaceOp, RiskClass> = {
   list_projects: "read-only",
@@ -823,18 +833,91 @@ export async function quitApp(
   return ok("quit_app", { runningAgents });
 }
 
+/**
+ * HOW MUCH of the durable history one search may see.
+ *
+ *  • `"default"` — build and brainstorm history. `concierge`-sourced rows are filtered OUT of the
+ *    result. This is what the concierge has always been able to see, and it stays the default when
+ *    the model omits the argument.
+ *  • `"all"` — everything, `concierge` rows included.
+ *
+ * WHY THIS ARGUMENT EXISTS. The founder's private conversations with the concierge are TO BE
+ * recorded into the same `history.db` that `search_history` queries. His decision was that those
+ * rows must be recorded and findable BY HIM, but that the concierge model must not be able to
+ * silently vacuum them back up — a model that can read every past turn of every private
+ * conversation is a different thing from one that can search build logs.
+ *
+ * THE RECORDING HALF HAS SINCE LANDED — `services/conciergeHistoryCapture.ts`. This gate was built
+ * first on purpose, so the rows were never readable without one. Two constraints it had to satisfy
+ * for this gate to hold, both of which it does; they are stated here because neither is discoverable
+ * from the enum alone, and either one silently regressing re-opens the door:
+ *
+ *   1. every concierge row carries `source: "concierge"`. The filter below is on that field and
+ *      nothing else; a row written under `build` is indistinguishable from a build log.
+ *      SATISFIED: `conciergeHistoryCapture.conversationEntry` sets it literally, and the same
+ *      literal is what `prune_in_with_max`'s SQL matches — one string, three consumers.
+ *   2. concierge rows do NOT carry a live agent's `agentId`. `conciergeTools/terminal.ts`'s history
+ *      tier is `read-only` (auto-allowed) and selects by `agentId`; it ALSO drops
+ *      `source: "concierge"`, but do not spend that defence — stamping the column's
+ *      `mountedAgentId` onto a concierge turn would put private text one filter away in a tool that
+ *      never asks. SATISFIED: the capture writes `agentId: null` (and `projectId: null`), because
+ *      the concierge is cross-project by construction rather than as a privacy measure.
+ *
+ * Retention has landed too: `src-tauri/src/history.rs`'s `prune_in_with_max` excludes
+ * `source = 'concierge'` from both age statements and bounds those rows by count instead.
+ *
+ * WHY THE GATE IS HERE RATHER THAN IN THE ALLOWLIST. The obvious alternative — leave the tool alone
+ * and withhold it from `--allowedTools` — does not work. `src-tauri/src/concierge.rs` records,
+ * measured against Claude Code 2.1.220, that `--allowedTools` does NOT gate MCP tools at all; the
+ * only real gate on this surface is the `controlListener` policy. So the distinction has to be a
+ * property of the CALL that the policy layer can see, which is what `scope` is. `policy.ts`'s
+ * `perCallRiskFor` reads it and escalates a `scope: "all"` call to an approval card.
+ *
+ * The filter is applied to what the backend RETURNED, on the hits' own `source` field, rather than
+ * pushed into the query — history.rs owns the search and this module is a façade over it (contract
+ * 1 in the header), and a second WHERE clause written here would be a second definition of "which
+ * rows exist". One consequence worth knowing: `limit` is applied by the backend BEFORE this filter,
+ * so a default-scope search can come back with fewer than `limit` hits. That is the honest
+ * behaviour — over-fetching to refill the page would mean reading MORE concierge rows in order to
+ * show fewer, which is the opposite of the point.
+ */
+// Re-exported, not redeclared: one vocabulary, defined in @sparkle/core/historyScope. It is
+// IMPORTED (above) and then re-exported, rather than the one-line `export type { X } from "…"`:
+// that form is a pure pass-through and never binds the name locally, so the three uses below —
+// `DEFAULT_HISTORY_SEARCH_SCOPE`, `HistorySearchOptions`, and `searchHistory`'s own signature —
+// could not see it.
+export type { HistorySearchScope };
+
+/** What applies when the model omits `scope`. The narrow one, deliberately: an omitted argument
+ *  must never be the one that widens what a model can see. */
+export const DEFAULT_HISTORY_SEARCH_SCOPE: HistorySearchScope = "default";
+
+export interface HistorySearchOptions {
+  scope?: HistorySearchScope;
+}
+
 /** Command-palette style full-text search across prompt/response history. A blank query is refused
- *  here rather than round-tripped for a guaranteed empty result. */
+ *  here rather than round-tripped for a guaranteed empty result.
+ *
+ *  NOT the ⌘K palette's own path: the palette calls services/history's `searchHistory` directly via
+ *  stores/historyStore and is unaffected by `scope` — the human searching their own machine sees
+ *  every source, always. This function is the MODEL's door onto the same index. */
 export async function searchHistory(
   query: string,
   limit?: number,
+  opts: HistorySearchOptions = {},
   deps: WorkspaceDeps = defaultWorkspaceDeps(),
 ): Promise<WorkspaceResult<HistoryHit[]>> {
   if (!query.trim()) {
     return refuse("search_history", "blank-query", "Give me something to search for.");
   }
+  const scope = opts.scope ?? DEFAULT_HISTORY_SEARCH_SCOPE;
   try {
-    return ok("search_history", await deps.searchHistory(query, limit));
+    const hits = await deps.searchHistory(query, limit);
+    return ok(
+      "search_history",
+      scope === WIDE_HISTORY_SCOPE ? hits : hits.filter((h) => h.source !== "concierge"),
+    );
   } catch (e) {
     return refuse("search_history", "backend-failed", `History search failed: ${describe(e)}`);
   }

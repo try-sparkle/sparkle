@@ -391,6 +391,76 @@ export function persistableThread(chat: ConciergeMessage[]): ConciergeMessage[] 
 export const RESTORED_ID_PREFIX = "restored:";
 
 /**
+ * Namespace of the ONE sparkle bubble kind that arrives incomplete.
+ *
+ * `ConciergeHost`'s brain subscription keys a streaming reply `${BRAIN_ID_PREFIX}${turnId}` and
+ * paints deltas into it roughly per token chunk, so that bubble holds a FRAGMENT until its turn
+ * reaches `markSettled`. Every other sparkle bubble — a `postSparkle` notice, a receipt, a refusal —
+ * is appended whole and is final the moment it appears.
+ *
+ * Exported because a reader of the thread cannot otherwise tell those two apart, and treating a
+ * first delta as a finished reply is a live defect shape: `conciergeHistoryCapture` did exactly that
+ * and indexed a few tokens of every reply, permanently, because its sink dedupes on the bubble id.
+ * Keep this the single source of the prefix — `key()` in ConciergeHost builds ids from it.
+ */
+export const BRAIN_ID_PREFIX = "brain-";
+
+/**
+ * Stamp every still-streaming brain bubble at or below `throughTurn` as `streamEnded`.
+ *
+ * ── WHY A SWEEP AT SEND TIME, AND NOT A MARKER ON THE TURN'S OWN `done` (roborev 62936) ─────────
+ * A turn displaced mid-stream has no `done` and no `error` to hang a marker on. `concierge.rs`
+ * installs the new turn, kills the child it evicts, and that reader returns SILENTLY — "superseded /
+ * cancelled mid-turn: the frontend already tore down. Stay silent, no retry". So it emits no
+ * terminal event at all, and `ConciergeHost`'s own supersede gates say as much: they are documented
+ * there as defence in depth, not the primary guard.
+ *
+ * The deltas that already arrived, however, are painted and STAY (see ConciergeMessage's ABANDONED
+ * FRAGMENT note). Sending is therefore the moment the frontend LEARNS those bubbles are dead — the
+ * only moment it will ever get — so that is where they are marked. Without this the fragment is one
+ * the founder can still scroll back to and never search for: `persistableThread` keeps it and
+ * `rehydrateThread` re-ids it under `RESTORED_ID_PREFIX`, which `conciergeHistoryCapture` skips by
+ * design, so the gap outlives the session.
+ *
+ * ── WHICH TURNS THIS CAN ACTUALLY CATCH — NOT AN ORDINARY DOUBLE-SEND (roborev 62937) ───────────
+ * An earlier version of this note said "the ordinary double-send", and that is WRONG in a way worth
+ * recording, because it is the shape everyone reaches for first. A user send arriving while a user
+ * turn is in flight does not dispatch at all: `conciergeTurnQueue.enqueue` takes the `running !==
+ * null` branch and the send WAITS — that is the entire point of the queue ("send again without
+ * destroying the answer you are waiting for"). `dispatchTurn`, and so this sweep, is never reached.
+ *
+ * What reaches it with a live brain bubble is a turn that holds NO queue slot: a **proactive/push**
+ * turn, which is backend-initiated, and a **lint-correction** turn painting during the window where
+ * `correctionTurnId` is still null. Both stream into a `BRAIN_ID_PREFIX` bubble and neither is the
+ * queue's business, so a user send during either one dispatches immediately and displaces them.
+ *
+ * Returns `chat` UNCHANGED when nothing qualifies, so a `setChat` through it cannot re-render the
+ * transcript for no reason — the same discipline `markSettled` keeps.
+ *
+ * A `settled` bubble is never touched: it answered, and `streamEnded` means the opposite.
+ */
+export function endStreamsThrough(
+  chat: ConciergeMessage[],
+  throughTurn: number,
+): ConciergeMessage[] {
+  let next: ConciergeMessage[] | null = null;
+  for (let i = 0; i < chat.length; i++) {
+    const m = chat[i]!;
+    if (m.kind !== "sparkle" || m.settled || m.streamEnded) continue;
+    if (!m.id.startsWith(BRAIN_ID_PREFIX)) continue;
+    const raw = m.id.slice(BRAIN_ID_PREFIX.length);
+    // Strictly a turn NUMBER, mirroring `supersededTurn`'s own guard: `Number("")` is 0 and
+    // `Number(" 5 ")` is 5, so a bubble keyed by anything else must not be swept by a numeric floor
+    // it was never on.
+    if (!/^\d+$/.test(raw)) continue;
+    if (Number(raw) > throughTurn) continue;
+    if (next === null) next = chat.slice();
+    next[i] = { ...m, streamEnded: true };
+  }
+  return next ?? chat;
+}
+
+/**
  * Turn a persisted thread into one that is SAFE to mix with a fresh session's messages.
  *
  * Persistence created an id-collision hazard that did not exist when the thread died with the page,

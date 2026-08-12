@@ -35,10 +35,13 @@ import {
   defaultDecisionFor,
   evaluateToolPolicy,
   isConciergeToolName,
+  perCallRiskFor,
   toToolPolicyOverrides,
   type ConciergeRiskClass,
   type ConciergeToolName,
+  SUMMARY_BY_TOOL,
 } from "./policy";
+import { WIDE_HISTORY_SCOPE } from "@sparkle/core";
 import { CONCIERGE_TERMINAL_TOOLS } from "./terminal";
 import { LIFECYCLE_OPS } from "./lifecycle";
 import { REVIEW_OPS } from "./review";
@@ -154,6 +157,208 @@ describe("nothing resolves to allow by accident", () => {
     expect(byName.get("stop_project_agents")?.riskClass).toBe("disruptive");
     expect(byName.get("send_to_agent_terminal")?.riskClass).toBe("disruptive");
     expect(byName.get("list_projects")?.riskClass).toBe("read-only");
+  });
+});
+
+// -----------------------------------------------------------------------------------------------
+// PER-CALL RISK. `search_history` is the only op whose danger is in its ARGUMENTS: `scope: "all"`
+// also reads `concierge`-sourced rows — the founder's own conversations with the minder — while the
+// default searches build history. The founder's call is that those rows are recorded and findable
+// by him, and not silently vacuumable by the model.
+// -----------------------------------------------------------------------------------------------
+describe("risk that depends on the CALL, not on the op name", () => {
+  const withScope = (scope?: unknown) => ({
+    overrides: NO_TOOL_POLICY_OVERRIDES,
+    args: scope === undefined ? { query: "widget" } : { query: "widget", scope },
+  });
+
+  it("a default-scope search stays read-only and auto-allows", () => {
+    // The PAIRED half of the escalation test below. Without it, "scope: all asks" is satisfied by a
+    // policy that asks on every search — which would be a regression, not a feature.
+    for (const ctx of [NONE, withScope(), withScope("default")]) {
+      const v = evaluateToolPolicy("search_history", ctx);
+      expect(v.riskClass).toBe("read-only");
+      expect(v.decision).toBe("allow");
+      expect(v.requiresConfirmation).toBe(false);
+    }
+  });
+
+  it("scope 'all' escalates the same op to privacy-sensitive and therefore to ask", () => {
+    const v = evaluateToolPolicy("search_history", withScope("all"));
+    expect(v.riskClass).toBe("privacy-sensitive");
+    expect(v.decision).toBe("ask");
+    expect(v.requiresConfirmation).toBe(true);
+    expect(v.defaultDecision).toBe("ask");
+    // Still the derived default — no config entry was involved in tightening it.
+    expect(v.source).toBe("default");
+    expect(v.overridden).toBe(false);
+  });
+
+  it("perCallRiskFor is total over garbage arguments and never escalates on a near-miss", () => {
+    // The policy is consulted BEFORE the registry's zod runs, so this sees raw model JSON. Anything
+    // it cannot positively recognise as the wider request must fall through to the name-keyed
+    // class — the safe direction, since the registry then refuses the malformed call anyway.
+    for (const args of [
+      undefined,
+      null,
+      "all",
+      42,
+      ["all"],
+      { scope: "ALL" },
+      { scope: ["all"] },
+      { scope: true },
+      { scope: null },
+      { scope: "all " },
+      { notScope: "all" },
+    ]) {
+      expect(perCallRiskFor("search_history", args), JSON.stringify(args) ?? "undefined").toBeNull();
+    }
+    expect(perCallRiskFor("search_history", { scope: "all" })).toBe("privacy-sensitive");
+  });
+
+  it("no OTHER tool grows a per-call opinion from the same argument", () => {
+    // `scope` is meaningful to exactly one op. A blanket "any call carrying scope:all is
+    // privacy-sensitive" would be the easy implementation and would mislabel unrelated calls.
+    for (const name of CONCIERGE_TOOL_NAMES) {
+      if (name === "search_history") continue;
+      expect(perCallRiskFor(name, { scope: "all" }), name).toBeNull();
+    }
+    // …and an unclassified name gets no opinion either, rather than throwing.
+    expect(perCallRiskFor("teleport_agent", { scope: "all" })).toBeNull();
+  });
+
+  it("does not change what the SETTINGS PANE says about the tool", () => {
+    // The pane asks about a TOOL, not a call, and it must keep rendering the row a human can act on
+    // — a permanently-asking `search_history` row would misdescribe the common case.
+    const entry = CONCIERGE_TOOL_CATALOG.find((t) => t.name === "search_history");
+    expect(entry?.riskClass).toBe("read-only");
+    expect(entry?.defaultDecision).toBe("allow");
+    // But its summary must NOT be the bare read-only note, because that note is what would headline
+    // the approval card raised for `scope: "all"`.
+    expect(entry?.summary).not.toBe(CONCIERGE_RISK_NOTE["read-only"]);
+    expect(entry?.summary).toContain("scope");
+  });
+
+  // roborev 61894-H1. The first cut let an explicit `allow` cover the wide call, on the reasoning
+  // that a standing yes is the human's to give. It is not, HERE, because the yes was never asked
+  // for the wide case: the bulk "Allow every concierge tool?" dialog derives its privacy warning
+  // from the CATALOG's riskClass, which this op deliberately keeps at `read-only`, so one click
+  // granted unprompted reads of the founder's private conversations while naming only screen
+  // capture. The escalation is now a FLOOR.
+  it("an explicit human allow does NOT cover the escalated call", () => {
+    const overrides = { search_history: "allow" };
+    // …but it does cover the ordinary one, which is what someone setting that row is asking for.
+    const narrow = evaluateToolPolicy("search_history", {
+      overrides,
+      args: { query: "widget" },
+    });
+    expect(narrow.decision).toBe("allow");
+    expect(narrow.source).toBe("override");
+
+    const wide = evaluateToolPolicy("search_history", {
+      overrides,
+      args: { query: "widget", scope: "all" },
+    });
+    expect(wide.decision).toBe("ask");
+    expect(wide.source).toBe("per-call-escalation");
+    expect(wide.riskClass).toBe("privacy-sensitive");
+    expect(wide.requiresConfirmation).toBe(true);
+    // The human DID set a rule; saying otherwise would make the pane show this row as untouched.
+    expect(wide.overridden).toBe(true);
+    // And the sentence has to explain the override was not ignored but out-scoped.
+    expect(wide.reason).toContain("You allowed");
+  });
+
+  it("the floor only ever tightens — it never turns a deny or an ask into something looser", () => {
+    for (const rule of ["deny", "ask"] as const) {
+      const v = evaluateToolPolicy("search_history", {
+        overrides: { search_history: rule },
+        args: { query: "widget", scope: "all" },
+      });
+      expect(v.decision, rule).toBe(rule);
+      expect(v.source, rule).toBe("override");
+    }
+  });
+
+  it("the floor touches nothing but the escalated op", () => {
+    // A tool with no per-call rule must still honour an allow, or the floor has leaked.
+    const v = evaluateToolPolicy("push_agent_branch", {
+      overrides: { push_agent_branch: "allow" },
+      args: { scope: "all" },
+    });
+    expect(v.decision).toBe("allow");
+    expect(v.source).toBe("override");
+  });
+
+  it("the row's summary promises what the floor delivers", () => {
+    // The summary tells the human the wide scope asks first EVEN IF they allow the tool. That is a
+    // claim about the rule above, so the two are pinned together — copy is code.
+    const entry = CONCIERGE_TOOL_CATALOG.find((t) => t.name === "search_history");
+    expect(entry?.summary).toContain("even if you allow this tool");
+    expect(
+      evaluateToolPolicy("search_history", {
+        overrides: { search_history: "allow" },
+        args: { query: "w", scope: "all" },
+      }).decision,
+    ).toBe("ask");
+  });
+
+  it("every domain that publishes prose still reaches the catalog — no spread can be dropped silently", () => {
+    // roborev 61938 then 61960. SUMMARY_BY_TOOL is assembled from seven spreads on a block of
+    // adjacent lines that has already been a merge conflict once and was resolved by hand. Dropping
+    // any one is SILENT: `entryFor` falls back to `CONCIERGE_RISK_NOTE[riskClass]`, so the row
+    // survives with generic prose, and the "summary is non-empty" check below is satisfied by that
+    // fallback. The screenshot rows are the worst case — `privacy-sensitive`, whose summaries exist
+    // precisely because a generic risk note is the wrong headline on a consent card.
+    //
+    // ── WHY THIS ITERATES THE OP LISTS AND NOT `SUMMARY_BY_TOOL` ──────────────────────────────────
+    // The obvious version — walk `SUMMARY_BY_TOOL` and check each entry reaches the catalog — is
+    // VACUOUS, and mutation-checking is the only reason that surfaced. The catalog is BUILT from
+    // that map, so deleting a spread removes the entry from both sides of the comparison and the
+    // assertion simply iterates fewer items. It passed with `...SCREENSHOT_TOOL_SUMMARY` and the
+    // workflow line deleted. A guard derived from the expression it guards cannot detect its own
+    // removal; the domains' OPS lists are the independent source of truth, so they are what this
+    // walks.
+    const prosePublishing: readonly (readonly [string, readonly string[]])[] = [
+      ["research", RESEARCH_OPS],
+      ["screenshot", SCREENSHOT_OPS],
+      ["attachments", ATTACHMENTS_OPS],
+      ["workflow", WORKFLOW_OPERATIONS],
+      ["terminal", TERMINAL_TOOL_NAMES],
+      ["app", APP_TOOL_NAMES],
+      ["workspace(search_history)", ["search_history"]],
+    ];
+    for (const [domain, ops] of prosePublishing) {
+      expect(ops.length, domain).toBeGreaterThan(0);
+      for (const op of ops) {
+        const entry = CONCIERGE_TOOL_CATALOG.find((t) => t.name === op);
+        expect(entry, `${domain}/${op}`).toBeTruthy();
+        // The fallback is the tell: a dropped spread leaves the row on its risk note.
+        expect(entry!.summary, `${domain}/${op}`).not.toBe(CONCIERGE_RISK_NOTE[entry!.riskClass]);
+        expect(entry!.summary, `${domain}/${op}`).toBe(
+          (SUMMARY_BY_TOOL as Record<string, string>)[op],
+        );
+      }
+    }
+    // …plus two content-level pins, because reaching the catalog is not the same as saying the thing
+    // that matters: someone deciding whether to gate `dispatch` needs to know it spends money.
+    expect(CONCIERGE_TOOL_CATALOG.find((t) => t.name === "dispatch")?.summary).toContain("metered");
+    // And `search_history`'s row must name the scope value that actually triggers the card. This is
+    // the one summary that describes an ARGUMENT rather than a verb, so it is the one that can go
+    // quietly wrong: a rename of the scope vocabulary would leave this sentence telling the human to
+    // expect a value the `.strict()` zod enum refuses. Asserted against the shared constant, not the
+    // literal — a copy of the literal here would rename right along with the bug.
+    expect(CONCIERGE_TOOL_CATALOG.find((t) => t.name === "search_history")?.summary).toContain(
+      `scope: "${WIDE_HISTORY_SCOPE}"`,
+    );
+  });
+
+  it("an explicit human deny still wins at scope all", () => {
+    const v = evaluateToolPolicy("search_history", {
+      overrides: { search_history: "deny" },
+      args: { query: "widget", scope: "all" },
+    });
+    expect(v.decision).toBe("deny");
   });
 });
 

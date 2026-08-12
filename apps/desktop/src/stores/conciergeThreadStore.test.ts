@@ -18,6 +18,8 @@ import {
   LIVE_THUMBNAIL_MESSAGES,
   LIVE_THUMBNAIL_MAX_CHARS,
   LIVE_THUMBNAIL_TOTAL_CHARS,
+  BRAIN_ID_PREFIX,
+  endStreamsThrough,
 } from "./conciergeThreadStore";
 import {
   LINT_CHECK_MAX_LEN,
@@ -642,5 +644,65 @@ describe("conciergeThreadStore", () => {
       const forged = rehydrateThread([marked([{ check: "hedge-words", severity: "warn", detail: "z".repeat(9000) }])]);
       expect((forged[0] as { lint?: { detail: string }[] }).lint![0]!.detail).toHaveLength(LINT_DETAIL_MAX_LEN);
     });
+  });
+});
+
+// ══ ABANDONED FRAGMENTS ARE DECLARED DEAD AT SEND TIME (roborev 62936) ═══════════════════════════
+// `endStreamsThrough` is the only thing that ever marks the ordinary double-send's casualty. The
+// backend kills the displaced child and its reader returns SILENTLY, so no `done` and no `error`
+// arrive for that turn — there is no event to hang a marker on, and the deltas it already painted
+// stay on screen forever. `conciergeHistoryCapture` waits for a bubble to stop growing before
+// indexing it, so without this sweep the most common abandoned reply in the app is one the founder
+// can scroll back to and never search for.
+describe("endStreamsThrough", () => {
+  const brain = (turn: number, text: string, extra: object = {}): ConciergeMessage =>
+    ({ id: `${BRAIN_ID_PREFIX}${turn}`, kind: "sparkle", text, ...extra }) as ConciergeMessage;
+
+  it("marks a streaming bubble at or below the floor", () => {
+    const out = endStreamsThrough([brain(7, "I was say")], 7);
+    expect((out[0] as { streamEnded?: true }).streamEnded).toBe(true);
+  });
+
+  it("leaves the turn ABOVE the floor alone — it is the one still talking", () => {
+    // The whole point of a floor: the send that retires 7 is the same send that starts 8, and
+    // sweeping 8 would mark the live reply final while its first chunk is all it has.
+    const out = endStreamsThrough([brain(7, "old"), brain(8, "new")], 7);
+    expect((out[0] as { streamEnded?: true }).streamEnded).toBe(true);
+    expect((out[1] as { streamEnded?: true }).streamEnded).toBeUndefined();
+  });
+
+  it("never touches a bubble that SETTLED — it answered, which is the opposite claim", () => {
+    const settled = brain(7, "done", { settled: true });
+    expect(endStreamsThrough([settled], 7)[0]).toBe(settled);
+  });
+
+  it("ignores non-brain bubbles and non-numeric turn ids", () => {
+    // A `postSparkle` notice is whole on arrival and was never on a numeric floor; sweeping by id
+    // shape rather than by kind alone is what keeps this from stamping one.
+    const notice = sparkle("sparkle-4", "Sent to Kraken Auth.");
+    const odd = brain(0, "x");
+    const weird = { id: `${BRAIN_ID_PREFIX}abc`, kind: "sparkle", text: "y" } as ConciergeMessage;
+    const out = endStreamsThrough([notice, odd, weird], 99);
+    expect(out[0]).toBe(notice);
+    expect((out[1] as { streamEnded?: true }).streamEnded).toBe(true);
+    expect(out[2]).toBe(weird);
+  });
+
+  it("keys on the PREFIX, not on 'six characters then digits'", () => {
+    // The turn number is read as `id.slice(BRAIN_ID_PREFIX.length)`, so without the prefix test the
+    // guard degrades into an offset coincidence: any sparkle id whose 7th character onward happens
+    // to be digits would be swept out of a namespace this function knows nothing about. That is a
+    // silent mis-sweep — the bubble is marked final and indexed early, with nothing to show for it
+    // in a diff. `toast-99` is the shape: six characters, then digits, and not a brain bubble.
+    const other = sparkle("toast-99", "not a brain reply");
+    expect(endStreamsThrough([other], 99)[0]).toBe(other);
+  });
+
+  it("returns the SAME array when nothing qualifies, so it cannot force a re-render", () => {
+    // Same discipline as `markSettled`: this runs on every send, and the common case is that
+    // nothing is mid-stream. A fresh array each time would rebuild a transcript of memoised rows
+    // for no reason.
+    const chat = [you("you-1"), sparkle("sparkle-1")];
+    expect(endStreamsThrough(chat, 99)).toBe(chat);
   });
 });

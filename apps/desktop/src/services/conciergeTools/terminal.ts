@@ -618,7 +618,19 @@ async function readHistoryTier(
   // whenever other agents outrank this one on the query. Capped in its own right — see
   // HISTORY_MAX_FETCH.
   const hits = await searchHistory(query, Math.min(want * 10, HISTORY_MAX_FETCH));
-  const mine = hits.filter((h) => h.agentId === agentId);
+  // TWO filters, and the second is a GATE rather than a relevance rule (roborev 61894-M1).
+  //
+  // `agentId` is what this tier is about: one agent's own terminal work. `source` is about who may
+  // read what — `concierge` rows are the founder's private conversations with his minder, and
+  // `workspace.ts`'s `search_history` makes reading them cost an approval card (`scope: "all"`).
+  // This tool is `read-only`, i.e. auto-allowed, and calls the raw history service, so without this
+  // line it is a SECOND door onto the same rows with no card and no scope argument.
+  //
+  // "The agentId filter already excludes them" is not a safe answer: it holds only while the
+  // recording half stores concierge turns with `agentId: null`, and the concierge column tracks a
+  // `mountedAgentId` that a plausible implementation would stamp onto them. Defence in depth — a
+  // terminal tier has no business returning concierge turns under ANY recording scheme.
+  const mine = hits.filter((h) => h.agentId === agentId && h.source !== "concierge");
   if (mine.length === 0) return { why: `no history entries for this agent matched "${query}"` };
   // Oldest last would put the newest material at the head, where the tail-cap would cut it. Order
   // oldest-first so "keep the tail" keeps the most recent, exactly as it does for a screen.

@@ -92,6 +92,37 @@ describe("policy binding — the human's settings reach the dispatch gate", () =
     expect(conciergeToolAuthority("call-1", d)).toBeNull();
   });
 
+  // The binding is the ONLY thing that carries a call's arguments into the policy layer, and
+  // `search_history` is the only op whose verdict depends on them. Drop `q.args` from the
+  // `evaluateToolPolicy` call and every other test in this file stays green while the founder's
+  // private concierge history becomes silently readable — so the wire gets its own assertions.
+  it("carries the CALL's arguments through, so scope: all asks and scope: default does not", () => {
+    expect(configuredToolPolicy(query("search_history", false, { query: "widget" })).tier).toBe(
+      "allow",
+    );
+    expect(
+      configuredToolPolicy(query("search_history", false, { query: "widget", scope: "default" }))
+        .tier,
+    ).toBe("allow");
+    // Neither of those may have raised anything at a human.
+    expect(pending()).toEqual([]);
+
+    const wide = configuredToolPolicy(query("search_history", false, { query: "w", scope: "all" }));
+    expect(wide).toEqual({ tier: "ask", approvedByUser: false });
+    expect(conciergeToolAuthority("call-1", wide)).toBeNull();
+
+    const [card] = pending();
+    expect(card).toBeDefined();
+    expect(card!.op).toBe("search_history");
+    // The CALL's risk, not the op's — and its note, straight out of CONCIERGE_RISK_NOTE.
+    expect(card!.riskClass).toBe("privacy-sensitive");
+    expect(card!.riskNote).toContain("private to you");
+    // The headline must not be the read-only note, which is what this row falls back to without a
+    // summary and which would read as "Observes only — changes nothing." on a privacy card.
+    expect(card!.summary).toContain("scope");
+    expect(card!.configPath).toBe("concierge.tools.search_history");
+  });
+
   it("fails CLOSED on a tool name the policy layer does not classify", () => {
     const d = configuredToolPolicy(query("definitely_not_a_real_tool"));
     expect(d.tier).toBe("deny");

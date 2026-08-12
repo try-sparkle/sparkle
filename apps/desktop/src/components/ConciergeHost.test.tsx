@@ -95,13 +95,13 @@ vi.mock("../services/openProjectTab", () => ({
   openProjectTab: h.openProjectTab,
   requestProjectTabFromOtherWindow: vi.fn(),
 }));
-// The two fire-and-forget bookkeeping calls on the dispatch path. Stubbed so these suites neither
-// touch `bd` nor the history DB, and so a case can make one THROW and assert the send survives —
-// see "still sends the message when history capture throws".
-vi.mock("../services/conciergeHistory", () => ({
-  recordConciergePrompt: vi.fn(),
-  recordConciergeReply: vi.fn(),
-}));
+// The fire-and-forget bookkeeping on the dispatch path. Stubbed so these suites do not touch `bd`,
+// and so a case can make it REJECT and assert the send survives.
+//
+// `services/conciergeHistoryCapture` is deliberately NOT stubbed here: it is a subscriber on the
+// thread store rather than a call this component makes, so leaving it real is what lets
+// "a failing ask queue does not take the history write with it" drive the production wiring end to
+// end and spy on the store's sink instead of on a mock.
 vi.mock("../services/conciergeAskQueue", () => ({
   captureAsksFrom: vi.fn(async () => ({ filed: [], bumped: [], reasked: [], dropped: 0 })),
   openAsksNow: vi.fn(() => []),
@@ -232,8 +232,8 @@ vi.mock("../stores/sparklePrefsStore", () => ({
 // string, and asserting the literal on each side is what pins that they stay shared. A hand-synced
 // copy here would turn a wording tweak into a red test for a non-bug (roborev 53044).
 import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
-import { recordConciergePrompt } from "../services/conciergeHistory";
 import { captureAsksFrom } from "../services/conciergeAskQueue";
+import { useHistoryStore } from "../stores/historyStore";
 import {
   _resetConciergeActivityForTests,
   noteConciergeToolCall,
@@ -613,28 +613,25 @@ describe("ConciergeHost", () => {
   });
 
   // ══ BOOKKEEPING MAY NEVER COST THE SEND (roborev 61903, and the regression it followed) ════════
-  // `recordConciergePrompt` and `captureAsksFrom` are fire-and-forget bookkeeping calls sitting on
-  // the dispatch path directly ahead of `startConciergeTurn`. A SYNCHRONOUS throw from either does
-  // not lose a history row or a bead — it aborts the send, and the founder's message is silently
-  // never delivered. That shipped once: an unguarded `crypto.randomUUID()` hung the queue-drain path.
+  // Fire-and-forget bookkeeping sits on the dispatch path directly ahead of `startConciergeTurn`. A
+  // SYNCHRONOUS throw from it does not lose a history row or a bead — it aborts the send, and the
+  // founder's message is silently never delivered. That shipped once: an unguarded
+  // `crypto.randomUUID()` hung the queue-drain path.
   //
-  // The module-local "capture does not throw" tests could not guard this. They assert the fix's
-  // CURRENT LOCATION, so moving the guard, or adding a third bookkeeping call beside these two,
+  // THE HISTORY HALF OF THIS MOVED (the sparkle-yd1ud × sparkle-s7rfc merge). There used to be a row
+  // here making `recordConciergePrompt` throw and asserting the turn still started. That call no
+  // longer exists: concierge history is captured by `services/conciergeHistoryCapture`'s subscriber
+  // on the thread store, so it is not on the dispatch path at all and cannot cost the send by
+  // construction. Its successor is `conciergeHistoryCapture.test.ts` ("a throwing sink does not
+  // break the conversation", the `record: boom` row) — the equivalent invariant at the new location,
+  // where the reachable damage is a throw escaping zustand's listener chain and failing the render.
+  // What remains here is the ask-queue half, below.
+  //
+  // The module-local "capture does not throw" tests could not guard this on their own. They assert
+  // the fix's CURRENT LOCATION, so moving the guard, or adding another bookkeeping call beside it,
   // brings the regression back with a fully green suite — the vacuous shape AGENTS.md calls the #1
-  // fleet-wide finding. This asserts the SIDE EFFECT instead: the turn still starts.
-  it("still sends the message when history capture throws", async () => {
-    vi.mocked(recordConciergePrompt).mockImplementationOnce(() => {
-      throw new TypeError("randomUUID is not a function");
-    });
-    h.feed = feedWith("approval");
-    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
-    fireEvent.click(screen.getByText("Send"));
-    await settle();
-    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
-    expect(h.startConciergeTurn.mock.calls[0]![0]).toContain("what needs me?");
-  });
-
+  // fleet-wide finding. These rows assert the SIDE EFFECT instead: the turn still starts.
+  //
   // A REJECTION, not a synchronous throw (roborev 61937). `captureAsksFrom` is `async` and catches
   // its own body, so it can never throw synchronously — a test that made it do so would pin a shape
   // the wire cannot produce, which is the same vacuity this file is otherwise careful about. The
@@ -669,12 +666,22 @@ describe("ConciergeHost", () => {
 
   // The independence half — the history row survives a failing ask queue. NOTE what this row can and
   // cannot prove (roborev 61987): the rejection is asynchronous, so a single shared `try` would ALSO
-  // have left `recordConciergePrompt` reachable. What makes it non-vacuous is the paired warn
-  // assertion: the ask-capture failure has to be OBSERVED (contained and logged) in the same turn
-  // that the history write lands, so a regression that drops the promise arm cannot pass by leaving
-  // the rejection unhandled and the sibling call incidentally intact.
+  // have left the history write reachable. What makes it non-vacuous is the paired warn assertion:
+  // the ask-capture failure has to be OBSERVED (contained and logged) in the same turn that the
+  // history write lands, so a regression that drops the promise arm cannot pass by leaving the
+  // rejection unhandled and the sibling write incidentally intact.
+  //
+  // IT SPIES ON THE STORE, NOT ON A MOCKED MODULE (sparkle-yd1ud × sparkle-s7rfc). The write is no
+  // longer a call the component makes; it is `conciergeHistoryCapture`'s subscriber reacting to the
+  // bubble. `conciergeHistoryCapture` is deliberately NOT mocked in this file, so what runs here is
+  // the real production wiring — mount, subscribe, bubble, record — with only the sink swapped. That
+  // is also the only thing that still covers the `useEffect` that starts it: delete that line and
+  // this row goes red.
   it("a failing ask queue does not take the history write with it", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
     try {
       vi.mocked(captureAsksFrom).mockRejectedValueOnce(new Error("bd is not available"));
       h.feed = feedWith("approval");
@@ -682,12 +689,19 @@ describe("ConciergeHost", () => {
       fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
       fireEvent.click(screen.getByText("Send"));
       await settle();
-      expect(recordConciergePrompt).toHaveBeenCalledWith("what needs me?");
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "prompt",
+          source: "concierge",
+          text: "what needs me?",
+        }),
+      );
       expect(warn).toHaveBeenCalledWith(
         expect.stringContaining("ask capture failed"),
         expect.any(Error),
       );
     } finally {
+      record.mockRestore();
       warn.mockRestore();
     }
   });
@@ -799,34 +813,19 @@ describe("ConciergeHost", () => {
     }
   });
 
-  // …and the same, the other way round: the sync call is the one that CAN throw.
+  // …and the same, the other way round — the row that made a SYNCHRONOUS bookkeeping call throw and
+  // asserted `bookkeep` names the unit ("history capture failed"), rather than one shared `try`
+  // logging a single generic line for whichever call died first (roborev 61987).
   //
-  // `captureAsksFrom` is dispatched BEFORE the history write, so "it was called" holds under any
-  // guard shape and cannot by itself distinguish per-call wrapping from one shared `try` (roborev
-  // 61987). The warn TEXT is what does: a shared `try` logs one generic "bookkeeping failed" for
-  // whichever call died first, while `bookkeep` names the unit — so asserting "history capture
-  // failed" goes red the moment the calls are re-grouped under a single catch.
-  it("a failing history write does not take the ask capture with it", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    try {
-      vi.mocked(recordConciergePrompt).mockImplementationOnce(() => {
-        throw new TypeError("randomUUID is not a function");
-      });
-      h.feed = feedWith("approval");
-      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
-      fireEvent.click(screen.getByText("Send"));
-      await settle();
-      expect(captureAsksFrom).toHaveBeenCalled();
-      expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
-      expect(warn).toHaveBeenCalledWith(
-        expect.stringContaining("history capture failed"),
-        expect.any(TypeError),
-      );
-    } finally {
-      warn.mockRestore();
-    }
-  });
+  // GONE WITH ITS SUBJECT (sparkle-yd1ud × sparkle-s7rfc), not quietly dropped. The history write it
+  // threw from is no longer a call on this path — see the merge note above — and `captureAsksFrom`
+  // is `async` and catches its own body, so nothing on the dispatch path can throw synchronously any
+  // more. Making one do so would pin a shape the wire cannot produce, which is precisely the vacuity
+  // this file is otherwise careful about.
+  //
+  // The property it guarded — per-call `bookkeep` wrapping, so one failing unit cannot swallow the
+  // next — is still pinned, by "one failing notice does not conceal the other" below: that row runs
+  // two sync `bookkeep` units in sequence, fails the first, and asserts the second still ran.
 
   it("sending a message starts a brain turn with a grounded snapshot", async () => {
     h.feed = feedWith("approval");
@@ -850,6 +849,189 @@ describe("ConciergeHost", () => {
     expect(inThread("On it.")).toBeTruthy();
     act(() => h.brain.done?.({ id: "7", text: "On it — approving CI Hardening." }));
     expect(inThread("On it — approving CI Hardening.")).toBeTruthy();
+  });
+
+  // ══ WHAT IS ON SCREEN IS IN THE INDEX, INCLUDING ON THE FAILURE PATH (roborev 62934/62935) ═════
+  // Two rows, and together they are the whole contract between this component and
+  // `conciergeHistoryCapture`. The capture waits for a brain bubble to stop growing before indexing
+  // it — otherwise it indexes the first token chunk and the sink's INSERT OR IGNORE makes that
+  // permanent. This component is what tells it when growing has stopped, so the marker has to be
+  // driven from HERE to be worth anything: asserting `streamEnded` on a hand-built fixture in the
+  // capture's own suite proves the capture reads the field, never that anything ever writes it.
+  //
+  // These spy on the real `historyStore` sink with `conciergeHistoryCapture` left unmocked, so what
+  // runs is delta → upsert → store write → subscriber → record.
+  it("indexes a streamed reply at its FINAL text, not at its first chunk", () => {
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
+    try {
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      act(() => h.brain.delta?.({ id: "7", text: "On " }));
+      act(() => h.brain.delta?.({ id: "7", text: "it." }));
+      // NOTHING yet — the reply is still arriving. This is the half that goes red if the capture
+      // finalises on first sight, which is what it used to do.
+      expect(record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response" }),
+      );
+      act(() => h.brain.done?.({ id: "7", text: "On it — approving CI Hardening." }));
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({
+          kind: "response",
+          source: "concierge",
+          text: "On it — approving CI Hardening.",
+        }),
+      );
+    } finally {
+      record.mockRestore();
+    }
+  });
+
+  it("indexes the partial text of a reply the brain ABANDONED, which stays on screen", () => {
+    // A turn that fails mid-stream keeps whatever it painted (ConciergeMessage's ABANDONED FRAGMENT
+    // note) — so the founder can scroll back to it, and a search that cannot find it is the exact
+    // "we never captured it" confusion the concierge history exists to remove. `markStreamEnded` in
+    // `offError` is what closes it; delete that call and this row goes red while the row above stays
+    // green, which is why the two are separate.
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
+    try {
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      act(() => h.brain.delta?.({ id: "7", text: "I'll get that st" }));
+      act(() => h.brain.error?.({ id: "7", detail: "You've hit your session limit" }));
+      expect(inThread("I'll get that st")).toBeTruthy();
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response", text: "I'll get that st" }),
+      );
+    } finally {
+      record.mockRestore();
+    }
+  });
+
+  it("indexes the partial text of a reply a newer SEND abandoned — with no terminal event at all", async () => {
+    // NO TERMINAL EVENT AT ALL — which is why this row fires no `done` for the displaced turn.
+    // `concierge.rs` installs the new turn, KILLS the child it evicts, and that reader returns
+    // silently, so the abandoned turn emits neither `done` nor `error`; `ConciergeHost`'s own
+    // supersede gates document themselves as defence in depth rather than the primary guard. A first
+    // version of this row called `h.brain.done` by hand and was therefore green against a branch the
+    // app rarely reaches (roborev 62936) — the vacuous shape AGENTS.md calls its #1 finding.
+    //
+    // WHICH TURN IS STREAMING HERE, and why it is not a user one (roborev 62937). The delta is
+    // injected with no prior send, so the turn queue's `running` is null — the state a BACKEND-
+    // INITIATED turn leaves it in. That is deliberate and it is the reachable shape: a user send
+    // arriving while a USER turn streams is QUEUED, never dispatched, so it cannot displace anything
+    // (see the companion row below). A push turn and a correction painting in the
+    // `correctionTurnId === null` window hold no queue slot, so a send during either one dispatches
+    // immediately and strands whatever they had painted.
+    //
+    // Dispatch is the only moment the frontend learns those bubbles are dead, so that is where
+    // `endStreamsThrough` marks them. Delete that call and this row goes red.
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
+    try {
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      act(() => h.brain.delta?.({ id: "7", text: "I was saying" }));
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "actually, hold on" } });
+      fireEvent.click(screen.getByText("Send"));
+      // The send is queued and dispatched asynchronously, and it is DISPATCH that retires the old
+      // turn — so this settle is load-bearing, not boilerplate.
+      await settle();
+      // The fragment is STILL ON SCREEN — which is the whole reason it has to be searchable.
+      expect(inThread("I was saying")).toBeTruthy();
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response", text: "I was saying" }),
+      );
+    } finally {
+      record.mockRestore();
+    }
+  });
+
+  it("a send arriving while a USER turn streams is queued, and sweeps nothing", async () => {
+    // The companion to the row above, and it pins the premise rather than the mechanism (roborev
+    // 62937). The obvious reading of `endStreamsThrough` is "a double-send kills the running reply
+    // at the frontend", and that is FALSE: `conciergeTurnQueue.enqueue` takes the `running !== null`
+    // branch and the second send WAITS, which is the whole point of the queue. So the reply in
+    // flight must NOT be marked ended, and must NOT be indexed while it is still arriving — if this
+    // row ever goes red, the sweep has started eating live replies.
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
+    try {
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      act(() => h.brain.delta?.({ id: "7", text: "still answering" }));
+      // THE POSITIVE HALF, and it is not decoration. A bare "nothing was recorded" passes for any
+      // number of reasons that have nothing to do with the queue — a gated delta, a Send affordance
+      // that stopped accepting the second message, or a message dropped on the floor. Each of those
+      // silently retires the premise while the row stays green, which is the vacuous shape this
+      // whole sequence exists to avoid, so all three are closed below.
+      expect(inThread("still answering")).toBeTruthy();
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
+      fireEvent.click(screen.getByText("Send"));
+      await settle();
+      // ¬DISPATCHED. Necessary, and on its own NOT sufficient: a second message that never reached
+      // `askSparkle` at all produces this same count.
+      expect(h.startConciergeTurn, "the second send must not dispatch").toHaveBeenCalledTimes(1);
+      expect(inThread("still answering")).toBeTruthy();
+      expect(record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response", text: "still answering" }),
+      );
+      // …AND QUEUED, which is the half `toHaveBeenCalledTimes(1)` cannot see (roborev 62939).
+      // Finishing the running turn must DRAIN the waiter — that is what separates "it waited" from
+      // "it evaporated", and only the first supports this row's premise that a double-send never
+      // reaches `endStreamsThrough`.
+      act(() => h.brain.done?.({ id: "7", text: "answered" }));
+      await settle();
+      expect(h.startConciergeTurn, "the queued message dispatches once the slot frees").toHaveBeenCalledTimes(2);
+      // Still never the streamed fragment: the bubble was settled by its own `done`, so what reached
+      // the index is the final text and not the chunk the sweep would have banked.
+      expect(record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response", text: "still answering" }),
+      );
+    } finally {
+      record.mockRestore();
+    }
+  });
+
+  it("indexes the fragment when a STRAGGLER done arrives for an already-displaced turn", () => {
+    // The belt to the row above, and a distinct call site: `offDone`'s `finally`, which marks on
+    // EVERY exit that did not render rather than on the four early returns one at a time. That
+    // shape is the fix for the second half of roborev 62936 — the first attempt marked the
+    // supersede return only and left the silenced one, which is reachable with a painted bubble
+    // during the window where `isCorrectionTurn`'s ref is still null.
+    //
+    // Driven through the supersede return because it is the one an event can reach from outside;
+    // the `finally` is shared, so a regression that moves the mark back into a single branch turns
+    // this red. `concierge.rs` normally silences these at the source — this is the straggler case
+    // its braces are the primary guard for.
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
+    try {
+      h.feed = feedWith("approval");
+      render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+      act(() => h.brain.delta?.({ id: "7", text: "I was saying" }));
+      // A newer turn's event is what retires 7 inside `supersededTurn`.
+      act(() => h.brain.delta?.({ id: "8", text: "Now then" }));
+      act(() => h.brain.done?.({ id: "7", text: "never rendered" }));
+      // What it PAINTED, never the `done` text it never showed.
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response", text: "I was saying" }),
+      );
+      expect(record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ text: "never rendered" }),
+      );
+    } finally {
+      record.mockRestore();
+    }
   });
 
   it("announces the FINISHED reply once, never the streaming chunks (roborev 53010)", () => {

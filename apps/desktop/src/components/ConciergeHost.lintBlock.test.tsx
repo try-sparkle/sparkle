@@ -115,6 +115,7 @@ import { ConciergeHost } from "./ConciergeHost";
 import { LINT_MARK_TESTID } from "./Concierge/LintMark";
 import { HELD_REPLY_TESTID } from "./Concierge/ConciergeMessageRow";
 import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
+import { useHistoryStore } from "../stores/historyStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
@@ -275,6 +276,76 @@ describe("the linter's block path — a blocked reply is re-prompted, once", () 
     expect(prompt, "the second check that fired").toContain("You hedged");
     expect(prompt, "the reply's own words must not travel with the finding").not.toContain(OFFER);
     expect(prompt).not.toContain("offered to act");
+  });
+
+  // ══ THE SEARCH INDEX GETS THE CORRECTION, NEVER THE DRAFT (roborev 62934/62937) ════════════════
+  // `conciergeHistoryCapture` indexes a brain bubble once it has stopped growing, keyed on the
+  // bubble id, and its sink is `INSERT OR IGNORE` on that id — so whatever is written FIRST is
+  // written forever. On this path the first text is the one the linter rejected.
+  //
+  // THIS ROW IS THE HOLD EXEMPTION'S MUTATION COVERAGE, and getting there took two wrong turns worth
+  // recording, because both were confident and neither survived being run.
+  //
+  //   - First I claimed the row could not cover the guard, because `retireThroughRef` would gate the
+  //     straggling delta once the correction's id resolved. WRONG: `takeHold` dispatches a BARE
+  //     `startConciergeTurn`, and the block-path header says it does so precisely so it never
+  //     touches `retireThroughRef`; only `dispatchTurn`'s `.then` advances it.
+  //   - Then a review claimed the row DID cover the guard, for that same wrong reason. Also wrong:
+  //     removing the condition by hand still left it green.
+  //
+  // The real cause was in the FIXTURE, not the source. `askAndAnswer` streams no deltas, so no
+  // `brain-1` bubble exists when the hold is taken and `markStreamEnded` no-ops on a bubble that is
+  // not there. So this row streams the draft FIRST — which is what production does, deltas arriving
+  // per token chunk — giving the stamp a bubble to land on. Remove the
+  // `lintHoldRef.current?.turnId !== e.id` condition now and the straggler assertion below goes red.
+  it("indexes the CORRECTED reply, never the blocked draft", async () => {
+    const record = vi
+      .spyOn(useHistoryStore.getState(), "record")
+      .mockImplementation(async () => undefined);
+    try {
+      h.runReplyLint.mockImplementation((i: { text: string }) =>
+        i.text === OFFER ? blocked(i.text) : clean(i.text),
+      );
+      // STREAMED, not handed straight to `done` — see the header. The bubble has to exist before the
+      // hold is taken or the stamp this row guards has nothing to land on.
+      render(<ConciergeHost feed={feed()} />);
+      await flush();
+      await send("what's the fleet doing?");
+      await act(async () => {
+        h.brain.delta?.({ id: "1", text: OFFER });
+      });
+      await flush();
+      expect(threadText()).toContain(OFFER);
+      await done({ id: "1", sessionId: "s", text: OFFER, toolCalls: [] });
+      const correctionId = issued[0]!;
+      expect(correctionId, "a correction turn must have been dispatched").toBeTruthy();
+      // NOTHING recorded yet — the reply on screen is blank while the correction runs, and the
+      // draft must not have been banked under the bubble's id in the meantime.
+      expect(record).not.toHaveBeenCalledWith(expect.objectContaining({ text: OFFER }));
+
+      // A LATE DELTA FOR THE HELD TURN DOES REACH THE BUBBLE. `offDelta` does not gate it (the turn
+      // is neither silenced nor superseded — `takeHold` deliberately leaves `retireThroughRef`
+      // alone), and `upsert` writes into a held bubble because that is how `settleHold` ends a hold.
+      // So if `streamEnded` had been stamped at hold time, this tail would be banked under `brain-1`
+      // and `INSERT OR IGNORE` would drop the correction forever. THIS is the assertion that fails
+      // when the exemption is removed.
+      await act(async () => {
+        h.brain.delta?.({ id: "1", text: "…and a straggling tail" });
+      });
+      await flush();
+
+      await done({ id: correctionId!, sessionId: "s", text: CORRECTED, toolCalls: [] });
+      expect(record).not.toHaveBeenCalledWith(
+        expect.objectContaining({ text: expect.stringContaining("straggling tail") }),
+      );
+
+      expect(record).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "response", source: "concierge", text: CORRECTED }),
+      );
+      expect(record).not.toHaveBeenCalledWith(expect.objectContaining({ text: OFFER }));
+    } finally {
+      record.mockRestore();
+    }
   });
 
   it("renders the CORRECTED reply and stamps the held violations \"revised\"", async () => {

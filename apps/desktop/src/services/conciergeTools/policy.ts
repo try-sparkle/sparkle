@@ -80,6 +80,7 @@ import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
 import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
+import { WIDE_HISTORY_SCOPE } from "@sparkle/core";
 
 // ---------------------------------------------------------------------------------------------
 // The three values
@@ -114,8 +115,9 @@ export const POLICY_DECISION_LABEL: Record<PolicyDecision, string> = {
  * can cover every tool. Each arm keeps the meaning its originating domain gave it:
  *
  *  • `read-only`       — observes; changes nothing anywhere.
- *  • `privacy-sensitive` — observes the HUMAN rather than the app: reads their screen or their
- *    surroundings. Changes nothing, and still must be asked about.
+ *  • `privacy-sensitive` — observes the HUMAN rather than the app: their screen, their
+ *    surroundings, or their own private conversations with Sparkle. Changes nothing, and still
+ *    must be asked about.
  *  • `routine`         — local, reversible, or one click from undone.
  *  • `disruptive`      — interrupts work in flight; the records survive, the running state doesn't.
  *  • `rewrites-branch` — rewrites the agent's own history (a rebase). Reflog-recoverable, ids change.
@@ -142,7 +144,11 @@ export type ConciergeRiskClass =
 /** One line per risk class, for the settings row and for the concierge explaining itself. */
 export const CONCIERGE_RISK_NOTE: Record<ConciergeRiskClass, string> = {
   "read-only": "Observes only — changes nothing.",
-  "privacy-sensitive": "Reads your screen — it may capture anything on it.",
+  // Covers both shapes this class is used for: a screen capture, and a history search asking for
+  // `scope: "all"` (which reaches your own concierge conversations). One sentence for both, because
+  // the class is one fact — "this reads something private to you" — and a second note per tool is
+  // the one that goes stale.
+  "privacy-sensitive": "Reads something private to you — your screen, or your own conversations with Sparkle.",
   routine: "Local and reversible.",
   disruptive: "Stops work that is in flight.",
   "rewrites-branch": "Rewrites the agent's own commit history.",
@@ -377,6 +383,30 @@ const RESEARCH_TOOL_SUMMARY: Record<ResearchOp, string> = {
   cancel: "Stop a background research task that is still running.",
 };
 
+/**
+ * The workspace domain's rows — deliberately just ONE of them.
+ *
+ * The workspace domain publishes no per-op prose, and inventing a sentence for all sixteen here
+ * would be a second description that drifts (see `SUMMARY_BY_TOOL`). `search_history` earns an
+ * exception because it is the only tool whose settings row and APPROVAL CARD are about an argument
+ * rather than the verb: the card is only ever raised for `scope: "all"`, and the fallback prose for
+ * this row is the `read-only` note — "Observes only — changes nothing." — which is true of the op
+ * and useless as the headline on a card asking whether a model may read your private conversations.
+ */
+const WORKSPACE_TOOL_SUMMARY: Partial<Record<WorkspaceOp, string>> = {
+  // The "even if you allow it" clause is load-bearing, not emphasis: allowing this row really does
+  // NOT cover `scope: "all"` (see `perCallRiskFor`'s floor), and a summary that merely said "it asks
+  // first" would be describing a promise the rule below it has to keep. These two move together.
+  // The scope value is INTERPOLATED, not spelled out, for the same reason `server.ts`'s model-facing
+  // description is: this sentence names an argument the `.strict()` zod enum has to accept, so a
+  // rename that missed it would leave the consent card telling the human to expect a value the
+  // schema now refuses — and nothing would go red, because prose is not typechecked.
+  search_history:
+    "Search your saved prompt and response history. Normally it searches build history only; " +
+    `reading your own conversations with the concierge needs \`scope: "${WIDE_HISTORY_SCOPE}"\`, ` +
+    "which always asks first — even if you allow this tool.",
+};
+
 /** The attachment domain's rows. Keyed on that domain's own op union, so an op added there is a
  *  typecheck failure here rather than a settings row that silently falls back to a risk note. */
 const ATTACHMENTS_TOOL_SUMMARY: Record<AttachmentsOp, string> = {
@@ -561,6 +591,105 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   ...RISK_OVERRIDES,
 };
 
+// ---------------------------------------------------------------------------------------------
+// PER-CALL RISK — the one place a tool's danger lives in its ARGUMENTS, not in its name
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * Risk that depends on WHAT WAS ASKED FOR, not on which tool was asked for.
+ *
+ * Everything above this comment keys risk off the op NAME, and that is right for nearly the whole
+ * catalog: `merge_pr` is `mutates-main` on every call anyone will ever make. `RISK_OVERRIDES` bends
+ * that by name too — it corrects a domain's vocabulary, it does not look at a call.
+ *
+ * `search_history` is the exception, and it is worth stating why it is an exception rather than the
+ * start of a pattern. Its two modes are not two degrees of the same thing: the default searches
+ * BUILD history — logs, prompts, agent chatter, regenerable and unremarkable — while
+ * `scope: "all"` additionally reaches `concierge`-sourced rows, which are to hold the founder's own
+ * private conversations with his minder (services/history.ts's `HistorySource`). The founder's
+ * explicit decision is that those must be RECORDED and findable by him while NOT being something
+ * the model can silently vacuum up. One op, two genuinely different questions to put to a human.
+ *
+ * (The RECORDING half has since landed — `services/conciergeHistoryCapture.ts`. The gate went first
+ * so the rows were never readable without one; conciergeTools/workspace.ts's `HistorySearchScope`
+ * lists the two constraints that half had to satisfy, and records that it does.)
+ *
+ * WHY IT CANNOT BE SOLVED BY SPLITTING THE OP IN TWO. A `search_all_history` sibling would key off
+ * the name again and would be the tidier shape — but the model chooses which tool it calls, so the
+ * gate would be exactly as strong as the model's willingness to pick the gated name, i.e. not a
+ * gate. The argument is what the model actually sends, so the argument is what has to be inspected.
+ *
+ * WHY IT CANNOT BE SOLVED IN THE ALLOWLIST EITHER. `src-tauri/src/concierge.rs` records, measured
+ * against Claude Code 2.1.220, that `--allowedTools` does NOT gate MCP tools; the `controlListener`
+ * policy — this module, through policyBinding — is the only real gate on this surface.
+ *
+ * SHAPE. A table keyed by `ConciergeToolName`, so the day someone renames the op this stops
+ * compiling instead of silently going quiet. `args` arrives RAW and UNVALIDATED (the policy is
+ * consulted before the registry's zod runs, deliberately — a denial must not leak which arguments
+ * it would have wanted), so every reader here has to be total over arbitrary JSON, and anything it
+ * cannot positively recognise as the wider request escalates NOTHING and falls through to the
+ * name-keyed class. That is safe in this direction only because the narrow default is the one that
+ * does not need a card; a mis-parse cannot hand out MORE than the name-keyed risk, and the
+ * registry's `.strict()` schema refuses the malformed call a moment later anyway.
+ *
+ * IT IS A FLOOR, NOT JUST A DEFAULT — an `allow` cannot cover an escalated call (roborev 61894-H1).
+ *
+ * The first cut escalated only the DERIVED DEFAULT, on the reasoning that a standing "yes" is the
+ * one thing this module treats as the human's to give. That was wrong here, and the reason is worth
+ * keeping because it generalises: the consent was never obtained for the wide case.
+ *
+ *   • The bulk "Allow every concierge tool?" dialog (`components/ConciergeToolsPane.tsx`) warns
+ *     about the privacy axis by DERIVING the names from `riskClass === "privacy-sensitive"` in the
+ *     CATALOG — and this op's catalog class is `read-only` on purpose (see `WORKSPACE_TOOL_SUMMARY`
+ *     and workspace.ts). So it is invisible to that warning by construction: one click would have
+ *     handed over unprompted reads of the founder's private conversations while the dialog named
+ *     only screen capture.
+ *   • The row's own summary says the wide scope asks first. A human setting Allow after reading
+ *     that has consented under a description an `allow`-beats-everything rule would have voided.
+ *
+ * So an `allow` covers the DEFAULT scope — the common case, and what someone setting that row is
+ * actually asking for — and `scope: "all"` still asks. `deny` is unaffected: tightening is always
+ * the human's, and `ask` is not the ceiling. This costs a real thing (there is now no way to say
+ * "never ask me about reading my own history"), and that is the founder's stated priority: the
+ * model must not be able to vacuum those rows silently, and one click on an approval card is the
+ * price of the wide read.
+ *
+ * Returns null for "no per-call opinion", which is the answer for every tool but one.
+ */
+const PER_CALL_RISK: Partial<
+  Record<ConciergeToolName, (args: unknown) => ConciergeRiskClass | null>
+> = {
+  search_history: (args) => {
+    if (!args || typeof args !== "object") return null;
+    // `WIDE_HISTORY_SCOPE` is the only value that widens what is read. Anything else — omitted,
+    // `"default"`, a typo, a number, an array — is the narrow search, which is also what the
+    // registry will accept or refuse on its own terms.
+    //
+    // COMPARED AGAINST THE SHARED CONSTANT, NOT A LITERAL, and that is load-bearing: `args` is
+    // `unknown` here, so this comparison has no typecheck coupling to the scope union at all.
+    // Re-spelling the value would fail to compile in the zod enum and the filter, but would leave
+    // THIS test silently false — and a silently-false escalation means the widened read of the
+    // user's own conversations runs as an auto-allowed `read-only` call with no approval card. The
+    // failure is silent and in the permissive direction, which is the worst pair.
+    return (args as { scope?: unknown }).scope === WIDE_HISTORY_SCOPE ? "privacy-sensitive" : null;
+  },
+};
+
+/**
+ * The per-call escalation for one call, or null when this call's risk is fully described by its
+ * name. Exported so the binding and the tests can ask the question without reimplementing it.
+ */
+export function perCallRiskFor(toolName: string, args: unknown): ConciergeRiskClass | null {
+  if (!isConciergeToolName(toolName)) return null;
+  return PER_CALL_RISK[toolName]?.(args) ?? null;
+}
+
+/** The risk class that actually governs ONE call: its per-call escalation if it has one, otherwise
+ *  the name-keyed classification. The single place the two are combined. */
+function riskForCall(toolName: ConciergeToolName, args: unknown): ConciergeRiskClass {
+  return perCallRiskFor(toolName, args) ?? RISK_BY_TOOL[toolName];
+}
+
 /** Which domain each tool belongs to. Total for the same structural reason as `RISK_BY_TOOL`. */
 const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(LIFECYCLE_RISK, "lifecycle" as const),
@@ -584,8 +713,19 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
  *  workspace domains classify risk but publish no per-op prose, and inventing a sentence per op
  *  here would be a second description that drifts from the code it describes. Those rows fall back
  *  to the risk note, which is a fact the domain DID publish. */
-const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
+// EXPORTED FOR ITS GUARD (roborev 61938/61960). Every line below is a spread on a block of adjacent
+// lines that has already been a merge conflict once and was resolved by hand. Dropping any one of
+// them is SILENT: `entryFor` falls back to `CONCIERGE_RISK_NOTE[riskClass]`, so the rows survive and
+// merely lose their prose, and a "summary is non-empty" check is satisfied by that fallback. The
+// screenshot rows are the worst case — they are `privacy-sensitive`, and their whole reason for
+// having prose is that a generic risk note is the wrong headline on a consent card.
+//
+// `policy.test.ts` asserts every entry here reaches the catalog verbatim, so losing ANY spread goes
+// red — rather than one test per domain, which leaves the next domain unguarded until someone
+// remembers this file.
+export const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
   ...RESEARCH_TOOL_SUMMARY,
+  ...WORKSPACE_TOOL_SUMMARY,
   ...SCREENSHOT_TOOL_SUMMARY,
   ...TERMINAL_TOOL_SUMMARY,
   ...ATTACHMENTS_TOOL_SUMMARY,
@@ -762,6 +902,20 @@ export interface ToolPolicyContext {
    * that talks to the stores is what actually supplies it.
    */
   readonly aiEnabled?: boolean;
+  /**
+   * The model's RAW, UNVALIDATED arguments for this call, when the caller has them.
+   *
+   * Read by exactly one thing — {@link perCallRiskFor} — and only to answer "is this the wider
+   * request?" for the one op whose risk lives in its arguments. Nothing here reads a `confirm`
+   * flag or any other model-supplied consent: those arrive inside the model's own arguments, so
+   * treating one as permission would let the model approve itself.
+   *
+   * OPTIONAL, and its absence means "no per-call opinion", never "assume the narrow call". That
+   * distinction is what keeps the settings pane honest: the pane asks about a TOOL, not a call, and
+   * it must keep rendering `search_history` as the `read-only` row it is by default rather than as
+   * a permanently-asking one.
+   */
+  readonly args?: unknown;
 }
 
 /** Where a decision came from — the pane shows it, and the concierge can say it out loud. */
@@ -772,6 +926,10 @@ export type ToolPolicySource =
   | "default"
   /** An entry exists but is not one of allow/ask/deny — resolved to `ask`, never to the default. */
   | "unreadable-override"
+  /** The human allowed this tool, but THIS CALL asked for something their `allow` does not cover —
+   *  resolved to `ask`. Only `perCallRiskFor` produces this; see it for why an `allow` is a
+   *  statement about the tool's ordinary use and not about the escalated call. */
+  | "per-call-escalation"
   /** No classification for this name at all. Resolved to `deny`; see the header, property 2. */
   | "unclassified"
   /** AI enhancements are off for the concierge, so nothing can run regardless of the rules. */
@@ -808,6 +966,13 @@ export interface ToolPolicyEvaluation {
  *     → { decision: "deny", source: "override", … }
  *   evaluateToolPolicy("teleport_agent", { overrides: {} })
  *     → { decision: "deny", source: "unclassified", riskClass: null, … }
+ *
+ * `ctx.args` is consulted ONLY by `perCallRiskFor`, and today only for `search_history`:
+ *
+ *   evaluateToolPolicy("search_history", { overrides: {} })
+ *     → { decision: "allow", riskClass: "read-only", … }
+ *   evaluateToolPolicy("search_history", { overrides: {}, args: { query: "x", scope: "all" } })
+ *     → { decision: "ask",   riskClass: "privacy-sensitive", … }
  */
 export function evaluateToolPolicy(
   toolName: string,
@@ -826,9 +991,9 @@ export function evaluateToolPolicy(
       source: "ai-disabled",
       reason:
         "AI enhancements are off, so the concierge can't run tools. Turn them on to let it act for you.",
-      riskClass: known ? RISK_BY_TOOL[toolName] : null,
+      riskClass: known ? riskForCall(toolName, ctx.args) : null,
       domain: known ? DOMAIN_BY_TOOL[toolName] : null,
-      defaultDecision: known ? DEFAULT_DECISION_BY_RISK[RISK_BY_TOOL[toolName]] : null,
+      defaultDecision: known ? DEFAULT_DECISION_BY_RISK[riskForCall(toolName, ctx.args)] : null,
       overridden: asPolicyDecision(ctx.overrides[toolName]) !== null,
       requiresConfirmation: false,
     };
@@ -850,7 +1015,12 @@ export function evaluateToolPolicy(
     };
   }
 
-  const riskClass = RISK_BY_TOOL[toolName];
+  // THE CALL'S risk, not merely the op's — see `perCallRiskFor`. Identical to `RISK_BY_TOOL` for
+  // every tool but `search_history`, and identical for that one too unless this call asked for
+  // `scope: "all"`. Everything downstream (the derived default, the reason sentence, the risk note
+  // on the approval card) reads from here, so the human is told about the call they are being asked
+  // to rule on rather than about the op in the abstract.
+  const riskClass = riskForCall(toolName, ctx.args);
   const domain = DOMAIN_BY_TOOL[toolName];
   const defaultDecision = DEFAULT_DECISION_BY_RISK[riskClass];
   const raw = ctx.overrides[toolName];
@@ -882,6 +1052,24 @@ export function evaluateToolPolicy(
       decision: "ask",
       source: "unreadable-override",
       reason: `The rule for “${toolName}” in config.toml is “${String(raw)}”, which is not allow, ask, or deny — asking first until it is fixed.`,
+      riskClass,
+      domain,
+      defaultDecision,
+      overridden: true,
+      requiresConfirmation: true,
+    };
+  }
+
+  // AN `allow` DOES NOT COVER AN ESCALATED CALL. The human's rule is a statement about the tool's
+  // ordinary use — and for the one op with a per-call rule, the escalated call is by construction
+  // not what they were shown when they set it. See `perCallRiskFor`. `deny` and `ask` fall through
+  // untouched: tightening is always the human's, and this only ever tightens.
+  if (parsed === "allow" && perCallRiskFor(toolName, ctx.args) !== null) {
+    return {
+      tool: toolName,
+      decision: "ask",
+      source: "per-call-escalation",
+      reason: `You allowed “${toolName}”, but this call is ${riskClass}, which that rule doesn't cover. ${CONCIERGE_RISK_NOTE[riskClass]} Asking about this one.`,
       riskClass,
       domain,
       defaultDecision,

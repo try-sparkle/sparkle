@@ -345,6 +345,25 @@ describe("readAgentTerminal — tier (c), the history FTS store", () => {
     expect(r.text).not.toContain("UNATTRIBUTED");
   });
 
+  // roborev 61894-M1. `search_history` makes reading `concierge`-sourced rows — the founder's
+  // private conversations with his minder — cost an approval card (`scope: "all"`, see
+  // conciergeTools/workspace.ts). THIS tool is `read-only`, i.e. auto-allowed, and reads the raw
+  // history service, so without the source filter it is a second door onto the same rows with no
+  // card and no scope argument. The concierge row here deliberately carries the TARGET agentId:
+  // "the agentId filter already excludes them" is only true while the not-yet-written recording
+  // half writes `agentId: null`, and this pins that the tier does not depend on that.
+  it("never returns a concierge row, even one stamped with this agent's id", async () => {
+    searchHistoryMock.mockResolvedValue([
+      { ...hit(AGENT, "PRIVATE MINDER TALK", 2), source: "concierge" },
+      hit(AGENT, "MY OWN WORK", 1),
+    ] as never);
+    const r = await readAgentTerminal(AGENT, { query: "work" });
+    // BOTH halves: the private row is gone AND the ordinary one survived the same read, so this
+    // cannot pass against a filter that dropped everything.
+    expect(r.text).toContain("MY OWN WORK");
+    expect(r.text).not.toContain("PRIVATE MINDER TALK");
+  });
+
   // Not a silent skip: the FTS5 table in src-tauri/src/history.rs indexes the `text` column only,
   // so "everything agent X said" is not a query it can answer. The caller has to know that the tier
   // was skipped for a structural reason rather than because the agent had no history.

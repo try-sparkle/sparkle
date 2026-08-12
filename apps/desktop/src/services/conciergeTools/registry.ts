@@ -242,7 +242,7 @@ import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuth
 import { useProjectStore } from "../../stores/projectStore";
 // The SAME predicate spawn_worker gates on — one copy, shared, so the two dispatch surfaces cannot
 // drift into enforcing different definitions of "a goal".
-import { validateWorkerGoal } from "@sparkle/core";
+import { validateWorkerGoal, HISTORY_SCOPES } from "@sparkle/core";
 import { log } from "../../logger";
 import {
   FLEET_OPS,
@@ -1411,8 +1411,25 @@ const helperBoundsArgs = z
   })
   .strict();
 
+/**
+ * `scope` is OPTIONAL and its absence means the narrow search, so every caller written before it
+ * existed keeps its exact meaning — but it has to be DECLARED here regardless, because the schema is
+ * `.strict()` and an undeclared field is a `bad-args` refusal rather than a field politely ignored.
+ *
+ * The value is what `policy.ts`'s `perCallRiskFor` gates on: `"all"` also reads `concierge`-sourced
+ * rows (the founder's own conversations with the minder) and therefore raises an approval card,
+ * while `"default"` stays the silent read-only search. Note the ORDER — the policy is consulted
+ * before this schema runs, so `perCallRiskFor` sees the raw string and this enum is the second line
+ * of defence, not the first.
+ */
 const searchHistoryArgs = z
-  .object({ query: z.string(), limit: z.number().int().positive().optional() })
+  .object({
+    query: z.string(),
+    limit: z.number().int().positive().optional(),
+    // Built from the shared list rather than a second spelling of it — see
+    // @sparkle/core/historyScope for why the value lives in one place.
+    scope: z.enum(HISTORY_SCOPES).optional(),
+  })
   .strict();
 
 /** A history hit, as `search_history` returned it. Validated field by field rather than passed
@@ -1472,7 +1489,7 @@ const WORKSPACE_ROUTES: Record<WorkspaceOp, Handler> = {
   ),
   set_helper_bounds: route(helperBoundsArgs, (a, ctx) => fromWorkspace(ctx, setHelperBounds(a))),
   search_history: route(searchHistoryArgs, async (a, ctx) =>
-    fromWorkspace(ctx, await searchHistory(a.query, a.limit)),
+    fromWorkspace(ctx, await searchHistory(a.query, a.limit, { scope: a.scope })),
   ),
   jump_to_history_hit: route(historyHitArgs, (a, ctx) =>
     fromWorkspace(ctx, jumpToHistoryHit(a.hit as HistoryHit)),

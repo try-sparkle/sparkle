@@ -50,7 +50,7 @@ import { useUiStore } from "../../stores/uiStore";
 import { useHelperPrefs } from "../../helper/helperPrefs";
 import { resetPaneReadiness, setPaneReady } from "../paneReadiness";
 import type { AgentTab, Project } from "../../types";
-import type { HistoryHit } from "../history";
+import type { HistoryHit, HistorySource } from "../history";
 
 function mkAgent(id: string): AgentTab {
   return {
@@ -80,6 +80,24 @@ function mkProject(id: string, agents: AgentTab[] = []): Project {
     createdAt: new Date(0).toISOString(),
     selectedAgentId: null,
     agents,
+  };
+}
+
+/** A history hit as the backend really returns one — FULLY POPULATED, and `source` in particular.
+ *  The scope filter reads that field, so a `{ id } as HistoryHit` cast (which is what these tests
+ *  used before the field mattered) would leave it `undefined` and make every hit look non-concierge
+ *  no matter what the filter did. */
+function mkHit(id: string, source: HistorySource): HistoryHit {
+  return {
+    id,
+    kind: "prompt",
+    source,
+    projectId: "p1",
+    agentId: "a1",
+    projectName: "Project p1",
+    agentName: "a1",
+    snippet: `…${id}…`,
+    createdAt: 0,
   };
 }
 
@@ -129,6 +147,18 @@ describe("the risk map", () => {
     expect(WORKSPACE_OP_RISK.quit_app).toBe("irreversible");
     expect(WORKSPACE_OP_RISK.stop_project_agents).toBe("disruptive");
     expect(WORKSPACE_OP_RISK.list_projects).toBe("read-only");
+  });
+
+  // DELIBERATELY STILL `read-only`, and this assertion is the one that used to sit inline above.
+  //
+  // It was moved out and given its own reasoning because the obvious reading of the concierge
+  // history-privacy work — "search_history can now read the founder's private conversations, so
+  // raise its risk" — is WRONG at this layer and would look like a fix. This map is keyed by op
+  // NAME, so raising the row raises it for every call, including the narrow default search the
+  // concierge runs constantly, and the human would be handed an approval card for reading a build
+  // log. The half that depends on the ARGUMENTS lives in policy.ts's `perCallRiskFor`; the
+  // companion assertions there are what pin the `scope: "all"` escalation.
+  it("keeps search_history read-only at the OP level — the scope gate is per-call, in policy.ts", () => {
     expect(WORKSPACE_OP_RISK.search_history).toBe("read-only");
   });
 
@@ -684,7 +714,7 @@ describe("window + app level", () => {
 
 describe("history", () => {
   it("refuses a blank query rather than round-tripping for nothing", async () => {
-    expect(await searchHistory("   ", undefined, deps)).toMatchObject({
+    expect(await searchHistory("   ", undefined, {}, deps)).toMatchObject({
       ok: false,
       reason: "blank-query",
     });
@@ -692,8 +722,8 @@ describe("history", () => {
   });
 
   it("returns hits", async () => {
-    search.mockResolvedValueOnce([{ id: "h1" } as HistoryHit]);
-    const res = await searchHistory("widget", 5, deps);
+    search.mockResolvedValueOnce([mkHit("h1", "build")]);
+    const res = await searchHistory("widget", 5, {}, deps);
     if (!res.ok) throw new Error("expected ok");
     expect(res.value).toHaveLength(1);
     expect(search).toHaveBeenCalledWith("widget", 5);
@@ -701,7 +731,73 @@ describe("history", () => {
 
   it("turns a backend failure into a typed refusal", async () => {
     search.mockRejectedValueOnce(new Error("db locked"));
-    expect(await searchHistory("widget", undefined, deps)).toMatchObject({
+    expect(await searchHistory("widget", undefined, {}, deps)).toMatchObject({
+      ok: false,
+      reason: "backend-failed",
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // THE SCOPE GATE. The founder's concierge conversations are recorded into the same history.db
+  // this tool queries; they must be findable BY HIM and not silently vacuumable BY THE MODEL.
+  // -------------------------------------------------------------------------------------------
+
+  // BOTH HALVES IN ONE TEST, on purpose. "the concierge row is absent" alone would pass against a
+  // backend that returned nothing at all — the vacuous shape AGENTS.md names as this repo's #1
+  // fleet-wide finding — so the same stubbed call must be shown to have KEPT the build row.
+  it("default scope drops concierge rows and keeps build rows from the same backend call", async () => {
+    search.mockResolvedValueOnce([
+      mkHit("build-1", "build"),
+      mkHit("concierge-1", "concierge"),
+      mkHit("brainstorm-1", "brainstorm"),
+    ]);
+    const res = await searchHistory("widget", undefined, {}, deps);
+    if (!res.ok) throw new Error("expected ok");
+    const ids = res.value.map((h) => h.id);
+    expect(ids).toContain("build-1");
+    expect(ids).toContain("brainstorm-1");
+    expect(ids).not.toContain("concierge-1");
+    // …and the backend really was asked, so the absence above is a FILTER and not an empty read.
+    expect(search).toHaveBeenCalledWith("widget", undefined);
+  });
+
+  it("omitting scope entirely is the same narrow search — an absent argument never widens", async () => {
+    search.mockResolvedValueOnce([mkHit("build-1", "build"), mkHit("concierge-1", "concierge")]);
+    const res = await searchHistory("widget", undefined, undefined, deps);
+    if (!res.ok) throw new Error("expected ok");
+    expect(res.value.map((h) => h.id)).toEqual(["build-1"]);
+  });
+
+  it("scope 'all' returns the concierge row", async () => {
+    search.mockResolvedValueOnce([mkHit("build-1", "build"), mkHit("concierge-1", "concierge")]);
+    const res = await searchHistory("widget", undefined, { scope: "all" }, deps);
+    if (!res.ok) throw new Error("expected ok");
+    expect(res.value.map((h) => h.id)).toEqual(["build-1", "concierge-1"]);
+  });
+
+  // The scope filter must gate the MODEL, never the human. ⌘K goes stores/historyStore →
+  // services/history → the Rust command, so the founder searching his own machine keeps seeing
+  // every source, `concierge` included. A source assertion rather than a behavioural one for the
+  // same reason as the picker test above: the hazard is a FUTURE refactor routing the palette
+  // through this façade "to share the code", which would silently hide the founder's own
+  // conversations from his own search — and no runtime test here can see a call that has not been
+  // written yet. Deliberately a NEGATIVE assertion about the import, not a pin on that module's
+  // contents, so it stays true while that file evolves.
+  it("leaves the ⌘K palette's own path outside this façade", () => {
+    const store = readFileSync(resolve(process.cwd(), "src/stores/historyStore.ts"), "utf8");
+    expect(store).not.toMatch(/conciergeTools/);
+    // …and it still reads the history service directly.
+    expect(store).toMatch(/from\s+"\.\.\/services\/history"/);
+  });
+
+  it("still refuses a blank query and a backend failure at scope 'all'", async () => {
+    // The gate must not have quietly replaced either existing refusal with a filtered empty array.
+    expect(await searchHistory("   ", undefined, { scope: "all" }, deps)).toMatchObject({
+      ok: false,
+      reason: "blank-query",
+    });
+    search.mockRejectedValueOnce(new Error("db locked"));
+    expect(await searchHistory("widget", undefined, { scope: "all" }, deps)).toMatchObject({
       ok: false,
       reason: "backend-failed",
     });

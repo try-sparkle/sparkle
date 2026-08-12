@@ -253,14 +253,27 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
  * reading your config" is a transient condition to retry, not something for a person to adjudicate,
  * and raising a prompt for it would train them to click through prompts.
  */
-function evaluateWithHydrationHold(op: string): {
+function evaluateWithHydrationHold(
+  op: string,
+  args: unknown,
+): {
   evaluation: ToolPolicyEvaluation;
   held: boolean;
 } {
   const { overrides, hydrated } = readToolPolicyOverrides();
   // The TOOL surface asks the entitlement question, not the inference-cost one — see
   // `conciergeToolsEnabled`.
-  const evaluation = evaluateToolPolicy(op, { overrides, aiEnabled: conciergeToolsEnabled() });
+  //
+  // `args` goes in for ONE reason: `search_history` is the only op whose risk depends on what was
+  // asked for rather than on which tool was asked for (policy.ts `perCallRiskFor`), and this is the
+  // seam that has the call in hand. The policy module stays pure — it reads no store and inspects
+  // nothing but the value handed to it — and it reads these arguments only to answer "is this the
+  // wider request?", never to find consent in them.
+  const evaluation = evaluateToolPolicy(op, {
+    overrides,
+    aiEnabled: conciergeToolsEnabled(),
+    args,
+  });
   const held =
     !hydrated && evaluation.decision === "allow" && evaluation.riskClass !== "read-only";
   return { evaluation, held };
@@ -275,7 +288,7 @@ const HYDRATION_HOLD: ToolPolicyDecision = {
 };
 
 export const configuredToolPolicy: ConciergeToolPolicy = (q: ToolPolicyQuery) => {
-  const { evaluation, held } = evaluateWithHydrationHold(q.op);
+  const { evaluation, held } = evaluateWithHydrationHold(q.op, q.args);
   if (held) return HYDRATION_HOLD;
   if (evaluation.decision !== "ask") {
     return toDispatchDecision(evaluation.decision, evaluation.reason);
@@ -309,7 +322,7 @@ export function appOpPolicy(
   op: string,
   ctx?: { requestId?: string; args?: unknown },
 ): ToolPolicyDecision {
-  const { evaluation, held } = evaluateWithHydrationHold(op);
+  const { evaluation, held } = evaluateWithHydrationHold(op, ctx?.args);
   if (held) return HYDRATION_HOLD;
   if (evaluation.decision !== "ask") {
     return toDispatchDecision(evaluation.decision, evaluation.reason);

@@ -19,7 +19,7 @@
 //      underlying destructive call never happened, not merely that `ok` was false.
 //   5. THE PTY WRITE IS AUTHORITY-GATED. The only authority the terminal domain ever sees is one
 //      `conciergeToolAuthority` built from the wire's toolCallId and the policy decision.
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const invoke = vi.fn(async () => undefined);
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...(a as [])) }));
@@ -158,6 +158,14 @@ import {
   type ToolPolicyQuery,
 } from "./registry";
 import { DISCARD_CONFIRM_TOKEN } from "./lifecycle";
+import { configuredToolPolicy } from "./policyBinding";
+import {
+  approveApproval,
+  clearConciergeApprovals,
+  pendingApprovals,
+  useConciergeApprovals,
+} from "../../stores/conciergeApprovals";
+import { useSettingsStore } from "../../stores/settingsStore";
 import { useAuthStore } from "../../stores/authStore";
 import { useCloudAuthStore } from "../../stores/cloudAuthStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -786,6 +794,133 @@ describe("dispatchConciergeTool — the policy seam", () => {
     // Never claim a prompt was raised when none could be — the ledger refuses a blank id.
     expect(refusal(r).message).toContain("no tool-call id");
     expect(refusal(r).message).toContain("concierge.tools.remove_project");
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // search_history's `scope` — the ONE op whose verdict depends on its ARGUMENTS.
+  //
+  // Driven through the REAL `configuredToolPolicy` rather than a stub, deliberately. A stub that
+  // re-derived the verdict from `evaluateToolPolicy` would be a COPY of the mechanism under test
+  // and would stay green if the binding stopped forwarding `q.args` at all — which is precisely
+  // the wire this feature hangs on.
+  // -------------------------------------------------------------------------------------------
+  describe("search_history scope", () => {
+    const HITS = [
+      {
+        id: "build-1",
+        kind: "prompt",
+        source: "build",
+        projectId: "p1",
+        agentId: "a1",
+        projectName: "P",
+        agentName: "a1",
+        snippet: "widget",
+        createdAt: 0,
+      },
+      {
+        id: "concierge-1",
+        kind: "prompt",
+        source: "concierge",
+        projectId: null,
+        agentId: null,
+        projectName: null,
+        agentName: null,
+        snippet: "widget",
+        createdAt: 0,
+      },
+    ];
+
+    const searchCall = (args: Record<string, unknown>) =>
+      call({ domain: "workspace", op: "search_history", args });
+
+    beforeEach(() => {
+      // The concierge AI gate is a precondition for every tool call; these tests are about the
+      // scope rule, not the entitlement, so it is opened explicitly (see aiGate.concierge.test.ts).
+      useSettingsStore.setState({
+        aiConcierge: true,
+        conciergeToolPolicy: {},
+        conciergeToolPolicyHydrated: true,
+      } as never);
+      useAuthStore.setState({
+        me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+        creditFloorCents: 0,
+      } as never);
+      clearConciergeApprovals();
+      // The shared `invoke` mock is declared zero-arg (`vi.fn(async () => undefined)`), so an
+      // implementation that reads the command name needs the cast.
+      invoke.mockImplementation(((cmd: unknown) =>
+        Promise.resolve(cmd === "history_search" ? HITS : undefined)) as never);
+    });
+
+    /** The commands `invoke` was actually asked for. Same cast reason as above. */
+    const invokedCommands = () => (invoke.mock.calls as unknown as unknown[][]).map((c) => c[0]);
+
+    afterEach(() => {
+      // `vi.clearAllMocks()` clears CALLS, not implementations, so an implementation set here would
+      // otherwise answer every later suite's `invoke`.
+      invoke.mockImplementation(async () => undefined);
+      clearConciergeApprovals();
+    });
+
+    it("a default-scope search runs silently and returns build hits WITHOUT the concierge row", async () => {
+      const r = await dispatchConciergeTool(searchCall({ query: "widget" }), {
+        policy: configuredToolPolicy,
+      });
+      if (!r.ok) throw new Error(`expected ok, got ${JSON.stringify(r)}`);
+      const ids = (r.data as { id: string }[]).map((h) => h.id);
+      // BOTH halves: the concierge row is gone AND the build row survived the same backend read.
+      expect(ids).toEqual(["build-1"]);
+      // Silently — no card was put in front of the human for an ordinary search.
+      expect(pendingApprovals(useConciergeApprovals.getState().entries)).toEqual([]);
+    });
+
+    it("an explicit scope 'default' behaves identically to omitting it", async () => {
+      const r = await dispatchConciergeTool(searchCall({ query: "widget", scope: "default" }), {
+        policy: configuredToolPolicy,
+      });
+      if (!r.ok) throw new Error(`expected ok, got ${JSON.stringify(r)}`);
+      expect((r.data as { id: string }[]).map((h) => h.id)).toEqual(["build-1"]);
+      expect(pendingApprovals(useConciergeApprovals.getState().entries)).toEqual([]);
+    });
+
+    it("scope 'all' is needs-approval — and the search never runs", async () => {
+      const r = await dispatchConciergeTool(searchCall({ query: "widget", scope: "all" }), {
+        policy: configuredToolPolicy,
+      });
+      expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
+      // The gate is not merely a label: the backend was never asked, so nothing was read.
+      expect(invokedCommands()).not.toContain("history_search");
+      // …and the human has a card naming what they are being asked about.
+      const [card] = pendingApprovals(useConciergeApprovals.getState().entries);
+      expect(card).toBeDefined();
+      expect(card!.op).toBe("search_history");
+      expect(card!.riskClass).toBe("privacy-sensitive");
+      expect(card!.args).toContainEqual({ key: "scope", value: "all" });
+    });
+
+    it("approving that card lets the SAME call through, concierge row included", async () => {
+      // The approval path for this op end to end: refuse → human approves → the replay (same
+      // toolCallId, same args, as conciergeApprovalResume performs it) spends the grant and runs.
+      const c = searchCall({ query: "widget", scope: "all" });
+      expect(refusal(await dispatchConciergeTool(c, { policy: configuredToolPolicy })).code).toBe(
+        REGISTRY_CODES.needsApproval,
+      );
+
+      approveApproval(TOOL_CALL_ID);
+
+      const r = await dispatchConciergeTool(c, { policy: configuredToolPolicy });
+      if (!r.ok) throw new Error(`expected ok, got ${JSON.stringify(r)}`);
+      expect((r.data as { id: string }[]).map((h) => h.id)).toEqual(["build-1", "concierge-1"]);
+    });
+
+    it("refuses a scope the schema does not know, rather than treating it as the wide one", async () => {
+      const r = await dispatchConciergeTool(searchCall({ query: "widget", scope: "everything" }), {
+        policy: configuredToolPolicy,
+      });
+      expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+      expect(refusal(r).message).toContain("scope");
+      expect(invokedCommands()).not.toContain("history_search");
+    });
   });
 
   it("an ASK the user approved runs", async () => {

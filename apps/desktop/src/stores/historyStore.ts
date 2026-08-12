@@ -49,7 +49,12 @@ interface HistoryState {
   search: (q: string) => Promise<void>;
   /** Load the active retention tier from the (stubbed) credit system. */
   loadEntitlement: () => Promise<void>;
-  /** Prune history older than the entitlement window (no-op on `indefinite`). */
+  /** Prune history older than the entitlement window.
+   *
+   *  `indefinite` skips the AGE bound only — it is no longer a full no-op. The concierge row-count
+   *  cap runs on every prune regardless of tier (`prune_in_with_max` in src-tauri/src/history.rs),
+   *  because count and age are independent bounds and concierge conversation is exempt from the age
+   *  one. So a prune at the `indefinite` tier can still delete rows and report a non-zero count. */
   prune: () => Promise<void>;
 }
 

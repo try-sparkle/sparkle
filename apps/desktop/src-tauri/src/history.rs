@@ -62,13 +62,42 @@ impl HistoryDb {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
-        let conn = Connection::open(dir.join("history.db"))
-            .map_err(|e| format!("open history.db: {e}"))?;
+        let db_path = dir.join("history.db");
+        let conn = Connection::open(&db_path).map_err(|e| format!("open history.db: {e}"))?;
+        // Owner-only on the FILE too, not just the directory above — security-audit finding M2.
+        // SQLite creates history.db at the process umask default (verified: `-rw-r--r--`), so the
+        // plaintext prompt/response corpus was world-readable inside an owner-only directory. Per
+        // finding C1 this buys nothing against a same-UID agent (which can chmod it back), but it
+        // is correct against other OS users and against backup/sync tools that copy modes along.
+        // Best-effort and unix-only, matching the directory chmod; after `open` so the file exists.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o600));
+        }
         // WAL for crash durability (a torn write can't corrupt the file). Note: all access is
         // serialized through the single `Mutex<Connection>` above, so WAL's read/write concurrency
         // isn't exercised here — it's kept for the durability guarantee, which is what we want.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| format!("set WAL: {e}"))?;
+        // The sidecars need the same treatment, and they are not covered by the chmod above. A
+        // FRESH `-wal`/`-shm` does inherit the main file's mode, so on a clean install the line
+        // above is enough — but a `-wal` left behind by a crash BEFORE this change keeps its old
+        // `-rw-r--r--` and is reused as-is on the next open. That file holds the newest
+        // uncheckpointed prompt/response text, i.e. exactly the plaintext M2 is about. Ordered
+        // after the pragma so the files exist to be chmod'd; missing ones are simply ignored.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for suffix in ["-wal", "-shm"] {
+                let mut side = db_path.clone().into_os_string();
+                side.push(suffix);
+                let _ = std::fs::set_permissions(
+                    std::path::Path::new(&side),
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+        }
         init_schema(&conn).map_err(|e| format!("init schema: {e}"))?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -168,25 +197,84 @@ pub(crate) fn search_in(conn: &Connection, query: &str, limit: u32) -> rusqlite:
     rows.collect()
 }
 
-/// Retention prune. `None` (indefinite) → no-op, 0. `Some(cutoff)` → soft-delete then hard-delete
-/// every row strictly older than `cutoff`; returns the number of rows hard-deleted.
+/// How many `source = 'concierge'` rows we keep, newest-first.
+///
+/// AGE and COUNT are two DIFFERENT bounds, and concierge rows are deliberately exempt from the age
+/// one: the founder's conversations with the concierge are kept forever, never aged out by the
+/// 24h/retention-tier prune that governs `build` rows. "Forever" with no second bound is just
+/// "unbounded", though — a table that only ever grows. This count bound is what makes keep-forever
+/// SAFE: the newest `CONCIERGE_HISTORY_MAX` conversation rows are kept whatever their age, and
+/// anything past that falls off the oldest end. At ~50k rows the corpus is still small (single-digit
+/// MB of text) while being far more history than a human conversation will ever revisit.
+pub(crate) const CONCIERGE_HISTORY_MAX: usize = 50_000;
+
+/// Retention prune. Two independent bounds, both applied here so they run on the same existing
+/// schedule and under the same lock:
+///
+/// * AGE — `Some(cutoff)` soft-deletes then hard-deletes every **non-concierge** row strictly older
+///   than `cutoff`. `None` (the "indefinite" tier) skips the age bound entirely.
+/// * COUNT — the concierge rows past the newest [`CONCIERGE_HISTORY_MAX`] are deleted. This runs on
+///   EVERY call, `None` included: the count bound is independent of the age bound, so an indefinite
+///   user still gets it (it is the only thing bounding concierge growth at all).
+///
+/// Returns the total number of rows hard-deleted, age-pruned plus count-trimmed.
 pub(crate) fn prune_in(conn: &Connection, cutoff: Option<i64>) -> rusqlite::Result<usize> {
-    let Some(cutoff) = cutoff else {
-        return Ok(0);
-    };
-    // Two-step soft-then-hard delete per the spec's retention contract: tombstone (`deleted_at`),
-    // then hard-delete. Today the tombstone isn't separately observable (both run under one lock in
-    // one call), but the step is intentional schema-readiness for the future cloud-backup path,
-    // where prune would tombstone now and a later pass would hard-delete only already-synced rows.
-    conn.execute(
-        "UPDATE entries SET deleted_at = ?1 WHERE created_at < ?1 AND deleted_at IS NULL",
-        rusqlite::params![cutoff],
-    )?;
-    let deleted = conn.execute(
-        "DELETE FROM entries WHERE created_at < ?1",
-        rusqlite::params![cutoff],
-    )?;
+    prune_in_with_max(conn, cutoff, CONCIERGE_HISTORY_MAX)
+}
+
+/// [`prune_in`] with the concierge count cap injected, so tests can drive the cap with a handful of
+/// rows instead of 50,000.
+pub(crate) fn prune_in_with_max(
+    conn: &Connection,
+    cutoff: Option<i64>,
+    concierge_max: usize,
+) -> rusqlite::Result<usize> {
+    let mut deleted = 0usize;
+    // The AGE bound. Two-step soft-then-hard delete per the spec's retention contract: tombstone
+    // (`deleted_at`), then hard-delete. Today the tombstone isn't separately observable (both run
+    // under one lock in one call), but the step is intentional schema-readiness for the future
+    // cloud-backup path, where prune would tombstone now and a later pass would hard-delete only
+    // already-synced rows. Both statements exclude `source = 'concierge'`: concierge conversation is
+    // kept forever and must never be aged out — it is bounded by count instead, below. The tombstone
+    // needs the same exclusion as the delete, or a concierge row would survive as an invisible
+    // soft-deleted row (`search_in` filters on `deleted_at IS NULL`), which is "kept" in name only.
+    if let Some(cutoff) = cutoff {
+        conn.execute(
+            "UPDATE entries SET deleted_at = ?1
+             WHERE created_at < ?1 AND deleted_at IS NULL AND source <> 'concierge'",
+            rusqlite::params![cutoff],
+        )?;
+        deleted += conn.execute(
+            "DELETE FROM entries WHERE created_at < ?1 AND source <> 'concierge'",
+            rusqlite::params![cutoff],
+        )?;
+    }
+    // The COUNT bound — outside the `if`, because it does not depend on the age tier.
+    deleted += prune_concierge_count_in(conn, concierge_max)?;
     Ok(deleted)
+}
+
+/// Delete the OLDEST `source = 'concierge'` rows beyond the newest `max`. Returns rows deleted.
+///
+/// Straight to a hard delete, no tombstone step: the age path's tombstone exists for the future
+/// cloud-backup handshake on *expired* rows, whereas this is an overflow bound on rows that are
+/// never expiring — there is nothing for a later sync pass to reconcile. `rowid` breaks `created_at`
+/// ties so the choice is deterministic (the frontend stamps `Date.now()`, which collides).
+pub(crate) fn prune_concierge_count_in(
+    conn: &Connection,
+    max: usize,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM entries
+         WHERE source = 'concierge'
+           AND rowid NOT IN (
+               SELECT rowid FROM entries
+               WHERE source = 'concierge'
+               ORDER BY created_at DESC, rowid DESC
+               LIMIT ?1
+           )",
+        rusqlite::params![max as i64],
+    )
 }
 
 /// Turn a free-text query into a punctuation-safe FTS5 match expression: each whitespace-separated
@@ -282,11 +370,41 @@ mod tests {
         conn
     }
 
+    fn count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap()
+    }
+
+    /// Surviving ids, oldest-first — so a count-cap assertion names WHICH rows were kept, not just
+    /// how many.
+    fn ids(conn: &Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM entries ORDER BY created_at ASC, rowid ASC")
+            .unwrap();
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
     fn entry(id: &str, kind: &str, text: &str, created_at: i64) -> EntryInput {
+        sourced_entry("build", id, kind, text, created_at)
+    }
+
+    /// A concierge-sourced row — same shape as `entry`, only `source` differs, which is exactly the
+    /// column the retention rules key on.
+    fn concierge(id: &str, text: &str, created_at: i64) -> EntryInput {
+        sourced_entry("concierge", id, "prompt", text, created_at)
+    }
+
+    fn sourced_entry(
+        source: &str,
+        id: &str,
+        kind: &str,
+        text: &str,
+        created_at: i64,
+    ) -> EntryInput {
         EntryInput {
             id: id.into(),
             kind: kind.into(),
-            source: "build".into(),
+            source: source.into(),
             project_id: Some("p1".into()),
             agent_id: Some("a1".into()),
             project_name: Some("Proj".into()),
@@ -362,12 +480,18 @@ mod tests {
     }
 
     #[test]
-    fn prune_none_is_a_noop() {
+    fn prune_none_does_no_age_deletion() {
+        // `None` is the "indefinite" tier: NO age bound at all, however old the row. It is no longer
+        // a whole-function no-op — the concierge count bound still runs — so this pins the age half
+        // specifically: nothing is deleted and nothing is tombstoned.
         let conn = mem();
         record_into(&conn, &entry("1", "prompt", "keep me", 1000)).unwrap();
         assert_eq!(prune_in(&conn, None).unwrap(), 0);
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM entries", [], |r| r.get(0)).unwrap();
-        assert_eq!(n, 1);
+        assert_eq!(count(&conn), 1);
+        let tombstoned: i64 = conn
+            .query_row("SELECT COUNT(*) FROM entries WHERE deleted_at IS NOT NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(tombstoned, 0);
     }
 
     #[test]
@@ -397,6 +521,121 @@ mod tests {
         assert!(search_in(&conn, "stale", 50).unwrap().is_empty());
     }
 
+    // ── Concierge retention: kept forever by AGE, bounded by COUNT ─────────────────────────────
+
+    #[test]
+    fn prune_keeps_concierge_and_deletes_a_build_row_of_the_same_age() {
+        // The paired assertion is the point: asserting only that the concierge row survived would
+        // also pass if the prune had silently done nothing at all (a wrong cutoff, an early return).
+        // The build row at the SAME created_at is the control that proves the prune really ran and
+        // that `source` is the thing that spared the other row.
+        let conn = mem();
+        record_into(&conn, &entry("build-old", "prompt", "build text", 1000)).unwrap();
+        record_into(&conn, &concierge("conc-old", "concierge text", 1000)).unwrap();
+
+        let deleted = prune_in(&conn, Some(2000)).unwrap();
+
+        assert_eq!(deleted, 1, "only the build row should have been hard-deleted");
+        assert_eq!(ids(&conn), vec!["conc-old".to_string()]);
+        // …and it is a LIVE row, not an invisible tombstone: the soft-delete step must carry the
+        // same exclusion as the hard delete, or the row is "kept" but unsearchable.
+        let deleted_at: Option<i64> = conn
+            .query_row("SELECT deleted_at FROM entries WHERE id = 'conc-old'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(deleted_at, None, "concierge row was tombstoned by the soft-delete step");
+        assert_eq!(search_in(&conn, "concierge", 50).unwrap().len(), 1);
+        assert!(search_in(&conn, "build", 50).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concierge_count_cap_deletes_the_oldest_beyond_max() {
+        // Drive the cap with an injected max of 3 rather than the 50k const — an injectable seam so
+        // the mechanism is actually exercised instead of asserted around.
+        let conn = mem();
+        for i in 0..5 {
+            record_into(&conn, &concierge(&format!("c{i}"), "chat", 1000 + i)).unwrap();
+        }
+        let deleted = prune_concierge_count_in(&conn, 3).unwrap();
+        assert_eq!(deleted, 2);
+        // Newest 3 kept, oldest 2 gone — not merely "3 rows remain".
+        assert_eq!(ids(&conn), vec!["c2".to_string(), "c3".to_string(), "c4".to_string()]);
+    }
+
+    #[test]
+    fn concierge_count_cap_under_max_deletes_nothing() {
+        let conn = mem();
+        for i in 0..3 {
+            record_into(&conn, &concierge(&format!("c{i}"), "chat", 1000 + i)).unwrap();
+        }
+        assert_eq!(prune_concierge_count_in(&conn, 3).unwrap(), 0);
+        assert_eq!(count(&conn), 3);
+    }
+
+    #[test]
+    fn concierge_count_cap_ignores_build_rows() {
+        // The cap is a bound on concierge rows only — build rows must neither be deleted by it nor
+        // consume slots in it. With max=2 and 3 build rows present, only the oldest concierge row
+        // may go.
+        let conn = mem();
+        for i in 0..3 {
+            record_into(&conn, &entry(&format!("b{i}"), "prompt", "build", 1000 + i)).unwrap();
+        }
+        for i in 0..3 {
+            record_into(&conn, &concierge(&format!("c{i}"), "chat", 2000 + i)).unwrap();
+        }
+        assert_eq!(prune_concierge_count_in(&conn, 2).unwrap(), 1);
+        assert_eq!(
+            ids(&conn),
+            vec!["b0", "b1", "b2", "c1", "c2"].into_iter().map(String::from).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn count_cap_still_runs_when_cutoff_is_none() {
+        // The indefinite tier is the case most likely to regress: `prune_in` used to early-return on
+        // `None`, and the count bound is the ONLY thing bounding concierge growth. So `None` must
+        // still trim by count while doing no age deletion at all — the old build row proves the age
+        // bound really was skipped in the same call.
+        let conn = mem();
+        record_into(&conn, &entry("build-ancient", "prompt", "build", 1)).unwrap();
+        for i in 0..4 {
+            record_into(&conn, &concierge(&format!("c{i}"), "chat", 1000 + i)).unwrap();
+        }
+        let deleted = prune_in_with_max(&conn, None, 2).unwrap();
+        assert_eq!(deleted, 2, "the two oldest concierge rows should be count-trimmed");
+        assert_eq!(
+            ids(&conn),
+            vec!["build-ancient", "c2", "c3"].into_iter().map(String::from).collect::<Vec<_>>(),
+            "no age deletion under None, but the count cap still applied"
+        );
+    }
+
+    #[test]
+    fn prune_in_with_max_returns_age_plus_count_deletions() {
+        // The returned count is documented as both bounds summed; prove it can be > either alone.
+        let conn = mem();
+        record_into(&conn, &entry("b-old", "prompt", "build", 1000)).unwrap();
+        for i in 0..4 {
+            record_into(&conn, &concierge(&format!("c{i}"), "chat", 1000 + i)).unwrap();
+        }
+        // 1 build row aged out + 2 concierge rows over the cap of 2.
+        assert_eq!(prune_in_with_max(&conn, Some(2000), 2).unwrap(), 3);
+        assert_eq!(count(&conn), 2);
+    }
+
+    #[test]
+    fn count_cap_delete_leaves_no_orphan_fts_match() {
+        // Mirrors `prune_soft_then_hard_leaves_zero_rows` for the count path: the `entries_ad`
+        // trigger must de-index the row, or search would keep returning a hit whose JOIN row is gone.
+        let conn = mem();
+        record_into(&conn, &concierge("c0", "stalechat", 1000)).unwrap();
+        record_into(&conn, &concierge("c1", "freshchat", 2000)).unwrap();
+        assert_eq!(search_in(&conn, "stalechat", 50).unwrap().len(), 1);
+        assert_eq!(prune_concierge_count_in(&conn, 1).unwrap(), 1);
+        assert!(search_in(&conn, "stalechat", 50).unwrap().is_empty());
+        assert_eq!(search_in(&conn, "freshchat", 50).unwrap().len(), 1);
+    }
+
     #[test]
     fn update_trigger_reindexes_changed_text() {
         // The `entries_au` AFTER UPDATE trigger keeps the FTS mirror in sync when `text` changes
@@ -409,6 +648,70 @@ mod tests {
         // Old term no longer matches; the new term does.
         assert!(search_in(&conn, "alpha", 50).unwrap().is_empty());
         assert_eq!(search_in(&conn, "omega", 50).unwrap().len(), 1);
+    }
+
+    /// Security-audit finding M2: the db FILE, not just its directory, must be owner-only.
+    ///
+    /// The starting mode is set EXPLICITLY to 0644 rather than inherited from the ambient umask.
+    /// That is the whole point of the setup: a fresh `Connection::open` creates the file at
+    /// `0666 & ~umask`, so under a hardened `0077` umask SQLite already lands on 0600 and this
+    /// assertion would pass with the `set_permissions` call deleted — a guard that holds only on
+    /// the machine it was written on. Pre-creating at 0644 and re-opening makes the assertion about
+    /// our chmod instead of about the environment.
+    #[cfg(unix)]
+    #[test]
+    fn history_db_file_is_owner_only_regardless_of_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("history");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.db");
+        // A world-readable, pre-existing db — the upgrade case, and a mode no umask can produce
+        // by accident here.
+        std::fs::File::create(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o644);
+
+        let db = HistoryDb::new(tmp.path()).unwrap();
+        drop(db);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history.db mode was {mode:o}, expected 600");
+    }
+
+    /// The `-wal` sidecar holds the newest uncheckpointed prompt/response text. A fresh one inherits
+    /// the main file's mode, but one left by a pre-upgrade crash keeps its old world-readable mode
+    /// and is reused on the next open — so seed exactly that case, at 0644, and prove the open
+    /// tightens it. Same reasoning as the test above: the mode is set explicitly, never inherited.
+    ///
+    /// The FIRST connection is deliberately held open for the whole test. SQLite checkpoints and
+    /// DELETES the `-wal` on a clean close, so a version of this that dropped the db before looking
+    /// found no sidecar and skipped its assertion — passing with the chmod removed. Holding the
+    /// connection is what keeps the file on disk, and the `wal.exists()` assert below is a hard
+    /// failure precisely so the test can never silently skip that way again.
+    #[cfg(unix)]
+    #[test]
+    fn history_db_wal_sidecar_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let held = HistoryDb::new(tmp.path()).unwrap();
+        {
+            let conn = held.conn.lock().unwrap();
+            record_into(&conn, &concierge("c0", "chat", 1000)).unwrap();
+        }
+        let wal = tmp.path().join("history").join("history.db-wal");
+        assert!(wal.exists(), "expected a -wal to exist while a connection is open");
+        // The upgrade case: a sidecar carrying the old world-readable mode.
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::metadata(&wal).unwrap().permissions().mode() & 0o777, 0o644);
+
+        // A second open of the same DB — the next app launch — must tighten it.
+        let reopened = HistoryDb::new(tmp.path()).unwrap();
+
+        let mode = std::fs::metadata(&wal).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "history.db-wal mode was {mode:o}, expected 600");
+        drop(reopened);
+        drop(held);
     }
 
     #[test]

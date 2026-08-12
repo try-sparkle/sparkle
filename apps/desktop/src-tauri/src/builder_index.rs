@@ -946,12 +946,10 @@ fn default_app_data_dir() -> Option<PathBuf> {
             None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
         }
     };
-    let dir = base.join("ai.sparkle.desktop");
-    Some(if crate::dev_identity::is_dev() {
-        dir.with_file_name("ai.sparkle.desktop-dev")
-    } else {
-        dir
-    })
+    // Route through dev_identity rather than re-formatting the suffix here: the dev identity is
+    // per-checkout as well as per-build-type, so a hand-rolled `-dev` would point a debug dry run at
+    // a directory no app writes.
+    Some(crate::dev_identity::dev_suffixed_path(&base.join("ai.sparkle.desktop")))
 }
 
 // ── keychain ────────────────────────────────────────────────────────────────────────────────
