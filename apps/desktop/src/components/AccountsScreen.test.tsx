@@ -13,6 +13,18 @@ import {
   type Identity,
 } from "../services/accountStore";
 import type { Ceiling } from "../services/headroom";
+import type { AccountUsageLive } from "../services/accountUsage";
+
+/** A neutral live-usage payload for the effect tests. */
+function liveUsage(fiveHourPercent: number, sevenDayPercent: number): AccountUsageLive {
+  return {
+    fiveHourPercent,
+    fiveHourResetsAt: null,
+    sevenDayPercent,
+    sevenDayResetsAt: null,
+    limits: [],
+  };
+}
 
 afterEach(() => cleanup());
 
@@ -31,6 +43,12 @@ function makeDeps(
     getUsage: vi.fn(async () => usage),
     getIdentities: vi.fn(async () => identities),
     listCeilings: vi.fn(async () => ceilings),
+    // Default: live usage is unavailable (no Tauri bridge in these suites). The row degrades to the
+    // "Real usage unavailable" note and the local-estimate bars below stay the only progressbars, so
+    // the counts these tests assert are unaffected. Tests that care override this per case.
+    getUsageLive: vi.fn(async () => {
+      throw new Error("live usage unavailable in test");
+    }),
     addAccount: vi.fn(async (nickname: string) => acct("new", { nickname })),
     setNickname: vi.fn(async () => {}),
     removeAccount: vi.fn(async () => {}),
@@ -55,6 +73,131 @@ describe("AccountsScreen", () => {
     expect(screen.getByText("default")).toBeTruthy();
     // Two windows per account × two accounts = 4 progressbars.
     expect(screen.getAllByRole("progressbar")).toHaveLength(4);
+  });
+
+  it("renders REAL live usage percentages when the live fetch resolves", async () => {
+    const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
+    // Override the default (which rejects) with the NEUTRAL confirmed shape.
+    deps.getUsageLive = vi.fn(async () => ({
+      fiveHourPercent: 42,
+      fiveHourResetsAt: "2026-08-12T04:09:59.793055+00:00",
+      sevenDayPercent: 15,
+      sevenDayResetsAt: "2026-08-17T10:59:59.793078+00:00",
+      limits: [],
+    }));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    // The real percentages appear — proof the AccountsScreen actually consumes and displays the
+    // live dep (would fail if the section weren't wired, i.e. non-vacuous). The fetch is keyed on
+    // the account's configDir.
+    expect(await screen.findByText("42%")).toBeTruthy();
+    expect(screen.getByText("15%")).toBeTruthy();
+    expect(deps.getUsageLive).toHaveBeenCalledWith("/cfg/a");
+    // The two live bars add to the two local-estimate bars: 4 progressbars for one account.
+    expect(screen.getAllByRole("progressbar")).toHaveLength(4);
+  });
+
+  it("a plain rename does NOT re-fetch live usage (the effect key excludes the nickname)", async () => {
+    const deps = makeDeps(
+      [acct("a", { nickname: "Old" })],
+      [],
+      [{ id: "a", email: "e@x.com", organization: null, accountUuid: "u1" }],
+    );
+    deps.getUsageLive = vi.fn(async () => liveUsage(42, 15));
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect(await screen.findByText("42%")).toBeTruthy();
+    expect(deps.getUsageLive).toHaveBeenCalledTimes(1);
+    // Rename → setNickname → refresh(). id/configDir/accountUuid are unchanged, so the live effect
+    // must NOT re-run (no extra keychain read / endpoint hit). Non-vacuous: keying on the array
+    // identity or a per-refresh nonce would fire a second fetch here and fail this assertion.
+    fireEvent.click(screen.getByText("Rename"));
+    const input = screen.getByLabelText("Rename Old");
+    fireEvent.change(input, { target: { value: "New Name" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(deps.setNickname).toHaveBeenCalledWith("a", "New Name"));
+    await new Promise((r) => setTimeout(r, 0)); // give any errant refetch a chance to fire
+    expect(deps.getUsageLive).toHaveBeenCalledTimes(1);
+  });
+
+  it("the ADD flow re-fetches live usage after sign-in (covers the handleAdd nonce)", async () => {
+    // Non-vacuous coverage for the handleAdd bump SPECIFICALLY — the primary add-and-sign-in flow,
+    // and a distinct call site from handleLogin (the "one fix, N sites, only one covered" trap,
+    // sparkle-50m03). A DEFERRED onLogin reproduces the real login window taking time: the account is
+    // created and fetched BEFORE the login completes (the pre-login fetch, which in production writes
+    // "error" against a dir with no creds yet), then the post-login nonce re-fetches. Deleting the
+    // handleAdd `setLiveNonce` drops that second call and fails the final assertion.
+    const accounts: Account[] = [];
+    let resolveLogin: () => void = () => {};
+    const deps = makeDeps([]);
+    deps.listAccounts = vi.fn(async () => [...accounts]);
+    deps.addAccount = vi.fn(async (nickname: string) => {
+      const a = acct("new", { nickname });
+      accounts.push(a);
+      return a;
+    });
+    deps.getUsageLive = vi.fn(async () => liveUsage(42, 15));
+    const onLogin = vi.fn(() => new Promise<void>((res) => (resolveLogin = res)));
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    fireEvent.click(await screen.findByText("+ Add account"));
+    fireEvent.change(screen.getByLabelText("New account nickname"), { target: { value: "Cloud Max" } });
+    fireEvent.click(screen.getByText("Create & log in"));
+    // Pre-login fetch: the new account is fetched while the login window is still "open".
+    await waitFor(() =>
+      expect(vi.mocked(deps.getUsageLive).mock.calls.filter((c) => c[0] === "/cfg/new")).toHaveLength(1),
+    );
+    // Close the login window → handleAdd's post-login refresh + nonce → the SECOND fetch.
+    resolveLogin();
+    await waitFor(() => {
+      const forNew = vi.mocked(deps.getUsageLive).mock.calls.filter((c) => c[0] === "/cfg/new");
+      expect(forNew.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it("re-authenticating an account RE-fetches its live usage (recovery + null-uuid path)", async () => {
+    // The post-login regression and its two subtlest cases in one: a login changes neither id nor
+    // configDir, and here the account has NO identity at all (so no accountUuid to key on) — yet a
+    // completed login must re-fetch. This is the recovery path a user takes from a failed
+    // ("unavailable") row: click "Finish sign-in", re-authenticate, expect fresh usage. The nonce
+    // bumped after onLogin drives it. Non-vacuous: without the nonce the click's refresh changes no
+    // key, so the fetch stays at 1 and the waitFor times out. Two SEPARATE events (mount + click) so
+    // the second effect run cannot batch into the first.
+    const deps = makeDeps([acct("a", { nickname: "A" })]); // no identity → "Finish sign-in" shows
+    deps.getUsageLive = vi.fn(async () => liveUsage(42, 15));
+    const onLogin = vi.fn(async () => {});
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByText("Finish sign-in"));
+    await waitFor(() => expect(onLogin).toHaveBeenCalledWith(expect.objectContaining({ id: "a" })));
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalledTimes(2));
+    expect(deps.getUsageLive).toHaveBeenLastCalledWith("/cfg/a");
+  });
+
+  it("discards a STALE live-usage batch that resolves after a newer one", async () => {
+    // The generation ref must keep the NEWEST batch: with a 15s window an older batch can resolve
+    // last, and a naive write would clobber fresh data. Batch 1 (the mount fetch) is left pending; a
+    // re-login (nonce) fires batch 2, which resolves FIRST with the new value, then batch 1 resolves
+    // LATE with stale data and must be discarded.
+    let resolveFirst: (v: AccountUsageLive) => void = () => {};
+    let resolveSecond: (v: AccountUsageLive) => void = () => {};
+    let n = 0;
+    const deps = makeDeps([acct("a", { nickname: "A" })]);
+    deps.getUsageLive = vi.fn(
+      () =>
+        new Promise<AccountUsageLive>((res) => {
+          n += 1;
+          if (n === 1) resolveFirst = res;
+          else resolveSecond = res;
+        }),
+    );
+    render(<AccountsScreen onLogin={vi.fn(async () => {})} deps={deps} />);
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalledTimes(1)); // batch 1 pending
+    fireEvent.click(screen.getByText("Finish sign-in"));
+    await waitFor(() => expect(deps.getUsageLive).toHaveBeenCalledTimes(2)); // batch 2 pending (nonce)
+    resolveSecond(liveUsage(15, 7)); // newest batch resolves first
+    expect(await screen.findByText("15%")).toBeTruthy();
+    resolveFirst(liveUsage(42, 99)); // stale, arrives late
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByText("42%")).toBeNull();
+    expect(screen.getByText("15%")).toBeTruthy();
   });
 
   it("Add account creates then calls onLogin with the new account", async () => {
@@ -86,6 +229,9 @@ describe("AccountsScreen", () => {
       getUsage: vi.fn(async () => []),
       getIdentities: vi.fn(async () => [...identities]),
       listCeilings: vi.fn(async () => []),
+      getUsageLive: vi.fn(async () => {
+        throw new Error("live usage unavailable in test");
+      }),
       addAccount: vi.fn(async (nickname: string) => {
         // Distinct ids so the multi-add case renders distinct rows, the way real ones do.
         const a = acct(`acct-${accounts.length}`, { nickname });

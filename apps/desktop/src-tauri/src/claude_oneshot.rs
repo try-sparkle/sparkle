@@ -3471,6 +3471,70 @@ mod no_anthropic_key {
     /// called "builder-index-api-key").
     const FORBIDDEN_NETWORK: &[&str] = &["api.anthropic.com", "\"x-api-key\"", "\"anthropic-version\""];
 
+    /// The ONE sanctioned direct-Anthropic host reference: the per-account SUBSCRIPTION-USAGE read
+    /// (`account_usage.rs`) calls Anthropic's OAuth usage endpoint with the USER'S OWN OAuth Bearer
+    /// token — their Claude Code subscription, NOT a Sparkle-funded API key. That is the invariant
+    /// HOLDING, not breaking: it reads the user's own allowance with the user's own credential, and
+    /// the token stays on-device (proxying it through Sparkle would be the privacy regression). The
+    /// `api.anthropic.com` host literal is unavoidable there, so a line carrying this exact marker is
+    /// waived FROM THE HOST NEEDLE ONLY. The `"x-api-key"` / `"anthropic-version"` needles and every
+    /// key-READ check still apply on that same line — so the marker cannot smuggle in a real API-key
+    /// path, which is what the guard actually exists to stop. Adding a second marked line is a
+    /// deliberate decision that shows up in the diff, not something that slips past a ceiling.
+    const HOST_EXEMPT_MARKER: &str = "anthropic-usage-ok";
+
+    /// The ONE file allowed to carry [`HOST_EXEMPT_MARKER`]. The waiver is scoped to this basename so
+    /// a `// anthropic-usage-ok` appended in any OTHER module is NOT honored (its host reference still
+    /// fails), and [`no_anthropic_api_key_is_reachable_from_this_crate`] additionally asserts the
+    /// marker appears exactly once among the SCANNED files — so a second marked line (even in this
+    /// file) turns the guard red instead of relying on a reviewer spotting the comment. Together these
+    /// close the "an unscoped escape hatch is the very fallback this guard exists to stop" hole.
+    ///
+    /// NOT truly crate-wide: `claude_oneshot.rs` is skipped by the walk (it DEFINES these forbidden
+    /// strings by construction — `FORBIDDEN_NETWORK`, the marker const, the test fixtures below), so
+    /// neither the offender scan nor this count sees it. Relocating the guard so that file is scanned
+    /// too is the durable fix; until then the count and the offender scan both mean "every module
+    /// EXCEPT the guard's own", which is what the assertion message says.
+    const HOST_EXEMPT_FILE: &str = "account_usage.rs";
+
+    /// The ONE full host+path the waiver may cover, ANCHORED at the string literal's closing quote.
+    /// Pinning the host AND path AND the terminating `"` means the single sanctioned slot can't be
+    /// silently REPOINTED:
+    ///   * to a different path — `.../v1/messages` never contains this;
+    ///   * to an EXTENDED path — `.../api/oauth/usage_v2"` or `.../api/oauth/usage/organization"` do
+    ///     not contain `…/usage"` (the char after `usage` is not the closing quote), so a prefix
+    ///     match no longer waives them — the hole a bare `…/usage` substring left open;
+    ///   * via a comment that merely NAMES the path — the comment carries no closing-quoted host+path.
+    /// The production line ends `…/api/oauth/usage"` (see `account_usage.rs`), so the real URL still
+    /// matches while every repoint above trips the host needle.
+    const HOST_EXEMPT_URL: &str = "api.anthropic.com/api/oauth/usage\"";
+
+    /// The first `FORBIDDEN_NETWORK` needle a line trips, or `None`. The `api.anthropic.com` host
+    /// needle is waived ONLY on a line in [`HOST_EXEMPT_FILE`] that carries [`HOST_EXEMPT_MARKER`] and
+    /// references [`HOST_EXEMPT_URL`] — and ONLY when that sanctioned URL is the line's SOLE
+    /// `api.anthropic.com` reference. The last clause is what stops a second host literal on the same
+    /// line (`… ? sanctioned_url : "https://api.anthropic.com/v1/messages"`) from riding the waiver.
+    /// The key-shaped needles are never waived, and the marker in any other file does nothing.
+    fn forbidden_network_hit(file_name: &str, line: &str) -> Option<&'static str> {
+        for needle in FORBIDDEN_NETWORK {
+            if !line.contains(needle) {
+                continue;
+            }
+            if *needle == "api.anthropic.com"
+                && file_name == HOST_EXEMPT_FILE
+                && line.contains(HOST_EXEMPT_MARKER)
+                && line.contains(HOST_EXEMPT_URL)
+                // …and the sanctioned URL is the ONLY api.anthropic.com on the line: removing it must
+                // leave no other host reference (a second URL literal, in code or comment, still trips).
+                && !line.replace(HOST_EXEMPT_URL, "").contains("api.anthropic.com")
+            {
+                continue;
+            }
+            return Some(needle);
+        }
+        None
+    }
+
     /// The env NAMES that carry or redirect Anthropic credentials.
     const KEY_NAMES: &[&str] = &[
         "ANTHROPIC_API_KEY",
@@ -3505,6 +3569,10 @@ mod no_anthropic_key {
     fn no_anthropic_api_key_is_reachable_from_this_crate() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut offenders: Vec<String> = Vec::new();
+        // Every line carrying the host-exemption marker, crate-wide, so we can assert there is
+        // exactly ONE and it lives in the sanctioned file — an escape hatch is only safe if it is
+        // counted, not merely commented.
+        let mut marked: Vec<String> = Vec::new();
         let mut scanned = 0usize;
 
         let mut stack = vec![src.clone()];
@@ -3526,20 +3594,21 @@ mod no_anthropic_key {
                 let body = std::fs::read_to_string(&path).expect("read source");
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
                 for (i, line) in body.lines().enumerate() {
+                    // Count marker occurrences on LIVE code (a comment merely explaining the marker
+                    // must not inflate the count). Tracked across every file so a marker smuggled
+                    // into another module fails the count assertion below even though the scoped
+                    // `forbidden_network_hit` already refuses to honor it there.
+                    if !is_comment(line) && line.contains(HOST_EXEMPT_MARKER) {
+                        marked.push(format!("{name}:{}", i + 1));
+                    }
                     if is_comment(line) {
                         continue;
                     }
                     if reads_a_key(line) {
                         offenders.push(format!("{name}:{}: reads a key: `{}`", i + 1, line.trim()));
                     }
-                    for needle in FORBIDDEN_NETWORK {
-                        if line.contains(needle) {
-                            offenders.push(format!(
-                                "{name}:{}: {needle} in `{}`",
-                                i + 1,
-                                line.trim()
-                            ));
-                        }
+                    if let Some(needle) = forbidden_network_hit(&name, line) {
+                        offenders.push(format!("{name}:{}: {needle} in `{}`", i + 1, line.trim()));
                     }
                 }
             }
@@ -3554,6 +3623,23 @@ mod no_anthropic_key {
              Code subscription (see claude_oneshot.rs); there is no Sparkle-funded key to fall back \
              to, and a silent fallback is what cost a full day of false alarms on 2026-07-28.\n  {}",
             offenders.join("\n  ")
+        );
+        // The host exemption must be used EXACTLY once, in the sanctioned file. A second marked line
+        // anywhere (a new direct-Anthropic path "just this once") turns this red rather than slipping
+        // past on a reviewer trusting the comment. "Among scanned files": `claude_oneshot.rs` is
+        // skipped above (it defines these strings), so its own marker const/fixtures don't count —
+        // see HOST_EXEMPT_FILE's note.
+        assert_eq!(
+            marked.len(),
+            1,
+            "the `{HOST_EXEMPT_MARKER}` host exemption must appear exactly once among scanned files \
+             (in {HOST_EXEMPT_FILE}; the guard's own {}) — found: {marked:?}",
+            "claude_oneshot.rs is excluded",
+        );
+        assert!(
+            marked[0].starts_with(HOST_EXEMPT_FILE),
+            "the host exemption must live in {HOST_EXEMPT_FILE}, not at {}",
+            marked[0],
         );
     }
 
@@ -3576,5 +3662,99 @@ mod no_anthropic_key {
 
         assert!(!is_comment(r#"    let k = std::env::var("ANTHROPIC_API_KEY");"#));
         assert!(is_comment("// ANTHROPIC_API_KEY is deliberately not read here"));
+    }
+
+    #[test]
+    fn host_marker_waives_only_the_host_needle_and_never_a_key_shape() {
+        // An UNMARKED direct-Anthropic host reference is still caught — the guard's whole point.
+        assert_eq!(
+            forbidden_network_hit("account_usage.rs", r#"let u = "https://api.anthropic.com/v1/x";"#),
+            Some("api.anthropic.com"),
+        );
+        // The sanctioned OAuth subscription-usage line in the sanctioned FILE, carrying the marker,
+        // is waived FOR THE HOST.
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const U: &str = "https://api.anthropic.com/api/oauth/usage"; // anthropic-usage-ok"#
+            ),
+            None,
+        );
+        // THE SCOPE: the SAME marked line in ANY OTHER file is NOT waived — an escape hatch bolted
+        // onto another module must not silently open the guard there.
+        assert_eq!(
+            forbidden_network_hit(
+                "some_other_module.rs",
+                r#"const U: &str = "https://api.anthropic.com/v1/messages"; // anthropic-usage-ok"#
+            ),
+            Some("api.anthropic.com"),
+        );
+        // THE ENDPOINT PIN: the sanctioned slot cannot be REPOINTED. In the right file, with the
+        // marker, but aimed at a DIFFERENT api.anthropic.com path, the host needle fires again — so
+        // editing the one marked line to a new endpoint can't smuggle a direct call past the guard.
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const U: &str = "https://api.anthropic.com/v1/messages"; // anthropic-usage-ok"#
+            ),
+            Some("api.anthropic.com"),
+        );
+        // COMMENT INJECTION: a repointed URL whose comment merely NAMES the sanctioned path must not
+        // ride the waiver — the comment does not reproduce the full host+path literal.
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const U: &str = "https://api.anthropic.com/v1/messages"; // anthropic-usage-ok (same auth as api/oauth/usage)"#
+            ),
+            Some("api.anthropic.com"),
+        );
+        // TWO HOST LITERALS ON ONE LINE: even with the sanctioned URL present, a SECOND
+        // api.anthropic.com host must still trip — the sanctioned URL has to be the line's only one.
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const U: &str = if beta { "https://api.anthropic.com/api/oauth/usage" } else { "https://api.anthropic.com/v1/messages" }; // anthropic-usage-ok"#
+            ),
+            Some("api.anthropic.com"),
+        );
+        // PATH EXTENSION: a repoint that EXTENDS the sanctioned path (so the pin is a prefix of it)
+        // must still trip — the closing-quote anchor is what catches these, where a bare-substring pin
+        // would have waived them.
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const U: &str = "https://api.anthropic.com/api/oauth/usage_v2"; // anthropic-usage-ok"#
+            ),
+            Some("api.anthropic.com"),
+        );
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const U: &str = "https://api.anthropic.com/api/oauth/usage/organization"; // anthropic-usage-ok"#
+            ),
+            Some("api.anthropic.com"),
+        );
+        // …and the genuine single sanctioned URL (the production shape, ending at the closing quote)
+        // is still waived.
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage"; // anthropic-usage-ok"#
+            ),
+            None,
+        );
+        // …and even in the sanctioned file the marker must NOT waive a key-shaped needle — that is
+        // the line the guard exists to stop, and the exemption cannot become a way to smuggle one in.
+        assert_eq!(
+            forbidden_network_hit("account_usage.rs", r#"req.set("x-api-key", k); // anthropic-usage-ok"#),
+            Some("\"x-api-key\""),
+        );
+        assert_eq!(
+            forbidden_network_hit(
+                "account_usage.rs",
+                r#"req.set("anthropic-version", v); // anthropic-usage-ok"#
+            ),
+            Some("\"anthropic-version\""),
+        );
     }
 }

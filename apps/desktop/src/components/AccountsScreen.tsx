@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { FiAlertTriangle, FiRotateCw, FiSlash, FiUserPlus } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
-import { FONT_UI } from "../theme/scale";
+import { FONT_UI, TYPE } from "../theme/scale";
 import { tag } from "./labelTreatment";
 import { AccountSpawnLog } from "./AccountSpawnLog";
 import { MODAL_PADDING } from "./ModalShell";
@@ -30,6 +30,7 @@ import {
   type Ceiling,
   type Headroom,
 } from "../services/headroom";
+import { getAccountUsageLive, type AccountUsageLive } from "../services/accountUsage";
 
 // Accounts settings screen for multi Claude Max account support (design spec
 // docs/superpowers/specs/2026-06-26-multi-max-account-design.md). Lists each registered Claude
@@ -57,6 +58,11 @@ const DEPS = {
   // OTHER (the relative UsageBars) but never how close any of them is to its OWN limit — which is
   // the number that decides whether rotation is about to matter.
   listCeilings,
+  // REAL live per-account usage (Anthropic's own 5h/7d utilization), fetched per account by config
+  // dir. Augments the relative token-tally bars with each account's ACTUAL server-side percent +
+  // reset time. Injectable/mockable like every other IO; a per-account failure degrades that row to
+  // "usage unavailable" and never blocks the screen (the local-tally `getUsage` stays the fallback).
+  getUsageLive: getAccountUsageLive,
   addAccount,
   setNickname,
   removeAccount,
@@ -208,6 +214,103 @@ function UsageBar({
  *  the all-exhausted banner can never quote the same instant two different ways. */
 function clockTime(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+/** "resets Aug 17, 10:59 AM" for an ISO-8601 reset instant, or null when the string is absent or
+ *  unparseable. A 7-day reset can be days out, so — unlike {@link clockTime} — this carries the date
+ *  too. Defensive: Anthropic sends `resets_at: null` for a scoped/inactive window, and a bad string
+ *  yields `NaN`, both of which must read as "no reset to show" rather than "Invalid Date". */
+function resetLabel(iso: string | null): string | null {
+  if (!iso) return null;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return null;
+  const when = new Date(ms).toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+  return `resets ${when}`;
+}
+
+/** A REAL usage bar filled by Anthropic's actual utilization percent (0–100), with an optional reset
+ *  caption. `percent: null` (a window the server didn't report) renders "—" and an empty bar, never
+ *  a fabricated 0%. Distinct from {@link UsageBar}, whose fill is RELATIVE across accounts; this one
+ *  is the account's honest standing against its own real limit. */
+function LiveUsageBar({
+  label,
+  percent,
+  resetsAt,
+}: {
+  label: string;
+  percent: number | null;
+  resetsAt: string | null;
+}) {
+  const pct = percent != null ? Math.max(0, Math.min(100, percent)) : 0;
+  const reset = resetLabel(resetsAt);
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted }}>
+        <span>{label}</span>
+        <span>{percent != null ? `${Math.round(percent)}%` : "—"}</span>
+      </div>
+      <div
+        role="progressbar"
+        aria-label={`${label} real usage`}
+        aria-valuenow={Math.round(pct)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        style={{
+          height: 6,
+          borderRadius: 3,
+          background: C.deepForest,
+          border: `1px solid ${C.muted}`,
+          marginTop: 2,
+          overflow: "hidden",
+        }}
+      >
+        <div style={{ width: `${pct}%`, height: "100%", background: C.teal }} />
+      </div>
+      {reset && <div style={{ fontSize: TYPE.micro, color: C.muted, marginTop: 2 }}>{reset}</div>}
+    </div>
+  );
+}
+
+/** The REAL live-usage block for one account row. Three states, none of which may break the screen:
+ *   - `undefined` (not fetched yet) → a muted "Loading real usage…";
+ *   - `"error"` (no token / offline / 401 / keychain declined) → "Real usage unavailable", and the
+ *     relative token-tally bars below remain the fallback;
+ *   - data → the two real percent bars. */
+function LiveUsageSection({ live }: { live: AccountUsageLive | "error" | undefined }) {
+  if (live === undefined) {
+    return (
+      <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>Loading real usage…</div>
+    );
+  }
+  if (live === "error") {
+    return (
+      <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>
+        Real usage unavailable — showing local estimate below.
+      </div>
+    );
+  }
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ fontSize: TYPE.micro, color: C.muted, textTransform: "uppercase", letterSpacing: 0.4 }}>
+        Real usage (Anthropic)
+      </div>
+      <LiveUsageBar
+        label="Session (5h)"
+        percent={live.fiveHourPercent}
+        resetsAt={live.fiveHourResetsAt}
+      />
+      <LiveUsageBar
+        label="Weekly (7d)"
+        percent={live.sevenDayPercent}
+        resetsAt={live.sevenDayResetsAt}
+      />
+    </div>
+  );
 }
 
 function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
@@ -412,6 +515,14 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // Real authenticated identity (email + org) per account id — the trustworthy label read from each
   // account's own .claude.json oauthAccount. The nickname is only a secondary alias.
   const [identities, setIdentities] = useState<Identity[]>([]);
+  // REAL live usage per account id. A value is Anthropic's own utilization; the literal "error"
+  // means the fetch failed (no token / offline / 401) and the row shows "usage unavailable"; a
+  // MISSING entry is "not fetched yet". Kept separate from the token-tally `usage` above because it
+  // fetches per account and each account can fail independently without blanking the others.
+  const [liveUsage, setLiveUsage] = useState<Record<string, AccountUsageLive | "error">>({});
+  // Bumped after every completed `onLogin` (handleAdd / handleLogin) to re-drive the live-usage
+  // effect — the trigger a login provides that the account SET does not (see the effect below).
+  const [liveNonce, setLiveNonce] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
@@ -437,6 +548,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   const getUsageFn = deps?.getUsage ?? DEPS.getUsage;
   const getIdentitiesFn = deps?.getIdentities ?? DEPS.getIdentities;
   const listCeilingsFn = deps?.listCeilings ?? DEPS.listCeilings;
+  const getUsageLiveFn = deps?.getUsageLive ?? DEPS.getUsageLive;
   const refresh = useCallback(async () => {
     setError(null);
     try {
@@ -454,6 +566,11 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       setUsage(u);
       setIdentities(ids);
       setCeilings(cs);
+      // NOTE: the REAL live-usage fetch is deliberately NOT awaited here. It reads each account's
+      // OAuth secret (a keychain read that can raise a macOS prompt) and hits the network per
+      // account — up to 15s each — so folding it into refresh's critical path would gate every
+      // add/rename/remove/login flow (each awaits refresh) behind N blocking round-trips. It runs in
+      // its own effect below, keyed on the account SET so a rename doesn't re-hit the endpoint.
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load accounts");
     }
@@ -462,6 +579,41 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  // ── REAL live usage, best-effort, OUT of refresh's critical path ──────────────────────────────
+  // Re-fetches on exactly the events that change what the endpoint would return, and NOT on a plain
+  // rename. Two triggers:
+  //   • `accountsKey` — the account SET (id + configDir): add / remove.
+  //   • `liveNonce`   — bumped after EVERY completed `onLogin` (see handleAdd / handleLogin). This is
+  //     the fix for the post-login regression: a login changes neither id nor configDir, so keying
+  //     on the set alone never re-fetched after one — a just-signed-in account stayed "unavailable"
+  //     and a switched account kept the PREVIOUS login's numbers. Crucially the nonce fires for
+  //     EVERY login, including (a) an email-only login that records no `accountUuid` (so an
+  //     identity-signature key would miss it — `accountStore.identityKey` exists precisely because
+  //     the uuid is null for such logins) and (b) re-authenticating the SAME account after a 401 /
+  //     offline error, the recovery path a user actually takes from the "unavailable" row.
+  //   • a plain RENAME calls neither, so it still doesn't re-hit the keychain / endpoint.
+  // Each result is written per-id as it settles, so rows fill independently and one hung account
+  // doesn't blank the column. A generation ref discards a stale batch's late results (and any write
+  // after unmount): with a 15s-per-account window an older batch can resolve after a newer one.
+  const accountsKey = accounts.map((a) => `${a.id} ${a.configDir}`).join("|");
+  const liveGenRef = useRef(0);
+  useEffect(() => {
+    if (accounts.length === 0) return;
+    const gen = ++liveGenRef.current;
+    for (const acct of accounts) {
+      getUsageLiveFn(acct.configDir)
+        .then((r) => {
+          if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [acct.id]: r }));
+        })
+        .catch(() => {
+          if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [acct.id]: "error" }));
+        });
+    }
+    // `accountsKey` is the content signature of the account SET (not the array identity, so a rename
+    // doesn't re-fire); `liveNonce` re-fires after any login. `accounts`/`getUsageLiveFn` read inside.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accountsKey, liveNonce, getUsageLiveFn]);
 
   const usageFor = (id: string) => usage.find((u) => u.id === id);
   const identityFor = (id: string) => identities.find((i) => i.id === id);
@@ -538,6 +690,10 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       // is to ask for the identities again. Whatever comes back drives the row: the resolved email
       // if there is one, an explicit "Not signed in" if there isn't.
       await refresh();
+      // A login just completed — re-fetch live usage for it. The account's id/configDir did not
+      // change, so only this nonce moves the live-usage effect (covers a null-uuid email-only login
+      // and a same-account re-login, neither of which an identity-signature key would catch).
+      setLiveNonce((n) => n + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to add account");
     } finally {
@@ -553,6 +709,10 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     try {
       await onLogin(a);
       await refresh();
+      // Re-fetch live usage for the account just (re-)authenticated — including re-logging into the
+      // SAME account to recover a row that had failed with a 401 / offline error, where neither the
+      // account set nor the identity changes.
+      setLiveNonce((n) => n + 1);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to log in");
     }
@@ -958,8 +1118,13 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               }
             />
 
-            <UsageBar label="5-hour window" tokens={u?.tokens5h ?? 0} peakTokens={peak5h} />
-            <UsageBar label="7-day window" tokens={u?.tokens7d ?? 0} peakTokens={peak7d} />
+            {/* REAL server-side usage from Anthropic (the account's actual 5h/7d percent + reset),
+                augmenting the relative token-tally bars below. Best-effort per account: an errored
+                fetch degrades this block only, and the local estimate below stays the fallback. */}
+            <LiveUsageSection live={liveUsage[a.id]} />
+
+            <UsageBar label="5-hour window (local estimate)" tokens={u?.tokens5h ?? 0} peakTokens={peak5h} />
+            <UsageBar label="7-day window (local estimate)" tokens={u?.tokens7d ?? 0} peakTokens={peak7d} />
           </div>
         );
       })}

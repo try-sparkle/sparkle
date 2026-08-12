@@ -66,6 +66,9 @@ function deps(entries: SpawnLogEntry[]): AccountsDeps {
       ],
     ),
     listCeilings: vi.fn(async () => []),
+    getUsageLive: vi.fn(async () => {
+      throw new Error("live usage unavailable in test");
+    }),
     addAccount: vi.fn(async () => acct("new")),
     setNickname: vi.fn(async () => {}),
     removeAccount: vi.fn(async () => {}),
