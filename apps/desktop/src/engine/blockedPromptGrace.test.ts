@@ -293,6 +293,35 @@ describe("regressions the first draft shipped", () => {
     expect(seen[seen.length - 1]).toBe("approval");
   });
 
+  it("MEDIUM: an unrelated `handled` cannot ERASE a give-up and re-hide the row", () => {
+    // `outcome` is per-agent and latest-wins, and the dispatcher reports on EVERY send — a free-text
+    // message, a queued send flushing, a recovery ping — all `handled`. Without the latch a later
+    // one overwrote the decline that had already surfaced the row and put it back into hiding until
+    // the ceiling, on an event that said nothing about the prompt (roborev 62848).
+    const ledger = emptyPromptGraceLedger();
+    expect(tick(ledger, "approval", T0)).toBe("idle");
+    notePromptAnswerOutcome("a", "declined", T0 + 500, ledger);
+    expect(tick(ledger, "approval", T0 + 600)).toBe("approval");
+    // Something entirely unrelated is delivered to this agent.
+    notePromptAnswerOutcome("a", "handled", T0 + 700, ledger);
+    expect(tick(ledger, "approval", T0 + 800)).toBe("approval");
+  });
+
+  it("MEDIUM: a give-up that arrives while the screen is UNREADABLE is still recorded", () => {
+    // The mirror ordering, and the LIKELIER one for `unreachable`: the screen states that make a
+    // capture unreadable (alternate-screen, pty-gone, a full-screen app owning the grid) are the
+    // same ones that produce it. Recording used to need an open episode, and an unreadable capture
+    // deletes the episode — so this ordering lost the give-up entirely (roborev 62897).
+    const ledger = emptyPromptGraceLedger();
+    expect(tick(ledger, "approval", T0)).toBe("idle");
+    // The grid goes unreadable: the episode is dropped …
+    expect(tick(ledger, "approval", T0 + 400, { text: "   \n ", at: T0 + 400 })).toBe("approval");
+    // … and only THEN does the answerer report it could not reach the pane.
+    notePromptAnswerOutcome("a", "unreachable", T0 + 500, ledger);
+    // The question comes back readable. It must NOT be held again.
+    expect(tick(ledger, "approval", T0 + 600, { text: PROMPT, at: T0 + 600 })).toBe("approval");
+  });
+
   it("MEDIUM: LEAVING the ask clears the give-up — it is sticky for the ask, not for the agent", () => {
     // The other side of making it sticky. If leaving the ask did not clear it, one decline would
     // permanently disable the hold for that agent — the feature quietly inert for anyone who ever

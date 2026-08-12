@@ -425,7 +425,7 @@ export function heldPromptIds<T extends { id: string }>(
 
 /**
  * The snapshot `newlyEntered` should compare against NEXT tick, given that this tick deliberately
- * did not act on the held prompts.
+ * did not act on the FROZEN agents.
  *
  * THE EDGE MUST BE DEFERRED, NOT DROPPED, and that distinction is the whole reason this exists.
  * Simply `continue`-ing past a held agent in the dispatch loop would ALSO record its red in the
@@ -433,8 +433,12 @@ export function heldPromptIds<T extends { id: string }>(
  * are lost permanently. That is strictly worse than not holding at all: the founder would be spared
  * the notification for the routine prompts AND for the wedged ones, which inverts the entire feature.
  *
- * So a held agent's baseline keeps its PREVIOUS value: this tick never happened as far as that agent
- * is concerned. Whatever it is really doing when the hold lifts is then a fresh transition from where
+ * So a FROZEN agent's baseline keeps its PREVIOUS value: this tick never happened as far as that
+ * agent is concerned. WHICH agents are frozen is the caller's decision and NOT "the ones held right
+ * now" — the sole caller passes the OWED set (see `owedBanner`), because a hold is only a reason to
+ * freeze when the run doing the hiding is also the run that would have delivered the banner. An
+ * earlier version of this paragraph said "held", and that reading is what a later edit would restore
+ * the fleet-wide freeze from (roborev 62898). Whatever it is really doing when the hold lifts is then a fresh transition from where
  * it genuinely was, which is also why the previous value is restored rather than the de-escalated one
  * — recording `idle` would swallow the ordinary "Finished — your turn" edge if the agent went on to
  * finish. An agent with NO previous entry has its key removed, since `undefined` is what "never
@@ -442,7 +446,7 @@ export function heldPromptIds<T extends { id: string }>(
  *
  * Returns the SAME reference when nothing is frozen, so the common path allocates nothing.
  */
-export function baselineWithHeldPrompts(
+export function baselineWithFrozenPrompts(
   next: StatusMap,
   prev: StatusMap,
   /** The agents whose banner this run still OWES — not simply the ones held right now. A hold is
@@ -641,7 +645,7 @@ export function useAttentionNotifications(): void {
       const pid = projectId;
       for (const { id, status: st } of newlyEntered(prevStatus.current, status, ownedIds, enabled)) {
         // A prompt still inside its grace window: neither channel fires. The edge is DEFERRED, not
-        // dropped — `baselineWithHeldPrompts` below keeps this agent's previous baseline, so when the
+        // dropped — `baselineWithFrozenPrompts` below keeps this agent's previous baseline, so when the
         // hold ends (ceiling lapsed, answerer declined, pane unreachable) this same transition is
         // detected afresh and both channels fire then.
         if (heldIds.has(id)) continue;
@@ -798,7 +802,7 @@ export function useAttentionNotifications(): void {
     // interrupted about a question that was never being deferred on his behalf. An agent only ever
     // has its baseline frozen while a run that could actually deliver its banner is the one holding
     // it back, which is precisely what `owedBanner` means.
-    prevStatus.current = baselineWithHeldPrompts(status, prevStatus.current, owedBanner.current);
+    prevStatus.current = baselineWithFrozenPrompts(status, prevStatus.current, owedBanner.current);
     prevProject.current = projectId;
     // `promptTick` is deliberately NOT referenced in the body — it is the only dependency that
     // changes when a grace window closes with nothing else happening in the app, which is precisely

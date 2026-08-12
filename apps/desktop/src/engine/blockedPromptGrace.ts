@@ -222,6 +222,13 @@ export interface PromptGraceLedger {
    * event that should clear it.
    */
   gaveUp: Set<string>;
+  /** agentId -> epoch ms the agent entered its CURRENT ask, stamped on the first tick that sees one
+   *  and cleared when it leaves. Its only job is to date a give-up: recording one used to require an
+   *  OPEN EPISODE, and an unreadable capture deletes the episode — so the ordering `blank repaint,
+   *  then decline` lost the give-up entirely. That is the MORE likely ordering for `unreachable`,
+   *  because the screen states that make a capture unreadable (alternate-screen, pty-gone, a
+   *  full-screen app owning the grid) are the same ones that produce it (roborev 62897). */
+  askSince: Map<string, number>;
   /** agentId -> every prompt identity that has already opened an eligible episode for it. The
    *  never-twice rule, in its precise form.
    *
@@ -240,6 +247,7 @@ export function emptyPromptGraceLedger(): PromptGraceLedger {
     episode: new Map(),
     holds: new Map(),
     gaveUp: new Set(),
+    askSince: new Map(),
     burned: new Map(),
     outcome: new Map(),
   };
@@ -271,6 +279,7 @@ export function resetPromptGraceLedgerForTests(): void {
   WINDOW_LEDGER.episode.clear();
   WINDOW_LEDGER.holds.clear();
   WINDOW_LEDGER.gaveUp.clear();
+  WINDOW_LEDGER.askSince.clear();
   WINDOW_LEDGER.burned.clear();
   WINDOW_LEDGER.outcome.clear();
 }
@@ -396,7 +405,7 @@ export interface PromptAsk {
 
 /**
  * Open, continue, and close prompt episodes for the whole fleet. THE ONLY MUTATOR of `episode`,
- * `holds`, `gaveUp` and `burned`; the overlay below is pure. Call once per rebuild, BEFORE the overlay, from
+ * `holds`, `gaveUp`, `askSince` and `burned`; the overlay below is pure. Call once per rebuild, BEFORE the overlay, from
  * the one place that holds the merged status — exactly as `noteRedEpochs` is called before
  * `withMovementRetraction`.
  *
@@ -436,6 +445,7 @@ export function notePromptEpisodes(
       // THE ONE EVENT THAT CLEARS A GIVE-UP. Deliberately not done in the no-identity branch below:
       // that is a screen event, and an unreadable repaint is not evidence the question was resolved.
       ledger.gaveUp.delete(id);
+      ledger.askSince.delete(id);
       continue;
     }
     const ask = askOf(id);
@@ -445,11 +455,13 @@ export function notePromptEpisodes(
     // path is not reached, and a later blank repaint then deleted the episode and took the only
     // evidence with it. Compared against the CURRENT episode's start, so a stale outcome from an
     // earlier ask records nothing.
-    const openEp = ledger.episode.get(id);
+    if (!ledger.askSince.has(id)) ledger.askSince.set(id, ask?.at ?? now);
+    const askedAt = ledger.askSince.get(id)!;
     const seen = ledger.outcome.get(id);
-    if (seen && openEp && seen.at >= openEp.startedAt && seen.outcome !== "handled") {
-      ledger.gaveUp.add(id);
-    }
+    // Dated against the ASK, not against an open episode. An episode is deleted by an unreadable
+    // capture, so requiring one lost every give-up that arrived while the screen was unreadable —
+    // which is exactly when `unreachable` happens (roborev 62897).
+    if (seen && seen.at >= askedAt && seen.outcome !== "handled") ledger.gaveUp.add(id);
     const key = ask ? promptEpisodeKey(ask.text) : "";
     // No readable question, so no identity. "Never twice" cannot be honoured without one, so do not
     // hold at all — the direction of that error is showing the founder.
@@ -513,6 +525,7 @@ export function notePromptEpisodes(
   for (const id of [...ledger.episode.keys()]) if (!live.has(id)) ledger.episode.delete(id);
   for (const id of [...ledger.holds.keys()]) if (!live.has(id)) ledger.holds.delete(id);
   for (const id of [...ledger.gaveUp]) if (!live.has(id)) ledger.gaveUp.delete(id);
+  for (const id of [...ledger.askSince.keys()]) if (!live.has(id)) ledger.askSince.delete(id);
   for (const id of [...ledger.outcome.keys()]) if (!live.has(id)) ledger.outcome.delete(id);
   for (const id of [...ledger.burned.keys()]) if (!live.has(id)) ledger.burned.delete(id);
 }
@@ -522,6 +535,15 @@ export function notePromptEpisodes(
 function isHeld(ledger: PromptGraceLedger, id: string, now: number): boolean {
   const ep = ledger.episode.get(id);
   if (!ep || !ep.eligible) return false;
+  // A GIVE-UP IS A LATCH, not a value that can be overwritten. `outcome` is keyed per agent and
+  // latest-wins, and the dispatcher reports on EVERY send — an ordinary free-text message, a queued
+  // send flushing, a recovery ping — all of which classify `handled`. So a later, unrelated
+  // `handled` did not merely fail to end the hold: it erased a `declined`/`unreachable` that had
+  // already ended it and put the row back into hiding until the ceiling, on an event that said
+  // nothing about the prompt (roborev 62848). `flushPendingSends` makes that ordinary rather than
+  // exotic — it emits `expired` first and delivered second, so one flush overwrites its own
+  // `unreachable` with a `handled` for a different entry.
+  if (ledger.gaveUp.has(id)) return false;
   const since = ep.startedAt;
   const rec = ledger.outcome.get(id);
   // An outcome from BEFORE this ask began describes a different prompt — ignore it, or one agent's

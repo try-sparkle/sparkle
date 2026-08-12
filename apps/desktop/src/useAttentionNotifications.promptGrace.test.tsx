@@ -50,7 +50,7 @@ vi.mock("./services/relayClient", () => ({
 }));
 
 import {
-  baselineWithHeldPrompts,
+  baselineWithFrozenPrompts,
   heldPromptIds,
   useAttentionNotifications,
 } from "./useAttentionNotifications";
@@ -407,15 +407,15 @@ describe("the notification is DEFERRED, not dropped", () => {
   });
 });
 
-describe("baselineWithHeldPrompts", () => {
+describe("baselineWithFrozenPrompts", () => {
   const status: Record<string, AgentTabStatus> = { a: "waiting", b: "working" };
 
   it("returns the SAME reference when nothing is held", () => {
-    expect(baselineWithHeldPrompts(status, {}, new Set())).toBe(status);
+    expect(baselineWithFrozenPrompts(status, {}, new Set())).toBe(status);
   });
 
-  it("restores a held agent's PREVIOUS value, leaving everyone else at the new one", () => {
-    const out = baselineWithHeldPrompts(status, { a: "working", b: "idle" }, new Set(["a"]));
+  it("restores a frozen agent's PREVIOUS value, leaving everyone else at the new one", () => {
+    const out = baselineWithFrozenPrompts(status, { a: "working", b: "idle" }, new Set(["a"]));
     // `a` is held: as far as the edge detector is concerned this tick did not happen for it.
     expect(out.a).toBe("working");
     // …and `b` is untouched, so an unrelated agent's own edges keep working normally.
@@ -426,14 +426,14 @@ describe("baselineWithHeldPrompts", () => {
     // `undefined` is what "never observed" means to newlyEntered. Writing the red in here would
     // consume the edge — the dropped-notification bug — for an agent seen for the first time while
     // already at a prompt.
-    const out = baselineWithHeldPrompts(status, {}, new Set(["a"]));
+    const out = baselineWithFrozenPrompts(status, {}, new Set(["a"]));
     expect("a" in out).toBe(false);
     expect(out.b).toBe("working");
   });
 
   it("does not mutate its inputs", () => {
     const prev = { a: "working" as AgentTabStatus };
-    baselineWithHeldPrompts(status, prev, new Set(["a"]));
+    baselineWithFrozenPrompts(status, prev, new Set(["a"]));
     expect(status.a).toBe("waiting");
     expect(prev.a).toBe("working");
   });
