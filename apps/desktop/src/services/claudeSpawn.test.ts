@@ -283,22 +283,30 @@ describe("buildClaudeExec ()", () => {
     expect(cmd).toBe(`${PATH_PREFIX}exec '/bin/claude' --model 'claude-sonnet-5' -- 'go'`);
   });
 
-  // BD_READONLY sandboxes a worker's beads writes: all worktrees share one Dolt beads DB, so an
-  // unrestricted worker could close/supersede a bead another agent owns. bd refuses writes (exit 1)
-  // under BD_READONLY while reads still work. Confined to the child, like the PATH/config exports.
-  it("exports BD_READONLY=1 before PATH when beadsReadonly is set (worker sandbox)", () => {
+  // BD_READONLY makes a child's `bd` read-only: bd refuses close/update/create/label (exit 1) while
+  // reads still work, confined to the child like the PATH/config exports.
+  //
+  // NOTE: the option has NO production call site today. It was wired for worker spawns and WITHDRAWN
+  // (roborev 62900, High; bead sparkle-x5xn0) because it also refuses two writes a worker's own
+  // persona mandates — retro filing via retro-beads.sh, and the `bd comment` peer channel AGENTS.md
+  // names as the only way to reach a peer agent. These tests therefore pin STRING ASSEMBLY only; they
+  // cannot observe a call site, and none exists. See the option's JSDoc in claudeSpawn.ts before
+  // re-enabling it.
+  it("exports BD_READONLY=1 before PATH when beadsReadonly is set", () => {
     const cmd = buildClaudeExec("/bin/claude", false, { beadsReadonly: true });
     expect(cmd).toBe(`export BD_READONLY=1; ${PATH_PREFIX}exec '/bin/claude'`);
   });
 
-  it("omits the BD_READONLY export by default (Build/Think agents keep beads write access)", () => {
+  it("omits the BD_READONLY export by default (every agent keeps beads write access today)", () => {
     expect(buildClaudeExec("/bin/claude", false)).not.toContain("BD_READONLY");
     expect(buildClaudeExec("/bin/claude", false, { beadsReadonly: false })).not.toContain("BD_READONLY");
   });
 
   it("orders BD_READONLY after CLAUDE_CONFIG_DIR and combines with the worker spawn shape", () => {
-    // The real worker spawn sets configDir + auto-approve + mission prompt alongside beadsReadonly;
-    // pin the whole exported prefix so a later reorder of the export block is caught.
+    // Shape a worker spawn WOULD have used (configDir + auto-approve + mission prompt alongside
+    // beadsReadonly). Written in the conditional deliberately: no production caller passes
+    // beadsReadonly today. What this pins is the ORDER of the exported prefix, so a later reorder of
+    // the export block is caught whenever the option is used again.
     const cmd = buildClaudeExec("/bin/claude", false, {
       configDir: "/acc/dir",
       beadsReadonly: true,

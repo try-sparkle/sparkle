@@ -176,8 +176,10 @@ export function buildClaudeExec(
   const configExport = opts.configDir
     ? `export CLAUDE_CONFIG_DIR=${shellQuote(opts.configDir)}; `
     : "";
-  // BD_READONLY confines the child's `bd` writes (worker sandboxes). Exported alongside PATH/config
-  // so it applies to the child `claude` and everything it shells out to, never to Sparkle's own env.
+  // BD_READONLY confines the child's `bd` to reads. NO caller sets it today — see the option's JSDoc
+  // above (withdrawn from worker spawns; bead sparkle-x5xn0) before wiring it anywhere. Exported
+  // alongside PATH/config so it applies to the child `claude` and everything it shells out to,
+  // never to Sparkle's own env.
   const beadsReadonlyExport = opts.beadsReadonly ? `export BD_READONLY=1; ` : "";
   return `${configExport}${beadsReadonlyExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
