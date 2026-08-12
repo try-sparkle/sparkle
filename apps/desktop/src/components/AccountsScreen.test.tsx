@@ -56,6 +56,7 @@ function makeDeps(
     // that mocks no Tauri bridge: it rejects, resolves to [] outside act() after the assertions
     // have run, and the mount cannot be asserted at all.
     readSpawnLog: vi.fn(async () => []),
+    requestSwitchAll: vi.fn(),
   };
 }
 
@@ -241,6 +242,7 @@ describe("AccountsScreen", () => {
       setNickname: vi.fn(async () => {}),
       removeAccount: vi.fn(async () => {}),
       readSpawnLog: vi.fn(async () => []),
+      requestSwitchAll: vi.fn(),
     };
     let readsAtLoginStart = -1;
     const onLogin = vi.fn(async () => {

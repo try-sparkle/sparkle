@@ -31,6 +31,7 @@ import {
   type Headroom,
 } from "../services/headroom";
 import { getAccountUsageLive, type AccountUsageLive } from "../services/accountUsage";
+import { requestSwitchAll } from "../services/manualAccountSwitch";
 
 // Accounts settings screen for multi Claude Max account support (design spec
 // docs/superpowers/specs/2026-06-26-multi-max-account-design.md). Lists each registered Claude
@@ -71,6 +72,11 @@ const DEPS = {
   // Tauri bridge, so the call rejected, resolved to [] outside `act()` after the assertions had
   // run, and the mount could not be asserted at all.
   readSpawnLog,
+  // The MANUAL "switch all agents to this account" trigger. Fires a request that the app-wide switch
+  // host (useAccountSwitch) drives — this screen must not own the long-running switch, since it is a
+  // modal that unmounts. Injectable so a component test can assert the CALL (the side effect) without
+  // standing up the host.
+  requestSwitchAll,
 };
 export type AccountsDeps = typeof DEPS;
 
@@ -536,6 +542,14 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // Two-step confirm for re-logging in the DEFAULT account, whose config dir is the user's real
   // ~/.claude — see the button below.
   const [confirmLogin, setConfirmLogin] = useState<string | null>(null);
+  // Two-step confirm for "Switch all agents here" — the second click re-spawns every agent (at its
+  // next safe boundary), so it takes the same confirm step as Remove / default-login. Holds the id
+  // of the account awaiting confirmation.
+  const [confirmSwitchAll, setConfirmSwitchAll] = useState<string | null>(null);
+  // The account a manual switch-all was just fired for, so the row can say it's underway. Cleared
+  // when the user picks a different account or re-opens the screen; the honest, app-wide progress
+  // ("N of M moved") is the AccountSwitchHost banner, which this note points at.
+  const [switchingAllTo, setSwitchingAllTo] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -748,6 +762,16 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to rename");
     }
+  }
+
+  // MANUAL "switch all agents here". The confirm is already past by the time this runs. Fires the
+  // request the app-wide host drives — it does NOT switch anything here, on purpose: the modal
+  // unmounts, and the switch outlives it (busy agents migrate as their turns end). Records
+  // `switchingAllTo` so the row can say it's underway.
+  function handleSwitchAll(id: string) {
+    setConfirmSwitchAll(null);
+    setSwitchingAllTo(id);
+    io.requestSwitchAll(id);
   }
 
   async function handleRemove(id: string) {
@@ -1056,6 +1080,48 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 ) : (
                   <button type="button" style={smallBtn} onClick={() => setConfirmRemove(a.id)}>
                     Remove
+                  </button>
+                ))}
+
+              {/* MANUAL "switch every agent + the concierge to THIS account, now". Shown only for a
+                  SIGNED-IN account (a login-less config dir cannot receive agents) and never for the
+                  account the fleet is already on (`currentAccountId`) — switching to it is a no-op.
+                  Two-step, like Remove: the confirm names the cost (agents re-spawn, at their next
+                  safe boundary, so no in-flight work is lost). */}
+              {!isEditing &&
+                signedIn &&
+                a.id !== currentAccountId &&
+                (switchingAllTo === a.id ? (
+                  <span
+                    data-testid={`switching-all-${a.id}`}
+                    style={{ fontSize: 12, color: C.teal, whiteSpace: "nowrap" }}
+                  >
+                    <FiRotateCw size={12} aria-hidden style={{ verticalAlign: "-1px", marginRight: 4 }} />
+                    Switching all agents here…
+                  </span>
+                ) : confirmSwitchAll === a.id ? (
+                  <>
+                    <button
+                      type="button"
+                      data-testid={`switch-all-confirm-${a.id}`}
+                      style={{ ...smallBtn, borderColor: C.teal, color: C.teal }}
+                      onClick={() => handleSwitchAll(a.id)}
+                    >
+                      Confirm — move all agents
+                    </button>
+                    <button type="button" style={smallBtn} onClick={() => setConfirmSwitchAll(null)}>
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    data-testid={`switch-all-${a.id}`}
+                    style={smallBtn}
+                    onClick={() => setConfirmSwitchAll(a.id)}
+                    title="Move every agent and the concierge onto this account. Busy agents switch when they finish their current turn, so no work is lost."
+                  >
+                    Switch all agents here
                   </button>
                 ))}
             </div>

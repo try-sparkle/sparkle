@@ -36,6 +36,7 @@ import { ModalShell } from "../ModalShell";
 import { AccountsScreen } from "../AccountsScreen";
 import { AccountLoginModal } from "../AccountLoginModal";
 import { invalidateAccountState } from "../../services/accountSelection";
+import { busiestPaneAccount } from "../../services/paneControl";
 import type { Account } from "../../services/accountStore";
 import { useUiStore } from "../../stores/uiStore";
 
@@ -247,6 +248,11 @@ export function KebabMenu() {
               to — resolved the await instantly and unmounted the thing that was waiting, so the
               post-login re-read could never run outside a test. */}
           <AccountsScreen
+            // The account the fleet is predominantly running on right now, so the "Switch all agents
+            // here" control can hide on the row that is already the target (switching to it is a
+            // no-op). A live snapshot of the pane registry — fine here, where the screen is a modal
+            // the user just opened.
+            currentAccountId={busiestPaneAccount()}
             onLogin={(account) =>
               new Promise<void>((resolve) => {
                 // Never drop an outstanding resolver on the floor. The background screen is still

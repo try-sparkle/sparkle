@@ -21,6 +21,7 @@
 
 import type { AgentTabStatus } from "../types";
 import { setPin } from "./accountStore";
+import { CONCIERGE_ACCOUNT_KEY } from "./accountSelection";
 
 /** Statuses at which an agent can be re-spawned without losing in-flight work. Everything except
  *  `working`; see the module note. */
@@ -56,6 +57,49 @@ export function planSwitch(
     .filter(([, acct]) => acct === fromAccountId)
     .map(([agentId]) => agentId);
   return { fromAccountId, toAccountId, pending, moved: [] };
+}
+
+/** The one field of a project this builder needs. Kept minimal so tests (and the caller) don't have
+ *  to construct a whole `Project`. The real `Project.agents` is assignable to this. */
+export interface AgentRef {
+  id: string;
+}
+export interface FleetProject {
+  agents: AgentRef[];
+}
+
+/** Build the MANUAL "switch EVERYTHING to one account" plan, and pin the concierge to match.
+ *
+ *  This is the human-triggered counterpart to {@link planSwitch}. The difference is the whole point:
+ *  `planSwitch` selects only the agents currently on ONE `fromAccountId` (the headroom recommendation
+ *  is about the account that's running out). This targets the ENTIRE fleet — every agent across every
+ *  project — regardless of which account each is running on right now, because "switch all agents
+ *  here" means all of them.
+ *
+ *  Two effects, BOTH required, so a caller can never do one without the other:
+ *   1. Returns a `SwitchPlan` whose `pending` is every agent id across `projects` (de-duped). The
+ *      existing `advanceSwitch` loop then migrates each at its own next safe boundary — busy agents
+ *      keep working and move when their turn ends, exactly as the recommendation path does.
+ *   2. PINS THE CONCIERGE. The concierge is not an AgentPane and has no entry in the fleet roster, so
+ *      it can never be in `pending`. Instead it resolves its account per turn via
+ *      `chooseAccountForAgent` (pin-first), so pinning `CONCIERGE_ACCOUNT_KEY` here is what carries
+ *      it to the new account at its next safe turn boundary. `setPinFn` is injectable purely for
+ *      tests; production passes the real `setPin`.
+ *
+ *  `fromAccountId` is left empty: there is no single account being left, and nothing reads this field
+ *  on an in-progress plan (the banner renders `pending`/`moved` only). */
+export function buildSwitchAllPlan(
+  projects: readonly FleetProject[],
+  toAccountId: string,
+  setPinFn: (agentId: string, accountId: string) => void = setPin,
+): SwitchPlan {
+  // Pin the concierge FIRST — it migrates via the pin, not via `pending`. Done unconditionally, even
+  // when the fleet is empty, because the concierge is always running.
+  setPinFn(CONCIERGE_ACCOUNT_KEY, toAccountId);
+  const pending = Array.from(
+    new Set(projects.flatMap((p) => p.agents).map((a) => a.id)),
+  );
+  return { fromAccountId: "", toAccountId, pending, moved: [] };
 }
 
 /** Which pending agents are ready to move right now, given live statuses. PURE — the caller

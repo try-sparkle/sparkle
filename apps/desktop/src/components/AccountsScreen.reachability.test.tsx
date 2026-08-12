@@ -73,6 +73,7 @@ function deps(entries: SpawnLogEntry[]): AccountsDeps {
     setNickname: vi.fn(async () => {}),
     removeAccount: vi.fn(async () => {}),
     readSpawnLog: vi.fn(async () => entries),
+    requestSwitchAll: vi.fn(),
   };
 }
 

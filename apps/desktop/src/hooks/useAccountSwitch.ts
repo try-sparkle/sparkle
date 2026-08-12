@@ -15,11 +15,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRuntimeStore } from "../stores/runtimeStore";
+import { useProjectStore } from "../stores/projectStore";
 import { loadAccountState, invalidateAccountState } from "../services/accountSelection";
 import { listCeilings } from "../services/accountStore";
 import { switchRecommendation, type SwitchRecommendation, type Ceiling } from "../services/headroom";
-import { advanceSwitch, planSwitch, type SwitchPlan } from "../services/accountSwitch";
+import { advanceSwitch, buildSwitchAllPlan, planSwitch, type SwitchPlan } from "../services/accountSwitch";
 import { busiestPaneAccount, paneAccountMap, restartPane } from "../services/paneControl";
+import { subscribeSwitchAll } from "../services/manualAccountSwitch";
 
 /** How often to re-evaluate headroom. Slower than the limit poll: the ceiling is cached in Rust for
  *  15 minutes and 5h consumption moves gradually, so a tighter loop would just burn IPC. */
@@ -36,6 +38,9 @@ export interface AccountSwitchState {
   plan: SwitchPlan | null;
   accept: () => void;
   dismiss: () => void;
+  /** MANUAL trigger: switch EVERY agent + the concierge to `accountId`, driven by the same
+   *  advanceSwitch loop that carries out an accepted recommendation. See {@link buildSwitchAllPlan}. */
+  switchAllTo: (accountId: string) => void;
 }
 
 export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwitchState {
@@ -135,5 +140,32 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
     setRecommendation(null);
   }, [recommendation]);
 
-  return { recommendation, plan, accept, dismiss };
+  // ---- MANUAL: switch EVERY agent + the concierge to one account ------------------------------
+  //
+  // A human clicked "switch all agents here". Unlike `accept`, this is NOT gated on a recommendation
+  // and is DELIBERATELY not consulted against `dismissed` — the founder asking for it outright always
+  // means it. It builds a plan over the WHOLE fleet (every agent across every project) and pins the
+  // concierge, then hands the plan to the SAME phase-2 loop above; there is no second switch loop.
+  const switchAllTo = useCallback((accountId: string) => {
+    const projects = useProjectStore.getState().projects;
+    // `buildSwitchAllPlan` also pins the concierge (setPin), so that happens even when the fleet has
+    // no panes to enroll.
+    const fresh = buildSwitchAllPlan(projects, accountId);
+    // Clear any live recommendation — the manual action supersedes it, and suppressing the banner is
+    // the honest thing while the switch runs.
+    setRecommendation(null);
+    // No agent panes to move: the concierge pin is already recorded above, so there is nothing to
+    // drive. Leaving an empty plan spinning would just churn the advance loop.
+    if (fresh.pending.length === 0) return;
+    // Write the ref alongside the state — phase 2 reads the plan from the ref (see its note), so it
+    // must be current the instant a plan exists rather than one commit later.
+    planRef.current = fresh;
+    setPlan(fresh);
+  }, []);
+
+  // The Accounts screen is a transient modal, so it cannot own the long-running switch. It fires a
+  // request through `manualAccountSwitch`; this app-wide host receives it and drives the loop.
+  useEffect(() => subscribeSwitchAll((accountId) => switchAllTo(accountId)), [switchAllTo]);
+
+  return { recommendation, plan, accept, dismiss, switchAllTo };
 }
