@@ -59,7 +59,7 @@ export function useProjectStaleness(
 ): Record<string, ProjectTabStaleness> {
   const [byProject, setByProject] = useState<Record<string, ProjectTabStaleness>>({});
   // Identity that changes only when the actual set of (id, path) pairs changes.
-  const key = targets.map((t) => `${t.id}\u0000${t.rootPath}`).join("");
+  const key = targets.map((t) => `${t.id}\u0000${t.rootPath}`).join("\u0001");
   const targetsRef = useRef(targets);
   targetsRef.current = targets;
   // Roots with an auto-fix already in flight. A poll every `pollMs` must not stack a second
@@ -176,7 +176,7 @@ function shallowEqual(
 export function useStalenessTargets(
   projects: readonly { id: string; rootPath: string }[],
 ): StalenessTarget[] {
-  const key = projects.map((p) => `${p.id}\u0000${p.rootPath}`).join("");
+  const key = projects.map((p) => `${p.id}\u0000${p.rootPath}`).join("\u0001");
   // eslint-disable-next-line react-hooks/exhaustive-deps -- `key` IS the content of `projects`.
   return useMemo(() => projects.map((p) => ({ id: p.id, rootPath: p.rootPath })), [key]);
 }
