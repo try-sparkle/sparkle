@@ -28,6 +28,9 @@ import { C as BRAND } from "@sparkle/ui";
 import {
   BADGE_EDGE_PCT,
   C,
+  CHAT_SENT_FILL,
+  CHAT_SENT_INK,
+  CHAT_SENT_MUTED,
   CHROME_MIN_CONTRAST,
   EDGE_MIN_CONTRAST,
   CONTROL_MIN_CONTRAST,
@@ -789,6 +792,101 @@ describe("the neutral ladder, where it is composited", () => {
           `${mode}: hairline is invisible against ${fill}`,
         ).toBeGreaterThan(EDGE_MIN_CONTRAST);
       }
+    }
+  });
+});
+
+// ── THE SENT CARD, AND THE ONE FLOOR IT CANNOT CLEAR ───────────────────────────────────────────
+// `chatBubbleSent` is the only chrome fill in this file that was placed by an INSTRUCTION rather
+// than by the neutral ladder: the founder asked for a black card on a message that was sent to an
+// agent. So the honest thing is to assert the floors it does clear and to record, in numbers, the
+// one it does not — the same shape as the composited-pair note above, and for the same reason:
+// leaving it undocumented is how the next reader "fixes" it by lightening the value.
+//
+// WHAT IT DOES NOT CLEAR: in DARK mode black is 1.22 against `conciergeSurface` and 1.45 against
+// `chatBubble` — over EDGE_MIN_CONTRAST, under CHROME_MIN_CONTRAST. The card reads as a dark well
+// rather than a crisp object, and that is a property of asking for black on a near-black column,
+// not a mistake in the value. In LIGHT mode the same black is ~18 against both, which is the
+// opposite problem: a heavy inverted slab. Both were shown to the founder as screenshots; the
+// remedy if he wants one is a drawn hairline edge (the direction separates by line weight), NOT a
+// quietly lightened fill, which would trade his instruction for a number.
+describe("the black `sent to an agent` card", () => {
+  // The card and both pinned inks are MODE-INVARIANT by construction, so a `for (const mode of
+  // MODES)` loop over them computes the identical ratio twice and proves nothing about light mode.
+  // An earlier version of this block did exactly that and read as if it covered the trap. Pin the
+  // invariance itself, then assert each real case once.
+  const CARD = THEME_HEX.dark.chatBubbleSent;
+
+  it("is the same black in both themes — the premise everything below rests on", () => {
+    expect(THEME_HEX.light.chatBubbleSent).toBe(THEME_HEX.dark.chatBubbleSent);
+  });
+
+  it("its PINNED inks clear AA on it", () => {
+    expect(contrast(CHAT_SENT_INK, CARD), "the sent card's pinned ink is unreadable on it")
+      .toBeGreaterThan(INK_MIN_CONTRAST);
+    expect(contrast(CHAT_SENT_MUTED, CARD), "the sent card's pinned muted ink is unreadable on it")
+      .toBeGreaterThan(INK_MIN_CONTRAST);
+  });
+
+  it("and the THEMED ink it refuses to inherit would be unreadable — why the pinning exists", () => {
+    // THE ACTUAL TRAP, asserted rather than described. `cream` INVERTS: #dce8fc dark, #0a1b33 light.
+    // A black card that inherited it would render near-black on black in light mode — the message
+    // text, the pill's label and every paste pill gone together. Nothing asserted that before, so
+    // the whole theme layer would have stayed green if the card dropped its pinning.
+    //
+    // This goes RED two ways, both of them the ones that matter: if someone retunes light's `cream`
+    // toward white and makes inheriting it look safe, and if the card's fill is lightened until the
+    // themed ink would have been fine — which is the "quietly lighten it" fix the header warns off.
+    expect(
+      contrast(THEME_HEX.light.cream, CARD),
+      "light's themed ink is now readable on the sent card — if that is intended, the pinning in " +
+        "SentToAgentRow.SENT_CARD_INK_VARS is no longer load-bearing and should be reconsidered " +
+        "deliberately, not left in place by accident",
+    ).toBeLessThan(INK_MIN_CONTRAST);
+  });
+
+  it("BOTH pinned inks also clear AA on the FILLS its own subtree paints", () => {
+    // THE HALF THE FIRST VERSION MISSED. The card supplies the ground for text drawn straight onto
+    // it — but a non-thumbnail attachment chip (AttachmentStrip) draws a ground of its OWN inside
+    // the bubble. Pinning only the ink left that ground themed, so light mode put #dce8fc on a
+    // #e8f0fd chip: ~1.07:1, invisible. The card pins that fill too (CHAT_SENT_FILL).
+    //
+    // BOTH INKS, not just the ink. The chip paints CHAT_SENT_MUTED as well as CHAT_SENT_INK — the
+    // file glyph and the extension label (AttachmentStrip.tsx:127,144) — and an earlier version of
+    // this sweep asserted only the ink while its title claimed both, leaving the muted pair free to
+    // drift under AA on a retune of BLUEPRINT.dark.muted with this suite green (roborev 62750).
+    //
+    // This sweep is what stops the list going stale: add a fill a card descendant paints for itself,
+    // add it here. Fills that need NO pin are listed in theme/colors beside CHAT_SENT_FILL, with the
+    // reason each is safe — the collapsed-paste pill is translucent, sienna carries its own ink.
+    for (const [fillName, fill] of [["the attachment chip", CHAT_SENT_FILL]] as const) {
+      for (const [inkName, ink] of [
+        ["ink", CHAT_SENT_INK],
+        ["muted ink", CHAT_SENT_MUTED],
+      ] as const) {
+        expect(
+          contrast(ink, fill),
+          `${fillName}: the card's pinned ${inkName} is unreadable on the ground that element paints for itself`,
+        ).toBeGreaterThan(INK_MIN_CONTRAST);
+      }
+    }
+  });
+
+  it("is tellable from an ordinary bubble and from the column it sits on", () => {
+    // The whole affordance is that a forwarded message is distinguishable AT A GLANCE from one the
+    // concierge answered. EDGE_MIN_CONTRAST is the floor these actually clear (see the note above);
+    // asserting it pins how little headroom dark mode has, so a future repaint of
+    // `conciergeSurface` or `chatBubble` toward black fails here instead of silently erasing the card.
+    for (const mode of MODES) {
+      const hex = THEME_HEX[mode];
+      expect(
+        contrast(hex.chatBubbleSent, hex.chatBubble),
+        `${mode}: the sent card is indistinguishable from an ordinary bubble`,
+      ).toBeGreaterThan(EDGE_MIN_CONTRAST);
+      expect(
+        contrast(hex.chatBubbleSent, hex.conciergeSurface),
+        `${mode}: the sent card is invisible against the concierge column`,
+      ).toBeGreaterThan(EDGE_MIN_CONTRAST);
     }
   });
 });

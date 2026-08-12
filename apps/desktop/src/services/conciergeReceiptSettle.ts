@@ -39,6 +39,14 @@ export function settleConciergeReceipt(
   data: unknown,
   reason: string | undefined,
   code?: string,
+  /** The user bubble this call belongs to, CAPTURED WHEN THE CALL STARTED — never read here.
+   *
+   *  Last and optional so the two existing positional call sites are unaffected, and so a caller
+   *  that genuinely does not know the origin (an approval resumed from a click handler, long after
+   *  the requesting turn ended) says so by omission. Omitted means the renderer marks no bubble;
+   *  see `setConciergeTurnOrigin` in ./conciergeReceipts for why inferring it at settle time is
+   *  wrong rather than merely imprecise. */
+  originBubbleId?: string,
 ): void {
   // ══ A DEFERRAL IS NOT A REFUSAL — DO NOT RECORD ONE ═══════════════════════════════════════════
   // roborev 57852 (High). `needs-approval` means the call is WAITING on the human, not that it was
@@ -64,7 +72,9 @@ export function settleConciergeReceipt(
       id: nextReceiptId(),
       at: Date.now(),
     });
-    if (receipt) recordConciergeActionReceipt(receipt);
+    // Attached AFTER classification, deliberately: provenance is not something the classifier reads
+    // out of a reply shape, and threading it through that signature would invite exactly that.
+    if (receipt) recordConciergeActionReceipt(originBubbleId ? { ...receipt, originBubbleId } : receipt);
   } catch (err) {
     console.warn("[control] concierge receipt classification failed", domain, op, err);
   }

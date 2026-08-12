@@ -57,6 +57,7 @@ import { noteConciergeAuditCall } from "./conciergeAudit";
 // imagined sending it" look identical. A receipt outlives the turn; the classifier decides which
 // calls earn one.
 import { settleConciergeReceipt } from "./conciergeReceiptSettle";
+import { currentConciergeTurnOrigin } from "./conciergeReceipts";
 import { CONCIERGE_RECEIPT_APP_OPS } from "./conciergeReceiptClassifier";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
@@ -1818,6 +1819,12 @@ function refusedCallerRemedy(domain: string, op: string): string {
 }
 
 async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolReply> {
+  // WHICH USER MESSAGE THIS CALL BELONGS TO, read HERE at entry rather than in the `finally` below.
+  // The gap between the two is the whole point: a displaced turn settles after the next bubble is
+  // already awaiting, so a read at settle time would attribute this send to a message that did not
+  // cause it — and the concierge paints that attribution as a black "sent to an agent" card, which
+  // is a delivery claim. See `setConciergeTurnOrigin` in ./conciergeReceipts (roborev 62737).
+  const originBubbleId = currentConciergeTurnOrigin() ?? undefined;
   // Read defensively: this payload was assembled by a model's MCP client, and the reply has to name
   // the domain/op it was asked about even when they arrive as the wrong type.
   const domain = typeof req.payload.domain === "string" ? req.payload.domain : "";
@@ -1921,6 +1928,8 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
       okData,
       auditReply.message,
       auditReply.code,
+      // Captured at ENTRY, above — not read here. See the note at the top of this function.
+      originBubbleId,
     );
   }
 }

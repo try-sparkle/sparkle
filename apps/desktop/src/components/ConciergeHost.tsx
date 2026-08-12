@@ -202,7 +202,11 @@ import {
   promiseVerbPhrase,
 } from "../services/conciergePromiseLedger";
 import { toLintToolCalls } from "../services/conciergeLintRunner";
-import { claimReceiptForDisplay, onConciergeActionReceipt } from "../services/conciergeReceipts";
+import {
+  claimReceiptForDisplay,
+  onConciergeActionReceipt,
+  setConciergeTurnOrigin,
+} from "../services/conciergeReceipts";
 import { routeMessage } from "../services/conciergeRouter";
 import {
   mentionFreeText,
@@ -3465,6 +3469,20 @@ export function ConciergeHost({
    *  the value as of NOW, not as of the last commit. */
   const awaitingBubbleRef = useRef<string | null>(null);
 
+  // PUBLISH THE AWAITING BUBBLE AS RECEIPT PROVENANCE, so a call that starts during this turn can be
+  // attributed to the message that caused it when it settles — possibly long afterwards, possibly
+  // when a different bubble is awaiting. `handleConciergeTool` reads it at call ENTRY; see
+  // `setConciergeTurnOrigin` in services/conciergeReceipts for why a read at settle time is wrong.
+  //
+  // DRIVEN OFF `awaitingId` RATHER THAN MIRRORED AT EACH ASSIGNMENT. There are five sites that move
+  // the awaiting bubble, and every one of them already sets this state beside the ref — so keying on
+  // it makes the module impossible to leave stale, where five hand-placed calls would be one
+  // forgotten edit away from attributing a send to the wrong message. The commit-time delay is
+  // immaterial: a turn's tool calls are network round-trips behind it.
+  useEffect(() => {
+    setConciergeTurnOrigin(awaitingId);
+  }, [awaitingId]);
+
   /** Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome.
    *
    *  `bubbleId` is the user bubble this turn answers. It is what lets a displaced message say so —
@@ -3867,6 +3885,95 @@ export function ConciergeHost({
       }),
     );
   }, [announce]);
+
+  /**
+   * Record on the user's OWN bubble that the concierge relayed it to an agent.
+   *
+   * WHY THIS EXISTS — it is the half of the founder's complaint the composer path never covered.
+   * There are two ways his words reach a build agent. He can address one himself (`@Agent …`, or a
+   * mounted column), and that path has always stamped his bubble at `dispatchToTerminal`. Or he can
+   * write ordinary prose and the CONCIERGE decides to relay it — and that path wrote nothing back
+   * onto his message at all. It posted a separate "Sent to X's terminal." line further down the
+   * thread, which is a statement by the concierge about its own action, several rows away from the
+   * message it concerns and easily scrolled past. So the bubble that left the room looked exactly
+   * like one that did not, which is what he had to work out by hand.
+   *
+   * `target: "sparkle"` WITH `alsoSentTo: "agent"` IS THE HONEST SHAPE, not `target: "agent"`. The
+   * message really did go to the concierge first — that is HOW it came to be relayed — and the agent
+   * is a second delivery the reader cannot otherwise see. It is also the shape the receipt vocabulary
+   * already had for "reached two places" (Concierge/types ConciergeReceipt), so nothing new is
+   * invented and RoutingReceipt's wording still holds if the card is ever turned off.
+   *
+   * NEVER OVERWRITES AN EXISTING AGENT RECORD. A bubble that already names an agent was addressed by
+   * the user, and his aim outranks anything inferred here — clobbering it would rename his own
+   * destination under him, which is the one error this whole feature exists to prevent.
+   *
+   * NO ANNOUNCEMENT, unlike `setReceipt` above. The relay already speaks for itself: the concierge
+   * posts a receipt line into the thread and the column's live region reads it. Announcing again
+   * from here would say the same sentence twice to a screen-reader user.
+   */
+  const stampRelayReceipt = useCallback(
+    (id: string, agentId: string, agentName: string | undefined) => {
+      setChat((prev) =>
+        prev.map((m) => {
+          if (m.kind !== "you" || m.id !== id) return m;
+          // Already carries an agent — the user's own aim, or a stamp from an earlier receipt in the
+          // same turn. A `refused` receipt is caught here too: those are always `target: "agent"`,
+          // and a message that bounced must not acquire a delivery it never made.
+          if (m.receipt?.target === "agent" || m.receipt?.alsoSentTo === "agent") return m;
+          return {
+            ...m,
+            receipt: { ...m.receipt, target: "sparkle", alsoSentTo: "agent", agentId, agentName },
+          };
+        }),
+      );
+    },
+    [],
+  );
+
+  // The subscription that does it. SEPARATE from the receipt-line effect above, deliberately: that
+  // one calls `claimReceiptForDisplay` to stop a replayed receipt drawing a second line, and this
+  // stamp must not be gated on winning that claim — they are different concerns and only one of them
+  // is about drawing a row. Replay is safe here on its own terms: a remount starts with no awaiting
+  // bubble, so there is nothing to stamp, and the guard above makes a repeat a no-op anyway.
+  useEffect(
+    () =>
+      onConciergeActionReceipt((receipt) => {
+        // THE JOIN, AND IT IS CARRIED RATHER THAN INFERRED. `originBubbleId` was captured when the
+        // call STARTED (handleConciergeTool reads it at entry); this used to read
+        // `awaitingBubbleRef.current` here instead, which is a different question — "what is
+        // awaiting NOW" — and the two diverge exactly where it hurts (roborev 62737):
+        //
+        //   • an approval resumed from a click handler settles arbitrarily long after its turn,
+        //   • a displaced turn's reply settles once the NEXT bubble is already awaiting — 149 of
+        //     378 turns on one measured day.
+        //
+        // Both would paint the black card on a message that was never sent while the one that WAS
+        // sent stayed bare: the feature's own false claim, inverted. Absent origin stamps nothing —
+        // the receipt line below the bubble still reports the send, so nothing is hidden.
+        const origin = receipt.originBubbleId;
+        // A TYPE NARROWING AND AN EARLY-OUT, NOT THE GUARD — said plainly because mutation-check
+        // flags this line as uncaught and that reading is correct. Deleting it changes no behaviour:
+        // `stampRelayReceipt` matches on `m.id === id`, and no message has an undefined id, so an
+        // origin-less receipt already marks nothing. The safety lives in that match; this just
+        // avoids walking the thread and keeps `origin` a string. The paired test asserts the
+        // BEHAVIOUR (an origin-less receipt marks no bubble), which is the durable claim and stays
+        // true however this line is written.
+        if (!origin) return;
+        // `ok`, because a refused tool call delivered nothing. `agentId`, because the card's whole
+        // promise is a pill the founder can click. `viaPicker` is excluded — that receipt is the
+        // concierge pressing a button on his behalf, not his words being forwarded, and describing
+        // it as a send would be the false claim conciergeReceipts exists to prevent. `fanout` has no
+        // single destination to name.
+        if (receipt.kind !== "sent" || !receipt.ok || receipt.viaPicker || receipt.fanout) return;
+        if (!receipt.agentId) return;
+        // "held" is NOT a delivery — it means the message goes in when the terminal is ready — so it
+        // must not turn the bubble into a card claiming it went. Terminal and inbox both did arrive.
+        if (receipt.channel !== "terminal" && receipt.channel !== "inbox") return;
+        stampRelayReceipt(origin, receipt.agentId, receipt.agentName);
+      }),
+    [stampRelayReceipt],
+  );
 
   /**
    * The one send path. Routes the text, delivers it, and posts the receipt that makes the routing

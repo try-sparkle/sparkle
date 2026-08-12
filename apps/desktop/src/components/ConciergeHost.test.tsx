@@ -240,6 +240,18 @@ import {
 } from "../services/conciergeActivity";
 import { MESSAGE_STATUS_TESTID } from "./Concierge/MessageStatus";
 import { FAILURE_EVIDENCE_TESTID } from "./Concierge/ConciergeMessageRow";
+// WHERE A ROUTED MESSAGE NAMES ITS DESTINATION NOW. It used to be a "→ Sent to X" line BELOW the
+// bubble; the founder moved it inside the black sent card (see Concierge/SentToAgentRow), so the
+// cases below settle on this row instead of on that sentence. The sentence itself is not gone — it
+// is still what the column's live region ANNOUNCES, which is why the announcer assertions are
+// untouched and still quote it verbatim.
+import { SENT_TO_AGENT_TESTID } from "./Concierge/SentToAgentRow";
+// The REAL seam the relay-stamp suite drives, rather than a mock of it: the production effect
+// subscribes to this module, so recording here is the same event the settler emits.
+import {
+  recordConciergeActionReceipt,
+  type ConciergeActionReceipt,
+} from "../services/conciergeReceipts";
 import { ConciergeAiDisabledError } from "../services/concierge";
 import { MAX_QUEUED_TURNS } from "../engine/conciergeTurnQueue";
 import { ANSWERED_MARKER_TESTID } from "./Concierge/ReplyAnchorViews";
@@ -1678,7 +1690,10 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     const announcer = () => screen.getByTestId("concierge-announcer");
 
     await send("ship it");
-    expect(await within(thread()).findByText("→ Sent to CI Hardening")).toBeTruthy();
+    // Settle on the card; then assert the ANNOUNCEMENT, which is what this case is about. The two
+    // deliberately differ now: the visible surface names the agent as a pill inside the bubble, and
+    // the live region still speaks the full sentence — a screen-reader user gets no pill to read.
+    await within(thread()).findByTestId(SENT_TO_AGENT_TESTID);
     expect(announcer().textContent).toBe("→ Sent to CI Hardening");
     const spoken = announcer().firstElementChild;
     const seq = spoken?.getAttribute("data-announce-seq");
@@ -1817,7 +1832,9 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
     h.dispatchConciergeAnswer.mockResolvedValueOnce({ ok: true, path: "free-text" });
     renderWithTarget();
     await send("landed fine");
-    await findInThread(/→ Sent to CI Hardening/);
+    // The settle signal, not the subject of the test: wait until the send has visibly landed before
+    // reading the box. The sent card is what says so now (see the import note above).
+    await within(thread()).findByTestId(SENT_TO_AGENT_TESTID);
     expect((screen.getByRole("textbox") as HTMLTextAreaElement).value).toBe("");
   });
 
@@ -2111,7 +2128,15 @@ describe("ConciergeHost — routing receipts", () => {
     routeToAgent();
     renderWithTarget();
     await send("add retry logic");
-    expect(await within(thread()).findByText("→ Sent to CI Hardening")).toBeTruthy();
+    // THE CLAIM IS UNCHANGED — a terminal-routed message says where it went — but the element that
+    // carries it moved INSIDE the user's own bubble, and the name is now a live `AgentPill` the
+    // founder can click rather than the dead text that made him work it out by hand.
+    const row = await within(thread()).findByTestId(SENT_TO_AGENT_TESTID);
+    expect(row.textContent).toContain("Sent to:");
+    expect(row.textContent).toContain("CI Hardening");
+    // …and it is INSIDE the bubble, which is the whole of what he asked for. Asserting only that the
+    // row exists would pass against a version that left it hanging underneath.
+    expect(within(thread()).getByTestId("you-bubble").contains(row)).toBe(true);
   });
 
   // ══ NO RECEIPT SENTENCE FOR AN ORDINARY CONCIERGE ANSWER (founder, 2026-08-04) ════════════════
@@ -3370,5 +3395,125 @@ describe("the cable reaches the concierge column", () => {
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
     // Read-side only: the patch survives, so re-selecting relights the flood with no second gesture.
     expect(useCableStore.getState().wired).toBe("right");
+  });
+});
+
+// ══ THE CONCIERGE RELAYING ON THE USER'S BEHALF ═════════════════════════════════════════════════
+// The other half of the founder's complaint, and the half that had no coverage at all (roborev
+// 62737). Two paths reach an agent: he addresses one himself — covered above, and it stamps
+// `target: "agent"` at dispatch — or he writes ordinary prose and the CONCIERGE decides to relay it.
+// That second path wrote nothing onto his bubble; it posted a receipt line rows further down.
+//
+// Every test here drives the REAL seam: a `ConciergeActionReceipt` recorded through the module the
+// production code subscribes to. None of them can pass against a version with the effect deleted,
+// because the fixture message routes to `sparkle` and so is not a card to begin with — which is the
+// vacuity trap roborev named for exactly this block.
+describe("ConciergeHost — the concierge relays a message, and says so ON the bubble", () => {
+  const AGENT = { id: "ag1", name: "CI Hardening" };
+
+  /** Send one ordinary message that the concierge answers ITSELF, and return its bubble id. */
+  async function sendPlain(text = "how's the booking flow?") {
+    h.feed = feedWith("approval");
+    h.routeMessage.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" });
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} promptTarget={null} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const bubble = within(thread()).getByTestId("you-bubble");
+    // PRECONDITION, ASSERTED. If this were already a card the positive case below would prove
+    // nothing — it would be green before the effect ran. This is the guard on that.
+    expect(bubble.dataset.sentToAgent).toBe("no");
+    const row = bubble.closest("[data-message-id]") as HTMLElement | null;
+    return row?.dataset.messageId ?? "";
+  }
+
+  /** Record a receipt the way the settler does, with whatever overrides the case is about. */
+  function relay(over: Partial<ConciergeActionReceipt> = {}) {
+    act(() =>
+      recordConciergeActionReceipt({
+        id: `r-${Math.random()}`,
+        kind: "sent",
+        ok: true,
+        channel: "terminal",
+        agentId: AGENT.id,
+        agentName: AGENT.name,
+        at: Date.now(),
+        op: "terminal.send_to_agent_terminal",
+        ...over,
+      } as ConciergeActionReceipt),
+    );
+  }
+
+  const card = () => within(thread()).getByTestId("you-bubble").dataset.sentToAgent;
+
+  it("turns the originating bubble into a sent card, with the agent's pill inside it", async () => {
+    const origin = await sendPlain();
+    relay({ originBubbleId: origin });
+    await waitFor(() => expect(card()).toBe("yes"));
+    const row = await within(thread()).findByTestId(SENT_TO_AGENT_TESTID);
+    expect(row.textContent).toContain("Sent to:");
+    expect(row.textContent).toContain(AGENT.name);
+  });
+
+  // ── THE FALSE-ATTRIBUTION CASES ───────────────────────────────────────────────────────────────
+  // These are the reason the join is CARRIED rather than inferred. Reading "whichever bubble is
+  // awaiting" at settle time made both of these paint the card on a message that was never sent.
+  it("marks NOTHING when the receipt carries no origin — an approval resumed after its turn", () => {
+    // `resumeApprovedCall` settles from a click handler, arbitrarily long after the requesting turn
+    // ended, and cannot know the bubble. Fail-closed: no origin, no claim.
+    return sendPlain().then(() => {
+      relay({ originBubbleId: undefined });
+      expect(card()).toBe("no");
+    });
+  });
+
+  it("marks the ORIGIN, never whatever happens to be awaiting now — the displaced turn", async () => {
+    await sendPlain();
+    // A reply that settles after its own turn was displaced names the bubble it actually belonged
+    // to. That bubble is not in this thread, so nothing here may be marked.
+    relay({ originBubbleId: "some-earlier-bubble" });
+    expect(card()).toBe("no");
+  });
+
+  // ── THE EXCLUSIONS, one test each. Every one is a delivery claim that would otherwise be false.
+  it.each([
+    ["a refusal delivered nothing", { ok: false }],
+    ["a HELD message has not arrived yet", { channel: "held" as const }],
+    ["a picker press is not the user's words being forwarded", { viaPicker: true as const }],
+    ["a fan-out has no single destination to name", { fanout: true as const }],
+    ["a receipt with no agent id has no pill to offer", { agentId: undefined }],
+    ["only a `sent` receipt is a send", { kind: "filed" as const }],
+  ])("does not claim delivery when %s", async (_why, over) => {
+    const origin = await sendPlain();
+    relay({ originBubbleId: origin, ...over });
+    expect(card()).toBe("no");
+  });
+
+  it("never overwrites an agent the USER addressed himself", async () => {
+    // His own aim outranks anything inferred. Renaming his destination under him is the one error
+    // this whole feature exists to prevent, so it must not be reachable from the relay path.
+    //
+    // Stated as BEFORE and AFTER on the same bubble rather than as a single expectation, so the
+    // test cannot pass by the destination having been something else all along.
+    routeToAgent();
+    h.feed = feedWith("approval");
+    render(
+      <ConciergeHost
+        feed={h.feed as ConciergeFeed}
+        promptTarget={{ projectId: "p1", agentId: "ag1", name: "CI Hardening" }}
+      />,
+    );
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "add retry logic" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const before = (await within(thread()).findByTestId(SENT_TO_AGENT_TESTID)).textContent ?? "";
+    expect(before).toContain("CI Hardening");
+
+    const row = within(thread()).getByTestId("you-bubble").closest("[data-message-id]") as HTMLElement;
+    // A relay receipt naming a DIFFERENT agent, against the bubble he already aimed himself.
+    relay({ originBubbleId: row.dataset.messageId, agentId: "ag-other", agentName: "Some Other Agent" });
+    const after = (await within(thread()).findByTestId(SENT_TO_AGENT_TESTID)).textContent ?? "";
+    expect(after).toBe(before);
+    expect(after).not.toContain("Some Other Agent");
   });
 });

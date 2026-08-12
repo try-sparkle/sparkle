@@ -21,6 +21,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
 import type { ConciergeMessage } from "./types";
 import { NUDGE_CARD_TESTID } from "./NudgeCard";
+import { SENT_TO_AGENT_TESTID } from "./SentToAgentRow";
 
 afterEach(() => cleanup());
 
@@ -145,7 +146,10 @@ describe("the thread prints no authorship captions", () => {
     // they stayed green.
     renderThread();
     expect(screen.getByTestId("concierge-recap")).toBeTruthy(); // recap
-    expect(screen.getByTestId("routing-receipt")).toBeTruthy(); // you + receipt
+    // `you` + receipt. The fixture's receipt names an AGENT, so that branch now draws the sent card's
+    // destination row INSIDE the bubble rather than a "→ Sent to X" line beneath it — see
+    // Concierge/SentToAgentRow. The coverage claim is the same one: this message kind rendered.
+    expect(screen.getByTestId(SENT_TO_AGENT_TESTID)).toBeTruthy();
     expect(screen.getByTestId("concierge-digest")).toBeTruthy(); // digest line
     expect(screen.getByText("All projects calm · nothing needs you")).toBeTruthy(); // batch
     expect(screen.getByLabelText("Sparkle is typing")).toBeTruthy(); // the typing row

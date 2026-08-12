@@ -64,6 +64,7 @@
   --c-pill-fill: #21395c;
   --c-chat-bubble: #14294a;
   --c-chat-bubble-active: #172b4b;
+  --c-chat-bubble-sent: #000000;
   --c-accent-ink: #5c96ff;
   --c-gold-ink: #5c96ff;
   --c-teal-ink: #5c96ff;
@@ -99,6 +100,9 @@
   --c-pill-fill: #cbd8ea;
   --c-chat-bubble: #e8f0fd;
   --c-chat-bubble-active: #e4ecfa;
+  /* Not a typo and not a missed override — the sent card is the same black in both themes.
+     See CHAT_SENT_BUBBLE in theme/colors.ts for why, and for what its inks do about it. */
+  --c-chat-bubble-sent: #000000;
   --c-accent-ink: #1550cf;
   --c-gold-ink: #1550cf;
   --c-teal-ink: #1550cf;

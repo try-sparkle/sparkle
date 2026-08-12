@@ -105,6 +105,49 @@ export interface ConciergeActionReceipt {
   /** The `domain.op` behind this receipt. Carried for diagnostics and for a future audit join;
    *  the renderer must not key display off it — that is what {@link kind} is for. */
   op: string;
+  /** WHICH USER BUBBLE CAUSED THIS, captured when the call STARTED — see `setConciergeTurnOrigin`.
+   *  Absent when the call did not originate in a user turn (a proactive nudge) or when the origin
+   *  was lost (an approval resumed from a click handler long after its turn ended). Absent means
+   *  "mark nothing": it is the fail-closed half of a delivery claim, never a licence to guess. */
+  originBubbleId?: string;
+}
+
+// ══ WHICH USER MESSAGE CAUSED THIS ═══════════════════════════════════════════════════════════════
+// Provenance, not display. The concierge marks a user's own bubble as having been relayed to an
+// agent (Concierge/SentToAgentRow), and that mark is a DELIVERY CLAIM — so the bubble it lands on
+// has to be the one that actually caused the send.
+//
+// THE OBVIOUS IMPLEMENTATION IS WRONG, which is why this exists. Reading "whichever bubble is
+// awaiting" at the moment the receipt settles attributes the send to whatever turn happens to be in
+// flight *then*, and two producers routinely settle outside their own turn (roborev 62737):
+//
+//   • `conciergeApprovalResume` runs an approved call from a CLICK HANDLER, arbitrarily long after
+//     the requesting turn ended. Approving a held send while a later question is in flight would
+//     paint that later, unrelated message as having left the room.
+//   • a tool reply that settles after its own turn was displaced — the common case, not the rare
+//     one: 149 of 378 turns on one measured day — lands while the ref already points at the next
+//     bubble.
+//
+// Both put the black card on a message that was never sent, and leave the one that WAS sent bare:
+// the precise false claim the feature exists to remove, inverted.
+//
+// So the origin is captured when the call STARTS and carried to the receipt, rather than inferred
+// when it finishes. `handleConciergeTool` reads this at entry and hands the captured value to the
+// settler in its `finally`; anything minting a receipt outside a turn passes nothing.
+//
+// FAIL-CLOSED: `undefined` means "no bubble may be marked", never "guess". A send whose origin was
+// lost simply gets no card — the receipt line below the bubble still reports it, so nothing is
+// hidden; only the stronger visual claim is withheld.
+let turnOrigin: string | null = null;
+
+/** Set by the concierge host as a user turn is dispatched, and cleared when it ends. */
+export function setConciergeTurnOrigin(bubbleId: string | null): void {
+  turnOrigin = bubbleId;
+}
+
+/** The bubble a call starting RIGHT NOW belongs to. Read at call entry, never at settle. */
+export function currentConciergeTurnOrigin(): string | null {
+  return turnOrigin;
 }
 
 type ReceiptListener = (r: ConciergeActionReceipt) => void;
@@ -230,6 +273,9 @@ export function _resetConciergeReceiptsForTests(): void {
   listeners.clear();
   // The replay buffer too, or one test's receipts are replayed into the next test's subscriber.
   recent.length = 0;
+  // And the turn origin, or a test that dispatched a turn leaks its bubble id into the next one —
+  // where it would attribute a send to a message from a previous test.
+  turnOrigin = null;
   // …and the posted-id set, which is the THIRD piece of module state here (roborev 57926). Every
   // receipts suite calls this reset and none of them knew to clear that separately, so a test
   // recording a receipt whose id a previous test had already "posted" would silently see it

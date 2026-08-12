@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Sent-to-agent card — both themes</title>
+  </head>
+  <body>
+    <!--
+      A LAYOUT-ONLY PAGE, served by the app's own vite dev server so it renders the REAL
+      ConciergeThread with the REAL stylesheet and the REAL theme variables. It exists because the
+      question the founder asked — "what does a black card look like in each theme" — is a question
+      about PAINT, and neither jsdom (no stylesheet, no computed colour) nor the full visual harness
+      (its concierge-column surface has no `you` messages in src/dev/visualFixtures.ts) can answer it.
+      Same reasoning, and the same shape, as recap-narrow-harness.html beside it.
+
+      See sent-card-shot.mjs for what is captured.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./sent-card-harness.jsx"></script>
+  </body>
+</html>

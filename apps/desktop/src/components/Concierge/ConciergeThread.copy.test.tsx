@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
 import { HELD_REPLY_TESTID } from "./ConciergeMessageRow";
 import { MESSAGE_ATTACHMENTS_TESTID } from "../composer/AttachmentStrip";
+import { SENT_TO_AGENT_TESTID } from "./SentToAgentRow";
 import type { ConciergeMessage } from "./types";
 
 let writeText: ReturnType<typeof vi.fn>;
@@ -187,15 +188,21 @@ describe("ConciergeThread — copy affordances", () => {
       expect(onCopied).not.toHaveBeenCalledWith("answer");
     });
 
-    it("sits ABOVE the routing receipt", async () => {
+    it("sits ABOVE the destination the message was sent to", async () => {
       // Both live on the bubble's right edge and must not share a ROW. Asserted by document order
       // rather than geometry — jsdom has no layout engine, so "which element comes first" is the
       // honest question to ask here.
       //
-      // AN AGENT RECEIPT, not a sparkle one: a message the concierge answered itself now renders NO
-      // receipt element at all ("Answered here" and the "Also ask" button are both gone), so a
-      // sparkle fixture would assert ordering against something that does not exist. An agent
-      // delivery still earns a line — it names somewhere the reader cannot see.
+      // AN AGENT RECEIPT, not a sparkle one: a message the concierge answered itself renders NO
+      // destination at all ("Answered here" and the "Also ask" button are both gone), so a sparkle
+      // fixture would assert ordering against something that does not exist. An agent delivery still
+      // says where it went — it names somewhere the reader cannot see.
+      //
+      // THE DESTINATION MOVED INSIDE THE BUBBLE (founder: *"it would be inside the card … sent to
+      // colon, and then … the agent as a clickable link"*), so the ordering claim is now about the
+      // sent card's own row rather than the line that used to hang beneath it. The claim itself is
+      // unchanged: the copy glyph belongs to the words, and comes before the note about where they
+      // went. See Concierge/SentToAgentRow.
       render(
         <ConciergeThread
           messages={[
@@ -210,11 +217,14 @@ describe("ConciergeThread — copy affordances", () => {
         />,
       );
       const copy = screen.getByTestId("concierge-copy-message");
-      const receipt = screen.getByTestId("routing-receipt");
-      expect(receipt.contains(copy)).toBe(false);
-      expect(copy.compareDocumentPosition(receipt) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-      // And the receipt hosts no control any more — the "Also ask" affordance was removed.
-      expect(receipt.querySelector('[data-testid="routing-redirect"]')).toBeNull();
+      const sentTo = screen.getByTestId(SENT_TO_AGENT_TESTID);
+      expect(sentTo.contains(copy)).toBe(false);
+      expect(copy.compareDocumentPosition(sentTo) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // And it hosts no control other than the agent pill — the "Also ask" affordance was removed.
+      expect(sentTo.querySelector('[data-testid="routing-redirect"]')).toBeNull();
+      // Nothing hangs below the bubble for this message any more, which is the other half of the
+      // founder's ask and the thing that would regress silently if only the ordering were checked.
+      expect(screen.queryByTestId("routing-receipt")).toBeNull();
     });
 
     it("copies the SENT text of a message that addressed an agent, with no internal id in it", async () => {

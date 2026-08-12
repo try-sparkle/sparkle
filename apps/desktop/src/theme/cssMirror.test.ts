@@ -3,6 +3,9 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BLUEPRINT } from "./blueprintSpec";
 import { C, MODAL_SHADOW, SCRIM, THEME_HEX } from "./colors";
+// The whole module, so the standalone-export sweep below sees every `var(--c-*)` string the file
+// exports rather than only the ones gathered into `C`.
+import * as colors from "./colors";
 
 // Enforce that index.css is a faithful mirror of THEME_HEX. Static CSS is required so a
 // data-theme flip re-themes with no FOUC and no JS, but that means the values are duplicated
@@ -121,6 +124,29 @@ describe("`C`'s var() strings name vars index.css actually declares", () => {
       dangling,
       "these tokens point at CSS variables index.css does not declare — var() resolves to nothing, " +
         "so the surface renders transparent:\n" + dangling.join("\n"),
+    ).toEqual([]);
+  });
+
+  // THE SAME HOLE, ONE SCOPE OUT. The check above walks `C` only, and `C` is not the whole surface:
+  // the module also exports STANDALONE `var(--c-*)` strings — CHAT_USER_BUBBLE, ROW_ACTIVE_BUBBLE,
+  // CHAT_SENT_BUBBLE — which no test covered. The key-set test cannot stand in for it: that forces
+  // the VARIABLE to exist because its key is in THEME_HEX, while a typo in one of these hand-written
+  // strings still resolves to nothing.
+  //
+  // It matters most for exactly the token whose failure is silent and total: an unresolved
+  // CHAT_SENT_BUBBLE renders the card TRANSPARENT, so a message that left the room reads as an
+  // ordinary bubble — the affordance simply disappears, with the whole suite green.
+  it("every standalone `var(--c-*)` export resolves to a declared variable too", () => {
+    const dangling: string[] = [];
+    for (const [key, value] of Object.entries(colors)) {
+      if (typeof value !== "string") continue;
+      const named = /^var\((--c-[\w-]+)\)$/.exec(value)?.[1];
+      if (named && !declared.has(named)) dangling.push(`${key} → ${named}`);
+    }
+    expect(
+      dangling,
+      "these standalone exports point at CSS variables index.css does not declare — var() resolves " +
+        "to nothing, so the surface renders transparent:\n" + dangling.join("\n"),
     ).toEqual([]);
   });
 });

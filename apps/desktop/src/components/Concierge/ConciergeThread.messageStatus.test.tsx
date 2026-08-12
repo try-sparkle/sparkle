@@ -20,6 +20,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
 import { MESSAGE_STATUS_TESTID, type ConciergeMessageStatusText } from "./MessageStatus";
+import { SENT_TO_AGENT_TESTID } from "./SentToAgentRow";
 import type { ConciergeMessage } from "./types";
 
 afterEach(() => cleanup());
@@ -119,7 +120,27 @@ describe("the status took the corner the glyph vacated", () => {
   });
 
   it("sits between the bubble and the routing receipt", () => {
-    draw({ u1: { text: "Checking git" } });
+    // A REFUSED RECEIPT, and the substitution is the point rather than a convenience. The fixture's
+    // ordinary agent receipt no longer renders a line BELOW the bubble at all: a message that
+    // reached an agent now says so inside the black sent card (Concierge/SentToAgentRow), which is
+    // above the status, not below it. A refused send is the case that still stacks a receipt
+    // underneath — it went nowhere, so it has no destination to draw and keeps the old line — and
+    // it is therefore where this ordering invariant still lives.
+    render(
+      <ConciergeThread
+        messages={[
+          {
+            id: "u1",
+            kind: "you",
+            text: "what needs me?",
+            receipt: { target: "agent", agentName: "Kraken Auth", agentId: "ag1", refused: true },
+          },
+        ]}
+        statuses={{ u1: { text: "Checking git" } }}
+        onNudgeClick={() => {}}
+        onNudgeAction={() => {}}
+      />,
+    );
     const bubble = screen.getAllByTestId("you-bubble")[0]!;
     const status = screen.getByTestId(MESSAGE_STATUS_TESTID);
     const receipt = screen.getByTestId("routing-receipt");
@@ -127,6 +148,21 @@ describe("the status took the corner the glyph vacated", () => {
     // last, so a status appended after it would put the live line under the archive.
     expect(precedes(bubble, status)).toBe(true);
     expect(precedes(status, receipt)).toBe(true);
+  });
+
+  it("still sits below the bubble when the destination is drawn INSIDE it", () => {
+    // The other half of the split above, so neither case can regress unnoticed. For a message that
+    // really did reach an agent the destination is inside the card and the status stays where the
+    // founder put it — under the box, in the corner the copy glyph vacated.
+    draw({ u1: { text: "Checking git" } });
+    const bubble = screen.getAllByTestId("you-bubble")[0]!;
+    const status = screen.getByTestId(MESSAGE_STATUS_TESTID);
+    const sentTo = screen.getByTestId(SENT_TO_AGENT_TESTID);
+    expect(bubble.contains(sentTo)).toBe(true);
+    expect(bubble.contains(status)).toBe(false);
+    expect(precedes(bubble, status)).toBe(true);
+    // Nothing hangs below it any more for this message.
+    expect(screen.queryByTestId("routing-receipt")).toBeNull();
   });
 
   it("appears on the ONE message it is keyed to, and on no other", () => {

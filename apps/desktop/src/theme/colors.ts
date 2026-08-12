@@ -191,6 +191,10 @@ export const THEME_HEX = {
     agentIdle: BLUEPRINT.dark.muted, cream: BLUEPRINT.dark.ink,
     hairline: BLUEPRINT.dark.seam, pillFill: BLUEPRINT.dark.hairSolid,
     chatBubble: BLUEPRINT.dark.bubble, chatBubbleActive: BLUEPRINT.dark.sel,
+    // A LITERAL, not a BLUEPRINT slot, and deliberately so: the direction has no "black" register —
+    // its darkest plane is the terminal's `term` (#030913 dark / #d9e3f3 light), which is a THEMED
+    // pair and therefore the opposite of what this token is for. See CHAT_SENT_BUBBLE below.
+    chatBubbleSent: "#000000",
     accentInk: BLUEPRINT.dark.primary, goldInk: BLUEPRINT.dark.primary,
     tealInk: BLUEPRINT.dark.primary, goldHotInk: BLUEPRINT.dark.primary,
     goldFill: BLUEPRINT.dark.primary, onGoldFill: BLUEPRINT.dark.onPrimary,
@@ -211,6 +215,12 @@ export const THEME_HEX = {
     agentIdle: BLUEPRINT.light.muted, cream: BLUEPRINT.light.ink,
     hairline: BLUEPRINT.light.seam, pillFill: BLUEPRINT.light.hairSolid,
     chatBubble: BLUEPRINT.light.bubble, chatBubbleActive: BLUEPRINT.light.sel,
+    // THE SAME BLACK IN BOTH THEMES — not an oversight. The founder asked for a black card, and a
+    // card that is black in one theme and pale in the other is not the affordance he asked for: it
+    // would stop being recognisable as "this one left the room" the moment he switched appearance.
+    // It stays a TOKEN rather than a bare constant so the two halves can be split later without
+    // touching a component (which is exactly the decision still open — see CHAT_SENT_BUBBLE).
+    chatBubbleSent: "#000000",
     accentInk: BLUEPRINT.light.primary, goldInk: BLUEPRINT.light.primary,
     tealInk: BLUEPRINT.light.primary, goldHotInk: BLUEPRINT.light.primary,
     goldFill: BLUEPRINT.light.primary, onGoldFill: BLUEPRINT.light.onPrimary,
@@ -570,6 +580,75 @@ export const CARD_WASH_PCT = 6;
 export const PRESENCE_SEGMENT_TINT_PCT = 16;
 
 export const CHAT_USER_BUBBLE = "var(--c-chat-bubble)";
+
+// ── THE CARD FOR A MESSAGE THAT LEFT THE ROOM ──────────────────────────────────────────────────
+// The founder: *"it would be a black background instead of a blue background when it was sent to an
+// agent."* He had just spent a minute working out, after the fact, which of his own messages had
+// gone to a build agent and which the concierge had answered itself — the two were the same blue
+// bubble, distinguished only by a grey line hanging outside and below it. This token is the "it
+// left" half of that answer; the agent pill drawn inside the card is the "where it went" half.
+//
+// SAME VALUE IN BOTH THEMES, which makes it the only chrome fill here that is not a themed pair.
+// That is the point rather than a shortcut: the card has to be recognisable as the same object in
+// either appearance, and a "black" that turns pale in light mode is not the affordance he asked for.
+//
+// ⚠ IT IS NOT HELD TO CHROME_MIN_CONTRAST AGAINST THE PLANE, AND CANNOT BE. Against dark's
+// concierge surface (#0d1b31) black measures ~1.22:1 — over EDGE_MIN_CONTRAST, under the 1.5 chrome
+// floor. Every other fill in this file is placed by the neutral ladder; this one is placed by an
+// explicit instruction, so the contrast it does have is recorded in theme/chromeContrast.test.ts as
+// a MEASUREMENT rather than asserted against a floor it was never going to clear. If the founder
+// later asks for an edge (a 1px hairline is the house answer — the direction draws structure rather
+// than filling it), that is what closes the gap; do not close it by quietly lightening this value.
+export const CHAT_SENT_BUBBLE = "var(--c-chat-bubble-sent)";
+
+// The inks the sent card pins on itself. NOT tokens, and this is the crux of the whole change.
+//
+// Every color in this app is the string `var(--c-*)`, and `cream` is the INK token — #dce8fc in
+// dark, #0a1b33 in LIGHT. So a card that is black in both themes cannot use the themed ink: in light
+// mode `C.cream` is near-black, and the message text, the agent pill's label and the collapsed-paste
+// pills would all be black-on-black. A fixed-luminance surface needs fixed inks.
+//
+// The card applies these by REDEFINING `--c-cream` and `--c-concierge-muted` on its own element, so
+// the whole subtree — AgentPill, MentionPill, TextPill, CopyAnswerButton — resolves to them with no
+// component changes and nothing to keep in sync. Values are the dark theme's own ink pair, which is
+// what "light ink on a dark ground" already means everywhere else in this app.
+export const CHAT_SENT_INK = BLUEPRINT.dark.ink;
+export const CHAT_SENT_MUTED = BLUEPRINT.dark.muted;
+
+// ⚠ PINNING THE INK IS ONLY HALF THE CONTRACT — THE FILLS ITS SUBTREE PAINTS MUST BE PINNED TOO.
+//
+// The first version of this pinned inks and stopped, on the reasoning that the card supplies the
+// ground. It does — for text drawn straight onto it. But two descendants draw a ground of their OWN
+// inside the bubble, and those grounds stayed THEMED while the ink on them became fixed-dark. In
+// light mode that inverts the pair and the label vanishes into its own chip:
+//
+//   • composer/AttachmentStrip.tsx:105 — a non-thumbnail attachment chip fills with
+//     CHAT_USER_BUBBLE (light #e8f0fd) and labels it `C.cream` → pinned #dce8fc ≈ 1.07:1.
+//     Its own comment calls the chip form "the designed steady state after a restart", so every
+//     previously-sent message carrying an attachment renders exactly this way. Not a rare state.
+//
+// Declaring `color` on the card cannot help there, because the chip declares its own ground. So the
+// card pins that fill to the DARK theme's value alongside the inks — same mechanism, same element,
+// same one-definition property: a descendant resolving `var(--c-chat-bubble)` gets a ground that
+// matches the ink it was already going to use.
+//
+// ── TWO FILLS THAT NEED NO PIN, and the reasons are different ──────────────────────────────────
+// Recorded because "not in the list" is otherwise indistinguishable from "overlooked", and a wrong
+// example here is worse than none: the sweep below tells the next reader to add fills to it.
+//
+//   • the COLLAPSED PASTE PILL is safe because it is TRANSLUCENT, not because anything pins it.
+//     ConciergeMessageRow's `collapsedPayload` draws every transcript paste as `variant="inline"`,
+//     whose fill is `color-mix(in srgb, teal 16%, transparent)` — it composites over whatever is
+//     behind it, which inside this card is the pinned black. (`C.deepForest` is TextPill's OTHER
+//     arm, the composer's 46px dashed draft box, which never appears in the transcript. An earlier
+//     version of this block pinned `--c-deep-forest` on that mistaken basis: nothing in a card's
+//     subtree resolves it, so the pin was inert and the test asserting it was vacuous by
+//     construction — roborev 62750.)
+//   • `C.sienna` (TextPill's error branch) pairs with ON_BRAND_FILL rather than `cream`, so it is
+//     internally consistent at any theme; pinning it would break a pair that already works.
+//
+// chromeContrast.test.ts sweeps BOTH pinned inks against every fill that IS in the list.
+export const CHAT_SENT_FILL = BLUEPRINT.dark.bubble;
 
 // The starker active-row fill — one notch more contrast than CHAT_USER_BUBBLE so three states read
 // at a glance: idle (the bare plane), hovered/expanded (CHAT_USER_BUBBLE), and the row you're

@@ -22,7 +22,11 @@
 // expanded says nothing about its siblings.
 import { memo } from "react";
 import { FiAlertCircle, FiBell } from "react-icons/fi";
-import { C, CHAT_USER_BUBBLE } from "../../theme/colors";
+// The sent card's INKS are not imported here on purpose — they arrive as `SENT_CARD_INK_VARS`
+// below, which is the whole mechanism: the card redefines the ink custom properties on its own
+// element so the entire subtree resolves to them. Naming the raw constants here would invite a
+// second, hand-applied copy that could drift from the one the subtree actually sees.
+import { C, CHAT_USER_BUBBLE, CHAT_SENT_BUBBLE } from "../../theme/colors";
 import { RADIUS } from "../../theme/scale";
 import { Markdown } from "../Markdown";
 import { bandColor } from "../../engine/statusBandLabels";
@@ -31,6 +35,7 @@ import { MessageStatusLive, type ConciergeMessageStatusText } from "./MessageSta
 import { NudgeCard } from "./NudgeCard";
 import { RecapCard } from "./RecapCard";
 import { RoutingReceipt } from "./RoutingReceipt";
+import { SentToAgentRow, sentToAgent, SENT_CARD_INK_VARS } from "./SentToAgentRow";
 import { LintMark } from "./LintMark";
 import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
@@ -270,7 +275,32 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   if (m.kind === "nudge")
     return <NudgeCard nudge={m} onNudgeClick={onNudgeClick} onNudgeAction={onNudgeAction} />;
   if (m.kind === "recap") return <RecapCard recap={m} onRevealAgent={onRevealAgent} />;
-  if (m.kind === "you")
+  if (m.kind === "you") {
+    // THE `unanswered` STAMP IS WITHDRAWN ONCE A REPLY NAMES THIS MESSAGE, and this is the seam
+    // where the two facts meet.
+    //
+    // `askSparkle` stamps `unanswered: true` on a bubble the user's NEXT send displaced before a
+    // single byte came back — true at that instant. It is not the last word: the concierge usually
+    // does answer, a couple of messages later, and when it does the reply records this message in
+    // its `answers` (see ./replyAnchors). At that point the receipt's "never answered" is
+    // contradicted by the app's own record, and would render directly above an "Answered below"
+    // marker pointing at the answer. One bubble, two opposite claims, one of them demonstrably false.
+    //
+    // WITHDRAWN HERE, NOT IN RoutingReceipt: that component owns the WORDS for a state, and this row
+    // owns which state is true. Passing it a corrected receipt needs nothing from it and survives
+    // its copy changing — including the deletion of the "never answered" string, after which this
+    // becomes a no-op on a field nobody renders.
+    //
+    // HOISTED OUT OF THE JSX (it used to be an inline ternary on RoutingReceipt's prop) because the
+    // corrected receipt now has a SECOND reader: `sentToAgent` below decides whether this bubble is
+    // drawn as a sent card. Two readers of one fact must not each re-derive it.
+    const receipt =
+      m.receipt && answeredBy && m.receipt.unanswered
+        ? { ...m.receipt, unanswered: undefined }
+        : m.receipt;
+    // NON-NULL EXACTLY WHEN THIS MESSAGE REACHED AN AGENT — the black card, and the destination row
+    // inside it. See ./SentToAgentRow for which receipts qualify and why a refused one does not.
+    const sent = receipt ? sentToAgent(receipt) : null;
     return (
       // `data-message-id` is THE JUMP TARGET (see ConciergeThread's `jumpTo`) — an attribute rather
       // than a ref registry because the thread already owns the scroller and can find its own
@@ -293,10 +323,19 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         <div
           data-testid="you-bubble"
           data-wired={wired ? "yes" : "no"}
+          // THE MACHINE-READABLE FORM OF THE TREATMENT, so a test can assert "this message is
+          // presented as having left the room" without reading colours out of a style attribute —
+          // the convention this column already follows (see NudgeCard's `data-resolved`).
+          data-sent-to-agent={sent && !wired ? "yes" : "no"}
           style={{
             display: "inline-block",
             textAlign: "left",
             fontSize: 13,
+            // THE INK PINNING FOR THE BLACK CARD, spread FIRST so nothing below can be shadowed by
+            // it and so the card's own declarations still win. Only when the card is actually drawn:
+            // pinning inks on an ordinary blue bubble would break it in light mode, which is the
+            // exact failure these vars exist to prevent, pointed the other way.
+            ...(sent && !wired ? SENT_CARD_INK_VARS : {}),
             // WIRED: a wash of the terminal's OWN ink over the flood, not `--k-bubble`.
             //
             // The mock writes this as `rgba(255,255,255,.08)`, which is a dark-mode idiom — on
@@ -306,9 +345,19 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
             // the bubble reads as a bubble at both ends, and it stays inside the terminal's own
             // register rather than reaching back into the shell's for a colour the flood just
             // replaced.
+            //
+            // SENT: black, because the message LEFT (founder: *"it would be a black background
+            // instead of a blue background when it was sent to an agent"*). See CHAT_SENT_BUBBLE.
+            //
+            // WIRED WINS OVER SENT, and the order of these branches is the decision. In a mounted
+            // column EVERY message goes to that one agent, so the destination is ambient — a black
+            // card on every bubble would be a signal that never varies, which is no signal, and it
+            // would fight the terminal flood this wash exists to sit inside.
             background: wired
               ? `color-mix(in srgb, currentColor 10%, transparent)`
-              : CHAT_USER_BUBBLE,
+              : sent
+                ? CHAT_SENT_BUBBLE
+                : CHAT_USER_BUBBLE,
             // NO BORDER. The bubble already has a FILL, and a fill is a shape — outlining it says the
             // same thing twice and, at a 25% wash of `muted`, said it faintly. The founder called
             // this out directly: the bubble should read as one solid object, not a tinted box inside
@@ -369,7 +418,12 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
                 • None of the bubble's geometry — `display: inline-block`, the 4px corners with the
                   hard tail, `padding: "9px 12px"`, the fill, the deliberate absence of a border — is
                   touched by any of this. */}
-          <div>
+          {/* TAGGED FOR THE VISUAL PROBE, which needs to read the paint on the founder's OWN WORDS
+              rather than on the card that holds them. scripts/visual/sent-card-shot.mjs measured the
+              card element itself while this was untagged, which re-read the card's own `color`
+              declaration and reported a healthy 16.99 for text that was actually unreadable. A
+              testid here is what makes that reading about the words. */}
+          <div data-testid="you-text">
             <span style={{ float: "right", marginLeft: 6, marginRight: -4, marginTop: -2 }}>
               {/* THE WHOLE MESSAGE, not the visible half. `m.text` is only what was typed AROUND
                   the pastes once this bubble carries pills, so copying it would silently hand over
@@ -390,6 +444,16 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
             </span>
             <MentionedText text={m.text} mentions={m.mentions} />
           </div>
+          {/* WHERE THIS MESSAGE WENT — INSIDE the card, which is the founder's ask: *"instead of
+              being below where it says send to admin calendar … it would be inside the card."*
+              Nothing hangs beneath the bubble for a forwarded message any more.
+
+              LAST CHILD, below the words and the pastes, because it is a fact ABOUT the message
+              rather than part of it — the reader takes the message first and the destination second.
+
+              NOT drawn while wired: the sent card is suppressed there (see the background above), so
+              its destination row would be a rule and a label floating in a bubble with no card. */}
+          {sent && !wired && receipt && <SentToAgentRow receipt={receipt} />}
         </div>
         {/* WHAT THE CONCIERGE IS DOING ABOUT THIS MESSAGE — the founder's ask, in the corner the
             copy glyph just vacated: *"below the box, where the copy icon currently is, it could show
@@ -406,24 +470,18 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
             entire transcript (roborev 57889-M2). It renders nothing at all without a status, which
             is the state almost every bubble is in. */}
         <MessageStatusLive status={status} />
-        {m.receipt && (
+        {/* THE LINE BELOW THE BUBBLE, FOR EVERY MESSAGE THE CARD DOES NOT SPEAK FOR. It is not
+            deleted and its wording is untouched: a REFUSED send ("Not sent — X couldn't take it")
+            still says so from here, which is deliberate. The founder chose it when asked — black
+            means the message left, so one that bounced must not be able to borrow the treatment, and
+            it has no destination to draw a pill for.
+
+            Also still the home for a wired-column send, whose card is suppressed above. */}
+        {receipt && !(sent && !wired) && (
           <RoutingReceipt
-            // THE `unanswered` STAMP IS WITHDRAWN ONCE A REPLY NAMES THIS MESSAGE, and this is the
-            // seam where the two facts meet.
-            //
-            // `askSparkle` stamps `unanswered: true` on a bubble the user's NEXT send displaced
-            // before a single byte came back — true at that instant. It is not the last word: the
-            // concierge usually does answer, a couple of messages later, and when it does the reply
-            // records this message in its `answers` (see ./replyAnchors). At that point the receipt's
-            // "never answered" is contradicted by the app's own record, and would render directly
-            // above an "Answered below" marker pointing at the answer. One bubble, two opposite
-            // claims, one of them demonstrably false.
-            //
-            // WITHDRAWN HERE, NOT IN RoutingReceipt: that component owns the WORDS for a state, and
-            // this row owns which state is true. Passing it a corrected receipt needs nothing from it
-            // and survives its copy changing — including the deletion of the "never answered" string,
-            // after which this becomes a no-op on a field nobody renders.
-            receipt={answeredBy && m.receipt.unanswered ? { ...m.receipt, unanswered: undefined } : m.receipt}
+            // Already corrected for the withdrawn `unanswered` stamp — see where `receipt` is
+            // derived at the top of this branch.
+            receipt={receipt}
             onRedirect={onRedirect ? () => onRedirect(m.id) : undefined}
           />
         )}
@@ -434,6 +492,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         {answeredBy && <AnsweredMarker replyId={answeredBy} onJump={onJump} />}
       </div>
     );
+  }
   if (m.kind === "digest") {
     // The digest LINE, not a card. Deliberately quiet chrome — a coloured edge and a count, the
     // width of a sentence — because the whole point is that N items stop occupying N cards' worth of
