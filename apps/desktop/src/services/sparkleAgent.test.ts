@@ -4,6 +4,12 @@
 // "never" is chat-only (no log dir, no log-review instructions at all).
 import { describe, expect, it } from "vitest";
 import {
+  LADDER_RETIREMENT_EXPLANATION,
+  countLadderEscalateIt,
+  PRIORITY_PROHIBITION,
+  RETIRED_PRIORITY_LADDER_INSTRUCTION,
+} from "./retiredLadderWordingTestUtils";
+import {
   ASKABLE_COMMAND_PROHIBITION,
   FINAL_COMMAND_PROHIBITION,
   GH_AUTH_ADVICE_HEADER,
@@ -341,11 +347,40 @@ describe("sparklePersona — agent-feedback inbox drain", () => {
     const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
     expect(p).toContain(AGENT_FEEDBACK_DRAIN_HEADER);
     expect(p).toContain(`bd list --label ${AGENT_FEEDBACK_LABEL}`);
-    // It must instruct the full drain behavior: file NEW, enrich/bump RECURRING, triage by severity,
+    // It must instruct the full drain behavior: file NEW, enrich RECURRING, triage by severity,
     // fix the top item — not merely "look at the inbox".
     expect(p).toContain("file a bead");
     expect(p).toContain("bd update");
-    expect(p).toMatch(/BUMP its priority|bump.*priority/i);
+    // A RECURRENCE IS RECORDED, NOT ESCALATED. This assertion used to demand the opposite —
+    // /BUMP its priority/ — which is the behaviour bead sparkle-mzgqt retired on 2026-08-09: a
+    // comment count silently driving priority is what the founder ruled out, so priority is set by
+    // a human and the sighting count feeds a separate (still unbuilt) severity score. The prompt is
+    // the product here, so a test still pinning the retired wording would hold the live persona at
+    // the old contract. Positive and negative are BOTH asserted on purpose: the negative alone is
+    // vacuous (any rewrite of the sentence satisfies it), and the positive alone would pass with the
+    // retired instruction still sitting beside it. The negative is the SHARED pattern
+    // (`retiredLadderWordingTestUtils.ts`), which covers the other word orders the sweep actually found —
+    // "priority bump", "priority climbs", "steps priority" — that a literal `/BUMP its priority/i`
+    // would have let straight through.
+    expect(p).toContain("RECORD the recurrence");
+    expect(p).toMatch(/priority is set by a human/i);
+    // THE PROHIBITION AND ITS POLARITY, pinned as a positive because the negative structurally
+    // cannot reach it — deletion leaves nothing to match, and `move` can never join the negative's
+    // verb list without firing on this very clause. See the module header for the full argument.
+    expect(p).toMatch(PRIORITY_PROHIBITION);
+    // ...and the explanatory clause, which is load-bearing rather than decorative: "escalate IT" is
+    // the wording that keeps `escalat` out of collision with this prompt's own prose, and this
+    // branch reworded line 609 to produce it precisely so `escalat` could join the verb list. Drop
+    // it and the `escalate it` re-entry reopens silently, with every other assertion still green.
+    expect(p).toMatch(LADDER_RETIREMENT_EXPLANATION);
+    // EXACTLY ONCE — the phrase is licensed only for that clause, so a second occurrence IN THE
+    // RETIRED-LADDER CONTEXT is a re-entry no positive and no negative can otherwise see. Not every
+    // second occurrence: only sibling phrasings whose next word is one of
+    // LADDER_ESCALATION_TRAILING_WORDS are counted, because a bare count fires on this persona's own
+    // unrelated "escalate to the user in chat" line. See the module header, case 3 and THE HONEST
+    // LIMIT — the residual is real rather than rhetorical.
+    expect(countLadderEscalateIt(p)).toBe(1);
+    expect(p).not.toMatch(RETIRED_PRIORITY_LADDER_INSTRUCTION);
     // ROUTED THROUGH TRIAGE. This persona is a production consumer of the inbox, so a ranking the
     // script computes but the persona never invokes reaches nobody — and triage is the only thing
     // that marks beads whose fix already MERGED or LANDED, which is what stops the pass

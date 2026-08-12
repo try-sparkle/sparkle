@@ -1,6 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { PASS_HOLD_TEXT } from "./pusherSnapshots";
 import {
+  LADDER_RETIREMENT_EXPLANATION,
+  countLadderEscalateIt,
+  PRIORITY_PROHIBITION,
+  RETIRED_PRIORITY_LADDER_INSTRUCTION,
+} from "./retiredLadderWordingTestUtils";
+import {
   notePaneStatus,
   paneBusySinceAt,
   PANE_BUSY_HOLD_LIMIT_MS,
@@ -237,6 +243,53 @@ describe("hourlyMissionPrompt", () => {
       // The retired claim must be GONE, not merely contradicted later in the paragraph.
       expect(p).not.toMatch(/dry run that writes nothing/);
       expect(p).not.toMatch(/always safe to run/);
+    }
+  });
+
+  // A RECURRENCE IS RECORDED, NOT ESCALATED — the same contract `sparkleAgent.test.ts` pins on the
+  // other live prompt, asserted here so BOTH halves are defended rather than one. This prompt read
+  // "(bumping its priority on recurrence)" until the ladder was retired 2026-08-09 (bead
+  // sparkle-mzgqt): a comment count silently driving priority is what the founder ruled out, so
+  // priority is set by a human and the sighting count feeds a separate (still unbuilt) severity
+  // score. Leaving this half unguarded is precisely how the tenth site survived nine sweep passes —
+  // unpinned prompt copy drifts back, and nothing goes red when it does. Positive AND negative on
+  // purpose: the negative alone is vacuous (any rewrite satisfies it) and the positive alone would
+  // pass with the retired instruction still sitting beside it. The negative is the SHARED pattern
+  // (`retiredLadderWordingTestUtils.ts`), not a locally hand-written one — two guards for one contract drift
+  // apart exactly the way two prompts do, which is the failure this whole sweep is about.
+  it("tells the pass to RECORD a recurrence, never to bump the bead's priority", () => {
+    for (const mode of ["always", "case_by_case"] as const) {
+      const p = hourlyMissionPrompt(mode);
+      expect(p).toContain("RECORD the recurrence");
+      expect(p).toMatch(/priority is set by a human/i);
+      // THE PROHIBITION AND ITS POLARITY, pinned as a positive because the negative structurally
+      // cannot reach it. `/priority is set by a human/` is descriptive prose about who sets
+      // priority, not an instruction to the agent — delete the "Do NOT move its priority" clause
+      // and it still passes, `RECORD the recurrence` still passes (different sentence), and the
+      // negative matches nothing because there is nothing left to match. All green, prompt no
+      // longer telling the agent not to escalate. `move` can never join the negative's verb list
+      // either, since it would fire on this very clause.
+      expect(p).toMatch(PRIORITY_PROHIBITION);
+      // ...AND the explanatory clause, which is load-bearing rather than decorative: "escalate IT"
+      // is the exact wording that keeps `escalat` from colliding with the prompt's own prose, and
+      // it is the only thing making `escalat` safe to have in the negative's verb list. A positive
+      // cannot prove the absence of a contradictory sibling, so an "escalate it when the count
+      // grows" added beside the prohibition would pass everything else — pinning the clause is what
+      // stops the constraint being reworded away without anyone noticing it was carrying weight.
+      expect(p).toMatch(LADDER_RETIREMENT_EXPLANATION);
+      // EXACTLY ONCE. Pinning the clause stops it being reworded away; it does not stop a SECOND
+      // "escalate it" being added beside it, which is the one re-entry no positive and no negative
+      // can see. The phrase is licensed once — in the explanatory clause — so a second occurrence
+      // in that context is by definition not that clause.
+      //
+      // NOT every second occurrence: only sibling phrasings whose next word is one of
+      // LADDER_ESCALATION_TRAILING_WORDS (when/on/as/once/after/every) are counted, because a bare
+      // count fires on ordinary escalation prose and a guard that reds on correct copy gets
+      // deleted. So "— escalate it, since a repeated signal matters" is NOT caught here. That
+      // residual is real; see THE HONEST LIMIT in the module header rather than assuming this
+      // assertion is total.
+      expect(countLadderEscalateIt(p)).toBe(1);
+      expect(p).not.toMatch(RETIRED_PRIORITY_LADDER_INSTRUCTION);
     }
   });
 
