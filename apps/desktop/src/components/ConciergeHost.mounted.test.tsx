@@ -178,6 +178,8 @@ import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
 import { CONCIERGE_THREAD_TESTID } from "../engine/composeBoxHeight";
 import { SPARKLE_AGENT_ID, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
+import { SHORTCUT_DEFAULTS, useKeybindingsStore } from "../stores/keybindingsStore";
+import { formatBinding } from "../keyboardHints/keybindings";
 
 function agent(id: string, name: string) {
   return {
@@ -309,6 +311,9 @@ afterEach(() => {
   // The store is a module singleton shared across cases — leaving rows behind would silently mount a
   // later suite's host against this one's fleet.
   useProjectStore.setState({ projects: [] });
+  // Same reasoning, and it is PERSISTED: a rebind left behind would follow every later case (and
+  // every later suite in this worker) into the notice copy they assert on.
+  useKeybindingsStore.getState().resetBinding("unmountCable");
 });
 
 async function send(text: string) {
@@ -1481,7 +1486,34 @@ describe("ConciergeHost — a plain mounted send goes to the mounted agent, alwa
     expect(notice().textContent).not.toContain("not Sparkle");
     // The unnamed fallback, whole — so a future edit cannot satisfy this row by dropping the
     // sentence that tells him where the reply is.
-    expect(notice().textContent).toContain("press Esc to unmount and read the reply");
+    expect(notice().textContent).toContain(
+      `press Esc or ${formatBinding(SHORTCUT_DEFAULTS.unmountCable)} to unmount and read the reply`,
+    );
+  });
+
+  // ══ AND THE WAY OUT NAMES BOTH KEYS (bead sparkle-thm9o) ══════════════════════════════════════
+  // Escape alone is what this said, and Escape is precisely the key one leaked hidden `role="dialog"`
+  // node disabled app-wide — the founder's "I could not unmount the concierge". So under the exact
+  // conditions that make someone read this sentence, it named the remedy that could not work while a
+  // working one went unmentioned. The chord is REBINDABLE, so a hard-coded "⌘⇧U" is the same defect
+  // one level along: this rebinds it and requires the notice to follow.
+  it("follows a REBOUND unmountCable rather than printing a hard-coded chord", async () => {
+    useKeybindingsStore.getState().setBinding("unmountCable", {
+      kind: "chord",
+      meta: true,
+      ctrl: false,
+      alt: true,
+      shift: false,
+      key: "k",
+    });
+    mountHidden();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    await waitFor(() => expect(notice().textContent).toContain("Asked Sparkle"));
+    // Case-free on the verb: this is the NAMED branch, which starts the sentence ("Press …"), while
+    // the unnamed fallback above continues one ("press …"). The keys are what this row is about.
+    expect(notice().textContent).toContain("Esc or ⌥⌘K to unmount");
+    expect(notice().textContent).not.toContain(formatBinding(SHORTCUT_DEFAULTS.unmountCable));
   });
 
   // The control: shown, and every half agrees, exactly as it did before.

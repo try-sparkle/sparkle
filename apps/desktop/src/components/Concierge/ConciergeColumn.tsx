@@ -38,6 +38,8 @@ import { WindowSpanButton } from "./WindowSpanButton";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { BeadPillHost } from "./BeadPill";
 import { KeyPill } from "./KeyPill";
+import { formatBinding } from "../../keyboardHints/keybindings";
+import { useKeybindingsStore } from "../../stores/keybindingsStore";
 import { pillStyle } from "./pillStyle";
 import { wordmarkRamp } from "./wordmarkRamp";
 import type { ConciergeAnnouncement, ConciergeColumnProps, ConciergeNudge } from "./types";
@@ -208,6 +210,11 @@ export function ConciergeColumn({
   // theme/blueprintSpec for why they are not in THEME_HEX, and ./wordmarkRamp for the ramp.
   const mode = useResolvedTheme();
   const isWired = wired !== "off";
+  // THE SECOND WAY OUT, named on screen (bead sparkle-thm9o). Subscribed to the LIVE binding rather
+  // than formatted from `SHORTCUT_DEFAULTS`: `unmountCable` is rebindable in ⋯ Settings → Shortcuts,
+  // and a hint naming a chord the user has since changed sends them to a key that does nothing —
+  // which is the same failure as the Escape-only hint it is here to repair.
+  const unmountChord = formatBinding(useKeybindingsStore((s) => s.bindings.unmountCable));
   const needsYou = model.vitals.needs_you;
   // The roster every agent pill in a concierge reply resolves against. MEMOIZED because it is a
   // context value: a fresh object each render would re-render every pill in the thread on every
@@ -924,8 +931,24 @@ export function ConciergeColumn({
                 of margin. An 0.9 opacity spends more than that: compositing #4f6284 at 0.9 over
                 #d9e3f3 measures ~3.93:1, under the suite's 4.5 floor, on the ONE glyph a reader must
                 actually read to know which key to press. The contrast suite measures token pairs and
-                cannot see an inline opacity, so nothing would have caught it (roborev 55535). */}
-            <KeyPill tone="violet">ESC</KeyPill> to unmount
+                cannot see an inline opacity, so nothing would have caught it (roborev 55535).
+
+                ══ AND THE SECOND KEY, BECAUSE THE FIRST ONE CAN BE DEAD (bead sparkle-thm9o) ══════
+                The founder's app wedged with "I could not unmount the concierge", and this hint was
+                part of the harm: Escape had been disabled app-wide by a leaked hidden dialog node,
+                `unmountCable` DID still work, and the only affordance on screen named exclusively
+                the key that no longer did anything. A hint offering a remedy that cannot work while
+                a working one exists unmentioned is the "user-facing copy is code" failure AGENTS.md
+                names — the remedy string has to be safe under the same conditions that broke the
+                path it describes. The probe bug is fixed; naming both keys is what makes the hint
+                survive the NEXT way Escape dies.
+
+                Drawn from the LIVE binding, never a hard-coded "⌘⇧U": `unmountCable` is rebindable
+                in ⋯ Settings → Shortcuts, and copy naming a chord the user has changed is the same
+                defect one level along. */}
+            <KeyPill tone="violet">ESC</KeyPill>
+            {" or "}
+            <KeyPill tone="violet">{unmountChord}</KeyPill> to unmount
           </span>
         </div>
       )}

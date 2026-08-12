@@ -12,7 +12,7 @@
 // worse than no hint: it says the cable is still patched when it isn't, which is exactly the stale
 // signal the unmount work exists to prevent. Both directions are asserted here for that reason —
 // a presence-only test would pass against a hint that is simply always rendered.
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -28,6 +28,8 @@ import { enableAiEnhancementsForTests } from "../../testing/aiEnhancements";
 import { CONCIERGE_AI_FIELD } from "./conciergeAiLock";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { C } from "../../theme/colors";
+import { SHORTCUT_DEFAULTS, useKeybindingsStore } from "../../stores/keybindingsStore";
+import { formatBinding } from "../../keyboardHints/keybindings";
 
 beforeEach(() => {
   enableAiEnhancementsForTests();
@@ -154,12 +156,16 @@ describe("mounted — the way out is on screen", () => {
     // the expectation being loosened to "has some border".
     expect(kbd.style.border).toContain(asRgb(C.violet));
     expect(kbd.style.color).toBe(C.violetInk);
-    // "to unmount" is NOT purple: the founder asked for the pill only. The row's own muted ink is
-    // set on the wrapper, so the assertion is that the kbd is the ONLY violet-inked node in there.
+    // "to unmount" is NOT purple: the founder asked for the pills only. The row's own muted ink is
+    // set on the wrapper, so the assertion is that the KEY PILLS are the only violet-inked nodes in
+    // there — expressed against the live set of `<kbd>`s rather than a hard-coded one, since the
+    // hint now names two keys (see the second-key cases below) and would grow a third the same way.
+    const pills = Array.from(hint()!.querySelectorAll<HTMLElement>("kbd"));
     const violetNodes = Array.from(hint()!.querySelectorAll<HTMLElement>("*")).filter(
       (el) => el.style.color === C.violetInk || el.style.color === C.violet,
     );
-    expect(violetNodes).toEqual([kbd]);
+    expect(violetNodes).toEqual(pills);
+    expect(pills[0]).toBe(kbd);
     expect(hint()!.style.color).not.toBe(C.violet);
     expect(hint()!.style.color).not.toBe(C.violetInk);
   });
@@ -172,6 +178,82 @@ describe("mounted — the way out is on screen", () => {
     // safe, so both pass; anything below it is the regression.
     const declared = kbd!.style.opacity;
     expect(declared === "" || Number(declared) === 1).toBe(true);
+  });
+
+  // ══ THE SECOND KEY (bead sparkle-thm9o) ═══════════════════════════════════════════════════════
+  // The founder's app wedged with "I could not unmount the concierge". Escape had been disabled
+  // app-wide by a leaked hidden dialog node; `unmountCable` still worked; and this hint — the only
+  // affordance on screen — named exclusively the key that no longer did anything. Copy offering a
+  // remedy that cannot work, while a working one exists unmentioned, is the failure AGENTS.md names
+  // under "user-facing copy is code". The probe bug is fixed; naming both keys is what makes the
+  // hint survive the NEXT way Escape dies.
+  describe("names a second way out, because the first one can be dead", () => {
+    afterEach(() => {
+      // The keybindings store is a persisted module singleton shared across every case in this file.
+      useKeybindingsStore.getState().resetBinding("unmountCable");
+    });
+
+    it("names the unmountCable chord alongside ESC", () => {
+      mount("right");
+      const pills = Array.from(hint()!.querySelectorAll("kbd")).map((k) => k.textContent);
+      expect(pills[0]).toBe("ESC"); // still first — the primary gesture and the founder's ask
+      expect(pills).toContain(formatBinding(SHORTCUT_DEFAULTS.unmountCable));
+      expect(pills).toHaveLength(2);
+      expect(hint()!.textContent).toMatch(/unmount/i); // one sentence, shared verb
+    });
+
+    // THE ASSERTION THAT MAKES THE ONE ABOVE MEAN SOMETHING. A hard-coded "⌘⇧U" satisfies it and is
+    // WRONG: `unmountCable` is rebindable in ⋯ Settings → Shortcuts, so a literal sends a user who
+    // has changed it to a key that does nothing — the same defect, one level along.
+    it("follows a REBOUND unmountCable rather than printing a hard-coded chord", () => {
+      useKeybindingsStore.getState().setBinding("unmountCable", {
+        kind: "chord",
+        meta: true,
+        ctrl: false,
+        alt: true,
+        shift: false,
+        key: "k",
+      });
+      mount("right");
+      const pills = Array.from(hint()!.querySelectorAll("kbd")).map((k) => k.textContent);
+      expect(pills).toContain("⌥⌘K");
+      // The old default must be GONE, not merely joined by the new one.
+      expect(pills).not.toContain(formatBinding(SHORTCUT_DEFAULTS.unmountCable));
+    });
+
+    // …AND IT REPAINTS ON A LIVE REBIND, which is the property the SUBSCRIPTION exists for and the
+    // case above cannot see (roborev 60345). Setting the binding before `mount` only proves the hint
+    // reads the store at render time — a non-subscribing
+    // `useKeybindingsStore.getState().bindings.unmountCable` satisfies it just as well. But the user
+    // rebinds this in ⋯ Settings → Shortcuts while the cable is patched and the hint is on screen,
+    // and with a `getState()` read the pill would keep advertising the old chord until some
+    // unrelated re-render — copy naming a key that does nothing, which is the whole defect this
+    // change closes. So: mount FIRST, rebind after, and require the paint to follow.
+    //
+    // (`ConciergeHost`'s notice needs no equivalent — its `getState()` read is correctly
+    // snapshot-at-send, since the sentence is composed once when the message goes out.)
+    it("repaints when the chord is rebound while the hint is already on screen", () => {
+      mount("right");
+      expect(Array.from(hint()!.querySelectorAll("kbd")).map((k) => k.textContent)).toContain(
+        formatBinding(SHORTCUT_DEFAULTS.unmountCable),
+      );
+
+      act(() => {
+        useKeybindingsStore.getState().setBinding("unmountCable", {
+          kind: "chord",
+          meta: true,
+          ctrl: false,
+          alt: true,
+          shift: false,
+          key: "k",
+        });
+      });
+
+      // No remount between the two reads — the same mounted tree has to have re-rendered.
+      const pills = Array.from(hint()!.querySelectorAll("kbd")).map((k) => k.textContent);
+      expect(pills).toContain("⌥⌘K");
+      expect(pills).not.toContain(formatBinding(SHORTCUT_DEFAULTS.unmountCable));
+    });
   });
 });
 

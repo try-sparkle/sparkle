@@ -131,6 +131,8 @@ import { oneLine } from "./promptHistory";
 import { openProjectTab } from "../services/openProjectTab";
 import { revealOutcomeFor, type RevealOutcome } from "../services/agentReveal";
 import { useHistoryStore } from "../stores/historyStore";
+import { formatBinding } from "../keyboardHints/keybindings";
+import { useKeybindingsStore } from "../stores/keybindingsStore";
 import { useConciergeMessageStatuses, waitingLine } from "../services/conciergeMessageStatuses";
 import {
   clearQueue,
@@ -4723,13 +4725,25 @@ export function ConciergeHost({
       // separate "the brain got it" from "your agent did not" must not collapse into a
       // contradiction when the two share a name; the unnamed form is the honest one there, and it
       // is the fallback that already exists.
+      //
+      // ══ AND IT NAMES BOTH KEYS, FOR THE REASON ConciergeColumn'S HINT DOES (bead sparkle-thm9o) ══
+      // This is the other on-screen affordance telling the user how to get out of a mount, and it
+      // said "Esc" alone. Escape is exactly the key one leaked hidden `role="dialog"` node disabled
+      // app-wide — the founder's "I could not unmount the concierge" — so under the conditions that
+      // make someone read this sentence, the remedy it offered was the one that could not work while
+      // a working one went unmentioned. Fixing the column's hint and leaving this would relocate the
+      // defect rather than close it (AGENTS.md, "user-facing copy is code").
+      //
+      // Drawn from the LIVE binding, not a hard-coded "⌘⇧U": `unmountCable` is rebindable in
+      // ⋯ Settings → Shortcuts. Read through `getState()` — this runs inside a send callback.
       if (displayMountedRef.current && !notedThisSend) {
         const mounted = displayMountedRef.current;
         const held = isSparkleAgentId(mounted) ? undefined : displayMountedNameRef.current;
+        const keys = `Esc or ${formatBinding(useKeybindingsStore.getState().bindings.unmountCable)}`;
         noteMounted(
           held
-            ? `Asked Sparkle — not ${held}. Press Esc to unmount and read the reply.`
-            : "Asked Sparkle — press Esc to unmount and read the reply.",
+            ? `Asked Sparkle — not ${held}. Press ${keys} to unmount and read the reply.`
+            : `Asked Sparkle — press ${keys} to unmount and read the reply.`,
           "info",
         );
       }
