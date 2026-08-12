@@ -4021,15 +4021,25 @@ describe("controlListener", () => {
       });
 
       it("carries NO origin when no turn was in flight — the fail-closed half", async () => {
-        // Distinct from "the module happens to be null at rest": this asserts that a call starting
-        // outside any turn produces a receipt the renderer will refuse to mark a bubble with.
-        setConciergeTurnOrigin(null);
-        dispatchConciergeToolMock.mockImplementationOnce(async () => ({
-          ok: true,
-          domain: "terminal",
-          op: "send_to_agent_terminal",
-          data: { ok: true, agentId: "agent-x", agentName: "CI Hardening", channel: "terminal" },
-        }));
+        // THE ORIGIN APPEARS *DURING* THE CALL, and that is the entire design of this case. Writing
+        // `setConciergeTurnOrigin(null)` here instead was a no-op — the describe's `afterEach` already
+        // resets the module to null — so the module was null at entry AND at settle, and the
+        // assertion could not tell the mechanism from the resting state (roborev 62827). Both
+        // forbidden reads stayed green against it, because there was no live value for either to
+        // pick up: exactly the precondition-satisfied shape this branch keeps producing.
+        //
+        // Leaving the module null at entry and letting a turn begin mid-flight makes the two answers
+        // differ: an entry read yields nothing (correct — this call belongs to no turn), a settle
+        // read yields the bubble that turned up afterwards and would mark an unrelated message.
+        dispatchConciergeToolMock.mockImplementationOnce(async () => {
+          setConciergeTurnOrigin("bubble-that-began-after-this-call");
+          return {
+            ok: true,
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            data: { ok: true, agentId: "agent-x", agentName: "CI Hardening", channel: "terminal" },
+          };
+        });
         fire({
           reqId: "r-noorigin",
           op: "concierge_tool",
