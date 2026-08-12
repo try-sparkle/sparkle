@@ -361,8 +361,9 @@ describe("Composer — placeholder reflects audio state", () => {
   });
 
   it("shows NO placeholder text at all when the mic is OFF (master mute)", () => {
-    // Mic off (enabled === false) → the composer must make no voice promise. It shows neither the
-    // wake-word prompt nor any speaking hint, so the box reads completely blank.
+    // Mic off (enabled === false) → the composer must make no voice promise. It shows no invitation
+    // to speak and no speaking hint, so the box reads completely blank. The retired wake/stop
+    // phrases are asserted absent below as a guard against that copy ever returning.
     act(() => useDictationStore.setState({ enabled: false, status: "idle" }));
     renderComposer();
     const body = document.body.textContent ?? "";
@@ -378,7 +379,7 @@ describe("Composer — placeholder reflects audio state", () => {
 
   // Regression (issue 2): armed but not actually capturing (focus-paused) keeps `enabled` true
   // while `status` is "idle". The composer must NOT claim "I'm listening" then — AND it must not
-  // invite the wake word either, since nothing is being captured. It shows the SAME honest
+  // invite the user to speak either, since nothing is being captured. It shows the SAME honest
   // "Listening paused" state the sidebar caption does (deriveMicPresentation === "focusPaused"), so
   // the two mic surfaces can never contradict each other in this state (the desync this fixes).
   it("shows the honest 'Listening paused' state when armed but capture is paused (enabled, status idle)", () => {
@@ -387,7 +388,7 @@ describe("Composer — placeholder reflects audio state", () => {
     const body = document.body.textContent ?? "";
     expect(body).toContain("Listening paused");
     expect(body).toContain("you can type here");
-    // Neither the "I'm listening" claim nor the wake-word invitation the mic can't hear.
+    // Neither the "I'm listening" claim nor any invitation to speak the mic can't hear.
     expect(body).not.toContain("I'm listening, so just start talking.");
     expect(body).not.toContain("Hey Sparkle");
   });
@@ -446,7 +447,7 @@ describe("Composer — placeholder reflects audio state", () => {
     // The overlay is aria-hidden (a decorative placeholder stand-in), so query by text, not role.
     // The accessible path to Refill lives in the sidebar notice (LogoWaveform), covered separately.
     expect(screen.getByText("Refill")).toBeTruthy();
-    // It replaces the wake-word placeholder — the two must not co-render.
+    // It replaces the live voice placeholder — the two must not co-render.
     expect(body).not.toContain("Hey Sparkle");
     act(() => useDictationStore.getState().clearOutOfCreditsNotice());
   });

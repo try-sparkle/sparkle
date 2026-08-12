@@ -9,9 +9,10 @@
 //
 // SCOPE, deliberately narrow. Only a terminal counts. NOT a dialog, a menu, a button, or `body`:
 // the concierge compose box holds the app-wide dictation insert target WITHOUT holding DOM focus
-// (see useConciergeDictation), and the flagship hands-free flow is saying "Hey Sparkle …" with the
-// caret nowhere in particular. Pausing on every non-composer target would kill wake-word dictation
-// outright. A terminal is different IN KIND — not "some other element", but another keyboard owner.
+// (see useConciergeDictation), and the flagship hands-free flow is the tray sitting on Speak while
+// the user talks with the caret nowhere in particular. Pausing on every non-composer target would
+// kill hands-free dictation outright. A terminal is different IN KIND — not "some other element",
+// but another keyboard owner.
 //
 // Pure + exported so the classification and the precedence are unit-tested directly without React,
 // Tauri, or a DOM (this codebase's convention — cf. deriveMicPresentation, classifyVoiceError). The
@@ -45,8 +46,8 @@ const TERMINAL_SELECTOR = `[${TERMINAL_SURFACE_ATTR}],.xterm,.xterm-screen,.xter
 
 /** Classify the element that holds the caret. `closest` matches the element ITSELF as well as its
  *  ancestors, so the helper textarea resolves on its own class without needing the wrapper.
- *  Null/undefined (no focused element at all) is "other" — that is the hands-free wake-word case,
- *  which must never be treated as a pause. */
+ *  Null/undefined (no focused element at all) is "other" — that is the hands-free case (the tray on
+ *  Speak, no caret anywhere), which must never be treated as a pause. */
 export function classifyFocusOwner(el: Element | null | undefined): FocusOwner {
   // Guard the call rather than the type: `document.activeElement` can hand back an SVGElement or a
   // stale node, and a missing `closest` must degrade to "not a terminal" (routing stays on) rather
@@ -110,7 +111,8 @@ export interface TerminalRoutingInput {
   enabled: boolean;
   /** Is dictation in a fault state? A faulted mic types nowhere. */
   errored: boolean;
-  /** THE WAKE GATE — has dictation been woken (`phase === "active"`), not merely armed? */
+  /** THE ROUTING GATE — is dictation actually routing speech (`phase === "active"`), not merely
+   *  armed? Speak holds this true; Push to talk only for the duration of a hold. */
   woken: boolean;
 }
 

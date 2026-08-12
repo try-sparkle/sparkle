@@ -66,6 +66,25 @@
 //! We derive it exactly as the reference client does — sha256(machine_id | username), first 32
 //! hex chars — and then PIN it in the state file so a later `ioreg` failure can't mint a second id.
 //!
+//! A 200 IS NOT PROOF THE REPORT LANDED — measured, not theorized (2026-08-11). This machine's
+//! reporter had been posting successfully for weeks with `last_status` reading "Reported 21 row(s)
+//! across 7 day(s)" while the profile read `tokens_28d: 0`. The server's actual reply:
+//!   200 {"ok":true,"rows":0,
+//!        "client_update":"Your tkmx-client is outdated (sparkle-desktop/0.98.0 → 1.3.0)…",
+//!        "profile_frozen":true}
+//! tkmx-server FREEZES a profile whose `client_version` is below its `minimum_client_version`
+//! (1.2.0 at the time), keeps serving the last snapshot, and says so only in `profile_frozen` —
+//! `ok` stays `true`. It parses `client_version` as bare semver: `sparkle-desktop/0.98.0` reads as
+//! 0.98.0, and so does `sparkle-desktop/1.3.0` — the prefix is not understood, so NO app-version
+//! bump can clear it. Both of the user's Sparkle reporters were frozen; both tkmx-client machines
+//! were not.
+//! [`discard_reason`] is the guard, and its PRIMARY rule is deliberately not a version check: if we
+//! sent rows and the server stored none, the cycle FAILS — whatever the reason. That covers the
+//! freeze, and it covers the next gate the operator invents without anyone having to hear about it.
+//! Sending an accepted `client_version` is a SEPARATE change, held for cutover: unfreezing while
+//! tkmx-client still reports this same machine would double-count every overlapping day, and the
+//! server's primary key makes those rows permanent.
+//!
 //! Profile prose (`tools`, `projects`, `communities`, `about`, `hn_username`, `demo_video_url`)
 //! is deliberately NOT sent. The reference client posts those from its `.env` on every run, so a
 //! Sparkle report that included them as empty strings could blank a profile the user filled in
@@ -730,8 +749,14 @@ pub fn rollup_activity(
 /// The `last_status` line for a successful post. Pure so BOTH branches are testable — the PARTIAL
 /// wording is the whole point of propagating `truncated`, and building it inline inside
 /// `report_once_sync` left it unreachable from a test. (roborev 47904/47899)
-pub fn posted_status(rows: usize, days: usize, truncated: bool) -> String {
+pub fn posted_status(rows: usize, days: usize, truncated: bool, notice: Option<&str>) -> String {
     let base = format!("Reported {rows} row(s) across {days} day(s).");
+    let base = match notice {
+        // The server's own words, not a paraphrase: a nag we re-word is a nag the operator can't
+        // recognize when the user pastes it back at them.
+        Some(n) => format!("{base} The server says: {n}"),
+        None => base,
+    };
     if truncated {
         // Say so out loud. "Reported N rows" over a capped scan is how a number ends up 84% low
         // and nobody notices. The activity metrics are named too, because "absent" is only honest
@@ -750,6 +775,183 @@ pub fn posted_status(rows: usize, days: usize, truncated: bool) -> String {
 /// Total rows across every day — what the per-cycle log line reports.
 pub fn row_count(data: &[DailyUsage]) -> usize {
     data.iter().map(|d| d.model_breakdowns.len()).sum()
+}
+
+// ── dry run ─────────────────────────────────────────────────────────────────────────────────
+
+/// What `--builder-index-dry-run` was asked for.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DryRunArgs {
+    /// `None` = whatever window the REPORTER would actually use, read from the persisted state.
+    /// Not `DEFAULT_REPORT_DAYS`: a user who set `report_days` to something else would otherwise
+    /// be shown a window their reporter never posts, which defeats the one claim this tool makes.
+    pub days: Option<u32>,
+    /// Sparkle's app-data root. `None` = the platform default for THIS build. Explicit because a
+    /// dry run must be able to point at the production store from a debug binary — measuring the
+    /// `-dev` sibling and reporting it as "what Sparkle collects" would be a confidently wrong
+    /// answer to the only question this tool exists to answer.
+    pub app_data: Option<PathBuf>,
+}
+
+/// Parse the dry-run flags out of the process args. `None` = an ordinary launch, so this must stay
+/// cheap and must never claim an argument the app itself uses.
+///
+/// `--builder-index-dry-run [--days N] [--app-data PATH]`
+pub fn dry_run_args<I: IntoIterator<Item = String>>(args: I) -> Option<DryRunArgs> {
+    let args: Vec<String> = args.into_iter().collect();
+    if !args.iter().any(|a| a == "--builder-index-dry-run") {
+        return None;
+    }
+    let value_after = |flag: &str| {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
+    Some(DryRunArgs {
+        // An unparseable or absent `--days` falls back to the REPORTER'S OWN window (resolved in
+        // `dry_run` from persisted state) rather than failing: the tool's job is to print numbers,
+        // and refusing over a typo'd flag is worse than printing the real window.
+        days: value_after("--days")
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|d| d.clamp(1, MAX_REPORT_DAYS)),
+        app_data: value_after("--app-data").map(PathBuf::from),
+    })
+}
+
+/// Compute exactly what [`report_once_sync`] would POST — and print it instead of posting it.
+///
+/// WHY THIS EXISTS. Retiring the community client requires proving Sparkle collects the same usage
+/// it does, on the same machine, over the same window. Proving that by publishing is not available:
+/// the leaderboard's primary key is (username, date, model, client_id) with SUM and no grouping, so
+/// two clients reporting the same machine double-count every overlapping day PERMANENTLY. This runs
+/// the real scan and the real [`rollup`] — not a reimplementation — and touches nothing:
+///   • no POST, so nothing is published and nothing double-counts;
+///   • no keychain read, so an unsigned dev binary can't trip the macOS authorization prompt;
+///   • no state write, so the pinned `client_id`, consent, and `last_status` are exactly as found.
+/// The `client_id` it prints is READ, never derived — the one identity that must survive the
+/// migration untouched is not something a diagnostic should be able to mint.
+pub fn dry_run(args: &DryRunArgs) -> String {
+    let app_data = args.app_data.clone().or_else(default_app_data_dir);
+    let state = app_data.as_deref().map(load_state);
+    // The REPORTER's window when `--days` is absent, not this module's default constant.
+    let days = args
+        .days
+        .unwrap_or_else(|| state.as_ref().map_or(DEFAULT_REPORT_DAYS, |s| s.window()));
+    // The one line this function's seam leaves untested (`dry_run_over` is what the tests drive).
+    // `transcript_roots` has its own coverage in spend.rs — including the account-store ordering
+    // this feature exists for — so the untested surface here is the call, not the behavior.
+    let roots = crate::spend::transcript_roots(app_data.as_deref());
+    dry_run_over(app_data.as_deref(), state.as_ref(), days, &roots)
+}
+
+/// [`dry_run`] with the scan roots handed in.
+///
+/// Split out for the same reason `spend::scan_window` is: without it the only way to exercise this
+/// is to scan whatever `$HOME/.claude` the machine happens to have — 3,697 project directories on
+/// the machine this was written on. That makes the test slow, machine-dependent, and quietly
+/// dependent on the tester's own `CLAUDE_CONFIG_DIR`, which is the exact contamination the
+/// `warning` field below exists to flag.
+fn dry_run_over(
+    app_data: Option<&Path>,
+    state: Option<&BuilderIndexState>,
+    days: u32,
+    roots: &[PathBuf],
+) -> String {
+    let scan = crate::spend::scan_window(roots, days);
+    let data = rollup(scan.records(), scan.today, days);
+    let session_stats = rollup_activity(&scan.activity(), scan.truncated, days, scan.today);
+
+    let mut totals = ModelBreakdown {
+        model_name: "ALL".to_string(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 0,
+        total_tokens: 0,
+        cost: None,
+        source: SOURCE.to_string(),
+    };
+    let mut cost = 0.0f64;
+    let mut priced = false;
+    for day in &data {
+        for m in &day.model_breakdowns {
+            totals.input_tokens = totals.input_tokens.saturating_add(m.input_tokens);
+            totals.output_tokens = totals.output_tokens.saturating_add(m.output_tokens);
+            totals.cache_creation_tokens =
+                totals.cache_creation_tokens.saturating_add(m.cache_creation_tokens);
+            totals.cache_read_tokens =
+                totals.cache_read_tokens.saturating_add(m.cache_read_tokens);
+            totals.total_tokens = totals.total_tokens.saturating_add(m.total_tokens);
+            if let Some(c) = m.cost {
+                cost += c;
+                priced = true;
+            }
+        }
+    }
+    totals.cost = priced.then_some(cost);
+
+    let report = serde_json::json!({
+        "posted": false,
+        "note": "DRY RUN — nothing was sent to the Builder Index and no state was written.",
+        "window_days": days,
+        "client_version_that_would_be_sent": client_version(),
+        "client_id": state.map(|s| s.client_id.clone()),
+        "username": state.map(|s| s.username.clone()),
+        "app_data": app_data.map(|p| p.display().to_string()),
+        "roots": roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+        // MEASURED THE HARD WAY. Run from inside a Sparkle agent's shell, `CLAUDE_CONFIG_DIR`
+        // points at ONE account store, so `transcript_roots` resolves the "primary" root to that
+        // store, dedupes it against itself, and `~/.claude/projects` — 3,697 project directories
+        // on the machine this was found on — is never scanned at all. The dry run answered 1.99B
+        // where the truth was 56.4B: a 32x undercount, with `truncated: false` and no other tell.
+        // A parity check that reads that number concludes Sparkle collects nothing. Say it out
+        // loud rather than leaving the reader to notice a missing line in `roots`.
+        "claude_config_dir": std::env::var("CLAUDE_CONFIG_DIR").ok(),
+        "warning": dry_run_warning(std::env::var("CLAUDE_CONFIG_DIR").ok().as_deref()),
+        // A capped scan UNDERSTATES the total, which is precisely the failure mode a parity
+        // comparison would otherwise misread as "Sparkle collects less than the other client".
+        "truncated": scan.truncated,
+        "rows": row_count(&data),
+        "days_with_usage": data.len(),
+        "totals": totals,
+        "data": data,
+        "session_stats": session_stats,
+    });
+    serde_json::to_string_pretty(&report).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
+}
+
+/// The caveat that belongs on a dry run's numbers, if any. Pure — taking the env value as an
+/// argument rather than reading it, so the warning is testable without mutating process-global
+/// state every other test in the binary shares.
+fn dry_run_warning(claude_config_dir: Option<&str>) -> Option<&'static str> {
+    claude_config_dir.filter(|s| !s.is_empty()).map(|_| {
+        "CLAUDE_CONFIG_DIR is set, so the primary ~/.claude store is probably NOT in `roots` and \
+         this total UNDERSTATES the machine. Re-run with `env -u CLAUDE_CONFIG_DIR`."
+    })
+}
+
+/// The platform app-data root for THIS build, without an `AppHandle`.
+///
+/// Mirrors `dev_identity::app_data_dir`'s dev suffix so a debug dry run reads the same store a
+/// debug app would. Only the macOS/Linux/Windows conventions Tauri itself uses.
+fn default_app_data_dir() -> Option<PathBuf> {
+    let base = if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support")
+    } else if cfg!(target_os = "windows") {
+        PathBuf::from(std::env::var_os("APPDATA")?)
+    } else {
+        match std::env::var_os("XDG_DATA_HOME") {
+            Some(x) => PathBuf::from(x),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
+        }
+    };
+    let dir = base.join("ai.sparkle.desktop");
+    Some(if crate::dev_identity::is_dev() {
+        dir.with_file_name("ai.sparkle.desktop-dev")
+    } else {
+        dir
+    })
 }
 
 // ── keychain ────────────────────────────────────────────────────────────────────────────────
@@ -900,7 +1102,12 @@ pub enum ReportOutcome {
     /// It rides on the outcome (not just `last_status`) because the modal renders the fresh
     /// message and suppresses `last_status` — without this the warning existed only in the log,
     /// which is not "saying so out loud". (roborev 47899)
-    Posted { rows: usize, days: usize, truncated: bool },
+    ///
+    /// `notice` is the server's own nag (an outdated client, an agentsview update) on a report that
+    /// DID land. It rides here for the same reason `truncated` does — and because the freeze this
+    /// module now fails loudly on arrives as a nag FIRST: the cycle before the server starts
+    /// discarding is the one where a visible warning is still actionable.
+    Posted { rows: usize, days: usize, truncated: bool, notice: Option<String> },
     Skipped(SkipReason),
 }
 
@@ -973,17 +1180,16 @@ fn report_once_sync(app_data: PathBuf, enabled: bool) -> Result<ReportOutcome, S
                 tracing::warn!(error = %e, "builder index: could not read the server response");
                 String::new()
             });
-            if let Some(err) = server_side_error(&body) {
-                let msg = format!("server accepted the request but reported: {err}");
-                record_outcome(&app_data, None, format!("Last report failed — {msg}."));
-                return Err(msg);
+            match classify_ok_response(&body, rows, days, scan.truncated) {
+                Ok((outcome, status)) => {
+                    record_outcome(&app_data, Some(now_secs()), status);
+                    Ok(outcome)
+                }
+                Err(msg) => {
+                    record_outcome(&app_data, None, format!("Last report failed — {msg}."));
+                    Err(msg)
+                }
             }
-            record_outcome(
-                &app_data,
-                Some(now_secs()),
-                posted_status(rows, days, scan.truncated),
-            );
-            Ok(ReportOutcome::Posted { rows, days, truncated: scan.truncated })
         }
         Err(e) => {
             // The error string can carry the URL but never the key (it lives only in a header we
@@ -1035,6 +1241,111 @@ fn server_side_error(body: &str) -> Option<String> {
         Some(serde_json::Value::String(e)) if e.is_empty() => None,
         Some(_) => Some(detail()),
     }
+}
+
+/// How many rows the server says it STORED, when it says so at all.
+///
+/// tkmx-server answers `{"ok":true,"rows":N,…}`. `N` is what it PERSISTED, which is not the same
+/// as what we sent — see [`discard_reason`] for the case where those differ.
+///
+/// THAT `N` IS THE STORED COUNT IS MEASURED, NOT ASSUMED, and the distinction matters: if the
+/// server always answered 0, [`discard_reason`]'s primary rule would fail every healthy cycle
+/// instead of catching a broken one. Both directions were observed against the live server on
+/// 2026-08-11 — a healthy non-empty report answered `{"ok":true,"rows":28}`, and a discarded one
+/// answered `{"ok":true,"rows":0}` for a payload carrying 21 rows.
+fn stored_rows(v: &serde_json::Value) -> Option<u64> {
+    v.get("rows").and_then(serde_json::Value::as_u64)
+}
+
+/// The operator's nag text (`client_update` / `agentsview_update`), reduced to its first line.
+///
+/// Those fields are multi-line install instructions; `last_status` is one line in a settings row.
+/// The first line carries the diagnosis ("Your tkmx-client is outdated (X → Y)") and the rest is
+/// shell commands the log already has in full.
+fn server_notice(v: &serde_json::Value) -> Option<String> {
+    for key in ["client_update", "agentsview_update"] {
+        if let Some(s) = v.get(key).and_then(serde_json::Value::as_str) {
+            let first = s.lines().next().unwrap_or("").trim();
+            if !first.is_empty() {
+                return Some(first.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Why a 200 response means the report did NOT land — `None` when it did.
+///
+/// THIS IS THE FIX FOR A SILENT ZERO, and it is deliberately not a version check. Measured against
+/// the live server on 2026-08-11: a Sparkle report of 21 rows was answered
+/// `200 {"ok":true,"rows":0,"client_update":"…outdated (sparkle-desktop/0.98.0 → 1.3.0)…",
+/// "profile_frozen":true}` — accepted, counted as a success by [`server_side_error`] (which only
+/// looks for `ok:false`/`error`), and thrown away. The profile read `tokens_28d: 0` for months
+/// while `last_status` read "Reported 21 row(s) across 7 day(s)."
+///
+/// Two rules, and the ORDER of durability matters more than either one:
+///   1. WE SENT ROWS AND THE SERVER STORED NONE. This is version-independent and reason-independent
+///      — it catches a freeze, a future minimum-version gate, a schema rejection, a quota, and
+///      whatever else the operator adds next. It is the rule that makes the silence structurally
+///      impossible rather than fixed for one known cause.
+///   2. `profile_frozen: true`, even on an empty post. A freeze means nothing we send LATER will
+///      land either, so an idle cycle must still say so rather than wait for a busy one.
+/// A SHORTFALL (stored some, but fewer than we sent) is deliberately NOT fatal: the server merges
+/// rows by (date, model), so a smaller count can be legitimate, and a false failure every cycle
+/// would train the user to ignore the one that is real.
+fn discard_reason(v: &serde_json::Value, sent_rows: usize) -> Option<String> {
+    let notice = server_notice(v);
+    let because = || match &notice {
+        Some(n) => format!(" The server says: {n}"),
+        None => String::new(),
+    };
+    if v.get("profile_frozen").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Some(format!(
+            "the server FROZE this profile — it accepted the request and kept none of it, so the \
+             Builder Index will keep showing the last snapshot.{}",
+            because()
+        ));
+    }
+    if sent_rows > 0 && stored_rows(v) == Some(0) {
+        return Some(format!(
+            "the server accepted the request but stored 0 of {sent_rows} row(s), so none of this \
+             usage reached the Builder Index.{}",
+            because()
+        ));
+    }
+    None
+}
+
+/// Decide a cycle's outcome from the server's 200 body. Pure, so every branch is testable.
+///
+/// Extracted rather than written inline for the reason `posted_status` was: the interesting paths
+/// here are the ones a test can only reach if they are not welded to a live socket. `report_once_sync`
+/// keeps exactly one untestable line — the POST itself — and hands the body straight to this.
+///
+/// `Err` = the report did not land. `Ok((outcome, status))` = it did; `status` is what goes in
+/// `last_status`.
+fn classify_ok_response(
+    body: &str,
+    rows: usize,
+    days: usize,
+    truncated: bool,
+) -> Result<(ReportOutcome, String), String> {
+    // An explicit failure marker still wins — it carries the operator's own wording.
+    if let Some(err) = server_side_error(body) {
+        return Err(format!("server accepted the request but reported: {err}"));
+    }
+    // A non-JSON or unreadable body is NOT treated as a discard: the happy-path shape is not a
+    // documented contract, and failing every cycle because the server changed its 200 body would
+    // be a worse bug than the one this catches.
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::Value::Null);
+    if let Some(reason) = discard_reason(&v, rows) {
+        return Err(reason);
+    }
+    let notice = server_notice(&v);
+    Ok((
+        ReportOutcome::Posted { rows, days, truncated, notice: notice.clone() },
+        posted_status(rows, days, truncated, notice.as_deref()),
+    ))
 }
 
 /// Write back ONLY the fields the reporter owns, re-reading state immediately beforehand.
@@ -1099,12 +1410,24 @@ pub fn spawn_reporter(app: tauri::AppHandle) {
                 Ok(dir) => {
                     let enabled = crate::config::current_effective().config.tools.builder_index;
                     match report_once_sync(dir, enabled) {
-                        Ok(ReportOutcome::Posted { rows, days, truncated }) => tracing::info!(
-                            rows,
-                            days,
-                            truncated,
-                            "builder index: reported daily token totals"
-                        ),
+                        Ok(ReportOutcome::Posted { rows, days, truncated, notice }) => {
+                            // The nag goes out at WARN with its FULL text (the status line only
+                            // keeps the first line): when it fires, the install instructions are
+                            // the actionable part, and the log is the only place they fit.
+                            if let Some(n) = &notice {
+                                tracing::warn!(
+                                    notice = %n,
+                                    "builder index: the server sent an update notice — a client it \
+                                     considers outdated is one freeze away from being discarded"
+                                );
+                            }
+                            tracing::info!(
+                                rows,
+                                days,
+                                truncated,
+                                "builder index: reported daily token totals"
+                            )
+                        }
                         Ok(ReportOutcome::Skipped(reason)) => {
                             tracing::debug!(reason = reason.as_str(), "builder index: cycle skipped")
                         }
@@ -1264,11 +1587,12 @@ impl Serialize for ReportOutcome {
         use serde::ser::SerializeMap;
         let mut m = s.serialize_map(None)?;
         match self {
-            ReportOutcome::Posted { rows, days, truncated } => {
+            ReportOutcome::Posted { rows, days, truncated, notice } => {
                 m.serialize_entry("status", "posted")?;
                 m.serialize_entry("rows", rows)?;
                 m.serialize_entry("days", days)?;
                 m.serialize_entry("truncated", truncated)?;
+                m.serialize_entry("notice", notice)?;
             }
             ReportOutcome::Skipped(reason) => {
                 m.serialize_entry("status", "skipped")?;
@@ -1848,9 +2172,13 @@ mod tests {
 
     #[test]
     fn report_outcome_serializes_as_a_tagged_object() {
-        let posted =
-            serde_json::to_value(ReportOutcome::Posted { rows: 12, days: 7, truncated: false })
-                .unwrap();
+        let posted = serde_json::to_value(ReportOutcome::Posted {
+            rows: 12,
+            days: 7,
+            truncated: false,
+            notice: None,
+        })
+        .unwrap();
         assert_eq!(posted["status"], "posted");
         assert_eq!(posted["rows"], 12);
         assert_eq!(posted["days"], 7);
@@ -1858,10 +2186,18 @@ mod tests {
         // `last_status`, so without it a capped (understated) scan reads as a clean report on the
         // only surface the user actually looks at. (roborev 47899)
         assert_eq!(posted["truncated"], false);
-        let partial =
-            serde_json::to_value(ReportOutcome::Posted { rows: 1, days: 1, truncated: true })
-                .unwrap();
+        assert_eq!(posted["notice"], serde_json::Value::Null);
+        let partial = serde_json::to_value(ReportOutcome::Posted {
+            rows: 1,
+            days: 1,
+            truncated: true,
+            notice: Some("Your tkmx-client is outdated".into()),
+        })
+        .unwrap();
         assert_eq!(partial["truncated"], true);
+        // Same reasoning as `truncated`: the nag has to reach the modal, which is the only surface
+        // the user reads. A warning that lives solely in `last_status` is one the modal suppresses.
+        assert_eq!(partial["notice"], "Your tkmx-client is outdated");
 
         let skipped = serde_json::to_value(ReportOutcome::Skipped(SkipReason::Disabled)).unwrap();
         assert_eq!(skipped["status"], "skipped");
@@ -2097,8 +2433,8 @@ mod tests {
     fn the_partial_marker_is_in_the_status_line_both_ways() {
         // The wording is the whole point of propagating `truncated`; built inline it was
         // unreachable from a test. (roborev 47904/47899)
-        assert_eq!(posted_status(3, 2, false), "Reported 3 row(s) across 2 day(s).");
-        let partial = posted_status(3, 2, true);
+        assert_eq!(posted_status(3, 2, false, None), "Reported 3 row(s) across 2 day(s).");
+        let partial = posted_status(3, 2, true, None);
         assert!(partial.starts_with("Reported 3 row(s) across 2 day(s)."));
         assert!(partial.contains("PARTIAL"));
         assert!(partial.contains("understates your usage"));
@@ -2111,7 +2447,231 @@ mod tests {
             "{partial}"
         );
         // The clean path stays clean: no scary omission text when nothing was omitted.
-        assert!(!posted_status(3, 2, false).contains("omitted"));
+        assert!(!posted_status(3, 2, false, None).contains("omitted"));
+    }
+
+    // ── the server's 200 is not proof the report landed ──────────────────────────────────
+
+    /// The exact body the live server returned to this machine's reporter on 2026-08-11, for a
+    /// cycle that had 21 real rows in it. Everything in this section is anchored to it rather than
+    /// to a shape someone guessed: `ok:true` with `rows:0` is what a discarded report looks like.
+    const FROZEN_BODY: &str = r#"{"ok":true,"rows":0,"client_update":"Your tkmx-client is outdated (sparkle-desktop/0.98.0 → 1.3.0). From your tkmx-client folder:\n  git pull && npm install","profile_frozen":true}"#;
+
+    #[test]
+    fn a_frozen_profile_is_a_failed_report_not_a_successful_one() {
+        // BEFORE this change `server_side_error` returned None here and the cycle recorded
+        // "Reported 21 row(s) across 7 day(s)." while the profile showed tokens_28d: 0. The
+        // assertion that matters is the OUTCOME — an Err — not that some field was parsed.
+        assert_eq!(server_side_error(FROZEN_BODY), None, "precondition: the old check passes this body");
+        let out = classify_ok_response(FROZEN_BODY, 21, 7, false);
+        let msg = out.expect_err("a frozen profile must not report success");
+        assert!(msg.contains("FROZE"), "{msg}");
+        // The user has to be able to act on it, which means the server's own diagnosis has to
+        // survive into the message rather than being flattened to "failed".
+        assert!(msg.contains("outdated"), "{msg}");
+    }
+
+    #[test]
+    fn storing_zero_of_the_rows_we_sent_fails_even_without_a_freeze_flag() {
+        // The durable half of the guard: no `profile_frozen`, no `error`, no nag — just a server
+        // that kept nothing. This is what a future gate (a new minimum version, a quota, a schema
+        // rejection) looks like, and it has to fail without anyone teaching this code about it.
+        let body = r#"{"ok":true,"rows":0}"#;
+        assert_eq!(server_side_error(body), None);
+        let msg = classify_ok_response(body, 21, 7, false)
+            .expect_err("storing none of what we sent is not a success");
+        assert!(msg.contains("stored 0 of 21"), "{msg}");
+    }
+
+    #[test]
+    fn an_idle_cycle_that_sent_nothing_is_still_a_success() {
+        // `rows: 0` back from a `data: []` post is CORRECT, not a discard — the reporter posts an
+        // empty window on purpose so the server can tell "alive and idle" from "gone". Failing here
+        // would make every quiet day look broken.
+        let (outcome, status) = classify_ok_response(r#"{"ok":true,"rows":0}"#, 0, 0, false)
+            .expect("an empty post is not a failure");
+        assert!(matches!(outcome, ReportOutcome::Posted { rows: 0, .. }));
+        assert_eq!(status, "Reported 0 row(s) across 0 day(s).");
+    }
+
+    #[test]
+    fn a_freeze_fails_even_on_an_idle_cycle() {
+        // ...but a FREEZE on an idle cycle is still fatal: it says nothing we send later will land
+        // either, so waiting for a busy cycle to surface it just delays the diagnosis.
+        let msg = classify_ok_response(r#"{"ok":true,"rows":0,"profile_frozen":true}"#, 0, 0, false)
+            .expect_err("a freeze is fatal regardless of what we sent");
+        assert!(msg.contains("FROZE"), "{msg}");
+    }
+
+    #[test]
+    fn a_nag_without_a_freeze_still_counts_as_reported_and_is_surfaced() {
+        // The cycle BEFORE the discard starts. It landed — so it must not fail — but the warning
+        // is the only actionable moment, so it has to reach both the status line and the outcome.
+        let body = r#"{"ok":true,"rows":21,"client_update":"Your tkmx-client is outdated (a → b).\n  git pull"}"#;
+        let (outcome, status) = classify_ok_response(body, 21, 7, false).expect("this report landed");
+        match outcome {
+            ReportOutcome::Posted { notice: Some(n), .. } => {
+                assert_eq!(n, "Your tkmx-client is outdated (a → b).", "first line only");
+            }
+            other => panic!("expected a notice on the outcome, got {other:?}"),
+        }
+        assert!(status.contains("Reported 21 row(s)"), "{status}");
+        assert!(status.contains("outdated"), "{status}");
+    }
+
+    #[test]
+    fn a_shortfall_is_not_treated_as_a_failure() {
+        // The server merges rows by (date, model), so storing fewer than we sent can be legitimate.
+        // A false failure every cycle is how a real one stops being read.
+        let (outcome, _) = classify_ok_response(r#"{"ok":true,"rows":19}"#, 21, 7, false)
+            .expect("a shortfall is not a discard");
+        assert!(matches!(outcome, ReportOutcome::Posted { rows: 21, .. }));
+    }
+
+    #[test]
+    fn an_unreadable_body_still_counts_as_reported() {
+        // The 200 happy-path shape is not a documented contract. If the operator changes it, the
+        // reporter must not start failing every cycle — that would be a worse bug than the silence.
+        for body in ["", "not json at all", "{}"] {
+            assert!(
+                classify_ok_response(body, 21, 7, false).is_ok(),
+                "an unrecognized 200 body must not fail the cycle: {body:?}"
+            );
+        }
+    }
+
+    // ── dry run ──────────────────────────────────────────────────────────────────────────
+
+    fn argv(s: &str) -> Vec<String> {
+        s.split_whitespace().map(String::from).collect()
+    }
+
+    #[test]
+    fn an_ordinary_launch_is_never_mistaken_for_a_dry_run() {
+        // This runs before the event loop on EVERY launch, so a false positive means the app
+        // prints JSON and exits instead of opening. Nothing but the exact flag may claim it.
+        assert_eq!(dry_run_args(argv("")), None);
+        assert_eq!(dry_run_args(argv("--days 28")), None);
+        assert_eq!(dry_run_args(argv("--builder-index-dry-run-please")), None);
+        assert_eq!(dry_run_args(argv("sparkle://open/agent/123")), None);
+    }
+
+    #[test]
+    fn the_dry_run_window_defaults_and_clamps_like_the_reporter() {
+        let days = |s: &str| dry_run_args(argv(s)).unwrap().days;
+        // No `--days` ⇒ DEFER to the reporter's persisted window (resolved in `dry_run`), NOT a
+        // constant. A user on report_days=14 must not be shown a 7-day figure and told it is what
+        // their reporter posts.
+        assert_eq!(days("--builder-index-dry-run"), None);
+        assert_eq!(days("--builder-index-dry-run --days 28"), Some(28));
+        // Clamped to what the server accepts, so a dry run can't advertise a window the reporter
+        // could never post.
+        assert_eq!(days("--builder-index-dry-run --days 9999"), Some(MAX_REPORT_DAYS));
+        assert_eq!(days("--builder-index-dry-run --days 0"), Some(1));
+        // A typo defers to the real window rather than refusing to print anything.
+        assert_eq!(days("--builder-index-dry-run --days seven"), None);
+        assert_eq!(days("--builder-index-dry-run --days"), None);
+    }
+
+    #[test]
+    fn a_dry_run_with_no_days_flag_uses_the_reporters_persisted_window() {
+        // The finding this fixes: it used to print DEFAULT_REPORT_DAYS regardless, so a machine
+        // configured for a 14-day window was shown 7 days of usage labelled as what it reports.
+        let tmp = tempfile::tempdir().unwrap();
+        let state = BuilderIndexState { report_days: 14, ..Default::default() };
+        save_state(tmp.path(), &state).unwrap();
+        let out = dry_run_over(Some(tmp.path()), Some(&state), state.window(), &[]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["window_days"], 14);
+        // ...and `window()` is what resolves it, so the two surfaces cannot drift apart.
+        assert_eq!(state.window(), 14);
+        assert_eq!(BuilderIndexState::default().window(), DEFAULT_REPORT_DAYS);
+    }
+
+    #[test]
+    fn the_dry_run_takes_an_explicit_app_data_root() {
+        let a = dry_run_args(argv("--builder-index-dry-run --app-data /tmp/store")).unwrap();
+        assert_eq!(a.app_data, Some(PathBuf::from("/tmp/store")));
+        assert_eq!(dry_run_args(argv("--builder-index-dry-run")).unwrap().app_data, None);
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_roots_it_actually_scanned() {
+        // The `roots` field is what let a 32x undercount be diagnosed at all (the missing
+        // ~/.claude line was the only visible tell), so it must reflect the scan rather than be
+        // re-derived from the environment at print time — those two answers can differ.
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("root-a");
+        let b = tmp.path().join("root-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let out = dry_run_over(Some(tmp.path()), None, 7, &[a.clone(), b.clone()]);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let roots: Vec<String> =
+            serde_json::from_value(v["roots"].clone()).expect("roots must be a string list");
+        assert_eq!(roots, vec![a.display().to_string(), b.display().to_string()]);
+    }
+
+    #[test]
+    fn a_dry_run_under_claude_config_dir_says_its_total_is_low() {
+        // The 32x undercount this warning exists for: with CLAUDE_CONFIG_DIR set, the primary
+        // ~/.claude store drops out of `roots` and the total reads 1.99B instead of 56.4B, with
+        // `truncated: false` and nothing else wrong-looking. A silent wrong answer is the exact
+        // failure this whole change is about, so the diagnostic must not have one of its own.
+        let w = dry_run_warning(Some("/some/account/store")).expect("must warn");
+        assert!(w.contains("UNDERSTATES"), "{w}");
+        assert!(w.contains("env -u CLAUDE_CONFIG_DIR"), "the fix has to be in the warning: {w}");
+        // Unset or empty is the normal case and must stay quiet — a warning on every clean run is
+        // one nobody reads on the run that matters.
+        assert_eq!(dry_run_warning(None), None);
+        assert_eq!(dry_run_warning(Some("")), None);
+    }
+
+    #[test]
+    fn a_dry_run_writes_nothing_and_posts_nothing() {
+        // The whole safety claim in one assertion: run it against a consented state file and the
+        // file must come back byte-identical. A dry run that re-pinned `client_id` or stamped
+        // `last_status` would be exactly the mutation the migration cannot survive.
+        let tmp = tempfile::tempdir().unwrap();
+        let before = BuilderIndexState {
+            username: "DROdio".into(),
+            client_id: "pinned-id-do-not-mint-a-new-one".into(),
+            consented_at: Some(7),
+            last_report_at: Some(11),
+            last_status: Some("Reported 21 row(s) across 7 day(s).".into()),
+            report_days: 0,
+        };
+        save_state(tmp.path(), &before).unwrap();
+        let raw_before = std::fs::read(state_path(tmp.path())).unwrap();
+
+        // Empty roots on purpose: `dry_run` proper resolves them from `$HOME/.claude`, and a test
+        // that scanned the tester's real 3,697-project store would be slow, machine-dependent, and
+        // silently sensitive to whether the tester's own CLAUDE_CONFIG_DIR happened to be set.
+        let out = dry_run_over(Some(tmp.path()), Some(&before), 7, &[]);
+
+        assert_eq!(
+            std::fs::read(state_path(tmp.path())).unwrap(),
+            raw_before,
+            "a dry run must not write the reporter's state file"
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["posted"], false);
+        // It reports the PINNED id it read — never a freshly derived one.
+        assert_eq!(v["client_id"], "pinned-id-do-not-mint-a-new-one");
+        assert_eq!(v["username"], "DROdio");
+        assert_eq!(v["window_days"], 7);
+        // The parity comparison is read off these two, so they have to be present even when the
+        // scan found nothing.
+        assert!(v["totals"]["totalTokens"].is_number(), "{out}");
+        assert!(v["truncated"].is_boolean(), "{out}");
+    }
+
+    #[test]
+    fn an_explicit_error_still_wins_over_the_discard_rules() {
+        // Ordering: the operator's own wording is more useful than our inferred one.
+        let msg = classify_ok_response(r#"{"ok":false,"error":"unknown user","rows":0}"#, 21, 7, false)
+            .expect_err("an explicit error is still an error");
+        assert!(msg.contains("unknown user"), "{msg}");
     }
 
     #[test]

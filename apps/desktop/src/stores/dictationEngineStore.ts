@@ -123,7 +123,29 @@ export type DictationFallbackReason =
    * `capture_ms` measured 232 ms on an idle machine and 2083 ms at load average 291, against
    * push-to-talk holds of ~345 ms.
    */
-  | "mic_missed_hold";
+  | "mic_missed_hold"
+  /**
+   * THE VOICE MODEL WAS STILL LOADING — this hold recorded nothing, and the mic was never even
+   * attempted.
+   *
+   * ── WHY THIS IS NOT `mic_missed_hold`, THOUGH BOTH LOSE THE UTTERANCE (roborev 61729) ────────
+   * Both mean "nothing was recorded", and for a while both were reported as `mic_missed_hold`.
+   * That was the unsafe-remedy shape AGENTS.md warns about, committed with the discriminator
+   * already in hand: `mic_missed_hold` says *"try holding the key a moment longer"*, and its
+   * justification is that a capture build takes a few hundred ms to a couple of seconds, so a
+   * longer hold clears it. A MODEL load is 2418 ms, 3536 ms, and **46 258 ms** measured at load
+   * average 291. No achievable hold clears that, so the advice fails repeatedly while blaming the
+   * user's hold speed for an ONNX initialisation.
+   *
+   * It also has a remedy of its own that is actually true: the model is loaded at most once per
+   * process, so the *next* attempt is warm (measured 5 ms). "Try again in a moment" works here and
+   * would be false for a capture race, which is why these are two reasons rather than one string
+   * stretched over both.
+   *
+   * Rare since `preload_model_in_background` moved the load to boot — reachable when a hold beats
+   * the preload, or after `retire_cached_decoder` has dropped the cache.
+   */
+  | "model_still_loading";
 
 /** What `start_cloud_stream` reports — the wire form of Rust's `CloudStreamOutcome`.
  *
@@ -298,7 +320,7 @@ export interface DictationEngineState {
   /** The microphone never started for a hold, so it recorded nothing. Its OWN seam, not the relay
    *  one: see the implementation for why routing this through `noteCloudUnavailable` was the same
    *  conflation this reason exists to delete. */
-  noteMicMissedHold: () => void;
+  noteMicMissedHold: (stage: "capture" | "model") => void;
   /** Drop an observation that has gone stale, so the store SETTLES rather than merely going
    *  unpainted. A no-op on a fresh notice and on an empty one. */
   retireStaleNotice: (now?: number) => void;
@@ -414,13 +436,20 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     // It still WINS the banner, deliberately: losing the whole utterance is strictly worse than
     // losing the live preview of an utterance that was captured, so it outranks a standing relay
     // reason. It just does not pretend to be one.
-    noteMicMissedHold: () =>
-      set((s) => ({
-        fallbackReason: "mic_missed_hold",
+    noteMicMissedHold: (stage) =>
+      set((s) => {
+        // THE DISCRIMINATOR IS CARRIED THROUGH, not logged and dropped (roborev 61729). The two
+        // stages lose the utterance for different reasons and have different true remedies, and
+        // collapsing them meant telling a user to hold longer against a 46-second model load.
+        const reason: DictationFallbackReason =
+          stage === "model" ? "model_still_loading" : "mic_missed_hold";
+        return {
+        fallbackReason: reason,
         observedAt: Date.now(),
-        dismissed: s.fallbackReason === "mic_missed_hold" ? s.dismissed : false,
+        dismissed: s.fallbackReason === reason ? s.dismissed : false,
         // openRefusals deliberately UNTOUCHED — see above.
-      })),
+        };
+      }),
     // ONE SEAM, FOUR BEHAVIOURS, decided by `classifyCloudOutcome` rather than here — so the policy
     // is a pure function a test can enumerate, and this stays a dispatch.
     //

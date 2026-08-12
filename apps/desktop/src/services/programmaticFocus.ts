@@ -12,7 +12,7 @@
 // Reading it off the gesture instead — claim on pointerdown/keydown — closes that but opens the
 // mirror hole: TAB-NAVIGATING into a composer produces neither event on the box being entered
 // (Tab's keydown fires on the element being LEFT), so a keyboard-only user's caret sits in one box
-// while the wake word types into another (roborev 54228). Focus is the right signal; it just needs
+// while dictation types into another (roborev 54228). Focus is the right signal; it just needs
 // the provenance attached.
 //
 // So: route every APP-INITIATED focus through `focusQuietly` and let `onFocus` ask.

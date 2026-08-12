@@ -143,6 +143,16 @@ fn notify_frontend_shown() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // BEFORE the event loop, before anything opens a window: the Builder Index dry run. It is a
+    // diagnostic, not a feature — it computes exactly the payload the reporter would POST and
+    // prints it, WITHOUT a network call, a keychain read, or a state write. That combination is
+    // the point: proving Sparkle's collection matches the client it is meant to replace must not
+    // require publishing anything, because the leaderboard's primary key makes a published row
+    // permanent. See `builder_index::dry_run`.
+    if let Some(args) = builder_index::dry_run_args(std::env::args().skip(1)) {
+        println!("{}", builder_index::dry_run(&args));
+        return;
+    }
     // Capture the main thread's identity HERE, on the main thread, before the event loop starts.
     // `cmd_timing` compares against it to report whether a command body actually ran on the main
     // thread rather than inferring it from the macro's source — see that module's header.

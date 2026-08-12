@@ -30,7 +30,7 @@ describe("useDictationPauseReason", () => {
     expect(renderHook(() => useDictationPauseReason()).result.current).toBeNull();
   });
 
-  it("says TERMINAL while dictation is un-woken, because the caret really is a dead end there", () => {
+  it("says TERMINAL while dictation is not routing, because the caret really is a dead end there", () => {
     set({ focusOwner: "terminal", phase: "passive" });
     expect(renderHook(() => useDictationPauseReason()).result.current).toBe("terminal");
   });

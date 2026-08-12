@@ -1683,7 +1683,7 @@ pub(crate) fn load_window_records(app_data: Option<&Path>, window_days: u32) -> 
 
 /// [`load_window_records`] with the roots handed in, so the scan half is testable against a temp
 /// tree instead of whatever `$HOME/.claude` this machine happens to have.
-fn scan_window(roots: &[PathBuf], window_days: u32) -> WindowScan {
+pub(crate) fn scan_window(roots: &[PathBuf], window_days: u32) -> WindowScan {
     let window = window_days.clamp(1, MAX_WINDOW_DAYS);
     let today = now_secs().div_euclid(86_400);
     let cutoff_secs = (today - (window as i64 - 1)) * 86_400;

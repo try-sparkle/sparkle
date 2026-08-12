@@ -29,9 +29,9 @@ afterEach(() => {
 });
 
 describe("classifyFocusOwner", () => {
-  it("nothing focused is NOT a terminal — the hands-free wake-word case must keep routing", () => {
-    // The flagship flow is saying "Hey Sparkle …" with the caret nowhere. If a null activeElement
-    // classified as anything pause-worthy, wake-word dictation would never route at all.
+  it("nothing focused is NOT a terminal — the hands-free case must keep routing", () => {
+    // The flagship flow is the tray on Speak with the caret nowhere. If a null activeElement
+    // classified as anything pause-worthy, hands-free dictation would never route at all.
     expect(classifyFocusOwner(null)).toBe<FocusOwner>("other");
     expect(classifyFocusOwner(undefined)).toBe<FocusOwner>("other");
   });
@@ -63,7 +63,7 @@ describe("classifyFocusOwner", () => {
 
   it("the composer, a dialog, a menu item and a plain button are all NOT terminals", () => {
     // SCOPE GUARD. These are exactly the targets the field trace also recorded (role=menuitem,
-    // role=dialog, body). Pausing on them would kill wake-word dictation, which routes while the
+    // role=dialog, body). Pausing on them would kill hands-free dictation, which routes while the
     // caret is on none of them.
     const cases = [
       [`<textarea data-testid="compose-input"></textarea>`, "textarea"],

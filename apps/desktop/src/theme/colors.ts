@@ -380,7 +380,7 @@ export const C = {
   // blue, so it is too dark on light's near-white planes (3.09:1 at worst) AND too dark on dark's
   // near-black ones (3.72:1) — the black-and-gold repaint took `forest` to #05070d and pulled it
   // under there too, which is exactly the accentInk story one hue over. Eighteen `color: C.teal`
-  // sites are text or a glyph — the wake-word phrase in the composer placeholder, BoardView's
+  // sites are text or a glyph — the emphasised phrase in the composer placeholder, BoardView's
   // worker lists, the drop pill's clip, SelectionPopup's header — and take this instead. TWO are
   // deliberately still on the brand literal: `WORKFLOW_STAGES`' stage colours, which are a fill in
   // WorkflowLine before they are ever an ink, and one label in `AgentSidebar` that belongs to a

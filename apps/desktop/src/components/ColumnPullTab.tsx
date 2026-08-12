@@ -295,7 +295,18 @@ function makeDragShield(onStrandedPress: () => void): HTMLDivElement {
   el.style.cssText =
     "position:fixed;inset:0;z-index:2147483647;cursor:col-resize;background:transparent";
   let dismissed = false;
-  const dismiss = () => {
+  const dismiss = (e: Event) => {
+    // A PRIMARY PRESS ONLY, and the reasoning above is exactly why (roborev 59592). The claim that
+    // "a live gesture's button is already down, so a fresh press means the sheet is stale" holds for
+    // the primary button of the primary pointer and for nothing else: pointer capture is per
+    // `pointerId`, so a right-click, a middle-click or a second finger during a perfectly healthy
+    // resize still reaches this sheet. Dismissing on those would tear down a working gesture and
+    // commit a width at whatever intermediate position the user was passing through — a regression
+    // handed to every user who right-clicks mid-drag, in exchange for a recovery path they do not
+    // need. Before the shield existed that press was inert, and it stays inert.
+    const p = e as MouseEvent & { isPrimary?: boolean };
+    if (p.button !== 0) return;
+    if (p.isPrimary === false) return;
     if (dismissed) return;
     dismissed = true;
     el.remove();

@@ -48,7 +48,7 @@ describe("deriveMicState — the shared mic tri-state", () => {
 // PREPARING — the first-run bug. useDictation optimistically sets status "listening" BEFORE
 // invoke("start_dictation"), which on a cold start blocks for MINUTES downloading the voice model.
 // For that whole wait the old derivation returned "paused", byte-identical to a healthy ready mic,
-// while the composer invited the user to say the wake word at a model that didn't exist yet.
+// while the composer invited the user to speak at a model that didn't exist yet.
 // modelProgress (non-null only while the backend is fetching the model) is the signal that tells
 // the two apart — and it is precisely the signal a WARM start never emits, which is what keeps the
 // already-downloaded case untouched.

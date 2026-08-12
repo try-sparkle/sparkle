@@ -1,0 +1,5 @@
+{
+  "_comment": "THE ONE dictation://capture-missed FIXTURE, read by BOTH suites. Rust parses it in dictation/tests.rs via include_str!; TypeScript imports it in useDictation.captureMissed.test.ts. Neither side may hand-write these values. A rename of a wire key or a stage token therefore reddens both suites together, which is the whole point: the frontend picks which REMEDY to show off `stage`, so a drift that only one side notices silently tells a user to hold the key longer against a 46-second model load.",
+  "model": { "stage": "model", "ms": 46258 },
+  "capture": { "stage": "capture", "ms": 2083 }
+}

@@ -514,7 +514,7 @@ describe("a send that did not happen is not announced or recorded", () => {
 describe("a speech-end that beats the mic claim is not lost", () => {
   it("replays it once ownership arrives", async () => {
     // micLive = owning && routing, and `owning` is React state written by a claim effect — so it
-    // lags by a commit. On the hands-free path the wake word and the speech-end for the SAME
+    // lags by a commit. On the hands-free path the phase flip and the speech-end for the SAME
     // utterance come from one Deepgram frame pair, so the speech-end can land while micLive is
     // still false. DROPPING it there is unrecoverable: only a new speechEndSeq can start a clock,
     // so the user's first sentence would sit in the box and never send.

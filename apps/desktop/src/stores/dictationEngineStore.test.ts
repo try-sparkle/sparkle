@@ -750,7 +750,7 @@ describe("a mic failure is not a relay verdict (roborev 61695)", () => {
     // relay evidence and makes the next real outage take an extra refusal to report. This is the
     // conflation the `mic_missed_hold` reason was added to delete, pointing the other way.
     useDictationEngineStore.setState({ openRefusals: 1 });
-    useDictationEngineStore.getState().noteMicMissedHold();
+    useDictationEngineStore.getState().noteMicMissedHold("capture");
     expect(useDictationEngineStore.getState().openRefusals).toBe(1);
     expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
   });
@@ -759,14 +759,24 @@ describe("a mic failure is not a relay verdict (roborev 61695)", () => {
     // Losing every word beats losing the live preview of words that were captured, so the mic
     // condition wins the banner — it just does not pretend to be a relay verdict to do it.
     useDictationEngineStore.getState().noteCloudUnavailable("too-slow");
-    useDictationEngineStore.getState().noteMicMissedHold();
+    useDictationEngineStore.getState().noteMicMissedHold("capture");
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
+  });
+
+  it("routes the MODEL stage to its own reason, not the capture one", () => {
+    // Both lose the utterance, but their true remedies differ: a capture race clears with a longer
+    // hold, a model load (measured up to 46s) does not. Collapsing them handed the user an
+    // instruction that fails every time they follow it (roborev 61729).
+    useDictationEngineStore.getState().noteMicMissedHold("model");
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("model_still_loading");
+    useDictationEngineStore.getState().noteMicMissedHold("capture");
     expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
   });
 
   it("stamps itself so it can go stale like any other observation", () => {
     // An unstamped notice can never be taken down by `isStale` (observedAt === null is never
     // stale), so it would stand for the rest of the run over a microphone that started working.
-    useDictationEngineStore.getState().noteMicMissedHold();
+    useDictationEngineStore.getState().noteMicMissedHold("capture");
     expect(useDictationEngineStore.getState().observedAt).toEqual(expect.any(Number));
   });
 
@@ -775,7 +785,7 @@ describe("a mic failure is not a relay verdict (roborev 61695)", () => {
     // that would silence the more severe condition the user has never seen.
     useDictationEngineStore.getState().noteCloudUnavailable("too-slow");
     useDictationEngineStore.setState({ dismissed: true });
-    useDictationEngineStore.getState().noteMicMissedHold();
+    useDictationEngineStore.getState().noteMicMissedHold("capture");
     expect(useDictationEngineStore.getState().dismissed).toBe(false);
   });
 });

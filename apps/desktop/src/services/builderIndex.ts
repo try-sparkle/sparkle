@@ -37,6 +37,14 @@ export type ReportOutcome =
       /** The transcript scan hit its file cap, so these numbers UNDERSTATE reality. Surfaced on
        *  the outcome (not only in `lastStatus`) because the modal shows the fresh message. */
       truncated: boolean;
+      /** The server's own warning on a report that DID land — an outdated client, an agentsview
+       *  update. Same reason `truncated` is here: the modal shows the fresh outcome and hides
+       *  `lastStatus`, so a warning that lived only in the stored status is never read.
+       *
+       *  `| null`, NOT optional-only: this is a Rust `Option<String>` with no
+       *  `skip_serializing_if`, so serde ALWAYS emits the key and sends `null` for `None`. A
+       *  `notice?: string` would describe a shape the wire cannot produce. */
+      notice?: string | null;
     }
   | { status: "skipped"; reason: string };
 

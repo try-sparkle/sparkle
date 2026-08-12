@@ -26,7 +26,8 @@ export function shouldBlockMicArm(me: Me | null): boolean {
 // state added):
 //   off       = !enabled                      — mic released, nothing captured
 //   preparing = enabled && a model download in flight — armed, but voice can't work YET
-//   paused    = enabled && !liveActive         — on, but waiting for the wake word (or focus-paused)
+//   paused    = enabled && !liveActive         — on, but not routing (Push to talk between holds,
+//                                                or focus-paused)
 //   active    = enabled && status listening && phase active — actively dictating right now
 //
 // A click never jumps straight from active to off: it PAUSES first. The full cycle:
@@ -56,7 +57,7 @@ export type MicIntent = Exclude<MicState, "preparing">;
  *  is what makes the first-run wait honest. useDictation sets status "listening" optimistically,
  *  BEFORE start_dictation — which on a cold start blocks for minutes on a ~482 MB download — so
  *  without this the mic drew the healthy "paused" glyph for the whole wait and the composer invited
- *  the user to say the wake word at a model that wasn't on disk yet. It outranks "active" because a
+ *  the user to speak at a model that wasn't on disk yet. It outranks "active" because a
  *  missing model can't dictate no matter what phase the user selects. Optional (defaults to null)
  *  so a WARM start — model already present, no progress events, every existing call site — derives
  *  exactly what it always did.
@@ -116,7 +117,7 @@ export function useMicToggle(): {
       // refill-then-rearm within the 5s window can't be force-disarmed (and the notice can't
       // linger next to an armed mic).
       clearOutOfCreditsNotice();
-      setEnabled(true); // off → paused (arm the mic; it resumes wake-word listening)
+      setEnabled(true); // off → paused (arm the mic; capture resumes, routing does not)
     } else if (state === "active")
       setPhase("passive"); // active → paused (stop dictating, stay listening — never turn off)
     else setEnabled(false); // paused (or preparing) → off
@@ -182,7 +183,7 @@ export function useMicActions(): {
       setEnabled(true);
       setPhase("active");
     },
-    // Arm but don't dictate (orange "muted" — on, waiting for the wake word). Same out-of-credits
+    // Arm but don't dictate (orange "muted" — on, capturing, routing nothing). Same out-of-credits
     // refusal as setActive.
     setMuted: () => {
       if (shouldBlockMicArm(useAuthStore.getState().me)) {
@@ -519,7 +520,7 @@ export function ComposerMic({
         data-hint="composer-mic"
         onClick={() => {
           // This mic belongs to an AGENT composer, so operating it points dictation at that box —
-          // and keeps it there for the wake word afterwards. Without this the concierge, which now
+          // and keeps it there for later utterances. Without this the concierge, which now
           // claims on any routing mic it believes is its own, would take the transcript straight
           // back off a composer the user just deliberately armed (dictationStore.voiceSurface).
           useDictationStore.getState().setVoiceSurface("agent");

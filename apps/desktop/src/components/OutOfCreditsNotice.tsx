@@ -45,7 +45,7 @@ export function RefillLink({ label = "Refill", color = C.tealInk }: { label?: st
 }
 
 /** Composer variant: a single inline line that stands in for the mic placeholder. Font is inherited
- *  from the placeholder overlay (so it matches the existing wake-word copy). */
+ *  from the placeholder overlay (so it matches the existing voice copy). */
 export function ComposerOutOfCreditsNotice() {
   return (
     <span>

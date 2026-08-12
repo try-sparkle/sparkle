@@ -19,7 +19,7 @@
         begin_start_decision, choose_engine, cloud_reuse, park_cloud_for_blur, discard_needs_reissue, note_build_failed, note_fresh_arm,
         apply_decode_plan, plan_decode_emit, DecodeEmitPlan, DecodeEmitSink, DecodeOutcome,
         should_install_cloud, should_keep_warm_on_stop, park_or_take_on_stop, park_target_active,
-        classify_capture_fate, CaptureFate,
+        classify_capture_fate, CaptureFate, capture_missed_payload, MissedStage,
         should_resume_on_focus, should_standby_on_blur, start_after_load, stop_is_noop, unpark_cloud_for_focus, BeginStart,
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
         raced_stream_disposition, RacedStream, late_report_for, LateReport, park_raced_stream, install_live_stream, CloudAudioSender,
@@ -2672,6 +2672,40 @@
     // `cargo test --lib -- --ignored --nocapture` ran both concurrently — whichever went second
     // timed a "cold" load that was already cache-warm, or timed its own wait on the other test's
     // mutex, and only the deleted one asserted on the ordering, so the contention could panic.
+
+    #[test]
+    fn the_capture_missed_payload_is_the_shape_typescript_parses() {
+        // ── THE RUST HALF OF A HAND-WRITTEN SEAM (roborev 61729) ─────────────────────────────────
+        // `dictation://capture-missed` crosses into TypeScript as JSON and the frontend picks which
+        // REMEDY to show off `stage` — so a renamed key or a mistyped value does not merely spoil a
+        // log line, it silently falls back to the capture branch and tells a user to "hold the key a
+        // moment longer" against a 46-second model load. No type error, no runtime error, nothing
+        // red. That is the Rust→TS trap AGENTS.md describes, where both halves stay green.
+        //
+        // ONE FIXTURE, READ BY BOTH SUITES — not two hand-written literals (roborev 61764). The
+        // previous version asserted against its own copy on each side and CLAIMED they would fail
+        // together; they would not. The realistic drift is a deliberate rename: change "stage" to
+        // "phase" here, this test reddens right next to the edit, you update it, and the vitest —
+        // different language, package and suite — stays green against the old token forever, while
+        // `missedStageOf` returns "capture" for every model-load failure. Reading the same file is
+        // what actually couples them.
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../src/fixtures/captureMissed.json"))
+                .expect("the shared capture-missed fixture must parse");
+        assert_eq!(
+            capture_missed_payload(MissedStage::Model, 46_258),
+            fixture["model"],
+            "the model stage's wire shape — src/fixtures/captureMissed.json"
+        );
+        assert_eq!(
+            capture_missed_payload(MissedStage::Capture, 2_083),
+            fixture["capture"],
+            "the capture stage's wire shape — src/fixtures/captureMissed.json"
+        );
+        assert_ne!(MissedStage::Capture.as_str(), MissedStage::Model.as_str());
+        assert_eq!(MissedStage::Capture.as_str(), "capture");
+        assert_eq!(MissedStage::Model.as_str(), "model");
+    }
 
     #[test]
     fn only_a_hold_that_recorded_nothing_is_reported_to_the_user() {

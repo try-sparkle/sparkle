@@ -46,7 +46,8 @@ use super::events::{emit_partial, reset_interim_log_sampling};
 use super::{
     begin_start_decision, choose_engine, cloud_reuse, emit_late_report, install_live_stream,
     late_report_for, load_model, note_fresh_arm, park_or_take_on_stop, park_raced_stream,
-    park_target_active, raced_stream_disposition, set_arm_origin, should_install_cloud,
+    capture_missed_payload, park_target_active, raced_stream_disposition, set_arm_origin,
+    should_install_cloud, MissedStage,
     start_after_load, stop_is_noop,
 };
 use super::{
@@ -342,7 +343,7 @@ pub async fn start_dictation(
             // "connected too late — your words are still captured" banner, which on this path is
             // false twice over: the words were never captured, and the relay was never the problem.
             // `model_ms` rather than a build duration: it is the number that explains this failure.
-            let _ = app.emit("dictation://capture-missed", serde_json::json!({ "stage": "model", "ms": model_ms }));
+            let _ = app.emit("dictation://capture-missed", capture_missed_payload(MissedStage::Model, model_ms));
             return Ok(());
         }
         StartAfterLoad::AlreadyArmed => {

@@ -141,7 +141,7 @@ export function PlaceholderEmphasis({ phrase }: { phrase: string }) {
 }
 
 /** The one-time voice-model download, shown in the placeholder slot. Deliberately quiet (the same
- *  muted voice as the wake-word copy it replaces) — this is a wait, not a problem. The
+ *  muted voice as the listening copy it replaces) — this is a wait, not a problem. The
  *  download-cloud glyph matches the mic's own preparing glyph, so the two surfaces read as one
  *  state. `pct` is null when the backend reports no content-length. */
 export function PreparingNotice({ pct }: { pct: number | null }) {
@@ -270,7 +270,8 @@ export function VoicePlaceholderCopy({
    * `activeListening` is reached both by Speak and by a push-to-talk HOLD, and the true sentence
    * differs — Speak ends an utterance when you stop talking, a hold ends when you let go. Keyed on
    * the presentation alone, a hold was shown Speak's "pause when you're done", which is the same
-   * defect that had push-to-talk showing wake-word copy: a caption describing the wrong mode.
+   * defect that had push-to-talk showing the retired wake-word copy: a caption describing the
+   * wrong mode.
    *
    * Taken as a PROP rather than read from the store here so this component stays pure (it renders
    * words, it decides nothing) — the caller reads it, exactly as it reads `micPresentation`.
@@ -333,7 +334,7 @@ export function VoicePlaceholderCopy({
     case "focusPaused":
       // Armed but NOT capturing (another window, the caret in a terminal, muted, or capture not
       // started yet). The mic can't hear anything, so — exactly like the sidebar's "Listening
-      // paused" caption — say so instead of inviting the wake word. The words come from the same
+      // paused" caption — say so instead of inviting speech. The words come from the same
       // module the sidebar's do, keyed on the same reason.
       //
       // THE TERMINAL CASE IS A TWO-LINE, CENTERED NOTICE (founder's copy) and the other causes are

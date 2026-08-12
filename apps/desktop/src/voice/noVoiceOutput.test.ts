@@ -2,7 +2,7 @@
 //
 // Text-to-speech was removed whole in PRD/feat/ui-refresh-2026-07-27 §5: `services/conciergeVoice`
 // and `voice/tts/ttsService` were deleted, along with every caller. Voice INPUT is untouched — the
-// mic, dictation and the wake word all stay. Sparkle simply never speaks.
+// mic and dictation both stay. Sparkle simply never speaks.
 //
 // The removal is only safe while it stays removed, and the way it comes back is a MERGE, not a
 // decision. `main` still carried TTS when §5 landed and had gone on building features through the

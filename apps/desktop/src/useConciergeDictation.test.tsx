@@ -8,9 +8,9 @@
 // The box no longer has a mic button, so none of this is driven by a click on it any more. The
 // gestures below are what the REAL surfaces do to the store: the header ring sets voiceSurface
 // "concierge" and arms (LogoWaveform + MicMenu), an agent composer's mic sets "agent"
-// (MicButton.ComposerMic), and the wake word just moves `phase` with no click at all. That last
-// one is the case the old click-driven claim could not serve, and is why this file exists in this
-// shape.
+// (MicButton.ComposerMic), and the send tray just moves `phase` with no click on a box at all.
+// That last one is the case the old click-driven claim could not serve, and is why this file
+// exists in this shape.
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -91,9 +91,9 @@ describe("useConciergeDictation", () => {
     expect(hook.result.current.micLive).toBe(true);
   });
 
-  it("the WAKE WORD routes here too, with no click anywhere", () => {
-    // Armed and passive is the resting state the ring's caption invites ("Mic paused. Say Hey
-    // Sparkle to activate"). The wake word only moves `phase`, so a claim that needs a click can
+  it("a TRAY-DRIVEN phase change routes here too, with no click on a box", () => {
+    // Armed and passive is the resting state of Push to talk between holds. Moving the tray to
+    // Speak (or beginning a hold) only moves `phase`, so a claim that needs a click on this box can
     // never fire on this path — which is most of how the mic is actually used.
     const { hook, append } = mountBox();
     act(() => useDictationStore.getState().setEnabled(true));
@@ -122,7 +122,7 @@ describe("useConciergeDictation", () => {
     expect(hook.result.current.micLive).toBe(false);
   });
 
-  it("end of speech (the stop word drops phase) releases the target with no click", () => {
+  it("end of dictation (the tray drops phase to passive) releases the target with no click", () => {
     const { hook } = mountBox();
     armFromRing();
     act(() => useDictationStore.getState().setPhase("passive"));

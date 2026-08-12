@@ -110,7 +110,7 @@ describe("arming the mic through the real path (setEnabled → the enabled effec
   });
 
   it("claims LISTENING when nothing holds the caret — the hands-free case must not self-pause", () => {
-    // `activeElement` is <body> after a wake word, with no caret anywhere. Pausing here would break
+    // `activeElement` is <body> with the tray on Speak and no caret anywhere. Pausing here would break
     // the flow this whole feature is built around, so "nothing focused" must read as routable.
     useDictationStore.setState({ enabled: true });
     renderHook(() => useAmbientVoice());

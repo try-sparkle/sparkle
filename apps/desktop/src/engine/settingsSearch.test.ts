@@ -14,10 +14,10 @@ describe("matchesSearch", () => {
   });
 
   it("requires EVERY term, in any order — the substring form required them adjacent", () => {
-    const hay = "Voice controls wake word stop word dictation microphone";
-    expect(matchesSearch(hay, "wake microphone")).toBe(true); // not adjacent, not in order
-    expect(matchesSearch(hay, "microphone wake")).toBe(true);
-    expect(matchesSearch(hay, "wake keyboard")).toBe(false); // one term missing → no match
+    const hay = "Voice controls push to talk speak dictation microphone";
+    expect(matchesSearch(hay, "push microphone")).toBe(true); // not adjacent, not in order
+    expect(matchesSearch(hay, "microphone push")).toBe(true);
+    expect(matchesSearch(hay, "push keyboard")).toBe(false); // one term missing → no match
   });
 
   it("treats an all-whitespace query as no filter at all", () => {

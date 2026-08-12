@@ -267,6 +267,46 @@ pub(crate) fn classify_capture_fate(
     CaptureFate::MissedTheHold
 }
 
+/// WHICH STAGE LOST THE HOLD — the one definition of the `dictation://capture-missed` wire values.
+///
+/// ── WHY AN ENUM AND A CONSTRUCTOR, NOT TWO `json!` LITERALS (roborev 61729) ──────────────────────
+/// The payload was built inline in TWO files, with `"stage"`, `"ms"`, `"capture"` and `"model"` as
+/// bare string literals on each side and a hand-written TS union reading them. Nothing tied the
+/// three together, and the consequence is no longer cosmetic: the frontend picks which REMEDY to
+/// show off `stage`, so a renamed key or a mistyped value silently falls back to the capture branch
+/// and tells a user to "hold the key a moment longer" against a 46-second model load — reinstating
+/// the exact defect the stage split was added to fix, with no type error and no failing test.
+///
+/// This is the Rust→TS seam AGENTS.md warns about, where both halves stay green and the merge is
+/// clean. `capture_missed_payload` is now the only way to build it, and
+/// `the_capture_missed_payload_is_the_shape_typescript_parses` pins the serialized bytes against the
+/// same literal the vitest side parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MissedStage {
+    /// The model was ready; the CoreAudio capture was still building when the key came up.
+    /// Clears with a longer hold.
+    Capture,
+    /// The on-device model was still loading, so no capture was ever attempted. A longer hold
+    /// cannot clear this — only waiting for the load (or the boot preload) can.
+    Model,
+}
+
+impl MissedStage {
+    /// The wire token. Kept beside the enum so the two cannot drift.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            MissedStage::Capture => "capture",
+            MissedStage::Model => "model",
+        }
+    }
+}
+
+/// Build the `dictation://capture-missed` payload. The ONLY constructor — both emitters call it, so
+/// the key names exist once rather than once per call site.
+pub(crate) fn capture_missed_payload(stage: MissedStage, ms: u64) -> serde_json::Value {
+    serde_json::json!({ "stage": stage.as_str(), "ms": ms })
+}
+
 /// Which generation's `cloud_active` flag guards the park decision.
 ///
 /// `raced_stream_disposition`'s `already_active` term means "never shadow a session that is actively
@@ -1993,7 +2033,7 @@ impl DictationState {
                     // Tell the frontend, so it can say THIS rather than let the relay's
                     // "connected too late" banner speak for a condition it does not cover. That
                     // banner promises "your words are still captured", which is false here.
-                    let _ = app.emit("dictation://capture-missed", serde_json::json!({ "stage": "capture", "ms": build_ms }));
+                    let _ = app.emit("dictation://capture-missed", capture_missed_payload(MissedStage::Capture, build_ms));
                 }
                 CaptureFate::LostToASibling => tracing::info!(
                     target: "dictation",

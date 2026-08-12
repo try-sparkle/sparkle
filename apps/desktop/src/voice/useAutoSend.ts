@@ -307,9 +307,9 @@ export function useAutoSend({
    *
    * `micLive = owning && routing`, and `owning` is React state written by a claim effect — so it
    * lags the phase flip by at least a commit plus a passive-effect flush. On the flagship hands-free
-   * path ("Hey Sparkle, deploy the staging branch") the wake word and the speech-end for the SAME
-   * utterance come from one Deepgram frame pair, so the speech-end can land while `micLive` is
-   * still false. Dropping it there is unrecoverable: only a NEW `speechEndSeq` bump can start a
+   * path (the tray on Speak, "deploy the staging branch" said in one breath) the phase flip and the
+   * speech-end for the SAME utterance come from one Deepgram frame pair, so the speech-end can land
+   * while `micLive` is still false. Dropping it there is unrecoverable: only a NEW `speechEndSeq` bump can start a
    * clock, so the user's first sentence sits in the box, nothing counts down, and they press Send
    * by hand — the dead-weight outcome the rail exists to remove.
    */

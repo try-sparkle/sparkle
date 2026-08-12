@@ -410,14 +410,14 @@ describe("a terminal draws the SAME grey off glyph as Send", () => {
     expect(micVisual(inTerminal.state, false)).toEqual(micVisual(send.state, false));
   });
 
-  it("takes every position to off ONLY when the wake gate is shut", () => {
+  it("takes every position to off ONLY when the routing gate is shut", () => {
     // ── THE SPLIT THIS ROW USED TO MISS (roborev 56699) ─────────────────────────────────────────
     // The earlier version asserted "off" for `live({ focusOwner: "terminal" })` — but `live()`
     // defaults to enabled + listening + phase "active", which IS `terminalRoutingArmed`. So it
     // asserted the demotion for the one terminal state where the mic IS feeding a destination, and
     // pinned the bug instead of catching it.
     //
-    // Paused-in-a-terminal is the wake gate SHUT. Each of the three ways it shuts, independently.
+    // Paused-in-a-terminal is the routing gate SHUT. Each of the three ways it shuts, independently.
     const shut = [
       { phase: "passive" as const },
       { enabled: false },
@@ -456,7 +456,7 @@ describe("a terminal draws the SAME grey off glyph as Send", () => {
 
   it("leaves every position alone when the caret is anywhere else", () => {
     // The guard against over-correcting: "other" includes NOTHING FOCUSED AT ALL, which is the
-    // flagship hands-free case. Pausing there would kill wake-word dictation outright.
+    // flagship hands-free case. Pausing there would kill hands-free dictation outright.
     for (const mode of ["send", "ptt", "speak"] as const) {
       expect(micIndicatorFor(mode, live({ focusOwner: "other" })).state).toBe(
         micIndicatorFor(mode, live()).state,

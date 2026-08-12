@@ -69,7 +69,7 @@ export async function openCloudDictationWindow(deps: CloudWindowDeps): Promise<v
   // call close a stream a still-active window is using.
   if (!outcomeInstalledStream(outcome)) return; // nothing installed by THIS call
   if (!deps.isStillActive()) {
-    // A stop word / mute / toggle landed during the open → close, and clear our own preview so this
+    // A tray move / mute / toggle landed during the open → close, and clear our own preview so this
     // helper is self-contained (not reliant on the separate passive/toggle effects).
     deps.stopCloudStream();
     deps.clearInterim();

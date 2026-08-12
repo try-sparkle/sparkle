@@ -111,7 +111,7 @@ const maxComposerHeight = () => Math.max(COMPOSER_MIN, window.innerHeight - 140)
 // which is only safe while they are built from one constant.
 
 /** The one-time voice-model download, shown in the composer's placeholder slot. Deliberately quiet
- *  (same muted placeholder voice as the wake-word copy it replaces) — this is a wait, not a
+ *  (same muted placeholder voice as the listening copy it replaces) — this is a wait, not a
  *  problem. The download-cloud glyph matches the mic's own preparing glyph, so the two surfaces
  *  read as one state. `pct` is null when the backend reports no content-length. */
 function ComposerPreparingNotice({ pct }: { pct: number | null }) {
@@ -312,29 +312,30 @@ export function Composer({
   // failure). Non-null renders a live region above the box, so a dropped prompt is never silent.
   // Cleared by the next successful delivery.
   const [deliveryNotice, setDeliveryNotice] = useState<string | null>(null);
-  // Mic hot ("audio is active") → the placeholder drops the wake-word prompt and invites the
-  // user to just start talking, since Sparkle is already listening. Gate on the ACTUAL capture
+  // Mic hot ("audio is active") → the placeholder invites the user to just start talking, since
+  // Sparkle is already listening. Gate on the ACTUAL capture
   // state (status === "listening"), not the armed/mute intent (`enabled`): `enabled` stays true
   // while capture is focus-paused, so keying off it falsely claims "I'm listening" when nothing
   // is being captured. When armed but not actually listening we show the honest "Listening paused"
   // copy (deriveMicPresentation === "focusPaused"), the same state the sidebar caption shows.
   const audioActive = useDictationStore((s) => s.status === "listening");
   // Master mute: `enabled` false means the mic is OFF (ambient listening is opt-in). When the mic
-  // is off the composer must make NO voice promise at all — no "Just say Hey Sparkle", no typing
+  // is off the composer must make NO voice promise at all — no invitation to speak, no typing
   // hint that references speaking — so the placeholder goes fully blank. Distinct from `enabled`
   // true + idle status (armed but focus-paused), which shows the honest "Listening paused" copy.
   const micEnabled = useDictationStore((s) => s.enabled);
-  // Capture being live is NOT the same as actively dictating. Split the mic-hot copy by PHASE so
-  // the composer tells the truth: only the "active" phase (wake word heard) gets the "I'm
-  // listening, say Sparkle, pause" copy; the "passive" phase (still waiting for "Hey Sparkle")
-  // gets the wake-word copy that mirrors the sidebar. Bug fixed: previously ANY live capture
-  // showed the active copy, so a passive (wake-word) session falsely read as "I'm listening".
+  // Capture being live is NOT the same as actively dictating, so the PHASE is a separate input to
+  // `deriveMicPresentation` below: "active" (the tray on Speak, or a push-to-talk hold in progress)
+  // is the only thing that reaches `activeListening` and earns the live copy. "passive" — armed but
+  // routing nothing, i.e. Push to talk between holds — derives `focusPaused` and gets the honest
+  // "Listening paused" wording instead. Bug fixed: previously ANY live capture showed the active
+  // copy, so an armed-but-not-routing session falsely read as "I'm listening".
   const phase = useDictationStore((s) => s.phase);
   // The one-time voice-model download (non-null ONLY while it's in flight — a warm install never
   // emits it). Without this the composer had no idea the download existed: `status` is set to
   // "listening" optimistically BEFORE start_dictation, which on a first run blocks for MINUTES, so
-  // every one of those minutes rendered the passive wake-word copy and invited the user to say
-  // "Hey Sparkle" at a model that wasn't on disk yet. `preparing` outranks BOTH live states below
+  // every one of those minutes rendered the passive listening copy and invited the user to speak
+  // at a model that wasn't on disk yet. `preparing` outranks BOTH live states below
   // for the same reason: no model means no dictation, whatever phase the user has selected.
   const modelProgress = useDictationStore((s) => s.modelProgress);
   // The raw backend failure. Previously written to the store and read by exactly one 10px caption
@@ -412,7 +413,7 @@ export function Composer({
   const ghostRef = useRef<HTMLDivElement | null>(null);
 
   // When this composer is the visible/active pane, make it the target for
-  // wake-word dictation. Only the visible pane registers (one at a time), so
+  // hands-free dictation. Only the visible pane registers (one at a time), so
   // dictation never leaks into another agent's input.
   useEffect(() => {
     if (!active || disabled) return;
@@ -600,7 +601,7 @@ export function Composer({
    *  from the app's own focus() calls — pane reveal, un-minimize, insertPrompt, attachPaths,
    *  showBlockAsText), and on key input into it. Focus rather than pointerdown alone because
    *  TAB-navigating in fires neither pointerdown nor a keydown on the box being entered, and a
-   *  keyboard-only user whose caret is here must not have the wake word type into another column
+   *  keyboard-only user whose caret is here must not have dictation type into another column
    *  (roborev 54228). Focus still claims the TARGET unconditionally (roborev 53304); only this
    *  names the surface. */
   const ownVoice = useCallback(() => {
@@ -613,7 +614,7 @@ export function Composer({
     if (inputRef) inputRef.current = el;
   };
   // The last caret position the user placed in the textarea WHILE it was focused. Kept so
-  // wake-word dictation can insert at that spot even after focus has since left the box (the
+  // hands-free dictation can insert at that spot even after focus has since left the box (the
   // common flow: click to place the caret, then talk — by which point the mic/voice UI may
   // hold focus). `null` = the user has never placed a caret, so dictation appends at the end.
   const lastCaretRef = useRef<{ start: number; end: number } | null>(null);
@@ -1860,7 +1861,7 @@ export function Composer({
               ) : micPresentation === "focusPaused" ? (
                 // Armed but NOT capturing (another window, the caret in a terminal, muted, or
                 // capture not started yet). The mic can't hear anything, so — exactly like the
-                // sidebar's "Listening paused" caption — say so instead of inviting the wake word,
+                // sidebar's "Listening paused" caption — say so instead of inviting speech,
                 // and NAME the cause. The copy already says what to do next, so it also subsumes
                 // the old focused-only typing hint.
                 pausedComposerPlaceholder(pauseReason)

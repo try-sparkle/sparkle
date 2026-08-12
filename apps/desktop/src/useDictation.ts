@@ -47,6 +47,33 @@ import {
 export const IDLE_RELAY_PARK_MS = 60_000;
 
 /**
+ * Which stage a `dictation://capture-missed` payload names — the one decision the listener makes,
+ * pulled out so the Rust→TS seam is driveable by a test (roborev 61729).
+ *
+ * DECLARED HERE, ABOVE `cloudStreamCommandFor`, rather than between that function and its own doc
+ * block (roborev 61764). Inserting it there orphaned the "── WHAT MOVED, AND WHY IT HAD TO ──"
+ * rationale: two stacked JSDoc blocks preceded one function, so hover/IDE lookup for
+ * `cloudStreamCommandFor` returned nothing and the surviving prose read as if it described the
+ * stage helper. In a file where these blocks are the primary record of WHY the wiring is shaped
+ * this way, a detached one is worse than none.
+ *
+ * `stage` is not decoration: it picks which REMEDY the banner offers, and the two are not
+ * interchangeable ("hold the key a moment longer" cannot clear a 46-second model load). So a
+ * renamed key or a mistyped value must not silently land on the capture branch.
+ *
+ * DEFAULTS TO `"capture"` for anything unrecognised, deliberately. Both stages tell the truth about
+ * what was lost ("nothing was recorded"); they differ only in the remedy, and the capture remedy is
+ * the SAFE default — telling someone to hold longer when the real cause was a model load wastes one
+ * attempt, whereas "try again in a moment" against a genuine capture race is advice that never
+ * clears. The paired Rust test pins the real values so this default is a backstop, not the norm.
+ */
+export function missedStageOf(payload: unknown): "capture" | "model" {
+  return (payload as { stage?: unknown } | null | undefined)?.stage === "model"
+    ? "model"
+    : "capture";
+}
+
+/**
  * The cloud-stream command (if any) a PHASE EDGE implies. Pure so the "local gate, then stream"
  * wiring is unit-testable without the hook: only a real CHANGE acts — entering ACTIVE opens the
  * Deepgram relay, returning to PASSIVE closes it, and a re-observation of an unchanged phase
@@ -583,7 +610,7 @@ export async function createDictationController(
       // ungated, a hold in window A would paint "nothing was recorded" in B and C, which cannot
       // take it down because every clearing path needs `isCapturable()`.
       if (isCapturable()) {
-        useDictationEngineStore.getState().noteMicMissedHold();
+        useDictationEngineStore.getState().noteMicMissedHold(missedStageOf(e.payload));
       }
     }),
 

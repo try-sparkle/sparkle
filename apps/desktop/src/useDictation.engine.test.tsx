@@ -53,6 +53,7 @@ import {
   type CloudStreamOutcome,
 } from "./stores/dictationEngineStore";
 import { useAmbientVoice } from "./useDictation";
+import captureMissed from "./fixtures/captureMissed.json";
 
 /** Yield a real MACROTASK, not a microtask. `createDictationController` awaits a `Promise.all` over
  *  ~10 `listen()` calls before it subscribes to the store, and each mocked `listen` resolves on its
@@ -258,6 +259,39 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
   const fireCloudLate = () => {
     for (const cb of listeners["dictation://cloud-late"] ?? []) cb({ payload: undefined });
   };
+
+  // ── THE CAPTURE-MISSED LISTENER, DRIVEN THROUGH THE REAL CLOSURE (roborev 61761) ──────────────
+  // `missedStageOf` has its own unit test, but the LINE THAT USES IT was untested — the defaulted-
+  // seam trap: the helper can be perfectly correct while the listener passes it the wrong thing, or
+  // stops calling it, and nothing goes red. This drives the actual registered listener.
+  const fireCaptureMissed = (payload: unknown) => {
+    for (const cb of listeners["dictation://capture-missed"] ?? []) cb({ payload });
+  };
+
+  it("routes each capture-missed stage to ITS OWN reason, through the real listener", async () => {
+    // THE SHARED FIXTURE, not a third hand-copy of it. `src/fixtures/captureMissed.json` is the same
+    // file the Rust test parses via include_str!, so a renamed wire key or stage token reddens this
+    // call-site test too — a copy would have stayed green against the old token forever while
+    // `missedStageOf` returned "capture" for every model-load failure.
+    await mountVoice();
+    fireCaptureMissed(captureMissed.model);
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("model_still_loading");
+
+    fireCaptureMissed(captureMissed.capture);
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
+  });
+
+  it("lands on the CAPTURE remedy when the wire drifts, and says so out loud here", async () => {
+    // A renamed key on the Rust side degrades silently by construction — no type error, no runtime
+    // error. Pinning the chosen default means the fallback is a DECISION with a test behind it
+    // rather than an accident: the capture remedy costs one wasted attempt, while "try again in a
+    // moment" against a real capture race is advice that never clears.
+    // Built FROM the fixture with the key renamed, so this stays a test about the wrong KEY rather
+    // than one that quietly encodes a stale stage token of its own.
+    await mountVoice();
+    fireCaptureMissed({ phase: captureMissed.model.stage, ms: captureMissed.model.ms });
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("mic_missed_hold");
+  });
 
   it("reports too-slow when the event lands BEFORE start_cloud_stream resolves", async () => {
     // The open is held pending so the event provably wins the race, rather than the test hoping it

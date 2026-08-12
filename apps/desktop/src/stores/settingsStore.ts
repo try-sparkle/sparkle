@@ -461,7 +461,8 @@ interface SettingsState {
   concurrencyBasis: string;
   /** Use the cloud streaming STT (Deepgram Nova-3) for active dictation when available. Default
    *  on — the gold-standard path. Falls back to the on-device model automatically when off, when
-   *  no key is present, or when offline. The always-listening wake word stays on-device either way.
+   *  no key is present, or when offline. The on-device model is the always-available local path
+   *  either way — nothing about the send tray changes when this is off, only which engine decodes.
    *  This is also AI feature "voiceDictation" in the Use AI Features menu. */
   cloudDictation: boolean;
   /** Auto-name worker agents from their first prompt (the generate_agent_name call). Off → agents

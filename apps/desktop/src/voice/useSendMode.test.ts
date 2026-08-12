@@ -259,7 +259,7 @@ describe("a release waits for the words he already said", () => {
   });
 
   it("waits when he was ALREADY talking as the key went down", async () => {
-    // The mic is armed between holds (it listens for the wake word), so the VAD can already be true
+    // The mic is armed between holds (capturing, but routing nothing), so the VAD can already be true
     // when the gesture starts — he began the sentence a beat before pressing. `speaking` is
     // EDGE-triggered, so no further edge is coming for that speech: the watch has to read the level
     // at the start (`startUtteranceWatch`'s seed) or that hold's audio is never accounted for at all.
@@ -650,7 +650,7 @@ describe("the caret moving into a terminal pauses Speak", () => {
     // microphone off. But when it's in speak mode, it doesn't do that, and it should."
     //
     // It was never a missing focus gate: both positions read the same `focusOwner`. What differed
-    // was `phase`. Speak's "active" intent PASSES the wake gate in `terminalRoutingArmed`, which
+    // was `phase`. Speak's "active" intent PASSES the routing gate in `terminalRoutingArmed`, which
     // stops a terminal being a pause and makes it a DESTINATION — so dictated speech was typed into
     // the focused agent's PTY. Push to talk's resting "paused" intent fails that gate, which is the
     // only reason it behaved.
@@ -750,8 +750,8 @@ describe("the caret moving into a terminal pauses Speak", () => {
   it("…nor even CLAIMS that surface when the foreign mic is already off", () => {
     // The mic-off half, and it is not cosmetic: `applyIntent` calls `setVoiceSurface("concierge")`
     // BEFORE it touches the mic, so an "off" reconcile on a surface we do not own rewrites
-    // ownership even though it changes no mic state. The user then arms with the wake word or the
-    // header ring — neither claims a surface — and the dictation lands in the concierge box instead
+    // ownership even though it changes no mic state. The user then arms from the
+    // header ring — which claims no surface of its own — and the dictation lands in the concierge box instead
     // of the agent composer they last put the caret in.
     useUiStore.setState({ conciergeSendMode: "ptt" });
     useDictationStore.setState({ enabled: false, phase: "passive", voiceSurface: "agent" });

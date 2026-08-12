@@ -76,9 +76,9 @@ interface DictationState {
    *  "" on the on-device path, which has no interim results. */
   interim: string;
 
-  // --- ambient always-listening ---
+  // --- ambient mic (armed continuously; the tray decides whether it ROUTES) ---
   /** Mic hot (master mute). Default FALSE — the ambient mic is opt-in, so a fresh install doesn't
-   *  fire the OS mic-permission prompt or load the VAD/wake-word model during cold start. Persisted
+   *  fire the OS mic-permission prompt or load the VAD / on-device speech model during cold start. Persisted
    *  and synced across all windows, so a user who turns it on stays on across windows and relaunch
    *  (only the DEFAULT changed — existing persisted `enabled: true` preferences are untouched). */
   enabled: boolean;
@@ -114,13 +114,14 @@ interface DictationState {
    *  to say who wins. That used to be implicit in the click: the concierge compose box had its own
    *  mic button and claimed the target from its handler, and the agent composer's ComposerMic
    *  claimed from its own (Composer.tsx `claimDictationRef`). Removing the concierge's button left
-   *  the wake word — and the top ring, which has no box of its own — with nothing to claim on, so
+   *  the top ring — which has no box of its own — with nothing to claim on, so
    *  speech went wherever the last-mounted agent pane had registered. That is the bug this field
    *  fixes: the decision is now explicit state rather than a side effect of which button existed.
    *
    *  Defaults to "concierge" because the ring in the concierge header is the app's primary mic
-   *  control and sits directly above the box you talk to Sparkle in — so wake-word activation, which
-   *  involves no click at all, routes there. "agent" is set only by an explicit arm on an agent
+   *  control and sits directly above the box you talk to Sparkle in — so activation from the send
+   *  tray (moving to Speak, or beginning a push-to-talk hold), which touches no composer's own mic
+   *  button, routes there. "agent" is set only by an explicit arm on an agent
    *  composer's own mic. Runtime only (never persisted): a relaunch should come back pointing at
    *  the always-present ring, not at whichever pane happened to be focused last session. */
   voiceSurface: VoiceSurface;
@@ -176,7 +177,8 @@ interface DictationState {
    */
   onDeviceSpeech: boolean;
   /** WHO holds the DOM caret in this window right now — "terminal" when it sits in an xterm pane,
-   *  "other" for everything else INCLUDING nothing at all (the hands-free wake-word case).
+   *  "other" for everything else INCLUDING nothing at all (the hands-free case: the tray on Speak
+   *  with no caret anywhere).
    *
    *  Written only by the focus tracker (voice/dictationFocusTracker), and only when the answer
    *  changes. It is an OBSERVATION, not a decision: `dictationPauseReason` turns it (plus

@@ -268,6 +268,69 @@ describe("BuilderIndexConsentModal", () => {
     await waitFor(() => expect(screen.getByText(/PARTIAL — the transcript scan hit its file cap/)).toBeTruthy());
   });
 
+  it("shows the server's warning on a report that landed", async () => {
+    // The cycle before the discard begins. tkmx-server nags about an outdated client for a while
+    // BEFORE it starts freezing that client and throwing every row away, so this warning is the
+    // last moment the user can act while their data is still landing. Swallowing it is how a
+    // machine publishes zero for months with this modal reading "Reported 21 row(s)".
+    vi.mocked(builderIndexReportNow).mockResolvedValue({
+      status: "posted",
+      rows: 21,
+      days: 7,
+      truncated: false,
+      notice: "Your tkmx-client is outdated (sparkle-desktop/0.98.0 → 1.3.0).",
+    });
+    render(<BuilderIndexConsentModal />);
+    fireEvent.change(screen.getByLabelText("tokenmaxxing username"), { target: { value: "sam" } });
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "k" } });
+    fireEvent.click(screen.getByRole("button", { name: "Publish my totals" }));
+    await waitFor(() =>
+      expect(screen.getByText(/Your tkmx-client is outdated/)).toBeTruthy(),
+    );
+    // Still a success — the report DID land, and crying failure here would train the user to
+    // ignore the message that means it did not.
+    expect(screen.getByText(/Reported 21 row\(s\)/)).toBeTruthy();
+  });
+
+  it("shows the server's warning from 'Report now' too, not just first-run", async () => {
+    // The SECOND call site. `postedMessage` is invoked from both confirm() and reportNow(), and a
+    // test that drives only one goes green while the other still drops the notice on the floor —
+    // which is the path a long-configured install actually uses.
+    useSettingsStore.setState({ builderIndexEnabled: true });
+    vi.mocked(builderIndexStatus).mockResolvedValue(CONFIGURED_STATUS);
+    vi.mocked(builderIndexReportNow).mockResolvedValue({
+      status: "posted",
+      rows: 4,
+      days: 2,
+      truncated: false,
+      notice: "Your tkmx-client is outdated (a → b).",
+    });
+    render(<BuilderIndexConsentModal />);
+    fireEvent.click(await screen.findByRole("button", { name: "Report now" }));
+    await waitFor(() => expect(screen.getByText(/Your tkmx-client is outdated/)).toBeTruthy());
+  });
+
+  it("a report with no warning says nothing extra", async () => {
+    // The paired negative: without it, the test above passes against a modal that appends the
+    // literal word "says" to every message, warning or not.
+    vi.mocked(builderIndexReportNow).mockResolvedValue({
+      status: "posted",
+      rows: 21,
+      days: 7,
+      truncated: false,
+      // `null`, not absent: this is a Rust `Option<String>` with no `skip_serializing_if`, so the
+      // key is ALWAYS on the wire and carries `null` for `None`. A fixture that omitted it would
+      // be testing a shape the server half cannot produce.
+      notice: null,
+    });
+    render(<BuilderIndexConsentModal />);
+    fireEvent.change(screen.getByLabelText("tokenmaxxing username"), { target: { value: "sam" } });
+    fireEvent.change(screen.getByLabelText("API key"), { target: { value: "k" } });
+    fireEvent.click(screen.getByRole("button", { name: "Publish my totals" }));
+    await waitFor(() => expect(screen.getByText("Reported 21 row(s) across 7 day(s).")).toBeTruthy());
+    expect(screen.queryByText(/The server says/)).toBeNull();
+  });
+
   it("dismissing mid-request can't start a second concurrent report", async () => {
     // Clearing `busy` on close (needed so a dismissal can never wedge the dialog) also cleared the
     // only re-entrancy guard: close → re-open → click fired a SECOND identity write and POST

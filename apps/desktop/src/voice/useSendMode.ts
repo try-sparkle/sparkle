@@ -197,10 +197,10 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   // in speak mode, it doesn't do that." The obvious reading is that the focus gate is wired into one
   // path and not the other. It is not — both read the same `focusOwner`. What differs is `phase`:
   //
-  //   Push to talk at rest -> `micIntentForMode` = "paused" -> phase PASSIVE -> the wake gate in
+  //   Push to talk at rest -> `micIntentForMode` = "paused" -> phase PASSIVE -> the routing gate in
   //     `terminalRoutingArmed` (voice/dictationFocus) is false -> `dictationPauseReason` returns
   //     "terminal" -> capture pauses. Correct, and by accident of the resting intent.
-  //   Speak -> "active" -> phase ACTIVE -> the wake gate PASSES -> the terminal stops being a pause
+  //   Speak -> "active" -> phase ACTIVE -> the routing gate PASSES -> the terminal stops being a pause
   //     and becomes a DESTINATION: `isTerminalRoutable()` is true and dictated speech is typed
   //     straight into the focused agent's PTY (useDictation's `dictation://partial` handler).
   //
@@ -222,7 +222,7 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   // `setEnabled(true); setPhase("passive")` (components/MicButton). So with the tray at Send and the
   // microphone released, moving the caret into a terminal TURNED THE MIC ON. It did not repair
   // itself either: leaving the terminal re-ran with `intent === "off"` and `enabled` now true, so
-  // the stand-down guard below returned and left the mic armed and wake-word listening indefinitely
+  // the stand-down guard below returned and left the mic armed and listening indefinitely
   // under a tray reading "Send" — with the indicator painting it grey "Microphone: off" the whole
   // time, which is the exact two-controls-disagreeing state this hook exists to delete. It also
   // fired the out-of-credits notice at anyone who merely clicked into a terminal, and stole
@@ -281,8 +281,8 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
     // because `applyIntent` CLAIMS THE SURFACE before it touches the mic (`setVoiceSurface`, then
     // `setOff`). So an "off" reconcile on a foreign surface is never harmless even when the mic is
     // already released: it silently rewrites ownership to "concierge" on every mount and every
-    // terminal focus edge. The user then arms with the wake word or the header ring — neither of
-    // which claims a surface — and their dictation lands in the concierge box instead of the agent
+    // terminal focus edge. The user then arms from the header ring — which claims no surface of its
+    // own — and their dictation lands in the concierge box instead of the agent
     // composer they last put the caret in. Checked BEFORE `enabled` for exactly that reason.
     if (intent === "off" && !ownedHere) return;
     if (intent === "off" && mic.enabled && mode !== "ptt") return;

@@ -152,7 +152,7 @@ export function isApiErrorLine(line: string): boolean {
 // Self-prompt / churn phrases the agent emits when it's wedged and pinging itself with no real work
 // to make. The REAL wedge invariant is "a stuck agent REPEATS a self-ping in a loop with no
 // progress" — NOT "nobody ever says this phrase once". The USER legitimately says these (e.g. "Are
-// you there?", or "hey Sparkler" — the voice-UI wake phrase), and an agent may even QUOTE them in
+// you there?", or "hey Sparkler" — how a user addresses Sparkle by name), and an agent may even QUOTE them in
 // prose; those single utterances get echoed into pty:output and must NOT paint a healthy agent RED.
 // So `isSelfPromptLine` stays a PURE phrase-matcher (other modules/tests import it), and the
 // REPETITION gate lives in `StreamFailureDetector.observe()`: a self-prompt phrase must recur

@@ -23,7 +23,7 @@ describe("ComposerMic — visibility", () => {
     expect(screen.queryByRole("button")).toBeNull();
   });
 
-  it("is visible while PAUSED (on, waiting for the wake word)", () => {
+  it("is visible while PAUSED (on, but not routing)", () => {
     useDictationStore.setState({ enabled: true, status: "listening", phase: "passive" });
     render(<ComposerMic />);
     expect(screen.getByRole("button", { name: "Turn off microphone" })).toBeTruthy();
@@ -39,7 +39,7 @@ describe("ComposerMic — visibility", () => {
 describe("ComposerMic — preparing (voice-model download) is visibly its own state", () => {
   // Bug 3: while the 631 MB model unpacks from its ~482 MB download, the mic used to draw the
   // "paused" glyph — pixel-identical to a healthy, ready mic. The user had no way to tell a
-  // multi-minute first-run wait from a mic that was simply waiting on the wake word.
+  // multi-minute first-run wait from a mic that was simply armed and idle.
   const downloading = { done: 100_000_000, total: 482_000_000 };
 
   it("does NOT draw the healthy paused/ready affordance while the model is downloading", () => {

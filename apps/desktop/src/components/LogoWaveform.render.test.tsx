@@ -386,10 +386,12 @@ describe("LogoWaveform — the mic indicator is a read-out of the send tray", ()
     expect(ring().style.color).toBe(GREY);
   });
 
-  it("stays ORANGE on Push to talk even after the WAKE WORD moves the phase", () => {
-    // THE desync, reproduced at its actual trigger. `phase` is not the tray's to set — the wake
-    // matcher flips it with no click anywhere — so an indicator reading the dictation store went
-    // green while the tray still said "Push to talk". Nothing about the tray changed here.
+  it("stays ORANGE on Push to talk even when the PHASE reads active", () => {
+    // THE desync, reproduced at its actual trigger. `phase` used not to be the tray's to set — the
+    // retired wake matcher flipped it with no click anywhere — so an indicator reading the
+    // dictation store went green while the tray still said "Push to talk". The matcher is gone, but
+    // the phase and the tray can still be driven apart (a hold in progress, a cross-window sync),
+    // so the indicator must keep deriving from the TRAY. Nothing about the tray changed here.
     const probe = document.createElement("span");
     probe.style.color = C.amber;
     const ORANGE = probe.style.color;
@@ -573,7 +575,7 @@ describe("the ring reflects the CARET, not just the tray — through the compone
   const ring = () => screen.getByRole("img", { name: /microphone/i });
 
   it("draws the grey OFF ring when the caret is in a terminal that cannot receive", () => {
-    // The founder's rule, at the surface where he actually sees it. Wake gate shut (phase passive),
+    // The founder's rule, at the surface where he actually sees it. Routing gate shut (phase passive),
     // so the terminal is a pause rather than a destination.
     useUiStore.setState({ conciergeSendMode: "speak" });
     useDictationStore.setState({

@@ -36,7 +36,7 @@
 // on the founder's ask for "just an empty compose window". Shown both renderings side by side, the
 // user chose the RICH one, so the native placeholder stays "" and composer/RichPlaceholder paints
 // the copy over the textarea instead. An overlay is not a flourish: a native `placeholder=` is one
-// flat string and cannot render the wake phrase bold + brand blue inside an otherwise muted
+// flat string and cannot render the emphasised phrase bold + brand blue inside an otherwise muted
 // sentence, which is the whole point of the copy.
 //
 // What survives from the empty-box era, unchanged:
@@ -2005,7 +2005,7 @@ export function ComposeBox({
             aria-label="Message"
             // EMPTY, on purpose — but no longer because the slot is empty. The RichPlaceholderOverlay
             // below paints this state's copy, and a native placeholder cannot style a substring
-            // (the wake phrase must be bold + brand blue), so the two must never both render.
+            // (the emphasised phrase must be bold + brand blue), so the two must never both render.
             // Nothing here names a destination either way (PRD/sparkle/concierge-auto-routing.md §1),
             // and the ⌘↩ hint stays on the Send button below rather than in this text.
             placeholder=""

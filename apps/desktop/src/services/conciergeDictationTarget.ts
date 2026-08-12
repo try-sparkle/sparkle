@@ -3,7 +3,7 @@
 // dictationStore holds exactly ONE insert target for the whole app, and the visible agent composer
 // registers itself for it (components/Composer.tsx). The concierge compose box therefore must NOT
 // hold the target merely because it is mounted — the column is on screen for the whole session, so
-// an unconditional claim would silently take wake-word dictation away from every agent composer.
+// an unconditional claim would silently take hands-free dictation away from every agent composer.
 // It BORROWS the target only while the user has the concierge mic live, and hands it straight back
 // on release.
 //

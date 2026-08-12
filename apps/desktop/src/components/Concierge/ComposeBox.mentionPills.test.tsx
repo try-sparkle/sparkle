@@ -307,8 +307,9 @@ describe("ComposeBox — dictating 'sparkle' inserts an @Sparkle pill", () => {
 // The narrow half of the rule, and the reason it is narrow: "sparkle" is this app's own name, so it
 // occurs in ordinary dictated prose. Only the ADDRESSING POSITION — the head of the message, which is
 // where `mentions[0]` already means "the envelope" — becomes a pill. Full reasoning, including why
-// the wake phrase ("Hey Sparkle") and stop phrase ("Sparkle, stop") cannot reach this code at all,
-// is on mentions.dictatedSparkleAddress.
+// a dictated "Hey Sparkle…" — said out of habit, since the wake word is retired and nothing strips
+// it any more — lands in the SAME accepted false-positive class rather than a new one, is on
+// mentions.dictatedSparkleAddress.
 describe("ComposeBox — dictated prose that merely CONTAINS 'sparkle' is left alone", () => {
   it("does not pill it mid-sentence", () => {
     const { dictate } = setup({ withDictation: true });

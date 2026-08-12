@@ -12,17 +12,19 @@
 // press-to-dictate control beside Send, whose handler both armed the mic and claimed the target in
 // one gesture. That button was the duplicate of the ring in the column header, and with it removed
 // the claim has to come from somewhere else — because the two ways the mic now goes live (the ring,
-// and saying the wake word, which is no click at all) never ran that handler. Ownership is
-// therefore derived from state rather than from a click:
+// and the send tray moving to Speak or a push-to-talk hold beginning, neither of which is a click
+// on a composer) never ran that handler. Ownership is therefore derived from state rather than
+// from a click:
 //
 //   routing  = mic armed AND phase "active"        (speech is being typed into a box at all)
 //   ours     = dictationStore.voiceSurface === "concierge"   (…and this is the box it belongs to)
 //
 // `voiceSurface` is set by the mic CONTROLS themselves — the ring sets "concierge", an agent
 // composer's ComposerMic sets "agent" — so "the mic you operated owns the transcript" still holds,
-// including for the wake word, which lands on whichever surface was last operated (and on the ring
-// by default). Saying the stop word, muting from anywhere, or arming an agent composer's own mic
-// all drop one of the two conditions, which releases the target here without a click.
+// including for a tray-driven arm, which lands on whichever surface was last operated (and on the
+// ring by default). Moving the tray off Speak (or releasing a hold), muting from anywhere, or
+// arming an agent composer's own mic all drop one of the two conditions, which releases the target
+// here without a click.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -97,9 +99,9 @@ export function useConciergeDictation(
     setOwning(true);
   }, [store]);
 
-  // Routing = the mic is armed AND speech is being typed into a box (rather than waiting on the
-  // wake word). Ownership only makes sense while that holds AND this is the surface the user is
-  // talking to — see `voiceSurface` in dictationStore.
+  // Routing = the mic is armed AND speech is being typed into a box (rather than armed-but-idle,
+  // i.e. Push to talk between holds). Ownership only makes sense while that holds AND this is the
+  // surface the user is talking to — see `voiceSurface` in dictationStore.
   const routing = enabled && phase === "active";
   const oursToHold = routing && voiceSurface === "concierge";
 
@@ -121,9 +123,9 @@ export function useConciergeDictation(
 
   // THE ownership rule, and the only thing that claims now that the box has no mic button of its
   // own. Takes the target the moment the mic starts routing to this surface — whether that came
-  // from the header ring, from a pill choice, or from the wake word with no click at all — and
-  // hands it back the moment either condition drops (stop word, a mute from anywhere, focus loss,
-  // out of credits, or the user arming an agent composer's own mic).
+  // from the header ring, from a pill choice, or from the send tray with no click on a box at all —
+  // and hands it back the moment either condition drops (the tray leaving Speak, a hold released, a
+  // mute from anywhere, focus loss, out of credits, or the user arming an agent composer's own mic).
   useEffect(() => {
     if (oursToHold) {
       if (appendRef.current && insertTarget !== appendRef.current) claim();

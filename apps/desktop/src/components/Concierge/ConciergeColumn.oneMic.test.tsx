@@ -58,7 +58,7 @@ afterEach(() => cleanup());
 
 const MIC_STATES = [
   ["mic off", { enabled: false, status: "idle" as const, phase: "passive" as const }],
-  ["mic armed, waiting on the wake word", { enabled: true, status: "listening" as const, phase: "passive" as const }],
+  ["mic armed but not routing", { enabled: true, status: "listening" as const, phase: "passive" as const }],
   ["mic actively dictating", { enabled: true, status: "listening" as const, phase: "active" as const }],
 ] as const;
 

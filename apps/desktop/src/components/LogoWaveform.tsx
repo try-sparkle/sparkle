@@ -368,8 +368,8 @@ export function LogoWaveform() {
   // The pulsating orb glow is driven directly by the rAF loop (paintOrb), so there's no
   // render-time energy to compute here.
   // Orb blob colors track the WAVEFORM: brand cyan/blue while ACTIVELY dictating, but SHADES OF
-  // GRAY while merely listening for the wake word (passive) — matching the gray bars, so the glow
-  // doesn't imply "active" before the wake word is heard. The grays are derived from the themed
+  // GRAY while armed but not routing (passive — Push to talk between holds) — matching the gray
+  // bars, so the glow doesn't imply "active" before speech is actually being routed. The grays are derived from the themed
   // muted token (the same color the bars use) so they flip correctly in light/dark mode. (Only the
   // mic GLYPH goes green when active — the waveform + orb stay blue by design.)
   const grayLight = `color-mix(in srgb, ${C.muted} 60%, white)`;

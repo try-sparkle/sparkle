@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 //
 // The host wiring for the voice pass (CM-U9) — INPUT ONLY. Voice output was removed whole
-// (PRD/feat/ui-refresh-2026-07-27 §5): the mic, dictation and the wake-word flow stay, and nothing
+// (PRD/feat/ui-refresh-2026-07-27 §5): the mic and dictation stay, and nothing
 // in this app speaks. What is left here is the mic seam plus the turn-token guard, which used to be
 // observed through "which reply gets spoken" and is now observed through the thread itself.
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
@@ -364,7 +364,7 @@ describe("ConciergeHost — turn tokens (a superseded turn keeps talking — con
 describe("ConciergeHost — dictated input", () => {
   it("a DICTATED turn reaches the brain like any other", async () => {
     const c = mount();
-    c.dictate("approve the deploy"); // the stop word then drops the mic; micLive stays false
+    c.dictate("approve the deploy"); // the mic is never armed in this harness; micLive stays false
     await c.send();
     expect(h.startConciergeTurn).toHaveBeenCalledWith(expect.stringContaining("approve the deploy"));
     c.reply("Approved.");

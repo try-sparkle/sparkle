@@ -33,8 +33,18 @@ const NEVER = "Never your code, prompts, file paths, project names, or API keys.
  *  this fresh message and hides the stored `lastStatus`, so a PARTIAL marker that lived only in
  *  the stored status would never be seen on the surface the user is actually looking at.
  *  (roborev 47899) */
-function postedMessage(rows: number, days: number, truncated: boolean): string {
-  const base = `Reported ${rows} row(s) across ${days} day(s).`;
+function postedMessage(
+  rows: number,
+  days: number,
+  truncated: boolean,
+  notice?: string | null,
+): string {
+  let base = `Reported ${rows} row(s) across ${days} day(s).`;
+  // The server's warning, verbatim. It arrives on a report that LANDED, which is exactly the
+  // moment it is still actionable: tkmx-server nags about an outdated client for a while before
+  // it starts freezing that client's data and discarding every row. Swallowing the nag here is
+  // how a machine ends up publishing zero for months with the modal reading "Reported 21 row(s)".
+  if (notice) base = `${base} The server says: ${notice}`;
   return truncated
     ? `${base} PARTIAL — the transcript scan hit its file cap, so this understates your usage.`
     : base;
@@ -130,7 +140,7 @@ export function BuilderIndexConsentModal() {
       const outcome = await builderIndexReportNow();
       setMessage(
         outcome.status === "posted"
-          ? postedMessage(outcome.rows, outcome.days, outcome.truncated)
+          ? postedMessage(outcome.rows, outcome.days, outcome.truncated, outcome.notice)
           : `Not reported yet — ${outcome.reason}.`,
       );
       setStatus(await builderIndexStatus());
@@ -153,7 +163,7 @@ export function BuilderIndexConsentModal() {
       const outcome = await builderIndexReportNow();
       setMessage(
         outcome.status === "posted"
-          ? postedMessage(outcome.rows, outcome.days, outcome.truncated)
+          ? postedMessage(outcome.rows, outcome.days, outcome.truncated, outcome.notice)
           : `Not reported — ${outcome.reason}.`,
       );
       setStatus(await builderIndexStatus());

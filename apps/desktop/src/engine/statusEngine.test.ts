@@ -897,7 +897,7 @@ describe("StatusEngine — self-prompt false-positive guard (Bug A)", () => {
     expect(last()).toBe("working");
   });
 
-  it("does NOT go errored on a single 'Hey, Sparkler.' (the voice-UI wake phrase)", () => {
+  it("does NOT go errored on a single 'Hey, Sparkler.' (how a user addresses Sparkle by name)", () => {
     const { engine, last } = makeEngine();
     engine.ingest(SPINNER);
     engine.ingest("Hey, Sparkler.\n");

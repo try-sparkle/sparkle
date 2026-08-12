@@ -21,7 +21,7 @@ export function matchesAny(entries: readonly string[], query: string): boolean {
  *
  *  Matching is per WHITESPACE-DELIMITED TERM, every term required. Substring-matching the raw query
  *  against one joined haystack — what this replaced — got both directions wrong:
- *    • a multi-word query ("wake word", "beads plan") only matched when the words happened to sit
+ *    • a multi-word query ("push to talk", "beads plan") only matched when the words happened to sit
  *      adjacent and in that order in the haystack, so the rail and a pane could easily disagree;
  *    • and because the haystack is several entries joined with spaces, a query could match a
  *      substring that SPANS two entries (the tail of one row's keywords plus the head of the next

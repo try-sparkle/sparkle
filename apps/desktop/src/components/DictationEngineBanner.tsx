@@ -110,6 +110,20 @@ export const WARNING: Record<DictationFallbackReason, string> = {
   // still ours to fix properly, which is why the copy owns the failure rather than blaming the user.
   mic_missed_hold:
     "That was too quick for the microphone — it was still starting when you let go, so nothing was recorded. Try holding the key a moment longer before you speak. Sparkle is slower to open the mic while your machine is busy",
+  // ── THE SAME LOSS, A DIFFERENT CAUSE, AND A REMEDY THAT IS TRUE FOR IT (roborev 61729) ─────────
+  // Shares "nothing was recorded" with `mic_missed_hold` and must NOT share its advice. That one
+  // says "hold the key a moment longer", which is honest against a capture build of a few hundred
+  // ms to a couple of seconds. A MODEL load measured 2418 ms, 3536 ms and 46 258 ms on this
+  // machine — no hold a human can perform clears 46 seconds, so reusing that string would blame
+  // the user's hold speed for an ONNX initialisation and hand them an instruction that fails every
+  // time they follow it. That is the remedy-unsafe-under-its-own-trigger shape, which the sibling
+  // `too-slow` copy avoids by offering no remedy at all.
+  //
+  // Here a true remedy DOES exist, which is why this is worth its own string: the model loads at
+  // most once per process (measured 5 ms warm afterwards), so "try again in a moment" genuinely
+  // works — and it is bounded, so it does not send the user into a retry loop.
+  model_still_loading:
+    "Sparkle was still loading the voice model, so nothing was recorded. This only happens right after launch — try again in a moment and it will be ready",
   // The two conditions that were previously invisible — both reported as a generic outage, sending
   // the user to debug a network that was never the problem.
   signed_out:

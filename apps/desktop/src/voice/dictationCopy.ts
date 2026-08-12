@@ -147,8 +147,8 @@ export function pausedComposerPlaceholder(reason: PauseReason | null): string {
 }
 
 // PREPARING (the mic is armed but the one-time voice-model download is still running). On a first
-// run this takes MINUTES, and we used to spend all of it painting the passive wake-word copy —
-// inviting the user to say "Hey Sparkle" at a model that didn't exist yet. This copy replaces it so
+// run this takes MINUTES, and we used to spend all of it painting the passive listening copy —
+// inviting the user to speak at a model that didn't exist yet. This copy replaces it so
 // the wait is honest and visible where the user actually is (the composer), not only in the sidebar.
 export const PREPARING_PREFIX = "Setting up voice";
 export const PREPARING_SUFFIX = " — you can type here meanwhile.";

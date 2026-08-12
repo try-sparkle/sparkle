@@ -28,6 +28,17 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/** The reasons that are NOT relay fallbacks — the microphone never started, so there is no live
+ *  preview to lose, no local engine that ran, and nothing captured.
+ *
+ *  ONE LIST, DRIVING BOTH HALVES OF THE DECISION (roborev 61761). This lived as two independent
+ *  literals: one that EXCLUDED these from the relay-copy sweep, and one that listed them for the
+ *  compensating "nothing was recorded" checks. Adding a reason to the first is the natural move
+ *  (it is the test that goes red) and forgetting the second left that reason with no copy
+ *  invariants at all except the no-raw-error rules — the guard-enumerated-by-value trap this very
+ *  file was edited to fix, moved one file over and silent by construction. */
+const NON_RELAY: DictationFallbackReason[] = ["mic_missed_hold", "model_still_loading"];
+
 describe("DictationEngineBanner", () => {
   it("renders nothing at rest — no fallback has been reported", () => {
     const { container } = render(<DictationEngineBanner />);
@@ -96,7 +107,9 @@ describe("DictationEngineBanner", () => {
       // The sweep still covers it for the no-raw-errors and no-false-blame rules above; only this
       // relay-shaped promise is scoped. See the paired test below, which pins the OPPOSITE for the
       // mic reason so neither can drift into the other's copy.
-      if (reason === "mic_missed_hold") continue;
+      // ASKED AS A SET, NOT A VALUE, and that set is module scope so this exclusion and the
+      // compensating checks below cannot diverge — see NON_RELAY.
+      if (NON_RELAY.includes(reason)) continue;
       // What was LOST and that the words still land — the reason the banner exists at all — must be
       // said by every relay reason, not just the two that were written first.
       expect(text).toMatch(/live dictation preview is off/i);
@@ -114,13 +127,30 @@ describe("DictationEngineBanner", () => {
     //
     // Asserted as an ABSENCE plus a positive claim, because absence alone would pass against an
     // empty string.
-    useDictationEngineStore.setState({ fallbackReason: "mic_missed_hold", dismissed: false });
-    render(<DictationEngineBanner />);
-    const text = screen.getByRole("status").textContent ?? "";
-    expect(text).not.toMatch(/still captured/i);
-    expect(text).not.toMatch(/local engine/i);
-    // It must say what actually happened...
-    expect(text).toMatch(/nothing was recorded/i);
+    const say = (reason: DictationFallbackReason) => {
+      cleanup();
+      useDictationEngineStore.setState({ fallbackReason: reason, dismissed: false });
+      render(<DictationEngineBanner />);
+      return screen.getByRole("status").textContent ?? "";
+    };
+    // DRIVEN FROM THE SAME LIST the sweep excludes, so a reason can never be dropped from the
+    // relay checks without being picked up here.
+    expect(NON_RELAY.length).toBeGreaterThan(0);
+    for (const reason of NON_RELAY) {
+      const t = say(reason);
+      expect(t, reason).not.toMatch(/still captured/i);
+      expect(t, reason).not.toMatch(/local engine/i);
+      // It must say what actually happened...
+      expect(t, reason).toMatch(/nothing was recorded/i);
+    }
+    // ...AND THE TWO MUST NOT SHARE A REMEDY (roborev 61729). Both lose the utterance, but a
+    // capture race clears with a longer hold while a model load — measured up to 46s — does not.
+    // Telling a user to hold longer against an ONNX init blames their hold speed and hands them an
+    // instruction that fails every time they follow it.
+    expect(say("mic_missed_hold")).toMatch(/holding the key a moment longer/i);
+    expect(say("model_still_loading")).not.toMatch(/hold/i);
+    expect(say("model_still_loading")).toMatch(/try again in a moment/i);
+    const text = say("mic_missed_hold");
     // ...and must not blame the device, the permission, or another app: all three were verified
     // working while this fired (the input device bound 41/41 times with zero failures).
     expect(text).not.toMatch(/permission|another app|no microphone|not found|unavailable/i);

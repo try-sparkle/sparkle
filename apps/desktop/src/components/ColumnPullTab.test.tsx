@@ -927,6 +927,48 @@ describe("a gesture the app can no longer observe — the stranded drag shield",
     expect(shield()).toBeNull();
   });
 
+  it("is NOT dismissed by a NON-PRIMARY button — a right-click must not kill a live drag", () => {
+    // roborev 59592 (Medium). The self-dismiss reasons that "a live gesture's button is already
+    // down, so a fresh press means the gesture is stale" — and that only holds for the PRIMARY
+    // button of the PRIMARY pointer. Pointer capture is per-`pointerId`, so a right-click, a
+    // middle-click or a second finger during a perfectly healthy resize still reaches the sheet.
+    // Dismissing on those tears down a working gesture and commits a width at whatever intermediate
+    // position the user happened to be at. Before this component grew a shield, a right-click
+    // mid-resize was simply inert; it has to stay inert.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    const el = shield() as HTMLElement;
+    fireEvent.pointerDown(el, { pointerId: 2, button: 2, buttons: 2, clientX: 700 });
+    fireEvent.mouseDown(el, { button: 1, clientX: 700 });
+    expect(shield()).not.toBeNull();
+    expect(onWidth).not.toHaveBeenCalled();
+    // The gesture is still live and still tracking.
+    moveTo(560);
+    expect(painted()).toBe("420px");
+    release();
+    expect(onWidth).toHaveBeenCalledWith(420);
+  });
+
+  it("is NOT dismissed by a SECOND pointer — isPrimary false is a second finger, not a stale sheet", () => {
+    // THE EVENT IS HAND-BUILT, and that is a jsdom caveat rather than a preference. Testing
+    // Library's `fireEvent.pointerDown` goes through a `PointerEventPolyfill` here which carries no
+    // `isPrimary` at all — passing `isPrimary: false` in the init leaves it `undefined` on the
+    // delivered event, so a guard reading `=== false` would never run and this case would pass
+    // against a component that has no such guard. Setting the property on the instance is what makes
+    // the assertion mean anything.
+    const { onWidth } = setup({ cssVar: VAR });
+    press(dots(), 500);
+    moveTo(540);
+    const second = new MouseEvent("pointerdown", { bubbles: true, cancelable: true, button: 0 });
+    Object.defineProperty(second, "isPrimary", { value: false });
+    fireEvent(shield() as HTMLElement, second);
+    expect(shield()).not.toBeNull();
+    expect(onWidth).not.toHaveBeenCalled();
+    release();
+    expect(onWidth).toHaveBeenCalledWith(400);
+  });
+
   it("SWEEPS any orphan shield when a new gesture starts — there is never more than one", () => {
     // The last line of defence: a sheet left behind by an instance that went away without its
     // cleanup running (a crashed render, a hot reload, the freeze itself) is cleared by the next
