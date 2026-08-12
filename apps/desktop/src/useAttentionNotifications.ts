@@ -62,6 +62,8 @@ import {
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withNewAgentCalm } from "./engine/newAgentAttention";
 import { useNewAgentCalm } from "./hooks/useNewAgentCalm";
+import { withBlockedPromptGrace, windowPromptGraceLedger } from "./engine/blockedPromptGrace";
+import { usePromptGraceTick } from "./hooks/useBlockedPromptGrace";
 import { useInteractionStore } from "./stores/interactionStore";
 import {
   withRedWorkerAttention,
@@ -396,6 +398,68 @@ export function attentionBodySource(
   return "generic_fallback";
 }
 
+/** No agent's prompt is being held. A shared frozen instance so the common path allocates nothing. */
+const NO_HELD_PROMPTS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Which of `agents` currently have a DRAWN PROMPT BEING HELD BACK from the founder — the ids
+ * `engine/blockedPromptGrace` de-escalated, read off the two maps rather than re-deriving the rule.
+ *
+ * Derived by DIFFING the overlay's output against its input, and not by exporting a second predicate
+ * from the engine, because the overlay already answers this question exactly once. A separate
+ * "is this one held?" export would be a second copy of a rule with three end conditions and a burn
+ * set, i.e. two chances to disagree about which prompts the founder is being spared. The overlay's
+ * documented no-op contract — the SAME reference back when nothing is held — makes the common case
+ * a single identity comparison.
+ */
+export function heldPromptIds<T extends { id: string }>(
+  agents: readonly T[],
+  status: StatusMap,
+  graced: StatusMap,
+): ReadonlySet<string> {
+  if (graced === status) return NO_HELD_PROMPTS;
+  const out = new Set<string>();
+  for (const a of agents) if (graced[a.id] !== status[a.id]) out.add(a.id);
+  return out.size === 0 ? NO_HELD_PROMPTS : out;
+}
+
+/**
+ * The snapshot `newlyEntered` should compare against NEXT tick, given that this tick deliberately
+ * did not act on the held prompts.
+ *
+ * THE EDGE MUST BE DEFERRED, NOT DROPPED, and that distinction is the whole reason this exists.
+ * Simply `continue`-ing past a held agent in the dispatch loop would ALSO record its red in the
+ * baseline — so when the hold ends there is no longer an edge to detect, and the banner + phone push
+ * are lost permanently. That is strictly worse than not holding at all: the founder would be spared
+ * the notification for the routine prompts AND for the wedged ones, which inverts the entire feature.
+ *
+ * So a held agent's baseline keeps its PREVIOUS value: this tick never happened as far as that agent
+ * is concerned. Whatever it is really doing when the hold lifts is then a fresh transition from where
+ * it genuinely was, which is also why the previous value is restored rather than the de-escalated one
+ * — recording `idle` would swallow the ordinary "Finished — your turn" edge if the agent went on to
+ * finish. An agent with NO previous entry has its key removed, since `undefined` is what "never
+ * observed" means to `newlyEntered` and writing the red in would be the dropped-edge bug again.
+ *
+ * Returns the SAME reference when nothing is frozen, so the common path allocates nothing.
+ */
+export function baselineWithHeldPrompts(
+  next: StatusMap,
+  prev: StatusMap,
+  /** The agents whose banner this run still OWES — not simply the ones held right now. A hold is
+   *  only a reason to freeze when the run that is hiding the prompt is also the run that would have
+   *  delivered its banner; see `owedBanner` at the call site for why those are different sets. */
+  frozenIds: ReadonlySet<string>,
+): StatusMap {
+  if (frozenIds.size === 0) return next;
+  const out: StatusMap = { ...next };
+  for (const id of frozenIds) {
+    const before = prev[id];
+    if (before === undefined) delete out[id];
+    else out[id] = before;
+  }
+  return out;
+}
+
 /** Bring this window to the foreground (notification click landed here). */
 async function bringToFront(): Promise<void> {
   try {
@@ -428,6 +492,25 @@ export function useAttentionNotifications(): void {
   const agents = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.agents ?? EMPTY_AGENTS,
   );
+  // THE WHOLE FLEET, and what it is load-bearing FOR is debt SURVIVAL, not the held set.
+  //
+  // A banner owed to an agent in project A must outlive the founder switching to project B and back
+  // — `liveIds` below is built from this, and it is the only thing that stops the carry-forward loop
+  // pruning that debt as "agent is gone" while he is looking elsewhere. Losing it lost a real
+  // notification: the prompt's edge was consumed while away and there was no transition left to fire
+  // on when the ceiling lapsed (roborev 62857), which is strictly worse than never holding at all.
+  //
+  // NOT because the held set must span `prevStatus`'s keys — an earlier version of this comment said
+  // that, and it stopped being true when the freeze was narrowed to the debt (roborev 62893).
+  // `heldIds` is now only ever consulted for owned ids.
+  //
+  // `agents` still scopes everything else — the dispatch loop, the badge count, the activity stamps
+  // — because those are about what THIS window owns.
+  const projectsForFleet = useProjectStore((s) => s.projects);
+  const fleetAgents = useMemo(
+    () => projectsForFleet.flatMap((p) => p.agents),
+    [projectsForFleet],
+  );
   // The badge count and the banner edge-detector BOTH read this map, and both were firing for
   // agents nobody had briefed: `errored` inside the spawn window inflates countAttention, and `idle`
   // — which notifies by DEFAULT as "Finished — your turn" — is simply false about an agent that was
@@ -441,6 +524,27 @@ export function useAttentionNotifications(): void {
   // Via the hook, not a bare memo: the backstop is a deadline, and an `errored` agent emits no
   // further status writes to recompute one. See hooks/useNewAgentCalm (roborev 54743, finding 1).
   const status = useNewAgentCalm(agents, rawStatus, interactionAt);
+  // A PROMPT THE CONCIERGE IS ABOUT TO ANSWER MUST NOT PING THE FOUNDER. This is the same window
+  // ledger the concierge feed both fills and reads (engine/blockedPromptGrace) — read-only here, and
+  // EMPTY unless the feed has opened an episode, which is what makes this addition inert for every
+  // caller and test that does not exercise the hold.
+  //
+  // It matters more on this path than on the feed's. A row the founder never looks at costs him
+  // nothing; a macOS banner and a phone push are an INTERRUPTION, delivered to a second device, about
+  // a permission dialog that will be answered before he can reach for it. Holding the row while still
+  // firing the banner would have left the whole feature defeated by its loudest channel.
+  const promptGrace = windowPromptGraceLedger();
+  // …and the hold needs a clock here for the same reason it does in the feed, with one extra twist:
+  // this effect's deps are `status` and `agents`, and a prompt whose answerer died changes NEITHER
+  // again. Without the tick the deferred banner below would be deferred FOREVER — the ceiling would
+  // silence a real question instead of merely delaying it. See hooks/useBlockedPromptGrace.
+  // The two ask-capture maps are what let the tick SEE a hold begin — the ledger is a mutated
+  // singleton whose identity never changes, and `setStatus` no-ops on an unchanged value while
+  // `setAttentionScreen` always writes fresh maps (roborev 62851). Subscribed here rather than read
+  // via `getState()` for that exact reason: a `getState()` read would not re-render this hook.
+  const attentionScreen = useRuntimeStore((s) => s.attentionScreen);
+  const attentionScreenAt = useRuntimeStore((s) => s.attentionScreenAt);
+  const promptTick = usePromptGraceTick(fleetAgents, promptGrace, attentionScreen, attentionScreenAt, status);
   const projectName = useProjectStore(
     (s) => s.projects.find((p) => p.id === projectId)?.name ?? "",
   );
@@ -460,6 +564,25 @@ export function useAttentionNotifications(): void {
   // Previous status snapshot + which project it was for, so a project switch re-baselines
   // instead of firing a notification for every already-notifiable agent in the new project.
   const prevStatus = useRef<StatusMap>({});
+  /**
+   * Agents whose banner is OWED — held at some point, and not yet delivered by a run that could
+   * actually deliver it.
+   *
+   * A HELD SET ALONE IS NOT ENOUGH, and that is the whole reason this ref exists. The hold defers an
+   * edge, and an edge is only deferred safely if the baseline stays frozen until someone ACTS on it.
+   * But two ordinary things stop this effect acting: the `sameProject` gate (a tab switch
+   * deliberately re-baselines without notifying, so it does not burst banners), and the dispatch
+   * loop being scoped to the selected project's agents. So with the deferral keyed only on "is it
+   * held right now", a founder who switched tabs inside the 30-second window got: ceiling lapses
+   * while away → nothing held any more → red baselined by a run that could not notify → switch back
+   * → no transition left to detect → the question is silenced permanently (roborev 62857). That is
+   * the "DEFERRED, NOT DROPPED" contract failing in exactly the direction that is strictly worse
+   * than never holding at all.
+   *
+   * Carrying the debt forward instead means the baseline is preserved until a run both owns the
+   * agent and is allowed to fire. Pruned to the live fleet, so a closed agent cannot leak.
+   */
+  const owedBanner = useRef<ReadonlySet<string>>(NO_HELD_PROMPTS);
   const prevProject = useRef<string | null>(null);
   // agentId -> the attention_id we sent the phone, so we can resolve it when it clears.
   const attentionIds = useRef<Record<string, string>>({});
@@ -474,7 +597,20 @@ export function useAttentionNotifications(): void {
   useEffect(() => {
     const now = Date.now();
     const ownedIds = agents.map((a) => a.id);
-    reportAttentionCount(label, countAttention(status, ownedIds));
+    // The whole fleet's ids, for pruning the owed-banner debt below. Fleet-wide for the same reason
+    // the hold is: the baseline it protects spans every project.
+    const liveIds = new Set(fleetAgents.map((a) => a.id));
+    // The held prompts, computed ONCE and used twice below: the dock badge counts the de-escalated
+    // map, and the dispatch loop skips these ids. Same reference back when nothing is held, so an
+    // ordinary tick does no extra work.
+    const graced = withBlockedPromptGrace(fleetAgents, status, promptGrace, now);
+    const heldIds = heldPromptIds(fleetAgents, status, graced);
+    // THE BADGE FOLLOWS THE HOLD TOO. It is the quietest of the three channels, but it is the one
+    // that is always on screen: a dock badge reading "3" that clears itself twice a minute is the
+    // same self-clearing noise in miniature, and leaving it alone would mean the founder still sees a
+    // number he cannot act on. Nothing about edge detection is involved — `countAttention` is a level
+    // reading, so this is a pure count over a map that already exists.
+    reportAttentionCount(label, countAttention(graced, ownedIds));
 
     // Observe activity narrations so we can judge their freshness at fire time (Phase-2b). Done
     // every run (before the sameProject gate) so a project switch still re-baselines the stamps.
@@ -504,6 +640,11 @@ export function useAttentionNotifications(): void {
       // delays an unrelated notice. The effect can't be async, so each task has its own catch.
       const pid = projectId;
       for (const { id, status: st } of newlyEntered(prevStatus.current, status, ownedIds, enabled)) {
+        // A prompt still inside its grace window: neither channel fires. The edge is DEFERRED, not
+        // dropped — `baselineWithHeldPrompts` below keeps this agent's previous baseline, so when the
+        // hold ends (ceiling lapsed, answerer declined, pane unreachable) this same transition is
+        // detected afresh and both channels fire then.
+        if (heldIds.has(id)) continue;
         const agent = agents.find((a) => a.id === id);
         if (!agent || pid == null) continue;
         const agentName = agent.name;
@@ -619,15 +760,59 @@ export function useAttentionNotifications(): void {
         delete attentionIds.current[id];
       }
     }
-    prevStatus.current = status;
+    // What is still OWED after this run: everything held right now, plus every earlier debt this run
+    // was not in a position to pay. A debt is paid only by a run that is BOTH allowed to notify
+    // (`sameProject`) and actually looking at that agent (`ownedIds`) — the two conditions the
+    // dispatch loop above needs to have considered it.
+    const ownedSet = new Set(ownedIds);
+    // A DEBT IS ONLY TAKEN ON BY A RUN THAT COULD HAVE PAID IT — the acquisition condition mirrors
+    // the payment condition exactly, and it must (roborev 62869). `heldIds` is fleet-wide, and the
+    // dispatch loop is `ownedIds`-scoped, so no banner was ever suppressed for an agent in another
+    // project and there is nothing owed to it. (The FREEZE below mirrors this same set — it does not
+    // use `heldIds` either, for the reason spelled out there.)
+    // Seeding the debt from the fleet froze those agents' baselines at their pre-hold value for as
+    // long as they stayed unowned — and then the first tick after the founder opened that project
+    // read every one of them as a fresh entry and fired a banner AND a phone push for each. That is
+    // the burst the `sameProject` gate exists to prevent, reintroduced through the back door.
+    // ONE definition of "this run was in a position to deliver that agent's banner", used to both
+    // ACQUIRE and PAY the debt. Written on one line so a mutation check can judge it — the two
+    // conditions drifting apart is precisely how a debt becomes unpayable.
+    const canPay = (id: string): boolean => sameProject && ownedSet.has(id);
+    const stillOwed = new Set([...heldIds].filter(canPay));
+    for (const id of owedBanner.current) {
+      if (!liveIds.has(id)) continue; // agent is gone; nothing left to notify about
+      const couldHaveFired = canPay(id) && !heldIds.has(id);
+      if (!couldHaveFired) stillOwed.add(id);
+    }
+    owedBanner.current = stillOwed.size === 0 ? NO_HELD_PROMPTS : stillOwed;
+    // THE FREEZE MIRRORS THE DEBT EXACTLY — `owedBanner`, not the fleet-wide held set.
+    //
+    // It is the FREEZE, not the debt, that produces a burst (roborev 62893). Freezing an unowned
+    // agent's baseline held it at `working` for as long as the hold was live, so a founder who opened
+    // that project BEFORE the ceiling lapsed got a fresh `working → waiting` edge at the lapse tick —
+    // one banner and one phone push per held agent. Opening a project with the same number of
+    // NON-held reds delivers zero, because the `sameProject` gate re-baselines silently.
+    //
+    // That inconsistency is the thing to remove, so this picks PARITY: arriving at a held prompt is
+    // the same experience as arriving at any other red — the row is there, and the founder is not
+    // interrupted about a question that was never being deferred on his behalf. An agent only ever
+    // has its baseline frozen while a run that could actually deliver its banner is the one holding
+    // it back, which is precisely what `owedBanner` means.
+    prevStatus.current = baselineWithHeldPrompts(status, prevStatus.current, owedBanner.current);
     prevProject.current = projectId;
+    // `promptTick` is deliberately NOT referenced in the body — it is the only dependency that
+    // changes when a grace window closes with nothing else happening in the app, which is precisely
+    // when a deferred banner is due. Same pattern, and the same reason, as useConciergeFeed's memo.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     status,
     agents,
+    fleetAgents,
     projectId,
     label,
     projectName,
     enabled,
+    promptTick,
   ]);
 
   // Report 0 on unmount so a closed window stops contributing to the app-global badge total.

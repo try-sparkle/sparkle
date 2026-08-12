@@ -10,7 +10,9 @@
 // agent wherever it is" path a notification click takes.
 import { useEffect, useMemo, useState } from "react";
 import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
+import { usePromptGraceTick } from "./hooks/useBlockedPromptGrace";
 import { windowRetractionLedger } from "./engine/movementRetraction";
+import { windowPromptGraceLedger } from "./engine/blockedPromptGrace";
 import { getRoster, onRosterChanged } from "./services/attention";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { buildConciergeFeed, type ConciergeFeed } from "./services/conciergeFeed";
@@ -50,6 +52,12 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
   const lastObserved = useRuntimeStore((s) => s.lastObserved);
   const agentMovement = useRuntimeStore((s) => s.agentMovement);
+  // The captured ask screen + when it was captured — the two sibling maps the prompt-grace rule
+  // hashes a prompt's identity from and measures its 30s ceiling against. Subscribed as a PAIR
+  // because the store writes them as one (runtimeStore.attentionScreenAt), and a feed holding one
+  // without the other would measure a hold from the wrong instant.
+  const attentionScreen = useRuntimeStore((s) => s.attentionScreen);
+  const attentionScreenAt = useRuntimeStore((s) => s.attentionScreenAt);
   const interaction = useInteractionStore((s) => s.lastAt);
 
   // WHEN EACH RED BEGAN — the other half of `engine/movementRetraction` (bead sparkle-7ba9e).
@@ -72,6 +80,14 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   // `rolledUpGreen` already is. Stamping it here off local `status` alone would leave every unhosted
   // red with no epoch — and a red with no epoch is never retracted, which is the whole bug.
   const retraction = windowRetractionLedger();
+
+  // WHICH DRAWN PROMPTS ARE BEING HELD — the same argument as `retraction` above, plus two reasons
+  // of its own (see `engine/blockedPromptGrace.windowPromptGraceLedger`). The BURN SET is the only
+  // record that a prompt was already hidden once, so losing it on an unmount re-arms the invisible
+  // hide→re-raise→hide loop the never-twice rule exists to prevent. And the OUTCOMES are written
+  // from services (`conciergeDispatch`, `suggestions/approvalsRuntime`) that hold no React context
+  // at all, so a per-component ledger could not receive them even in principle.
+  const promptGrace = windowPromptGraceLedger();
 
   // The store's shouldInterrupt is a STABLE function reference, so subscribing to it alone would
   // never re-render when a rule is added/cleared. Subscribe to the rules map and rebuild the gate
@@ -104,11 +120,15 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   // `errored` agent — so without a tick the concierge column would band it calm forever while
   // `get_agent_status` (clock-per-call) reported errored/needsYou. Same defect, same fix, as the
   // three surfaces in hooks/useNewAgentCalm (roborev 54830).
-  const graceTick = useNewAgentGraceTick(
-    useMemo(() => projects.flatMap((p) => p.agents), [projects]),
-    status,
-    interaction,
-  );
+  const fleetAgents = useMemo(() => projects.flatMap((p) => p.agents), [projects]);
+  const graceTick = useNewAgentGraceTick(fleetAgents, status, interaction);
+
+  // …AND THE PROMPT HOLD IS A DEADLINE TOO, with a sharper edge. The 30s ceiling exists for exactly
+  // the case where the answerer is wedged, crashed or was never invoked — and in every one of those
+  // cases nothing further is emitted, so none of this memo's deps change again and the held prompt
+  // would band CALM FOREVER while the founder never learns a question was asked. Same defect, same
+  // fix; see hooks/useBlockedPromptGrace.
+  const promptTick = usePromptGraceTick(fleetAgents, promptGrace, attentionScreen, attentionScreenAt, status);
 
   return useMemo(
     () =>
@@ -125,10 +145,13 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
         pinnedProjectId,
         agentMovement,
         retraction,
+        promptGrace,
+        attentionScreen,
+        attentionScreenAt,
       }),
-    // `graceTick` is not referenced in the body BY DESIGN — it is the only input that changes when a
-    // grace window closes with nothing else happening in the app, which is the whole point of it.
-    // Same pattern, and the same reason, as hooks/useNewAgentCalm's memo.
+    // `graceTick` / `promptTick` are not referenced in the body BY DESIGN — they are the only inputs
+    // that change when a grace window closes with nothing else happening in the app, which is the
+    // whole point of them. Same pattern, and the same reason, as hooks/useNewAgentCalm's memo.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       projects,
@@ -138,11 +161,14 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       openAgentIds,
       lastObserved,
       agentMovement,
+      attentionScreen,
+      attentionScreenAt,
       interaction,
       roster,
       shouldInterrupt,
       pinnedProjectId,
       graceTick,
+      promptTick,
     ],
   );
 }

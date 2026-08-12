@@ -158,6 +158,18 @@ const GLYPH_EXEMPT = new Set([
   // `isRegexLiteral` escape hatch covers a line that IS a bare regex but not a `const` holding an
   // array of them, which is the only reason this file surfaces at all.
   "engine/claudeCodeScreen.ts",
+  // `services/promptTextNormalize.ts` is the same category as the line above, and arrived by the
+  // same route. Its `VOLATILE_SPAN` names the braille/ASCII spinner codepoints so it can STRIP them
+  // out of a captured terminal screen — `⠋⠙⠹…◐◓◑◒` are bytes another program painted into a PTY, and
+  // matching them is the entire point. There is no DOM and no output; a react-icon cannot match text
+  // on a terminal, and changing the codepoints would simply stop the matcher working.
+  //
+  // It surfaces here only because the regex is too long to fit on one line, so the scanner's
+  // `isRegexLiteral` escape hatch — which needs the `= /…/g;` on a single line — does not fire. That
+  // is a formatting accident, not a fact about the code: the identical regex lived unflagged in
+  // `services/pickerFingerprint.ts` purely because it fit. Naming the file states the exemption
+  // deliberately instead of leaving it hostage to prettier's print width.
+  "services/promptTextNormalize.ts",
 ]);
 
 function hits(): string[] {

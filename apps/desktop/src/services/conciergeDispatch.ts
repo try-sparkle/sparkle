@@ -103,6 +103,9 @@ import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
+// The blocked-prompt grace window's outcome channel. A VALUE import, and it does not close a cycle:
+// that module imports `ConciergeDispatchPath` from here `import type`, which erases at compile time.
+import { answerOutcomeForPath, notePromptAnswerOutcome } from "../engine/blockedPromptGrace";
 import { pickerFingerprint } from "./pickerFingerprint";
 import {
   screenBlocksWrite,
@@ -467,14 +470,49 @@ export function answersLivePicker(agentId: string, text: string): boolean {
 }
 
 /**
+ * Tell the blocked-prompt grace window what just became of an answer attempt, and hand the result
+ * straight back.
+ *
+ * ONE FUNNEL, NOT N SPRINKLED CALLS, and that is the whole reason it exists rather than a
+ * `notePromptAnswerOutcome` beside each `return`. This function has sixteen return arms and grows a
+ * new one every few roborev rounds; a per-arm call means the next arm added is silently unreported,
+ * and an unreported REFUSAL is the exact failure the grace window was built to remove — the founder's
+ * prompt stays hidden for the full ceiling because nothing said the answerer had given up on it.
+ * Routing every arm through here makes "did you report it?" a property of the wrapper, not of the
+ * author's memory.
+ *
+ * The classification is NOT re-derived here: `answerOutcomeForPath` is exhaustive over
+ * `ConciergeDispatchPath` with a `never` guard, so a new path is a compile error there until someone
+ * decides which of handled/declined/unreachable it is. Deciding it twice would let the two copies
+ * disagree, and the safe-looking arm (`handled`) is the one that hides a prompt.
+ */
+function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatchResult {
+  notePromptAnswerOutcome(result.agentId, answerOutcomeForPath(result.path));
+  return result;
+}
+
+/**
  * Route a user's concierge answer to `agentId`'s terminal. Re-reads the CURRENT screen so we only
  * answer a still-present prompt. Returns a structured result; the concierge surfaces it (e.g. "sent",
  * "which option?", or "that agent's terminal has closed"). Never throws for the expected outcomes.
+ *
+ * The body is `routeConciergeAnswer` below; this wrapper exists ONLY to put every one of its returns
+ * through {@link reportAnswerOutcome}. See that function for why the reporting is not written at the
+ * individual arms. A thrown (unexpected) error reports nothing on purpose: nothing was decided about
+ * the prompt, so the grace window's ceiling is the honest backstop.
  */
 export async function dispatchConciergeAnswer(
   agentId: string,
   text: string,
   /** No default, deliberately — `authority` must be declared. See ConciergeDispatchOptions. */
+  opts: ConciergeDispatchOptions,
+): Promise<ConciergeDispatchResult> {
+  return reportAnswerOutcome(await routeConciergeAnswer(agentId, text, opts));
+}
+
+async function routeConciergeAnswer(
+  agentId: string,
+  text: string,
   opts: ConciergeDispatchOptions,
 ): Promise<ConciergeDispatchResult> {
   // THE GATE, and it runs before everything — ahead of the emptiness check, the cloud check and any
@@ -958,6 +996,17 @@ export function onDeferredSendOutcome(cb: OutcomeListener): () => void {
 }
 
 function emitOutcome(r: ConciergeDispatchResult): void {
+  // ══ THE DEFERRED HALF OF THE GRACE WINDOW'S OUTCOME CHANNEL ═══════════════════════════════════
+  // Every deferred outcome passes through here — a queued prompt finally delivered, one that aged
+  // out (`expired`), one whose pane died while it waited (`pty-gone`), one abandoned by an unmount.
+  // The three failures are exactly the case the direct path CANNOT report: the dispatch already
+  // answered `queued` (→ `handled`, keep holding), and if the send then never lands, nothing else
+  // would ever correct that and the founder's prompt would ride out the whole 30s ceiling.
+  //
+  // BEFORE the listeners, not after: a listener throwing is swallowed below by design, and the
+  // grace window must not be hostage to that. It reports the LATEST outcome for the agent, so an
+  // older entry's expiry followed by a fresh `queued` correctly ends on the in-flight send.
+  reportAnswerOutcome(r);
   for (const cb of outcomeListeners) {
     try {
       cb(r);

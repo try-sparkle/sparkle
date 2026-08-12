@@ -39,6 +39,12 @@ import {
   type MovementEvidence,
   type RetractionLedger,
 } from "../engine/movementRetraction";
+import {
+  notePromptEpisodes,
+  withBlockedPromptGrace,
+  type PromptAsk,
+  type PromptGraceLedger,
+} from "../engine/blockedPromptGrace";
 import { publishedStatusFor } from "../useAttentionNotifications";
 import type { BranchStatus } from "./branchStatus";
 import type { Roster } from "./rosterTypes";
@@ -257,7 +263,34 @@ export interface ConciergeFeedInput {
    *  caller (`useConciergeFeed`) holds the window's shared ledger. Omit in tests for no retraction —
    *  a red whose beginning was never observed is never retracted. */
   retraction?: RetractionLedger;
-  /** The clock, for tests. Defaults to `Date.now()`; only the red-epoch stamp reads it. */
+  /** WHICH DRAWN PROMPTS ARE BEING HELD BACK while an automated answerer works — a caller-owned
+   *  ledger this builder both MUTATES (`notePromptEpisodes`) and reads (`withBlockedPromptGrace`),
+   *  exactly like `retraction` above and for the same reason: the episode has to be opened against
+   *  the merged status, and that merge only exists in here.
+   *
+   *  OMITTED MEANS NO HOLD, which is precisely today's behaviour — every existing caller and every
+   *  existing test is unchanged by this field's arrival. See `engine/blockedPromptGrace` for the
+   *  whole rule; the short version is that a routine permission dialog an answerer disposes of in
+   *  under a second must not spend a second in the founder's needs-you list. */
+  promptGrace?: PromptGraceLedger;
+  /** The captured ask screen per agent (runtimeStore.attentionScreen) — what the hold's identity is
+   *  hashed from. NO TEXT → NO IDENTITY → NO HOLD: a rule that cannot tell two prompts apart cannot
+   *  honour "never suppress the same prompt twice", so it declines to run rather than guess. Omit
+   *  for no hold. */
+  attentionScreen?: Record<string, string>;
+  /** When each `attentionScreen` entry was WRITTEN (runtimeStore.attentionScreenAt) — the instant the
+   *  30s ceiling is measured from.
+   *
+   *  A SIBLING MAP, mirroring the store's own shape (bead sparkle-5wbhn) rather than collapsing the
+   *  pair into `{ text, at }` here: the two are written in lockstep by `runtimeStore`, and re-shaping
+   *  them at this boundary would give the feed a third representation to keep in step. Its absence is
+   *  not fatal — an entry with no timestamp measures from `nowMs` instead, which merely means a
+   *  prompt that predates this window's first observation earns a fresh window rather than surfacing
+   *  at once. */
+  attentionScreenAt?: Record<string, number>;
+  /** The clock, for tests. Defaults to `Date.now()`; read by the red-epoch stamp and the prompt
+   *  grace window (which is the SAME clock on purpose — two would let the epoch a hold is measured
+   *  from and the moment it is judged against disagree inside one rebuild). */
   nowMs?: number;
   /** The mute gate (sparklePrefsStore.shouldInterrupt). Defaults to allow-everything. */
   shouldInterrupt?: (topic: string) => boolean;
@@ -555,10 +588,47 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     );
     noteMovement(ledger, (id) => input.agentMovement?.[id], nowMs);
   }
-  const mergedStatus =
+  const retractedStatus =
     ledger === undefined
       ? observedStatus
       : withMovementRetraction(allAgents, observedStatus, isDismissibleRed, ledger);
+
+  // ── A PROMPT SOMEBODY IS ABOUT TO ANSWER IS NOT YET THE FOUNDER'S PROBLEM ────────────────────
+  //
+  // The rule, and every word of the reasoning behind it, lives in `engine/blockedPromptGrace`. Two
+  // placement decisions are made HERE, and both are load-bearing.
+  //
+  // (1) BEFORE `publishedStatusFor`, for the identical reason retraction is. That call bubbles a
+  // worker's red onto its orchestrator and rolls subtrees up; holding afterwards would calm the
+  // WORKER while leaving the parent wearing a copy of a red whose owner is calm — a needs-you row
+  // naming an agent that is not asking, which is exactly what this is trying to remove. Holding
+  // first means the held prompt never enters the bubble at all.
+  //
+  // (2) AFTER `withMovementRetraction`, which is the less obvious call, so: the two overlays produce
+  // the SAME output in either order (retraction only ever de-escalates a red, and a de-escalated
+  // status is no longer a demonstrated ask, so whichever runs second finds nothing left to do). What
+  // the order really decides is which map the MUTATOR observes — and an episode carries a cost the
+  // overlay does not. Opening one BURNS that prompt's identity, permanently and by design ("never
+  // suppress the same prompt twice"), so a burn spent on a red that retraction was about to withdraw
+  // is a burn the same question cannot spend later when it is genuinely re-drawn. Retraction answers
+  // the prior question — is this red even a claim about NOW? — so it goes first, and an episode is
+  // only ever opened for a prompt the founder would otherwise really have seen.
+  //
+  // Same clock as the epoch stamp above (`nowMs`), never a second `Date.now()`: the instant a hold is
+  // measured from and the instant it is judged against must not be able to disagree within one build.
+  const promptGrace = input.promptGrace;
+  let mergedStatus = retractedStatus;
+  if (promptGrace !== undefined) {
+    const askOf = (id: string): PromptAsk | undefined => {
+      const text = input.attentionScreen?.[id];
+      if (text === undefined) return undefined;
+      const at = input.attentionScreenAt?.[id];
+      return at === undefined ? { text } : { text, at };
+    };
+    const fleetIds = allAgents.map((a) => a.id);
+    notePromptEpisodes(promptGrace, retractedStatus, askOf, nowMs, fleetIds);
+    mergedStatus = withBlockedPromptGrace(allAgents, retractedStatus, promptGrace, nowMs);
+  }
   // `rolledUpGreen` collects the heads whose `working` is their SUBTREE's, not their own. The away-
   // recap needs that distinction: a promoted head goes idle→working→idle purely because its worker
   // ran, which reads as the head finishing a job it never started (roborev 53886).

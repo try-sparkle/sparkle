@@ -12,7 +12,8 @@ import { useApprovalsStore } from "../../stores/approvalsStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { aiFeatureVisibleNow } from "../aiGate";
-import { writePtyChained } from "../../pty";
+import { writePtyChainedStrict } from "../../pty";
+import { notePromptAnswerOutcome } from "../../engine/blockedPromptGrace";
 import { classifyApproval, headerRegion } from "./approvalClassifier";
 import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
 import { detectClaudeCodePicker, detectResumePrompt } from "./heuristics";
@@ -36,6 +37,60 @@ export function pickerSignature(scrollback: string): string {
 }
 
 /**
+ * "I read this prompt and I am not going to answer it." Records `declined` for the blocked-prompt
+ * grace window and returns the `null` the caller was returning anyway, so a decline arm stays one
+ * line and cannot drift into a bare `return null`.
+ *
+ * WHICH ARMS GET THIS, AND WHICH MUST NOT. Only the returns taken AFTER the screen has been
+ * recognised as a prompt — the master toggle being off, the denied-tool veto, an MCP tool the policy
+ * will not auto-answer, a rule that is not `always`, a resume rule left at `ask`. Every one of those
+ * is this module reading a real question and handing it to the human, which is precisely what
+ * `declined` means and why it surfaces the row at once.
+ *
+ * NOT the "this isn't a prompt I recognise" arms (`!classification`, `!detected`). Reporting there
+ * would fire on EVERY ordinary screen this runs against — a build log, an idle shell — and each one
+ * would stamp an outcome that ends the hold for whatever prompt the agent draws next. That is not a
+ * narrower version of the feature; it is the feature switched off, with the cost of a per-frame write.
+ */
+function declined(agentId: string): null {
+  notePromptAnswerOutcome(agentId, "declined");
+  return null;
+}
+
+/**
+ * Type an auto-answer keystroke into `agentId`'s pane and REPORT WHAT BECAME OF IT to the
+ * blocked-prompt grace window (engine/blockedPromptGrace).
+ *
+ * ══ WHY THE STRICT VARIANT ═════════════════════════════════════════════════════════════════════
+ * This used to be `void writePtyChained(...)` — the TOLERANT write, which resolves even when the PTY
+ * is gone (it exists to swallow the teardown race). Under it, ANSWERED and FAILED-TO-REACH are
+ * literally indistinguishable from here: there is no rejection to observe, so this module could not
+ * report a failure however hard it tried. That is the state the grace window cannot survive — an
+ * unreachable pane means nobody but the founder is going to answer this prompt, and it is the case
+ * he called out by name. The strict variant rejects with PtyGoneError, which is the only thing that
+ * makes `unreachable` reportable at all.
+ *
+ * The promise was ALREADY ignored (`void`), so nothing about the write's timing or ordering changes;
+ * what changes is that the rejection now has somewhere to go. BOTH arms are attached deliberately —
+ * a `.then(ok)` alone would turn every dead-PTY auto-approve into an unhandled rejection.
+ */
+function typeAutoAnswer(agentId: string, keystroke: string, what: "auto-approve" | "auto-resume") {
+  // Chained: the option keystroke carries its own CR (see pty.writePtyChainedStrict).
+  void writePtyChainedStrict(agentId, keystroke).then(
+    () => {
+      notePromptAnswerOutcome(agentId, "handled");
+    },
+    (err: unknown) => {
+      notePromptAnswerOutcome(agentId, "unreachable");
+      log.warn("approvals", `${what} keystroke never reached the pane`, {
+        agentId,
+        e: String(err),
+      });
+    },
+  );
+}
+
+/**
  * Decide whether to auto-answer the permission prompt (if any) currently in `scrollback`, and if so
  * type the plain-Yes keystroke into the PTY exactly once per picker instance. Returns the category
  * it auto-answered (so the caller shows the "Auto-approved {label}" note and suppresses buttons), or
@@ -50,11 +105,13 @@ export function maybeAutoApprove(
   handled: Set<string>,
 ): ApprovalCategory | null {
   const classification = classifyApproval(scrollback);
+  // NOT a `declined` report, deliberately — see the note above `maybeAutoApprove`. An unclassifiable
+  // screen is not a decision about a prompt; there may be no prompt at all.
   if (!classification) return null; // not a classifiable permission prompt → never auto-type
   // Master toggle only — NOT credit-gated. Auto-approve is a purely local regex classifier that
   // spends no AI credits, so gating it on a positive balance would leave out-of-credit users blocked
   // by prompts forever. The on/off toggle (ai.auto_approve) is the sole gate here.
-  if (!aiFeatureVisibleNow("autoApprove")) return null;
+  if (!aiFeatureVisibleNow("autoApprove")) return declined(agentId);
   // ---------------------------------------------------------------------------------------------
   // THE DENY VETO, deliberately ahead of the category branch and independent of it.
   //
@@ -77,7 +134,7 @@ export function maybeAutoApprove(
       category: classification.category,
       tool: namedTool,
     });
-    return null;
+    return declined(agentId);
   }
   const root = projectRootForAgent(agentId);
   const rule = effectiveApprovalRule(root, classification.category);
@@ -89,17 +146,19 @@ export function maybeAutoApprove(
   // founder kept hitting — and it refuses anything that spawns, discards, merges, pushes, or speaks
   // as him EVEN IF he set `mcp = "always"`. An unreadable tool name always asks.
   if (classification.category === "mcp") {
-    if (mcpAutoAnswerable(promptRegion, rule) !== "auto") return null;
+    if (mcpAutoAnswerable(promptRegion, rule) !== "auto") return declined(agentId);
   } else if (rule !== "always") {
-    return null;
+    return declined(agentId);
   }
   const sig = pickerSignature(scrollback);
   // Already answered THIS picker instance: keep the buttons suppressed + the note shown, but never
   // re-send the keystroke (a re-hash of the same settled screen must not double-answer).
+  // NOTHING IS REPORTED HERE either: the answer that settled this picker already reported its own
+  // outcome, and re-stating it would overwrite a later, truer one (a `handled` written now would
+  // undo the `unreachable` the write it refers to may have just recorded).
   if (handled.has(sig)) return classification.category;
   handled.add(sig);
-  // Chained: the option keystroke carries its own CR (see pty.writePtyChained).
-  void writePtyChained(agentId, classification.approveOption);
+  typeAutoAnswer(agentId, classification.approveOption, "auto-approve");
   // The audit trail for an answer the human never saw. `tool` is the load-bearing field: a bare
   // category cannot distinguish a narration string that was auto-answered from a lifecycle op that
   // was, which is the exact question anyone reviewing this after the fact will be asking.
@@ -130,19 +189,24 @@ export function maybeAutoResume(
   handled: Set<string>,
 ): Exclude<ResumeRule, "ask"> | null {
   const detected = detectResumePrompt(scrollback);
+  // No report — the exact parallel of `!classification` above, for the same reason: a screen that is
+  // not the resume prompt is not a decision about anything.
   if (!detected) return null; // not the resume prompt (or missing an option) → never auto-type
   // Gated on the SAME master toggle as auto-approve — this is a sub-option of it, so it must never
   // fire while the parent is off.
-  if (!aiFeatureVisibleNow("autoApprove")) return null;
+  if (!aiFeatureVisibleNow("autoApprove")) return declined(agentId);
   const root = projectRootForAgent(agentId);
   const rule = effectiveResumeRule(root);
-  if (rule === "ask") return null; // user hasn't opted into auto-resuming → surface the prompt
+  // "surface the prompt" is now literal rather than aspirational: `declined` is what takes this
+  // prompt out of the grace window's hold and puts it in front of the founder immediately.
+  if (rule === "ask") return declined(agentId); // user hasn't opted in → surface the prompt
   const sig = pickerSignature(scrollback);
-  // Already answered THIS picker instance: keep buttons suppressed, but never re-send the keystroke.
+  // Already answered THIS picker instance: keep buttons suppressed, but never re-send the keystroke
+  // — and never re-report it either (see the same early return in maybeAutoApprove).
   if (handled.has(sig)) return rule;
   handled.add(sig);
-  // Chained: the option keystroke carries its own CR (see pty.writePtyChained).
-  void writePtyChained(agentId, rule === "summary" ? detected.summaryOption : detected.fullOption);
+  const option = rule === "summary" ? detected.summaryOption : detected.fullOption;
+  typeAutoAnswer(agentId, option, "auto-resume");
   log.info("approvals", "auto-resumed", { agentId, mode: rule });
   return rule;
 }

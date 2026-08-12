@@ -7,7 +7,10 @@ const writePty = vi.fn((_id: string, _data: string) => Promise.resolve());
 vi.mock("../../pty", () => ({
   // The module writes through the CHAINED variant: these keystrokes carry their own carriage
   // return, so they must not land inside another operation's paste→CR window (roborev 54375).
-  writePtyChained: (id: string, data: string) => writePty(id, data),
+  // STRICT, because a dead PTY has to REJECT here — the tolerant variant cannot tell "answered"
+  // from "never reached the pane", which is what the grace window needs to know. See
+  // approvalsRuntime.grace.test.ts for the paired resolve/reject cases.
+  writePtyChainedStrict: (id: string, data: string) => writePty(id, data),
 }));
 
 // Auto-approve is gated on the flag-only VISIBLE read (aiFeatureVisibleNow), NOT the credit-gated
@@ -24,6 +27,7 @@ import {
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useApprovalsStore } from "../../stores/approvalsStore";
 import { useProjectStore } from "../../stores/projectStore";
+import { resetPromptGraceLedgerForTests } from "../../engine/blockedPromptGrace";
 
 const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
 const RESUME_FOOTER = "Enter to confirm · Esc to cancel";
@@ -61,6 +65,9 @@ const BASH_PROMPT_AMEND_FOOTER = [
 ].join("\n");
 
 beforeEach(() => {
+  // The grace ledger is WINDOW-level module state: an outcome one case records would otherwise
+  // still be there deciding the next one.
+  resetPromptGraceLedgerForTests();
   writePty.mockClear();
   aiFeatureVisibleNow.mockReturnValue(true);
   // No project in context → effectiveApprovalRule falls back to the global settings mirror.

@@ -19,6 +19,7 @@
 // `getAgentScrollback`, so a test can drive the whole identity rule through one seam.
 
 import { getAgentScrollback } from "./terminalScrollback";
+import { ANSI, steady } from "./promptTextNormalize";
 import {
   pickerBlockBounds,
   pickerWindow,
@@ -38,24 +39,13 @@ import type { SuggestionButton } from "./suggestions/types";
 // (roborev 55218). The rule that survived four rounds of this is parity, not generosity, so the
 // generic branch imports `MENU_LINE` and there is exactly one definition of what an option row is.
 
-/** Content that MOVES on its own: progress percentages, `(3120/6640)` counters, byte totals,
- *  elapsed-time readouts, braille/ASCII spinners. Any of it inside a fingerprint makes the
- *  fingerprint tick while the question sits still, so `read_picker_options` and
- *  `select_picker_option` disagree and the prompt becomes UNANSWERABLE — with a refusal whose own
- *  remedy is "re-read and try again", which loops (roborev 55170).
- *
- *  NORMALISED, NOT DROPPED. Dropping the whole line was worse than the bug it fixed: these patterns
- *  match ordinary question text — "Delete 2.3 GB of build artifacts? [y/n]" is a volatile line by
- *  this pattern — so the filter discarded the only content that distinguishes one prompt from
- *  another, and two destructive-vs-benign prompts collapsed to the same empty block (roborev 55172).
- *  Replacing just the moving SPAN with a placeholder keeps the distinguishing text and neutralises
- *  the movement. */
-const VOLATILE_SPAN = /\d+(?:\.\d+)?\s*%|\(\s*\d+\s*\/\s*\d+\s*\)|\b\d+(?:\.\d+)?\s*[KMG]i?B\b|\b\d+m\s*\d+s\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/g;
-
-/** Neutralise the moving parts of a line, keeping everything else. */
-function steady(line: string): string {
-  return line.replace(VOLATILE_SPAN, "#");
-}
+// THE NORMALISER MOVED OUT, unchanged, to `services/promptTextNormalize` (roborev 62838, finding 3).
+// `engine/blockedPromptGrace` needs the identical rule to decide whether a re-drawn question is one
+// it has already held, and it cannot import THIS module (the `getAgentScrollback` /
+// suggestion-heuristic imports above are not reachable from `engine/`). It briefly carried a verbatim
+// copy of the two regexes instead, with a comment claiming a cross-module test kept them in step and
+// no such test existing — so what a prompt's identity IS now has exactly one definition, and the two
+// callers share it rather than resembling each other.
 
 /** How far above the option block the question may sit. Claude Code's Bash-approval dialog puts the
  *  command and its description 3–4 lines up; generous without reaching into unrelated output. */
@@ -67,13 +57,6 @@ const QUESTION_BLOCK_MAX_LINES = 20;
 
 /** How many trailing non-empty lines a y/n question may occupy — the detector's own rule. */
 const YN_TAIL = 2;
-
-/** The same screen re-rendered with a different highlight colour must not read as a different
- *  question, so escapes come off before anything is hashed. Hoisted with the disable comment the
- *  way `suggestions/pendingQuestion.ts` and `engine/statusEngine.ts` do it — the rule is right in
- *  general, and this is the one place it does not apply. */
-// eslint-disable-next-line no-control-regex
-const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
 
 // NO LOCAL RUN SELECTOR EITHER.
 //
