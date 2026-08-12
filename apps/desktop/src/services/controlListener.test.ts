@@ -161,6 +161,7 @@ import { useConciergeAudit, _resetConciergeAuditForTests } from "./conciergeAudi
 // perfectly if the wiring is deleted, and nothing else would notice.
 import {
   onConciergeActionReceipt,
+  setConciergeTurnOrigin,
   _resetConciergeReceiptsForTests,
   type ConciergeActionReceipt,
 } from "./conciergeReceipts";
@@ -3973,6 +3974,76 @@ describe("controlListener", () => {
         // a subscriber pushing into a dead array for the rest of the file.
         _resetConciergeReceiptsForTests();
         classifyReceiptMock.mockClear();
+      });
+
+      // ══ THE ORIGIN IS CAPTURED AT CALL ENTRY, NOT READ AT SETTLE ═══════════════════════════════
+      // THE ONE TEST THE FEATURE TURNS ON, and the one that was missing (roborev 62814). The
+      // concierge marks a user's own bubble as relayed to an agent, which is a DELIVERY CLAIM, so it
+      // must name the message that CAUSED the send. `handleConciergeTool` therefore reads
+      // `currentConciergeTurnOrigin()` at ENTRY and hands that value to the settler in its `finally`.
+      //
+      // Every other test of this can be satisfied by either mechanism, because the origin does not
+      // move while they run. This one MOVES IT MID-CALL — the dispatch mock advances the module state
+      // the way a displaced turn does — so "captured at entry" and "read at settle" give different
+      // answers and only the correct one passes. Move that read down into the `finally` and this
+      // reds; nothing else in the suite does.
+      it("stamps the bubble that was awaiting when the call STARTED, not when it settled", async () => {
+        setConciergeTurnOrigin("bubble-at-entry");
+        dispatchConciergeToolMock.mockImplementationOnce(async () => {
+          // The next turn is dispatched while this call is still in flight. On the measured day this
+          // happened to 149 of 378 turns, so it is the common case rather than a contrived one.
+          setConciergeTurnOrigin("bubble-dispatched-later");
+          return {
+            ok: true,
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            data: { ok: true, agentId: "agent-x", agentName: "CI Hardening", channel: "terminal" },
+          };
+        });
+        fire({
+          reqId: "r-origin",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            args: { agentId: "agent-x", text: "add retry logic" },
+            toolCallId: "tc-origin",
+          },
+        });
+        await flush();
+
+        expect(received).toHaveLength(1);
+        expect(received[0]!.originBubbleId).toBe("bubble-at-entry");
+        // Stated as a second assertion rather than trusted to the first: this exact value is what a
+        // settle-time read would have produced, and naming it is what makes the test's intent legible.
+        expect(received[0]!.originBubbleId).not.toBe("bubble-dispatched-later");
+      });
+
+      it("carries NO origin when no turn was in flight — the fail-closed half", async () => {
+        // Distinct from "the module happens to be null at rest": this asserts that a call starting
+        // outside any turn produces a receipt the renderer will refuse to mark a bubble with.
+        setConciergeTurnOrigin(null);
+        dispatchConciergeToolMock.mockImplementationOnce(async () => ({
+          ok: true,
+          domain: "terminal",
+          op: "send_to_agent_terminal",
+          data: { ok: true, agentId: "agent-x", agentName: "CI Hardening", channel: "terminal" },
+        }));
+        fire({
+          reqId: "r-noorigin",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            args: { agentId: "agent-x", text: "add retry logic" },
+            toolCallId: "tc-noorigin",
+          },
+        });
+        await flush();
+        expect(received).toHaveLength(1);
+        expect(received[0]!.originBubbleId).toBeUndefined();
       });
 
       it("publishes exactly one receipt for a spawn, carrying the id from the REPLY", async () => {

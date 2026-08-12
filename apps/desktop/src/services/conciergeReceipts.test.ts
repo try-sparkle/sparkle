@@ -187,6 +187,11 @@ describe("conciergeReceipts", () => {
 describe("the turn origin a receipt carries", () => {
   afterEach(() => _resetConciergeReceiptsForTests());
 
+  // NOTE ON SCOPE, so these are not mistaken for coverage of the capture. The settler only FORWARDS
+  // a value it is handed; the mechanism the feature turns on — reading the origin at CALL ENTRY so a
+  // late settle cannot re-date it — lives in `handleConciergeTool` and is pinned in
+  // controlListener.test.ts, by a case that moves the origin mid-call so entry and settle disagree.
+  // These three cover the parameter contract only, which is the part that lives in this module.
   it("is what the settler stamps, and it survives to the listener", async () => {
     const { settleConciergeReceipt } = await import("./conciergeReceiptSettle");
     const { setConciergeTurnOrigin } = await import("./conciergeReceipts");
@@ -209,10 +214,18 @@ describe("the turn origin a receipt carries", () => {
 
   it("is ABSENT when the caller does not know it — the fail-closed half", async () => {
     const { settleConciergeReceipt } = await import("./conciergeReceiptSettle");
+    const { setConciergeTurnOrigin } = await import("./conciergeReceipts");
     const seen: ConciergeActionReceipt[] = [];
     onConciergeActionReceipt((r) => void seen.push(r));
     // `conciergeApprovalResume` settles from a click handler and cannot know the bubble, so it
-    // passes nothing. The receipt must then carry nothing rather than picking up a stale value.
+    // passes nothing.
+    //
+    // A LIVE VALUE IS SET FIRST, and that is what makes this test mean anything. With the module
+    // already null at rest, the assertion was satisfied by a PRECONDITION rather than by the
+    // settler's behaviour — introduce the exact defect the design forbids (`originBubbleId ??
+    // currentConciergeTurnOrigin()` at settle time) and it stayed green (roborev 62814). Setting a
+    // conflicting value means only the omission itself can produce `undefined`.
+    setConciergeTurnOrigin("bubble-that-must-not-be-picked-up");
     settleConciergeReceipt(
       "terminal",
       "send_to_agent_terminal",
