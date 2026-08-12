@@ -1067,6 +1067,53 @@ pub struct FreshnessConfig {
     pub auto_fast_forward: bool,
 }
 
+/// WHICH PR-SCOPED REVIEWER WATCHES A REPO, or `none` if there isn't one. Per-project overridable
+/// (like [freshness]) because one machine routinely works on repos that have a reviewer and repos
+/// that do not — this is a property of the REPO, not of the laptop.
+///
+/// WHY THIS IS CONFIGURABLE AT ALL. knightwatch runs on someone else's machine and is reachable
+/// only through GitHub comments — there is no endpoint to probe and no credential we hold. When
+/// that access ends, the COVERAGE half of the probe gate (`knightwatch::coverage`) stops being
+/// "unanswered" and becomes UNANSWERABLE: no new review can ever name the current head, so
+/// `NotCovered` is permanent and its own remedy ("post `/srosro-update-review` and wait for the
+/// review to land") can never complete. Every already-reviewed PR in the repo becomes unmergeable
+/// except through a recorded override — the remedy-that-cannot-be-followed shape AGENTS.md names.
+///
+/// IT RETIRES THE COVERAGE HALF ONLY. Unanswered `[blocking]` probes already posted on a PR are
+/// REAL FINDINGS, and a reviewer going away does not answer the questions it already asked; those
+/// still refuse the merge. Collapsing the two is the one way to get this wrong.
+///
+/// KEEP THE DEFAULT IN STEP WITH `scripts/lib/sparkle-config.sh`'s callers — the shell gate
+/// (`scripts/probe-gate.sh`) reads this same key and passes its own fallback, and the two
+/// implementations disagreeing about one PR is exactly the drift the shared fixture corpus exists
+/// to prevent.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ReviewConfig {
+    /// `"knightwatch"` (default — today's behaviour) or `"none"`. Free-form rather than an enum so
+    /// a future reviewer can be named here without a schema migration; any value that is not the
+    /// word `none` means "a reviewer is expected", which is the fail-closed direction.
+    pub pr_reviewer: String,
+}
+
+impl ReviewConfig {
+    /// True when NO PR-scoped reviewer watches this repo, so the coverage gate cannot ever be
+    /// satisfied and must not block.
+    ///
+    /// THE MATCH IS TRIMMED AND CASE-INSENSITIVE, and `scripts/probe-gate.sh` normalises the same
+    /// way before its own comparison. That agreement is the whole point: the config reader used by
+    /// the shell side (`_sparkle_awk_get`) returns the text between the quotes VERBATIM, so a
+    /// byte-exact rule on one side and a lenient one on the other makes `"None"` retire the gate for
+    /// the in-app merge button while `gh pr merge` still refuses the same PR — the harder direction
+    /// to debug, because the app reports the gate as off. Change one side and you must change both.
+    ///
+    /// Leniency stops at whitespace and case: `nonesuch` is NOT `none`, so a typo leaves the gate
+    /// ON rather than silently off.
+    pub fn has_no_pr_reviewer(&self) -> bool {
+        self.pr_reviewer.trim().eq_ignore_ascii_case("none")
+    }
+}
+
 /// Pre-warmed git worktree pool. At idle, Sparkle parks a few detached-HEAD worktrees checked out
 /// to the base commit; a spawn then CLAIMS one (a near-instant `git worktree move` + branch create)
 /// instead of paying the multi-second `git worktree add` on the critical path. Repo-scoped +
@@ -1211,6 +1258,9 @@ pub struct SparkleConfig {
     /// reason as [roborev]: it is machine-wide state, not a per-repo preference.
     pub onepassword: OnePasswordConfig,
     pub freshness: FreshnessConfig,
+    /// Which PR-scoped reviewer watches this repo, or `none`. Per-project overridable; the shell
+    /// merge gate reads the same key out of `.sparkle/config.toml`.
+    pub review: ReviewConfig,
     pub worktree_pool: WorktreePoolConfig,
     /// Live in-app browser preview (repo-scoped + per-project overridable).
     pub preview: PreviewConfig,
@@ -1328,6 +1378,12 @@ impl Default for SparkleConfig {
                 stale_build_block_commits: 25,
                 require_fresh_branch: true,
                 auto_fast_forward: true,
+            },
+            review: ReviewConfig {
+                // Today's behaviour: assume a PR-scoped reviewer IS watching, so a repo that never
+                // writes this key keeps its coverage gate. Keep in sync with the bash fallback
+                // passed by scripts/probe-gate.sh.
+                pr_reviewer: "knightwatch".to_string(),
             },
             // Pre-warm a small pool by default so the common fan-out spawn skips `git worktree add`.
             worktree_pool: WorktreePoolConfig { enabled: true, size: 2 },
@@ -1615,6 +1671,11 @@ struct PartialFreshness {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialReview {
+    pr_reviewer: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialWorktreePool {
     enabled: Option<bool>,
     size: Option<u32>,
@@ -1680,6 +1741,7 @@ struct PartialConfig {
     babysit: Option<PartialBabysit>,
     onepassword: Option<PartialOnePassword>,
     freshness: Option<PartialFreshness>,
+    review: Option<PartialReview>,
     worktree_pool: Option<PartialWorktreePool>,
     preview: Option<PartialPreview>,
     capture: Option<PartialCapture>,
@@ -1773,6 +1835,13 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
     }
     if let Some(v) = p.auto_fast_forward {
         into.auto_fast_forward = v;
+    }
+}
+
+fn apply_review(into: &mut ReviewConfig, p: Option<PartialReview>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.pr_reviewer {
+        into.pr_reviewer = v;
     }
 }
 
@@ -3046,6 +3115,7 @@ fn build_effective(
                 apply_improvement(&mut cfg.improvement, p.improvement);
                 apply_onepassword(&mut cfg.onepassword, p.onepassword);
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_review(&mut cfg.review, p.review);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_preview(&mut cfg.preview, p.preview, Layer::Global, &mut warnings);
                 apply_capture(&mut cfg.capture, p.capture);
@@ -3180,7 +3250,7 @@ fn build_effective(
                             .to_string(),
                     );
                 }
-                // Per-project layer: [workflow], [freshness], [approvals], [plugins], and the
+                // Per-project layer: [workflow], [freshness], [review], [approvals], [plugins], and the
                 // [done]/[delivered] stage definitions are repo-scoped and may override. [approvals]
                 // is honored here so "this project" auto-approve rules actually take effect (per
                 // category, project beats global). [plugins] is repo-scoped because which agent
@@ -3191,6 +3261,7 @@ fn build_effective(
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_review(&mut cfg.review, p.review);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_preview(&mut cfg.preview, p.preview, Layer::Project, &mut warnings);
                 apply_approvals(&mut cfg.approvals, p.approvals);
@@ -3951,6 +4022,25 @@ require_fresh_branch      = true
 # ancestor of origin/<default> — Sparkle may fast-forward it for you with no click. Anything else
 # (dirty, detached, a feature branch, or diverged) still waits for you. Set false to always ask.
 auto_fast_forward         = true
+
+# --- PR-scoped code review (repo-scoped; overridable in a project file) -----------------
+# Which PR-scoped reviewer watches this repo. Sparkle's merge gate refuses to land a PR that still
+# carries an UNANSWERED [blocking] probe, and separately refuses one whose current head no NEW
+# review has covered yet ("not converged").
+#
+# Set this to "none" when no PR-scoped reviewer watches the repo. That retires the CONVERGENCE
+# half only — otherwise it can never be satisfied, because no new review will ever arrive, and the
+# refusal's own remedy ("ask for a re-review and wait") cannot be followed.
+#
+# It does NOT retire the probe half: [blocking] probes already posted on a PR are real findings and
+# still block the merge. A reviewer going away does not answer the questions it already asked.
+#
+# The value is matched TRIMMED and CASE-INSENSITIVELY, so "none", "None" and " none " are the same
+# setting — the shell merge gate (scripts/probe-gate.sh) normalises identically, and the two must
+# agree or the in-app merge button and `gh pr merge` disagree about the same PR. Anything that is
+# not the word "none" — including a typo like "nonesuch" — means a reviewer IS expected.
+[review]
+pr_reviewer = "knightwatch"
 
 # --- Pre-warmed worktree pool (repo-scoped; overridable in a project file) --------------
 # The slow part of spawning an agent is `git worktree add`, which materializes the whole working
@@ -6386,6 +6476,60 @@ quit_app = 42
         // Untouched freshness field keeps its default; no "ignored" warning (unlike [workers]/[ai]).
         assert_eq!(cfg.freshness.stale_build_block_commits, 25);
         assert!(warns.is_empty());
+    }
+
+    /// `[review]` LAYERING, and the normalisation rule the shell twin mirrors.
+    ///
+    /// Without this the only path a user actually takes — writing `pr_reviewer = "none"` into a
+    /// repo's `.sparkle/config.toml` — is untested by construction: `default_template_parses_to_
+    /// defaults` ships the DEFAULT value, so it passes unchanged even with BOTH `apply_review`
+    /// calls deleted, and the knightwatch wiring assertion only pins that `enforce` *calls*
+    /// `has_no_pr_reviewer()`, never that the config carries the value. Drop the project-arm call
+    /// and a repo that sets `none` keeps the permanent unmergeable refusal this exists to remove,
+    /// while the app reports the write as ok — the defaulted-seam vacuity shape AGENTS.md names.
+    #[test]
+    fn review_defaults_and_overrides() {
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(cfg.review.pr_reviewer, "knightwatch", "absent [review] keeps today's behaviour");
+        assert!(!cfg.review.has_no_pr_reviewer());
+
+        // GLOBAL layer.
+        let g = "[review]\npr_reviewer = \"none\"\n";
+        let (cfg, _, _) = effective(Some(g), None);
+        assert!(cfg.review.has_no_pr_reviewer(), "a global [review] must reach cfg.review");
+
+        // PROJECT layer — per-project overridable (like [freshness]), so NO "ignored" warning.
+        let p = "[review]\npr_reviewer = \"none\"\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(cfg.review.has_no_pr_reviewer(), "a project [review] must reach cfg.review");
+        assert!(warns.is_empty(), "[review] is project-honored; it must not warn: {warns:?}");
+
+        // Project beats global, per-key like every other repo-scoped section.
+        let (cfg, _, _) = effective(Some("[review]\npr_reviewer = \"none\"\n"), Some(
+            "[review]\npr_reviewer = \"knightwatch\"\n",
+        ));
+        assert!(!cfg.review.has_no_pr_reviewer(), "the project file wins");
+
+        // THE NORMALISATION TABLE. scripts/probe-gate.sh trims the ends and compares
+        // case-insensitively; these rows are the contract both sides implement. `nonesuch` is the
+        // fail-closed row — leniency stops at whitespace and case, so a typo leaves the gate ON.
+        for (value, expect_off) in [
+            ("none", true),
+            ("None", true),
+            ("NONE", true),
+            (" none ", true),
+            ("knightwatch", false),
+            ("nonesuch", false),
+            ("", false),
+        ] {
+            let cfg = ReviewConfig { pr_reviewer: value.to_string() };
+            assert_eq!(
+                cfg.has_no_pr_reviewer(),
+                expect_off,
+                "pr_reviewer = {value:?} must {} the coverage gate",
+                if expect_off { "retire" } else { "keep" }
+            );
+        }
     }
 
     #[test]

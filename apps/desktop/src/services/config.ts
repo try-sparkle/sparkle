@@ -166,6 +166,13 @@ export interface FreshnessConfig {
   stale_build_block_commits: number;
   require_fresh_branch: boolean;
 }
+/** Which PR-scoped reviewer watches this repo, or `"none"`. `"none"` retires the merge gate's
+ *  CONVERGENCE half — which cannot be satisfied once no reviewer will ever post again — but NOT its
+ *  probe half: `[blocking]` probes already on a PR are real findings and still block. `pr_reviewer`
+ *  is a plain Rust `String`, so it is always present on the wire (never null). */
+export interface ReviewConfig {
+  pr_reviewer: string;
+}
 // NOTE: there is no `VoiceConfig` mirror here any more. It described exactly three keys — the wake
 // word, the stop word and pause-on-submit — and all three were retired with the wake word itself.
 // What remains in Rust's `[voice]` (the microphone UID and the virtual-input opt-in) has never been
@@ -227,6 +234,10 @@ export interface SparkleConfig {
    *  defaults — never read an absent section as "enabled". */
   onepassword?: OnePasswordConfig;
   freshness: FreshnessConfig;
+  /** Optional for the same back-compat reason as `tools?`/`roborev?` above: a payload from a Rust
+   *  backend predating [review] omits it. An absent section means "a reviewer is expected", the
+   *  fail-closed default — never read it as "no reviewer, gate off". */
+  review?: ReviewConfig;
   capture: CaptureConfig;
   // Optional so callers must guard: an older Rust backend (predating [voice]) omits it at runtime.
   // The current backend always sends it, but the type stays honest about the config-changed payload.

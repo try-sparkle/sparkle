@@ -387,6 +387,10 @@ const PROJECT_HONORED_SECTIONS: readonly string[] = [
   "workflow",
   "plugins",
   "freshness",
+  // Which PR-scoped reviewer watches a repo is a property of the REPO — one machine routinely works
+  // on repos that have one and repos that do not — so `apply_review` runs in BOTH arms of
+  // build_effective (config.rs) and this entry keeps the concierge from refusing a write Rust honors.
+  "review",
   "worktree_pool",
   // Whether a project is worth previewing — and how eagerly — is a property of the project, so
   // `apply_preview` runs in BOTH arms of build_effective (config.rs). Without this entry the

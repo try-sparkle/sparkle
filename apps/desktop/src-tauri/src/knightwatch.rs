@@ -894,6 +894,38 @@ pub(crate) fn coverage(gate: &ProbeGate, head: Option<&str>) -> Coverage {
     }
 }
 
+/// The coverage verdict INCLUDING whether this repo has a PR-scoped reviewer at all.
+///
+/// PURE, and separate from [`enforce`] for the same reason [`decide`] and [`decide_coverage`] were
+/// extracted: with the config read and the head read inlined, no test could reach the no-reviewer
+/// branch, and this module has already been bitten once by wiring that read as a feature while
+/// being entirely inert.
+///
+/// WHY A REPO MAY HAVE NO REVIEWER. knightwatch runs on someone else's machine and is reachable
+/// only through GitHub comments. Once that access ends, the coverage question stops being
+/// "unanswered" and becomes UNANSWERABLE — no new review can ever name the current head — so
+/// [`Coverage::NotCovered`] is permanent and [`coverage_refusal`]'s own remedy ("post
+/// `/srosro-update-review`, wait for the review to land") can never complete. Every already-reviewed
+/// PR in the repo becomes unmergeable except through a recorded override.
+///
+/// `NotApplicable` is deliberately the SAME answer this gate already gives when the reviewer simply
+/// never posted here — both mean "this gate is not the one holding you up" — rather than a fourth
+/// state every caller would have to learn.
+///
+/// THIS RETIRES THE COVERAGE HALF ONLY. Unanswered `[blocking]` probes already on the PR are real
+/// findings and are judged by [`decide`], which does not consult this at all: a reviewer going away
+/// does not answer the questions it already asked.
+pub(crate) fn coverage_for_repo(
+    gate: &ProbeGate,
+    head: Option<&str>,
+    no_pr_reviewer: bool,
+) -> Coverage {
+    if no_pr_reviewer {
+        return Coverage::NotApplicable;
+    }
+    coverage(gate, head)
+}
+
 /// Abbreviate an oid for a human, without assuming it is 40 chars.
 fn short_sha(sha: &str) -> String {
     sha.chars().take(7).collect()
@@ -1262,12 +1294,14 @@ pub(crate) fn enforce(
     // So a reason buys ONE bypass. When both gates fail and only one rationale was supplied, we
     // refuse and say the head is also unreviewed — the author decides about the head knowing it is
     // the head, or does not decide at all.
-    let coverage_verdict = if gate.applicable {
-        coverage(&gate, read_head(root, number).as_deref())
+    let no_pr_reviewer = crate::config::for_project(root).config.review.has_no_pr_reviewer();
+    let coverage_verdict = if gate.applicable && !no_pr_reviewer {
+        coverage_for_repo(&gate, read_head(root, number).as_deref(), false)
     } else {
-        // The head read is skipped entirely when the reviewer was never here, so a repo it does
-        // not watch pays no extra `gh` call per merge.
-        Coverage::NotApplicable
+        // The head read is skipped entirely when the reviewer was never here, or when this repo has
+        // no PR-scoped reviewer at all, so a repo it does not watch pays no extra `gh` call per
+        // merge just to be told the gate is not the thing holding it up.
+        coverage_for_repo(&gate, None, no_pr_reviewer)
     };
 
     match decide(&gate, number, knightwatch_override) {
@@ -2311,6 +2345,50 @@ mod tests {
         assert_eq!(coverage(&gate, Some("9c65efe112233")), Coverage::NotApplicable);
     }
 
+    /// A REPO WITH NO PR-SCOPED REVIEWER cannot ever satisfy the coverage question, so asking it is
+    /// not a gate — it is a permanent refusal behind a remedy nobody can follow.
+    ///
+    /// Deliberately a PAIR on the SAME gate and the SAME head, because a lone "it returns
+    /// NotApplicable" assertion passes just as happily against a `coverage_for_repo` that ignores
+    /// its inputs entirely.
+    #[test]
+    fn no_pr_reviewer_retires_the_coverage_gate() {
+        let gate = covering("275f462");
+        let head = Some("1867679aabbccddeeff00112233445566778899a");
+
+        assert!(
+            matches!(coverage_for_repo(&gate, head, false), Coverage::NotCovered(_)),
+            "with a reviewer expected, an uncovered head is still NOT COVERED"
+        );
+        assert_eq!(
+            coverage_for_repo(&gate, head, true),
+            Coverage::NotApplicable,
+            "with no PR-scoped reviewer, the same uncovered head must not block"
+        );
+    }
+
+    /// THE GUARD ON THE FOUNDER'S STANDING RULE — a PR is not done while any probe on it is
+    /// unanswered. Retiring COVERAGE must never be mistaken for ANSWERING the probes the departed
+    /// reviewer already raised: `decide` is what judges those, and it does not consult the reviewer
+    /// setting at all. If this ever returns Allow, the change is wrong.
+    #[test]
+    fn no_pr_reviewer_does_not_excuse_an_unanswered_blocking_probe() {
+        let body = format!(
+            "{REVIEW_MARKER}\n**Probes**\n\n1. [blocking] [from: tests] [bug] A real finding."
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+
+        assert!(
+            !gate.unanswered_blocking().is_empty(),
+            "fixture must actually carry an unanswered blocking probe, or this test proves nothing"
+        );
+        assert!(
+            matches!(decide(&gate, 1273, None), Decision::Refuse(_)),
+            "a [blocking] probe still refuses the merge; the reviewer going away does not answer \
+             the questions it already asked"
+        );
+    }
+
     /// THE WIRING, not the pure verdict. Deleting `decide_coverage`'s call from `enforce` left
     /// every `coverage` test above green while the gate was entirely inert, so the decision that
     /// actually refuses a merge is asserted here.
@@ -2373,9 +2451,17 @@ mod tests {
         let body = &body[..end];
 
         assert!(
-            body.contains("coverage(&gate, read_head(root, number).as_deref())"),
+            body.contains("coverage_for_repo(&gate, read_head(root, number).as_deref(), false)"),
             "enforce must actually READ the head and compute coverage; without this call the whole \
              gate is inert while every `coverage` unit test stays green"
+        );
+        // And it must actually ASK whether this repo has a reviewer. Without this the no-reviewer
+        // branch is unreachable in production while every `coverage_for_repo` unit test stays green
+        // — the same relocated-vacuity shape the slice guard above exists to catch.
+        assert!(
+            body.contains("has_no_pr_reviewer()"),
+            "enforce must consult [review].pr_reviewer; otherwise a repo with no PR-scoped reviewer \
+             is still refused for an unreviewed head, behind a remedy nobody can follow"
         );
         assert!(
             body.lines().any(|l| l.trim().starts_with("match decide_coverage_from(")),

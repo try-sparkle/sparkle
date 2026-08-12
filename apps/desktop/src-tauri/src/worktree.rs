@@ -1436,7 +1436,18 @@ fn append_missing_ignores(existing: &str, patterns: &[&str]) -> Option<String> {
         .copied()
         .filter(|p| {
             let bare = p.trim_end_matches('/');
-            !present.iter().any(|l| *l == *p || *l == bare)
+            // THE CONTENTS FORM SATISFIES THE DIRECTORY FORM. `.sparkle/*` ignores everything in
+            // the directory just as `.sparkle/` does, and a repo uses it precisely so it can
+            // re-include ONE file with a `!` negation — which the directory form makes impossible,
+            // because git never descends into an excluded directory and the negation goes inert.
+            //
+            // Without this, a repo that had deliberately switched to the contents form got a bare
+            // `.sparkle/` appended to its TRACKED .gitignore on the next project prep, silently
+            // defeating the negation and un-tracking the very file it was protecting. The two
+            // visible symptoms are an unexplained `.gitignore` diff no human made, and a policy file
+            // that can no longer be `git add`ed without `-f`.
+            let contents = format!("{bare}/*");
+            !present.iter().any(|l| *l == *p || *l == bare || *l == contents)
         })
         .collect();
     if missing.is_empty() {
@@ -9287,6 +9298,37 @@ mod tests {
         assert_eq!(out, ".sparkle/\n.wt-*/\n");
         // A file with no trailing newline gets one rather than a glued-on pattern.
         assert_eq!(append_missing_ignores("x", &[".wt-*/"]).unwrap(), "x\n.wt-*/\n");
+    }
+
+    /// THE CONTENTS FORM COUNTS AS PRESENT — this repo's own `.gitignore` depends on it.
+    ///
+    /// A repo switches from `.sparkle/` to `.sparkle/*` for exactly one reason: to re-include a
+    /// single file with a `!` negation, which the directory form makes impossible (git never
+    /// descends into an excluded directory, so the negation is silently inert). If this function
+    /// does not recognise the contents form, every project prep appends a bare `.sparkle/` back
+    /// into the user's TRACKED .gitignore — defeating the negation and un-tracking the very policy
+    /// file the split exists to share, with no action by any human.
+    #[test]
+    fn the_contents_form_satisfies_the_directory_pattern() {
+        // The exact shape this repo ships.
+        let real = ".sparkle/*\n!/.sparkle/config.toml\n**/*/.sparkle/\n";
+        assert!(
+            append_missing_ignores(real, &[".sparkle/"]).is_none(),
+            "`.sparkle/*` must count as `.sparkle/` being present, or the negation below it is \
+             silently defeated on the next project prep"
+        );
+        // Still appends when the directory is genuinely unignored — leniency must not swallow a
+        // real miss.
+        assert_eq!(
+            append_missing_ignores("node_modules/\n", &[".sparkle/"]).unwrap(),
+            "node_modules/\n.sparkle/\n"
+        );
+        // And it is scoped to THIS pattern's own contents form, not any line that merely ends in
+        // `/*` — `.other/*` says nothing about `.sparkle/`.
+        assert_eq!(
+            append_missing_ignores(".other/*\n", &[".sparkle/"]).unwrap(),
+            ".other/*\n.sparkle/\n"
+        );
     }
 
     #[test]
