@@ -81,6 +81,22 @@ use std::time::Duration;
 /// under a human account, so `login` proves nothing in either direction.
 const REVIEW_MARKER: &str = "<!-- knightwatch-reviewer:auto-post -->";
 
+/// Sparkle's OWN PR-scoped reviewer (`scripts/pr-review.sh`), which replaced the upstream one after
+/// its access was withdrawn. A DISTINCT marker on purpose — posting under the upstream bot's would
+/// impersonate a real person's account — but it must be recognised by exactly the same rules.
+///
+/// WHY THIS IS A SET AND NOT ONE STRING. Rule 3 says a probe is answered by a NON-review comment
+/// posted after it, and rule 1 makes the marker the only thing that decides which is which. A
+/// reviewer whose marker is unknown is therefore not merely ignored — it is classified as an
+/// ANSWER, and its body is scanned for `Probe <N>` citations. Sparkle's reviewer is handed the
+/// prior reviews and told not to restate their findings, so writing "Probe 2 from the prior
+/// round…" is a phrasing it is actively steered toward — which would mark an unanswered
+/// `[blocking]` probe as answered and flip a refusal into a merge. That is the exact invariant the
+/// module header states ("a later knightwatch comment can NEVER answer a probe, or the bot clears
+/// its own gate"), defeated by a bot this gate could not see was one. Adding a producer without
+/// teaching the consumer its marker is a gate bypass, not a missing feature.
+const SPARKLE_REVIEW_MARKER: &str = "<!-- sparkle-reviewer:auto-post -->";
+
 /// Stamped into the comment that records an override, in the [`crate::pr_owner`] marker style: one
 /// line, machine-findable, invisible in rendered markdown.
 pub const OVERRIDE_MARKER: &str = "<!-- sparkle:probe-gate-override -->";
@@ -341,7 +357,7 @@ fn parse_review_coverage(body: &str) -> (Option<String>, bool) {
 
 /// Is this comment a knightwatch review? The marker, and nothing else.
 fn is_knightwatch(body: &str) -> bool {
-    body.contains(REVIEW_MARKER)
+    body.contains(REVIEW_MARKER) || body.contains(SPARKLE_REVIEW_MARKER)
 }
 
 /// ASCII word character, for the `\b` boundaries in rule 3. Deliberately ASCII-only: the shell
@@ -2364,6 +2380,73 @@ mod tests {
             coverage_for_repo(&gate, head, true),
             Coverage::NotApplicable,
             "with no PR-scoped reviewer, the same uncovered head must not block"
+        );
+    }
+
+    /// A SPARKLE REVIEW IS A REVIEW, NOT AN ANSWER — the Rust half of the gate-bypass fix.
+    ///
+    /// This test exists because the shell half was pinned and this one was not, and that asymmetry
+    /// is the one dimension where the two implementations could silently diverge: deleting
+    /// `|| body.contains(SPARKLE_REVIEW_MARKER)` from [`is_knightwatch`] leaves every other test in
+    /// this file green while re-opening the bypass — in the consumer that guards all six in-app
+    /// merge paths.
+    ///
+    /// The bypass: the marker is the only thing separating a review from an answer, so an
+    /// unrecognised reviewer is not ignored, it is treated as an ANSWER and scanned for
+    /// `Probe <N>`. Sparkle's producer is handed the prior reviews and told not to restate their
+    /// findings, so citing "Probe 1" is a phrasing it is steered toward.
+    /// THE CONSTANT'S VALUE, pinned as a LITERAL.
+    ///
+    /// The two tests below interpolate `{SPARKLE_REVIEW_MARKER}`, so they assert `is_knightwatch`
+    /// agrees with whatever the constant currently holds — they cannot fail if its value is edited
+    /// or typo'd. `REVIEW_MARKER` has no such hole, because its literal appears in the shared
+    /// fixture bodies and a change to it reds the corpus test. This one does not appear in any
+    /// fixture yet, and meanwhile the producer (`scripts/pr-review.sh`) and the shell consumer
+    /// (`scripts/probe-gate.sh`) each hold their own literal copy, both pinned by their suites — so
+    /// without this the in-app gate is the ONE consumer whose marker can drift from the producer's
+    /// with every Rust test green, silently re-opening the bypass across all six merge paths.
+    #[test]
+    fn the_sparkle_marker_literal_matches_the_producer_and_the_shell_consumer() {
+        assert_eq!(
+            SPARKLE_REVIEW_MARKER, "<!-- sparkle-reviewer:auto-post -->",
+            "this literal is duplicated in scripts/pr-review.sh (the producer) and \
+             scripts/probe-gate.sh (the shell consumer); changing one without the others makes the \
+             in-app gate stop recognising Sparkle's own reviews"
+        );
+    }
+
+    #[test]
+    fn a_sparkle_review_cannot_answer_a_knightwatch_probe() {
+        let kw = format!(
+            "{REVIEW_MARKER}\n**Probes**\n\n1. [blocking] [from: tests] [bug] A real finding."
+        );
+        let sparkle = format!(
+            "{SPARKLE_REVIEW_MARKER}\n> 📋 First Sparkle review.\n\n**Probes**\n\nNone. \
+             Probe 1 from the prior round is out of scope for this pass."
+        );
+        let gate = evaluate(&[comment(1, &kw), comment(2, &sparkle)]);
+        assert_eq!(
+            gate.unanswered_blocking().len(),
+            1,
+            "a Sparkle review citing 'Probe 1' must NOT answer knightwatch's probe — a reviewer \
+             the gate cannot recognise as a bot would otherwise clear the gate for it"
+        );
+    }
+
+    /// ...and the other half of recognising it: a Sparkle review's OWN probes must COUNT. Being
+    /// excluded from the answer path is worthless if the producer's findings are invisible.
+    #[test]
+    fn a_sparkle_reviews_own_blocking_probe_is_counted() {
+        let body = format!(
+            "{SPARKLE_REVIEW_MARKER}\n**Probes**\n\n1. [blocking] [from: contract-drift] [bug] \
+             The other half of the invariant was never updated."
+        );
+        let gate = evaluate(&[comment(1, &body)]);
+        assert!(gate.applicable, "a Sparkle review must be parsed as a review at all");
+        assert_eq!(
+            gate.unanswered_blocking().len(),
+            1,
+            "a Sparkle [blocking] probe must block the merge, or the producer is decorative"
         );
     }
 
