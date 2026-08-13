@@ -22,6 +22,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -501,7 +502,7 @@ describe("the `local_none` rung is actually WIRED to the column (roborev 57842)"
     useRuntimeStore.setState({ branchStatus: { a1: bs(false) } } as never);
     render(<AgentSidebar project={project} />);
 
-    fireEvent.contextMenu(screen.getByText("Cleanly"));
+    openAgentCard(screen.getByText("Cleanly"));
     const line = screen.getByTestId("card-workflow-line");
     expect(line.textContent).not.toMatch(/loses this work/);
     expect(line.textContent).toMatch(/nothing here is at risk/);
@@ -516,7 +517,7 @@ describe("the `local_none` rung is actually WIRED to the column (roborev 57842)"
     useRuntimeStore.setState({ branchStatus: { a1: bs(true) } } as never);
     render(<AgentSidebar project={project} />);
 
-    fireEvent.contextMenu(screen.getByText("Dirty"));
+    openAgentCard(screen.getByText("Dirty"));
     expect(screen.getByTestId("card-workflow-line").textContent).toMatch(/loses this work/);
   });
 

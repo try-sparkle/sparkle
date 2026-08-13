@@ -246,6 +246,7 @@ import {
   agentTranscriptWorktree,
   subscribeAgentTranscriptWorktrees,
 } from "../services/agentTranscriptRegistry";
+import { useSparkleSessionBinding } from "../hooks/useSparkleSessionBinding";
 import { createArrivalOrder, forgetArrival, orderByArrival } from "../engine/conciergeStreamOrder";
 import {
   forgetEpisode,
@@ -1043,6 +1044,12 @@ export function ConciergeHost({
     (mountedIsSparkle ? SPARKLE_AGENT_NAME : undefined) ??
     (mountedAgentId ? target?.name : undefined);
   const mountedWorktreePath = mountedRow?.worktreePath ?? sparkleWorktreePath;
+  // THE PANE-LESS AGENT'S BINDING. `useAgentTranscript` below fails closed on an agent whose Claude
+  // sessions it does not know, and the app-owned Sparkle agent — the one this host explicitly
+  // supports mounting — has no `AgentPane`, hence no hook events, hence no binding, hence an empty
+  // pane forever (roborev 63133/63135). The hook keeps its own gate and its own refresh rule; read
+  // it rather than inlining a second copy of the reasoning here.
+  useSparkleSessionBinding(mountedAgentId, mountedWorktreePath ?? null);
   const mountedThread = useMountedThread(mountedAgentId);
   const { pageBack } = useAgentTranscript(mountedAgentId, mountedWorktreePath ?? null);
   // STAGED ATTACHMENTS FOLLOW THE DRAFT THEY WERE STAGED FOR.

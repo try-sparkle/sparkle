@@ -45,13 +45,13 @@ describe("a caret the APP parked — Escape keeps its old meaning", () => {
   // terminal whenever a pane is visible and ready, so this is the app's RESTING state — not a signal
   // that the user is working there. One Escape must still release, exactly as it has for years.
   it("releases on the FIRST press", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(noteTerminalEscape({ now: 1_000 })).toBe("release");
     expect(wired()).toBe("off");
   });
 
   it("charges no toll, so nothing is left half-armed behind it", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     noteTerminalEscape({ now: 1_000 });
     expect(terminalEscapeTollPaid(1_000)).toBe(false);
   });
@@ -60,7 +60,7 @@ describe("a caret the APP parked — Escape keeps its old meaning", () => {
 describe("a terminal the USER is working in — Escape twice unmounts", () => {
   // The founder's gesture: "when I'm in terminal … if I press escape twice, it unmounts the concierge."
   it("withholds the first press and releases on the second", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     noteTerminalInteraction(); // the user typed, or clicked in
     expect(noteTerminalEscape({ now: 1_000 })).toBe("process-only");
     expect(wired()).toBe("right");
@@ -71,7 +71,7 @@ describe("a terminal the USER is working in — Escape twice unmounts", () => {
   // A TOLL, NOT A PER-PRESS CHARGE. Paid once per sequence, so the gesture is two presses total rather
   // than two per rung — which is what someone would hit if the toll re-armed on every press.
   it("does not re-charge itself between the two presses", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     noteTerminalInteraction();
     noteTerminalEscape({ now: 1_000 });
     expect(terminalEscapeTollPaid(1_050)).toBe(true);
@@ -83,7 +83,7 @@ describe("a terminal the USER is working in — Escape twice unmounts", () => {
   // different context — roborev 55478's defect. The wall clock is the backstop that cannot be defeated
   // by xterm swallowing every intervening keystroke.
   it("re-charges the toll once the window has passed", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     noteTerminalInteraction();
     noteTerminalEscape({ now: 1_000 });
     const late = 1_000 + RELEASE_ARM_WINDOW_MS + 1;
@@ -92,7 +92,7 @@ describe("a terminal the USER is working in — Escape twice unmounts", () => {
   });
 
   it("re-charges the toll after an intervening gesture clears it", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     noteTerminalInteraction();
     noteTerminalEscape({ now: 1_000 });
     clearTerminalEscapeToll(); // a pointer press, or any non-Escape key
@@ -110,7 +110,7 @@ describe("provenance is upgraded by interaction, not decided once at focus time"
   it("treats a parked caret the user has since typed at as deliberate", () => {
     markTerminalAutoFocus(); // the pane parks the caret…
     resetTerminalFocusIntent();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     // …and now the user types at it, which is the only signal available.
     noteTerminalInteraction();
     expect(noteTerminalEscape({ now: 1_000 })).toBe("process-only");
@@ -118,7 +118,7 @@ describe("provenance is upgraded by interaction, not decided once at focus time"
   });
 
   it("is idempotent, because it runs once per keystroke", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     noteTerminalInteraction();
     noteTerminalInteraction();
     noteTerminalInteraction();
@@ -136,7 +136,7 @@ describe("nothing patched", () => {
     expect(wired()).toBe("off");
     expect(terminalEscapeTollPaid(1_000)).toBe(false);
     // …so once a cable IS patched, the gesture starts from the beginning.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(noteTerminalEscape({ now: 1_100 })).toBe("process-only");
     expect(wired()).toBe("right");
   });

@@ -40,10 +40,27 @@ export type OverlaySurface = "off" | "assist" | "build";
 export interface CableState {
   readonly wired: WiredSide;
   readonly overlay: OverlaySurface;
+  /**
+   * WHICH AGENT IS ON THE FAR END — PINNED AT MOUNT TIME, not derived from selection.
+   *
+   * The far end used to be read as `wiredProject.selectedAgentId` (Workspace), which quietly made
+   * the live cable follow the SELECTION rather than the mount. A single click on a different row
+   * re-aimed the concierge at that row with no mount gesture and no `patchCable` call at all —
+   * so: double-click A to mount, single-click B to read its terminal, type in the concierge, and
+   * the message goes to B (roborev 63145, finding 4).
+   *
+   * That is the exact thing the founder's single/double split was FOR. His complaint was that
+   * clicking a row to look at it hijacked the pane; a target derived from selection re-created it
+   * one layer down, where it is invisible — nothing on screen changes when the far end moves.
+   *
+   * `null` while unwired, and while unwired the compose box still follows the selection as it
+   * always has. The pin is a statement about a cable that exists.
+   */
+  readonly agentId: string | null;
 }
 
 /** Unplugged and docked — the concierge floating in the middle, lifted, nothing patched. */
-export const CABLE_REST: CableState = { wired: "off", overlay: "off" };
+export const CABLE_REST: CableState = { wired: "off", overlay: "off", agentId: null };
 
 /**
  * Patch the cable into `side`.
@@ -54,9 +71,13 @@ export const CABLE_REST: CableState = { wired: "off", overlay: "off" };
  * than at the render site is what makes the invariant unfakeable: there is no ordering of calls
  * that leaves the app both wired and overlaid.
  */
-export function patchCable(state: CableState, side: PairSide): CableState {
-  if (state.wired === side && state.overlay === "off") return state;
-  return { wired: side, overlay: "off" };
+export function patchCable(state: CableState, side: PairSide, agentId: string | null): CableState {
+  // `agentId` JOINS THE NO-OP TEST, and leaving it out would be the bug this parameter exists to
+  // fix, relocated: re-patching the same side onto a DIFFERENT agent is a real move of the cable,
+  // and an identity return would swallow it — the mount gesture would appear to do nothing while
+  // the concierge kept talking to the previous row.
+  if (state.wired === side && state.overlay === "off" && state.agentId === agentId) return state;
+  return { wired: side, overlay: "off", agentId };
 }
 
 // ── WHICH ROW ACTIVATION PATCHES THE CABLE ────────────────────────────────────────────────────
@@ -98,10 +119,24 @@ export function patchCable(state: CableState, side: PairSide): CableState {
 // Reading `detail === 2` off the second click looks equivalent and is not, because the row's OTHER
 // second-click rule would collide with it: clicking an already-selected orchestrator folds its
 // worker subtree. Keying the mount on the count means the fold and the mount fight over the same
-// press and one of them has to be suppressed — a second rule, added here, to repair the first.
-// `dblclick` is a distinct event the browser raises AFTER both clicks, from the same OS double-click
-// interval the user has already tuned, so the two rules never contend: the clicks fold exactly as
-// they did before this change, and the mount arrives on its own event.
+// press. `dblclick` is a distinct event the browser raises AFTER both clicks, from the same OS
+// double-click interval the user has already tuned, so the mount arrives on its own event.
+//
+// ══ BUT THE TWO RULES DO CONTEND, AND THIS BLOCK USED TO SAY THEY NEVER DO ══════════════════════
+// The retracted claim was: *"the two rules never contend: the clicks fold exactly as they did
+// before this change."* True per EVENT, false for the composite GESTURE, and the false half is the
+// one that shipped (roborev 63145, finding 3). Mounting onto an orchestrator takes at least two
+// clicks on a row you are about to be seated on, so the second one always satisfies the fold's
+// `wasAlreadySelected` — and the fold is PERSISTED. Patching the cable onto an orchestrator
+// therefore folded or unfolded its worker subtree EVERY time, restructuring the column on a gesture
+// that says nothing about workers. The new tests only exercised childless rows, where
+// `subtreeCollapsed` is null and the second rule does not exist, so nothing caught it.
+//
+// The repair is a suppression in `AgentRow.onRowClick` (`e.detail >= 2` skips the fold) — i.e.
+// exactly the "second rule added to repair the first" that this block cites as the cost of keying
+// the mount on the click count. Choosing `dblclick` avoided the ordering problem, not this one.
+// A comment asserting a guarantee the code does not provide is worse than no comment, so: the rules
+// are keyed on different events, and the gesture that raises one raises the other.
 export type RowActivation =
   /** A `click`. `detail` is the pointer click-count — 1 for a plain press, 0 for a synthetic/AT one. */
   | { type: "click"; detail: number }
@@ -132,7 +167,9 @@ export function mountsOnRowActivation(activation: RowActivation): boolean {
  */
 export function unbindCable(state: CableState): CableState {
   if (state.wired === "off") return state;
-  return { ...state, wired: "off" };
+  // The pin goes with the cable. A far end remembered across an unbind would be a target nothing on
+  // screen claims, and the compose box falls back to following the selection while unwired.
+  return { ...state, wired: "off", agentId: null };
 }
 
 /**
@@ -145,7 +182,10 @@ export function unbindCable(state: CableState): CableState {
  */
 export function setOverlay(state: CableState, overlay: OverlaySurface): CableState {
   if (state.overlay === overlay && !(overlay === "assist" && state.wired !== "off")) return state;
-  return { wired: overlay === "assist" ? "off" : state.wired, overlay };
+  const unwires = overlay === "assist";
+  // Same rule as `unbindCable`: whatever drops the cable drops its far end with it, so there is no
+  // path that leaves a pinned agent behind an unwired concierge.
+  return { wired: unwires ? "off" : state.wired, overlay, agentId: unwires ? null : state.agentId };
 }
 
 // ── THE CLICK-AWAY TEST ───────────────────────────────────────────────────────────────────────

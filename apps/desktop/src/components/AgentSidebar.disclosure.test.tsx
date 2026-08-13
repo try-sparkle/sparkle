@@ -37,6 +37,7 @@ import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { settleFold } from "../testing/rowGestures";
 import { C } from "../theme/colors";
 import { childRowOf, strayTreeChildren, treeContainerCount } from "./subtreeTestUtils";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
@@ -107,8 +108,13 @@ function advance(
  *  reads selection from its `project` PROP, which these tests pass as a static object, so a click
  *  that updates the store never reaches the row. Without the pre-selection the first click here only
  *  selects, and a "did the subtree open?" assertion would be measuring the wrong gesture. */
-const toggleHead = (name: string) =>
+const toggleHead = async (name: string) => {
   fireEvent.click(screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement);
+  // The fold is DEFERRED one double-click interval — that click may turn out to be the first half
+  // of a double press that mounts the concierge instead (roborev 63145 #3;
+  // AgentRow.FOLD_DOUBLE_PRESS_GRACE_MS). So the toggle is not readable on the next line any more.
+  await settleFold();
+};
 
 const isCollapsed = (id: string) => useUiStore.getState().collapsedOrchestrators[id] !== false;
 
@@ -154,25 +160,25 @@ describe("worker subtree disclosure — only the user opens a parent", () => {
 
   // The user's gesture is still the one thing that DOES write it — if this fails, the funnel has been
   // welded shut rather than narrowed, and the feature is broken in the opposite direction.
-  it("the user's own gesture still opens and closes the subtree", () => {
+  it("the user's own gesture still opens and closes the subtree", async () => {
     const project = seed({ w1: { name: "Fix The Parser", status: "working" } }, "a1");
     render(<AgentSidebar project={project} />);
-    toggleHead("Alpha");
+    await toggleHead("Alpha");
     expect(isCollapsed("a1")).toBe(false);
     expect(childRowOf("a1", "Fix The Parser")).toBe(true); // the real child row, not a peek
-    toggleHead("Alpha");
+    await toggleHead("Alpha");
     expect(isCollapsed("a1")).toBe(true);
   });
 
   // A subtree the user has just closed must not be re-opened by a worker that is STILL red. The old
   // module guarded this with an edge detector; with auto-expansion gone there is nothing to detect,
   // and this pins that nothing grew back.
-  it("a steady red does not re-open a subtree the user just collapsed", () => {
+  it("a steady red does not re-open a subtree the user just collapsed", async () => {
     const project = seed({ w1: { name: "Fix The Parser", status: "errored" } }, "a1");
     const { rerender } = render(<AgentSidebar project={project} />);
-    toggleHead("Alpha"); // user opens it
+    await toggleHead("Alpha"); // user opens it
     expect(isCollapsed("a1")).toBe(false);
-    toggleHead("Alpha"); // user closes it again, red still standing
+    await toggleHead("Alpha"); // user closes it again, red still standing
     expect(isCollapsed("a1")).toBe(true);
     advance(rerender, project, "w1", "errored"); // another pass over the same red
     expect(isCollapsed("a1")).toBe(true);
@@ -230,16 +236,16 @@ describe("the peek — a closed parent with a red worker shows one line", () => 
   });
 
   // Opening the parent replaces the peek with the real children; closing it brings the peek back.
-  it("is replaced by the real child rows when the parent opens, and returns when it closes", () => {
+  it("is replaced by the real child rows when the parent opens, and returns when it closes", async () => {
     const project = seed({ w1: { name: "Fix The Parser", status: "errored" } }, "a1");
     render(<AgentSidebar project={project} />);
     expect(peek()).toBeTruthy();
 
-    toggleHead("Alpha");
+    await toggleHead("Alpha");
     expect(peek()).toBeNull(); // no longer a peek…
     expect(childRowOf("a1", "Fix The Parser")).toBe(true); // …because the real row is there
 
-    toggleHead("Alpha");
+    await toggleHead("Alpha");
     expect(peek()).toBeTruthy();
     expect(childRowOf("a1", "Fix The Parser")).toBe(false);
   });

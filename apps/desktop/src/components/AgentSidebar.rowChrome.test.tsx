@@ -18,7 +18,7 @@
 // branch rebase, path reveal, the alert toggle and per-worker detail. It moved to right-click, so
 // several assertions below check that the card is absent from a LEFT click and present on a right
 // one, rather than that it is gone entirely.
-import { cleanup, createEvent, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
@@ -46,6 +46,7 @@ vi.mock("../services/branchStatus", () => ({
 
 import { AgentSidebar } from "./AgentSidebar";
 import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
+import { settleFold } from "../testing/rowGestures";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -320,13 +321,18 @@ describe("Build column — left-click selects and folds, right-click opens the c
   // The rerender between the clicks is not ceremony: the component reads selection from its
   // `project` PROP, and in the running app that prop is re-supplied from the store after a
   // selection. These tests own the prop, so the rerender IS that step.
-  it("first click SELECTS only; the second click folds the subtree", () => {
+  it("first click SELECTS only; the second click folds the subtree", async () => {
     const project = seed();
     const { rerender } = render(<AgentSidebar project={project} />);
 
     // `seed()` starts COLLAPSED, so "the subtree did not change" means the workers stay hidden.
     fireEvent.click(rowFor("Alpha"));
     expect(liveProject().selectedAgentId).toBe("a1");
+    // SETTLED FIRST — the fold is deferred one double-click interval now (roborev 63145 #3, see
+    // AgentRow.FOLD_DOUBLE_PRESS_GRACE_MS), so reading it on the next line would say "untouched"
+    // about a fold that simply had not landed yet, in a case whose whole point is that it never
+    // does. This wait is what keeps the assertion below meaning what it says.
+    await settleFold();
     // UNTOUCHED — not merely "still collapsed". `undefined` is the never-written state, so this
     // also fails if the first click wrote a fold that something else then undid.
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBeUndefined();
@@ -337,11 +343,11 @@ describe("Build column — left-click selects and folds, right-click opens the c
     rerender(<AgentSidebar project={onAlpha} />);
 
     fireEvent.click(rowFor("Alpha")); // now on the row we are already on — this one opens it
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    await waitFor(() => expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false));
     expect(screen.queryByText("Parser Worker")).toBeTruthy();
 
     fireEvent.click(rowFor("Alpha")); // and folds it again
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+    await waitFor(() => expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true));
     expect(screen.queryByText("Parser Worker")).toBeNull();
   });
 
@@ -400,10 +406,11 @@ describe("Build column — left-click selects and folds, right-click opens the c
   });
 
   // A childless row has nothing to fold; a left click must not throw or half-toggle it.
-  it("leaves a childless row's collapse state untouched", () => {
+  it("leaves a childless row's collapse state untouched", async () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
     fireEvent.click(rowFor("Solo"));
+    await settleFold(); // an absence assertion — see settleFold's note on "no fold" vs "not yet"
     expect(useUiStore.getState().collapsedOrchestrators.solo).toBeUndefined();
     expect(liveProject().selectedAgentId).toBe("solo");
   });
@@ -595,7 +602,7 @@ describe("Build column — a worker going red does NOT open its parent", () => {
 
   // Holding it open for as long as the worker stays red turns a helpful reveal into a control that
   // won't take no for an answer. The head's disc keeps carrying the signal after the fold.
-  it("stays folded across further renders while the worker is still red", () => {
+  it("stays folded across further renders while the worker is still red", async () => {
     // Pre-selected: folding is the SECOND-stage click, so the head has to be the selected row for
     // this gesture to exist at all. What the test measures — that a still-red worker cannot
     // re-open a subtree the user shut — is unchanged.
@@ -606,9 +613,9 @@ describe("Build column — a worker going red does NOT open its parent", () => {
     rerender(<AgentSidebar project={{ ...project }} />);
 
     fireEvent.click(rowFor("Alpha")); // the user opens it deliberately
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    await waitFor(() => expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false));
     fireEvent.click(rowFor("Alpha")); // and folds it back
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
+    await waitFor(() => expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true));
 
     rerender(<AgentSidebar project={{ ...project }} />); // still red, another render
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
@@ -730,7 +737,7 @@ describe("Build column — a HINT JUMP selects without folding", () => {
   // describes the DISPATCH MECHANISM, and assistive-tech activations (VoiceOver / Switch Control
   // AXPress on a non-native control) also arrive with detail 0. Under the sniff they were
   // indistinguishable from a hint jump and silently lost the fold.
-  it("DOES toggle on an unmarked programmatic click, the way an AT activation arrives", () => {
+  it("DOES toggle on an unmarked programmatic click, the way an AT activation arrives", async () => {
     // Pre-selected, so the click under test is the FOLDING one. The point of this case is that an
     // AT activation is not mistaken for a hint jump and does not lose the fold — which can only be
     // observed on a click that is supposed to fold in the first place.
@@ -738,7 +745,10 @@ describe("Build column — a HINT JUMP selects without folding", () => {
     useProjectStore.setState({ projects: [project] } as never);
     render(<AgentSidebar project={project} />);
     rowFor("Alpha").click(); // detail === 0, but no hint marker
-    expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
+    // Detail 0 has no double form, so it takes the SAME deferred path rather than a second branch
+    // that could drift — its fold simply lands one interval later. `waitFor`, not `settleFold`,
+    // because the claim here is that the fold DOES happen.
+    await waitFor(() => expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false));
   });
 });
 
@@ -752,7 +762,7 @@ describe("Build column — the rename input keeps its own context menu", () => {
     // Grab the row BEFORE renaming: once the input mounts, the title text is gone from the DOM and
     // rowFor() (which looks the row up by its visible name) can no longer find it.
     const row = rowFor("Alpha");
-    fireEvent.doubleClick(screen.getByText("Alpha"));
+    fireEvent.contextMenu(screen.getByText("Alpha"));
     expect(screen.getByDisplayValue("Alpha")).toBeTruthy(); // in rename mode
 
     const ev = createEvent.contextMenu(row);

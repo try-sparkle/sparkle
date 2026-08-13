@@ -71,7 +71,7 @@ describe("CHAT_ROW_SELECTOR", () => {
   });
 
   it("keeps the cable patched when a person row is pressed", () => {
-    const wired = patchCable(CABLE_REST, "right");
+    const wired = patchCable(CABLE_REST, "right", null);
     expect(unbindsOnPointerDown(wired, mountChatRow())).toBe(false);
   });
 
@@ -79,7 +79,7 @@ describe("CHAT_ROW_SELECTOR", () => {
     // The complement, so the test above cannot pass by the predicate having become "never unbind".
     document.body.innerHTML = `<div data-testid="shell-background"></div>`;
     const outside = document.querySelector('[data-testid="shell-background"]') as HTMLElement;
-    expect(unbindsOnPointerDown(patchCable(CABLE_REST, "right"), outside)).toBe(true);
+    expect(unbindsOnPointerDown(patchCable(CABLE_REST, "right", null), outside)).toBe(true);
   });
 
   it("is scoped to the chat tree — a stray treeitem elsewhere is not a chat row", () => {

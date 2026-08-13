@@ -76,7 +76,11 @@ import { PtyGoneError, writePtyChainedStrict } from "../../pty";
 import { searchHistory } from "../history";
 import { pickerParseDiagnosis, type PickerBlindness } from "../suggestions/heuristics";
 import { SNAPSHOT_MAX_LINES, getAgentScrollback } from "../terminalScrollback";
-import { agentTranscriptPath, agentTranscriptWorktree } from "../agentTranscriptRegistry";
+import {
+  agentSessionIds,
+  agentTranscriptPath,
+  agentTranscriptWorktree,
+} from "../agentTranscriptRegistry";
 import { isRedStatus } from "../windowStatus";
 // The "has this agent acted since its red was raised" ledger, shared with the concierge feed's
 // stale-red retraction — see `captureFor` for why the ask-screen needs the same answer.
@@ -320,6 +324,20 @@ export interface ConciergeSendResult {
 //     background `claude` sharing the worktree's log. Read that helper's doc comment before changing
 //     anything here; the two are a pair.
 //
+//     ⚠ AND IT IS ALSO WHAT TIER (d) NOW REQUIRES, which narrows writer (2) below to less than it
+//     advertises. Since roborev 63135 the tier is gated on writer (3)'s SESSION IDS, and the only
+//     production writers of those are this hook handler and the two Sparkle-only paths
+//     (`improvementPass`, `sparkleTranscript`). So a build agent whose pane has never been mounted
+//     has a worktree and NO session binding, and its tier-(d) read now returns null where it
+//     previously returned a transcript. That is a deliberate fail-closed trade — the alternative is
+//     quoting a stranger's conversation to the concierge as this agent's own words — but it is a
+//     REAL loss of coverage for exactly the population writer (2) was introduced to serve, and
+//     nothing in the suite surfaces it (the test pins the refusal). Tracked as its own bead; the
+//     repair is a non-hook binding source for pane-less build agents, mirroring what
+//     `bindWorktreeSession` already gives the app-owned Sparkle agent. Read this before concluding
+//     from the comment below that the pane-less case still works end to end — it resolves, and then
+//     tier (d) declines.
+//
 //  2. A WORKTREE — `noteAgentTranscriptWorktree`, for an agent with NO pane, hence no hook events
 //     — and, since the mounted-concierge transcript work, for EVERY BUILD AGENT: `projectStore
 //     .setAgentWorktree` registers one the moment a worktree is cut. (It was the app-owned Improve
@@ -333,9 +351,9 @@ export interface ConciergeSendResult {
 //     The mounted pane does not rely on this registry at all — it resolves the worktree from the
 //     roster row and calls the transcript reader directly — so widening this writer buys
 //     `readAgentTerminal` a fallback it did not have across relaunches without putting the new
-//     surface behind the weaker resolution. Nothing tells us
-//     which session is live, so the file is resolved AT READ TIME as the newest transcript in that
-//     worktree's project dir. Its safety property is weaker and worth stating exactly:
+//     surface behind the weaker resolution. The file is resolved AT READ TIME as the newest
+//     transcript in that worktree's project dir THAT IS ONE OF THE AGENT'S OWN SESSIONS — writer (3)
+//     supplies the "own", and without it this read is skipped entirely. Its safety property:
 //       • The worktree is one the app itself created; no id-to-path guessing, nothing a model said.
 //       • "Newest at read time" is the live session while an agent is running, because the file being
 //         written has the freshest mtime. That is the whole point of resolving late: this used to
@@ -343,14 +361,16 @@ export interface ConciergeSendResult {
 //         therefore writes a brand-new `<uuid>.jsonl` every hour — pinned the PREVIOUS pass's
 //         transcript forever, and handed the concierge the wrong conversation (not a stale view of
 //         the right one) for the whole pass.
-//       • RESIDUAL RACE, accepted knowingly: a *different* `claude` invoked with that same cwd writes
-//         into the same project dir and can hold the newest mtime, and unlike writer (1) there is no
-//         session gate to reject it. A mtime floor does not help (a sibling post-dates any floor a
-//         registration could set), and pinning the session id the pass reports on
-//         `sparkle_improve:done` cannot help mid-flight, which is when the read is asked for — and
-//         would reintroduce a stale pin outranking a live resolution, i.e. this exact bug. The
-//         exposure is bounded: it requires the agent to spawn its own `claude` in the app's own
-//         worktree, and the result is mislabelled provenance rather than a read of an arbitrary file.
+//       • THE SIBLING-`claude` RACE IS CLOSED (roborev 63135). It used to be accepted knowingly: a
+//         *different* `claude` invoked with that same cwd writes into the same project dir, can hold
+//         the newest mtime, and unlike writer (1) there was no session gate to reject it. That was
+//         tolerable when the alternative on offer was a stale pin — pinning the id the pass reports
+//         on `sparkle_improve:done` cannot help mid-flight, which is exactly when the read is asked
+//         for, and would reintroduce a stale pin outranking a live resolution. Writer (3) is neither:
+//         it is a SET that accumulates, so it constrains the resolution without pinning it, and the
+//         live session joins it as soon as the agent speaks. `agent_own_session_path` chooses the
+//         newest among the agent's own files; an unknown binding resolves NOTHING rather than the
+//         newest stranger. Fail-closed here costs a tier; the alternative costs the truth.
 //
 // Writer (1) WINS when both are registered, because an exact session-gated path is strictly better
 // evidence than a directory scan. No agent has both today.
@@ -368,12 +388,18 @@ export interface ConciergeSendResult {
 // `SNAPSHOT_MAX_LINES` into the module graph of every test importing the project store, failing 16
 // of them at COLLECTION with zero test failures. Re-exported here so this module's public surface is
 // unchanged for existing importers.
+//
+// ONLY THE NAMES THAT HAVE AN IMPORTER HERE. `agentSessionIds` and `subscribeAgentSessionIds` were
+// also re-exported and nothing imported either one from this module — every consumer reaches the
+// leaf directly. That was not merely dead surface: it made the registry header's claim that writer
+// (3) constrains writer (2) READ as though it were implemented here, while `resolveWorktreeTranscript`
+// below still resolved unfiltered (roborev 63135). It is implemented now, and `agentSessionIds` is
+// imported for that use rather than re-exported — a re-export is a promise to other modules, and
+// there is no other module.
 export {
   noteAgentTranscriptPath,
   noteAgentTranscriptWorktree,
   noteAgentSessionId,
-  agentSessionIds,
-  subscribeAgentSessionIds,
   forgetAgentTranscriptPath,
 } from "../agentTranscriptRegistry";
 
@@ -656,22 +682,78 @@ async function readHistoryTier(
 async function readTranscriptTier(agentId: string): Promise<TierResult> {
   const path = agentTranscriptPath(agentId) ?? (await resolveWorktreeTranscript(agentId));
   if (!path) {
-    return {
-      why: "no transcript path is known for this agent (see noteAgentTranscriptPath / noteAgentTranscriptWorktree)",
-    };
+    // THE TWO REASONS ARE NAMED SEPARATELY, because they call for opposite responses and this string
+    // is read by an LLM that will act on it. "No worktree" means nobody registered this agent yet;
+    // "unknown binding" means we know where to look and are REFUSING to guess whose file it is. A
+    // single message would have the concierge report a deliberate, correct refusal as missing
+    // plumbing — and the obvious repair for missing plumbing is to widen the read, which is the
+    // defect. (AGENTS.md: a remedy string is an instruction the reader will follow.)
+    // THE TRAILING CLAUSE USED TO PROMISE A WAIT THAT NEVER ENDS (roborev 63248). It said the
+    // binding "arrives with its first hook event" — but hook-driven binding requires a mounted
+    // pane, and an agent with a mounted pane has writer (1) and never reaches this branch at all.
+    // So for exactly the population that reads this string, the promised event cannot arrive. An
+    // LLM told to wait for it waits forever, and the obvious repair for a wait that never resolves
+    // is to widen the read — which is the wrong-attribution defect this tier was closed to prevent.
+    // It now describes a standing condition, so the reader stops waiting and reports it instead.
+    //
+    // SPLIT ON THE BINDING, NOT ON THE WORKTREE (roborev 63331). The worktree-present branch is
+    // reached from TWO states that call for opposite responses, and answering both with one
+    // sentence inverts the transient/standing axis for one of them — the very axis this string
+    // exists to get right:
+    //   (b1) NO BINDING. Standing: hook-driven binding needs a mounted pane, and an agent with one
+    //        never reaches this branch, so nothing will arrive on its own.
+    //   (b2) BOUND, but Claude has not yet written one of this agent's sessions into that worktree.
+    //        `resolveWorktreeTranscript`'s own doc calls this "the normal state of a brand-new agent
+    //        rather than a fault" — it resolves by itself the moment the file appears.
+    // Telling (b2) the condition is standing is the more dangerous error of the two: a reader that
+    // stops re-reading reports a healthy new agent as permanently unreadable, or widens the read to
+    // compensate, which is the wrong-attribution defect this tier was closed to prevent.
+    const bound = (agentSessionIds(agentId)?.length ?? 0) > 0;
+    const why = agentTranscriptWorktree(agentId)
+      ? bound
+        ? "this agent is bound to its Claude sessions, but none of them has been written into its worktree yet — that is the normal state of a brand-new agent, and it resolves on its own once Claude writes the first one"
+        : "this agent's Claude sessions aren't known, so its transcript can't be read without risking another agent's conversation. No session binding is recorded, which is the standing state for an agent whose pane has never been open — it is not a delay to wait out"
+      : "no transcript path is known for this agent (see noteAgentTranscriptPath / noteAgentTranscriptWorktree)";
+    return { why };
   }
   const text = await invoke<string>("read_transcript_last_assistant", { path });
   if (!text || text.trim() === "") return { why: "the transcript has no assistant turn yet" };
   return { text };
 }
 
-/** Writer (2)'s half of tier (d): the newest transcript in this agent's registered worktree, or null
- *  when it has no worktree registered — or has one Claude has not yet written a session for, which is
- *  the normal state of a brand-new agent rather than a fault. */
+/**
+ * Writer (2)'s half of tier (d): the newest transcript in this agent's registered worktree that is
+ * one of THIS AGENT'S OWN sessions — or null when it has no worktree registered, no session binding,
+ * or a worktree Claude has not yet written one of its sessions into (the normal state of a brand-new
+ * agent rather than a fault).
+ *
+ * CONSTRAINED BY WRITER (3), which is what the registry's header claims and, until roborev 63135,
+ * was not true here. This resolved through the unfiltered `claude_latest_session_path`, so it could
+ * hand `read_transcript_last_assistant` whichever `claude` in that directory had the newest mtime —
+ * the identical wrong-attribution defect the mounted pane was fixed for, on the surface where it is
+ * arguably worse: the pane shows a stranger's words to a human who can see they look wrong, whereas
+ * this quotes them to the concierge as "what this agent last said", which then repeats it as fact.
+ *
+ * FAILS CLOSED on an unknown binding, exactly like the page and tail reads. Checked HERE rather than
+ * left to Rust — which also fails closed — so an unidentified agent costs zero IPC, and so the
+ * refusal has a reason the caller can be told (see `readTranscriptTier`). The Rust guard stays as
+ * defence in depth: it is the surface, and `agent_own_session_path` documents why it is a separate
+ * command from the unfiltered LEARN seam rather than a mode of it.
+ */
 async function resolveWorktreeTranscript(agentId: string): Promise<string | null> {
   const worktreePath = agentTranscriptWorktree(agentId);
   if (!worktreePath) return null;
-  return (await invoke<string | null>("claude_latest_session_path", { worktreePath })) ?? null;
+  const sessionIds = agentSessionIds(agentId);
+  if (!sessionIds) return null;
+  // `[...sessionIds]`, matching the page and tail call sites in `services/agentTranscript`: the
+  // registry hands out a FROZEN array (its identity has to be stable for `useSyncExternalStore`), and
+  // all three readers of that binding send a copy across the boundary rather than the shared object.
+  return (
+    (await invoke<string | null>("agent_own_session_path", {
+      worktreePath,
+      sessionIds: [...sessionIds],
+    })) ?? null
+  );
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -3537,7 +3537,7 @@ describe("the cable reaches the concierge column", () => {
     expect(screen.queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
     expect(screen.getByTestId(CONCIERGE_THREAD_TESTID)).toBeTruthy();
 
-    act(() => useCableStore.getState().patch("right"));
+    act(() => useCableStore.getState().patch("right", null));
 
     // Patched: THAT agent's thread, and the concierge thread is gone rather than merely hidden.
     // Asserted by the accessible name too, because "a thread is present" would be true either way —
@@ -3555,9 +3555,9 @@ describe("the cable reaches the concierge column", () => {
 
   it("follows the cable into either pair", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    act(() => useCableStore.getState().patch("right"));
+    act(() => useCableStore.getState().patch("right", null));
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("right");
-    act(() => useCableStore.getState().patch("left"));
+    act(() => useCableStore.getState().patch("left", null));
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("left");
     act(() => useCableStore.getState().unbind());
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("off");
@@ -3568,7 +3568,7 @@ describe("the cable reaches the concierge column", () => {
     // while this column still flooded. That contradiction is what this row makes unrepresentable,
     // and it is asserted HERE because the root's own suite cannot see the column.
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
-    act(() => useCableStore.getState().patch("right"));
+    act(() => useCableStore.getState().patch("right", null));
     expect(screen.getByLabelText("Sparkle concierge").getAttribute("data-wired")).toBe("right");
     act(() =>
       useProjectStore.setState({

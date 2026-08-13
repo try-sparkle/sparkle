@@ -176,9 +176,58 @@ struct ImproveDone {
     text: String,
 }
 
+/// Payload of `sparkle_improve:error`.
+///
+/// CARRIES THE SESSION ID TOO, for the same reason `ImproveDone` does and with more at stake
+/// (roborev 63251). A failing pass still wrote a conversation, and a failure is the ending someone
+/// is most likely to open the pane to READ. `session_id` was in scope on this branch all along —
+/// it is moved into `ImproveDone` only on the `ok` side — and was simply dropped, so the exact case
+/// the `done` bind exists to cover (the pass forked or continued mid-flight, so the once-only early
+/// announcement names a different file than the final one) left the tail unreadable on every
+/// failure. It also covers a stream whose `init` line carried no id: on the error path `done` never
+/// arrives, so this is the ONLY id the app would ever see.
+///
+/// `rename_all` is required now that a second, multi-word field exists — without it this would
+/// cross as `session_id` while every other payload in this module sends camelCase. It is a plain
+/// `String` (empty when unknown), not an `Option`, matching `ImproveDone`; the TS handler treats
+/// the empty string as "no id" via a falsy check rather than a null test.
 #[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ImproveError {
     message: String,
+    session_id: String,
+}
+
+/// Payload of `sparkle_improve:session` — the id of the Claude session THIS pass is writing,
+/// announced as soon as Claude reports it rather than held until the pass ends.
+///
+/// WHY EARLY MATTERS. The mounted transcript reads an agent's history by SESSION ID and fails closed
+/// on an agent whose sessions it does not know. This pass is the one Sparkle agent with no pane and
+/// therefore no hook events, so the app has no other authoritative way to learn which session is
+/// its own — and `sparkle_improve:done` carries the id at turn END, which is far too late for
+/// someone watching the pass work. Everything else available mid-flight is a directory scan
+/// ("the newest `*.jsonl` in the worktree"), which cannot tell this pass's file from any other
+/// `claude` that has run in the same tree. This id can: the app spawned the process that reported it.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImproveSession {
+    session_id: String,
+}
+
+/// The session-id announcement a stream line should produce, if any — `Some(id)` exactly ONCE, the
+/// first time `handle_event` has filled one in.
+///
+/// Pulled out of the reader loop so the once-only rule is testable: `handle_event` re-assigns
+/// `session_id` on the `result` event as well as on `system/init`, so an emit written inline as
+/// "non-empty → emit" would fire again at the end of every pass. A duplicate is harmless downstream
+/// (the binding is a set that no-ops on a known id) but it is a claim the event's name does not
+/// make, and a second announcement of a DIFFERENT id would be a real signal nothing is listening for.
+fn session_announcement(session_id: &str, announced: &mut bool) -> Option<String> {
+    if *announced || session_id.is_empty() {
+        return None;
+    }
+    *announced = true;
+    Some(session_id.to_string())
 }
 
 /// Build the `exec …` script handed to `zsh -l -c`. Everything user-influenced is
@@ -375,6 +424,8 @@ pub fn sparkle_improve_run(
             // That combination used to dead-end on the bare "(exit code 1)" fallback, which is
             // the one failure shape triage can do nothing with.
             let mut plain_stdout = String::new();
+            // Has this pass's session id been announced yet? See `session_announcement`.
+            let mut session_announced = false;
             loop {
                 line.clear();
                 match reader.read_until(b'\n', &mut line) {
@@ -389,6 +440,13 @@ pub fn sparkle_improve_run(
                             // No delta consumer for the hourly pass — the closure only feeds
                             // `acc`, the fallback if the stream ends without a `result` event.
                             handle_event(&ev, &mut session_id, &mut final_text, &mut acc, &mut |_| {});
+                            // Announce WHICH session this pass is writing, the moment Claude says so
+                            // (its `system/init` line, i.e. within a second of the spawn). The
+                            // frontend binds it as this agent's own so a mounted pane can read the
+                            // pass while it works; see `ImproveSession`.
+                            if let Some(sid) = session_announcement(&session_id, &mut session_announced) {
+                                let _ = read_app.emit("sparkle_improve:session", ImproveSession { session_id: sid });
+                            }
                             capture_result_status(
                                 &ev,
                                 &mut result_subtype,
@@ -437,7 +495,15 @@ pub fn sparkle_improve_run(
                     &wait_result,
                 );
                 tracing::warn!(%message, elapsed_ms, "sparkle_improve: pass failed");
-                let _ = read_app.emit("sparkle_improve:error", ImproveError { message });
+                // `session_id` goes with it — see `ImproveError`. It is still owned here because
+                // only the `ok` arm above moves it.
+                let _ = read_app.emit(
+                    "sparkle_improve:error",
+                    ImproveError {
+                        message,
+                        session_id,
+                    },
+                );
             }
         });
     }
@@ -986,5 +1052,40 @@ mod tests {
             &failed_status(),
         );
         assert_eq!(m, "Claude usage limit reached");
+    }
+
+    // The mounted transcript keys on SESSION ID and fails closed on an agent whose sessions it does
+    // not know. This pass has no pane and so no hook events, which made the app-owned Sparkle agent
+    // permanently unbindable while a pass ran (roborev 63133/63135). Drive the same seam the reader
+    // loop uses — `handle_event` over the real NDJSON, then the announcement decision.
+    #[test]
+    fn the_pass_announces_its_session_id_once_from_the_first_line_claude_writes() {
+        let (mut session_id, mut final_text, mut acc) = (String::new(), String::new(), String::new());
+        let mut announced = false;
+
+        // Claude has not said anything yet: nothing to announce, and nothing announced by accident.
+        assert_eq!(session_announcement(&session_id, &mut announced), None);
+        assert!(!announced);
+
+        // The stream's FIRST line — this is where the id arrives, ~a second after the spawn, which
+        // is the whole point of announcing here rather than on `sparkle_improve:done`.
+        let init: Value = serde_json::from_str(
+            r#"{"type":"system","subtype":"init","session_id":"pass-live-1"}"#,
+        )
+        .unwrap();
+        handle_event(&init, &mut session_id, &mut final_text, &mut acc, &mut |_| {});
+        assert_eq!(
+            session_announcement(&session_id, &mut announced),
+            Some("pass-live-1".to_string())
+        );
+
+        // ONCE. `handle_event` re-assigns `session_id` on the `result` event too, so a bare
+        // "non-empty → emit" would fire a second time at the end of every pass.
+        let result: Value = serde_json::from_str(
+            r#"{"type":"result","subtype":"success","session_id":"pass-live-1","result":"done"}"#,
+        )
+        .unwrap();
+        handle_event(&result, &mut session_id, &mut final_text, &mut acc, &mut |_| {});
+        assert_eq!(session_announcement(&session_id, &mut announced), None);
     }
 }

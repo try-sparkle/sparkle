@@ -1327,7 +1327,56 @@ export function Workspace() {
   // the cable would light up and the prompt would still land in the right pair, which is the exact
   // "user-facing remedy that does the unsafe thing" shape AGENTS.md warns about.
   const wiredProject = wired === "left" ? leftProject : project;
-  const wiredAgentId = wiredProject?.selectedAgentId ?? null;
+  // WHICH AGENT IS ON THE FAR END — THE ONE THE MOUNT NAMED, not the one you last clicked.
+  //
+  // This read `wiredProject?.selectedAgentId` and that was the bug (roborev 63145, finding 4): the
+  // live cable followed the SELECTION, so a single click on a different row re-aimed the concierge
+  // at it — no mount gesture, no `patchCable`, and nothing on screen to say the far end had moved.
+  // The founder's own failure: double-click A to mount, single-click B to read its terminal, type
+  // in the concierge, and the message goes to B. That is precisely the hijack his single/double
+  // split exists to prevent, re-created one layer down where it is invisible.
+  //
+  // So the pin wins whenever there IS a cable. `cableStore` records the agent at mount time and
+  // clears it on every unbind, which is what makes "look at an agent without changing what you are
+  // talking to" true rather than merely intended.
+  const pinnedAgentId = useCableStore((s) => s.agentId);
+  const wiredAgentId =
+    // UNWIRED KEEPS FOLLOWING THE SELECTION, deliberately. With no cable the compose box has always
+    // targeted the selected agent, and that is not what the finding is about — reading the pin
+    // unconditionally would leave the box aimed at nothing until the first mount of the session,
+    // which is a second, larger behaviour change smuggled in as a fix.
+    wired === "off" ? (wiredProject?.selectedAgentId ?? null) : pinnedAgentId;
+  // ── THE CABLE MUST NOT OUTLIVE THE AGENT IT NAMES ────────────────────────────────────────────
+  //
+  // roborev 63302. Pinning the far end removed an accident that was doing real work: while the far
+  // end tracked the SELECTION, two click-reachable states self-healed. With a pin they do not, and
+  // NEITHER fires an unbind, because the control you press is itself inside the circuit — so
+  // `unbindsOnPointerDown` ignores it by design:
+  //
+  //   • CLOSE THE MOUNTED AGENT. `removeAgent` deletes the row and re-points `selectedAgentId` at
+  //     `agents[0]`; the `×` lives inside a build row, a `CIRCUIT_SELECTOR` member.
+  //   • SWITCH THE WIRED PAIR'S PROJECT TAB. The tab bar renders inside the wired pair, so the
+  //     cable survives the press while `wiredProject` becomes a project the pin has no agent in.
+  //
+  // Left alone, routing fails its roster lookup and the mounted thread disappears while the shell
+  // stays flooded and the row joints stay drawn open — the shell-says-connected /
+  // column-says-not contradiction of roborev 55386, reachable again because the DRAWN far end and
+  // the ROUTED far end came from two different facts.
+  //
+  // DROPPING THE CABLE, rather than teaching the projection to read the pin. The projection is
+  // shared by three surfaces and keyed on the selection; making it pin-aware is the better end
+  // state but it changes what "occupied" means for every one of them at once. This says the
+  // narrower true thing — a cable whose agent is gone is not a cable — and both surfaces then agree
+  // because they are reading the same `wired: "off"`.
+  //
+  // The Sparkle pane is exempt: its agent is deliberately never a roster member, so a roster lookup
+  // would unbind the one mount whose far end is app-owned.
+  useEffect(() => {
+    if (wired === "off" || pinnedAgentId === null) return;
+    if (pinnedAgentId === sparkleAgentId) return;
+    if (wiredProject?.agents.some((a) => a.id === pinnedAgentId)) return;
+    unbind();
+  }, [wired, pinnedAgentId, sparkleAgentId, wiredProject, unbind]);
   // WHAT THE SHELL DRAWS, from the ONE shared derivation (hooks/useEffectiveWired). It was a local
   // expression here for one commit, and `wired` has three readers — this root, the concierge column
   // via ConciergeHost, and the sidebar's row joint — so projecting it at one of them left the state

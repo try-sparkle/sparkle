@@ -324,7 +324,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const h = await handler();
     // A parked caret (the resting state): one press releases, per the founder-confirmed ladder.
@@ -341,7 +341,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const h = await handler();
     expect(dataHandler.fn).not.toBeNull();
@@ -362,7 +362,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const h = await handler();
     h(key({ key: "Escape" }));
@@ -379,7 +379,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const h = await handler();
     expect(dataHandler.fn).not.toBeNull();
@@ -401,7 +401,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const h = await handler();
     dataHandler.fn!("x");
@@ -417,7 +417,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const menu = document.createElement("div");
     menu.setAttribute("role", "menu");
@@ -437,7 +437,7 @@ describe("Escape reaches the cable even though it never reaches `window`", () =>
     resetCable();
     resetTerminalFocusIntent();
     clearTerminalEscapeToll();
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
 
     const h = await handler();
     // `true` is xterm's go-ahead. The cable moved AND the process gets its ESC — never one instead of

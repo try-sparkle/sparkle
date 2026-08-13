@@ -18,7 +18,7 @@
 // So the invariant is exactly: A ROW RENDERS FILLETS XOR IT IS CONTAINED. Both directions matter —
 // dropping the gate clips the active row's arcs, and dropping the containment brings the freeze
 // back — so each is asserted against the real rendered DOM rather than against a helper.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -33,6 +33,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { resetCable } from "../stores/cableStore";
 import type { Project, AgentTab } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string): AgentTab {
   return {
@@ -178,7 +179,7 @@ describe("AgentRow — CSS containment gate", () => {
     // The hover card is createPortal'd to document.body, so it is not a DOM descendant of the row
     // and this row's paint containment cannot clip it. If that ever changes, the card will start
     // being clipped to a ~32px row and this test is where the reasoning is recorded.
-    fireEvent.contextMenu(screen.getByText("One"));
+    openAgentCard(screen.getByText("One"));
 
     for (const row of screen.getAllByRole("treeitem")) {
       expect(isContained(row)).toBe(!hasFillets(row));

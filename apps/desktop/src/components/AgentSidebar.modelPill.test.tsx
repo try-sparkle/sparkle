@@ -24,6 +24,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { applyModelToRunningAgent } from "../services/agentModel";
 import type { Project, AgentTab } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 const TITLE = "Agent Name";
 
@@ -84,7 +85,7 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([mkAgent()]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(screen.getByText(TITLE)); // open the hover card
+    openAgentCard(screen.getByText(TITLE)); // open the hover card
     fireEvent.click(screen.getByTestId("model-pill").querySelector("button")!);
     fireEvent.click(screen.getByText("Opus 4.8"));
     expect(agentModel()).toBe("claude-opus-4-8");
@@ -95,7 +96,7 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([mkAgent({ model: "claude-opus-4-8" })]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(screen.getByText(TITLE));
+    openAgentCard(screen.getByText(TITLE));
     fireEvent.click(screen.getByTestId("model-pill").querySelector("button")!);
     fireEvent.click(screen.getByText("Default (Claude Code setting)"));
     expect(agentModel()).toBeUndefined();
@@ -106,7 +107,7 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([mkAgent()]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(screen.getByText(TITLE)); // opening the card selects a1
+    openAgentCard(screen.getByText(TITLE)); // opening the card selects a1
     fireEvent.click(screen.getByTestId("model-pill").querySelector("button")!);
     fireEvent.click(screen.getByText("Sonnet 5"));
     // The card is still open (the pill's clicks stopPropagation, so they never close it) and the
@@ -128,12 +129,12 @@ describe("AgentRow — ModelPill wiring", () => {
     const project = mkProject([claudeAgent, shell]);
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(screen.getByText("Shell Row"));
+    openAgentCard(screen.getByText("Shell Row"));
     expect(screen.getByTestId("agent-hover-card")).toBeTruthy(); // card open…
     expect(screen.queryByTestId("model-pill")).toBeNull(); // …but no pill for a shell tab
     // (Once hovered, the name renders twice — hidden in-flow row + overlay — hence getAllByText.)
     fireEvent.mouseOut(screen.getAllByText("Shell Row")[0]!);
-    fireEvent.contextMenu(screen.getByText(TITLE));
+    openAgentCard(screen.getByText(TITLE));
     expect(screen.getByTestId("model-pill")).toBeTruthy(); // the claude-terminal card has one
   });
 });
@@ -151,7 +152,7 @@ describe("ModelPill — a filled chip on the hover card takes the FILL token, no
   const openCard = (project: Project) => {
     seedProject(project);
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(screen.getByText(TITLE));
+    openAgentCard(screen.getByText(TITLE));
     return screen.getByTestId("model-pill").querySelector("button")!;
   };
 

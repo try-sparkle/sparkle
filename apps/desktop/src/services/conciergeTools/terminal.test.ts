@@ -84,7 +84,9 @@ import {
   TERMINAL_READ_MAX_LINES,
   forgetAgentTranscriptPath,
   getAgentStatus,
+  noteAgentSessionId,
   noteAgentTranscriptPath,
+  noteAgentTranscriptWorktree,
   readAgentTerminal,
   sendToAgentTerminal,
   type AgentTerminalRead,
@@ -471,6 +473,130 @@ describe("readAgentTerminal — tier (d), the session transcript", () => {
     const d = r.attempts.find((t) => t.source === "transcript")!;
     expect(d.ok).toBe(false);
     expect(d.why).toMatch(/transcript path/i);
+  });
+
+  // --- writer (2): resolving from a WORKTREE, constrained by the session binding (roborev 63135) ---
+  //
+  // A session directory belongs to a WORKTREE, so it holds a file for every `claude` that ever ran
+  // there. This resolution used to go through the unfiltered `claude_latest_session_path` and could
+  // hand `read_transcript_last_assistant` a stranger's newest file — the same wrong-attribution
+  // defect the mounted pane was fixed for, on a surface where it is arguably worse: the pane shows a
+  // human something that looks wrong, this quotes it to the concierge as fact.
+
+  /** Answer `agent_own_session_path` with `own`, and blow up if the UNFILTERED command is reached —
+   *  a resolve that falls back to it is exactly the defect, and a permissive stub would hide it. */
+  function stubResolve(own: string | null, lastAssistant = "MY OWN LAST TURN") {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "agent_own_session_path") return Promise.resolve(own);
+      if (cmd === "read_transcript_last_assistant") return Promise.resolve(lastAssistant);
+      if (cmd === "claude_latest_session_path") {
+        throw new Error("tier (d) must not resolve through the UNFILTERED command");
+      }
+      return Promise.resolve("");
+    });
+  }
+
+  it("resolves a registered worktree through the agent's OWN sessions and reads that file", async () => {
+    noteAgentTranscriptWorktree(AGENT, "/wt/ag-1");
+    noteAgentSessionId(AGENT, "mine-1111");
+    noteAgentSessionId(AGENT, "mine-2222");
+    stubResolve("/home/u/.claude/projects/-wt-ag-1/mine-2222.jsonl");
+
+    const r = await readAgentTerminal(AGENT);
+
+    // THE SIDE EFFECT: the file that got opened, and the text that came back out of the tier.
+    expect(r.source).toBe("transcript");
+    expect(r.text).toContain("MY OWN LAST TURN");
+    expect(invokeMock).toHaveBeenCalledWith("read_transcript_last_assistant", {
+      path: "/home/u/.claude/projects/-wt-ag-1/mine-2222.jsonl",
+    });
+    // And the resolve was CONSTRAINED — an unbound resolve is the defect even when it happens to
+    // land on the right file, because which file it lands on is not something the caller controls.
+    expect(invokeMock).toHaveBeenCalledWith("agent_own_session_path", {
+      worktreePath: "/wt/ag-1",
+      sessionIds: ["mine-1111", "mine-2222"],
+    });
+  });
+
+  it("skips the tier entirely, at zero IPC, when the worktree is known but the binding is not", async () => {
+    noteAgentTranscriptWorktree(AGENT, "/wt/ag-1");
+    stubResolve("/home/u/.claude/projects/-wt-ag-1/someone-else.jsonl");
+
+    const r = await readAgentTerminal(AGENT);
+
+    expect(transcriptReads()).toHaveLength(0);
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "agent_own_session_path"),
+    ).toEqual([]);
+    const d = r.attempts.find((t) => t.source === "transcript")!;
+    expect(d.ok).toBe(false);
+    // NAMED AS A REFUSAL, not as missing plumbing. This string is read by an LLM that acts on it,
+    // and "no transcript path is known" invites the repair of registering one — which would not
+    // help and whose obvious next step is to widen the read.
+    expect(d.why).toMatch(/sessions aren't known/i);
+    // AND IT MUST NOT PROMISE A HOOK EVENT THAT CANNOT ARRIVE (roborev 63248). The string used to
+    // end "the binding arrives with its first hook event". Hook-driven binding requires a mounted
+    // pane, and an agent with a pane resolves through writer (1) and never reaches this branch — so
+    // for every reader of this message the promised event never comes. Asserting only the half
+    // above left the false half free to come back; this is the half that changes what the concierge
+    // DOES, because a reader told to wait waits forever and then widens the read to compensate.
+    expect(d.why).not.toMatch(/hook event/i);
+    expect(d.why).toMatch(/not a delay to wait out/i);
+  });
+
+  // PAIRED WITH THE CASE ABOVE, and that pairing is the point: identical registration, one session
+  // id added. Without it, "nothing was read" has two possible causes — the fail-closed rule, or a
+  // tier that is broken for this registration shape — and an absence with two causes proves neither.
+  it("reads that same registration once one session id is known", async () => {
+    noteAgentTranscriptWorktree(AGENT, "/wt/ag-1");
+    noteAgentSessionId(AGENT, "mine-1111");
+    stubResolve("/home/u/.claude/projects/-wt-ag-1/mine-1111.jsonl", "NOW IT READS");
+
+    const r = await readAgentTerminal(AGENT);
+
+    expect(r.source).toBe("transcript");
+    expect(r.text).toContain("NOW IT READS");
+    expect(transcriptReads()).toHaveLength(1);
+  });
+
+  it("skips the tier when the agent is bound but has written no session in that worktree yet", async () => {
+    noteAgentTranscriptWorktree(AGENT, "/wt/ag-1");
+    noteAgentSessionId(AGENT, "mine-1111");
+    stubResolve(null);
+
+    const r = await readAgentTerminal(AGENT);
+
+    expect(transcriptReads()).toHaveLength(0);
+    const d = r.attempts.find((t) => t.source === "transcript")!;
+    expect(d.ok).toBe(false);
+    // AND THE REASON MUST NOT INVERT THE AXIS (roborev 63331). This case asserted only `ok === false`
+    // while the two states behind this branch — no binding at all, and bound-but-no-file-yet — got
+    // ONE sentence between them. This is the transient one: `resolveWorktreeTranscript` calls it
+    // "the normal state of a brand-new agent rather than a fault", so telling the reader it is
+    // standing is the dangerous direction. It stops re-reading and either reports a healthy new
+    // agent as permanently unreadable or widens the read to compensate.
+    expect(d.why).not.toMatch(/no session binding is recorded/i);
+    expect(d.why).not.toMatch(/not a delay to wait out/i);
+    expect(d.why).toMatch(/resolves on its own/i);
+  });
+
+  // Writer (1) is strictly better evidence — an exact, session-gated path from Claude's own Stop
+  // event — so it must not be demoted by the new binding requirement. An agent with a registered
+  // path and NO session binding still reads, which is the state every pre-existing caller is in.
+  it("still prefers an exact registered path, and does not require a binding for it", async () => {
+    noteAgentTranscriptPath(AGENT, "/tmp/exact.jsonl");
+    noteAgentTranscriptWorktree(AGENT, "/wt/ag-1");
+    stubResolve("/home/u/.claude/projects/-wt-ag-1/someone-else.jsonl", "EXACT PATH TURN");
+
+    const r = await readAgentTerminal(AGENT);
+
+    expect(r.text).toContain("EXACT PATH TURN");
+    expect(invokeMock).toHaveBeenCalledWith("read_transcript_last_assistant", {
+      path: "/tmp/exact.jsonl",
+    });
+    expect(
+      invokeMock.mock.calls.filter(([cmd]) => cmd === "agent_own_session_path"),
+    ).toEqual([]);
   });
 });
 

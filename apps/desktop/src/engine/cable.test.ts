@@ -23,20 +23,20 @@ import {
 
 describe("patching", () => {
   it("puts the live cable on the patched side", () => {
-    expect(patchCable(CABLE_REST, "left")).toEqual({ wired: "left", overlay: "off" });
-    expect(patchCable(CABLE_REST, "right")).toEqual({ wired: "right", overlay: "off" });
+    expect(patchCable(CABLE_REST, "left", null)).toEqual({ wired: "left", overlay: "off", agentId: null });
+    expect(patchCable(CABLE_REST, "right", null)).toEqual({ wired: "right", overlay: "off", agentId: null });
   });
 
   it("moves the cable rather than lighting both sides — ONE live circuit", () => {
-    const left = patchCable(CABLE_REST, "left");
-    expect(patchCable(left, "right").wired).toBe("right");
+    const left = patchCable(CABLE_REST, "left", null);
+    expect(patchCable(left, "right", null).wired).toBe("right");
   });
 
   // "Receding" is the far pair's state, and it is NOT greying out: the pair still renders and its
   // last-active row is still selected. The machine only ever says which side is live; nothing here
   // may grow a notion of a disabled pair.
   it("marks exactly one pair live and the other merely not-live", () => {
-    const s = patchCable(CABLE_REST, "left");
+    const s = patchCable(CABLE_REST, "left", null);
     expect(pairIsLive(s, "left")).toBe(true);
     expect(pairIsLive(s, "right")).toBe(false);
     expect(pairIsLive(CABLE_REST, "left")).toBe(false);
@@ -46,25 +46,25 @@ describe("patching", () => {
   // WIRING DOCKS THE OVERLAY. A floating concierge sits on top of the very row it claims to be
   // wired to, so the two states cannot both be true.
   it("docks a floating concierge when the cable is patched", () => {
-    const floating: CableState = { wired: "off", overlay: "assist" };
-    expect(patchCable(floating, "right")).toEqual({ wired: "right", overlay: "off" });
+    const floating: CableState = { wired: "off", overlay: "assist", agentId: null };
+    expect(patchCable(floating, "right", null)).toEqual({ wired: "right", overlay: "off", agentId: null });
   });
 
   it("docks a floating build column too — nothing floats over a live circuit", () => {
-    const floating: CableState = { wired: "off", overlay: "build" };
-    expect(patchCable(floating, "left").overlay).toBe("off");
+    const floating: CableState = { wired: "off", overlay: "build", agentId: null };
+    expect(patchCable(floating, "left", null).overlay).toBe("off");
   });
 
   it("is referentially stable when it changes nothing", () => {
-    const s: CableState = { wired: "left", overlay: "off" };
-    expect(patchCable(s, "left")).toBe(s);
+    const s: CableState = { wired: "left", overlay: "off", agentId: null };
+    expect(patchCable(s, "left", null)).toBe(s);
   });
 });
 
 describe("unbinding", () => {
   it("returns the concierge to floating middle", () => {
-    expect(unbindCable({ wired: "right", overlay: "off" }).wired).toBe("off");
-    expect(unbindCable({ wired: "left", overlay: "off" }).wired).toBe("off");
+    expect(unbindCable({ wired: "right", overlay: "off", agentId: null }).wired).toBe("off");
+    expect(unbindCable({ wired: "left", overlay: "off", agentId: null }).wired).toBe("off");
   });
 
   it("leaves an unwired state untouched, by identity", () => {
@@ -72,39 +72,49 @@ describe("unbinding", () => {
   });
 
   it("says nothing about floating surfaces — unbind is about the cable only", () => {
-    expect(unbindCable({ wired: "left", overlay: "build" })).toEqual({
+    expect(unbindCable({ wired: "left", overlay: "build", agentId: "a1" })).toEqual({
       wired: "off",
       overlay: "build",
+      // …but it DOES say something about the far end: the pin goes with the cable. A remembered
+      // agent behind an unwired concierge is a target nothing on screen claims.
+      agentId: null,
     });
   });
 });
 
 describe("overlay ⇄ cable", () => {
   it("floating the concierge unbinds — it would sit on the row it claims to be wired to", () => {
-    expect(setOverlay({ wired: "right", overlay: "off" }, "assist")).toEqual({
+    expect(setOverlay({ wired: "right", overlay: "off", agentId: "a1" }, "assist")).toEqual({
       wired: "off",
       overlay: "assist",
+      // The SECOND path to `wired: "off"`, and it clears the pin by the same rule as `unbindCable`.
+      // One path clearing and the other not is exactly how an unclaimable far end comes to exist.
+      agentId: null,
     });
   });
 
   it("floating the build column over its own terminal does not touch the cable", () => {
-    expect(setOverlay({ wired: "right", overlay: "off" }, "build")).toEqual({
+    expect(setOverlay({ wired: "right", overlay: "off", agentId: "a1" }, "build")).toEqual({
       wired: "right",
       overlay: "build",
+      // "Does not touch the cable" now includes its far end — floating a build column happens
+      // INSIDE a pair and says nothing about who the concierge is talking to.
+      agentId: "a1",
     });
   });
 
   it("docking changes nothing about the cable", () => {
-    expect(setOverlay({ wired: "left", overlay: "build" }, "off")).toEqual({
+    expect(setOverlay({ wired: "left", overlay: "build", agentId: "a1" }, "off")).toEqual({
       wired: "left",
       overlay: "off",
+      agentId: "a1",
     });
   });
 });
 
 // ── THE TWO GESTURES, WHICH ARE ONE STATE CHANGE ──────────────────────────────────────────────
 describe("gestures", () => {
-  const wired: CableState = { wired: "right", overlay: "off" };
+  const wired: CableState = { wired: "right", overlay: "off", agentId: null };
 
   it("Escape unbinds while wired", () => {
     expect(unbindsOnKey(wired, "Escape")).toBe(true);
@@ -204,7 +214,7 @@ describe("releaseStillArmed", () => {
 // row. These are the rungs as pure predicates; Workspace.cockpit.test.tsx drives the real key
 // events through the listener and asserts the store writes that follow.
 describe("Escape — the progressive release", () => {
-  const wired: CableState = { wired: "right", overlay: "off" };
+  const wired: CableState = { wired: "right", overlay: "off", agentId: null };
 
   const armed = { releaseArmed: true };
 
@@ -238,7 +248,7 @@ describe("Escape — the progressive release", () => {
   // claimed. An Escape claimed by NEITHER rung is the common case: it is what every Escape did
   // before this feature existed, and what an Escape in a terminal must keep doing.
   it("lets an ordinary Escape through untouched, claimed by neither rung", () => {
-    for (const state of [CABLE_REST, { wired: "off", overlay: "assist" }] as CableState[]) {
+    for (const state of [CABLE_REST, { wired: "off", overlay: "assist", agentId: null }] as CableState[]) {
       expect(unbindsOnKey(state, "Escape")).toBe(false);
       expect(clearsSelectionOnKey(state, "Escape")).toBe(false);
     }
@@ -249,10 +259,10 @@ describe("Escape — the progressive release", () => {
   it("never lets both rungs claim the same press", () => {
     for (const state of [
       CABLE_REST,
-      { wired: "left", overlay: "off" },
-      { wired: "right", overlay: "off" },
-      { wired: "off", overlay: "assist" },
-      { wired: "left", overlay: "build" },
+      { wired: "left", overlay: "off", agentId: null },
+      { wired: "right", overlay: "off", agentId: null },
+      { wired: "off", overlay: "assist", agentId: null },
+      { wired: "left", overlay: "build", agentId: null },
     ] as CableState[]) {
       for (const releaseArmed of [true, false]) {
         const claims = [
@@ -268,7 +278,7 @@ describe("Escape — the progressive release", () => {
   // stale latch (armed, then re-patched without a pointer press to clear it) must not double-fire.
   it("stays inert while wired, however it was armed", () => {
     expect(clearsSelectionOnKey(wired, "Escape", armed)).toBe(false);
-    expect(clearsSelectionOnKey({ wired: "left", overlay: "build" }, "Escape", armed)).toBe(false);
+    expect(clearsSelectionOnKey({ wired: "left", overlay: "build", agentId: null }, "Escape", armed)).toBe(false);
   });
 
   // Same hazard as roborev 54697, one rung further along — and worse here. A press aimed at a modal
@@ -428,7 +438,7 @@ describe("dismissibleSurfaceOpen only counts surfaces that are genuinely rendere
 });
 
 describe("Escape in a terminal — rung 2 stays out of reach", () => {
-  const wired: CableState = { wired: "right", overlay: "off" };
+  const wired: CableState = { wired: "right", overlay: "off", agentId: null };
 
   it("does not clear the build row when the user deliberately entered the terminal", () => {
     expect(
@@ -439,10 +449,10 @@ describe("Escape in a terminal — rung 2 stays out of reach", () => {
   it("stays out of reach at any press count and in every cable state", () => {
     for (const state of [
       CABLE_REST,
-      { wired: "left", overlay: "off" },
-      { wired: "right", overlay: "off" },
-      { wired: "off", overlay: "assist" },
-      { wired: "left", overlay: "build" },
+      { wired: "left", overlay: "off", agentId: null },
+      { wired: "right", overlay: "off", agentId: null },
+      { wired: "off", overlay: "assist", agentId: null },
+      { wired: "left", overlay: "build", agentId: null },
     ] as CableState[]) {
       for (const releaseArmed of [true, false]) {
         expect(
@@ -477,7 +487,7 @@ describe("Escape in a terminal — rung 2 stays out of reach", () => {
 });
 
 describe("the circuit, not the row — roborev 54697", () => {
-  const wired: CableState = { wired: "right", overlay: "off" };
+  const wired: CableState = { wired: "right", overlay: "off", agentId: null };
 
   /** Build a detached element inside a container matching `selector`-ish markup. */
   function inside(html: string, innerSelector: string): Element {
@@ -523,7 +533,7 @@ describe("the circuit, not the row — roborev 54697", () => {
 });
 
 describe("Escape is shared, not claimed — roborev 54697", () => {
-  const wired: CableState = { wired: "right", overlay: "off" };
+  const wired: CableState = { wired: "right", overlay: "off", agentId: null };
 
   it("unbinds when nothing else is claiming the press", () => {
     expect(unbindsOnKey(wired, "Escape")).toBe(true);
@@ -536,12 +546,12 @@ describe("Escape is shared, not claimed — roborev 54697", () => {
   });
 
   it("is still inert when nothing is patched", () => {
-    expect(unbindsOnKey({ wired: "off", overlay: "off" }, "Escape")).toBe(false);
+    expect(unbindsOnKey({ wired: "off", overlay: "off", agentId: null }, "Escape")).toBe(false);
   });
 });
 
 describe("portalled surfaces are still the circuit — roborev 54821", () => {
-  const wired: CableState = { wired: "right", overlay: "off" };
+  const wired: CableState = { wired: "right", overlay: "off", agentId: null };
 
   it("a press in a surface portalled to document.body does not unbind", () => {
     // The hover card and the model menu (plus its full-screen backdrop) are `createPortal`ed to

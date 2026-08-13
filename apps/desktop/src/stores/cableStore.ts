@@ -21,8 +21,15 @@ import {
 } from "../engine/cable";
 
 interface CableStore extends CableState {
-  /** Patch the cable into a side's build agent. Docks any floating surface (see engine/cable). */
-  patch: (side: PairSide) => void;
+  /** Patch the cable into a side's build agent, PINNING which agent is on the far end.
+   *
+   *  `agentId` is required rather than optional, and that is the whole point of the parameter: the
+   *  far end used to be re-derived from the selection on every render, so it silently followed the
+   *  last row you clicked (roborev 63145, finding 4). An optional argument would let a caller
+   *  re-open that hole by omission — the failure would be invisible, since a cable with no pin
+   *  falls back to exactly the old selection-following behaviour. Pass `null` only where there is
+   *  genuinely no agent (the dev fixtures drive the visuals with no roster behind them). */
+  patch: (side: PairSide, agentId: string | null) => void;
   /** Back to floating middle. Both unbind gestures — Escape and click-away — call exactly this. */
   unbind: () => void;
   /** Float or dock a surface; floating the concierge unbinds. */
@@ -34,7 +41,7 @@ export const useCableStore = create<CableStore>((set) => ({
   // `set` with the reducer's own return keeps zustand's shallow equality meaningful: the reducers
   // return the SAME object for a no-op, so an inert gesture writes nothing new and subscribers
   // (the shell root, the concierge column) do not re-render.
-  patch: (side) => set((s) => patchCable(s, side)),
+  patch: (side, agentId) => set((s) => patchCable(s, side, agentId)),
   unbind: () => set((s) => unbindCable(s)),
   overlayTo: (overlay) => set((s) => setOverlay(s, overlay)),
 }));

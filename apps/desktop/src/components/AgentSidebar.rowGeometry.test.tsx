@@ -359,7 +359,7 @@ describe("Build column — the wired joint bridges the row into the concierge", 
   });
 
   it("opens the concierge end once THIS pair holds the cable", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     render(<AgentSidebar project={seed("a1")} />);
     const row = rowFor("Alpha");
     expect(joint(row).top).toBeTruthy();
@@ -371,7 +371,7 @@ describe("Build column — the wired joint bridges the row into the concierge", 
 
   it("leaves the OTHER pair alone — one live circuit, not two", () => {
     // The project is right-assigned; patching LEFT must not open its joint.
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     render(<AgentSidebar project={seed("a1")} />);
     const row = rowFor("Alpha");
     expect(joint(row).top).toBeNull();
@@ -380,7 +380,7 @@ describe("Build column — the wired joint bridges the row into the concierge", 
 
   it("mirrors the joint too — a wired LEFT pair opens toward the concierge on its right", () => {
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     render(<AgentSidebar project={seed("a1")} />);
     const top = joint(rowFor("Alpha")).top!;
     expect(top.style.right).toBe("0px");
@@ -393,7 +393,7 @@ describe("Build column — the wired joint bridges the row into the concierge", 
     // IS that plane (theme/colors derives `forest` from `BLUEPRINT[mode].term`). The fillet's fill
     // and the surface it opens onto are therefore the same value in light and in dark. A bespoke
     // colour here would have to be re-derived per theme and would drift the moment either moved.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     render(<AgentSidebar project={seed("a1")} />);
     const { top, bottom } = joint(rowFor("Alpha"));
     for (const strip of [top!, bottom!]) {
@@ -407,7 +407,7 @@ describe("Build column — the wired joint bridges the row into the concierge", 
     // Geometry belongs to every row: the concierge-side bleed lands on `.row`, and the padding pays
     // it back one-for-one. Unselected rows are transparent, so nothing but the selected row's fill
     // actually reaches further — but the BOXES must agree or the list twitches when you plug in.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     render(<AgentSidebar project={seed("a1")} />);
     const box = boxOf(rowFor("Beta"));
     expect(box.marginLeft).toBe("-8px");
@@ -439,7 +439,7 @@ describe("Build column — the terminal seam is drawn on the pane side, not alwa
 
   it("keeps the hairline off a wired LEFT pair's concierge edge", () => {
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     render(<AgentSidebar project={seed("a1")} />);
 
     // The joint mouth names the concierge end — right, for a left pair. The seam must be on the
@@ -451,7 +451,7 @@ describe("Build column — the terminal seam is drawn on the pane side, not alwa
   });
 
   it("still draws it on the right for a right pair, where right IS the terminal edge", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     render(<AgentSidebar project={seed("a1")} />);
     expect(seam().style.right).toBe("0px");
     expect(seam().style.left).toBe("");

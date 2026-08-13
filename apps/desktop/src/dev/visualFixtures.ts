@@ -1351,7 +1351,9 @@ export function applyVisualFixtures(
     (window as unknown as { __sparkleCable?: (side: "off" | "left" | "right") => void }).__sparkleCable =
       (side) => {
         if (side === "off") useCableStore.getState().unbind();
-        else useCableStore.getState().patch(side);
+        // `null` far end: these fixtures drive the VISUALS (flood, bleed, recede) with no roster
+        // behind them, so there is no agent to pin. Nothing here sends a prompt.
+        else useCableStore.getState().patch(side, null);
       };
 
     // ── AND A HANDLE ON THE MIC, FOR THE SAME REASON ──────────────────────────────────────────

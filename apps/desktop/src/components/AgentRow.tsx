@@ -110,6 +110,85 @@ import {
 // fresh reference every render and loops the store. Reuse one array.
 export const NO_BEADS: Bead[] = [];
 
+/**
+ * WHAT COUNTS AS "A CONTROL, NOT THE ROW" for the double-click mount (`onRowDoubleClick`).
+ *
+ * The row mounts the concierge on a double press, and every chip on it stops its own CLICK — which
+ * does nothing to `dblclick`. This is the one place that decides which presses belong to a chip
+ * rather than to the row; see `onRowDoubleClick` for the failure it repairs (roborev 63145).
+ *
+ * ══ THREE OF THE FIVE CHIPS ROBOREV NAMED NEED NOTHING HERE, AND THE REASON IS WORTH KEEPING ═════
+ * The finding lists five leaking controls: the notice mark, the founder-ask chip, the retire pill,
+ * the epic pill and the feedback pill. Only the ones that are still on screen when the `dblclick`
+ * arrives can actually leak, and three of them are not:
+ *
+ *   • the EPIC pill and the FEEDBACK pill both call `openPlanBoard` on their first click, which
+ *     replaces this whole build column with the Plan board. The row is UNMOUNTED before the second
+ *     click, let alone the `dblclick` — measured, not reasoned: a probe that clicks the feedback
+ *     pill once finds no `[data-hint="agent"]` left in the document and the side's work mode
+ *     already flipped to `plan`.
+ *   • the retire PILL lives on the hover card, which is `createPortal`'d as a SIBLING of the row
+ *     element rather than a child of it — so a press there is outside the row's React subtree and
+ *     never reaches this handler at all. (The retire MARK, its collapsed-row twin, is inside the
+ *     row and does leak. That pair is the whole distinction.)
+ *
+ * They were marked with a `data-row-control` attribute first, and every one of those markers stayed
+ * GREEN under `mutation-check` — no test could make them matter, because no gesture can reach them.
+ * Marking them anyway would have been three lines of defence against a press that cannot happen,
+ * carrying the false implication that a chip is safe BECAUSE it is marked. What actually protects a
+ * chip is one of the three facts above, and a future chip gets none of them for free.
+ *
+ * ══ SO WHAT REMAINS IS THE INTERACTIVE-ROLE TEST ════════════════════════════════════════════════
+ * The controls that both stay mounted and sit inside the row — the retire mark, the founder-ask
+ * chip, the notice marks, the goal chip, the close button, the rename input — all carry a real
+ * interactive role or tag (the role + tabIndex + key-handler trio came from roborev 59545/59322).
+ * A NEW chip that stays on the row must carry one too, which is the same bar a11y already sets.
+ *
+ * ══ SO THE LIST IS THE INTERACTIVE ROLES, NOT JUST `button` ═════════════════════════════════════
+ * It recognised `role="button"` alone, which made the doc above a promise the code did not keep
+ * (roborev 63236): a chip marked `role="link"`, `"switch"`, `"checkbox"`, `"menuitem"`, `"tab"`,
+ * `"radio"` or `"combobox"` clears the stated bar and the a11y bar, and still leaked the mount —
+ * and the symptom is the quiet one, a cable moving with no error anywhere.
+ *
+ * `tabindex` is deliberately NOT here. The row itself carries `tabIndex` (roving, :2443), so a
+ * selector matching it would make every press look like a press on a control and disable mounting
+ * outright. The `hit !== currentTarget` bound at the call site is what keeps this list safe to
+ * grow; read that comment before adding anything the row itself could match.
+ */
+export const ROW_CONTROL_SELECTOR =
+  '[role="button"],[role="link"],[role="switch"],[role="checkbox"],[role="menuitem"],' +
+  '[role="tab"],[role="radio"],[role="combobox"],button,input,select,textarea,a[href]';
+
+/**
+ * How long a fold waits to see whether it is really half of a MOUNT (roborev 63145, finding 3).
+ *
+ * The row's fold rule ("click a row you are already on to fold its workers") and the mount rule
+ * ("double click to patch the cable") are keyed on different events — `click` and `dblclick` — and
+ * that is exactly why they were believed not to collide. They collide anyway, because ONE gesture
+ * raises BOTH: a double press on an orchestrator you are already on folds on its FIRST click and
+ * mounts on the `dblclick`, so the cable could not be patched onto an orchestrator without
+ * restructuring its subtree, persistently, every time.
+ *
+ * ══ WHY A TIMER AND NOT JUST `e.detail >= 2` ═══════════════════════════════════════════════════
+ * Because the click that folds is the FIRST one, and at the moment it arrives nothing distinguishes
+ * it from a plain single click — `detail` is 1 for both, and no second press has happened yet. The
+ * count test does close the other half (an UNSELECTED orchestrator, where the fold would land on
+ * click two), and it is kept for that: it means no timer is armed on a press we already know is a
+ * double. But the already-selected case — the common one, since you click a row to read it before
+ * you double-click it to talk to it — is only reachable by waiting.
+ *
+ * ══ THE VALUE, AND WHAT A WRONG ONE COSTS ══════════════════════════════════════════════════════
+ * The browser exposes no way to READ the OS double-click interval, so this is a guess at it. Both
+ * directions of being wrong are bounded and neither is new behaviour:
+ *   • too SHORT (a user whose interval is longer): the fold lands, then the mount does — i.e. the
+ *     pre-fix behaviour, for that user, on that gesture. Nothing is broken that was not already.
+ *   • too LONG: a deliberate fold visibly lags. This is the cost that lands on the common gesture,
+ *     which is why it is not simply set to a safe 600ms.
+ * 350ms sits under the macOS default and above a brisk deliberate double press. The fold is a
+ * layout change rather than an answer to typing, so the delay reads as deliberation, not lag.
+ */
+export const FOLD_DOUBLE_PRESS_GRACE_MS = 350;
+
 export const AgentRow = memo(function AgentRow({
   project,
   a,
@@ -178,6 +257,8 @@ export const AgentRow = memo(function AgentRow({
 
   const rowRef = useRef<HTMLDivElement>(null);
   const hideTimer = useRef<number | null>(null);
+  // A fold waiting out FOLD_DOUBLE_PRESS_GRACE_MS to see whether a `dblclick` follows it.
+  const foldTimer = useRef<number | null>(null);
   // Set true the instant Escape is pressed so the input's trailing blur (which fires when the field
   // unmounts in this Chromium webview) discards instead of committing — Escape must always cancel.
   const cancelNextBlur = useRef(false);
@@ -384,17 +465,43 @@ export const AgentRow = memo(function AgentRow({
     // misread as jumps, quietly losing the fold for the users least able to work around it
     // (roborev 53837). See keyboardHints/hintTargets.HINT_JUMP_ATTR.
     const isHintJump = (e.currentTarget as HTMLElement).hasAttribute(HINT_JUMP_ATTR);
+    // THE SECOND CLICK OF A DOUBLE PRESS IS NOT A SECOND CLICK — it is half of a mount, and the
+    // fold must not read it as the "click it again" gesture (roborev 63145, finding 3).
+    //
+    // The two rules do not contend PER EVENT: the fold is keyed on `click`, the mount on `dblclick`.
+    // But they contend as a COMPOSITE GESTURE, and that is what the claim in `engine/cable` used to
+    // miss. Mounting the concierge onto an ORCHESTRATOR is always at least two clicks on a row you
+    // are about to be on, so the second one always satisfies `wasAlreadySelected` — and the fold it
+    // triggers is PERSISTED. Net effect: you could not patch the cable onto an orchestrator without
+    // also folding or unfolding its worker subtree, restructuring the column every single time.
+    //
+    // `e.detail >= 2` is the whole test, and it is the click-count for a real pointer sequence — 2
+    // on the second press of a double, 3 on a triple. It cannot swallow a deliberate fold: a user
+    // clicking again to fold is, by construction, clicking OUTSIDE the OS double-click interval the
+    // browser uses to raise `dblclick`, so their second press arrives with detail back at 1.
+    //
+    // NOT `!== 1`: detail 0 is the assistive-tech / HintOverlay class, which has no double form and
+    // whose fold behaviour is already decided one line up by `isHintJump`. Excluding it here would
+    // silently take the fold away from AT users — the exact failure roborev 53837 is cited for.
+    const isDoublePress = e.detail >= 2;
     // `wasActive` — the SECOND click is the one that folds. A jump still never folds (above), and
     // a jump onto an already-selected row is still a jump, so the check stays ahead of this.
-    if (subtreeCollapsed !== null && !isHintJump && wasAlreadySelected) onToggleSubtree();
+    if (subtreeCollapsed !== null && !isHintJump && !isDoublePress && wasAlreadySelected) {
+      // DEFERRED, not called — see FOLD_DOUBLE_PRESS_GRACE_MS. This click may be the first half of a
+      // mount, and nothing about it says so yet; `onRowDoubleClick` cancels the pending fold if the
+      // `dblclick` arrives. An AT/synthetic activation (detail 0) takes the same path deliberately:
+      // it can never be followed by a `dblclick`, so its fold simply lands one interval later
+      // rather than acquiring a second code path that could drift from this one.
+      if (foldTimer.current) clearTimeout(foldTimer.current);
+      foldTimer.current = window.setTimeout(() => {
+        foldTimer.current = null;
+        onToggleSubtree();
+      }, FOLD_DOUBLE_PRESS_GRACE_MS);
+    }
     // …AND ONLY THEN, THE MOUNT. This is `false` for every ordinary mouse press (detail ≥ 1) — which
     // is the founder's whole ask — and `true` only for a click with no pointer sequence behind it:
     // an assistive-tech activation or HintOverlay's synthetic jump, neither of which can produce the
     // `dblclick` the mouse uses. See `engine/cable`'s block for the full table.
-    //
-    // NOTHING ABOVE IS GATED ON IT, deliberately. The fold rule keeps running on the exact presses it
-    // always ran on, so this change cannot alter which clicks fold — the class of collision that
-    // keying the mount on `detail === 2` would have created.
     if (mountsOnRowActivation({ type: "click", detail: e.detail })) onMount();
   };
   /**
@@ -409,8 +516,45 @@ export const AgentRow = memo(function AgentRow({
    * the agent, ask its terminal for the caret — is idempotent and already complete when this runs. The
    * one thing that WOULD have contended is the fold-on-second-click rule, which is precisely why the
    * mount is not keyed on the click count (`engine/cable`).
+   *
+   * ══ AND IT BAILS OVER THE ROW'S OWN CONTROLS. `stopPropagation` ON A CLICK DOES NOT STOP A
+   *    DBLCLICK ═════════════════════════════════════════════════════════════════════════════════
+   * Every chip on this row guards itself the same way — `onClick={(e) => { e.stopPropagation(); … }}`
+   * — and that guard was complete right up until the row grew a `dblclick` handler, because `click`
+   * and `dblclick` are SEPARATE events and stopping one says nothing about the other. So the day the
+   * mount landed, double-pressing the retire pill opened the close dialog AND silently patched the
+   * cable onto that row; the same for the notice mark, the founder-ask chip, the epic pill and the
+   * feedback pill (roborev 63145). Before the mount existed those controls were simply inert on a
+   * double press, which is why nothing caught it.
+   *
+   * ONE CENTRAL BAIL, NOT A GUARD PER CHIP. Five `onDoubleClick={(e) => e.stopPropagation()}` lines
+   * beside five existing click guards is five places for the sixth chip to forget — and forgetting
+   * is silent here, because the symptom is a cable quietly moving, not an error.
    */
-  const onRowDoubleClick = () => {
+  const onRowDoubleClick = (e: React.MouseEvent) => {
+    // THE PRESS WAS A MOUNT, SO IT WAS NEVER A FOLD. Cancels the fold `onRowClick` deferred a
+    // moment ago (FOLD_DOUBLE_PRESS_GRACE_MS). Done BEFORE the control bail on purpose: a press
+    // that starts on a chip never armed a fold — the chip stops the click — so this is a no-op
+    // there, and putting it first means the cancel can never be skipped by a later early return.
+    if (foldTimer.current) {
+      clearTimeout(foldTimer.current);
+      foldTimer.current = null;
+    }
+    // BOUNDED AT THE ROW, and the bound is not defensive dressing (roborev 63236). A bare
+    // `closest` walks to the document root, so any future ANCESTOR of the row matching the
+    // selector — a wrapper given `role="tab"`, a column that becomes a `<button>` — would match on
+    // every press and kill mounting for the whole column at once, silently and everywhere.
+    //
+    // It is also what makes broadening the selector safe rather than catastrophic. To be exact
+    // about the state of things today (roborev 63316): the row's role is `treeitem`, which the
+    // selector does NOT list, and `tabindex` is deliberately excluded — so right now `closest`
+    // returns null on a press on the row and this bound is not what carries that case. It is a
+    // guard against the NEXT edit, and the tests treat it that way: they give the row (and an
+    // ancestor) a matching role explicitly, because a case that does not create the condition
+    // cannot pin the bound. `hit !== e.currentTarget` says the control must be something OTHER than
+    // the row; `contains` says it must be INSIDE it. A press on the row is then never a control.
+    const hit = e.target instanceof Element ? e.target.closest(ROW_CONTROL_SELECTOR) : null;
+    if (hit && hit !== e.currentTarget && e.currentTarget.contains(hit)) return;
     onMount();
   };
   // The row is the disclosure control now, so it has to be a real one: focusable, and operable by
@@ -494,9 +638,39 @@ export const AgentRow = memo(function AgentRow({
     onSelect();
     show();
   };
+  /**
+   * RIGHT click ON THE NAME = rename. Founder, 2026-08-12, asked how the row's two gestures should
+   * resolve: *"double click mounts. right click to rename."*
+   *
+   * ══ WHY IT IS NOT THE DOUBLE CLICK ANY MORE ═══════════════════════════════════════════════════
+   * Rename owned `dblclick` on the name and stopped it propagating, and the name span covers the
+   * row's whole flexible width in BOTH layouts — so the mount gesture that shipped the same day was
+   * dead over the largest target on the row (roborev 63145). Two gestures cannot share one event;
+   * one of them had to move, and the founder chose which.
+   *
+   * ══ WHY IT STOPS PROPAGATION, WHERE THE OLD HANDLER MUST NOT HAVE ═════════════════════════════
+   * `contextmenu` IS a gesture the row uses — it is how the detail card opens (`openCard`) — so a
+   * right click on the name has to claim the event or it would rename AND throw the card across the
+   * pane. That is the opposite of the old `stopPropagation`, which was blocking an event the row
+   * needed and nothing else wanted. `preventDefault` for the same reason `openCard` calls it: no
+   * native menu is left standing behind the editor.
+   *
+   * The consequence, stated because it is a real cost of the founder's rule rather than an oversight:
+   * the detail card is now reached by right-clicking the row OUTSIDE the name — the disc, the chips,
+   * the trailing gutter. The card is still the only home for the model picker, Land and the path
+   * reveal, so if that gets hard to hit, the card needs its own affordance, not the name back.
+   */
+  const beginRename = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setEditing(a.id);
+  };
   useEffect(
     () => () => {
       if (hideTimer.current) clearTimeout(hideTimer.current);
+      // A row can be unmounted mid-gesture (a fold, a filter, a project switch). Firing a deferred
+      // fold afterwards would write persisted state for a row nobody is looking at any more.
+      if (foldTimer.current) clearTimeout(foldTimer.current);
     },
     [],
   );
@@ -886,7 +1060,7 @@ export const AgentRow = memo(function AgentRow({
    */
   const openNoticePill = (noticeId: string) => {
     onSelect();
-    useCableStore.getState().patch(paneSide);
+    useCableStore.getState().patch(paneSide, a.id);
     useUiStore.getState().setFocusedNotice(paneSide, noticeId);
   };
   const noticeMarksEl = noticeMarks.map((mark) => {
@@ -1574,7 +1748,7 @@ export const AgentRow = memo(function AgentRow({
             // "Title:  description" on ONE row-height line — the bold title followed by the
             // regular-weight description. The whole line is nowrap + ellipsis, so a long
             // description truncates ("…") rather than wrapping and growing the strip over the column
-            // rows beneath it. Double-click the line to edit (rename) — same affordance as collapsed.
+            // rows beneath it. RIGHT-click the line to edit (rename) — same affordance as collapsed.
             // No title tooltip (the user finds it noise). gap:8 matches the collapsed row.
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
               {lastTouchAt != null && (
@@ -1582,10 +1756,7 @@ export const AgentRow = memo(function AgentRow({
               )}
               <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 4 }}>
                 <div
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    setEditing(a.id);
-                  }}
+                  onContextMenu={beginRename}
                   style={{
                     flex: "0 1 auto",
                     minWidth: 0,
@@ -1713,10 +1884,7 @@ export const AgentRow = memo(function AgentRow({
                   // rule documented at 220 and so applied the 16px floor across the whole 220–259
                   // band — including the default width. See AGENT_NAME_TIGHT_FLOOR_BELOW_PX.
                   minWidthPx={agentNameFloorFor(columnWidth ?? 0)}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    setEditing(a.id);
-                  }}
+                  onContextMenu={beginRename}
                 />
                 {workerCountBadge}
                 {/* "Someone has queued instructions for this agent, and it has not seen them yet."

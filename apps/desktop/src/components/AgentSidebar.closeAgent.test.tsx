@@ -78,6 +78,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useBeadsStore, __setBeadsPolledAtForTest } from "../stores/beadsStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 function buildAgentProject(beadId?: string): Project {
   const agent: AgentTab = {
@@ -529,7 +530,7 @@ describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkl
     // so it is absent from the scannable list by construction. That absence is exactly why the mark
     // exists, and why this surface needs its own test rather than a shared one.
     expect(screen.queryByTestId("row-retire-pill")).toBeNull();
-    fireEvent.contextMenu(screen.getByText("Build 1"));
+    openAgentCard(screen.getByText("Build 1"));
     const pill = screen.getByTestId("row-retire-pill");
     expect(pill.getAttribute("data-retire-state")).toBe("ready");
     // WORDED is the point of this surface — the mark deliberately has none.

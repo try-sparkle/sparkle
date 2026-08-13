@@ -141,7 +141,7 @@ import { startConciergeTurn } from "../services/concierge";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchIntent";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
-import { doubleClickRow } from "../testing/rowGestures";
+import { doubleClickRow, singleClickRow } from "../testing/rowGestures";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(id: string, name: string): AgentTab {
@@ -367,7 +367,10 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
     // What the click leaves behind: the cable patched into the pair the row sits in. Omitted for the
     // UNMOUNTED cells — Escape unpatches the cable and leaves the pane on screen, which is exactly
     // the state the founder was in when he could no longer reach the concierge.
-    if (cable) act(() => useCableStore.getState().patch("right"));
+    // Pinned to the SPARKLE agent — it is the one this mount named. Routing here goes through
+    // `decidePromptTarget`'s special arm, which wins over the roster path, so the pin does not
+    // decide these cases; it is passed truthfully rather than as `null`.
+    if (cable) act(() => useCableStore.getState().patch("right", SPARKLE_ID));
     render(<Workspace />);
   }
 
@@ -508,5 +511,132 @@ describe("the Improve-Sparkle mount routes to the Sparkle agent, through the rea
     expect(disp.dispatchConciergeAnswer).not.toHaveBeenCalled();
     expect(refusalOnScreen()).toBe(false);
     expect(vi.mocked(startConciergeTurn)).toHaveBeenCalled();
+  });
+});
+
+// ══ THE CABLE'S FAR END IS THE AGENT YOU MOUNTED, NOT THE ROW YOU LAST CLICKED ═════════════════
+//
+// roborev 63145, finding 4 — and the one with a message going to the wrong agent behind it.
+//
+// The far end used to be `wiredProject.selectedAgentId`, so the live cable followed the SELECTION.
+// A single click on a different row re-aimed the concierge at it with no mount gesture, no
+// `patchCable` call, and nothing on screen to say the far end had moved. The founder's sequence:
+// double-click A to mount, single-click B to read its terminal, type in the concierge — and the
+// message goes to B.
+//
+// The existing case "does NOT drop a cable already patched to this pair" sets this very scenario up
+// and asserts only `wired === "right"`, never WHICH agent is on the far end. That is why a real bug
+// sat under a green suite: the side was right and the agent was wrong.
+//
+// ASSERTED AS THE DISPATCH, not as a store field. `wiredAgentId` being correct is a claim about a
+// variable; `dispatchConciergeAnswer` being driven at agent A's id is the thing the founder would
+// have noticed.
+describe("a concierge send goes to the MOUNTED agent, not the selected one", () => {
+  const MOUNTED = "Stripe checkout retry"; // a1
+  const LOOKED_AT = SLIDER; // a2
+
+  beforeEach(() => {
+    // BOTH agents get a readable, calm terminal. `dispatchConciergeAnswer` is only reached for a
+    // target the write-guard accepts, and an agent with no registered viewport is not one — without
+    // this the send falls to the brain and every case below asserts "the spy was not called" about
+    // a path that never ran, which is the vacuous shape this file's own header warns about.
+    registerViewport("a1", () => ({ text: "> \n", alternateBuffer: false }));
+    registerViewport("a2", () => ({ text: "> \n", alternateBuffer: false }));
+  });
+
+  async function sendFromConcierge(text: string) {
+    const ta = within(columnEl()).getByRole("textbox") as HTMLTextAreaElement;
+    fireEvent.change(ta, {
+      target: { value: text, selectionStart: text.length, selectionEnd: text.length },
+    });
+    await act(async () => {
+      fireEvent.click(within(columnEl()).getByRole("button", { name: "Send" }));
+      for (let i = 0; i < 8; i++) await Promise.resolve();
+    });
+    await act(async () => {
+      for (const i of armedIntents()) fireIntent(i.id);
+      for (let i = 0; i < 12; i++) await Promise.resolve();
+    });
+  }
+
+  it("reaches the mounted agent when nothing else has been clicked", async () => {
+    // THE PREMISE. Without it the case below could pass because the send reaches nobody at all,
+    // which is a different bug wearing the same green.
+    render(<Workspace />);
+    doubleClickRow(rowFor(MOUNTED));
+    await sendFromConcierge("tighten the retry backoff");
+    expect(disp.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(disp.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("a1");
+  });
+
+  it("STILL reaches it after a single click on another row — the founder's sequence", async () => {
+    // Double-click A to mount, single-click B to read its terminal, type. Against the code as it
+    // shipped this dispatches to "a2".
+    render(<Workspace />);
+    doubleClickRow(rowFor(MOUNTED));
+    singleClickRow(rowFor(LOOKED_AT));
+    // The single click did its job — B is selected and on screen. The whole point is that looking
+    // at B is allowed; what must not change is who the concierge is talking to.
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBe("a2");
+    expect(useCableStore.getState().wired).toBe("right");
+    await sendFromConcierge("tighten the retry backoff");
+    expect(disp.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(disp.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("a1");
+  });
+
+  // ══ THE CABLE MUST NOT OUTLIVE THE AGENT IT NAMES — roborev 63302 ═══════════════════════════
+  //
+  // The pin removed an accident that was doing real work: while the far end tracked the SELECTION,
+  // these self-healed. Neither fires an unbind on its own, because the control pressed is itself
+  // inside the circuit. Left alone, routing loses its target while the shell stays flooded — the
+  // shell-says-connected / column-says-not contradiction, reachable again.
+  //
+  // ASSERTED AS THE STORE GOING OFF, which is what makes both surfaces agree: they read the same
+  // `wired`, so there is no second value that could disagree with this one.
+  it("drops the cable when the agent it is pinned to is CLOSED", async () => {
+    render(<Workspace />);
+    doubleClickRow(rowFor(MOUNTED));
+    expect(useCableStore.getState().wired).toBe("right");
+    expect(useCableStore.getState().agentId).toBe("a1");
+
+    // Exactly what `removeAgent` leaves behind: the mounted row gone, the OTHER agent selected — so
+    // the pair still has a selection and only the pin can tell the mounted agent is gone.
+    await act(async () => {
+      useProjectStore.setState({
+        projects: [mkProject("p1", "Alpha", [mkAgent("a2", SLIDER)], "a2")],
+      } as never);
+    });
+
+    expect(useCableStore.getState().wired).toBe("off");
+    expect(useCableStore.getState().agentId).toBeNull();
+  });
+
+  it("…and STAYS put when some OTHER agent is closed", async () => {
+    // THE PAIRED CASE. Without it the one above is satisfied by a rule that drops the cable on any
+    // roster write at all, which would make the mount useless — closing an unrelated row is the
+    // ordinary act the pin exists to survive.
+    render(<Workspace />);
+    doubleClickRow(rowFor(MOUNTED));
+    expect(useCableStore.getState().wired).toBe("right");
+
+    await act(async () => {
+      useProjectStore.setState({
+        projects: [mkProject("p1", "Alpha", [mkAgent("a1", MOUNTED)], "a1")],
+      } as never);
+    });
+
+    expect(useCableStore.getState().wired).toBe("right");
+    expect(useCableStore.getState().agentId).toBe("a1");
+  });
+
+  it("and a DOUBLE click on the other row does move it — the pin is not a latch", async () => {
+    // The paired case. A pin that could never be re-aimed would satisfy both cases above and break
+    // the feature: mounting is how you change who you are talking to.
+    render(<Workspace />);
+    doubleClickRow(rowFor(MOUNTED));
+    doubleClickRow(rowFor(LOOKED_AT));
+    await sendFromConcierge("and this one goes to the other agent");
+    expect(disp.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
+    expect(disp.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("a2");
   });
 });

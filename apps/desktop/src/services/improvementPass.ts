@@ -26,6 +26,9 @@ import {
   type SubmitVerdict,
 } from "./sparkleAgent";
 import { registerSparkleTranscript } from "./sparkleTranscript";
+// The LEAF registry, not the `conciergeTools/terminal` re-export: this module must not drag the
+// snapshot machinery and the dispatcher into its graph (see agentTranscriptRegistry's header).
+import { noteAgentSessionId } from "./agentTranscriptRegistry";
 import { claimPass, releasePass } from "./improvementPassLatch";
 import { accountConfigDirFor } from "./accountSelection";
 import {
@@ -844,12 +847,58 @@ export async function runImprovementPass(
         else unlisteners.push(u);
       };
       Promise.all([
-        listen<{ sessionId: string; text: string }>("sparkle_improve:done", (ev) =>
-          settle({ ok: true, text: ev.payload.text }),
-        ).then(track),
-        listen<{ message: string }>("sparkle_improve:error", (ev) =>
-          settle({ ok: false, text: ev.payload.message }),
-        ).then(track),
+        listen<{ sessionId: string; text: string }>("sparkle_improve:done", (ev) => {
+          // BIND BEFORE SETTLING, and both orderings matter for a different reason.
+          //
+          // Bind at all: `done` carries the id of the session the pass FINISHED writing, and it is
+          // exactly as authoritative as the early announcement below — it comes from the same
+          // process the app started. `handle_event` re-assigns `session_id` on the `result` event,
+          // so if the pass forked or continued mid-flight the two differ, and the final file is the
+          // TAIL of the conversation someone opened the pane to read. The announcement is once-only
+          // by design (it must not re-fire at turn end), which means without this the late id is
+          // dropped and that tail is unreadable until next hour's directory scan. It also covers a
+          // stream whose `init` line never carried an id, where `done` is the only one the app ever
+          // sees. Additive and idempotent — the registry accumulates and no-ops on a known id.
+          //
+          // Before `settle`: so the id is recorded before anything later in this handler can throw
+          // or be reordered. NOT because settling stops this handler — it does not, and the comment
+          // here used to say so (roborev 63251). `settle` → `finish` unlistens fire-and-forget and
+          // resolves; neither aborts the handler that is currently executing, and the awaiting
+          // continuation only runs on a later microtask, so a bind placed after `settle` would
+          // still run and still run before any consumer could observe the registry. In a file where
+          // comments are read as contracts, that invented an ordering rule a future reader would
+          // carry to other handlers, where it is equally untrue.
+          if (ev.payload.sessionId) noteAgentSessionId(SPARKLE_AGENT_ID, ev.payload.sessionId);
+          settle({ ok: true, text: ev.payload.text });
+        }).then(track),
+        listen<{ message: string; sessionId?: string }>("sparkle_improve:error", (ev) => {
+          // THE SAME BIND ON THE FAILING PATH, and it matters more here (roborev 63251). A pass that
+          // fails still wrote a conversation, and a failure is the ending someone actually opens the
+          // pane to read. Rust had the id in scope on this branch and dropped it, so the very case
+          // the `done` bind covers — a pass that forked or continued mid-flight, leaving the
+          // once-only early announcement naming a different file than the final one — left the tail
+          // unreadable on every failure. On the error path `done` never arrives, so for a stream
+          // whose `init` line carried no id this is the only id the app will ever see.
+          if (ev.payload.sessionId) noteAgentSessionId(SPARKLE_AGENT_ID, ev.payload.sessionId);
+          settle({ ok: false, text: ev.payload.message });
+        }).then(track),
+        // WHICH SESSION THIS PASS IS WRITING — announced by Rust from Claude's own first stream line,
+        // and the ONLY authoritative answer available mid-pass.
+        //
+        // The mounted transcript reads by session id and fails closed on an agent whose sessions it
+        // does not know. This pass has no pane and therefore no hook events, so `AgentPane`'s gated
+        // writer can never fire for it (roborev 63133/63135). `registerSparkleTranscript` above does
+        // bind something — but it runs BEFORE the spawn, and the spawn carries no `--resume`, so
+        // what it can see is the PREVIOUS pass's session. This is the live one, and it comes from
+        // the process the app itself started rather than from a directory scan that cannot tell this
+        // pass's file from any other `claude` run in the same tree.
+        //
+        // It does NOT settle the pass. It is a binding, not an outcome, and it arrives ~a second in
+        // — treating it as a result would end every pass immediately. It is tracked like its
+        // siblings so it cannot outlive the run.
+        listen<{ sessionId: string }>("sparkle_improve:session", (ev) => {
+          if (ev.payload.sessionId) noteAgentSessionId(SPARKLE_AGENT_ID, ev.payload.sessionId);
+        }).then(track),
       ]).then(
         () => {
           // Same settlement discipline as track: if the pass already settled (e.g. the

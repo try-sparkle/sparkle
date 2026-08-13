@@ -26,6 +26,17 @@
 //     "newest mtime" is chosen among the agent's own sessions instead of among every `claude` that
 //     ever ran in the tree. Session-gated like writer (1). See its own block below.
 //
+//     THAT SENTENCE DESCRIBES BOTH READERS OF WRITER (2) — checked, because for one commit it did
+//     not (roborev 63135). The mounted pane got the filter; the concierge's tool read
+//     (`conciergeTools/terminal`'s tier (d)) kept resolving through the unfiltered
+//     `claude_latest_session_path` and could still quote a stranger's last turn as this agent's. A
+//     comment asserting a guarantee the code does not provide is worse than no comment, and this
+//     repo has paid for that twice — so if you add a THIRD reader of writer (2), it takes the filter
+//     or this paragraph stops being true. The readers are: `hooks/useAgentTranscript` (page + tail,
+//     via `agent_transcript_page`/`agent_transcript_tail`) and `conciergeTools/terminal`'s
+//     `resolveWorktreeTranscript` (via `agent_own_session_path`). All three commands fail closed on
+//     an unknown binding.
+//
 // Writer (1) WINS wherever both are registered, which is what keeps the weaker resolution off any
 // agent the founder is actually looking at. Writer (3) is orthogonal to both — it constrains what a
 // directory read may return rather than naming a path.

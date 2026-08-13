@@ -73,13 +73,13 @@ describe("useEffectiveWired — the subscription", () => {
   });
 
   it("names the patched side while that pair has a selected agent", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("right");
   });
 
   it("reports OFF once that pair's selection is cleared", () => {
     // The state no acquisition guard can prevent, because nothing is being acquired.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     useProjectStore.setState({ projects: [mkProject("p1", null)] } as never);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
     // The STORE is untouched — the projection is read-side, so no removal path has to remember to
@@ -93,7 +93,7 @@ describe("useEffectiveWired — the subscription", () => {
       projects: [mkProject("p1", "p1-a1"), mkProject("p2", "p2-a1")],
       selectedProjectId: "p1",
     } as never);
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("left");
 
     // Empty the LEFT pair specifically; the right pair still has a selection and must not rescue it.
@@ -114,7 +114,7 @@ describe("useEffectiveWired — the subscription", () => {
       projects: [mkProject("p1", "p1-a1"), mkProject("p2", null)],
       selectedProjectId: "p2",
     } as never);
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
 
     // And the inverse, which the `find` got wrong in the other direction: P1 emptied, selected P2
@@ -134,7 +134,7 @@ describe("useEffectiveWired — the subscription", () => {
       selectedProjectId: "p2",
     } as never);
     useUiStore.setState({ openProjectIds: ["p2"] } as never);
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
   });
 
@@ -143,7 +143,7 @@ describe("useEffectiveWired — the subscription", () => {
     // the hook joined three stores and woke on two. `ConciergeHost` subscribes to no pair state of
     // its own, so it kept a stale snapshot and stayed flooded while the root went off — roborev
     // 55386's contradiction, one store later (roborev 55490).
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     const { result } = renderHook(() => useEffectiveWired());
     expect(result.current).toBe("right");
 
@@ -164,7 +164,7 @@ describe("useEffectiveWired — the subscription", () => {
   // A rename replaces the array and changes nothing about the far end, which is exactly the write this
   // must not wake for.
   it("does NOT re-render on a project write that leaves the far end alone", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     let renders = 0;
     const { result } = renderHook(() => {
       renders += 1;
@@ -181,7 +181,7 @@ describe("useEffectiveWired — the subscription", () => {
 
   it("DOES re-render when that same kind of write changes the far end — the inverse guard", () => {
     // Without this, the row above is satisfied by a hook that never wakes at all.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     let renders = 0;
     const { result } = renderHook(() => {
       renders += 1;
@@ -196,7 +196,7 @@ describe("useEffectiveWired — the subscription", () => {
 
   it("gives every surface the SAME answer — that is the whole point", () => {
     // Three readers, one value. The bug was three readers and two values.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     useProjectStore.setState({ projects: [mkProject("p1", null)] } as never);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("off");
     expect(renderHook(() => usePairIsLive("right")).result.current).toBe(false);
@@ -224,12 +224,12 @@ describe("the Improve-Sparkle pane as a far end", () => {
   it("lights the patched pair's JOINT with the Sparkle pane up and no agent selected", () => {
     // THE REGRESSION GUARD. Against the pre-fix `patched && farEndHasAgent` this is false, which is
     // the shut joint — the row not bleeding into the concierge column.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(renderHook(() => usePairIsLive("right")).result.current).toBe(true);
   });
 
   it("makes the joint and the flood agree — the contradiction, stated as one assertion", () => {
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(renderHook(() => useEffectiveWired()).result.current).toBe("right");
     expect(renderHook(() => usePairIsLive("right")).result.current).toBe(true);
   });
@@ -246,7 +246,7 @@ describe("the Improve-Sparkle pane as a far end", () => {
   // points the left rows at a concierge column showing the RIGHT pair's pane — the exact "joint
   // drawn open onto a pair with nothing selected" this projection exists to prevent.
   it("does not light the LEFT pair just because the Sparkle pane is up", () => {
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
     // The left pair's own project has nothing selected — so `farEndHasAgent` is false and the
     // sparkle arm is the ONLY thing that could light it.
@@ -260,14 +260,14 @@ describe("the Improve-Sparkle pane as a far end", () => {
   it("does NOT light a pair the cable is not patched to", () => {
     // The inverse guard: without it, `useFarEndOccupied` returning true for everything would satisfy
     // the rows above. `patched` still has to hold.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     expect(renderHook(() => usePairIsLive("left")).result.current).toBe(false);
   });
 
   it("goes dark again when the Sparkle pane is dismissed", () => {
     // Proves the value tracks `activeSpecial` rather than being unconditionally true, and that the
     // hook WAKES on that store — the joint must shut when the pane closes, with no cable write.
-    useCableStore.getState().patch("right");
+    useCableStore.getState().patch("right", null);
     const { result } = renderHook(() => usePairIsLive("right"));
     expect(result.current).toBe(true);
 

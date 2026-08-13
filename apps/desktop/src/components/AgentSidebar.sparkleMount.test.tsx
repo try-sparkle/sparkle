@@ -111,7 +111,7 @@ describe("clicking the Improve Sparkle row patches the cable", () => {
   it("MOVES a cable already patched to the other side rather than lighting both", () => {
     // ONE LIVE CIRCUIT, from patchCable's own reducer. This row must not be the exception that
     // leaves two pairs looking connected at once.
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     render(<AgentSidebar project={PROJECT} />);
     act(() => {
       fireEvent.click(sparkleRow());

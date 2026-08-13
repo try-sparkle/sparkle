@@ -49,7 +49,7 @@ describe("AgentSidebar — agent pinning is REMOVED", () => {
   it("renaming a top-level agent freezes its name but does NOT anchor its row", () => {
     const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
     render(<AgentSidebar project={project} />);
-    fireEvent.doubleClick(screen.getByText("Alpha"));
+    fireEvent.contextMenu(screen.getByText("Alpha"));
     const input = screen.getByDisplayValue("Alpha");
     fireEvent.change(input, { target: { value: "Alpha2" } });
     fireEvent.blur(input);

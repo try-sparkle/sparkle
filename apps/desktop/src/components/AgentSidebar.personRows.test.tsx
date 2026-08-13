@@ -198,7 +198,8 @@ describe("The Build sidebar paints PEOPLE", () => {
     const project = seedProject();
     project.selectedAgentId = "a1";
     useProjectStore.setState({ projects: [project] } as never);
-    useCableStore.getState().patch(SPARKLE_PANE_SIDE);
+    // `null` far end — this suite is about which ROWS render, not about who the concierge talks to.
+    useCableStore.getState().patch(SPARKLE_PANE_SIDE, null);
     render(<AgentSidebar project={project} />);
 
     const row = screen.getByTestId(PERSON_ROW_TESTID);

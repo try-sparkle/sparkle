@@ -276,10 +276,29 @@ export function useAgentTranscript(
         });
         if (gen !== genRef.current) return;
         appendEntries(id, filterSystemAuthored(page.entries));
-        patch(id, { paging: false, next: page.next, hasMore: page.hasMore });
+        patch(id, { next: page.next, hasMore: page.hasMore });
       } catch (e) {
         if (gen !== genRef.current) return;
-        patch(id, { paging: false, error: describe(e) });
+        patch(id, { error: describe(e) });
+      } finally {
+        // ALWAYS CLEAR `paging`, INCLUDING ON THE STALE-GENERATION RETURNS ABOVE.
+        //
+        // The two `gen !== genRef.current` guards drop a result that no longer belongs to what is
+        // mounted — correct for the ENTRIES and the CURSOR, and wrong for this flag, because
+        // `paging` is not data about the page: it is the in-flight LATCH that `pageBack`'s own
+        // early return reads (`thread.paging` above). Returning without clearing it leaves the
+        // latch set with nothing left to unset it, so every later `pageBack` no-ops, "Loading
+        // earlier…" sticks, and the agent's history is unreachable until the pane remounts.
+        //
+        // Reachable since `sessionIds` joined the first-page effect's deps: the generation now
+        // bumps on an event that could not happen mid-pane-life before — the binding WIDENING when
+        // the agent resumes into a new session — which can land while a backwards page is in
+        // flight. Keyed by the `id` this call captured, so a bump caused by mounting a DIFFERENT
+        // agent settles this agent's thread rather than the newly-mounted one's.
+        //
+        // `finally` runs after the `try`/`catch` bodies, so the success path's cursor write is not
+        // clobbered by this one.
+        patch(id, { paging: false });
       }
     })();
   }, [appendEntries, patch]);

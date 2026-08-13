@@ -787,14 +787,14 @@ describe("the shell reports no circuit when the far end is empty", () => {
 
   it("lights the cable when the wired pair HAS a selected agent", () => {
     render(<Workspace />);
-    act(() => useCableStore.getState().patch("right"));
+    act(() => useCableStore.getState().patch("right", null));
     expect(screen.getByTestId("workspace-shell").getAttribute("data-wired")).toBe("right");
   });
 
   it("reports OFF when the wired pair's project has no selected agent", () => {
     // The state an acquisition guard cannot prevent, because nothing is being acquired.
     render(<Workspace />);
-    act(() => useCableStore.getState().patch("right"));
+    act(() => useCableStore.getState().patch("right", null));
     act(() => {
       useProjectStore.setState({
         projects: [{ ...mkProject("p1", "Alpha", [mkAgent("a1")]), selectedAgentId: null }],

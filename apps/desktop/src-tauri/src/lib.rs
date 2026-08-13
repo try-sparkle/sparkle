@@ -952,6 +952,10 @@ pub fn run() {
             // agent's own Claude Code JSONL transcripts.
             transcript::agent_transcript_page,
             transcript::agent_transcript_tail,
+            // The session-filtered resolve for the concierge's tool read (tier d). Distinct from
+            // `claude::claude_latest_session_path`, which is the unfiltered LEARN seam — see
+            // `agent_own_session_path`'s doc for why they are two commands and not one with a mode.
+            transcript::agent_own_session_path,
             spend::spend_report,
             builder_index::builder_index_status,
             builder_index::builder_index_set_identity,

@@ -1490,6 +1490,55 @@ fn transcript_tail_sync(
     })
 }
 
+/// The newest of `worktree_path`'s transcripts that belongs to THIS AGENT, or `None`.
+///
+/// The session-filtered twin of [`crate::claude::claude_latest_session_path`], and the difference
+/// between the two is the whole reason this exists rather than a `session_ids` parameter being bolted
+/// onto that one. They answer different questions:
+///
+///   * `claude_latest_session_path` answers "which session is being written in this tree" — the
+///     LEARN seam. It has to be unfiltered, because its caller is trying to DISCOVER an id it does
+///     not have yet (`services/sparkleTranscript`'s `bindWorktreeSession`).
+///   * this one answers "which of this agent's OWN sessions is newest" — the READ seam.
+///
+/// Adding an optional filter to the first would have collapsed them into one command with two modes,
+/// where omitting the argument silently gives you the unfiltered scan. That is precisely the defect
+/// (roborev 63135): a reader that forgets the filter reports a stranger's conversation as this
+/// agent's, and nothing about the call site would look wrong. Two commands, two names, and the
+/// READ one fails closed.
+///
+/// FAILS CLOSED, via the same [`own_session_files`] the page and tail commands use: an unknown
+/// binding (`None`) yields `None`, never the newest file in the directory. So a caller that omits
+/// `session_ids` entirely gets no path at all — the default is CLOSED, which is the property the
+/// merged-command shape could not have had.
+///
+/// Returning `None` for "we do not know" and for "the agent has no sessions yet" is deliberate: both
+/// mean there is no file this reader may attribute to this agent, which is the only thing the caller
+/// can act on.
+#[tauri::command]
+pub async fn agent_own_session_path(
+    worktree_path: String,
+    session_ids: Option<Vec<String>>,
+    config_dir: Option<String>,
+) -> Option<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        own_session_path_sync(&worktree_path, session_ids.as_deref(), config_dir.as_deref())
+    })
+    .await
+    .unwrap_or_default()
+}
+
+/// Blocking core of [`agent_own_session_path`], driven directly by the tests.
+fn own_session_path_sync(
+    worktree_path: &str,
+    session_ids: Option<&[String]>,
+    config_dir: Option<&str>,
+) -> Option<String> {
+    let dir = session_dir(worktree_path, config_dir)?;
+    let files = own_session_files(&dir, session_ids)?;
+    Some(files.first()?.to_string_lossy().into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3138,5 +3187,143 @@ mod tests {
         .unwrap();
         assert!(tail.entries.is_empty(), "an unbound tail command must follow nothing");
         assert_eq!(tail.file, "");
+    }
+
+    // --- the READ seam for the concierge's tool path (roborev 63135) ------------------------------
+    //
+    // The page and tail commands above got the session filter; `readAgentTerminal`'s tier (d) did
+    // not, and kept resolving through the unfiltered `claude_latest_session_path`. Same directory,
+    // same stranger, same wrong attribution — except that instead of rendering in a pane it is
+    // quoted back to the concierge as "here is what this agent last said", which then repeats it to
+    // the founder as fact. `agent_own_session_path` is that seam, filtered.
+
+    /// The defect, at the resolution seam: the stranger's session holds the NEWEST mtime, so an
+    /// unfiltered resolve hands back their file. THIS FAILS AGAINST `claude_latest_session_path`,
+    /// which is what tier (d) called before.
+    ///
+    /// Asserts the resolved PATH — the thing the caller then opens and quotes — not the ids passed in.
+    #[test]
+    fn the_read_seam_resolves_this_agents_newest_session_not_the_newest_stranger() {
+        let f = fixture();
+        f.session(
+            "mine-old-1111.jsonl",
+            &[agent_rec("a0", "2026-07-01T00:00:01Z", "MY OLDER ANSWER")],
+            1_000,
+        );
+        f.session(
+            "mine-new-3333.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "MY LATEST ANSWER")],
+            5_000,
+        );
+        // Newest in the whole directory, and not ours.
+        f.session(
+            "theirs-2222.jsonl",
+            &[agent_rec("a2", "2026-07-01T00:01:02Z", "THEIR ROBOREV REVIEW")],
+            9_000,
+        );
+
+        let got = own_session_path_sync(
+            &f.worktree,
+            Some(&sess(&["mine-old-1111", "mine-new-3333"])),
+            Some(&f.config_arg()),
+        )
+        .expect("the agent has sessions of its own, so a path must resolve");
+
+        assert!(
+            got.ends_with("mine-new-3333.jsonl"),
+            "expected this agent's NEWEST own session, got {got}",
+        );
+        assert!(
+            !got.contains("theirs"),
+            "another agent's session must never be resolved as this agent's: {got}",
+        );
+
+        // PAIRED, so the assertion above cannot pass for the wrong reason: the stranger's file is
+        // genuinely the newest in the directory, which is what the old unfiltered resolve returned.
+        let unfiltered = crate::claude::claude_latest_session_path_sync(&f.worktree, Some(&f.config_arg()))
+            .expect("the directory is not empty");
+        assert!(
+            unfiltered.ends_with("theirs-2222.jsonl"),
+            "the fixture must reproduce the defect for the test above to mean anything, got {unfiltered}",
+        );
+    }
+
+    /// An UNKNOWN binding resolves NOTHING. Same rule as the page and tail commands, and for the
+    /// same reason: the fallback IS the bug.
+    ///
+    /// Paired with a positive resolve over the identical directory, so "returned None" is pinned to
+    /// the filter rather than to an empty or unreadable directory — an absence with two possible
+    /// causes proves neither.
+    #[test]
+    fn the_read_seam_returns_nothing_when_the_binding_is_unknown() {
+        let f = fixture();
+        f.session(
+            "s-1111.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "hello")],
+            1_000,
+        );
+
+        assert_eq!(
+            own_session_path_sync(&f.worktree, None, Some(&f.config_arg())),
+            None,
+            "an unknown binding must not borrow the newest file in the directory",
+        );
+
+        assert!(
+            own_session_path_sync(&f.worktree, Some(&sess(&["s-1111"])), Some(&f.config_arg()))
+                .is_some_and(|p| p.ends_with("s-1111.jsonl")),
+            "the same directory DOES resolve once the binding is known, so the None above is the filter",
+        );
+    }
+
+    /// An agent that is bound but has written nothing yet is the normal state of a brand-new agent,
+    /// not a fault — and it must not fall through to a sibling's file either.
+    #[test]
+    fn the_read_seam_resolves_nothing_for_a_bound_agent_with_no_files_yet() {
+        let f = fixture();
+        f.session(
+            "theirs-2222.jsonl",
+            &[agent_rec("a2", "2026-07-01T00:01:02Z", "THEIR REVIEW")],
+            9_000,
+        );
+
+        assert_eq!(
+            own_session_path_sync(&f.worktree, Some(&sess(&["mine-1111"])), Some(&f.config_arg())),
+            None,
+            "a bound agent with no sessions of its own resolves nothing, never a sibling's file",
+        );
+    }
+
+    /// The COMMAND fails closed too, not just its sync core — that is the surface the frontend calls
+    /// and where a `null` off the wire arrives. A Rust `Option` crosses as `null`, never as an absent
+    /// key, so this is the shape the TS side can actually produce.
+    #[test]
+    fn the_read_seam_command_fails_closed_on_an_unknown_binding() {
+        let f = fixture();
+        f.session(
+            "s-1111.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "hello")],
+            1_000,
+        );
+
+        assert_eq!(
+            tauri::async_runtime::block_on(agent_own_session_path(
+                f.worktree.clone(),
+                None,
+                Some(f.config_arg()),
+            )),
+            None,
+            "an unbound resolve command must hand back no path",
+        );
+
+        assert!(
+            tauri::async_runtime::block_on(agent_own_session_path(
+                f.worktree.clone(),
+                Some(sess(&["s-1111"])),
+                Some(f.config_arg()),
+            ))
+            .is_some_and(|p| p.ends_with("s-1111.jsonl")),
+            "and the bound call through the same command does resolve",
+        );
     }
 }

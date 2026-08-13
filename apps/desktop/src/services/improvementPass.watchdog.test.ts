@@ -78,6 +78,7 @@ import {
 } from "./sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { forgetAgentTranscriptPath, readAgentTerminal } from "./conciergeTools/terminal";
+import { agentSessionIds } from "./agentTranscriptRegistry";
 import { invalidateAccountState, resetStickyAccounts } from "./accountSelection";
 import { setPin, clearAllPins } from "./accountStore";
 
@@ -832,14 +833,28 @@ describe("connectivity re-attempt", () => {
 // Sparkle agent returns what that agent is saying.
 describe("readable while a headless pass runs", () => {
   const TRANSCRIPT = "/home/u/.claude/projects/-wt-sparkle-self/this-pass.jsonl";
+  /** The file's STEM is its session id — the convention `transcript.rs`'s `session_id_of` encodes,
+   *  and what `registerSparkleTranscript` records off the resolve above. */
+  const TRANSCRIPT_SESSION = "this-pass";
   const SAID = "I looked at the logs and I'd prioritise the park refusal.";
 
   beforeEach(() => {
     vi.useFakeTimers();
     resetHarness();
     // A worktree Claude has run in: the resolve answers, and the transcript has an assistant turn.
-    harness.invokeImpl = (cmd) => {
+    //
+    // TWO RESOLVE COMMANDS, and keeping them distinct is the point (roborev 63135).
+    // `claude_latest_session_path` is the unfiltered LEARN seam — how the app DISCOVERS a session id
+    // it does not have yet. `agent_own_session_path` is the READ seam, and it answers only for a
+    // session the caller has already established is this agent's, which is why the stub honours the
+    // filter instead of returning the path unconditionally: a stub that ignored `sessionIds` would
+    // pass just as well against a reader that never sent them.
+    harness.invokeImpl = (cmd, args) => {
       if (cmd === "claude_latest_session_path") return Promise.resolve(TRANSCRIPT);
+      if (cmd === "agent_own_session_path") {
+        const ids = (args as { sessionIds?: string[] } | undefined)?.sessionIds;
+        return Promise.resolve(ids?.includes(TRANSCRIPT_SESSION) ? TRANSCRIPT : null);
+      }
       if (cmd === "read_transcript_last_assistant") return Promise.resolve(SAID);
       return undefined;
     };
@@ -894,6 +909,139 @@ describe("readable while a headless pass runs", () => {
       "no transcript path is known",
     );
   });
+
+  // WHICH SESSION IS THIS PASS'S — the binding the mounted transcript reads by, and the one thing a
+  // headless pass could not previously supply (roborev 63133 / 63135). It has no pane, so
+  // `AgentPane`'s gated hook writer never fires for it; the mounted pane then failed closed and
+  // rendered nothing for the app-owned agent, forever.
+  //
+  // The discriminator is deliberate: the resolve is planted to answer with LAST hour's file, which
+  // is exactly what a directory scan can see at registration time (the pass has not spawned yet and
+  // spawns with no `--resume`). So an id that the scan could not have produced is proof the pass's
+  // OWN announcement reached the registry — not that something bound something.
+  it("binds the session the pass is actually writing, which the directory scan cannot see", async () => {
+    const LAST_PASS = "/home/u/.claude/projects/-wt-sparkle-self/last-pass.jsonl";
+    harness.invokeImpl = (cmd) => {
+      if (cmd === "claude_latest_session_path") return Promise.resolve(LAST_PASS);
+      return undefined;
+    };
+
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    // All the app can know before Claude speaks: the previous pass's session.
+    expect(agentSessionIds(SPARKLE_AGENT_ID)).toEqual(["last-pass"]);
+
+    // Rust announces the live session off Claude's own first stream line (`system/init`).
+    harness.handlers
+      .get("sparkle_improve:session")
+      ?.({ payload: { sessionId: "this-pass-live" } });
+
+    // ACCUMULATED, not replaced: this pass is readable AND the previous one still is.
+    expect(agentSessionIds(SPARKLE_AGENT_ID)).toEqual(["last-pass", "this-pass-live"]);
+
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "done" } });
+    await pass;
+
+    // The listener is torn down with its siblings, so a late announcement cannot bind an id into a
+    // pass that is already over.
+    expect(harness.handlers.size).toBe(0);
+  });
+
+  // THE ID ON `done` IS AUTHORITATIVE TOO, and it used to be typed, destructured and thrown away
+  // (roborev 63231). `handle_event` re-assigns `session_id` on the `result` event, so a pass that
+  // forked or continued mid-flight finishes in a DIFFERENT file than the one it announced at
+  // `system/init` — and the early announcement is once-only by design, so nothing else can catch it.
+  // That final file is the TAIL of the conversation the pane is opened to read.
+  //
+  // The two ids are deliberately different here: with them equal the case would pass on the
+  // announcement alone and prove nothing about `done`.
+  it("also binds the session the pass FINISHED in, when it differs from the announced one", async () => {
+    harness.invokeImpl = (cmd) =>
+      cmd === "claude_latest_session_path" ? Promise.resolve(null) : undefined;
+
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    harness.handlers.get("sparkle_improve:session")?.({ payload: { sessionId: "announced-at-init" } });
+    harness.handlers
+      .get("sparkle_improve:done")
+      ?.({ payload: { sessionId: "forked-and-finished-here", text: "done" } });
+    await pass;
+
+    expect(agentSessionIds(SPARKLE_AGENT_ID)).toEqual([
+      "announced-at-init",
+      "forked-and-finished-here",
+    ]);
+  });
+
+  // …and `done` binds on its OWN, with no announcement in front of it.
+  //
+  // THIS CASE USED TO FIRE BOTH EVENTS WITH THE SAME ID, and so proved nothing (roborev 63251):
+  // the `session` handler alone recorded "one-session", making the assertion true whether or not
+  // `done` ever called `noteAgentSessionId` — it was already true against the pre-change code. Its
+  // comment claimed to pin the set-add contract "at THIS call site", but the only thing it actually
+  // re-asserted was the registry's dedup, which `agentTranscriptRegistry.test.ts` owns directly.
+  //
+  // Dropping the announcement is what makes the bind observable: this is now the only writer, so
+  // deleting it empties the set. Dedup stays where it is tested on its own terms.
+  it("binds the finishing id from `done` alone, with no announcement before it", async () => {
+    harness.invokeImpl = (cmd) =>
+      cmd === "claude_latest_session_path" ? Promise.resolve(null) : undefined;
+
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    harness.handlers
+      .get("sparkle_improve:done")
+      ?.({ payload: { sessionId: "one-session", text: "done" } });
+    await pass;
+
+    expect(agentSessionIds(SPARKLE_AGENT_ID)).toEqual(["one-session"]);
+  });
+
+  // ── THE FAILING PASS BINDS ITS SESSION TOO ──────────────────────────────────────────────────
+  //
+  // roborev 63251, finding 3. The bind covered only the clean exit, while Rust held `session_id` on
+  // the failure branch and dropped it — so the exact scenario the `done` bind exists for (a pass
+  // that forked mid-flight, leaving the once-only announcement naming a different file than the
+  // final one) left the tail unreadable whenever the pass FAILED, which is both the more common
+  // ending and the one someone is most likely to open the pane for.
+  it("binds the session a FAILED pass wrote, which is the ending most likely to be read", async () => {
+    harness.invokeImpl = (cmd) =>
+      cmd === "claude_latest_session_path" ? Promise.resolve(null) : undefined;
+
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    harness.handlers
+      .get("sparkle_improve:error")
+      ?.({ payload: { message: "claude exited 1", sessionId: "written-then-failed" } });
+    await pass;
+
+    expect(agentSessionIds(SPARKLE_AGENT_ID)).toEqual(["written-then-failed"]);
+    // The pass still ENDED — the bind is additive, not a path that swallows the failure. Asserted
+    // as the teardown the settle performs, since `runImprovementPass` resolves to void and the
+    // outcome is not observable from its return.
+    expect(harness.handlers.size).toBe(0);
+  });
+
+  // NO CASE HERE FOR AN EMPTY SESSION ID, deliberately — and the deletion is the fix, not a gap
+  // (roborev 63344).
+  //
+  // One stood here asserting `agentSessionIds(...) === undefined` after an error payload carrying
+  // `sessionId: ""`, and it was VACUOUS in the same way as the case retired above.
+  // `noteAgentSessionId` already short-circuits a blank id of its own accord
+  // (`agentTranscriptRegistry.ts`: `const id = sessionId.trim(); if (id === "" …) return;`), so
+  // deleting the `if (ev.payload.sessionId)` guard from the error handler leaves the registry empty
+  // and that assertion green — true with and against the line it existed to pin.
+  //
+  // The property is owned directly by `agentTranscriptRegistry.test.ts` ("ignores blank ids rather
+  // than binding an empty session"), exactly as the dedup it was retired for re-asserting. Pinning
+  // it HERE instead needs the call itself observed — a spy on `noteAgentSessionId` — and the source
+  // imports it as a direct named binding, so that means module-wide mocking which would take the
+  // real registry away from every other case in this file. Not worth it for a property already
+  // covered one layer down.
 });
 
 // ── Which Claude account the hourly pass runs under (PRD/sparkle/account-rotation.md Phase 0) ──

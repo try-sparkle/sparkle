@@ -167,7 +167,10 @@ afterEach(() => {
 });
 
 const shell = () => screen.getByTestId("workspace-shell");
-const patch = (side: "left" | "right") => act(() => useCableStore.getState().patch(side));
+// `null` far end — this suite is about the SHELL's projection of `wired` (flood, recede,
+// mirror), not about who the concierge talks to. See cableStore.patch on why the pin is required
+// rather than optional.
+const patch = (side: "left" | "right") => act(() => useCableStore.getState().patch(side, null));
 
 // ── 1. THE STATE LIVES ON THE ROOT ────────────────────────────────────────────────────────────
 describe("the shell root carries the whole cockpit state", () => {

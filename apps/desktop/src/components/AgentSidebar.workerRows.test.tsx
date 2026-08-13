@@ -43,6 +43,7 @@ import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { settleFold } from "../testing/rowGestures";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
@@ -94,7 +95,13 @@ const queryRow = (name: string) => screen.queryByText(name);
  *  It has to be the fixture and not two clicks: the component reads selection from its `project`
  *  PROP, which these tests pass as a static object, so a click that updates the store never reaches
  *  the row. Pre-selecting is the only way to express the precondition here. */
-const toggleAlpha = () => fireEvent.click(rowFor("Alpha"));
+const toggleAlpha = async () => {
+  fireEvent.click(rowFor("Alpha"));
+  // The fold is DEFERRED one double-click interval — see testing/rowGestures.settleFold and
+  // AgentRow.FOLD_DOUBLE_PRESS_GRACE_MS. Without this every assertion below would read the state
+  // as it was BEFORE the gesture.
+  await settleFold();
+};
 
 /** Fold Alpha when the selection currently sits SOMEWHERE ELSE — the honest two-click gesture.
  *
@@ -105,15 +112,16 @@ const toggleAlpha = () => fireEvent.click(rowFor("Alpha"));
  *  Written out rather than folded into `toggleAlpha` because the difference matters: `toggleAlpha`
  *  is for fixtures that already have Alpha selected, and quietly doing two clicks there would fold
  *  and immediately unfold. */
-const foldAlphaFromElsewhere = (
+const foldAlphaFromElsewhere = async (
   rerender: (ui: React.ReactElement) => void,
   project: Project,
-): Project => {
+): Promise<Project> => {
   fireEvent.click(rowFor("Alpha")); // stage 1 — commits to Alpha, folds nothing
   const nowOnAlpha: Project = { ...project, selectedAgentId: "a1" };
   useProjectStore.setState({ projects: [nowOnAlpha] } as never);
   rerender(<AgentSidebar project={nowOnAlpha} />);
   fireEvent.click(rowFor("Alpha")); // stage 2 — the fold
+  await settleFold(); // …which lands one double-click interval later (see the helper)
   // RETURNED, and callers must keep using it. Folding a head SELECTS that head — under click-only
   // selection there is no gesture that folds Alpha while leaving a worker selected. Re-rendering
   // the old (worker-selected) project afterwards would be re-selecting the worker, which correctly
@@ -185,12 +193,12 @@ describe("AgentSidebar — worker child rows", () => {
     expect(queryRow("Lexer Worker")).toBeNull();
   });
 
-  it("collapsing hides the children without touching the agents themselves", () => {
+  it("collapsing hides the children without touching the agents themselves", async () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
     expect(queryRow("Parser Worker")).toBeTruthy();
 
-    toggleAlpha();
+    await toggleAlpha();
 
     expect(queryRow("Parser Worker")).toBeNull();
     // The workers are still in the store — collapse is a view state, not a teardown. A fold that
@@ -199,32 +207,32 @@ describe("AgentSidebar — worker child rows", () => {
     expect(fresh.agents.map((a) => a.id).sort()).toEqual(["a1", "w1", "w2"]);
   });
 
-  it("persists the collapse choice through uiStore", () => {
+  it("persists the collapse choice through uiStore", async () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    toggleAlpha();
+    await toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
-    toggleAlpha();
+    await toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
   });
 
   // Removing the chevron BUTTON must not remove the fold from assistive tech: the row inherited the
   // job, so it inherits aria-expanded. Without this the change reads to a screen reader as "the
   // feature is gone" rather than "the control moved".
-  it("reports its state to assistive tech", () => {
+  it("reports its state to assistive tech", async () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
     expect(rowFor("Alpha").getAttribute("aria-expanded")).toBe("true");
-    toggleAlpha();
+    await toggleAlpha();
     expect(rowFor("Alpha").getAttribute("aria-expanded")).toBe("false");
   });
 
   // Left click folds and selects; it does NOT throw the detail card over the rows it just revealed.
   // The card moved to right-click for exactly this reason.
-  it("does not open the hover card when the row is clicked", () => {
+  it("does not open the hover card when the row is clicked", async () => {
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
-    toggleAlpha();
+    await toggleAlpha();
     expect(screen.queryByTestId("agent-hover-card")).toBeNull();
   });
 
@@ -431,14 +439,14 @@ describe("AgentSidebar — a subtree opens when a worker needs you, not when one
 
   // A subtree the user closed stays closed while a worker under it is still red, across further
   // status ticks. There is no edge detector left to get this wrong, which is the point.
-  it("stays collapsed after the user closes a subtree whose worker is still red", () => {
+  it("stays collapsed after the user closes a subtree whose worker is still red", async () => {
     const project = seed({ w1: "working", w2: "working" });
     const { rerender } = render(<AgentSidebar project={project} />);
 
     advance(rerender, project, { w1: "errored", w2: "working" });
-    toggleAlpha(); // the user opens it themselves
+    await toggleAlpha(); // the user opens it themselves
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
-    toggleAlpha(); // and shuts it again, red and all
+    await toggleAlpha(); // and shuts it again, red and all
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     // w1 is still errored; an unrelated change ticks the render.
@@ -459,10 +467,10 @@ describe("AgentSidebar — a subtree opens when a worker needs you, not when one
 
   // COLLAPSING is the user's gesture too: a subtree they opened stays open when the red clears.
   // Nothing folds it away on their behalf.
-  it("does not collapse the subtree the user opened when the red clears", () => {
+  it("does not collapse the subtree the user opened when the red clears", async () => {
     const project = seed({ w1: "errored" });
     const { rerender } = render(<AgentSidebar project={project} />);
-    toggleAlpha();
+    await toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(false);
 
     advance(rerender, project, { w1: "working" });
@@ -470,10 +478,10 @@ describe("AgentSidebar — a subtree opens when a worker needs you, not when one
     expect(queryRow("Parser Worker")).toBeTruthy();
   });
 
-  it("does not re-expand a parent the user collapsed while its workers spin down", () => {
+  it("does not re-expand a parent the user collapsed while its workers spin down", async () => {
     const project = seedExpanded();
     const { rerender } = render(<AgentSidebar project={project} />);
-    toggleAlpha();
+    await toggleAlpha();
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     const shrunk: Project = { ...project, agents: project.agents.filter((a) => a.id !== "w2") };
@@ -552,13 +560,13 @@ describe("AgentSidebar — a selected worker always has a row", () => {
 
   // Selection is a CHANGE trigger, not a state one: having selected a worker must not stop the user
   // from shutting the subtree afterwards.
-  it("stays collapsed after the user closes a subtree holding the selected worker", () => {
+  it("stays collapsed after the user closes a subtree holding the selected worker", async () => {
     const project = seedExpanded({ w1: "working", w2: "working" });
     const selected: Project = { ...project, selectedAgentId: "w1" };
     useProjectStore.setState({ projects: [selected] } as never);
     const { rerender } = render(<AgentSidebar project={selected} />);
 
-    const folded = foldAlphaFromElsewhere(rerender, selected);
+    const folded = await foldAlphaFromElsewhere(rerender, selected);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     // An unrelated tick, selection unchanged.
@@ -581,7 +589,7 @@ describe("AgentSidebar — a selected worker always has a row", () => {
   // ONE AgentSidebar stays mounted across project switches (Workspace renders it once with `project`
   // as a prop), so a last-seen-id ref would read a round trip as two selection changes and re-open a
   // subtree the user shut — even though this project's selection never moved.
-  it("does not re-expand after a project switch away and back", () => {
+  it("does not re-expand after a project switch away and back", async () => {
     const project = seedExpanded({ w1: "working", w2: "working" });
     const a: Project = { ...project, selectedAgentId: "w1" };
     const b: Project = {
@@ -592,7 +600,7 @@ describe("AgentSidebar — a selected worker always has a row", () => {
     useProjectStore.setState({ projects: [a, b] } as never);
     const { rerender } = render(<AgentSidebar project={a} />);
 
-    const folded = foldAlphaFromElsewhere(rerender, a);
+    const folded = await foldAlphaFromElsewhere(rerender, a);
     expect(useUiStore.getState().collapsedOrchestrators.a1).toBe(true);
 
     rerender(<AgentSidebar project={b} />); // switch away…

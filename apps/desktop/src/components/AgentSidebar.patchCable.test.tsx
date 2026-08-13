@@ -146,7 +146,7 @@ describe("selecting a build row patches the cable", () => {
   it("hovering does not STEAL a cable already patched to the other side", () => {
     // The prompt-routing case, which is the one that costs a user their message: patched left,
     // cursor transits the right column, Send must still go left.
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     vi.useFakeTimers();
     try {
       render(<AgentSidebar project={PROJECT} />);
@@ -196,7 +196,7 @@ describe("selecting a build row patches the cable", () => {
     useProjectStore.setState({ projects: [EMPTY], selectedProjectId: "p1" } as never);
     useRuntimeStore.setState({ openAgentIds: [], status: {} } as never);
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
-    useCableStore.getState().patch("left");
+    useCableStore.getState().patch("left", null);
     render(<AgentSidebar project={EMPTY} />);
     clickBuildChevron();
     expect(useCableStore.getState().wired).toBe("left");

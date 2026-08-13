@@ -166,9 +166,31 @@ import { CloseAgentPrompt } from "./CloseAgentPrompt";
 
 /**
  * Left column: the current project's agents as a vertical list (spec layout, revised).
- * Each row is a status dot + the agent name rendered in that status's color; click a row
- * to open the agent, double-click the agent name to rename it, ×
- * to close. "+ Agent" adds one.
+ * Each row is a status dot + the agent name rendered in that status's color; × to close,
+ * "+ Agent" adds one.
+ *
+ * THE ROW'S GESTURES, as the founder settled them (*"double click mounts. right click to
+ * rename."*) — this block described the retired set until roborev 63223, which is worth a line of
+ * its own: it is the top-of-file description the next reader trusts, and it contradicted the
+ * governing comments in `AgentRow.tsx` / `FittedAgentName.tsx`.
+ *
+ *   single click            select the agent and hand its terminal the caret — no cable. AND, on a
+ *                           row that was ALREADY selected and has workers, fold/unfold its subtree
+ *                           — which PERSISTS. That is not a footnote: the first version of this
+ *                           list said "no cable" and stopped, which reads as "selection only, no
+ *                           side effects" (roborev 63321). The fold is also why the click is
+ *                           DEFERRED by `FOLD_DOUBLE_PRESS_GRACE_MS` — it may turn out to be half
+ *                           of a mount, and one gesture must not mean two things.
+ *   double click            mount the concierge onto it (see `ROW_CONTROL_SELECTOR` for the
+ *                           controls this deliberately does not fire on)
+ *   Enter / Space           also mount — the row is the disclosure control, so it is operable from
+ *                           the keyboard; a synthetic `detail: 0` click takes the same path. Any
+ *                           change to the mount rule has to hold for these, not only for the mouse.
+ *   right click ON THE NAME open the rename editor
+ *   right click ELSEWHERE   open the detail card
+ *
+ * Read `AgentRow.tsx` for the authority on each; this is the index, and it is exhaustive as of
+ * roborev 63321 — if you add a gesture, it belongs here too.
  */
 // `--hd-h` from rev4.html: the height of every column header band in the cockpit — the concierge's
 // `.ahd` and this column's `.bhd`. One number so the two line up across the seam; a header that is
@@ -1077,7 +1099,11 @@ export function AgentSidebar({
     // no agent is not a connection (roborev 55246).
     if (!id) return;
     open(id);
-    patchCable(pairSide);
+    // `id`, not the selection: THIS is the agent the gesture named, and pinning it here is what
+    // stops the live cable from following whatever row is clicked next (roborev 63145, finding 4).
+    // The early return above guarantees it is non-null — a gesture that seats no agent is not a
+    // connection, and a pin of `null` would fall straight back to the selection-following bug.
+    patchCable(pairSide, id);
   };
   /**
    * SEAT THE AGENT AND HAND ITS TERMINAL THE CARET. A SINGLE CLICK, AND NO CABLE.
@@ -1241,7 +1267,12 @@ export function AgentSidebar({
       activateLocal: () => {
         setActiveSpecial("sparkle");
         open(sparkleAgentId);
-        patchCable(pairSide);
+        // PINNED TO THE SPARKLE AGENT, which is the one this gesture named (roborev 63145 #4).
+        // It is deliberately NOT `project.selectedAgentId`: this agent is never a roster member, so
+        // the selection here names some OTHER agent entirely — exactly the mismatch the pin exists
+        // to remove. Routing to the pane goes through `decidePromptTarget`'s special arm rather than
+        // this pin, so the value is truthful state rather than the thing that decides the send.
+        patchCable(pairSide, sparkleAgentId);
       },
     });
   }, [setActiveSpecial, open, sparkleAgentId, patchCable, pairSide]);

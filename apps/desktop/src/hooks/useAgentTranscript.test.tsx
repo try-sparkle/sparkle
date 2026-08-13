@@ -383,4 +383,57 @@ describe("useAgentTranscript — the session binding", () => {
 
     expect(invoke.mock.calls.filter(([c]) => c === "agent_transcript_page").length).toBe(pagesBefore);
   });
+
+  // THE LATCH THAT THE BINDING DEP MADE REACHABLE (roborev 63135).
+  //
+  // `pageBack` sets `paging: true` and both of its late returns are gated on the GENERATION. Adding
+  // `sessionIds` to the first-page effect's deps introduced a generation bump that cannot be a
+  // remount — the binding widening when the agent resumes — so a backwards page in flight when that
+  // lands used to return without ever clearing the flag. `paging` is what `pageBack`'s own guard
+  // reads, so history became unreachable for the rest of the pane's life.
+  //
+  // The assertion is the SIDE EFFECT and not the flag: a later `pageBack` must actually ISSUE a
+  // read and merge the older entries. Asserting `paging === false` alone would pass against a fix
+  // that cleared the flag but left the reader wedged some other way.
+  it("clears the paging latch when the binding widens mid-page, so history stays reachable", async () => {
+    invoke.mockResolvedValueOnce(page([human("h1", "tip", "2026-07-30T10:00:00.000Z")]));
+    render(<PagingHarness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+
+    // A backwards page that has NOT resolved yet.
+    let resolveBack: (v: unknown) => void = () => {};
+    invoke.mockImplementationOnce(() => new Promise((r) => (resolveBack = r)));
+    act(() => reader!.pageBack());
+    await flush();
+    expect(useMountedThreadStore.getState().threads["a1"]!.paging).toBe(true);
+
+    // The agent resumes: a SECOND session id joins the binding. The first-page effect re-runs with
+    // the widened set and bumps the generation, which is what strands the in-flight page.
+    invoke.mockResolvedValueOnce(page([human("h1", "tip", "2026-07-30T10:00:00.000Z")]));
+    await act(async () => {
+      noteAgentSessionId("a1", "sess-a1-resumed");
+      await Promise.resolve();
+    });
+    await flush();
+
+    // The stranded page lands under the old generation and is dropped — correctly, for its entries.
+    await act(async () => {
+      resolveBack(page([human("stale", "dropped", "2026-07-30T08:00:00.000Z")]));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(entriesOf("a1")).not.toContain("stale");
+
+    // THE POINT: paging back still works. It issues a real read, carrying the widened binding, and
+    // the older entry merges in.
+    const backsBefore = invoke.mock.calls.filter(([c]) => c === "agent_transcript_page").length;
+    invoke.mockResolvedValueOnce(page([human("h0", "older", "2026-07-30T09:00:00.000Z")]));
+    act(() => reader!.pageBack());
+    await flush();
+
+    expect(invoke.mock.calls.filter(([c]) => c === "agent_transcript_page").length).toBe(
+      backsBefore + 1,
+    );
+    expect(entriesOf("a1")).toEqual(["h0", "h1"]);
+  });
 });

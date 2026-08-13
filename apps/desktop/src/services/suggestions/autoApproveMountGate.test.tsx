@@ -219,7 +219,6 @@ describe("opening a pane is no longer what answers a pending permission prompt",
 
     expect(keystrokes()).toBe(1);
     expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
-  
   });
 });
 
@@ -242,12 +241,23 @@ describe("opening a pane is no longer what answers a pending permission prompt",
 //
 // ══ AND ON THE SETTLE WATCHER, which outlived the behaviour change ═══════════════════════════════
 //
-// `useSuggestions` also polls `getAgentScrollback` on a `setInterval` at `SETTLE_TICK_MS` (1200ms,
-// `useSuggestions.ts:961`), settling after two identical hashes. That path is why an earlier version
-// of this file was wrong to conclude "the MOUNT, not the registration" was the trigger: registration
-// alone answered within ~2.4s. Now that `autoApproveWatch.ts` decides off captured screens instead,
-// that route is no longer the founder-visible one — but the trap that hid it is still live for
-// anyone writing tests here. THESE TESTS RUN ON REAL TIMERS and finish in milliseconds, so any
-// interval-driven path is silently unexercised, and a case that "proves" such a path does not exist
-// may only be proving that the clock never advanced. Reach for `vi.useFakeTimers()` and advance
-// deliberately whenever you mean to exercise one.
+// `useSuggestions` also polls `getAgentScrollback` on a `setInterval` at `SETTLE_TICK_MS` (1200ms —
+// grep the symbol, it has moved), settling after two identical hashes. That path is why an earlier
+// version of this file was wrong to conclude "the MOUNT, not the registration" was the trigger:
+// registration alone answered within ~2.4s. Now that `autoApproveWatch.ts` decides off captured
+// screens instead, that route is no longer the founder-visible one — but the trap that hid it is
+// exactly the kind that comes back, so read the next paragraph as the reason this file is shaped the
+// way it is rather than as a caveat about it.
+//
+// THE TRAP: an interval-driven path is silently unexercised when the clock never advances, so a case
+// that "proves" such a path does not fire may only be proving that no time passed. Every assertion
+// here is of the form "nothing MORE was typed", which is precisely the shape that trap makes
+// worthless.
+//
+// THE DISCHARGE, and do not undo it: this file runs on FAKE timers — `beforeEach` calls
+// `vi.useFakeTimers()` and pins the clock, `afterEach` restores real ones — and the `settle()` helper
+// above advances that clock deliberately, three rounds of `SETTLE_MS`, wrapping each in `act` so the
+// microtask arm gets to run too. That is what makes "nothing more was typed" a real claim. An earlier
+// revision of this note still described the file as running on real timers, which had by then become
+// the opposite of the truth; a note that narrates a superseded state is the LOCK failure AGENTS.md
+// warns about, so if you change the timer discipline, change this paragraph in the same commit.
