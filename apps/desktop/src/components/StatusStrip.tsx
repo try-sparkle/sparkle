@@ -15,6 +15,7 @@
 import { useEffect, useRef, useState } from "react";
 import { C } from "../theme/colors";
 import { SupportModal } from "./SupportModal";
+import { WhatsNewPanel } from "./WhatsNewPanel";
 import { FONT_UI } from "../theme/scale";
 import {
   CHANGELOG_URL,
@@ -119,11 +120,13 @@ export function StatusStrip() {
       >
         {/* A real anchor: focusable and announced as a link for free. href is the changelog URL so
             the accessible name and the destination agree, but the click is intercepted — the webview
-            must never navigate away from the app, so it goes to the system browser instead. */}
+            must never navigate away from the app. It now opens the IN-APP What's New panel rather
+            than the browser: the public page was 35 releases stale, and "what changed in the build I
+            just restarted into?" should not require leaving the app. See appChrome.openChangelog. */}
         <a
           href={CHANGELOG_URL}
           data-hint="changelog"
-          title="Open the Sparkle changelog"
+          title="See what's new in this version"
           onClick={(e) => {
             e.preventDefault();
             openChangelog(SCOPE);
@@ -224,6 +227,11 @@ export function StatusStrip() {
       {/* Outside the strip on purpose: the strip is a 24px row with `user-select: none` and 11px
           type, and a modal nested in it would inherit both. */}
       {supportOpen && <SupportModal onClose={() => setSupportOpen(false)} />}
+      {/* ALWAYS mounted, not gated on a click: it owns the launch-time auto-open too (once per new
+          version, see WhatsNewPanel), and renders null until it has something to show. It lives here
+          rather than in Workspace because the Changelog link above is its deliberate entry point —
+          one home for the affordance and the surface it opens. */}
+      <WhatsNewPanel />
     </>
   );
 }

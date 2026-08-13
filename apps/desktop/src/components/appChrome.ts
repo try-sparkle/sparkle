@@ -17,8 +17,11 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { C } from "../theme/colors";
 import { getAppVersion, getLogDir, revealLogs, log } from "../logger";
 import { checkForUpdates, type CheckOutcome } from "../services/updaterService";
+import { useWhatsNewStore } from "../stores/whatsNewStore";
 import { FONT_UI } from "../theme/scale";
 
+/** The public changelog page. No longer where "Changelog" sends you — see `openChangelog` — but
+ *  still the anchor's real `href` and the panel's "View online" fallback. */
 export const CHANGELOG_URL = "https://sparkle.ai/changelog";
 
 /** Manual "Check for updates" feedback, shown inline wherever the version popover renders. */
@@ -103,9 +106,28 @@ export function useVersionCheck(scope: string) {
   return { checkState, beginSession, endSession, runCheck };
 }
 
-/** Open the changelog in the system browser (never in the webview). */
+/**
+ * Open the changelog — the IN-APP "What's New" panel, not the website.
+ *
+ * This used to hand the user to `CHANGELOG_URL` in the system browser. Two things were wrong with
+ * that: the page was frozen 35 releases behind, and it made "what's different in the build I just
+ * restarted into?" a question you had to leave the app to answer. Every existing caller of this
+ * helper gets the in-app panel by changing it here, which is the whole reason the changelog
+ * behaviour has one home (see this module's header).
+ *
+ * `CHANGELOG_URL` is still exported and still the anchor's `href` in StatusStrip, so the link has a
+ * real destination for its accessible name — and `openChangelogInBrowser` below is the escape hatch
+ * the panel itself offers when it has nothing to show.
+ */
 export function openChangelog(scope: string): void {
   log.info(scope, "changelog clicked");
+  useWhatsNewStore.getState().openWhatsNew();
+}
+
+/** Open the public changelog page in the system browser (never in the webview). The panel's
+ *  "View online" fallback, kept for when the in-app fetch has nothing at all to render. */
+export function openChangelogInBrowser(scope: string): void {
+  log.info(scope, "changelog opened in browser");
   void openUrl(CHANGELOG_URL).catch((e) => log.error(scope, "open changelog failed", e));
 }
 

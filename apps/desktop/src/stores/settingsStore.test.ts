@@ -112,7 +112,7 @@ describe("suggestedActions AI flag", () => {
   });
 });
 
-describe("migrateSettings — v0→v1 AI opt-out + v1→v2 autoApplyUpdates default", () => {
+describe("migrateSettings — v0→v1 AI opt-out, v1→v2 autoApplyUpdates, v2→v3 last-seen changelog", () => {
   it("maps a stored aiEnabled:false to all four feature flags off (no silent re-arm)", () => {
     const out = migrateSettings({ aiEnabled: false, chiefPat: "x" }, 0) as Record<string, unknown>;
     expect(out.aiAutoRename).toBe(false);
@@ -125,18 +125,53 @@ describe("migrateSettings — v0→v1 AI opt-out + v1→v2 autoApplyUpdates defa
     expect(migrateSettings({ aiEnabled: true }, 0)).toEqual({
       aiEnabled: true,
       autoApplyUpdates: true,
+      lastSeenChangelogVersion: null,
     });
     expect(migrateSettings({ chiefPat: "x" }, 0)).toEqual({
       chiefPat: "x",
       autoApplyUpdates: true,
+      lastSeenChangelogVersion: null,
     });
   });
   it("does not clobber an existing autoApplyUpdates value on migration", () => {
-    expect(migrateSettings({ autoApplyUpdates: false }, 1)).toEqual({ autoApplyUpdates: false });
+    expect(migrateSettings({ autoApplyUpdates: false }, 1)).toEqual({
+      autoApplyUpdates: false,
+      lastSeenChangelogVersion: null,
+    });
+  });
+  it("v2→v3 adds lastSeenChangelogVersion as an EXPLICIT null, not an absent key", () => {
+    // The distinction is load-bearing: WhatsNewPanel reads "no recorded version" as a first run and
+    // seeds it to whatever is running, so an existing install sees only the release it is on rather
+    // than the whole 35-release backlog. `toHaveProperty` with null fails on an absent key, which is
+    // exactly what this is guarding.
+    const out = migrateSettings({ chiefPat: "x" }, 2);
+    expect(out).toHaveProperty("lastSeenChangelogVersion", null);
+  });
+  it("v2→v3 does not clobber a version already recorded", () => {
+    expect(migrateSettings({ lastSeenChangelogVersion: "0.99.0" }, 2)).toEqual({
+      lastSeenChangelogVersion: "0.99.0",
+    });
   });
   it("is a no-op at the current version", () => {
-    const blob = { aiEnabled: false, autoApplyUpdates: true };
-    expect(migrateSettings(blob, 2)).toBe(blob);
+    const blob = { aiEnabled: false, autoApplyUpdates: true, lastSeenChangelogVersion: "0.102.0" };
+    expect(migrateSettings(blob, 3)).toBe(blob);
+  });
+});
+
+describe("settingsStore — lastSeenChangelogVersion", () => {
+  it("records a version and advances it", () => {
+    useSettingsStore.setState({ lastSeenChangelogVersion: null });
+    useSettingsStore.getState().setLastSeenChangelogVersion("0.99.0");
+    expect(useSettingsStore.getState().lastSeenChangelogVersion).toBe("0.99.0");
+    useSettingsStore.getState().setLastSeenChangelogVersion("0.102.0");
+    expect(useSettingsStore.getState().lastSeenChangelogVersion).toBe("0.102.0");
+  });
+  it("IGNORES a blank version rather than storing one", () => {
+    // useAppInfo reports "" until Rust answers; storing that would look like "nothing seen yet"
+    // forever, so the panel would re-open on every launch.
+    useSettingsStore.getState().setLastSeenChangelogVersion("0.102.0");
+    useSettingsStore.getState().setLastSeenChangelogVersion("   ");
+    expect(useSettingsStore.getState().lastSeenChangelogVersion).toBe("0.102.0");
   });
 });
 

@@ -275,11 +275,21 @@ export function aiFeatureMode(f: AiFeatureFlags): AiMode {
  *  - v1 → v2: `autoApplyUpdates` was added (default on). An existing install has no stored value,
  *    so set it to `true` explicitly here — the same default a fresh install gets — rather than
  *    relying on merge alone, so the migrated shape is self-describing.
+ *  - v2 → v3: `lastSeenChangelogVersion` was added (the in-app What's New panel). An existing
+ *    install has no record of what it was running, and there is no honest way to invent one — so it
+ *    migrates to an EXPLICIT null, which WhatsNewPanel reads as "first run": seed it to the version
+ *    now running and show only that release. Anything else would dump the whole backlog at a user
+ *    on their next launch. The auto-open then fires on the release AFTER this one, which is the
+ *    first transition the app can actually observe.
  * Pure + exported for testing.
  */
 export function migrateSettings(persisted: unknown, version: number): unknown {
   let prev = persisted as
-    | (Partial<AiFeatureFlags> & { aiEnabled?: boolean; autoApplyUpdates?: boolean })
+    | (Partial<AiFeatureFlags> & {
+        aiEnabled?: boolean;
+        autoApplyUpdates?: boolean;
+        lastSeenChangelogVersion?: string | null;
+      })
     | null
     | undefined;
   if (version < 1 && prev && prev.aiEnabled === false) {
@@ -292,6 +302,9 @@ export function migrateSettings(persisted: unknown, version: number): unknown {
   }
   if (version < 2 && prev && prev.autoApplyUpdates === undefined) {
     prev = { ...prev, autoApplyUpdates: true };
+  }
+  if (version < 3 && prev && prev.lastSeenChangelogVersion === undefined) {
+    prev = { ...prev, lastSeenChangelogVersion: null };
   }
   return prev;
 }
@@ -582,6 +595,14 @@ interface SettingsState {
    *  Persisted. See sparkleAgent.shouldWarmSparkleAtLaunch — that gate, not this flag, is the
    *  single place the three modes are resolved. */
   improvementLaunchWarm: boolean | null;
+  /** The app version whose "What's New" has already been shown to this user, e.g. "0.102.0".
+   *
+   *  null = nothing recorded (a fresh install, or an upgrade from before this key existed). The app
+   *  had NO record of a previously-run version before this, which is why "what changed since the
+   *  version you were on" was unanswerable — see WhatsNewPanel, which seeds this on first run and
+   *  advances it each time it shows the panel. Persisted; a restart must not re-show the same
+   *  release's What's New. */
+  lastSeenChangelogVersion: string | null;
 
   // --- Editable config-file mirror (reflections of config.toml; the file is the source of truth) ---
   // Hydrated from the TOML config via `hydrateFromConfig` at startup and on every config-changed
@@ -778,6 +799,10 @@ interface SettingsState {
   setImprovementLastRunAt: (at: number) => void;
   /** Set the launch-warm opt-in (the "Start automatically when Sparkle opens" control). */
   setImprovementLaunchWarm: (on: boolean) => void;
+  /** Record the app version whose What's New the user has now been shown. A blank version is
+   *  ignored rather than stored — `useAppInfo` reports "" until Rust answers, and recording that
+   *  would look like "nothing seen yet" forever. */
+  setLastSeenChangelogVersion: (version: string) => void;
   /** Reflect the effective config (from config.toml) into the mirrored store fields. Called at
    *  startup and whenever the file changes. The file is the source of truth — this is the read side. */
   hydrateFromConfig: (eff: EffectiveConfig) => void;
@@ -823,6 +848,7 @@ export const useSettingsStore = create<SettingsState>()(
       sparkleImprovementConsent: DEFAULT_SPARKLE_CONSENT,
       improvementLastRunAt: null,
       improvementLaunchWarm: null,
+      lastSeenChangelogVersion: null,
 
       // Config-file mirror defaults (match SparkleConfig::default() in config.rs; overwritten by hydrate).
       requirePr: true,
@@ -928,6 +954,11 @@ export const useSettingsStore = create<SettingsState>()(
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
       setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
       setImprovementLaunchWarm: (on) => set({ improvementLaunchWarm: on }),
+      setLastSeenChangelogVersion: (version) =>
+        set((s) => {
+          const next = version.trim();
+          return next ? { lastSeenChangelogVersion: next } : s;
+        }),
 
       setChiefProject: (sparkleProjectId, chiefProjectId) =>
         set((s) => ({
@@ -1200,8 +1231,9 @@ export const useSettingsStore = create<SettingsState>()(
       storage: createJSONStorage(() => localStorage),
       // v0 → v1: preserve a prior `aiEnabled=false` opt-out across the binary→four-flag schema
       // change so we never silently re-arm AI/credits on upgrade. v1 → v2: seed autoApplyUpdates
-      // (default on) for existing installs. See migrateSettings.
-      version: 2,
+      // (default on) for existing installs. v2 → v3: add lastSeenChangelogVersion as an explicit
+      // null so the in-app What's New treats an existing install as a first run. See migrateSettings.
+      version: 3,
       migrate: migrateSettings,
       // Merge persisted state over the live defaults, but DEEP-merge notifyStatuses so a store
       // saved before this field existed (or one missing a newly-added status) inherits the
@@ -1245,6 +1277,7 @@ export const useSettingsStore = create<SettingsState>()(
         sparkleImprovementConsent: s.sparkleImprovementConsent,
         improvementLastRunAt: s.improvementLastRunAt,
         improvementLaunchWarm: s.improvementLaunchWarm,
+        lastSeenChangelogVersion: s.lastSeenChangelogVersion,
       }),
     },
   ),

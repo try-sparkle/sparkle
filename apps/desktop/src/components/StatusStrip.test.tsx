@@ -7,7 +7,7 @@
 // What's pinned here:
 //   • all three items render, right-aligned, in order
 //   • Changelog and Support are announced as LINKS with accessible names (the explicit ask)
-//   • Changelog goes through openUrl with the changelog URL and does NOT navigate the webview
+//   • Changelog opens the IN-APP What's New panel and does NOT navigate the webview
 //   • Support opens the REUSED SupportModal (mocked at its module seam)
 //   • the version opens a popover that still reaches revealLogs() — the point of the original
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
@@ -39,12 +39,21 @@ vi.mock("./SupportModal", () => ({
   ),
 }));
 
+// The strip mounts the What's New panel (its Changelog link is that panel's entry point), which
+// reaches the changelog API through the Tauri HTTP plugin. Stub the network seam; the panel's own
+// behaviour is covered in WhatsNewPanel.test.tsx.
+vi.mock("@tauri-apps/plugin-http", () => ({
+  fetch: () => Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve([]) }),
+}));
+
 import { StatusStrip } from "./StatusStrip";
 import { CHANGELOG_URL } from "./appChrome";
+import { useWhatsNewStore } from "../stores/whatsNewStore";
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  useWhatsNewStore.setState({ open: false });
 });
 
 const versionButton = () => screen.getByRole("button", { name: "v1.2.3" });
@@ -91,14 +100,24 @@ describe("StatusStrip — Changelog and Support are links", () => {
     expect(names).toEqual(["Changelog", "Support"]);
   });
 
-  it("Changelog opens the changelog URL in the system browser, not the webview", () => {
+  it("Changelog opens the IN-APP What's New panel, not the browser and not the webview", () => {
+    // DELIBERATELY CHANGED: this used to assert openUrl(CHANGELOG_URL). The public page was 35
+    // releases stale and the repo is private, so "what changed in the build I just restarted into?"
+    // could not be answered without leaving the app. The anchor keeps its href — a real destination
+    // for the accessible name — but the click now opens the panel.
     render(<StatusStrip />);
     const link = screen.getByRole("link", { name: "Changelog" });
-    // A real anchor, so its destination is inspectable and it is focusable for free.
     expect(link.getAttribute("href")).toBe(CHANGELOG_URL);
+    expect(useWhatsNewStore.getState().open).toBe(false);
     const evt = new MouseEvent("click", { bubbles: true, cancelable: true });
-    link.dispatchEvent(evt);
-    expect(openUrlMock).toHaveBeenCalledWith(CHANGELOG_URL);
+    // A raw dispatch (rather than fireEvent) so `defaultPrevented` is inspectable below; act() is
+    // what flushes the store subscription into a render.
+    act(() => {
+      link.dispatchEvent(evt);
+    });
+    expect(useWhatsNewStore.getState().open).toBe(true);
+    expect(screen.getByTestId("whats-new-panel")).toBeTruthy();
+    expect(openUrlMock).not.toHaveBeenCalled(); // it no longer punts to the system browser
     expect(evt.defaultPrevented).toBe(true); // the webview must never navigate away
   });
 
