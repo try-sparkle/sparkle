@@ -291,8 +291,12 @@ export interface HookEventHandlerDeps {
   /** Persist prompts/responses to history (and dispatch the followup judge). */
   captureHistory: (ev: HookEvent) => void;
   /**
-   * Park a Stop event's transcript path for the concierge's terminal read chain (tier d) —
-   * `components/AgentPane.noteTranscriptFromStop`.
+   * Park what this event says about WHERE this agent's conversation lives and WHOSE it is —
+   * `components/AgentPane.noteTranscriptFromHook`. Two registrations, from the same gated stream:
+   *
+   *   • a Stop event's transcript PATH, for the concierge's terminal read chain (tier d);
+   *   • every event's `session_id`, which is what lets the mounted concierge pane tell this agent's
+   *     transcript apart from every other `claude` that has run in the same worktree.
    *
    * REQUIRED, not optional, and that is the point of it living here rather than inline in the
    * component. A Stop event is the only place a session transcript path is ever known, and the
@@ -302,6 +306,11 @@ export interface HookEventHandlerDeps {
    * difference between a four-tier read chain and a three-tier one, and when it lived as a line
    * inside AgentPane's capture closure, deleting it broke nothing that any test could see. As a
    * required dep, dropping it is a compile error.
+   *
+   * THE SESSION HALF RAISES THE STAKES OF THE GATE ABOVE, rather than adding a new requirement:
+   * registering a foreign session id here would point the pane at another agent's words with full
+   * confidence — the exact wrong-attribution defect the binding exists to remove. The gate in
+   * `createHookEventHandler` already covers it; this note is so nobody moves this call in front of it.
    */
   noteTranscript: (ev: HookEvent) => void;
   /**

@@ -12,7 +12,7 @@
 // A fleet can be 60 panes; a tail poll per agent would be 60 file reads a second for 59 views nobody
 // is looking at. The effect keys on `agentId`, so unmounting (or mounting a different agent) tears
 // the interval down.
-import { useCallback, useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
 
 import {
   TRANSCRIPT_PAGE_SIZE,
@@ -20,6 +20,10 @@ import {
   fetchTranscriptTail,
   filterSystemAuthored,
 } from "../services/agentTranscript";
+import {
+  agentSessionIds,
+  subscribeAgentSessionIds,
+} from "../services/agentTranscriptRegistry";
 import { useMountedThreadStore } from "../stores/mountedThreadStore";
 
 /** How often to look for newly-appended records while mounted.
@@ -56,6 +60,29 @@ export function useAgentTranscript(
   const patch = useMountedThreadStore((s) => s.patch);
   const appendEntries = useMountedThreadStore((s) => s.appendEntries);
 
+  // ---- WHOSE conversation this is ---------------------------------------------------------------
+  //
+  // A worktree is NOT an identity. Its session directory holds a `<session-id>.jsonl` for every
+  // `claude` that ever ran there — the agent, each of its restarts, every background one-shot, and
+  // every other agent pointed at the same tree (1,172 files in one measured worktree). Reading it
+  // with only a worktree path returned whichever session had the newest mtime, so a pane whose footer
+  // said "Chatting with Sparkle" rendered a stranger's roborev review. The binding is what fixes it.
+  //
+  // READ FROM THE REGISTRY HERE, NOT ACCEPTED AS AN ARGUMENT, and that is deliberate. An injectable
+  // `sessionIds` param would be defaulted at the one production call site and overridden by every
+  // test — the "defaulted seam" shape in AGENTS.md, where the single line that supplies the real
+  // value is covered by nothing and can be deleted with the suite still green. One path only: tests
+  // seed the registry through `noteAgentSessionId`, exactly as `AgentPane`'s hook handler does.
+  //
+  // SUBSCRIBED, not read once: the binding lands on the agent's FIRST hook event, which is routinely
+  // after this pane's first render. A plain `agentSessionIds()` at render time would capture
+  // `undefined`, never see the id arrive, and leave the pane permanently empty for an agent whose
+  // session is perfectly well known — the subscribe-vs-getState mistake the worktree map beside it
+  // already documents.
+  const sessionIds = useSyncExternalStore(subscribeAgentSessionIds, () =>
+    agentId ? (agentSessionIds(agentId) ?? null) : null,
+  );
+
   // Generation counter. Every async read captures the value at issue time and drops its result if
   // the value has since moved — which happens whenever the founder mounts a DIFFERENT agent while a
   // read is in flight. Without it a slow first page for agent A lands in the store after B is
@@ -72,13 +99,29 @@ export function useAgentTranscript(
   const agentRef = useRef(agentId);
   const worktreeRef = useRef(worktreePath);
   const configRef = useRef(configDir ?? null);
+  const sessionRef = useRef(sessionIds);
   agentRef.current = agentId;
   worktreeRef.current = worktreePath;
   configRef.current = configDir ?? null;
+  sessionRef.current = sessionIds;
 
-  // ---- first page, on mount / on agent change -------------------------------------------------
+  // ---- first page, on mount / on agent change / WHEN THE BINDING ARRIVES ----------------------
   useEffect(() => {
     if (!agentId || !worktreePath) return;
+    // UNKNOWN BINDING → READ NOTHING, and render the ordinary empty state rather than a spinner.
+    //
+    // FAIL CLOSED. The tempting fallback — "no ids, so just show the newest session in the
+    // directory" — is precisely the defect: it renders another agent's conversation under this
+    // agent's name, with full confidence and no way for the reader to tell. An empty pane under a
+    // correct name is strictly better than a full pane under the wrong one.
+    //
+    // This also reads identically to the benign case (an agent seconds old that genuinely has no
+    // turns yet), which is right — in both we have nothing we can honestly attribute to this agent —
+    // and it self-heals: the agent's first hook event re-runs this effect with the binding in hand.
+    if (!sessionIds) {
+      patch(agentId, { loading: false, error: null });
+      return;
+    }
     const gen = ++genRef.current;
     let cancelled = false;
 
@@ -94,6 +137,7 @@ export function useAgentTranscript(
           worktreePath,
           configDir: configRef.current,
           limit: TRANSCRIPT_PAGE_SIZE,
+          sessionIds,
         });
         if (cancelled || gen !== genRef.current) return;
         // KEEP THE DEEPER CURSOR when we are re-mounting onto entries we already hold.
@@ -123,13 +167,25 @@ export function useAgentTranscript(
     return () => {
       cancelled = true;
     };
-  }, [agentId, worktreePath, patch, appendEntries]);
+    // `sessionIds` IS A DEPENDENCY, and it has to be: the binding usually arrives after this pane's
+    // first render (the agent's first hook event), and it WIDENS on resume. Both must re-page, or the
+    // pane stays empty for an agent we can now identify, or misses the session it just resumed into.
+    // Safe as an identity dep — `agentTranscriptRegistry` hands back a frozen array whose identity
+    // only changes when an id is genuinely added, so an idle agent's constant hook traffic does not
+    // re-fetch.
+  }, [agentId, worktreePath, sessionIds, patch, appendEntries]);
 
   // ---- live tail ------------------------------------------------------------------------------
   const readTail = useCallback(async () => {
     const id = agentRef.current;
     const wt = worktreeRef.current;
+    const bound = sessionRef.current;
     if (!id || !wt) return;
+    // No binding, nothing to follow. "The newest session file" is the tail's whole file-selection
+    // strategy, so an unbound tail live-follows whichever OTHER agent in this worktree is being
+    // written to right now — a wrong-attribution bug that ARRIVES OVER TIME into a pane that looked
+    // fine on mount. Bailing here also means an unidentified agent costs zero reads per second.
+    if (!bound) return;
     // One tail read at a time. A slow read must not stack behind the timer: two concurrent reads
     // from the same offset would each return the same records, and the second would rewind
     // `tailByte` to a position already consumed.
@@ -149,6 +205,7 @@ export function useAgentTranscript(
         // Name the file the offset belongs to, so a new session that started under us restarts the
         // read instead of seeking to a meaningless position inside it.
         fromFile: thread.tailFile,
+        sessionIds: bound,
       });
       if (gen !== genRef.current) return;
       // A DIFFERENT file means the agent started a new session while we watched. Its byte offset is
@@ -199,7 +256,10 @@ export function useAgentTranscript(
   const pageBack = useCallback(() => {
     const id = agentRef.current;
     const wt = worktreeRef.current;
-    if (!id || !wt) return;
+    const bound = sessionRef.current;
+    // Same fail-closed rule as the first page: with no binding there is no history we can attribute
+    // to this agent, so there is nothing to page back INTO.
+    if (!id || !wt || !bound) return;
     const thread = useMountedThreadStore.getState().threads[id];
     if (!thread || thread.paging || !thread.hasMore || thread.next === null) return;
     const gen = genRef.current;
@@ -212,6 +272,7 @@ export function useAgentTranscript(
           configDir: configRef.current,
           before,
           limit: TRANSCRIPT_PAGE_SIZE,
+          sessionIds: bound,
         });
         if (gen !== genRef.current) return;
         appendEntries(id, filterSystemAuthored(page.entries));

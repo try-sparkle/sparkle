@@ -313,7 +313,7 @@ export interface ConciergeSendResult {
 // TWO WRITERS, TWO DIFFERENT SAFETY PROPERTIES. Both are app code; neither takes a model's word for
 // anything. What they differ on is which file, and how they know it is the right one:
 //
-//  1. AN EXACT PATH — `noteAgentTranscriptPath`, from `components/AgentPane.noteTranscriptFromStop`,
+//  1. AN EXACT PATH — `noteAgentTranscriptPath`, from `components/AgentPane.noteTranscriptFromHook`,
 //     wired as the REQUIRED `noteTranscript` field of `engine/hookEvents.HookEventHandlerDeps` (so the
 //     hand-off cannot be dropped without a compile error). Its safety property is Claude Code's own
 //     Stop event: the path names the session that just spoke, and the handler's session gate rejects a
@@ -371,6 +371,9 @@ export interface ConciergeSendResult {
 export {
   noteAgentTranscriptPath,
   noteAgentTranscriptWorktree,
+  noteAgentSessionId,
+  agentSessionIds,
+  subscribeAgentSessionIds,
   forgetAgentTranscriptPath,
 } from "../agentTranscriptRegistry";
 

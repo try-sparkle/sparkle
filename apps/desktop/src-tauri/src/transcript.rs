@@ -335,7 +335,11 @@ pub struct TranscriptPage {
     /// Feed back as `before` to page further backwards. `None` = start of history.
     pub next: Option<Cursor>,
     pub has_more: bool,
-    /// How many `*.jsonl` session files the directory listing yielded (the candidate set).
+    /// How many of the directory's `*.jsonl` files are THIS AGENT'S (the candidate set, after the
+    /// session filter). Not the directory's size: a worktree's session directory holds every
+    /// `claude` that ever ran there, and only the agent's own sessions are candidates. `0` when the
+    /// agent→session binding is unknown, which is also the only case that yields no `tail_file`
+    /// alongside a directory that is not empty.
     pub sessions_scanned: usize,
     /// How many of those were actually opened. A first page should be 1.
     pub files_opened: usize,
@@ -412,6 +416,55 @@ fn session_files_by_mtime_desc(dir: &Path) -> Vec<PathBuf> {
     // (which would make a cursor's file position unstable mid-page).
     files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     files.into_iter().map(|(_, p)| p).collect()
+}
+
+/// The session id a Claude Code transcript file belongs to: its file STEM.
+///
+/// Claude Code names each session's log `<session_id>.jsonl`, so the stem IS the id — no open
+/// required, which is what lets the filter below stay metadata-only.
+fn session_id_of(path: &Path) -> Option<&str> {
+    path.file_stem().and_then(|s| s.to_str())
+}
+
+/// THE AGENT'S OWN session files in `dir`, newest mtime first — or `None` when we do not know which
+/// sessions are the agent's.
+///
+/// ── WHY THIS EXISTS AT ALL, AND WHY IT FAILS CLOSED ──────────────────────────────────────────────
+/// A session DIRECTORY is keyed by WORKTREE, never by agent. Every `claude` that has ever run in
+/// that directory has a file in it — the interactive agent, each restart, every background one-shot,
+/// every OTHER agent the app pointed at the same tree. Measured on this machine: the Improve Sparkle
+/// worktree's directory holds 1,172 `*.jsonl` files, the main checkout 98, a busy agent worktree 41.
+///
+/// The reader used to take `files.first()` and page from there — i.e. render whichever session in
+/// the directory had the newest mtime, with no agent id and no session id reaching the read at any
+/// point. So a pane whose footer said "Chatting with Sparkle" rendered a DIFFERENT agent's roborev
+/// review, because that agent's session happened to be the one being written. That is the defect
+/// this function removes: any directory with more than one file could render the wrong conversation.
+///
+/// `None` means the agent→session binding is UNKNOWN, and it returns `None` rather than falling back
+/// to "whatever is newest" — the fallback IS the bug. Showing someone else's conversation under this
+/// agent's name is far worse than showing nothing, so an unknown binding renders an honest empty
+/// pane. (Same convention as `agentId: null` in AGENTS.md: null is UNKNOWN, never "none".)
+///
+/// ── FILE-LEVEL, NOT RECORD-LEVEL, AND THAT IS DELIBERATE ─────────────────────────────────────────
+/// Every `Entry` also carries the `sessionId` off its own record, so filtering the RECORDS was the
+/// obvious alternative. It is wrong, and in the one direction that matters most here: when Claude
+/// Code resumes a session it writes the prior conversation into the NEW session's file with the
+/// records' ORIGINAL `sessionId` preserved. A record-level filter would therefore drop exactly the
+/// resumed history the founder mounted the pane to read — the "drops history on resume" failure that
+/// makes a single-id binding unacceptable in the first place. A file's stem answers a different and
+/// better question: is this file one of THIS AGENT'S session logs? If it is, everything in it is
+/// this agent's conversation, including the part it inherited.
+///
+/// It also keeps the load-bearing performance property intact. Filtering is metadata-only, so a
+/// first page still opens exactly ONE file even in the 1,172-file directory; a record-level filter
+/// would have to open candidates until it accumulated `limit` surviving entries, which in a
+/// directory full of other agents' sessions is a scan of the whole directory.
+fn own_session_files(dir: &Path, session_ids: Option<&[String]>) -> Option<Vec<PathBuf>> {
+    let ids = session_ids?;
+    let mut files = session_files_by_mtime_desc(dir);
+    files.retain(|p| session_id_of(p).is_some_and(|id| ids.iter().any(|want| want == id)));
+    Some(files)
 }
 
 // ---------------------------------------------------------------------------
@@ -1154,15 +1207,26 @@ fn page_from_file_with(
 /// `async` + `spawn_blocking`, mandatory: a sync `#[tauri::command]` body runs on the MAIN thread,
 /// and this one does directory scans plus multi-MB reads. `assert_async_command` in the tests
 /// holds the shape at compile time.
+/// `session_ids` NAMES WHOSE CONVERSATION THIS IS, and `None` renders nothing. A session directory
+/// belongs to a WORKTREE, so it holds every `claude` that ever ran there; without this the read
+/// returned whichever session had the newest mtime, under the mounted agent's name. See
+/// [`own_session_files`] for the full reasoning and why an unknown binding must not fall back.
 #[tauri::command]
 pub async fn agent_transcript_page(
     worktree_path: String,
     config_dir: Option<String>,
     before: Option<Cursor>,
     limit: usize,
+    session_ids: Option<Vec<String>>,
 ) -> Result<TranscriptPage, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        transcript_page_sync(&worktree_path, config_dir.as_deref(), before, limit)
+        transcript_page_sync(
+            &worktree_path,
+            config_dir.as_deref(),
+            before,
+            limit,
+            session_ids.as_deref(),
+        )
     })
     .await
     .map_err(|e| format!("agent_transcript_page task failed: {e}"))?
@@ -1174,10 +1238,24 @@ fn transcript_page_sync(
     config_dir: Option<&str>,
     before: Option<Cursor>,
     limit: usize,
+    session_ids: Option<&[String]>,
 ) -> Result<TranscriptPage, String> {
     let dir = session_dir(worktree_path, config_dir)
         .ok_or_else(|| "no Claude projects root: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string())?;
-    let files = session_files_by_mtime_desc(&dir);
+    // UNKNOWN binding → an empty page, never the newest stranger in the directory. Reported as a
+    // page with nothing in it and no tail anchor, so the caller renders its ordinary empty state and
+    // the live tail has nowhere to start.
+    let Some(files) = own_session_files(&dir, session_ids) else {
+        return Ok(TranscriptPage {
+            entries: Vec::new(),
+            next: None,
+            has_more: false,
+            sessions_scanned: 0,
+            files_opened: 0,
+            tail_file: None,
+            tail_byte: 0,
+        });
+    };
     let sessions_scanned = files.len();
     let limit = limit.clamp(1, MAX_PAGE_LIMIT);
 
@@ -1276,6 +1354,10 @@ fn transcript_page_sync(
 /// `from_byte` past EOF (rotated/truncated file) restarts from 0 rather than erroring.
 ///
 /// `async` + `spawn_blocking` for the same reason as [`agent_transcript_page`].
+/// `session_ids` NAMES WHOSE CONVERSATION THIS IS — same rule and same stakes as
+/// [`agent_transcript_page`], and it matters here for a second reason: "the newest session file" is
+/// the tail's whole file-selection strategy, so an unfiltered tail follows whichever OTHER agent in
+/// the worktree is being written to right now. `None` returns nothing rather than borrowing it.
 #[tauri::command]
 pub async fn agent_transcript_tail(
     worktree_path: String,
@@ -1284,9 +1366,16 @@ pub async fn agent_transcript_tail(
     // `from_file`: the file `from_byte` was measured in, or `None` to trust the offset against
     // whatever is newest. See `transcript_tail_sync` for why an offset without its file is unsafe.
     from_file: Option<String>,
+    session_ids: Option<Vec<String>>,
 ) -> Result<TranscriptTail, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        transcript_tail_sync(&worktree_path, config_dir.as_deref(), from_byte, from_file.as_deref())
+        transcript_tail_sync(
+            &worktree_path,
+            config_dir.as_deref(),
+            from_byte,
+            from_file.as_deref(),
+            session_ids.as_deref(),
+        )
     })
     .await
     .map_err(|e| format!("agent_transcript_tail task failed: {e}"))?
@@ -1298,10 +1387,13 @@ fn transcript_tail_sync(
     config_dir: Option<&str>,
     from_byte: u64,
     from_file: Option<&str>,
+    session_ids: Option<&[String]>,
 ) -> Result<TranscriptTail, String> {
     let dir = session_dir(worktree_path, config_dir)
         .ok_or_else(|| "no Claude projects root: neither CLAUDE_CONFIG_DIR nor HOME is set".to_string())?;
-    let files = session_files_by_mtime_desc(&dir);
+    // UNKNOWN binding → follow nothing. Identical shape to "the agent has no sessions yet", which is
+    // the honest answer in both cases: we have no file we can attribute to this agent.
+    let files = own_session_files(&dir, session_ids).unwrap_or_default();
     let Some(path) = files.first() else {
         return Ok(TranscriptTail {
             entries: Vec::new(),
@@ -1634,16 +1726,16 @@ mod tests {
     /// one-argument version above: reverting `pub async fn` to `pub fn` makes the return type a
     /// plain `Result`, which is not a `Future`, and THIS STOPS COMPILING. Both new commands do
     /// directory scans and multi-MB reads — inline on the main thread that is a whole-UI freeze.
-    fn assert_async_command4<A, B, C, D, Fut: std::future::Future>(_f: fn(A, B, C, D) -> Fut) {}
+    fn assert_async_command5<A, B, C, D, E, Fut: std::future::Future>(_f: fn(A, B, C, D, E) -> Fut) {}
 
     #[test]
     fn agent_transcript_page_stays_async() {
-        assert_async_command4(agent_transcript_page);
+        assert_async_command5(agent_transcript_page);
     }
 
     #[test]
     fn agent_transcript_tail_stays_async() {
-        assert_async_command4(agent_transcript_tail);
+        assert_async_command5(agent_transcript_tail);
     }
 
     /// A temp `CLAUDE_CONFIG_DIR` laid out exactly as Claude Code lays one out, so the tests drive
@@ -1657,6 +1749,14 @@ mod tests {
         config: StdPathBuf,
         sessions: StdPathBuf,
         worktree: String,
+        /// Every session stem this fixture has written, in write order.
+        ///
+        /// The reads below are keyed on a SESSION SET now (see `own_session_files`), so a test has to
+        /// say whose sessions it is asking for. The default — `page`/`tail` — claims all of them,
+        /// which is what every pre-existing test means: one agent, and every file in the directory is
+        /// its own. Tests about the filter itself name the set explicitly via `page_for`/`tail_for`,
+        /// and `page_unknown`/`tail_unknown` ask with no binding at all.
+        ids: std::cell::RefCell<Vec<String>>,
     }
 
     fn fixture() -> Fixture {
@@ -1674,7 +1774,13 @@ mod tests {
             config,
             sessions,
             worktree,
+            ids: std::cell::RefCell::new(Vec::new()),
         }
+    }
+
+    /// `&[&str]` → the owned session-id slice the reader takes.
+    fn sess(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
     }
 
     impl Fixture {
@@ -1692,6 +1798,7 @@ mod tests {
             }
             std::fs::write(&path, body).unwrap();
             set_mtime(&path, mtime_secs);
+            self.remember(&path);
             path
         }
 
@@ -1700,21 +1807,80 @@ mod tests {
             let path = self.sessions.join(name);
             std::fs::write(&path, body).unwrap();
             set_mtime(&path, mtime_secs);
+            self.remember(&path);
             path
         }
 
+        fn remember(&self, path: &Path) {
+            let id = super::session_id_of(path).unwrap().to_string();
+            let mut ids = self.ids.borrow_mut();
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+
+        /// Every session written so far — the default binding for tests that are not about the
+        /// filter.
+        fn all_ids(&self) -> Vec<String> {
+            self.ids.borrow().clone()
+        }
+
         fn page(&self, before: Option<super::Cursor>, limit: usize) -> TranscriptPage {
-            transcript_page_sync(&self.worktree, Some(&self.config_arg()), before, limit).unwrap()
+            self.page_for(&self.all_ids(), before, limit)
+        }
+
+        /// Page as an agent bound to exactly `session_ids`.
+        fn page_for(
+            &self,
+            session_ids: &[String],
+            before: Option<super::Cursor>,
+            limit: usize,
+        ) -> TranscriptPage {
+            transcript_page_sync(
+                &self.worktree,
+                Some(&self.config_arg()),
+                before,
+                limit,
+                Some(session_ids),
+            )
+            .unwrap()
+        }
+
+        /// Page with NO session binding — the fail-closed path.
+        fn page_unknown(&self, limit: usize) -> TranscriptPage {
+            transcript_page_sync(&self.worktree, Some(&self.config_arg()), None, limit, None).unwrap()
         }
 
         fn tail(&self, from_byte: u64) -> TranscriptTail {
-            transcript_tail_sync(&self.worktree, Some(&self.config_arg()), from_byte, None).unwrap()
+            self.tail_for(&self.all_ids(), from_byte, None)
         }
 
         /// Tail while CLAIMING the offset belongs to `from_file` — the shape the live poll actually
         /// uses, and the only one that can exercise the rotation guard.
         fn tail_from(&self, from_byte: u64, from_file: &str) -> TranscriptTail {
-            transcript_tail_sync(&self.worktree, Some(&self.config_arg()), from_byte, Some(from_file))
+            self.tail_for(&self.all_ids(), from_byte, Some(from_file))
+        }
+
+        /// Tail as an agent bound to exactly `session_ids`.
+        fn tail_for(
+            &self,
+            session_ids: &[String],
+            from_byte: u64,
+            from_file: Option<&str>,
+        ) -> TranscriptTail {
+            transcript_tail_sync(
+                &self.worktree,
+                Some(&self.config_arg()),
+                from_byte,
+                from_file,
+                Some(session_ids),
+            )
+            .unwrap()
+        }
+
+        /// Tail with NO session binding — the fail-closed path.
+        fn tail_unknown(&self, from_byte: u64) -> TranscriptTail {
+            transcript_tail_sync(&self.worktree, Some(&self.config_arg()), from_byte, None, None)
                 .unwrap()
         }
     }
@@ -1733,8 +1899,15 @@ mod tests {
     // --- record builders, shaped like the real JSONL ---
 
     fn human_rec(uuid: &str, ts: &str, text: &str) -> String {
+        human_rec_in(uuid, ts, text, "sess")
+    }
+
+    /// A human record carrying an EXPLICIT `sessionId`, for the tests about what the session filter
+    /// keys on. Records inside one file can name different sessions — a resume carries the prior
+    /// conversation across with its original ids — so this is a real shape, not a contrived one.
+    fn human_rec_in(uuid: &str, ts: &str, text: &str, session: &str) -> String {
         format!(
-            r#"{{"type":"user","uuid":"{uuid}","timestamp":"{ts}","sessionId":"sess","promptSource":"typed","message":{{"role":"user","content":[{{"type":"text","text":{}}}]}}}}"#,
+            r#"{{"type":"user","uuid":"{uuid}","timestamp":"{ts}","sessionId":"{session}","promptSource":"typed","message":{{"role":"user","content":[{{"type":"text","text":{}}}]}}}}"#,
             j(text)
         )
     }
@@ -2354,13 +2527,243 @@ mod tests {
         assert_eq!(t.entries.iter().map(|e| e.text()).collect::<Vec<_>>(), vec!["new"]);
     }
 
+    // --- WHOSE CONVERSATION IS THIS? (the session filter) --------------------------------------
+    //
+    // A session directory belongs to a WORKTREE, so it accumulates every `claude` that ever ran
+    // there. Before these tests the reader took the newest file by mtime with no agent id and no
+    // session id reaching the read, so a pane mounted to one agent rendered whichever session was
+    // most recently written — the founder saw a `pr-checks.sh` code review from an unrelated run
+    // under the footer "Chatting with Sparkle".
+    //
+    // Every assertion below is on the RENDERED entries (their text) or on the resolved tail FILE,
+    // never on the binding that was passed in.
+
+    /// Two agents, one session directory, and the OTHER agent's session is the newest one — the exact
+    /// arrangement that produced the defect. THIS FAILS AGAINST THE OLD READER: it took `files[0]`,
+    /// which is `other`, and rendered the stranger's turns.
+    #[test]
+    fn two_agents_in_one_session_dir_render_only_the_mounted_agents_turns() {
+        let f = fixture();
+        f.session(
+            "mine-1111.jsonl",
+            &[
+                human_rec("h1", "2026-07-01T00:00:01Z", "MY QUESTION"),
+                agent_rec("a1", "2026-07-01T00:00:02Z", "MY ANSWER"),
+            ],
+            1_000,
+        );
+        // Newest mtime, so the unfiltered reader reaches for this one first.
+        f.session(
+            "theirs-2222.jsonl",
+            &[
+                human_rec("h2", "2026-07-01T00:01:01Z", "run pr-checks.sh"),
+                agent_rec("a2", "2026-07-01T00:01:02Z", "THEIR ROBOREV REVIEW"),
+            ],
+            9_000,
+        );
+
+        let page = f.page_for(&sess(&["mine-1111"]), None, 40);
+        let texts: Vec<&str> = page.entries.iter().map(|e| e.text()).collect();
+        assert_eq!(
+            texts,
+            vec!["MY QUESTION", "MY ANSWER"],
+            "the mounted agent's own turns, and nothing else",
+        );
+        assert!(
+            !texts.iter().any(|t| t.contains("ROBOREV")),
+            "another agent's conversation must never render under this agent's name: {texts:?}",
+        );
+        // The live edge must belong to us too — otherwise the tail immediately imports the stranger.
+        assert!(
+            page.tail_file.as_deref().is_some_and(|p| p.ends_with("mine-1111.jsonl")),
+            "tail anchored to {:?}, expected the agent's own session",
+            page.tail_file,
+        );
+        assert_eq!(
+            page.sessions_scanned, 1,
+            "only the agent's own files are candidates, not the directory's",
+        );
+    }
+
+    /// An UNKNOWN binding must render NOTHING. Fail-closed is the whole point: falling back to
+    /// "whatever is newest in the directory" is precisely the defect, and an empty pane under a
+    /// correct name beats a full pane under the wrong one.
+    #[test]
+    fn an_unknown_session_binding_renders_empty_instead_of_borrowing_the_newest_file() {
+        let f = fixture();
+        f.session(
+            "someone-else.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "NOT YOURS")],
+            9_000,
+        );
+
+        let page = f.page_unknown(40);
+        assert!(
+            page.entries.is_empty(),
+            "unknown binding rendered {} entries: {:?}",
+            page.entries.len(),
+            page.entries.iter().map(|e| e.text()).collect::<Vec<_>>(),
+        );
+        assert!(
+            page.tail_file.is_none(),
+            "unknown binding must not hand the live tail a file to follow: {:?}",
+            page.tail_file,
+        );
+        assert_eq!(page.sessions_scanned, 0);
+        assert_eq!(page.files_opened, 0);
+
+        // NOT VACUOUS: the same directory, read WITH a binding for that file, does return it. So the
+        // empty result above is the filter refusing, not an empty directory.
+        let bound = f.page_for(&sess(&["someone-else"]), None, 40);
+        assert_eq!(
+            bound.entries.iter().map(|e| e.text()).collect::<Vec<_>>(),
+            vec!["NOT YOURS"],
+            "the content is readable when it is claimed — the empty page above is the filter",
+        );
+    }
+
+    /// The tail's whole file-selection strategy is "the newest file", so it needs the filter at least
+    /// as much as the page does: unfiltered, a mounted pane live-follows whichever OTHER agent in the
+    /// worktree is being written to right now.
+    #[test]
+    fn the_live_tail_follows_the_mounted_agents_session_not_the_newest_stranger() {
+        let f = fixture();
+        f.session(
+            "mine-1111.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "MY WORDS")],
+            1_000,
+        );
+        f.session(
+            "theirs-2222.jsonl",
+            &[agent_rec("a2", "2026-07-01T00:01:02Z", "THEIR WORDS")],
+            9_000,
+        );
+
+        let tail = f.tail_for(&sess(&["mine-1111"]), 0, None);
+        assert!(
+            tail.file.ends_with("mine-1111.jsonl"),
+            "tail resolved {}, expected the agent's own session",
+            tail.file,
+        );
+        assert_eq!(
+            tail.entries.iter().map(|e| e.text()).collect::<Vec<_>>(),
+            vec!["MY WORDS"],
+        );
+    }
+
+    #[test]
+    fn an_unknown_binding_tails_nothing() {
+        let f = fixture();
+        f.session(
+            "someone-else.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "NOT YOURS")],
+            9_000,
+        );
+
+        let tail = f.tail_unknown(0);
+        assert!(
+            tail.entries.is_empty(),
+            "unknown binding tailed {} entries",
+            tail.entries.len(),
+        );
+        assert_eq!(tail.file, "", "and named no file to resume against");
+        assert_eq!(tail.next_byte, 0);
+    }
+
+    /// A BINDING IS A SET, NOT A VALUE. An agent that resumes gets a new session id and a new file,
+    /// and both are its own — reading only the latest would silently drop the history the founder
+    /// mounted the pane to read.
+    #[test]
+    fn every_session_the_agent_has_owned_renders_as_one_thread() {
+        let f = fixture();
+        f.session(
+            "mine-first.jsonl",
+            &[human_rec("h1", "2026-07-01T00:00:01Z", "BEFORE RESUME")],
+            1_000,
+        );
+        f.session(
+            "mine-second.jsonl",
+            &[human_rec("h2", "2026-07-01T00:05:01Z", "AFTER RESUME")],
+            5_000,
+        );
+        f.session(
+            "theirs.jsonl",
+            &[human_rec("h3", "2026-07-01T00:09:01Z", "STRANGER")],
+            9_000,
+        );
+
+        let page = f.page_for(&sess(&["mine-first", "mine-second"]), None, 40);
+        assert_eq!(
+            page.entries.iter().map(|e| e.text()).collect::<Vec<_>>(),
+            vec!["BEFORE RESUME", "AFTER RESUME"],
+            "both of the agent's own sessions, in time order, and no one else's",
+        );
+        assert_eq!(page.sessions_scanned, 2);
+    }
+
+    /// THE FILTER IS PER FILE, NOT PER RECORD — and this test is what stops someone "tightening" it
+    /// onto `Entry::session_id`. When Claude Code resumes, it writes the prior conversation into the
+    /// NEW session's file with each record's ORIGINAL `sessionId` intact. A record-level filter keyed
+    /// on the current session would drop exactly that inherited history.
+    #[test]
+    fn resumed_history_inside_our_file_survives_though_its_records_name_an_older_session() {
+        let f = fixture();
+        f.session(
+            "mine-second.jsonl",
+            &[
+                // Carried over by the resume: our file, an older session's id on the record.
+                human_rec_in("h1", "2026-07-01T00:00:01Z", "INHERITED TURN", "an-older-session"),
+                human_rec_in("h2", "2026-07-01T00:05:01Z", "FRESH TURN", "mine-second"),
+            ],
+            5_000,
+        );
+
+        // Bound ONLY to the current session id — the state after an app restart that saw one
+        // SessionStart. The inherited turn must still render: it is in our file.
+        let page = f.page_for(&sess(&["mine-second"]), None, 40);
+        assert_eq!(
+            page.entries.iter().map(|e| e.text()).collect::<Vec<_>>(),
+            vec!["INHERITED TURN", "FRESH TURN"],
+            "history inherited by a resumed session is this agent's own conversation",
+        );
+    }
+
+    /// A file whose stem is not a session id we know is not ours, no matter how it is named — the
+    /// filter is an exact match, not a prefix or substring one.
+    #[test]
+    fn the_session_match_is_exact_not_a_prefix() {
+        let f = fixture();
+        f.session(
+            "mine.jsonl",
+            &[agent_rec("a1", "2026-07-01T00:00:02Z", "MINE")],
+            1_000,
+        );
+        f.session(
+            "mine-but-actually-another.jsonl",
+            &[agent_rec("a2", "2026-07-01T00:01:02Z", "NOT MINE")],
+            9_000,
+        );
+
+        let page = f.page_for(&sess(&["mine"]), None, 40);
+        assert_eq!(
+            page.entries.iter().map(|e| e.text()).collect::<Vec<_>>(),
+            vec!["MINE"],
+        );
+    }
+
     // --- boundary / degradation ---
 
     #[test]
     fn missing_session_dir_is_an_empty_page_not_an_error() {
         let f = fixture();
-        let page =
-            transcript_page_sync("/no/such/worktree", Some(&f.config_arg()), None, 40).unwrap();
+        let page = transcript_page_sync(
+            "/no/such/worktree",
+            Some(&f.config_arg()),
+            None,
+            40,
+            Some(&sess(&["whatever"])),
+        )
+        .unwrap();
         assert!(page.entries.is_empty());
         assert_eq!(page.sessions_scanned, 0);
         assert_eq!(page.files_opened, 0);
@@ -2687,6 +3090,7 @@ mod tests {
             Some(f.config_arg()),
             None,
             40,
+            Some(sess(&["s"])),
         ))
         .unwrap();
         assert_eq!(texts(&page), vec!["hello"]);
@@ -2696,8 +3100,43 @@ mod tests {
             Some(f.config_arg()),
             0,
             None,
+            Some(sess(&["s"])),
         ))
         .unwrap();
         assert_eq!(tail.entries.len(), 1);
+    }
+
+    /// The COMMANDS fail closed too, not just their sync cores — the fail-closed rule has to hold at
+    /// the surface the frontend actually calls, since that is where a `null` from the wire arrives.
+    #[test]
+    fn the_async_commands_fail_closed_on_an_unknown_binding() {
+        let f = fixture();
+        f.session(
+            "s.jsonl",
+            &[human_rec("h1", "2026-07-01T00:00:01Z", "hello")],
+            1_000,
+        );
+
+        let page = tauri::async_runtime::block_on(agent_transcript_page(
+            f.worktree.clone(),
+            Some(f.config_arg()),
+            None,
+            40,
+            None,
+        ))
+        .unwrap();
+        assert!(page.entries.is_empty(), "an unbound page command must render nothing");
+        assert!(page.tail_file.is_none());
+
+        let tail = tauri::async_runtime::block_on(agent_transcript_tail(
+            f.worktree.clone(),
+            Some(f.config_arg()),
+            0,
+            None,
+            None,
+        ))
+        .unwrap();
+        assert!(tail.entries.is_empty(), "an unbound tail command must follow nothing");
+        assert_eq!(tail.file, "");
     }
 }

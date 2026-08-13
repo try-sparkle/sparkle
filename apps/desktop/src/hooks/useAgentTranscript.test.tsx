@@ -14,6 +14,10 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 
 import { useAgentTranscript } from "./useAgentTranscript";
 import { useMountedThreadStore } from "../stores/mountedThreadStore";
+import {
+  forgetAgentTranscriptPath,
+  noteAgentSessionId,
+} from "../services/agentTranscriptRegistry";
 import type { TranscriptEntry } from "../services/agentTranscript";
 
 function human(id: string, text: string, ts: string): TranscriptEntry {
@@ -54,15 +58,29 @@ function PagingHarness({ agentId, worktree }: { agentId: string; worktree: strin
   return null;
 }
 
+/** Agent ids these tests mount. Their session bindings are seeded/cleared per case below. */
+const AGENTS = ["a1", "a2"];
+
 beforeEach(() => {
   vi.useFakeTimers();
   invoke.mockReset();
   reader = null;
   useMountedThreadStore.setState({ threads: {} });
+  localStorage.clear();
+  // A MOUNTED PANE READS NOTHING UNTIL IT KNOWS WHOSE SESSIONS TO READ. Seeded through the real
+  // writer, the same one `AgentPane`'s gated hook handler calls — the reader takes no injectable
+  // sessionIds argument precisely so the production path is the tested one. Every case below except
+  // the fail-closed ones needs this, which is itself the point.
+  for (const id of AGENTS) {
+    forgetAgentTranscriptPath(id);
+    noteAgentSessionId(id, `sess-${id}`);
+  }
 });
 afterEach(() => {
   vi.useRealTimers();
   cleanup();
+  for (const id of AGENTS) forgetAgentTranscriptPath(id);
+  localStorage.clear();
 });
 
 const flush = async () => {
@@ -203,5 +221,166 @@ describe("useAgentTranscript", () => {
     const tailCalls = invoke.mock.calls.filter(([cmd]) => cmd === "agent_transcript_tail").length;
     expect(tailCalls).toBeGreaterThan(0);
     expect(tailCalls).toBeLessThan(15);
+  });
+});
+
+// ── WHOSE CONVERSATION IS THIS? (the session binding) ────────────────────────────────────────────
+//
+// A worktree's session directory holds a `<session-id>.jsonl` for every `claude` that ever ran there
+// (1,172 files in one measured worktree). Reading it with only a worktree path returned whichever
+// session had the newest mtime, so a pane whose footer read "Chatting with ● Sparkle" rendered a
+// different agent's roborev review. These tests pin the two halves of the fix: the binding is SENT,
+// and an unknown binding reads NOTHING rather than borrowing the newest file.
+describe("useAgentTranscript — the session binding", () => {
+  it("sends the agent's own session ids with every read", async () => {
+    noteAgentSessionId("a1", "sess-resumed");
+    invoke.mockResolvedValue(page([human("h1", "hello", "2026-07-30T10:00:00.000Z")]));
+    render(<Harness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+
+    const pageCall = invoke.mock.calls.find(([cmd]) => cmd === "agent_transcript_page");
+    // BOTH ids — the binding is a SET, because an agent that resumes owns every session it has had.
+    // Sending only the newest would drop the history before the resume.
+    expect(pageCall![1]).toMatchObject({ sessionIds: ["sess-a1", "sess-resumed"] });
+
+    invoke.mockResolvedValue({ entries: [], file: "/s1.jsonl", nextByte: 500 });
+    await act(async () => {
+      vi.advanceTimersByTime(1100);
+      await Promise.resolve();
+    });
+    const tailCall = invoke.mock.calls.find(([cmd]) => cmd === "agent_transcript_tail");
+    // The tail needs it at least as much: "newest file" is its whole file-selection strategy, so an
+    // unbound tail live-follows whichever OTHER agent in the worktree is being written to now.
+    expect(tailCall![1]).toMatchObject({ sessionIds: ["sess-a1", "sess-resumed"] });
+  });
+
+  // THE FAIL-CLOSED GUARD, and the most important test here. The tempting fallback — no binding, so
+  // show the newest session in the directory — IS the defect. An empty pane under a correct name
+  // beats a full pane under the wrong one.
+  it("reads NOTHING for an agent whose session binding is unknown", async () => {
+    forgetAgentTranscriptPath("a1");
+    invoke.mockResolvedValue(page([human("stranger", "another agent's words", "2026-07-30T10:00:00.000Z")]));
+
+    render(<Harness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+    // Plus a tail tick, because an unbound tail is the version of this bug that arrives over time
+    // into a pane that looked correct on mount.
+    await act(async () => {
+      vi.advanceTimersByTime(2100);
+      await Promise.resolve();
+    });
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(entriesOf("a1")).toEqual([]);
+    // And not stuck on a spinner: an unknown binding is a settled empty state, not a pending read.
+    expect(useMountedThreadStore.getState().threads["a1"]?.loading).toBe(false);
+  });
+
+  // THE TAIL'S OWN FAIL-CLOSED GUARD, reached only with a tail cursor already in hand.
+  //
+  // Written because a mutation check proved the first version of this test could not see it: with no
+  // binding the first page never runs, so `tailFile` stays null and the poll bailed on THAT guard
+  // instead — the "an earlier guard short-circuits the path" shape from AGENTS.md. Seeding the cursor
+  // is what makes the binding the only thing left standing between the poll and a stranger's session.
+  it("does not tail an unbound agent even when a tail cursor is already present", async () => {
+    forgetAgentTranscriptPath("a1");
+    act(() => {
+      useMountedThreadStore.getState().patch("a1", { tailFile: "/s1.jsonl", tailByte: 500 });
+    });
+    invoke.mockResolvedValue({
+      entries: [human("stranger", "another agent's words", "2026-07-30T10:00:00.000Z")],
+      file: "/s1.jsonl",
+      nextByte: 600,
+    });
+
+    render(<Harness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+    await act(async () => {
+      vi.advanceTimersByTime(2100);
+      await Promise.resolve();
+    });
+
+    expect(invoke.mock.calls.filter(([cmd]) => cmd === "agent_transcript_tail")).toEqual([]);
+    expect(entriesOf("a1")).toEqual([]);
+  });
+
+  // PAGING BACK CARRIES IT TOO. Also written off a mutation check: every other case here either
+  // never reaches the pageBack fetch or has history exhausted, so the binding could have been
+  // dropped from this one call site with the suite still green — and a pageBack without it walks
+  // backwards through every other agent's sessions in the directory.
+  it("carries the binding when paging back into history", async () => {
+    invoke.mockResolvedValueOnce(page([human("h1", "tip", "2026-07-30T10:00:00.000Z")]));
+    render(<PagingHarness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+
+    invoke.mockResolvedValueOnce(page([human("h0", "older", "2026-07-30T09:00:00.000Z")]));
+    act(() => reader!.pageBack());
+    await flush();
+
+    // The older entry really arrived and merged in oldest-first — the side effect, not the call.
+    expect(entriesOf("a1")).toEqual(["h0", "h1"]);
+    const backCall = invoke.mock.calls.filter(([cmd]) => cmd === "agent_transcript_page")[1];
+    expect(backCall![1]).toMatchObject({
+      before: { file: "/s1.jsonl", line: 10 },
+      sessionIds: ["sess-a1"],
+    });
+  });
+
+  it("pageBack reads nothing while the binding is unknown", async () => {
+    forgetAgentTranscriptPath("a1");
+    render(<PagingHarness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+    act(() => {
+      useMountedThreadStore
+        .getState()
+        .patch("a1", { next: { file: "/s0.jsonl", line: 3 }, hasMore: true });
+    });
+
+    invoke.mockResolvedValue(page([human("stranger", "not ours", "2026-07-30T10:00:00.000Z")]));
+    act(() => reader!.pageBack());
+    await flush();
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(entriesOf("a1")).toEqual([]);
+  });
+
+  // SELF-HEALING, and why the binding is SUBSCRIBED rather than read once. It lands on the agent's
+  // first hook event, which is routinely after the pane's first render — a one-shot read would
+  // capture `undefined` and leave the pane empty forever for an agent we can now identify.
+  it("pages as soon as the binding arrives, without a remount", async () => {
+    forgetAgentTranscriptPath("a1");
+    render(<Harness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+    expect(invoke).not.toHaveBeenCalled();
+
+    invoke.mockResolvedValue(page([human("h1", "at last", "2026-07-30T10:00:00.000Z")]));
+    await act(async () => {
+      noteAgentSessionId("a1", "sess-late");
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(entriesOf("a1")).toEqual(["h1"]);
+    const pageCall = invoke.mock.calls.find(([cmd]) => cmd === "agent_transcript_page");
+    expect(pageCall![1]).toMatchObject({ sessionIds: ["sess-late"] });
+  });
+
+  // A hook event carrying an id we already hold must not re-page. Events arrive continuously, and a
+  // fresh snapshot identity per event would re-fetch the first page once a second forever.
+  it("does not re-page when a known session id is re-registered", async () => {
+    invoke.mockResolvedValue(page([human("h1", "hello", "2026-07-30T10:00:00.000Z")]));
+    render(<Harness agentId="a1" worktree="/wt/a1" />);
+    await flush();
+    const pagesBefore = invoke.mock.calls.filter(([c]) => c === "agent_transcript_page").length;
+    expect(pagesBefore).toBe(1);
+
+    await act(async () => {
+      noteAgentSessionId("a1", "sess-a1");
+      noteAgentSessionId("a1", "sess-a1");
+      await Promise.resolve();
+    });
+    await flush();
+
+    expect(invoke.mock.calls.filter(([c]) => c === "agent_transcript_page").length).toBe(pagesBefore);
   });
 });

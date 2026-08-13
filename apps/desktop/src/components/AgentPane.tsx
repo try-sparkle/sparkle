@@ -47,7 +47,7 @@ import {
 import { chooseAccountForAgent } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
-import { noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
+import { noteAgentSessionId, noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
 import { invoke } from "@tauri-apps/api/core";
 import { HookStatusEngine, createHookEventHandler, type HookEvent } from "../engine/hookEvents";
 import { createStatusRouter, type StatusRouter } from "../engine/statusRouter";
@@ -110,7 +110,16 @@ export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
 }
 
 /**
- * Park a Stop event's transcript path where the concierge's terminal read chain can find it.
+ * Park what a hook event says about this agent's conversation: WHERE it lives, and WHOSE it is.
+ *
+ * Two registrations, from one gated stream — see the body for each:
+ *
+ *   1. a Stop event's transcript PATH, for the concierge's terminal read chain (tier d);
+ *   2. every event's SESSION ID, which is what lets the mounted concierge pane tell this agent's
+ *      transcript apart from every other `claude` that has run in the same worktree.
+ *
+ * (2) is why this is no longer `noteTranscriptFromStop`: a Stop fires only at turn END, far too late
+ * to identify an agent someone is looking at right now.
  *
  * THIS COMPONENT IS THE ONLY PLACE THE PATH IS EVER KNOWN. The Stop hook event carries it, the
  * capture handler below reads the last assistant turn out of it, and it was then dropped on the
@@ -139,11 +148,33 @@ export function buildShellSpawnArgs(shell: string, cmd: string): string[] {
  * reading a closed agent's final transcript is an honest answer. `forgetAgentTranscriptPath` exists
  * for a caller that genuinely knows an agent is gone — there isn't one yet.
  */
-export function noteTranscriptFromStop(agentId: string, ev: HookEvent): void {
+export function noteTranscriptFromHook(agentId: string, ev: HookEvent): void {
+  // WHOSE CONVERSATION THIS IS — from EVERY event, not just Stop.
+  //
+  // A session directory belongs to a WORKTREE, so it holds a transcript for every `claude` that ever
+  // ran there. Without an id the mounted concierge pane read the newest file by mtime and rendered
+  // another agent's conversation under this agent's name. `session_id` is on every hook payload, and
+  // this call sits behind `createHookEventHandler`'s session gate — the same gate that stops a
+  // background `claude` driving status, liveness and history — so what arrives here is this agent's
+  // own session by construction.
+  //
+  // EVERY EVENT, because `Stop` is far too late for the pane. SessionStart fires the moment the agent
+  // spawns and UserPromptSubmit on its first turn, while Stop only fires when a turn ENDS — an agent
+  // mounted mid-turn would render empty for minutes with its session sitting right there in the log.
+  // `noteAgentSessionId` accumulates and no-ops on an id it already holds, so the per-event call is a
+  // Set membership test, not a write.
+  if (ev.session_id) noteAgentSessionId(agentId, ev.session_id);
+
   if (ev.event !== "Stop") return;
   const path = ev.transcriptPath?.trim();
   if (!path) return;
   noteAgentTranscriptPath(agentId, path);
+  // The transcript path is `<projects>/<slug>/<session-id>.jsonl`, so its STEM is a session id — the
+  // same one the event carries. Recorded as a belt-and-braces second source: an emitter that passes
+  // `transcript_path` but no `session_id` (the older shape `parseHookLine` still tolerates) would
+  // otherwise leave the binding unknown and the pane empty for the whole run.
+  const stem = path.split("/").pop()?.replace(/\.jsonl$/i, "");
+  if (stem) noteAgentSessionId(agentId, stem);
 }
 
 /** Settle a pane's "switch:<id>" waterfall against its visibility, returning the effect cleanup.
@@ -636,7 +667,7 @@ function AgentPaneInner({
             captureHistory: captureHistoryFromHook,
             // Tier (d) of the concierge's read chain. A REQUIRED dep, so this hand-off cannot be
             // dropped without a compile error — see HookEventHandlerDeps.noteTranscript.
-            noteTranscript: (ev) => noteTranscriptFromStop(agent.id, ev),
+            noteTranscript: (ev) => noteTranscriptFromHook(agent.id, ev),
           }),
           // Start at EOF: the log is keyed by worktree and accumulates prior runs + background
           // one-shot `claude` sessions. We want status from THIS spawn's session, which the engine

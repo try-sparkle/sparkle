@@ -134,6 +134,29 @@ export interface TranscriptTail {
  *  virtualization at this size; add it only if a page proves janky. */
 export const TRANSCRIPT_PAGE_SIZE = 40;
 
+// ── WHY EVERY READ HERE CARRIES A SESSION BINDING, AND WHY UNKNOWN MEANS EMPTY ───────────────────
+//
+// A Claude Code session DIRECTORY is keyed by WORKTREE, never by agent. Every `claude` that has ever
+// run in that tree has a `<session-id>.jsonl` in it: the interactive agent, each of its restarts,
+// every background one-shot, and every OTHER agent the app pointed at the same directory. Measured on
+// one machine: 1,172 files in the Improve Sparkle worktree, 98 in the main checkout, 41 in a busy
+// agent worktree.
+//
+// These reads used to pass a worktree and nothing else, and Rust answered with the newest file by
+// mtime — so the mounted pane rendered whichever session was being written, under the mounted agent's
+// name. The founder saw a footer reading "Chatting with ● Sparkle" above another agent's `pr-checks.sh`
+// roborev review. Any directory with more than one file could do this.
+//
+// So the caller must say WHOSE conversation it wants: `sessionIds`, the agent's own Claude session ids
+// from `services/agentTranscriptRegistry.agentSessionIds`. A SET rather than one id, because an agent
+// spans several sessions across resumes and all of them are its history.
+//
+// `null` MEANS UNKNOWN AND MUST RENDER NOTHING. Rust returns an empty page and no tail anchor rather
+// than falling back to the newest file — that fallback IS the defect, and showing someone else's
+// conversation under this agent's name is far worse than showing nothing. It reads the same as the
+// benign case (an agent seconds old with no turns yet), which is correct: in both, we have nothing we
+// can honestly attribute to this agent.
+
 /**
  * Read one page of an agent's transcript, newest-first-by-default.
  *
@@ -147,12 +170,18 @@ export async function fetchTranscriptPage(opts: {
   configDir?: string | null;
   before?: TranscriptCursor | null;
   limit?: number;
+  /** WHOSE conversation to read — the agent's own Claude session ids, from
+   *  `services/agentTranscriptRegistry.agentSessionIds`. `null`/omitted means UNKNOWN, and Rust
+   *  answers with an EMPTY page rather than the newest session in the directory. See the
+   *  session-binding note above {@link TRANSCRIPT_PAGE_SIZE}. */
+  sessionIds?: readonly string[] | null;
 }): Promise<TranscriptPage> {
   return await invoke<TranscriptPage>("agent_transcript_page", {
     worktreePath: opts.worktreePath,
     configDir: opts.configDir ?? null,
     before: opts.before ?? null,
     limit: opts.limit ?? TRANSCRIPT_PAGE_SIZE,
+    sessionIds: opts.sessionIds ? [...opts.sessionIds] : null,
   });
 }
 
@@ -170,11 +199,16 @@ export async function fetchTranscriptTail(opts: {
   /** The file `fromByte` was measured in. Pass it — an offset without its file is unsafe (see the
    *  param's own note below). `null` only on the very first poll after a page load. */
   fromFile?: string | null;
+  /** WHOSE conversation to follow. Same rule as {@link fetchTranscriptPage}, and it matters at least
+   *  as much here: "the newest session file" is the tail's entire file-selection strategy, so an
+   *  unbound tail live-follows whichever OTHER agent in the worktree is being written to right now. */
+  sessionIds?: readonly string[] | null;
 }): Promise<TranscriptTail> {
   return await invoke<TranscriptTail>("agent_transcript_tail", {
     worktreePath: opts.worktreePath,
     configDir: opts.configDir ?? null,
     fromByte: opts.fromByte,
+    sessionIds: opts.sessionIds ? [...opts.sessionIds] : null,
     // WHY THE FILE TRAVELS WITH THE OFFSET. Rust resolves "the newest session" itself, so a bare
     // byte offset is a claim about a file the caller cannot name. When the agent restarts (or is
     // resumed with `--continue`) it opens a new `<uuid>.jsonl` that immediately becomes newest — and
