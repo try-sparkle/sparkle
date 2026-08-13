@@ -2,7 +2,7 @@
 // Frontend read path for beads (bd) issues. Wraps the Rust `list_beads` / `bead_show`
 // commands (which shell out to `bd list/show --json`), normalizes the tolerant/varying
 // bd JSON shape into a stable `Bead`, and buckets issues into the board's four columns.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./ipc";
 
 export type BeadStatus = "open" | "in_progress" | "closed";
 

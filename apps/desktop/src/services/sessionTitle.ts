@@ -8,7 +8,7 @@
 // Best-effort throughout: no worktree, no title yet (the first turn hasn't summarized), or any
 // backend error simply leaves the current name untouched — the store action respects a pinned
 // (manually-renamed) name and de-dupes an unchanged title.
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./ipc";
 import { useProjectStore } from "../stores/projectStore";
 import { normalizeAgentName } from "../engine/decodeEntities";
 import { reportNamingOutcome } from "./selfReportObservability";

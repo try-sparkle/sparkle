@@ -10,7 +10,7 @@
 // Each record is shipped to Rust via the `frontend_log` command. Shipping is best-effort:
 // outside a Tauri webview (e.g. a plain browser) invoke throws and we silently no-op.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./services/ipc";
 
 type Level = "debug" | "info" | "warn" | "error";
 

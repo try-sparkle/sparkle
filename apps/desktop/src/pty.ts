@@ -2,7 +2,7 @@
 // `claude` binary (or any command) locally under their own login — Sparkle is the
 // terminal-emulator UI on top, it never handles the auth token.
 
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "./services/ipc";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { noteUserInputForAgent } from "./engine/engineRegistry";
 // The CLI input line is TOLD what we did to it: xterm's `onData` sees only what the user types, so

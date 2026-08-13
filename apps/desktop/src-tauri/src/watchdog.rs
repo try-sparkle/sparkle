@@ -77,6 +77,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tauri::{AppHandle, Runtime};
 
+use crate::ipc_trace;
+
 /// How often the watchdog wakes to check. Also the resolution of everything below.
 const TICK: Duration = Duration::from_secs(1);
 
@@ -970,6 +972,20 @@ fn renderer_dump_path(dir: &Path, stamp_ms: u64, pid: u32) -> PathBuf {
 /// happened. Reporting only the fork/exec succeeding would name a file that may hold nothing.
 #[cfg(target_os = "macos")]
 fn capture_stack_into(dir: &Path, stamp_ms: u64, keep: usize) {
+    // ── THE IPC TIMELINE GOES FIRST, BEFORE ANY `sample(1)` ───────────────────────────────────
+    // This is a synchronous in-process write of state we already hold, so it costs milliseconds and
+    // cannot fail for a reason outside this process. `sample` can be missing, refused by the
+    // security policy, or simply slow, and every one of those outcomes used to leave an episode
+    // with NO evidence at all — which is exactly what happened three times on 2026-08-13, where the
+    // stacks that did land could not explain the hang anyway (see this module's header and
+    // `ipc_ring`'s). Ordering it ahead of `spawn_sample` means the timeline lands whatever the
+    // sampler does.
+    //
+    // Here rather than in `try_capture_with`: that function's `capture` argument is INJECTED so its
+    // tests can avoid the filesystem entirely, so a write placed there would be replaced by every
+    // test and never exercised. `capture_stack_into` is already the "do the I/O" boundary.
+    ipc_trace::dump_to_file(dir, stamp_ms);
+
     if let Err(e) = std::fs::create_dir_all(dir) {
         tracing::warn!(target: "watchdog", "could not create dump dir {dir:?}, stack skipped: {e}");
         return;
@@ -1557,6 +1573,85 @@ mod tests {
         assert_eq!(total, 300, "an episode's renderer dumps count toward the byte cap");
         assert!(root.join("hang-5.txt").exists(), "and the newest episode is the survivor");
         assert!(root.join("hang-5.webcontent-90005.txt").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The IPC timeline must land even when `sample(1)` produces nothing at all.
+    ///
+    /// WHAT MUST BREAK FOR THIS TO GO RED: `dump_to_file` moving after `spawn_sample`, or out of
+    /// `capture_stack_into` altogether. The assertion is taken IMMEDIATELY after
+    /// `capture_stack_into` returns — before any sampler child could possibly have finished, and
+    /// regardless of whether `/usr/bin/sample` exists or is refused on this machine — so the file
+    /// being present at that instant is proof it did not wait on, or depend on, the sampler.
+    ///
+    /// That independence is the whole point of the ordering: the three real captures on
+    /// 2026-08-13 all produced stacks that could not explain the hang, and an episode whose
+    /// sampler is missing or denied used to leave no evidence whatsoever.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_ipc_timeline_lands_before_and_independently_of_the_sampler() {
+        let root = std::env::temp_dir().join(format!("-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+
+        crate::ipc_ring::set_enabled(true);
+        capture_stack_into(&root, 555_000, 20);
+
+        let ipc = root.join("hang-555000.ipc.json");
+        assert!(
+            ipc.exists(),
+            "the IPC timeline must be on disk the moment capture_stack_into returns, whatever \
+             the sampler is doing"
+        );
+        let body = std::fs::read_to_string(&ipc).expect("readable");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&body).is_ok(),
+            "and it must be parseable JSON, not a truncated write"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// …and it ages and is evicted WITH its episode, rather than accumulating forever.
+    ///
+    /// WHAT MUST BREAK FOR THIS TO GO RED: renaming the file to anything `dump_stamp` cannot parse
+    /// (`ipc-<stamp>.json`, say). That is not a cosmetic failure — an unrecognised name is invisible
+    /// to the pruner, so it would never be counted toward the budgets and never deleted, which is
+    /// exactly how "add files without teaching the pruner about them" makes the caps stop binding.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_ipc_timeline_is_pruned_together_with_its_episodes_stacks() {
+        use std::io::Write;
+        let root = std::env::temp_dir().join(format!("-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Three episodes, each a host stack plus an IPC timeline.
+        for stamp in 1..=3u64 {
+            for path in [host_dump_path(&root, stamp), crate::ipc_trace::dump_path(&root, stamp)] {
+                let mut f = std::fs::File::create(&path).unwrap();
+                f.write_all(&[b'x'; 100]).unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 6, "precondition");
+
+        // The pairing must be legible to the pruner BEFORE it prunes: same stamp, both files.
+        assert_eq!(dump_stamp("hang-2.ipc.json"), Some("2"));
+        assert_eq!(dump_stamp("hang-2.txt"), dump_stamp("hang-2.ipc.json"));
+
+        prune_hang_dumps_to(&root, 1, u64::MAX);
+
+        let mut left: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["hang-3.ipc.json", "hang-3.txt"],
+            "keep=1 must leave ONE whole episode — both of its files — and evict the rest; an \
+             IPC timeline the pruner cannot see would still be here"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

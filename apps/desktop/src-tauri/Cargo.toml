@@ -83,6 +83,13 @@ ureq = "2"
 # Best-effort secret redaction of the log tail we attach to support tickets (support.rs). Already
 # in the tree transitively; declared here so support.rs can use it directly.
 regex = "1"
+# `ipc_trace.rs` registers our OWN `ipc:` URI-scheme protocol, shadowing Tauri's, and so has to
+# reproduce Tauri's `parse_invoke_request` byte for byte — including its content-type switch
+# (`mime`) and its percent-decode of the command out of the URL path (`percent-encoding`). Both are
+# already in the lock as Tauri's own dependencies; declared here so the copy can use them directly
+# rather than diverging from the original with hand-rolled string comparison.
+mime = "0.3"
+percent-encoding = "2"
 # Blocking WebSocket client for the Deepgram Nova-3 streaming STT path. rustls (not native-tls)
 # to reuse the rustls/webpki-roots already in the tree (via reqwest/tauri) — no new system-TLS dep.
 tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "handshake"] }

@@ -44,6 +44,8 @@ mod claude_oneshot;
 mod cloud;
 mod cmd_timing;
 mod crash;
+mod ipc_ring;
+mod ipc_trace;
 mod config;
 mod connectivity;
 mod delivery;
@@ -175,6 +177,20 @@ pub fn run() {
         // forgot the Edit submenu would silently take ⌘X/⌘C/⌘V/⌘A away from the whole app.
         .menu(app_menu::build)
         .on_menu_event(app_menu::on_menu_event)
+        // ── OUR `ipc:` PROTOCOL SHADOWS TAURI'S. THIS IS THE APP'S IPC PATH. ──────────────────
+        // Tauri registers its own `ipc` handler only `if !registered_scheme_protocols.contains(…)`
+        // (tauri-2.11.3 `src/manager/webview.rs:280`), and builder protocols are pushed into that
+        // list at `:230` — before the check. So this line, and nothing else, decides which handler
+        // every invoke in the app goes through.
+        //
+        // WHY: Tauri hands the protocol handler a responder that fires at COMMAND COMPLETION for
+        // async commands as well as sync ones. `cmd_timing::measure` (still wired below, still
+        // useful for main-thread occupancy) cannot see that instant — for the 232 async commands it
+        // measures only the dispatch hop. See `ipc_trace`'s header.
+        //
+        // ALWAYS ON, deliberately: an opt-in probe is disarmed at exactly the moment it is needed.
+        // The killswitch is `ipc_trace_set_enabled` — config, not a compile gate.
+        .register_asynchronous_uri_scheme_protocol("ipc", ipc_trace::ipc_protocol)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -685,6 +701,13 @@ pub fn run() {
             // block on the main thread it exists to report on. See key_window.rs.
             key_window::main_window_key_state,
             cmd_timing::cmd_timing_report,
+            // The four-point IPC timeline (bead sparkle-i7ryx). `ipc_clock_probe` must stay a
+            // do-nothing command: the renderer times it NTP-style to place its own
+            // `performance.now()` stamps on Rust's monotonic axis, and any work in it is
+            // indistinguishable from transit delay to that estimator.
+            ipc_trace::ipc_clock_probe,
+            ipc_trace::ipc_trace_dump,
+            ipc_trace::ipc_trace_set_enabled,
             fleet::fleet_digest,
             fleet::fleet_read_hook_stream,
             fleet::fleet_read_transcript,
