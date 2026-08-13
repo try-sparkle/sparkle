@@ -93,7 +93,17 @@ describe("DictationEngineBanner", () => {
       cleanup();
       useDictationEngineStore.setState({ fallbackReason: reason, dismissed: false });
       render(<DictationEngineBanner />);
-      const text = screen.getByRole("status").textContent ?? "";
+      // ── ONE REASON HAS NO RENDERED TEXT TO SWEEP (sparkle-v3990) ─────────────────────────────
+      // `too-slow` is deliberately never painted in this bar — see the suppression test below and
+      // the store's `fallbackReasonWarrantsBanner`. Its string is still the reason's canonical copy
+      // (the store records the reason, and the console diagnostic reads it), so the copy rules are
+      // asserted against the map rather than skipped. Written as a literal, not derived from the
+      // production predicate: if a SECOND reason is ever suppressed, `getByRole` throws here and
+      // whoever did it has to come and say so, instead of the sweep quietly going soft.
+      const text =
+        reason === "too-slow"
+          ? WARNING[reason]
+          : (screen.getByRole("status").textContent ?? "");
       expect(text).not.toMatch(/HTTP \d|\b4\d\d\b|\b5\d\d\b|websocket|deepgram|sherpa|@/i);
       expect(text).not.toMatch(/your network|you're offline|you are offline|Claude|rate.?limit/i);
       // ── NARROWED FROM "EVERY REASON" TO "EVERY RELAY REASON" (roborev 61695) ──────────────────
@@ -166,7 +176,13 @@ describe("DictationEngineBanner", () => {
       cleanup();
       useDictationEngineStore.setState({ fallbackReason: reason, dismissed: false });
       render(<DictationEngineBanner />);
-      const text = screen.getByRole("status").textContent ?? "";
+      // The unpainted reason is compared on its canonical string, for the reason given in the sweep
+      // above — distinctness is a property of the COPY, so dropping it here would let a new reason
+      // be pasted from `too-slow` unnoticed.
+      const text =
+        reason === "too-slow"
+          ? WARNING[reason]
+          : (screen.getByRole("status").textContent ?? "");
       expect(seen.has(text)).toBe(false);
       seen.set(text, reason);
     }
@@ -256,6 +272,51 @@ describe("DictationEngineBanner", () => {
     expect(container.innerHTML).not.toBe("");
 
     act(() => useDictationEngineStore.getState().noteCloudLive());
+
+    expect(container.innerHTML).toBe("");
+  });
+
+  // ══ THE PER-UTTERANCE FALLBACK IS NOT AN ALARM (sparkle-v3990) ═════════════════════════════════
+  // The founder reported the microphone as BROKEN twice on the strength of the `too-slow` bar, while
+  // he was NOT holding the push-to-talk key — which is the only time it can appear at all, since
+  // `dictation://cloud-late` is emitted once a handshake completes after the utterance ended. It
+  // then stood for the full TTL, re-stamped by every subsequent short hold, so under his normal
+  // usage the amber alert was up essentially permanently.
+  //
+  // These drive the REAL store transition rather than setting `fallbackReason` by hand: the defect
+  // is that the production path from a late handshake ends in a painted alarm, so the test has to
+  // start where that path starts.
+
+  it("paints NOTHING when a handshake merely landed late — no alarm, no remedy to offer", () => {
+    act(() => useDictationEngineStore.getState().noteCloudConnectedLate(true));
+    // The store still holds the reason — this is a presentation change, and the latency work needs
+    // that signal — so the assertion below is about the DOM, not about the store forgetting.
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("too-slow");
+
+    const { container } = render(<DictationEngineBanner />);
+
+    expect(container.innerHTML).toBe("");
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  // THE PAIR. Without it, the test above passes just as well against a banner that never renders
+  // anything — which is emphatically not the change. A STANDING condition with a remedy still speaks.
+  it("still paints for a standing, user-actionable reason on the same path", () => {
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("exhausted"));
+    const { container } = render(<DictationEngineBanner />);
+    expect(container.innerHTML).not.toBe("");
+    expect(screen.getByRole("status").textContent ?? "").toMatch(/refill/i);
+  });
+
+  it("comes DOWN when a standing outage turns out to have been a late handshake", () => {
+    // The relay was unreachable, the bar is up and correct — then a handshake completes late, which
+    // disproves the connectivity claim outright. The honest state is "nothing to tell the user", so
+    // the bar must go away rather than swap one amber sentence for another.
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("unavailable"));
+    const { container } = render(<DictationEngineBanner />);
+    expect(container.innerHTML).not.toBe("");
+
+    act(() => useDictationEngineStore.getState().noteCloudConnectedLate(true));
 
     expect(container.innerHTML).toBe("");
   });

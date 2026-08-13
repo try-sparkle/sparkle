@@ -82,6 +82,18 @@ export const WARNING: Record<DictationFallbackReason, string> = {
     "Sparkle can't reach the cloud transcription service. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. It usually reconnects on its own, so try dictating again in a moment",
   exhausted:
     "You're out of Sparkle credits. Live dictation preview is off — dictation is running on the local engine. Your words are still captured; they appear when you finish speaking instead of word by word. Refill your credits to get the live preview back",
+  // ── THIS BAR NEVER PAINTS THIS ONE ANY MORE (sparkle-v3990) ───────────────────────────────────
+  // `shouldWarnLocalEngine` suppresses `too-slow`, so the component below cannot reach this string;
+  // the full justification is on `fallbackReasonWarrantsBanner` in the store, where the rule lives.
+  // The short version is that the sentence under this comment already argues for its own removal:
+  // a condition that is per-utterance, self-correcting, and — as the next paragraph says outright —
+  // has NO remedy the user can act on is pure alarm when it is rendered as a persistent amber alert.
+  //
+  // KEPT, not deleted: `WARNING` is a `Record<DictationFallbackReason, string>`, so the key is what
+  // keeps the map exhaustive over the union, and this is still the reason's canonical copy — the
+  // store records `too-slow`, the copy tests sweep it, and any future non-alarming surface (a quiet
+  // line in a diagnostics pane, say) should say this and not re-invent it.
+  //
   // DELIBERATELY SAYS NOTHING ABOUT CONNECTIVITY. This reason is only reached once a stream has
   // actually opened, which proves the service was reachable — so any mention of the network here
   // would be false, and it is precisely the false claim that sent the founder (and an investigating

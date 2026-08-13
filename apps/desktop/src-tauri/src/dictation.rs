@@ -644,7 +644,7 @@ impl From<crate::cloud::RelayRefusal> for CloudStreamOutcome {
 
 /// The decision `cloud_reuse` returns: what `start_cloud_stream` should do with whatever socket is
 /// currently installed.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CloudReuse {
     /// A live socket for THIS project is already routing — do nothing (idempotent: a repeated
     /// passive→active transition must not open a second socket).
@@ -673,6 +673,159 @@ pub(crate) fn cloud_reuse(active: bool, installed: Option<Installed>) -> CloudRe
         // opening a second stream underneath it.
         _ if active => CloudReuse::AlreadyRouting,
         _ => CloudReuse::Open,
+    }
+}
+
+// ── THE PUSH-TO-TALK PRE-CONNECT (sparkle-v3990, the latency half) ──────────────────────────────
+//
+// EVERYTHING ABOVE OPENS THE SOCKET ON THE KEYDOWN, AND THAT IS THE BUG. `cloudStreamCommandFor`
+// returns `start_cloud_stream` on the passive→active phase edge; push to talk sits `passive` at rest
+// and goes `active` only for the duration of a hold, so the ~490 ms TLS+WS handshake begins at the
+// instant the key goes down. The founder's measured holds on 2026-08-09 were **76-567 ms**. The
+// socket therefore lands after the key comes up, is parked or discarded, the command answers
+// `Raced`, and the utterance falls back to the on-device engine — which decodes only CLOSED VAD
+// segments and has NO interim results at all. That is the structural reason a short press never gets
+// the live word-by-word preview, and why "longer utterances usually get it" is the signature of a
+// connect race rather than of a capture failure. Measured 2026-08-06: 171 sockets opened, 136
+// discarded for landing after the utterance had ended, on a network healthy throughout.
+//
+// `WARM_STANDBY` already fixes the SECOND hold and every one after it — `cloud_reuse`'s `Resume`
+// path costs no handshake. What it cannot fix is the FIRST hold in a cold window, and with an
+// intermittent speaker that is the hold the user keeps hitting.
+//
+// SO: connect BEFORE the key goes down. Nothing here is a new socket lifecycle — the pre-connect
+// lands in exactly the state `RacedStream::ParkWarm` produces (`park_raced_stream`: pause(), sender
+// installed, `cloud_active` untouched) and is picked up by exactly the same `cloud_reuse` `Resume`
+// arm. What is new is only WHEN we decide to open one, and a mark saying the socket is still a guess.
+
+/// Minimum spacing between two pre-connect HANDSHAKES on one session — the cost floor.
+///
+/// A pre-connect is speculative spending: the relay debits a minute UP FRONT on open
+/// (`firstMinuteCents`, 6¢) whether or not a word is ever spoken into the socket. That is a fine
+/// trade once — it buys the founder the live preview on a hold he would otherwise lose — but it must
+/// not be repeatable at the rate a window can gain and lose focus.
+///
+/// It is `PAID_MINUTE`, deliberately, because that is the unit being spent: at one handshake per
+/// paid minute the worst case a user can provoke by alt-tabbing is exactly the bound this repo
+/// already accepts elsewhere for an idle relay (`IDLE_RELAY_PARK_MS`, whose own doc reasons "bounds
+/// an idle Speak session at one minute of charge instead of an unbounded number"). Anything shorter
+/// buys minutes the user is already paying for; anything longer just loses holds.
+///
+/// WHAT IT COSTS, stated plainly: a user who tabs away and comes straight back inside the window
+/// gets no pre-connect, so that hold pays a handshake. That is the behaviour before this change, not
+/// a regression — the floor can only ever remove a speculative purchase, never a real one, because
+/// the hold's own `start_cloud_stream` is untouched by it.
+const PRECONNECT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What the pre-connect should do right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreconnectPlan {
+    /// Open a socket now and PARK it, so the next hold resumes instead of handshaking.
+    Connect,
+    /// The pre-arm state no longer holds (the tray moved, the window blurred, the entitlement went
+    /// away) and the socket in the slot is one WE opened on spec and nobody ever used. Close it.
+    Release,
+    /// Nothing to do — either a usable socket is already banked, or there is nothing speculative to
+    /// give back.
+    Idle,
+}
+
+/// Decide the pre-connect action. Pure, and it is where the whole fix is pinned: the assertion that
+/// matters is that at the moment of a hold `cloud_reuse` answers `Resume` rather than `Open`, and
+/// that is a statement about this decision plus the park it drives — not about anything that needs a
+/// relay, a microphone, or a 482 MB model to observe.
+///
+/// * `want` — the FRONTEND's gate, and deliberately not re-derived here. It carries "push to talk is
+///   the armed tray position, at rest, and this window has the caret", plus the two live AI-feature
+///   prefs `openCloud` itself checks (`voice/cloudPreconnect`). The bearer-token gate stays where it
+///   already is, in the command's own `choose_engine` call — a pre-connect must never contact the
+///   relay for a signed-out, unentitled or out-of-credits user, both because it is wasted work and
+///   because it would occupy a relay stream slot and can trip the server-side cap that produces the
+///   `too_many_streams` refusal in another window.
+/// * `focused` — the app-global OS focus flag, and THE OUTER TERM, exactly as
+///   `capture_should_be_live` makes it for the microphone. Tab away and this releases. A relay socket
+///   held open while the user is in another app is the same class of promise as an open microphone,
+///   so it gets the same answer; `want` alone must not be able to keep one alive.
+/// * `reuse` — what `cloud_reuse` would say about the socket already in the slot. `Open` is the only
+///   answer that means a hold would pay a handshake, so it is the only one worth pre-connecting for.
+///   `Resume` means a warm socket is already banked (the pre-connect's own work, or the last
+///   utterance's) and re-opening would burn a second `firstMinuteCents` debit for nothing.
+///   `AlreadyRouting` means the user is mid-utterance. `Reopen` is a project mismatch, which is a
+///   BILLING decision the hold's own `start_cloud_stream` already owns and must not be pre-empted
+///   here — tearing down another project's live socket on spec is not this function's call.
+/// * `speculative` — whether the socket in the slot is an unused pre-connect (`is_speculative`).
+///   Only such a socket may be released: a socket that carried real dictation keeps the existing
+///   warm-standby posture, including the focus-regain resume `park_cloud_for_blur` exists for.
+/// * `since_last_connect` — how long ago this session last SPENT a pre-connect handshake, or `None`
+///   if it never has. See `PRECONNECT_COOLDOWN`; a `Duration` rather than an `Instant` so the rule
+///   is testable without a clock.
+pub(crate) fn preconnect_plan(
+    want: bool,
+    focused: bool,
+    reuse: CloudReuse,
+    speculative: bool,
+    since_last_connect: Option<std::time::Duration>,
+) -> PreconnectPlan {
+    if want && focused {
+        // THE COST BOUND, AND IT IS THE RELEASE ABOVE THAT MAKES IT NECESSARY. Releasing on blur is
+        // right for privacy and it is exactly what turns a focus cycle into a fresh 6¢ debit: the
+        // blur empties the slot, so the refocus finds `Open` and buys another first minute. Without
+        // a floor, alt-tabbing between Sparkle and a browser costs one relay minute per round trip,
+        // for a microphone the user never touched.
+        if matches!(since_last_connect, Some(d) if d < PRECONNECT_COOLDOWN) {
+            return PreconnectPlan::Idle;
+        }
+        return match reuse {
+            CloudReuse::Open => PreconnectPlan::Connect,
+            _ => PreconnectPlan::Idle,
+        };
+    }
+    // The pre-arm state is gone. Give back what we took on spec — and ONLY that.
+    if speculative {
+        PreconnectPlan::Release
+    } else {
+        PreconnectPlan::Idle
+    }
+}
+
+/// What to do with a PRE-CONNECTED socket once its handshake lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreconnectLanding {
+    /// Bank it in the CURRENT generation's slot, parked, for the next hold.
+    Park,
+    /// Nothing wants it any more — silence and close it.
+    Discard,
+}
+
+/// Decide a landed pre-connect's fate. Deliberately its OWN function rather than a call into
+/// `raced_stream_disposition`, and the difference is one term: that function guards on `armed`, and
+/// push to talk RESTS DISARMED (`useMicActions::setOff`, the hold's resting state), so every
+/// pre-connect would land on its `Discard` arm and the feature would be inert. Widening `armed`
+/// there would weaken a guard that is load-bearing for a genuinely different situation — a handshake
+/// landing just after a MUTE — so the two decisions stay separate.
+///
+/// The terms that DO carry over are carried over unchanged, and they are the ones that are not
+/// vacuous here: `slot_empty` (never clobber an occupant) and `!already_active` (never shadow a
+/// session that is routing). Both are read from the CURRENT session, because — exactly like
+/// `RacedStream::ParkCurrent` — a pre-connect banks into `sess.*`: the generation may well have
+/// rotated under us (the user started a hold while we were connecting), and the current Arcs are the
+/// only ones anybody still holds. `focused` is re-checked for the same reason it gates the plan: the
+/// user may have tabbed away during the handshake, and a socket nobody is present for is not one to
+/// keep.
+///
+/// No epoch term, matching the existing park arms: parking has never depended on the epoch, only
+/// INSTALLING has. A `stop_cloud_stream` landing mid-handshake either empties the slot (we park,
+/// which is correct — that is precisely the warm socket the next hold wants) or parks its own
+/// session in it (we discard, because `slot_empty` is false).
+pub(crate) fn preconnect_landing(
+    focused: bool,
+    slot_empty: bool,
+    already_active: bool,
+) -> PreconnectLanding {
+    if focused && slot_empty && !already_active {
+        PreconnectLanding::Park
+    } else {
+        PreconnectLanding::Discard
     }
 }
 
@@ -1360,8 +1513,25 @@ pub struct DictationSession {
     /// KEEP THE MICROPHONE WARM UNTIL THIS INSTANT, so the next push-to-talk hold does not pay
     /// `Capture::start` (160-990 ms) inside a hold that may only last 76 ms.
     ///
-    /// Stamped by `stop_dictation` on the disarm, read by `capture_should_be_live`'s `hold_recent`
-    /// term. `None` (or elapsed) = the old two-term behaviour, mic released on release.
+    /// ⚠ **NOT YET WRITTEN — NOTHING STAMPS THIS TODAY.** This field is declared and READ (by
+    /// `capture_warm_now`, feeding `capture_should_be_live`'s `hold_recent` term) and assigned
+    /// nowhere in the tree, so it is permanently `None`: `hold_recent` is always false and the
+    /// capture behaviour is exactly the old two-term `focused && armed`. An earlier version of this
+    /// doc said it *is* "stamped by `stop_dictation` on the disarm", which describes the intended
+    /// writer as though it had landed — a future reader greps the doc, believes the warm path is
+    /// live, and debugs the wrong layer (roborev 62000).
+    ///
+    /// THE WRITER IS DELIBERATELY NOT LANDED, and it is not a mechanical follow-up. `stop_dictation`
+    /// is the single disarm path for BOTH a push-to-talk release and a deliberate mute, so a naive
+    /// stamp there would hold the OS mic open (indicator lit) right after the user explicitly asked
+    /// it to stop — the axis the founder reversed himself on (`sparkle-u81cz`, "IT SHOULD NOT BE
+    /// CAPTURING ANY WAVEFORM"). Whoever lands it must thread the disarm REASON through, or stamp at
+    /// the push-to-talk keyup call site instead, and must also give the expiry an EVENT: every
+    /// caller of `capture_should_be_live` is event-driven, and `watchdog_tick` consults it only in
+    /// the `capture.is_none()` arm — so a warm window that merely ELAPSES is never re-read and the
+    /// mic would stay open until the next focus change or arm toggle.
+    ///
+    /// `None` (or elapsed) = the old two-term behaviour, mic released on release.
     ///
     /// This is the CAPTURE half of what `af0c91a11` did for the relay socket — see
     /// `frame_policy::capture_should_be_live` for the measurement and the privacy reasoning. `focused`
@@ -1422,6 +1592,30 @@ pub struct DictationSession {
     /// re-acquire: one silent retry, then escalate. Cleared by every capture that actually installs
     /// and by every fresh arm, so the budget is per-attempt rather than per-process.
     build_failure_reissued: bool,
+    /// A `preconnect_cloud_stream` handshake is in flight right now.
+    ///
+    /// Claimed and released under the session Mutex, so it is a real mutual exclusion rather than a
+    /// hint. Without it the pre-connect has the shape every other command here has had to be
+    /// defended against: the frontend fires it on a state EDGE, and a remount, a rapid
+    /// blur→focus→blur, or two windows agreeing they are focused would each start their own ~490 ms
+    /// TLS+WS handshake against an empty slot. Only the first can park (the rest fail
+    /// `preconnect_landing`'s `slot_empty`) — but every one of them has already cost the user a
+    /// `firstMinuteCents` debit by the time it discovers that, and a burst of them can trip the
+    /// relay's per-account concurrent-stream cap and produce a `too_many_streams` refusal in a window
+    /// that is genuinely trying to dictate.
+    ///
+    /// DELIBERATELY NOT the epoch: the epoch is the INSTALL protocol's token and is bumped by stops
+    /// and by every `start_cloud_stream` attempt, so it answers "is my attempt still current",
+    /// not "is someone else already connecting". A pre-connect must stand down for a peer that is
+    /// mid-handshake, which is a question nothing here could previously ask.
+    preconnect_in_flight: bool,
+    /// When this session last SPENT a pre-connect handshake — i.e. last paid a `firstMinuteCents`
+    /// debit on spec. Read as an elapsed `Duration` by `preconnect_plan`'s cost floor; see
+    /// `PRECONNECT_COOLDOWN`. `None` = never, which is always allowed.
+    ///
+    /// Stamped on the attempt rather than on its success, because a refused or unreachable relay is
+    /// exactly when a retry loop would be cheapest to enter and least useful to run.
+    last_preconnect_at: Option<std::time::Instant>,
     /// Consecutive watchdog ticks where the mic SHOULD be capturing but no capture exists.
     /// Debounces the ordinary in-flight-rebuild window so only a genuinely stuck state escalates.
     audio_missing_ticks: u8,
@@ -1545,6 +1739,63 @@ fn park_raced_stream(
     session.pause();
     *cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = Some(session.audio_sender());
     *cloud.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
+}
+
+/// Bank a PRE-CONNECTED socket — one opened before the user pressed anything — in the warm-standby
+/// slot, marked as still a guess.
+///
+/// THE PARK ITSELF IS `park_raced_stream`, UNCHANGED AND ON PURPOSE. The pre-connect's whole design
+/// constraint is that it must land in the state warm standby already produces, so that the next hold
+/// reaches `cloud_reuse`'s `Resume` arm by the ordinary route with no second socket lifecycle to
+/// reason about. A parallel path here would be a second source of truth for a resource that is
+/// already hard to reason about — so this adds exactly one thing to it, and that thing is a mark,
+/// not a behaviour.
+///
+/// `cloud_active` IS NOT PASSED, LET ALONE SET, and that is the metering seam stated as a signature.
+/// `park_raced_stream`'s own doc records why parking leaves the flag alone ("parked is not routing,
+/// and the caller must not meter"), and a pre-connected socket must be identical in that respect:
+/// billing the user for sockets they never spoke into would be a worse bug than the latency this
+/// fixes. There is no argument here through which a caller could route audio or start a meter.
+///
+/// The mark goes on BEFORE the park, so the socket is never observable in the slot without it — a
+/// blur landing between the two would otherwise see an ordinary warm session and decline to release
+/// it.
+fn park_preconnected_stream(
+    cloud: &Mutex<Option<DeepgramSession>>,
+    cloud_tx: &Mutex<Option<CloudAudioSender>>,
+    session: DeepgramSession,
+) {
+    session.mark_speculative();
+    park_raced_stream(cloud, cloud_tx, session);
+}
+
+/// Take a still-unused pre-connected socket back out of the slot, SILENCED, for the caller to close.
+///
+/// Returns `None` — leaving the slot untouched — for anything else, and re-reads the mark itself
+/// rather than trusting the plan that sent it here. A socket becomes non-speculative the instant
+/// `resume()` hands it an utterance, and "never close a socket that is carrying speech" is a
+/// property worth having in the function that does the closing rather than only in the one that
+/// decided to.
+///
+/// `cloud_tx` is cleared alongside, exactly as `take_for_teardown` does in `start_cloud_stream`:
+/// warm standby deliberately leaves the sender installed next to the parked session, so taking the
+/// session without clearing the sender would leave `cloud_tx` pointing at a socket that is gone.
+///
+/// `silence_now()` rather than a bare take, for the reason every other teardown here gives: `Drop`
+/// only signals Close, so an un-silenced session drains whatever it has into whichever session
+/// raced ahead and emits a `cloud-ended` that would stop it. A pre-connect has no transcripts to
+/// drain — it never routed audio — but the `cloud-ended` is real, and the cost of being consistent
+/// here is one atomic store.
+fn take_speculative_stream(
+    cloud: &Mutex<Option<DeepgramSession>>,
+    cloud_tx: &Mutex<Option<CloudAudioSender>>,
+) -> Option<crate::cloud::SilencedSession> {
+    let mut slot = cloud.lock().unwrap_or_else(|p| p.into_inner());
+    if !slot.as_ref().is_some_and(DeepgramSession::is_speculative) {
+        return None;
+    }
+    *cloud_tx.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    slot.take().map(DeepgramSession::silence_now)
 }
 
 /// Install a freshly handshaked socket as the LIVE cloud stream and start routing audio at it.
@@ -2427,10 +2678,18 @@ impl DictationSession {
     /// Is the post-release warm window still open? The `hold_recent` term of
     /// `capture_should_be_live` — see that function for why the capture is kept warm at all.
     ///
-    /// `checked_duration_since` and NOT `saturating_duration_since` (memory: a saturating read
-    /// returns 0 on a backwards clock, so a future-stamped entry HITS and gets its life extended).
-    /// `Instant` is monotonic so the backwards case should be impossible, but this is a microphone
-    /// staying open — the failure direction to avoid is "warm forever", so read it the strict way.
+    /// A STRICT `until > now`, never a duration read that can saturate (memory:
+    /// `saturating_duration_since` returns 0 on a backwards clock, so a future-stamped entry HITS
+    /// and gets its life extended). `Instant` is monotonic so the backwards case should be
+    /// impossible, but this is a microphone staying open — the failure direction to avoid is "warm
+    /// forever", so read it the strict way. An earlier version of this note named
+    /// `checked_duration_since`, which this function does not call; the property it was arguing for
+    /// is the one the comparison above actually has.
+    ///
+    /// Its three behaviours are pinned in `tests::capture_warm_now_*`. They were unpinned until
+    /// roborev 62000: the neighbouring tests exercise the pure `capture_should_be_live` with
+    /// hand-passed booleans, so the boolean the production path actually computes was untested by
+    /// construction — mutating this to `is_some()`, or to `>=`, left the whole suite green.
     fn capture_warm_now(&self) -> bool {
         self.warm_capture_until.is_some_and(|until| until > std::time::Instant::now())
     }

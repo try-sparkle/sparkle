@@ -192,6 +192,27 @@ pub struct DeepgramSession {
     /// switched projects would bill the new project's minutes to the old one. `start_cloud_stream`
     /// compares against this before reusing and reopens on a mismatch (roborev 48164).
     project: Option<String>,
+    /// True while this socket was opened SPECULATIVELY — by the push-to-talk pre-connect, before the
+    /// user pressed anything — and has never once routed audio.
+    ///
+    /// It exists for exactly one decision, and it is a privacy decision rather than a billing one:
+    /// on a window BLUR a speculative socket is closed outright, while a socket that carried real
+    /// dictation keeps the existing warm-standby posture (held for the reuse window, resumed on
+    /// focus-regain). Without the distinction the blur path could only choose between releasing
+    /// nothing — leaving a relay connection open to Sparkle's servers while the user is in another
+    /// app, purely on a guess that they might come back and speak — or releasing everything, which
+    /// would delete the focus-regain resume that `park_cloud_for_blur` exists for.
+    ///
+    /// Set by `mark_speculative()` at pre-connect time and cleared by `resume()`: the moment the
+    /// socket starts carrying an utterance it stops being a guess and becomes an ordinary warm
+    /// session. Cleared in `resume()` rather than at the call site because `resume()` is the single
+    /// funnel every routing path goes through (`cloud_reuse`'s `Resume`, the focus-regain unpark), so
+    /// a new caller cannot forget to retire the flag.
+    ///
+    /// Lives on the SESSION, not on `DictationSession`, so it travels with the socket across
+    /// `note_fresh_arm`'s generation rotation — which is precisely the hop a pre-connected socket
+    /// makes on its way to the hold that uses it.
+    speculative: Arc<AtomicBool>,
 }
 
 impl DeepgramSession {
@@ -241,6 +262,10 @@ impl DeepgramSession {
             parked: Arc::new(AtomicBool::new(false)),
             muted,
             project: normalize_project(project.as_deref()),
+            // FALSE by default: `start` is the ordinary open, driven by a gesture the user made.
+            // Only the pre-connect path marks it, so a socket that reaches here any other way keeps
+            // the pre-existing blur posture unchanged.
+            speculative: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -272,7 +297,24 @@ impl DeepgramSession {
     /// Leave warm standby and resume forwarding audio on the same connection (no handshake).
     pub fn resume(&self) {
         self.parked.store(false, Ordering::Relaxed);
+        // A socket that is about to carry speech is no longer a guess — see `speculative`. Retired
+        // HERE rather than at the call sites because this is the one funnel every routing path goes
+        // through, so the flag cannot outlive the speculation by being forgotten somewhere.
+        self.speculative.store(false, Ordering::Relaxed);
         let _ = self.audio_tx.send(AudioMsg::Resume);
+    }
+
+    /// Mark this socket as opened by the push-to-talk PRE-CONNECT: connected on spec, never used.
+    /// See the `speculative` field for what the mark decides (blur release) and what it deliberately
+    /// does not (metering — a speculative socket is parked, and parked is not routing).
+    pub fn mark_speculative(&self) {
+        self.speculative.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether this socket is still an unused pre-connect. False once `resume()` has handed it an
+    /// utterance, and false for every socket opened by an ordinary `start_cloud_stream`.
+    pub fn is_speculative(&self) -> bool {
+        self.speculative.load(Ordering::Relaxed)
     }
 
     /// Whether this session is currently parked in warm standby. Checked (alongside `is_alive`) by
@@ -1466,6 +1508,11 @@ pub(crate) fn parkable_session() -> (DeepgramSession, ParkedChannel) {
         parked: Arc::new(AtomicBool::new(false)),
         muted: Arc::new(AtomicBool::new(false)),
         project: None,
+        // FALSE, matching `DeepgramSession::start`, and for the same reason as `suppress_ended`
+        // above: a fixture that started pre-marked would make every "the pre-connect marked it"
+        // assertion vacuous, and would let the blur-release test pass against a socket the user
+        // actually dictated into.
+        speculative: Arc::new(AtomicBool::new(false)),
     };
     (session, ParkedChannel(rx))
 }

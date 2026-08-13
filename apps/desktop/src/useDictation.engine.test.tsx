@@ -49,6 +49,7 @@ vi.mock("./services/aiGate", () => ({
 import { useDictationStore } from "./stores/dictationStore";
 import {
   noteCloudLate,
+  shouldWarnLocalEngine,
   useDictationEngineStore,
   type CloudStreamOutcome,
 } from "./stores/dictationEngineStore";
@@ -128,6 +129,11 @@ beforeEach(() => {
     dismissed: false,
     observedAt: null,
     openRefusals: 0,
+    // The SESSION axis belongs in this reset for the same reason `openRefusals` does: mounting the
+    // hook arms the mic, which bumps `captureSession`, so without this the counter climbs across
+    // cases and a later case's "previous session" seed would have to guess the running value.
+    captureSession: 0,
+    observedSession: null,
   });
 });
 
@@ -574,6 +580,56 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
     await mountVoice();
     await goActive();
     expect(useDictationEngineStore.getState().fallbackReason).toBe("signed_out");
+  });
+
+  // ── THE ARM IS WHERE A CAPTURE SESSION BEGINS, AND IT IS WIRED HERE OR NOWHERE ────────────────
+  // The store test pins the RULE (`noteSessionStart` withdraws a previous session's claim); these
+  // two pin the WIRING, which lives in `useAmbientVoice`'s `[enabled]` effect and is unreachable
+  // from the node-env suites. Delete that one line and the store's own tests all stay green while
+  // the founder's mic-on banner comes straight back.
+  it("arming the mic takes down a banner left over from the PREVIOUS session", async () => {
+    // Evidence from a session that has already ended: same wall clock (well inside the TTL), a
+    // session marker that the arm below is about to leave behind. This is the founder's report —
+    // "as soon as I turn the mic on, I get this error banner" — reproduced at the seam.
+    useDictationEngineStore.setState({
+      fallbackReason: "unavailable",
+      observedAt: Date.now(),
+      captureSession: 0,
+      observedSession: 0,
+      dismissed: false,
+    });
+    expect(shouldWarnLocalEngine(useDictationEngineStore.getState())).toBe(true);
+    // `enabled` is already true in the fixture, so mounting RUNS the arm effect — the same path the
+    // mic button and the voice menu reach through `setEnabled(true)`.
+    await mountVoice();
+    expect(shouldWarnLocalEngine(useDictationEngineStore.getState())).toBe(false);
+    // Presentation only: the observation is still on record for the diagnostics and the
+    // preservation rules that read it. What changed is that it no longer speaks for a session it
+    // predates.
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("unavailable");
+  });
+
+  it("a refusal from the SAME gesture that armed the mic still speaks", async () => {
+    // THE PAIRED CASE, and it is an ORDERING test — the one bead `sparkle-40va0` records. Arming
+    // from the mic pill writes `enabled` AND `phase` in one gesture (`useMicActions.setActive`), so
+    // the session bump and the relay's answer are racing. The bump is synchronous in the effect;
+    // the answer lands after the `start_cloud_stream` round trip. Get that order wrong and this
+    // session's own outage is stamped with the session before it and never paints — a mute that no
+    // store-level test can see, because at that level nothing is asynchronous.
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "start_cloud_stream"
+        ? Promise.resolve("insufficient_credits")
+        : Promise.resolve(undefined),
+    );
+    useDictationStore.setState({ enabled: false, phase: "passive" });
+    await mountVoice();
+    await act(async () => {
+      useDictationStore.setState({ enabled: true, phase: "active" });
+    });
+    await flush();
+    expect(invoke).toHaveBeenCalledWith("start_cloud_stream", expect.anything());
+    expect(useDictationEngineStore.getState().fallbackReason).toBe("exhausted");
+    expect(shouldWarnLocalEngine(useDictationEngineStore.getState())).toBe(true);
   });
 
   it("a cloud stream coming back RETIRES a standing fallback and re-arms the dismissal", async () => {

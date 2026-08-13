@@ -24,6 +24,9 @@
         CloudReuse, DeepgramSession, DictationState, Engine, Installed, ReconcileStep, StartAfterLoad,
         raced_stream_disposition, RacedStream, late_report_for, LateReport, park_raced_stream, install_live_stream, CloudAudioSender,
         CloudStreamOutcome,
+        park_preconnected_stream, preconnect_landing, preconnect_plan, take_speculative_stream,
+        PreconnectLanding, PreconnectPlan,
+        PRECONNECT_COOLDOWN,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
@@ -1949,6 +1952,45 @@
         );
     }
 
+    // ── THE BOOLEAN THE PRODUCTION PATH ACTUALLY COMPUTES ────────────────────────────────────────
+    // The three cases above pin the pure `capture_should_be_live` with HAND-PASSED booleans, so the
+    // one place `hold_recent` is really derived — `DictationSession::capture_warm_now()` — was
+    // untested by construction (roborev 62000). That is the guard-vacuity shape `sparkle-lgbwf`
+    // records: mutating the reader to `warm_capture_until.is_some()`, or relaxing `>` to `>=`, or
+    // deleting the comparison outright, left every one of those tests green because none of them
+    // ever calls it. `tests` is a child module of `dictation`, so it can set the private field.
+
+    #[test]
+    fn capture_warm_now_is_false_with_no_stamp_and_stays_false_once_the_window_elapses() {
+        let mut sess = DictationSession::default();
+        // The state the tree is permanently in today: nothing writes `warm_capture_until`, so this
+        // is the case that decides live behaviour — and it must read as the OLD two-term rule.
+        assert!(
+            !sess.capture_warm_now(),
+            "an unstamped session is not warm — this is the resting state and the shipped one"
+        );
+        sess.warm_capture_until = Some(Instant::now() - Duration::from_secs(1));
+        assert!(
+            !sess.capture_warm_now(),
+            "an ELAPSED stamp must read cold, or the mic is warm forever after one hold"
+        );
+    }
+
+    #[test]
+    fn capture_warm_now_is_true_only_while_the_stamp_is_still_in_the_future() {
+        // THE PAIRED CASE: the test above alone passes against a `capture_warm_now` hard-wired to
+        // `false`, which would silently delete the feature the moment a writer lands.
+        let mut sess = DictationSession::default();
+        sess.warm_capture_until = Some(Instant::now() + Duration::from_secs(30));
+        assert!(sess.capture_warm_now(), "an unexpired stamp is warm");
+        // And it feeds the term it exists for: (armed=false, focused=true) — the state BETWEEN two
+        // push-to-talk holds — goes live only because of this reader.
+        assert!(
+            capture_should_be_live(false, true, sess.capture_warm_now()),
+            "the warm reader must be what turns the between-holds row live"
+        );
+    }
+
     #[test]
     fn plan_capture_builds_when_live_and_absent_and_tears_down_when_dead_and_present() {
         // The capture transition reconcile must make, factored out so it can be DECIDED under the
@@ -3094,6 +3136,314 @@
             "an installed live stream routes — this is the flag the capture callback reads"
         );
         displaced.finish();
+    }
+
+    // ── THE PUSH-TO-TALK PRE-CONNECT (sparkle-v3990, the latency half) ──────────────────────────
+
+    /// What `start_cloud_stream` would ask `cloud_reuse` at the moment of a hold, read off a real
+    /// session slot. The whole fix is a statement about this value, so it is computed the way the
+    /// command computes it rather than hand-built — a fixture that constructs `Installed` itself
+    /// would assert the test's own arithmetic instead of the session's state.
+    fn reuse_at_hold_time(sess: &DictationSession) -> CloudReuse {
+        let cloud = sess.cloud.lock().unwrap();
+        let installed = cloud.as_ref().map(|s| Installed {
+            alive: s.is_alive(),
+            project_matches: s.is_for_project(None),
+        });
+        cloud_reuse(sess.cloud_active.load(Ordering::Relaxed), installed)
+    }
+
+    #[test]
+    fn a_short_hold_finds_the_socket_already_connected_instead_of_paying_a_handshake() {
+        // THE ONE ASSERTION THE WHOLE CHANGE EXISTS FOR, and it is deliberately taken at the
+        // decision layer rather than through the command: `start_cloud_stream` needs an `AppHandle`,
+        // a `State` and a live relay, and the arms that matter here cannot be driven to completion
+        // in CI — the vacuous shape `plan_capture_for`'s doc warns about, where the test passes
+        // identically with and without the fix.
+        //
+        // BEFORE — push to talk at rest, nothing banked. This is not a hypothetical: push to talk
+        // rests DISARMED and PASSIVE, and the socket is opened on the passive→active edge, so this
+        // is the state every single hold started from. `Open` means a full TLS+WS handshake (~490 ms
+        // measured) inside a hold measured at 76-567 ms — the socket lands after the key comes up,
+        // the utterance falls back on-device, and the on-device engine emits no interims at all.
+        let cold = DictationSession::default();
+        assert_eq!(
+            reuse_at_hold_time(&cold),
+            CloudReuse::Open,
+            "the un-preconnected rest state is exactly the one that pays a handshake per hold"
+        );
+
+        // AFTER — the same rest state, plus the pre-connect firing when push to talk became the
+        // armed tray position in a focused window.
+        let mut sess = DictationSession::default();
+        sess.focused = true;
+        assert_eq!(
+            preconnect_plan(true, sess.focused, reuse_at_hold_time(&sess), false, None),
+            PreconnectPlan::Connect,
+            "a focused, at-rest push-to-talk window with an empty slot is what a pre-connect is for"
+        );
+        // The handshake the plan authorised, landing while the user still has not pressed anything.
+        let (socket, rx) = crate::cloud::parkable_session();
+        let slot_empty = sess.cloud.lock().unwrap().is_none();
+        assert_eq!(
+            preconnect_landing(sess.focused, slot_empty, sess.cloud_active.load(Ordering::Relaxed)),
+            PreconnectLanding::Park
+        );
+        park_preconnected_stream(&sess.cloud, &sess.cloud_tx, socket);
+
+        // THE HOLD. Same question, same code path, at the same point in the gesture — and now the
+        // answer is the one that costs nothing. `Resume` is `start_cloud_stream` returning without
+        // ever reaching `DeepgramSession::start`, so the relay is live from the first syllable and
+        // the interims that drive the word-by-word preview start arriving immediately.
+        assert_eq!(
+            reuse_at_hold_time(&sess),
+            CloudReuse::Resume,
+            "at the moment of the hold the socket must ALREADY be connected — Resume is the whole \
+             fix, and Open here means the founder is back to a handshake he cannot outlast"
+        );
+        // And the reuse is real rather than nominal: the socket is genuinely parked with its warm
+        // timer running, which is what `Resume`'s `resume()` un-parks.
+        assert!(
+            rx.took_pause(),
+            "the banked socket must have been PAUSED, or it runs no warm timer, never closes on our \
+             schedule, and `resume()` un-parks something that was never parked"
+        );
+    }
+
+    #[test]
+    fn a_pre_connected_socket_survives_the_arm_the_hold_itself_performs() {
+        // THE HOP THAT MAKES THE FIX REACHABLE AT ALL, and it is invisible from the plan alone. A
+        // pre-connect banks its socket while the mic is DISARMED (push to talk rests at
+        // `setEnabled(false)`), so the hold's own `start_dictation` runs `note_fresh_arm` and
+        // rotates all four cloud Arcs out from under it. If the socket did not cross that boundary
+        // the pre-connect would be dead on arrival — every hold would find an empty slot and
+        // handshake exactly as before, with nothing in the logs to say why.
+        let mut sess = DictationSession::default();
+        sess.focused = true;
+        let (socket, _rx) = crate::cloud::parkable_session();
+        park_preconnected_stream(&sess.cloud, &sess.cloud_tx, socket);
+
+        // The hold: `setEnabled(true)` → start_dictation → note_fresh_arm.
+        note_fresh_arm(&mut sess);
+
+        assert_eq!(
+            reuse_at_hold_time(&sess),
+            CloudReuse::Resume,
+            "the arm must CARRY the pre-connected socket into the new generation, not drop it"
+        );
+        assert!(
+            sess.cloud_tx.lock().unwrap().is_some(),
+            "and its sender crosses with it, or the slot and the sender stop mirroring each other"
+        );
+        assert!(
+            !sess.cloud_active.load(Ordering::Relaxed),
+            "the carried socket is still PARKED, not routing — an arm must not start a meter"
+        );
+        assert!(
+            sess.cloud.lock().unwrap().as_ref().unwrap().is_speculative(),
+            "and it is still a guess: the user has not spoken into it yet, so a blur may still \
+             release it"
+        );
+    }
+
+    #[test]
+    fn a_pre_connected_socket_is_parked_and_never_meters() {
+        // THE BILLING SEAM, ASSERTED RATHER THAN ARGUED. Parking deliberately does not meter — the
+        // `Raced` arm's comment says "the caller must NOT start metering (nothing is streaming)" —
+        // and a socket opened before the user pressed anything must be identical in that respect.
+        // Charging the founder for sockets he never spoke into would be a worse bug than the latency
+        // this fixes.
+        let sess = DictationSession::default();
+        let (socket, rx) = crate::cloud::parkable_session();
+
+        park_preconnected_stream(&sess.cloud, &sess.cloud_tx, socket);
+
+        assert!(
+            !sess.cloud_active.load(Ordering::Relaxed),
+            "cloud_active is the flag the capture callback routes on AND the state a live install \
+             sets — a pre-connect must leave it false or it bills for silence"
+        );
+        let guard = sess.cloud.lock().unwrap();
+        let parked = guard.as_ref().expect("the socket is banked, not dropped");
+        assert!(parked.is_parked(), "and it is parked, so a stop keeps it instead of closing it");
+        assert!(parked.is_speculative(), "marked as a guess, which is what a blur releases on");
+        assert!(
+            rx.took_pause(),
+            "the Pause must REACH the worker: it is what starts the warm timer, and the warm timer \
+             is the only thing that ever closes a socket the user never used"
+        );
+        assert!(
+            sess.cloud_tx.lock().unwrap().is_some(),
+            "cloud_tx mirrors the slot, exactly as warm standby leaves the pair"
+        );
+    }
+
+    #[test]
+    fn tabbing_away_hands_back_a_socket_that_was_only_ever_a_guess() {
+        // `focused` is the OUTER term, mirroring `capture_should_be_live` for the microphone: a
+        // relay connection held open to Sparkle's servers while the user is in another app is the
+        // same class of promise as an open mic. Declining to open the NEXT one is not enough — the
+        // one already open has to go back.
+        let mut sess = DictationSession::default();
+        sess.focused = true;
+        let (socket, _rx) = crate::cloud::parkable_session();
+        park_preconnected_stream(&sess.cloud, &sess.cloud_tx, socket);
+
+        // The blur. `want` is still true (the tray has not moved) — focus alone must decide it.
+        assert_eq!(
+            preconnect_plan(true, false, reuse_at_hold_time(&sess), true, None),
+            PreconnectPlan::Release
+        );
+
+        let taken = take_speculative_stream(&sess.cloud, &sess.cloud_tx)
+            .expect("a speculative socket must actually leave the slot, not merely be planned away");
+        assert!(
+            taken.is_silenced(),
+            "and leave silenced: Drop only signals Close, so an un-silenced session emits a \
+             cloud-ended into whatever session comes up next"
+        );
+        assert!(sess.cloud.lock().unwrap().is_none(), "the slot is empty again");
+        assert!(
+            sess.cloud_tx.lock().unwrap().is_none(),
+            "and the sender goes with it, or cloud_tx outlives the socket it points at"
+        );
+        taken.finish();
+    }
+
+    #[test]
+    fn a_blur_never_takes_a_socket_the_user_actually_dictated_into() {
+        // THE PAIR THAT MAKES THE TEST ABOVE MEAN "SPECULATIVE" RATHER THAN "ANY PARKED SOCKET".
+        // Warm standby holds a socket across a blur ON PURPOSE — `park_cloud_for_blur` exists so a
+        // quick tab-away and back resumes on the same connection instead of paying a handshake. A
+        // release that could not tell the two apart would delete that.
+        let mut sess = DictationSession::default();
+        sess.focused = true;
+        let (socket, _rx) = crate::cloud::parkable_session();
+        park_preconnected_stream(&sess.cloud, &sess.cloud_tx, socket);
+
+        // The user held the key and spoke: `cloud_reuse`'s Resume arm calls resume(), which is where
+        // a socket stops being a guess.
+        sess.cloud.lock().unwrap().as_ref().unwrap().resume();
+        assert!(
+            !sess.cloud.lock().unwrap().as_ref().unwrap().is_speculative(),
+            "resume() retires the mark — the socket has carried an utterance now"
+        );
+
+        assert_eq!(
+            preconnect_plan(true, false, reuse_at_hold_time(&sess), false, None),
+            PreconnectPlan::Idle,
+            "a blur must not release a socket the user dictated into"
+        );
+        assert!(
+            take_speculative_stream(&sess.cloud, &sess.cloud_tx).is_none(),
+            "and the take re-reads the mark itself, so a stale plan cannot close a live socket"
+        );
+        assert!(
+            sess.cloud.lock().unwrap().is_some(),
+            "the focus-regain resume must still have a socket to come back to"
+        );
+    }
+
+    #[test]
+    fn the_pre_connect_never_opens_a_second_socket_or_pre_empts_a_hold() {
+        // `Open` is the ONLY reuse answer that means a hold would pay a handshake, so it is the only
+        // one worth spending a `firstMinuteCents` debit on. Each of the others is a distinct reason
+        // NOT to, and collapsing any of them into Connect costs real money or breaks a live stream.
+        assert_eq!(preconnect_plan(true, true, CloudReuse::Open, false, None), PreconnectPlan::Connect);
+        assert_eq!(
+            preconnect_plan(true, true, CloudReuse::Resume, true, None),
+            PreconnectPlan::Idle,
+            "a warm socket is already banked — re-opening burns a second first-minute debit for a \
+             connection the next hold already had"
+        );
+        assert_eq!(
+            preconnect_plan(true, true, CloudReuse::AlreadyRouting, false, None),
+            PreconnectPlan::Idle,
+            "the user is mid-utterance; a speculative socket underneath a live one is the \
+             speak-into-the-successor hazard, bought with money"
+        );
+        assert_eq!(
+            preconnect_plan(true, true, CloudReuse::Reopen, false, None),
+            PreconnectPlan::Idle,
+            "a project mismatch is a BILLING decision start_cloud_stream owns — tearing down \
+             another project's socket on spec is not the pre-connect's call"
+        );
+        // The two gates, each sufficient on its own.
+        assert_eq!(
+            preconnect_plan(true, false, CloudReuse::Open, false, None),
+            PreconnectPlan::Idle,
+            "unfocused: nothing is opened, whatever the tray says"
+        );
+        assert_eq!(
+            preconnect_plan(false, true, CloudReuse::Open, false, None),
+            PreconnectPlan::Idle,
+            "the frontend's gate (tray position, rest state, the live AI prefs) is not advisory"
+        );
+        // A gate that is off with nothing speculative banked is simply nothing to do — it must not
+        // become a release that reaches for someone else's socket.
+        assert_eq!(preconnect_plan(false, true, CloudReuse::Resume, false, None), PreconnectPlan::Idle);
+        assert_eq!(preconnect_plan(false, true, CloudReuse::Resume, true, None), PreconnectPlan::Release);
+    }
+
+    #[test]
+    fn focus_churn_cannot_buy_more_than_one_speculative_minute_per_minute() {
+        // THE COST FLOOR, AND IT IS THE BLUR RELEASE THAT MAKES IT NECESSARY. Releasing on blur is
+        // the right privacy answer and it is exactly what turns a focus cycle into a fresh 6¢
+        // debit: the blur empties the slot, so the refocus sees `Open` and buys another first
+        // minute. Alt-tabbing between Sparkle and a browser would cost one relay minute per round
+        // trip, for a microphone nobody touched — which is a worse bug than the latency this change
+        // fixes, and unlike the latency it is silent.
+        let just_now = PRECONNECT_COOLDOWN - Duration::from_secs(1);
+        assert_eq!(
+            preconnect_plan(true, true, CloudReuse::Open, false, Some(just_now)),
+            PreconnectPlan::Idle,
+            "a second speculative handshake inside the paid minute buys a minute already paid for"
+        );
+        // Never pre-connected, and cooled down: both must fire, or the feature is off rather than
+        // merely bounded.
+        assert_eq!(preconnect_plan(true, true, CloudReuse::Open, false, None), PreconnectPlan::Connect);
+        assert_eq!(
+            preconnect_plan(true, true, CloudReuse::Open, false, Some(PRECONNECT_COOLDOWN)),
+            PreconnectPlan::Connect,
+            "the boundary is inclusive — at exactly one paid minute the previous debit is spent"
+        );
+        // AND THE FLOOR MUST NEVER GATE A RELEASE. It exists to stop us SPENDING; applying it to
+        // the give-back would leave a speculative socket open across a blur for up to a minute,
+        // which is the privacy property inverted by a cost guard.
+        assert_eq!(
+            preconnect_plan(true, false, CloudReuse::Resume, true, Some(Duration::ZERO)),
+            PreconnectPlan::Release
+        );
+        // Cheap, but the one relationship worth pinning: the floor is the BILLING quantum, not a
+        // UX delay. A floor shorter than the paid minute is a floor that lets churn re-buy.
+        assert_eq!(
+            PRECONNECT_COOLDOWN,
+            Duration::from_secs(60),
+            "PRECONNECT_COOLDOWN is the relay's per-minute debit quantum; changing it changes what \
+             a user can be charged for doing nothing"
+        );
+    }
+
+    #[test]
+    fn a_pre_connect_that_lands_too_late_is_discarded_rather_than_banked() {
+        // The handshake takes hundreds of ms, and all three of these can happen inside it.
+        assert_eq!(preconnect_landing(true, true, false), PreconnectLanding::Park);
+        assert_eq!(
+            preconnect_landing(true, false, false),
+            PreconnectLanding::Discard,
+            "a hold started and claimed the slot — banking over it would drop a live socket through \
+             Drop, which only signals Close"
+        );
+        assert_eq!(
+            preconnect_landing(true, true, true),
+            PreconnectLanding::Discard,
+            "never shadow a session that is routing"
+        );
+        assert_eq!(
+            preconnect_landing(false, true, false),
+            PreconnectLanding::Discard,
+            "the window blurred while we connected — the same outer term, re-checked after the wait"
+        );
     }
 
     #[test]

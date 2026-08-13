@@ -196,9 +196,17 @@ pub(crate) fn frame_on_device_speech(cloud_active: bool, vad_detected: bool) -> 
 /// mode (`MicButton::setMuted`, "on, waiting for the wake word"), which already holds the mic open.
 ///
 /// The founder REVERSED himself on this axis once (`sparkle-u81cz`: "IT SHOULD NOT BE CAPTURING ANY
-/// WAVEFORM"), then re-accepted it for `PreRoll` on 2026-08-06 — so the caller keeps it behind a
-/// config flag rather than assuming. Passing `hold_recent: false` restores the old two-term
-/// behaviour exactly.
+/// WAVEFORM"), then re-accepted it for `PreRoll` on 2026-08-06. Passing `hold_recent: false`
+/// restores the old two-term behaviour exactly.
+///
+/// ⚠ **AND THAT IS WHAT EVERY CALLER PASSES TODAY.** An earlier version of this paragraph said "the
+/// caller keeps it behind a config flag rather than assuming" — there is no such flag, and no caller
+/// that could pass `true`: `hold_recent` comes from `DictationSession::capture_warm_now()`, which
+/// reads `warm_capture_until`, which **nothing in the tree writes** (roborev 62000). So this third
+/// term is inert and the live behaviour is still `focused && armed`. The privacy analysis above
+/// describes what a warm capture WOULD mean once a writer lands; see `warm_capture_until`'s own doc
+/// for the two things that writer must get right (which disarm stamps it, and giving the expiry an
+/// event so a lapsed window actually releases the mic).
 pub(crate) fn capture_should_be_live(armed: bool, focused: bool, hold_recent: bool) -> bool {
     focused && (armed || hold_recent)
 }

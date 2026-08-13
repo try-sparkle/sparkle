@@ -17,6 +17,8 @@ import { safeUnlisten } from "./services/safeUnlisten";
 import { selectedProjectName } from "./services/creditProject";
 import { classifyVoiceError, isWatchdogFault } from "./voice/dictationCopy";
 import { peekHoldOriginAge, takeHoldOriginAge } from "./voice/holdOrigin";
+import { shouldPreconnectCloud } from "./voice/cloudPreconnect";
+import { useUiStore } from "./stores/uiStore";
 import { copyToClipboard } from "./clipboard";
 import type { Phase } from "./voice/dictationPhase";
 import { routeDictationToTerminal } from "./services/dictationTerminalSink";
@@ -1232,6 +1234,51 @@ export function useAmbientVoice(): void {
     }
   }, [enabled, cloudDictation, aiComposer]);
 
+  // ── PRE-CONNECT THE RELAY SOCKET BEFORE THE KEY GOES DOWN (sparkle-v3990) ─────────────────────
+  //
+  // `cloudStreamCommandFor` above opens the relay on the passive→active phase edge — the KEYDOWN —
+  // and the handshake (~490 ms) outlasts the founder's measured holds (76-567 ms). The socket
+  // therefore lands after the key comes up, the utterance falls back to the on-device engine, and
+  // that engine has no interim results at all: which is why a short press structurally never gets
+  // the live word-by-word preview. See `voice/cloudPreconnect` for the full measurement.
+  //
+  // So the open moves EARLIER, to the moment push to talk becomes the armed tray position in a
+  // focused window. The socket is parked, not routed — the backend banks it through the same
+  // `park_raced_stream` warm standby already uses — so the hold that follows reaches
+  // `cloud_reuse`'s `Resume` arm and pays no handshake at all.
+  const conciergeSendMode = useUiStore((s) => s.conciergeSendMode);
+  const phase = useDictationStore((s) => s.phase);
+  const windowFocused = useDictationStore((s) => s.windowFocused);
+  const wantPreconnect = shouldPreconnectCloud({
+    mode: conciergeSendMode,
+    phase,
+    windowFocused,
+    aiComposer,
+    voiceDictation: cloudDictation,
+  });
+  // SENT ON THE EDGE, IN BOTH DIRECTIONS. A `false` is not a no-op — it is the RELEASE, and it is
+  // what makes `windowFocused` an honest outer term rather than a term that merely declines to open
+  // the next one: tabbing away hands the speculative socket back instead of leaving a relay
+  // connection open to Sparkle's servers while the user is in another app.
+  //
+  // The ref suppresses the initial `false` every mounting window would otherwise send — there is
+  // nothing to release before this window has pre-connected anything, and a window whose tray is
+  // parked at Send (the default) must cost nothing at all.
+  const lastPreconnectWant = useRef(false);
+  useEffect(() => {
+    if (lastPreconnectWant.current === wantPreconnect) return;
+    lastPreconnectWant.current = wantPreconnect;
+    // Fire-and-forget, and deliberately NOT routed through `openCloud`/`openCloudDictationWindow`:
+    // that is the metering path, and nothing here is streaming. The command answers its own
+    // `PreconnectOutcome` — a vocabulary `classifyCloudOutcome` cannot read — so a pre-connect can
+    // never start a meter, retire a fallback notice, or charge a refusal to the corroboration
+    // counter on behalf of an utterance the user has not spoken yet.
+    invoke("preconnect_cloud_stream", {
+      want: wantPreconnect,
+      project: selectedProjectName(),
+    }).catch(() => {});
+  }, [wantPreconnect]);
+
   // Open the cloud (relay) dictation window. Shared by BOTH the passive→active phase edge AND
   // focus-regain resume, so a Speak session stays active across tabbing away and back without the
   // user touching the tray. Gated on the live cloud-dictation prefs — a no-op when off, so
@@ -1398,6 +1445,15 @@ export function useAmbientVoice(): void {
     const store = useDictationStore.getState();
     if (enabled) {
       store.setError(null);
+      // A NEW CAPTURE SESSION STARTS HERE, so no fallback notice from a previous one may speak for
+      // it (the founder's "as soon as I turn the mic on, I get this error banner"). SYNCHRONOUSLY,
+      // at the top of the arm — never inside the `.then()` below. Every write that records fallback
+      // evidence lands after an `await` (the `start_cloud_stream` round trip, or a Rust event), so
+      // bumping the counter on this synchronous edge is what keeps THIS session's evidence stamped
+      // with THIS session; deferring it past the await would orphan a real outage and mute the
+      // banner for good. That ordering is the trap bead `sparkle-40va0` records — one gesture
+      // dispatching two commands does not run in the order the source reads.
+      useDictationEngineStore.getState().noteSessionStart();
       // Optimistic: the real arm can be minutes of model download away, and a dead-looking button is
       // worse. KNOWN GAP: if that start aborts (a stop landed first), nothing retracts this — the
       // ring keeps claiming to listen until the else-branch below settles it on the next mute. A

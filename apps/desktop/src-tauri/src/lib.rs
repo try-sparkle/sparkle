@@ -892,6 +892,7 @@ pub fn run() {
             dictation::commands::stop_dictation,
             dictation::commands::start_cloud_stream,
             dictation::commands::stop_cloud_stream,
+            dictation::commands::preconnect_cloud_stream,
             dictation::commands::list_audio_inputs,
             dictation::commands::get_audio_input_settings,
             dictation::commands::set_audio_input,

@@ -310,6 +310,17 @@ export interface DictationEngineState {
   /** When `fallbackReason` was last OBSERVED (epoch ms), which is what makes it perishable. `null`
    *  means "no stamp" and is read as fresh, never as stale — see `shouldWarnLocalEngine`. */
   observedAt: number | null;
+  /** Which CAPTURE SESSION is running now — a monotonic counter bumped by `noteSessionStart`, i.e.
+   *  every time the microphone is armed. Not a clock and not comparable across windows; its only
+   *  job is to be different from the one before it. */
+  captureSession: number;
+  /** The capture session `fallbackReason` was observed IN. `null` means "no observation", and — as
+   *  with `observedAt` — is read as belonging to the present, never as belonging to the past: this
+   *  guard may only take a banner down when it can PROVE the evidence is someone else's. */
+  observedSession: number | null;
+  /** The microphone was armed — a new capture session begins, so nothing observed before now speaks
+   *  for it. See the implementation for why this is a counter rather than a clear. */
+  noteSessionStart: () => void;
   /** Hidden for THIS episode. Cleared by a cloud stream coming back, so a later, distinct outage
    *  re-arms the banner rather than being permanently silenced by one dismissal. */
   dismissed: boolean;
@@ -386,14 +397,47 @@ export const useDictationEngineStore = create<DictationEngineState>()(
   (set, get) => ({
     fallbackReason: null,
     observedAt: null,
+    captureSession: 0,
+    observedSession: null,
     dismissed: false,
     openRefusals: 0,
+    // ── A NOTICE BELONGS TO THE SESSION THAT PRODUCED IT (the founder's mic-on banner) ───────────
+    // Reported as: "As soon as I turn the mic on, I get this error banner… then as soon as I start
+    // speaking, it goes away." Both halves are the same defect, and the second half is the tell.
+    // The notice was perishable by WALL CLOCK alone, so arming the mic within
+    // `FALLBACK_NOTICE_TTL_MS` of a previous fallback painted a banner about an utterance that had
+    // already ended — before the new session had produced any evidence at all. It then vanished on
+    // the first `dictation://interim`, because the relay's first streamed word reaches
+    // `noteCloudLive`; that clear is the MITIGATION, and the gap it leaves is exactly mic-on until
+    // first speech. A banner cannot be evidence for a session it predates.
+    //
+    // A COUNTER, NOT A CLEAR, and that is the whole design. Clearing `fallbackReason` here would
+    // throw away a real observation to fix a PRESENTATION bug — the same split
+    // `fallbackReasonWarrantsBanner` makes, and for the same reason: the console diagnostic, the
+    // corroboration counter and the `exhausted`-preservation rules all read that reason, and a
+    // standing account condition is still true across a mic toggle. So the evidence stays, the
+    // stamp stays, and only the CLAIM on the present is withdrawn. If the condition really is
+    // standing, this session's own `start_cloud_stream` re-reports it within a round trip and it
+    // speaks again with a stamp it has earned.
+    //
+    // IT DOES NOT TOUCH `openRefusals`. That counter is evidence about the RELAY, not about this
+    // microphone; zeroing it on every arm would discard a genuine first `unreachable` and make a
+    // real outage take one extra hold to report — the same conflation `noteMicMissedHold` states
+    // one seam over.
+    //
+    // SCOPED TO THE ARM, NOT TO EACH HOLD, and on the reported path those are the same thing: push
+    // to talk RESTS at `setEnabled(false)` (`useMicActions.setOff`), so one hold is one capture
+    // session is one utterance. In Speak mode the mic stays armed across many utterances, and
+    // re-scoping per phase edge there would blink a standing outage off and on at the start of
+    // every hold — worse than the bug. The TTL still governs within a session.
+    noteSessionStart: () => set((s) => ({ captureSession: s.captureSession + 1 })),
     // Any evidence of a live cloud also clears the corroboration counter — consecutive means
     // consecutive, so a refusal an hour and a hundred good streams ago must not be half of a verdict.
     noteCloudLive: () =>
       set({
         fallbackReason: null,
         observedAt: null,
+        observedSession: null,
         dismissed: false,
         openRefusals: 0,
       }),
@@ -418,6 +462,10 @@ export const useDictationEngineStore = create<DictationEngineState>()(
       set((s) => ({
         fallbackReason: reason,
         observedAt: Date.now(),
+        // Observing stamps BOTH perishability axes together — see `noteSessionStart`. Wherever the
+        // clock is renewed the session marker is too, and wherever a reason is merely PRESERVED
+        // (below) neither moves.
+        observedSession: s.captureSession,
         dismissed: s.fallbackReason === reason ? s.dismissed : false,
         openRefusals: 0,
       })),
@@ -446,6 +494,7 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         return {
         fallbackReason: reason,
         observedAt: Date.now(),
+        observedSession: s.captureSession,
         dismissed: s.fallbackReason === reason ? s.dismissed : false,
         // openRefusals deliberately UNTOUCHED — see above.
         };
@@ -487,6 +536,7 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           ? {
               fallbackReason: null,
               observedAt: null,
+              observedSession: null,
               dismissed: false,
               // The episode is over, so its corroboration goes with it (roborev 59941) — otherwise
               // a retired notice leaves the counter armed and the next lone refusal speaks alone.
@@ -568,6 +618,10 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           // Sparkle credits… Refill" forever. Keeping the old stamp lets a stale `exhausted` expire
           // on its own TTL, after which this seam reports `unavailable` honestly.
           observedAt: preserved ? s.observedAt : Date.now(),
+          // The session marker moves with the clock, never apart from it. A preserved reason keeps
+          // the session that observed it for the same reason it keeps the stamp: this seam did not
+          // see that condition, so it cannot vouch for it in a session the condition never spoke in.
+          observedSession: preserved ? s.observedSession : s.captureSession,
           dismissed: s.fallbackReason === reason ? s.dismissed : false,
         };
       }),
@@ -638,7 +692,13 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // fix something that has already cleared, which is the remedy-that-cannot-help shape.
         if (!speaks)
           return s.fallbackReason === "unavailable" || s.fallbackReason === "too_many_streams"
-            ? { openRefusals: 0, fallbackReason: null, observedAt: null, dismissed: false }
+            ? {
+                openRefusals: 0,
+                fallbackReason: null,
+                observedAt: null,
+                observedSession: null,
+                dismissed: false,
+              }
             : { openRefusals: 0 };
         // Bound to a local first so the narrowing survives, for the same TypeScript reason
         // `noteCloudOpenRefused` states: an aliased condition written against a property of the
@@ -658,6 +718,9 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         return {
           fallbackReason: reason,
           observedAt: preserved ? s.observedAt : Date.now(),
+          // Same rule as the refusal seam: preserved keeps the observing session, a freshly stated
+          // `too-slow` belongs to the session whose utterance the handshake missed.
+          observedSession: preserved ? s.observedSession : s.captureSession,
           dismissed: s.fallbackReason === reason ? s.dismissed : false,
           openRefusals: 0,
         };
@@ -676,6 +739,57 @@ function isStale(state: DictationEngineState, now: number): boolean {
   );
 }
 
+/** Does this observation belong to a capture session that has already ENDED?
+ *
+ *  The twin of `isStale`, on the other perishability axis, and it carries the same burden of proof:
+ *  an observation with no session marker is treated as the present one, because we cannot prove it
+ *  is not. Only a marker that DISAGREES with the running session takes a banner down.
+ *
+ *  `!==` rather than `<`: the counter only ever increments (`noteSessionStart` is its sole writer),
+ *  so any disagreement means "not this session" — and an ordering comparison would quietly start
+ *  painting again if the counter were ever reset to 0 by a store rehydration. */
+function isFromEarlierSession(state: DictationEngineState): boolean {
+  return state.observedSession !== null && state.observedSession !== state.captureSession;
+}
+
+/** Is this reason one the app-shell bar should ever SPEAK for?
+ *
+ * ── WHY `too-slow` IS RECORDED BUT NEVER PAINTED (sparkle-v3990) ────────────────────────────────
+ * The bar exists so that a SILENT engine swap does not read as a broken feature — see this file's
+ * header and the component's. That rationale holds for every reason that names a STANDING
+ * condition with something the user can do about it: `unavailable`, `exhausted`, `signed_out`,
+ * `not_entitled`, `too_many_streams` (and `mic_missed_hold`, whose whole point is that words were
+ * LOST and a longer hold recovers them). `too-slow` is the opposite on every axis:
+ *
+ *   • PER-UTTERANCE. It is raised from `dictation://cloud-late`, which Rust emits from
+ *     `start_cloud_stream`'s parked/discard arms — i.e. once the handshake completes LATE, which by
+ *     construction is at or after the push-to-talk RELEASE. So it can only ever appear while no key
+ *     is held and nothing on screen connects it to anything the user just did.
+ *   • SELF-CORRECTING. The next utterance opens on the warm relay; nothing is standing.
+ *   • NO REMEDY, and the `WARNING` copy says so outright: "the handshake being slower than a short
+ *     utterance is ours to fix, not theirs". Even "try again" would be unsafe under its own trigger,
+ *     because the retry hits the same race.
+ *
+ * Rendered anyway, it became a persistent amber alert: raised with no key held, held for the full
+ * `FALLBACK_NOTICE_TTL_MS`, and re-stamped by every subsequent short hold — so under repeated short
+ * holds, the ordinary push-to-talk pattern, it was up essentially permanently. Pure alarm with no
+ * action, and it cost two false "the microphone is broken" reports from the founder.
+ *
+ * THE SUPPRESSION IS PRESENTATION ONLY, deliberately. The reason is still recorded, the stamp still
+ * taken, `noteCloudConnectedLate` still runs in full and the `[dictation] cloud open attempt`
+ * console diagnostic is untouched — knowing the handshake lost the race is exactly the signal the
+ * latency fix is verified against, so none of it may be thrown away. The one thing that changes is
+ * that it no longer shouts.
+ *
+ * AND IT LIVES HERE, NOT IN THE COMPONENT. `shouldWarnLocalEngine` is the single place the "should
+ * the bar be up?" rule lives — the component says so in as many words — so deriving this there
+ * would be a second copy to drift. */
+export function fallbackReasonWarrantsBanner(
+  reason: DictationFallbackReason,
+): boolean {
+  return reason !== "too-slow";
+}
+
 /** Should the banner be showing? Split out from the component so the rule is testable without a
  *  DOM — and so there is exactly ONE place that decides it.
  *
@@ -686,7 +800,11 @@ export function shouldWarnLocalEngine(
   now: number = Date.now(),
 ): boolean {
   return (
-    state.fallbackReason !== null && !state.dismissed && !isStale(state, now)
+    state.fallbackReason !== null &&
+    fallbackReasonWarrantsBanner(state.fallbackReason) &&
+    !state.dismissed &&
+    !isStale(state, now) &&
+    !isFromEarlierSession(state)
   );
 }
 

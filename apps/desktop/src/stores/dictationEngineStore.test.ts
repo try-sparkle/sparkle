@@ -41,6 +41,36 @@ describe("dictationEngineStore", () => {
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 
+  // ══ A NOTICE BELONGS TO THE SESSION THAT PRODUCED IT (the founder's mic-on banner) ═══════════
+  // Reported as: "As soon as I turn the mic on, I get this error banner… then as soon as I start
+  // speaking, it goes away." Both halves are the same defect. The notice was a single global
+  // {fallbackReason, observedAt} pair keyed only to WALL CLOCK, so turning the mic on within
+  // FALLBACK_NOTICE_TTL_MS of a previous fallback painted a banner describing an utterance that had
+  // ALREADY ENDED — before the new session had produced any evidence at all. It then vanished on the
+  // first `dictation://interim`, because the relay's first streamed word calls `noteCloudLive`;
+  // that clear is the MITIGATION, and the gap it leaves is precisely mic-on until first speech.
+  //
+  // `unavailable`, NOT `too-slow`, and that choice is what keeps these tests honest: `too-slow` is
+  // suppressed outright by `fallbackReasonWarrantsBanner`, so a session-scoping test written with it
+  // would pass against the unfixed store and prove nothing.
+  it("does not inherit the PREVIOUS session's fallback notice when the mic is armed again", () => {
+    read().noteCloudUnavailable("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+    read().noteSessionStart();
+    // The evidence is still RECORDED — suppression here is presentation-only, the same split
+    // `fallbackReasonWarrantsBanner` makes. What must not happen is speaking about a dead utterance.
+    expect(read().fallbackReason).toBe("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  // THE PAIRED CASE, per AGENTS.md: one test proving absence is ambiguous — it passes just as well
+  // against a `shouldWarnLocalEngine` hard-wired to `false`, which would mute every real outage.
+  it("still speaks for evidence observed IN the current session", () => {
+    read().noteSessionStart();
+    read().noteCloudUnavailable("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
   it("retires the warning when a cloud stream comes back", () => {
     read().noteCloudUnavailable("unavailable");
     read().noteCloudLive();
@@ -318,8 +348,10 @@ describe("a relay that CONNECTED is never reported as unreachable", () => {
 
   it("calls a late-but-successful connection 'too-slow', not 'unavailable'", () => {
     read().noteCloudConnectedLate(true);
+    // The REASON is still recorded — that is the diagnostic signal, and the latency fix needs it.
+    // What changed is that it no longer speaks in the app shell; see the describe block at the end
+    // of this file for why, and for the assertion that pins it.
     expect(read().fallbackReason).toBe("too-slow");
-    expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 
   it("does NOT downgrade a standing out-of-credits — reachability says nothing about credits", () => {
@@ -458,15 +490,20 @@ describe("a relay that CONNECTED is never reported as unreachable", () => {
   });
 
   it("re-arms a dismissal when the reason changes from unavailable to too-slow", () => {
-    // The store's existing rule across the NEW boundary: these are different things to tell the
-    // user, so learning it was a timing fault must be able to speak even after the (wrong)
-    // connectivity claim was waved away.
+    // The store's existing rule across the NEW boundary: these are different things to RECORD, so
+    // the dismissal of the (wrong) connectivity claim must not carry over onto the timing fault —
+    // otherwise a later reason that DOES speak could inherit a wave-away it never earned.
+    //
+    // The banner itself stays down either way now, because `too-slow` never paints (see the last
+    // describe in this file). `dismissed` is asserted directly for that reason: with the reason
+    // suppressed, `shouldWarnLocalEngine` is false whether the flag re-armed or not, so it can no
+    // longer tell the two apart.
     read().noteCloudUnavailable("unavailable");
     read().dismiss();
     expect(shouldWarnLocalEngine(read())).toBe(false);
     read().noteCloudConnectedLate(true);
     expect(read().fallbackReason).toBe("too-slow");
-    expect(shouldWarnLocalEngine(read())).toBe(true);
+    expect(read().dismissed).toBe(false);
   });
 });
 
@@ -787,5 +824,73 @@ describe("a mic failure is not a relay verdict (roborev 61695)", () => {
     useDictationEngineStore.setState({ dismissed: true });
     useDictationEngineStore.getState().noteMicMissedHold("capture");
     expect(useDictationEngineStore.getState().dismissed).toBe(false);
+  });
+});
+
+// ══ A PER-UTTERANCE FALLBACK IS NOT AN ALARM (sparkle-v3990) ═══════════════════════════════════
+// The founder reported the microphone as BROKEN twice on the strength of the `too-slow` bar. Two
+// facts about it compound into that report, and neither is a spurious fire — the fallback is real:
+//
+//   1. `too-slow` is raised from `dictation://cloud-late`, which Rust emits from the parked/discard
+//      arms of `start_cloud_stream` — i.e. once the handshake completes LATE, which by construction
+//      is at or after the push-to-talk RELEASE. So it can only ever be reported while no key is
+//      held, with nothing on screen to connect it to.
+//   2. It then renders as the amber app-shell alert for the full `FALLBACK_NOTICE_TTL_MS`, and each
+//      further short hold re-stamps `observedAt` and pushes that deadline out. Under the founder's
+//      normal usage — repeated short holds — the alarm is up essentially permanently.
+//
+// So the assertions below are about the ALARM, not the record: the reason is still stored (the
+// diagnostic value of knowing the handshake lost the race is what the latency fix is verified
+// against), it simply never reaches the bar.
+describe("a per-utterance late connect never raises the app-shell alarm", () => {
+  it("records 'too-slow' but does NOT warn — it is self-correcting and has no remedy", () => {
+    read().noteCloudConnectedLate(true);
+    // The signal survives in full…
+    expect(read().fallbackReason).toBe("too-slow");
+    expect(read().observedAt).toEqual(expect.any(Number));
+    // …and the alarm does not fire.
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  // THE PAIR THAT STOPS THE ABOVE PASSING AGAINST A BLANKET "NEVER WARN". Every reason that names a
+  // STANDING condition with a remedy the user can act on still speaks, through the same predicate.
+  it.each(["unavailable", "exhausted", "signed_out", "not_entitled", "too_many_streams"] as const)(
+    "still warns for '%s' — a standing condition the user can act on",
+    (reason) => {
+      read().noteCloudUnavailable(reason);
+      expect(shouldWarnLocalEngine(read())).toBe(true);
+    },
+  );
+
+  it("does not swallow a LATER standing reason — the suppression is per-reason, not a latch", () => {
+    read().noteCloudConnectedLate(true);
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+
+    read().noteCloudUnavailable("exhausted");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  it("stays silent across the founder's pattern — a run of short holds, minutes apart", () => {
+    // Each late connect re-stamps `observedAt`, so under the old rule the deadline was pushed out
+    // again and again and the amber bar never came down. The gap between holds is a QUARTER of the
+    // TTL deliberately: every observation stays FRESH throughout, so the silence below cannot be the
+    // staleness guard doing the work — `isStale` is false at every one of these assertions.
+    vi.useFakeTimers();
+    for (let i = 0; i < 6; i += 1) {
+      read().noteCloudConnectedLate(true);
+      expect(shouldWarnLocalEngine(read())).toBe(false);
+      vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS / 4);
+    }
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  it("takes a standing 'unavailable' DOWN when a handshake lands late", () => {
+    // The reverse direction, and the one that would hide a regression to "warn on too-slow": the
+    // late connect replaces the connectivity claim it disproves, so the bar must go from up to down.
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i += 1) read().noteCloudOpenRefused();
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+
+    read().noteCloudConnectedLate(true);
+    expect(shouldWarnLocalEngine(read())).toBe(false);
   });
 });

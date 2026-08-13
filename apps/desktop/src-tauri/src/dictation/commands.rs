@@ -1,4 +1,4 @@
-//! The 8 `#[tauri::command]` entry points for dictation.
+//! The 9 `#[tauri::command]` entry points for dictation.
 //!
 //! Split out of `dictation.rs` because this cluster is a REVERSE LEAF: nothing inside `dictation`
 //! calls these, only `lib.rs`'s `generate_handler!` does. That makes it the largest extraction that
@@ -29,8 +29,8 @@
 //!
 //! So a green build is conclusive for path RESOLUTION only, never for the registration SET, which
 //! nothing pins today. Partial cover for renames exists: `cmd_timing.rs`'s `GUARDED` table names
-//! `list_audio_inputs` in this file and hard-panics if it cannot find it — 1 of the 8. Keep the 8
-//! names here and the 8 paths in `lib.rs` in step by hand.
+//! `list_audio_inputs` in this file and hard-panics if it cannot find it — 1 of the 9. Keep the 9
+//! names here and the 9 paths in `lib.rs` in step by hand.
 
 // Imported from their defining crates rather than re-borrowed through `super::*`, so this module's
 // dependencies stay legible and the parent's `use` block can change without silently breaking it.
@@ -45,14 +45,14 @@ use crate::transcribe::Transcriber;
 use super::events::{emit_partial, reset_interim_log_sampling};
 use super::{
     begin_start_decision, choose_engine, cloud_reuse, emit_late_report, install_live_stream,
-    late_report_for, load_model, note_fresh_arm, park_or_take_on_stop, park_raced_stream,
-    capture_missed_payload, park_target_active, raced_stream_disposition, set_arm_origin,
-    should_install_cloud, MissedStage,
-    start_after_load, stop_is_noop,
+    capture_missed_payload, late_report_for, load_model, note_fresh_arm, park_or_take_on_stop,
+    park_preconnected_stream, park_raced_stream, park_target_active, preconnect_landing,
+    preconnect_plan, raced_stream_disposition, set_arm_origin, should_install_cloud,
+    start_after_load, stop_is_noop, take_speculative_stream, MissedStage,
 };
 use super::{
     BeginStart, CloudReuse, CloudStreamOutcome, DictationState, Engine, Installed, LateReport,
-    RacedStream, StartAfterLoad,
+    PreconnectLanding, PreconnectPlan, RacedStream, StartAfterLoad,
 };
 
 /// Arm the mic, downloading + loading the on-device model first if this is a fresh install.
@@ -825,6 +825,256 @@ pub async fn start_cloud_stream(
             Ok(outcome)
         }
     }
+}
+
+/// WHAT A `preconnect_cloud_stream` CALL DID — its own enum, deliberately NOT `CloudStreamOutcome`.
+///
+/// The two answer different questions and only one of them is about billing. Every
+/// `CloudStreamOutcome` variant flows into the frontend's `classifyCloudOutcome`, which decides
+/// whether to start metering, whether to retire or raise the on-device fallback notice, and whether
+/// to charge a refusal to the corroboration counter. A pre-connect must reach NONE of that: it
+/// happens before the user has pressed anything, so there is no utterance to meter, no engine
+/// decision to report, and a refusal it hits says nothing about the hold that has not happened yet.
+///
+/// Sharing the enum would have made that a matter of the frontend remembering to filter. Keeping
+/// them apart makes it a matter of types: there is no value this command can return that the
+/// metering seam knows how to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreconnectOutcome {
+    /// A socket was opened and PARKED. The next hold will reach `cloud_reuse`'s `Resume` arm and pay
+    /// no handshake — the entire point.
+    Connected,
+    /// A socket we had opened on spec, and nobody ever used, was closed (the tray moved, the window
+    /// blurred, or the entitlement went away).
+    Released,
+    /// Nothing to do: a usable socket is already banked, the user is mid-utterance, or there was
+    /// nothing speculative to give back.
+    Idle,
+    /// Another pre-connect is already handshaking. Stand down rather than open a second socket.
+    Busy,
+    /// The handshake completed but nothing wanted it by then — a hold started and claimed the slot,
+    /// or the window blurred. Silenced and closed.
+    Raced,
+    /// No Sparkle bearer on this machine — we never contacted the relay.
+    SignedOut,
+    /// The relay refused (401/402/403/429/503) or could not be reached. Named coarsely ON PURPOSE:
+    /// the specific causes are the hold's story to tell, through `start_cloud_stream`'s
+    /// `CloudStreamOutcome`, at a moment when the user is actually trying to dictate. A pre-connect
+    /// reporting them would put a banner in front of someone who has not asked for anything.
+    Unavailable,
+}
+
+/// PRE-CONNECT the relay socket, so a SHORT push-to-talk press gets live interims from its first
+/// syllable instead of none at all.
+///
+/// See the `preconnect_plan` block in `dictation.rs` for the measured defect and the design. In one
+/// line: the socket is opened on the passive→active phase EDGE, i.e. on the keydown, and the
+/// handshake (~490 ms) outlasts the founder's measured holds (76-567 ms), so it lands after the key
+/// comes up and the utterance falls back to an engine that has no interim results at all. This is
+/// the same open, moved earlier — to the moment push to talk becomes the armed tray position in a
+/// focused window.
+///
+/// `want` is the frontend's gate (`voice/cloudPreconnect`), which carries the tray position, the
+/// rest-state check and the two live AI-feature prefs `openCloud` reads. It is re-invoked whenever
+/// that verdict CHANGES, in both directions, so a `false` is a release rather than a no-op.
+///
+/// ── FOUR THINGS THIS DOES NOT DO, EACH FOR A REASON ─────────────────────────────────────────────
+///
+/// **It does not meter, and cannot.** The socket is banked by `park_preconnected_stream`, which is
+/// `park_raced_stream` plus a mark — `cloud_active` is never passed to it, let alone set. Parked is
+/// not routing: the capture callback reads that flag to decide where frames go, and the frontend
+/// reads the command's answer to decide whether to bill. This command's answers are not in the
+/// vocabulary the metering seam speaks (see `PreconnectOutcome`), and the one place a socket starts
+/// billing — `start_cloud_stream` answering `Opened`/`Resumed` — is reached only by a real hold.
+///
+/// **It does not bump `cloud_epoch`.** That token means "is MY install attempt still current", and
+/// this command never installs. Bumping it would invalidate a concurrent `start_cloud_stream` — a
+/// real hold, in flight, which is the one thing here that must always win.
+///
+/// **It does not emit `dictation://cloud-late`.** That event means "we connected too late for the
+/// utterance you just spoke", and there is no utterance here. Emitting it would put the fallback
+/// banner in front of a user who has not touched the microphone.
+///
+/// **It does not fire when signed out, unentitled, or out of credits.** `choose_engine` below
+/// refuses the signed-out case without contacting the relay, and the relay's own refusal ends the
+/// attempt. Beyond being wasted work, a speculative socket occupies one of the account's concurrent
+/// relay stream slots, and a burst of them can produce the `too_many_streams` refusal in another
+/// window that is genuinely dictating.
+///
+/// MUST stay `async fn`, for the same reason `start_cloud_stream` does: a sync `#[tauri::command]`
+/// runs inline on the IPC/event-loop thread, and this body contains the same blocking TLS+WS
+/// handshake. Freezing the webview to save a future keypress would be a poor trade.
+#[tauri::command]
+pub async fn preconnect_cloud_stream(
+    app: AppHandle,
+    state: State<'_, DictationState>,
+    // The frontend's pre-arm verdict. True = push to talk is armed and at rest in a focused window
+    // with the prefs on; false = that state has ended and anything opened on spec should be released.
+    want: bool,
+    // The project the NEXT utterance would be attributed to, so the banked socket is one
+    // `cloud_reuse` will actually accept (it compares strictly, in both directions). A project
+    // switch between the pre-connect and the hold falls back to a fresh handshake, exactly as it
+    // does between two ordinary utterances.
+    project: Option<String>,
+) -> Result<PreconnectOutcome, ()> {
+    // ── DECIDE AND CLAIM, UNDER ONE LOCK ────────────────────────────────────────────────────────
+    // Everything the decision reads and everything it does to the slot happens in this critical
+    // section, so it is atomic against `start_cloud_stream`'s reuse block and against a stop.
+    //
+    // A NAMED STEP RATHER THAN AN `Option`, and it is not a style choice. The first version carried
+    // the release out as `Option<SilencedSession>` and then re-derived "was this a release?" from
+    // `!want` below. That is a different question: `Release` fires on `want && !focused` too, so a
+    // release whose take came back empty fell straight through into the HANDSHAKE without ever
+    // having claimed `preconnect_in_flight` — and the `!want` arm it was meant to hit would have
+    // cleared a claim belonging to a concurrent pre-connect. Two bugs from one inferred fact.
+    enum Step {
+        Release(Option<crate::cloud::SilencedSession>),
+        Connect,
+    }
+    let step = {
+        let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        let (installed, speculative) = {
+            let cloud = sess.cloud.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                cloud.as_ref().map(|s| Installed {
+                    alive: s.is_alive(),
+                    project_matches: s.is_for_project(project.as_deref()),
+                }),
+                cloud.as_ref().is_some_and(DeepgramSession::is_speculative),
+            )
+        };
+        let reuse = cloud_reuse(sess.cloud_active.load(Ordering::Relaxed), installed);
+        let since_last = sess.last_preconnect_at.map(|t| t.elapsed());
+        match preconnect_plan(want, sess.focused, reuse, speculative, since_last) {
+            PreconnectPlan::Idle => return Ok(PreconnectOutcome::Idle),
+            PreconnectPlan::Release => {
+                // Taken here, under the session lock, and finished below once it is released — the
+                // same take-then-close-off-thread shape every other teardown here uses.
+                Step::Release(take_speculative_stream(&sess.cloud, &sess.cloud_tx))
+            }
+            PreconnectPlan::Connect => {
+                if sess.preconnect_in_flight {
+                    return Ok(PreconnectOutcome::Busy);
+                }
+                sess.preconnect_in_flight = true;
+                // Stamped HERE — on the attempt, under the same lock that claimed it — so the cost
+                // floor counts handshakes we committed to rather than handshakes that succeeded. A
+                // relay that refuses is precisely the case where retrying every focus flicker would
+                // be cheapest to fall into and least likely to help.
+                sess.last_preconnect_at = Some(std::time::Instant::now());
+                Step::Connect
+            }
+        }
+    };
+    match step {
+        // A release is the whole job — the claim above was never taken, so there is nothing to clear.
+        Step::Release(taken) => {
+            let Some(s) = taken else {
+                // Unreachable by construction — the plan and the take run in the SAME critical
+                // section, so nothing can empty the slot between them — but stated rather than
+                // assumed, and stated as an EXIT. Falling through here is what would send a release
+                // into the handshake below.
+                return Ok(PreconnectOutcome::Idle);
+            };
+            tracing::info!(
+                target: "dictation",
+                "releasing the pre-connected relay socket: the pre-arm state ended before it was used"
+            );
+            // Bounded (~2 s) but blocking, and already silenced under the lock.
+            tauri::async_runtime::spawn_blocking(move || s.finish());
+            return Ok(PreconnectOutcome::Released);
+        }
+        Step::Connect => {}
+    }
+
+    // ── THE HANDSHAKE ───────────────────────────────────────────────────────────────────────────
+    let token = crate::auth::bearer_token();
+    if choose_engine(true, token.is_some(), true) != Engine::Cloud {
+        clear_preconnect_claim(&state);
+        return Ok(PreconnectOutcome::SignedOut);
+    }
+    let token = token.expect("choose_engine returned Cloud only when a bearer is present");
+    let base_url = crate::auth::base_url();
+    let t_connect = std::time::Instant::now();
+    let started = match tauri::async_runtime::spawn_blocking(move || {
+        DeepgramSession::start(app, base_url, token, project)
+    })
+    .await
+    {
+        Ok(res) => res,
+        Err(join_err) => {
+            tracing::info!(target: "dictation", error = %join_err, "cloud pre-connect task failed");
+            clear_preconnect_claim(&state);
+            return Ok(PreconnectOutcome::Unavailable);
+        }
+    };
+    let session = match started {
+        Ok(s) => s,
+        Err(e) => {
+            // Logged by name for diagnosis, reported coarsely — see `PreconnectOutcome::Unavailable`
+            // for why a speculative attempt must not name a cause at the user.
+            tracing::info!(
+                target: "dictation",
+                error = %e,
+                refusal = e.refusal.as_str(),
+                "cloud pre-connect refused; the next hold will try for itself"
+            );
+            clear_preconnect_claim(&state);
+            return Ok(PreconnectOutcome::Unavailable);
+        }
+    };
+
+    // ── LAND IT ─────────────────────────────────────────────────────────────────────────────────
+    // Re-decide under the lock: the user may have started a hold, or tabbed away, during the
+    // hundreds of ms we spent connecting. Both terms are read from the CURRENT session — a
+    // pre-connect banks into `sess.*` for the same reason `RacedStream::ParkCurrent` does.
+    let discard = {
+        let mut sess = state.0.lock().unwrap_or_else(|p| p.into_inner());
+        sess.preconnect_in_flight = false;
+        let slot_empty = sess.cloud.lock().unwrap_or_else(|p| p.into_inner()).is_none();
+        let already_active = sess.cloud_active.load(Ordering::Relaxed);
+        match preconnect_landing(sess.focused, slot_empty, already_active) {
+            PreconnectLanding::Park => {
+                park_preconnected_stream(&sess.cloud, &sess.cloud_tx, session);
+                None
+            }
+            PreconnectLanding::Discard => Some(session.silence_now()),
+        }
+    };
+    match discard {
+        Some(s) => {
+            tracing::info!(
+                target: "dictation",
+                "discarding a pre-connected relay socket: a hold claimed the slot, or the window \
+                 blurred, while it was connecting"
+            );
+            tauri::async_runtime::spawn_blocking(move || s.finish());
+            Ok(PreconnectOutcome::Raced)
+        }
+        None => {
+            // THE LINE THAT SHOWS THE FIX WORKING. Its companion is `log_socket_live`'s `resumed`
+            // path on the hold that follows: a `resumed` with no `opened` before it in the same
+            // window is a hold that paid no handshake because this ran first.
+            tracing::info!(
+                target: "dictation",
+                connect_ms = t_connect.elapsed().as_millis() as u64,
+                "pre-connected the relay socket and parked it; the next hold resumes with no handshake"
+            );
+            Ok(PreconnectOutcome::Connected)
+        }
+    }
+}
+
+/// Give back the `preconnect_in_flight` claim on a path that took it and then bailed.
+///
+/// Its own function because EVERY early exit after the claim owes this, and an exit that forgets
+/// wedges the feature permanently: the flag is never cleared by anything else, so one leaked claim
+/// means every later pre-connect answers `Busy` for the life of the process and the founder silently
+/// goes back to paying a handshake per hold. The landing path clears it inline instead, inside the
+/// same critical section that parks — one lock, not two.
+fn clear_preconnect_claim(state: &State<'_, DictationState>) {
+    state.0.lock().unwrap_or_else(|p| p.into_inner()).preconnect_in_flight = false;
 }
 
 /// Close the Deepgram cloud stream. The frontend calls this when the dictation phase leaves ACTIVE
