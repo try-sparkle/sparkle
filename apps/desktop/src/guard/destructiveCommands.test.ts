@@ -19,7 +19,12 @@ const fixture = JSON.parse(
   readFileSync(join(here, "..", "..", "shared", "destructive-commands.json"), "utf8"),
 ) as {
   denyRules: string[];
-  mustBlock: { command: string; why: string }[];
+  mustBlock: { command: string; why: string; guardOnly?: boolean }[];
+  // Multi-line attack shapes, in their own list because a command carrying a newline is something
+  // the prefix-matched deny layer can never see — and because every entry here was a bypass whose
+  // SINGLE-LINE sibling passed while missing it entirely (a here-string swallowing the next line,
+  // a quoted `<<EOF` opening a body). A one-line corpus cannot pin a multi-line defect.
+  mustBlockMultiline: { command: string; why: string }[];
   mustAllow: { command: string; why: string }[];
 };
 
@@ -27,6 +32,11 @@ describe("blocksDestructiveCommand — the mustBlock corpus", () => {
   it("the fixture actually has entries (a silently empty corpus would make every case vacuous)", () => {
     expect(fixture.mustBlock.length).toBeGreaterThan(20);
     expect(fixture.mustAllow.length).toBeGreaterThan(20);
+  });
+
+  it.each(fixture.mustBlockMultiline)("blocks a MULTI-LINE command — $why", ({ command }) => {
+    const verdict = blocksDestructiveCommand(command);
+    expect(verdict, `expected a refusal for:\n${command}`).not.toBeNull();
   });
 
   it.each(fixture.mustBlock)("blocks `$command` — $why", ({ command }) => {

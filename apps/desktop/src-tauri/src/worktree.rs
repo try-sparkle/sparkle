@@ -6364,8 +6364,18 @@ const SPARKLE_DENY_RULES: &[&str] = &[
     // literal string prefix, so the enumeration has to spell out every form of the SAME command:
     //   * `diskutil [quiet] verb …` — a literal `quiet` may sit before the verb.
     //   * verbs are case-insensitive (`diskutil ERASEDISK` runs), prefixes are not.
-    // The JS guard normalises both instead of enumerating; this list cannot, so it enumerates. The
-    // fixture pins each form with a `mustBlock` case so a missing spelling fails a test.
+    // The JS guard normalises both instead of enumerating; this list cannot, so it enumerates.
+    //
+    // BE HONEST ABOUT WHAT THIS LAYER COVERS. An earlier version of this comment claimed the
+    // fixture "pins each form with a `mustBlock` case so a missing spelling fails a test" — it did
+    // not. `mustBlock` is driven against the JS GUARD; the Rust side only asserted string equality
+    // with the fixture, so the deny layer was unverified per-command and was in fact missing
+    // spellings the guard covered by lowercasing. A deny rule is a literal prefix on the whole
+    // command, so it can only ever decide a SIMPLE invocation — it cannot see a compound, a nested
+    // shell, or an argument-level judgement like `rm -rf /` versus `rm -rf node_modules`. That
+    // split is why there are two layers at all, and `merge_permission_posture` now refuses to write
+    // the bypass unless the guard is installed, so the guard is present whenever this list matters.
+    // `every_deny_rule_is_exercised_by_the_fixture` keeps the rules honest from the other side.
     "Bash(diskutil eraseDisk:*)",
     "Bash(diskutil eraseVolume:*)",
     "Bash(diskutil partitionDisk:*)",
@@ -11234,6 +11244,87 @@ mod tests {
             SPARKLE_DENY_RULES.to_vec(),
             expected,
             "SPARKLE_DENY_RULES drifted from apps/desktop/shared/destructive-commands.json"
+        );
+    }
+
+    /// Every deny rule must be exercised by a `mustBlock` command, and every `mustBlock` command
+    /// that STARTS WITH a denied binary must match one of that binary's rules.
+    ///
+    /// This is the pin the `SPARKLE_DENY_RULES` comment used to claim and did not have. It is
+    /// deliberately not "every mustBlock command is denied": a deny rule is a literal prefix on the
+    /// whole command, so it structurally cannot decide `rm -rf /` versus `rm -rf node_modules`, and
+    /// asserting otherwise would force rules that deny ordinary work. What it CAN own is a binary
+    /// or subcommand it claims outright — and a claimed binary with a missing SPELLING is a real
+    /// hole, which is exactly what was there (`diskutil quiet erasedisk`, `diskutil apfs
+    /// erasevolume`), invisible because the guard lowercases and the fixture only drove the guard.
+    ///
+    /// Direction two — no DEAD rules — matters just as much: a rule nothing exercises is a rule
+    /// nobody has checked does what its author thought.
+    #[test]
+    fn every_deny_rule_is_exercised_by_the_fixture() {
+        let fixture = destructive_commands_fixture();
+        let prefixes: Vec<String> = SPARKLE_DENY_RULES
+            .iter()
+            .filter_map(|r| {
+                r.strip_prefix("Bash(")
+                    .and_then(|r| r.strip_suffix(')'))
+                    .map(|r| r.trim_end_matches(":*").to_string())
+            })
+            .collect();
+        let entries = fixture["mustBlock"].as_array().expect("mustBlock array");
+        let commands: Vec<&str> = entries
+            .iter()
+            .map(|e| e["command"].as_str().expect("command is a string"))
+            .collect();
+        // `"guardOnly": true` is an EXPLICIT decision that the deny layer cannot express this case
+        // (today: diskutil's unbounded verb-case variants) and the guard owns it. Opting out has to
+        // be written down in the fixture and read at review time — an unexplained skip in the test
+        // is how the previous silent gap survived.
+        let guard_only: std::collections::BTreeSet<&str> = entries
+            .iter()
+            .filter(|e| e["guardOnly"].as_bool().unwrap_or(false))
+            .map(|e| e["command"].as_str().unwrap())
+            .collect();
+
+        // (1) A denied BINARY owns every simple mustBlock command that starts with it.
+        let denied_binaries: std::collections::BTreeSet<&str> =
+            prefixes.iter().map(|p| p.split(' ').next().unwrap()).collect();
+        let mut uncovered = Vec::new();
+        for cmd in &commands {
+            let bin = cmd.split(' ').next().unwrap_or("");
+            if !denied_binaries.contains(bin) || guard_only.contains(cmd) {
+                continue; // argument-level, unclaimed, or explicitly guard-owned — by design
+            }
+            if !prefixes.iter().any(|p| cmd.starts_with(p.as_str())) {
+                uncovered.push(*cmd);
+            }
+        }
+        assert!(
+            uncovered.is_empty(),
+            "the deny list CLAIMS these binaries but matches none of these spellings, so only the \
+             guard stops them — add the spelling to SPARKLE_DENY_RULES: {uncovered:#?}"
+        );
+
+        // (2) No dead rules — checked at the level of the ACT a rule denies, not its spelling.
+        //
+        // Demanding a corpus case per spelling would demand ~26 near-identical entries whose only
+        // difference is capitalisation or a `quiet` prefix, which is bloat that teaches a reader
+        // nothing. What must be exercised is the VERB: every destructive act the list claims needs
+        // one real command behind it. Normalising both sides (drop `quiet`, lowercase) asks exactly
+        // that question.
+        let normalize = |s: &str| s.to_lowercase().replace("diskutil quiet ", "diskutil ");
+        let normalized_commands: Vec<String> = commands.iter().map(|c| normalize(c)).collect();
+        let unexercised: Vec<&String> = prefixes
+            .iter()
+            .filter(|p| {
+                let np = normalize(p);
+                !normalized_commands.iter().any(|c| c.starts_with(np.as_str()))
+            })
+            .collect();
+        assert!(
+            unexercised.is_empty(),
+            "these deny rules deny an act NO mustBlock command exercises, so nothing checks they do \
+             what their author intended — add a case or drop the rule: {unexercised:#?}"
         );
     }
 
