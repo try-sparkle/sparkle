@@ -555,9 +555,16 @@ fn install_git_blocking(_app: &AppHandle) -> Result<GitInstallResult, String> {
 // a launchd LaunchAgent so the daemon survives logout/reboot. macOS + Apple Silicon only at v0.1 —
 // no Intel/darwin-x64 asset is published, so an Intel Mac gets a clean surfaced error, not a panic.
 //
-// The daemon's `claude` child INHERITS the user's `claude login` (~/.claude): the plist carries a
-// plain PATH and NO ANTHROPIC_API_KEY / CLAUDE_CODE_SIMPLE / shim dir — that's the whole point, so
-// an end-user who authenticated via `claude login` is used as-is.
+// The daemon's `claude` child authenticates as a SUBSCRIPTION login, never an API key: the plist
+// carries NO ANTHROPIC_API_KEY and NO CLAUDE_CODE_SIMPLE, so an end-user who authenticated via
+// `claude login` is used as-is.
+//
+// WHICH login it uses is now chosen per review job by Sparkle's account-selecting shim, first on
+// the daemon PATH (see `crate::roborev_account`). Before that shim existed the child always
+// inherited `$HOME/.claude` — one account, forever — so a wall on that single account killed every
+// review: 1,020 of 3,013 failed jobs in ~/.roborev/reviews.db are the quota/credential family, none
+// ever recovered. The shim only ever sets CLAUDE_CONFIG_DIR, and falls open to the pre-shim
+// behavior if anything about its candidate list is wrong.
 
 /// The label for the roborev launchd LaunchAgent (also the plist basename stem).
 const ROBOREV_DAEMON_LABEL: &str = "co.plow.roborev-daemon";
@@ -593,14 +600,27 @@ fn xml_escape(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-/// The PATH the roborev daemon runs with: a NORMAL user PATH with NO shim prefix and NO
-/// ANTHROPIC_API_KEY, so roborev's `claude` child resolves the user's own login-authenticated
-/// `claude`. SINGLE SOURCE OF TRUTH — the daemon plist and the auth self-test
-/// ([`roborev_auth_selftest`]) both build their environment from this, so the probe can never drift
-/// from the environment it exists to test. Pure — unit-tested.
+/// The PATH the roborev daemon runs with: Sparkle's account-selecting `claude` shim first, then a
+/// NORMAL user PATH. NO `ANTHROPIC_API_KEY` and NO API-key shim — roborev's `claude` child still
+/// authenticates as a SUBSCRIPTION login; the shim only chooses WHICH of the user's registered
+/// Claude accounts that is (see [`crate::roborev_account`]).
+///
+/// The shim prefix is what makes review rotation possible at all: roborev exposes no flag, env var
+/// or config key for account selection, so intercepting its `claude` lookup is the only hook. If
+/// the shim is not installed the directory simply does not exist and PATH resolution falls through
+/// to the real `claude` — the pre-shim behavior.
+///
+/// This is DISTINCT from `~/.roborev-shim`, the retired installer shim that injected
+/// `ANTHROPIC_API_KEY` + `CLAUDE_CODE_SIMPLE=1` and killed every review against an unfunded key.
+/// That directory remains banned from this PATH by name, and a unit test still pins the ban.
+///
+/// SINGLE SOURCE OF TRUTH — the daemon plist and the auth self-test ([`roborev_auth_selftest`])
+/// both build their environment from this, so the probe can never drift from the environment it
+/// exists to test. Pure — unit-tested.
 pub fn daemon_path_env(home: &Path) -> String {
     format!(
-        "{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        "{}:{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+        crate::roborev_account::shim_dir(home).to_string_lossy(),
         home.to_string_lossy()
     )
 }
@@ -753,6 +773,33 @@ fn install_roborev_blocking(app: &AppHandle) -> Result<String, String> {
         resolved
     };
 
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| "no HOME directory".to_string())?;
+
+    // Install/refresh the account-selecting `claude` shim BEFORE any early return below, so an
+    // already-running daemon still picks it up. Best-effort: a shim that fails to install leaves
+    // roborev exactly as it was (the real `claude`, default account), which is the pre-rotation
+    // behavior — never a reason to fail the whole install.
+    match preflight::cached_claude_path() {
+        Some(real_claude) => match crate::roborev_account::install_shim(&home, &real_claude) {
+            Ok(()) => emit(app, "roborev", "Installed the Claude account-selecting shim."),
+            Err(e) => emit(app, "roborev", format!("Could not install the account shim ({e}); reviews will use the default account.")),
+        },
+        None => emit(app, "roborev", "No `claude` on PATH yet; skipping the account shim."),
+    }
+    // Publish an initial candidate list so the very first review after install already rotates.
+    // Without this the shim would fail open to the default account until the first observed wall
+    // triggered a republish — i.e. rotation would only start working after it was first needed.
+    if let Ok(app_data) = crate::worktree::app_data_dir_pub(app) {
+        crate::accounts::republish_roborev_candidates(&app_data, &home);
+    }
+
+    let plist_path = home
+        .join("Library/LaunchAgents")
+        .join(format!("{ROBOREV_DAEMON_LABEL}.plist"));
+    let desired_plist = roborev_daemon_plist(&roborev_path, &home);
+
     // Don't tear down a healthy, already-running daemon on every app launch (the startup ensure
     // calls this): RunAtLoad/KeepAlive already persist the service across reboots. If we didn't just
     // install a new binary and the service is already loaded, leave it — and any in-flight review —
@@ -760,8 +807,14 @@ fn install_roborev_blocking(app: &AppHandle) -> Result<String, String> {
     // ONLY ever bootstrapped by this function, which always runs that configure step BEFORE the
     // bootstrap — so a loaded daemon implies the agent was already configured. We only (re)configure
     // + (re)bootstrap on a fresh install or a not-currently-loaded service.
+    //
+    // EXCEPT when the on-disk plist no longer matches what we generate. The daemon's environment is
+    // fixed at bootstrap, so a running daemon keeps the OLD PATH until it is reloaded — which is
+    // exactly what happens when the shim directory is added to `daemon_path_env`. Without this
+    // check, rotation would only reach machines that happened to reinstall roborev.
     let uid = current_uid()?;
-    if !freshly_installed && roborev_daemon_loaded(&uid) {
+    let plist_current = std::fs::read_to_string(&plist_path).unwrap_or_default();
+    if !freshly_installed && roborev_daemon_loaded(&uid) && plist_current == desired_plist {
         emit(app, "roborev", "roborev daemon already running.");
         return Ok(roborev_path);
     }
@@ -775,18 +828,12 @@ fn install_roborev_blocking(app: &AppHandle) -> Result<String, String> {
         .map_err(|e| format!("`roborev config set default_agent` failed: {e}"))?;
 
     // (5) Write + (re)load the launchd daemon so reviews run in the background across reboots.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| "no HOME directory".to_string())?;
-    let plist_path = home
-        .join("Library/LaunchAgents")
-        .join(format!("{ROBOREV_DAEMON_LABEL}.plist"));
     if let Some(parent) = plist_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {parent:?}: {e}"))?;
     }
     emit(app, "roborev", "Writing the roborev daemon LaunchAgent…");
-    std::fs::write(&plist_path, roborev_daemon_plist(&roborev_path, &home))
+    std::fs::write(&plist_path, &desired_plist)
         .map_err(|e| format!("writing daemon plist failed: {e}"))?;
 
     // bootout first so a reload picks up an updated plist/binary. Ignore its result: the service is
@@ -1564,12 +1611,24 @@ mod tests {
     }
 
     #[test]
-    fn daemon_path_env_has_no_shim_and_prefers_the_user_local_bin() {
+    fn daemon_path_env_puts_the_account_shim_first_and_still_bans_the_api_key_shim() {
         let p = daemon_path_env(Path::new("/Users/ada"));
-        assert!(p.starts_with("/Users/ada/.local/bin:"), "user bin must win: {p}");
-        // The shim is a dev-machine-only mechanism that injects an API key. It must NEVER be on the
-        // shipped daemon's PATH — end-users authenticate via their own `claude login`.
-        assert!(!p.contains(".roborev-shim"), "shim must not be on the end-user daemon PATH: {p}");
+        // The account-selecting shim must resolve BEFORE the real claude, or roborev looks the real
+        // one up directly and no rotation can happen.
+        assert!(
+            p.starts_with("/Users/ada/.sparkle/roborev-claude:"),
+            "account shim must be first on the daemon PATH: {p}"
+        );
+        assert!(p.contains("/Users/ada/.local/bin:"), "user bin must still be on PATH: {p}");
+        assert!(
+            p.find("/Users/ada/.sparkle/roborev-claude").unwrap()
+                < p.find("/Users/ada/.local/bin").unwrap(),
+            "shim must precede the real claude: {p}"
+        );
+        // The RETIRED shim — which injected ANTHROPIC_API_KEY and forced CLAUDE_CODE_SIMPLE=1
+        // against an unfunded key, killing every review — must NEVER be on the daemon PATH. That
+        // ban is unrelated to the account shim above and still holds.
+        assert!(!p.contains(".roborev-shim"), "API-key shim must not be on the daemon PATH: {p}");
     }
 
     #[test]
@@ -1737,14 +1796,19 @@ cccc3333  node-v22.12.0-darwin-x64.tar.gz
         // RunAtLoad + KeepAlive so the daemon survives logout/reboot.
         assert!(plist.contains("<key>RunAtLoad</key>\n    <true/>"));
         assert!(plist.contains("<key>KeepAlive</key>\n    <true/>"));
-        // A NORMAL user PATH (user-local first), and CRUCIALLY no shim dir / no API key: roborev's
-        // claude child must inherit the user's `claude login`, which env-stripping never touches.
+        // A NORMAL user PATH, with Sparkle's account-selecting shim ahead of it so roborev's
+        // `claude` lookup can be pointed at a healthy account per review job.
         assert!(plist.contains(
             "/Users/x/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         ));
+        assert!(plist.contains("/Users/x/.sparkle/roborev-claude"));
+        // CRUCIALLY still no API key anywhere: the claude child authenticates as a SUBSCRIPTION
+        // login. The shim chooses WHICH subscription account; it never supplies a credential.
+        // (The blanket `!contains("shim")` this replaces was a proxy for these two invariants —
+        // it banned the mechanism by name rather than the behavior that was actually unsafe.)
         assert!(!plist.contains("ANTHROPIC_API_KEY"));
         assert!(!plist.contains("CLAUDE_CODE_SIMPLE"));
-        assert!(!plist.to_lowercase().contains("shim"));
+        assert!(!plist.contains(".roborev-shim"), "the retired API-key shim must stay off PATH");
     }
 
     #[test]

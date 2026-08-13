@@ -2629,7 +2629,50 @@ pub fn accounts_mark_exhausted(
     let _guard = lock.guard();
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    mark_exhausted_at(&accounts_json_path(&app_data), &id, until_epoch, home.as_deref())
+    mark_exhausted_at(&accounts_json_path(&app_data), &id, until_epoch, home.as_deref())?;
+    // An observed wall is exactly the moment roborev must stop using that account. Republishing the
+    // shim's candidate list HERE is what closes the rotation loop: the daemon is a launchd agent
+    // Sparkle cannot signal, so the next review job discovers the change by reading this file.
+    // Best-effort — a failed republish leaves the previous list in place (stale, but valid), and
+    // must never fail the exhaustion write that the whole fleet depends on.
+    if let Some(h) = home.as_deref() {
+        republish_roborev_candidates(&app_data, h);
+    }
+    Ok(())
+}
+
+/// Recompute the roborev shim's account candidates from the accounts on disk.
+///
+/// Lives here rather than in `roborev_account` because it needs `read_accounts_at` +
+/// `usage_for_accounts`, both private to this module. Errors are swallowed deliberately: every
+/// caller is a best-effort refresh on a path whose real job is something else.
+pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
+    let Ok(all) = read_accounts_at(&accounts_json_path(app_data)) else {
+        return;
+    };
+
+    // Drop registrations that are not actually signed in. WITHOUT this the rotation is worse than
+    // no rotation: an unauthenticated account has consumed zero tokens, so it scores as the account
+    // with the MOST headroom and every review is routed to the one account guaranteed to fail
+    // ("Not logged in · Please run /login" — already 175 of the recorded failures).
+    //
+    // Fail OPEN if the check excludes everything: a credential probe that cannot read anything (a
+    // keychain quirk, a locked login session) must not silently stop all reviews. Better to try a
+    // possibly-stale account than to publish STANDDOWN on the strength of a failed probe.
+    let signed_in: Vec<Account> = all
+        .iter()
+        .filter(|a| crate::account_usage::has_readable_credential(&a.config_dir))
+        .cloned()
+        .collect();
+    let accounts = if signed_in.is_empty() { all } else { signed_in };
+
+    let now = now_secs();
+    let tallies: Vec<(String, u64)> = usage_for_accounts(&accounts, now)
+        .into_iter()
+        .map(|u| (u.id, u.tokens_5h))
+        .collect();
+    let headroom = crate::roborev_account::headroom_from_tokens(&tallies);
+    let _ = crate::roborev_account::publish_candidates(home, &accounts, &headroom, now);
 }
 
 /// Per-account token tallies (5h / 7d) plus any in-effect exhausted-until epoch.

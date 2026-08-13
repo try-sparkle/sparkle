@@ -96,6 +96,7 @@ mod research;
 mod retention;
 mod revival;
 mod review_cmd;
+mod roborev_account;
 mod roborev_probe;
 mod transcribe;
 mod screenshot;

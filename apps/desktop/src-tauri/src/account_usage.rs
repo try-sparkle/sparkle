@@ -234,6 +234,16 @@ fn resolve_config_dir_with(config_dir: &str, home: Option<&str>) -> Result<Strin
 /// same seam the tests drive — so the precedence and fallback logic (the part most likely to be
 /// wrong, and the path the default account with `config_dir: ""` depends on) is exercised without a
 /// keychain, and the production call site is not left untested by construction.
+/// Is there a usable credential for this config dir?
+///
+/// Used by roborev account rotation to drop registrations that are not actually signed in. That
+/// filter is load-bearing, not cosmetic: an unauthenticated account has consumed ZERO tokens, so a
+/// headroom ranking scores it as the emptiest account available and would route every review to the
+/// one account guaranteed to fail. See [`crate::roborev_account`].
+pub(crate) fn has_readable_credential(config_dir: &str) -> bool {
+    read_access_token(config_dir).is_ok()
+}
+
 fn read_access_token(config_dir: &str) -> Result<String, String> {
     let home = std::env::var("HOME").ok();
     let user = std::env::var("USER").ok();
