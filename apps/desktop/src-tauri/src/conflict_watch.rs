@@ -815,26 +815,371 @@ fn discover_repos(app_data: &Path) -> Vec<Repo> {
         .collect()
 }
 
+/// The cheap fingerprint of the worktree layout: the base directory's mtime plus each project
+/// directory's, and NOTHING below that.
+///
+/// A directory's mtime moves when an entry is added to or removed from IT, which is exactly the
+/// event that changes the answer [`discover_repos`] computes: a new project bumps `base`, a new or
+/// removed worktree bumps that project's directory. So `1 + projects` stats decide whether a full
+/// enumeration is needed at all — against `1 + projects` read_dirs plus one `.git` stat PER
+/// WORKTREE, which is 140 syscalls a sweep on the founder's machine for an answer that changes
+/// perhaps twice an hour.
+///
+/// THE STAMPED IDS COME FROM THE FILESYSTEM, NOT FROM THE ENUMERATION'S RESULT — and that
+/// distinction is load-bearing, not a detail. [`discover_repos`] DROPS a project directory whose
+/// worktrees are all gone (`(!dirs.is_empty()).then(…)`), so keying the stamp off the returned
+/// repos leaves an empty-but-present project directory stat'd by nothing. Repopulating it bumps
+/// only that directory's mtime — `base` does not move, because the directory already existed — so
+/// the stamp compares equal and the project stays invisible until an unrelated project is added or
+/// removed, or the app restarts.
+///
+/// That failure is worse than a stale cache: the project is simply ABSENT, so there is no `Err`, no
+/// blind look, and nothing added to `unreadable`. It is exactly the "reads as no conflicts" outcome
+/// this module must never produce, and empty project directories are an ordinary steady state on a
+/// machine that has ever torn down every worktree of a project. Reading `base` here costs one
+/// `read_dir` — the same one `discover_repos` would do first anyway — and covers them.
+///
+/// KNOWN GAP, and it is the right trade: deleting the `.git` file INSIDE an existing worktree
+/// directory bumps neither, so a freshly-pruned husk stays in the cache until something else
+/// changes. That costs at most one failed probe against a directory [`probe_repo`] already falls
+/// through, and the fan-out cap bounds it — whereas re-statting every worktree to notice it is the
+/// cost this exists to remove. Note the asymmetry with the paragraph above: a lingering husk is
+/// fail-closed (we probe it and it answers badly), a missing project is not.
+fn discovery_stamp(base: &Path) -> Vec<(String, Option<SystemTime>)> {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut out = vec![(String::new(), mtime(base))];
+    let mut ids: Vec<String> = std::fs::read_dir(base)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    // Sorted so the stamp is a stable value: `read_dir` order is unspecified, and an unstable
+    // ordering would compare unequal at random and re-walk for no reason.
+    ids.sort();
+    out.extend(ids.into_iter().map(|id| {
+        let m = mtime(&base.join(&id));
+        (id, m)
+    }));
+    out
+}
+
+/// [`discover_repos`], re-run only when the worktree layout actually changed.
+///
+/// The enumeration itself is injected so a test can COUNT it. That is the whole assertion — "the
+/// layout did not change, so we did not walk it again" is a statement about a side effect, and a
+/// test that only compared the returned lists would pass just as happily against an implementation
+/// that re-enumerated every single sweep.
+#[derive(Default)]
+struct DiscoveryCache {
+    stamp: Option<Vec<(String, Option<SystemTime>)>>,
+    repos: Vec<Repo>,
+}
+
+impl DiscoveryCache {
+    fn repos<E>(&mut self, app_data: &Path, enumerate: E) -> Vec<Repo>
+    where
+        E: FnOnce(&Path) -> Vec<Repo>,
+    {
+        let base = app_data.join("worktrees");
+        // STAMPED BEFORE THE WALK, and the ordering is the whole correctness argument. A stamp
+        // taken AFTER `enumerate` already includes any change that landed mid-walk — the walk
+        // missed it, but the stamp records it as seen, so the next sweep compares equal and that
+        // worktree is never picked up at all. Taking it first is the safe direction: a change
+        // landing during the walk leaves the stored (older) stamp differing from the current one,
+        // which costs exactly one redundant re-walk instead of a permanent miss.
+        let stamp = discovery_stamp(&base);
+        if self.stamp.as_deref() == Some(stamp.as_slice()) {
+            return self.repos.clone();
+        }
+        let repos = enumerate(app_data);
+        self.stamp = Some(stamp);
+        self.repos = repos.clone();
+        repos
+    }
+}
+
+/// How many of a project's worktrees we ask before declaring the project unreadable.
+///
+/// EVERY worktree of a project is a linked checkout of the SAME repo — same remote, same open PRs —
+/// so the fallback below exists purely to survive an INDIVIDUALLY broken directory, and the answer
+/// from the eightieth is by construction the answer the first would have given. Two spares is
+/// already generous for that job; asking all of them is not thoroughness, it is the same question
+/// eighty times.
+///
+/// Unbounded, it is what turns one logged-out `gh` into a subprocess storm. Measured on the
+/// founder's machine while the UI was unresponsive: 125 worktrees across 15 projects, one project
+/// holding 47 — so a sweep in which `gh` fails everywhere is up to 125 spawns, each able to burn a
+/// full [`PROBE_TIMEOUT`]. That is ~41 minutes of serial subprocess waiting for a sweep the ladder
+/// expects to take seconds, and it gets WORSE as the fleet grows, which is the property that makes
+/// it a bug rather than a slow path.
+///
+/// This is the FAN-OUT half of the bound and it is NOT sufficient alone — 15 projects × 3 attempts
+/// × 20s is still 15 minutes — which is exactly why [`SWEEP_BUDGET`] bounds the sweep as a whole.
+const MAX_PROBE_FALLBACKS: usize = 3;
+
+/// Ceiling on how long ONE sweep may spend talking to `gh`, across every project.
+///
+/// WHY A WHOLE-SWEEP BUDGET RATHER THAN A PER-PROCESS ONE. [`PROBE_TIMEOUT`] bounds a single child,
+/// and a per-child bound MULTIPLIES: the sweep is serial, so the real worst case is (worktrees ×
+/// one timeout each) and it scales with the fleet. A budget on the SWEEP does not multiply — it is
+/// the same 60s whether the machine runs 5 worktrees or 500. That is the only shape that stays
+/// correct as the fleet grows, and the fleet is the thing that keeps growing.
+///
+/// A sweep that runs out does NOT report the repos it never reached as clean. They take the same
+/// fail-closed `Err` arm every other unreadable repo takes, carrying [`SWEEP_BUDGET_REASON`], so
+/// the module's one inviolable rule — never say "no conflicts" because we could not look — holds
+/// for a budget cut-off exactly as it does for a broken `gh`.
+const SWEEP_BUDGET: Duration = Duration::from_secs(60);
+
+/// The `blocked_by` reason a repo carries when the sweep ran out of budget before reaching it.
+///
+/// Deliberately distinct from `gh-unavailable`/`gh-failed`: those mean the repo ANSWERED BADLY,
+/// this means WE NEVER ASKED. Anyone chasing a stuck flag needs to tell those apart, and a shared
+/// reason string would hide the one case a human can actually fix by reducing the fleet.
+const SWEEP_BUDGET_REASON: &str = "sweep-budget";
+
+/// Per-project probe backoff: `project_id -> (retry_at_ms, consecutive_failures, last_reason)`.
+///
+/// Keyed by PROJECT, not global — one repo with a broken `gh` must not slow the probe of a healthy
+/// one. Entries are removed on the first success, so this only ever holds repos we are currently
+/// failing to read.
+///
+/// This is the ACROSS-SWEEPS half of the bound, and it is a different axis from the two constants
+/// above: [`MAX_PROBE_FALLBACKS`] and [`SWEEP_BUDGET`] bound what ONE sweep may spend, while this
+/// stops a repo that is broken for hours from being asked again on every sweep in between.
+/// Absorbed from PR #1308 (`sparkle/conflict-watch-probe-backoff`), which had the reasoning right
+/// but was written against an older shape of this module and never compiled.
+type ProbeBackoff = HashMap<String, (u64, u32, &'static str)>;
+
+/// How long to wait before re-probing a repo whose `gh` call just failed.
+///
+/// WHY A BACKOFF AT ALL. The sweep's cadence is driven by the earliest per-PR ladder deadline
+/// (`next_scan_at_ms`), and a failing probe does not slow that down: the blind looks it produces
+/// keep climbing, so the repo is re-probed on the fastest rung any of its PRs happens to sit on.
+/// That is correct for the LADDER and wrong for the PROBE, because the two failure modes this hits
+/// most are not transient-per-look:
+///
+///   • A logged-out or missing `gh` stays broken until a human intervenes — every retry in between
+///     is a subprocess spawned to be told the same thing.
+///   • A rate limit is worse than useless: `gh pr list --limit N --json …statusCheckRollup` is a
+///     GraphQL query whose cost is scored by node count, so the retries are what KEEP the budget at
+///     zero. Captured logs show one machine failing this way continuously for over three hours,
+///     which blinds not just this sweep but every other `gh` consumer on the account for the whole
+///     window.
+///
+/// Doubling from one rung, capped at the ladder's top rung — the same time scale the module already
+/// reasons in, so a repo that comes back is picked up within one ordinary look.
+fn probe_retry_secs(consecutive_failures: u32) -> u64 {
+    let top = conflict_ladder::LADDER_SECS[conflict_ladder::LADDER_SECS.len() - 1];
+    conflict_ladder::LADDER_SECS[0]
+        // The exponent is clamped BEFORE the shift: `1u64 << 64` is undefined-behaviour-adjacent in
+        // release and a panic in debug, and `consecutive_failures` is unbounded by construction.
+        .saturating_mul(1u64 << consecutive_failures.saturating_sub(1).min(16))
+        .min(top)
+}
+
 /// Ask a project's worktrees for its open PRs, taking the first that ANSWERS.
 ///
-/// Only a probe that fails in EVERY worktree declares the project unreadable, so one broken
-/// checkout cannot blind a project permanently (roborev 57873). The `probe` is a parameter so the
-/// fallback — the interesting behaviour, and the one that needs a broken directory to exercise — is
-/// assertable without a `gh` binary.
+/// Only a probe that fails in every worktree it TRIES declares the project unreadable, so one
+/// broken checkout cannot blind a project permanently (roborev 57873). The `probe` is a parameter
+/// so the fallback — the interesting behaviour, and the one that needs a broken directory to
+/// exercise — is assertable without a `gh` binary.
 /// Returns the worktree that answered alongside the PRs, because the caller needs a working
 /// directory for the local `git rev-list` that computes commits-behind.
-fn probe_repo<P>(repo: &Repo, mut probe: P) -> Result<(PathBuf, Probed), &'static str>
+///
+/// `max_attempts` is the cap from [`MAX_PROBE_FALLBACKS`]; it is a parameter rather than a constant
+/// read inside so a test can state the bound it is asserting instead of inheriting it.
+fn probe_repo<P>(
+    repo: &Repo,
+    max_attempts: usize,
+    mut probe: P,
+) -> Result<(PathBuf, Probed), &'static str>
 where
     P: FnMut(&Path) -> Result<Probed, &'static str>,
 {
     let mut last = "no-worktree";
-    for dir in &repo.dirs {
+    // `.max(1)` so a nonsense cap still asks once — a zero here would report every project
+    // unreadable forever, which is a far worse failure than an unbounded fallback.
+    for dir in repo.dirs.iter().take(max_attempts.max(1)) {
         match probe(dir) {
             Ok(prs) => return Ok((dir.clone(), prs)),
             Err(reason) => last = reason,
         }
     }
     Err(last)
+}
+
+/// WHY a repo's outcome came out the way it did — three different facts a human chasing a stuck
+/// flag has to be able to tell apart.
+///
+/// All three can carry an `Err`, and they mean completely different things: the repo answered
+/// badly, we deliberately did not ask because it is still broken, or we ran out of time before
+/// reaching it. Collapsing them onto one reason string is what hides the single case a human can
+/// actually act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    /// We spawned `gh` — up to [`MAX_PROBE_FALLBACKS`] times across this project's worktrees.
+    Asked,
+    /// The per-project backoff held us off `gh`; the `Err` carries the CACHED reason from the
+    /// probe that last actually ran. `retry_in_secs` is how long until this repo is eligible again.
+    Suppressed { retry_in_secs: u64 },
+    /// [`SWEEP_BUDGET`] ran out before we reached this repo. We never asked, so we learned nothing
+    /// about it — and in particular this must never be recorded as a probe FAILURE.
+    BudgetSkipped,
+}
+
+/// What one sweep of every project's `gh` probe produced — see [`sweep_probes`].
+struct Swept {
+    /// `(index into repos, outcome, why)` for EVERY repo, without exception. A repo the budget cut
+    /// off still appears, carrying [`SWEEP_BUDGET_REASON`], because a repo silently missing from
+    /// this list would be a repo whose tracked PRs stop climbing — indistinguishable, downstream,
+    /// from a repo that came back clean.
+    outcomes: Vec<(usize, Result<(PathBuf, Probed), &'static str>, Disposition)>,
+    /// Project ids the budget prevented us from probing at all, in probe order.
+    skipped: Vec<String>,
+    /// Project ids the BACKOFF held off `gh` this sweep, in probe order. Distinct from `skipped`:
+    /// these were reached and cost nothing, which is the backoff working rather than a shortfall.
+    suppressed: Vec<String>,
+    /// `gh` invocations this sweep actually made. The number the whole change exists to bound.
+    probe_calls: usize,
+    /// Where the NEXT sweep should start, so a budget cut-off rotates instead of starving the tail.
+    next_cursor: usize,
+    elapsed_ms: u64,
+}
+
+/// Probe every project under ONE budget for the sweep as a whole, starting at `cursor`.
+///
+/// WHY THE ROTATION. A plain budget always cuts the same tail: with the projects in a fixed order,
+/// the ones past the budget are never probed on ANY sweep, so their PRs climb blind forever and
+/// the fix quietly becomes a different outage. Starting each sweep where the last one stopped means
+/// a machine too big to sweep in one budget still covers every project, just across several sweeps.
+///
+/// Both the probe and the clock are injected because `tick` takes an `AppHandle` and has no test:
+/// a bound that lives inside `tick` is a bound no assertion can reach. Everything this decides —
+/// how many worktrees to ask, when to stop, whether the backoff still holds, what to hand back for
+/// a repo we skipped — is decided HERE, so the tests exercise the production path rather than
+/// restating it.
+///
+/// THE CLOCK IS ABSOLUTE (epoch ms, `now_ms` in production), not a stopwatch. The budget reads it
+/// as a difference and the backoff reads it as a deadline, so one injected clock drives both and a
+/// test cannot accidentally advance one without the other.
+///
+/// ORDER MATTERS: the backoff is consulted BEFORE the budget. A suppressed repo costs no
+/// subprocess, so serving it is free even once the budget is spent — and its cached reason is
+/// strictly more informative to a human than [`SWEEP_BUDGET_REASON`] would be.
+fn sweep_probes<P, C>(
+    repos: &[Repo],
+    backoff: &mut ProbeBackoff,
+    cursor: usize,
+    budget_ms: u64,
+    mut probe: P,
+    mut clock: C,
+) -> Swept
+where
+    P: FnMut(&Path) -> Result<Probed, &'static str>,
+    C: FnMut() -> u64,
+{
+    let started = clock();
+    let mut outcomes = Vec::with_capacity(repos.len());
+    let mut skipped = Vec::new();
+    let mut suppressed = Vec::new();
+    let mut probe_calls = 0usize;
+    let mut first_skipped: Option<usize> = None;
+    if repos.is_empty() {
+        return Swept {
+            outcomes,
+            skipped,
+            suppressed,
+            probe_calls,
+            next_cursor: 0,
+            elapsed_ms: 0,
+        };
+    }
+    let start_at = cursor % repos.len();
+    for step in 0..repos.len() {
+        let idx = (start_at + step) % repos.len();
+        let project = &repos[idx].project_id;
+
+        // THE BACKOFF, first — see the note above on ordering. Deliberately NOT a `continue` past
+        // the repo: a suppressed look takes the same `Err` arm carrying the cached reason, so the
+        // fail-closed contract is untouched. The blind looks are still produced and the ladder
+        // still climbs on its own schedule. Only the subprocess is skipped.
+        if let Some(&(retry_at, _, reason)) = backoff.get(project) {
+            let now = clock();
+            if now < retry_at {
+                suppressed.push(project.clone());
+                outcomes.push((
+                    idx,
+                    Err(reason),
+                    Disposition::Suppressed {
+                        retry_in_secs: retry_at.saturating_sub(now).div_ceil(1000),
+                    },
+                ));
+                continue;
+            }
+        }
+
+        // Checked BEFORE the probe, never after: a budget tested only on the way out still pays
+        // for one more full [`PROBE_TIMEOUT`] per remaining repo, which is the multiplication the
+        // budget exists to stop.
+        if clock().saturating_sub(started) >= budget_ms {
+            if first_skipped.is_none() {
+                first_skipped = Some(idx);
+            }
+            skipped.push(project.clone());
+            // NOT entered into the backoff. `SWEEP_BUDGET_REASON` means WE NEVER ASKED, so
+            // recording it as a probe failure would back a repo off that may be perfectly healthy
+            // — and would compound across sweeps into exactly the starvation `next_cursor` exists
+            // to prevent.
+            outcomes.push((idx, Err(SWEEP_BUDGET_REASON), Disposition::BudgetSkipped));
+            continue;
+        }
+
+        let probe_started = clock();
+        let out = probe_repo(&repos[idx], MAX_PROBE_FALLBACKS, |dir| {
+            probe_calls += 1;
+            probe(dir)
+        });
+        match &out {
+            Ok(_) => {
+                // The first success clears the whole entry, so a repo that comes back is on the
+                // ordinary cadence immediately rather than serving out a window it no longer needs.
+                backoff.remove(project);
+            }
+            Err(reason) => {
+                let failures = backoff
+                    .get(project)
+                    .map_or(0, |&(_, n, _)| n)
+                    .saturating_add(1);
+                // Anchored to when the probe FINISHED, not to when the sweep began. `probe_repo`
+                // tries a project's worktrees SERIALLY, each with its own [`PROBE_TIMEOUT`], so at
+                // the fan-out cap this call can burn 60s — half the first interval. A sweep-start-
+                // anchored deadline would already be that much closer to the past the moment it was
+                // written, and at a larger cap would be behind us outright, so the backoff would
+                // hold for zero sweeps in exactly the case it exists for. `.max(probe_started)`
+                // keeps a clock that steps backwards from shortening the window.
+                let done = clock().max(probe_started);
+                let secs = probe_retry_secs(failures);
+                backoff.insert(
+                    project.clone(),
+                    (done.saturating_add(secs.saturating_mul(1000)), failures, reason),
+                );
+            }
+        }
+        outcomes.push((idx, out, Disposition::Asked));
+    }
+    Swept {
+        outcomes,
+        skipped,
+        suppressed,
+        probe_calls,
+        // A sweep that finished everything restarts at the same place; only a cut-off rotates. A
+        // BACKOFF-suppressed repo does not rotate the cursor: it was reached, it just cost nothing.
+        next_cursor: first_skipped.unwrap_or(start_at),
+        elapsed_ms: clock().saturating_sub(started),
+    }
 }
 
 /// Every open PR in `dir`'s repo, plus whether the list was TRUNCATED at [`PROBE_LIMIT`].
@@ -961,6 +1306,14 @@ struct Watch {
     /// is announced once instead of once per PR per sweep. `None` = no collisions last sweep, which
     /// is what makes a recurrence after a clean sweep announce itself again.
     last_collision_fp: Option<u64>,
+    /// The worktree layout, re-walked only when it changes — see [`DiscoveryCache`].
+    discovery: DiscoveryCache,
+    /// Where the next sweep starts probing, so a machine too big to sweep inside [`SWEEP_BUDGET`]
+    /// rotates through its projects instead of permanently starving the tail.
+    sweep_cursor: usize,
+    /// Per-project probe backoff — see [`ProbeBackoff`]. Holds only repos we are currently failing
+    /// to read; an entry is cleared by the first success.
+    probe_backoff: ProbeBackoff,
 }
 
 /// How many `project#pr` pairs a collision announcement names before it elides the rest.
@@ -1161,7 +1514,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
         return;
     };
 
-    let repos = discover_repos(&app_data);
+    let repos = watch.discovery.repos(&app_data, discover_repos);
     let mut looks: Vec<Look> = Vec::new();
     let mut seen: HashSet<u64> = HashSet::new();
     // Projects whose PR listing we actually READ this sweep. Only these may prune — see
@@ -1175,8 +1528,47 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
     // `(project, pr)` for every PR this sweep skipped because another project claimed the number.
     let mut collisions: Vec<(String, u64)> = Vec::new();
 
-    for repo in &repos {
-        match probe_repo(repo, probe_open_prs) {
+    // ONE budget for the whole sweep, a fan-out cap inside it, and a per-project backoff across
+    // sweeps — see [`SWEEP_BUDGET`], [`MAX_PROBE_FALLBACKS`] and [`ProbeBackoff`]. This is the only
+    // path from this thread to a `gh` subprocess.
+    let swept = sweep_probes(
+        &repos,
+        &mut watch.probe_backoff,
+        watch.sweep_cursor,
+        SWEEP_BUDGET.as_millis() as u64,
+        probe_open_prs,
+        now_ms,
+    );
+    watch.sweep_cursor = swept.next_cursor;
+    if !swept.skipped.is_empty() {
+        // MAKE THE COST VISIBLE. Before this the sweep simply took minutes and said nothing; the
+        // only evidence a human ever had was a process sample. Naming the projects we did not reach
+        // is what turns "the app feels slow" into a filable observation.
+        tracing::warn!(
+            target: "conflict_watch",
+            elapsed_ms = swept.elapsed_ms,
+            budget_ms = SWEEP_BUDGET.as_millis() as u64,
+            gh_spawns = swept.probe_calls,
+            projects = repos.len(),
+            worktrees = repos.iter().map(|r| r.dirs.len()).sum::<usize>(),
+            skipped = %swept.skipped.join(","),
+            "conflict sweep hit its whole-sweep budget; these projects were NOT probed and their \
+             tracked PRs keep climbing blind. The next sweep starts with them."
+        );
+    } else {
+        tracing::debug!(
+            target: "conflict_watch",
+            elapsed_ms = swept.elapsed_ms,
+            gh_spawns = swept.probe_calls,
+            projects = repos.len(),
+            backed_off = swept.suppressed.len(),
+            "conflict sweep complete"
+        );
+    }
+
+    for (idx, result, disposition) in swept.outcomes {
+        let repo = &repos[idx];
+        match result {
             Ok((dir, probed)) => {
                 probed_ok.insert(repo.project_id.clone());
                 let was_saturated = probed.saturated;
@@ -1222,14 +1614,34 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
             Err(reason) => {
                 unreadable += 1;
                 last_error = Some(reason);
-                tracing::warn!(
-                    target: "conflict_watch",
-                    project = %repo.project_id,
-                    worktrees = repo.dirs.len(),
-                    reason,
-                    "could not read this repo's PRs in ANY of its worktrees; its tracked PRs keep \
-                     climbing rather than being reported clean"
-                );
+                // The WARNING is for a repo we actually asked. A repo the backoff suppressed is
+                // logged at debug instead: we already warned when the probe that set the window
+                // really failed, and re-warning every sweep for hours is the noise this change
+                // exists to remove — one machine emitted this line continuously for over three
+                // hours. The fail-closed handling below is IDENTICAL either way; only the level
+                // differs, so nothing about escalation moves with the log.
+                match disposition {
+                    Disposition::Suppressed { retry_in_secs } => tracing::debug!(
+                        target: "conflict_watch",
+                        project = %repo.project_id,
+                        reason,
+                        retry_in_secs,
+                        "not re-probing this repo yet; it is inside its failure backoff and its \
+                         tracked PRs keep climbing on the cached reason"
+                    ),
+                    _ => tracing::warn!(
+                        target: "conflict_watch",
+                        project = %repo.project_id,
+                        worktrees = repo.dirs.len(),
+                        reason,
+                        retry_in_secs = watch
+                            .probe_backoff
+                            .get(&repo.project_id)
+                            .map_or(0, |&(at, _, _)| at.saturating_sub(now).div_ceil(1000)),
+                        "could not read this repo's PRs in ANY of its worktrees; its tracked PRs \
+                         keep climbing rather than being reported clean"
+                    ),
+                }
                 // FAIL CLOSED: keep climbing on the last known facts. Reporting nothing here would
                 // read as "no conflicts", which is the one thing this module must never say.
                 for (pr, t) in watch.tracked.iter() {
@@ -2303,7 +2715,7 @@ mod tests {
             dirs: vec!["/a/broken".into(), "/a/works".into()],
         };
         let mut asked: Vec<String> = Vec::new();
-        let got = probe_repo(&repo, |dir| {
+        let got = probe_repo(&repo, MAX_PROBE_FALLBACKS, |dir| {
             asked.push(dir.to_string_lossy().to_string());
             if dir.ends_with("broken") {
                 Err("gh-failed")
@@ -2318,7 +2730,602 @@ mod tests {
 
         // Only a probe that fails EVERYWHERE declares the project unreadable — and it reports the
         // last real reason, not a generic one.
-        assert_eq!(probe_repo(&repo, |_| Err("gh-unavailable")), Err("gh-unavailable"));
+        assert_eq!(
+            probe_repo(&repo, MAX_PROBE_FALLBACKS, |_| Err("gh-unavailable")),
+            Err("gh-unavailable")
+        );
+    }
+
+    // ══ THE SWEEP'S BOUNDS ══════════════════════════════════════════════════════════════════════
+    //
+    // These are written at the fleet size that produced the report — ~125 worktrees across 15
+    // projects, one project holding 47 — and not at n=2, because the defect IS the multiplication.
+    // At n=2 every assertion below passes against the unbounded code.
+
+    /// The founder's layout at the time of the capture, largest project last-but-one.
+    ///
+    /// The per-project split totals 127 while the capture was written up as ~125. The discrepancy
+    /// is in the SOURCE, not here, and it is not worth inventing a number to hide: what the fixture
+    /// has to be faithful to is the SHAPE that produces the bug — a fleet-sized worktree count, a
+    /// realistic project count, and one project far larger than the rest. Those three are asserted
+    /// in [`the_whole_fleet_stops_at_the_sweep_budget_instead_of_multiplying_timeouts`]; the exact
+    /// total is decoration, and an assertion pinning it would have been precision the evidence does
+    /// not support.
+    const FLEET: [usize; 15] = [7, 2, 2, 11, 10, 7, 1, 4, 3, 19, 4, 8, 1, 47, 1];
+
+    fn repo_of(id: &str, worktrees: usize) -> Repo {
+        Repo {
+            project_id: id.to_string(),
+            dirs: (0..worktrees)
+                .map(|i| PathBuf::from(format!("/wt/{id}/{i}")))
+                .collect(),
+        }
+    }
+
+    fn fleet() -> Vec<Repo> {
+        FLEET
+            .iter()
+            .enumerate()
+            .map(|(i, n)| repo_of(&format!("p{i}"), *n))
+            .collect()
+    }
+
+    /// THE FAN-OUT CAP, isolated from the budget (the clock never moves, so nothing can be cut off
+    /// for time — only the cap can hold the count down).
+    ///
+    /// Every worktree of a project is a linked checkout of the SAME repo, so asking the 80th is
+    /// asking the first again. Unbounded, one logged-out `gh` costs 80 spawns for one project.
+    #[test]
+    fn a_project_with_eighty_worktrees_costs_three_gh_spawns_not_eighty() {
+        let repos = vec![repo_of("big", 80)];
+        let mut backoff = ProbeBackoff::new();
+        let swept = sweep_probes(&repos, &mut backoff, 0, 60_000, |_| Err("gh-failed"), || 0);
+
+        assert_eq!(
+            swept.probe_calls, MAX_PROBE_FALLBACKS,
+            "an 80-worktree project must cost the CAP in `gh` spawns, not one per worktree"
+        );
+        assert_eq!(
+            swept.outcomes.len(),
+            1,
+            "and the project still gets an outcome"
+        );
+        assert_eq!(
+            swept.outcomes[0].1.as_ref().err(),
+            Some(&"gh-failed"),
+            "carrying the last REAL reason — a capped fallback is still an honest failure"
+        );
+        assert_eq!(
+            swept.outcomes[0].2,
+            Disposition::Asked,
+            "and it is recorded as a repo we ASKED — the cap is not a skip"
+        );
+        assert!(
+            swept.skipped.is_empty(),
+            "nothing was skipped for time; the cap alone did this"
+        );
+    }
+
+    /// THE WHOLE-SWEEP BUDGET — the half the fan-out cap cannot cover.
+    ///
+    /// 15 projects × 3 attempts × a 20s [`PROBE_TIMEOUT`] is still ~15 minutes, so a per-process
+    /// bound is not a bound at all: it MULTIPLIES by repo count. This asserts the sweep's total,
+    /// which does not. Against the unbounded sweep the same fleet is 125 spawns and ~2500s.
+    #[test]
+    fn the_whole_fleet_stops_at_the_sweep_budget_instead_of_multiplying_timeouts() {
+        use std::cell::Cell;
+        let repos = fleet();
+        // The SHAPE that produces the bug, not a fabricated exact total — see [`FLEET`]. Each of
+        // these three fails if the fixture is shrunk toward the n=2 case where the unbounded code
+        // passes too.
+        let worktrees = repos.iter().map(|r| r.dirs.len()).sum::<usize>();
+        assert!(
+            worktrees >= 125,
+            "this test is only meaningful at the size that produced the report; got {worktrees}"
+        );
+        assert_eq!(repos.len(), 15, "across the captured number of projects");
+        assert_eq!(
+            repos.iter().map(|r| r.dirs.len()).max(),
+            Some(47),
+            "with one project far larger than the rest — the fan-out cap's worst case"
+        );
+        let clock = Cell::new(0u64);
+        let budget = SWEEP_BUDGET.as_millis() as u64;
+        let mut backoff = ProbeBackoff::new();
+        // The worst case the budget exists for: every probe burns a full PROBE_TIMEOUT.
+        let swept = sweep_probes(
+            &repos,
+            &mut backoff,
+            0,
+            budget,
+            |_| {
+                clock.set(clock.get() + PROBE_TIMEOUT.as_millis() as u64);
+                Err("gh-unavailable")
+            },
+            || clock.get(),
+        );
+
+        // One project already in flight may overrun; the point is that the OTHER fourteen cannot
+        // each add their own timeouts on top.
+        let overshoot = PROBE_TIMEOUT.as_millis() as u64 * MAX_PROBE_FALLBACKS as u64;
+        assert!(
+            swept.elapsed_ms <= budget + overshoot,
+            "a sweep must be bounded as a WHOLE: took {}ms against a {}ms budget (unbounded, this \
+             fleet is ~2_500_000ms)",
+            swept.elapsed_ms,
+            budget
+        );
+        assert!(
+            swept.probe_calls <= MAX_PROBE_FALLBACKS * 4,
+            "and must not spawn once per worktree: {} spawns (unbounded, this fleet is {worktrees})",
+            swept.probe_calls
+        );
+        assert_eq!(
+            swept.outcomes.len(),
+            repos.len(),
+            "EVERY project still gets an outcome — a repo missing from this list is a repo whose \
+             PRs silently stop climbing"
+        );
+        assert!(
+            !swept.skipped.is_empty(),
+            "and the ones we could not reach are named rather than lost"
+        );
+
+        // ── THE LOWER BOUNDS, and they are the half that makes this test mean anything ──────────
+        //
+        // Everything above is an UPPER bound, and a sweep that probes NOTHING AT ALL satisfies
+        // every one of them: 0 spawns is ≤ the cap, 0ms is ≤ the budget, and every project lands in
+        // `skipped` with an outcome apiece. Mutating the budget comparison on the line this guards
+        // does exactly that — it cuts the sweep off before the first probe — and the test stayed
+        // GREEN through it (caught by `scripts/mutation-check.sh`, not by reading).
+        //
+        // So pin that the sweep did REAL WORK before the budget stopped it. "Bounded" and "inert"
+        // are the two ways to spend zero subprocesses, and only these assertions tell them apart.
+        assert!(
+            swept.probe_calls >= MAX_PROBE_FALLBACKS,
+            "the sweep must actually ASK before the budget cuts it off — {} spawns means it did \
+             nothing, which passes every upper bound above while the feature is dead",
+            swept.probe_calls
+        );
+        assert!(
+            swept
+                .outcomes
+                .iter()
+                .any(|(_, _, d)| *d == Disposition::Asked),
+            "and at least one project must be recorded as ASKED, not merely accounted for"
+        );
+        assert!(
+            swept.skipped.len() < repos.len(),
+            "a sweep that skips EVERY project is the degenerate case, not a bounded one"
+        );
+        assert!(
+            swept.elapsed_ms > 0,
+            "and time really has to have passed — a zero-length sweep bought its bound by not \
+             looking"
+        );
+    }
+
+    /// A BUDGET CUT-OFF FAILS CLOSED, exactly as a broken `gh` does.
+    ///
+    /// The one thing this module must never say is "no conflicts" because it could not look — and
+    /// "we ran out of time" is a way of not looking. The reason is DISTINCT from `gh-failed`
+    /// because "the repo answered badly" and "we never asked" are different facts to a human.
+    #[test]
+    fn a_project_the_budget_cut_off_says_so_rather_than_reading_as_clean() {
+        use std::cell::Cell;
+        let repos = vec![repo_of("a", 1), repo_of("b", 1)];
+        let clock = Cell::new(0u64);
+        let mut backoff = ProbeBackoff::new();
+        let swept = sweep_probes(
+            &repos,
+            &mut backoff,
+            0,
+            10_000,
+            |_| {
+                clock.set(clock.get() + 10_000);
+                Err("gh-failed")
+            },
+            || clock.get(),
+        );
+
+        assert_eq!(swept.probe_calls, 1, "the budget stopped us after the first");
+        assert_eq!(swept.skipped, vec!["b".to_string()]);
+        let b = swept
+            .outcomes
+            .iter()
+            .find(|(i, _, _)| repos[*i].project_id == "b")
+            .expect("the skipped project still has an outcome");
+        assert_eq!(
+            b.1.as_ref().err(),
+            Some(&SWEEP_BUDGET_REASON),
+            "and it is an Err — never an Ok with an empty PR list, which would read as 'clean'"
+        );
+        assert_eq!(b.2, Disposition::BudgetSkipped, "recorded as never-asked");
+
+        // AND IT IS NOT BACKED OFF. `SWEEP_BUDGET_REASON` means we never asked, so treating it as a
+        // probe failure would suppress a repo that may be perfectly healthy — and would compound
+        // with the rotation into the starvation both mechanisms exist to prevent.
+        assert!(
+            !backoff.contains_key("b"),
+            "a repo the BUDGET skipped must not enter the failure backoff — we learned nothing \
+             about it"
+        );
+        assert!(
+            backoff.contains_key("a"),
+            "while the one that really was asked, and really did fail, is backed off"
+        );
+    }
+
+    /// NO STARVATION. A fixed-order budget always cuts the SAME tail, so those projects would never
+    /// be probed on any sweep — the fix would quietly become a different outage. The next sweep
+    /// starts where this one stopped.
+    #[test]
+    fn the_projects_a_budget_cut_off_are_probed_first_on_the_next_sweep() {
+        use std::cell::Cell;
+        let repos = vec![repo_of("a", 1), repo_of("b", 1), repo_of("c", 1)];
+        // A FRESH backoff per sweep, deliberately: this test isolates the ROTATION, and a carried
+        // backoff would suppress the repo that just failed and mask whether the cursor moved. Their
+        // interaction gets its own test below.
+        let sweep = |cursor: usize| {
+            let clock = Cell::new(0u64);
+            let mut backoff = ProbeBackoff::new();
+            let mut asked: Vec<String> = Vec::new();
+            let swept = sweep_probes(
+                &repos,
+                &mut backoff,
+                cursor,
+                10_000,
+                |dir| {
+                    asked.push(dir.to_string_lossy().to_string());
+                    clock.set(clock.get() + 10_000);
+                    Err("gh-failed")
+                },
+                || clock.get(),
+            );
+            (asked, swept.next_cursor, swept.skipped)
+        };
+
+        let (asked1, cursor1, skipped1) = sweep(0);
+        assert_eq!(asked1, vec!["/wt/a/0"], "only the first fits in the budget");
+        assert_eq!(skipped1, vec!["b".to_string(), "c".to_string()]);
+
+        let (asked2, cursor2, _) = sweep(cursor1);
+        assert_eq!(
+            asked2,
+            vec!["/wt/b/0"],
+            "the next sweep starts with the project the last one could not reach"
+        );
+
+        let (asked3, _, _) = sweep(cursor2);
+        assert_eq!(asked3, vec!["/wt/c/0"], "and the one after that reaches the tail");
+    }
+
+    // ══ THE BACKOFF, ACROSS SWEEPS ══════════════════════════════════════════════════════════════
+    //
+    // Absorbed from PR #1308. The two constants above bound what ONE sweep may spend; this bounds
+    // how often a repo that is broken for HOURS gets asked at all. Neither implies the other: a
+    // fleet small enough to sweep well inside the budget still re-spawns a doomed `gh` on every
+    // ladder rung without this, which is what pinned an account's GraphQL budget at zero for over
+    // three hours.
+
+    #[test]
+    fn a_repeatedly_failing_probe_backs_off_instead_of_retrying_on_every_sweep() {
+        // The measured bug: the interval never grew, so a stuck `gh` was re-spawned on the fastest
+        // ladder rung indefinitely. Assert the SPACING widens, not merely that a number exists.
+        let first = probe_retry_secs(1);
+        assert_eq!(first, conflict_ladder::LADDER_SECS[0], "one failure waits exactly one rung");
+        assert_eq!(probe_retry_secs(2), first * 2, "and each further failure doubles it");
+        assert_eq!(probe_retry_secs(3), first * 4);
+        assert!(probe_retry_secs(4) > probe_retry_secs(3), "still growing before the cap");
+    }
+
+    #[test]
+    fn the_backoff_is_capped_at_the_ladders_top_rung_and_never_overflows() {
+        let top = conflict_ladder::LADDER_SECS[conflict_ladder::LADDER_SECS.len() - 1];
+        assert_eq!(probe_retry_secs(20), top, "a long outage parks at the top rung");
+        // Without the clamp on the exponent this shift is wider than u64 — a debug panic.
+        assert_eq!(probe_retry_secs(u32::MAX), top, "and cannot overflow");
+    }
+
+    /// Drive the real seam across a whole outage and COUNT the subprocesses.
+    ///
+    /// The predecessor of this test (in #1308) rebuilt `now < retry_at` in a local closure over a
+    /// hand-made map and never called production code, so deleting the suppression — or the
+    /// success-clearing — left it green while the storm came back. Everything below goes through
+    /// `sweep_probes`, the one path `tick` has to `gh`, and the assertion is the number of times the
+    /// injected probe was actually INVOKED.
+    #[test]
+    fn the_backoff_holds_a_failing_repo_off_gh_until_its_deadline() {
+        use std::cell::Cell;
+        let repos = vec![repo_of("p", 1)];
+        let mut backoff = ProbeBackoff::new();
+        let calls = Cell::new(0usize);
+        let rung = conflict_ladder::LADDER_SECS[0] * 1000;
+        // A budget far larger than anything this test spends, so NOTHING here can be attributed to
+        // the sweep budget — only the backoff can hold the count down.
+        let budget = 10_000_000u64;
+
+        // A failing probe that does not return instantly: this one burns 130s, MORE than the whole
+        // first retry interval, which is the shape several timing-out worktrees produce at 20s each.
+        // Anchored to the sweep's start the deadline would land at 120_000 — already in the past.
+        let sweep = |backoff: &mut ProbeBackoff, now: u64, fail: bool, elapsed: u64| {
+            let clock = Cell::new(now);
+            let swept = sweep_probes(
+                &repos,
+                backoff,
+                0,
+                budget,
+                |_| {
+                    calls.set(calls.get() + 1);
+                    clock.set(clock.get() + elapsed);
+                    if fail {
+                        Err("gh-failed")
+                    } else {
+                        Ok(Probed { prs: vec![], saturated: false })
+                    }
+                },
+                || clock.get(),
+            );
+            swept
+        };
+
+        let swept = sweep(&mut backoff, 0, true, 130_000);
+        assert_eq!(calls.get(), 1, "the first sweep really does shell out");
+        assert_eq!(swept.outcomes[0].2, Disposition::Asked);
+        assert_eq!(swept.outcomes[0].1.as_ref().err(), Some(&"gh-failed"));
+        let (retry_at, failures, _) = backoff["p"];
+        assert_eq!(
+            retry_at,
+            130_000 + rung,
+            "the deadline is anchored to when the probe FINISHED, not to when the sweep began"
+        );
+        assert_eq!(failures, 1);
+
+        // A sweep inside the window spawns nothing — and it lands past 120_000, so a start-anchored
+        // deadline would have let this one straight through.
+        let swept = sweep(&mut backoff, 140_000, true, 0);
+        assert_eq!(calls.get(), 1, "still inside the backoff, so `gh` is NOT spawned again");
+        assert!(
+            matches!(swept.outcomes[0].2, Disposition::Suppressed { .. }),
+            "and the caller is told the look was suppressed rather than asked"
+        );
+        assert_eq!(
+            swept.outcomes[0].1.as_ref().err(),
+            Some(&"gh-failed"),
+            "FAIL CLOSED: the cached reason rides out, so the ladder still climbs blind"
+        );
+        assert_eq!(swept.suppressed, vec!["p".to_string()]);
+        assert!(
+            swept.skipped.is_empty(),
+            "a backoff suppression is NOT a budget shortfall and must not be reported as one"
+        );
+        assert_eq!(backoff["p"].0, 130_000 + rung, "a suppressed look never extends its deadline");
+        assert_eq!(backoff["p"].1, 1, "nor counts as a fresh failure");
+
+        // At the deadline the subprocess runs again, fails, and the window doubles.
+        let deadline = 130_000 + rung;
+        sweep(&mut backoff, deadline, true, 0);
+        assert_eq!(calls.get(), 2, "at the deadline the probe is retried for real");
+        assert_eq!(backoff["p"].1, 2, "second consecutive failure");
+        assert_eq!(backoff["p"].0, deadline + rung * 2, "and the next window is twice as long");
+
+        // Recovery: suppression is honoured right up to the deadline, and the first success clears
+        // the entry so nothing is left to suppress the sweep after it.
+        sweep(&mut backoff, deadline + 1, false, 0);
+        assert_eq!(calls.get(), 2, "a success attempt inside the doubled window is suppressed too");
+
+        let recovered = deadline + rung * 2;
+        let swept = sweep(&mut backoff, recovered, false, 0);
+        assert_eq!(calls.get(), 3, "past it, the probe runs");
+        assert_eq!(
+            swept.outcomes[0].1.as_ref().map(|(dir, p)| (dir.clone(), p.prs.len())).ok(),
+            Some((PathBuf::from("/wt/p/0"), 0)),
+            "and the answering worktree comes back with it"
+        );
+        assert!(
+            !backoff.contains_key("p"),
+            "the per-project entry is CLEARED on success, so the repo is back on the ordinary cadence"
+        );
+
+        // Proof the clearing is what matters: the very next sweep probes with no delay at all.
+        let swept = sweep(&mut backoff, recovered, false, 0);
+        assert_eq!(calls.get(), 4, "no window survives a success");
+        assert_eq!(swept.outcomes[0].2, Disposition::Asked);
+    }
+
+    /// ONE BROKEN REPO MUST NOT SLOW A HEALTHY ONE — the reason the backoff is keyed per project.
+    ///
+    /// A global backoff would pass every assertion in the test above while blinding the entire
+    /// fleet on one logged-out checkout, which is strictly worse than the bug being fixed.
+    #[test]
+    fn a_broken_repo_does_not_back_off_its_healthy_neighbour() {
+        use std::cell::Cell;
+        let repos = vec![repo_of("broken", 1), repo_of("healthy", 1)];
+        let mut backoff = ProbeBackoff::new();
+        let asked = Cell::new(0usize);
+        let mut sweep = |backoff: &mut ProbeBackoff, now: u64| {
+            let mut hit: Vec<String> = Vec::new();
+            sweep_probes(
+                &repos,
+                backoff,
+                0,
+                10_000_000,
+                |dir| {
+                    asked.set(asked.get() + 1);
+                    hit.push(dir.to_string_lossy().to_string());
+                    if dir.starts_with("/wt/broken") {
+                        Err("gh-failed")
+                    } else {
+                        Ok(Probed { prs: vec![], saturated: false })
+                    }
+                },
+                || now,
+            );
+            hit
+        };
+
+        assert_eq!(sweep(&mut backoff, 0).len(), 2, "the first sweep asks both");
+        let second = sweep(&mut backoff, 1_000);
+        assert_eq!(
+            second,
+            vec!["/wt/healthy/0".to_string()],
+            "the broken repo is suppressed; the healthy one is still probed on the ordinary cadence"
+        );
+        assert!(backoff.contains_key("broken"));
+        assert!(
+            !backoff.contains_key("healthy"),
+            "and a repo that answered holds no backoff entry at all"
+        );
+    }
+
+    /// DISCOVERY IS NOT RE-WALKED WHEN NOTHING MOVED.
+    ///
+    /// The assertion is the SIDE EFFECT — how many times the enumeration ran — because comparing
+    /// the returned lists would pass just as happily against code that re-walks every sweep, which
+    /// is precisely the behaviour being removed.
+    #[test]
+    fn an_unchanged_worktree_layout_is_not_walked_again() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("worktrees");
+        let wt = base.join("proj-a").join("agent-1");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), "gitdir: ...").unwrap();
+
+        let mut cache = DiscoveryCache::default();
+        // A `Cell`, not a captured `&mut`, so reading the count between calls does not fight the
+        // borrow `walk` itself holds — `walk` is called again after every assertion below, so a
+        // plain `&mut usize` capture keeps the borrow alive across the read (E0502).
+        let walks = std::cell::Cell::new(0usize);
+        let mut walk = |c: &mut DiscoveryCache| {
+            c.repos(d.path(), |p| {
+                walks.set(walks.get() + 1);
+                discover_repos(p)
+            })
+        };
+
+        let first = walk(&mut cache);
+        let second = walk(&mut cache);
+        assert_eq!(walks.get(), 1, "the layout did not change, so it must not be walked twice");
+        assert_eq!(first, second, "and the cached answer is the same answer");
+        assert_eq!(first.len(), 1);
+
+        // A NEW WORKTREE MUST STILL BE FOUND — a cache that never invalidates is just a bug with
+        // better latency.
+        let wt2 = base.join("proj-a").join("agent-2");
+        std::fs::create_dir_all(&wt2).unwrap();
+        std::fs::write(wt2.join(".git"), "gitdir: ...").unwrap();
+        let third = walk(&mut cache);
+        assert_eq!(walks.get(), 2, "adding a worktree bumps its project dir's mtime, so we re-walk");
+        assert_eq!(third[0].dirs.len(), 2, "and the new worktree is in the answer");
+
+        // A NEW PROJECT bumps the BASE directory instead — the other half of the stamp.
+        let wt3 = base.join("proj-b").join("agent-3");
+        std::fs::create_dir_all(&wt3).unwrap();
+        std::fs::write(wt3.join(".git"), "gitdir: ...").unwrap();
+        let fourth = walk(&mut cache);
+        assert_eq!(walks.get(), 3, "a new PROJECT is caught by the base dir's mtime");
+        assert_eq!(fourth.len(), 2);
+    }
+
+    /// A PROJECT EMPTIED AND THEN REPOPULATED MUST COME BACK — the cache's worst failure mode, and
+    /// the one that is NOT fail-closed (roborev 63301, High).
+    ///
+    /// `discover_repos` drops a project directory whose worktrees are all gone, so a stamp keyed off
+    /// the ENUMERATION's result stops watching that directory the moment it empties. Refilling it
+    /// bumps only that directory's mtime — `base` does not move, because the directory still exists
+    /// — so nothing invalidates and the project stays invisible until an unrelated project appears
+    /// or the app restarts.
+    ///
+    /// That is not a stale read. The project is ABSENT: no `Err`, no blind look, nothing counted as
+    /// unreadable. Every PR in it silently reads as "no conflicts", which is the one thing this
+    /// module must never say. Empty project directories are ordinary on a machine that has torn
+    /// down every worktree of a project, so this is the steady state, not a corner.
+    #[test]
+    fn a_project_that_empties_and_refills_is_found_again() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("worktrees");
+        let proj = base.join("proj-a");
+        let wt1 = proj.join("agent-1");
+        std::fs::create_dir_all(&wt1).unwrap();
+        std::fs::write(wt1.join(".git"), "gitdir: ...").unwrap();
+
+        let mut cache = DiscoveryCache::default();
+        let walks = std::cell::Cell::new(0usize);
+        let mut walk = |c: &mut DiscoveryCache| {
+            c.repos(d.path(), |p| {
+                walks.set(walks.get() + 1);
+                discover_repos(p)
+            })
+        };
+
+        assert_eq!(walk(&mut cache).len(), 1, "the project is found while it holds a worktree");
+        assert_eq!(walks.get(), 1);
+
+        // Tear the only worktree down. The project DIRECTORY survives — that is the precondition.
+        std::fs::remove_dir_all(&wt1).unwrap();
+        assert!(proj.is_dir(), "the now-empty project directory is still present");
+        assert!(walk(&mut cache).is_empty(), "and the project drops out of the answer");
+        assert_eq!(walks.get(), 2, "removing a worktree bumps the project dir, so we re-walked");
+
+        // A new agent starts up in that same project. Only the project dir's mtime moves.
+        let wt2 = proj.join("agent-2");
+        std::fs::create_dir_all(&wt2).unwrap();
+        std::fs::write(wt2.join(".git"), "gitdir: ...").unwrap();
+
+        let back = walk(&mut cache);
+        assert_eq!(
+            walks.get(),
+            3,
+            "the emptied project directory must STILL be stamped — keying the stamp off the walk's \
+             result stops watching it here, and nothing ever invalidates again"
+        );
+        assert_eq!(back.len(), 1, "and the project is visible again");
+        assert_eq!(back[0].dirs, vec![wt2], "carrying its new worktree");
+    }
+
+    /// THE STAMP IS TAKEN BEFORE THE WALK, so a change that lands mid-walk costs one redundant
+    /// re-walk rather than being lost forever (roborev 63301, Medium).
+    ///
+    /// Asserted through the seam the production path uses: the injected `enumerate` creates a
+    /// worktree WHILE it runs, standing in for one appearing between `read_dir` and the stamp. A
+    /// post-walk stamp would record that creation as already-seen and never look again.
+    #[test]
+    fn a_worktree_appearing_during_the_walk_is_not_lost() {
+        let d = tempfile::tempdir().unwrap();
+        let base = d.path().join("worktrees");
+        let proj = base.join("proj-a");
+        std::fs::create_dir_all(proj.join("agent-1")).unwrap();
+        std::fs::write(proj.join("agent-1").join(".git"), "gitdir: ...").unwrap();
+
+        let mut cache = DiscoveryCache::default();
+        let walks = std::cell::Cell::new(0usize);
+
+        // First walk: while enumerating, a second worktree appears — after this walk has already
+        // decided what it saw.
+        let first = cache.repos(d.path(), |p| {
+            walks.set(walks.get() + 1);
+            let seen = discover_repos(p);
+            let late = proj.join("agent-2");
+            std::fs::create_dir_all(&late).unwrap();
+            std::fs::write(late.join(".git"), "gitdir: ...").unwrap();
+            seen
+        });
+        assert_eq!(first[0].dirs.len(), 1, "the walk legitimately missed the late arrival");
+
+        let second = cache.repos(d.path(), |p| {
+            walks.set(walks.get() + 1);
+            discover_repos(p)
+        });
+        assert_eq!(
+            walks.get(),
+            2,
+            "the next sweep MUST re-walk: the stamp predates the mid-walk change, so it differs"
+        );
+        assert_eq!(
+            second[0].dirs.len(),
+            2,
+            "and the worktree that appeared during the walk is picked up rather than lost forever"
+        );
     }
 
     // ══ THE PRUNE ═══════════════════════════════════════════════════════════════════════════════

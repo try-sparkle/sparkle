@@ -202,6 +202,14 @@ import {
   type ApprovalsResult,
 } from "./approvals";
 import {
+  ACCOUNTS_OPS,
+  ACCOUNTS_RISK,
+  readUsage,
+  switchAll,
+  type AccountsOp,
+  type AccountsResult,
+} from "./accounts";
+import {
   PLANS_OPS,
   PLANS_RISK,
   listPlans,
@@ -279,6 +287,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "diff",
   "fleet",
   "research",
+  "accounts",
 ] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
@@ -553,6 +562,14 @@ function fromDiff<T>(ctx: OpContext, r: DiffResult<T>): ConciergeToolReply {
 /** approvals: same convention as board. Read-only throughout — see approvals.ts's header for why
  *  there is deliberately no `approve` op for this to normalize. */
 function fromApprovals<T>(ctx: OpContext, r: ApprovalsResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** accounts: same convention as board. Its four refusal codes pass through because they demand
+ *  different next moves — `same-quota` means "pick a different login" (the switch would be a no-op
+ *  that interrupts the whole fleet), while `already-current` means there is nothing to do at all. A
+ *  caller that cannot tell them apart will retry the one that costs everyone a turn boundary. */
+function fromAccounts<T>(ctx: OpContext, r: AccountsResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
@@ -1652,6 +1669,22 @@ const APPROVALS_ROUTES: Record<ApprovalsOp, Handler> = {
 };
 
 // ---------------------------------------------------------------------------------------------
+// ACCOUNTS — which Claude account has room, and moving the fleet onto it.
+// ---------------------------------------------------------------------------------------------
+
+/** The target account. No `confirm` flag: `switch_all` is `disruptive`, so the ASK TIER is its gate
+ *  (see accounts.ts's header). A confirm argument here would be a gate a model satisfies by setting
+ *  a boolean, in front of the one a human actually answers. */
+const switchAllArgs = z
+  .object({ accountId: z.string().min(1, "an account id is required") })
+  .strict();
+
+const ACCOUNTS_ROUTES: Record<AccountsOp, Handler> = {
+  read_usage: route(noArgs, async (_a, ctx) => fromAccounts(ctx, await readUsage())),
+  switch_all: route(switchAllArgs, async (a, ctx) => fromAccounts(ctx, await switchAll(a.accountId))),
+};
+
+// ---------------------------------------------------------------------------------------------
 // RESEARCH — "Concierge Agents": ask a question, keep talking, read the answer later.
 // ---------------------------------------------------------------------------------------------
 
@@ -1969,6 +2002,11 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => RESEARCH_WRITE[op as ResearchOp] ?? true,
     ops: RESEARCH_OPS,
   },
+  accounts: {
+    routes: ACCOUNTS_ROUTES,
+    write: (op) => ACCOUNTS_RISK[op as AccountsOp] !== "read-only",
+    ops: ACCOUNTS_OPS,
+  },
 };
 
 /**
@@ -2004,6 +2042,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   diff: DOMAINS.diff.ops,
   fleet: DOMAINS.fleet.ops,
   research: DOMAINS.research.ops,
+  accounts: DOMAINS.accounts.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

@@ -56,6 +56,7 @@ import { PLANS_OPS } from "./plans";
 import { DIFF_OPS } from "./diff";
 import { FLEET_OPS } from "./fleet";
 import { RESEARCH_OPS } from "./research";
+import { ACCOUNTS_OPS } from "./accounts";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
 const NONE = { overrides: NO_TOOL_POLICY_OVERRIDES };
@@ -321,6 +322,7 @@ describe("risk that depends on the CALL, not on the op name", () => {
     // walks.
     const prosePublishing: readonly (readonly [string, readonly string[]])[] = [
       ["research", RESEARCH_OPS],
+      ["accounts", ACCOUNTS_OPS],
       ["screenshot", SCREENSHOT_OPS],
       ["attachments", ATTACHMENTS_OPS],
       ["workflow", WORKFLOW_OPERATIONS],
@@ -372,6 +374,17 @@ describe("explicit rules — the three values", () => {
       expect(v.requiresConfirmation).toBe(decision === "ask");
       expect(v.defaultDecision).toBe("ask");
     }
+  });
+
+  // THE ACCOUNTS GATE, asserted where it is actually decided. accounts.test.ts pins the WORD
+  // (`switch_all` is `disruptive`), but the word only matters because of the translation and the
+  // derivation this module performs on it — and both are places the row could silently land on
+  // `routine` while that test stayed green. What must be true is this: moving every agent between
+  // Anthropic logins asks a human first, and merely reading headroom does not.
+  it("switch_all asks a human; read_usage does not", () => {
+    expect(defaultDecisionFor("switch_all")).toBe("ask");
+    expect(evaluateToolPolicy("switch_all", NONE).requiresConfirmation).toBe(true);
+    expect(defaultDecisionFor("read_usage")).toBe("allow");
   });
 
   it("an explicit allow can loosen a dangerous default — that is the point of per-tool control", () => {
@@ -433,6 +446,7 @@ describe("the tool set is derived from the domains", () => {
       "diff",
       "fleet",
       "research",
+      "accounts",
       "app",
     ]);
     expect(CONCIERGE_TOOL_DOMAINS.map((d) => d.id)).toEqual(
@@ -487,6 +501,7 @@ describe("the tool set is derived from the domains", () => {
         DIFF_OPS.length +
         FLEET_OPS.length +
         RESEARCH_OPS.length +
+        ACCOUNTS_OPS.length +
         APP_TOOL_NAMES.length,
     );
   });

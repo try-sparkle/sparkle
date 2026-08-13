@@ -31,6 +31,7 @@ import type { DiffOp } from "../services/conciergeTools/diff";
 import type { FleetOp } from "../services/conciergeTools/fleet";
 import type { PlansOp } from "../services/conciergeTools/plans";
 import type { ResearchOp } from "../services/conciergeTools/research";
+import type { AccountsOp } from "../services/conciergeTools/accounts";
 import { conciergeNativeToolLine } from "./conciergeNativeToolLine";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
@@ -422,6 +423,20 @@ const RESEARCH_PHRASES: Record<ResearchOp, OpPhrase> = {
   cancel: phrase("Calling off a research task", "Called off a research task"),
 };
 
+/**
+ * Claude accounts. `switch_all` says REQUESTED, not "switched", for the same reason `dispatch`
+ * above says "sent": each agent moves at its own safe stopping point, so the switch is still
+ * running minutes after the op returns. A past-tense "Moved every agent" would claim a migration
+ * that has not happened yet — and this line is what the human reads instead of watching it.
+ */
+const ACCOUNTS_PHRASES: Record<AccountsOp, OpPhrase> = {
+  read_usage: phrase("Checking your Claude accounts", "Checked your Claude accounts"),
+  switch_all: phrase(
+    "Moving every agent to another Claude account",
+    "Asked every agent to move to another Claude account",
+  ),
+};
+
 /** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
  *  domain cannot be added without deciding how the column describes it.
  *
@@ -459,6 +474,9 @@ const DOMAINS: Record<
   // Reuses the agents glyph: a research task IS an agent — a background `claude` child the
   // concierge started — so it belongs with the other lines about agents doing work.
   research: { icon: "agents", phrases: RESEARCH_PHRASES },
+  // Reuses the agents glyph: both ops are about where the AGENTS are running — which login has
+  // room for them, and moving them onto it. No new glyph, consistent with `board` and `plans`.
+  accounts: { icon: "agents", phrases: ACCOUNTS_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.

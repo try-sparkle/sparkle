@@ -80,6 +80,12 @@ import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
 import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
+import {
+  ACCOUNTS_OPS,
+  ACCOUNTS_RISK,
+  ACCOUNTS_TOOL_SUMMARY,
+  type AccountsOp,
+} from "./accounts";
 import { WIDE_HISTORY_SCOPE } from "@sparkle/core";
 
 // ---------------------------------------------------------------------------------------------
@@ -180,6 +186,7 @@ export type ConciergeToolDomain =
   | "diff"
   | "fleet"
   | "research"
+  | "accounts"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -198,6 +205,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "diff", label: "Diff" },
   { id: "fleet", label: "Fleet awareness" },
   { id: "research", label: "Background research" },
+  { id: "accounts", label: "Claude accounts" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -507,6 +515,7 @@ export type ConciergeToolName =
   | PlansOp
   | FleetOp
   | ResearchOp
+  | AccountsOp
   | AppToolName;
 
 /**
@@ -569,6 +578,11 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // translation rather than declaring a second identical one.
   ...translateRisk(BOARD_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(APPROVALS_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Accounts publishes `read-only` and `disruptive` — both members of workspace's vocabulary. The
+  // load-bearing row is `switch_all`: `disruptive` derives to `ask`, which IS its confirmation gate
+  // (see accounts.ts). Re-classing it `routine` would silently let the concierge move the entire
+  // fleet between Anthropic logins unprompted.
+  ...translateRisk(ACCOUNTS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(PLANS_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(DIFF_RISK, WORKSPACE_RISK_TO_CLASS),
   // Fleet publishes the same four risk words. The load-bearing rows are the two `routine` sends:
@@ -706,6 +720,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(DIFF_RISK, "diff" as const),
   ...constantOver(FLEET_RISK, "fleet" as const),
   ...constantOver(RESEARCH_RISK, "research" as const),
+  ...constantOver(ACCOUNTS_RISK, "accounts" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -730,6 +745,7 @@ export const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
   ...TERMINAL_TOOL_SUMMARY,
   ...ATTACHMENTS_TOOL_SUMMARY,
   ...APP_TOOL_SUMMARY,
+  ...ACCOUNTS_TOOL_SUMMARY,
   ...Object.fromEntries(WORKFLOW_OPERATIONS.map((op) => [op, WORKFLOW_RISK[op].summary])),
 };
 
@@ -749,6 +765,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   diff: DIFF_OPS,
   fleet: FLEET_OPS,
   research: RESEARCH_OPS,
+  accounts: ACCOUNTS_OPS,
   app: APP_TOOL_NAMES,
 };
 
