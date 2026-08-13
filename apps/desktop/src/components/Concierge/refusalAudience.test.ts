@@ -277,3 +277,40 @@ describe("every real roborev refusal string classifies as an internal gate", () 
     expect(refusalAudience(reason)).toBe("founder");
   });
 });
+
+// ── THE TERMINAL SEND'S SCREEN GUARDS REACH THE FOUNDER, AND THIS PINS IT (roborev 63727) ──────
+//
+// AN INVERSION TEST, not a coverage one. An `INTERNAL_GATES` entry for the alternate-screen refusal
+// was written and removed before it shipped, and the reason it is easy to re-add is that the refusal
+// LOOKS internal: it repeats once per agent, it reads as machinery, and the concierge does route
+// around it. What it actually fires on is `alternateBuffer && !claudeCodeHoldsTheBuffer` — which
+// CLAUDE CODE'S OWN PERMISSION DIALOG takes, because the dialog replaces the composer box
+// `isClaudeCodeScreen` requires. `goalContinuationRunner` measured the population: "five agents
+// frozen with this reason, every one of them a normal Claude Code pane stopped at `Do you want to
+// proceed?`, not one in an editor or a pager".
+//
+// So withholding it would hide the one thing only the founder can clear. These two cases exist to go
+// RED if a future entry ever matches either sentence.
+//
+// Producer-bound like the roborev block above: `registry.ts` hands `sendDetail`'s sentence back as
+// the refusal `message` and `controlListener` settles it as the receipt's `reason`.
+import { sendDetail } from "../../services/conciergeTools/terminal";
+
+describe("both terminal screen guards reach the founder", () => {
+  it("does not withhold the alternate-screen refusal — it is usually an approval prompt", () => {
+    const reason = sendDetail("alternate-screen", "agent-1");
+    // The corrected copy names the EVIDENCE and leads with the likelier cause, rather than asserting
+    // an editor or pager that is essentially never there.
+    expect(reason).toContain("full-screen mode");
+    expect(reason).toContain("permission dialog");
+    expect(refusalAudience(reason)).toBe("founder");
+    expect(refusalGist(reason)).toBeNull();
+  });
+
+  it("does not withhold the sibling credential-field refusal either", () => {
+    const blocked = sendDetail("blocked-prompt", "agent-1");
+    expect(blocked).toContain("credential");
+    expect(refusalAudience(blocked)).toBe("founder");
+    expect(refusalGist(blocked)).toBeNull();
+  });
+});

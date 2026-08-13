@@ -792,21 +792,21 @@ describe("the fold's anonymous wording is the same wording an individual row use
     );
   });
 
-  // ══ THE REFUSED SPAWN THAT CARRIES A SUBJECT IS EXACTLY ONE SHAPE, AND IT DOES NOT FOLD ═════════
+  // ══ THE REFUSED SPAWN THAT CARRIES A SUBJECT IS EXACTLY ONE SHAPE, AND IT FOLDS VERBATIM ════════
   //
   // `agentId` reaches a refused `spawned` receipt through ONE door: the classifier's fatal
   // `spawnShortfall` arm, which flips a transport-level ok to `ok: false` when the reply says
   // `agentExists === false`. That arm also OVERWRITES `reason` with its own words — `briefFailureCopy`'s
   // sentence, or the literal "that agent is already gone". Neither matches an `INTERNAL_GATES` entry,
-  // so `refusalGist` is null, `receiptMark` writes no `gist`, and `foldKeyOf` refuses at its refusal
-  // arm. Meanwhile the capacity sentence that DOES yield a gist comes only from `refuse()`, which
-  // carries no `data` and therefore no `agentId`.
+  // so `refusalGist` is null and `receiptMark` writes no `gist`.
   //
-  // So the subject-carrying refusal and the foldable refusal are DISJOINT populations, and the two
-  // facts are pinned separately below rather than smuggled into one fold assertion. The previous
-  // version paired an `agentId` with the capacity reason — a combination no producer emits — and
-  // asserted the FOLD on it, which is the very hazard `bothWays`' header warns about, one round after
-  // that header was written (roborev 63613, Medium).
+  // THIS BLOCK USED TO SAY IT THEREFORE DOES NOT FOLD AT ALL, and that stopped being true at roborev
+  // 63727: a gist-less refusal now folds on its VERBATIM reason, so this population is foldable — it
+  // simply folds through the door that KEEPS its words rather than the one that replaces them. The
+  // 63613 hazard the old note guarded against is unchanged and still guarded: what must never happen
+  // is pairing an `agentId` with the CAPACITY reason, a combination no producer emits, and then
+  // asserting a fold on it. The capacity sentence comes only from `refuse()`, which carries no `data`
+  // and therefore no `agentId`. So the two doors stay distinct; only "unfoldable" was too strong.
   const shortfall = (): ConciergeActionReceipt => ({
     id: "r4",
     kind: "spawned",
@@ -817,12 +817,46 @@ describe("the fold's anonymous wording is the same wording an individual row use
     reason: "that agent is already gone",
   });
 
-  it("pins that the subject-carrying refusal is UNFOLDABLE, rather than assuming it", () => {
+  it("pins WHICH door it folds through — the verbatim one, never a gist", () => {
     // Stated as an assertion because everything below depends on it: if a future gate entry ever
-    // matched the shortfall's words, this reds and the two cases after it need a fold half.
+    // matched the shortfall's words, the fold would start WITHHOLDING them and this reds.
     const mark = receiptMark(shortfall(), () => null);
     expect(mark.gist).toBeUndefined();
-    expect(foldKeyOf(mark)).toBeNull();
+    expect(mark.reason).toBe("that agent is already gone");
+    expect(foldKeyOf(mark)).toBe("verbatim:spawned:that agent is already gone");
+  });
+
+  it("names only the agents the rows named, when two of them fold together", () => {
+    // `spawned` is a WHO-SHAPED arm — its sentence counts agents, so its residue goes out whole. The
+    // invariant that matters is the one this file has broken twice: the fold must never name an
+    // agent the rows it replaced did not. Both members here resolve, so both chips are earned.
+    const resolve = (id: string) =>
+      id === "atlas-1"
+        ? { id: "atlas-1", name: "Atlas" }
+        : id === "atlas-2"
+          ? { id: "atlas-2", name: "Borealis" }
+          : null;
+    const mk = (id: string, agentId: string): ConciergeMessage => {
+      const r = { ...shortfall(), id, agentId };
+      return {
+        id,
+        kind: "sparkle",
+        text: actionReceiptLine(r, resolve)?.md ?? "",
+        actionReceipt: receiptMark(r, resolve),
+      };
+    };
+    const fold = receiptRunLine(
+      runOf([mk("a", "atlas-1"), mk("b", "atlas-2")]),
+    );
+    expect(fold.spoken).toBe(
+      "Couldn't spawn 2 agents — that agent is already gone — Atlas, Borealis",
+    );
+    // THE RESIDUE ONLY, because this reason's own words happen to CONTAIN the anonymous wording
+    // ("that agent is already gone") — a flat `not.toContain(ANONYMOUS_SUBJECT)` over the whole
+    // sentence tests the tool's phrasing rather than the chips, and reds on a correct fold.
+    const residue = fold.spoken.split(" — ").at(-1) ?? "";
+    expect(residue).toBe("Atlas, Borealis");
+    expect(residue).not.toContain(ANONYMOUS_SUBJECT);
   });
 
   it("draws a PILL on that refusal when its id resolves — the shape spawnShortfall really ships", () => {
@@ -830,9 +864,10 @@ describe("the fold's anonymous wording is the same wording an individual row use
     // reachable for the first time; the hard-coded words could never draw one.
     //
     // Asserted on `.md`, because `.spoken` flattens a pill to the bare name and so cannot tell a chip
-    // from plain text. The correspondence is asserted on `receiptMark`'s `subjectId` instead of on a
-    // folded line, because this receipt never reaches a fold — but the two still read the SAME
-    // resolver, which is the property that matters: whatever the row drew, the mark agrees with.
+    // from plain text. The correspondence is asserted on `receiptMark`'s `subjectId` rather than on a
+    // folded line because this case is about a SINGLE row — the folded twin is the case above — but
+    // the two still read the SAME resolver, which is the property that matters: whatever the row
+    // drew, the mark agrees with.
     const resolve = (id: string) =>
       id === "atlas-1" ? { id: "atlas-1", name: "Atlas" } : null;
     const r = shortfall();
@@ -884,5 +919,211 @@ describe("the fold's anonymous wording is the same wording an individual row use
     // hold with stray residue attached). Neither side may mint a chip for a receipt that named nobody.
     expect(md).not.toContain("sparkle-agent:");
     expect(foldedMd).not.toContain("sparkle-agent:");
+  });
+});
+
+// ══ THE FIVE-AGENT RELAY THAT HIT FIVE APPROVAL PROMPTS ══════════════════════════════════════════
+//
+// THE REPORT, for the fourth time: "Maybe you collapse them all or something." One relay to a fleet
+// refuses ONCE PER AGENT, so five agents whose panes are in full-screen mode produced five
+// full-width copies of one sentence — the wall this module exists to end, arriving through the one
+// door still open to it.
+//
+// AND THE FIRST FIX WAS WRONG IN A WAY WORTH KEEPING ON THE PAGE (roborev 63727, Medium). It gave
+// that refusal a GIST, which folds by WITHHOLDING the tool's words — and the population is not what
+// the old sentence claimed. The guard fires on `alternateBuffer && !claudeCodeHoldsTheBuffer`, and
+// Claude Code's own permission dialog takes it (the dialog replaces the composer box
+// `isClaudeCodeScreen` requires). `goalContinuationRunner` measured it: "five agents frozen with
+// this reason, every one of them a normal Claude Code pane stopped at `Do you want to proceed?`".
+// Withholding that would hide the one thing only the founder can clear, behind a cause that is
+// essentially never the real one.
+//
+// SO THESE ROWS FOLD ON THEIR VERBATIM REASON INSTEAD. The founder loses the four duplicates and
+// nothing else: the sentence is repeated word for word, the count is stated, every agent is a pill,
+// and the chevron expands in place.
+//
+// PRODUCER-BOUND AND MARK-DERIVED, per this file's header: the reason is `sendDetail`'s real
+// sentence and the marks come from `receiptMark`, so a hand-written field cannot fake the fold.
+import { sendDetail } from "../../services/conciergeTools/terminal";
+
+describe("a fleet relay refused by five full-screen panes folds to ONE row", () => {
+  const NAMES = ["Alpha", "Beta", "Gamma", "Delta", "Epsilon"];
+  const REASON = sendDetail("alternate-screen", "agent-Alpha");
+  /** What both the row and the fold actually splice — the producer's sentence minus its own verb. */
+  const TAIL = REASON.replace(/^Not sent:\s*/, "");
+  const resolve: ResolveReceiptAgent = (id) => {
+    const name = NAMES.find((n) => id === `agent-${n}`);
+    return name ? { id, name } : null;
+  };
+  const refusal = (
+    name: string,
+    reason: string = REASON,
+  ): ConciergeActionReceipt => ({
+    id: `r-${name}`,
+    kind: "sent",
+    ok: false,
+    at: 1,
+    op: "fleet.send_to_agent_terminal",
+    agentId: `agent-${name}`,
+    agentName: name,
+    reason,
+  });
+  const asMessage = (r: ConciergeActionReceipt): ConciergeMessage => ({
+    id: r.id,
+    kind: "sparkle",
+    text: actionReceiptLine(r, resolve)?.md ?? "",
+    actionReceipt: receiptMark(r, resolve),
+  });
+  const messages = (): ConciergeMessage[] =>
+    NAMES.map((name) => asMessage(refusal(name)));
+
+  it("is a FOUNDER refusal — it carries the words, never a gist", () => {
+    // Stated as an assertion because everything below depends on it: if a future INTERNAL_GATES
+    // entry ever matches this sentence, the fold silently becomes a withholding one and this reds.
+    const mark = receiptMark(refusal("Alpha"), resolve);
+    expect(mark.gist).toBeUndefined();
+    expect(mark.reason).toBe(TAIL);
+  });
+
+  // ══ NO STUTTER, AND NOTHING THAT COLLIDES WITH THE ROW'S OWN SEPARATOR (roborev 63747) ═════════
+  it("does not repeat the verb the row is about to say itself", () => {
+    // The producer's sentence opens with its own "Not sent: ", and every arm splices the reason
+    // after a verb of ours. Spliced raw the founder read "Not sent to Alpha — Not sent: that
+    // terminal…", and the fold stuttered identically. Both halves read one `why()`, so this pins
+    // the row and the fold together.
+    expect(REASON).toMatch(/^Not sent:/);
+    expect(TAIL).not.toMatch(/^Not sent/);
+    const row = actionReceiptLine(refusal("Alpha"), resolve)?.spoken ?? "";
+    expect(row).toBe(`Not sent to Alpha — ${TAIL}`);
+    expect(row).not.toContain("— Not sent:");
+  });
+
+  it("keeps the fold's own separator out of the reason it splices", () => {
+    // ` — ` separates verb, reason and agent pills. A reason containing one leaves the reader unable
+    // to see where the reason ends and the agent list begins, so the producer's copy must stay clear
+    // of it — asserted on the PRODUCER, since that is the thing a copy edit changes.
+    expect(REASON).not.toContain(" — ");
+  });
+
+  it("collapses five rows into one", () => {
+    const rows = foldReceiptRuns(messages());
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.type).toBe("receipt-run");
+    expect(runOf(messages()).members).toHaveLength(5);
+  });
+
+  it("repeats the reason VERBATIM — folding is not withholding", () => {
+    const fold = receiptRunLine(runOf(messages()));
+    // THE WHOLE STRING, not a prefix and not a `toContain` — the residue bugs this file has already
+    // shipped twice were invisible to both (roborev 63364, 63482).
+    expect(fold.spoken).toBe(
+      `Not sent, 5 times — ${TAIL} — ${NAMES.join(", ")}`,
+    );
+    // Every word the five rows carried is still on screen, in one row instead of five.
+    expect(fold.spoken).toContain(TAIL);
+    // Five real pills, so the navigation the unfolded rows had survives the fold.
+    for (const name of NAMES)
+      expect(fold.md).toContain(`sparkle-agent:agent-${name}`);
+    // …and it never claims the send happened.
+    expect(fold.spoken).not.toMatch(/^Sent\b/);
+  });
+
+  it("keeps TWO DIFFERENT reasons apart — the key is the words, not the kind", () => {
+    // The property that makes verbatim folding safe: only genuinely identical refusals merge. A
+    // credential-field refusal beside a full-screen one is two facts and stays two rows.
+    const other = sendDetail("blocked-prompt", "agent-Beta");
+    expect(other).not.toBe(REASON);
+    const rows = foldReceiptRuns([
+      asMessage(refusal("Alpha")),
+      asMessage(refusal("Beta")),
+      asMessage(refusal("Gamma", other)),
+      asMessage(refusal("Delta", other)),
+    ]);
+    expect(rows.map((r) => r.type)).toEqual(["receipt-run", "receipt-run"]);
+    const [first, second] = rows as ReceiptRun[];
+    expect(receiptRunLine(first!).spoken).toContain(TAIL);
+    expect(receiptRunLine(second!).spoken).toContain(
+      other.replace(/^Not sent:\s*/, ""),
+    );
+  });
+
+  it("still stands a refusal with NO reason on its own", () => {
+    // Absence is not evidence: nothing proves two of those say the same thing, so they never merge.
+    const bare = (name: string): ConciergeMessage =>
+      asMessage({ ...refusal(name), reason: undefined });
+    expect(
+      foldReceiptRuns([bare("Alpha"), bare("Beta")]).every(
+        (r) => r.type === "message",
+      ),
+    ).toBe(true);
+  });
+});
+
+// ══ THE TWO POPULATIONS THE VERBATIM DOOR MADE REACHABLE (roborev 63747, Medium ×2) ══════════════
+//
+// Both were unreachable-by-luck rather than handled: while a refusal needed a GIST to fold, no
+// `INTERNAL_GATES` entry matched either shape, so neither could ever reach the fold. The verbatim
+// door opened both at once, and each fails in a different direction.
+describe("what the verbatim door newly reaches", () => {
+  const resolve: ResolveReceiptAgent = (id) =>
+    id === "a1"
+      ? { id: "a1", name: "Alpha" }
+      : id === "a2"
+        ? { id: "a2", name: "Beta" }
+        : null;
+  const mk = (
+    id: string,
+    over: Partial<ConciergeActionReceipt>,
+  ): ConciergeMessage => {
+    const r: ConciergeActionReceipt = {
+      id,
+      kind: "retired",
+      ok: false,
+      at: 1,
+      op: "fleet.retire_agent",
+      reason: "that agent is mid-turn",
+      ...over,
+    } as ConciergeActionReceipt;
+    return {
+      id,
+      kind: "sparkle",
+      text: actionReceiptLine(r, resolve)?.md ?? "",
+      actionReceipt: receiptMark(r, resolve),
+    };
+  };
+
+  it("gives a folded RETIRED run its own verb, instead of '2 actions didn't go through'", () => {
+    // `retire_agent` is a per-agent op the concierge issues in BATCHES on its own initiative, so a
+    // run of them is ordinary. The kind whose own doc says the receipt is the only witness — the
+    // founder was not present for the act — is the worst one to drop the verb on.
+    const fold = receiptRunLine(
+      runOf([mk("r1", { agentId: "a1" }), mk("r2", { agentId: "a2" })]),
+    );
+    expect(fold.spoken).toBe(
+      "Couldn't retire 2 agents — that agent is mid-turn — Alpha, Beta",
+    );
+    expect(fold.spoken).not.toContain("actions didn't go through");
+    // WHO-SHAPED like `closed`: the count is subject-derived, so the residue goes out whole and both
+    // chips are earned by members that really resolved.
+    expect(fold.md).toContain("sparkle-agent:a1");
+    expect(fold.md).toContain("sparkle-agent:a2");
+  });
+
+  it("still refuses to fold an already-plural REFUSAL — the guard sits above the refusal arm", () => {
+    // Two `inbox_broadcast` refusals sharing one reason. Folded, "Not sent, 2 times" would describe
+    // two fan-outs of N recipients each as two sends — understating how many agents missed the
+    // message, which is the one direction this module may not be wrong in. The guard's POSITION is
+    // what holds this: under the refusal arm it would never be consulted.
+    const bcast = (id: string): ConciergeMessage =>
+      mk(id, { kind: "sent", fanout: true } as Partial<ConciergeActionReceipt>);
+    const rows = foldReceiptRuns([bcast("b1"), bcast("b2")]);
+    expect(rows.every((r) => r.type === "message")).toBe(true);
+    // And the mark really did carry the reason, so this is the guard refusing rather than a missing
+    // field quietly producing the same answer — the difference between a guard and an accident.
+    const one = bcast("b1");
+    expect(one.kind).toBe("sparkle");
+    expect(one.kind === "sparkle" ? one.actionReceipt?.reason : undefined).toBe(
+      "that agent is mid-turn",
+    );
   });
 });

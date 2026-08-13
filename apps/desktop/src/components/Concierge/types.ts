@@ -258,7 +258,11 @@ export interface ConciergeReceiptMark {
   /** For `sent`: which channel, because the three are visible at different times and must not share
    *  a folded sentence. */
   channel?: ConciergeSendChannel;
-  /** This receipt was already plural (a broadcast). Never folded — see ./receiptRuns. */
+  /** This receipt was already plural (a broadcast). NEVER folded, refused or not — and that test
+   *  sits ABOVE the refusal arm in `foldKeyOf` precisely so it still holds now that a gist-less
+   *  refusal folds (roborev 63747). Folding several fan-outs would need a count of counts, and "Not
+   *  sent, 2 times" over two broadcasts of N recipients understates how many agents missed the
+   *  message. See ./receiptRuns. */
   fanout?: true;
   /** This `sent` was a picker press, not a message. Folds in its own bucket. */
   viaPicker?: true;
@@ -302,10 +306,42 @@ export interface ConciergeReceiptMark {
    * founder's original report was that he saw them "verbatim and repeatedly". Keeping every row (as
    * it must, so a refusal can still contradict a turn claiming success) therefore trades N
    * paragraphs for N identical rows, which is the same column-of-identical-rows this module exists
-   * to end. Folding on `kind + gist` collapses them without merging two different reasons, and a
-   * founder-actionable refusal still never folds because it has no gist.
+   * to end. Folding on `kind + gist` collapses them without merging two different reasons.
+   *
+   * THIS DOC USED TO END "and a founder-actionable refusal still never folds because it has no
+   * gist", which is the exact rule roborev 63727 reversed. It folds — on its VERBATIM reason, see
+   * {@link reason} — and this block comment is the spec the next agent pins tests against, so a
+   * stale sentence here is a live trap rather than an untidy comment. What `gist` still means, and all
+   * it means, is WITHHOLDING: the tool's paragraph replaced by a short phrase, limited to refusals
+   * `refusalAudience` positively recognises as the concierge's.
    */
   gist?: string;
+  /**
+   * For a refusal the FOUNDER must read: its verbatim words, so a run of IDENTICAL ones can fold
+   * while still saying every word the rows it replaced said.
+   *
+   * THE OPPOSITE FIELD FROM {@link gist}, and mutually exclusive with it by construction — `gist` is
+   * what a row shows INSTEAD of the tool's words, this is the words themselves. Exactly one of the
+   * two is set on a refusal, which is what lets `./receiptRuns` tell a withheld reason from a kept
+   * one without re-running the classifier.
+   *
+   * WHY THE TEXT AND NOT A BOOLEAN, unlike {@link hasDetail}. That field only had to answer "must
+   * this row stand alone?", and the answer is a bit. This one has to be RENDERED: the folded
+   * sentence repeats the reason verbatim, so a bit would leave it with nothing to say and force it
+   * back to a count — which is the withholding this field exists to avoid. A digest would bucket
+   * correctly and still not render.
+   *
+   * FOLDING IS NOT WITHHOLDING, which is the whole licence for this field (the founder's ruling:
+   * "maybe you collapse them all or something", after four reports of the same wall). A folded run
+   * of founder refusals states the count, repeats the reason word for word, names every subject as
+   * the row did, and expands in place. Nothing that reached him before reaches him less.
+   *
+   * IT COSTS LOCALSTORAGE, and that is the known trade. Every mark is persisted on every turn, and
+   * `hasDetail`'s doc chose a boolean partly for that reason. A refusal reason is one sentence and
+   * only refusals carry it, so the cost falls on the population that is by definition rare — while
+   * the alternative is a permanent wall on the population that is not.
+   */
+  reason?: string;
 }
 
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */

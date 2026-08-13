@@ -68,6 +68,33 @@ function who(receipt: ConciergeActionReceipt, resolve: ResolveReceiptAgent) {
 }
 
 /**
+ * THE REFUSAL'S WORDS, WITHOUT THE VERB THIS MODULE IS ABOUT TO SAY ITSELF (roborev 63747, Medium).
+ *
+ * Every `conciergeTools/terminal.sendDetail` refusal opens with its own `"Not sent: "`, and every
+ * arm below splices the reason after a verb of ours. Spliced raw, the founder read
+ * *"Not sent to Alpha — Not sent: that terminal is in full-screen mode…"*, and the folded row
+ * stuttered the same way. That is new: for `alternate-screen` these rows previously showed a short
+ * gist, so the redundancy arrived with the verbatim door.
+ *
+ * ONE DERIVATION, READ BY BOTH HALVES, which is the property that matters rather than the regex.
+ * {@link actionReceiptLine} splices this into the row and {@link receiptMark} stores it for the
+ * fold, so the two cannot disagree about what the reason says — the same reason `who()` is shared
+ * rather than copied. Stripping in only one of them is how a fold and its rows drift.
+ *
+ * DELIBERATELY LITERAL AND NARROW: the producer's own prefix, in the two shapes it writes, anchored
+ * at the start. Anything else falls through untouched, because a reason we do not recognise is one
+ * we have no grounds to edit — the same default `refusalAudience` takes.
+ */
+function why(receipt: ConciergeActionReceipt): string | undefined {
+  const text = receipt.reason?.trim();
+  if (!text) return undefined;
+  const stripped = text.replace(/^not sent\s*[:—-]\s*/i, "").trim();
+  // NEVER RETURN AN EMPTY STRING: a reason that was ONLY the prefix has nothing left to say, and an
+  // empty tail must read as "no reason given" rather than as a dangling em-dash.
+  return stripped === "" ? undefined : stripped;
+}
+
+/**
  * What the posted line REMEMBERS about the receipt behind it — the mark that lets a run of identical
  * receipts fold to one row (./receiptRuns).
  *
@@ -109,6 +136,15 @@ export function receiptMark(
     // reader can tell apart, or refuse to fold two that are identical on screen.
     ...(receipt.ok !== true && refusalGist(receipt.reason)
       ? { gist: refusalGist(receipt.reason)! }
+      : {}),
+    // ══ AND THE VERBATIM WORDS WHEN THERE IS NO GIST ══════════════════════════════════════════
+    // The founder-actionable half. `gist` is what the row showed INSTEAD of the tool's words; this
+    // is the words themselves, carried so a run of identical refusals can fold WITHOUT withholding
+    // anything (./receiptRuns). Exactly one of the two is ever set, because this arm is the `else`
+    // of the one above — read off the SAME `refusalGist` call for the same reason that one is, so
+    // the two can never both be present or both be missing.
+    ...(receipt.ok !== true && !refusalGist(receipt.reason) && why(receipt)
+      ? { reason: why(receipt)! }
       : {}),
     // ONLY WHEN THE LOOKUP HIT. A `subjectId` present means the sentence drew a real pill, so the
     // fold may draw one too; absent means it did not, and the fold shows the same words it did.
@@ -169,8 +205,11 @@ export function actionReceiptLine(
     // beneath it. His complaint was the WALL OF TEXT, not the line, so the gist replaces the tool's
     // words and the refusal itself still shows.
     const gist = refusalGist(receipt.reason);
-    const why = gist ?? receipt.reason?.trim();
-    const tail = why ? plain(` — ${why}`) : plain("");
+    // THROUGH `why()` ON THE VERBATIM SIDE — the same call `receiptMark` makes, so the row and the
+    // fold splice identical text (roborev 63747). A gist is already short and carries no verb of
+    // its own, so it is used as-is.
+    const reason = gist ?? why(receipt);
+    const tail = reason ? plain(` — ${reason}`) : plain("");
     switch (receipt.kind) {
       case "spawned":
         // THROUGH `who()`, LIKE EVERY OTHER ARM — not a second reader of the fallback (roborev

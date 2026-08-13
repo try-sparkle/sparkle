@@ -19,13 +19,19 @@
 // has to act on — "I couldn't" is the answer to "why didn't it do the thing I asked". So:
 //
 //   • successes fold;
-//   • a refusal the FOUNDER must read never folds, and no refusal ever counts toward a success
-//     total. This bullet used to read "a refusal (`ok: false`) NEVER folds" flat, and that is no
-//     longer the rule (roborev 63295): a refusal aimed at the CONCIERGE — a review gate, running
-//     checks, no free agent slot — is one it read and routed around, so there is nothing owed and
-//     nothing to act on, and those repeat by construction until N identical rows rebuild the very
-//     wall this module exists to end. Those fold, keyed on `kind + gist`. The test is whether
-//     `Concierge/refusalAudience` gave the reason a gist; a founder-actionable refusal has none;
+//   • no refusal ever counts toward a success total;
+//   • a refusal aimed at the CONCIERGE — a review gate, running checks, no free agent slot — is one
+//     it read and routed around, so there is nothing owed and nothing to act on. Its paragraph is
+//     WITHHELD and replaced by a short gist (`Concierge/refusalAudience`), and it folds on
+//     `kind + gist` (roborev 63295);
+//   • a refusal the FOUNDER must read is NEVER withheld — and, since roborev 63727, still FOLDS,
+//     keyed on `kind + the verbatim reason` and repeating that reason word for word. WITHHOLDING
+//     AND FOLDING ARE DIFFERENT OPERATIONS, and this module conflated them for two rounds: the rule
+//     "his refusals never fold" was written to protect the words, but folding does not touch the
+//     words — it removes DUPLICATES of them. One relay to five agents parked on the same approval
+//     prompt is five copies of one sentence, and there is no reading of "he must see it" under
+//     which he must see it five times. His own ruling, after four reports: "maybe you collapse them
+//     all or something";
 //   • …and a folded refusal still never claims the action happened, and never drops its reason;
 //   • a partial fan-out (`failed > 0`) never folds either — `inboxBroadcast` reports a partial
 //     failure as an OK reply carrying counts, so keying on `ok` alone would swallow the failures
@@ -91,12 +97,27 @@ export const MIN_RUN = 2;
  * branch lands elsewhere or not at all.
  *
  *   1. Can this list contain an actionable row? YES — a refusal is the action he owes.
- *   2. Can the cap hide one? NO, and not merely because actionable rows sort first (which the audit
- *      says is insufficient): an actionable receipt cannot ENTER a fold. THREE independent guards
- *      below enforce that, and all three are load-bearing — `ok !== true` (a refusal), `failed > 0`
- *      (a fan-out that reported ok while losing recipients), and `hasDetail` (a success whose line
- *      says more than its standard wording, e.g. a spawn that could not be briefed). Deleting any
- *      ONE of them breaks this property while the other two still look like they hold it.
+ *   2. Can the cap hide one? NO — and the ANSWER IS NO FOR A DIFFERENT REASON SINCE roborev 63727,
+ *      which is worth stating precisely because the old reason was simpler and is now wrong. It used
+ *      to be "an actionable receipt cannot ENTER a fold". It can. What it cannot do is LOSE ANYTHING
+ *      by entering one: a founder refusal folds on its VERBATIM reason and the folded sentence
+ *      repeats that reason word for word, names every subject the rows named, and expands in place.
+ *      The audit asks whether the reader can still reach what he must act on, not whether the rows
+ *      were left un-merged — and five copies of one sentence answer that question no better than
+ *      one copy does.
+ *
+ *      FOUR guards still keep a row OUT of a fold entirely, each load-bearing because its population
+ *      would lose something, and deleting any ONE breaks this property while the other three still
+ *      look like they hold it:
+ *        • `fanout` — an already-plural receipt. Folding fan-outs needs a count of counts, and "Not
+ *          sent, 2 times" over two broadcasts UNDERSTATES how many agents missed the message. It is
+ *          tested ABOVE the refusal arm, which is what keeps it true for refusals too (roborev
+ *          63747 — under the arm it was unreachable-by-luck rather than correct).
+ *        • `failed > 0` — a fan-out that reported ok while losing recipients; folding rolls a
+ *          reported failure into a success count.
+ *        • `hasDetail` — a success whose line says more than its standard wording (a spawn that
+ *          could not be briefed); the count has no way to say the second sentence.
+ *        • a refusal with NO reason at all — nothing proves two of those say the same thing.
  *   3. Does the residue name what was withheld? Nothing actionable is withheld, and every distinct
  *      SUBJECT is named exactly once — as a clickable pill when its receipt resolved to an openable
  *      agent, otherwise as the words the individual row used ("that agent"). PER SUBJECT, NOT PER
@@ -129,16 +150,49 @@ export function foldKeyOf(
   // now" are different reasons and must not collapse into one count. And a founder-actionable
   // refusal has NO gist (see `refusalAudience`), so it still never folds — its verbatim words are
   // the thing he has to read, and a count cannot say them.
-  if (mark.ok !== true)
-    return mark.gist ? `refusal:${mark.kind}:${mark.gist}` : null;
+  //
+  // ══ AND A FOUNDER-ACTIONABLE REFUSAL FOLDS TOO — WITH ITS WORDS KEPT (roborev 63727) ═══════════
+  //
+  // THE RULE CHANGED, ON THE FOUNDER'S OWN RULING: "maybe you collapse them all or something", after
+  // four reports of the same wall. It used to be that a refusal with no gist NEVER folds, because
+  // "its verbatim words are the thing he has to read, and a count cannot say them". The second half
+  // of that is true and is why this arm exists at all; the first half confused two operations.
+  //
+  // WITHHOLDING replaces the tool's words with a short phrase — that is `gist`, and it stays limited
+  // to refusals `refusalAudience` positively recognises as the concierge's. FOLDING replaces N
+  // copies of one row with one row that says the same thing once, plus a count, plus every subject,
+  // plus a chevron. The founder loses nothing to the second and everything to the first, so only the
+  // first needs the allowlist. A run of five agents all parked on the same approval prompt is FIVE
+  // COPIES OF ONE SENTENCE; there is no reading of "he must see it" under which he must see it five
+  // times.
+  //
+  // KEYED ON THE VERBATIM REASON, so only genuinely identical refusals merge — two different screens
+  // give two different sentences and stay two rows. That is stricter than the gist key above, which
+  // deliberately merges different paragraphs onto one recognised phrase.
+  //
+  // A REFUSAL WITH NO REASON AT ALL STILL STANDS ALONE. Absence is not evidence: `receiptMark` sets
+  // neither field, we cannot prove two such rows say the same thing, and the fail-open default of
+  // this whole function is to surface the row.
+  // AN ALREADY-PLURAL RECEIPT DOES NOT FOLD, AND THIS TEST SITS **ABOVE** THE REFUSAL ARM (roborev
+  // 63747, Medium). A broadcast line already reads "Left a message for N agents" — or, refused,
+  // "Not sent to those agents" — so folding several of them would need a COUNT OF COUNTS, and no
+  // arm below has an honest way to say that.
+  //
+  // It used to sit under the refusal arm, which was harmless only while refusals needed a gist (no
+  // `INTERNAL_GATES` entry matches a broadcast's refusal). The verbatim door made it reachable: two
+  // consecutive `inbox_broadcast` refusals sharing one reason would have folded to "Not sent, 2
+  // times" over what was really two fan-outs of N recipients each — a number that is wrong in the
+  // one direction this module is forbidden to be wrong in, understating how many agents missed the
+  // message. Ordering is the whole fix, so it is stated rather than left to the reader to notice.
+  if (mark.fanout === true) return null;
+  if (mark.ok !== true) {
+    if (mark.gist) return `refusal:${mark.kind}:${mark.gist}`;
+    return mark.reason ? `verbatim:${mark.kind}:${mark.reason}` : null;
+  }
   // A PARTIAL FAN-OUT IS NOT A SUCCESS. `ok` is true on a broadcast some inboxes rejected; the
   // failures live in `failed`. Folding it would roll a reported failure into a success count — the
   // one outcome this module is forbidden to produce.
   if (typeof mark.failed === "number" && mark.failed > 0) return null;
-  // AN ALREADY-PLURAL RECEIPT DOES NOT FOLD. A broadcast line already reads "Left a message for N
-  // agents"; folding several of them would need a count of counts, and the folded sentence has no
-  // honest way to say that. Rare enough not to be worth a wrong sentence.
-  if (mark.fanout === true) return null;
   // A SUCCESS THAT SAYS MORE THAN "IT HAPPENED" DOES NOT FOLD EITHER, and this is the guard the
   // `ok` test does not cover. A spawn whose agent came up but could NOT be briefed reports
   // `ok: true` and carries the shortfall as a second sentence ("its terminal didn't start … its
@@ -458,9 +512,24 @@ export function receiptRunLine(run: ReceiptRun): Line {
   // The gist comes off a MEMBER, not off the key, so nothing has to parse a delimiter back out of a
   // string that contains free text. Every member of a run shares the key by construction, so any
   // member's gist is the run's.
-  if (run.key.startsWith("refusal:")) {
+  //
+  // ══ …AND A FOLDED RUN OF FOUNDER REFUSALS TAKES THE SAME SENTENCES (roborev 63727) ════════════
+  //
+  // ONE ARM FOR BOTH, deliberately, because the only difference between them is which WORDS go in
+  // the tail — a withheld reason's gist, or a kept reason verbatim. The verbs, the count, the
+  // residue rules and the never-claims-it-happened property are identical, and giving the founder
+  // half its own copy of this switch is how the two would drift into saying different things about
+  // the same refusal. `foldKeyOf` has already decided which population this is; here it is one
+  // lookup that finds whichever field is set.
+  if (run.key.startsWith("refusal:") || run.key.startsWith("verbatim:")) {
+    // WHICHEVER FIELD THE MARK CARRIES — exactly one of the two is set (see ConciergeReceiptMark),
+    // so this cannot silently prefer a stale gist over a live reason or vice versa. Read off a
+    // MEMBER rather than parsed back out of the key, so nothing has to split a string containing
+    // free text.
     const gist =
-      run.members.find((m) => m.actionReceipt?.gist)?.actionReceipt?.gist ?? "";
+      run.members.find((m) => m.actionReceipt?.gist)?.actionReceipt?.gist ??
+      run.members.find((m) => m.actionReceipt?.reason)?.actionReceipt?.reason ??
+      "";
     const kind = run.members[0]?.actionReceipt?.kind;
     /**
      * DOES ANY MEMBER NAME SOMEONE? (roborev 63364, Medium — shipped, fixed forward.)
@@ -530,6 +599,25 @@ export function receiptRunLine(run: ReceiptRun): Line {
         break;
       case "goal":
         sentence = line`Couldn't set a goal on ${who}${tail}`;
+        subjectShaped = true;
+        break;
+      // RETIRED — ADDED WITH THE VERBATIM DOOR, WHICH IS WHAT MADE IT REACHABLE (roborev 63747,
+      // Medium). No `INTERNAL_GATES` entry matches a retirement refusal, so while a refusal needed a
+      // gist to fold this arm could never run and its absence cost nothing. A gist-less refusal now
+      // folds, and `retire_agent` is a per-agent op the concierge issues in BATCHES on its own
+      // initiative — so two refused retirements sharing a reason went straight to the `default` arm
+      // and rendered "2 actions didn't go through", dropping the verb both rows carried.
+      //
+      // That is the worst kind to drop it on. `foldKeyOf`'s success side singles `retired` out
+      // precisely because the founder was not present for the act: nobody watched it happen and
+      // nobody will remember asking for it, so the line is the only account of what was attempted.
+      // A refused retirement did not happen — there is no judgement being hidden — but "2 actions"
+      // still deletes WHICH action, in the one kind whose row is its only witness.
+      //
+      // WHO-SHAPED like `closed`, its nearest neighbour: the sentence counts agents, so its residue
+      // goes out whole.
+      case "retired":
+        sentence = line`Couldn't retire ${who}${tail}`;
         subjectShaped = true;
         break;
       case "filed":

@@ -945,8 +945,14 @@ export interface SendToAgentTerminalOptions {
   pickerPress?: { fingerprint: string };
 }
 
-/** One sentence per outcome, ready to hand back to a model composing a reply. */
-function sendDetail(path: ConciergeSendPath, agentId: string): string {
+/** One sentence per outcome, ready to hand back to a model composing a reply.
+ *
+ *  EXPORTED FOR THE CLASSIFIER'S PRODUCER-BOUND TESTS, not for another caller.
+ *  `Concierge/refusalAudience` matches some of these sentences literally, and nothing coupled the two
+ *  — so a routine copy edit here would silently reclassify a gate and put the wall of text back in
+ *  the founder's feed with the whole suite green. That drift had already happened once for the
+ *  roborev gates (roborev 63295); `refusalAudience.test.ts` now reads THIS function so a reword reds. */
+export function sendDetail(path: ConciergeSendPath, agentId: string): string {
   switch (path) {
     case "picker-option":
       return "Answered the prompt that was on screen.";
@@ -985,13 +991,47 @@ function sendDetail(path: ConciergeSendPath, agentId: string): string {
     // falling into the bare "Not sent." default if a caller ever sets it.
     case "addressed-at-picker":
       return "Not sent: the agent is waiting on a choice on screen, so a message can't go in right now.";
-    // The remedy is the SAME whoever is reading: nothing may be written to a full-screen app,
-    // because it would run as editor/pager commands. The exit is for the human to leave that app —
-    // there is no wording of the message that makes it safe, so this line offers no alternative
-    // phrasing to try (AGENTS.md: a remedy string is an instruction, and must be safe under the
-    // same conditions that triggered the refusal).
+    // ── NAME THE EVIDENCE, NOT A GUESS DRESSED AS ONE (roborev 63727, Medium) ────────────────────
+    //
+    // This read "the agent is in a full-screen app (an editor or pager), where typed text would run
+    // as commands." That asserts as fact something this path does not know, and which the field
+    // measurements in this tree say is essentially never true. The refusal fires on
+    // `alternateBuffer && !claudeCodeHoldsTheBuffer` (services/conciergeDispatch) — and CLAUDE CODE'S
+    // OWN PERMISSION DIALOG takes it, because the dialog replaces the composer box
+    // `isClaudeCodeScreen` requires, leaving exactly one marker family and a `false`.
+    //
+    // `goalContinuationRunner` already made this correction for its own copy of the sentence, on the
+    // measured evidence: "five agents frozen with this reason, every one of them a normal Claude Code
+    // pane stopped at `Do you want to proceed?`, not one in an editor or a pager". The two sentences
+    // describe ONE screen state; they must not disagree about what is on it. AGENTS.md is explicit
+    // that user-facing copy is code and that a remedy string is an instruction — "quit that app" is
+    // one a human cannot follow when there is no app to quit, and it names an obstacle that does not
+    // exist while withholding the one that does.
+    //
+    // The guard's PREMISE is untouched: typed text in a real pager still runs as commands, and this
+    // still refuses. Only the claim about WHY has been narrowed to what was actually observed.
+    //
+    // ── AND THE REMEDY IS ADDRESSED TO THE HUMAN, OUT LOUD (roborev 63747, Medium) ────────────────
+    //
+    // THIS STRING IS DUAL-AUDIENCE, which is the trap. `registry.ts` returns it to the concierge
+    // MODEL as the tool's error `detail`, and `controlListener` settles the same text as the
+    // FOUNDER-facing receipt reason. A first draft ended "open its pane and answer what's on screen"
+    // — read by the human that is right, and read by the model it is an invitation to answer the
+    // prompt ITSELF via `read_picker_options` + `select_picker_option`, which is the one write path
+    // holding a verified exemption from this very guard (`conciergeDispatch`'s `verifiedPickerPress`).
+    // A refusal that points at the path around itself, ending in a button press the founder never
+    // read.
+    //
+    // That is exactly the `sparkle-8bvh` shape AGENTS.md names: a remedy string is an INSTRUCTION,
+    // and it has to be safe under the same conditions that triggered the refusal. So the remedy now
+    // names WHOSE it is and says plainly that this side will not act on it. The founder still learns
+    // what to do; the model is told, in the same sentence, not to do it for him.
+    //
+    // NO EM-DASH IN THIS SENTENCE, deliberately: ` — ` is the receipt line's own separator between
+    // verb, reason and agent pills, and a reason containing it leaves the reader unable to see where
+    // the reason ends and the agent list begins (same finding). Keep any future wording clear of it.
     case "alternate-screen":
-      return "Not sent: the agent is in a full-screen app (an editor or pager), where typed text would run as commands.";
+      return "Not sent: that terminal is in full-screen mode and I couldn't recognise it as Claude Code's own prompt, so typing there could have run as commands. Usually that means a permission dialog is waiting. It's the human's to answer in that agent's own pane; I won't press anything on their behalf.";
     // Same shape as the line above and the same reason it offers no rephrasing: the screen is
     // waiting on a specific answer, and free text submitted into it would be answering the wrong
     // question — or, at a credential field, echoing nothing while it did so.

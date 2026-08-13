@@ -196,6 +196,33 @@ const INTERNAL_GATES: readonly { re: RegExp; gist: string }[] = [
   { re: /\bbehind (its|the) base\b/i, gist: "the branch needs updating first" },
 ];
 
+// ══ THE TERMINAL SCREEN GUARD IS **NOT** AN INTERNAL GATE, AND THIS IS WHY ══════════════════════
+//
+// An entry for `conciergeTools/terminal.sendDetail`'s `alternate-screen` refusal was written and
+// then REMOVED before it shipped (roborev 63727, Medium). It is recorded here rather than silently
+// omitted, because the refusal LOOKS like a textbook internal gate — it repeats once per agent, it
+// reads as machinery, and the concierge does route around it — and the next reader will reach for
+// the same entry unless the counter-evidence is on the page.
+//
+// THE POPULATION IS NOT WHAT THE SENTENCE SAYS IT IS. The refusal fires on
+// `alternateBuffer && !claudeCodeHoldsTheBuffer` (services/conciergeDispatch), and CLAUDE CODE'S OWN
+// PERMISSION DIALOG takes that path: the dialog REPLACES the composer box that `isClaudeCodeScreen`
+// requires, so the predicate returns false for it (`claudeCodeScreen.test.ts` pins exactly one
+// surviving marker family for an approval screen). `goalContinuationRunner` already made this
+// correction for its own copy of the sentence, on measured evidence — "five agents frozen with this
+// reason, every one of them a normal Claude Code pane stopped at `Do you want to proceed?`, not one
+// in an editor or a pager".
+//
+// SO THE INTERNAL JUSTIFICATION IS FALSE FOR THE DOMINANT CASE. "The concierge takes the inbox
+// route, which delivers at that agent's next turn" assumes a next turn: an agent parked on an
+// approval prompt does not TAKE one until a human answers it. Withholding that refusal would hide
+// the one thing only the founder can clear, behind a phrase naming a cause that is essentially never
+// the real one — this module's header rule, broken in both directions at once.
+//
+// THE WALL IS STILL REAL, and it is answered where it belongs: `./receiptRuns` now folds a run of
+// IDENTICAL founder refusals while keeping their words verbatim. Folding and withholding are
+// different operations, and only the second one needs this list.
+
 /**
  * The SHORT phrase that stands in for an internal gate's paragraph, or `null` when the reason is the
  * founder's to read and must be shown verbatim.
