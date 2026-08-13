@@ -1,10 +1,21 @@
 // @vitest-environment jsdom
 //
-// The "Listening: <device>" line, driven END TO END from the `dictation://device` event: this file
+// The VIRTUAL-AUDIO-DEVICE warning, driven END TO END from the `dictation://device` event: this file
 // emits the real event through the real subscription and asserts the RENDERED TEXT changed. A test
 // that set `audioInputStore.bound` by hand and checked the render would pass with the listener
-// deleted — i.e. with the caption frozen on a device that is no longer being captured, which is
-// precisely the failure the caption exists to make visible.
+// deleted — i.e. with the warning frozen on a device that is no longer being captured, which is
+// precisely the failure it exists to make visible.
+//
+// ══ THE ORDINARY "Listening: MacBook Pro Microphone" LINE IS GONE (sparkle-bbfsx) ═══════════════
+// The founder cut it: *"take out the listening MacBook Pro microphone completely… We shouldn't have
+// that line on either push to talk or speak."* So a REAL microphone now renders nothing here at all,
+// and the rows below say so. What survives is the amber warning for a VIRTUAL bind — a different
+// fact, kept deliberately (confirmed with him), because that one is the guard against dictating into
+// silence for nine minutes with every surface claiming to listen.
+//
+// The verb rows further down still exist and still matter: they are the "never re-assert a capture
+// the notice above just retracted" invariant, and they now ride on the virtual bind because that is
+// the case still on screen.
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -68,26 +79,39 @@ describe("BoundDeviceCaption — the event drives the rendered device name", () 
     expect(document.body.textContent).not.toMatch(/Listening:/);
   });
 
-  it("a dictation://device event puts the device name on screen", async () => {
+  it("A REAL MICROPHONE RENDERS NOTHING — the line the founder cut", async () => {
+    // THE ROW THIS CHANGE IS ABOUT, and it is the overwhelmingly common case: the ordinary bind is
+    // a real mic, and that is exactly the state he wanted the space back from.
     await renderHost();
     emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(useAudioInputStore.getState().bound?.name).toBe("MacBook Pro Microphone");
+    });
+    // The BIND still happened — this is a rendering decision, not a wiring one. Every other surface
+    // that reads `bound` (the input picker, the sync hook) is untouched.
+    expect(document.body.textContent).toBe("");
+  });
+
+  it("a dictation://device event puts a VIRTUAL device's warning on screen", async () => {
+    await renderHost();
+    emitBind({ name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true });
+    await waitFor(() => {
+      expect(screen.getByText("Listening: BlackHole 2ch")).toBeTruthy();
     });
   });
 
   it("a REBIND replaces the name on screen — the old device is gone, not appended", async () => {
     await renderHost();
-    emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
+    emitBind({ name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Listening: BlackHole 2ch")).toBeTruthy();
     });
 
-    emitBind({ name: "Yeti Stereo Microphone", uid: "usb-yeti", isVirtual: false });
+    emitBind({ name: "Loopback Audio", uid: "hal-loopback-2", isVirtual: true });
     await waitFor(() => {
-      expect(screen.getByText("Listening: Yeti Stereo Microphone")).toBeTruthy();
+      expect(screen.getByText("Listening: Loopback Audio")).toBeTruthy();
     });
-    expect(screen.queryByText("Listening: MacBook Pro Microphone")).toBeNull();
+    expect(screen.queryByText("Listening: BlackHole 2ch")).toBeNull();
   });
 });
 
@@ -102,13 +126,15 @@ describe("BoundDeviceCaption — a non-microphone bind says so", () => {
   });
 
   it("a real microphone does NOT carry it", async () => {
-    // The discriminating half: a warning shown on every bind would be ignored within a day.
+    // The discriminating half: a warning shown on every bind would be ignored within a day. Since
+    // sparkle-bbfsx a real bind draws NOTHING, which is a stronger version of the same claim.
     await renderHost();
     emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(useAudioInputStore.getState().bound?.isVirtual).toBe(false);
     });
     expect(screen.queryByText(BOUND_VIRTUAL_WARNING)).toBeNull();
+    expect(document.body.textContent).toBe("");
   });
 
   it("uses a POINTING verb in a BACKGROUND window, where `status` never drops", async () => {
@@ -122,36 +148,40 @@ describe("BoundDeviceCaption — a non-microphone bind says so", () => {
     // without the pause term this caption printed "Listening: MacBook Pro Microphone" two lines
     // under LogoWaveform's freshly demoted "Listening paused" — the present-tense re-assertion this
     // component's own header forbids (roborev 55289).
+    //
+    // ON A VIRTUAL BIND since sparkle-bbfsx, because that is the one still rendered — the invariant
+    // is unchanged and so is what it protects: this row sits under LogoWaveform's own caption and
+    // must never re-assert a capture that line has just retracted.
     await renderHost();
-    emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
+    emitBind({ name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Listening: BlackHole 2ch")).toBeTruthy();
     });
     act(() => {
       // `status` STAYS "listening" — that is the whole point of the case.
       useDictationStore.setState({ windowFocused: false, phase: "active" });
     });
     await waitFor(() => {
-      expect(screen.getByText("Mic: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Mic: BlackHole 2ch")).toBeTruthy();
     });
-    expect(screen.queryByText("Listening: MacBook Pro Microphone")).toBeNull();
+    expect(screen.queryByText("Listening: BlackHole 2ch")).toBeNull();
   });
 
   it("uses a POINTING verb when armed but not actually capturing", async () => {
     // Focus-paused: LogoWaveform's own caption right above reads "Listening paused: Will
     // auto-resume…". Claiming "Listening: <device>" underneath contradicts it in the present tense.
     await renderHost();
-    emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
+    emitBind({ name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Listening: BlackHole 2ch")).toBeTruthy();
     });
     act(() => {
       useDictationStore.setState({ status: "idle" });
     });
     await waitFor(() => {
-      expect(screen.getByText("Mic: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Mic: BlackHole 2ch")).toBeTruthy();
     });
-    expect(screen.queryByText("Listening: MacBook Pro Microphone")).toBeNull();
+    expect(screen.queryByText("Listening: BlackHole 2ch")).toBeNull();
   });
 
   it("does not claim to be LISTENING under a notice that says voice failed", async () => {
@@ -162,32 +192,32 @@ describe("BoundDeviceCaption — a non-microphone bind says so", () => {
     // declaring it dead, which is the whole class of dishonesty this branch exists to remove.
     // The verb must come from the SHARED presentation, which the notice also switches on.
     await renderHost();
-    emitBind({ name: "Yeti Stereo Microphone", uid: "yeti", isVirtual: false });
+    emitBind({ name: "Loopback Audio", uid: "hal-loopback", isVirtual: true });
     await waitFor(() => {
-      expect(screen.getByText("Listening: Yeti Stereo Microphone")).toBeTruthy();
+      expect(screen.getByText("Listening: Loopback Audio")).toBeTruthy();
     });
     act(() => {
       // Exactly what the dictation://error listener does: the error lands, status is untouched.
-      useDictationStore.setState({ error: 'No audio from "Yeti Stereo Microphone".' });
+      useDictationStore.setState({ error: 'No audio from "Loopback Audio".' });
     });
     await waitFor(() => {
-      expect(screen.getByText("Mic: Yeti Stereo Microphone")).toBeTruthy();
+      expect(screen.getByText("Mic: Loopback Audio")).toBeTruthy();
     });
-    expect(screen.queryByText("Listening: Yeti Stereo Microphone")).toBeNull();
+    expect(screen.queryByText("Listening: Loopback Audio")).toBeNull();
   });
 
   it("does not claim to be LISTENING while the voice model is still downloading", async () => {
     // Same shape one state over: armed and optimistic, model not down yet, nothing being heard.
     await renderHost();
-    emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
+    emitBind({ name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Listening: BlackHole 2ch")).toBeTruthy();
     });
     act(() => {
       useDictationStore.setState({ modelProgress: { done: 12_000_000, total: 482_000_000 } });
     });
     await waitFor(() => {
-      expect(screen.getByText("Mic: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.getByText("Mic: BlackHole 2ch")).toBeTruthy();
     });
   });
 
@@ -201,9 +231,10 @@ describe("BoundDeviceCaption — a non-microphone bind says so", () => {
 
     emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(screen.queryByText(BOUND_VIRTUAL_WARNING)).toBeNull();
     });
-    expect(screen.queryByText(BOUND_VIRTUAL_WARNING)).toBeNull();
+    // …and with the warning cleared there is nothing left to draw at all.
+    expect(document.body.textContent).toBe("");
   });
 });
 
@@ -214,7 +245,7 @@ describe("BoundDeviceCaption — a disarmed mic has no bound device", () => {
     // re-arms — and the caption reappears naming hardware that is not connected, before any bind
     // has occurred. If the re-bind then fails, no event ever corrects it.
     await renderHost();
-    emitBind({ name: "Yeti Stereo Microphone", uid: "usb-yeti", isVirtual: false });
+    emitBind({ name: "Yeti Stereo Microphone", uid: "usb-yeti", isVirtual: true });
     await waitFor(() => {
       expect(screen.getByText("Listening: Yeti Stereo Microphone")).toBeTruthy();
     });
@@ -260,15 +291,30 @@ describe("LogoWaveform — the REAL tree's enabled gate", () => {
     globalThis.cancelAnimationFrame = (() => {}) as typeof cancelAnimationFrame;
   });
 
-  it("shows the device while the mic is armed", async () => {
+  it("shows a VIRTUAL device's warning while the mic is armed", async () => {
+    render(<LogoWaveform />);
+    await waitFor(() => {
+      expect(listeners["dictation://device"]?.length).toBeGreaterThan(0);
+    });
+    emitBind({ name: "BlackHole 2ch", uid: "hal-loopback", isVirtual: true });
+    await waitFor(() => {
+      expect(screen.getByText("Listening: BlackHole 2ch")).toBeTruthy();
+    });
+  });
+
+  it("…and NOTHING for an ordinary microphone — the reclaimed row (sparkle-bbfsx)", async () => {
+    // Through the REAL tree, so this covers the whole path the founder was looking at: the gate in
+    // LogoWaveform, the component, and the new virtual-only guard inside it.
     render(<LogoWaveform />);
     await waitFor(() => {
       expect(listeners["dictation://device"]?.length).toBeGreaterThan(0);
     });
     emitBind({ name: "MacBook Pro Microphone", uid: "builtin-mic", isVirtual: false });
     await waitFor(() => {
-      expect(screen.getByText("Listening: MacBook Pro Microphone")).toBeTruthy();
+      expect(useAudioInputStore.getState().bound?.name).toBe("MacBook Pro Microphone");
     });
+    expect(document.body.textContent ?? "").not.toMatch(/MacBook Pro Microphone/);
+    expect(document.body.textContent ?? "").not.toMatch(/Listening:|Mic:/);
   });
 
   it("a MUTED mic advertises no device at all", async () => {

@@ -171,7 +171,7 @@ import { SendModeTray, type SendTrayModel } from "./SendModeTray";
 import {
   DEFAULT_SEND_CHORD,
   chordSends,
-  modeCountsDown,
+  modeHasAutoSend,
   type SendChord,
   type SendMode,
 } from "../../voice/sendMode";
@@ -2269,26 +2269,35 @@ export function ComposeBox({
         // i.e. the one cue that separates counting from armed-idle disappears (roborev 55244).
         wired={wired}
       />
-      {/* THE AUTO-SEND SWITCH — below the tray, right-aligned, and ONLY in Speak.
+      {/* THE AUTO-SEND SWITCH — below the tray, right-aligned, in Speak AND in Push to talk.
 
-          The founder's placement, verbatim: "below the slider tray, but to the right side".
+          The founder's placement, verbatim: "below the slider tray, but to the right side" — and,
+          for the second position, "the same slider as we have under speak. It can be in the same
+          spot in the bottom right" (sparkle-bbfsx). Same component, same corner, deliberately: a
+          second switch that merely looked similar is what he asked us not to build.
 
-          `modeCountsDown` rather than `sendMode === "speak"` spelled out again: the toggle governs
-          what an expired countdown does, so "there is a switch here" and "there is a countdown here"
-          are ONE fact (voice/sendMode). Two spellings is how a switch ends up in a position with
-          nothing behind it.
+          `modeHasAutoSend` rather than `modeCountsDown`, and that swap is the whole point. The two
+          used to be one fact because Speak was the only position with a dispatch to switch off.
+          Push to talk now has one and it is NOT a countdown — the release is its trigger — so
+          widening `modeCountsDown` instead would have armed the silence countdown in the deliberate
+          mode (voice/useAutoSend reads it through `useSendMode.armed`). See voice/sendMode.
 
-          Hidden — not disabled — outside Speak. The setting is remembered while it is hidden (it
-          lives in the persisted store, not in this subtree), so the founder's "every time I go to
-          the speak slider, then it stays on" holds across mode changes and across relaunches.
+          Hidden — not disabled — in Send, which has no automatic dispatch to govern. The settings
+          are remembered while hidden (they live in the persisted store, not in this subtree), so the
+          founder's "every time I go to the speak slider, then it stays on" holds across mode changes
+          and relaunches — and each position remembers its OWN.
 
           NO TOGGLE WITHOUT A LISTENER: `onAutoSendChange` absent means this host has not wired the
           setting to the countdown, and painting a movable switch the engine ignores is worse than
           painting none. */}
-      {onAutoSendChange && modeCountsDown(sendMode) && (
+      {onAutoSendChange && modeHasAutoSend(sendMode) && (
         <AutoSendToggle
           checked={autoSendOn}
           onChange={onAutoSendChange}
+          // Speak dispatches on the silence countdown, Push to talk on the key coming up. Same
+          // control, and the tooltip is the one thing that must not claim the other mode's gesture:
+          // "when you stop talking" is plainly false while a key is being held.
+          trigger={sendMode === "ptt" ? "release" : "silence"}
           // Greyed with the tray when a live PTY owns the keyboard, for the same reason the tray
           // greys: keystrokes are going somewhere else. The VALUE is untouched and still shown.
           disabled={trayInert}

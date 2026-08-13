@@ -1,4 +1,7 @@
-// "Listening: MacBook Pro Microphone" — the device line under the sidebar waveform.
+// THE VIRTUAL-AUDIO-DEVICE WARNING under the sidebar waveform — and, until sparkle-bbfsx, the
+// "Listening: MacBook Pro Microphone" line beside it. The ordinary device line is gone (the founder
+// cut three rows of voice chrome down to one); the amber warning below is what remains, and the
+// reasoning for keeping exactly that half is at the `if (!virtual) return null` guard.
 //
 // This is the answer to the question the nine-minute silent capture left a user unable to ask: the
 // mic surfaces all said "listening", and not one of them said WHAT to. It renders from
@@ -33,6 +36,19 @@ export function BoundDeviceCaption() {
   // A non-microphone bind is amber and carries the consequence sentence, because at this point the
   // user is no longer choosing — it is already what Sparkle is hearing.
   const virtual = bound.isVirtual;
+  // ══ THE ORDINARY DEVICE LINE IS NOT DRAWN ANY MORE (sparkle-bbfsx) ════════════════════════════
+  // *"take out the listening MacBook Pro microphone completely… We shouldn't have that line on
+  // either push to talk or speak. Let's just recapture the space."* A real microphone bound as
+  // expected is exactly the case where this line told him what he already knew, and it was one of
+  // three rows of chrome he cut down to one.
+  //
+  // THE WARNING IS NOT CHROME, AND THAT IS WHY THE COMPONENT SURVIVES. What is left is the case the
+  // component was written for: a VIRTUAL bind (Loopback, BlackHole, an aggregate device) means
+  // Sparkle is listening to something that may never carry his voice, and the failure mode is
+  // SILENT — the nine-minute capture in which every surface said "listening" and not one said what
+  // to. Deleting the amber row along with the grey one would take the answer away and leave the
+  // question. Confirmed with the founder rather than decided here.
+  if (!virtual) return null;
   return (
     <div
       style={{

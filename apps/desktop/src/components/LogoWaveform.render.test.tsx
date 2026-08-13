@@ -25,19 +25,22 @@ import { useUiStore } from "../stores/uiStore";
 import {
   PAUSED_WINDOW_CAPTION,
   PTT_CAPTION_ACTION,
-  PTT_CAPTION_HEADLINE,
-  SPEAK_CAPTION_ACTION,
+  PTT_CAPTION_HELD,
   SPEAK_CAPTION_HEADLINE,
 } from "../voice/dictationCopy";
 import { C } from "../theme/colors";
+import { VOICE_STATUS_LINE_MIN_HEIGHT } from "./VoiceStatusLine";
 
-// Both LINES of the push-to-talk caption, so it cannot be satisfied by a stray word turning up in an
-// aria-label or title. Module-scoped because two separate describe blocks assert on it — the caption
-// block and the mic-indicator block, which is where the founder's original bug showed. It is a DIV,
-// not a button: the caption used to toggle phase on click, which was a second mic control.
+// THE push-to-talk status line — ONE line since sparkle-bbfsx, where it used to be a grey headline
+// ("Push to talk") over a blue action. Matched through the component's own testid rather than by
+// scanning body text, so a stray word in an aria-label or title cannot satisfy it. Module-scoped
+// because two separate describe blocks assert on it — the caption block and the mic-indicator block,
+// which is where the founder's original bug showed. It is a DIV, not a button: the caption used to
+// toggle phase on click, which was a second mic control.
+const statusLine = () => screen.queryByTestId("voice-status-line");
 const pttHint = () => {
-  const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
-  return t.includes(PTT_CAPTION_HEADLINE) && t.includes(PTT_CAPTION_ACTION) ? t : null;
+  const el = statusLine();
+  return el && (el.textContent ?? "").includes(PTT_CAPTION_ACTION) ? el.textContent : null;
 };
 
 // jsdom has no rAF by the time the effect runs in some setups; stub a no-op so the live
@@ -269,14 +272,18 @@ describe("LogoWaveform — honest listening", () => {
     expect(pttHint()).toBeNull();
   });
 
-  it("Speak + listening → its own two-line caption, naming no phrase to say", () => {
+  it("Speak + listening → ONE blue line, naming no phrase to say", () => {
     useUiStore.setState({ conciergeSendMode: "speak" });
     useDictationStore.setState({ enabled: true, status: "listening", phase: "active" });
     render(<LogoWaveform />);
     const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
-    expect(t).toContain(SPEAK_CAPTION_HEADLINE);
-    expect(t).toContain(SPEAK_CAPTION_ACTION);
-    // Push to talk's caption must not show, and neither retired phrase may reappear.
+    expect(statusLine()?.textContent).toBe(SPEAK_CAPTION_HEADLINE);
+    // BLUE, because the mic is live — the colour roles swapped in sparkle-bbfsx.
+    expect(statusLine()?.getAttribute("data-tone")).toBe("live");
+    // "Just pause when you're done" was cut, and so was the device line under it.
+    expect(t).not.toMatch(/pause when you're done/i);
+    expect(t).not.toMatch(/Listening:/);
+    // Push to talk's line must not show, and neither retired phrase may reappear.
     expect(pttHint()).toBeNull();
     expect(t).not.toMatch(/Hey Sparkle/);
     expect(t).not.toMatch(/Sparkle,\s*pause/);
@@ -299,11 +306,50 @@ describe("LogoWaveform — honest listening", () => {
     useUiStore.setState({ conciergeSendMode: "ptt" });
     useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
     render(<LogoWaveform />);
-    const t = document.body.textContent?.replace(/\s+/g, " ") ?? "";
-    expect(t).toContain(PTT_CAPTION_HEADLINE);
     expect(pttHint()).not.toBeNull();
+    // GREY at rest — the founder's swap: "it should be instead of in blue, it should be in gray".
+    expect(statusLine()?.getAttribute("data-tone")).toBe("rest");
+    // The retired headline is gone entirely, not merely restyled.
+    expect(document.body.textContent ?? "").not.toContain("Push to talk");
     // It is the resting affordance, not a claim that anything is being heard.
     expect(screen.queryByText(/Listening paused/)).toBeNull();
+  });
+
+  it("THE HELD STATE: pressing ⌘ turns the line BLUE and names the release (sparkle-bbfsx)", () => {
+    // The founder's ask, end to end through the real component: *"when I am holding command, it
+    // should say release command to send… when I am actually holding it, that's when it should be
+    // blue."*
+    //
+    // DRIVEN BY THE PROP, not by the mic state, and that is the point of the row: `pttHeld` is
+    // `useSendMode.held`, written by the keydown listener before the microphone is asked for
+    // anything. The store below is left in the RESTING mic state (`enabled: false`) precisely so
+    // this cannot pass by reading capture — at the instant the key goes down, that is exactly what
+    // the real store still looks like.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    const { rerender } = render(<LogoWaveform pttHeld={false} />);
+    expect(statusLine()?.textContent).toBe(PTT_CAPTION_ACTION);
+    expect(statusLine()?.getAttribute("data-tone")).toBe("rest");
+
+    rerender(<LogoWaveform pttHeld />);
+    expect(statusLine()?.textContent).toBe(PTT_CAPTION_HELD);
+    expect(statusLine()?.getAttribute("data-tone")).toBe("live");
+  });
+
+  it("…and the line does not RELAYOUT across that swap — same slot, same reserved height", () => {
+    // The two strings are different widths and they swap on a keypress. The block is full-width and
+    // centred with a pinned single-line minHeight, so nothing around it moves. jsdom cannot lay out,
+    // so this asserts the properties that make the layout stable rather than measuring pixels.
+    useUiStore.setState({ conciergeSendMode: "ptt" });
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
+    const { rerender } = render(<LogoWaveform pttHeld={false} />);
+    const rest = statusLine()!;
+    const restBox = [rest.style.width, rest.style.textAlign, rest.style.minHeight];
+    rerender(<LogoWaveform pttHeld />);
+    const held = statusLine()!;
+    expect([held.style.width, held.style.textAlign, held.style.minHeight]).toEqual(restBox);
+    expect(held.style.textAlign).toBe("center");
+    expect(held.style.minHeight).toBe(`${VOICE_STATUS_LINE_MIN_HEIGHT}px`);
   });
 
   it("…but NOT while a terminal owns the keyboard — that ⌘ is unbound", () => {
@@ -333,7 +379,7 @@ describe("LogoWaveform — honest listening", () => {
     useDictationStore.setState({ enabled: false, status: "idle", phase: "passive" });
     render(<LogoWaveform />);
     expect(pttHint()).toBeNull();
-    expect(document.body.textContent ?? "").not.toContain(PTT_CAPTION_HEADLINE);
+    expect(statusLine()).toBeNull();
   });
 });
 

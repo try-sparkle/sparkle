@@ -620,6 +620,30 @@ interface UiState {
   conciergeSpeakAutoSend: boolean;
   setConciergeSpeakAutoSend: (v: boolean) => void;
   /**
+   * Does RELEASING the push-to-talk key send, or leave the words in the composer? (sparkle-bbfsx)
+   *
+   * The founder asked for the switch by pointing at the one Speak already has: *"For Push to talk.
+   * I also want to have an auto-send option, so it should be the same slider as we have under
+   * speak. It can be in the same spot in the bottom right. And so if auto-send is off, then when I
+   * let go of the push the talk button, it does not actually auto-send. It just leaves it in the"*
+   * — the message ends there; he confirmed the reading: it stays in the composer, editable, until
+   * he presses Send.
+   *
+   * ── A SECOND KEY, NOT A SHARED ONE, AND THAT IS DELIBERATE ────────────────────────────────────
+   * "The same slider" describes the CONTROL, not the setting behind it. The two positions dispatch
+   * on entirely different events — Speak on a silence countdown expiring, Push to talk on a key
+   * coming up — so one shared boolean would mean switching off the release-send also switches off
+   * the countdown-send he never touched, in a mode he is not even in. A user turning something off
+   * in one place and finding it off somewhere else is the drift this store's other fields warn
+   * about.
+   *
+   * DEFAULT TRUE, for exactly the reason its Speak twin is: a release has SENT since push-to-talk
+   * shipped (`useSendMode.endHold`), and flipping the default would change what an existing user's
+   * chosen mode does with nothing on screen to explain why their words stopped going out.
+   */
+  conciergePttAutoSend: boolean;
+  setConciergePttAutoSend: (v: boolean) => void;
+  /**
    * Grade each auto-send with a background Haiku call, to tune the heuristics (PRD §4e).
    *
    * DEFAULT OFF and opt-in, because it spends the USER'S OWN Claude subscription: the classify runs
@@ -874,6 +898,11 @@ export const useUiStore = create<UiState>()(
       // doc: picking Speak is the deliberate consent, and Speak has auto-sent since it shipped.
       conciergeSpeakAutoSend: true,
       setConciergeSpeakAutoSend: (v) => set({ conciergeSpeakAutoSend: v }),
+      // ON by default, for the same reason its Speak twin is: a push-to-talk release has always
+      // sent, and a new default that silently stops an existing user's words going out is not the
+      // safer one. See the field's doc.
+      conciergePttAutoSend: true,
+      setConciergePttAutoSend: (v) => set({ conciergePttAutoSend: v }),
       // OFF by default — it spends the user's own Claude subscription. See the field's doc.
       conciergeAutoSendTuner: false,
       setConciergeAutoSendTuner: (v) => set({ conciergeAutoSendTuner: v }),

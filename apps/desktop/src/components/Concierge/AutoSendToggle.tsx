@@ -1,4 +1,13 @@
-// The **Auto-send** switch — a small on/off slider under the send tray, shown only in Speak.
+// The **Auto-send** switch — a small on/off slider under the send tray, shown in Speak and in Push
+// to talk.
+//
+// ══ PUSH TO TALK GOT THE SAME SWITCH (sparkle-bbfsx) ════════════════════════════════════════════
+// *"For Push to talk. I also want to have an auto-send option, so it should be the same slider as we
+// have under speak. It can be in the same spot in the bottom right. And so if auto-send is off, then
+// when I let go of the push the talk button, it does not actually auto-send. It just leaves it in
+// the [composer]."* One control, two positions, two persisted settings and TWO DIFFERENT TRIGGERS —
+// Speak dispatches when the silence countdown expires, Push to talk when the key comes up. The only
+// thing that varies here is the tooltip's verb; see `autoSendToggleTitle`.
 //
 // THE FOUNDER'S ASK, verbatim: *"when speak is active, I want to have a slider. on-off slider
 // button. For auto-send. And I think what I'm imagining is that It shows up. Below the speak button.
@@ -49,11 +58,27 @@ export const AUTO_SEND_LABEL = "Auto-send";
  * in the box waiting for them. Saying "auto-send is off" and stopping there would leave someone
  * reasonably assuming Speak had stopped ending their sentences too.
  */
-export function autoSendToggleTitle(checked: boolean): string {
+export function autoSendToggleTitle(
+  checked: boolean,
+  /**
+   * WHICH GESTURE dispatches in this position (sparkle-bbfsx). Speak's is the silence countdown;
+   * Push to talk's is letting go of the key.
+   *
+   * The switch is the same control in both, but the sentence must not be: "when you stop talking"
+   * is FALSE in push-to-talk — you can stop talking and hold the key all day — and it is exactly the
+   * kind of copy-describing-another-mode defect this file family keeps being written about. Defaults
+   * to the silence wording so the Speak call site is untouched.
+   */
+  trigger: AutoSendTrigger = "silence",
+): string {
+  const when = trigger === "release" ? "When you let go" : "When you stop talking";
   return checked
-    ? "Auto-send is ON. When you stop talking, the message sends on its own."
-    : "Auto-send is OFF. When you stop talking, your words wait in the composer — press Send to send them.";
+    ? `Auto-send is ON. ${when}, the message sends on its own.`
+    : `Auto-send is OFF. ${when}, your words wait in the composer — press Send to send them.`;
 }
+
+/** What ends an utterance in this position, and therefore what the tooltip names. */
+export type AutoSendTrigger = "silence" | "release";
 
 /** Track and knob geometry, matching components/ToolsPane's Switch so the two read as one control
  *  in two places. Slightly smaller here: this sits under a compact tray in a column that can be
@@ -67,11 +92,16 @@ export function AutoSendToggle({
   checked,
   onChange,
   disabled = false,
+  trigger = "silence",
 }: {
-  /** Is auto-send on? The persisted `conciergeSpeakAutoSend`. */
+  /** Is auto-send on? The current position's persisted setting — `conciergeSpeakAutoSend` in Speak,
+   *  `conciergePttAutoSend` in Push to talk. Resolved by `useSendMode`, not here. */
   checked: boolean;
   /** The user flipped it. */
   onChange: (next: boolean) => void;
+  /** Which gesture dispatches in this position — see {@link autoSendToggleTitle}. The control is
+   *  identical in both; only the sentence it explains itself with changes. */
+  trigger?: AutoSendTrigger;
   /**
    * A live PTY owns the keyboard (voice/sendMode `trayInert`), so the tray is greyed and nothing is
    * counting. The switch greys with it rather than disappearing: its VALUE is unchanged and still
@@ -103,7 +133,7 @@ export function AutoSendToggle({
       <label
         data-testid="auto-send-toggle"
         data-checked={checked}
-        title={autoSendToggleTitle(checked)}
+        title={autoSendToggleTitle(checked, trigger)}
         style={{
           display: "inline-flex",
           alignItems: "center",

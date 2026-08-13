@@ -14,16 +14,14 @@ import {
 import { useDictationStore } from "../stores/dictationStore";
 import { useUiStore } from "../stores/uiStore";
 import {
-  SPEAK_CAPTION_HEADLINE,
-  SPEAK_CAPTION_ACTION,
-  PTT_CAPTION_HEADLINE,
-  PTT_CAPTION_ACTION,
   modelPercent,
   preparingCaption,
   voiceErrorNotice,
   pausedCaption,
   MICROPHONE_SETTINGS_URL,
 } from "../voice/dictationCopy";
+import { voiceStatusLine } from "../voice/voiceStatusLine";
+import { VoiceStatusLine } from "./VoiceStatusLine";
 import { useDictationPauseReason } from "../voice/useDictationPauseReason";
 import type { PauseReason } from "../voice/dictationFocus";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -133,7 +131,25 @@ export function captionFor(
  * microphone into states that contradicted each other, which is exactly what this change deletes.
  * They are now read-outs: no onClick, no hover pill, no toggle.
  */
-export function LogoWaveform() {
+export interface LogoWaveformProps {
+  /**
+   * Is the push-to-talk key DOWN right now (`useSendMode.held`)? Decides which of the status line's
+   * two states shows (sparkle-bbfsx).
+   *
+   * ── A PROP, THOUGH EVERY OTHER INPUT HERE IS A STORE READ ─────────────────────────────────────
+   * The gesture is React state owned by `useSendMode`, which `ConciergeHost` mounts exactly once and
+   * already threads down this column (the tray's own held treatment reads the same value). Copying
+   * it into a store to save one prop would create a SECOND source for a fact whose whole hazard is
+   * two sources disagreeing — the failure `voice/micPresentation`'s header is written about.
+   *
+   * Defaults to false, which is right for the CAPTURE WINDOW: it renders this component too, and
+   * the hold gesture is bound in the main window (`usePushToTalk` claims `voiceSurface:
+   * "concierge"`), so a capture overlay has no hold of its own to report.
+   */
+  pttHeld?: boolean;
+}
+
+export function LogoWaveform({ pttHeld = false }: LogoWaveformProps = {}) {
   const phase = useDictationStore((s) => s.phase);
   const enabled = useDictationStore((s) => s.enabled);
   const status = useDictationStore((s) => s.status);
@@ -309,6 +325,12 @@ export function LogoWaveform() {
   // WHICH sentence the live caption shows — from the tray position, the same single input the glyph
   // above takes, so the two can never argue. See voice/micPresentation `micCaptionKind`.
   const captionKind = micCaptionKind(sendMode);
+  // …and WHAT that one line says, plus whether it is resting grey or live blue. The rule is pure
+  // (voice/voiceStatusLine) and takes the GESTURE rather than the mic, so the words track his finger
+  // instead of the capture start-up — see that module. Null means "nothing true to claim here", and
+  // the arms below then render NOTHING rather than an empty row: the founder asked for the space to
+  // be reclaimed, and a reserved blank line is the thing he was removing.
+  const statusLine = voiceStatusLine({ captionKind, pttHeld });
 
   // The tray position, demoted by what the hardware is actually doing (voice/micPresentation
   // `micIndicatorFor` — its precedence note is the whole story). The position alone was not enough:
@@ -623,41 +645,25 @@ export function LogoWaveform() {
           {preparingCaption(modelPercent(modelProgress))}
         </div>
       ) : (presentation === "activeListening" || presentation === "passiveWaiting") &&
-        captionKind !== "none" ? (
-        // Live. Plain text, not a button: it used to toggle phase on click, which is the same
-        // second mic control the waveform strip was. WHICH of the two sentences shows is decided by
-        // the tray position (voice/micPresentation `micCaptionKind`), NOT by `phase`.
+        statusLine !== null ? (
+        // Live. ONE LINE (sparkle-bbfsx) — blue while the mic is live, and for Push to talk keyed on
+        // whether the KEY is down rather than on the presentation, so the words change with his
+        // finger rather than with the capture start-up. Plain text, not a button: it used to toggle
+        // phase on click, which is the same second mic control the waveform strip was.
         //
-        // Both sentences are true of the POSITION ALONE, which is what lets this stay a pure read of
-        // the tray: "Hold ⌘ to talk" is as true between holds as during one. The pair it replaces
-        // was not — Push to talk had no caption of its own and borrowed Speak's opposite, so the
-        // founder was shown wake-word copy in a mode that never had a wake word.
+        // This block used to be TWO lines — a grey headline naming the mode and a blue action line
+        // under it — plus a device caption below. All three were the founder's complaint; see
+        // voice/voiceStatusLine for his words and for the colour roles swapping.
         //
-        // `captionKind === "none"` (the tray is on Send) suppresses it entirely, even though the
-        // presentation says the mic is live: that happens when the mic was armed from a surface
-        // this column does not govern — an agent composer's own mic — and promising anything here
-        // would claim speech that is routed to that one.
-        <div
-          style={{
-            display: "block",
-            width: "100%",
-            textAlign: "center",
-            marginTop: 4,
-            color: C.muted,
-            fontSize: 12,
-          }}
-        >
-          {/* Line 1 — what the mic is doing. Same slot/styling in both states. */}
-          <span style={{ display: "block", fontWeight: 600 }}>
-            {captionKind === "pushToTalk" ? PTT_CAPTION_HEADLINE : SPEAK_CAPTION_HEADLINE}
-          </span>
-          {/* Line 2 — how the user works it. Emphasised in solid brand blue (C.tealInk), the same
-              treatment the retired wake phrase carried, so the caption keeps its two-line shape. */}
-          <span style={{ display: "block", fontWeight: 600, color: C.tealInk }}>
-            {captionKind === "pushToTalk" ? PTT_CAPTION_ACTION : SPEAK_CAPTION_ACTION}
-          </span>
-        </div>
-      ) : presentation === "off" && captionKind === "pushToTalk" && !trayInert(focusOwner) ? (
+        // A null model (the tray is on Send) suppresses it entirely, even though the presentation
+        // says the mic is live: that happens when the mic was armed from a surface this column does
+        // not govern — an agent composer's own mic — and promising anything here would claim speech
+        // that is routed to that one.
+        <VoiceStatusLine model={statusLine} />
+      ) : presentation === "off" &&
+        captionKind === "pushToTalk" &&
+        statusLine !== null &&
+        !trayInert(focusOwner) ? (
         // PUSH TO TALK AT REST — a RELEASED mic, since sparkle-u81cz (see voice/sendMode
         // `micIntentForMode`). This arm exists because that fix moved this position out of the live
         // states above: without it, closing the mic would also have deleted "Hold ⌘ to talk", which
@@ -672,25 +678,17 @@ export function LogoWaveform() {
         // conditions that produced it. Before this fix that state was `enabled: true` and reached
         // the honest `focusPaused` arm; now it falls through to silence, which claims nothing.
         //
-        // Same two-line shape and the same constants as the live arm, so the caption does not
-        // reflow or restyle when the key goes down — from the user's side the words simply stay put
-        // while the glyph beside them comes alive. Rendered for `pushToTalk` ONLY: an `off` mic
-        // under Send or master mute still claims nothing.
-        <div
-          style={{
-            display: "block",
-            width: "100%",
-            textAlign: "center",
-            marginTop: 4,
-            color: C.muted,
-            fontSize: 12,
-          }}
-        >
-          <span style={{ display: "block", fontWeight: 600 }}>{PTT_CAPTION_HEADLINE}</span>
-          <span style={{ display: "block", fontWeight: 600, color: C.tealInk }}>
-            {PTT_CAPTION_ACTION}
-          </span>
-        </div>
+        // THE SAME COMPONENT AND THE SAME MODEL as the live arm, which is what makes the hold
+        // transition a colour change rather than a relayout: the line is in the same slot, at the
+        // same size, and only its text and tone move when the key goes down. Rendered for
+        // `pushToTalk` ONLY — an `off` mic under Send or master mute still claims nothing.
+        //
+        // THIS IS ALSO THE AUTO-SEND-OFF RESTING STATE. With the push-to-talk Auto-send switch off,
+        // a release leaves the words in the composer and drops the mic, so this arm is what the user
+        // reads with unsent text above it. The founder chose that deliberately over a third string:
+        // the line is true (holding ⌘ does talk again) and his words are visible in the box a few
+        // pixels up, so a "press Send" instruction would be telling him what he can already see.
+        <VoiceStatusLine model={statusLine} />
       ) : presentation === "focusPaused" ? (
         // Armed but paused (focus lost): show the honest caption as plain text — not a
         // wake hint, since saying "Hey Sparkle" right now wouldn't be heard. `caption` here is
@@ -699,10 +697,20 @@ export function LogoWaveform() {
       ) : null /* "off" (disarmed) — or live but the tray is on Send, i.e. a mic this column does
                   not govern. Either way there is nothing true for this surface to claim. */}
 
-      {/* WHAT the mic is pointed at, under WHAT IT IS DOING. Gated on `enabled` only — it shows
-          while focus-paused too, on purpose: the device is still the one that will be re-bound when
-          focus returns, and hiding it exactly when the mic looks idle is how a wrong device stays
-          invisible. A disarmed mic hears nothing, so it claims nothing. */}
+      {/* THE DEVICE LINE IS GONE IN THE ORDINARY CASE (sparkle-bbfsx): *"take out the listening
+          MacBook Pro microphone completely… We shouldn't have that line on either push to talk or
+          speak. Let's just recapture the space."*
+
+          What survives is the AMBER VIRTUAL-DEVICE WARNING, which this component now renders alone
+          — see its own header. That is a different fact from the chrome he cut: "Listening ·
+          MacBook Pro Microphone" tells him something he already knows, while "Sparkle is bound to a
+          virtual audio device" is the guard against the nine-minute silent capture that put this
+          component here. Confirmed with him rather than assumed.
+
+          Still gated on `enabled` only, so it shows while focus-paused too: the device is still the
+          one that will be re-bound when focus returns, and hiding a wrong device exactly when the
+          mic looks idle is how it stays invisible. A disarmed mic hears nothing, so it claims
+          nothing. */}
       {enabled ? <BoundDeviceCaption /> : null}
     </div>
   );

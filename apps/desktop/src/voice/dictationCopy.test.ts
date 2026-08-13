@@ -1,11 +1,10 @@
 import { describe, it, expect } from "vitest";
 import {
   LIVE_COMPOSER_PLACEHOLDER,
-  PTT_CAPTION_HEADLINE,
   PTT_CAPTION_ACTION,
+  PTT_CAPTION_HELD,
   PTT_COMPOSER_PLACEHOLDER,
   SPEAK_CAPTION_HEADLINE,
-  SPEAK_CAPTION_ACTION,
   SPEAK_COMPOSER_PLACEHOLDER,
   preparingCaption,
   preparingPlaceholder,
@@ -31,11 +30,10 @@ import { TALK_KEY_GLYPH } from "./sendMode";
 // added without being listed here.
 const LIVE_COPY = [
   LIVE_COMPOSER_PLACEHOLDER,
-  PTT_CAPTION_HEADLINE,
   PTT_CAPTION_ACTION,
+  PTT_CAPTION_HELD,
   PTT_COMPOSER_PLACEHOLDER,
   SPEAK_CAPTION_HEADLINE,
-  SPEAK_CAPTION_ACTION,
   SPEAK_COMPOSER_PLACEHOLDER,
 ];
 
@@ -56,22 +54,40 @@ describe("dictationCopy — the retired wake and stop words", () => {
 
   it("push-to-talk copy names the talk key through the shared glyph, never a literal", () => {
     expect(PTT_CAPTION_ACTION).toContain(TALK_KEY_GLYPH);
+    expect(PTT_CAPTION_HELD).toContain(TALK_KEY_GLYPH);
     expect(PTT_COMPOSER_PLACEHOLDER).toContain(TALK_KEY_GLYPH);
   });
 
-  // The constraint voice/micPresentation states: the caption follows the TRAY POSITION alone, so it
-  // must read true whether or not the key is down. A sentence in the present continuous ("I'm
-  // listening") is true only mid-hold; the push-to-talk copy must be in the imperative.
-  it("push-to-talk copy is an instruction, so it is true at rest AND mid-hold", () => {
+  // THE RESTING SENTENCE IS STILL AN INSTRUCTION, and that has not changed: it is what the user
+  // reads when nothing is happening, so it has to say how to make something happen.
+  it("push-to-talk's RESTING copy is an instruction — how to open a mic that is shut", () => {
     expect(PTT_CAPTION_ACTION.startsWith("Hold")).toBe(true);
     expect(PTT_COMPOSER_PLACEHOLDER.startsWith("Hold")).toBe(true);
   });
 
+  // ── THE ONE SENTENCE THAT IS DELIBERATELY *NOT* TRUE AT REST (sparkle-bbfsx) ──────────────────
+  // Every other live string here is true of the tray POSITION alone, which is what kept the caption
+  // a pure read of the tray. The founder asked for one that is not: "when I am holding command, it
+  // should say release command to send". It is only ever rendered while `useSendMode.held` is true
+  // (voice/voiceStatusLine), so the exception is carried by the RULE rather than by the copy.
+  it("push-to-talk's HELD copy names the release, and is the pair's other tense", () => {
+    expect(PTT_CAPTION_HELD.startsWith("Release")).toBe(true);
+    expect(PTT_CAPTION_HELD).toMatch(/send/i);
+    // Two tenses of one sentence: same key, opposite ends of the gesture.
+    expect(PTT_CAPTION_HELD).not.toBe(PTT_CAPTION_ACTION);
+  });
+
   // Speak is always on, so its copy must not promise a way to stop that no longer exists; what ends
-  // an utterance is silence, and the copy says so.
+  // an utterance is silence, and the composer's own sentence says so. The CAPTION no longer does:
+  // "Just pause when you're done" was cut ("It does not have to say just pause when you're done"),
+  // leaving the caption a bare statement of what the mic is doing.
   it("Speak copy names silence — not a phrase — as what finishes an utterance", () => {
-    expect(SPEAK_CAPTION_ACTION).toMatch(/pause/i);
     expect(SPEAK_COMPOSER_PLACEHOLDER).toMatch(/pause when you/i);
+  });
+
+  it("the Speak caption is now a bare state, with no instruction bolted on", () => {
+    expect(SPEAK_CAPTION_HEADLINE).toBe("Actively listening");
+    expect(SPEAK_CAPTION_HEADLINE).not.toMatch(/pause/i);
   });
 
   // THE SURFACES WITHOUT A TRAY. `useAutoSend` is mounted only by ConciergeHost and a push-to-talk
@@ -88,9 +104,9 @@ describe("dictationCopy — the retired wake and stop words", () => {
   });
 
   it("the two modes never share a sentence — that borrowing IS the defect", () => {
-    expect(PTT_CAPTION_ACTION).not.toBe(SPEAK_CAPTION_ACTION);
+    expect(PTT_CAPTION_ACTION).not.toBe(SPEAK_CAPTION_HEADLINE);
+    expect(PTT_CAPTION_HELD).not.toBe(SPEAK_CAPTION_HEADLINE);
     expect(PTT_COMPOSER_PLACEHOLDER).not.toBe(SPEAK_COMPOSER_PLACEHOLDER);
-    expect(PTT_CAPTION_HEADLINE).not.toBe(SPEAK_CAPTION_HEADLINE);
   });
 });
 

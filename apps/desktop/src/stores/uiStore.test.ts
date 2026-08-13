@@ -561,6 +561,12 @@ describe("uiStore persistence — exactly these keys reach the blob", () => {
     // that makes the tray default to "send" is already satisfied by the time this is reachable:
     // you cannot see this switch without having deliberately chosen Speak.
     "conciergeSpeakAutoSend",
+    // …and the same switch under Push to talk (sparkle-bbfsx), which dispatches on the KEY COMING
+    // UP rather than on a countdown expiring. Persisted for the identical reason, and a SEPARATE
+    // key on purpose: one shared boolean would mean switching off the release-send also switches
+    // off the countdown-send in a mode the user is not even in. Defaults ON, because a release has
+    // sent since push-to-talk shipped.
+    "conciergePttAutoSend",
     // Opt-in for the background Haiku grader (PRD §4e). Persisted so a deliberate opt-in is not
     // re-asked every launch — and it is a SEPARATE switch from the rail above on purpose: arming
     // auto-send costs nothing, while this spends the user's own Claude subscription quota.

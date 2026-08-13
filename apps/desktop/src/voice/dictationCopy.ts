@@ -23,25 +23,53 @@ import { ALLOW_VIRTUAL_LABEL, INPUT_PICKER_LOCATION } from "../services/audioInp
 import { TALK_KEY_GLYPH } from "./sendMode";
 import type { PauseReason } from "./dictationFocus";
 
+// ══ ONE STATUS LINE PER MODE, AND IT IS NOW LIVE (bead sparkle-bbfsx) ═══════════════════════════
+//
+// This file used to hold TWO strings per position, a HEADLINE and an ACTION, drawn as two lines with
+// a device caption under them — three rows of chrome under the waveform. The founder cut it to one:
+//
+//   *"it still says push to talk in gray. And then it says hold command to talk in blue, and then it
+//   says listening MacBook microphone. So I wanna take out the listening Mac microphone completely…
+//   Let's just remove push to talk completely. So where it says hold command to talk, when I am
+//   holding command, it should say release command to send… It says hold command to talk, when I'm
+//   not talking. And it should be instead of in blue, it should be in gray… And then when I am
+//   actually holding it, that's when it should be blue."*
+//
+// …and, for Speak: *"it says in gray, actively listening. Let's take that out. And actually, it says
+// just pause when you're done in blue, so let's take that out. Let's make actively listening be the
+// blue color when it's active."*
+//
+// So `PTT_CAPTION_HEADLINE` ("Push to talk") and `SPEAK_CAPTION_ACTION` ("Just pause when you're
+// done") are GONE — not renamed, deleted — and the two that survive changed colour rather than
+// wording. The rule that picks between them is `voice/voiceStatusLine`; the component that draws it
+// is `components/VoiceStatusLine`.
+//
+// ── AND THE FILE HEADER'S "TRUE OF THE POSITION ALONE" RULE HAS ONE DELIBERATE EXCEPTION ───────
+// Everything above says a caption must be true whether or not the key is down, which is what kept
+// it a pure read of the tray. `PTT_CAPTION_HELD` is the exception the founder asked for by name: it
+// is true ONLY while the key is down, so the line now takes the GESTURE as a second input. That is
+// safe here in a way the wake-word copy never was, because the gesture is a fact this app owns
+// synchronously — `useSendMode.held` is written by the keydown listener itself (voice/usePushToTalk)
+// BEFORE the microphone is asked to do anything. Keying it on the mic's own liveness instead would
+// make the words lag his finger by the capture start-up, which is the one thing he would notice.
+
 // ── SPEAK (the tray is on Speak: dictation is ON, continuously) ─────────────────────────────────
 // No spoken command starts it and none ends it. What ends an UTTERANCE is silence — Speak is the
 // one position that runs the auto-send countdown (voice/sendMode `modeCountsDown`, voice/useAutoSend),
-// so stopping talking is what dispatches the message. What ends DICTATION is moving the tray. Both
-// sentences below say the first of those, because that is the one the user is about to do.
+// so stopping talking is what dispatches the message. What ends DICTATION is moving the tray.
 export const SPEAK_CAPTION_HEADLINE = "Actively listening";
-export const SPEAK_CAPTION_ACTION = "Just pause when you're done";
 export const SPEAK_COMPOSER_PLACEHOLDER =
   "I'm listening, so just start talking — pause when you're done.";
 
 // ── PUSH TO TALK (the tray is on Push to talk) ──────────────────────────────────────────────────
-// The copy sparkle-yx7o7 proposed and was blocked waiting on: "a sentence that is true whether or
-// not the key is down needs no live input at all." Both of these are, so the caption stays a pure
-// function of the position and nothing has to be threaded in to keep it honest mid-hold.
-//
-// The glyph comes from `TALK_KEY_GLYPH`, never a literal, so this copy and the tray's own keycap
-// chiclet cannot name different keys.
-export const PTT_CAPTION_HEADLINE = "Push to talk";
+// TWO STATES OF ONE LINE, and which one shows is the key, not the microphone. The glyph comes from
+// `TALK_KEY_GLYPH`, never a literal, so this copy and the tray's own keycap chiclet cannot name
+// different keys.
 export const PTT_CAPTION_ACTION = `Hold ${TALK_KEY_GLYPH} to talk`;
+/** WHILE THE KEY IS DOWN. The founder's words were "release command to send"; the line renders the
+ *  glyph he was reading on screen rather than the word he spoke, exactly as its resting twin does —
+ *  the two are one sentence in two tenses and must name the key the same way. */
+export const PTT_CAPTION_HELD = `Release ${TALK_KEY_GLYPH} to send`;
 /** THE WHOLE SENTENCE, with no typing tail. It read `… — or type here instead.` and the founder
  *  trimmed it (sparkle-u81cz): *"it should only say the 'Hold X to talk' part."* He can see the
  *  box, so the tail was noise. This SUPERSEDES the copy table agreed in sparkle-6hu3c's comments,

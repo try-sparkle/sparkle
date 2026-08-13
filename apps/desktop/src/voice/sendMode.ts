@@ -299,16 +299,37 @@ export function pttHeldIntent(): MicIntent {
  * make the deliberate mode feel laggier than the automatic one, which inverts the whole point of
  * offering both.
  *
- * IT ALSO DECIDES WHERE THE **AUTO-SEND** TOGGLE APPEARS (ComposeBox), and that is ONE fact rather
- * than two. The founder asked for the switch in exactly those terms — *"when speak is active, I
- * want to have a slider … for auto-send"* — and it governs what an EXPIRED countdown does, so a
- * position with no countdown has nothing for it to govern: a control the user could operate that
- * changes nothing. Asking this function rather than adding a second `mode === "speak"` predicate
- * beside it is what stops a fourth position drawing a switch over nothing, or running a countdown
- * nobody can turn off.
+ * IT NO LONGER DECIDES WHERE THE **AUTO-SEND** TOGGLE APPEARS — see {@link modeHasAutoSend}. It did,
+ * and that was one fact while Speak was the only position with anything to switch off. Push to talk
+ * now has one too (sparkle-bbfsx), and it is not a countdown: the release is the trigger there. The
+ * two questions have come apart, so they are two functions.
  */
 export function modeCountsDown(mode: SendMode): boolean {
   return mode === "speak";
+}
+
+/**
+ * Does this position have an **Auto-send** switch — i.e. is there a dispatch the user can turn off?
+ *
+ * Speak and Push to talk, for two different triggers: Speak dispatches when the countdown expires,
+ * Push to talk when the key comes up. Send has nothing to switch — pressing Send IS the dispatch,
+ * so a control there would be a switch over the user's own gesture.
+ *
+ * ── WHY THIS IS NOT `modeCountsDown` ANY MORE ─────────────────────────────────────────────────
+ * The founder asked for the second switch by pointing at the first: *"For Push to talk. I also want
+ * to have an auto-send option, so it should be the same slider as we have under speak. It can be in
+ * the same spot in the bottom right."* Widening `modeCountsDown` to satisfy that would have armed
+ * the SILENCE COUNTDOWN in push-to-talk — `useAutoSend`'s `armed` reads it through
+ * `useSendMode` — so a release would race a timer that has no business running in the deliberate
+ * mode. One predicate answering two questions is fine only while the answers coincide; they no
+ * longer do.
+ *
+ * The two positions still read DIFFERENT persisted settings behind the one control shape
+ * (`conciergeSpeakAutoSend` / `conciergePttAutoSend`) — see the store's doc for why one shared
+ * boolean would switch off a mode the user was not in.
+ */
+export function modeHasAutoSend(mode: SendMode): boolean {
+  return mode === "speak" || mode === "ptt";
 }
 
 /**

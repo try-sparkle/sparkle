@@ -111,6 +111,16 @@ function setup() {
   return { box, onSend, sync, commits, ...view };
 }
 
+/** A committed segment for a box these rows hold directly — the same three writes `setup().commits`
+ *  makes, spelled once so the appended describe blocks can use it without threading the closure. */
+function commitsInto(box: Box, text: string) {
+  act(() => {
+    useDictationStore.getState().setInterim("");
+    useDictationStore.getState().noteCommittedSegment();
+    box.text = box.text ? `${box.text} ${text}` : text;
+  });
+}
+
 // ── THE GESTURE ──────────────────────────────────────────────────────────────────────────────────
 // Dispatched on `window`, because that is where usePushToTalk binds ("hold ⌘ ANYWHERE").
 const down = () => act(() => void fireEvent.keyDown(window, { key: TALK_KEY }));
@@ -979,5 +989,120 @@ describe("held — the third tray state", () => {
     expect(result.current.held).toBe(true);
     act(() => useUiStore.getState().setConciergeSendMode("send"));
     expect(result.current.held).toBe(false);
+  });
+});
+
+// ── THE PUSH-TO-TALK AUTO-SEND SWITCH (bead sparkle-bbfsx) ──────────────────────────────────────
+//
+// *"if auto-send is off, then when I let go of the push the talk button, it does not actually
+// auto-send. It just leaves it in the [composer]."*
+//
+// The rows below are about the seam that is easy to get wrong: OFF must still DRAIN. A release
+// waits for the tail of the utterance to arrive before it does anything (that wait is what the whole
+// file above is about), and reusing the abandon path for "keep" would skip it and drop the mic
+// immediately — truncating exactly the words he asked to keep, silently.
+describe("Auto-send OFF keeps the words instead of sending them", () => {
+  beforeEach(() => {
+    useUiStore.setState({ conciergePttAutoSend: false });
+  });
+  afterEach(() => {
+    useUiStore.setState({ conciergePttAutoSend: true });
+  });
+
+  it("a release SENDS NOTHING, and the words are still in the box", async () => {
+    const { box, onSend } = setup();
+    down();
+    interim("deploy the staging branch");
+    commitsInto(box, "deploy the staging branch");
+    up();
+    await advance(PARTIAL_SETTLE_CAP_MS + SETTLE_MARGIN_MS);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.sent).toEqual([]);
+    // THE HALF THAT MATTERS: they are still there, editable, waiting for a deliberate Send.
+    expect(box.text).toBe("deploy the staging branch");
+  });
+
+  it("THE MIC IS STILL LIVE WHEN THE TAIL LANDS — 'keep' drains, it does not abandon", async () => {
+    // ── THE ROW THIS DESCRIBE EXISTS FOR, and the one that fails if `keep` is implemented as the
+    // existing abandon path. `endHold`'s doc calls the ordering load-bearing: `paused` stops
+    // routing, so tearing the mic down in the keyup's own tick is what prevents the very transcript
+    // we are waiting for from ever landing. Auto-send OFF still has to protect his words — it
+    // withholds the DISPATCH, not the WAIT.
+    //
+    // ASSERTED ON THE MIC, not on `box.text`: this box is a test double that accumulates whatever
+    // `commitsInto` writes, so a row that only checked the final string would go green against the
+    // abandon path too — vacuous in exactly the way AGENTS.md warns about. What actually differs is
+    // whether the microphone was still routing at the moment the tail arrived.
+    const { box, onSend } = setup();
+    down();
+    interim("deploy the staging");
+    commitsInto(box, "deploy the staging");
+    micCalls.length = 0;
+    up();
+    await flush();
+    // NOTHING DROPPED YET: the drain is running and the mic is still routing.
+    expect(micCalls).toEqual([]);
+    // …so a segment still in flight on the cloud path lands into a live capture.
+    await advance(GROWTH_GAP_MS);
+    commitsInto(box, "branch to production");
+    await advance(PARTIAL_SETTLE_CAP_MS + SETTLE_MARGIN_MS);
+    // Only now is the mic released — after the wait, exactly as the sending path does it.
+    expect(micCalls.length).toBeGreaterThan(0);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.text).toBe("deploy the staging branch to production");
+  });
+
+  it("ON is untouched — the shipped behaviour is the default", async () => {
+    // The control row: everything above must be attributable to the switch and nothing else.
+    useUiStore.setState({ conciergePttAutoSend: true });
+    const { box, onSend } = setup();
+    down();
+    interim("ship it");
+    commitsInto(box, "ship it");
+    up();
+    await advance(PARTIAL_SETTLE_CAP_MS + SETTLE_MARGIN_MS);
+    expect(onSend).toHaveBeenCalled();
+    expect(box.sent).toEqual(["ship it"]);
+    expect(box.text).toBe("");
+  });
+
+  it("reads the switch AS OF THE RELEASE, not as of the render that bound the listener", async () => {
+    // The callback is registered with the key listener; a value captured at bind time would send a
+    // message he had just switched off (or withhold one he had just switched on).
+    useUiStore.setState({ conciergePttAutoSend: true });
+    const { box, onSend } = setup();
+    down();
+    interim("ship it");
+    commitsInto(box, "ship it");
+    act(() => {
+      useUiStore.setState({ conciergePttAutoSend: false });
+    });
+    up();
+    await advance(PARTIAL_SETTLE_CAP_MS + SETTLE_MARGIN_MS);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(box.text).toBe("ship it");
+  });
+
+  it("the tray still reports the position's OWN setting, not Speak's", async () => {
+    // One control, two persisted settings (uiStore). Switching push-to-talk off must not disarm the
+    // countdown-send in a mode the user is not even in.
+    useUiStore.setState({ conciergePttAutoSend: false, conciergeSpeakAutoSend: true });
+    const { result } = setup();
+    expect(result.current.autoSend).toBe(false);
+    act(() => {
+      useUiStore.setState({ conciergeSendMode: "speak" });
+    });
+    expect(result.current.autoSend).toBe(true);
+    expect(useUiStore.getState().conciergePttAutoSend).toBe(false);
+  });
+
+  it("Push to talk still runs NO countdown, switch or no switch", async () => {
+    // Reconciling the two changes that landed together: the Auto-send switch does not arm the
+    // silence countdown here (`armed` is Speak-only), so this cannot fight the mention-pause work in
+    // sparkle-14dtu — there is no clock in this mode for either of them to hold.
+    const { result } = setup();
+    expect(result.current.armed).toBe(false);
+    useUiStore.setState({ conciergePttAutoSend: true });
+    expect(result.current.armed).toBe(false);
   });
 });

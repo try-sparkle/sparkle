@@ -84,6 +84,17 @@ describe("the tooltip states what OFF actually does", () => {
     expect(autoSendToggleTitle(false)).toMatch(/press Send/i);
   });
 
+  it("names the RIGHT gesture per position — 'stop talking' is false while a key is held", () => {
+    // sparkle-bbfsx. The control is shared; the sentence must not be. Push to talk dispatches on
+    // the release, and you can stop talking and go on holding the key all day.
+    expect(autoSendToggleTitle(true, "silence")).toMatch(/when you stop talking/i);
+    expect(autoSendToggleTitle(true, "release")).toMatch(/when you let go/i);
+    expect(autoSendToggleTitle(false, "release")).toMatch(/when you let go/i);
+    expect(autoSendToggleTitle(false, "release")).not.toMatch(/stop talking/i);
+    // …and the default is still Speak's wording, so the older call site is unchanged.
+    expect(autoSendToggleTitle(false)).toBe(autoSendToggleTitle(false, "silence"));
+  });
+
   it("never promises that the countdown stops", () => {
     // A remedy string is an instruction the user will follow (AGENTS.md). Copy claiming the
     // countdown is disabled would describe a different feature from the one that shipped.
@@ -91,23 +102,44 @@ describe("the tooltip states what OFF actually does", () => {
   });
 });
 
-describe("where it appears — Speak only, below the tray", () => {
+describe("where it appears — Speak AND Push to talk, below the tray", () => {
   const box = (extra: Record<string, unknown> = {}) =>
     render(
       <ComposeBox onSend={vi.fn()} onAttach={vi.fn()} onAutoSendChange={vi.fn()} {...extra} />,
     );
 
-  it("is absent under Send and Push to talk — it is an affordance of the countdown", () => {
+  it("is absent under Send — pressing Send IS the dispatch, so there is nothing to switch off", () => {
     box({ sendMode: "send" });
-    expect(queryToggle()).toBeNull();
-    cleanup();
-    box({ sendMode: "ptt" });
     expect(queryToggle()).toBeNull();
   });
 
   it("appears under Speak", () => {
     box({ sendMode: "speak" });
     expect(queryToggle()).not.toBeNull();
+  });
+
+  it("APPEARS UNDER PUSH TO TALK TOO (sparkle-bbfsx)", () => {
+    // *"For Push to talk. I also want to have an auto-send option, so it should be the same slider
+    // as we have under speak. It can be in the same spot in the bottom right."* It used to be
+    // absent here, on the reasoning that the switch was an affordance of the COUNTDOWN — push to
+    // talk has no countdown, but it does have an automatic dispatch (the release), and that is what
+    // the switch governs.
+    box({ sendMode: "ptt" });
+    expect(queryToggle()).not.toBeNull();
+  });
+
+  it("is the SAME control in the SAME corner, not a second one that looks similar", () => {
+    // He asked for reuse by name. One component, one testid, one right-aligned row in both modes.
+    box({ sendMode: "speak" });
+    const speakRow = screen.getByTestId("auto-send-row");
+    const speakStyle = [speakRow.style.display, screen.getByTestId("auto-send-toggle").style.marginLeft];
+    cleanup();
+    box({ sendMode: "ptt" });
+    const pttRow = screen.getByTestId("auto-send-row");
+    expect([pttRow.style.display, screen.getByTestId("auto-send-toggle").style.marginLeft]).toEqual(
+      speakStyle,
+    );
+    expect(screen.getAllByTestId("auto-send-row")).toHaveLength(1);
   });
 
   it("sits BELOW the tray — document order is the column's reading order", () => {

@@ -547,7 +547,11 @@ export function ConciergeColumn({
           // the pill was already taking.
           style={{ marginLeft: WAVEFORM_INSET, marginRight: WAVEFORM_INSET }}
         >
-          <LogoWaveform />
+          {/* The GESTURE, not the microphone — the status line under the waveform swaps to
+              "Release ⌘ to send" on the keydown itself (sparkle-bbfsx). This column is already the
+              conduit for the same value into the tray's held treatment (`pttHeld` below), so the
+              two read one fact rather than two. */}
+          <LogoWaveform pttHeld={pttHeld} />
         </div>
         <div
           data-testid="concierge-credit-overlay"

@@ -43,6 +43,24 @@ import type { MicIntent } from "../components/MicButton";
 export const PARTIAL_SETTLE_CAP_MS = 4_000;
 
 /**
+ * How a push-to-talk hold ended, and therefore what happens to the words it captured.
+ *
+ *   • `send`    — he let go with Auto-send ON. Wait for the utterance to finish arriving, then
+ *                 dispatch it. The behaviour push-to-talk has always had.
+ *   • `keep`    — he let go with Auto-send OFF (sparkle-bbfsx). Wait exactly the same way, then
+ *                 leave the words in the composer for him to edit and send by hand. *"if auto-send
+ *                 is off, then when I let go of the push the talk button, it does not actually
+ *                 auto-send. It just leaves it in the [composer]."*
+ *   • `abandon` — the gesture was aborted (window blur, a ⌘-chord, ⌘-click). Send NOTHING and do
+ *                 not wait: nothing said the utterance was over, so there is no tail to protect.
+ *
+ * THE SPLIT THAT MATTERS IS `keep` vs `abandon`, NOT `keep` vs `send`. Both of the first two keep
+ * his words, so both must drain; only `abandon` may tear the microphone down immediately. A
+ * two-valued flag put `keep` on the wrong side of that line by construction.
+ */
+export type HoldOutcome = "send" | "keep" | "abandon";
+
+/**
  * How long the ARRIVAL SIGNAL — committed segments, and the live interim on the cloud path — has to
  * sit COMPLETELY UNCHANGED before a release treats the utterance as settled.
  *
@@ -100,16 +118,25 @@ export interface SendModeController {
    *  DELIBERATELY UNAFFECTED BY {@link SendModeController.autoSend} — see that field. */
   armed: boolean;
   /**
-   * Does an expired countdown SEND, or leave the words in the composer? Persisted (uiStore
-   * `conciergeSpeakAutoSend`), because the founder asked for a switch that remembers its position
-   * across mode changes and across relaunches.
+   * Does this position's automatic dispatch actually SEND, or leave the words in the composer?
+   * Persisted, because the founder asked for a switch that remembers its position across mode
+   * changes and across relaunches.
+   *
+   * ── IT IS RESOLVED PER POSITION, AND THE TRIGGER DIFFERS (sparkle-bbfsx) ──────────────────────
+   *   Speak        → uiStore `conciergeSpeakAutoSend`. The dispatch is the COUNTDOWN expiring.
+   *   Push to talk → uiStore `conciergePttAutoSend`.   The dispatch is the KEY COMING UP.
+   * Two settings, one control shape. See the store's `conciergePttAutoSend` doc for why they are
+   * not one shared boolean.
    *
    * READ IT ALONGSIDE `armed`, NOT INSTEAD OF IT. `armed` says whether the countdown runs; this says
-   * what it does when it finishes. Off does NOT stop the countdown — the utterance still ends on the
-   * same schedule, the fill still drains, typing still pauses it — it only withholds the dispatch.
+   * what happens at the dispatch. Off does NOT stop the countdown in Speak — the utterance still
+   * ends on the same schedule, the fill still drains, typing still pauses it — it only withholds the
+   * dispatch. In Push to talk there is no countdown to stop either way (`modeCountsDown`), so off
+   * means only that the release keeps the words instead of sending them.
    */
   autoSend: boolean;
-  /** Flip the Auto-send toggle. Writes straight through to the persisted store. */
+  /** Flip the Auto-send toggle FOR THE CURRENT POSITION. Writes straight through to that
+   *  position's persisted setting — see `autoSend` for which one that is. */
   setAutoSend: (v: boolean) => void;
   /** Is the push-to-talk GESTURE active right now — the key or the button held down?
    *
@@ -129,8 +156,14 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   const setStoredMode = useUiStore((s) => s.setConciergeSendMode);
   // The Auto-send toggle. Read from the SAME persisted store as the position, so "it remembers the
   // last position I set it to" costs nothing extra and cannot drift from the tray it belongs to.
-  const autoSend = useUiStore((s) => s.conciergeSpeakAutoSend);
-  const setAutoSend = useUiStore((s) => s.setConciergeSpeakAutoSend);
+  const speakAutoSend = useUiStore((s) => s.conciergeSpeakAutoSend);
+  const setSpeakAutoSend = useUiStore((s) => s.setConciergeSpeakAutoSend);
+  // …and Push to talk's own, which is a SEPARATE persisted setting behind the same control shape
+  // (sparkle-bbfsx). See the store's `conciergePttAutoSend` doc for why it is not one shared
+  // boolean: the two positions dispatch on different events, and switching off the release-send
+  // must not switch off a countdown in a mode the user is not in.
+  const pttAutoSend = useUiStore((s) => s.conciergePttAutoSend);
+  const setPttAutoSend = useUiStore((s) => s.setConciergePttAutoSend);
   // The store's MIRROR of the focus owner, not a live DOM read. That is the right choice for paint
   // (it is what re-renders the tray when the caret moves) and the wrong one for routing, which is
   // why voice/dictationFocus keeps `focusOwnerNow` separate — see its doc.
@@ -418,6 +451,15 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
   /**
    * End the hold: send (or not), then drop the mic back to armed-but-not-routing.
    *
+   * ── THREE OUTCOMES, AND THE MIDDLE ONE IS WHY THIS IS NOT A BOOLEAN (sparkle-bbfsx) ───────────
+   * It used to take `send: boolean`, which conflated two different questions: *do the words go out*
+   * and *do we wait for them to arrive first*. The push-to-talk Auto-send switch splits them — with
+   * it off, a release must still drain the utterance (his words are being KEPT, and the whole point
+   * of the wait below is that they are not all here yet) and simply not dispatch. Reusing `false`
+   * there would have taken the abandon path: no wait, mic dropped immediately, and the tail of the
+   * sentence never lands — a silent truncation of exactly the words he asked to keep. See
+   * {@link HoldOutcome}.
+   *
    * ── A RELEASE IS A SEND, FULL STOP ────────────────────────────────────────────────────────────
    * Not "a send when there is a transcript". A hold with no speech in it at all is a deliberate way
    * to dispatch a TYPED draft, so it takes the fast path below and sends in the keyup's own tick.
@@ -505,7 +547,11 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
    * we are waiting for from ever landing.
    */
   const endHold = useCallback(
-    (send: boolean) => {
+    (outcome: HoldOutcome) => {
+      const send = outcome === "send";
+      // WAIT FOR THE WORDS unless the gesture was aborted. `keep` drains exactly as `send` does and
+      // differs only in what happens at the end of the wait — see the `HoldOutcome` doc.
+      const drain = outcome !== "abandon";
       settling.current?.();
       const finish = () => {
         settling.current = null;
@@ -522,7 +568,7 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
       // Skipped only when the watch's own debt says there is nothing to drain: nothing was ever
       // captured, or every captured run's close has already been confirmed. NOT a live "is it quiet
       // right now" read — see the watch's doc for why that reopens the bug on the on-device path.
-      if (!send || !utterance.current || utterance.current.owed <= 0) {
+      if (!drain || !utterance.current || utterance.current.owed <= 0) {
         finish();
         return;
       }
@@ -692,14 +738,24 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
     // the mic ring's job, not the pill's.
     onHoldEnd: useCallback(() => {
       setHeld(false);
-      endHold(true);
+      // ── THE PUSH-TO-TALK AUTO-SEND SWITCH DECIDES *DISPATCH*, NEVER *DRAIN* (sparkle-bbfsx) ────
+      // "keep" is not "abandon", and collapsing the two would silently truncate his words. A
+      // release still has to wait for the tail of the utterance to arrive — that wait is the whole
+      // subject of `endHold`'s doc, and the microphone is deliberately dropped only AFTER it — so
+      // with the switch off the drain runs exactly as before and only the `onSend` call is
+      // withheld. `endHold(false)` skips the wait entirely, which is right for a gesture the user
+      // aborted and wrong for one whose words they want to keep and edit.
+      //
+      // READ FROM THE STORE, not from a hook subscription: this callback is registered with the
+      // key listener and must see the value AS OF THE RELEASE, not as of the render that bound it.
+      endHold(useUiStore.getState().conciergePttAutoSend ? "send" : "keep");
     }, [endHold]),
     // ABANDON SENDS NOTHING — see usePushToTalk's header on ⌘Tab never delivering its keyup. It
     // still has to clear the indicator, or a ⌘Tab away leaves the tray painting a pressed button
     // over a microphone that was stood down: the precise "held but idle" lie this exists to remove.
     onAbandon: useCallback(() => {
       setHeld(false);
-      endHold(false);
+      endHold("abandon");
     }, [endHold]),
   });
 
@@ -723,9 +779,16 @@ export function useSendMode({ onSend }: UseSendModeArgs): SendModeController {
     armed: mode === "speak" && !inert,
     // NOT gated on `inert`, and NOT collapsed with "is this Speak": a terminal focus greys the tray
     // but does not un-choose a setting, and the countdown is already stopped there by `armed`. WHERE
-    // the toggle is shown is ComposeBox's question, answered from the pure `modeCountsDown`.
-    autoSend,
-    setAutoSend,
+    // the toggle is shown is ComposeBox's question, answered from the pure `modeHasAutoSend`.
+    //
+    // ── ONE PAIR OF FIELDS, RESOLVED PER POSITION (sparkle-bbfsx) ──────────────────────────────
+    // The tray now has two Auto-send settings behind one control, so this resolves which one the
+    // CURRENT position means. Exposing both and letting the consumer pick would put the resolution
+    // in the surfaces — and the countdown reads `autoSend` too (voice/useAutoSend), so a surface
+    // that picked wrong would silently govern the wrong dispatch. `speak` is the fallback for a
+    // position with no setting of its own (`send`), where nothing reads it anyway.
+    autoSend: mode === "ptt" ? pttAutoSend : speakAutoSend,
+    setAutoSend: mode === "ptt" ? setPttAutoSend : setSpeakAutoSend,
     /** Is the push-to-talk key down RIGHT NOW — i.e. is the microphone actually capturing?
      *  Distinct from `mode === "ptt"`, which only says the position is selected. */
     held,
