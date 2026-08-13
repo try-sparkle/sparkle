@@ -123,6 +123,57 @@ describe("an account switch retires the wall it is switching AWAY from", () => {
     }
   });
 
+  // THE CASE THE FIRST TEST STRUCTURALLY CANNOT SEE (roborev 63114, High). It banners and switches in
+  // consecutive statements, so `failureKind` is still `"quota"` at the assertion — and the release
+  // used to be gated on exactly that. The gate therefore held for the one interleaving the test wrote
+  // and failed for the one production takes.
+  //
+  // A wall OUTLIVES the sticky red on purpose: `clearStreamFailure()` runs on every routine recovery
+  // and leaves `quotaBlock` set. The most ordinary post-limit shape does exactly this — Claude prints
+  // the banner, then draws the session-limit picker, which is a prompt screen and clears the red. A
+  // classified tool event is the same transition and is the one drivable through `ingest`, so that is
+  // what stands in for it here.
+  //
+  // Pinned in BOTH directions, because "the wall is gone after the move" alone would also hold if the
+  // recovery signal had simply dropped the wall itself: the wall must still be UP after the recovery
+  // and gone only after the move.
+  it("releases a wall whose sticky red a routine recovery already cleared", () => {
+    const agentId = "agent-recovered-then-moved";
+    const engine = walledAgent(agentId);
+    try {
+      // The recovery signal. Real forward progress clears the red; the wall is explicitly NOT
+      // released here (`statusEngine`'s "THE WALL IS DELIBERATELY *NOT* RELEASED HERE").
+      //
+      // THE LEADING `\n` IS LOAD-BEARING, and leaving it off cost a full red-green round. The banner
+      // is drawn with `\r` and no newline (that is how a terminal repaints in place), so it is still
+      // sitting in the engine's `partial` buffer. Without a newline to terminate it, this chunk is
+      // APPENDED to it and the two arrive as ONE line — which still matches the quota banner and
+      // re-trips the red the tool event just cleared. The engine then reads `failureKind === "quota"`
+      // at the move, the old guard holds, and this test passes against the unfixed code while
+      // asserting nothing. Probed directly: unterminated → `kind=quota`; terminated → `kind=null`,
+      // wall still up, which is the state this test exists to reach.
+      engine.ingest("\n⏺ Reading file src/foo.ts\n");
+
+      // HALF ONE, and it is what makes the other half mean anything: the wall survived the recovery.
+      expect(quotaBlockForAgent(agentId, NOW + 60_000)).toBeDefined();
+
+      expect(moveAgent(agentId, "account-with-headroom", () => true)).toBe(true);
+
+      // HALF TWO. Before the fix this came back DEFINED — the switch was a silent no-op, and the
+      // agent stayed walled on an account it was no longer running under until 4pm.
+      expect(quotaBlockForAgent(agentId, NOW + 60_000)).toBeUndefined();
+      expect(
+        decideContinuation({
+          ...readyToResume(),
+          quotaBlock: quotaBlockForAgent(agentId, NOW + 60_000),
+        }).action,
+      ).toBe("continue");
+    } finally {
+      unregisterStatusEngine(agentId, engine);
+      engine.dispose();
+    }
+  });
+
   it("leaves an agent that was NOT moved still walled", () => {
     // The paired control. Same wall, same clock, same registry — the only difference is that no
     // switch touched this agent. If this one also came back undefined, the assertion above would be

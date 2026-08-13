@@ -46,6 +46,19 @@
 // — the diagnosis stays executable rather than becoming a comment — and it flips to a hard red the
 // moment the producer fix lands, which is exactly the reminder wanted. The PR that lands the durable
 // store converts these back to plain `it()`; nothing else in the file needs to change.
+//
+// ── AND WHY THE PRECONDITION IS NOT INSIDE THEM (roborev 63214, Medium) ──────────────────────────
+// `it.fails` inverts the WHOLE body: any throw at all satisfies it, and it cannot distinguish the
+// throw it was written for from one it was not. Two consequences, and the second is the expensive
+// one. An assertion carried inside an inverted case can never red again — so a labelled precondition
+// there is not a check, it is decoration. And once the durable store lands, ANY bit rot in the body
+// keeps these cases green, silently killing the flip-to-red the whole arrangement is built around:
+// the file would go on reporting "still broken" long after it was fixed.
+//
+// So each inverted case holds SETUP PLUS ONE CLAIM — the durability assertion and nothing else — and
+// the mounted-path precondition lives in a plain `it()` below with the identical setup, where it can
+// still fail. The residue is that a throw from the setup lines themselves is still absorbed; that is
+// inherent to `it.fails`, and the plain case running the same setup is what covers it.
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { StatusEngine } from "../engine/statusEngine";
 import {
@@ -128,29 +141,42 @@ afterEach(() => {
 });
 
 describe("the Pusher can still see a quota wall after the pane that saw it is gone", () => {
-  // `it.fails` — see the header. RED against current code is the assertion; when the durable store
-  // lands this goes red as a PASS and gets converted back to a plain `it()`.
-  it.fails("keeps the wall on the snapshot once the agent's pane tears down", () => {
+  /**
+   * THE PRECONDITION, and it lives OUT HERE for the reason in the header: an assertion inside an
+   * `it.fails` can never red, so carrying it there would make it decoration. This is the half that
+   * works today — and it is exactly why the defect is invisible to every existing test, so a
+   * regression in it would otherwise be silent. The setup is character-for-character the inverted
+   * cases' setup, which is what makes this cover their absorbed-throw residue.
+   */
+  it("maps a MOUNTED pane's wall onto the snapshot — the half that already works", () => {
     const agent = freshAgent();
     const engine = mount(agent);
     engine.ingest("✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)");
     engine.ingest(`\r⏺ ${SPEND_LIMIT}`);
 
-    // PRECONDITION, asserted rather than assumed: while the pane is mounted this all works, which is
-    // why the defect is invisible to every existing test.
-    expect(buildFleetSnapshots(inputFor(agent))[0]?.quota?.message).toBe(SPEND_LIMIT);
+    const snaps = buildFleetSnapshots(inputFor(agent));
+    expect(snaps[0]?.quota?.message).toBe(SPEND_LIMIT);
+    expect(isQuotaWalled(snaps[0]!, NOW)).toBe(true);
+    expect(evaluateFleetConditions(snaps, NOW).map((c) => c.id)).toContain("quota-blocked");
+  });
+
+  // `it.fails` — see the header. RED against current code is the assertion; when the durable store
+  // lands this goes red as a PASS and gets converted back to a plain `it()`. SETUP PLUS ONE CLAIM,
+  // deliberately: everything else this case used to assert now lives in the plain case above.
+  it.fails("keeps the wall on the snapshot once the agent's pane tears down", () => {
+    const agent = freshAgent();
+    const engine = mount(agent);
+    engine.ingest(`\r⏺ ${SPEND_LIMIT}`);
 
     // THE INCIDENT'S ACTUAL SEQUENCE. The banner ended the turn (`exit_code=Some(1)` in the logs),
     // and the row was closed — which is exactly Terminal.tsx's teardown pair.
     unregisterStatusEngine(agent, engine);
     engine.dispose();
 
-    // THE SIDE EFFECT. The wall was really observed and its 5h bounded window has not elapsed, so
-    // the Pusher must still be able to report it. Today both of these are empty: the registry entry
-    // is gone AND `dispose()` deleted the block behind it.
-    const snaps = buildFleetSnapshots(inputFor(agent));
-    expect(snaps[0]?.quota?.message).toBe(SPEND_LIMIT);
-    expect(isQuotaWalled(snaps[0]!, NOW)).toBe(true);
+    // THE SIDE EFFECT, and the only claim in this body. The wall was really observed and its 5h
+    // bounded window has not elapsed, so the Pusher must still be able to report it. Today the
+    // registry entry is gone AND `dispose()` deleted the block behind it.
+    expect(buildFleetSnapshots(inputFor(agent))[0]?.quota?.message).toBe(SPEND_LIMIT);
   });
 
   it.fails("yields a quota-blocked condition end-to-end for that agent", () => {

@@ -545,14 +545,30 @@ export class StatusEngine {
    * {@link releaseQuotaWallOnAccountChange} — so the two can never drift on what "the wall is gone"
    * means.
    *
-   * The `failureKind` guard is why this is a method rather than three inlined lines: it makes the
-   * release a no-op unless a QUOTA wall is what is actually up, so neither caller can clear an
-   * unrelated api/churn failure it never observed.
+   * THE TWO EFFECTS ARE GATED DIFFERENTLY, AND THAT ASYMMETRY IS THE WHOLE METHOD.
+   *
+   * `releaseQuotaBlock()` runs ALWAYS. Gating it on `failureKind === "quota"` was a bug, and the
+   * same one {@link noteUserInput} documents at length one screen down: THE WALL IS DESIGNED TO
+   * OUTLIVE THE STICKY RED. `clearStreamFailure()` nulls the kind on every routine recovery — a
+   * classified tool event, a token advance, a calm prompt screen — and each of those deliberately
+   * leaves `quotaBlock` set. So `failureKind === "quota"` is not "a wall is up"; it is "a wall is up
+   * AND nothing has recovered since", which is the narrower state and not the common one. In the
+   * ordinary post-limit shape (Claude prints the banner, then draws the limit picker, which is a
+   * prompt screen and clears the red) the guard made both callers silent no-ops: the switch left the
+   * wall standing, and — worse, because nothing else would ever come for it — so did the stated-reset
+   * timer this method is the callback for. Every consumer reads `quotaBlock`, not the kind:
+   * `quotaBlockNow`, and through it the sidebar, the row, `stallReport` and `decideContinuation`.
+   *
+   * `clearStreamFailure()` and the settle STAY gated, because those are claims about the RED, and a
+   * caller that never observed an api/churn failure must not wipe one. `releaseQuotaBlock` cannot
+   * drift that way — it touches `quotaBlock` and its timer and nothing else, so calling it when no
+   * wall is up is a no-op rather than a side effect on someone else's state.
    */
   private retireQuotaWall(): void {
-    if (this.disposed || this.failureKind !== "quota") return;
-    this.clearStreamFailure();
+    if (this.disposed) return;
     this.releaseQuotaBlock();
+    if (this.failureKind !== "quota") return;
+    this.clearStreamFailure();
     // Settle rather than forcing a colour: the wall is down, but whether the agent is working or
     // resting is a question for the ordinary classifier, not for this caller to assert.
     this.settle("quiet-settle");
