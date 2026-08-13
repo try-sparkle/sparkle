@@ -188,7 +188,16 @@ import {
   markStaleProactive,
   surfacedDigest,
 } from "../services/conciergeProactive";
-import { setConciergeNotifier, clearConciergeNotifier } from "../services/conciergeNotifier";
+import {
+  setConciergeNotifier,
+  clearConciergeNotifier,
+  notifyConcierge,
+} from "../services/conciergeNotifier";
+import {
+  initialState as initialDelegationState,
+  noteToolCall as noteDelegationToolCall,
+  type DelegationState,
+} from "../engine/conciergeDelegation";
 import {
   agentCanAcceptPrompt,
   dispatchConciergeAnswer,
@@ -654,6 +663,9 @@ export function ConciergeHost({
    * when a message moves from waiting to working.
    */
   const turnQueueRef = useRef<TurnQueueState>(EMPTY_TURN_QUEUE);
+  /** The delegation ladder's per-turn state (engine/conciergeDelegation). A ref, not state: it is
+   *  folded from the live tool stream on every `concierge:tool` event and must never re-render. */
+  const delegationRef = useRef<DelegationState>(initialDelegationState());
   const [turnQueue, setTurnQueue] = useState<TurnQueueState>(EMPTY_TURN_QUEUE);
   /** `dispatchTurn` through a ref: the send path calls it above its definition, and the turn-ended
    *  handlers call it from effects that must not re-subscribe when it changes identity. */
@@ -2376,6 +2388,37 @@ export function ConciergeHost({
       // ambiguity that made the founder ask "are you there".
       if (supersededTurn(e.id)) return;
       noteConciergeNativeToolCall(e.name, e.input);
+
+      // ══ THE DELEGATION LADDER (bead sparkle-6vool) ════════════════════════════════════════════
+      // The founder, 2026-08-13: "I have eight queued props that you're not responding to. Because
+      // you're not using concierge agents but should be." This is the mechanical backstop: count
+      // consecutive investigative calls and push back when the concierge is grinding through them
+      // instead of dispatching `sparkle_research`.
+      //
+      // FOLDED HERE because this is the only channel that reports a tool call WHILE THE TURN RUNS.
+      // The `done` event carries the same list, but it arrives after the founder has already done
+      // the waiting the ladder exists to prevent.
+      //
+      // The queue depth is what makes it hair-trigger: 6 calls normally, 2 when messages are
+      // stacked up behind this turn (the founder's own threshold choice).
+      const fold = noteDelegationToolCall(delegationRef.current, e, {
+        turnId: e.id,
+        queuedCount: waitingCount(turnQueueRef.current),
+      });
+      delegationRef.current = fold.state;
+      if (fold.decision.action === "nudge") {
+        const { rung, text, serial } = fold.decision.nudge;
+        // DELIVERY IS NOT INSTANT, AND THE COMMENT SAYS SO RATHER THAN IMPLYING OTHERWISE. There is
+        // no channel that interrupts a `claude -p` turn already in flight, so the notifier's push
+        // lands at the next turn boundary. A refusal (`false`) means it went nowhere at all — worth
+        // a line, for the same reason `notifyConcierge` logs its own refusals.
+        const delivered = notifyConcierge(text);
+        log.warn(
+          "concierge",
+          `delegation nudge #${rung}: ${serial} investigative call(s), 0 delegations` +
+            (delivered ? "" : " — push refused, nudge not delivered"),
+        );
+      }
     });
     // ══ EVERY EXIT FROM `done` ENDS THE BUBBLE'S LIFE — ONE PLACE, NOT FOUR (roborev 62936) ═══════
     // `offError` marks above every gate for a stated reason ("a fifth exit added later cannot

@@ -155,6 +155,18 @@ and never overrides the rules above about honesty or about never guessing an age
 preference about your communication, not \
 facts about their projects, and not a one-off instruction that only shapes the current reply. Do \
 not save the same rule twice — if it is already in that section, just follow it.\n\n\
+DELEGATE THE DIGGING — NEVER READ SERIALLY WHILE THEY WAIT. When answering needs you to go and \
+FIND something out — reading a long file, digging through history, checking how something is done \
+elsewhere in the repo, sweeping several agents' terminals — send it to `sparkle_research` (op \
+`dispatch`) and carry on the conversation. It returns immediately with a taskId, and its findings \
+are handed to you at the start of a later turn; spawn a build agent instead when the work needs \
+writes. What you must NOT do is grind through a long run of one-at-a-time Read / Grep / \
+read-agent-terminal / check-this-PR calls yourself. Every one of those is time the user spends \
+watching their own messages stack up behind your turn, and it is the single complaint they have \
+made most often about you. YOU DO NOT HAVE CLAUDE'S `Task`/`Agent` TOOL — `sparkle_research` is \
+your version of it, so an instruction anywhere telling you to 'fan out subagents via your Agent \
+tool' means this tool. Reach for it EARLY, on the first question that needs real digging rather \
+than after you are ten reads deep, and say that you have sent it off.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -2039,6 +2051,37 @@ mod tests {
         assert!(CONCIERGE_PERSONA.contains("THE USER'S OWN COMMUNICATION GUIDELINES"));
         assert!(crate::concierge_guidelines::injection_block("- a rule")
             .contains("THE USER'S OWN COMMUNICATION GUIDELINES"));
+    }
+
+    #[test]
+    fn persona_tells_the_model_to_delegate_digging_and_names_a_tool_it_actually_has() {
+        // Bead `sparkle-6vool`. The founder, 2026-08-13: "You are again not using concierge agents?
+        // I have eight queued props that you're not responding to."
+        //
+        // WHY THIS IS PINNED IN CODE AND NOT LEFT TO THE GUIDELINES FILE. The instruction DID exist
+        // — in `concierge-guidelines.md`, added 2026-07-29 and AGAIN on 2026-08-11 after nothing
+        // changed. It was inert for two compounding reasons, and this test guards both:
+        //
+        //   1. It named the wrong tool. It said "fan out parallel subagents via your own Agent
+        //      tool", but `Task`/`Agent` is absent from CONCIERGE_ALLOWED_TOOLS — the concierge was
+        //      told to reach for something it does not have.
+        //   2. `concierge_guidelines::INJECTION_HEADING` documents that file as governing STYLE,
+        //      not PERMISSION — the one channel this codebase declares advisory.
+        //
+        // So the directive belongs HERE, and it must name the delegation surface that exists.
+        assert!(CONCIERGE_PERSONA.contains("sparkle_research"));
+        assert!(CONCIERGE_PERSONA.contains("DELEGATE THE DIGGING"));
+        // The correction that makes the older guideline harmless rather than contradictory: it
+        // tells the model that an "Agent tool" instruction elsewhere means THIS tool.
+        assert!(CONCIERGE_PERSONA.contains("YOU DO NOT HAVE CLAUDE'S `Task`/`Agent` TOOL"));
+        // The tool it is pointed at must be one the allowlist actually admits, or this repeats the
+        // exact defect above. `sparkle_research` arrives via the `mcp__sparkle-control__*` entry.
+        assert!(CONCIERGE_ALLOWED_TOOLS.contains("mcp__sparkle-control__*"));
+        assert!(
+            !CONCIERGE_ALLOWED_TOOLS.contains("Task"),
+            "if Task is ever added, the persona's 'you do not have it' sentence becomes a lie \
+             and must be rewritten in the same change"
+        );
     }
 
     #[test]
