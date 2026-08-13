@@ -438,6 +438,40 @@ describe("an OBSERVED wall migrates running agents without being asked", () => {
     expect(view.result.current.recommendation).toBeNull();
   });
 
+  it("and the EXTENDED expiry becomes the reference once the original lapses", async () => {
+    // The re-stamp is the load-bearing half of that extension branch, and the test above cannot see
+    // it: whether the wave-off is KEPT across one extension is decided by the branch condition
+    // alone, and at that instant both the stale original and the extended value are still in the
+    // future, so it passes either way. The assignment only changes an answer on a LATER evaluation.
+    //
+    // That later evaluation is reachable, and by the ordinary route rather than an exotic one:
+    // retirement is skipped entirely while a switch plan is open — which the docblock notes one
+    // stuck agent can hold for hours — and on any `state.failed` tick. So an extension observed at
+    // t < T1, followed by a blind stretch running past T1, arrives with a stale stamp: the claim is
+    // then judged lapsed, falls to the new-episode branch, and the wave-off is deleted for a wall
+    // that never ended. Keeping the stamp current is what closes that.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    // Lapses AFTER the next tick but BEFORE the one after it — so the extension is observed while
+    // the original is still live, and the following tick is past it. That ordering is the whole
+    // point: it is the only arrangement in which a stale stamp and a current one differ.
+    h.usage = [{ id: "acct-a", exhaustedUntil: Date.now() + POLL_MS * 1.5 }];
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+
+    // The bench is extended far past the original expiry, and THIS tick observes it while the
+    // original is still live — the moment the claim has to be re-stamped.
+    h.usage = [wall("acct-a")];
+    await repoll();
+    expect(view.result.current.recommendation).toBeNull();
+
+    // Now past the ORIGINAL expiry, with the extended wall still live and unchanged. Judged against
+    // the stale stamp this reads as a lapsed episode and the banner returns.
+    await repoll();
+
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
   it("and with NO episode recorded it falls back to plain is-it-walled-now", async () => {
     // The fallback arm. A claim is stamped with the `exhaustedUntil` observed for its account, but
     // that can be `null` — nothing was known about the account when the user acted. Episode identity
