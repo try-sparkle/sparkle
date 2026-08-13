@@ -2066,27 +2066,40 @@ export function setChiefClient(client: ChiefClient | null): void {
  * down with it.
  */
 export async function connectChief(
-  deps: { createClient?: typeof createChiefMcpClient; resolvePat?: () => Promise<string> } = {},
+  deps: {
+    createClient?: typeof createChiefMcpClient;
+    resolvePat?: () => Promise<string>;
+    /** True while the start that began this connect is still the current one. See the epoch note. */
+    isCurrent?: () => boolean;
+  } = {},
 ): Promise<boolean> {
   const create = deps.createClient ?? createChiefMcpClient;
   const resolve = deps.resolvePat ?? resolveChiefPat;
+  // EVERY WRITE IS EPOCH-GUARDED, because boot ABANDONS this promise on timeout rather than
+  // cancelling it — there is nothing to cancel in a Tauri round trip — and it is the abandoned
+  // promise that performs the write (roborev 63509). Two real races without this: a slow keychain
+  // answering after a `teardown()` re-installs a client the teardown deliberately nulled (defeating
+  // the very invariant the teardown test pins), and a straggler from start #1 overwriting start #2's
+  // client AND its catalog registry — which is exactly the "a cache keyed to a retired client would
+  // serve one token's catalog to the next" hazard `setChiefClient` is documented against.
+  const current = deps.isCurrent ?? (() => true);
+  const apply = (client: ChiefClient | null): boolean => {
+    if (!current()) return false; // stale start: leave whatever is installed now untouched
+    setChiefClient(client);
+    return client !== null;
+  };
   try {
     // GUARDED ON THE PAT BEING RESOLVABLE. With no token every call would reach the network and come
     // back unauthorized, which reads to a model as "Chief is broken" rather than "Chief is not set
     // up" — and `handleChiefTool`'s `chief_unavailable` says the latter, correctly, when the client
     // is null.
     const pat = await resolve();
-    if (!pat) {
-      setChiefClient(null);
-      return false;
-    }
-    setChiefClient(create({ resolvePat: resolve }));
-    return true;
+    if (!pat) return apply(null);
+    return apply(create({ resolvePat: resolve }));
   } catch {
     // A keychain read can fail (locked, denied, no Rust side in a test harness). Chief is optional,
     // so this is a state, not an error: clear the client and let the refusal explain itself.
-    setChiefClient(null);
-    return false;
+    return apply(null);
   }
 }
 
@@ -2668,6 +2681,10 @@ function teardown(): void {
   void safeUnlisten(unlisten);
   unlisten = undefined;
   startPromise = undefined;
+  // INVALIDATE ANY IN-FLIGHT CONNECT FIRST. A `connectChief` that boot already gave up waiting on is
+  // still running, and its write lands whenever the keychain finally answers — after this line, if
+  // nothing retires it. Bumping the epoch is what makes the clear below stick (roborev 63509).
+  chiefEpoch++;
   // DROP THE CHIEF CLIENT TOO, for the same reason `setChiefClient` rebuilds the registry: a client
   // is bound to the PAT that was resolvable when it was built, and a teardown is exactly when that
   // may be changing (sign-out, HMR after a token edit). Holding it would serve the retired token's
@@ -2679,6 +2696,10 @@ function teardown(): void {
 /** How long boot will wait on the Chief connect before giving up on it for this start. Generous —
  *  this is a hang guard, not a latency budget; a keychain that answers at all answers well inside it. */
 export const CHIEF_CONNECT_TIMEOUT_MS = 10_000;
+
+/** Bumped by every `doStart` and every `teardown`, so a connect that boot abandoned can tell that
+ *  the start it belonged to is over and decline to write. See `connectChief`'s epoch note. */
+let chiefEpoch = 0;
 
 /** Resolve `p`, or `fallback` if it has not settled within `ms`. The loser is abandoned, not
  *  cancelled (there is nothing to cancel in a Tauri round trip) — it simply stops being awaited. */
@@ -2726,7 +2747,12 @@ async function doStart(): Promise<() => void> {
   // `startControlListener()` caller shares that one promise. A `chief_tool` op landing inside the
   // connect window already fails closed to the honest `chief_unavailable`, so a slow connect costs
   // nothing but Chief itself.
-  const chiefUp = await withTimeout(connectChief(), CHIEF_CONNECT_TIMEOUT_MS, false);
+  const epoch = ++chiefEpoch;
+  const chiefUp = await withTimeout(
+    connectChief({ isCurrent: () => epoch === chiefEpoch }),
+    CHIEF_CONNECT_TIMEOUT_MS,
+    false,
+  );
   console.info(`[control] chief ${chiefUp ? "connected" : "not configured"}`);
   return teardown;
 }

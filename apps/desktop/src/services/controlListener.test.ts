@@ -161,6 +161,7 @@ import {
 import { useSettingsStore } from "../stores/settingsStore";
 import {
   startControlListener,
+  CHIEF_CONNECT_TIMEOUT_MS,
   isControlOpSuccess,
   CONCIERGE_CALLER_AGENT_ID,
   setChiefClient,
@@ -4416,6 +4417,85 @@ describe("controlListener", () => {
 
       releasePat("pat_live_token");
       cleanup = await starting;
+    });
+
+    // THE HANG GUARD, which shipped with no coverage at all (roborev 63509). The ordering test above
+    // resolves the PAT itself, so it holds with or without the bound — nothing asserted that
+    // `startControlListener()` RESOLVES when the keychain never answers, which is the whole stated
+    // hazard (a shared `startPromise` pending forever for every later caller).
+    it("still finishes boot when the PAT read NEVER settles", async () => {
+      cleanup?.();
+      cleanup = undefined;
+      firedHandler = undefined;
+      vi.useFakeTimers();
+      try {
+        chiefResolvePat.mockReturnValue(new Promise<string>(() => {})); // never settles
+
+        const starting = startControlListener();
+        await vi.advanceTimersByTimeAsync(CHIEF_CONNECT_TIMEOUT_MS + 1);
+        cleanup = await starting; // would hang forever without the bound
+
+        // The listener is serving, and Chief reports itself honestly rather than half-connected.
+        fire({ reqId: "hang1", op: "get_state", callerAgentId: callerId, payload: {} });
+        await vi.advanceTimersByTimeAsync(0);
+        expect((lastReply() as { agents: unknown[] }).agents.length).toBeGreaterThan(0);
+
+        fire({
+          reqId: "hang2",
+          op: "chief_tool",
+          callerAgentId: callerId,
+          payload: { chiefTool: "list_assets", project: "chief_p1" },
+        });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(lastReply()).toMatchObject({ ok: false, code: "chief_unavailable" });
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    // THE STRAGGLER (roborev 63509). A timed-out connect is ABANDONED, not cancelled, and it is the
+    // abandoned promise that writes the client. So a keychain answering after boot gave up — and
+    // after a teardown — would re-install a client the teardown deliberately nulled, reaching the
+    // exact invariant the teardown test pins by a delayed path instead of a synchronous one.
+    it("IGNORES a keychain that answers after its start was torn down", async () => {
+      cleanup?.();
+      cleanup = undefined;
+      vi.useFakeTimers();
+      try {
+        let releasePat: (v: string) => void = () => {};
+        chiefResolvePat.mockReturnValue(
+          new Promise<string>((resolve) => {
+            releasePat = resolve;
+          }),
+        );
+        const callTool = vi.fn(async () => ({ text: "ok" }));
+        chiefCreateClient.mockReturnValue({
+          listProjects: vi.fn(async () => [{ project_id: "chief_p1", name: "Acme Rebrand" }]),
+          callTool,
+        });
+
+        const starting = startControlListener();
+        await vi.advanceTimersByTimeAsync(CHIEF_CONNECT_TIMEOUT_MS + 1);
+        const stop = await starting;
+        stop(); // teardown nulls the client and retires this start's epoch
+
+        // NOW the keychain finally answers. The write must not land.
+        releasePat("pat_live_token");
+        await vi.advanceTimersByTimeAsync(0);
+
+        fire({
+          reqId: "strag1",
+          op: "chief_tool",
+          callerAgentId: callerId,
+          payload: { chiefTool: "list_assets", project: "chief_p1" },
+        });
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(lastReply()).toMatchObject({ ok: false, code: "chief_unavailable" });
+        expect(callTool).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
     });
 
     // OBSERVES THE TEARDOWN ITSELF, which nothing else here does (roborev 63315). Every other case
