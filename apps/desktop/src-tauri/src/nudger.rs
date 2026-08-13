@@ -458,6 +458,8 @@ fn status_map<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, AgentFacts> {
             let facts = AgentFacts {
                 goal_met: goal_is_met(a.goal_state.as_deref()),
                 status: a.status,
+                rollup_dot: a.rollup_dot.as_deref().and_then(nudge_ladder::intern_dot),
+                stage: a.workflow_stage.as_deref().and_then(nudge_ladder::intern_stage),
             };
             (a.id, facts)
         })
@@ -469,6 +471,12 @@ fn status_map<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, AgentFacts> {
 struct AgentFacts {
     status: String,
     goal_met: bool,
+    /// The row's disc once folded workers are counted, and the workflow stage — both already on the
+    /// roster slice and both previously DROPPED here. They are what lets the native watcher see the
+    /// founder's condition: a row that is not green and not yet merged to main. See
+    /// `nudge_ladder::tick_unlanded_clock`.
+    rollup_dot: Option<&'static str>,
+    stage: Option<&'static str>,
 }
 
 /// Is this agent's goal MET? Only the exact token counts.
@@ -562,7 +570,11 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         // An agent missing from the roster has NO goal fact, which reads as unmet — so an unobserved
         // agent keeps the full ladder rather than being silenced by an absence.
         let goal_met = facts.is_some_and(|f| f.goal_met);
-        let obs = observe(observer, status_str, goal_met, now);
+        // An agent ABSENT from the roster yields `None` for both, which every rule reads as no
+        // evidence — so an unobserved agent is never flagged on this path, only on the ordinary one.
+        let rollup_dot = facts.and_then(|f| f.rollup_dot);
+        let stage = facts.and_then(|f| f.stage);
+        let obs = observe(observer, status_str, goal_met, rollup_dot, stage, now);
 
         let decision = nudge_ladder::step(&mut entry.state, &obs);
         entry.due_at_ms = now.saturating_add(decision.next_look_secs * 1000);
@@ -585,6 +597,11 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
             goal_met = goal_met,
             reply = entry.state.last_reply().map(|r| r.as_str()).unwrap_or("-"),
             nudges = entry.state.attempts(),
+            // The second clock. Without it "why was this row raised" is unanswerable from the log
+            // for every agent flagged on the unlanded path rather than the silence path.
+            rollup_dot = rollup_dot.unwrap_or("-"),
+            stage = stage.unwrap_or("-"),
+            unlanded_secs = entry.state.unlanded_secs(),
             "nudger tick"
         );
 
@@ -721,7 +738,14 @@ fn sweep_dead_flags(flags: &NudgeFlags, live_ids: &std::collections::HashSet<&st
 /// parked-reader setter and getter, which is a precondition, not a side effect — breaking `tick`'s
 /// use of it left that test green. This is the seam where "the reader is parked" actually becomes
 /// "do not write".
-fn observe(observer: &PtyObserver, status: &str, goal_met: bool, now: u64) -> Observation {
+fn observe(
+    observer: &PtyObserver,
+    status: &str,
+    goal_met: bool,
+    rollup_dot: Option<&'static str>,
+    stage: Option<&'static str>,
+    now: u64,
+) -> Observation {
     let hash = observer.hash_with_status(status);
     let (text, alternate) = observer.render();
     // A parked reader means this screen is NOT being updated, so it may be arbitrarily out of date.
@@ -765,6 +789,8 @@ fn observe(observer: &PtyObserver, status: &str, goal_met: bool, now: u64) -> Ob
         // reason `nudger_send_escape` re-derives its own: a wedged WebView's last opinion is
         // exactly the stale evidence that would press a button nobody read. An unreadable screen
         // is never answerable.
+        rollup_dot,
+        stage,
         answerable: screen_readable
             && nudge_gate::answer_refusal(Some(&Screen {
                 text: &text,
@@ -1261,21 +1287,21 @@ mod tests {
         // A screen that is unambiguously SAFE to write to, so the only thing under test is the park.
         o.ingest("\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────");
         assert_eq!(
-            observe(&o, "idle", false, now_ms()).refusal,
+            observe(&o, "idle", false, None, None, now_ms()).refusal,
             None,
             "precondition: screen permits"
         );
 
         o.set_reader_parked(true);
         assert_eq!(
-            observe(&o, "idle", false, now_ms()).refusal,
+            observe(&o, "idle", false, None, None, now_ms()).refusal,
             Some("reader-parked"),
             "a screen that is not being updated must be refused, not trusted"
         );
 
         // ...and it must clear, or one burst of backpressure mutes the nudger for the session.
         o.set_reader_parked(false);
-        assert_eq!(observe(&o, "idle", false, now_ms()).refusal, None);
+        assert_eq!(observe(&o, "idle", false, None, None, now_ms()).refusal, None);
     }
 
     /// END TO END, the wedged-mid-turn case: a spinner frozen on a parked reader's grid must not
@@ -1291,7 +1317,7 @@ mod tests {
         o.ingest("\x1b[2J\x1b[H✻ Churning… (1m 24s · esc to interrupt)");
         o.set_reader_parked(true);
 
-        let obs = observe(&o, "working", false, now_ms());
+        let obs = observe(&o, "working", false, None, None, now_ms());
         assert!(obs.working, "the frozen screen and the stale roster both still say working");
         assert!(!obs.screen_readable, "but nothing read off that grid is current");
 
@@ -1313,13 +1339,13 @@ mod tests {
     fn either_the_roster_or_the_screen_can_veto_as_working() {
         let idle = observer();
         idle.ingest("\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────");
-        assert!(!observe(&idle, "idle", false, now_ms()).working);
-        assert!(observe(&idle, "working", false, now_ms()).working, "roster veto");
+        assert!(!observe(&idle, "idle", false, None, None, now_ms()).working);
+        assert!(observe(&idle, "working", false, None, None, now_ms()).working, "roster veto");
 
         let spinning = observer();
         spinning.ingest("\x1b[2J\x1b[H✻ Churning… (1m 24s · esc to interrupt)");
         assert!(
-            observe(&spinning, "", false, now_ms()).working,
+            observe(&spinning, "", false, None, None, now_ms()).working,
             "screen veto, with the roster saying nothing at all — the wedged-WebView case"
         );
     }
@@ -1745,6 +1771,8 @@ mod tests {
                 goal_met: false,
                 reply: None,
                 answerable: false,
+                rollup_dot: None,
+                stage: None,
             };
             for _ in 0..7 {
                 nudge_ladder::step(&mut state, &stalled);
@@ -1882,6 +1910,8 @@ mod tests {
             goal_met: false,
             reply: None,
             answerable: false,
+            rollup_dot: None,
+            stage: None,
         };
         for _ in 0..looks {
             nudge_ladder::step(&mut state, &stalled);
@@ -2065,6 +2095,8 @@ mod tests {
             goal_met: false,
             reply: None,
             answerable: false,
+            rollup_dot: None,
+            stage: None,
         };
         for _ in 0..7 {
             nudge_ladder::step(&mut state, &stalled);

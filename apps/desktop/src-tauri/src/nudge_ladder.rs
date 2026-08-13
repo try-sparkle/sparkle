@@ -127,6 +127,89 @@ const LIVE_LOOKS_TO_RESET: u32 = 3;
 /// own output resetting the episode long before this elapses.
 const QUOTA_BACKOFF_SECS: u64 = 1800;
 
+/// The workflow stages, in order, as `engine/workflowStage.ts` defines them.
+///
+/// -- WHY THE NATIVE SIDE NEEDS THESE AT ALL ----------------------------------------------------
+/// Everything else in this module measures ONE thing: whether the terminal produced bytes. That
+/// misses the failure the founder named -- "a row that is not green and is not at least merged to
+/// main is a problem" -- because a row can be gray with unlanded work while its pane keeps
+/// repainting, and a repaint resets the silence clock. Such an agent is invisible to the ladder no
+/// matter how long it sits there.
+///
+/// The web layer already reasons about this (`engine/workflowStage.ts::hasUnmergedCommittedWork`,
+/// `engine/unmergedAttention.ts`), but it is a WEB-LAYER overlay -- and the web layer is exactly
+/// what freezes in the failure this watcher exists to survive. So the two halves never met: the
+/// component that knows "gray and owes work" cannot act when it matters, and the component that
+/// can act could not see it. These two facts already arrive on the roster slice the nudger reads;
+/// they were simply being dropped.
+pub const WORKFLOW_STAGES: [&str; 10] = [
+    "thought",
+    "specd",
+    "planned",
+    "building_unsaved",
+    "building_saved",
+    "pushed",
+    "pull_request",
+    "merged_local",
+    "merged",
+    "shipped",
+];
+
+/// Rank of a stage in `WORKFLOW_STAGES`. `None` for an unknown or absent stage, which is treated
+/// as NO EVIDENCE everywhere below -- never as stage zero, which would read an unknown string as
+/// "has made no progress at all" and flag a healthy agent.
+pub fn stage_rank(stage: &str) -> Option<usize> {
+    WORKFLOW_STAGES.iter().position(|s| *s == stage)
+}
+
+/// Intern a roster stage string to its `'static` form, or `None` if we do not know it.
+///
+/// The roster hands us owned `String`s, and this module's `Observation` is rebuilt for every agent
+/// on every look — on a thread whose whole justification is staying cheap on a fleet of dozens. So
+/// the known vocabulary is matched by identity rather than cloned, and an UNKNOWN stage becomes
+/// `None`, which every rule below reads as no evidence rather than as stage zero.
+pub fn intern_stage(stage: &str) -> Option<&'static str> {
+    WORKFLOW_STAGES.iter().copied().find(|s| *s == stage)
+}
+
+/// The row discs `rollup_dot` can carry, interned the same way. `None` for anything else —
+/// including the empty string a window that cannot compute the rollup publishes.
+pub fn intern_dot(dot: &str) -> Option<&'static str> {
+    ["green", "gray", "red", "orange"].into_iter().find(|d| *d == dot)
+}
+
+/// Does this stage mean "there IS committed work that has not landed on ORIGIN main yet"?
+///
+/// The Rust twin of `workflowStage.ts::hasUnmergedCommittedWork`: true across the committed-but-
+/// unlanded band, `building_saved` through `merged_local`, and false below it (nothing committed)
+/// and at or above `merged`. `merged_local` still counts as unlanded because the workflow lands via
+/// a PR to origin, so local-only work still needs a human to get it the rest of the way.
+///
+/// An unknown stage is `false` -- no evidence, so no flag. `stage_vocabulary_matches_the_frontend`
+/// pins this list against the TypeScript source, which is the only thing stopping the two from
+/// drifting into disagreeing about the same agent at the same moment.
+pub fn holds_unlanded_work(stage: &str) -> bool {
+    match (stage_rank(stage), stage_rank("building_saved"), stage_rank("merged")) {
+        (Some(idx), Some(lo), Some(hi)) => idx >= lo && idx < hi,
+        _ => false,
+    }
+}
+
+/// How long a NOT-GREEN row holding unlanded work may go without its stage advancing before the
+/// concierge is told, in seconds.
+///
+/// -- WHY THIS CLOCK IS SLOW, AND WHY IT IS SEPARATE FROM THE SILENCE CLOCK ---------------------
+/// It does NOT reset on output, which is the entire point: the agent this catches is the one whose
+/// pane is busy while nothing lands. Since terminal activity cannot clear it, only real progress
+/// can, it has to be generous enough that ordinary work never trips it -- an agent can legitimately
+/// read code, run a long suite, or think for a long stretch without the stage moving. Thirty
+/// minutes of a non-green row holding unlanded work with no stage advance is not a busy agent; it
+/// is a row a human should look at.
+///
+/// It raises the CONCIERGE, never the founder directly, for the same reason: this is the weakest
+/// evidence in the module, resting on two frontend-written facts, so it earns the lower level.
+const UNLANDED_STALL_SECS: u64 = 1800;
+
 /// The one-line answers the nudge asks for, and the ONLY vocabulary this module accepts.
 ///
 /// ── THE DEFECT THIS TYPE EXISTS TO CLOSE ──────────────────────────────────────────────────────
@@ -310,6 +393,16 @@ pub struct Observation {
     /// The agent's own one-line answer to the most recent nudge, per `parse_reply`. `None` when it
     /// has not answered, or when the screen cannot be read unambiguously.
     pub reply: Option<Reply>,
+    /// This agent's ROW DISC once the workers folded under it are counted — `rollup_dot` on the
+    /// roster slice. `None` when the window could not say, which is NOT the same as gray.
+    ///
+    /// Frontend-written, like `working` and `goal_met`. Trusted here ONLY to raise a flag and never
+    /// to suppress one, which is the asymmetry that makes a stale value safe: erring toward telling
+    /// a human is the one direction this module is allowed to err in.
+    pub rollup_dot: Option<&'static str>,
+    /// This agent's workflow stage, per `engine/workflowStage.ts`. `None` when absent or unknown —
+    /// treated as NO EVIDENCE, never as "has made no progress".
+    pub stage: Option<&'static str>,
     /// The screen is an ordinary permission prompt whose command the gate's ALLOWLIST covers, so
     /// the affirmative option may be selected without a human reading it.
     ///
@@ -384,6 +477,14 @@ pub struct AgentState {
     /// proxy for. Cleared at the top of every look, so it means "the look immediately before this
     /// one" and never leaks further.
     wrote_last_look: bool,
+    /// Seconds a NOT-GREEN row holding unlanded work has gone without its stage advancing.
+    ///
+    /// A SECOND CLOCK, deliberately independent of `silent_secs`: output does not clear it, because
+    /// the agent it exists to catch is the one whose pane is busy while nothing lands.
+    unlanded_secs: u64,
+    /// The best stage rank seen this episode, so an ADVANCE can be told from a repeat. High-water,
+    /// so a roster blink that drops the stage cannot read as regress and re-arm the clock.
+    stage_high_water: Option<usize>,
     /// Looks spent parked on a screen only a human can clear, for that path's escalation ladder.
     ///
     /// Deliberately NOT `attempts`, which means "nudges we tried to send" and is both the
@@ -443,6 +544,10 @@ impl AgentState {
     #[cfg(test)]
     pub fn parked_looks_for_test(&self) -> u32 {
         self.parked_looks
+    }
+    /// Seconds this row has been not-green, holding unlanded work, with no stage advance.
+    pub fn unlanded_secs(&self) -> u64 {
+        self.unlanded_secs
     }
     pub fn silent_secs(&self) -> u64 {
         self.silent_secs
@@ -507,6 +612,64 @@ pub const QUIET_AFTER_OTHER_WRITE_MS: u64 = 5_000;
 /// for ten minutes should reach the escalation rungs and get a human's attention, which is exactly
 /// what a picker nobody is answering deserves.
 pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
+    // TICKED FIRST, and OUTSIDE the ladder, because it must survive every early return below and
+    // must NOT be cleared by output. See `UNLANDED_STALL_SECS`.
+    let rose = tick_unlanded_clock(state, obs);
+    let mut decision = step_inner(state, obs);
+
+    // The row EXISTS for as long as the condition holds, and ESCALATES only on the look it crossed
+    // — the same split `flagged` / `escalate` keep everywhere else in this module. Folded in here
+    // rather than at each of the seven return sites inside `step_inner`, so a path added later
+    // cannot silently forget it.
+    if state.unlanded_secs >= UNLANDED_STALL_SECS {
+        decision.flagged = decision.flagged.max(Some(Escalation::Concierge));
+    }
+    decision.escalate = decision.escalate.max(rose);
+    decision
+}
+
+/// Advance the unlanded-work clock, returning a target only when it just crossed the threshold.
+///
+/// THE CONDITION IS THE FOUNDER'S, VERBATIM: a row that is not green and is not at least merged to
+/// main is a problem. The only thing added here is a TIME BOUND, because that condition is the
+/// ordinary state of every agent mid-task — it is being STUCK in it that matters, not being in it.
+///
+/// Cleared by real progress and by nothing else: the stage advancing, the row going green, or the
+/// work landing. Output does NOT clear it, which is what makes it catch the agent the silence clock
+/// cannot see — the one whose pane keeps repainting while nothing lands.
+fn tick_unlanded_clock(state: &mut AgentState, obs: &Observation) -> Option<Escalation> {
+    // An ADVANCE is real progress. High-water, so a roster blink that drops or lowers the stage
+    // reads as "no news" rather than as a regression that re-arms the clock.
+    if let Some(rank) = obs.stage.and_then(stage_rank) {
+        if state.stage_high_water.is_none_or(|best| rank > best) {
+            state.stage_high_water = Some(rank);
+            state.unlanded_secs = 0;
+        }
+    }
+
+    // `None` is NOT gray. A window that could not tell us the disc is no evidence at all, and this
+    // clock only ever runs on positive evidence of a problem.
+    let not_green = matches!(obs.rollup_dot, Some("gray" | "red" | "orange"));
+    let unlanded = obs.stage.is_some_and(holds_unlanded_work);
+    if !not_green || !unlanded {
+        state.unlanded_secs = 0;
+        return None;
+    }
+
+    // The interval that just elapsed is the one the PREVIOUS decision scheduled, which is this
+    // rung's entry — `state.rung` has not been advanced yet at this point in the look.
+    let elapsed = LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)];
+    let before = state.unlanded_secs;
+    state.unlanded_secs = state.unlanded_secs.saturating_add(elapsed);
+
+    // Only on the look it CROSSES, so one stuck row is one notice rather than a stream.
+    if before < UNLANDED_STALL_SECS && state.unlanded_secs >= UNLANDED_STALL_SECS {
+        return raise(state, Some(Escalation::Concierge));
+    }
+    None
+}
+
+fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
     let previous = state.hash;
     let changed = previous.is_some_and(|h| h != obs.hash);
     // Consumed immediately, so it can only ever mean "the look before this one".
@@ -1207,6 +1370,8 @@ mod tests {
             goal_met: false,
             reply: None,
             answerable: false,
+            rollup_dot: None,
+            stage: None,
         }
     }
 
@@ -2405,6 +2570,164 @@ mod tests {
             decisions.iter().any(|d| d.escalate == Some(Escalation::Concierge)),
             "and a human must be told instead"
         );
+    }
+
+    // ══ A ROW THAT IS NOT GREEN AND NOT YET MERGED ══════════════════════════════════════════════
+
+    /// An agent whose row is gray with unlanded work, WHOSE PANE KEEPS REPAINTING.
+    ///
+    /// This is the case the silence clock structurally cannot see: every repaint resets the rung,
+    /// so the ordinary ladder never climbs, never nudges, and never escalates — the agent is
+    /// invisible for as long as it likes. It is also the founder's stated condition: "if a row is
+    /// not green and it's not at least merged to main, we have a problem."
+    #[test]
+    fn a_busy_looking_row_with_unlanded_work_is_still_escalated() {
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+        let mut raised = None;
+        let mut looks = 0;
+
+        // The pane repaints on EVERY look, so the silence clock is pinned at zero throughout.
+        while raised.is_none() && looks < 4000 {
+            hash += 1;
+            let d = step(
+                &mut s,
+                &Observation {
+                    hash,
+                    rollup_dot: Some("gray"),
+                    stage: Some("building_saved"),
+                    ..stalled()
+                },
+            );
+            raised = d.escalate;
+            looks += 1;
+        }
+
+        assert_eq!(raised, Some(Escalation::Concierge), "a stuck-but-busy row must reach a human");
+        assert_eq!(s.silent_secs(), 0, "premise: the silence clock never ran — it repainted every look");
+        assert!(s.unlanded_secs() >= UNLANDED_STALL_SECS);
+    }
+
+    /// THE CONTROL, and it is what stops the rule above from being "escalate on everything".
+    ///
+    /// The same repainting row, the same duration — but the work has LANDED. Nothing is owed, so
+    /// nobody is told. Without this the test above passes against a clock that ignores the stage.
+    #[test]
+    fn a_merged_row_is_never_escalated_however_long_it_sits() {
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+        for _ in 0..4000 {
+            hash += 1;
+            let d = step(
+                &mut s,
+                &Observation {
+                    hash,
+                    rollup_dot: Some("gray"),
+                    stage: Some("merged"),
+                    ..stalled()
+                },
+            );
+            assert_eq!(d.escalate, None, "merged work owes nobody anything");
+        }
+        assert_eq!(s.unlanded_secs(), 0);
+    }
+
+    /// …and a GREEN row is left alone too, whatever its stage. Green means work is running under it.
+    #[test]
+    fn a_green_row_is_never_escalated_on_this_path() {
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+        for _ in 0..4000 {
+            hash += 1;
+            let d = step(
+                &mut s,
+                &Observation {
+                    hash,
+                    rollup_dot: Some("green"),
+                    stage: Some("building_saved"),
+                    ..stalled()
+                },
+            );
+            assert_eq!(d.escalate, None, "a green row is not a problem");
+        }
+    }
+
+    /// PROGRESS CLEARS IT, and only progress does. An agent that keeps ADVANCING through the stages
+    /// is working, however long the whole journey takes.
+    #[test]
+    fn a_stage_that_keeps_advancing_never_trips_the_clock() {
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+        // Walk the unlanded band, spending a long stretch on each rung — but always moving.
+        for stage in ["building_saved", "pushed", "pull_request", "merged_local"] {
+            for _ in 0..40 {
+                hash += 1;
+                let d = step(
+                    &mut s,
+                    &Observation { hash, rollup_dot: Some("gray"), stage: Some(stage), ..stalled() },
+                );
+                assert_eq!(d.escalate, None, "an advancing agent is not stuck (at {stage})");
+            }
+        }
+    }
+
+    /// ABSENCE IS NOT EVIDENCE. A window that cannot report the disc or the stage must not have its
+    /// silence read as "gray" or as "nothing committed" — that would flag every agent a wedged or
+    /// out-of-date window cannot describe, which is most of them in exactly the outage this module
+    /// exists for.
+    #[test]
+    fn an_unreported_row_is_never_escalated_on_this_path() {
+        for (dot, stage) in [(None, None), (None, Some("building_saved")), (Some("gray"), None)] {
+            let mut s = AgentState::default();
+            let mut hash = 0u64;
+            for _ in 0..4000 {
+                hash += 1;
+                let d = step(
+                    &mut s,
+                    &Observation { hash, rollup_dot: dot, stage, ..stalled() },
+                );
+                assert_eq!(d.escalate, None, "absent evidence must not flag: {dot:?}/{stage:?}");
+            }
+        }
+    }
+
+    /// The unlanded band, pinned against `workflowStage.ts::hasUnmergedCommittedWork`: committed
+    /// but not on ORIGIN main. `merged_local` counts as unlanded — the workflow lands via a PR to
+    /// origin, so local-only work still needs a human to finish it.
+    #[test]
+    fn the_unlanded_band_matches_the_frontend() {
+        for stage in ["building_saved", "pushed", "pull_request", "merged_local"] {
+            assert!(holds_unlanded_work(stage), "{stage} is committed but not on origin main");
+        }
+        for stage in ["thought", "specd", "planned", "building_unsaved", "merged", "shipped"] {
+            assert!(!holds_unlanded_work(stage), "{stage} owes nothing");
+        }
+        // An unknown stage is NO EVIDENCE, never stage zero.
+        assert!(!holds_unlanded_work("who-knows"));
+        assert_eq!(stage_rank("who-knows"), None);
+        assert_eq!(intern_stage("who-knows"), None);
+        assert_eq!(intern_dot(""), None, "a window that cannot compute the rollup says nothing");
+    }
+
+    /// The vocabulary itself, in order, against the TypeScript source it mirrors. A stage inserted
+    /// on one side and not the other silently moves the unlanded band.
+    #[test]
+    fn stage_vocabulary_matches_the_frontend() {
+        let ts = std::fs::read_to_string("../src/engine/workflowStage.ts")
+            .expect("engine/workflowStage.ts must be readable from the crate root");
+        for (i, stage) in WORKFLOW_STAGES.iter().enumerate() {
+            let needle = format!("id: \"{stage}\"");
+            assert!(ts.contains(&needle), "{stage} (rank {i}) is missing from workflowStage.ts");
+        }
+        // …and in the SAME order, which is what the band's arithmetic rests on.
+        let mut at = 0usize;
+        for stage in WORKFLOW_STAGES {
+            let needle = format!("id: \"{stage}\"");
+            let found = ts[at..].find(&needle).map(|i| at + i).unwrap_or_else(|| {
+                panic!("{stage} is out of order relative to workflowStage.ts")
+            });
+            at = found;
+        }
     }
 
     // ══ A MET GOAL IS NOT A LIFETIME EXEMPTION ══════════════════════════════════════════════════
