@@ -21,6 +21,15 @@ beforeEach(() => {
     dismissed: false,
     observedAt: null,
     openRefusals: 0,
+    // THE SESSION AXIS BELONGS IN THE RESET, exactly as `openRefusals` does and for the same reason
+    // (roborev 63346). A case that calls `noteSessionStart()` leaves `captureSession` at 1 for every
+    // test after it, with `observedSession` still 0 — and nothing fails today only because the rest
+    // seed through ACTIONS, which re-stamp. Any future test seeding with
+    // `setState({ fallbackReason, observedAt })` — the dominant idiom in the banner's own suite —
+    // would read as an earlier session and be muted, an order-dependent failure whose cause is
+    // invisible at the assertion. The sibling suite already resets both.
+    captureSession: 0,
+    observedSession: null,
   });
 });
 
@@ -69,6 +78,145 @@ describe("dictationEngineStore", () => {
     read().noteSessionStart();
     read().noteCloudUnavailable("unavailable");
     expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // ══ THE TWO `preserved` SEAMS STAMP THE SESSION THEY OBSERVED IN (roborev 63346) ══════════════
+  // These cover the hole the pair above cannot see. The definitive seams re-stamp both axes and so
+  // self-heal; the two seams that PRESERVE a named reason carried the old session marker forward,
+  // which muted an outage observed in the CURRENT session for up to the full TTL — strictly worse
+  // than the bug the session axis was added to fix, since before it the banner painted.
+  //
+  // `exhausted` is what makes these tests bite: `preserved` is only true for a named reason, so a
+  // version written with a bare `unavailable` takes the `else` branch, stamps the current session
+  // anyway, and passes against the broken code.
+  it("speaks for a THIS-SESSION corroborated outage standing on a reason preserved from the last one", () => {
+    read().noteCloudUnavailable("exhausted"); // session 0: the relay stated out-of-credits
+    read().noteSessionStart(); // the user mutes and re-arms → session 1
+    // Two consecutive `unreachable`s in session 1 — the corroboration this seam exists for.
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    // The more informative reason is still the one displayed…
+    expect(read().fallbackReason).toBe("exhausted");
+    // …but the EVIDENCE is this session's, so it must speak.
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  it("speaks for a preserved reason when THIS session's handshake proved the relay reachable", () => {
+    read().noteCloudUnavailable("exhausted");
+    read().noteSessionStart();
+    // A handshake that COMPLETED, in this session, too late to install. It preserves `exhausted`
+    // (a balance is not disproved by reachability) — and it observed that in session 1.
+    read().noteCloudConnectedLate(true);
+    expect(read().fallbackReason).toBe("exhausted");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // …AND THE PRESERVATION OF THE CLOCK IS UNCHANGED, which is the property that must NOT be traded
+  // away to fix the two above. Preserving `observedAt` is what stops every pair of refusals pushing
+  // a preserved `exhausted` deadline out again forever; stamping the session axis extends nothing,
+  // because the preserved stamp still decides when the notice expires.
+  it("does not renew the EXPIRY of a preserved reason, only its session", () => {
+    vi.useFakeTimers();
+    try {
+      read().noteCloudUnavailable("exhausted");
+      const stampedAt = read().observedAt;
+      vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS - 1_000);
+      read().noteSessionStart();
+      for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+      expect(read().observedAt).toBe(stampedAt);
+      expect(shouldWarnLocalEngine(read())).toBe(true);
+      // …and one second past the deadline it retires on its own, exactly as before.
+      vi.advanceTimersByTime(2_000);
+      expect(shouldWarnLocalEngine(read())).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ══ …AND A DEAD CLAIM YIELDS TO FRESH EVIDENCE (roborev 63538 → 63558) ════════════════════════
+  // The three above stamp the current session onto a PRESERVED reason. `preserved` at these seams
+  // means only "something named this", which is far wider than the account facts those tests use:
+  // it also carries `mic_missed_hold` and `model_still_loading`, each a claim about ONE HOLD's
+  // audio. A refusal or a completed handshake is no evidence at all about whether the current hold
+  // captured anything, so stamping this session onto those re-paints a previous session's "nothing
+  // was recorded" over a session that recorded fine — the founder-reported "as soon as I turn the
+  // mic on, I get this error banner" shape the session axis exists to kill.
+  //
+  // The first fix muted them by keeping the dead MARKER, and that was half a fix: the dead reason
+  // still outranked the seam's own verdict, so a REAL outage in the new session was reported as
+  // nothing at all until the dead reason's TTL expired. The session test therefore sits on the
+  // REASON — a stale per-hold claim is not preserved, and the seam reports what it can see.
+  it("drops a previous session's mic failure and reports THIS session's outage instead", () => {
+    read().noteMicMissedHold("capture"); // session 0: the mic never started for THAT hold
+    read().noteSessionStart(); // the user mutes and re-arms → session 1, audio is fine
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    // The false claim is gone — not merely muted…
+    expect(read().fallbackReason).toBe("unavailable");
+    // …and what IS happening in this session gets said, on this session's stamp.
+    expect(read().observedSession).toBe(read().captureSession);
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  it("drops a previous session's model-loading notice when a handshake lands late", () => {
+    read().noteMicMissedHold("model");
+    read().noteSessionStart();
+    read().noteCloudConnectedLate(true);
+    // This seam's own verdict, which is recorded but never painted — so the banner stays down, and
+    // it stays down because nothing is wrong rather than because a dead notice is being hidden.
+    expect(read().fallbackReason).toBe("too-slow");
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  // THE PAIRED CASE, and it discriminates on the SESSION TEST specifically: the identical setup
+  // minus the session change must keep the mic reason, because within one session losing every word
+  // still outranks the relay's ambiguous refusal (the precedence the suite below documents). Delete
+  // `isFromEarlierSession` from the guard and this reads `unavailable`; delete the guard entirely
+  // and the two above read `mic_missed_hold` / `model_still_loading`.
+  it("keeps a mic failure observed in the SAME session as the refusals", () => {
+    read().noteMicMissedHold("capture");
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    expect(read().fallbackReason).toBe("mic_missed_hold");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // …AND ITS MIRROR AT THE OTHER SEAM, which the pair above cannot stand in for (roborev 63588).
+  // One fix landed at TWO sites and only one of them had a discriminating test: dropping
+  // `isFromEarlierSession` from the LATE-CONNECT seam alone left the whole suite green, because the
+  // negative case there expects `"too-slow"` either way. Unguarded, the hold's own late handshake
+  // downgrades a same-session `mic_missed_hold` to `too-slow`, which never paints — so the user
+  // loses the "nothing was recorded, hold longer" notice for a hold that genuinely captured nothing,
+  // silently inverting the precedence pinned in the mic-failure suite below.
+  it("keeps a mic failure when THAT hold's own handshake lands late", () => {
+    read().noteMicMissedHold("capture");
+    read().noteCloudConnectedLate(true);
+    expect(read().fallbackReason).toBe("mic_missed_hold");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // ══ AND THE SAME SILENCE WITHIN ONE SESSION: `too-slow` (roborev 63588) ═══════════════════════
+  // A session boundary was never required to reach the failure this block is about — it just made it
+  // easy to see. `too-slow` is a claim about ONE UTTERANCE, dead the moment the next one starts, and
+  // in Speak mode the mic stays armed across many utterances inside one session. Preserved, it
+  // reported a corroborated, happening-right-now outage as nothing at all, because `too-slow` is
+  // recorded but never painted.
+  it("reports a corroborated outage that follows a late connect in the SAME session", () => {
+    read().noteCloudConnectedLate(true); // this utterance's handshake landed too late
+    expect(shouldWarnLocalEngine(read())).toBe(false); // …which correctly says nothing
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    // The per-utterance claim yields to the seam's corroborated verdict…
+    expect(read().fallbackReason).toBe("unavailable");
+    // …and nothing is downgraded by that, because `too-slow` never painted in the first place.
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // AND THE ACCOUNT-FACT EXEMPTION IS WHAT THE GUARD IS *NOT* ALLOWED TO SWEEP UP. A cross-session
+  // `exhausted` must still outrank the seam's own `unavailable`, or the refill remedy disappears
+  // behind "can't reach the cloud transcription service" — the misdirection roborev 59930 fixed.
+  // (The pair at the top of this block asserts it still SPEAKS; this asserts it still WINS.)
+  it("keeps an account fact across a session boundary, where a per-hold claim yields", () => {
+    read().noteCloudUnavailable("exhausted");
+    read().noteSessionStart();
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    expect(read().fallbackReason).toBe("exhausted");
   });
 
   it("retires the warning when a cloud stream comes back", () => {
@@ -778,6 +926,9 @@ describe("a mic failure is not a relay verdict (roborev 61695)", () => {
       observedAt: null,
       dismissed: false,
       openRefusals: 0,
+      // Same reason as the file-level reset above (roborev 63346).
+      captureSession: 0,
+      observedSession: null,
     });
   });
 

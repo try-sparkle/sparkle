@@ -578,7 +578,37 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // against a property of the callback's argument — `preserved ? s.fallbackReason : …` types
         // as `DictationFallbackReason | null` and fails the build.
         const stated = s.fallbackReason;
-        const preserved = stated !== null && stated !== "unavailable";
+        // ── …AND A DEAD CLAIM MUST NOT OUTRANK FRESH EVIDENCE (roborev 63558) ───────────────────
+        // The precedence above is a WITHIN-SESSION rule: it is about which of two accounts of the
+        // same moment is more informative. Applied across a capture session it inverts, because a
+        // per-hold reason is not an account of this moment at all — `mic_missed_hold` says "THAT
+        // hold captured no audio", and the mic has been re-armed since. Preserving it then costs
+        // twice over: the banner it would paint is false (fixed one lap earlier by muting it), and
+        // the muting is itself a second bug — a genuine outage happening RIGHT NOW is reported as
+        // nothing at all, for the remainder of the dead reason's TTL, and once that expires two
+        // FURTHER refusals are needed because this seam zeroes its counter.
+        //
+        // So the session test belongs on the REASON, not on the marker (which is where it was first
+        // written). An account fact still outranks — nothing about a mic re-arm refills a balance or
+        // signs anyone in — but every other stale reason yields to what this seam can see now.
+        //
+        // `too-slow` IS EXCLUDED OUTRIGHT, and it is the same argument made WITHIN one session
+        // (roborev 63588). It produces the identical silence: a late-landing handshake records
+        // `too-slow`, two consecutive `unreachable`s follow in the same capture session, and because
+        // `too-slow` was preserved the corroborated outage was reported as nothing at all — that
+        // reason is recorded but never painted. Then the counter is zeroed at expiry, so two FURTHER
+        // refusals are needed. The reason a session boundary was not required to reach it: `too-slow`
+        // is a claim about ONE UTTERANCE, so it is dead the moment the next one starts, and in Speak
+        // mode the mic stays armed across many utterances inside one session. Not hypothetical
+        // traffic either — this file records 136 of 171 opens discarded as late. Push-to-talk was
+        // covered by the session guard above only because each hold is its own session.
+        //
+        // The late-connect seam has excluded it since it was introduced; this is the refusal seam
+        // catching up. It costs nothing: `too-slow` never paints, so nothing is downgraded — the
+        // banner goes from silent to reporting the outage that is actually happening.
+        const staleClaim = isFromEarlierSession(s) && !isAccountFact(stated);
+        const preserved =
+          stated !== null && stated !== "unavailable" && stated !== "too-slow" && !staleClaim;
         const reason: DictationFallbackReason = preserved ? stated : "unavailable";
         return {
           // THE COUNT KEEPS CLIMBING ONCE THE WARNING IS UP, AND THAT IS DELIBERATE (roborev 59971).
@@ -618,10 +648,40 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           // Sparkle credits… Refill" forever. Keeping the old stamp lets a stale `exhausted` expire
           // on its own TTL, after which this seam reports `unavailable` honestly.
           observedAt: preserved ? s.observedAt : Date.now(),
-          // The session marker moves with the clock, never apart from it. A preserved reason keeps
-          // the session that observed it for the same reason it keeps the stamp: this seam did not
-          // see that condition, so it cannot vouch for it in a session the condition never spoke in.
-          observedSession: preserved ? s.observedSession : s.captureSession,
+          // ── THE SESSION MARKER IS STAMPED UNCONDITIONALLY, AND `observedAt` IS NOT ──────────────
+          // These two look like one rule and are two (roborev 63346). `observedAt`'s preservation
+          // guards against unbounded DEADLINE EXTENSION: this seam saw an ambiguous `false` and has
+          // no evidence of out-of-credits, so renewing the clock would let every pair of refusals
+          // push a preserved `exhausted` out again forever. That is a wall-clock concern and the
+          // session axis has no equivalent — stamping it extends nothing, because the preserved
+          // `observedAt` still governs when the notice expires.
+          //
+          // Carrying the OLD marker through was an outright regression, and worse than the bug this
+          // axis was added to fix. `preserved` is about the reason STRING; the refusal being counted
+          // here genuinely happened in the CURRENT session. Session 1 records `exhausted` → the user
+          // mutes and re-arms → session 2 refuses twice and crosses the threshold → the preserved
+          // marker made `isFromEarlierSession` true and the user saw NOTHING for up to the full TTL,
+          // where before the session axis existed the banner painted. The definitive seams re-stamp
+          // and self-heal, so the hole was specific to the two `preserved` branches.
+          //
+          // The rule, stated once: A SEAM THAT OBSERVED SOMETHING STAMPS THE SESSION IT OBSERVED IT
+          // IN — for as long as the reason it ends up displaying is one the thing it observed still
+          // speaks for. THAT QUALIFIER IS NOT DECORATION (roborev 63538): stated unconditionally it
+          // was too wide, because `preserved` here means only "something named this", and that set
+          // includes `mic_missed_hold` and `model_still_loading` — claims about ONE HOLD's audio,
+          // not about the account. Stamping this session onto those re-paints a previous session's
+          // "that hold captured no audio" over a session that captured fine, which is precisely the
+          // founder-reported "as soon as I turn the mic on, I get this error banner" shape the
+          // session axis exists to kill.
+          //
+          // IT IS UNCONDITIONAL AGAIN, AND THAT IS NOT A REVERT — the qualifier moved UP, into
+          // `preserved` itself (roborev 63558). Gating the marker was the wrong seam for it: it
+          // silenced the false banner by keeping a dead reason with a dead marker, so a REAL outage
+          // in this session went unreported too. Now a stale non-account reason simply is not
+          // preserved, which means everything reaching this line either was observed in this session
+          // (where the stamp is a no-op) or is an account fact that outlives its session. Both take
+          // the current marker, so there is nothing left to condition on.
+          observedSession: s.captureSession,
           dismissed: s.fallbackReason === reason ? s.dismissed : false,
         };
       }),
@@ -709,18 +769,30 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // of an utterance that refused at the cap and then connected after the user stopped talking
         // is "connected too late" — not "too many windows are dictating", which is no longer true
         // and whose remedy would do nothing.
+        // The cross-session test the refusal seam documents at length applies here identically: a
+        // handshake completing is no evidence about whether a PREVIOUS hold captured audio, so a
+        // stale `mic_missed_hold` must not survive it (roborev 63558). What this seam yields to is
+        // its own `too-slow`, which is recorded but never painted — so the outcome is the same
+        // silence the marker-gating produced, reached honestly: the stored reason now describes
+        // what actually happened in this session rather than preserving a claim about a dead one.
+        const staleClaim = isFromEarlierSession(s) && !isAccountFact(stated);
         const preserved =
           stated !== null &&
           stated !== "unavailable" &&
           stated !== "too-slow" &&
-          stated !== "too_many_streams";
+          stated !== "too_many_streams" &&
+          !staleClaim;
         const reason: DictationFallbackReason = preserved ? stated : "too-slow";
         return {
           fallbackReason: reason,
           observedAt: preserved ? s.observedAt : Date.now(),
-          // Same rule as the refusal seam: preserved keeps the observing session, a freshly stated
-          // `too-slow` belongs to the session whose utterance the handshake missed.
-          observedSession: preserved ? s.observedSession : s.captureSession,
+          // Same rule as the refusal seam above (roborev 63346, and unconditional again for the
+          // reason 63558 gives there): this seam OBSERVED something in the current session — a
+          // handshake that completed — so it stamps this session. Preserving the marker would mute
+          // a standing `exhausted` in the very session that proved the relay reachable, and the
+          // per-hold reasons that made an unconditional stamp look unsafe no longer reach this line
+          // at all: `preserved` above drops a stale one before the marker is ever chosen.
+          observedSession: s.captureSession,
           dismissed: s.fallbackReason === reason ? s.dismissed : false,
           openRefusals: 0,
         };
@@ -728,6 +800,43 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     dismiss: () => set({ dismissed: true }),
   }),
 );
+
+/**
+ * Does this reason describe the ACCOUNT rather than one hold, one utterance, or one moment?
+ *
+ * This is the line that decides whether a standing reason may be PRESERVED across a capture session
+ * at all (roborev 63538, moved here from the marker by 63558). An account fact — no credits, signed
+ * out, not entitled — is unchanged by muting and re-arming the mic: nothing but a refill, a sign-in
+ * or a purchase clears it, so a seam that observes anything at all in the new session is observing a
+ * world where that fact still holds. It keeps its precedence, and it takes the new session's marker
+ * so the banner speaks. Everything else is a claim about a SPECIFIC EVENT, and does not survive the
+ * session it was made in:
+ *
+ *   - `mic_missed_hold` / `model_still_loading` — "THIS hold captured no audio", "the model was
+ *     still loading when you held the key". A later refusal or handshake is no evidence whatsoever
+ *     about the current hold's audio, and re-raising them paints a mic failure over a session that
+ *     captured fine.
+ *   - `too-slow` — "the handshake landed after THAT utterance ended". About one utterance.
+ *   - `too_many_streams` — another window held the cap at that instant. It self-clears the moment
+ *     that window stops, so it too is a claim about a moment rather than about the account.
+ *   - `unavailable` — never preserved at either seam; it is what the ambiguous seam itself reports.
+ *
+ * Those YIELD across a session boundary: the seam reports what it can see now, freshly stamped, and
+ * the dead claim is gone rather than merely muted. That distinction is the whole of 63558 — muting
+ * it left a real, current-session outage reported as nothing at all until the dead reason's TTL ran
+ * out. Nothing observed in the CURRENT session is affected either way, since `isFromEarlierSession`
+ * is false for it and the precedence is unchanged.
+ *
+ * ── NOT THE SAME LIST AS `fallbackReasonWarrantsBanner`'S, AND IT MUST NOT BE ────────────────────
+ * That predicate answers "is this worth a banner AT ALL", and by that test `unavailable` and
+ * `too_many_streams` are standing conditions with real remedies, so they pass it. This one answers
+ * the narrower "did the passage of a capture session destroy the evidence", where both fail: a
+ * remedy the user can act on is not the same claim as a fact that is still true a session later.
+ * Keep them separate; collapsing them re-opens the hole at whichever seam borrowed the wrong list.
+ */
+function isAccountFact(reason: DictationFallbackReason | null): boolean {
+  return reason === "exhausted" || reason === "signed_out" || reason === "not_entitled";
+}
 
 /** Has this observation stopped speaking for the present? An unstamped notice is NOT stale — we
  *  cannot prove it is, and the guard may only ever take down a banner it can prove has expired. */
