@@ -72,9 +72,14 @@ impl RoborevProbe {
 #[derive(Debug, serde::Deserialize)]
 struct RawRow {
     id: u64,
-    /// The CLI DOES emit this, and it is load-bearing: `roborev list --branch X` returns X's rows
-    /// PLUS rows whose branch is null, even for a branch name that exists nowhere. `belongs_to_branch`
-    /// uses this field to drop the ones that are not ours.
+    /// PRESENT ONLY WHEN roborev RECORDED ONE. The CLI omits null fields entirely (Go `omitempty`),
+    /// so this key is ABSENT — not `null` — for any job that died before its branch was written, and
+    /// present for every job that has one. Both shapes arrive in the same response.
+    ///
+    /// `roborev list --branch X` returns X's rows PLUS every branchless row, even for a branch name
+    /// that exists nowhere — so this field alone cannot rule a row out. When it is missing,
+    /// attribution falls back to asking git about `git_ref` (see `ShaAttribution`); treating the
+    /// absence itself as unknowable froze every merge in the repo.
     #[serde(default)]
     branch: Option<String>,
     #[serde(default)]
@@ -105,10 +110,10 @@ fn clamp_limit(limit: Option<u32>) -> u32 {
 fn project_row(raw: RawRow, queried_branch: &str) -> RoborevJobRow {
     RoborevJobRow {
         id: raw.id,
-        // The row's OWN branch, never the one we asked for. `belongs_to_branch` has already
-        // discarded anything that is not this branch, so the fallback is unreachable for kept rows
-        // — and substituting the query here is precisely how a null-branch row used to get
-        // relabelled as belonging to the PR under test.
+        // The row's OWN branch when it has one. The fallback is now REACHED, and only for rows git
+        // proved are on the branch under test (`ShaAttribution::OnBranch`) — so labelling them with
+        // the queried branch states something verified, not something assumed. Rows we could not
+        // attribute never get here: they are dropped or reported, never relabelled.
         branch: raw.branch.clone().unwrap_or_else(|| queried_branch.to_string()),
         git_ref: raw.git_ref.unwrap_or_default(),
         // A row with no status is not "done" and not in flight — say so in a word the consumer can
@@ -123,7 +128,14 @@ fn project_row(raw: RawRow, queried_branch: &str) -> RoborevJobRow {
 
 /// Parse `roborev list --json` output into projected rows. An `Err` here is the UNKNOWN state — the
 /// caller must not turn it into an empty row list.
-fn parse_rows(stdout: &str, queried_branch: &str) -> Result<Vec<RoborevJobRow>, String> {
+/// `attribute` answers "is this commit on the branch under test?" and is INJECTED so the parsing
+/// rules can be tested without a git repo — the previous fixtures could not reach this decision at
+/// all, which is how the repo-wide freeze shipped green.
+fn parse_rows(
+    stdout: &str,
+    queried_branch: &str,
+    attribute: &dyn Fn(&str) -> ShaAttribution,
+) -> Result<Vec<RoborevJobRow>, String> {
     // An empty document is what the CLI prints when it dies before saying anything; treating it as
     // `[]` would invent an authoritative answer out of silence.
     let trimmed = stdout.trim();
@@ -144,28 +156,65 @@ fn parse_rows(stdout: &str, queried_branch: &str) -> Result<Vec<RoborevJobRow>, 
     let (mine, foreign): (Vec<RawRow>, Vec<RawRow>) =
         raws.into_iter().partition(|r| belongs_to_branch(r, queried_branch));
 
-    // A DISCARD MUST NOT BECOME AN AUTHORITATIVE EMPTY. Rows whose branch is null are legacy jobs
-    // written before roborev had the column; dropping them silently is the same "I could not find
-    // out" → "it is clean" collapse the header forbids, one level down. Two cases have to be
-    // UNKNOWN rather than clean:
-    //   - an unattributable row that WOULD have blocked (in flight, or open without a clean pass);
-    //   - a non-empty result set from which we kept nothing, which is what a roborev build that
-    //     never records `branch` looks like — otherwise every branch reports "no reviews" forever
-    //     with no error and nothing for a human to notice.
-    // Rows whose branch is present and DIFFERENT are genuinely not ours; they never count here.
-    let unattributable: Vec<&RawRow> = foreign.iter().filter(|r| r.branch.is_none()).collect();
-    let blocking: Vec<u64> = unattributable.iter().filter(|r| would_block(r)).map(|r| r.id).collect();
-    if !blocking.is_empty() {
-        // NAME THE IDS. These rows are returned for EVERY branch query, so one of them makes every
-        // merge in the repo unknown — and `roborev-unknown` is not waivable by design. The remedy
-        // has to be one step, and it is: `roborev close <id>` drops the row out of `--open` and the
-        // block clears. Reporting only a count would make the reader re-derive what we already know.
-        let ids = blocking.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+    // A DISCARD MUST NOT BECOME AN AUTHORITATIVE EMPTY — but neither may an un-ASKED question become
+    // a repo-wide refusal. A row whose `branch` is null is not unknowable; it carries a `git_ref`,
+    // and git can say whether that commit is on the branch we were asked about. Ask, and the row
+    // stops being a mystery: it is either ours (keep it, and let the ordinary buckets judge it) or
+    // demonstrably not (drop it).
+    //
+    // WHY THIS REPLACED A BLANKET `Err`: this function used to treat every null-branch blocking row
+    // as UNKNOWN for the branch under test. Because `roborev list --branch X` returns null-branch
+    // rows for EVERY X — including branch names that exist nowhere — one such row made every merge
+    // in the repository refuse, unwaivably (`roborev-unknown` takes no acknowledgement). On
+    // 2026-08-05 six jobs died at agent startup on Claude quota exhaustion, before roborev could
+    // record their branch. They produced no review output, so they had no row in roborev's `reviews`
+    // table; `closed` lives on THAT table, so `roborev close` answered `404 review not found for
+    // job` — the very remedy this error told the reader to run. `/api/job/cancel` refused them as
+    // terminal, and `/api/job/rerun` refused them because their worktrees were gone. The result was
+    // a gate that failed closed across the whole repo with no exit at all, and PRs were merged with
+    // `gh` to route around it — which is the opposite of what a review gate is for.
+    //
+    // Attribution by SHA is strictly MORE precise than the branch column, not a weakening: a row is
+    // now judged against the commits the branch actually contains.
+    let mut kept = mine;
+    let mut undecidable: Vec<u64> = Vec::new();
+    for raw in foreign {
+        // Rows whose branch is present and DIFFERENT are genuinely not ours; they never count here.
+        if raw.branch.is_some() {
+            continue;
+        }
+        let sha = raw.git_ref.as_deref().unwrap_or("").trim().to_string();
+        match attribute(&sha) {
+            // git says this branch contains the commit: it IS ours. Keeping it means the ordinary
+            // buckets judge it — an in-flight row still blocks, a FAIL still blocks, and a crashed
+            // row lands in `errored`, which IS waivable by acknowledgement. That is the exit the
+            // old blanket `Err` did not have.
+            ShaAttribution::OnBranch => kept.push(raw),
+            // Not on this branch, or a commit git has never heard of (garbage-collected, or never
+            // fetched into this clone). Either way it cannot be a finding about the code being
+            // merged here, so it must not block this merge.
+            ShaAttribution::NotOnBranch | ShaAttribution::ShaUnknown => {}
+            // We could not ASK — git itself is unavailable or the row carries no ref. That is a
+            // genuine "I could not find out", so it still fails closed, but only for rows that
+            // would actually have blocked.
+            ShaAttribution::Undecidable => {
+                if would_block(&raw) {
+                    undecidable.push(raw.id);
+                }
+            }
+        }
+    }
+    if !undecidable.is_empty() {
+        // NAME THE IDS, and name a remedy that WORKS. `roborev close <id>` is deliberately not
+        // suggested first: it 404s on exactly the crashed, output-less rows that reach this path.
+        let ids = undecidable.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
         return Err(format!(
-            "roborev row(s) {ids} carry no branch, so they cannot be attributed to {queried_branch} \
-             or ruled out — and each is unresolved or still running. Judge them and \
-             `roborev close <id>` each with a reason (or re-run them); they will keep every branch \
-             in this repo unreadable until they are closed."
+            "roborev row(s) {ids} carry no branch, and git could not be consulted to attribute \
+             their commits to {queried_branch} or rule them out — so each is still unresolved. \
+             Re-attribute them with roborev's daemon API \
+             (`POST /api/job/update-branch {{\"job_id\":<id>,\"branch\":\"<branch>\"}}`), which \
+             works even on a crashed job; `roborev close <id>` only works once a job has review \
+             output, and returns 404 for jobs that died before producing any."
         ));
     }
     // There is deliberately NO second check for "this build never recorded the branch column".
@@ -181,7 +230,74 @@ fn parse_rows(stdout: &str, queried_branch: &str) -> Result<Vec<RoborevJobRow>, 
     // unattributable row is closed or passing, then "no blocking reviews are attributable to this
     // branch" is a true statement about the whole repo, and reporting it is honest rather than
     // optimistic.
-    Ok(mine.into_iter().map(|r| project_row(r, queried_branch)).collect())
+    Ok(kept.into_iter().map(|r| project_row(r, queried_branch)).collect())
+}
+
+/// What git can tell us about a row's commit, relative to the branch under test.
+///
+/// Four answers, not three: "git says no" and "git could not be asked" are different facts, and
+/// collapsing them is what turned a missing branch column into a repo-wide merge freeze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShaAttribution {
+    /// The branch under test contains this commit — the row is about the code being merged.
+    OnBranch,
+    /// The branch does not contain it. Some other branch's row.
+    NotOnBranch,
+    /// git ran and has never heard of this commit (garbage-collected, or never fetched here). It
+    /// cannot be a finding about this branch, so it does not block.
+    ShaUnknown,
+    /// We could not ask at all — no ref on the row, or git is unavailable. Fails closed.
+    Undecidable,
+}
+
+/// Ask git whether `branch` contains `sha`. The production resolver behind `parse_rows`'s injected
+/// `attribute` closure; tests supply their own so the parsing logic stays pure.
+///
+/// Ancestry is asked with `merge-base --is-ancestor`, whose exit status is the answer: 0 contains,
+/// 1 does not. Any other status is a failure to ask, NOT a "no" — which is why existence is probed
+/// separately first, so a genuinely unknown commit is reported as such instead of masquerading as a
+/// broken git.
+fn attribute_sha(root: &str, branch: &str, sha: &str) -> ShaAttribution {
+    if sha.is_empty() {
+        return ShaAttribution::Undecidable;
+    }
+    // Does this clone know the commit at all?
+    let mut exists = Command::new("git");
+    exists.args(["cat-file", "-e", &format!("{sha}^{{commit}}")]).current_dir(root);
+    apply_noninteractive(&mut exists);
+    match crate::worktree::output_with_timeout(exists, PROBE_TIMEOUT) {
+        Ok(o) if o.status.success() => {}
+        // git ran and said "no such object" — a real answer.
+        Ok(_) => return ShaAttribution::ShaUnknown,
+        // git could not be run at all.
+        Err(_) => return ShaAttribution::Undecidable,
+    }
+    // The branch ref has to be resolvable before ancestry means anything. A PR head branch may only
+    // exist as a remote-tracking ref in this clone, so try that spelling too before giving up.
+    let branch_ref = ["", "origin/"].iter().find_map(|prefix| {
+        let candidate = format!("{prefix}{branch}");
+        let mut probe = Command::new("git");
+        probe.args(["rev-parse", "--verify", "--quiet", &format!("{candidate}^{{commit}}")])
+            .current_dir(root);
+        apply_noninteractive(&mut probe);
+        match crate::worktree::output_with_timeout(probe, PROBE_TIMEOUT) {
+            Ok(o) if o.status.success() => Some(candidate),
+            _ => None,
+        }
+    });
+    let Some(branch_ref) = branch_ref else {
+        // We know the commit but cannot resolve the branch, so we cannot decide. Fail closed.
+        return ShaAttribution::Undecidable;
+    };
+    let mut anc = Command::new("git");
+    anc.args(["merge-base", "--is-ancestor", sha, &branch_ref]).current_dir(root);
+    apply_noninteractive(&mut anc);
+    match crate::worktree::output_with_timeout(anc, PROBE_TIMEOUT) {
+        Ok(o) if o.status.success() => ShaAttribution::OnBranch,
+        // Exit 1 is git's definitive "not an ancestor". Anything else is a failure to ask.
+        Ok(o) if o.status.code() == Some(1) => ShaAttribution::NotOnBranch,
+        _ => ShaAttribution::Undecidable,
+    }
 }
 
 /// Would this row block a merge if it DID belong to the branch? Used only to decide whether an
@@ -228,8 +344,13 @@ fn list_argv(root: &str, branch: &str, limit: u32) -> Vec<String> {
 /// saturation decision used to live inside the async command, where no unit test could reach it —
 /// a mutation that treated a full window as authoritative stayed GREEN, which is the vacuous-test
 /// failure this repo tracks as its #1 finding. The command is now a shell around this.
-fn probe_from_stdout(stdout: &str, branch: &str, limit: u32) -> RoborevProbe {
-    match parse_rows(stdout, branch) {
+fn probe_from_stdout(
+    stdout: &str,
+    branch: &str,
+    limit: u32,
+    attribute: &dyn Fn(&str) -> ShaAttribution,
+) -> RoborevProbe {
+    match parse_rows(stdout, branch, attribute) {
         // A SATURATED window is not an authoritative answer. The CLI returns the newest N rows with
         // no truncation signal, so at the cap we cannot know whether an older open FAIL fell off the
         // end — and reporting the window as the whole truth is precisely how a gate merges over
@@ -370,7 +491,8 @@ pub async fn roborev_branch_probe(
             return Ok(RoborevProbe::unknown(format!("roborev list exited non-zero: {msg}")));
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        Ok(probe_from_stdout(&stdout, &branch, limit))
+        let attribute = |sha: &str| attribute_sha(&root, &branch, sha);
+        Ok(probe_from_stdout(&stdout, &branch, limit, &attribute))
     })
     .await
     .map_err(|e| format!("roborev_branch_probe task failed: {e}"))?
@@ -415,9 +537,116 @@ mod tests {
         )
     }
 
+    // Stand-ins for the four answers git can give. Injecting these is the whole point: before this,
+    // no fixture could reach the attribution decision, so the repo-wide freeze shipped green.
+    fn on_branch(_sha: &str) -> ShaAttribution {
+        ShaAttribution::OnBranch
+    }
+    fn not_on_branch(_sha: &str) -> ShaAttribution {
+        ShaAttribution::NotOnBranch
+    }
+    fn sha_unknown(_sha: &str) -> ShaAttribution {
+        ShaAttribution::ShaUnknown
+    }
+    fn undecidable(_sha: &str) -> ShaAttribution {
+        ShaAttribution::Undecidable
+    }
+
+    /// THE REAL CLI SHAPE. roborev is Go and omits null fields, so a job that died before recording
+    /// a branch emits NO `branch` key at all — and no `closed`, and no `verdict`. Every fixture in
+    /// this module used to include `branch`, which is exactly why the freeze below shipped green.
+    /// Both shapes arrive in one response, so the fixture carries one of each.
+    const REAL_CLI_MIXED: &str = r#"[
+        {"id":59204,"repo_id":12,"git_ref":"13de4544","status":"failed","commit_subject":"a subject",
+         "error":"agent: claude-code failed\nstream errors: You've hit your monthly spend limit"},
+        {"id":62759,"repo_id":12,"git_ref":"fd0a363","status":"done","branch":"someone-else",
+         "closed":false,"verdict":"P"}
+    ]"#;
+
+    /// THE REGRESSION. On 2026-08-05 six jobs died at agent startup on quota exhaustion before their
+    /// branch was recorded. `roborev list --branch X` returns branchless rows for EVERY X, so those
+    /// six made every merge in the repository refuse with `roborev-unknown` — which takes no
+    /// acknowledgement — while the remedy the refusal named (`roborev close <id>`) returned 404,
+    /// because `closed` lives on the `reviews` table and a crashed job has no row there.
+    ///
+    /// Asking git instead: the commit is not on this branch, so the row cannot be a finding about
+    /// the code being merged, and the branch reads CLEAN.
+    #[test]
+    fn a_branchless_failed_row_does_not_make_an_unrelated_branch_unreadable() {
+        let rows = parse_rows(REAL_CLI_MIXED, "sparkle/some-other-agent", &not_on_branch)
+            .expect("a branchless row git can rule out must NOT make the branch unknowable");
+        assert_eq!(rows, vec![], "nothing on this branch, and that is an ANSWER — not unknown");
+    }
+
+    /// The PAIRED half, which is what makes the test above mean anything: the same fixture, the same
+    /// crashed row, and the only thing that changed is git's answer. Proving absence alone is
+    /// ambiguous — this pins that attribution, not leniency, is doing the work.
+    #[test]
+    fn the_same_branchless_row_is_kept_when_git_says_the_commit_is_on_this_branch() {
+        let rows = parse_rows(REAL_CLI_MIXED, "sparkle/owns-it", &on_branch)
+            .expect("an attributable row is an answer, not an unknown");
+        assert_eq!(rows.len(), 1, "the branchless row is now attributed to this branch");
+        assert_eq!(rows[0].id, 59204);
+        assert_eq!(rows[0].status, "failed");
+        assert_eq!(
+            rows[0].branch, "sparkle/owns-it",
+            "labelled with the branch git PROVED contains it"
+        );
+        // And it reaches the caller as a row rather than an unknowable — `failed` lands in the TS
+        // summarizer's `errored` bucket, which acknowledgement CAN clear. That is the exit the old
+        // blanket refusal did not have.
+        assert!(!rows[0].closed, "a crashed job is not closed — it has no review row to close");
+    }
+
+    /// A commit this clone has never heard of (garbage-collected, or never fetched) cannot be a
+    /// finding about this branch, so it must not block it.
+    #[test]
+    fn a_commit_git_has_never_heard_of_does_not_block() {
+        let rows = parse_rows(REAL_CLI_MIXED, "mine", &sha_unknown)
+            .expect("an unknown SHA is ruled out, not fatal");
+        assert_eq!(rows, vec![]);
+    }
+
+    /// But a failure to ASK is still unknown, and still fails closed. This is the one direction a
+    /// merge gate must never get wrong, and the fix must not have widened it into a pass.
+    #[test]
+    fn git_being_unavailable_still_fails_closed_and_names_a_remedy_that_works() {
+        let err = parse_rows(REAL_CLI_MIXED, "mine", &undecidable)
+            .expect_err("if git cannot be consulted, a blocking branchless row is UNKNOWN");
+        assert!(err.contains("59204"), "the refusal must name the row: {err}");
+        // The remedy has to be one that actually succeeds on a crashed, output-less job. It does
+        // not: `roborev close` 404s on exactly these rows, so the copy must not offer it as THE fix.
+        assert!(
+            err.contains("update-branch"),
+            "must name the daemon call that works on a crashed job: {err}"
+        );
+        assert!(
+            err.contains("404"),
+            "and must say why `roborev close` is not the answer here: {err}"
+        );
+    }
+
+    /// A branchless row that would NOT have blocked stays harmless under every git answer — the fix
+    /// must not have made previously-clean branches noisy.
+    #[test]
+    fn a_harmless_branchless_row_is_clean_however_git_answers() {
+        let json = r#"[{"id":2,"status":"done","verdict":"P","closed":false}]"#;
+        for resolver in [
+            &on_branch as &dyn Fn(&str) -> ShaAttribution,
+            &not_on_branch,
+            &sha_unknown,
+            &undecidable,
+        ] {
+            let rows = parse_rows(json, "mine", resolver).expect("a passing row is never unknown");
+            // On-branch keeps it (as a passing row); every other answer drops it. Neither blocks.
+            assert!(rows.len() <= 1);
+            assert!(rows.iter().all(|r| r.verdict.as_deref() == Some("P")));
+        }
+    }
+
     #[test]
     fn projection_keeps_the_fields_a_gate_reads() {
-        let rows = parse_rows(&cli_row(""), "sparkle/left-pair").unwrap();
+        let rows = parse_rows(&cli_row(""), "sparkle/left-pair", &undecidable).unwrap();
         assert_eq!(rows.len(), 1);
         let row = &rows[0];
         assert_eq!(row.id, 53382);
@@ -435,7 +664,7 @@ mod tests {
     fn a_null_verdict_stays_null_and_is_never_coerced_to_a_pass() {
         let json = r#"[{"id":1,"status":"running","verdict":null,"closed":false,"branch":"b"},
                        {"id":2,"status":"done","closed":false,"branch":"b"}]"#;
-        let rows = parse_rows(json, "b").unwrap();
+        let rows = parse_rows(json, "b", &undecidable).unwrap();
         assert_eq!(rows[0].verdict, None, "an explicit null verdict must stay null");
         assert_eq!(rows[1].verdict, None, "an absent verdict must stay null");
         assert!(rows.iter().all(|r| r.verdict.as_deref() != Some("P")));
@@ -447,6 +676,7 @@ mod tests {
         let rows = parse_rows(
             &cli_row(r#","some_field_invented_next_month":{"a":[1,2]}"#),
             "sparkle/left-pair",
+            &undecidable,
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
@@ -461,7 +691,7 @@ mod tests {
         let json = format!(
             r#"[{{"id":7,"status":"done","verdict":"F","branch":"b","prompt":"{bulk}"}}]"#
         );
-        let rows = parse_rows(&json, "b").unwrap();
+        let rows = parse_rows(&json, "b", &undecidable).unwrap();
         let serialized = serde_json::to_string(&rows[0]).unwrap();
         assert!(!serialized.contains(&bulk), "the raw prompt must be dropped in projection");
         assert!(serialized.len() < 512);
@@ -471,11 +701,11 @@ mod tests {
     /// the conflation that let #806 through.
     #[test]
     fn malformed_json_is_unknown_not_an_empty_answer() {
-        assert!(parse_rows("{not json", "b").is_err());
-        assert!(parse_rows("", "b").is_err(), "silence is not an authoritative empty answer");
-        assert!(parse_rows("   \n", "b").is_err());
+        assert!(parse_rows("{not json", "b", &undecidable).is_err());
+        assert!(parse_rows("", "b", &undecidable).is_err(), "silence is not an authoritative empty answer");
+        assert!(parse_rows("   \n", "b", &undecidable).is_err());
         // And the real empty answers still parse as answers.
-        assert_eq!(parse_rows("[]", "b").unwrap(), vec![]);
+        assert_eq!(parse_rows("[]", "b", &undecidable).unwrap(), vec![]);
     }
 
     /// `roborev list --json` prints the LITERAL `null` for an empty result set, not `[]`. Parsing
@@ -483,8 +713,8 @@ mod tests {
     /// repo could never merge anything. Verified against the real CLI.
     #[test]
     fn a_bare_null_document_is_zero_rows_not_a_parse_failure() {
-        assert_eq!(parse_rows("null", "b").unwrap(), vec![]);
-        assert_eq!(parse_rows("  null\n", "b").unwrap(), vec![]);
+        assert_eq!(parse_rows("null", "b", &undecidable).unwrap(), vec![]);
+        assert_eq!(parse_rows("  null\n", "b", &undecidable).unwrap(), vec![]);
     }
 
     /// `--branch X` leaks rows that belong to no branch (their `branch` is null), and returns them
@@ -496,7 +726,7 @@ mod tests {
                        {"id":2,"status":"done","verdict":"P","closed":false,"branch":null},
                        {"id":3,"status":"done","verdict":"F","closed":false,"branch":"someone-else"},
                        {"id":4,"status":"done","verdict":"F","closed":true}]"#;
-        let rows = parse_rows(json, "mine").unwrap();
+        let rows = parse_rows(json, "mine", &undecidable).unwrap();
         assert_eq!(rows.len(), 1, "only the row actually on `mine` survives");
         assert_eq!(rows[0].id, 1);
     }
@@ -514,7 +744,7 @@ mod tests {
         ] {
             let json =
                 format!(r#"[{{"id":1,"status":"done","verdict":"P","closed":false,"branch":"mine"}},{row}]"#);
-            let err = parse_rows(&json, "mine").expect_err(
+            let err = parse_rows(&json, "mine", &undecidable).expect_err(
                 "an unattributable blocking row must be UNKNOWN, not silently dropped",
             );
             // The id, so `roborev close <id>` is a one-step remedy rather than a hunt.
@@ -531,13 +761,13 @@ mod tests {
     fn a_fresh_branch_beside_a_harmless_legacy_row_is_a_clean_empty_answer() {
         let json = r#"[{"id":2,"status":"done","verdict":"P","closed":false}]"#;
         assert_eq!(
-            parse_rows(json, "mine").unwrap(),
+            parse_rows(json, "mine", &undecidable).unwrap(),
             vec![],
             "a new branch alongside a non-blocking unattributable row is CLEAN, not unknown"
         );
         // Explicit JSON null, the other spelling of the same thing.
         let explicit = r#"[{"id":2,"status":"done","verdict":"P","closed":false,"branch":null}]"#;
-        assert_eq!(parse_rows(explicit, "mine").unwrap(), vec![]);
+        assert_eq!(parse_rows(explicit, "mine", &undecidable).unwrap(), vec![]);
     }
 
     /// The dangerous half of a column-less build is still caught: an unattributable row that WOULD
@@ -546,7 +776,7 @@ mod tests {
     fn a_column_less_build_still_fails_closed_on_anything_that_would_block() {
         let json = r#"[{"id":1,"status":"done","verdict":"P","closed":false},
                        {"id":2,"status":"running","verdict":null,"closed":false}]"#;
-        let err = parse_rows(json, "mine").expect_err("a blocking unattributable row is UNKNOWN");
+        let err = parse_rows(json, "mine", &undecidable).expect_err("a blocking unattributable row is UNKNOWN");
         assert!(err.contains("2"), "naming the row: {err}");
     }
 
@@ -594,7 +824,7 @@ mod tests {
             .map(|i| format!(r#"{{"id":{i},"status":"done","verdict":"P","branch":"mine"}}"#))
             .collect();
         let saturated = format!("[{}]", full.join(","));
-        let p = probe_from_stdout(&saturated, "mine", 50);
+        let p = probe_from_stdout(&saturated, "mine", 50, &undecidable);
         assert!(p.enabled);
         assert!(p.jobs.is_none(), "a saturated window must NOT be an authoritative answer");
         let err = p.error.expect("and it must say why");
@@ -604,7 +834,7 @@ mod tests {
 
         // One row short of the cap is a real answer.
         let short = format!("[{}]", full[..49].join(","));
-        let ok = probe_from_stdout(&short, "mine", 50);
+        let ok = probe_from_stdout(&short, "mine", 50, &undecidable);
         assert_eq!(ok.jobs.expect("authoritative").len(), 49);
         assert!(ok.error.is_none());
     }
@@ -616,7 +846,7 @@ mod tests {
         let rows: Vec<String> = (0..50)
             .map(|i| format!(r#"{{"id":{i},"status":"done","verdict":"P","branch":"theirs"}}"#))
             .collect();
-        let p = probe_from_stdout(&format!("[{}]", rows.join(",")), "mine", 50);
+        let p = probe_from_stdout(&format!("[{}]", rows.join(",")), "mine", 50, &undecidable);
         assert!(p.jobs.is_none());
         assert!(p.error.unwrap().contains("50 row(s) returned"));
     }
@@ -624,9 +854,9 @@ mod tests {
     /// An empty answer and a parse failure must still come through the extracted path unchanged.
     #[test]
     fn probe_from_stdout_preserves_the_empty_and_unknown_states() {
-        let empty = probe_from_stdout("null", "mine", 50);
+        let empty = probe_from_stdout("null", "mine", 50, &undecidable);
         assert_eq!(empty.jobs.expect("null is an ANSWER of zero rows"), vec![]);
-        let broken = probe_from_stdout("{not json", "mine", 50);
+        let broken = probe_from_stdout("{not json", "mine", 50, &undecidable);
         assert!(broken.enabled && broken.jobs.is_none(), "unparseable is unknown, not empty");
     }
 
