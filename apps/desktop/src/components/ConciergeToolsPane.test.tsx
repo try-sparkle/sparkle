@@ -44,6 +44,7 @@ import {
   CONCIERGE_TOOL_CATALOG,
   CONCIERGE_TOOL_GROUPS,
 } from "../services/conciergeTools/policy";
+import { argsCarryTauriUnavailableSignature } from "../services/tauriUnavailableSignature";
 
 /** What the gate reports for the next render. Enhancements are ON unless a test says otherwise. */
 let aiAccess: ConciergeAiAccess = { enabled: true, remedy: null };
@@ -796,5 +797,56 @@ describe("the pane also answers 'what did it just DO?'", () => {
     _resetConciergeAuditForTests();
     render(<ConciergeToolsPane />);
     expect(screen.getByTestId("concierge-audit-empty")).toBeTruthy();
+  });
+});
+
+describe("mounting does not flood the console (bead sparkle-yzcjc)", () => {
+  // This file never mocks @tauri-apps/api/core — it is testing tool-policy UI, not Tauri. The
+  // audit pane's retirement-ledger read (services/deathRecordWriter.readRetirementLog) calls the
+  // REAL invoke() on every mount regardless, and under jsdom with no Tauri webview that throws
+  // synchronously, gets caught, and logs a warning once per render — 49 times across this file
+  // alone. At full-suite scale, that console volume (funnelled through vitest's worker→main RPC
+  // channel — the same channel `onTaskUpdate` acks over) can starve that channel past its 60s
+  // timeout and redden an otherwise fully-passing shard with an unhandled RPC-timeout error, never
+  // a test failure `retry` can see.
+  //
+  // test-setup.ts filters this ONE well-understood console signature rather than changing
+  // invoke()'s behavior (two earlier designs that DID change it each caused a real, different
+  // regression — see that file's header). So this test does NOT assert invoke() resolves (it
+  // still rejects, unchanged) — it asserts the FILTER PREDICATE directly, against the actual
+  // argument shapes the two real call sites in this codebase produce. Imported from
+  // ../services/tauriUnavailableSignature, NOT from ../test-setup: that file is wired in only via
+  // vite.config.ts's setupFiles, invisible to scripts/dormant-modules.mjs's import-graph scan, so
+  // importing it directly from a .test.tsx would be its ONLY visible importer and read as
+  // "reachable only from a test" (caught by that exact guard on this bead's first attempt here).
+  //
+  // NOT a `vi.spyOn(console, "warn")` end-to-end check: test-setup.ts's filter WRAPS console.warn
+  // before any test's own spy can install, so `vi.spyOn` would wrap the filter (seeing every call
+  // whether or not the filter went on to suppress it), not observe suppression itself. That shape
+  // already fooled one earlier version of this test (asserted `console.warn` was never called,
+  // which passed on both pre- and post-fix code for an unrelated reason — services/logger.ts binds
+  // `console.warn` into its own `realConsole` at import time, before a same-test spy installs).
+  // Testing the exported predicate directly is unambiguous and avoids that whole class of mistake.
+  it("recognizes deathRecordWriter's formatted log line", () => {
+    // The exact shape services/logger.ts's `log.warn` produces: two strings, scope then message,
+    // with the caught error already stringified into the second one.
+    const args = [
+      "[resurrection]",
+      `could not read the retirement ledger {"error":"TypeError: Cannot read properties of undefined (reading 'invoke')"}`,
+    ];
+    expect(argsCarryTauriUnavailableSignature(args)).toBe(true);
+  });
+
+  it("recognizes preview.ts's raw Error instance", () => {
+    // preview.ts's own catch: `console.debug("preview_capability failed", e)` — the caught object
+    // is the real TypeError instance, not pre-stringified.
+    const args = ["preview_capability failed", new TypeError("Cannot read properties of undefined (reading 'invoke')")];
+    expect(argsCarryTauriUnavailableSignature(args)).toBe(true);
+  });
+
+  it("does NOT filter an unrelated console line — this is a narrow signature match, not a blanket mute", () => {
+    expect(argsCarryTauriUnavailableSignature(["some other warning", { error: "TypeError: x is not a function" }])).toBe(
+      false,
+    );
   });
 });
