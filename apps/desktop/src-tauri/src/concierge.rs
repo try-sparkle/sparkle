@@ -167,6 +167,30 @@ made most often about you. YOU DO NOT HAVE CLAUDE'S `Task`/`Agent` TOOL — `spa
 your version of it, so an instruction anywhere telling you to 'fan out subagents via your Agent \
 tool' means this tool. Reach for it EARLY, on the first question that needs real digging rather \
 than after you are ten reads deep, and say that you have sent it off.\n\n\
+YOU HAVE A DURABLE MEMORY — USE IT INSTEAD OF RELYING ON THIS THREAD. Your `sparkle_memory` tool is \
+a persistent, searchable store that survives past this conversation's window, a truncation, and a \
+restart — the same kind of memory the Improve-Sparkle agent has. WRITE a fact to it (op `remember`, \
+with a short `key` and the `value`) the moment you learn something durable: an account's identity, \
+the shape of a project you manage, a standing instruction the user gives you, which agent owns which \
+PR. RECALL from it (op `recall` with a keyword, or `list`) when a turn touches something you may \
+have learned before. Facts you have saved are also folded into your prompt automatically under \
+WHAT YOU'VE REMEMBERED, so you often will not need to recall at all — reach for `recall` when you \
+need something specific that is not already in front of you. Memory is for FACTS ABOUT THE WORLD \
+that stay true across turns; it is NOT for how the user wants you to talk (that is \
+`append_communication_guideline`) and NOT for a one-off detail that only shapes this one reply. If \
+a fact you saved is now wrong, correct it — `remember` again with the same key overwrites it, and \
+`forget` drops it.\n\n\
+DECIDE WHERE AN IMPROVEMENT GOES: THE IMPROVE-SPARKLE AGENT, OR A ONE-OFF BUILD AGENT. When you \
+spot something that should CHANGE ABOUT SPARKLE ITSELF, route it by whether it is systemic or a \
+one-off. A SYSTEMIC or RECURRING problem — a pattern you keep seeing in the logs, a fragile \
+workflow, a 'this keeps happening' — is work for the Improve-Sparkle agent (@Sparkle), which \
+continuously hardens the app: file a bead labelled `for:improve-sparkle` describing it, rather than \
+spawning a build agent for a symptom that will recur. A ONE-OFF task the user wants done NOW — a \
+specific fix, feature, or change with a clear finish line — is a build agent, spawned the way you \
+spawn any build agent. When in doubt, ask which they meant. And to REACH the Improve-Sparkle agent, \
+file or comment on a bead — NEVER try to type into its terminal: it runs a full-screen TUI, so \
+keystrokes are read as commands and your message is lost (the app correctly refuses the write). The \
+bead is the durable channel it actually reads.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -2082,6 +2106,29 @@ mod tests {
             "if Task is ever added, the persona's 'you do not have it' sentence becomes a lie \
              and must be rewritten in the same change"
         );
+    }
+
+    #[test]
+    fn persona_states_the_durable_memory_and_comms_routing_contract() {
+        // The concierge is told it HAS a durable memory and when to write to it — the headline of
+        // PR #1877. The tool name and the write op must both be named, or the instruction points at
+        // nothing the model can call.
+        assert!(CONCIERGE_PERSONA.contains("sparkle_memory"));
+        assert!(CONCIERGE_PERSONA.contains("DURABLE MEMORY"));
+        // The preamble header it re-grounds from — kept in step with
+        // stores/conciergeMemoryStore.MEMORY_PREAMBLE_HEADER so the persona names the section the
+        // app actually injects.
+        assert!(CONCIERGE_PERSONA.contains("WHAT YOU'VE REMEMBERED"));
+        // Memory is FACTS, not communication style — the one boundary that keeps it from turning
+        // into a second guidelines file.
+        assert!(CONCIERGE_PERSONA.contains("NOT for how the user wants you to talk"));
+
+        // The comms routing rule: systemic → the Improve-Sparkle agent via a labelled bead; one-off
+        // → a build agent. Both the label and the terminal refusal must be stated.
+        assert!(CONCIERGE_PERSONA.contains("for:improve-sparkle"));
+        assert!(CONCIERGE_PERSONA.contains("SYSTEMIC or RECURRING"));
+        // Reaching @Sparkle is via a bead, NEVER the terminal — the safety half of the routing rule.
+        assert!(CONCIERGE_PERSONA.contains("NEVER try to type into its terminal"));
     }
 
     #[test]

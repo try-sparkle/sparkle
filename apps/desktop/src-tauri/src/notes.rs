@@ -295,7 +295,7 @@ fn run_cmd_bounded(
 /// Defaulting an UNKNOWN subcommand to "mutation" is the safe direction, and the asymmetry is the
 /// whole reason to state it: over-caution on a read merely tells someone to look before retrying,
 /// while under-caution on a write invites exactly the duplicate this message exists to prevent.
-const BD_READ_SUBCOMMANDS: [&str; 4] = ["list", "show", "blocked", "where"];
+const BD_READ_SUBCOMMANDS: [&str; 5] = ["list", "show", "blocked", "where", "memories"];
 
 /// Does this invocation change the store? Pure, so the classification is testable without bd.
 ///
@@ -908,6 +908,144 @@ pub async fn delete_bead(project_path: String, id: String) -> Result<String, Str
         .map_err(|e| format!("bd task failed: {e}"))?
 }
 
+// ---------------------------------------------------------------------------
+// Concierge durable MEMORY — `bd remember` / `bd memories` / `bd forget`
+// (PRD/sparkle/concierge-durable-memory-design.md, PR #1877; bead sparkle-jce9).
+// ---------------------------------------------------------------------------
+//
+// The concierge is a `claude -p` per turn with NO Bash in its allowlist (concierge.rs), so it cannot
+// run `bd` itself; these app-side commands are how its memory tool reaches the store. Unlike every
+// OTHER bd command in this file, these do NOT take a project_path: concierge memory lives in ONE
+// fixed store — the concierge's own app-data dir — so `recall` finds what `remember` wrote no matter
+// which project a turn concerns, and a `remember` never files a row onto a user project's Tasks
+// board. The dir is created and a beads DB initialized on first use; every call is bounded by
+// `run_bd` (BD_TIMEOUT), so a wedged Dolt store surfaces as an error, never a hung turn.
+
+/// The one stable directory the concierge's memory beads DB lives in — the same app-data `concierge`
+/// dir the brain runs its turns in (concierge.rs). Resolved from the AppHandle so there is a single
+/// source of truth for "where concierge state lives".
+fn concierge_memory_dir(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    Ok(crate::worktree::app_data_dir_pub(app)?.join("concierge"))
+}
+
+/// Serializes `ensure_memory_db` across the whole process. `ensure_memory_db` is a check-then-act
+/// (`bd where` then maybe `bd init`), and it is reachable CONCURRENTLY on first use: the mount effect
+/// fires `refresh()` while a dispatch or a `remember` can fire another before the first `bd init`
+/// returns. Without this, both probes see no DB and both run `bd init` in the same dir — one wins and
+/// the other errors "already initialized", surfacing a spurious failure on first use. Contention is
+/// only ever at first use (the `bd where` fast-path returns before this matters afterwards).
+static MEMORY_INIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Ensure the concierge memory dir exists and has a beads DB, creating both if needed. Idempotent
+/// and cheap on the common path (a `bd where` probe short-circuits once a DB resolves). Mirrors
+/// `ensure_beads_db`, but for the fixed concierge dir rather than a project the caller named, and
+/// serialized behind {@link MEMORY_INIT_LOCK} so concurrent first-use callers init at most once.
+fn ensure_memory_db(dir: &str) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("create concierge memory dir: {e}"))?;
+    // Hold the lock across the whole check-then-act. A poisoned lock (a prior panic) must not wedge
+    // memory forever, so recover the guard rather than propagating the poison.
+    let _guard = MEMORY_INIT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    // `bd where` exits 0 once any workspace resolves here; only init when none does.
+    if run_bd(dir, &["where"])?.success {
+        return Ok(());
+    }
+    let init = run_bd(dir, &["init", "--non-interactive", "--quiet"])?;
+    if init.success {
+        return Ok(());
+    }
+    let stderr = init.stderr.trim().to_string();
+    Err(if stderr.is_empty() { "bd init failed".to_string() } else { stderr })
+}
+
+/// The `bd memories` argv for a recall, as owned tokens. Pure, so the flag-safety shape is unit-
+/// testable without invoking bd. A blank query LISTS everything; a query with content SEARCHES,
+/// passed after a `--` terminator so a hyphen-leading term (`-race`, `--json`) is treated as a
+/// search string and not as a flag. `--json` must precede `--`, or it too becomes positional.
+fn memory_recall_argv(query: Option<&str>) -> Vec<String> {
+    let q = query.map(str::trim).unwrap_or("");
+    if q.is_empty() {
+        vec!["memories".into(), "--json".into()]
+    } else {
+        vec!["memories".into(), "--json".into(), "--".into(), q.into()]
+    }
+}
+
+/// A memory key is a single argv token; reject empty, flag-like (leading `-`, which cobra would
+/// parse as a flag), and control characters. The VALUE has no such restriction — it is passed after
+/// a `--` terminator so it can be arbitrary prose, dashes and all.
+fn valid_memory_key(key: &str) -> bool {
+    !key.is_empty() && !key.starts_with('-') && !key.contains(|c: char| c.is_control())
+}
+
+/// Store one durable fact under `key`. `bd remember --key <key> -- <value>`: the `--` terminator lets
+/// the value start with a dash without cobra reading it as a flag.
+#[tauri::command]
+pub async fn concierge_memory_remember(
+    app: tauri::AppHandle,
+    key: String,
+    value: String,
+) -> Result<String, String> {
+    if !valid_memory_key(&key) {
+        return Err(format!("invalid memory key: {key}"));
+    }
+    if value.trim().is_empty() {
+        return Err("refusing to remember an empty value".to_string());
+    }
+    let dir = concierge_memory_dir(&app)?.to_string_lossy().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_memory_db(&dir)?;
+        let output = run_bd(&dir, &["remember", "--key", &key, "--", &value])?;
+        select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
+}
+
+/// Read memory as `bd memories [query] --json` (a key→value JSON map). A null/blank `query` lists
+/// everything; a query filters. Returns bd's raw JSON stdout for the frontend to parse. An empty
+/// store yields `{}` rather than an error — "no memories" is a valid answer, not a failure.
+#[tauri::command]
+pub async fn concierge_memory_recall(
+    app: tauri::AppHandle,
+    query: Option<String>,
+) -> Result<String, String> {
+    let dir = concierge_memory_dir(&app)?.to_string_lossy().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_memory_db(&dir)?;
+        // A query that trims to empty LISTS; anything with content SEARCHES, passed after `--` so a
+        // hyphen-leading search term is not misread as a flag. See `memory_recall_argv`.
+        let argv = memory_recall_argv(query.as_deref());
+        let arg_refs: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let output = run_bd(&dir, &arg_refs)?;
+        if output.success {
+            let stdout = output.stdout.trim();
+            Ok(if stdout.is_empty() { "{}".to_string() } else { stdout.to_string() })
+        } else {
+            let stderr = output.stderr.trim();
+            Err(if stderr.is_empty() { "bd memories failed".to_string() } else { stderr.to_string() })
+        }
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
+}
+
+/// Drop one memory by key. `bd forget -- <key>` (the `--` keeps a stored key that begins with a dash
+/// from being read as a flag, mirroring `remember`).
+#[tauri::command]
+pub async fn concierge_memory_forget(app: tauri::AppHandle, key: String) -> Result<String, String> {
+    if !valid_memory_key(&key) {
+        return Err(format!("invalid memory key: {key}"));
+    }
+    let dir = concierge_memory_dir(&app)?.to_string_lossy().to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        ensure_memory_db(&dir)?;
+        let output = run_bd(&dir, &["forget", "--", &key])?;
+        select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
+    })
+    .await
+    .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -924,6 +1062,44 @@ mod tests {
         // The id-taking commands reject a flag-like id before shelling out.
         assert!(bead_claim_inner("/tmp".into(), "-s".into()).is_err());
         assert!(delete_bead_inner("/tmp".into(), "--force".into()).is_err());
+    }
+
+    #[test]
+    fn valid_memory_key_forbids_empty_and_flag_like() {
+        assert!(valid_memory_key("test-fact"));
+        assert!(valid_memory_key("account:storytell owns pr 1877"));
+        assert!(!valid_memory_key("")); // empty
+        assert!(!valid_memory_key("-k")); // cobra would read it as a flag
+        assert!(!valid_memory_key("--key")); // ditto
+        assert!(!valid_memory_key("a\nb")); // control char
+    }
+
+    #[test]
+    fn bd_memories_is_classified_as_a_read_not_a_mutation() {
+        // A recall that times out must NOT get the write-ambiguity "may or may not have landed" copy
+        // (roborev 59622's defect, reintroduced for the new subcommand). `memories` reads.
+        assert!(!bd_subcommand_mutates(&["memories", "--json"]));
+        assert!(!bd_subcommand_mutates(&["memories", "--json", "--", "race"]));
+        // `remember`/`forget` still classify as writes.
+        assert!(bd_subcommand_mutates(&["remember", "--key", "k", "--", "v"]));
+        assert!(bd_subcommand_mutates(&["forget", "--", "k"]));
+    }
+
+    #[test]
+    fn memory_recall_argv_lists_when_blank_and_searches_after_dash_dash() {
+        // Blank / whitespace / absent → list everything, no `--`.
+        assert_eq!(memory_recall_argv(None), vec!["memories", "--json"]);
+        assert_eq!(memory_recall_argv(Some("   ")), vec!["memories", "--json"]);
+        // A real query goes AFTER `--`, so a hyphen-leading term is a search string, not a flag —
+        // and `--json` precedes `--`, or bd would treat it as positional too.
+        assert_eq!(
+            memory_recall_argv(Some("-race")),
+            vec!["memories", "--json", "--", "-race"],
+        );
+        assert_eq!(
+            memory_recall_argv(Some("dolt")),
+            vec!["memories", "--json", "--", "dolt"],
+        );
     }
 
     #[test]

@@ -246,6 +246,16 @@ import {
   type ResearchResult,
 } from "./research";
 import { RESEARCH_DEPTHS } from "../research/types";
+import {
+  MEMORY_OPS,
+  MEMORY_RISK,
+  forgetMemory,
+  listMemories,
+  recallMemory,
+  rememberMemory,
+  type MemoryOp,
+  type MemoryResult,
+} from "./memory";
 import { conciergeToolConfigPath } from "./policy";
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
@@ -289,6 +299,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "fleet",
   "research",
   "accounts",
+  "memory",
 ] as const;
 
 export type ConciergeToolDomain = (typeof CONCIERGE_TOOL_DOMAINS)[number];
@@ -579,6 +590,11 @@ function fromAccounts<T>(ctx: OpContext, r: AccountsResult<T>): ConciergeToolRep
  *  the second says "that id was never real" — and a caller that cannot tell them apart will retry
  *  exactly the one that starts a second metered child. */
 function fromResearch<T>(ctx: OpContext, r: ResearchResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
+/** memory: same convention as research/board — the refusal's `reason` becomes the wire code. */
+function fromMemory<T>(ctx: OpContext, r: MemoryResult<T>): ConciergeToolReply {
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
@@ -1795,6 +1811,32 @@ const RESEARCH_ROUTES: Record<ResearchOp, Handler> = {
   ),
 };
 
+// The memory domain's argument schemas. `key`/`value`/`query` are the only fields; `.strict()`
+// refuses an unrecognized one, matching every other domain.
+const memoryRememberArgs = z
+  .object({
+    key: z.string().min(1, "give the fact a short key to file it under"),
+    value: z.string().min(1, "tell me what to remember"),
+  })
+  .strict();
+
+const memoryRecallArgs = z
+  .object({ query: z.string().min(1, "give a keyword or phrase to search memory for") })
+  .strict();
+
+const memoryForgetArgs = z
+  .object({ key: z.string().min(1, "name the memory key to drop") })
+  .strict();
+
+const MEMORY_ROUTES: Record<MemoryOp, Handler> = {
+  remember: route(memoryRememberArgs, async (a, ctx) =>
+    fromMemory(ctx, await rememberMemory(a.key, a.value)),
+  ),
+  recall: route(memoryRecallArgs, async (a, ctx) => fromMemory(ctx, await recallMemory(a.query))),
+  forget: route(memoryForgetArgs, async (a, ctx) => fromMemory(ctx, await forgetMemory(a.key))),
+  list_memories: route(noArgs, async (_a, ctx) => fromMemory(ctx, await listMemories())),
+};
+
 /**
  * Does this op change the world? Written as an exhaustive `Record` rather than derived from
  * `RESEARCH_RISK`, so a fifth op is a TYPECHECK FAILURE here until someone decides — which is the
@@ -2050,6 +2092,13 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => ACCOUNTS_RISK[op as AccountsOp] !== "read-only",
     ops: ACCOUNTS_OPS,
   },
+  memory: {
+    routes: MEMORY_ROUTES,
+    // `remember`/`forget` are `routine` (a write); `recall`/`list` are `read-only`. The risk map
+    // answers "is this a write" exactly, so there is no separate MEMORY_WRITE table to keep in step.
+    write: (op) => MEMORY_RISK[op as MemoryOp] !== "read-only",
+    ops: MEMORY_OPS,
+  },
 };
 
 /**
@@ -2086,6 +2135,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   fleet: DOMAINS.fleet.ops,
   research: DOMAINS.research.ops,
   accounts: DOMAINS.accounts.ops,
+  memory: DOMAINS.memory.ops,
 };
 
 function isDomain(v: string): v is ConciergeToolDomain {

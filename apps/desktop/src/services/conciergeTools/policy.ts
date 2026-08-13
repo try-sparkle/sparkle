@@ -80,6 +80,7 @@ import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
 import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
+import { MEMORY_OPS, MEMORY_RISK, type MemoryOp } from "./memory";
 import {
   CHIEF_OPS,
   CHIEF_RISK,
@@ -198,6 +199,7 @@ export type ConciergeToolDomain =
   | "research"
   | "chief"
   | "accounts"
+  | "memory"
   | "app";
 
 /** The domains in the order the pane lists them, with the heading each renders under. */
@@ -218,6 +220,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "research", label: "Background research" },
   { id: "chief", label: "Chief (client work)" },
   { id: "accounts", label: "Claude accounts" },
+  { id: "memory", label: "Durable memory" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
 
@@ -422,6 +425,19 @@ const TERMINAL_TOOL_SUMMARY: Record<TerminalToolName, string> = {
  * because "this spends money in the background" is the fact someone deciding to gate `dispatch`
  * actually needs.
  */
+/**
+ * The memory domain's rows — and, like research's, a summary is REQUIRED rather than nice to have.
+ * `remember`/`recall`/`forget`/`list` are among the most generic op names in the catalog, and the
+ * risk-note fallback ("Local and reversible.") tells the human nothing about what is being stored or
+ * where. Each row says what it does AND that this is the concierge's OWN durable, searchable memory.
+ */
+const MEMORY_TOOL_SUMMARY: Record<MemoryOp, string> = {
+  remember: "Save a durable fact to the concierge's own memory, so it survives past the chat window.",
+  recall: "Search the concierge's saved memory for a keyword or phrase.",
+  forget: "Drop one saved memory by its key.",
+  list_memories: "List everything the concierge has saved to its durable memory.",
+};
+
 const RESEARCH_TOOL_SUMMARY: Record<ResearchOp, string> = {
   dispatch:
     "Send a question off to a background research agent and keep talking — it answers later, and " +
@@ -589,6 +605,7 @@ export type ConciergeToolName =
   | ResearchOp
   | ChiefOp
   | AccountsOp
+  | MemoryOp
   | AppToolName;
 
 /**
@@ -684,6 +701,10 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // research.ts's header records the reasoning, including why `dispatch` is not `costs-money` and
   // why `cancel` is not the `disruptive` that RISK_OVERRIDES gives close_agent/stop_agent.
   ...translateRisk(RESEARCH_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Memory publishes two of workspace's four risk words. `remember`/`forget` are `routine` and
+  // auto-allow — the whole point is that the concierge accumulates durable context without the
+  // human approving each fact; `recall`/`list` are `read-only`. See memory.ts.
+  ...translateRisk(MEMORY_RISK, WORKSPACE_RISK_TO_CLASS),
   // Chief publishes two of WORKFLOW's five risk words, so it reuses that translation. The split is
   // the load-bearing part: the seven reads are `read-only` and auto-allow, while the four writes and
   // the `chief_call` hatch are `outward-facing` and ask — because what they write lands in a real
@@ -861,6 +882,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(RESEARCH_RISK, "research" as const),
   ...constantOver(CHIEF_RISK, "chief" as const),
   ...constantOver(ACCOUNTS_RISK, "accounts" as const),
+  ...constantOver(MEMORY_RISK, "memory" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
 
@@ -880,6 +902,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
 // remembers this file.
 export const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
   ...RESEARCH_TOOL_SUMMARY,
+  ...MEMORY_TOOL_SUMMARY,
   ...WORKSPACE_TOOL_SUMMARY,
   ...SCREENSHOT_TOOL_SUMMARY,
   ...TERMINAL_TOOL_SUMMARY,
@@ -908,6 +931,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   research: RESEARCH_OPS,
   chief: CHIEF_OPS,
   accounts: ACCOUNTS_OPS,
+  memory: MEMORY_OPS,
   app: APP_TOOL_NAMES,
 };
 

@@ -960,6 +960,9 @@ pub fn run() {
             notes::bead_dep_add,
             notes::bead_label,
             notes::delete_bead,
+            notes::concierge_memory_remember,
+            notes::concierge_memory_recall,
+            notes::concierge_memory_forget,
             notes::bead_claim,
             notes::bead_close,
             // The typed/capped planning surface (services/beadsCommands.ts). Distinct from the

@@ -954,6 +954,24 @@ describe("research findings ride a proactive turn", () => {
     expect(researchTaskIds).toEqual(["r-1"]);
   });
 
+  it("folds SAVED MEMORY into a proactive turn — the persona promises it is always folded in (roborev 63933)", () => {
+    // The gap this closes: only the user-turn seam folded memory in, so an unprompted turn carried
+    // no WHAT YOU'VE REMEMBERED section while the persona claimed it always does. A proactive turn is
+    // exactly where re-grounding matters most — there is no human message to re-supply context.
+    const h = harness({
+      peekMemoryPreamble: () => "WHAT YOU'VE REMEMBERED — 1 fact(s):\n\n- founder-priority: wall-clock speed over token cost",
+    });
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    const prompt = h.fired[0]!.prompt;
+    // The remembered VALUE actually reaches the proactive prompt, ahead of the roster.
+    expect(prompt).toContain("wall-clock speed over token cost");
+    expect(prompt.indexOf("wall-clock speed over token cost")).toBeLessThan(prompt.indexOf("Approve?"));
+  });
+
   it("rides a NOTICE-ONLY turn too — the one that never calls buildProactivePrompt", () => {
     const h = harness({ peekResearch: staging("RESEARCH BACK — 1 finding(s):\nthe answer", "r-1") });
     const s = createProactiveScheduler(h.deps);

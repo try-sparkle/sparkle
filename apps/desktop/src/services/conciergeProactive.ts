@@ -27,6 +27,7 @@
 import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
 import { withResearchPreamble, type ResearchStaging } from "./research/drain";
+import { withMemoryPreamble } from "../stores/conciergeMemoryStore";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
 
@@ -102,6 +103,14 @@ export interface ProactiveDeps {
    * id it gets back; the claim happens only once that turn delivers. See services/research/drain.
    */
   peekResearch?(): ResearchStaging;
+  /**
+   * The memory re-grounding preamble for this turn (`""` when nothing is saved), read from the same
+   * cache the user-turn seam reads (stores/conciergeMemoryStore). Present so an UNPROMPTED turn also
+   * carries the WHAT YOU'VE REMEMBERED section — the persona tells the model its memories are folded
+   * in automatically, and a proactive turn is precisely where re-grounding matters most (no human
+   * message re-supplies context). Pure string; claims nothing, so unlike research it needs no staging.
+   */
+  peekMemoryPreamble?(): string;
   /**
    * Start one proactive turn. `digest` is the state it is being authored against — the caller
    * records it against the turn id so the resulting message can be marked stale later.
@@ -792,8 +801,11 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     ]
       .filter((part): part is string => part !== null)
       .join("\n\n");
-    // Identity when there is nothing unread — no empty header, on any turn.
-    const prompt = withResearchPreamble(research.preamble, body);
+    // Identity when there is nothing unread — no empty header, on any turn. Memory re-grounding
+    // wraps OUTSIDE research, matching the user-turn seam's order (memories are background context
+    // the brain should already hold; research findings are what just came back).
+    const memoryPreamble = deps.peekMemoryPreamble?.() ?? "";
+    const prompt = withMemoryPreamble(memoryPreamble, withResearchPreamble(research.preamble, body));
     lastAttemptAt = now;
     dropPending();
 

@@ -32,6 +32,7 @@ import type { FleetOp } from "../services/conciergeTools/fleet";
 import type { PlansOp } from "../services/conciergeTools/plans";
 import type { ResearchOp } from "../services/conciergeTools/research";
 import type { AccountsOp } from "../services/conciergeTools/accounts";
+import type { MemoryOp } from "../services/conciergeTools/memory";
 import { conciergeNativeToolLine } from "./conciergeNativeToolLine";
 
 /** Which glyph family a line wears. A KIND, not a component: this module stays React-free, and the
@@ -450,6 +451,13 @@ const ACCOUNTS_PHRASES: Record<AccountsOp, OpPhrase> = {
   ),
 };
 
+const MEMORY_PHRASES: Record<MemoryOp, OpPhrase> = {
+  remember: phrase("Saving something to memory", "Saved something to memory"),
+  recall: phrase("Searching my memory", "Searched my memory"),
+  forget: phrase("Dropping a memory", "Dropped a memory"),
+  list_memories: phrase("Reading my memory", "Read my memory"),
+};
+
 /** Domain → its phrase table and its glyph. Keyed on the registry's own domain union, so a new
  *  domain cannot be added without deciding how the column describes it.
  *
@@ -490,6 +498,9 @@ const DOMAINS: Record<
   // Reuses the agents glyph: both ops are about where the AGENTS are running — which login has
   // room for them, and moving them onto it. No new glyph, consistent with `board` and `plans`.
   accounts: { icon: "agents", phrases: ACCOUNTS_PHRASES },
+  // Reuses the workspace glyph: durable memory is a fact about the concierge's own state, not an
+  // agent or a branch. No new glyph, consistent with `board` and `plans`.
+  memory: { icon: "workspace", phrases: MEMORY_PHRASES },
 };
 
 /** What an op's `%s` refers to, so the recorder knows which id to resolve into a name.

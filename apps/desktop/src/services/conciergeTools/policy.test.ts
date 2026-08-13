@@ -59,6 +59,7 @@ import { RESEARCH_OPS } from "./research";
 import { CHIEF_CALL_TOOL_ARG, CHIEF_OPS, CHIEF_RISK, chiefCallToolName } from "./chief";
 import { CHIEF_DESTRUCTIVE_TOOLS } from "../chiefScope";
 import { ACCOUNTS_OPS } from "./accounts";
+import { MEMORY_OPS } from "./memory";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
 const NONE = { overrides: NO_TOOL_POLICY_OVERRIDES };
@@ -327,6 +328,7 @@ describe("risk that depends on the CALL, not on the op name", () => {
     const prosePublishing: readonly (readonly [string, readonly string[]])[] = [
       ["research", RESEARCH_OPS],
       ["accounts", ACCOUNTS_OPS],
+      ["memory", MEMORY_OPS],
       ["screenshot", SCREENSHOT_OPS],
       ["attachments", ATTACHMENTS_OPS],
       ["workflow", WORKFLOW_OPERATIONS],
@@ -484,6 +486,7 @@ describe("the tool set is derived from the domains", () => {
       "research",
       "chief",
       "accounts",
+      "memory",
       "app",
     ]);
     expect(CONCIERGE_TOOL_DOMAINS.map((d) => d.id)).toEqual(
@@ -541,6 +544,7 @@ describe("the tool set is derived from the domains", () => {
         RESEARCH_OPS.length +
         CHIEF_OPS.length +
         ACCOUNTS_OPS.length +
+        MEMORY_OPS.length +
         APP_TOOL_NAMES.length,
     );
   });

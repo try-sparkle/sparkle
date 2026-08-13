@@ -121,6 +121,11 @@ import { startConciergeHistoryCapture } from "../services/conciergeHistoryCaptur
 import { captureAsksFrom, openAsksNow, startAskQueue } from "../services/conciergeAskQueue";
 import { createResearchDrain, withResearchPreamble } from "../services/research/drain";
 import {
+  buildMemoryPreamble,
+  useConciergeMemoryStore,
+  withMemoryPreamble,
+} from "../stores/conciergeMemoryStore";
+import {
   allTasksNow as allResearchTasks,
   markResearchRead,
   refreshResearch,
@@ -612,6 +617,11 @@ export function ConciergeHost({
       return next.length === prev.length ? prev : next;
     });
   }, [feed]);
+  // Warm the durable-memory cache on mount so the FIRST turn re-grounds on saved facts rather than
+  // waiting for a dispatch to trigger the first read. Fire-and-forget — see conciergeMemoryStore.
+  useEffect(() => {
+    void useConciergeMemoryStore.getState().refresh();
+  }, []);
   // Agents seen WORKING during the current away stretch — the recap's evidence that a finish was
   // real rather than an overlay repopulating (services/conciergeRecap.buildRecap sawWorking,
   // roborev 53669-M). Accumulated here because this effect is the only thing that observes the
@@ -3093,6 +3103,13 @@ export function ConciergeHost({
       // The research drain's second seam (§3.3's free improvement). Consulted by `fire` only once
       // it has already decided to speak, so a finding never buys a push of its own.
       peekResearch: () => researchDrain.peek(),
+      // Fold saved memories into proactive turns too, from the same cache the user-turn seam reads —
+      // otherwise an unprompted turn carries no WHAT YOU'VE REMEMBERED section, contradicting the
+      // persona's promise that memories are always folded in (roborev 63933).
+      peekMemoryPreamble: () => {
+        const s = useConciergeMemoryStore.getState();
+        return buildMemoryPreamble(s.memories, s.total);
+      },
       startTurn: async (prompt, digest, researchTaskIds) => {
         const id = await startProactiveConciergeTurn(prompt);
         // Null means no turn ran — the user owns the conversation, or the bridge failed. Reporting
@@ -4078,6 +4095,16 @@ export function ConciergeHost({
     // can no longer be a synchronous throw that costs the send; see the import block's note and
     // services/conciergeHistoryCapture.ts.
     const research = researchDrain.peek();
+    // ══ AUTO RE-GROUNDING FROM DURABLE MEMORY (PR #1877) ══════════════════════════════════════════
+    //
+    // Read the concierge's saved memories from the cache SYNCHRONOUSLY (the store is refreshed off
+    // the turn path — see below and stores/conciergeMemoryStore), and kick a fresh read for NEXT
+    // turn. Same shape as the research drain's peek: this reads a kept snapshot, it does not block
+    // the turn on a `bd` subprocess. The memories fold in AHEAD of everything, because they are
+    // background context the brain should already hold, not an answer to this message.
+    const memoryState = useConciergeMemoryStore.getState();
+    const memoryPreamble = buildMemoryPreamble(memoryState.memories, memoryState.total);
+    void memoryState.refresh();
     // ══ THE PUSHER'S OWED FINDINGS RIDE THIS TURN TOO ═════════════════════════════════════════════
     //
     // Because the channel they were built for is SELF-DEFEATING for exactly the findings that
@@ -4125,11 +4152,14 @@ export function ConciergeHost({
       // message. Both preambles go AHEAD of `buildSnapshot` rather than after it, because his
       // message is the last thing inside that snapshot — anything appended would sit under the
       // question and read as part of it.
-      withResearchPreamble(
-        research.preamble,
-        withNoticeSection(
-          owedNotices,
-          buildSnapshot(feedRef.current, entry.text, openAsksNow(), continuity),
+      withMemoryPreamble(
+        memoryPreamble,
+        withResearchPreamble(
+          research.preamble,
+          withNoticeSection(
+            owedNotices,
+            buildSnapshot(feedRef.current, entry.text, openAsksNow(), continuity),
+          ),
         ),
       ),
     ).then(
