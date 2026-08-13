@@ -53,6 +53,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApprovalPrompt } from "./ApprovalPrompt";
 import { AgentPillProvider } from "./AgentPill";
 import { NudgeCard } from "./NudgeCard";
+import { QuoteChiclet, QUOTE_CHICLET_TESTID } from "./QuoteChiclet";
 import { SendModeTray } from "./SendModeTray";
 import type { ConciergeApproval } from "../../stores/conciergeApprovals";
 import type { ConciergeNudge } from "./types";
@@ -164,6 +165,52 @@ describe("NudgeCard — the BLOCKED card's Approve button", () => {
     for (const testId of ["concierge-nudge-mute", "concierge-nudge-dismiss"]) {
       expect(screen.getByTestId(testId).style.borderRadius).toBe(reference);
     }
+  });
+});
+
+describe("QuoteChiclet — the quote-response button", () => {
+  // Founder, 2026-08-12: *"Make this quote response button less rounded I can't stand the rounded
+  // buttons like that."* — the same complaint as 2026-08-06, one component later. It shipped as
+  // `PILL` behind a comment arguing "this really is a pill"; that reading has been overruled, and
+  // PR #1775 moved it to `RADIUS.input`.
+  //
+  // ── WHY THIS CASE EXISTS ALONGSIDE `QuoteChiclet.radius.test.tsx`, AND WHAT IT DOES *NOT* ADD ─
+  // That file asserts the chiclet equals the `RADIUS.input` TOKEN. This one asserts it equals the
+  // BUTTON HE NAMED, measured off the DOM. The delta is narrower than it first looks, and the
+  // overstated version of this comment was written and then MEASURED before it was believed:
+  //
+  //   re-point `--r-input` at "999px" → BOTH files go red. The token test's own "is not the PILL
+  //   token" case catches it, because `PILL` did not move with the re-point. So "a token re-point
+  //   would sail past the token test" is FALSE; it was the tempting argument for this file and it
+  //   does not hold.
+  //
+  // What this DOES add is the case the token test cannot see, because it never looks at the
+  // reference: the chiclet and the button the founder pointed at DIVERGING. Hard-code Push to
+  // talk's radius, or move it to a different token, and the chiclet keeps matching `RADIUS.input`
+  // (token test green) while no longer matching Push to Talk — which is the relationship he
+  // actually named, and the one this file exists to hold every labelled action button to. The
+  // "reference itself" case at the top is what tells those two failures apart.
+  //
+  // So: kept because the instruction was a comparison, not a value, and this is where every other
+  // button in that instruction is pinned — not because the token test has a hole.
+  //
+  // Being PORTALLED to `document.body` is why this component was not swept up with
+  // `NudgeCard`/`ApprovalPrompt` in the first pass: it renders outside the thread, so a sweep that
+  // rendered cards never saw it.
+  function renderChiclet() {
+    render(<QuoteChiclet x={40} y={40} onQuote={vi.fn()} onDismiss={vi.fn()} />);
+    return screen.getByTestId(QUOTE_CHICLET_TESTID);
+  }
+
+  it("rounds exactly like Push to Talk", () => {
+    const reference = pushToTalkRadius();
+    expect(renderChiclet().style.borderRadius).toBe(reference);
+  });
+
+  it("is no longer a stadium pill", () => {
+    // The direct statement of the complaint, independent of the reference — the assertion that
+    // fails against the version PR #1775 replaced, where this button carried `borderRadius: PILL`.
+    expect(renderChiclet().style.borderRadius).not.toBe(CAPSULE);
   });
 });
 
