@@ -202,7 +202,7 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
    *  An EMPTY plan returns after step 1 rather than leaving a plan spinning: phase 2's interval
    *  never retires a plan with no pending agents, so setting one would poll forever. Same reasoning
    *  as `accept`. */
-  const switchTo = useCallback((accountId: string) => {
+  const switchTo = useCallback((accountId: string): number => {
     // The preference, and the sweep of the pins an EARLIER switch wrote. Both are durable and
     // neither needs this hook, so they live in one place `activateAccount` can reach too.
     recordActivation(accountId);
@@ -224,10 +224,11 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         planRef.current = null;
         setPlan(null);
       }
-      return;
+      return 0;
     }
     planRef.current = fresh;
     setPlan(fresh);
+    return fresh.pending.length;
   }, []);
 
   // Publish this hook's lever for the accounts modal, which is nowhere near this hook in the tree
@@ -247,8 +248,10 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   return { recommendation, plan, accept, dismiss, switchTo };
 }
 
-/** The `switchTo` of the currently mounted hook, or null when none is mounted. */
-let liveSwitchTo: ((accountId: string) => void) | null = null;
+/** The `switchTo` of the currently mounted hook, or null when none is mounted. It returns how many
+ *  already-running agents the activation enrolled, which is what lets `activateAccount` distinguish
+ *  "a host answered" from "something is actually moving". */
+let liveSwitchTo: ((accountId: string) => number) | null = null;
 
 /** Everything an activation must do that does NOT need a mounted hook: record the preference, and
  *  drop the pins a previous activation's migration wrote.
@@ -267,14 +270,20 @@ function recordActivation(accountId: string): void {
 
 /** Activate `accountId` from outside React (the accounts modal's "Activate this account").
  *
- *  Returns whether a mounted hook took the MIGRATION half. Everything durable happens either way
- *  (see `recordActivation`) — it must not depend on whether a particular component happens to be in
- *  the tree. Only "move what is already running" needs the hook, and an agent that is not moved now
- *  still lands on the activated account at its next spawn, so the fallback is a slower path to the
- *  same place rather than a silent failure. */
+ *  Returns whether ANY ALREADY-RUNNING AGENT WAS ENROLLED IN A MIGRATION — not whether a hook
+ *  happened to be mounted. The distinction is the whole value of the return: `AccountSwitchHost` is
+ *  mounted unconditionally inside `AuthGate`, so "a hook answered" is true in essentially every real
+ *  app and would be a constant dressed up as a signal. `switchTo` returns after the durable half
+ *  whenever the plan comes back empty — every pane already on the target, all remaining panes
+ *  pinned or sticky, or no panes mounted — and in each of those cases nothing is moving. A caller
+ *  that reads a mounted host as "the fleet is migrating" tells the human waiting out a rate limit
+ *  the one thing that is not happening.
+ *
+ *  Everything durable happens either way (see `recordActivation`) — it must not depend on whether a
+ *  particular component is in the tree. An agent that is not moved now still lands on the activated
+ *  account at its next spawn, so a `false` is a slower path to the same place, never a failure. */
 export function activateAccount(accountId: string): boolean {
   recordActivation(accountId);
   if (!liveSwitchTo) return false;
-  liveSwitchTo(accountId);
-  return true;
+  return liveSwitchTo(accountId) > 0;
 }

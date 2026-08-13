@@ -38,13 +38,19 @@
 // raised it, so this domain hands off the request and returns; it never drives the migration itself.
 //
 // ACTIVATION HAS TWO HALVES AND ONLY ONE IS GUARANTEED, so the reply reports which happened.
-// `activateAccount` returns whether a mounted host took the MIGRATION half; the durable half —
-// recording the preference and sweeping the previous activation's pins — happens either way. With
-// no host mounted, nothing already running moves and each agent lands on the account at its next
-// spawn. That is a slower path to the same place, not a failure, but it is a different sentence to
-// say to a human waiting for a limit to clear: "they are moving" and "they will move as they
-// restart" are answers to different questions, and reporting the second as the first is the copy
-// bug this field exists to prevent.
+// `activateAccount` returns whether any already-running agent was ENROLLED IN A MIGRATION; the
+// durable half — recording the preference and sweeping the previous activation's pins — happens
+// either way. When nothing is enrolled, each agent lands on the account at its next spawn instead.
+// That is a slower path to the same place, not a failure, but it is a different sentence to say to
+// a human waiting for a limit to clear: "they are moving" and "they will move as they restart" are
+// answers to different questions, and reporting the second as the first is the copy bug this field
+// exists to prevent.
+//
+// AN EMPTY PLAN IS THE COMMON CASE, NOT THE EXOTIC ONE — which is why the signal cannot be "did a
+// host answer". `AccountSwitchHost` is mounted unconditionally inside `AuthGate`, so a host is
+// essentially always there; what varies is whether the plan enrolled anyone, and it enrolls nobody
+// when every pane already sits on the target or the rest are pinned. Reading a mounted host as a
+// migration is exactly the false reassurance this field was added to stop (roborev job 63349).
 //
 // It is classified `disruptive`, which under `DEFAULT_DECISION_BY_RISK` derives to `ask` — so the
 // human is asked before the fleet moves, through the ordinary approval path. There is deliberately
@@ -332,9 +338,11 @@ export interface SwitchAllAccepted {
    *  reports that the request was ACCEPTED, never that every agent has already moved. */
   requested: true;
   /**
-   * Whether anything ALREADY RUNNING is being moved. True when a mounted switch host took the
-   * migration half; false when only the durable half happened, so nothing moves until each agent
-   * next spawns. Never collapse this into `requested` — see the header.
+   * Whether anything ALREADY RUNNING was enrolled in a migration. False whenever the plan came back
+   * empty — every agent already on this account, all remaining ones pinned or sticky, or nothing
+   * mounted — in which case only the durable half happened and each agent lands here at its next
+   * spawn. Never collapse this into `requested`, and never read it as "a switch host exists": that
+   * host is mounted unconditionally, so it is a constant, not a signal. See the header.
    */
   migratingNow: boolean;
   /** How many agents are expected to migrate is deliberately NOT claimed here: each moves at its own

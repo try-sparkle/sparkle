@@ -430,16 +430,23 @@ const RESEARCH_PHRASES: Record<ResearchOp, OpPhrase> = {
 };
 
 /**
- * Claude accounts. `switch_all` says REQUESTED, not "switched", for the same reason `dispatch`
- * above says "sent": each agent moves at its own safe stopping point, so the switch is still
- * running minutes after the op returns. A past-tense "Moved every agent" would claim a migration
- * that has not happened yet — and this line is what the human reads instead of watching it.
+ * Claude accounts. `switch_all` phrases the half that ALWAYS happens, because this line cannot see
+ * which halves did.
+ *
+ * The op has two outcomes — the durable preference change, which is unconditional, and the live
+ * migration of running agents, which enrolls nobody when every pane is already on the target or all
+ * remaining ones are pinned. The reply distinguishes them with `migratingNow`; a phrase table is
+ * keyed on the OP ALONE and gets no result to branch on, so any wording that asserts agents are
+ * moving is false in exactly the case the reply exists to flag. "Which account your agents use"
+ * covers both: it is the thing that changed either way. A past tense "Asked every agent to move"
+ * reads as a fleet-wide migration and would put the claim the tool refuses to make into the one
+ * surface a non-model human actually reads.
  */
 const ACCOUNTS_PHRASES: Record<AccountsOp, OpPhrase> = {
   read_usage: phrase("Checking your Claude accounts", "Checked your Claude accounts"),
   switch_all: phrase(
-    "Moving every agent to another Claude account",
-    "Asked every agent to move to another Claude account",
+    "Changing which Claude account your agents use",
+    "Changed which Claude account your agents use",
   ),
 };
 

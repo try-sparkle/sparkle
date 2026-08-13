@@ -436,6 +436,28 @@ describe("activateAccount — the modal's lever", () => {
     expect(await accountFor("agent-new")).toBe("acct-b");
   });
 
+  // THE CASE THAT ACTUALLY HAPPENS IN A RUNNING APP, and the one a mounted-host check cannot see.
+  // `AccountSwitchHost` is mounted unconditionally inside `AuthGate`, so `liveSwitchTo` is set
+  // essentially always — which made the old "did a hook answer" return a constant. Here the hook IS
+  // mounted and the plan is still empty (every pane is already on the target), so nothing migrates.
+  // Reporting `true` here is what tells a human waiting out a rate limit that a fleet is moving
+  // when none is.
+  it("returns false when the hook IS mounted but the plan enrolls nobody", async () => {
+    // Every mounted pane is ALREADY on the target, so `planSwitchToAccount` comes back empty and
+    // `switchTo` returns after the durable half. The hook is mounted throughout — that is the point.
+    h.paneAccounts = { a1: "acct-b", a2: "acct-b" };
+    await mounted();
+
+    act(() => {
+      expect(activateAccount("acct-b")).toBe(false);
+    });
+    tick();
+
+    expect(h.restart).not.toHaveBeenCalled();
+    // The durable half still ran — this is "nothing to move", not "nothing happened".
+    expect(await accountFor("agent-new")).toBe("acct-b");
+  });
+
   it("sweeps the last activation's pins even with NO hook mounted", async () => {
     // The path with no other remedy: nothing is mounted, so nothing arrives later to correct it. An
     // agent still carrying a pin from the PREVIOUS activation outranks the preference and would
