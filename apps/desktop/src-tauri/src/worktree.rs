@@ -2992,18 +2992,47 @@ fn merge_adds_nothing(root: &str, target: &str, branch: &str) -> bool {
     }
 }
 
+/// True iff every commit `branch` carries beyond `target` is already patch-equivalent to something
+/// in `target` — i.e. `git cherry <target> <branch>` reports no `+` (genuinely new) lines. Unlike
+/// `ref_contains` (exact-SHA ancestry) and `merge_adds_nothing` (whole merge-tree equality against
+/// `target`'s CURRENT tip), this compares commits BY PATCH ID, so it also catches a branch whose work
+/// reached `target` through an out-of-band rebase or cherry-pick where the tree comparison no longer
+/// lines up (e.g. `target` has since drifted with unrelated changes in the same region, so
+/// `merge_adds_nothing`'s three-way merge conflicts even though every one of `branch`'s commits
+/// individually already landed). sparkle-uj037: the founder's own independent verification of a
+/// genuinely-merged branch used exactly this command as one of three proofs ("git cherry origin/main
+/// HEAD" → empty); wiring it in here closes the gap between what the app computes and what a human
+/// checks by hand, including the case a bad rebase silently drops commits — an ancestor check alone
+/// would read the truncated tip as "landed" (it IS an ancestor of whatever it became), while `git
+/// cherry` against the ORIGINAL commit set would surface the dropped ones as unmatched `+` lines. A
+/// missing target/branch or any git error reads as "not confirmed landed" — emptiness is a claim only
+/// an actually-successful, actually-`+`-free run may make.
+fn cherry_empty(root: &str, target: &str, branch: &str) -> bool {
+    if target.trim().is_empty() || branch.trim().is_empty() {
+        return false;
+    }
+    match git(root, &["cherry", target, branch]) {
+        Ok(out) => !out.lines().any(|l| l.starts_with('+')),
+        Err(_) => false,
+    }
+}
+
 /// Is `branch` effectively landed on the integration branch? The single source of the "landed"
 /// rule, used by BOTH the workflow-state signal and the close-agent safe branch delete so they can
-/// never disagree. Checks fast-forward ancestry into LOCAL or ORIGIN `<target>`, OR a merge-tree
-/// no-op against either (which catches squash/rebase merges — where the work lands on the remote as
-/// a NEW commit and the branch tip is not an ancestor — and survives an advancing target). `tip` is
-/// the branch's resolved SHA ("" = no tip). Callers wanting the freshest remote state refresh origin
-/// first; `||` short-circuits so the merge-tree probes only run for not-already-reachable branches.
+/// never disagree. Checks fast-forward ancestry into LOCAL or ORIGIN `<target>`, a merge-tree no-op
+/// against either (which catches squash/rebase merges — where the work lands on the remote as a NEW
+/// commit and the branch tip is not an ancestor — and survives an advancing target), OR a
+/// patch-by-patch `git cherry` no-op against either (see `cherry_empty` — the third ground-truth
+/// signal, covering cases the first two can miss). `tip` is the branch's resolved SHA ("" = no tip).
+/// Callers wanting the freshest remote state refresh origin first; `||` short-circuits so the more
+/// expensive merge-tree/cherry probes only run for not-already-reachable branches.
 fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
     let origin_ref = format!("origin/{target}");
     (!tip.is_empty() && (ref_contains(root, target, tip) || ref_contains(root, &origin_ref, tip)))
         || merge_adds_nothing(root, target, branch)
         || merge_adds_nothing(root, &origin_ref, branch)
+        || cherry_empty(root, target, branch)
+        || cherry_empty(root, &origin_ref, branch)
 }
 
 /// One memoized [`branch_landed`] answer, plus the inputs that answer is only valid for.
@@ -4591,14 +4620,18 @@ pub fn agent_workflow_state_in(
     };
 
     let default_branch = resolve_default_branch(root);
-    // On the network-allowed poll, opportunistically refresh origin/<default> FIRST so the
-    // reachability checks below see a merge that landed in another worktree/session (throttled per
-    // repo). Gated on `probe_pr_state` so the fast/local poll skips the `git remote` spawn entirely;
-    // computed once and reused for the PR-probe gate below (both uses are network-poll-only).
-    let has_origin = probe_pr_state && git(root, &["remote", "get-url", "origin"]).is_ok();
-    if has_origin {
+    // Opportunistically refresh origin/<default> FIRST so the reachability checks below see a
+    // merge that landed in another worktree/session (throttled per repo — see FETCH_COOLDOWN).
+    // sparkle-uj037: this used to be gated on `probe_pr_state`, so a CLOSED agent pane never fetched
+    // — in_origin_main/landed then froze at whatever they were the last time the pane was open,
+    // forever, even after the PR genuinely merged on GitHub. The fetch itself is cheap and already
+    // per-repo throttled, so it runs for every poll with a remote, open pane or not; only the `gh`
+    // PR-state probe below stays gated on `probe_pr_state` (that's the actual network+auth cost).
+    let remote_exists = git(root, &["remote", "get-url", "origin"]).is_ok();
+    if remote_exists {
         maybe_refresh_origin(root, &default_branch);
     }
+    let has_origin = probe_pr_state && remote_exists;
     // ONE implementation, shared with the batched project poll — see `workflow_state_shared`. These
     // two used to carry byte-identical copies of the whole derivation, which is how a fix applied to
     // one silently left the other (the path the sidebar actually polls) wrong.
@@ -4973,13 +5006,19 @@ pub fn project_agents_status_at(
 ) -> Vec<AgentStatusResult> {
     // ── Shared repo discovery, done ONCE for the whole batch ──
     let default_branch = resolve_default_branch(root);
-    // `has_origin` folds in the PR-probe gate exactly as agent_workflow_state_at does: the network
-    // touches (origin fetch + gh probe) only happen on a probe-enabled poll against a repo with a
-    // remote. Reachability into origin/<default> still runs regardless (it's a local ref read).
-    let has_origin = probe_pr_state && git(root, &["remote", "get-url", "origin"]).is_ok();
-    if has_origin {
+    // sparkle-uj037: the opportunistic fetch runs for EVERY batch with a remote, probed or not — see
+    // the matching comment in `agent_workflow_state_in`. It used to be gated on `probe_pr_state`
+    // (`has_origin` below), which meant a project with every pane CLOSED never fetched origin/<default>
+    // at all: `in_origin_main`/`landed` for those agents then read whatever they were the last time a
+    // pane was open, forever, even after their PR genuinely merged. Reachability into origin/<default>
+    // is "just a local ref read" ONLY if that ref is kept fresh — this fetch is what keeps it fresh.
+    // `has_origin` still folds in the PR-probe gate: the `gh` probe (the real network+auth cost) stays
+    // restricted to `probe_pr_state` polls.
+    let remote_exists = git(root, &["remote", "get-url", "origin"]).is_ok();
+    if remote_exists {
         maybe_refresh_origin(root, &default_branch);
     }
+    let has_origin = probe_pr_state && remote_exists;
     // One clock read for the whole batch, so every agent's PR-reprobe TTL is measured from the same
     // instant (sparkle-prpb).
     let now = Instant::now();
@@ -7745,6 +7784,47 @@ mod tests {
             git_spawns_on_this_thread() > after_first,
             "every None call must shell out — a second one served from cache means None is \
              silently participating in the memo instead of bypassing it"
+        );
+    }
+
+    /// `cherry_empty` — the new patch-by-patch ground-truth signal in `branch_landed` (sparkle-uj037,
+    /// per the founder's explicit "git cherry origin/main HEAD" verification). Proved independently
+    /// of the existing ancestor/merge-tree checks: cherry-pick `feature`'s commit onto `main` under a
+    /// DIFFERENT sha (so `ref_contains` is false — the tip is provably not an ancestor, exactly the
+    /// shape an out-of-band rebase/cherry-pick produces) and confirm `branch_landed` still reports
+    /// landed, driven by the cherry signal.
+    #[test]
+    fn branch_landed_recognizes_a_cherry_picked_equivalent_even_when_the_tip_is_not_an_ancestor() {
+        let r = init_repo("cherry-landed");
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+        std::fs::write(format!("{r}/feature.txt"), "agent work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "agent work"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+
+        // Sanity: before landing, cherry reports the commit as genuinely new (a `+` line).
+        let unmerged = git(&r, &["cherry", "main", "feature"]).unwrap();
+        assert!(unmerged.starts_with('+'), "PRECONDITION: unmerged work must read as a '+' commit");
+        assert!(!cherry_empty(&r, "main", "feature"), "PRECONDITION: not yet landed");
+        assert!(!branch_landed(&r, "main", "feature", &tip), "PRECONDITION: branch_landed agrees");
+
+        // Cherry-pick the SAME patch onto main under a NEW sha — `-x` appends a "(cherry picked
+        // from …)" trailer, which guarantees a different commit message (hence a different sha)
+        // regardless of whether author/committer timestamps happen to coincide with the original.
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["cherry-pick", "-x", &tip]).unwrap();
+        assert!(
+            !ref_contains(&r, "main", &tip),
+            "PRECONDITION: the original tip must NOT be an ancestor of main after a cherry-pick"
+        );
+
+        assert!(
+            cherry_empty(&r, "main", "feature"),
+            "the patch reached main by cherry-pick; git cherry must recognize it as equivalent"
+        );
+        assert!(
+            branch_landed(&r, "main", "feature", &tip),
+            "branch_landed must report landed via the cherry signal even though ancestry says no"
         );
     }
 
@@ -12729,6 +12809,77 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
         let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// sparkle-uj037: THE BUG, reproduced directly. `agentWorkflowState`/`agentWorkflowStateShared`
+    /// used to gate the opportunistic `origin/<default>` fetch behind `probe_pr_state`, so a CLOSED
+    /// agent pane (the closed-sweep tick always passes `probe_pr_state=false`) never fetched — at
+    /// all, ever, for as long as the pane stayed closed. A branch that had genuinely merged into
+    /// `origin/main` FROM ELSEWHERE (another worktree/session — reproduced here the same way
+    /// `advance_origin_main_elsewhere` does, by merging in a throwaway clone and pushing) therefore
+    /// kept reading `in_origin_main: false` / `landed: false` forever: this repo's own
+    /// `refs/remotes/origin/main` sat stale because the one poll path that would have refreshed it
+    /// was permanently switched off. This is exactly "Sparkle Changelog Catch Up" (bd sparkle-uj037):
+    /// its pane was closed, PR #1837 genuinely merged, and the builder column kept showing
+    /// "Local: Committed" because the poll that would have proven otherwise never looked.
+    ///
+    /// FAILS against pre-fix code (`in_origin_main`/`landed` stay false — the fetch never runs on a
+    /// `probe_pr_state=false` call) and PASSES post-fix (the fetch now runs whenever a remote exists,
+    /// regardless of `probe_pr_state`, so this very call self-heals).
+    #[test]
+    fn a_closed_agent_poll_still_sees_a_merge_that_landed_elsewhere() {
+        let root_str = init_repo("uj037-closed-fetch");
+        let origin = unique_root("uj037-closed-fetch-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&root_str, &["remote", "add", "origin", o]).unwrap();
+        git(&root_str, &["push", "-q", "origin", "main"]).unwrap();
+
+        // The agent branch, cut from main directly with plain git (NOT `create_worktree_at` — that
+        // kicks its own background `spawn_background_origin_refresh`, which would prime this repo's
+        // FETCH_COOLDOWN before the test is ready and race the very fetch under test), with real
+        // committed work of its own. `agent_workflow_state_at` resolves the branch by the minted
+        // `sparkle/agent-<id>` name directly (ctx: None), so no actual worktree is needed.
+        git(&root_str, &["checkout", "-q", "-b", "sparkle/agent-cc1"]).unwrap();
+        std::fs::write(format!("{root_str}/changelog.txt"), "catch up").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-q", "-m", "changelog catch up"]).unwrap();
+        let tip = rev_parse_tip(&root_str, "sparkle/agent-cc1");
+        git(&root_str, &["push", "-q", "origin", "sparkle/agent-cc1"]).unwrap();
+        git(&root_str, &["checkout", "-q", "main"]).unwrap();
+
+        // The PR merges into origin/main via a real merge commit — but FROM ELSEWHERE (another
+        // worktree/session/machine): `root_str`'s own `refs/remotes/origin/main` is not touched by
+        // this and stays pointed at the pre-merge tip until something fetches it.
+        let elsewhere = unique_root("uj037-closed-fetch-elsewhere");
+        let elsewhere_str = elsewhere.to_string_lossy().to_string();
+        git(&elsewhere_str, &["clone", "-q", o, "."]).unwrap();
+        git(&elsewhere_str, &["config", "user.email", "t@t"]).unwrap();
+        git(&elsewhere_str, &["config", "user.name", "t"]).unwrap();
+        git(&elsewhere_str, &["checkout", "-q", "main"]).unwrap();
+        git(&elsewhere_str, &["merge", "--no-ff", "-m", "Merge pull request: changelog catch up", "origin/sparkle/agent-cc1"]).unwrap();
+        git(&elsewhere_str, &["push", "-q", "origin", "main"]).unwrap();
+
+        // PRECONDITION: this repo hasn't fetched since the merge, so its view of origin/main is stale
+        // — exactly the state a closed, unwatched pane sits in indefinitely pre-fix.
+        assert!(
+            !ref_contains(&root_str, "origin/main", &tip),
+            "PRECONDITION: this repo's origin/main ref must still be stale"
+        );
+
+        // A CLOSED-pane poll: probe_pr_state=false, exactly what the closed sweep passes every tick.
+        let ws = agent_workflow_state_at(&root_str, "cc1", "", false).unwrap();
+        assert!(
+            ws.in_origin_main,
+            "a closed-pane poll must still fetch origin and see the merge — pre-fix this reads \
+             false forever, which is the sparkle-uj037 bug: a genuinely-merged agent stuck under \
+             'Local: Committed' because nothing ever looked"
+        );
+        assert!(ws.landed, "and therefore report landed too");
+
+        let _ = std::fs::remove_dir_all(&root_str);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     /// The full expected `WorkflowState` shape at one step of the e2e walk. Mirrors the TS fixture
