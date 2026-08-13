@@ -1514,8 +1514,22 @@ fn live_usage_passes() -> &'static std::sync::Mutex<HashSet<u64>> {
 // feeds both the 7d cutoff filter and the parse memo. Nothing about which files are found, or in
 // what order they are parsed, changes — this is a syscall cut, not a policy change.
 //
-// Measured steady state on the same tree: 20,515 dir stats + 17,470 file stats ≈ 0.36-0.60 s, a
-// 5-7x cut, and only the handful of directories that actually changed are re-listed.
+// Measured on the same tree, running the real before/after code INTERLEAVED (so load drift hits
+// both arms equally) while the fleet was live, six pairs, identical 4,251-file results every pair:
+//
+//     read_dir calls per pass   20,515  ->  0        (deterministic — this is the profiled frame)
+//     wall clock, median         6,861 ms -> 1,593 ms   (4.3x; 3.3x at the min)
+//
+// Trust those two lines in that order. The read_dir count is a property of the algorithm; the wall
+// clock is not — one BEFORE pass ranged 2.8 s to 25.4 s on one tree inside a minute, and one AFTER
+// pass came in slower than its own BEFORE on pure load noise. A 25 s walk on a blocking worker
+// against a 5 s poll is the UI hang this started from.
+//
+// What remains is the ~17,470 `std::fs::metadata` calls, one per `.jsonl`, and they are NOT an
+// oversight this cache forgot to cover: an append leaves the parent's mtime untouched, so a
+// transcript must be stat'd every pass however settled its directory is — the same fact that makes
+// caching the LISTING sound. Cutting those needs a bulk stat (`getattrlistbulk`, a libc dependency
+// and a macOS-only path) or a change to what "in-window" means. Bigger and riskier than this.
 
 /// How settled a directory's mtime must be before its listing may be cached.
 ///

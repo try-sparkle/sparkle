@@ -2604,6 +2604,36 @@ export function AgentSidebar({
         display: "flex",
         flexDirection: "column",
         height: "100%",
+        // ── A LAYOUT ROOT — THE OTHER HALF OF THE CARET FIX ──────────────────────────────────
+        // `content-visibility: auto` on the rows (AgentRow.tsx, commit c0a76998c) already stops the
+        // OFF-SCREEN ones laying out. This is the complementary boundary: it stops the on-screen
+        // ones' churn escaping the column.
+        //
+        // The column is unvirtualized, so a fleet of ~65 agents is ~65 live rows whose elapsed
+        // timers re-render continuously. Without containment each of those marks its containing
+        // blocks all the way up to the `RenderView`, which means the concierge caret's next
+        // `Document::updateLayout()` — WebKit flushes a full synchronous layout on EVERY caret
+        // animation frame, via `recomputeCaretRect` → `canonicalPosition` — re-lays-out this whole
+        // column too. That chain measured 15.1% of the renderer's main thread in v0.103.0, 12.9% of
+        // it inside `RenderView::layout()`. See ConciergeColumn's matching note for the full
+        // profile and PRD/sparkle/renderer-input-lag.md for the capture.
+        //
+        // BEHAVIOURALLY INERT, AND THE TWO SCARY ONES ARE BOTH ALREADY TRUE HERE. Layout
+        // containment gives an independent formatting context (already: `display: flex`), a
+        // stacking context (already: `position: relative` + `zIndex: BUILD_COLUMN_Z` above — so
+        // this does NOT change paint order, and in particular does NOT re-trap the active row's
+        // bleed over the terminal pane, which depends on that z-index and on nothing here), a
+        // containing block for absolutely positioned descendants (already: `position: relative`),
+        // and a containing block for FIXED ones — the only actual change. The single fixed element
+        // in this subtree is the agent hover card, and it is `createPortal`'d to `document.body`,
+        // so it is not a DOM descendant and containment cannot reach it (AgentRow.tsx says the same
+        // about `content-visibility`). Asserted, not assumed — see AgentRow.containment.test.tsx.
+        //
+        // `layout` ONLY. Paint containment would clip to the border box and square off the active
+        // row's fillets and its bleed through the seam — the exact regression the `filletEnds` gate
+        // in AgentRow.tsx exists to prevent. Do not "strengthen" this to `paint`, `content`, or
+        // `strict`.
+        contain: "layout",
         // OVERLAY MODE: the same element, lifted out of flow and laid over the terminal. Absolute
         // against the ②+③ wrapper, whose content box starts exactly where this column starts — so
         // anchoring it at the column's OWN edge reproduces the docked position with no measurement,

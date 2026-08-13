@@ -261,6 +261,50 @@ export function ConciergeColumn({
         minHeight: 0,
         display: "flex",
         flexDirection: "column",
+        // ── A LAYOUT ROOT, SO THE BLINKING CARET STOPS RE-LAYING-OUT THE WHOLE APP ────────────
+        // This column owns the compose box, which owns the caret, and a caret is not a passive
+        // thing: WebKit's `OpacityCaretAnimator` recomputes the caret RECT on every animation
+        // frame, and `recomputeCaretRect` → `VisiblePosition::canonicalPosition` calls
+        // `Document::updateLayout()` — a SYNCHRONOUS, DOCUMENT-WIDE layout flush. A `sample` of the
+        // v0.103.0 renderer during the founder's 3-10s input lag put 15.1% of the main thread in
+        // exactly that chain (7694 samples; see PRD/sparkle/renderer-input-lag.md), 12.9% of it
+        // inside `RenderView::layout()` running ~50 nested levels of `RenderBlock::simplifiedLayout`
+        // / `RenderFlexibleBox::layoutBlock` and bottoming out in `TextUtil::width()` measuring
+        // glyphs one at a time.
+        //
+        // THE CARET IS THE VICTIM, NOT THE CAUSE. `updateLayout()` is cheap when layout is clean;
+        // it cost 12.9% because something else in the shell dirties layout every frame (65 live
+        // agent rows with ticking timers, panes streaming PTY output). Without containment a dirty
+        // box marks its containing blocks all the way up to the `RenderView`, so ANY dirt anywhere
+        // makes the caret's next flush re-lay-out EVERY column. `contain: layout` makes this
+        // section its own layout root: dirt inside it stops here, and dirt outside it cannot reach
+        // in. The agent sidebar column carries the same declaration for the same reason.
+        //
+        // WHY THIS IS BEHAVIOURALLY INERT HERE, which is the whole reason it is safe to apply to a
+        // column this heavily commented. Layout containment does exactly four things, and this
+        // element already had three of them:
+        //   • independent formatting context — already, via `display: flex`;
+        //   • stacking context — already, via `position: relative` + `zIndex` below;
+        //   • containing block for ABSOLUTELY positioned descendants — already, via `position:
+        //     relative`;
+        //   • containing block for FIXED positioned descendants — the one real change.
+        // So the only way this can regress anything is a `position: fixed` descendant, which would
+        // be re-anchored to this ~360px column instead of the viewport. There is none: the palette
+        // is mounted by `Workspace`, NOT inside this section, and `QuoteChiclet` /
+        // `ConciergeSuggestions` are `createPortal`'d out of the tree. That is an invariant a later
+        // change could break silently, so it is asserted rather than trusted — see
+        // ConciergeColumn.containment.test.tsx.
+        //
+        // NOT `contain: strict` or `contain: paint`. Paint containment CLIPS descendants to the
+        // border box, and this column paints a `boxShadow` outside its own box (the lift, below) —
+        // the same trap the agent rows' `content-visibility` gate documents at AgentRow.tsx, where
+        // paint containment would have squared off the fillets. Size containment would collapse the
+        // column to zero. Layout is the one that buys the layout root and nothing else.
+        //
+        // NOT ON THE TERMINAL PANES, deliberately: panes render `position: fixed` surfaces that
+        // exist to cover THIS column, and containing them would cap those to the pane. See the
+        // `isolation: isolate` note in layers.ts and the `terminal-stage` note in Workspace.
+        contain: "layout",
         // ── LIFT AT REST, FLOOD WHEN WIRED ───────────────────────────────────────────────────
         // UNWIRED it LIFTS: a soft shadow and NO colour change, so it reads as a layer above the
         // pairs. WIRED it DROPS FLUSH — loses the shadow and takes the TERMINAL's colour, which is
