@@ -43,6 +43,29 @@ pub fn register_pending(pending: &PendingMap, req_id: &str, build_agent_id: &str
     rx
 }
 
+/// `register_pending`, but REFUSING once the map already holds `cap` entries — returns `Err(depth)`
+/// with the observed depth so the caller can name it in the refusal (bead `sparkle-4rgb1`).
+///
+/// The check and the insert share ONE lock acquisition on purpose: a check-then-register pair would
+/// let N threads all read 31 and all insert, which is precisely the unbounded pile-up this exists to
+/// stop. Nothing is registered on the refusal path, so a refused caller leaves no entry behind to
+/// time out later.
+fn try_register_pending_capped(
+    pending: &PendingMap,
+    req_id: &str,
+    owner_id: &str,
+    cap: usize,
+) -> Result<mpsc::Receiver<Value>, usize> {
+    let mut map = pending.lock().unwrap_or_else(|e| e.into_inner());
+    let depth = map.len();
+    if depth >= cap {
+        return Err(depth);
+    }
+    let (tx, rx) = mpsc::channel();
+    map.insert(req_id.to_string(), PendingEntry { tx, build_agent_id: owner_id.to_string() });
+    Ok(rx)
+}
+
 /// Deliver `value` to the op awaiting `req_id` (if any), removing the entry. No-op if absent or
 /// the receiver was already dropped (e.g. the op timed out).
 pub fn resolve_pending(pending: &PendingMap, req_id: &str, value: Value) {
@@ -751,8 +774,11 @@ fn handle_request_line_ctx(
 // ALL control ops (the Phase-1 self-report/config set + the Phase-3 breadth ops: pin/unpin/model/
 // ordering/zoom/navigate) are frontend round-trips: the bridge emits a `control:request` event,
 // blocks on the shared pending rendezvous, and returns whatever `control_respond` resolves. This
-// reuses the exact register_pending/wait_pending/resolve_pending primitives + ROUNDTRIP_TIMEOUT as
-// the orchestrator — so a new op is just a name added to CONTROL_OPS + a frontend dispatch case.
+// reuses the exact register_pending/wait_pending/resolve_pending primitives as the orchestrator —
+// so a new op is just a name added to CONTROL_OPS + a frontend dispatch case. It does NOT reuse
+// ROUNDTRIP_TIMEOUT verbatim any more: a control caller states its own remaining budget as
+// `deadlineMs` and the bridge waits `clamp(deadlineMs, CONTROL_MIN_WAIT, ROUNDTRIP_TIMEOUT)`, with
+// a `CONTROL_MAX_INFLIGHT` cap on how many may await the frontend at once (bead `sparkle-4rgb1`).
 //
 // THERE IS A SECOND CONTROL SOCKET (bead `sparkle-9a8j`): the concierge brain's. It is not an agent
 // tab — it is a headless `claude -p` child — so it has no SPARKLE_AGENT_ID to stamp and would fail
@@ -810,7 +836,34 @@ const CONTROL_OPS: &[&str] = &[
 ];
 
 /// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
-const CONTROL_RESERVED_FIELDS: &[&str] = &["id", "token", "op", "callerAgentId"];
+/// `deadlineMs` is envelope, not data: it is how long the CALLER will still be listening, which is
+/// the bridge's business and no frontend handler's — see `control_effective_wait`.
+const CONTROL_RESERVED_FIELDS: &[&str] = &["id", "token", "op", "callerAgentId", "deadlineMs"];
+
+/// Floor on a caller-stated `deadlineMs` (bead `sparkle-4rgb1`). A garbage or absurdly small value
+/// must not be able to make every control op fail instantly — 1s is below any real client budget
+/// (the smallest today is 10s per attempt) and above the scheduling noise of a busy frontend.
+const CONTROL_MIN_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// How many control round-trips may be awaiting the frontend at once before new ones are REFUSED
+/// (bead `sparkle-4rgb1`).
+///
+/// WHY THIS EXISTS. `serve_control_conn` is spawned one-thread-per-connection with no cap, and the
+/// control `PendingMap` had no depth limit, so a slow frontend turned into a congestion collapse:
+/// callers pile on, the retryable ops in `apps/mcp-control`'s `TIMEOUT_RETRYABLE_OPS` re-send up to
+/// 3× — each retry emitting a FRESH frontend event, adding load at exactly the moment the frontend
+/// is starved — and no caller can tell "the bridge is saturated" from "my op is slow". A macOS
+/// `sample` of a real 3-minute hang caught 5 bridge threads blocked in `wait_pending` at once.
+///
+/// 32 is comfortably above any legitimate burst (steady state is 0–2; that observed backlog was
+/// 5–6) and decisively below a storm, so crossing it is evidence of the collapse loop rather than
+/// of load. Refusing is strictly better than queuing here: the refusal is instant and names the
+/// depth, so the caller (and a human reading its log) learns the bridge is saturated instead of
+/// waiting out a timeout for an answer the frontend was never going to get to.
+///
+/// The counter is shared by BOTH control sockets (Shared + Concierge) because they contend on ONE
+/// resource — the single frontend — so one shared depth is the honest measure of that queue.
+const CONTROL_MAX_INFLIGHT: usize = 32;
 
 /// The RESERVED caller id for the concierge brain (bead `sparkle-9a8j`, design A7.3).
 ///
@@ -1080,10 +1133,60 @@ fn resolve_control_caller(req: &Value, caller: ControlCaller) -> Result<String, 
     }
 }
 
+/// One control request line, fully decoded: everything the round-trip needs and nothing that
+/// touches a socket or an app. Split out from `handle_control_request_line` so the wiring — which
+/// fields are envelope, which become payload, and where `deadlineMs` is read — is assertable
+/// directly, rather than only through a round-trip that needs a live frontend to observe.
+struct ControlRequest {
+    id: Value,
+    op: String,
+    caller_agent_id: String,
+    payload: Value,
+    deadline_ms: Option<i64>,
+}
+
+/// Validate the token, check the op against the allowlist, resolve `callerAgentId` from the SOCKET
+/// (see `resolve_control_caller`), split envelope from payload. Pure: `Err` is the ready-to-write
+/// response line for a rejected request, so no rejection path can accidentally register or emit.
+fn decode_control_request(
+    line: &str,
+    token: &str,
+    caller: ControlCaller,
+) -> Result<ControlRequest, String> {
+    let req: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => return Err(json!({ "id": Value::Null, "ok": false, "error": format!("bad json: {e}") }).to_string()),
+    };
+    let id = req.get("id").cloned().unwrap_or(Value::Null);
+    if req.get("token").and_then(|t| t.as_str()) != Some(token) {
+        return Err(json!({ "id": id, "ok": false, "error": "unauthorized" }).to_string());
+    }
+    let op = match req.get("op").and_then(|o| o.as_str()) {
+        Some(o) => o.to_string(),
+        None => return Err(json!({ "id": id, "ok": false, "error": "missing op" }).to_string()),
+    };
+    if !CONTROL_OPS.contains(&op.as_str()) {
+        return Err(json!({ "id": id, "ok": false, "error": "unknown op" }).to_string());
+    }
+    // Authoritative identity comes from the SOCKET (plus, on the shared socket only, the TOP-LEVEL
+    // callerAgentId) — never from anything nested in payload, which build_control_payload strips.
+    let caller_agent_id = match resolve_control_caller(&req, caller) {
+        Ok(c) => c,
+        Err(e) => return Err(json!({ "id": id, "ok": false, "error": e }).to_string()),
+    };
+    Ok(ControlRequest {
+        id,
+        op,
+        caller_agent_id,
+        payload: build_control_payload(&req),
+        // The caller's own remaining budget for this attempt — envelope, stripped from `payload`.
+        deadline_ms: control_deadline_ms(&req),
+    })
+}
+
 /// Pure request handler for the control bridge: one request JSON line → one response JSON line.
-/// Validates the token, checks the op against the allowlist, resolves `callerAgentId` from the
-/// SOCKET (see `resolve_control_caller`) plus the `payload`, then round-trips through the frontend.
-/// No socket IO, so it is directly unit-testable.
+/// Decodes (above), then round-trips through the frontend. No socket IO, so it is directly
+/// unit-testable.
 fn handle_control_request_line(
     line: &str,
     token: &str,
@@ -1091,39 +1194,140 @@ fn handle_control_request_line(
     app: &Option<AppHandle>,
     pending: &PendingMap,
 ) -> String {
-    let req: Value = match serde_json::from_str(line) {
-        Ok(v) => v,
-        Err(e) => return json!({ "id": Value::Null, "ok": false, "error": format!("bad json: {e}") }).to_string(),
-    };
-    let id = req.get("id").cloned().unwrap_or(Value::Null);
-    if req.get("token").and_then(|t| t.as_str()) != Some(token) {
-        return json!({ "id": id, "ok": false, "error": "unauthorized" }).to_string();
+    match decode_control_request(line, token, caller) {
+        Err(resp) => resp,
+        Ok(r) => handle_control_op(r.id, &r.op, &r.caller_agent_id, r.payload, r.deadline_ms, app, pending),
     }
-    let op = match req.get("op").and_then(|o| o.as_str()) {
-        Some(o) => o,
-        None => return json!({ "id": id, "ok": false, "error": "missing op" }).to_string(),
-    };
-    if !CONTROL_OPS.contains(&op) {
-        return json!({ "id": id, "ok": false, "error": "unknown op" }).to_string();
+}
+
+/// The caller's remaining budget for THIS attempt, in ms, if it stated a usable one.
+///
+/// Only a top-level JSON INTEGER > 0 counts. A float, a string, or a non-positive number is treated
+/// exactly like an absent field — see `control_effective_wait` for what that falls back to.
+fn control_deadline_ms(req: &Value) -> Option<i64> {
+    req.get("deadlineMs").and_then(|v| v.as_i64()).filter(|ms| *ms > 0)
+}
+
+/// How long a control round-trip actually waits: `clamp(deadlineMs, CONTROL_MIN_WAIT, ROUNDTRIP_TIMEOUT)`.
+///
+/// THE DEFECT THIS FIXES (bead `sparkle-4rgb1`). `ROUNDTRIP_TIMEOUT` is 600s, but the control client
+/// (`apps/mcp-control/src/bridgeClient.ts`) gives up at `DEFAULT_TIMEOUT_MS` = 30s — or 10s per
+/// attempt for the four `TIMEOUT_RETRYABLE_OPS`. So the caller abandoned the call at 10–30s while
+/// this connection thread stayed blocked in `wait_pending` for up to ten minutes: a 20×–60×
+/// mismatch, each abandoned call pinning one OS thread plus one `PendingMap` entry, and the
+/// frontend still eventually doing the work for a reply nobody would ever read. Honouring the
+/// caller's own stated budget releases the thread when the caller stops listening, not 590s later.
+/// (The ORCHESTRATION bridge has no such defect — its client waits 660s > the server's 600s, the
+/// correct ordering — which is why this is a control-only change.)
+///
+/// An old client that sends nothing keeps EXACTLY today's behaviour: absent → the full 600s.
+/// Pure, so the clamp is unit-testable without a socket, a clock, or a frontend.
+fn control_effective_wait(deadline_ms: Option<i64>) -> std::time::Duration {
+    match deadline_ms {
+        Some(ms) if ms > 0 => {
+            let lo = CONTROL_MIN_WAIT.as_millis() as u64;
+            let hi = ROUNDTRIP_TIMEOUT.as_millis() as u64;
+            std::time::Duration::from_millis((ms as u64).clamp(lo, hi))
+        }
+        _ => ROUNDTRIP_TIMEOUT,
     }
-    // Authoritative identity comes from the SOCKET (plus, on the shared socket only, the TOP-LEVEL
-    // callerAgentId) — never from anything nested in payload, which build_control_payload strips.
-    let caller_agent_id = match resolve_control_caller(&req, caller) {
-        Ok(c) => c,
-        Err(e) => return json!({ "id": id, "ok": false, "error": e }).to_string(),
+}
+
+/// The `control:request` event envelope. `deadlineAtMs` is absolute unix-epoch ms at which this
+/// request expires (= now + the effective wait) and is ALWAYS present — including the legacy 600s
+/// fallback — so the frontend never has to distinguish "no deadline" from "a deadline I can't see",
+/// and can skip work for a caller that has already given up. Pure so the envelope is assertable
+/// without a live app.
+fn control_request_event(
+    req_id: &str,
+    op: &str,
+    caller_agent_id: &str,
+    payload: Value,
+    deadline_at_ms: u64,
+) -> Value {
+    json!({
+        "reqId": req_id,
+        "op": op,
+        "callerAgentId": caller_agent_id,
+        "payload": payload,
+        "deadlineAtMs": deadline_at_ms,
+    })
+}
+
+/// Wall-clock unix-epoch milliseconds. Saturating on a pre-epoch clock rather than panicking — a
+/// nonsense clock must not take the bridge down.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// The control round-trip itself: cap the queue, register the reqId BEFORE emitting (so a fast
+/// frontend reply can't race ahead of registration), emit, then block for the caller's own budget.
+///
+/// `emit` is the app boundary, taken as a closure so the whole body — the cap, the envelope, the
+/// bounded wait — is exercisable in tests without a Tauri runtime. Production passes the one
+/// closure that calls `AppHandle::emit`; there is no default, so no test can silently bypass a
+/// production-only call site.
+fn control_round_trip<E>(
+    id: Value,
+    op: &str,
+    caller_agent_id: &str,
+    payload: Value,
+    deadline_ms: Option<i64>,
+    pending: &PendingMap,
+    emit: E,
+) -> String
+where
+    E: FnOnce(Value) -> Result<(), String>,
+{
+    let req_id = match generate_token() {
+        Ok(t) => t,
+        Err(e) => return json!({ "id": id, "ok": false, "error": format!("reqId gen: {e}") }).to_string(),
     };
-    let payload = build_control_payload(&req);
-    handle_control_op(id, op, &caller_agent_id, payload, app, pending)
+    let wait = control_effective_wait(deadline_ms);
+    // Owner = the calling agent, so a control-bridge teardown can release this agent's blocked ops
+    // (mirrors the orchestrator's per-owner resolve; main added the owner-id param to register_pending).
+    // Refuse rather than pile on once the frontend is already this far behind — nothing is
+    // registered and nothing is emitted on this path, so a saturated bridge stops ADDING load.
+    let rx = match try_register_pending_capped(pending, &req_id, caller_agent_id, CONTROL_MAX_INFLIGHT) {
+        Ok(rx) => rx,
+        Err(depth) => {
+            return json!({
+                "id": id,
+                "ok": false,
+                "error": format!("control bridge saturated: {depth} requests already awaiting the frontend"),
+            })
+            .to_string();
+        }
+    };
+    let event = control_request_event(
+        &req_id,
+        op,
+        caller_agent_id,
+        payload,
+        now_unix_ms().saturating_add(wait.as_millis() as u64),
+    );
+    if let Err(e) = emit(event) {
+        resolve_pending(pending, &req_id, Value::Null); // clean up the entry we just registered
+        return json!({ "id": id, "ok": false, "error": e }).to_string();
+    }
+    match wait_pending(rx, pending, &req_id, wait) {
+        Some(val) => json!({ "id": id, "ok": true, "result": val }).to_string(),
+        None => json!({ "id": id, "ok": false, "error": "frontend round-trip timeout" }).to_string(),
+    }
 }
 
 /// Emit the `control:request` event and block on the rendezvous until `control_respond` resolves it
-/// (or ROUNDTRIP_TIMEOUT fires). Register the reqId BEFORE emitting so a fast frontend reply can't
-/// race ahead of registration.
+/// (or the caller's own `deadlineMs`-derived wait fires). Thin wrapper: it resolves the app handle,
+/// then hands the real work to `control_round_trip` with the Tauri emit closure.
 fn handle_control_op(
     id: Value,
     op: &str,
     caller_agent_id: &str,
     payload: Value,
+    deadline_ms: Option<i64>,
     app: &Option<AppHandle>,
     pending: &PendingMap,
 ) -> String {
@@ -1131,27 +1335,9 @@ fn handle_control_op(
         Some(a) => a,
         None => return json!({ "id": id, "ok": false, "error": "no app handle" }).to_string(),
     };
-    let req_id = match generate_token() {
-        Ok(t) => t,
-        Err(e) => return json!({ "id": id, "ok": false, "error": format!("reqId gen: {e}") }).to_string(),
-    };
-    // Owner = the calling agent, so a control-bridge teardown can release this agent's blocked ops
-    // (mirrors the orchestrator's per-owner resolve; main added the owner-id param to register_pending).
-    let rx = register_pending(pending, &req_id, caller_agent_id);
-    let event = json!({
-        "reqId": req_id,
-        "op": op,
-        "callerAgentId": caller_agent_id,
-        "payload": payload,
-    });
-    if let Err(e) = app.emit("control:request", event) {
-        resolve_pending(pending, &req_id, Value::Null); // clean up the entry we just registered
-        return json!({ "id": id, "ok": false, "error": format!("emit failed: {e}") }).to_string();
-    }
-    match wait_pending(rx, pending, &req_id, ROUNDTRIP_TIMEOUT) {
-        Some(val) => json!({ "id": id, "ok": true, "result": val }).to_string(),
-        None => json!({ "id": id, "ok": false, "error": "frontend round-trip timeout" }).to_string(),
-    }
+    control_round_trip(id, op, caller_agent_id, payload, deadline_ms, pending, |event| {
+        app.emit("control:request", event).map_err(|e| format!("emit failed: {e}"))
+    })
 }
 
 /// Start (or return the cached) singleton app-level control bridge (Tauri command). Idempotent:
@@ -2222,5 +2408,397 @@ mod tests {
             ts.contains(&literal),
             "controlListener.ts must define CONCIERGE_CALLER_AGENT_ID = {literal}",
         );
+    }
+
+    // ========================================================================================
+    // bead `sparkle-4rgb1` — the control bridge must not turn a slow frontend into an unbounded,
+    // long-lived backlog of blocked connection threads.
+    //
+    // WHAT THESE TESTS DRIVE, AND WHY IT IS NOT `handle_control_op`. Every control round-trip needs
+    // an `AppHandle` to emit, and there is no Tauri runtime in a cargo unit test — `handle_control_op`
+    // therefore returns "no app handle" before it can reach a single line of the behaviour under
+    // test (the existing `control_op_without_app_handle_errors` pins exactly that). So the emit is a
+    // closure parameter of `control_round_trip`, and these drive that: the SAME body production
+    // runs, with the one line that talks to Tauri swapped for a recorder. `handle_control_op` is a
+    // three-line wrapper over it with no branching of its own.
+    // ========================================================================================
+
+    /// An emit closure that records the event and never answers — a frontend that has stopped
+    /// responding, which is the condition the whole change exists for.
+    fn recording_emit(sink: Arc<Mutex<Vec<Value>>>) -> impl FnOnce(Value) -> Result<(), String> {
+        move |event: Value| {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(event);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn control_effective_wait_clamps_the_callers_budget() {
+        use std::time::Duration;
+        // ABSENT → today's behaviour exactly. An old client that sends no deadline must be
+        // indistinguishable from before this change, or upgrading the app breaks every stale MCP.
+        assert_eq!(control_effective_wait(None), ROUNDTRIP_TIMEOUT);
+        // Non-positive / garbage is treated as absent, never as "expire immediately".
+        assert_eq!(control_effective_wait(Some(0)), ROUNDTRIP_TIMEOUT);
+        assert_eq!(control_effective_wait(Some(-5)), ROUNDTRIP_TIMEOUT);
+        // FLOOR: a tiny value clamps UP, so a garbage deadline cannot fail every op instantly.
+        assert_eq!(control_effective_wait(Some(1)), CONTROL_MIN_WAIT);
+        assert_eq!(control_effective_wait(Some(200)), CONTROL_MIN_WAIT);
+        // CEILING: a caller cannot ask the bridge to hold a thread longer than it ever would.
+        assert_eq!(control_effective_wait(Some(10_000_000)), ROUNDTRIP_TIMEOUT);
+        // In range → honoured verbatim. This is the case that fixes the 20×–60× mismatch: the
+        // client's own 10s-per-attempt budget becomes the server's wait.
+        assert_eq!(control_effective_wait(Some(10_000)), Duration::from_millis(10_000));
+        assert_eq!(control_effective_wait(Some(30_000)), Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn control_deadline_ms_is_read_from_the_envelope_and_stripped_from_the_payload() {
+        // Drives the PRODUCTION decode (`decode_control_request` is what handle_control_request_line
+        // calls), so this fails if the deadline wiring is dropped from the request path — not just
+        // if the pure helpers are broken.
+        let r = decode_control_request(
+            r#"{"id":"1","token":"T","op":"rename_agent","callerAgentId":"a1","deadlineMs":10000,"name":"Neo"}"#,
+            "T",
+            ControlCaller::Shared,
+        )
+        .expect("valid request must decode");
+        assert_eq!(r.deadline_ms, Some(10_000), "the envelope deadline must reach the round-trip");
+        assert!(
+            r.payload.get("deadlineMs").is_none(),
+            "deadlineMs is envelope, not payload — it must never reach a frontend handler: {}",
+            r.payload
+        );
+        assert_eq!(r.payload["name"], "Neo", "real op data still passes through");
+
+        // Absent stays absent (the legacy client), and a non-integer is treated as absent rather
+        // than as a deadline of zero.
+        let none = decode_control_request(
+            r#"{"id":"2","token":"T","op":"rename_agent","callerAgentId":"a1","name":"Neo"}"#,
+            "T",
+            ControlCaller::Shared,
+        )
+        .unwrap();
+        assert_eq!(none.deadline_ms, None);
+        for bad in [r#""10000""#, "12.5", "null", "0", "-1"] {
+            let line = format!(
+                r#"{{"id":"3","token":"T","op":"rename_agent","callerAgentId":"a1","deadlineMs":{bad}}}"#
+            );
+            let r = decode_control_request(&line, "T", ControlCaller::Shared).unwrap();
+            assert_eq!(r.deadline_ms, None, "deadlineMs={bad} must fall back, not expire instantly");
+            assert!(r.payload.get("deadlineMs").is_none(), "deadlineMs={bad} must still be stripped");
+        }
+    }
+
+    #[test]
+    fn control_round_trip_gives_up_at_the_callers_deadline_not_at_600s() {
+        use std::time::Instant;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        // 200ms is below CONTROL_MIN_WAIT, so the floor makes the real wait ~1s. That IS the
+        // contract (a garbage deadline must not fail every op instantly), so the assertion is
+        // two-sided: at least the floor, and nowhere near the 600s this used to block for.
+        let resp = control_round_trip(
+            json!("1"),
+            "set_theme",
+            "a1",
+            json!({ "theme": "dark" }),
+            Some(200),
+            &pending,
+            recording_emit(seen.clone()),
+        );
+        let elapsed = started.elapsed();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["error"], "frontend round-trip timeout");
+        assert!(
+            elapsed >= CONTROL_MIN_WAIT,
+            "a sub-floor deadline must still be clamped up to {CONTROL_MIN_WAIT:?}, waited {elapsed:?}",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "must release at the caller's clamped budget, not ROUNDTRIP_TIMEOUT — waited {elapsed:?}",
+        );
+        // The event WAS emitted (this is a timeout, not a refusal) and the stale entry is gone, so
+        // an abandoned call leaves nothing pinned behind it.
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(pending.lock().unwrap().is_empty(), "a timed-out request must not leak a pending entry");
+    }
+
+    #[test]
+    fn control_saturation_refuses_instantly_without_registering_or_emitting() {
+        use std::time::Instant;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        // Fill the queue to exactly the cap with requests nobody will ever answer.
+        let mut held = Vec::new();
+        for i in 0..CONTROL_MAX_INFLIGHT {
+            held.push(register_pending(&pending, &format!("held-{i}"), "someone"));
+        }
+        assert_eq!(pending.lock().unwrap().len(), CONTROL_MAX_INFLIGHT);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let started = Instant::now();
+        let resp = control_round_trip(
+            json!("over"),
+            "set_theme",
+            "a1",
+            json!({ "theme": "dark" }),
+            Some(30_000),
+            &pending,
+            recording_emit(seen.clone()),
+        );
+        let elapsed = started.elapsed();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(
+            v["error"],
+            format!("control bridge saturated: {CONTROL_MAX_INFLIGHT} requests already awaiting the frontend"),
+            "the refusal must NAME the depth, so a caller can tell saturation from a slow op",
+        );
+        // The three side effects that matter, and the reason a plain "it returned an error"
+        // assertion would be vacuous: the refusal must ADD NOTHING to the collapse.
+        assert!(elapsed < std::time::Duration::from_millis(500), "refusal must be immediate, took {elapsed:?}");
+        assert_eq!(
+            pending.lock().unwrap().len(),
+            CONTROL_MAX_INFLIGHT,
+            "a refused request must not register a pending entry",
+        );
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "a refused request must not emit — re-emitting is what feeds the congestion-collapse loop",
+        );
+
+        // …and the cap is a gate, not a latch: draining one slot admits the next caller.
+        drop(held.pop());
+        resolve_pending(&pending, &format!("held-{}", CONTROL_MAX_INFLIGHT - 1), Value::Null);
+        assert_eq!(pending.lock().unwrap().len(), CONTROL_MAX_INFLIGHT - 1);
+        let seen2 = Arc::new(Mutex::new(Vec::new()));
+        let resp2 = control_round_trip(
+            json!("next"),
+            "set_theme",
+            "a1",
+            json!({}),
+            Some(1),
+            &pending,
+            recording_emit(seen2.clone()),
+        );
+        let v2: Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["error"], "frontend round-trip timeout", "a freed slot must admit the next caller: {v2}");
+        assert_eq!(seen2.lock().unwrap().len(), 1, "the admitted request DOES emit");
+    }
+
+    #[test]
+    fn control_flood_of_unanswered_requests_stays_bounded_and_releases_fast() {
+        // THE REPRO. A macOS `sample` of a real 3-minute hang caught 5 bridge threads blocked in
+        // wait_pending at once while the frontend answered nothing. Before this change every one of
+        // them would have held its OS thread and its PendingMap entry for the full 600s, and the
+        // client's retries would have kept adding more. Both halves are asserted here:
+        //   (a) every caller returns at its own stated budget, not at ROUNDTRIP_TIMEOUT, and
+        //   (b) the queue never grows past the cap — the excess is REFUSED, not queued.
+        use std::time::Instant;
+        const FLOOD: usize = CONTROL_MAX_INFLIGHT * 2; // 64 callers against a 32-deep queue
+        const DEADLINE_MS: i64 = 1_200;
+
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        // A depth watcher, so "the queue did not grow unbounded" is observed rather than inferred
+        // from the final state (which is empty either way once everything drains).
+        let max_depth = Arc::new(AtomicUsize::new(0));
+        let watching = Arc::new(AtomicBool::new(true));
+        let watcher = {
+            let (p, m, w) = (pending.clone(), max_depth.clone(), watching.clone());
+            std::thread::spawn(move || {
+                while w.load(Ordering::SeqCst) {
+                    let d = p.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    m.fetch_max(d, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+
+        let started = Instant::now();
+        let handles: Vec<_> = (0..FLOOD)
+            .map(|i| {
+                let p = pending.clone();
+                std::thread::spawn(move || {
+                    let t0 = Instant::now();
+                    // Nothing ever answers: the emit is a black hole, exactly like a starved frontend.
+                    let resp = control_round_trip(
+                        json!(i),
+                        "get_state",
+                        &format!("agent-{i}"),
+                        json!({}),
+                        Some(DEADLINE_MS),
+                        &p,
+                        |_event| Ok(()),
+                    );
+                    (t0.elapsed(), resp)
+                })
+            })
+            .collect();
+
+        let mut saturated = 0usize;
+        let mut timed_out = 0usize;
+        for h in handles {
+            let (elapsed, resp) = h.join().expect("no control thread may panic");
+            let v: Value = serde_json::from_str(&resp).unwrap();
+            assert_eq!(v["ok"], false, "nothing was ever answered, so nothing may report ok: {v}");
+            let err = v["error"].as_str().unwrap_or_default().to_string();
+            if err.starts_with("control bridge saturated") {
+                saturated += 1;
+                // A refusal is the fast path — it must not have waited on anything at all.
+                assert!(elapsed < std::time::Duration::from_millis(500), "refusal took {elapsed:?}: {err}");
+            } else {
+                assert_eq!(err, "frontend round-trip timeout", "unexpected error: {err}");
+                timed_out += 1;
+                // The headline property: released at the caller's budget, not at 600s.
+                assert!(
+                    elapsed < std::time::Duration::from_secs(5),
+                    "an admitted caller waited {elapsed:?} for a {DEADLINE_MS}ms budget",
+                );
+            }
+        }
+        watching.store(false, Ordering::SeqCst);
+        watcher.join().unwrap();
+
+        assert_eq!(saturated + timed_out, FLOOD);
+        assert!(
+            saturated > 0,
+            "with {FLOOD} concurrent callers against a {CONTROL_MAX_INFLIGHT}-deep queue the cap must have fired",
+        );
+        assert!(
+            max_depth.load(Ordering::SeqCst) <= CONTROL_MAX_INFLIGHT,
+            "queue reached depth {} — the cap is what stops the unbounded backlog",
+            max_depth.load(Ordering::SeqCst),
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "every entry must drain: an abandoned call leaves nothing pinned for 600s",
+        );
+        // The whole flood — 64 callers — costs about one budget, not 64 of them and not 600s.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the flood took {:?}; the point of the fix is that it collapses fast",
+            started.elapsed(),
+        );
+    }
+
+    #[test]
+    fn control_round_trip_without_a_deadline_still_resolves_normally() {
+        // NO REGRESSION for a client that sends nothing: it must still get its answer, and get it
+        // as soon as the frontend replies — the 600s fallback is a ceiling, never a delay.
+        use std::time::Instant;
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let started = Instant::now();
+        let p = pending.clone();
+        let resp = control_round_trip(
+            json!("1"),
+            "get_state",
+            "a1",
+            json!({}),
+            None, // legacy client: no deadlineMs on the wire
+            &pending,
+            move |event: Value| {
+                // Stand in for the frontend: read the reqId off the envelope and answer it.
+                let req_id = event["reqId"].as_str().expect("envelope must carry reqId").to_string();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    resolve_pending(&p, &req_id, json!({ "agents": [] }));
+                });
+                Ok(())
+            },
+        );
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["ok"], true, "an absent deadline must not break the happy path: {v}");
+        assert_eq!(v["result"], json!({ "agents": [] }));
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn control_event_envelope_always_carries_an_absolute_deadline() {
+        // `deadlineAtMs` is what lets the frontend skip work for a caller that has already given up,
+        // so it must be present on EVERY request — including the legacy 600s fallback, where the
+        // temptation is to omit it.
+        let before = now_unix_ms();
+        let ev = control_request_event("r1", "get_state", "a1", json!({ "x": 1 }), before + 10_000);
+        assert_eq!(ev["reqId"], "r1");
+        assert_eq!(ev["op"], "get_state");
+        assert_eq!(ev["callerAgentId"], "a1");
+        assert_eq!(ev["payload"], json!({ "x": 1 }));
+        assert_eq!(ev["deadlineAtMs"], json!(before + 10_000));
+
+        // Through the real round-trip, for both a stated deadline and none — the value must be an
+        // absolute epoch-ms instant consistent with the effective wait, not a duration.
+        for (deadline_ms, expect_wait) in
+            [(Some(10_000i64), std::time::Duration::from_millis(10_000)), (None, ROUNDTRIP_TIMEOUT)]
+        {
+            let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let p = pending.clone();
+            let sink = seen.clone();
+            let t0 = now_unix_ms();
+            let resp = control_round_trip(
+                json!("1"),
+                "get_state",
+                "a1",
+                json!({}),
+                deadline_ms,
+                &pending,
+                move |event: Value| {
+                    let req_id = event["reqId"].as_str().unwrap().to_string();
+                    sink.lock().unwrap().push(event);
+                    std::thread::spawn(move || resolve_pending(&p, &req_id, json!({})));
+                    Ok(())
+                },
+            );
+            assert_eq!(serde_json::from_str::<Value>(&resp).unwrap()["ok"], true);
+            let events = seen.lock().unwrap();
+            let at = events[0]["deadlineAtMs"].as_u64().unwrap_or_else(|| {
+                panic!("deadlineAtMs must be present as an integer on every event: {}", events[0])
+            });
+            let expected = t0 + expect_wait.as_millis() as u64;
+            assert!(
+                at >= expected && at <= expected + 2_000,
+                "deadlineAtMs {at} must be ~now+{:?} ({expected}) for deadlineMs={deadline_ms:?}",
+                expect_wait,
+            );
+        }
+    }
+
+    #[test]
+    fn control_cap_is_shared_across_both_sockets_but_not_with_the_orchestrator() {
+        // The two control sockets contend on ONE frontend, so one shared depth is the honest
+        // measure — a per-socket cap would let the concierge and the agents each build their own
+        // 32-deep backlog. The ORCHESTRATOR's map is separate and deliberately uncapped (its client
+        // waits 660s > the server's 600s, the correct ordering — it has no such defect).
+        let ctrl = ControlBridgeManager::default();
+        let orch = BridgeManager::default();
+        let mut held = Vec::new();
+        for i in 0..CONTROL_MAX_INFLIGHT {
+            held.push(register_pending(&ctrl.pending, &format!("h{i}"), "x"));
+        }
+        // The orchestrator map is untouched by control traffic…
+        assert!(orch.pending.lock().unwrap().is_empty());
+        // …and past the cap, the control map refuses regardless of which caller identity asks —
+        // i.e. the concierge cannot mint itself a fresh allowance.
+        for who in [CONCIERGE_CALLER_AGENT_ID, "some-agent-uuid"] {
+            let v: Value = serde_json::from_str(&control_round_trip(
+                json!("x"),
+                "get_state",
+                who,
+                json!({}),
+                Some(30_000),
+                &ctrl.pending,
+                |_e| panic!("a refused request must never emit"),
+            ))
+            .unwrap();
+            assert!(
+                v["error"].as_str().unwrap_or_default().starts_with("control bridge saturated"),
+                "caller {who} must share the one depth counter: {v}",
+            );
+        }
+        // An orchestration op is NOT gated by the control cap (different map entirely).
+        assert!(orch.pending.lock().unwrap().is_empty());
     }
 }

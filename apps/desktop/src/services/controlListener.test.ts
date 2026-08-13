@@ -141,8 +141,14 @@ import {
   startControlListener,
   isControlOpSuccess,
   CONCIERGE_CALLER_AGENT_ID,
+  controlExpiredSkipCounts,
+  _resetControlExpiredSkipsForTests,
   type ControlRequest,
 } from "./controlListener";
+// The human-facing side effect of the concierge's `ask` tier. Asserted by the expiry suite below
+// because "skipped BEFORE the policy gate" is only provable by the absence of the thing the gate
+// produces — a refusal reply alone looks identical whichever gate wrote it.
+import { clearConciergeApprovals, pendingApprovals } from "../stores/conciergeApprovals";
 import { useSelfReportMetrics } from "../stores/selfReportMetrics";
 // The thrash accumulator is module-level and window-local — fed here so a case can tell "no hook
 // events seen for this agent" apart from a real looping verdict.
@@ -4237,6 +4243,282 @@ describe("controlListener", () => {
         expect(lastReply()).toMatchObject({ ok: true });
         expect(received).toHaveLength(0);
       });
+    });
+  });
+
+  // ── expired requests: work dropped for callers who already gave up (bead sparkle-4rgb1) ────────
+  //
+  // The Rust bridge waits 600s for a reply; the control client gives up after 10-30s and re-sends
+  // the retryable ops up to 3×. So a starved frontend eventually performs the work for every
+  // abandoned call, at triple volume, exactly when it has the least capacity — see the block comment
+  // above `dispatch` for the `sample` that caught this.
+  //
+  // EVERY CASE HERE IS A PAIR, and that is not padding. A test that only proves an expired request
+  // did nothing is ambiguous: this file is full of gates that also produce "nothing happened"
+  // (tiers, target resolution, the concierge policy), so an assertion of absence could be passing
+  // for a reason that has nothing to do with expiry. The twin runs the IDENTICAL setup with a future
+  // deadline and proves that setup DOES reach the handler — which is what pins the cause.
+  //
+  // The clock is the real one. `deadlineAtMs` is built relative to `Date.now()` rather than injected,
+  // so the production call site is the code these tests actually run (AGENTS.md's defaulted-seam
+  // trap: a `deps = clock` parameter every test overrides leaves the real call site covered by
+  // nothing). The offsets are seconds wide, far outside any plausible scheduling jitter.
+  describe("expired requests are skipped, not run", () => {
+    const EXPIRED = () => Date.now() - 5_000;
+    const LIVE = () => Date.now() + 60_000;
+    const agentOf = (id: string) =>
+      useProjectStore.getState().projects[0]!.agents.find((a) => a.id === id)!;
+    const activityOf = (id: string) => agentOf(id).activity;
+    const goalOf = (id: string) => agentOf(id).goal;
+
+    beforeEach(() => {
+      _resetControlExpiredSkipsForTests();
+      // Module-level ledger, like the audit log and the thrash tracker above: without this an
+      // approval raised by one case would make the "no approval was raised" assertions below pass
+      // or fail on suite ordering.
+      clearConciergeApprovals();
+      // Same class of leak: the receipt subscriber set is module-level, so a case that threw before
+      // its unsubscribe would leave a listener pushing into a dead array for the rest of the file.
+      _resetConciergeReceiptsForTests();
+      // And the success tally, which is session-scoped and never zeroed by the outer beforeEach —
+      // earlier cases in this file leave a non-zero count, so "a skip is not a success" needs a
+      // known-zero baseline or it asserts nothing.
+      useSelfReportMetrics.getState().reset();
+    });
+
+    it("an EXPIRED request never reaches its handler — the store is untouched", async () => {
+      // THE SIDE EFFECT, not the reply. `set_agent_activity` is free-tier, synchronous, and writes
+      // one field, so "did the handler run" has an unambiguous answer in the store. Asserting only
+      // the reply shape would pass against the old code too, which returned a reply as well — just
+      // after doing all the work first.
+      // Unset on the RAW record is `undefined`; `get_state` is what normalises it to null on the
+      // wire. Asserting the store's own spelling keeps this a statement about the handler.
+      expect(activityOf(otherId)).toBeUndefined();
+      fire({
+        reqId: "x1",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "should never be written" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(activityOf(otherId)).toBeUndefined();
+      // …and it was not counted as a successful op either — a skip is not a success.
+      expect(useSelfReportMetrics.getState().controlOps.set_agent_activity).toBe(0);
+    });
+
+    it("…and the IDENTICAL request with a future deadline DOES mutate the store", async () => {
+      // The pair. Same op, same caller, same target, same payload — only the deadline differs. If
+      // this went the same way as the case above, the skip would be proving nothing about expiry.
+      fire({
+        reqId: "x2",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "should never be written" },
+        deadlineAtMs: LIVE(),
+      });
+      await flush();
+      expect(activityOf(otherId)).toBe("should never be written");
+      expect(lastReply()).toEqual({ ok: true });
+    });
+
+    it("replies EXACTLY once when it skips, with a machine-readable code", async () => {
+      // The invariant `dispatch` documents holds on the skip path too. Rust's pending entry is gone
+      // by now so the reply lands nowhere, but a silent early return is how "reply exactly once"
+      // rots into a hang the next time the timing changes.
+      fire({
+        reqId: "x3",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "nope" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(controlResponds.filter((r) => r.reqId === "x3")).toHaveLength(1);
+      expect(lastReply()).toMatchObject({ ok: false, code: "request_expired" });
+      expect(String(lastReply().error)).toContain("expired");
+    });
+
+    it("counts the skip so the drop rate is readable rather than inferred", async () => {
+      fire({
+        reqId: "x4a",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "nope" },
+        deadlineAtMs: EXPIRED(),
+      });
+      fire({
+        reqId: "x4b",
+        op: "rename_agent",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, name: "Nope" },
+        deadlineAtMs: EXPIRED(),
+      });
+      fire({
+        reqId: "x4c",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "nope" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(controlExpiredSkipCounts()).toEqual({ set_agent_activity: 2, rename_agent: 1 });
+    });
+
+    it("counts NOTHING when nothing was skipped (the counter's own pair)", async () => {
+      fire({
+        reqId: "x5",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "live" },
+        deadlineAtMs: LIVE(),
+      });
+      await flush();
+      expect(controlExpiredSkipCounts()).toEqual({});
+    });
+
+    it("an ABSENT deadline runs the op — an older Rust build emits no such key", async () => {
+      // Fail towards doing the work. Reading "no deadline" as "expired" would make this listener
+      // drop EVERY op against a bridge that predates the contract.
+      fire({
+        reqId: "x6",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "no deadline known" },
+      });
+      await flush();
+      expect(activityOf(otherId)).toBe("no deadline known");
+      expect(controlExpiredSkipCounts()).toEqual({});
+    });
+
+    it("a NULL deadline runs the op — serde emits the key with null for None", async () => {
+      // The shape the wire actually produces for a Rust `Option::None` (AGENTS.md's serde rule). A
+      // parser typed `deadlineAtMs?: number` would not describe this at all, and the absent-key
+      // fixture above would be testing a case production never sends.
+      fire({
+        reqId: "x7",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "null deadline" },
+        deadlineAtMs: null,
+      });
+      await flush();
+      expect(activityOf(otherId)).toBe("null deadline");
+      expect(controlExpiredSkipCounts()).toEqual({});
+    });
+
+    it("a NON-FINITE deadline runs the op rather than dropping it", async () => {
+      // `NaN > x` is false so NaN would fall through anyway, but `Infinity`/`-Infinity` would not:
+      // a negative infinity reads as "expired an infinite time ago" and would silently drop the op.
+      // Only a finite number is a deadline.
+      fire({
+        reqId: "x8",
+        op: "set_agent_activity",
+        callerAgentId: callerId,
+        payload: { targetAgentId: otherId, activity: "garbage deadline" },
+        deadlineAtMs: Number.NEGATIVE_INFINITY,
+      });
+      await flush();
+      expect(activityOf(otherId)).toBe("garbage deadline");
+      expect(controlExpiredSkipCounts()).toEqual({});
+    });
+
+    // ── the ORDERING claim: expiry is evaluated before the concierge policy gate ────────────────
+    //
+    // `appOpPolicy` is not a pure read — an `ask` verdict RAISES AN APPROVAL REQUEST in the human's
+    // concierge column. So evaluating it for an abandoned call puts a question on a human's screen
+    // about work that will never run, three times over under the retry storm this gate exists for.
+    // The pair is what makes this provable: both cases refuse, and the refusals are only
+    // distinguishable by whether the approval exists.
+    it("an EXPIRED concierge set_config raises NO approval request and writes nothing", async () => {
+      fire({
+        reqId: "x9",
+        op: "set_config",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { path: "workers.max_concurrent", value: 9 },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "request_expired" });
+      expect(setConfigCalls).toEqual([]);
+      // The gate never ran, so it never asked.
+      expect(pendingApprovals()).toHaveLength(0);
+      expect(controlExpiredSkipCounts()).toEqual({ set_config: 1 });
+    });
+
+    it("…and the IDENTICAL live request DOES reach the gate and ask", async () => {
+      // The pair, and the one that makes the case above mean something: same caller, same op, same
+      // payload. This refusal comes from the POLICY, and it leaves the human a question behind.
+      fire({
+        reqId: "x10",
+        op: "set_config",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { path: "workers.max_concurrent", value: 9 },
+        deadlineAtMs: LIVE(),
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(lastReply().code).toBeUndefined(); // a policy refusal, not an expiry one
+      expect(setConfigCalls).toEqual([]); // still no write — the gate is before the mutation
+      expect(pendingApprovals()).toHaveLength(1);
+    });
+
+    it("an EXPIRED privileged op from a worker is skipped before the TIER gate too", async () => {
+      // A worker may not run `set_theme` at all, so the refusal is over-determined. The `code` is
+      // what says WHICH gate answered — and it has to be expiry, or the ordering claim in
+      // `dispatch` is wrong and an expired request is still paying for a policy evaluation.
+      fire({
+        reqId: "x11",
+        op: "set_theme",
+        callerAgentId: otherId,
+        payload: { theme: "dark" },
+        deadlineAtMs: EXPIRED(),
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "request_expired" });
+      expect(useUiStore.getState().themePref).toBe("auto");
+    });
+
+    it("an expired CONCIERGE op settles no receipt", async () => {
+      // `set_agent_goal` is the one op that settles a receipt outside `handleConciergeTool`. An
+      // abandoned call must not put a durable "here is what I did" record in the human's thread for
+      // something that never happened.
+      const received: ConciergeActionReceipt[] = [];
+      const off = onConciergeActionReceipt((r) => received.push(r));
+      try {
+        fire({
+          reqId: "x12",
+          op: "set_agent_goal",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: { targetAgentId: callerId, goal: "PR #900 is merged into main" },
+          deadlineAtMs: EXPIRED(),
+        });
+        await flush();
+        expect(received).toHaveLength(0);
+        expect(goalOf(callerId)).toBeUndefined();
+      } finally {
+        off();
+      }
+    });
+
+    it("…and the IDENTICAL live request DOES settle one and set the goal", async () => {
+      const received: ConciergeActionReceipt[] = [];
+      const off = onConciergeActionReceipt((r) => received.push(r));
+      try {
+        fire({
+          reqId: "x13",
+          op: "set_agent_goal",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: { targetAgentId: callerId, goal: "PR #900 is merged into main" },
+          deadlineAtMs: LIVE(),
+        });
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true });
+        expect(received).toHaveLength(1);
+        expect(goalOf(callerId)?.text).toBe("PR #900 is merged into main");
+      } finally {
+        off();
+      }
     });
   });
 });

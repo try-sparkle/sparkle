@@ -293,6 +293,27 @@ export interface ControlRequest {
   /** The agent that made the call — stamped server-side from SPARKLE_AGENT_ID, not caller-supplied. */
   callerAgentId: string;
   payload: Record<string, unknown>;
+  /**
+   * Absolute unix-epoch milliseconds at which this request expires — the moment its CALLER stops
+   * waiting. Supplied by the control client, carried through `bridge.rs`, and honoured here by
+   * `dispatch` dropping the op unrun (see `expiredBy`).
+   *
+   * `number | null` AND optional, deliberately, which is not the same thing as `?: number`:
+   *
+   *  - `null` is what the WIRE actually produces. Rust serialises it from an `Option`-shaped value,
+   *    and serde's derive emits the key with a `null` value for `None` — it omits the key only under
+   *    `#[serde(skip_serializing_if)]`. TypeScript's `?: number` means `number | undefined`, which
+   *    does NOT include `null`, so a type written that way describes a shape the bridge cannot send
+   *    (AGENTS.md's serde rule; bead `sparkle-16y6h` is the case where that mismatch silently
+   *    disabled a whole feature).
+   *  - ABSENT is what an OLDER Rust build produces — one that predates the deadline contract and
+   *    emits no such key at all.
+   *
+   * Both mean the same thing to us: NO DEADLINE IS KNOWN, so never skip. Only a finite number is a
+   * deadline. Erring the other way — treating an unreadable deadline as "expired" — would make this
+   * listener silently drop every op on a mixed build, which is far worse than doing redundant work.
+   */
+  deadlineAtMs?: number | null;
 }
 
 let unlisten: UnlistenFn | undefined;
@@ -1961,10 +1982,100 @@ function reportControlOpSuccess(req: ControlRequest, result: unknown): void {
   reportControlOp(op, callerKind, targetKind);
 }
 
+// ── Abandoned requests: don't spend a starved frontend on replies nobody will read ───────────────
+//
+// THE FAILURE THIS EXISTS FOR (bead `sparkle-4rgb1`). A `sample` of a real three-minute app hang
+// caught five bridge threads parked in `bridge::wait_pending` for the whole window — two of them on
+// the control socket — while the Rust main thread sat ~95% idle. Nothing was deadlocked: Rust was
+// waiting on frontend replies that never came, because the JS thread was not running. `set_agent_goal`
+// is a synchronous Zustand write that cannot take thirty seconds, so a thirty-second timeout on it
+// means the webview never got a slice at all.
+//
+// Two mismatched timeouts then turn a transient slowdown into a sustained one. The Rust bridge waits
+// 600s; the control client gives up after 10-30s and, for the retryable ops, RE-SENDS up to three
+// times — each retry emitting a fresh `control:request` event. So the frontend eventually performs
+// the work for every call that was abandoned long ago, and it is handed roughly 3× the work at
+// exactly the moment it has the least capacity to do it. Every one of those replies goes to a caller
+// that has already left.
+//
+// Dropping that work is the most direct way to hand the capacity back. It is also SAFE in a way a
+// timeout normally is not: the deadline is the caller's OWN, so skipping cannot lose an answer
+// anyone is still waiting for — the Rust pending entry is gone by then and the reply would have
+// been discarded on arrival regardless.
+
+/**
+ * Session-scoped tally of requests dropped unrun, keyed by op. Counts only — same privacy rule as
+ * `stores/selfReportMetrics`: an op NAME is a non-identifying enum, the payload never is.
+ *
+ * IN THIS FILE rather than in `selfReportObservability` / `useSelfReportMetrics`, which is where the
+ * success tally lives, for one reason worth stating so the next reader does not think it an
+ * oversight: those two record a `ControlOp` SUCCESS and feed the Phase-2c self-report coverage ratio,
+ * and a skipped request is neither — folding it in would corrupt that ratio, and giving it its own
+ * PostHog event needs a new `ANALYTICS_EVENTS` member in `@sparkle/core`. Graduating this to that
+ * mechanism is a follow-up; until then a reader is a `controlExpiredSkipCounts()` away from the
+ * answer, which is the point — the alternative is inferring the drop rate from its absence.
+ */
+const expiredSkipsByOp = new Map<string, number>();
+
+/** How many requests we have dropped unrun this session, by op. A snapshot — mutating it is inert. */
+export function controlExpiredSkipCounts(): Record<string, number> {
+  return Object.fromEntries(expiredSkipsByOp);
+}
+
+/** Zero the tally (test hook, mirroring `useSelfReportMetrics.reset`). */
+export function _resetControlExpiredSkipsForTests(): void {
+  expiredSkipsByOp.clear();
+}
+
+/**
+ * Has this request's caller already given up? True ONLY for a finite `deadlineAtMs` now in the past.
+ *
+ * Absent, `null`, `NaN` and `Infinity` all answer NO — see the field's own doc for why an unreadable
+ * deadline must fail towards doing the work. Pure; `Date.now()` is read by the caller so the
+ * production call site is the one the tests drive (AGENTS.md's defaulted-seam trap: a `deps = clock`
+ * parameter that every test overrides leaves the real call site covered by nothing).
+ */
+function expiredBy(req: ControlRequest, now: number): number | null {
+  const d = req.deadlineAtMs;
+  if (typeof d !== "number" || !Number.isFinite(d)) return null;
+  return now > d ? now - d : null;
+}
+
+/** Record one dropped request: bump the tally and say so, since the caller never will. */
+function reportControlOpExpired(req: ControlRequest, lateByMs: number): void {
+  expiredSkipsByOp.set(req.op, (expiredSkipsByOp.get(req.op) ?? 0) + 1);
+  // The op name and a duration only — never the payload, which is the identifying part.
+  console.warn(`[control] skipped expired ${req.op}: caller gave up ${lateByMs}ms ago`);
+}
+
 /** Dispatch one op and reply EXACTLY once. Any thrown error becomes an `{ error }` reply so a
  *  handler failure can't leave the bridge blocked for its full timeout. */
 async function dispatch(req: ControlRequest): Promise<void> {
   try {
+    // FIRST GATE, BEFORE EVERY OTHER ONE — and the ordering is the whole point, not an accident of
+    // where the code was pasted. An expired request must cost NOTHING: not a handler, not a receipt,
+    // and specifically not a POLICY EVALUATION, because `appOpPolicy` is not a pure read — an
+    // `ask`-tier verdict RAISES AN APPROVAL REQUEST in the human's concierge column. Evaluating the
+    // policy for a call nobody is waiting on would put a question on the human's screen about work
+    // that will never run, and under the retry storm this gate exists for it would put the same
+    // question there three times. So: expiry, then tiers, then the concierge policy.
+    //
+    // We still reply. The Rust pending entry is already gone, so `respond` is a harmless no-op — but
+    // this function's contract is "reply EXACTLY once" on every path, and a silent early return is
+    // how that invariant rots into a hang the next time the timing changes. It costs one IPC call.
+    const lateByMs = expiredBy(req, Date.now());
+    if (lateByMs !== null) {
+      reportControlOpExpired(req, lateByMs);
+      await respond(req.reqId, {
+        ok: false,
+        // A stable machine-readable code beside the prose, like `target_required` elsewhere here —
+        // a client that DOES still read this (a clock skew, a retry that raced the deadline) can
+        // tell "you gave up on me" apart from a genuine refusal without parsing English.
+        code: "request_expired",
+        error: `${req.op} expired before the frontend reached it (${lateByMs}ms past its deadline); it was not run`,
+      });
+      return;
+    }
     // Centralized safety gate (PRD §10/§11): a `privileged` op requires an interactive (non-worker)
     // caller. Look up the op's tier BEFORE mutating; `free` ops (and unknown ops, whose tier is
     // undefined → they fall through to the default "unknown op" reply) skip the check. This is the
