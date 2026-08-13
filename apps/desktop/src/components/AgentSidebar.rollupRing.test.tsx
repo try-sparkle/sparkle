@@ -28,6 +28,8 @@ vi.mock("../services/branchStatus", () => ({
 }));
 
 import { AgentSidebar } from "./AgentSidebar";
+import { CONCIERGE_AGENTS_HINT } from "./ConciergeAgentsRow";
+import { SPARKLE_AGENT_ID } from "../services/sparkleAgent";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -122,5 +124,92 @@ describe("AgentSidebar — an own red fills, a worker's red rings", () => {
     const dot = headDot();
     expect(dot.style.boxShadow).toBe("");
     expect(dot.style.background).not.toBe(RED);
+  });
+});
+
+// ── THE SAME RULE ON THE TWO PINNED ROWS (roborev 63208) ─────────────────────────────────────────
+//
+// `AgentSidebar` threads `dotRing` at THREE call sites — the ordinary head row above, plus
+// `ConciergeAgentsRow` and `SparkleAgentRow`. Only the first had a test: the suite that owns the
+// pinned rows (`AgentSidebar.sparkleRow.test.tsx`) never mentions `dotRing`, and this file rendered
+// only the head row. The pinned rows sit at the bottom of the column PERMANENTLY, so a borrowed red
+// drawn as an own red is more persistent there, not less — which is the whole reason those two sites
+// were wired in the first place.
+describe("AgentSidebar — the pinned rows ring too", () => {
+  /** The Improve Sparkle agent with one worker of its own. Its own status stays calm, so the band
+   *  the rollup lands in disagrees with the band of its own status and the override fires. */
+  function seedSparkle(sparkleStatus: AgentTabStatus, workerStatus: AgentTabStatus): Project {
+    const alpha = mkAgent("a1", "Alpha", { namePinned: true });
+    const sparkleWorker = mkAgent("sw1", "Sparkle Worker", {
+      kind: "worker", parentId: SPARKLE_AGENT_ID, baseBranch: "main",
+      worktreePath: "/wt/sw1", createdAt: 1,
+    });
+    const project: Project = {
+      id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [alpha, sparkleWorker],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      branchStatus: {}, workflowStage: {},
+      status: {
+        a1: "idle",
+        [SPARKLE_AGENT_ID]: sparkleStatus,
+        sw1: workerStatus,
+      } as Record<string, AgentTabStatus>,
+      openAgentIds: ["a1", SPARKLE_AGENT_ID, "sw1"],
+      open: vi.fn(),
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    return project;
+  }
+
+  /** Located exactly like `headDot` — by shape, off the pinned row's own `data-hint`. */
+  function pinnedDot(hint: string): HTMLElement {
+    const row = document.querySelector(`[data-hint="${hint}"]`) as HTMLElement | null;
+    if (!row) throw new Error(`no row with data-hint="${hint}"`);
+    const dot = Array.from(row.querySelectorAll("span")).find(
+      (el) => (el as HTMLElement).style.borderRadius === "50%",
+    );
+    if (!dot) throw new Error(`no status disc found on the ${hint} row`);
+    return dot as HTMLElement;
+  }
+
+  it("draws a RING on Improve Sparkle when its own worker needs the human", () => {
+    render(<AgentSidebar project={seedSparkle("idle", "waiting")} />);
+    const dot = pinnedDot("improve");
+    expect(dot.style.boxShadow).toContain(AGENT_STATUS.waiting.color);
+    expect(dot.style.boxShadow).toContain("inset");
+    expect(dot.style.background).toBe("transparent");
+  });
+
+  it("draws a FILL on Improve Sparkle when the row itself is the one blocked", () => {
+    // Own-red short-circuits the rollup before any worker is counted, so the bands agree and the
+    // override never fires — the same pairing the head row takes above. Without this, a `dotRing`
+    // hardcoded to `true` would satisfy the ring case alone.
+    render(<AgentSidebar project={seedSparkle("waiting", "working")} />);
+    const dot = pinnedDot("improve");
+    expect(dot.style.background).toBe(RED);
+    expect(dot.style.boxShadow).toBe("");
+  });
+
+  // ⚠️ THE CONCIERGE ROW'S RING IS WIRED BUT NOT CURRENTLY REACHABLE, and saying so is the point.
+  // `researchRollupStatuses` maps every LIVE task to `working` and drops the terminal ones — its
+  // docstring states the consequence as a decision: *"the collapsed row is GREEN while anything is
+  // live and GRAY otherwise, and it never goes red."* So `conciergeRollup` is never red or orange,
+  // and the `dotRing={…}` expression at that call site is always `false` today.
+  //
+  // The wiring is kept rather than deleted because that same docstring designs for the extension —
+  // *"if research ever grows a state that genuinely blocks the founder, add it here and the whole
+  // rollup/band/chip chain follows for free"* — and "for free" is only true if the call site is
+  // already threaded. What CAN be pinned is the half that would silently break: that the prop
+  // reaches the disc's variant at all. That is asserted directly on the component, at the foot of
+  // `ConciergeAgentsRow.test.tsx`; this row pins the reachable sidebar state, so a change
+  // that starts painting the pinned row hollow on ordinary live work fails here.
+  it("draws no ring on Concierge Agents while research is merely running", () => {
+    render(<AgentSidebar project={seedSparkle("idle", "working")} />);
+    const dot = pinnedDot(CONCIERGE_AGENTS_HINT);
+    expect(dot.style.boxShadow).toBe("");
+    expect(dot.style.background).not.toBe("transparent");
   });
 });

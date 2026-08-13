@@ -76,8 +76,14 @@ vi.mock("./rowAnatomy", async (orig) => {
   };
 });
 
+import { AGENT_STATUS } from "@sparkle/ui";
 import { AgentSidebar } from "./AgentSidebar";
-import { CONCIERGE_AGENTS_HINT, CONCIERGE_AGENTS_TITLE } from "./ConciergeAgentsRow";
+import {
+  ConciergeAgentsRow,
+  CONCIERGE_AGENTS_HINT,
+  CONCIERGE_AGENTS_TITLE,
+} from "./ConciergeAgentsRow";
+import { asRgb } from "./statusDotTestUtils";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -515,5 +521,55 @@ describe("Concierge Agents — memo contract", () => {
     });
     expect(rowRenders.n).toBeGreaterThan(before);
     expect(row().textContent).toContain(`+${LIVE_IN_FIXTURE + 1}`);
+  });
+});
+
+// ── THE ROLLED-UP DISC IS DRAWN AS A RING, NOT A FILL (roborev 63208) ────────────────────────────
+//
+// `AgentSidebar` threads `dotRing` here exactly where it threads `dotColor`, so a borrowed colour
+// reads as "something under this row", not "answer me" — the rule `AgentSidebar.rollupRing.test.tsx`
+// pins for the ordinary head row and the Improve Sparkle row.
+//
+// ⚠️ IT IS ASSERTED ON THE COMPONENT, DELIBERATELY, and that is the honest scope. The sidebar-level
+// state cannot be reached today: `researchRollupStatuses` maps every live task to `working` and
+// drops the terminal ones, so `conciergeRollup` is never red or orange and the caller's
+// `dotRing={…}` expression is always `false`. Its docstring states that as a decision and designs
+// the extension — *"if research ever grows a state that genuinely blocks the founder, add it here
+// and the whole rollup/band/chip chain follows for free."* "For free" is only true if the prop is
+// threaded to the disc, which is precisely what these two rows prove, and what would otherwise be
+// covered by nothing at all.
+describe("ConciergeAgentsRow — a borrowed colour draws a ring", () => {
+  const BORROWED = AGENT_STATUS.waiting.color;
+  const props = {
+    status: "stopped" as AgentTabStatus,
+    dotColor: BORROWED,
+    dotLabel: "a task under here needs you",
+    liveCount: 1,
+    hydrated: true,
+    paneSide: "left" as const,
+    jointOpen: false,
+  };
+  const disc = () => {
+    const el = document.querySelector(`[data-hint="${CONCIERGE_AGENTS_HINT}"]`) as HTMLElement;
+    const d = Array.from(el.querySelectorAll("span")).find(
+      (s) => (s as HTMLElement).style.borderRadius === "50%",
+    );
+    if (!d) throw new Error("no status disc on the Concierge Agents row");
+    return d as HTMLElement;
+  };
+
+  it("draws a hollow ring in the borrowed colour when dotRing is set", () => {
+    render(<ConciergeAgentsRow {...props} dotRing />);
+    expect(disc().style.boxShadow).toContain(BORROWED);
+    expect(disc().style.boxShadow).toContain("inset");
+    expect(disc().style.background).toBe("transparent");
+  });
+
+  // The paired direction: same colour, no ring. Without it, a `variant` hardcoded to `"ring"` would
+  // satisfy the row above.
+  it("draws a filled disc in the same colour when dotRing is not set", () => {
+    render(<ConciergeAgentsRow {...props} />);
+    expect(disc().style.background).toBe(asRgb(BORROWED));
+    expect(disc().style.boxShadow).toBe("");
   });
 });

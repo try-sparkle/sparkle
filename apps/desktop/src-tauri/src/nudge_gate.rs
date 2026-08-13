@@ -2303,11 +2303,32 @@ mod tests {
             r"const SEPARATOR_ROW = /^[\s│|┃╭╮╰╯┌┐└┘┏┓┗┛─━┄┈═]*$/;",
             r"const OPENING_BORDER = /[╭╮┌┐┏┓]/;",
             r"const CLOSING_BORDER = /[╰╯└┘┗┛]/;",
-            r"/[([]y\/n[)\]]/i,",
-            r"/press enter to continue/i,",
-            r"/\boverwrite\?/i,",
+            // THE WHOLE DECLARATION for these three, same rule and same reason as the
+            // `YES_NO_PROMPT` needle below (roborev 58550). They moved out of the array literal
+            // into named consts so `DISPLAY_AMBIGUOUS_SHELL_PROMPTS` can name them BY OBJECT
+            // IDENTITY, and `contains` is a substring test — a bare `/…/i` needle has no
+            // right-anchor, so it would keep matching through a flag edit to `/im`, `/gi`, `/iu`.
+            // A stray `g` on a shared regex makes `.test()` stateful via `lastIndex`, which is an
+            // INTERMITTENT hole in a guard, reported as no drift. The trailing `;` restores the
+            // end-anchor and re-asserts each is still a standalone const, which is exactly what the
+            // identity-based partition depends on.
+            r"const YES_NO_INLINE = /[([]y\/n[)\]]/i;",
+            r"const PRESS_ENTER = /press enter to continue/i;",
+            r"const OVERWRITE = /\boverwrite\?/i;",
             r"/(^|\s)password:\s*$/im,",
             r"/enter passphrase/i,",
+            // THE PARTITION ITSELF, not just its members (roborev 63208). The TS write gate stopped
+            // re-scanning these three over the whole snapshot, because a pane merely DISPLAYING
+            // `(y/n)` — a `--help`, a README, a `git show` of the guard — was refusing every write.
+            // Moving an arm INTO this list narrows the TS guard, and moving one OUT widens it; the
+            // second direction is the one that matters here, since this gate must never permit a
+            // screen the TS guard would refuse. Pinned so neither edit is silent.
+            //
+            // NOTE THE DELIBERATE DIVERGENCE, in the refusing direction as the header requires:
+            // Rust still tests all five arms over the whole screen. That makes this gate strictly
+            // MORE refusing than the TS write gate for the three above — a skipped nudge, never a
+            // keystroke into something live — so the port is correct without following the split.
+            "export const DISPLAY_AMBIGUOUS_SHELL_PROMPTS: readonly RegExp[] = [\n  YES_NO_INLINE,\n  PRESS_ENTER,\n  OVERWRITE,\n];",
         ] {
             assert!(
                 classifier.contains(needle),
@@ -2462,14 +2483,26 @@ mod tests {
 
         // The shell-prompt list is the one most likely to GROW. Count its entries so a new arm
         // fails here instead of being silently absent from the Rust port.
+        //
+        // COUNTED BY ENTRY, NOT BY `/i` OCCURRENCE (roborev 63208). The count used to be
+        // `matches("/i").count()`, which silently measured the wrong thing the moment three arms
+        // moved out of the array into named consts: the list still held five entries, but only two
+        // were inline regexes, so the tally read 2 and this assertion failed for a REFACTOR while
+        // remaining unable to notice a sixth arm added as a const. One entry per line is the shape
+        // this file has always had, and unlike a comma split it cannot be fooled by a `{1,3}`
+        // quantifier inside a future pattern.
         let shell_block = classifier
             .split("const SHELL_PROMPTS: RegExp[] = [")
             .nth(1)
             .and_then(|s| s.split("];").next())
             .expect("SHELL_PROMPTS list not found");
+        let arms = shell_block
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .count();
         assert_eq!(
-            shell_block.matches("/i").count(),
-            5,
+            arms, 5,
             "SHELL_PROMPTS gained or lost an arm; nudge_gate.rs ports all of them individually"
         );
     }

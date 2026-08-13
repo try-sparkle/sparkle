@@ -166,6 +166,7 @@ function spanOf(task: ResearchTask): { since: number; until: number | null } {
 export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   status,
   dotColor,
+  dotRing,
   dotLabel,
   liveCount,
   hydrated,
@@ -177,6 +178,9 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   /** Rolled-up disc paint, when the tasks under this row disagree with its own status. Same override
    *  every build head takes; `undefined` means "use the status taxonomy". */
   dotColor?: string;
+  /** Draw the disc as a RING: the colour describes a row UNDER this one. Set exactly where
+   *  `dotColor` is — see StatusDot's `variant` (roborev 63126). */
+  dotRing?: boolean;
   dotLabel?: string;
   /** Queued + running. Straight from the store's `liveTasks` selector via the caller — NOT counted
    *  again in here, so the badge and the disc can never tell different stories. */
@@ -287,7 +291,13 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
             justifyContent: "center",
           }}
         >
-          <StatusDot status={status} size={DOT_SIZE} color={dotColor} label={dotLabel} />
+          <StatusDot
+            status={status}
+            size={DOT_SIZE}
+            color={dotColor}
+            variant={dotRing ? "ring" : "fill"}
+            label={dotLabel}
+          />
         </div>
         <div
           style={{

@@ -35,7 +35,11 @@
 // Both are read from the VIEWPORT, never the scrollback — see `services/terminalViewport.ts` for why
 // history latches the second guard true forever.
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
-import { screenAwaitsInput } from "../engine/screenClassifier";
+import {
+  DISPLAY_AMBIGUOUS_SHELL_PROMPTS,
+  screenAwaitsInput,
+  SHELL_PROMPTS,
+} from "../engine/screenClassifier";
 import type { TerminalViewport } from "../services/terminalViewport";
 
 /**
@@ -172,7 +176,46 @@ function screenTail(snapshot: string, rows = 3): string {
  */
 export function screenBlocksWrite(snapshot: string): boolean {
   if (screenAwaitsInput(snapshot)) return true;
+  if (matchesShellPrompt(snapshot)) return true;
   return screenIsCredentialPrompt(snapshot);
+}
+
+/**
+ * The `SHELL_PROMPTS` arms this gate re-tests over the WHOLE snapshot — which is deliberately not
+ * all of them.
+ *
+ * ══ WHY A WHOLE-SNAPSHOT SCAN EXISTS HERE AT ALL (roborev 63126) ════════════════════════════════
+ * ⚠️ This gate must NOT inherit `screenAwaitsInput`'s bottom-anchoring. That predicate was
+ * bottom-anchored so prompt-shaped SCROLLBACK stops painting a sidebar row red — there a false
+ * positive costs a wrong colour. Here a miss types a spoken sentence into a password field.
+ * Inheriting the narrowing silently shrank this gate: a `password:` more than LIVE_TAIL_LINES
+ * non-empty rows above the bottom stopped blocking, and `screenIsCredentialPrompt` cannot backstop
+ * it because it reads only the last 3 rows.
+ *
+ * ══ AND WHY IT COVERS ONLY THE CREDENTIAL-SHAPED ARMS (roborev 63208) ═══════════════════════════
+ * ⚠️ Scanning all five whole-snapshot re-opens the over-block roborev 58540 / 58562 / 58575 removed
+ * three separate times: `(y/n)`, `press enter to continue` and `overwrite?` are things a pane merely
+ * DISPLAYS — a `--help`, a README, a `git show` of THIS FILE — and matching them anywhere refused
+ * every write to that agent, with no override, until it scrolled off. The blast radius is not just
+ * dictation: `screenBlocksWrite` is also the gate at `services/conciergeDispatch`, which runs for
+ * every screen where Claude Code holds the alternate buffer (the most common state in the product)
+ * and serves the concierge relay, the model-issued `send_to_agent_terminal` AND the goal auto-resume.
+ *
+ * ══ THE AMBIGUOUS ARMS ARE NOT RE-TESTED HERE BECAUSE THAT WOULD BE DEAD CODE ═══════════════════
+ * The obvious repair — give them a bounded tail, the way `matchesBlockingPrompt` tail-scopes
+ * `YES_NO_PROMPT` — was written first and MEASURED to add nothing: `screenAwaitsInput`'s arm 3
+ * already scans these same patterns over the last LIVE_TAIL_LINES (12) non-empty rows, PER LINE,
+ * and that is a strict superset of any `screenTail(snapshot, 5)` this function could take (5 raw
+ * rows ⊆ 12 non-empty rows, and `screenTail`'s space-join cannot rescue a wrapped `(y/n)` either —
+ * the pattern admits no space). Neutralizing the tail branch left every blocking test green, which
+ * is the vacuous-guard shape AGENTS.md warns about. So the live-prompt direction is `screenAwaitsInput`'s
+ * job, asserted through `screenBlocksWrite` below, and this function stays the narrow thing it is.
+ * An arm added to SHELL_PROMPTS without being listed as display-ambiguous defaults to blocking.
+ */
+function matchesShellPrompt(snapshot: string): boolean {
+  return SHELL_PROMPTS.filter((re) => !DISPLAY_AMBIGUOUS_SHELL_PROMPTS.includes(re)).some((re) =>
+    re.test(snapshot),
+  );
 }
 
 /**

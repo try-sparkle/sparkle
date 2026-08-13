@@ -41,6 +41,7 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
   active,
   status,
   dotColor,
+  dotRing,
   dotLabel,
   workerCount,
   onSelect,
@@ -52,6 +53,9 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
   /** Rolled-up disc paint, when this row's workers disagree with its own status. Same override the
    *  build rows take; `undefined` means "use the status taxonomy". */
   dotColor?: string;
+  /** Draw the disc as a RING: the colour describes a row UNDER this one. Set exactly where
+   *  `dotColor` is — see StatusDot's `variant` (roborev 63126). */
+  dotRing?: boolean;
   dotLabel?: string;
   /** Workers folded under this row. 0 today (the improvement pass runs a single agent), wired to
    *  the same rule build rows use so a future subtree gets the same badge for free. */
@@ -146,7 +150,13 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
           justifyContent: "center",
         }}
       >
-        <StatusDot status={status} size={DOT_SIZE} color={dotColor} label={dotLabel} />
+        <StatusDot
+            status={status}
+            size={DOT_SIZE}
+            color={dotColor}
+            variant={dotRing ? "ring" : "fill"}
+            label={dotLabel}
+          />
       </div>
       {/* Timer, then title, then badges — the collapsed build row's strip, element for element. */}
       <div

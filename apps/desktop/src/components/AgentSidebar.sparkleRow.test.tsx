@@ -17,7 +17,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { C } from "../theme/colors";
-import { asRgb } from "./statusDotTestUtils";
+import { asRgb, dotInk } from "./statusDotTestUtils";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -386,35 +386,35 @@ describe("Improve Sparkle row — status comes from the build rows' pipeline", (
   // status. Sharing the pipeline is what makes the approval-detection fix reach this row too.
   it("turns RED when a picker is on screen (approval), like every build row", () => {
     render(<AgentSidebar project={bothAt("approval")} />);
-    expect(discIn(sparkleRow()).style.background).toBe(asRgb(AGENT_STATUS.approval.color));
-    expect(discIn(sparkleRow()).style.background).toBe(discIn(buildRow()).style.background);
+    expect(dotInk(discIn(sparkleRow()))).toBe(asRgb(AGENT_STATUS.approval.color));
+    expect(dotInk(discIn(sparkleRow()))).toBe(dotInk(discIn(buildRow())));
   });
 
   it("turns RED on the other needs-you statuses too", () => {
     for (const s of ["waiting", "blocked", "errored"] as const) {
       render(<AgentSidebar project={bothAt(s)} />);
-      expect(discIn(sparkleRow()).style.background).toBe(discIn(buildRow()).style.background);
+      expect(dotInk(discIn(sparkleRow()))).toBe(dotInk(discIn(buildRow())));
       cleanup();
     }
   });
 
   it("is GREEN while running", () => {
     render(<AgentSidebar project={bothAt("working")} />);
-    expect(discIn(sparkleRow()).style.background).toBe(asRgb(AGENT_STATUS.working.color));
-    expect(discIn(sparkleRow()).style.background).toBe(discIn(buildRow()).style.background);
+    expect(dotInk(discIn(sparkleRow()))).toBe(asRgb(AGENT_STATUS.working.color));
+    expect(dotInk(discIn(sparkleRow()))).toBe(dotInk(discIn(buildRow())));
   });
 
   it("is GRAY when paused", () => {
     render(<AgentSidebar project={bothAt("idle")} />);
-    expect(discIn(sparkleRow()).style.background).toBe(asRgb(AGENT_STATUS.idle.color));
-    expect(discIn(sparkleRow()).style.background).toBe(discIn(buildRow()).style.background);
+    expect(dotInk(discIn(sparkleRow()))).toBe(asRgb(AGENT_STATUS.idle.color));
+    expect(dotInk(discIn(sparkleRow()))).toBe(dotInk(discIn(buildRow())));
   });
 
   // Before it ever spawns there is no live status for the id; "stopped" is the same fallback a
   // build row takes, and it must not throw or render an undefined color.
   it("falls back to stopped before the agent has ever run", () => {
     render(<AgentSidebar project={seed()} />);
-    expect(discIn(sparkleRow()).style.background).toBe(asRgb(AGENT_STATUS.stopped.color));
+    expect(dotInk(discIn(sparkleRow()))).toBe(asRgb(AGENT_STATUS.stopped.color));
   });
 
   // Proof the ROLLUP is genuinely consulted, not just the row's own status: this is the same
@@ -425,7 +425,7 @@ describe("Improve Sparkle row — status comes from the build rows' pipeline", (
       mkAgent("sw1", "Sparkle Worker", { kind: "worker", parentId: SPARKLE_AGENT_ID }),
     ]);
     render(<AgentSidebar project={project} />);
-    expect(discIn(sparkleRow()).style.background).toBe(asRgb(AGENT_STATUS.waiting.color));
+    expect(dotInk(discIn(sparkleRow()))).toBe(asRgb(AGENT_STATUS.waiting.color));
     expect(discIn(sparkleRow()).getAttribute("title")).toBe("Workers need you");
   });
 });

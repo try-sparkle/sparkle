@@ -355,6 +355,36 @@ describe("a credential prompt refuses on the normal buffer too", () => {
     expect(r.ok).toBe(true);
   });
 
+  // ══ …AND THE `(y/n)` SPELLING TOO, WHICH IS THE ONE THAT CAME BACK (roborev 63208) ═════════════
+  // The row above is the same claim for `(yes/no)`, and it is why this hole survived: EVERY fixture
+  // in this suite uses that spelling, which `SHELL_PROMPTS`' `/[([]y\/n[)\]]/i` does not match. So
+  // when `screenBlocksWrite` re-acquired an unscoped whole-snapshot scan of that list, this suite —
+  // the one that owns exactly these delivering rows — stayed green while the dominant path in the
+  // product started refusing every write: the concierge relay, the model-issued
+  // `send_to_agent_terminal`, and the goal auto-resume, all `{ok:false, path:"blocked-prompt"}` with
+  // no override, on any pane showing a `--help`, `AGENTS.md`, or a `git show` of the guard itself.
+  //
+  // The filler rows are load-bearing, not padding: `screenAwaitsInput`'s arm 3 scans the last 12
+  // non-empty rows per line, so on a short fixture IT blocks and the assertion says nothing about
+  // the arm under test.
+  it("delivers on a busy Claude Code pane that merely displays (y/n)", async () => {
+    const SCREEN = [
+      "⏺ Reading the guard's source.",
+      "  ⎿  the pattern matches screens like (y/n) — documentation, not a prompt",
+      ...Array.from({ length: 15 }, (_, i) => `     step ${i} complete`),
+      "⏺ Updated three files and ran the suite — all green.",
+      "──────────────────────────────────────────────────────────────────────────────",
+      "❯ ",
+      "──────────────────────────────────────────────────────────────────────────────",
+      "  ⏸ manual mode on · ? for shortcuts",
+    ].join("\n");
+    vi.mocked(getAgentScrollback).mockReturnValue(SCREEN);
+    vi.mocked(getAgentViewport).mockReturnValue({ text: SCREEN, alternateBuffer: true });
+    const r = await dispatchConciergeAnswer(AGENT, "carry on", OPTS);
+    expect(r.path).toBe("free-text");
+    expect(r.ok).toBe(true);
+  });
+
   // ══ AND MERELY MENTIONING (yes/no) IS NOT A PROMPT (roborev 58562) ════════════════════════════
   // The delivering direction for the yes/no arm, which `screenIsYesNoPrompt` previously lacked: it
   // tested the WHOLE viewport, so any pane displaying the string — this source file, a `git show` of

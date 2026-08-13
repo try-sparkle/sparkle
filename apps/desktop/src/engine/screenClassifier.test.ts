@@ -1036,3 +1036,36 @@ describe("screenAwaitsInput — prompt-shaped scrollback is not a live prompt", 
     expect(screenAwaitsInput("Enter passphrase for key '/Users/me/.ssh/id_ed25519':")).toBe(true);
   });
 });
+
+// ── THE STREAM PATH IS A MULTI-FRAME PARTIAL, NOT A VIEWPORT (roborev 63126) ────────────────────
+//
+// Bottom-anchoring arm 1 added a LIVENESS check (`nothingUnrecognizedBelowFooter`) and, with it, a
+// `\r` → `\n` split. That is right for the rendered viewport `settle()` reads. It is WRONG for
+// `statusEngine.ts:1042`, which feeds `this.partial` — the unterminated in-place-redraw tail whose
+// documented shape is `frame\rframe\rframe` and which accumulates to MAX_PARTIAL = 4096 chars.
+//
+// Split on `\r`, every LATER redraw frame becomes "a line below the footer". AMBIENT_CHROME_LINE
+// recognizes only ✻ ✽ ✢ of the spinner glyph set, so a single `· Thinking… (12s)` frame makes arm 1
+// false — and even an all-✻ tail exceeds MAX_CHROME_BELOW_FOOTER = 8 after nine redraws. Arms 2 and
+// 3 cannot backstop it (a footer frame carries no cursor and no shell prompt), so a genuinely
+// blocked agent reads GRAY until the next settle. That is the false-calm direction this whole file
+// calls strictly worse than a false red, and the change's own doc block claimed the opposite.
+//
+// The pre-existing 54749 guard could not catch it: it asserts `PICKER_FOOTER.test(...)`, never
+// `screenAwaitsInput(...)`, so it stayed green throughout. Pinned at the predicate level here.
+describe("screenAwaitsInput — a footer inside a \\r-framed stream partial", () => {
+  const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
+
+  it("still flags a footer followed by a spinner redraw frame", () => {
+    expect(screenAwaitsInput(`${FOOTER}\r· Thinking… (12s)`)).toBe(true);
+  });
+
+  it("still flags it when the redraw frame arrives FIRST", () => {
+    expect(screenAwaitsInput(`· Thinking… (12s)\r${FOOTER}`)).toBe(true);
+  });
+
+  it("survives more redraw frames than MAX_CHROME_BELOW_FOOTER", () => {
+    const frames = Array.from({ length: 12 }, (_, i) => `✻ Churning… (${i}s)`).join("\r");
+    expect(screenAwaitsInput(`${FOOTER}\r${frames}`)).toBe(true);
+  });
+});

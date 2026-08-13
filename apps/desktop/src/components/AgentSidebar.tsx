@@ -3137,6 +3137,13 @@ export function AgentSidebar({
           status={conciergeStatus}
           dotColor={conciergeRollupOverrides ? ROLLUP_DOT_COLOR[conciergeRollup] : undefined}
           dotLabel={conciergeRollupOverrides ? rollupLabel(conciergeRollup) : undefined}
+          // Same borrowed-red-draws-a-ring rule as the ordinary head row (roborev 63126). These two
+          // pinned rows sit at the bottom of the column permanently, so a borrowed red that looked
+          // like an own red was MORE persistent here, not less.
+          dotRing={
+            conciergeRollupOverrides &&
+            (conciergeRollup === "red" || conciergeRollup === "orange")
+          }
           liveCount={conciergeLive.length}
           hydrated={researchHydrated}
           paneSide={pairSide}
@@ -3153,6 +3160,9 @@ export function AgentSidebar({
           status={sparkleStatus}
           dotColor={sparkleRollupOverrides ? ROLLUP_DOT_COLOR[sparkleRollup] : undefined}
           dotLabel={sparkleRollupOverrides ? rollupLabel(sparkleRollup) : undefined}
+          dotRing={
+            sparkleRollupOverrides && (sparkleRollup === "red" || sparkleRollup === "orange")
+          }
           workerCount={sparkleWorkerCount}
           onSelect={onSelectSparkle}
           paneSide={pairSide}

@@ -197,16 +197,43 @@ export function textHasPickerFooter(text: string): boolean {
   return lines.some((_, i) => pickerFooterSpan(lines, i) > 0);
 }
 
-// Classic shell / CLI prompts. These don't appear in Claude's prose, so they're safe to
-// match anywhere in the snapshot. The `/i` flag case-folds, so one delimiter-agnostic
+// Classic shell / CLI prompts. These don't appear in Claude's PROSE, so they're safe to
+// match anywhere in a line. The `/i` flag case-folds, so one delimiter-agnostic
 // pattern covers `(y/n)`, `[Y/n]`, `[y/N]` etc. (It also matches mismatched delimiters
 // like `(y/n]` — harmless: such strings never occur in prose and are still prompt-like.)
+const YES_NO_INLINE = /[([]y\/n[)\]]/i;
+const PRESS_ENTER = /press enter to continue/i;
+const OVERWRITE = /\boverwrite\?/i;
+
 export const SHELL_PROMPTS: RegExp[] = [
-  /[([]y\/n[)\]]/i,
-  /press enter to continue/i,
-  /\boverwrite\?/i,
+  YES_NO_INLINE,
+  PRESS_ENTER,
+  OVERWRITE,
   /(^|\s)password:\s*$/im,
   /enter passphrase/i,
+];
+
+/**
+ * The SHELL_PROMPTS arms a pane can merely DISPLAY rather than be blocked by — so a caller scanning
+ * a WHOLE SNAPSHOT (rather than a line, or the live tail) must bound these to the region where
+ * "the screen is waiting" actually means something.
+ *
+ * ══ WHY THE LIST IS EXPORTED RATHER THAN RE-DERIVED (roborev 63208) ══════════════════════════════
+ * `voice/dictationTerminalRoute.screenBlocksWrite` scanned all five whole-snapshot and re-opened the
+ * over-block that roborev 58540 / 58562 / 58575 removed three separate times: a `--help`, a README,
+ * or a `git show` of the source file that mentions `(y/n)` refused every write to that agent, with
+ * no override, until it scrolled off. That gate also serves `services/conciergeDispatch` for every
+ * screen where Claude Code holds the alternate buffer — the most common state in the product.
+ *
+ * The complement (`password:`, `enter passphrase`) deliberately stays whole-snapshot everywhere: a
+ * pane does not incidentally display a password line the way it displays documentation, and a miss
+ * there types a spoken sentence into a concealed field. Membership is by IDENTITY, so an arm added
+ * to SHELL_PROMPTS without being listed here defaults to the blocking side.
+ */
+export const DISPLAY_AMBIGUOUS_SHELL_PROMPTS: readonly RegExp[] = [
+  YES_NO_INLINE,
+  PRESS_ENTER,
+  OVERWRITE,
 ];
 
 // ── The SESSION-LIMIT picker ────────────────────────────────────────────────────────────────────
@@ -486,17 +513,31 @@ export function tailContent(snapshot: string, n: number): string[] {
  */
 export function screenAwaitsInput(snapshot: string): boolean {
   if (!snapshot.trim()) return false;
-  const lines = snapshot.replace(/\r/g, "\n").split("\n");
 
   // ARM 1 — A PICKER FOOTER THAT IS STILL LIVE. Structural, never budgeted (see above). The
   // discriminator is WHAT is below the footer, not HOW MUCH: persistent chrome means the dialog is
   // still up, genuine new agent output means it has been answered. Same rule, same function, as
   // `screenOffersAnswer` arm 1 and `isSessionLimitPicker`.
-  for (let i = 0; i < lines.length; i++) {
-    const span = pickerFooterSpan(lines, i);
-    // `i + span - 1` is footerLast: a footer that wrapped onto a second line must not have its own
-    // continuation counted as unrecognised content below it (roborev 61827).
-    if (span > 0 && nothingUnrecognizedBelowFooter(lines, i + span - 1)) return true;
+  //
+  // ⚠️ EVALUATED PER `\r`-FRAME, AND THAT IS NOT COSMETIC (roborev 63126). A rendered viewport has
+  // no `\r`, so for `settle()` this loop runs once and behaves exactly as a whole-snapshot walk.
+  // But `statusEngine.ts:1042` feeds `this.partial` — the unterminated in-place-redraw tail whose
+  // shape is `frame\rframe\rframe`, up to MAX_PARTIAL = 4096 chars. Flattening `\r` to `\n` there
+  // turns every LATER redraw frame into "a line below the footer", and `AMBIENT_CHROME_LINE`
+  // recognizes only ✻ ✽ ✢ of the spinner glyph set — so one `· Thinking… (12s)` frame, or nine ✻
+  // ones (MAX_CHROME_BELOW_FOOTER = 8), made arm 1 false. Arms 2 and 3 cannot backstop a footer
+  // frame (no cursor, no shell prompt), so a genuinely BLOCKED agent read gray until the next
+  // settle — the false-calm this file calls strictly worse than a false red. A frame is the unit a
+  // liveness question is even meaningful in: "what is below the footer" means below it *on the
+  // screen as drawn*, not below it in a concatenation of successive redraws.
+  for (const frame of snapshot.split("\r")) {
+    const lines = frame.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const span = pickerFooterSpan(lines, i);
+      // `i + span - 1` is footerLast: a footer that wrapped onto a second line must not have its own
+      // continuation counted as unrecognised content below it (roborev 61827).
+      if (span > 0 && nothingUnrecognizedBelowFooter(lines, i + span - 1)) return true;
+    }
   }
 
   const tail = tailContent(snapshot, LIVE_TAIL_LINES);

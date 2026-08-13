@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   classifyTerminalRoute,
   normalizeForTerminal,
+  screenBlocksWrite,
   type TerminalRouteInput,
 } from "./dictationTerminalRoute";
 
@@ -194,5 +195,108 @@ describe("classifyTerminalRoute", () => {
       kind: "refuse",
       reason: "not-writable",
     });
+  });
+});
+
+// ── THE WRITE GATE'S ARMS ARE REGIONED INDIVIDUALLY, NOT ALL ONE WAY ─────────────────────────────
+//
+// Two rules pull in opposite directions, and applying either to all five SHELL_PROMPTS arms breaks
+// the other. The pairs below pin BOTH, because a suite that only ever asserts `true` here cannot
+// tell a working gate from one that refuses everything.
+//
+// (1) The gate must NOT inherit `screenAwaitsInput`'s bottom-anchoring (roborev 63126): that
+//     predicate is bottom-anchored so prompt-shaped SCROLLBACK stops painting a sidebar row red,
+//     where a false positive costs a wrong colour. Here a miss types a spoken sentence into a
+//     password field, and `screenIsCredentialPrompt` cannot backstop it — it reads only 3 rows.
+//
+// (2) But `(y/n)`, `press enter to continue` and `overwrite?` are things a pane merely DISPLAYS
+//     (roborev 63208). Scanning those whole-snapshot re-opens the over-block roborev 58540 / 58562
+//     / 58575 removed three separate times, and `screenBlocksWrite` is also the gate at
+//     `services/conciergeDispatch` for every Claude Code alternate-buffer screen — so it took out
+//     the concierge relay, `send_to_agent_terminal` and the goal auto-resume with it.
+describe("screenBlocksWrite — credential arms scan the whole grid", () => {
+  const filler = (n: number) => Array.from({ length: n }, (_, i) => `     step ${i} complete`);
+
+  it("blocks a password prompt sitting far above the bottom", () => {
+    const screen = ["$ sudo deploy", "Password:", ...filler(30)].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(true);
+  });
+
+  // ⚠️ THE ONE ROW THAT ISOLATES THE WHOLE-SNAPSHOT SHELL_PROMPTS SCAN, and it took a mutation run
+  // to find a shape that does. Every other credential fixture here is caught by something else
+  // first: `matchesBlockingPrompt` already tests `/\bpass(word|phrase)\b[^\n]*:\s*$/im` over the
+  // whole snapshot, so ANY prompt ending in a colon blocks with this arm deleted, and
+  // `screenAwaitsInput`'s arm 3 catches anything within 12 non-empty rows of the bottom.
+  //
+  // What is left is exactly this: ssh-keygen's parenthetical, which puts no colon at end of line,
+  // scrolled past the live tail. Delete the scan and this row goes red — nothing else sees it.
+  it("blocks an 'enter passphrase' with no trailing colon, far above the bottom", () => {
+    const screen = [
+      "$ ssh-keygen -t ed25519",
+      "Enter passphrase for key 'id_ed25519' (leave empty for no passphrase)",
+      ...filler(30),
+    ].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(true);
+  });
+});
+
+describe("screenBlocksWrite — display-ambiguous arms are bounded to the live tail", () => {
+  const filler = (n: number) => Array.from({ length: n }, (_, i) => `     step ${i} complete`);
+
+  // The DELIVERING direction, which is the half the whole-snapshot scan could not express. Thirty
+  // rows of output printed BELOW a `(y/n)` is proof it was already answered.
+  it("delivers when a (y/n) has scrolled far above the bottom", () => {
+    const screen = ["$ ./migrate.sh", "Drop the production table? (y/n)", ...filler(30)].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(false);
+  });
+
+  it("delivers when 'press enter to continue' has scrolled far above the bottom", () => {
+    const screen = ["Press enter to continue…", ...filler(30)].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(false);
+  });
+
+  // The concrete repro from roborev 63208: a pane DISPLAYING this guard's own source, then getting
+  // on with its work. The commit that introduced the whole-snapshot scan locked itself out of its
+  // own agent this way — `git show` of this file, `AGENTS.md`, any `--help`.
+  //
+  // The filler is not padding. `screenAwaitsInput`'s arm 3 already scans the last LIVE_TAIL_LINES
+  // (12) non-empty rows per line, so on a SHORT snapshot it blocks this fixture by itself and the
+  // assertion would prove nothing about the arm under test — the short version of this fixture was
+  // written first and passed for exactly that wrong reason. A real terminal is 40+ rows and the
+  // read scrolls up; this is the shape that actually reaches the whole-snapshot scan.
+  it("delivers on a tall pane that is merely displaying documentation containing (y/n)", () => {
+    const screen = [
+      "● Reading apps/desktop/src/voice/dictationTerminalRoute.ts",
+      "  ⎿  // a `password:` / `(y/n)` / `press enter to continue` sitting above the bottom",
+      "     //  of the snapshot stopped blocking, and `overwrite?` with it",
+      ...filler(20),
+      "● Updated three files and ran the suite — all green.",
+      "",
+      "╭────────────────────────────────────────────╮",
+      "│ >                                          │",
+      "╰────────────────────────────────────────────╯",
+      "  ? for shortcuts",
+    ].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(false);
+  });
+
+  // …and a LIVE one still blocks. ⚠️ These two do NOT cover `matchesShellPrompt` — measured, by
+  // neutralizing its ambiguous branch and watching them stay green, which is what showed that branch
+  // to be dead code. `screenAwaitsInput`'s arm 3 is what supplies this, over a strictly larger window
+  // (12 non-empty rows, per line). They are here as the paired direction for the four above: a
+  // suite that only asserts "delivers" cannot tell a working gate from one that blocks nothing.
+  it("blocks a (y/n) sitting at the bottom under two lines of chatter", () => {
+    const screen = [
+      ...filler(30),
+      "Drop the production table? (y/n)",
+      "Waiting for response…",
+      "Press Ctrl-C to abort.",
+    ].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(true);
+  });
+
+  it("blocks a live 'press enter to continue' on the last row", () => {
+    const screen = [...filler(30), "Press enter to continue…"].join("\n");
+    expect(screenBlocksWrite(screen)).toBe(true);
   });
 });

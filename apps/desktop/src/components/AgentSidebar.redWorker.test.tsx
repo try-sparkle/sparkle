@@ -134,17 +134,30 @@ describe("AgentSidebar — attention workers stay reachable via the card", () =>
 //   • `status`          — liveStatus + withUnstartedWorkerAttention + withRedWorkerAttention.
 //                         The WORKER overlays are already in here.
 //   • `effectiveStatus` — status + withUnmergedWork + withDismissedAlerts.
-// Case by case, so this comment cannot drift into claiming coverage that is not here:
-//   • "takes its worker's RED"      — catches a revert to `liveStatus` (goes gray). Not `status`.
-//   • "goes red for an UNSTARTED"   — catches a revert to `liveStatus` (goes gray). Not `status`.
-//   • "stays gray when … working"   — catches NEITHER. a1 has no status of its own, so the head
-//                                     reads `stopped` under every map in the chain. It is the
-//                                     contrast that stops "always red" from passing case 1, not a
-//                                     guard against any revert.
-//   • "reads a DISMISSED red …"     — the only seed where `status` and `effectiveStatus` disagree,
-//                                     so the only one that catches `effectiveStatus → status`.
-// Measured, not assumed: reverting to `liveStatus` fails 3 (the two above plus the dismissed case);
-// reverting to `status` fails 1 (the dismissed case).
+// ⚠️ RE-MEASURED 2026-08-12 (roborev 63141) — THIS FILE NO LONGER GUARDS THE WORKER OVERLAYS.
+// The paragraph that stood here claimed "reverting to `liveStatus` fails 3; reverting to `status`
+// fails 1". That is FALSE now, and the measurement is: neutralizing `withRedWorkerAttention` AND
+// `withUnstartedWorkerAttention` together (composeRollup's `bubbled` fed the un-overlaid map)
+// leaves ALL 8 TESTS IN THIS FILE GREEN.
+//
+// Why: a head's disc is painted from the ROLLUP whenever the rollup band disagrees with the head's
+// own band (AgentSidebar.tsx ~2894), and `rollupOf` is built by `rollupViewFor(..., liveStatus, ...)`
+// — from the RAW map plus its own strand logic, not from the overlaid one. In `seed("errored")` and
+// `seed(null)` the head has no status of its own, so its own band is `done`, the rollup reads red,
+// the override fires, and the disc's red comes from `engine/workerRollup` — never from the overlays.
+//
+// This gap PRE-DATES the ring change; the ring only made it visible, by breaking the two assertions
+// that had been reading a rollup-painted disc while claiming to prove an overlay. What each case
+// actually pins today:
+//   • "takes its worker's RED"      — `engine/workerRollup` over `liveStatus`. Also covered by
+//                                     rowChrome.test.tsx and rollupRing.test.tsx.
+//   • "goes red for an UNSTARTED"   — same, via the rollup's strand handling.
+//   • "stays gray when … working"   — nothing; it is the contrast that stops "always red" passing.
+//   • "reads a DISMISSED red …"     — the ONLY case here that still catches an overlay revert
+//                                     (`effectiveStatus → status`), because the head has no workers,
+//                                     the override never fires, and the disc reads `st`.
+// Restoring a render-site guard for the overlay chain is tracked as its own bead — do not re-state
+// a coverage claim here without re-running the measurement above.
 describe("AgentSidebar — a head row's color agrees with the concierge feed", () => {
   const headRow = () => screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
   /** The head row's own status disc (its children's discs live in their own rows). */
