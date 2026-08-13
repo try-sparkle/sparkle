@@ -712,6 +712,58 @@ def open_fail_backlog(db_path: Path = ROBOREV_DB) -> list[dict] | None:
     return [dict(r) for r in rows if not _is_ephemeral_repo(r["root_path"])]
 
 
+# Review round at which the commit-time surface starts printing the stopping
+# rule alongside the findings. Measured over 6,281 reviews, the FAIL rate by a
+# review's ordinal within its branch is 61.6% on the first, then 53.5, 46.2,
+# 46.0 — and plateaus around 40-48% from there through at least the 14th. Every
+# fix is itself reviewable, so a fix->review->fix loop has a coin-flip chance of
+# producing new findings indefinitely: it does not converge. AGENTS.md documents
+# that, but the commit-time surface below says "act on these NOW" with no sense
+# of how many laps the branch has already taken, so an agent reading only the
+# hook cannot tell whether it is on round 2 or round 9 (one branch drew 63
+# reviews in three days). 4 is where the decline has flattened — before it,
+# another round still buys a materially lower failure rate.
+#
+# This does NOT duplicate the post-commit round cap (`ROBOREV_ROUND_CAP`,
+# default 12), and the two are deliberately far apart. That cap is a hard stop
+# on ENQUEUE — past 12 un-landed commits the daemon simply stops reviewing — so
+# it ends a runaway loop but says nothing while one is forming. The measured
+# case behind this notice ran NINE rounds, which never reaches the cap: the
+# branch was reviewed every time and nothing told the agent it was on lap nine.
+# 4..12 is that gap, and here the surface is advisory, not a stop.
+ROUND_NOTICE_THRESHOLD = 4
+
+
+def format_round_notice(rounds: int, *, threshold: int | None = None) -> str:
+    """The stopping-rule paragraph for a branch that has already drawn `rounds`
+    reviews, or "" while it is still below `threshold` (default
+    `ROUND_NOTICE_THRESHOLD`) — early rounds converge, so the notice would just
+    be noise there.
+
+    Advisory only, and deliberately narrower than "stop": the pre-push gate
+    still denies on any open FAIL, so the notice tells the agent to CLOSE the
+    findings it is declining (with a stated reason) rather than to ignore them.
+    That is the same disposition AGENTS.md prescribes, surfaced at the moment
+    the agent is deciding whether to take another lap."""
+    limit = ROUND_NOTICE_THRESHOLD if threshold is None else threshold
+    if rounds < limit:
+        return ""
+    return (
+        f"ROUND {rounds + 1} ON THIS BRANCH — roborev has already recorded {rounds} review"
+        f"{'s' if rounds != 1 else ''} here, so this is not the first lap. The FAIL rate by "
+        "round plateaus around 40-48% from round 3 onward (measured over 6,281 reviews): every "
+        "fix is itself reviewable, so a fix->review->fix loop does NOT converge, and staying in "
+        "it until roborev goes quiet will burn the session without getting there. That plateau "
+        "is a property of the loop, not a sign you are close.\n"
+        "So on this and every later round, prefer LANDING over another lap: fix everything "
+        "Medium and above (that is what the pre-push gate enforces), and for anything below it "
+        "record a decision instead of chasing it — `EDITOR=true roborev comment <id> -m \"<why>\"` "
+        "then `roborev close <id>`. A declined finding with a reason attached is finished work; "
+        "an unread one is backlog. Do not take another round for findings the gate does not "
+        "block on.\n"
+    )
+
+
 # How much of the machine-wide backlog the PUSH-TIME notice is allowed to print.
 # The full list belongs to `roborev-list-all.py`, which is what an agent runs when
 # it has decided to sweep; the push-time surface only has to make the backlog's

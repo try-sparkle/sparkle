@@ -51,6 +51,7 @@ from _roborev_hooklib import (
     _list_jobs,
     _is_open_fail,
     _emit_hook,
+    format_round_notice,
 )
 
 MAX_REVIEWS = 5
@@ -139,37 +140,47 @@ def main() -> int:
     branch = _current_branch(cwd)
     if not repo_root or not branch:
         return 0
-    rows = _fail_open_reviews(roborev, repo_root, branch)
+    rows, rounds = _fail_open_reviews(roborev, repo_root, branch)
     if rows:
-        _emit_hook({"additionalContext": _format_findings(roborev, repo_root, branch, rows)})
+        _emit_hook(
+            {"additionalContext": _format_findings(roborev, repo_root, branch, rows, rounds)}
+        )
     return 0
 
 
-def _fail_open_reviews(roborev: str, repo_root: str, branch: str) -> list[tuple[int, str]]:
-    """`[(job_id, short_sha), ...]` for OPEN FAIL-verdict reviews on this
-    repo+branch, newest-first (uncapped — the formatter caps + reports the
+def _fail_open_reviews(roborev: str, repo_root: str, branch: str) -> tuple[list[tuple[int, str]], int]:
+    """`([(job_id, short_sha), ...], rounds)` for OPEN FAIL-verdict reviews on
+    this repo+branch, newest-first (uncapped — the formatter caps + reports the
     total). Shares the job fetch (`_list_jobs`) and the outstanding-finding
     predicate (`_is_open_fail`) with the pre-push gate so the warn and deny
     surfaces can never disagree on what counts. A drifted row (missing/null
-    `id`/`git_ref`) fails soft to `[]` rather than crashing the commit hook."""
+    `id`/`git_ref`) fails soft to `([], 0)` rather than crashing the commit hook.
+
+    `rounds` counts EVERY review recorded for this repo+branch, not just the
+    open FAILs — the closed and passing ones are laps this branch already took,
+    which is exactly what the round notice is measuring. It comes out of the one
+    `_list_jobs` call the open-FAIL filter already makes, so it costs nothing."""
     # Warn surface: a `roborev list` failure (None) maps to [] — under-reporting
     # a non-blocking context hint is benign (the push gate is where None must
     # fail closed, not here).
+    jobs = _list_jobs(roborev, repo_root, branch) or []
     try:
         rows = [
             (int(j["id"]), str(j["git_ref"])[:8])
-            for j in (_list_jobs(roborev, repo_root, branch) or [])
+            for j in jobs
             if _is_open_fail(j)
         ]
     except (ValueError, KeyError, TypeError):
-        return []
+        return [], 0
     # Sort newest-first so the cap keeps the newest findings regardless of the
     # CLI's (unverified) default order.
     rows.sort(key=lambda t: t[0], reverse=True)
-    return rows
+    return rows, len(jobs)
 
 
-def _format_findings(roborev: str, repo_root: str, branch: str, rows: list[tuple[int, str]]) -> str:
+def _format_findings(
+    roborev: str, repo_root: str, branch: str, rows: list[tuple[int, str]], rounds: int = 0
+) -> str:
     total = len(rows)
     shown = rows[:MAX_REVIEWS]
     # Never silently truncate — if the cap drops some, say how many so the agent
@@ -198,6 +209,11 @@ def _format_findings(roborev: str, repo_root: str, branch: str, rows: list[tuple
         "without that invalid/YAGNI/valid judgment. This hook does NOT block the commit "
         "(it's informational); the pre-push gate is the hard stop — clearing findings "
         "here keeps the eventual push unblocked.\n\n"
+        # Past the threshold the categorize-each-finding instruction above still
+        # holds, but "VALID -> fix it in the very next commit" stops being the
+        # cheap option — so say which lap this is and what the documented
+        # stopping rule asks for. Below it this renders empty.
+        f"{format_round_notice(rounds)}"
         f"{UNTRUSTED_DATA_WARNING}\n"
     )
     sections = [header]

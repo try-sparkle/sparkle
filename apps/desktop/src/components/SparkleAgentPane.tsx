@@ -20,6 +20,7 @@ import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneRea
 import { registerPaneRestart, unregisterPaneRestart } from "../services/paneControl";
 import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
+import { SparkleAgentInputRow } from "./SparkleAgentInputRow";
 import { Terminal } from "./Terminal";
 import { Onboarding } from "./Onboarding";
 import { TerminalDropOverlay } from "./TerminalDropOverlay";
@@ -56,25 +57,39 @@ interface SpawnCmd {
  * shared clone — so the id keys this pane's worktree, PTY, and status independently of other
  * windows'. Closing the pane keeps the worktree, so reopening in the same window resumes.
  *
- * NO PER-PANE COMPOSER — you TALK to this agent by MOUNTING the concierge to its row, exactly as
- * with every other build agent (founder, 2026-07-29: "the improved Sparkle agent has some old
- * composer window functionality that should be stripped out so that it works like other build
- * agents do"). This pane was the LAST holdout: AgentPane's composer went when the concierge became
- * the one compose surface, and this one kept a private copy of the mic / screenshot / Send row, so
- * Improve Sparkle had two ways in while everything else had one. What stays is the CONSENT BANNER
- * at the top — that is the pane's own control surface, not a compose surface, and the founder was
- * explicit it stays.
+ * THE OLD BESPOKE COMPOSER IS GONE AND STAYS GONE; A PLAIN INPUT ROW REPLACES IT. Two founder
+ * instructions, a fortnight apart, and the second one supersedes only half of the first:
  *
- * The consequences of not having a composer, all of them deliberate:
- *  - The terminal is the pane's input surface for anyone typing directly, so it takes the caret on
- *    reveal (guarded by isTypingInProgress, so it never steals a half-typed concierge message).
- *  - The ⌘J "focus the composer" chord finds nothing here and is swallowed, same as in AgentPane.
- *    In particular this pane no longer names itself as the dictation surface: revealing it must not
- *    move the mic off the concierge box.
- *  - There is no pinned prompt header at all. It used to echo the last composer send; with the
- *    concierge owning the send it degenerated into a static label, and the founder had that label
- *    removed outright (2026-07-30) rather than reworded. The consent row is now the pane's top
- *    chrome.
+ *  - 2026-07-29: "the improved Sparkle agent has some old composer window functionality that should
+ *    be stripped out so that it works like other build agents do" — the mic, the "I'm listening"
+ *    placeholder, the screenshot button, attachments, the drop catch-all that swallowed terminal
+ *    drops. Plus, on the same screenshots: "I don't want you to strip out the top functionality
+ *    here… Just this bottom composer functionality" — the CONSENT ROW stays.
+ *  - 2026-08-12: "There's a problem where the improved sparkle agent doesn't have a row to type
+ *    into." Said while this agent sat BLOCKED ON HIM, asking a direct question it had no visible way
+ *    to receive an answer to. Routing everything through the mounted concierge was the reading of
+ *    the July instruction that produced that dead end — "works like other build agents do" meant
+ *    stop being bespoke, not stop having input.
+ *
+ * So `SparkleAgentInputRow` sits at the bottom: a textarea and a Send button, nothing else, writing
+ * STRAIGHT INTO THIS AGENT'S PTY via `submitPrompt` — the founder's explicit call, not through the
+ * concierge relay. `__sparkle_self__` is app-owned and in no project store, so a relay that resolves
+ * it the ordinary way gets null; the PTY is addressed by id and needs no lookup.
+ *
+ * What did NOT come back with it, all deliberate:
+ *  - No `composerOverlay` claim on the terminal. The row is a SIBLING below the terminal, not a box
+ *    floating over it, so terminalSelectionReclaim has nothing to re-interpret (roborev 46485-M).
+ *  - No `onRequestFocus` / `onUserRequestFocus`. The ⌘J chord is still swallowed here, and this pane
+ *    still does not name itself the dictation surface — revealing it must not move the mic off the
+ *    concierge box. The row is typed into, not dictated into.
+ *  - The terminal still takes the caret on reveal (guarded by isTypingInProgress, so it never steals
+ *    a half-typed message — including one half-typed into the row below it).
+ *  - Still no pinned prompt header. It used to echo the last composer send; with the concierge
+ *    owning the send it degenerated into a static label, and the founder had that label removed
+ *    outright (2026-07-30) rather than reworded. The consent row is the pane's top chrome.
+ *  - The concierge path is UNTOUCHED — mounting the concierge to this row still works, and the
+ *    readiness/paneControl publications below still back it. This is a second way in, not a
+ *    replacement.
  */
 export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agentId: string }) {
   const [phase, setPhase] = useState<Phase>("preparing");
@@ -339,6 +354,7 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
       )}
       {phase === "no-claude" && <Onboarding onRetry={() => void prepare()} />}
       {phase === "ready" && spawn && (
+        <>
         <div style={{ position: "relative", flex: 1, minHeight: 0 }}>
           {/* The terminal's own drop region (useTerminalDrop above). Tauri's drag events are
               window-global and carry no target element, so the hit test needs a marked box.
@@ -408,6 +424,13 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
             />
           )}
         </div>
+        {/* THE ROW THE FOUNDER ASKED FOR (2026-08-12) — see the pane doc above. A SIBLING of the
+            terminal stage, not an overlay on it: that is what keeps `composerOverlay` false and
+            keeps the terminal's own drop region (the box above) the pane's only drop surface. It is
+            gated on `ptyReady` rather than rendered conditionally, so the row is visible — and its
+            state legible — while the workspace is still coming up. */}
+        <SparkleAgentInputRow agentId={agentId} ready={ptyReady} />
+        </>
       )}
     </div>
   );

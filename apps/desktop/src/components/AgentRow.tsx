@@ -2267,6 +2267,35 @@ export const AgentRow = memo(function AgentRow({
           position: "relative",
           display: "flex",
           flexDirection: "column",
+          // OFF-SCREEN ROWS DO NO LAYOUT — this is the renderer half of the 2026-08-12 freeze.
+          // The column is UNVIRTUALIZED, so ~65 agents means ~65 live rows. A `sample` of the
+          // WebContent process (not the app process — that one sat 98% idle in mach_msg, which is
+          // what made this look like a backend hang) caught its main thread 30+ frames deep in
+          // nested RenderBlock::simplifiedLayout → RenderFlexibleBox::layoutBlock →
+          // layoutOutOfFlowBox, bottoming out in computePreferredLogicalWidths — every frame was
+          // recomputing intrinsic widths across the whole tree. `content-visibility: auto` lets the
+          // engine skip layout AND paint for rows outside the viewport, which is most of them.
+          //
+          // GATED ON `filletEnds`, and the gate is load-bearing: content-visibility implies PAINT
+          // containment, which clips descendants to the border box — and the fillets deliberately
+          // paint OUTSIDE it (`top: -ACTIVE_FILLET` / `bottom: -ACTIVE_FILLET`, rowAnatomy) to bite
+          // the arc out of this row's corner. Containing a filleted row would square that opening
+          // back off, undoing the bleed the comment above spends 20 lines protecting. Only the
+          // active/concierge ends carry fillets and those rows are on screen by definition, so
+          // exempting them costs nothing. They are also the only descendants that overflow — every
+          // other negative offset here is the row's OWN margin, which its own containment can't clip.
+          //
+          // The hover card is unaffected: it is createPortal'd to document.body, so it is not a DOM
+          // descendant and containment here cannot reach it.
+          ...(filletEnds.length === 0
+            ? {
+                contentVisibility: "auto" as const,
+                // `auto` remembers the row's last-rendered height, so a skipped row still reserves
+                // its true size and the scrollbar doesn't jump as you scroll. The 32px fallback
+                // applies only to a row that has never been on screen (one 20px line + 4px padding).
+                containIntrinsicSize: "auto 32px",
+              }
+            : {}),
           // 4px vertical, down from 8: the row is a single 20px line of text now (the sub-line and
           // the progress bar moved to the card), so the old padding was sized for content that is
           // no longer here and left the column looking sparse rather than calm.

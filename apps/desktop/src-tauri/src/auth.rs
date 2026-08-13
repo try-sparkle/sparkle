@@ -8,7 +8,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 
@@ -122,13 +122,73 @@ fn entry() -> Result<keyring::Entry, String> {
         .map_err(|e| e.to_string())
 }
 
-fn read_token() -> Option<String> {
+// ── Token cache ───────────────────────────────────────────────────────────────────────────────
+//
+// EVERY authenticated path used to call the keychain. `read_token` has 20+ call sites (the /me
+// poll, every credit spend, the AI proxy, `desktop_list_tickets` — which fires every 60s AND on
+// every window focus), and each one was a synchronous `SecKeychainFindGenericPassword` into
+// securityd. That call is SERIALIZED across callers and does full item-integrity checking, so
+// under a fleet of concurrent blocking tasks the tokio blocking pool parks in securityd and
+// nothing returns to the UI: the app looks frozen while its main thread sits idle in mach_msg.
+// That is the signature of the 2026-08-12 ~2-minute freeze.
+//
+// The token is a long-lived bearer that changes only when THIS process writes it (sign-in) or
+// deletes it (sign-out) — both of which invalidate below — so it is safe to hold in memory.
+// It stays in Rust and never crosses into JS, exactly as before.
+
+/// Last value read from the keychain. `None` = never read (cold); `Some(v)` = cached, where an
+/// inner `None` is the CACHED SIGNED-OUT state — a signed-out app must not re-hit the keychain on
+/// every call either, so "no token" is a cacheable answer, not a cache miss.
+static TOKEN_CACHE: RwLock<Option<Option<String>>> = RwLock::new(None);
+
+/// Serializes the cold-path keychain read so N concurrent callers perform ONE `get_password`
+/// rather than N. Without this the cache alone still lets a thundering herd through on a cold
+/// start — which is precisely the concurrent-blocking-task case that saturated the pool.
+static TOKEN_LOAD_LOCK: Mutex<()> = Mutex::new(());
+
+/// The uncached keychain read. Only `cached_token` should call this.
+fn keychain_read_token() -> Option<String> {
     let t = entry().ok()?.get_password().ok()?;
     if t.is_empty() {
         None
     } else {
         Some(t)
     }
+}
+
+/// Read the token through the cache, loading via `load` on a miss. Split from `read_token` so a
+/// test can COUNT loads (the falsifiable part — a timing assertion would prove nothing).
+fn cached_token(load: impl FnOnce() -> Option<String>) -> Option<String> {
+    // Fast path: a plain read lock, which is what the 20+ call sites now pay instead of an IPC
+    // round-trip into securityd. Scoped so the guard is dropped before we ever take the write lock.
+    {
+        if let Some(v) = TOKEN_CACHE.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return v.clone();
+        }
+    }
+    // Cold path, one loader at a time.
+    let _serialize = TOKEN_LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-check: whoever held the lock ahead of us has already filled the cache, so the herd behind
+    // them performs zero additional keychain reads. This is the line the coalescing test pins.
+    {
+        if let Some(v) = TOKEN_CACHE.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            return v.clone();
+        }
+    }
+    let v = load();
+    *TOKEN_CACHE.write().unwrap_or_else(|e| e.into_inner()) = Some(v.clone());
+    v
+}
+
+/// Drop the cached token so the next read goes back to the keychain. MUST be called by every path
+/// that writes or deletes the keychain item — otherwise a sign-out leaves the old bearer live in
+/// memory (a security bug, not just a staleness one) and a sign-in keeps serving the stale `None`.
+pub(crate) fn invalidate_token_cache() {
+    *TOKEN_CACHE.write().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn read_token() -> Option<String> {
+    cached_token(keychain_read_token)
 }
 
 /// The stored desktop bearer token (or None if signed out), for other Rust modules that need to
@@ -215,7 +275,13 @@ pub fn desktop_bearer_token() -> Option<String> {
 /// Clear the stored token (local sign-out). Missing entry is treated as success.
 #[tauri::command]
 pub fn desktop_sign_out() -> Result<(), String> {
-    match entry()?.delete_credential() {
+    let deleted = entry()?.delete_credential();
+    // Invalidate UNCONDITIONALLY, before inspecting the outcome. A cached bearer that outlives the
+    // keychain item is a security bug, not merely a stale read: every `read_token` caller would go
+    // on authenticating as the user who just signed out. On a failed delete the extra keychain read
+    // this costs is the cheap side of the trade.
+    invalidate_token_cache();
+    match deleted {
         Ok(_) => Ok(()),
         Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(e.to_string()),
@@ -265,6 +331,10 @@ pub async fn desktop_exchange_code(
         .and_then(|t| t.as_str())
         .ok_or_else(|| "exchange response missing token".to_string())?;
     entry()?.set_password(token).map_err(|e| e.to_string())?;
+    // The cache holds the PRE-SIGN-IN answer — almost always a cached `None` (signed out), which
+    // without this would be served to every caller until restart, leaving the app authenticated
+    // nowhere immediately after a successful sign-in.
+    invalidate_token_cache();
     Ok(())
 }
 
@@ -974,5 +1044,111 @@ mod tests {
             server_error("history", 400, r#"{"message":"no error field"}"#),
             r#"history failed: HTTP 400: {"message":"no error field"}"#
         );
+    }
+}
+
+// ── Token cache ───────────────────────────────────────────────────────────────────────────────
+//
+// These COUNT keychain loads. That is the falsifiable part: a timing assertion ("it got faster")
+// would pass on a fast machine with the cache deleted, and this is guarding a freeze, so the test
+// has to fail loudly when the cache stops working. Every case below reads N and asserts 1.
+//
+// No keychain is touched — `cached_token` takes its loader as a parameter, so the tests drive the
+// SAME process-wide cache `read_token` uses without going near securityd (which would also pop a
+// macOS confidential-info prompt in CI).
+#[cfg(test)]
+mod token_cache_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    /// These all drive ONE process-wide cache, and cargo runs tests in parallel threads — without
+    /// this they would clobber each other's cache state and flake.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn n_concurrent_readers_perform_exactly_one_keychain_read() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_token_cache();
+
+        const N: usize = 16;
+        let loads = Arc::new(AtomicUsize::new(0));
+        // A barrier so all N arrive at a COLD cache simultaneously. Staggered threads would let the
+        // first finish and fill the cache before the rest start, which passes without any
+        // coalescing at all — the test would then be vacuous for the case it exists to cover.
+        let barrier = Arc::new(Barrier::new(N));
+
+        let handles: Vec<_> = (0..N)
+            .map(|_| {
+                let loads = Arc::clone(&loads);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    cached_token(|| {
+                        loads.fetch_add(1, Ordering::SeqCst);
+                        Some("bearer-xyz".to_string())
+                    })
+                })
+            })
+            .collect();
+        let seen: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Against the pre-cache code this is N (one securityd round-trip per caller) — which is
+        // what parked the tokio blocking pool and froze the UI.
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "the keychain must be read at most once across {N} concurrent callers"
+        );
+        // Coalescing must hand every waiter the REAL token. Returning `None` to the herd would also
+        // satisfy the count above while silently signing the whole app out.
+        assert!(
+            seen.iter().all(|v| v.as_deref() == Some("bearer-xyz")),
+            "every concurrent caller must receive the loaded token, got {seen:?}"
+        );
+
+        invalidate_token_cache();
+    }
+
+    #[test]
+    fn a_signed_out_answer_is_cached_rather_than_re_read() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_token_cache();
+
+        let loads = AtomicUsize::new(0);
+        let load = || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+
+        assert_eq!(cached_token(load), None);
+        assert_eq!(cached_token(load), None);
+
+        // "No token" is an ANSWER, not a miss. Treating it as a miss would leave a signed-out app
+        // hitting securityd on all 20+ call sites forever — the freeze, minus the sign-in.
+        assert_eq!(
+            loads.load(Ordering::SeqCst),
+            1,
+            "signed-out must be cached, not re-read on every call"
+        );
+
+        invalidate_token_cache();
+    }
+
+    #[test]
+    fn invalidation_sends_the_next_read_back_to_the_keychain() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_token_cache();
+
+        assert_eq!(cached_token(|| Some("first".to_string())), Some("first".to_string()));
+        // Cached: the second loader is never run, so its different value is not observed.
+        assert_eq!(cached_token(|| Some("second".to_string())), Some("first".to_string()));
+
+        // This is the mechanism `desktop_sign_out` and `desktop_exchange_code` rely on. Without it
+        // a sign-out leaves the old bearer live in memory and a sign-in serves a stale `None`.
+        invalidate_token_cache();
+        assert_eq!(cached_token(|| Some("second".to_string())), Some("second".to_string()));
+
+        invalidate_token_cache();
     }
 }
