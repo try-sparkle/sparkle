@@ -94,6 +94,37 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         );
         // Suppress while a switch is already running — the answer is "we're on it", not a new ask.
         if (planRef.current) return;
+
+        // ══ AN OBSERVED WALL MOVES THE FLEET BY ITSELF; AN ESTIMATE STILL ASKS ═══════════════════
+        // `reason: "exhausted"` comes from an observed rate-limit event, and `headroom.ts` says so
+        // in its own words: it "is authoritative … so it outranks any estimate". `"approaching"` is
+        // the learned ceiling, whose measured CoV of 0.24 is exactly why `headroom.ts` declined to
+        // re-spawn a RUNNING fleet unasked. So the two get different answers, and the split is the
+        // whole point: act on the fact, ask about the guess.
+        //
+        // Acting here is safe for the reason the manual path is safe — `advanceSwitch` moves each
+        // agent only at a boundary where `isSafeToSwitch` holds, so nothing is re-spawned mid-turn
+        // and no in-flight work is lost. And it is worth doing because the alternative is not
+        // "wait a moment": an agent behind a session wall is refused by `decideContinuation` until
+        // that account's window resets, which for a session limit is up to five hours of a fleet
+        // sitting idle on an account it can no longer use.
+        //
+        // A DISMISSAL DOES NOT SUPPRESS THIS, deliberately. `dismissed` records "don't nag me that
+        // this account is getting close" — a wave-off of the prediction. It is not a standing
+        // instruction to keep agents parked on an account that has since actually hit its limit,
+        // and reading it that way would turn one impatient click into hours of dead fleet.
+        if (rec && rec.reason === "exhausted") {
+          const fresh = planSwitch(rec.from.id, rec.to.id, paneAccountMap());
+          // Nothing mounted to move: fall through to the banner rather than spin an empty plan
+          // (phase 2 never retires one), same rule as `accept`.
+          if (fresh.pending.length > 0) {
+            setRecommendation(null);
+            planRef.current = fresh;
+            setPlan(fresh);
+            return;
+          }
+        }
+
         setRecommendation(rec && !dismissed.current.has(rec.from.id) ? rec : null);
       } catch (e) {
         console.warn("headroom check failed", e);
