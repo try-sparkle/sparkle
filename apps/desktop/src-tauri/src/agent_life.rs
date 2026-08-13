@@ -123,6 +123,16 @@ pub enum DeathCause {
     /// process, a `Live` record and a `working` status for 47 minutes, invisible to recovery,
     /// because the only sealer (`seal_stale_at`) runs at app LAUNCH and keys on a dead epoch.
     ProcessGone,
+    /// A PERSON DELIBERATELY STOPPED THIS AGENT. Written by `mark_stopped_at` (which `pty_kill`
+    /// calls) and by nothing else — it is sourced from an ACTION this app performed on a human's
+    /// instruction, never inferred from an observation.
+    ///
+    /// IT IS WHY `Unknown` IS RESURRECTABLE NOW. Until 2026-08-13 a stop was recorded as `Unknown`
+    /// on the reasoning that "`unknown` needs no new vocabulary", which forced `is_resurrectable`
+    /// to refuse the entire class — a crash and a stop were literally the same record, and the only
+    /// safe policy over that union was to recover neither. Splitting them lets each get the answer
+    /// it deserves: this one is never resurrectable, and the crashes are.
+    HumanStopped,
     Unknown,
 }
 
@@ -149,6 +159,13 @@ pub enum DeathEvidence {
     /// a window WATCHED the close. Sharing `PtyExit` made `validate` reject every record the
     /// reaper writes (roborev 61705).
     SessionVanished,
+    /// THE APP KILLED THE PTY, on a human's instruction. Written from inside `mark_stopped_at`,
+    /// before the close, by the code that performed the stop.
+    ///
+    /// Distinct from `PtyExit`, which is what a window sees from OUTSIDE a closing PTY and is
+    /// therefore compatible with every cause there is. Nothing infers this one, so nothing can
+    /// mistake a crash for it — which is exactly what `PtyExit` could not promise.
+    UserStop,
     PtyExit,
     SessionEndHook,
     None,
@@ -166,6 +183,7 @@ pub fn cause_of(evidence: DeathEvidence) -> Option<DeathCause> {
         }
         DeathEvidence::EpochDead => Some(DeathCause::AppRestart),
         DeathEvidence::SessionVanished => Some(DeathCause::ProcessGone),
+        DeathEvidence::UserStop => Some(DeathCause::HumanStopped),
         DeathEvidence::PtyExit | DeathEvidence::SessionEndHook | DeathEvidence::None => {
             Some(DeathCause::Unknown)
         }
@@ -183,14 +201,25 @@ pub fn cause_of(evidence: DeathEvidence) -> Option<DeathCause> {
 /// added later and silently answers `false` — so a new cause would default to "never recover", the
 /// one direction that costs the user work, with no compile error and no test failure to say so. The
 /// `match` forces whoever adds a variant to state the policy.
+///
+/// `Unknown` IS TRUE, as of 2026-08-13, and the flip is the whole point of `HumanStopped` existing.
+/// It was false only because a deliberate stop was written as `Unknown`, so the two were one record
+/// and refusing was the only safe policy over the union. Measured cost of that coupling on the
+/// founder's install: 25 of 76 records were `Unknown`/`PtyExit` and every one was permanently
+/// outside recovery, sitting dead with a red row at a human who could do nothing about it. Recovery
+/// PACE for `Unknown` is the conservative one — see `resurrection.armsOnSlowestRung` on the TS side,
+/// which is where "we do not know why" is priced. This function answers eligibility only.
 pub fn is_resurrectable(cause: DeathCause) -> bool {
     match cause {
         DeathCause::TransportTransient
         | DeathCause::WallSession
         | DeathCause::WallSpend
         | DeathCause::AppRestart
-        | DeathCause::ProcessGone => true,
-        DeathCause::CleanGoalMet | DeathCause::BlockedOnHuman | DeathCause::Unknown => false,
+        | DeathCause::ProcessGone
+        | DeathCause::Unknown => true,
+        // `HumanStopped` joins the two terminal ones for a third reason: the human already decided,
+        // and restarting is a wrong ACTION against a stated decision rather than a missed recovery.
+        DeathCause::CleanGoalMet | DeathCause::BlockedOnHuman | DeathCause::HumanStopped => false,
     }
 }
 
@@ -207,6 +236,7 @@ pub fn arms_on_clock(cause: DeathCause) -> bool {
         | DeathCause::BlockedOnHuman
         | DeathCause::AppRestart
         | DeathCause::ProcessGone
+        | DeathCause::HumanStopped
         | DeathCause::Unknown => false,
     }
 }
@@ -228,6 +258,7 @@ fn serde_name_cause(cause: DeathCause) -> &'static str {
         DeathCause::BlockedOnHuman => "blocked-on-human",
         DeathCause::AppRestart => "app-restart",
         DeathCause::ProcessGone => "process-gone",
+        DeathCause::HumanStopped => "human-stopped",
         DeathCause::Unknown => "unknown",
     }
 }
@@ -245,6 +276,7 @@ fn serde_name_evidence(evidence: DeathEvidence) -> &'static str {
         DeathEvidence::GoalDischargedOnGitProof => "goal-discharged-on-git-proof",
         DeathEvidence::EpochDead => "epoch-dead",
         DeathEvidence::SessionVanished => "session-vanished",
+        DeathEvidence::UserStop => "user-stop",
         DeathEvidence::PtyExit => "pty-exit",
         DeathEvidence::SessionEndHook => "session-end-hook",
         DeathEvidence::None => "none",
@@ -621,7 +653,7 @@ fn validate(death: &Death, wall: Option<&Wall>) -> Result<(), LifeError> {
 /// call from `pty_kill`, or changing its cause to something resurrectable, left the entire suite
 /// green while every ordinary stop path became resurrectable again.
 ///
-/// ── WHY `Dead`/`unknown` AND NOT `Retired` (roborev 61714) ────────────────────────────────────
+/// ── WHY `Dead` AND NOT `Retired` (roborev 61714) ──────────────────────────────────────────────
 /// `Retired` carries more meaning than "do not resurrect": `derive` maps it to
 /// `ReaperVerdict::Reapable` UNCONDITIONALLY, with none of the `PROTECTION_MAX` grace `Dead` gets.
 /// But "stop the agents when I close this window" is explicitly not "delete them" — the records and
@@ -629,9 +661,20 @@ fn validate(death: &Death, wall: Option<&Wall>) -> Result<(), LifeError> {
 /// still alive in the cloud on that same worktree. Marking either `Reapable` would hand a worktree
 /// holding uncommitted work to any future reaper.
 ///
-/// `unknown` needs no new vocabulary: `deathTypes` documents it as "a human clicking stop produces
-/// exactly this observation", and `is_resurrectable` refuses it. `PtyExit` is the honest evidence —
-/// a window watched this close, which is what makes it distinct from the reaper's `SessionVanished`.
+/// ── WHY `HumanStopped`/`UserStop` AND NOT `Unknown`/`PtyExit` (2026-08-13) ─────────────────────
+/// It WAS `Unknown`/`PtyExit`, under a comment on this very function arguing that "`unknown` needs
+/// no new vocabulary: `deathTypes` documents it as 'a human clicking stop produces exactly this
+/// observation', and `is_resurrectable` refuses it". Every clause of that was true and the
+/// conclusion was still wrong, because the implication runs the other way: it is not that a stop
+/// happens to look like `Unknown`, it is that writing it as `Unknown` FORCED `is_resurrectable` to
+/// refuse every unexplained death in order to protect this one — and an ordinary crash is
+/// `Unknown`/`PtyExit` too. Measured on the founder's install: 25 of 76 records were exactly that
+/// pair, all permanently unrecoverable, workers sitting dead for 45+ minutes with nothing to offer
+/// but `claude --resume <uuid>` typed into a terminal that is not running.
+///
+/// So the stop gets its own vocabulary and `Unknown` gets to mean "we do not know". `UserStop` is
+/// the honest evidence and is STRONGER than `PtyExit` was: it is written from inside the stop path
+/// by the code performing it, rather than inferred from a close a window watched.
 ///
 /// ONLY a `Live` record is touched, so this can never downgrade a richer verdict a window already
 /// observed (a met goal, a wall, a transport banner). `Ok(false)` means "there was nothing to mark",
@@ -642,8 +685,8 @@ pub fn mark_stopped_at(dir: &Path, agent_id: &str, now_ms: i64) -> Result<bool, 
         _ => return Ok(false),
     }
     let death = Death {
-        cause: DeathCause::Unknown,
-        evidence: DeathEvidence::PtyExit,
+        cause: DeathCause::HumanStopped,
+        evidence: DeathEvidence::UserStop,
         at: now_ms,
         message: None,
         goal_met_at: None,
@@ -1428,16 +1471,7 @@ mod tests {
     fn the_serde_strings_match_deathtypes_ts() {
         let src = include_str!("../../src/engine/deathTypes.ts");
 
-        let causes = [
-            DeathCause::TransportTransient,
-            DeathCause::WallSession,
-            DeathCause::WallSpend,
-            DeathCause::CleanGoalMet,
-            DeathCause::BlockedOnHuman,
-            DeathCause::AppRestart,
-            DeathCause::ProcessGone,
-            DeathCause::Unknown,
-        ];
+        let causes = EVERY_CAUSE;
         for c in causes {
             // serde really emits what the exhaustive helper claims…
             assert_eq!(
@@ -1613,13 +1647,22 @@ mod tests {
     /// like that: `spinDownWorker`, `ProjectModal` killing a whole project's agents,
     /// `AgentSidebar` closing a row, `killAllOpenAgents` on window close.
     ///
-    /// `pty_kill` marks the record `Dead`/`unknown` before killing (see
-    /// `pty.rs::mark_stopped_before_kill`), and this asserts what that buys. `unknown` rather than
+    /// `pty_kill` marks the record `Dead`/`HumanStopped` before killing (see
+    /// `pty.rs::mark_stopped_before_kill`), and this asserts what that buys. `Dead` rather than
     /// `Retired` is load-bearing in BOTH directions, so both are asserted:
     ///   - not resurrectable, so the fleet cannot restart what the user stopped
     ///   - still PROTECTED from the worktree reaper, because "stop" is not "delete" and the
     ///     promotion cutover kills a local pty for an agent still alive in the cloud. `Retired`
     ///     maps to `Reapable` unconditionally, with none of `Dead`'s `PROTECTION_MAX` grace.
+    ///
+    /// ── THIS TEST ONLY STARTED DISCRIMINATING ON 2026-08-13 ───────────────────────────────────
+    /// The stop used to be written as `Unknown`, and `Unknown` was refused resurrection, so the
+    /// `!resurrectable` assertion below was ALSO satisfied by a `mark_stopped_at` that recorded
+    /// nothing specific at all — it could not tell "the stop was recorded" from "every unexplained
+    /// death is refused". Now that `Unknown` recovers, reverting the cause here turns this red:
+    /// `resurrectable` becomes true and the fleet restarts what the user killed. The cause is
+    /// asserted DIRECTLY as well, so the guard names the property rather than depending on a policy
+    /// two functions away continuing to imply it.
     ///
     /// Inverted pair against `a_live_record_whose_session_vanished_is_reaped_and_becomes_
     /// resurrectable`: identical inputs, and ONLY the recorded stop differs.
@@ -1636,6 +1679,23 @@ mod tests {
             mark_stopped_at(&dir, "a1", NOW).unwrap(),
             "a Live record must actually be marked — an Ok(false) here would make everything below \
              assert about a record nothing touched"
+        );
+
+        // THE CAUSE ITSELF, named. `!resurrectable` below is the consequence; this is the fact, and
+        // it is the one a reader has to be able to check without re-deriving `is_resurrectable`.
+        let stopped = read_record_at(&dir, "a1").unwrap().unwrap();
+        let stopped_death = stopped.death.as_ref().expect("the stop must have written a death");
+        assert_eq!(
+            stopped_death.cause,
+            DeathCause::HumanStopped,
+            "a deliberate stop must be recorded AS a stop. It was `Unknown` until 2026-08-13, which \
+             is what forced `is_resurrectable` to refuse every unexplained death to protect this \
+             one — 25 of 76 records on the founder's install, all permanently unrecoverable"
+        );
+        assert_eq!(
+            stopped_death.evidence,
+            DeathEvidence::UserStop,
+            "and the evidence must say the app did it, not that a window watched a PTY close"
         );
 
         let at = NOW + REAP_GRACE_MS;
@@ -1662,8 +1722,13 @@ mod tests {
     /// while changing real behaviour. `close_at` refuses a downgrade ONLY for `CleanGoalMet`; every
     /// other recorded death is overwritten. So an agent already sealed on a session wall — whose
     /// `reset_at` is exactly what `arms_on_clock` uses to bring it back — that is then swept by
-    /// `killAllOpenAgents` or `ProjectModal` would have its cause rewritten to `unknown`, which
-    /// `is_resurrectable` refuses. It would silently never come back at reset.
+    /// `killAllOpenAgents` or `ProjectModal` would have its cause rewritten to `HumanStopped`,
+    /// which `is_resurrectable` refuses. It would silently never come back at reset.
+    ///
+    /// THE STAKES WENT UP with the 2026-08-13 taxonomy split, they did not go down. The overwrite
+    /// used to land on `Unknown`, which was also refused — so this guarded against losing the wall's
+    /// `reset_at` clock. It now lands on a cause that is refused BY DESIGN and permanently, so a
+    /// missing pre-check would convert a recoverable wall death into a terminal one.
     ///
     /// Paired with the test above: same call, and the ONLY difference is the record's prior state.
     #[test]
@@ -1691,8 +1756,8 @@ mod tests {
         assert_eq!(
             rec.death.as_ref().unwrap().cause,
             DeathCause::WallSession,
-            "the wall death must survive the stop — rewriting it to `unknown` makes an agent that \
-             would have returned at reset never return at all"
+            "the wall death must survive the stop — rewriting it to `human-stopped` makes an agent \
+             that would have returned at reset never return at all"
         );
         assert_eq!(
             rec.wall.as_ref().unwrap().reset_at,
@@ -1838,6 +1903,23 @@ mod tests {
         assert_eq!(r.reaper_verdict, ReaperVerdict::Reapable);
     }
 
+    /// EVERY `DeathCause` VARIANT, for the same reason `EVERY_EVIDENCE` below exists — it was a
+    /// list local to `the_serde_strings_match_deathtypes_ts`, and the moment a SECOND test needed
+    /// the causes (`is_resurrectable_matches_deathtypes_ts`) that local list would have become the
+    /// duplicated pair whose drift `EVERY_EVIDENCE`'s own doc argues against. Hand-written for the
+    /// same residual reason: Rust cannot enumerate an enum's variants without `strum`.
+    const EVERY_CAUSE: [DeathCause; 9] = [
+        DeathCause::TransportTransient,
+        DeathCause::WallSession,
+        DeathCause::WallSpend,
+        DeathCause::CleanGoalMet,
+        DeathCause::BlockedOnHuman,
+        DeathCause::AppRestart,
+        DeathCause::ProcessGone,
+        DeathCause::HumanStopped,
+        DeathCause::Unknown,
+    ];
+
     /// EVERY `DeathEvidence` VARIANT, in one place.
     ///
     /// Hand-written, because Rust cannot enumerate an enum's variants without `strum` — that
@@ -1851,7 +1933,7 @@ mod tests {
     /// a STALE EXTRA entry here is caught by the sibling serde guard, which round-trips every element
     /// through serde. The `len` equality inside the mapping test compares the TS switch against the
     /// TS union — both TypeScript-side — and says nothing about this array.
-    const EVERY_EVIDENCE: [DeathEvidence; 11] = [
+    const EVERY_EVIDENCE: [DeathEvidence; 12] = [
         DeathEvidence::QuotaBlock,
         DeathEvidence::Transcript429,
         DeathEvidence::ApiBanner,
@@ -1860,10 +1942,48 @@ mod tests {
         DeathEvidence::GoalDischargedOnGitProof,
         DeathEvidence::EpochDead,
         DeathEvidence::SessionVanished,
+        // The deliberate-stop evidence. It arrived on a branch that predated this array (it was a
+        // list duplicated per test back then), so the merge that brought the two together had to add
+        // it HERE rather than to the copy it was written against — which is the drift this array
+        // exists to make impossible, working as designed: the serde guard round-trips every element
+        // and compares the result against `deathTypes.ts`'s union as a SET, so a member present in
+        // TS and missing here fails loudly instead of silently narrowing the guard's coverage.
+        DeathEvidence::UserStop,
         DeathEvidence::PtyExit,
         DeathEvidence::SessionEndHook,
         DeathEvidence::None,
     ];
+
+    /// Split one line of a TS `switch` into the `case "x":` labels it opens and whatever follows
+    /// them on that same line.
+    ///
+    /// WHY THIS IS NOT `strip_prefix("case \"")` (roborev 63744, Medium). The two switch parsers
+    /// below used to recognise a label and a `return` only as the FIRST token of their own trimmed
+    /// line. A single-line arm — `case "x": return true;`, valid TS and blocked by nothing here —
+    /// therefore pushed `"x"` onto the pending list and never saw its `return`, so `"x"` silently
+    /// took the NEXT arm's verdict. The membership assertions still passed (the key is present), so
+    /// the guard would report green while pinning the wrong answer: the exact drift class these
+    /// tests exist to catch, reproduced inside the tests themselves.
+    ///
+    /// A `default:` arm is refused outright rather than mis-attributed — these switches are
+    /// exhaustive over a union and have none, and guessing what a fallthrough default means is how
+    /// the above happened.
+    fn ts_case_labels(line: &str) -> (Vec<String>, &str) {
+        let mut labels = Vec::new();
+        let mut rest = line.trim();
+        while let Some(after) = rest.strip_prefix("case \"") {
+            let Some(end) = after.find('"') else { break };
+            labels.push(after[..end].to_string());
+            rest = after[end + 1..].trim_start();
+            rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+        }
+        assert!(
+            !rest.starts_with("default:"),
+            "this switch parser cannot read a `default:` arm — it would silently take the verdict \
+             meant for the labels before it"
+        );
+        (labels, rest)
+    }
 
     /// Parse `causeOf`'s switch out of `deathTypes.ts` — the labels run as regularly as the union
     /// members `ts_union_members` already handles: `case "x":` lines accumulate until a `return`
@@ -1876,21 +1996,23 @@ mod tests {
         let mut out = std::collections::BTreeMap::new();
         let mut pending: Vec<String> = Vec::new();
         for line in body.lines() {
-            let t = line.trim();
-            if let Some(rest) = t.strip_prefix("case \"") {
-                if let Some(end) = rest.find('"') {
-                    pending.push(rest[..end].to_string());
-                }
-            } else if let Some(rest) = t.strip_prefix("return ") {
-                let cause = rest.strip_prefix('"').and_then(|r| r.find('"').map(|e| r[..e].to_string()));
+            let (labels, rest) = ts_case_labels(line);
+            pending.extend(labels);
+            if let Some(value) = rest.strip_prefix("return ") {
+                let cause = value.strip_prefix('"').and_then(|r| r.find('"').map(|e| r[..e].to_string()));
                 for evidence in pending.drain(..) {
                     out.insert(evidence, cause.clone());
                 }
-            } else if t == "}" && !out.is_empty() && pending.is_empty() {
+            } else if rest == "}" && !out.is_empty() && pending.is_empty() {
                 break;
             }
         }
         assert!(!out.is_empty(), "parsed no arms from causeOf — the parser, not the switch, is probably wrong");
+        assert!(
+            pending.is_empty(),
+            "causeOf left {pending:?} with no `return` — the parser dropped an arm, so every verdict \
+             below it is unproven"
+        );
         out
     }
 
@@ -1941,6 +2063,132 @@ mod tests {
             let got = cause_of(*rust).map(|c| serde_name_cause(c).to_string());
             assert_eq!(&got, want, "cause_of({evidence:?}) drifted from deathTypes.causeOf");
         }
+    }
+
+    /// Parse `isResurrectable`'s switch out of `deathTypes.ts`. Same shape as `ts_cause_of` above —
+    /// `case "x":` labels accumulate until a `return` names the verdict they share — except the
+    /// verdict is a bare `true`/`false` rather than a quoted string.
+    fn ts_is_resurrectable(src: &str) -> std::collections::BTreeMap<String, bool> {
+        let body = src
+            .split("export function isResurrectable")
+            .nth(1)
+            .expect("isResurrectable not found in deathTypes.ts");
+        let mut out = std::collections::BTreeMap::new();
+        let mut pending: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let (labels, rest) = ts_case_labels(line);
+            pending.extend(labels);
+            if let Some(value) = rest.strip_prefix("return ") {
+                let verdict = match value.trim_end_matches(';').trim() {
+                    "true" => true,
+                    "false" => false,
+                    other => panic!("isResurrectable returned {other:?}, which this parser cannot read"),
+                };
+                for cause in pending.drain(..) {
+                    out.insert(cause, verdict);
+                }
+            } else if rest == "}" && !out.is_empty() && pending.is_empty() {
+                break;
+            }
+        }
+        assert!(!out.is_empty(), "parsed no arms from isResurrectable — the parser, not the switch, is probably wrong");
+        assert!(
+            pending.is_empty(),
+            "isResurrectable left {pending:?} with no `return` — the parser dropped an arm, so every \
+             verdict below it is unproven"
+        );
+        out
+    }
+
+    /// THE PARSERS ABOVE ARE THEMSELVES TESTED, because they are the thing every cross-language
+    /// assertion in this module stands on and their failure mode is a WRONG ANSWER, not an error.
+    ///
+    /// Both cases here are drawn from roborev 63744 (Medium): a compact single-line arm used to
+    /// donate its labels to the next arm's verdict, and a trailing label with no `return` used to
+    /// vanish. The first is asserted directly; the second is the `#[should_panic]` beside it.
+    #[test]
+    fn the_switch_parsers_read_a_single_line_arm() {
+        let src = "export function isResurrectable(c: DeathCause): boolean {\n\
+                   switch (c) {\n\
+                   case \"a\": return true;\n\
+                   case \"b\":\n\
+                   case \"c\":\n\
+                   return false;\n\
+                   }\n\
+                   }\n";
+        let got = ts_is_resurrectable(src);
+        assert_eq!(got.get("a"), Some(&true), "a compact arm must keep its OWN verdict");
+        assert_eq!(got.get("b"), Some(&false));
+        assert_eq!(got.get("c"), Some(&false));
+        assert_eq!(got.len(), 3);
+
+        let cause_src = "export function causeOf(e: DeathEvidence): DeathCause | null {\n\
+                         switch (e) {\n\
+                         case \"user-stop\": return \"human-stopped\";\n\
+                         case \"quota-block\":\n\
+                         return null;\n\
+                         }\n\
+                         }\n";
+        let got = ts_cause_of(cause_src);
+        assert_eq!(got.get("user-stop"), Some(&Some("human-stopped".to_string())));
+        assert_eq!(got.get("quota-block"), Some(&None));
+    }
+
+    #[test]
+    #[should_panic(expected = "the parser dropped an arm")]
+    fn a_case_label_with_no_return_is_a_loud_failure_not_a_dropped_arm() {
+        // `"orphan"` never reaches a `return`. Silently dropping it would leave the guard green
+        // while saying nothing about that cause at all.
+        let src = "export function isResurrectable(c: DeathCause): boolean {\n\
+                   switch (c) {\n\
+                   case \"a\":\n\
+                   return true;\n\
+                   case \"orphan\":\n";
+        let _ = ts_is_resurrectable(src);
+    }
+
+    /// THE RECOVERY POLICY, ASSERTED AGAINST `deathTypes.ts` ITSELF — the sibling of
+    /// `cause_of_maps_every_evidence_the_way_deathtypes_ts_does`, for the other hand-mirrored table.
+    ///
+    /// `the_serde_strings_match_deathtypes_ts` compares the two vocabularies as SETS OF STRINGS, so
+    /// it is structurally blind to the VERDICTS: flip `unknown` on one side only and both suites
+    /// stay green while the Rust revival thread and the TypeScript UI disagree about whether a dead
+    /// agent may come back. That is not hypothetical — this branch flipped exactly that value, and
+    /// the only thing that failed was a stale behavioural test in this module, which would not have
+    /// existed had the flip been made in the other order.
+    ///
+    /// COVERAGE, STATED EXACTLY: this fails on a parsed TS cause whose Rust verdict differs, and on
+    /// a TS cause with no Rust variant (the lookup panics). A stale EXTRA entry in `EVERY_CAUSE` is
+    /// caught by `the_serde_strings_match_deathtypes_ts`, which compares the sets in both
+    /// directions — do not weaken that guard on the strength of this one.
+    #[test]
+    fn is_resurrectable_matches_deathtypes_ts() {
+        let src = include_str!("../../src/engine/deathTypes.ts");
+        let expected = ts_is_resurrectable(src);
+
+        // Every cause in the TS union must appear in the switch, or everything below is vacuous.
+        let members = ts_union_members(src, "DeathCause");
+        for m in &members {
+            assert!(expected.contains_key(m), "isResurrectable has no arm for {m:?}");
+        }
+        assert_eq!(expected.len(), members.len(), "isResurrectable and the union disagree on membership");
+
+        for (cause_str, want) in &expected {
+            let rust = EVERY_CAUSE
+                .iter()
+                .find(|c| serde_name_cause(**c) == cause_str.as_str())
+                .unwrap_or_else(|| panic!("no Rust variant serialises as {cause_str:?}"));
+            assert_eq!(
+                is_resurrectable(*rust),
+                *want,
+                "is_resurrectable({cause_str:?}) drifted from deathTypes.isResurrectable"
+            );
+        }
+
+        // The pair that carries this branch's whole point, asserted by name so a reader does not
+        // have to trust the loop above to have covered them.
+        assert!(*expected.get("unknown").expect("no `unknown` arm"), "an unexplained death must be recoverable");
+        assert!(!*expected.get("human-stopped").expect("no `human-stopped` arm"), "a human's stop is a decision");
     }
 
     #[test]
@@ -2451,14 +2699,36 @@ mod tests {
         assert_eq!(reaper_verdict_at(&dir, &app_data, "a1", past), ReaperVerdict::Reapable);
     }
 
+    /// AN UNCLASSIFIED DEATH IS RECOVERED, NOT DESTROYED — and this test asserted the opposite
+    /// until 2026-08-13.
+    ///
+    /// It read `assert!(!r.resurrectable)` because `Unknown`/`PtyExit` was also what the app wrote
+    /// when a HUMAN clicked stop, so refusing was the only safe policy over that union. Now that
+    /// `HumanStopped`/`UserStop` carries the stops (see `is_resurrectable`), `Unknown` means what
+    /// it says and is eligible — on the slowest rung, which is a separate question answered in
+    /// `resurrection.armsOnSlowestRung`. This is the READ path the UI consumes, so it is the
+    /// surface where the flip has to be visible.
     #[test]
-    fn an_unclassified_death_is_neither_resurrected_nor_destroyed() {
+    fn an_unclassified_death_is_recovered_not_destroyed() {
         let (_td, dir, app_data) = dirs();
         open(&dir, "a1", "e");
         close_at(&dir, "a1", death(DeathCause::Unknown, DeathEvidence::PtyExit), None).unwrap();
         let r = read_at(&dir, &app_data, "a1", NOW).unwrap().unwrap();
-        assert!(!r.resurrectable);
+        assert!(r.resurrectable, "an unexplained death must reach recovery, not sit dead forever");
         assert_eq!(r.reaper_verdict, ReaperVerdict::Protected);
+    }
+
+    /// THE PAIRED NEGATIVE. Without it the assertion above would pass equally well against a read
+    /// path that reported EVERY death as resurrectable — which would restart agents the founder
+    /// had just stopped, the one outcome this module ranks worse than a missed recovery.
+    #[test]
+    fn a_death_the_human_asked_for_is_not_resurrectable_on_the_same_read_path() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "e");
+        close_at(&dir, "a1", death(DeathCause::HumanStopped, DeathEvidence::UserStop), None)
+            .unwrap();
+        let r = read_at(&dir, &app_data, "a1", NOW).unwrap().unwrap();
+        assert!(!r.resurrectable, "a human's stop is a decision, not a fault to recover from");
     }
 
     #[test]

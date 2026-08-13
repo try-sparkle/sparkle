@@ -568,6 +568,48 @@ export function routeRetriesExhausted(input: {
 }
 
 /**
+ * A DEAD SESSION whose automatic recovery has spent its whole daily budget — the respawn ladder's
+ * terminus, and the sibling of {@link routeRetriesExhausted} on the other side of the liveness axis.
+ *
+ * ── WHY IT IS A SEPARATE ROUTE FROM ITS SIBLING ─────────────────────────────────────────────────
+ * `routeRetriesExhausted` is about an agent that is STILL RUNNING and keeps failing — its own doc
+ * spends four paragraphs establishing that, because saying "it is not running" about a live agent
+ * sent the concierge to do the wrong thing twice. This one is the opposite fact: the process is
+ * gone. `decideResurrection` requires `processAlive === false` before it will spend a rung at all,
+ * so anything reaching here has been positively observed dead. Reusing either sibling's sentence
+ * would state the liveness backwards, which is precisely the defect that split them apart.
+ *
+ * ── AND WHY IT GOES TO THE CONCIERGE RATHER THAN THE FOUNDER ────────────────────────────────────
+ * The founder's objection, on a fleet of dead workers painting red at him: *"there's nothing I can
+ * do to resolve this. So why am I seeing this?"* He cannot type into a terminal that is not running.
+ * Restarting an agent, or taking its branch over, is exactly what the concierge does — so this is
+ * the same preference order every route in this file follows: agent, then concierge, then the human.
+ *
+ * ── THE CAP IS A ROLLING WINDOW, AND THE COPY MUST NOT CLAIM OTHERWISE ──────────────────────────
+ * `MAX_RESURRECTS_PER_AGENT_PER_DAY` is counted over a rolling 24h, so the budget refills by itself.
+ * The sentence therefore says the automatic path is spent FOR NOW rather than that the agent is
+ * unrecoverable — a concierge told "this is dead for good" would retire work that only needed to
+ * wait, and `resurrectionRunner` classifies this reason as transient for the identical reason.
+ */
+export function routeRecoveryExhausted(input: {
+  label: string;
+  /** Respawns actually spent in the rolling window. The caller supplies the real figure; the router
+   *  owns every other word, so nothing it says can be doubled by an interpolated message. */
+  attempts: number;
+}): BlockerRoute {
+  return {
+    target: "concierge",
+    reason: "recovery-exhausted",
+    text:
+      `${input.label} is DEAD — its process has exited — and automatic recovery has spent its ` +
+      `daily budget of ${input.attempts} respawns without getting it back. Nothing further is ` +
+      `scheduled until that rolling window frees up, so this is yours now, not the founder's: he ` +
+      `cannot type into a terminal that is not running. Read what it was doing, then restart it or ` +
+      `take its branch over. Do not retire it without checking for unlanded work.`,
+  };
+}
+
+/**
  * Does this failure read as self-clearing?
  *
  * MATCHED ON THE VERBATIM MESSAGE, because that is the only durable channel: an agent that dies

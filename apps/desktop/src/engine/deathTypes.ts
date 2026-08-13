@@ -49,8 +49,11 @@
  * retry loop and is very often GONE by the time the PTY closes. Whether the banner survives to
  * `exit()` is a race against the last retry, and the census says it loses: of 76 agent-life records
  * on the founder's v0.95.0 install, **zero** are `transport-transient` while 25 are `unknown` with
- * evidence `pty-exit` — and `isResurrectable` refuses `unknown`, so all 25 were structurally outside
- * recovery. The banner has to be RETAINED past the recovery signal, and a retained banner has to
+ * evidence `pty-exit` — and `isResurrectable` refused `unknown` at the time, so all 25 were
+ * structurally outside recovery. (That refusal is gone; see {@link isResurrectable}. This window
+ * still matters, because `transport-transient` recovers on the FAST rungs and `unknown` on the
+ * slowest — classifying honestly is what buys the difference.) The banner has to be RETAINED past
+ * the recovery signal, and a retained banner has to
  * expire or it becomes a permanent stamp of the last bad turn.
  *
  * ── WHY 5 MINUTES ────────────────────────────────────────────────────────────────────────────
@@ -89,14 +92,28 @@ export type DeathCause =
    * still-live epoch. Distinct from `app-restart` (the whole app died; keyed on a dead epoch) and
    * from `unknown` (a window WATCHED the exit and had nothing to say).
    *
-   * Resurrectable, and the asymmetry with `unknown` is deliberate rather than inconsistent. The
-   * comment on {@link isResurrectable} explains that `unknown` refuses because a human clicking
-   * stop produces exactly that observation — but a deliberate stop is BY CONSTRUCTION observed,
-   * since a mounted pane is what renders the button. This cause is reached only when nothing
-   * observed the exit, which is the one case a human stop cannot produce. It is the "distinct
-   * cause sourced from the app's own liveness" that comment asks for, from the other side.
+   * Resurrectable — as `unknown` now is too, so the asymmetry this comment used to argue for is
+   * gone. It was a workaround: `unknown` refused because a human clicking stop was recorded as
+   * `unknown`, and this cause escaped the refusal by being reachable ONLY when nothing observed the
+   * exit — the one case a deliberate stop cannot produce. It was "the distinct cause sourced from
+   * the app's own liveness" the {@link isResurrectable} comment asked for, from the other side.
+   * `human-stopped` is now that cause from the intended side, so the two are simply both eligible.
+   *
+   * It still earns its own name: `process-gone` is an inference from an ABSENCE with no observer,
+   * which is a different fact from `unknown`'s "a window watched and had nothing to say" — and the
+   * two now recover at different PACES (see `resurrection.armsOnSlowestRung`), so collapsing them
+   * would slow every reaped agent to the 30-minute rung for no reason.
    */
   | "process-gone"
+  /**
+   * A PERSON DELIBERATELY STOPPED THIS AGENT — written by the app's own stop path, never inferred.
+   *
+   * The one cause sourced from an ACTION rather than from an observation: `pty_kill` calls
+   * `agent_life::mark_stopped_at`, so the record says "we did this on a human's instruction"
+   * instead of "the PTY closed and we have no idea why". Never resurrectable, and it is the reason
+   * `unknown` no longer has to be — see {@link isResurrectable}.
+   */
+  | "human-stopped"
   /** Nothing was observed. A first-class, honest value — NOT a synonym for "healthy" or "fine". */
   | "unknown";
 
@@ -141,6 +158,16 @@ export type DeathEvidence =
    * record the reaper writes — the invariant stated but untrue (roborev 61705).
    */
   | "session-vanished"
+  /**
+   * THE APP ITSELF KILLED THE PTY, on a human's instruction — `pty_kill` → `mark_stopped_at`.
+   *
+   * Distinct from `"pty-exit"`, and the distinction is the whole of this change. Both describe a
+   * closed PTY that a window watched; only this one knows WHO closed it. `"pty-exit"` is what a
+   * window sees from the outside and is compatible with every cause there is, which is why it
+   * supports only `"unknown"`; this is written from INSIDE the stop path, before the close, by the
+   * code that performed it. Nothing infers it, so nothing can mistake a crash for it.
+   */
+  | "user-stop"
   /** The PTY ended, or a SessionEnd hook landed, with nothing else to say about why. */
   | "pty-exit"
   | "session-end-hook"
@@ -203,6 +230,8 @@ export function causeOf(evidence: DeathEvidence): DeathCause | null {
       return "app-restart";
     case "session-vanished":
       return "process-gone";
+    case "user-stop":
+      return "human-stopped";
     case "pty-exit":
     case "session-end-hook":
       return "unknown";
@@ -234,21 +263,33 @@ export function verdictIsSupported(verdict: DeathVerdict): boolean {
  * bounded backoff and comes back the moment a probe succeeds. Telling the founder is a byproduct, so
  * he can shorten the outage; it is never what the system waits on.
  *
- * ── WHY `unknown` IS FALSE, DELIBERATELY (roborev 60067 / 60061 argued for TRUE) ───────────────
- * The review's case is real and worth stating fairly: `pty-exit` and `session-end-hook` are the most
- * common observations there are, both map to `unknown`, so a false here means most deaths never
- * recover — "today's behaviour restated as a contract".
+ * ── WHY `unknown` IS NOW TRUE — THE TAXONOMY GAP IS CLOSED ────────────────────────────────────
+ * This function refused `unknown` until 2026-08-13, and the refusal was never about `unknown`. It
+ * was about ONE cause wearing two meanings: `mark_stopped_at` — the ledger half of "a person clicked
+ * stop" — wrote `{cause: unknown, evidence: pty-exit}`, on the reasoning that "`unknown` needs no new
+ * vocabulary". So a deliberate stop and an unexplained crash were the SAME record, and the only
+ * policy that is safe over that union is the conservative one: refuse. The earlier version of this
+ * comment said as much and named the fix — "a distinct `human-stopped` cause sourced from the app's
+ * own stop path; once that exists, `unknown` genuinely does mean 'we do not know' and can move to
+ * the most conservative pace rather than to a refusal."
  *
- * It is still false, for a reason the review did not weigh: **a human deliberately stopping an agent
- * produces exactly that observation.** A clean PTY exit with no error banner, no wall and no met
- * goal is indistinguishable, from here, from a person clicking stop. Making `unknown` resurrectable
- * would have the fleet restart agents their owner just killed — a wrong action against an explicit
- * human decision, which is strictly worse than the missed recovery it would buy.
+ * {@link DeathCause.human-stopped} is that cause, and `"user-stop"` is its evidence. A stop is now
+ * recorded as a stop, by the code that performs it, BEFORE the PTY closes — so it is not inferred
+ * and cannot be confused with anything. `unknown` is therefore free to mean what it says.
  *
- * This is a gap in the TAXONOMY, not a policy to invert. The right fix is a distinct `human-stopped`
- * cause sourced from the app's own stop path; once that exists, `unknown` genuinely does mean "we do
- * not know" and can move to the most conservative pace rather than to a refusal. Until then the
- * refusal stays, and it is the one place this module chooses a missed recovery over a wrong action.
+ * WHAT IT COST TO LEAVE IT FALSE, measured on the founder's v0.95.0 install: 25 of 76 agent-life
+ * records were `unknown`/`pty-exit` and 0 were `transport-transient`, so essentially EVERY
+ * unexplained death was structurally outside recovery — permanently, with the row painting red at a
+ * human who could do nothing about it. His words: *"there's nothing I can do to resolve this. So why
+ * am I seeing this?"* A dead session is blocked on a RESTART, not on a person.
+ *
+ * TRUE HERE IS NOT "TREAT IT LIKE A KNOWN FAULT". `unknown` recovers on the SLOWEST rung available
+ * and never on the fast path — see `resurrection.armsOnSlowestRung`, which is where the "most
+ * conservative pace" half of that sentence is implemented. This function answers ELIGIBILITY; the
+ * pace is a separate question and a separate answer.
+ *
+ * The two remaining `false` answers are unchanged and are false for opposite reasons — see the head
+ * of this comment — and `human-stopped` joins them for a third: the human already decided.
  */
 export function isResurrectable(cause: DeathCause): boolean {
   switch (cause) {
@@ -257,10 +298,16 @@ export function isResurrectable(cause: DeathCause): boolean {
     case "wall-spend":
     case "app-restart":
     case "process-gone":
+    case "unknown":
       return true;
     case "clean-goal-met":
     case "blocked-on-human":
-    case "unknown":
+    case "human-stopped":
+      // `human-stopped` is an explicit human decision. Restarting it would be a wrong ACTION
+      // against a stated one, which this module has always ranked strictly worse than a missed
+      // recovery. (The note lives in the body rather than between the labels: a comment sitting
+      // between two case labels is what `no-fallthrough` reports, and it is an ERROR in this
+      // package's lint gate — it went red in CI written the other way.)
       return false;
   }
 }

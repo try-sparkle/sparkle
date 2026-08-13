@@ -3100,11 +3100,19 @@ export function AgentSidebar({
             // Read only when the head is closed: opening it renders the real child rows, and both at
             // once would say the same thing twice. Empty for a green/gray subtree, so a settled
             // fleet stays exactly as compact as it is today.
+            //
+            // ONE STATUS EXPRESSION, TWO CONSUMERS. `peekStatusOf` is what SELECTS the peek's
+            // workers and what PAINTS them, named once rather than written twice — the peek and the
+            // worker's own row disagreed for exactly as long as they derived a worker's attention
+            // separately (see WorkerPeek's header, and workerPeekRowAgreement.test.tsx). It is the
+            // same `effectiveStatus[id] ?? "stopped"` the row above reads into `st`, so a worker's
+            // dot means the same thing folded and unfolded.
+            const peekStatusOf = (id: string): AgentTabStatus => effectiveStatus[id] ?? "stopped";
             const peek = collapsed.has(top.id)
               ? attentionWorkersOf(
                   project?.agents ?? [],
                   top.id,
-                  (id) => effectiveStatus[id] ?? "stopped",
+                  peekStatusOf,
                   (id) => liveStatus[id] !== undefined,
                 )
               : [];
@@ -3118,6 +3126,7 @@ export function AgentSidebar({
                 {peek.length > 0 && (
                   <WorkerPeek
                     workers={peek}
+                    statusOf={peekStatusOf}
                     headName={top.name}
                     onOpen={() => toggleOrchestratorCollapsed(top.id)}
                   />

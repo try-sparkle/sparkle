@@ -22,6 +22,7 @@ const ALL_EVIDENCE = [
   "goal-discharged-on-git-proof",
   "epoch-dead",
   "session-vanished",
+  "user-stop",
   "pty-exit",
   "session-end-hook",
   "none",
@@ -35,6 +36,7 @@ const ALL_CAUSES = [
   "blocked-on-human",
   "app-restart",
   "process-gone",
+  "human-stopped",
   "unknown",
 ] as const satisfies readonly DeathCause[];
 
@@ -155,8 +157,30 @@ describe("isResurrectable", () => {
     expect(isResurrectable("blocked-on-human")).toBe(false);
   });
 
-  it("refuses an unclassified death — the one case where being wrong loops on a real fault", () => {
-    expect(isResurrectable("unknown")).toBe(false);
+  it("RECOVERS an unexplained death — and refuses the deliberate stop that used to hide inside it", () => {
+    // ⚠️ THIS ASSERTION WAS INVERTED UNTIL 2026-08-13, and the inversion was never about `unknown`.
+    // `agent_life::mark_stopped_at` — the ledger half of "the user clicked stop" — wrote
+    // `{cause: unknown, evidence: pty-exit}`, and an ordinary crash lands on the same pair. One
+    // cause, two meanings, so the only safe policy over the union was to refuse both. The cost, on
+    // the founder's v0.95.0 install: 25 of 76 records were exactly that pair and every one was
+    // structurally unrecoverable, painting red at a human who could do nothing about it.
+    //
+    // The two are asserted TOGETHER because neither is safe alone. The flip is only defensible
+    // because the stop now has somewhere else to live.
+    expect(isResurrectable("unknown")).toBe(true);
+    expect(isResurrectable("human-stopped")).toBe(false);
+  });
+
+  it("gives the stop its own evidence, so nothing has to INFER it from a closed PTY", () => {
+    // `user-stop` is written from inside the stop path by the code performing it; `pty-exit` is what
+    // a window sees from outside and is compatible with every cause there is. Keeping `pty-exit`
+    // pointed at `unknown` is the other half — re-point it and every crash becomes unrecoverable
+    // again, with the whole change bought for nothing.
+    expect(causeOf("user-stop")).toBe("human-stopped");
+    expect(causeOf("pty-exit")).toBe("unknown");
+    expect(verdictIsSupported({ cause: "human-stopped", evidence: "user-stop" })).toBe(true);
+    expect(verdictIsSupported({ cause: "human-stopped", evidence: "pty-exit" })).toBe(false);
+    expect(verdictIsSupported({ cause: "unknown", evidence: "user-stop" })).toBe(false);
   });
 
   it("DOES resurrect a spend cap, because it is probed rather than waited on", () => {
@@ -172,19 +196,22 @@ describe("isResurrectable", () => {
     expect(isResurrectable("app-restart")).toBe(true);
   });
 
-  it("DOES resurrect a vanished process, and that is not in tension with refusing `unknown`", () => {
-    // Stated as the PAIR, because read apart the two look contradictory: both are "the agent is
-    // gone and nothing explained why", yet one is recovered and the other refused.
+  it("DOES resurrect a vanished process — and no longer needs an asymmetry with `unknown` to do it", () => {
+    // This used to be the PAIR `process-gone: true` / `unknown: false`, which read as a
+    // contradiction (both are "the agent is gone and nothing explained why") and was defended by a
+    // discriminator about WHO WAS WATCHING: `process-gone` is inferred from an absence with no
+    // observer, which is the one case a deliberate stop cannot produce — so it escaped a refusal
+    // that existed only to protect the stop hiding inside `unknown`.
     //
-    // The discriminator is WHO WAS WATCHING. `unknown` is written by a mounted pane that observed
-    // the exit and had nothing to say — and a human clicking stop produces exactly that, which is
-    // why it must refuse. `process-gone` is written only by `agent_life::reap_dead_sessions_at`,
-    // from an ABSENCE, with no observer at all — the one case a deliberate stop cannot produce,
-    // since the button that stops an agent is rendered by the very pane whose presence would have
-    // made the death `unknown` instead. (`pty.killPty` retires the record on every deliberate stop
-    // precisely so that rule holds for the programmatic stop paths too.)
+    // It was a workaround, and the workaround is gone: the stop has its own cause, so both are
+    // simply eligible. The distinction survives for a different reason — the two recover at
+    // different PACES — which is what the second assertion pins.
     expect(isResurrectable("process-gone")).toBe(true);
-    expect(isResurrectable("unknown")).toBe(false);
+    expect(isResurrectable("unknown")).toBe(true);
+    // Still a real distinction, and collapsing them would slow every reaped agent to the 30-minute
+    // rung for nothing.
+    expect(causeOf("session-vanished")).toBe("process-gone");
+    expect(causeOf("pty-exit")).toBe("unknown");
   });
 
   it("pairs `process-gone` with the evidence that is its ONLY support", () => {

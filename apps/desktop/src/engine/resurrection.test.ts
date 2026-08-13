@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { DeathCause } from "./deathTypes";
 import {
   MAX_RESURRECTS_PER_AGENT_PER_DAY,
+  RESURRECT_LADDER_CEILING_MS,
   RESURRECT_LADDER_MS,
   type ResurrectionInput,
   attemptsInWindow,
@@ -52,11 +53,11 @@ describe("the ladder", () => {
 
   it("measures the first rung from the death and later rungs from the last attempt", () => {
     const diedAt = NOW - 5 * MIN;
-    expect(nextRungDueAt({ attemptsThisEpisode: 0, lastAttemptAt: undefined, diedAt })).toBe(
+    expect(nextRungDueAt({ cause: "transport-transient", attemptsThisEpisode: 0, lastAttemptAt: undefined, diedAt })).toBe(
       diedAt + 60_000,
     );
     const lastAttemptAt = NOW - MIN;
-    expect(nextRungDueAt({ attemptsThisEpisode: 1, lastAttemptAt, diedAt })).toBe(
+    expect(nextRungDueAt({ cause: "transport-transient", attemptsThisEpisode: 1, lastAttemptAt, diedAt })).toBe(
       lastAttemptAt + 2 * MIN,
     );
   });
@@ -67,7 +68,7 @@ describe("the ladder", () => {
     // notices. The ceiling is what keeps it probing.
     const ceiling = RESURRECT_LADDER_MS[RESURRECT_LADDER_MS.length - 1]!;
     for (const n of [RESURRECT_LADDER_MS.length, RESURRECT_LADDER_MS.length + 50]) {
-      expect(nextRungDueAt({ attemptsThisEpisode: n, lastAttemptAt: NOW, diedAt: NOW })).toBe(
+      expect(nextRungDueAt({ cause: "transport-transient", attemptsThisEpisode: n, lastAttemptAt: NOW, diedAt: NOW })).toBe(
         NOW + ceiling,
       );
     }
@@ -88,6 +89,7 @@ describe("the ladder and the cap are consistent — the bug roborev 60067 caught
     const attempts: number[] = [];
     for (let i = 0; i < MAX_RESURRECTS_PER_AGENT_PER_DAY; i++) {
       const due = nextRungDueAt({
+        cause: "wall-spend",
         attemptsThisEpisode: i,
         lastAttemptAt: i === 0 ? undefined : at,
         diedAt: NOW,
@@ -130,11 +132,29 @@ describe("terminal causes are refused before anything else can mask them", () =>
     expect(d).toEqual({ action: "none", reason: "blocked-on-human" });
   });
 
-  it("refuses an unclassified death rather than guessing", () => {
-    expect(decideResurrection(input({ cause: "unknown" }))).toEqual({
+  it("never undoes a stop the user asked for — BY NAME, not by falling through", () => {
+    // ⚠️ THIS TEST USED TO SAY `cause: "unknown"` → `unclassified-death`, and that was the whole
+    // defect in one line: a deliberate stop was RECORDED as `unknown`, so refusing every
+    // unexplained death was the only way to avoid restarting agents their owner had just killed.
+    // Since `mark_stopped_at` now writes `human-stopped`, this is the arm that keeps that promise —
+    // and `unknown` recovers, on the conservative rung (see the ladder tests above).
+    //
+    // Asserted by NAME rather than through the `!isResurrectable` backstop: a stop reported as
+    // `unclassified-death` would be unreadable in a log, and it would stop discriminating the moment
+    // another cause joined that arm.
+    expect(decideResurrection(input({ cause: "human-stopped" }))).toEqual({
       action: "none",
-      reason: "unclassified-death",
+      reason: "human-stopped",
     });
+  });
+
+  it("…while an UNEXPLAINED death is now recovered — the paired positive", () => {
+    // Without this leg the refusal above would also pass for a gate that still refused everything,
+    // which is exactly the state this change exists to leave.
+    expect(
+      decideResurrection(input({ cause: "unknown", now: NOW + RESURRECT_LADDER_CEILING_MS }))
+        .action,
+    ).toBe("respawn");
   });
 
   it("refuses when nothing recorded the death", () => {

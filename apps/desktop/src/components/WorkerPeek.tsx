@@ -2,43 +2,72 @@ import { C } from "../theme/colors";
 import { TYPE } from "../theme/scale";
 import { DEPTH_INDENT } from "../engine/rowGeometry";
 import { bandColor } from "../engine/statusBandLabels";
-import type { AgentTab } from "../types";
+import { STATUS_BANDS, bandOfStatus, type StatusBand } from "../engine/buildSections";
+import { StatusDot } from "./StatusDot";
+import type { AgentTab, AgentTabStatus } from "../types";
 
 /**
  * THE PEEK: one inset line under a CLOSED head, shown only when a worker beneath it needs you.
  *
  * This is not the subtree, and the distinction is the whole feature. It is a single line no matter
- * how many workers are red — several red workers collapse to a COUNT rather than several lines,
- * because a peek that grows with the fleet is an expansion wearing a different name. The head stays
+ * how many workers are asking — several collapse to a COUNT rather than several lines, because a
+ * peek that grows with the fleet is an expansion wearing a different name. The head stays
  * `aria-expanded="false"`, the `group` of real child rows is not rendered, and nothing is written to
- * `collapsedOrchestrators`; when the red clears the line simply stops being rendered, leaving the
+ * `collapsedOrchestrators`; when the ask clears the line simply stops being rendered, leaving the
  * user's collapse exactly as they left it.
  *
  * It replaces the capability the deleted auto-expander provided — "something under this closed head
  * needs you" — without the cost that made that machinery wrong: it cannot leave a subtree standing
  * open after the red has gone, because it never opened one.
  *
- * GREEN AND GRAY WORKERS NEVER REACH HERE (see engine/workerExpansion.attentionWorkersOf), so a
- * settled fleet is exactly as compact as it was before.
+ * CALM WORKERS NEVER REACH HERE (see engine/workerExpansion.attentionWorkersOf), so a settled fleet
+ * is exactly as compact as it was before.
  *
  * Clicking it opens the parent for real — the peek names a row you cannot otherwise click, so the
  * obvious gesture has to lead somewhere. That click goes through the same
  * `toggleOrchestratorCollapsed` as the head row: it is the USER opening the subtree, which is
  * allowed, rather than the app doing it on their behalf, which is what this feature removed.
+ *
+ * ══ THE LIST IS MIXED-BAND, SO THE LINE MUST BE PAINTED PER WORKER (the 2026-08-13 fix) ══════════
+ * `attentionWorkersOf` deliberately admits THREE different things: the red `needs_you` band, the
+ * BLUE `questions` band, and the GRAY `unmerged` ("Needs merge") — an ask the founder can act on
+ * that is explicitly not an alarm (read that function's header for why each one peeks). This
+ * component used to paint every one of them with a hardcoded `bandColor("needs_you")` and write the
+ * literal words "needs you", which made the peek disagree with the worker's OWN row about the same
+ * worker at the same instant: the founder caught a worker showing a red dot and "needs you" in the
+ * peek, and a gray dot with "Saved" once he expanded its parent. At most one of those can be true.
+ *
+ * So the dot is a real {@link StatusDot} carrying that worker's status — the SAME component, and
+ * therefore the same `AGENT_STATUS[status].color` expression, that the expanded row's disc uses
+ * (`AgentRow`, which passes no `color` override for a worker). Agreement is structural rather than a
+ * claim two files each make separately, which is what let them drift.
+ * `workerPeekRowAgreement.test.tsx` walks the whole status taxonomy and pins it.
  */
 export function WorkerPeek({
   workers,
+  statusOf,
   headName,
   onOpen,
 }: {
   workers: readonly AgentTab[];
+  /** Each worker's presented status — the SAME map the caller's `attentionWorkersOf` selection was
+   *  made from, threaded in rather than looked up again here. A second status source is precisely
+   *  how the peek and the row came to disagree, and a pure component cannot reach for one. */
+  statusOf: (id: string) => AgentTabStatus;
   headName: string;
   onOpen: () => void;
 }) {
   const n = workers.length;
-  // One line, always. With several red workers the NAMES are dropped rather than joined — a joined
-  // list is how this becomes two lines at the first long agent name.
+  // One line, always. With several workers the NAMES are dropped rather than joined — a joined list
+  // is how this becomes two lines at the first long agent name.
   const label = n === 1 ? (workers[0]?.name ?? "") : `${n} workers`;
+  // WHICH worker the single line speaks for. With one worker it is that worker; with several it is
+  // the loudest band present, so a red under a fold is never demoted to "needs merge" by a calmer
+  // sibling sharing the line. Everything the line renders — dot, marker, aria-label — comes from
+  // this ONE status, so the three cannot describe different workers.
+  const spokesman = dominant(workers, statusOf);
+  const status = spokesman === undefined ? "stopped" : statusOf(spokesman.id);
+  const marker = markerFor(status, n);
   return (
     <button
       type="button"
@@ -60,14 +89,17 @@ export function WorkerPeek({
       // no keyboard path can act on (see tabIndex below).
       // NOT a Tab stop. The column is roving-tabindex — one stop for the whole list — so a
       // `tabIndex=0` here would add one per peek. It is deliberately not in the arrow-key ring
-      // either: the peek is a REDUNDANT affordance (the head row carries the same red on its own
+      // either: the peek is a REDUNDANT affordance (the head row carries the same signal on its own
       // dot, and opening that head is what reveals the real worker row), so a keyboard user loses
       // no reachable path. Pointer users get the shortcut; nobody depends on it.
       tabIndex={-1}
       data-testid="worker-peek"
       data-peek-count={n}
       onClick={onOpen}
-      aria-label={`${label} under ${headName} ${n === 1 ? "needs" : "need"} you — open this subtree`}
+      // THE SAME WORDS THE LINE SHOWS. The marker below is the visible half of this sentence, so
+      // they are one expression: a screen reader saying "needs you" about a line reading "needs
+      // merge" is the original bug with a smaller audience.
+      aria-label={`${label} under ${headName} ${marker} — open this subtree`}
       style={{
         display: "flex",
         alignItems: "center",
@@ -90,34 +122,81 @@ export function WorkerPeek({
         overflow: "hidden",
       }}
     >
-      <span
-        aria-hidden
-        style={{
-          flex: "0 0 auto",
-          width: 6,
-          height: 6,
-          borderRadius: "50%",
-          background: bandColor("needs_you"),
-        }}
-      />
+      {/* `aria-hidden` on the WRAPPER rather than the dot, because StatusDot takes no such prop and
+          renders a `title`. The button's own aria-label already carries the whole sentence in words;
+          leaving the disc in the a11y tree would only add a second, terser reading of it. */}
+      <span aria-hidden style={{ display: "flex", flex: "0 0 auto" }}>
+        {/* 6px, the signpost size this line has always used — a peek is a smaller mark than a row's
+            disc on purpose. Only the SIZE is local; the ink comes from the shared taxonomy. */}
+        <StatusDot status={status} size={6} />
+      </span>
       <span
         style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}
       >
         {label}
       </span>
-      {/* The marker that says WHY this line is here. Same vocabulary as the filter chips and the
-          band counts, via bandCountLabel, so the column says "needs you" in one voice. */}
+      {/* The marker that says WHY this line is here — inked from the same band it is worded from, so
+          a "needs merge" can never arrive wearing the alarm colour. */}
       <span
         style={{
           flex: "0 0 auto",
           marginLeft: "auto",
           fontSize: TYPE.micro,
           fontWeight: 600,
-          color: bandColor("needs_you"),
+          color: bandColor(bandOfStatus(status)),
         }}
       >
-        {n === 1 ? "needs you" : "need you"}
+        {marker}
       </span>
     </button>
   );
+}
+
+/** The worker the single line speaks for: the one in the highest-priority band present.
+ *
+ *  Priority is STATUS_BANDS' own order (needs_you › questions › running › done) read out of the
+ *  taxonomy rather than listed here — the same discipline `buildSections.ASKING_BANDS` documents, so
+ *  a fifth band is a decision made in one place instead of a silent omission in this one. Ties go to
+ *  the first worker, which is the caller's order. */
+function dominant(
+  workers: readonly AgentTab[],
+  statusOf: (id: string) => AgentTabStatus,
+): AgentTab | undefined {
+  const rank = (w: AgentTab) => STATUS_BANDS.findIndex((b) => b.id === bandOfStatus(statusOf(w.id)));
+  let best: AgentTab | undefined;
+  let bestRank = Number.POSITIVE_INFINITY;
+  for (const w of workers) {
+    const r = rank(w);
+    if (r < bestRank) {
+      best = w;
+      bestRank = r;
+    }
+  }
+  return best;
+}
+
+/** What this line SAYS, agreeing in number with the count beside it.
+ *
+ *  The vocabulary matches `statusBandLabels.bandCountLabel`'s, and it inflects the same two ways for
+ *  the same reason: `needs_you` is a SENTENCE, so a plural subject takes the plural VERB ("3 workers
+ *  NEED you"), while `questions` is a NOUN and gains its -s instead ("3 questions"). "Needs merge" is
+ *  a sentence like the first, so it loses its -s in the plural.
+ *
+ *  `unmerged` is checked BEFORE the band because it is the one status whose band does not name it:
+ *  it falls in `done` (gray — a landing state, not an alarm) while still owing the founder an action,
+ *  which is the whole reason it peeks at all. See workerExpansion.isOwedAsk. */
+function markerFor(status: AgentTabStatus, n: number): string {
+  if (status === "unmerged") return n === 1 ? "needs merge" : "need merge";
+  const band: StatusBand = bandOfStatus(status);
+  if (band === "needs_you") return n === 1 ? "needs you" : "need you";
+  if (band === "questions") return n === 1 ? "question" : "questions";
+  // UNREACHABLE against today's admission rule — `attentionWorkersOf` returns only the two bands
+  // above plus `unmerged` — and written anyway so this function is total. A future status admitted
+  // to the peek gets its band's own word here rather than silently inheriting somebody else's.
+  return bandLabelWord(band);
+}
+
+/** A band's chip label as a mid-sentence word ("Running" → "running"). */
+function bandLabelWord(band: StatusBand): string {
+  return (STATUS_BANDS.find((b) => b.id === band)?.label ?? "").toLowerCase();
 }

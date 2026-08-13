@@ -61,6 +61,9 @@ import {
 } from "./engine/workerRollup";
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withNewAgentCalm } from "./engine/newAgentAttention";
+import { withDeadSessionCalm } from "./engine/deadSessionAttention";
+import { deathCauseForAgent } from "./services/deadSessionRegistry";
+import type { DeathCause } from "./engine/deathTypes";
 import { useNewAgentCalm } from "./hooks/useNewAgentCalm";
 import { withBlockedPromptGrace, windowPromptGraceLedger } from "./engine/blockedPromptGrace";
 import { usePromptGraceTick } from "./hooks/useBlockedPromptGrace";
@@ -91,6 +94,13 @@ import { projectNameForAgent } from "./services/creditProject";
  *      `blocked` statusEngine's 25s stall timer gives it for being quiet. FIRST, and on the RAW map,
  *      so a briefless agent's false red is corrected before steps 1–2 can bubble it to an
  *      orchestrator, where it would be indistinguishable from the parent's own.
+ *   0b. `withDeadSessionCalm` — an agent whose SESSION HAS EXITED with a cause the app will recover
+ *      from reads the amber `lapsed` instead of the red `errored` statusEngine writes on exit. Same
+ *      placement as (0) and for the identical reason: it must land before steps 1–2 can bubble a
+ *      dead worker's red onto its orchestrator. `RED = THE FOUNDER IS THE ONLY ACTOR WHO CAN
+ *      UNBLOCK THIS` (engine/redAttentionTaxonomy.test.ts), and a dead session is blocked on a
+ *      RESTART — which `services/resurrectionRunner` is already performing. See
+ *      engine/deadSessionAttention for why `blocked-on-human` cannot reach it.
  *   1. `withUnstartedWorkerAttention` — a worker whose worktree was cut but which never went live has
  *      NO status entry, so nothing downstream would call it red. Invents the red and bubbles it.
  *   2. `withRedWorkerAttention` — a worker that started and then went red paints its orchestrator.
@@ -130,6 +140,11 @@ export function publishedStatusFor(
   /** agentId → positively read as finished. Defaults to "unread" (demotes nothing), because this
    *  file has no git state of its own — only the sidebar polls it. See composeRollup. */
   isFinishedOf: (id: string) => boolean | undefined = () => undefined,
+  /** agentId → why its session ended, for step (0b). Defaults to the live window-local registry at
+   *  this OUTERMOST boundary, exactly as `interaction` and `thrashOf` do — so every production
+   *  caller drives the real de-redding without passing anything, while `composeRollup` itself stays
+   *  pure. `undefined` from it means "no reading", never "alive". */
+  deathCauseOf: (id: string) => DeathCause | undefined = deathCauseForAgent,
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -141,6 +156,7 @@ export function publishedStatusFor(
     interaction,
     thrashOf,
     isFinishedOf,
+    deathCauseOf,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -174,6 +190,10 @@ export function rollupViewFor(
    *  reads the finished-calmed published map, so a column that skipped it would keep painting a
    *  finished head red while every other surface had calmed it. */
   isFinishedOf: (id: string) => boolean | undefined = () => undefined,
+  /** See `publishedStatusFor`'s parameter of the same name. The Build column needs it too: a dead
+   *  agent's row must read amber HERE as well, or the column would paint red while every other
+   *  surface had calmed it — the column↔feed drift this file exists to prevent. */
+  deathCauseOf: (id: string) => DeathCause | undefined = deathCauseForAgent,
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -185,6 +205,7 @@ export function rollupViewFor(
     interaction,
     thrashOf,
     isFinishedOf,
+    deathCauseOf,
   );
   return { own, dotOf };
 }
@@ -219,6 +240,13 @@ function composeRollup(
    *  from git state the sidebar polls, and this composition documents itself as pure. Defaults to
    *  "unread", i.e. exactly today's behaviour for any caller with no evidence to give. */
   isFinishedOf: (id: string) => boolean | undefined = () => undefined,
+  /** agentId → why its session ended (services/deadSessionRegistry), or `undefined` for "we did not
+   *  look". Injected for the same reason `thrashOf` and `isFinishedOf` are — this composition is
+   *  consumed by `buildConciergeFeed`, which documents itself as pure, and the registry is module
+   *  state. Defaults to "no reading", which demotes nothing: exactly today's behaviour for a caller
+   *  with no evidence to give. The real registry is wired in at the two OUTERMOST boundaries above,
+   *  so no production path relies on this default. */
+  deathCauseOf: (id: string) => DeathCause | undefined = () => undefined,
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -226,7 +254,18 @@ function composeRollup(
   // can spread. It cannot interfere with step (1): withUnstartedWorkerAttention invents a red for a
   // STRANDED WORKER, and a worker carries its orchestrator's `task` as its brief, so it is never
   // briefless. See engine/newAgentAttention.ts.
-  const calm = withNewAgentCalm(agents, status, now, interaction);
+  // (0b): a session that has EXITED with a recoverable cause is amber, never red. Beside (0), on
+  // the RAW map, and for the same reason — steps (1)+(2) below make a bubbled red indistinguishable
+  // from the parent's own, so a dead worker's red has to be corrected before it can spread to an
+  // orchestrator the founder would then have to triage. The two overlays cannot collide: (0)
+  // reaches only agents that have never been briefed, (0b) only agents whose session has ended.
+  // See engine/deadSessionAttention — `blocked-on-human` stays RED by construction, because the
+  // gate is `isResurrectable` and that cause is not.
+  const calm = withDeadSessionCalm(
+    agents,
+    withNewAgentCalm(agents, status, now, interaction),
+    deathCauseOf,
+  );
   // (1)+(2): the two worker-attention bubbles. Kept as its own binding because the rollup below
   // needs exactly this map — pre-unmerged, pre-dismissal — to answer "is this parent in motion?" and
   // "which reds has the user dismissed?".

@@ -641,8 +641,18 @@ mod tests {
         assert!(due_at(&readings, NOW + 86_400_000, &no_claims()).is_empty());
     }
 
-    /// The three terminal causes, each refused for its own reason. Asserted together because the
-    /// mistake they guard against is one mistake: reading "we do not know" as "bring it back".
+    /// The three terminal causes, each refused for its own reason.
+    ///
+    /// ⚠️ THE THIRD ONE USED TO BE `Unknown`, and its inclusion here was the bug rather than the
+    /// guard (2026-08-13). The comment justified it as "reading 'we do not know' as 'bring it back'"
+    /// — but the real reason `Unknown` had to be terminal was that `mark_stopped_at` recorded a
+    /// DELIBERATE HUMAN STOP as `Unknown`, so refusing the class was the only way to avoid
+    /// restarting agents their owner had just killed. An ordinary crash lands on `Unknown` too, so
+    /// this test was pinning 25 of the founder's 76 dead agents as permanently unrecoverable.
+    ///
+    /// `HumanStopped` now carries the stops, so it takes that slot and `Unknown` becomes due — at
+    /// the conservative pace, which is the TS ladder's business, not this list's. The paired
+    /// positive is directly below, because a refusal list with nothing outside it proves nothing.
     #[test]
     fn terminal_causes_are_never_due() {
         let readings = map(vec![
@@ -659,16 +669,34 @@ mod tests {
                 None,
             ),
             reading(
-                dead("mystery", DeathCause::Unknown, NOW),
+                dead("stopped", DeathCause::HumanStopped, NOW),
                 false,
-                Some(DeathCause::Unknown),
+                Some(DeathCause::HumanStopped),
                 None,
             ),
         ]);
         assert!(
             due_at(&readings, NOW + 86_400_000, &no_claims()).is_empty(),
-            "clean-goal-met, blocked-on-human and unknown are all terminal"
+            "clean-goal-met, blocked-on-human and human-stopped are all terminal"
         );
+    }
+
+    /// THE PAIRED POSITIVE, and the whole point of splitting the stop out of `Unknown`.
+    ///
+    /// Without it the refusal above would pass just as well against a `due_at` that refused
+    /// everything — which is exactly the state this change left. An unexplained death is the most
+    /// common record there is (25 of 76 on the founder's install), and it is now due.
+    #[test]
+    fn an_unexplained_death_IS_due() {
+        let readings = map(vec![reading(
+            dead("mystery", DeathCause::Unknown, NOW),
+            false,
+            Some(DeathCause::Unknown),
+            None,
+        )]);
+        let due = due_at(&readings, NOW + 86_400_000, &no_claims());
+        assert_eq!(due.len(), 1, "an unexplained death must reach recovery, not sit dead forever");
+        assert_eq!(due[0].cause, DeathCause::Unknown);
     }
 
     /// A retired record is one a human finished with. Distinct from the terminal causes above: the

@@ -83,7 +83,25 @@ export type NoResurrectReason =
   | "clean-goal-met"
   /** A person is the blocker; a respawn re-asks nothing. Escalate the question instead. */
   | "blocked-on-human"
-  /** Observed, but nothing said why. The one case where being wrong loops on a real fault. */
+  /**
+   * A PERSON STOPPED IT. The safety property that pays for `unknown` becoming resurrectable.
+   *
+   * `deathTypes.isResurrectable` refused every unexplained death until 2026-08-13 for exactly one
+   * reason: a deliberate stop was recorded as `unknown`, so refusing the whole class was the only
+   * way to avoid restarting an agent its owner had just killed. Now that the stop path writes
+   * `human-stopped`, this is the arm that keeps that promise — and it must stay a REFUSAL by name,
+   * because a stop routed into any other reason is the regression, not a relabelling.
+   */
+  | "human-stopped"
+  /**
+   * A cause this module has no policy for — the exhaustive backstop behind `isResurrectable`.
+   *
+   * NOT `unknown` any more. It used to be exactly that ("observed, but nothing said why"), back when
+   * `unknown` was refused; `unknown` now recovers, at the slowest pace ({@link armsOnSlowestRung}).
+   * Nothing reaches this today: every non-resurrectable cause has its own named arm above. It is
+   * kept so that a cause added later — declared non-resurrectable and given no arm here — is refused
+   * rather than admitted, which is the direction that cannot lose work.
+   */
   | "unclassified-death"
   /** A session wall whose stated reset instant has not arrived. */
   | "wall-not-yet-reset"
@@ -122,15 +140,52 @@ export interface ResurrectionInput {
   now: number;
 }
 
+/**
+ * Which causes recover at THE MOST CONSERVATIVE PACE — every attempt on the slowest rung the ladder
+ * has, never on the fast ones.
+ *
+ * This is the second half of the taxonomy fix, and without it the first half is reckless.
+ * `deathTypes.isResurrectable` used to refuse `unknown` outright, because a deliberate human stop
+ * was recorded as `unknown` and restarting one of those is a wrong action against a stated decision.
+ * `human-stopped` now carries the stops, so `unknown` means what it says — but what it says is *"a
+ * window watched this exit and had nothing to say about why"*, which is the ONE classification with
+ * no theory of the fault behind it. `deathTypes` states the requirement in those words: it "can move
+ * to the most conservative pace rather than to a refusal".
+ *
+ * SO PACE, NOT ELIGIBILITY, IS WHERE THE CAUTION LIVES NOW. A cause with a known, retryable fault
+ * behind it (`transport-transient`, a wall lifting, an app restart) has a reason to believe a quick
+ * retry works, and the fast rungs are how it gets the founder's agent back in a minute. `unknown`
+ * has no such reason: the fault may be a crash loop that re-fails instantly, so a 60s first rung
+ * would spend a quarter of the 24-attempt daily budget in the first ten minutes and be out of
+ * budget by the time a genuinely transient condition cleared. At the ceiling the same 24 attempts
+ * span twelve hours.
+ *
+ * IMPLEMENTED HERE RATHER THAN AT A CALL SITE, deliberately. A caller that special-cased `unknown`
+ * before calling would leave `nextRungDueAt` — which is exported precisely so a surface can say
+ * "next try in 3m" — telling every reader the wrong number for the most common cause there is.
+ */
+export function armsOnSlowestRung(cause: DeathCause): boolean {
+  return cause === "unknown";
+}
+
 /** When the next rung is due. ALWAYS defined: past the last rung the gap holds at the ceiling, so an
  *  agent waiting on a wall only a human can lift keeps probing. Exported so a caller can show "next
- *  try in 3m" without re-deriving the curve. */
+ *  try in 3m" without re-deriving the curve.
+ *
+ *  `cause` is REQUIRED rather than optional, and that is not pedantry: {@link armsOnSlowestRung}
+ *  changes the answer for `unknown` — the single most common cause on the census — so a caller
+ *  allowed to omit it would silently get the FAST curve for exactly the population the slow one
+ *  exists for. This repo's own name for that shape is the defaulted seam, and it is the one where
+ *  the production call site ends up untested by construction. */
 export function nextRungDueAt(input: {
+  cause: DeathCause;
   attemptsThisEpisode: number;
   lastAttemptAt: number | undefined;
   diedAt: number;
 }): number {
-  const gap = RESURRECT_LADDER_MS[input.attemptsThisEpisode] ?? RESURRECT_LADDER_CEILING_MS;
+  const gap = armsOnSlowestRung(input.cause)
+    ? RESURRECT_LADDER_CEILING_MS
+    : (RESURRECT_LADDER_MS[input.attemptsThisEpisode] ?? RESURRECT_LADDER_CEILING_MS);
   // Gaps are measured from the LAST attempt, or from the death itself for the first rung — the same
   // convention `REVIVE_LADDER_MS` documents, so the two read alike.
   return (input.lastAttemptAt ?? input.diedAt) + gap;
@@ -158,6 +213,11 @@ export function decideResurrection(input: ResurrectionInput): ResurrectionDecisi
   if (cause === undefined) return { action: "none", reason: "no-death-record" };
   if (cause === "clean-goal-met") return { action: "none", reason: "clean-goal-met" };
   if (cause === "blocked-on-human") return { action: "none", reason: "blocked-on-human" };
+  // THE ARM THAT PAYS FOR `unknown` BECOMING RESURRECTABLE. A stop is a stated human decision, and
+  // this module has always ranked a wrong action above a missed recovery. Named rather than folded
+  // into the backstop below so a log reader — and a test — can see the refusal happen for the right
+  // reason instead of by accident of exhaustiveness.
+  if (cause === "human-stopped") return { action: "none", reason: "human-stopped" };
   if (!isResurrectable(cause)) return { action: "none", reason: "unclassified-death" };
 
   // ── 2. Liveness, failing CLOSED ─────────────────────────────────────────────────────────────
@@ -179,7 +239,11 @@ export function decideResurrection(input: ResurrectionInput): ResurrectionDecisi
   }
 
   // ── 5. The ladder, which plateaus rather than ending ────────────────────────────────────────
-  if (input.now < nextRungDueAt(input)) return { action: "none", reason: "waiting-for-next-rung" };
+  // `cause` is spread back in NARROWED — the gates above have eliminated `undefined`, and
+  // `nextRungDueAt` requires a real cause because the pace depends on it.
+  if (input.now < nextRungDueAt({ ...input, cause })) {
+    return { action: "none", reason: "waiting-for-next-rung" };
+  }
 
   return { action: "respawn", attempt: input.attemptsThisEpisode + 1 };
 }

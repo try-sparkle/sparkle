@@ -30,6 +30,11 @@
 // ids, two `invoke`s, and a Set write.
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
+// The SHARED router for findings handed to the concierge — extended additively with
+// `routeRecoveryExhausted` rather than given a second copy of the words, so the routing decision
+// and the sentence that carries it cannot drift (packages/core/pusherBlocker's own rule).
+import { routeRecoveryExhausted } from "@sparkle/core";
+import { agentDisplayName } from "../engine/agentDisplayName";
 import { lastFailureForAgent, quotaBlockForAgent } from "../engine/engineRegistry";
 import {
   MAX_RESURRECTS_PER_AGENT_PER_DAY,
@@ -57,6 +62,7 @@ import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { notifyAttention } from "./attention";
+import { notifyConcierge } from "./conciergeNotifier";
 import { restartPane } from "./paneControl";
 import { admitAgent } from "./resurrectionAdmission";
 import { ownsProjectInThisWindow, suppressContinuation } from "./goalContinuationRunner";
@@ -147,6 +153,15 @@ export interface ResurrectionSweepOptions {
   suppress?: (agentId: string, untilMs: number) => void;
   /** What was observed about a canary during its probation window. */
   probationEvidence?: (canaryId: string, spawnedAt: number, now: number) => ProbationEvidence;
+  /**
+   * Hand one finding to the concierge. Returns whether it was ACCEPTED — `false` means it went
+   * nowhere and stays owed, which is `notifyConcierge`'s own published contract.
+   *
+   * Defaults to the real `services/conciergeNotifier`, so the production path is what every caller
+   * that passes nothing exercises. Injected only so a test can drive the escalation without a
+   * registered sink.
+   */
+  escalate?: (text: string) => boolean;
 }
 
 // ── module state: the phases, and who has been burned ────────────────────────────────────────
@@ -179,6 +194,21 @@ let cohortAttempts = new Map<string, number>();
  *  claim/mount/release chain awaits, so without this a second sweep starting mid-chain would decide
  *  to respawn the same agent again off pre-admission state. */
 const inFlight = new Set<string>();
+/**
+ * agentId → the `diedAt` of the episode whose exhausted recovery has ALREADY been handed to the
+ * concierge.
+ *
+ * ONCE PER EPISODE, and keyed on the death instant rather than a bare boolean so a genuinely NEW
+ * death re-escalates. The sweep runs every 15s and `daily-cap-spent` persists for hours, so an
+ * unlatched escalation would be ~240 concierge findings an hour for one agent — and each one costs
+ * a real turn against the same account limit the fleet is already fighting. Same reasoning, same
+ * shape, as this module's `lastDecisionSignature` change detection.
+ *
+ * A REFUSED delivery is deliberately NOT latched: `notifyConcierge` returning false means the text
+ * went nowhere, and `conciergeNotifier`'s own doctrine is that such a finding stays owed and comes
+ * back next sweep. Latching on a failed hand-off is exactly how the Pusher lost findings.
+ */
+let recoveryExhaustedReported = new Map<string, number>();
 
 /** Test seam: forget every cohort phase, binding, burned set and in-flight admission. */
 export function _resetResurrectionRunnerForTests(): void {
@@ -186,6 +216,7 @@ export function _resetResurrectionRunnerForTests(): void {
   cohortBinding = new Map();
   burnedCanaries = new Map();
   cohortAttempts = new Map();
+  recoveryExhaustedReported = new Map();
   inFlight.clear();
   _resetResurrectionDecisionLogForTests();
 }
@@ -387,6 +418,8 @@ function liveOptions(opts: ResurrectionSweepOptions): Required<ResurrectionSweep
     mount: opts.mount ?? ((agentId) => defaultMount(agentId, hasAgentRow)),
     suppress: opts.suppress ?? suppressContinuation,
     probationEvidence: opts.probationEvidence ?? defaultProbationEvidence,
+    // The REAL notifier by default, so every production sweep drives the escalation path.
+    escalate: opts.escalate ?? ((text) => notifyConcierge(text)),
   };
 }
 
@@ -447,6 +480,97 @@ const PERMANENT_NO_RESURRECT: ReadonlySet<NoResurrectReason> = new Set<NoResurre
 const TRANSIENT_NO_RESURRECT: ReadonlySet<NoResurrectReason> = new Set<NoResurrectReason>([
   "daily-cap-spent",
 ]);
+
+/** This agent's display name, or its id when no row holds it. Mirrors `apiRecoveryRunner`'s helper
+ *  of the same name — a bare uuid in a concierge finding is unreadable to a human and unusable to
+ *  the concierge, which resolves agents by name. */
+function labelForAgent(agentId: string): string {
+  const agent = useProjectStore
+    .getState()
+    .projects.flatMap((p) => p.agents)
+    .find((a) => a.id === agentId);
+  return agent === undefined ? agentId : agentDisplayName(agent);
+}
+
+/**
+ * RECOVERY IS EXHAUSTED FOR THIS AGENT — TELL THE CONCIERGE, NOT THE FOUNDER.
+ *
+ * ── THE FACT THAT NOTHING USED TO REPORT ──────────────────────────────────────────────────────
+ * `daily-cap-spent` is the ONLY terminal bound `decideResurrection` has — the ladder plateaus at 30
+ * minutes rather than ending, so every other refusal clears by itself. It was reported through the
+ * sweep's returned `outcomes`, which the interval caller discards, and through a grouped log line.
+ * So the moment automatic recovery stopped trying reached nobody at all, which is the same shape as
+ * the gap `apiRecoveryRunner.onEscalate` was built to close on the LIVE side of the liveness axis:
+ * every existing signal fires when a row TURNS red, and giving up moves no digest — the row has
+ * been dead the whole time.
+ *
+ * ── AND THE DE-REDDING IS WHAT MAKES IT REQUIRED, NOT MERELY NICE ─────────────────────────────
+ * A dead session with a resurrectable cause now renders amber and is excluded from the needs-you
+ * band (`engine/deadSessionAttention`), on the rule that red is reserved for the founder being the
+ * only actor who can unblock something. That is correct precisely BECAUSE something else is coming
+ * to act. When the budget is spent nothing is coming any more — so without this hand-off the row
+ * would go quiet with no owner, which is a silently abandoned agent and strictly worse than the
+ * false red that was removed.
+ *
+ * The concierge is the right recipient because it can actually act: restart it, or take its branch
+ * over. That is the preference order every route in `pusherBlocker` follows — agent, concierge,
+ * then the human.
+ */
+function reportRecoveryExhausted(d: DueAgent, escalate: (text: string) => boolean): void {
+  if (recoveryExhaustedReported.get(d.agentId) === d.diedAt) return;
+  const route = routeRecoveryExhausted({
+    label: labelForAgent(d.agentId),
+    // The REAL figure, from the durable ledger, rather than the cap constant. They coincide today
+    // (the gate fires at `>=` the cap) but the router's sentence quotes this number to a human, and
+    // a count restated from a constant is a claim about the ledger made without reading it.
+    attempts: d.attemptsAt.length,
+  });
+  // `target` is always "concierge" here, so this is a self-check rather than a branch: if that route
+  // is ever re-pointed at the founder, this stops delivering instead of quietly paging him — the
+  // one outcome this whole change exists to prevent. Same guard `apiRecoveryRunner` applies.
+  if (route.target !== "concierge") return;
+  if (!escalate(route.text)) {
+    // NOT LATCHED — see `recoveryExhaustedReported`. The finding stays owed and is re-offered next
+    // sweep, exactly as `conciergeNotifier` instructs its callers.
+    log.warn("resurrection", "recovery is exhausted and the concierge could not be told", {
+      agentId: d.agentId,
+    });
+    return;
+  }
+  recoveryExhaustedReported.set(d.agentId, d.diedAt);
+  log.info("resurrection", "handed an unrecoverable agent to the concierge", {
+    agentId: d.agentId,
+    attempts: d.attemptsAt.length,
+  });
+}
+
+/**
+ * Record ONE refusal — the outcome line, plus the concierge hand-off when the refusal is terminal.
+ *
+ * ── WHY THIS IS A FUNCTION AND NOT TWO CALL SITES ─────────────────────────────────────────────
+ * The sweep refuses an agent in TWO structurally different places, and which one an agent lands in
+ * depends on something entirely unrelated to its own state: `groupCohorts` discards a run below
+ * `SHARED_FAILURE_MIN_VICTIMS` ("a lone death with no linked neighbour is not an incident"), so a
+ * solo death never enters the cohort loop at all and is refused in the admission loop instead.
+ *
+ * That is exactly the shape this repo files under "one fix, N call sites": the escalation was first
+ * wired into the cohort loop only, and every assertion about it passed EXCEPT the ones driving a
+ * single dead agent — which is the founder's own case, since his workers die one at a time. One
+ * implementation, called from both, removes the possibility of that asymmetry rather than relying on
+ * whoever edits next to notice it.
+ */
+function pushRefusal(
+  outcomes: ResurrectionOutcome[],
+  d: DueAgent,
+  reason: NoResurrectReason | "no-agent-row",
+  escalate: (text: string) => boolean,
+): void {
+  // THE LADDER'S ONLY TERMINUS NOW REACHES SOMEBODY. Every other refusal here either clears by
+  // itself or is a fact about what the agent IS; this one is the moment automatic recovery stopped
+  // trying, and the row has just been de-redded on the promise that something else is acting.
+  if (reason === "daily-cap-spent") reportRecoveryExhausted(d, escalate);
+  outcomes.push({ agentId: d.agentId, action: "none", detail: reason });
+}
 
 function memberOf(d: DueAgent): CohortMember {
   return {
@@ -853,7 +977,9 @@ export async function sweepResurrections(
       // asked about.
       const terminal = refusedReason.get(m.agentId);
       if (terminal !== undefined) {
-        outcomes.push({ agentId: m.agentId, action: "none", detail: terminal });
+        // REFUSAL SITE 1 OF 2 — the cohort path, for an agent that died alongside neighbours. See
+        // `pushRefusal` for why the escalation cannot live at either site alone.
+        pushRefusal(outcomes, d, terminal, o.escalate);
         continue;
       }
       if (!allowedSet.has(m.agentId)) {
@@ -917,11 +1043,10 @@ export async function sweepResurrections(
     const decision = decideResurrection(resurrectionInputFor(d, processAlive, o.now));
 
     if (decision.action === "none") {
-      outcomes.push({
-        agentId: d.agentId,
-        action: "none",
-        detail: decision.reason satisfies NoResurrectReason,
-      });
+      // REFUSAL SITE 2 OF 2 — the admission path, and the one a SOLO death always takes, because
+      // `groupCohorts` discards a run below `SHARED_FAILURE_MIN_VICTIMS`. The founder's workers die
+      // one at a time, so this is the site his case actually runs through. See `pushRefusal`.
+      pushRefusal(outcomes, d, decision.reason satisfies NoResurrectReason, o.escalate);
       continue;
     }
 

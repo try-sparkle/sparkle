@@ -29,6 +29,9 @@ import {
   classifyDeath,
 } from "../engine/deathRecord";
 import type { DeathVerdict } from "../engine/deathTypes";
+// The window-local mirror of the two ledger edges this module writes. Kept in step by being written
+// from the SAME two calls — see services/deadSessionRegistry's header.
+import { forgetAgentDeath, noteAgentDeath } from "./deadSessionRegistry";
 import {
   lastFailureForAgent,
   quotaBlockForAgent,
@@ -123,6 +126,11 @@ export async function openDeathRecord(
 ): Promise<boolean> {
   try {
     await deps.invoke("agent_life_open", { agentId, projectId, worktree });
+    // THE WINDOW-LOCAL MIRROR'S OTHER EDGE. Spawning is the end of a death, so the row stops
+    // rendering as a recovering one here — by the same act that reopens the durable record, which is
+    // what keeps the two from drifting. Cleared AFTER the invoke lands, so a failed open leaves the
+    // row amber rather than silently repainting an agent that did not come back.
+    forgetAgentDeath(agentId);
     return true;
   } catch (e) {
     log.warn("resurrection", "could not open the agent-life record", {
@@ -291,6 +299,12 @@ export async function recordDeath(
       // true, and recovery needs both: resurrect BECAUSE the app died, but NOT before the reset.
       wall: verdict.wall ?? null,
     });
+    // THE WINDOW-LOCAL MIRROR, written only on the path that actually closed the record — after the
+    // two refusals above, both of which decline to write a death and must decline to paint one.
+    // This is what lets the synchronous row-colour pipeline know a session ended without awaiting a
+    // ledger read: a resurrectable cause renders the amber `lapsed` tier instead of red, because the
+    // agent is blocked on a restart rather than on a person. See engine/deadSessionAttention.
+    noteAgentDeath(agentId, verdict.cause);
     log.info("resurrection", "recorded a death", {
       agentId,
       cause: verdict.cause,

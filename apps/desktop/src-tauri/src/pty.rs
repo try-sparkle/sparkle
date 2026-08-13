@@ -1301,7 +1301,7 @@ pub fn pty_resize(
 /// then never killed at all, which is precisely the orphaned-child case that budget exists to
 /// prevent. One command, dispatched once, with the order guaranteed on this side instead.
 ///
-/// ── WHY `Dead`/`unknown` AND NOT `Retired` (roborev 61714) ────────────────────────────────────
+/// ── WHY `Dead` AND NOT `Retired` (roborev 61714) ──────────────────────────────────────────────
 /// `Retired` carries more meaning than "do not resurrect": `derive` maps it to
 /// `ReaperVerdict::Reapable` UNCONDITIONALLY, with none of the `PROTECTION_MAX` grace `Dead` gets.
 /// But "stop the agents when I close this window" is explicitly not "delete them" — the records and
@@ -1309,10 +1309,14 @@ pub fn pty_resize(
 /// still alive in the cloud on that same worktree. Marking either `Reapable` would hand a worktree
 /// holding uncommitted work to any future reaper.
 ///
-/// `unknown` is the exactly-right cause here and needs no new vocabulary: `deathTypes` already
-/// documents it as "a human clicking stop produces exactly this observation", and
-/// `is_resurrectable` refuses it. So a deliberate stop is recorded as what it is, stays
-/// unresurrectable, and keeps the ordinary protection window.
+/// ── AND WHY THE CAUSE IS `HumanStopped`, NOT `Unknown` (2026-08-13) ───────────────────────────
+/// It was `Unknown`, under a comment here claiming it "needs no new vocabulary" because `deathTypes`
+/// documents `unknown` as "a human clicking stop produces exactly this observation". The
+/// observation matched; the CONCLUSION was backwards. Writing a stop as `Unknown` is what forced
+/// `is_resurrectable` to refuse the entire class — an ordinary crash is `Unknown`/`PtyExit` too —
+/// so protecting this one path made every unexplained death permanently unrecoverable (25 of 76
+/// records on the founder's install). The stop now has its own cause and its own evidence, so it is
+/// still never resurrected, `Unknown` recovers, and both keep the ordinary protection window.
 ///
 /// ONLY a `Live` record is touched, so this can never downgrade a richer verdict a window already
 /// observed (a met goal, a wall, a transport banner). Failure is swallowed: a ledger write is an
