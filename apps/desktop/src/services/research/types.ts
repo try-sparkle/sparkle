@@ -276,3 +276,53 @@ export function isUnread(task: ResearchTask): boolean {
 export function isLive(task: ResearchTask): boolean {
   return isLivePhase(task.status);
 }
+
+/**
+ * A terminal task the concierge has NOT yet been told about, and whose news is not a FINDING.
+ *
+ * The complement of {@link isUnread} within the terminal phase, and between them they cover it
+ * exactly: a `done` task carrying findings is owed to the prompt preamble, and everything else that
+ * has stopped — `failed`, `cancelled`, and the `done`-with-nothing case a runner can produce — is
+ * owed to the event log instead. Neither list is enumerated twice; this is defined as "terminal,
+ * unclaimed, and not the other one", so a new status cannot land in the gap between them.
+ *
+ * WHY THE `done`-WITH-NO-FINDINGS CASE MATTERS more than it looks: it is the one shape that would
+ * otherwise be owed to NOBODY. `isUnread` requires `findings !== null`, so such a task is never in
+ * the preamble; without this predicate it would also never be claimed, and a row that can never be
+ * claimed is a row that can never retire. It would sit in the sidebar forever — which is the exact
+ * complaint this whole change exists to answer.
+ */
+export function isNoticePending(task: ResearchTask): boolean {
+  return isTerminal(task.status) && task.readAt === null && !isUnread(task);
+}
+
+/**
+ * Has this task's row been torn down?
+ *
+ * ══ ONE FIELD MEANS BOTH "THE CONCIERGE HAS IT" AND "THE ROW MAY GO" ═══════════════════════════
+ *
+ * That identity is the whole design, and it is what makes "retiring never discards a finding" a
+ * property rather than a promise. {@link isUnread} — what the drain still owes the prompt — and this
+ * predicate read the SAME `readAt`. So a `done` task whose findings have not been delivered is
+ * unread AND not retired, by construction; the row cannot outrun the drain, because there is no
+ * second piece of state for the two to disagree about. The instant delivery stamps `readAt`, the
+ * task stops being owed and becomes retirable in the same write.
+ *
+ * The rejected alternatives, recorded because each looks simpler and is wrong:
+ *
+ *   • A TIMER ("retire terminal tasks older than an hour") can retire a finding that was never
+ *     delivered — a silent loss, the direction this repo's every queue rule forbids.
+ *   • A COUNT ("keep the newest 10") is the same loss with extra steps, and it is worst exactly when
+ *     the founder is busiest, which is when the most is owed.
+ *   • RETIRING AT THE MOMENT THE EVENT IS RECORDED reads as obviously right and is not:
+ *     `stores/conciergeEventLog` is plain module state that does NOT survive an app reload, and
+ *     `drain.ts`'s standing rule is that PEEK MUST NEVER CLAIM. A notice claimed when it was merely
+ *     recorded, with the app quitting before any turn drained the log, is gone with no residue —
+ *     the row vanishing as though the task had answered.
+ *
+ * `readAt` is on disk (`research/<id>.json`), so a restart cannot resurrect a retired row, and a
+ * row whose task is still owed comes back exactly as it was.
+ */
+export function isRetired(task: ResearchTask): boolean {
+  return isTerminal(task.status) && task.readAt !== null;
+}

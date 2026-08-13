@@ -23,13 +23,15 @@ import { join } from "node:path";
 
 import {
   MAX_STAGED_TURNS,
+  RESEARCH_FAILED_PREAMBLE_HEADER,
   RESEARCH_PREAMBLE_HEADER,
+  buildResearchFailurePreamble,
   buildResearchPreamble,
   createResearchDrain,
   withResearchPreamble,
   type ResearchDrainDeps,
 } from "./drain";
-import { _resetResearchStoreForTests } from "./store";
+import { _resetResearchStoreForTests, visibleTasks } from "./store";
 import type { ResearchTask } from "./types";
 import type { ConciergeEvent, ConciergeEventPayload } from "../../stores/conciergeEventLog";
 
@@ -41,6 +43,11 @@ const FIXTURE: ResearchTask[] = JSON.parse(
 const UNREAD = FIXTURE.find((t) => t.status === "done" && t.readAt === null)!;
 /** The fixture's already-claimed one — a finding the founder has been told about. */
 const CLAIMED = FIXTURE.find((t) => t.status === "done" && t.readAt !== null)!;
+/** The two that stopped WITHOUT an answer. These are the 11 red rows in the founder's sidebar. */
+const FAILED = FIXTURE.find((t) => t.status === "failed")!;
+const CANCELLED = FIXTURE.find((t) => t.status === "cancelled")!;
+/** Everything one turn is accountable for claiming, oldest-first within each section. */
+const ALL_OWED = [UNREAD.id, ...[FAILED, CANCELLED].sort((a, b) => a.createdAt - b.createdAt).map((t) => t.id)];
 
 const task = (over: Partial<ResearchTask>): ResearchTask => ({
   ...UNREAD,
@@ -131,30 +138,108 @@ describe("buildResearchPreamble", () => {
   });
 });
 
+describe("buildResearchFailurePreamble", () => {
+  it("carries the runner's OWN sentence, not a reconstruction of it", () => {
+    const p = buildResearchFailurePreamble([FAILED]);
+    expect(p).toContain(FAILED.error!);
+    expect(p).toContain(FAILED.question);
+    expect(p).toContain(RESEARCH_FAILED_PREAMBLE_HEADER);
+  });
+
+  // The 3-minute wall clock is the failure the founder actually hit, five times in one evening. The
+  // brain has to be able to READ the cap out of the line, or "re-dispatch it deeper" is advice it
+  // cannot act on.
+  it("passes a timeout sentence through intact, cap and all", () => {
+    const timeout = "The research run hit its 3 minute limit and was stopped.";
+    expect(buildResearchFailurePreamble([task({ status: "failed", error: timeout })])).toContain(
+      timeout,
+    );
+  });
+
+  // `cancelled` has no `error` by construction — the founder killed it. Without this arm the line
+  // would read "No reason was recorded", which is true of the field and false about the world.
+  it("says the founder stopped it, for a cancelled task", () => {
+    const p = buildResearchFailurePreamble([CANCELLED]);
+    expect(p).toContain("You stopped it.");
+    expect(p).not.toContain("No reason was recorded");
+  });
+
+  // A failed task whose error never got written still has to say something honest.
+  it("admits when no reason was recorded rather than inventing one", () => {
+    expect(buildResearchFailurePreamble([task({ status: "failed", error: null })])).toContain(
+      "No reason was recorded.",
+    );
+  });
+
+  it("adds NOTHING when nothing failed — not an empty header", () => {
+    expect(buildResearchFailurePreamble([])).toBe("");
+  });
+});
+
 // ---------------------------------------------------------------------------------------------
 // What the drain selects
 // ---------------------------------------------------------------------------------------------
 
 describe("peek — what reaches the prompt", () => {
-  it("names the unread finding and nothing else in the fixture", () => {
+  it("names the unread finding, and carries its findings verbatim", () => {
     const h = harness(FIXTURE);
     const d = createResearchDrain(h.deps);
     const { preamble, taskIds } = d.peek();
-    expect(taskIds).toEqual([UNREAD.id]);
+    expect(taskIds).toContain(UNREAD.id);
     expect(preamble).toContain(UNREAD.findings!);
   });
 
-  it("says nothing about queued, running, failed, cancelled or already-claimed tasks", () => {
+  // ── A FAILURE IS NOW CARRIED TOO, AND THAT IS A DELIBERATE CONTRACT CHANGE ───────────────────
+  //
+  // This suite used to assert the opposite ("says nothing about … failed, cancelled …"), on the
+  // reasoning recorded at `isUnread`: "there are none" is not a finding, and the row is the surface
+  // the founder chose. Changed on the founder's explicit instruction, and on evidence — the row had
+  // stopped being a surface (28 stacked, 11 red), the event log that carried failures does not
+  // survive an app reload, and five of six dispatches in one evening died silently on the 3-minute
+  // wall clock. What has NOT changed is the discipline: a failure is one terse line in its own
+  // section, never mixed in with findings, and it is still claimed only on delivery.
+  it("names a failed and a cancelled task, in their OWN section", () => {
     const h = harness(FIXTURE);
-    const { preamble } = createResearchDrain(h.deps).peek();
+    const { preamble, taskIds } = createResearchDrain(h.deps).peek();
+
+    expect(taskIds).toEqual(ALL_OWED);
+    expect(preamble).toContain(RESEARCH_FAILED_PREAMBLE_HEADER);
+    expect(preamble).toContain(FAILED.question);
+    expect(preamble).toContain(CANCELLED.question);
+    // The runner's own sentence, not a reconstruction of it.
+    expect(preamble).toContain(FAILED.error!);
+
+    // THE SECTIONS MUST NOT BLUR. A failure appearing under the findings header would have the brain
+    // answer the founder with "there are none" as though it were a result.
+    const findingsAt = preamble.indexOf(RESEARCH_PREAMBLE_HEADER);
+    const failuresAt = preamble.indexOf(RESEARCH_FAILED_PREAMBLE_HEADER);
+    expect(findingsAt).toBeGreaterThanOrEqual(0);
+    expect(failuresAt).toBeGreaterThan(findingsAt);
+    expect(preamble.slice(findingsAt, failuresAt)).not.toContain(FAILED.question);
+  });
+
+  it("still says nothing about queued, running or already-claimed tasks", () => {
+    const h = harness(FIXTURE);
+    const { preamble, taskIds } = createResearchDrain(h.deps).peek();
     for (const t of FIXTURE) {
-      if (t.id === UNREAD.id) continue;
+      if (ALL_OWED.includes(t.id)) continue;
       expect(preamble).not.toContain(t.question);
+      expect(taskIds).not.toContain(t.id);
     }
-    // Named explicitly, because these two are the ones a careless filter lets through: a finished
-    // task WITH findings that was already told, and a finished-but-failed one.
+    // Named explicitly, because this is the one a careless filter lets through: a finished task
+    // WITH findings that has already been told.
     expect(preamble).not.toContain(CLAIMED.findings!);
     expect(preamble).not.toContain(CLAIMED.question);
+  });
+
+  // The empty case has to stay EXACTLY "" now that two sections are joined — `withResearchPreamble`
+  // keys on that to leave a prompt untouched, so a join returning "\n\n" would put a blank line on
+  // every prompt the app sends.
+  it("is exactly the empty string when nothing at all is owed", () => {
+    const h = harness(FIXTURE.filter((t) => t.status === "queued" || t.status === "running"));
+    const { preamble, taskIds } = createResearchDrain(h.deps).peek();
+    expect(preamble).toBe("");
+    expect(taskIds).toEqual([]);
   });
 
   it("keeps the store's OLDEST-FIRST order — the story is told forwards", () => {
@@ -196,8 +281,52 @@ describe("a delivered finding is not told twice", () => {
     expect(first.preamble).toContain(UNREAD.findings!);
     expect(second.preamble).toBe("");
     expect(second.taskIds).toEqual([]);
-    expect(h.marked).toEqual([{ ids: [UNREAD.id], at: h.at() }]);
+    // The failures are claimed by the SAME settle, because the same prompt delivered them — which is
+    // what lets their rows retire. Surfaced once, then gone.
+    expect(h.marked).toEqual([{ ids: ALL_OWED, at: h.at() }]);
     expect(h.readAtOf(UNREAD.id)).toBe(h.at());
+    expect(h.readAtOf(FAILED.id)).toBe(h.at());
+    expect(h.readAtOf(CANCELLED.id)).toBe(h.at());
+  });
+
+  // THE WHOLE POINT OF THE FEATURE, asserted end-to-end on the drain's own terms: after one
+  // delivered turn, every terminal task in the fixture is retired and the row has nothing left to
+  // show but live work. Before the turn, none of them are.
+  it("leaves every terminal task RETIRED once a turn has delivered", () => {
+    const h = harness(FIXTURE);
+    const d = createResearchDrain(h.deps);
+
+    expect(visibleTasks(h.list).map((t) => t.id)).toEqual(
+      expect.arrayContaining([UNREAD.id, FAILED.id, CANCELLED.id]),
+    );
+
+    const first = d.peek();
+    d.stage("11", first.taskIds);
+    d.settle("11");
+
+    const stillShowing = visibleTasks(h.list);
+    expect(stillShowing.map((t) => t.id)).not.toContain(UNREAD.id);
+    expect(stillShowing.map((t) => t.id)).not.toContain(FAILED.id);
+    expect(stillShowing.map((t) => t.id)).not.toContain(CANCELLED.id);
+    // What REMAINS is exactly the work still in flight — teardown never touches a running row.
+    expect(stillShowing.map((t) => t.status).sort()).toEqual(["queued", "running"]);
+  });
+
+  // The failure direction that would be a silent loss: a turn that never delivered must leave the
+  // failure notice owed, and its row on screen. `abandon` is the superseded/cancelled path.
+  it("keeps a failure owed — and its row visible — when the turn never delivered", () => {
+    const h = harness(FIXTURE);
+    const d = createResearchDrain(h.deps);
+
+    const first = d.peek();
+    d.stage("11", first.taskIds);
+    d.abandon("11"); // superseded before it rendered — the founder was told nothing
+
+    expect(h.marked).toEqual([]);
+    expect(h.readAtOf(FAILED.id)).toBeNull();
+    expect(visibleTasks(h.list).map((t) => t.id)).toContain(FAILED.id);
+    // ...and it is offered again on the very next turn.
+    expect(d.peek().taskIds).toEqual(ALL_OWED);
   });
 
   it("holds even while the store's cache still reports it unread", () => {
@@ -220,7 +349,7 @@ describe("a delivered finding is not told twice", () => {
     const a = d.peek();
     d.stage("11", a.taskIds);
     const b = d.peek();
-    expect(b.taskIds).toEqual([UNREAD.id]); // A told the founder nothing yet, so B carries it too
+    expect(b.taskIds).toEqual(ALL_OWED); // A told the founder nothing yet, so B carries it all too
     d.stage("12", b.taskIds);
     d.settle("12");
     d.settle("11");
@@ -247,7 +376,7 @@ describe("a dropped turn does not drop the finding", () => {
     expect(h.marked).toEqual([]);
     expect(h.readAtOf(UNREAD.id)).toBeNull();
     const second = d.peek();
-    expect(second.taskIds).toEqual([UNREAD.id]);
+    expect(second.taskIds).toEqual(ALL_OWED);
     expect(second.preamble).toContain(UNREAD.findings!);
   });
 
@@ -274,7 +403,7 @@ describe("a dropped turn does not drop the finding", () => {
     d.stage("11", d.peek().taskIds);
     d.abandon("11"); // `supersededTurn(e.id)` in the host's `concierge:done` handler
     expect(d.stats()).toMatchObject({ claimed: 0, abandoned: 1 });
-    expect(d.peek().taskIds).toEqual([UNREAD.id]);
+    expect(d.peek().taskIds).toEqual(ALL_OWED);
   });
 
   it("an evicted staging is a repeat, never a loss", () => {
@@ -284,7 +413,7 @@ describe("a dropped turn does not drop the finding", () => {
     for (let i = 0; i < MAX_STAGED_TURNS; i++) d.stage(`x${i}`, ["other"]);
     d.settle("1"); // evicted — this claims nothing
     expect(h.marked).toEqual([]);
-    expect(d.peek().taskIds).toEqual([UNREAD.id]);
+    expect(d.peek().taskIds).toEqual(ALL_OWED);
     expect(d.stats().evicted).toBeGreaterThan(0);
   });
 });
@@ -333,7 +462,7 @@ describe("research_completed", () => {
     const h = harness(FIXTURE);
     const d = createResearchDrain({ ...h.deps, recordEvent: undefined });
     expect(() => d.observe()).not.toThrow();
-    expect(d.peek().taskIds).toEqual([UNREAD.id]);
+    expect(d.peek().taskIds).toEqual(ALL_OWED);
   });
 });
 

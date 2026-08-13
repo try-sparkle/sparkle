@@ -24,6 +24,7 @@ import {
   sortedTasks,
   unreadTasks,
   useResearchStore,
+  visibleTasks,
 } from "./store";
 import type { ResearchTask } from "./types";
 
@@ -179,6 +180,68 @@ describe("liveTasks — what the row's +[n] counts", () => {
     expect(statuses.has("done")).toBe(false);
     expect(statuses.has("failed")).toBe(false);
     expect(statuses.has("cancelled")).toBe(false);
+  });
+});
+
+describe("visibleTasks — what the row renders, and what it tears down", () => {
+  // The bug in one assertion: the row rendered every task the store had ever seen. The fixture's
+  // already-claimed `done` task is the one that has said everything it is going to say.
+  it("drops a task the concierge has already been told about", () => {
+    const ids = visibleTasks(FIXTURE).map((t) => t.id);
+    expect(ids).not.toContain("rsh_01HQZX000000000000CLAIMED_DONE");
+    // …and the rest are all still there, so this is a retirement and not a filter that ate the list.
+    expect(ids).toHaveLength(FIXTURE.length - 1);
+  });
+
+  // THE ONE THAT MUST NEVER REGRESS. A row that retires an undelivered finding has discarded it from
+  // the only surface the founder can see, while the drain still believes it is owed.
+  it("KEEPS a finished task whose findings are still owed", () => {
+    expect(visibleTasks(FIXTURE).map((t) => t.id)).toContain("rsh_01HQZX000000000000UNREAD_DONE");
+  });
+
+  it("keeps everything still in flight, so work in progress stays visible", () => {
+    const statuses = visibleTasks(FIXTURE).map((t) => t.status);
+    expect(statuses).toContain("queued");
+    expect(statuses).toContain("running");
+  });
+
+  // The 11 red rows. Unclaimed failures are still owed a surfacing, so they stay — the retirement is
+  // what happens AFTER they are told, which is the next case.
+  it("keeps an unclaimed failed or cancelled task until it has been surfaced", () => {
+    const statuses = visibleTasks(FIXTURE).map((t) => t.status);
+    expect(statuses).toContain("failed");
+    expect(statuses).toContain("cancelled");
+  });
+
+  // THE TRANSITION, which is the side effect the whole feature is. Asserting the end states alone
+  // would hold for a selector that keyed on `status` and ignored the claim entirely; this pins that
+  // stamping the claim is what removes the row, on the SAME list with ONE field changed.
+  it("retires a task the moment its claim is stamped, and only then", () => {
+    const before = visibleTasks(FIXTURE).map((t) => t.id);
+    expect(before).toContain("rsh_01HQZX000000000000000FAILED");
+
+    const claimed = FIXTURE.map((t) =>
+      t.id === "rsh_01HQZX000000000000000FAILED" ? { ...t, readAt: 1_754_700_500_000 } : t,
+    );
+    const after = visibleTasks(claimed).map((t) => t.id);
+    expect(after).not.toContain("rsh_01HQZX000000000000000FAILED");
+    // Exactly one row went away — nothing else moved.
+    expect(after).toHaveLength(before.length - 1);
+  });
+
+  // A claim can never retire something still running, whatever else is true of it. Belt and braces
+  // against a future edit that drops the `isTerminal` half of the predicate.
+  it("never retires a live task, even one carrying a stray claim", () => {
+    const odd = FIXTURE.map((t) => (t.status === "running" ? { ...t, readAt: 123 } : t));
+    expect(visibleTasks(odd).map((t) => t.status)).toContain("running");
+  });
+
+  it("is newest first, like everything else the human looks at", () => {
+    const two: ResearchTask[] = [
+      { ...FIXTURE[0]!, id: "older", createdAt: 1000 },
+      { ...FIXTURE[0]!, id: "newer", createdAt: 2000 },
+    ];
+    expect(visibleTasks(two).map((t) => t.id)).toEqual(["newer", "older"]);
   });
 });
 

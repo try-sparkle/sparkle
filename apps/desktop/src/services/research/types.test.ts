@@ -16,6 +16,8 @@ import {
   ResearchTaskParseError,
   isLive,
   isLivePhase,
+  isNoticePending,
+  isRetired,
   isTerminal,
   isUnread,
   parseResearchTask,
@@ -264,6 +266,101 @@ describe("the research task contract", () => {
 
     it("is false for a task still running", () => {
       expect(isUnread(byId(loadFixture(), "RUNNING"))).toBe(false);
+    });
+  });
+
+  // ── RETIREMENT ────────────────────────────────────────────────────────────────────────────────
+  //
+  // The founder watched 28 research rows stack up, 11 of them red at exactly 3m, none of which ever
+  // went away. These two predicates are what lets a row tear itself down — and the property that
+  // matters more than the teardown is that it CANNOT discard a finding, because it and `isUnread`
+  // read the same `readAt`.
+  describe("isRetired", () => {
+    it("is false while the task is still going, so work in flight stays visible", () => {
+      const fixture = loadFixture();
+      expect(isRetired(byId(fixture, "QUEUED"))).toBe(false);
+      expect(isRetired(byId(fixture, "RUNNING"))).toBe(false);
+    });
+
+    // THE LOAD-BEARING CASE. If this ever returns true, the row retires a finding nobody has been
+    // told, which is the one outcome the whole design exists to make impossible.
+    it("is FALSE for a finished task whose findings are still owed", () => {
+      const owed = byId(loadFixture(), "UNREAD_DONE");
+      expect(owed.readAt).toBeNull();
+      expect(isUnread(owed)).toBe(true);
+      expect(isRetired(owed)).toBe(false);
+    });
+
+    it("is true once the findings have been delivered", () => {
+      const delivered = byId(loadFixture(), "CLAIMED_DONE");
+      expect(delivered.readAt).not.toBeNull();
+      expect(isRetired(delivered)).toBe(true);
+    });
+
+    // THE INVARIANT, asserted over the whole fixture rather than case by case: no task is ever both
+    // owed to the preamble and torn down. A hand-written pair of cases can miss a status; this
+    // cannot, because it quantifies over every task the shared fixture carries.
+    it("is never true at the same time as isUnread, for any task in the fixture", () => {
+      for (const t of loadFixture()) {
+        expect(isUnread(t) && isRetired(t)).toBe(false);
+      }
+    });
+
+    // The transition itself, which is the SIDE EFFECT the row's behaviour turns on. Asserting only
+    // the two end states would hold for a predicate that ignored `readAt` entirely and keyed on,
+    // say, `findings` — this pins that stamping the claim is what flips it.
+    it("flips from false to true when — and only when — the claim is stamped", () => {
+      const owed = byId(loadFixture(), "UNREAD_DONE");
+      expect(isRetired(owed)).toBe(false);
+      expect(isRetired({ ...owed, readAt: 1_754_700_500_000 })).toBe(true);
+    });
+  });
+
+  describe("isNoticePending", () => {
+    // These two are the 11 red rows. They carry no findings, so the preamble never names them and
+    // `isUnread` is false — without this predicate nothing would ever claim them and they could
+    // never retire.
+    it("is true for an unclaimed failed or cancelled task", () => {
+      const fixture = loadFixture();
+      expect(isNoticePending(byId(fixture, "FAILED"))).toBe(true);
+      expect(isNoticePending(byId(fixture, "CANCELLED"))).toBe(true);
+    });
+
+    it("is false while the task is still going", () => {
+      const fixture = loadFixture();
+      expect(isNoticePending(byId(fixture, "QUEUED"))).toBe(false);
+      expect(isNoticePending(byId(fixture, "RUNNING"))).toBe(false);
+    });
+
+    // The two owed-lists must not overlap, or a finding would be claimed by the notice path before
+    // the preamble ever carried it — a loss dressed up as a delivery.
+    it("is false for a done task whose findings are owed, which the preamble carries instead", () => {
+      expect(isNoticePending(byId(loadFixture(), "UNREAD_DONE"))).toBe(false);
+    });
+
+    it("is false once claimed, so a notice is pending exactly once", () => {
+      const failed = byId(loadFixture(), "FAILED");
+      expect(isNoticePending({ ...failed, readAt: 1_754_700_500_000 })).toBe(false);
+    });
+
+    // THE SHAPE THAT WOULD OTHERWISE BE OWED TO NOBODY: `done` with no findings. `isUnread` requires
+    // `findings !== null`, so the preamble skips it; if this predicate skipped it too, the row could
+    // never be claimed and would sit in the sidebar forever — the exact complaint being fixed.
+    it("covers a done task that produced no findings at all", () => {
+      const empty = { ...byId(loadFixture(), "UNREAD_DONE"), findings: null };
+      expect(isUnread(empty)).toBe(false);
+      expect(isNoticePending(empty)).toBe(true);
+    });
+
+    // TOTALITY, over the fixture: every terminal task is owed to exactly one of the two channels
+    // until it is claimed, and to neither afterwards. This is what stops a future status landing in
+    // the gap between the two lists.
+    it("partitions the unclaimed terminal tasks with isUnread, leaving no gap", () => {
+      for (const t of loadFixture()) {
+        const owed = isUnread(t) || isNoticePending(t);
+        expect(owed).toBe(isTerminal(t.status) && t.readAt === null);
+        expect(isUnread(t) && isNoticePending(t)).toBe(false);
+      }
     });
   });
 });

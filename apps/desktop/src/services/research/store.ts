@@ -25,7 +25,7 @@ import { useShallow } from "zustand/react/shallow";
 import { invoke } from "@tauri-apps/api/core";
 
 import { log } from "../../logger";
-import { isLive, isUnread, type ResearchDepth, type ResearchTask } from "./types";
+import { isLive, isRetired, isUnread, type ResearchDepth, type ResearchTask } from "./types";
 
 // ---------------------------------------------------------------------------------------------
 // The Tauri command surface — these five strings are the contract with `src-tauri/src/research.rs`
@@ -132,6 +132,27 @@ export function sortedTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
 /** What the "Concierge Agents" row counts in its `+[n]`. */
 export function liveTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
   return sortedTasks(tasks.filter(isLive));
+}
+
+/**
+ * What the "Concierge Agents" row actually RENDERS — everything except the retired.
+ *
+ * The row used to render `sortedTasks(Object.values(byId))`: every task the store had ever seen,
+ * for the life of the install. There was no retirement concept anywhere and no pruning on either
+ * side of the seam, so the founder's sidebar reached 28 stacked rows — 11 of them red at exactly
+ * 3m, all of them dead research runs that had already said everything they were going to say.
+ *
+ * A row disappears when {@link isRetired} says the concierge has been told. Live work is never
+ * retired, so anything genuinely in flight still shows; and a finished task whose findings are still
+ * owed is not retired either, because that predicate and `isUnread` read the same `readAt`. The row
+ * therefore cannot outrun the drain — it is not a rule this function enforces, it is one it cannot
+ * express the violation of.
+ *
+ * NOTHING IS DELETED. `retired` means "not in the sidebar": the task's JSON stays on disk with its
+ * findings intact and its record readable. Teardown is a surface decision, not a data one.
+ */
+export function visibleTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
+  return sortedTasks(tasks.filter((t) => !isRetired(t)));
 }
 
 /**

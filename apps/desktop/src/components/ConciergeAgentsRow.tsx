@@ -65,8 +65,8 @@ import {
   cancelResearch,
   refreshResearch,
   RESEARCH_POLL_INTERVAL_MS,
-  sortedTasks,
   useResearchStore,
+  visibleTasks,
 } from "../services/research/store";
 import { isLive, type ResearchStatus, type ResearchTask } from "../services/research/types";
 
@@ -185,7 +185,18 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   const setOpenTask = useResearchStore((s) => s.setOpenTask);
   // Newest first, through the store's OWN selector. Sorting here instead would be a second answer to
   // "which task is the latest", which is the drift `sortedTasks` exists to prevent.
-  const tasks = useMemo(() => sortedTasks(Object.values(byId)), [byId]);
+  //
+  // ══ AND RETIRED TASKS ARE NOT RENDERED AT ALL ═══════════════════════════════════════════════════
+  //
+  // This was `sortedTasks(Object.values(byId))` — every task the store had ever seen, for the life of
+  // the install, because nothing anywhere retired one. The founder's sidebar reached 28 stacked rows,
+  // 11 of them red at exactly 3m: dead research runs that had already said everything they were ever
+  // going to say, sitting there looking like live work.
+  //
+  // `visibleTasks` drops only what the concierge has been TOLD about. It cannot drop a finding still
+  // owed — that predicate and `isUnread` read the same `readAt`, so there is no second piece of state
+  // for the row and the drain to disagree about — and it cannot drop anything still running.
+  const tasks = useMemo(() => visibleTasks(Object.values(byId)), [byId]);
 
   // HYDRATE ON MOUNT, THEN KEEP POLLING. The store is a cache and the disk is the truth: the
   // concierge that dispatched a task has usually exited by the time this window paints, so a row

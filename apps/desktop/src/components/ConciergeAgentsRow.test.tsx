@@ -106,6 +106,16 @@ const FIXTURE: ResearchTask[] = JSON.parse(
 /** The arithmetic the `+[n]` assertion depends on, stated so a fixture edit fails loudly. */
 const LIVE_IN_FIXTURE = 2;
 const TASKS_IN_FIXTURE = 6;
+/**
+ * How many of those the row actually RENDERS. One fixture task is already claimed, and a claimed
+ * terminal task is retired — the row tears it down rather than stacking it up forever.
+ *
+ * Derived from the fixture rather than hard-coded to 5, so adding a claimed task to the fixture
+ * cannot make this drift into a number that means nothing.
+ */
+const VISIBLE_IN_FIXTURE = FIXTURE.filter(
+  (t) => !(t.status !== "queued" && t.status !== "running" && t.readAt !== null),
+).length;
 
 const DONE_WITH_FINDINGS = FIXTURE.find((t) => t.status === "done" && t.findings !== null)!;
 const RUNNING = FIXTURE.find((t) => t.status === "running")!;
@@ -243,7 +253,41 @@ describe("Concierge Agents — click the row, then click an agent", () => {
 
     fireEvent.click(row());
     expect(row().getAttribute("aria-expanded")).toBe("true");
-    expect(childRows()).toHaveLength(TASKS_IN_FIXTURE);
+    // NOT `TASKS_IN_FIXTURE`: the already-claimed task is retired and must not be rendered. That
+    // difference is the whole feature, so the two constants are deliberately kept apart.
+    expect(childRows()).toHaveLength(VISIBLE_IN_FIXTURE);
+    expect(VISIBLE_IN_FIXTURE).toBeLessThan(TASKS_IN_FIXTURE);
+  });
+
+  // THE FOUNDER'S COMPLAINT, in a real render: 28 rows stacked up because nothing ever retired one.
+  // Asserting on the CHANGE — same task list, one claim stamped, one fewer row — rather than on a
+  // count, which a fixture edit could satisfy by accident.
+  it("tears a row down the moment its task is claimed, leaving the others alone", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+    const before = childRows().length;
+    const victim = FIXTURE.find((t) => t.status === "failed")!;
+    expect(screen.getAllByText(victim.question).length).toBeGreaterThan(0);
+
+    act(() => {
+      seedResearch(
+        FIXTURE.map((t) => (t.id === victim.id ? { ...t, readAt: 1_754_700_500_000 } : t)),
+      );
+    });
+
+    expect(childRows()).toHaveLength(before - 1);
+    expect(screen.queryByText(victim.question)).toBeNull();
+  });
+
+  // The other half, and the one that must never regress: a finished task whose findings have NOT
+  // been delivered stays on screen. If this ever goes red, the row is discarding a finding.
+  it("KEEPS a finished task whose findings are still owed", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+    const owed = FIXTURE.find((t) => t.status === "done" && t.readAt === null)!;
+    expect(screen.getAllByText(owed.question).length).toBeGreaterThan(0);
   });
 
   it("folds again on a second click", () => {

@@ -40,7 +40,7 @@
 // list, the claim itself and the event recorder as dependencies. That is what lets exactly-once —
 // and, more importantly, "a dropped turn does not drop the finding" — be tested as arithmetic
 // rather than by mounting an app.
-import { isTerminal, type ResearchTask } from "./types";
+import { isNoticePending, isTerminal, type ResearchTask } from "./types";
 import { unreadTasks } from "./store";
 import type { ConciergeEventPayload } from "../../stores/conciergeEventLog";
 
@@ -86,6 +86,61 @@ export function buildResearchPreamble(tasks: readonly ResearchTask[]): string {
     return [`${i + 1}. You asked: ${t.question}`, "   What came back:", findings].join("\n");
   });
   return [`${RESEARCH_PREAMBLE_HEADER} ${tasks.length} finding(s):`, "", ...items].join("\n");
+}
+
+/**
+ * The opening line of the FAILURE section — research that stopped without an answer.
+ */
+export const RESEARCH_FAILED_PREAMBLE_HEADER =
+  "RESEARCH DID NOT COME BACK — research you dispatched stopped without an answer, and the founder " +
+  "has NOT seen this. Say so plainly if it bears on what he is asking, and re-dispatch it (deeper, " +
+  "or as a narrower question) rather than waiting: nothing else is going to retry it. Oldest first.";
+
+/**
+ * Render unclaimed FAILED/CANCELLED tasks into their own short section. `""` when there is nothing.
+ *
+ * ══ WHY THIS EXISTS, WHEN `isUnread` DELIBERATELY EXCLUDED FAILURES ═════════════════════════════
+ *
+ * `isUnread`'s own note says a failure "is not worth spending prompt preamble on — the concierge
+ * asked for findings, and 'there are none' is not a finding", and points at the row as the surface
+ * the founder chose. That judgement was reasonable and it was wrong in practice, on evidence:
+ *
+ *   • The failures were NOT reaching anyone. They went only to `stores/conciergeEventLog`, which is
+ *     plain module state that does not survive an app reload — so a failure could be recorded and
+ *     then silently lost with no residue at all.
+ *   • And they were not rare. Five of six dispatches in one evening died on the 3-minute quick-tier
+ *     wall clock, which the dispatching agent discovered only by explicitly listing tasks. A
+ *     research surface that fails most of the time AND fails silently is worse than none.
+ *   • The row was not the backstop it was assumed to be: 28 rows had stacked up, 11 of them red, so
+ *     "the founder can see it there" had stopped being true through sheer volume.
+ *
+ * So a failure now gets exactly ONE line, on the one channel the brain is guaranteed to read. It is
+ * deliberately terse — a failure is not a finding and must not read like one — and it carries the
+ * runner's own sentence rather than a reconstruction.
+ *
+ * IT IS ALSO WHAT LETS THE ROW RETIRE. Being in the preamble means being staged and then CLAIMED on
+ * delivery, exactly like a finding; and `isRetired` reads that same claim. Without this, a failed
+ * task would be owed to nobody, could never be claimed, and its row could never go away.
+ */
+export function buildResearchFailurePreamble(tasks: readonly ResearchTask[]): string {
+  if (tasks.length === 0) return "";
+  const items = tasks.map((t, i) => {
+    // `cancelled` has no error by construction — the founder killed it, and that is the whole story.
+    const why = t.status === "cancelled" ? "You stopped it." : (t.error ?? "No reason was recorded.");
+    return `${i + 1}. You asked: ${t.question}\n   What happened: ${why}`;
+  });
+  return [`${RESEARCH_FAILED_PREAMBLE_HEADER} ${tasks.length} of them:`, "", ...items].join("\n");
+}
+
+/**
+ * Join the two sections, skipping the empty ones.
+ *
+ * The empty case must stay EXACTLY `""` — `withResearchPreamble` keys on that to return the prompt
+ * object unchanged, so a "join" that produced `"\n\n"` for two empty sections would put a blank line
+ * on every prompt the app has ever sent.
+ */
+function joinSections(...sections: readonly string[]): string {
+  return sections.filter((s) => s !== "").join("\n\n");
 }
 
 /**
@@ -247,9 +302,24 @@ export function createResearchDrain(deps: ResearchDrainDeps): ResearchDrain {
       // set is the only thing layered on top, and it can only ever REMOVE — so this can never
       // surface something the store considers read.
       const pending = unreadTasks(all).filter((t) => !claimed.has(t.id));
-      const preamble = buildResearchPreamble(pending);
-      if (pending.length > 0) stats.peeked++;
-      return { preamble, taskIds: pending.map((t) => t.id) };
+      // The other half of what a terminal task can be owed. `isNoticePending` is defined as the
+      // COMPLEMENT of `isUnread` within the terminal phase, so these two lists cannot overlap and
+      // cannot leave a gap — a task is in exactly one of them until it is claimed.
+      const failures = all
+        .filter((t) => isNoticePending(t) && !claimed.has(t.id))
+        .sort((a, b) => a.createdAt - b.createdAt);
+      const preamble = joinSections(
+        buildResearchPreamble(pending),
+        buildResearchFailurePreamble(failures),
+      );
+      if (pending.length > 0 || failures.length > 0) stats.peeked++;
+      // ONE LIST OF WHAT THIS TURN IS ACCOUNTABLE FOR — findings and failures together, because both
+      // are delivered by the same prompt and must therefore be claimed by the same `settle`. Nothing
+      // is stamped here; peek still never claims.
+      return {
+        preamble,
+        taskIds: [...pending.map((t) => t.id), ...failures.map((t) => t.id)],
+      };
     },
 
     stage(turnId, taskIds) {
