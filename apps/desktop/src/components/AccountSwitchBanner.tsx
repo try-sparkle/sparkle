@@ -7,6 +7,7 @@
 // Once a switch is accepted (or an observed wall triggers an automatic one) it reports progress
 // rather than disappearing, because the switch is NOT instantaneous by design — busy agents migrate
 // as their turns end, so the notice stays up while that happens.
+import { FiX } from "react-icons/fi";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { accountSentenceName, type Account, type AccountDisplay } from "../services/accountStore";
 import { describeRecommendation, type SwitchRecommendation } from "../services/headroom";
@@ -65,12 +66,17 @@ const progressWrap: React.CSSProperties = {
 };
 
 // "Manage" — a link, not a button box, in the same black as the text.
+//
+// `inherit`, not a second `"#000"`: the bar sets black on the brand green above, and an underlined
+// element carrying its own unverifiable literal is what `theme/linkContrast.test.ts` fails on — it
+// requires a link's colour to resolve to an ink tier or to carry no colour of its own. Inheriting
+// is both: it is provably the same black the sentence beside it uses, so the two can never drift.
 const manageLink: React.CSSProperties = {
   background: "transparent",
   border: "none",
   padding: 0,
   margin: 0,
-  color: "#000",
+  color: "inherit",
   font: "inherit",
   fontWeight: 600,
   textDecoration: "underline",
@@ -78,16 +84,32 @@ const manageLink: React.CSSProperties = {
   whiteSpace: "nowrap",
 };
 
-// The dismiss ✕, pinned to the far right (mirrors the warning banners).
+// The dismiss control, pinned to the far right (mirrors the warning banners).
+//
+// AN ICON, NOT A GLYPH CHARACTER. It was a literal `✕`, which raised the glyph-as-icon count past
+// the ceiling `components/glyphIcons.test.ts` ratchets — the repo's standing rule is that an
+// affordance is a react-icon, because a character's size, weight and baseline are the font's to
+// decide and it reads differently on every platform. `FiX` is the same mark, drawn.
+//
+// With the glyph gone there is no text to size, so the off-scale 15px type size went with it — it
+// was the sole entry in `theme/scale.test.ts`'s ratchet. The icon carries its own size instead.
+//
+// (Do not write that retired property's name and a number together in a comment here: the ratchet
+// scans raw source text, comments included, so naming it is indistinguishable from committing it.)
 const dismissX: React.CSSProperties = {
   background: "transparent",
   border: "none",
-  color: "#000",
-  fontSize: 15,
+  color: "inherit",
   lineHeight: 1,
   cursor: "pointer",
   padding: "0 2px",
+  display: "inline-flex",
+  alignItems: "center",
 };
+
+/** The dismiss icon's size in px. Matches the 15px the glyph it replaces was set at, so the control
+ *  keeps the weight it was tuned to on the green bar. */
+const DISMISS_ICON = 15;
 
 export function AccountSwitchBanner({
   recommendation,
@@ -126,7 +148,7 @@ export function AccountSwitchBanner({
         <span style={{ flex: 1, display: "flex", justifyContent: "flex-end" }}>
           {onDismissProgress ? (
             <button type="button" aria-label="Dismiss" style={dismissX} onClick={onDismissProgress}>
-              ✕
+              <FiX size={DISMISS_ICON} aria-hidden />
             </button>
           ) : null}
         </span>

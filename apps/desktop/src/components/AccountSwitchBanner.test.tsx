@@ -59,16 +59,51 @@ describe("AccountSwitchBanner", () => {
     expect(onDismiss).toHaveBeenCalledOnce();
   });
 
-  it("reports progress while agents migrate, and explains why it isn't instant", () => {
-    // The switch is deliberately gradual — busy agents move as their turns end — so the banner has
-    // to say so rather than looking stuck.
+  it("names the TRIGGER and how many agents are moving, while they migrate", () => {
+    // ── THE COPY THIS ASSERTED WAS REPLACED, AND THESE ROWS WERE LEFT BEHIND ────────────────────
+    // The banner used to report "1 of 3 agents moved … finish their current turn". The restyle
+    // (b4525018f, "true to the trigger") replaced that with a sentence naming WHY the switch is
+    // happening — a session limit that was actually observed — and this row went red on `main`,
+    // blocking every open PR, because the copy moved and its test did not.
+    //
+    // What is asserted now is what the new sentence PROMISES, not its exact prose: the trigger, the
+    // COUNT of agents being moved (still `pending + moved`, so it does not shrink as they land),
+    // and the destination. Pinning the whole string would make the next copy tweak red again.
     const plan: SwitchPlan = { fromAccountId: "a", toAccountId: "b", pending: ["y", "z"], moved: ["x"] };
     render(
-      <AccountSwitchBanner recommendation={null} plan={plan} display={display} onAccept={vi.fn()} onDismiss={vi.fn()} />,
+      <AccountSwitchBanner
+        recommendation={null}
+        plan={plan}
+        display={display}
+        targetName="Second Account"
+        onAccept={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
     );
     const status = screen.getByRole("status");
-    expect(status.textContent).toContain("1 of 3 agents moved");
-    expect(status.textContent).toContain("finish their current turn");
+    expect(status.textContent).toContain("Session limit reached");
+    expect(status.textContent).toContain("3 agents");
+    expect(status.textContent).toContain("Second Account");
+  });
+
+  it("the count is the WHOLE switch, so it does not shrink as agents land", () => {
+    // `pending + moved`: the sentence names how many this switch is moving, and an agent leaving
+    // `pending` for `moved` must not make the banner claim a smaller job than it started.
+    const almost: SwitchPlan = { fromAccountId: "a", toAccountId: "b", pending: [], moved: ["x", "y", "z"] };
+    render(
+      <AccountSwitchBanner recommendation={null} plan={almost} display={display} onAccept={vi.fn()} onDismiss={vi.fn()} />,
+    );
+    expect(screen.getByRole("status").textContent).toContain("3 agents");
+  });
+
+  it("says 'agent', singular, when it is moving exactly one", () => {
+    const one: SwitchPlan = { fromAccountId: "a", toAccountId: "b", pending: ["y"], moved: [] };
+    render(
+      <AccountSwitchBanner recommendation={null} plan={one} display={display} onAccept={vi.fn()} onDismiss={vi.fn()} />,
+    );
+    const text = screen.getByRole("status").textContent ?? "";
+    expect(text).toContain("1 agent");
+    expect(text).not.toContain("1 agents");
   });
 
   it("the in-progress state takes precedence over a stale recommendation", () => {
@@ -77,7 +112,8 @@ describe("AccountSwitchBanner", () => {
       <AccountSwitchBanner recommendation={rec} plan={plan} display={display} onAccept={vi.fn()} onDismiss={vi.fn()} />,
     );
     expect(screen.queryByRole("alert")).toBeNull();
-    expect(screen.getByRole("status").textContent).toContain("1 of 1 agents moved");
+    // Same copy move as the row above: the in-progress bar is identified by its trigger sentence.
+    expect(screen.getByRole("status").textContent).toContain("Session limit reached");
   });
 
   it("states a reached limit without a percentage", () => {
