@@ -14,6 +14,10 @@ import {
   FiLock,
   FiGitBranch,
   FiCheckSquare,
+  FiGitMerge,
+  FiKey,
+  FiMessageSquare,
+  FiBell,
 } from "react-icons/fi";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { C, ON_BRAND_FILL } from "../theme/colors";
@@ -136,6 +140,35 @@ export const TOOL_META = {
     desc: "Prove a test can actually fail. Mutates the source under test and flags any test that stays green — vacuous or stale.",
     keywords:
       "mutation check test quality vacuous stale prove fail assertion sparkle marketplace plugin",
+  },
+  sparkleConflictWatch: {
+    name: "Conflict watch",
+    desc: "Catch a pull request that cannot merge and is therefore UNTESTED: a conflicting PR never fires GitHub's pull_request event, so no CI run is ever created — its checks are absent, not failing.",
+    keywords:
+      "conflict watch merge conflict pull request pr untested ci checks absent pending github sparkle marketplace plugin",
+  },
+  sparkleSecrets: {
+    name: "Secrets skill",
+    // Says "teaches", not "backs up". This row is the SKILL only; the "1Password env backup" row a
+    // few rows below is the switch that actually copies anything, and it ships OFF. Copy that said
+    // "back a project's .env up to 1Password" told a user who turned this on that backups were
+    // running when nothing was backing anything up — the same failure NO_VAULT_HINT exists to
+    // prevent on the adjacent row.
+    desc: "Teaches agents how to restore a project's .env from 1Password safely, with the restore traps that bite in practice. Turn on 1Password env backup below to actually store them.",
+    keywords:
+      "secrets env dotenv 1password op backup restore vault worktree seed sparkle marketplace plugin",
+  },
+  sparkleReviewProbes: {
+    name: "Review probes",
+    desc: "Don't merge a PR that still carries unanswered [blocking] review probes.",
+    keywords:
+      "review probes blocking unanswered question pr merge gate code review sparkle marketplace plugin",
+  },
+  sparklePusher: {
+    name: "Pusher",
+    desc: "Surface a fleet condition to a human proactively instead of waiting to be asked.",
+    keywords:
+      "pusher push notify proactive fleet condition surface alert human attention sparkle marketplace plugin",
   },
 } as const satisfies Record<string, { name: string; desc: string; keywords: string }>;
 
@@ -536,6 +569,44 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       checked: pluginsEnabled.sparkleMutationCheck,
       onToggle: () =>
         void setPluginEnabled("sparkleMutationCheck", !pluginsEnabled.sparkleMutationCheck),
+    },
+    {
+      ...TOOL_META.sparkleConflictWatch,
+      key: "sparkleConflictWatch",
+      Icon: FiGitMerge,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-conflict-watch`,
+      hint: pluginHint(pluginInstallState.sparkleConflictWatch),
+      checked: pluginsEnabled.sparkleConflictWatch,
+      onToggle: () =>
+        void setPluginEnabled("sparkleConflictWatch", !pluginsEnabled.sparkleConflictWatch),
+    },
+    {
+      ...TOOL_META.sparkleSecrets,
+      key: "sparkleSecrets",
+      Icon: FiKey,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-secrets`,
+      hint: pluginHint(pluginInstallState.sparkleSecrets),
+      checked: pluginsEnabled.sparkleSecrets,
+      onToggle: () => void setPluginEnabled("sparkleSecrets", !pluginsEnabled.sparkleSecrets),
+    },
+    {
+      ...TOOL_META.sparkleReviewProbes,
+      key: "sparkleReviewProbes",
+      Icon: FiMessageSquare,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-review-probes`,
+      hint: pluginHint(pluginInstallState.sparkleReviewProbes),
+      checked: pluginsEnabled.sparkleReviewProbes,
+      onToggle: () =>
+        void setPluginEnabled("sparkleReviewProbes", !pluginsEnabled.sparkleReviewProbes),
+    },
+    {
+      ...TOOL_META.sparklePusher,
+      key: "sparklePusher",
+      Icon: FiBell,
+      url: `${SPARKLE_MARKETPLACE_URL}/tree/main/plugins/sparkle-pusher`,
+      hint: pluginHint(pluginInstallState.sparklePusher),
+      checked: pluginsEnabled.sparklePusher,
+      onToggle: () => void setPluginEnabled("sparklePusher", !pluginsEnabled.sparklePusher),
     },
     {
       ...TOOL_META.onepassword,

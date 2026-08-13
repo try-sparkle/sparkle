@@ -10,12 +10,21 @@
 //!   • one row per (calendar day, model): five token counters + an estimated cost
 //!   • the username the user typed and a per-machine `client_id`
 //!   • aggregate session activity: tool-call counts per CATEGORY, subagent-dispatch and plan-mode
-//!     counts, session counts, and the NAMES of skills invoked — see [`SessionStats`]
-//! There are no file paths, no project or session names, no prompts, no code, no keys — the
-//! rollup below is built from [`crate::spend::UsageRecord`] and structurally cannot carry them
-//! (a record's `project`/`session` fields are dropped by [`rollup`], not merely omitted). The
-//! activity half is counters plus skill names; it never carries a tool's ARGUMENTS, so a Bash
-//! command, an edited path and a prompt cannot ride along inside it either.
+//!     counts, and session counts — see [`SessionStats`]. Skills appear there only as a COUNT
+//!     (`distinct_skills`); that blob has never carried a skill NAME and has no field for one.
+//!   • this machine's hostname, OS, CPU and RAM, plus the names of the Claude Code PLUGINS
+//!     installed here — see [`MachineConfig`]. Those names are read from
+//!     `~/.claude/plugins/installed_plugins.json`, i.e. from what is INSTALLED. Nothing here
+//!     reports which skills were INVOKED, or when: no transcript is consulted for this list, and a
+//!     name the user never installed can't reach the profile (the manifest is an allowlist by
+//!     construction). [`crate::config::BuilderIndexConfig::skills_exclude`] subtracts from it.
+//! Apart from the hostname — which the profile's "Machines" card exists to display, and which the
+//! community reporter already publishes for the same machine — there are no file paths, no project
+//! or session names, no prompts, no code, no keys. The rollup below is built from
+//! [`crate::spend::UsageRecord`] and structurally cannot carry them (a record's `project`/`session`
+//! fields are dropped by [`rollup`], not merely omitted). The activity half is COUNTERS ONLY; it
+//! never carries a tool's ARGUMENTS, so a Bash command, an edited path and a prompt cannot ride
+//! along inside it either.
 //!
 //! WHY THE ACTIVITY HALF EXISTS. Reporting tokens natively fixed the token undercount but left the
 //! profile's SUBAGENTS/SESSION, PLAN MODE and TOOL MIX panels sourced from the community indexer,
@@ -43,7 +52,15 @@
 //!               modelBreakdowns: [ { modelName, inputTokens, outputTokens,
 //!                                    cacheCreationTokens, cacheReadTokens, totalTokens,
 //!                                    cost?, source } ] } ],
-//!     session_stats?: { schema_version, source, window, adoption?, tool_mix? } }
+//!     session_stats?: { schema_version, source, window, adoption?, tool_mix? },
+//!     machine_config?: { hostname, os, cpu, memory_gb?, claude_skills? } }
+//! `os` is NODE's platform token, not Rust's — `"darwin 25.6.0"`, never `"macos 25.6.0"`; see
+//! [`platform_token`]. `memory_gb?` is OURS, not the reference's: its TS interface types it as a
+//! required `number`, and we omit it when `hw.memsize` is unreadable rather than send a `0` that
+//! claims the machine has no RAM. See the open question below — that trade is not free.
+//! `machine_config` is likewise an existing field (tkmx-client reporter/report.ts's `MachineConfig`)
+//! and its `claude_skills` array is what the profile's SKILLS row renders. Field names mirror that
+//! interface exactly — the server reads by key, so a rename drops the value silently.
 //! `session_stats` is an EXISTING field of that protocol (tkmx-client reporter/session-stats.ts
 //! forwards the community indexer's blob in it verbatim), which is why the activity metrics need no
 //! wire-protocol change and no coordination with the server operator. It is optional in both
@@ -61,6 +78,60 @@
 //!   • the fix for the flapping is environmental, not code: set `REPORT_SESSION_STATS=false` for the
 //!     community reporter while Sparkle reports natively. That is a change to the USER's launch
 //!     agent, so this module does not make it silently — it is called out for the operator instead.
+//! `machine_config` INHERITS THAT HAZARD, and we cannot fully honour the superset rule there.
+//! Assume it is replaced wholesale too (it is the same server and the same shape of field), so
+//! whatever Sparkle omits from it, the community reporter's last post loses:
+//!   • `hostname`, `os`, `cpu` and `memory_gb` we compute, so those are a genuine superset — same
+//!     keys, same meanings, same formatting.
+//!     The one seam: if a fact reads as unknown we OMIT its key rather than send a placeholder, so
+//!     that key is momentarily lost from the card. That is still the better trade — a placeholder
+//!     (`""`, `0`) is not "unknown" on the wire, it is a wrong value that renders as fact — and it
+//!     is why an unreadable HOSTNAME suppresses the whole object instead ([`build_machine_config`]).
+//!   • `claude_skills` is a DELIBERATE SUBSET, and it is the one place we knowingly break the
+//!     superset rule. MEASURED against tkmx-client `origin/main`, not assumed: `collectClaudeSkills`
+//!     (reporter/skills.ts) unions the plugin manifest with every `~/.claude/skills/<name>/SKILL.md`
+//!     directory, and `collectMachineConfig` (reporter/report.ts) then unions the configured MCP
+//!     server names on top — so its list is a strict superset of ours. Sparkle publishes the PLUGIN
+//!     MANIFEST ONLY: the founder's explicit choice, and the narrower one, since every name on it is
+//!     backed by something the user deliberately installed.
+//!     CONSEQUENCE, not hypothetical: on a machine where BOTH reporters post machine_config, the
+//!     personal-skill and MCP badges appear after tkmx-client's post and vanish after Sparkle's,
+//!     every couple of hours. It is bounded today — tkmx-client only builds this object when
+//!     `REPORT_MACHINE_CONFIG=true`, and then only when a snapshot hash says the config CHANGED —
+//!     but it is real wherever both run.
+//!     THIS IS SETTLED, NOT OPEN. The founder was asked directly (2026-08-12) and chose the NARROW
+//!     list: only names backed by an installed plugin. Personal `~/.claude/skills/*` directories and
+//!     MCP server names are withheld deliberately — on the machine this was measured on that is 13
+//!     directory names plus every MCP server name, all of which would become publicly visible in
+//!     exchange for removing a flap that only occurs where the other reporter also runs. Do not
+//!     reopen this as a "parity" cleanup: it is a privacy decision, and the flap is the accepted
+//!     cost of it. `reporting_never_publishes_a_personal_skill_directory` is the tripwire, and it
+//!     drives [`reported_skills_from`] — the function that holds `home` and is therefore where such
+//!     a union would actually be written.
+//!   • `codex_version` we CANNOT compute — it is tkmx-client's reading of the user's Codex install,
+//!     which Sparkle does not manage. There is no carry-forward available: the POST is
+//!     write-only, so the reporter cannot read the profile's current value back to re-send it.
+//!     A machine running both reporters therefore alternates between having that field and not.
+//!     OPEN QUESTION FOR THE SERVER OPERATOR: does `/api/usage` MERGE `machine_config` per-key
+//!     rather than replacing it? If it merges, this is a non-issue and the paragraph can go. If it
+//!     replaces, the fix is server-side (merge) or environmental (retire the other reporter) —
+//!     inventing a value here would be worse than omitting one.
+//!   • `memory_gb` we OMIT when `hw.memsize` is unreadable, and that omission is not evidenced.
+//!     The reference client's TS interface types it as a required `number` (`reporter/report.ts`),
+//!     and `os.totalmem()` cannot fail there, so it never has to make this choice and its shape
+//!     tells us nothing about whether the server tolerates the key's ABSENCE. We chose absence over
+//!     a `0` that would assert the machine has no RAM. SECOND OPEN QUESTION FOR THE SERVER OPERATOR:
+//!     does `/api/usage` VALIDATE `machine_config`'s required keys? If it rejects the POST outright,
+//!     that is strictly worse than a stale memory reading — the whole report dies and takes the
+//!     usage rows with it, and it would be INVISIBLE today: `discard_reason` covers `rows: 0`, so a
+//!     400 on a report with no rows to count carries nothing to notice. If that turns out to be the
+//!     behaviour, send the last-known-good size (or drop just this key server-side), don't reinstate
+//!     the zero. Until it is answered the exposure is bounded by how nearly-impossible the trigger
+//!     is: `hw.memsize` is a boot-time kernel constant on the only platform this ships to.
+//! [`MachineConfig`] is a plain struct with `skip_serializing_if` on every optional field, so
+//! adding `codex_version` (or any later key) once it becomes computable is one field plus one
+//! assignment, not a reshape.
+//!
 //! The server's primary key is (username, date, model, client_id, source), so `client_id` must be
 //! STABLE per machine or every re-derivation double-counts the overlapping days on the profile.
 //! We derive it exactly as the reference client does — sha256(machine_id | username), first 32
@@ -482,6 +553,50 @@ pub struct ReportBody {
     /// whenever the scan cannot support them; see [`rollup_activity`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_stats: Option<SessionStats>,
+    /// The "Machines" card and the SKILLS row. OMITTED when we learned nothing worth publishing;
+    /// see [`build_machine_config`] and the module header's coexistence note.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_config: Option<MachineConfig>,
+}
+
+/// This machine's identity + its installed feature list, as the profile renders them.
+///
+/// Field names mirror tkmx-client's `MachineConfig` interface (reporter/report.ts) EXACTLY, for the
+/// reason on [`ModelBreakdown`]: the server reads by key, so a renamed key is dropped silently
+/// rather than rejected — the field would simply never appear on the profile and nothing would say
+/// why.
+///
+/// `hostname`, `os` and `cpu` are always present and always non-empty — [`build_machine_config`]
+/// refuses to build the struct at all unless the hostname read succeeded, and the other two are
+/// derived from it or from a compile-time constant. `memory_gb` and `claude_skills` are omitted
+/// when unknown.
+///
+/// NOTHING HERE IS EVER A PLACEHOLDER. The reference client's `cpu: ""` is a transient INITIALIZER
+/// that its very next lines overwrite whenever `os.cpus()` is non-empty; its `hostname` and
+/// `memory_gb` come from `os.hostname()`/`os.totalmem()`, which do not return blanks. So an empty
+/// string here would not be "matching the reference client" — it would be a value neither reporter
+/// ever sends, and `memory_gb: 0` would be a positive false claim that this machine has no RAM.
+/// Since the server REPLACES `machine_config` wholesale, such a write degrades a correct "Machines"
+/// card rather than merely failing to improve it. Omit instead: see [`build_machine_config`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MachineConfig {
+    pub hostname: String,
+    /// `"<platform> <release>"`, e.g. `"darwin 25.6.0"` — matching the reference client's
+    /// `os.platform() + " " + os.release()` so the two writers don't render this card differently.
+    /// The platform half is NODE's token, which is not Rust's: see [`platform_token`], and do not
+    /// "simplify" it back to `std::env::consts::OS`, which spells it `macos` and makes the card flap.
+    pub os: String,
+    /// `"<brand> (<n> cores)"`, e.g. `"Apple M3 Max (16 cores)"`.
+    pub cpu: String,
+    /// Whole gigabytes, base-10 like the reference client's `Math.round(os.totalmem() / 1e9)`.
+    /// OMITTED rather than sent as `0` when the read fails — `0` is not "unknown", it is a claim.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_gb: Option<u64>,
+    /// The profile's SKILLS row. `None` OMITS the key, leaving whatever the server already holds;
+    /// `Some(vec![])` deliberately CLEARS the row (see [`collect_claude_skills`] for why the two
+    /// must not be collapsed).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_skills: Option<Vec<String>>,
 }
 
 /// The window a [`SessionStats`] blob describes, so a reader never has to infer it.
@@ -569,6 +684,256 @@ const STATS_SOURCE: &str = "-accounts";
 /// The denominator label. `interactive_sessions` = transcripts with ≥2 typed user turns; see
 /// `spend::FileActivity::is_interactive` for why that threshold and what it measured.
 const STATS_DENOMINATOR: &str = "interactive_sessions";
+
+// ── machine config + the SKILLS row ──────────────────────────────────────────────────────────
+
+/// The manifest the REPORTER reads — `~/.claude/plugins/installed_plugins.json`, unconditionally.
+///
+/// DIVERGENCE 1 FROM [`crate::hooks`], and it is deliberate: `hooks::claude_plugins_dir` honours
+/// `CLAUDE_CONFIG_DIR`, because the install-skip decision has to look wherever the
+/// `claude plugin install` child it spawned actually wrote. REPORTING is a different question. The
+/// community tkmx-client reporter reads this fixed path (`reporter/skills.ts`'s `DEFAULT_MANIFEST`
+/// is `path.join(os.homedir(), ".claude", "plugins", "installed_plugins.json")`), the server
+/// REPLACES `claude_skills` wholesale, and both reporters post for the same profile every couple of
+/// hours — so if Sparkle read a per-account config dir while tkmx-client read `~/.claude`, the
+/// profile's SKILLS row would flap between two different lists forever. Agreeing on the path is
+/// what makes the two writers idempotent with respect to each other.
+fn reporting_manifest_path(home: &Path) -> PathBuf {
+    home.join(".claude").join("plugins").join("installed_plugins.json")
+}
+
+/// tkmx-client's `pluginKey.split("@")[0]`: `warp@claude-code-warp` → `warp`.
+fn plugin_display_name(id: &str) -> &str {
+    id.split('@').next().unwrap_or(id)
+}
+
+/// The names for the profile's SKILLS row, read from the installed-plugin manifest at `manifest`.
+///
+/// `None` vs `Some(vec![])` is the whole contract, and collapsing them would be a data-loss bug:
+///   • `None` — we could not look (no manifest, unreadable, or a shape we don't recognize). The
+///     caller OMITS `claude_skills`, so the server keeps whatever it already has. A transient read
+///     failure must never blank a profile.
+///   • `Some(vec![])` — we looked, and this machine has no installed plugins (or the user excluded
+///     all of them). The empty array is SENT, which clears the row. That is the only way a denylist
+///     can remove the last badge, so it has to stay reachable.
+///
+/// DIVERGENCE 2 FROM [`crate::hooks`]: `observe_installed_plugins` UNIONS this manifest with a
+/// `cache/<marketplace>/<plugin>/` directory scan. That union is right for its caller — for an
+/// install-skip decision, over-reporting what's present costs at worst a skipped reinstall — but it
+/// is wrong here: the cache holds `temp_git_*` clones and entries a user believes they uninstalled,
+/// none of which is evidence that a plugin is installed NOW. The manifest is Claude Code's own
+/// record, and reading only it is what makes this list an ALLOWLIST rather than a scrape. Manifest
+/// only, no union — and do not "unify" these two readers on the strength of them sharing a parser.
+///
+/// WHAT THIS IS *NOT*: parity with the community reporter. An earlier version of this comment said
+/// "tkmx-client reports the manifest only", and that is FALSE — MEASURED on its `origin/main`,
+/// `collectClaudeSkills` (reporter/skills.ts) unions the manifest with every
+/// `~/.claude/skills/<name>/SKILL.md` directory, and `collectMachineConfig` (reporter/report.ts)
+/// unions the configured MCP server names after that. Its list is a strict SUPERSET of this one.
+/// Sparkle is narrower ON PURPOSE — see the module header for what that costs and why widening it
+/// is the user's call rather than a refactor.
+///
+/// The fixed `~/.claude` path above is a separate matter and still exactly right: where the two
+/// reporters read the SAME source, they must read it from the same place.
+fn collect_claude_skills(manifest: &Path) -> Option<Vec<String>> {
+    let ids = crate::hooks::read_installed_plugin_ids(manifest)?;
+    // Dedupe case-insensitively keeping the first spelling seen, then sort — tkmx-client's
+    // `dedupeSkills`. Two plugins of the same name from different marketplaces collapse to one
+    // badge, which is what the profile renders anyway.
+    let mut out: Vec<String> = Vec::new();
+    for name in ids.iter().map(|id| plugin_display_name(id)) {
+        let Some(key) = crate::config::normalize_skill_name(name) else { continue };
+        if !out.iter().any(|kept| crate::config::normalize_skill_name(kept) == Some(key.clone())) {
+            out.push(name.to_string());
+        }
+    }
+    out.sort();
+    Some(out)
+}
+
+/// Drop the names the user asked us not to publish.
+///
+/// `exclude` arrives already normalized from [`crate::config::BuilderIndexConfig::skills_exclude`];
+/// the candidate is normalized here through the SAME function, which is what makes the comparison
+/// case-insensitive and whitespace-insensitive on both sides. That is tkmx-client's
+/// `applyExclusions` semantics exactly, and the two reporters have to agree — see that config
+/// field's doc for what disagreeing costs.
+///
+/// Applied LAST, after collection, so an entry catches a name however it was spelled in the
+/// manifest.
+fn apply_skill_exclusions(names: Vec<String>, exclude: &[String]) -> Vec<String> {
+    if exclude.is_empty() {
+        return names;
+    }
+    names
+        .into_iter()
+        .filter(|n| match crate::config::normalize_skill_name(n) {
+            Some(key) => !exclude.iter().any(|e| *e == key),
+            // An unnameable entry can't be matched by a denylist, so it can't be withheld either.
+            None => true,
+        })
+        .collect()
+}
+
+/// The SKILLS row this machine should publish right now: collect from the manifest, then subtract
+/// the configured denylist.
+///
+/// The impure seam — it locates `$HOME` and reads the live config — reduced to exactly those two
+/// LOOKUPS, with every decision that composes the list living in [`reported_skills_from`] below.
+/// `None` propagates: an unreadable manifest omits the field rather than clearing the profile, and
+/// the denylist has nothing to subtract from.
+fn reported_skills() -> Option<Vec<String>> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(PathBuf::from)?;
+    let exclude = crate::config::current_effective().config.builder_index.skills_exclude;
+    reported_skills_from(&home, &exclude)
+}
+
+/// [`reported_skills`] with its two impure inputs handed in: the home directory to read under, and
+/// the already-normalized denylist.
+///
+/// THE SPLIT EXISTS TO MAKE THE WIDENING SITE TESTABLE, which is a narrower claim than "for
+/// tidiness" and the reason it must not be inlined back. Composing the list inside `reported_skills`
+/// put it behind a `std::env::var_os` read and a `config::current_effective()` call, so no test
+/// could drive it — and this is the ONE function that holds `home`, which makes it the natural place
+/// to add a `~/.claude/skills/*` union (the community reporter's shape). A union added there used to
+/// compile clean, publish personal skill names on the wire, and leave
+/// `reporting_never_publishes_a_personal_skill_directory` green, because that test drove
+/// [`collect_claude_skills`] — which only ever receives the MANIFEST PATH and so could not have
+/// grown the union in the first place. The tripwire now drives this function instead.
+fn reported_skills_from(home: &Path, exclude: &[String]) -> Option<Vec<String>> {
+    let names = collect_claude_skills(&reporting_manifest_path(home))?;
+    Some(apply_skill_exclusions(names, exclude))
+}
+
+/// The machine facts, gathered impurely once so [`build_machine_config`] stays pure and testable.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostFacts {
+    pub hostname: Option<String>,
+    /// Kernel release, e.g. `25.6.0` — the second half of the reference client's `os` string.
+    pub os_release: Option<String>,
+    pub cpu_brand: Option<String>,
+    pub cores: Option<u32>,
+    pub memory_bytes: Option<u64>,
+}
+
+/// Assemble the wire struct, or `None` to omit the key entirely.
+///
+/// THE HOSTNAME IS THE RECORD'S IDENTITY, so its absence — not the absence of everything — is what
+/// makes this `None`. The "Machines" card is per-machine and the server REPLACES `machine_config`
+/// wholesale, so a post that cannot name its machine cannot improve the card; it can only overwrite
+/// a correct one with an unattributable blank. Staying silent leaves whatever the community
+/// reporter published for this machine intact, which is the strictly safer degradation.
+///
+/// The cost of that choice is real and deliberate: a machine whose hostname read fails publishes no
+/// skills either, so its denylist stops taking effect. That is accepted because the alternative is
+/// destructive rather than merely inert, and because the read is a kernel constant (`kern.hostname`)
+/// whose failure means something far more broken than this field.
+///
+/// Given a hostname, the other three are total: `os` is [`platform_token`] plus an optional release,
+/// and `cpu` falls back to the hostname exactly as the reference client does — so neither can come
+/// out blank. Only `memory_gb` can be genuinely unknown, and it is OMITTED rather than zeroed.
+/// Nothing here is ever a placeholder; see [`MachineConfig`].
+///
+/// "Cannot come out blank" is a claim about EMPTINESS only, and is not a claim that either string is
+/// correct — `os` shipped a well-formed wrong value (Rust's `macos` for Node's `darwin`) for two
+/// commits under exactly this reasoning. Non-empty is the cheap property; agreeing with the other
+/// writer is the one that matters, and only a test pinned to a LITERAL can hold it.
+///
+/// Never `Some` with an empty `claude_skills` derived from a FAILED read: that distinction is made
+/// upstream in [`collect_claude_skills`] and simply carried here.
+fn build_machine_config(facts: &HostFacts, claude_skills: Option<Vec<String>>) -> Option<MachineConfig> {
+    let hostname = facts.hostname.clone()?;
+    // The reference client falls back to the hostname when the CPU model reads as unknown, so the
+    // "Machines" card can still tell two machines apart. Same fallback here.
+    let brand = facts
+        .cpu_brand
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty() && !b.eq_ignore_ascii_case("unknown"))
+        .unwrap_or(hostname.as_str());
+    let cpu = match facts.cores {
+        Some(n) => format!("{brand} ({n} cores)"),
+        None => brand.to_string(),
+    };
+    Some(MachineConfig {
+        hostname,
+        os: match facts.os_release.as_deref() {
+            Some(r) => format!("{} {r}", platform_token()),
+            None => platform_token().to_string(),
+        },
+        cpu,
+        // Base-10 GB and rounded, matching `Math.round(os.totalmem() / 1e9)`.
+        memory_gb: facts.memory_bytes.map(|b| (b as f64 / 1e9).round() as u64),
+        claude_skills,
+    })
+}
+
+/// The platform token the reference client's `os` field carries, which is NODE's spelling and not
+/// Rust's.
+///
+/// MEASURED, not assumed (`node -e 'console.log(os.platform())'` on this machine prints `darwin`,
+/// while `std::env::consts::OS` is `macos`). Emitting Rust's spelling made the "Machines" card's OS
+/// field alternate between `"darwin 25.6.0"` and `"macos 25.6.0"` every couple of hours on any
+/// machine running both reporters — the same wholesale-replace flap the fixed manifest path and the
+/// `cpu` formatting already exist to prevent, just on the one field nobody re-checked.
+///
+/// Only the two names that actually differ are mapped; Node and Rust agree on `linux` and on the
+/// BSDs, so anything else passes through rather than being silently renamed.
+fn platform_token() -> &'static str {
+    platform_token_for(std::env::consts::OS)
+}
+
+/// The mapping itself, split out as a pure function OVER ITS INPUT so the table can be tested.
+///
+/// `platform_token` reads a compile-time constant, so a test calling it can only ever exercise the
+/// one arm matching the host it runs on — the other arms are structurally unreachable, and an
+/// assertion written against it has nothing to compare to but the function's own output. Taking the
+/// os string as an argument is what makes every arm reachable from every host and lets the test pin
+/// literals on both sides.
+fn platform_token_for(os: &str) -> &str {
+    match os {
+        "macos" => "darwin",
+        "windows" => "win32",
+        other => other,
+    }
+}
+
+/// Read the machine facts. Memoized — every one of these is fixed hardware or a boot-time constant,
+/// and the reporter runs on a loop.
+fn host_facts() -> HostFacts {
+    static FACTS: std::sync::OnceLock<HostFacts> = std::sync::OnceLock::new();
+    FACTS
+        .get_or_init(|| HostFacts {
+            hostname: sysctl_string("kern.hostname"),
+            os_release: sysctl_string("kern.osrelease"),
+            cpu_brand: sysctl_string("machdep.cpu.brand_string"),
+            cores: std::thread::available_parallelism().ok().map(|n| n.get() as u32),
+            memory_bytes: sysctl_string("hw.memsize").and_then(|s| s.parse::<u64>().ok()),
+        })
+        .clone()
+}
+
+/// One `sysctl -n <key>`, or `None`. Shelling out rather than taking a new dependency mirrors
+/// `config::total_memory_bytes`, which reads `hw.memsize` the same way.
+#[cfg(target_os = "macos")]
+fn sysctl_string(key: &str) -> Option<String> {
+    let out = std::process::Command::new("/usr/sbin/sysctl").args(["-n", key]).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if v.is_empty() {
+        None
+    } else {
+        Some(v)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sysctl_string(_key: &str) -> Option<String> {
+    // Sparkle ships mac-only; off macOS the facts degrade to empty and the card just says less.
+    None
+}
 
 // ── rollup (pure) ───────────────────────────────────────────────────────────────────────────
 
@@ -1132,6 +1497,7 @@ fn report_once_sync(app_data: PathBuf, enabled: bool) -> Result<ReportOutcome, S
     let scan = crate::spend::load_window_records(Some(&app_data), window);
     let data = rollup(scan.records(), scan.today, window);
     let session_stats = rollup_activity(&scan.activity(), scan.truncated, window, scan.today);
+    let machine_config = build_machine_config(&host_facts(), reported_skills());
     let rows = row_count(&data);
     let days = data.len();
     if scan.truncated {
@@ -1153,6 +1519,7 @@ fn report_once_sync(app_data: PathBuf, enabled: bool) -> Result<ReportOutcome, S
         report_days: window,
         data,
         session_stats,
+        machine_config,
     };
     // An empty `data: []` is still POSTed rather than short-circuited. That matches the reference
     // client (which falls through on an inactive day on purpose) and it is the only signal the
@@ -1876,6 +2243,8 @@ mod tests {
             // Absent here so the base key set stays the frozen one; the `session_stats` shape has
             // its own tests, and `an_omitted_session_stats_key_is_absent_not_null` covers this half.
             session_stats: None,
+            // Absent for the same reason, and covered by `an_omitted_machine_config_key_is_absent`.
+            machine_config: None,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
 
@@ -1935,9 +2304,10 @@ mod tests {
             client_version: client_version(),
             report_days: 7,
             data: data.clone(),
-            // Carried through the privacy check too: the activity blob is the newest thing that
-            // could leak, and it is built from the SAME records whose session/project labels must
-            // not escape. A skill name is the only string it may contain.
+            // Carried through the privacy check too: the activity blob is built from the SAME
+            // records whose session/project labels must not escape. It contains no free strings at
+            // all — skills appear only as the `distinct_skills` COUNT — so the category keys and
+            // the fixed `source`/`denominator` labels are the whole of what it can spell.
             session_stats: rollup_activity(
                 &crate::spend::ActivityTotals {
                     sessions_total: 9,
@@ -1952,6 +2322,19 @@ mod tests {
                 7,
                 today(),
             ),
+            // And the machine half, which is the newest thing that could leak. Populated on
+            // purpose: `None` here would make the assertions below vacuous, since a field that
+            // isn't serialized trivially contains no secrets.
+            machine_config: build_machine_config(
+                &HostFacts {
+                    hostname: Some("a-laptop".into()),
+                    os_release: Some("25.6.0".into()),
+                    cpu_brand: Some("Apple M3 Max".into()),
+                    cores: Some(16),
+                    memory_bytes: Some(128 * 1_000_000_000),
+                },
+                Some(vec!["superpowers".to_string()]),
+            ),
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("a-private-project-name"), "{json}");
@@ -1960,6 +2343,28 @@ mod tests {
         // body because `client_version` is legitimately "sparkle-desktop/<version>".)
         let rows_json = serde_json::to_string(&data).unwrap();
         assert!(!rows_json.contains('/'), "no path separators in the rows: {rows_json}");
+
+        // The machine half is EXPECTED to be new data on the wire — the profile's "Machines" card
+        // renders a per-machine hostname, and the community reporter already publishes one for this
+        // same machine. So assert the boundary rather than absence: hostname is there BECAUSE we
+        // chose to send it, and nothing beyond the five documented keys came with it.
+        let mc = v_of(&body)["machine_config"].clone();
+        assert_eq!(mc["hostname"], "a-laptop");
+        let mut mc_keys: Vec<&str> = mc.as_object().unwrap().keys().map(String::as_str).collect();
+        mc_keys.sort();
+        assert_eq!(mc_keys, vec!["claude_skills", "cpu", "hostname", "memory_gb", "os"]);
+        // No filesystem path ever reaches it: the manifest is READ from `~/.claude/...`, and only
+        // the names inside it travel. A regression that published the path it read, or a per-account
+        // config dir, shows up here as a separator.
+        let mc_json = serde_json::to_string(&mc).unwrap();
+        assert!(!mc_json.contains('/'), "no paths in machine_config: {mc_json}");
+        assert!(!mc_json.contains(".claude"), "{mc_json}");
+    }
+
+    /// `serde_json::Value` of a body, for tests that assert on the SERIALIZED shape rather than on
+    /// the struct — the only view that proves what actually leaves the machine.
+    fn v_of(body: &ReportBody) -> serde_json::Value {
+        serde_json::from_str(&serde_json::to_string(body).unwrap()).unwrap()
     }
 
     #[test]
@@ -1974,11 +2379,405 @@ mod tests {
             report_days: 7,
             data: vec![],
             session_stats: None,
+            machine_config: None,
         };
         let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
         for k in ["tools", "projects", "communities", "about", "hn_username", "demo_video_url"] {
             assert!(v.get(k).is_none(), "{k} must not be sent");
         }
+    }
+
+    // ── machine_config + the SKILLS row ──────────────────────────────────────────────────
+
+    /// Write a `<home>/.claude/plugins/installed_plugins.json` holding `ids`, and return the home.
+    fn home_with_manifest(dir: &Path, ids: &[&str]) -> PathBuf {
+        let home = dir.join("home");
+        let plugins = home.join(".claude").join("plugins");
+        std::fs::create_dir_all(&plugins).unwrap();
+        let entries: Vec<String> = ids.iter().map(|id| format!("{id:?}:[{{\"scope\":\"user\"}}]")).collect();
+        std::fs::write(
+            plugins.join("installed_plugins.json"),
+            format!("{{\"version\":2,\"plugins\":{{{}}}}}", entries.join(",")),
+        )
+        .unwrap();
+        home
+    }
+
+    /// A body carrying exactly this skills list, serialized — the only view that proves what leaves
+    /// the machine. Asserting on an intermediate `Vec` would pass even if the field never shipped.
+    fn payload_with_skills(skills: Option<Vec<String>>) -> serde_json::Value {
+        v_of(&ReportBody {
+            username: "someone".into(),
+            team: "default".into(),
+            client_id: "abc".into(),
+            client_version: "v".into(),
+            report_days: 7,
+            data: vec![],
+            session_stats: None,
+            machine_config: build_machine_config(
+                &HostFacts { hostname: Some("a-laptop".into()), ..HostFacts::default() },
+                skills,
+            ),
+        })
+    }
+
+    #[test]
+    fn an_excluded_name_is_absent_from_the_serialized_payload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(
+            tmp.path(),
+            &["superpowers@claude-plugins-official", "warp@claude-code-warp"],
+        );
+
+        let names = collect_claude_skills(&reporting_manifest_path(&home)).expect("a readable manifest");
+        assert_eq!(names, vec!["superpowers".to_string(), "warp".to_string()], "both installed");
+
+        // The side effect that matters: the name is gone from the JSON that would be POSTed, not
+        // merely from some intermediate list. `claude_skills` is replaced wholesale server-side, so
+        // this absence IS the badge disappearing from the profile.
+        let json = payload_with_skills(Some(apply_skill_exclusions(names, &["warp".to_string()])));
+        assert_eq!(json["machine_config"]["claude_skills"], serde_json::json!(["superpowers"]));
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("warp"),
+            "the excluded name must not appear anywhere on the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn exclusion_is_case_insensitive_and_whitespace_trimmed() {
+        // Both sides normalize, and both sides go through config's `normalize_skill_name`, because
+        // the community reporter's `applyExclusions` does `.trim().toLowerCase()` on both. The two
+        // post to the same profile alternately, so a mismatch here doesn't merely fail to exclude —
+        // it makes the badge flap every couple of hours.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(tmp.path(), &["Warp@claude-code-warp", "superpowers@official"]);
+        let names = collect_claude_skills(&reporting_manifest_path(&home)).unwrap();
+
+        // `" WARP "` as the user typed it, resolved through the real config path.
+        let (cfg, warns, _) = crate::config::test_effective(
+            Some("[builder_index]\nskills_exclude = [\" WARP \"]\n"),
+            None,
+        );
+        assert!(warns.is_empty(), "a well-formed list warns about nothing: {warns:?}");
+        let json = payload_with_skills(Some(apply_skill_exclusions(
+            names,
+            &cfg.builder_index.skills_exclude,
+        )));
+        assert_eq!(json["machine_config"]["claude_skills"], serde_json::json!(["superpowers"]));
+    }
+
+    #[test]
+    fn a_name_not_in_the_manifest_is_never_published() {
+        // The ALLOWLIST, which is the manifest itself. Nothing scans transcripts, a skills
+        // directory, or the marketplace cache, so a name the user never installed has no path onto
+        // the profile even though this machine's transcripts are full of it.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(tmp.path(), &["superpowers@claude-plugins-official"]);
+        let json = payload_with_skills(collect_claude_skills(&reporting_manifest_path(&home)));
+        assert_eq!(json["machine_config"]["claude_skills"], serde_json::json!(["superpowers"]));
+        assert!(!serde_json::to_string(&json).unwrap().contains("systematic-debugging"));
+    }
+
+    #[test]
+    fn reporting_reads_the_manifest_only_never_the_marketplace_cache() {
+        // DIVERGENCE 1 from `hooks::observe_installed_plugins`, pinned so a later refactor cannot
+        // quietly "unify" the two readers on the strength of them sharing a parser.
+        //
+        // WHY: that function UNIONS the manifest with a `cache/<marketplace>/<plugin>/` scan, which
+        // is correct for ITS caller — an install-skip decision may safely over-report what is
+        // present. It is wrong for REPORTING: the cache holds `temp_git_*` clones and plugins the
+        // user believes they uninstalled, so a cache-only entry is not evidence of an installed
+        // plugin — it is exactly the kind of stale name a public profile should not grow.
+        // NOT because "tkmx-client reports the manifest only" — an earlier version of this comment
+        // said that and it is false; see `collect_claude_skills`, which records what was measured.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(tmp.path(), &["superpowers@claude-plugins-official"]);
+        // A stale payload for a plugin the manifest does NOT list — e.g. one the user uninstalled.
+        std::fs::create_dir_all(home.join(".claude/plugins/cache/claude-code-warp/warp")).unwrap();
+
+        let names = collect_claude_skills(&reporting_manifest_path(&home)).unwrap();
+        assert_eq!(names, vec!["superpowers".to_string()]);
+        assert!(!names.iter().any(|n| n == "warp"), "the cache dir must not be a source: {names:?}");
+    }
+
+    #[test]
+    fn reporting_never_publishes_a_personal_skill_directory() {
+        // DIVERGENCE 3 — and this one is a divergence from the COMMUNITY REPORTER, not from
+        // `hooks`. It is pinned because it is the one place Sparkle knowingly sends a SUBSET of
+        // what the other writer sends, and because the comment that used to sit here asserted the
+        // opposite of the truth.
+        //
+        // MEASURED on tkmx-client `origin/main`: `collectClaudeSkills` unions the plugin manifest
+        // with every `~/.claude/skills/<name>/SKILL.md` directory (`collectPersonalSkills`), and
+        // `collectMachineConfig` unions the configured MCP server names after that. Sparkle
+        // publishes the manifest ONLY — the founder's explicit "must be backed by an installed
+        // plugin" rule.
+        //
+        // So this test does NOT claim the two reporters agree. It claims the narrowing is
+        // DELIBERATE: widening it puts new names on a PUBLIC profile, so it must be a decision
+        // someone makes and re-points this test at, never a silent side effect of "unifying" the
+        // readers. The cost of the narrowing is recorded on `collect_claude_skills`.
+        //
+        // IT DRIVES `reported_skills_from`, NOT `collect_claude_skills`, and the altitude is the
+        // whole point. `collect_claude_skills` only ever receives the MANIFEST PATH, so a personal-
+        // skills union could not be written there without reconstructing `$HOME` by walking parents
+        // or changing the signature — whereas `reported_skills_from` already holds `home` and is
+        // where such a union goes naturally. Pinned at the lower altitude, this test stayed green
+        // against exactly the change it exists to catch.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(tmp.path(), &["superpowers@claude-plugins-official"]);
+        // A personal skill exactly as tkmx-client recognizes one: a directory holding a SKILL.md.
+        let personal = home.join(".claude").join("skills").join("clerk-webhooks");
+        std::fs::create_dir_all(&personal).unwrap();
+        std::fs::write(personal.join("SKILL.md"), "# clerk-webhooks\n").unwrap();
+
+        // Assert on the SERIALIZED payload — the only view that proves what leaves the machine.
+        let json = payload_with_skills(reported_skills_from(&home, &[]));
+        assert_eq!(json["machine_config"]["claude_skills"], serde_json::json!(["superpowers"]));
+        assert!(
+            !serde_json::to_string(&json).unwrap().contains("clerk-webhooks"),
+            "a ~/.claude/skills directory must not reach the wire: {json}"
+        );
+    }
+
+    #[test]
+    fn the_denylist_is_applied_on_the_path_the_reporter_actually_takes() {
+        // `apply_skill_exclusions` has its own unit tests, but they call it directly — so they stay
+        // green even if the composition stops calling it at all. This drives the same function the
+        // live reporter does, one lookup below `reported_skills`, and is what proves the denylist
+        // is actually WIRED rather than merely correct in isolation. Two names in, one excluded, so
+        // the assertion distinguishes "the exclusion ran" from "the list happens to be short".
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(
+            tmp.path(),
+            &["superpowers@claude-plugins-official", "warp@claude-code-warp"],
+        );
+
+        let kept = reported_skills_from(&home, &[]).expect("a readable manifest must report");
+        assert_eq!(kept, vec!["superpowers".to_string(), "warp".to_string()]);
+
+        let denied = reported_skills_from(&home, &["warp".to_string()])
+            .expect("a denylist must subtract, never suppress the whole report");
+        assert_eq!(
+            denied,
+            vec!["superpowers".to_string()],
+            "the `warp` badge must be droppable by the denylist alone"
+        );
+    }
+
+    #[test]
+    fn reporting_reads_the_fixed_home_claude_path_not_claude_config_dir() {
+        // DIVERGENCE 2 from `hooks::claude_plugins_dir`, pinned for the same reason.
+        //
+        // WHY: that helper honours `CLAUDE_CONFIG_DIR` because the install-skip check must look
+        // where the `claude plugin install` child actually wrote. REPORTING must instead agree with
+        // tkmx-client, whose `DEFAULT_MANIFEST` is `~/.claude/plugins/installed_plugins.json`
+        // unconditionally. If the two reporters read different trees they publish different lists,
+        // and the wholesale server-side replace makes the SKILLS row alternate between them.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = home_with_manifest(tmp.path(), &["superpowers@claude-plugins-official"]);
+        // A rival per-account manifest, deliberately placed UNDER `home` so it is REACHABLE from the
+        // only input this test hands the reader. An earlier version of this fixture sat in a sibling
+        // of `home` (`tmp/account-2/…`), where no path derivable from `home` could ever reach it —
+        // dead setup that a comment nonetheless credited with giving the assertion its teeth.
+        let account = home.join(".claude").join("accounts").join("account-2").join("plugins");
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(
+            account.join("installed_plugins.json"),
+            r#"{"plugins":{"only-in-the-account-store@x":[]}}"#,
+        )
+        .unwrap();
+
+        // WHAT THIS PINS: that the reporter reads the ONE fixed manifest and does not union or
+        // prefer a per-account tree under `$HOME`. That is a real widening path — `hooks` already
+        // enumerates per-account plugin trees — and the rival manifest above is what makes the
+        // second assertion able to fail: a reader that grew that logic returns
+        // `only-in-the-account-store`, not `superpowers`.
+        //
+        // WHAT THIS DOES NOT PIN, stated plainly so the next reader does not trust it further than
+        // it goes: env-awareness. A body that kept `home: &Path` and consulted `CLAUDE_CONFIG_DIR`
+        // only when set would compile against this call site unchanged and, with the variable unset
+        // here, fall through to `home/.claude` and leave both assertions green. There is no way to
+        // close that without mutating process env — and doing so is worse than the hole: `cargo
+        // test` runs this binary across threads and `CLAUDE_CONFIG_DIR` is memoized in a `OnceLock`
+        // by `claude::effective_spawn_config_dir`, so setting it here can poison an unrelated test
+        // for the whole run, an intermittent failure with no visible connection to this file. The
+        // env divergence is instead pinned on the `hooks` side, which is the half that reads it.
+        let path = reporting_manifest_path(&home);
+        let names = collect_claude_skills(&path);
+
+        assert_eq!(path, home.join(".claude").join("plugins").join("installed_plugins.json"));
+        assert_eq!(names, Some(vec!["superpowers".to_string()]));
+
+        // ...and the path is a function of its ARGUMENT alone: a different home yields the
+        // correspondingly different path, so a reader that pinned one absolute location (or cached
+        // the first home it saw) fails here rather than in production on a second account.
+        let other = tmp.path().join("other-home");
+        assert_eq!(
+            reporting_manifest_path(&other),
+            other.join(".claude").join("plugins").join("installed_plugins.json")
+        );
+    }
+
+    #[test]
+    fn a_missing_or_malformed_manifest_omits_the_row_rather_than_clearing_it() {
+        // The distinction the whole design rests on. `claude_skills` REPLACES the profile's row, so
+        // "we could not look" must serialize as an ABSENT key — an empty array would wipe a list
+        // the other reporter (or an earlier cycle) correctly published.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir_all(home.join(".claude").join("plugins")).unwrap();
+        let manifest = reporting_manifest_path(&home);
+
+        assert_eq!(collect_claude_skills(&manifest), None, "absent manifest");
+        let json = payload_with_skills(collect_claude_skills(&manifest));
+        assert!(
+            json["machine_config"].as_object().unwrap().get("claude_skills").is_none(),
+            "an unreadable manifest must omit the key, not send []: {json}"
+        );
+
+        std::fs::write(&manifest, "{ truncated").unwrap();
+        assert_eq!(collect_claude_skills(&manifest), None, "malformed manifest");
+
+        // But a manifest that PARSES and lists nothing is real knowledge: send `[]`, which clears
+        // the row. That is the only way a denylist can remove the last remaining badge, so it has
+        // to stay reachable.
+        std::fs::write(&manifest, r#"{"version":2,"plugins":{}}"#).unwrap();
+        assert_eq!(collect_claude_skills(&manifest), Some(Vec::new()));
+        let json = payload_with_skills(collect_claude_skills(&manifest));
+        assert_eq!(json["machine_config"]["claude_skills"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn an_omitted_machine_config_key_is_absent() {
+        // `machine_config: None` must vanish from the payload rather than serialize as `null` — the
+        // same rule `session_stats` follows, and for the same reason: the server reads the key, and
+        // a null is a value.
+        let json = v_of(&ReportBody {
+            username: "someone".into(),
+            team: "default".into(),
+            client_id: "abc".into(),
+            client_version: "v".into(),
+            report_days: 7,
+            data: vec![],
+            session_stats: None,
+            machine_config: None,
+        });
+        assert!(
+            !json.as_object().unwrap().contains_key("machine_config"),
+            "the key must be absent, not null: {json}"
+        );
+        // And nothing to report really does produce `None`, rather than a shell of empty strings
+        // that would overwrite a good "Machines" card with a blank one.
+        assert_eq!(build_machine_config(&HostFacts::default(), None), None);
+
+        // THE PAIRED HALF, and the one doing the mutation work here: an unreadable HOSTNAME
+        // suppresses the object even when there IS a skills list to publish. Deleting the `?` (or
+        // widening the guard back to "only when we learned nothing at all") builds the struct from
+        // defaults instead — `hostname: ""`, `cpu: ""`, `memory_gb` absent — and since the server
+        // replaces `machine_config` wholesale, that POST degrades a correct card to an
+        // unattributable blank. `.is_some()` cannot see that, so assert the ABSENCE of the object.
+        //
+        // (The mirror case — hostname present, skills absent — is deliberately NOT re-asserted
+        // here: `the_machine_facts_mirror_the_reference_clients_formatting` below and
+        // `payload_with_skills` both already call this function that way and `.expect()` the
+        // result, so a guard inverted to reject a hostname-only machine reds those instead. One
+        // more copy here would add no coverage and would read as if it were closing a hole.)
+        assert_eq!(
+            build_machine_config(&HostFacts::default(), Some(vec!["superpowers".into()])),
+            None,
+            "no hostname means the record cannot be attributed to a machine — omit it entirely \
+             rather than blanking the card this machine already has"
+        );
+
+        // A hostname alone IS reportable, and what it publishes must be facts, never placeholders.
+        // Asserted on the serialized JSON because that is what the server replaces the card with:
+        // an intermediate struct with `memory_gb: None` is fine, a wire `"memory_gb": 0` is a claim
+        // that this machine has no RAM.
+        assert!(
+            build_machine_config(
+                &HostFacts { hostname: Some("a-laptop".into()), ..HostFacts::default() },
+                None
+            )
+            .is_some(),
+            "a readable hostname is reportable even when nothing else is"
+        );
+        // `payload_with_skills` builds from exactly that fact set — a hostname and nothing else —
+        // so this reads the machine half off a whole serialized report, the way the server sees it.
+        let mc = payload_with_skills(None)["machine_config"].clone();
+        assert_eq!(mc["hostname"], "a-laptop");
+        // The CPU falls back to the hostname rather than going blank, so no empty string ships.
+        assert_eq!(mc["cpu"], "a-laptop");
+        assert!(
+            mc.as_object().unwrap().get("memory_gb").is_none(),
+            "an unreadable memory size must be OMITTED, never sent as 0: {mc}"
+        );
+        for (key, value) in mc.as_object().unwrap() {
+            assert_ne!(value.as_str(), Some(""), "`{key}` shipped as an empty string: {mc}");
+        }
+    }
+
+    #[test]
+    fn the_platform_token_table_is_nodes_spelling_not_rusts() {
+        // Literals on BOTH sides, and the input is an argument rather than the host's own constant,
+        // so every arm is reachable from every host and none of these can be satisfied by the
+        // implementation restating itself. Verified against the reference on a mac:
+        // `node -e 'console.log(os.platform())'` prints `darwin`, not Rust's `macos`.
+        assert_eq!(platform_token_for("macos"), "darwin", "Node calls it darwin");
+        assert_eq!(platform_token_for("windows"), "win32", "Node calls it win32");
+        // The pass-through the doc's "not silently renamed" claim rests on: where the two runtimes
+        // already agree, nothing is rewritten.
+        assert_eq!(platform_token_for("linux"), "linux");
+        assert_eq!(platform_token_for("freebsd"), "freebsd");
+        // And the real host goes through the same table, so the wire value can't bypass it.
+        assert_eq!(platform_token(), platform_token_for(std::env::consts::OS));
+    }
+
+    #[test]
+    fn the_machine_facts_mirror_the_reference_clients_formatting() {
+        // Same machine, same strings: the two reporters overwrite each other's `machine_config`, so
+        // a differently-formatted `cpu` or `os` would make the "Machines" card flip between two
+        // spellings of the same truth.
+        let mc = build_machine_config(
+            &HostFacts {
+                hostname: Some("a-laptop".into()),
+                os_release: Some("25.6.0".into()),
+                cpu_brand: Some("Apple M3 Max".into()),
+                cores: Some(16),
+                memory_bytes: Some(128 * 1_000_000_000),
+            },
+            None,
+        )
+        .expect("a hostname is enough to report");
+        assert_eq!(mc.cpu, "Apple M3 Max (16 cores)");
+        // Pinned to the LITERAL the reference client sends, not to `std::env::consts::OS`. Written
+        // the latter way this assertion restated the implementation's own expression, so it was
+        // green for whatever the code happened to produce — and it stayed green while the field
+        // shipped Rust's `"macos"` against the contract's Node `"darwin"`. Verified against the
+        // reference on this machine: `os.platform() + " " + os.release()` == "darwin 25.6.0".
+        // Only asserted on macOS, and with a LITERAL — this covers the COMPOSITION (token + space +
+        // release). The mapping table itself is covered host-independently by
+        // `the_platform_token_table_is_nodes_spelling_not_rusts`; there is deliberately no
+        // `cfg(not(macos))` arm here, because the only thing such an arm could compare `mc.os`
+        // against is `platform_token()`'s own output, which is the vacuous form this test exists to
+        // demonstrate the absence of.
+        #[cfg(target_os = "macos")]
+        assert_eq!(mc.os, "darwin 25.6.0", "the reference client sends Node's platform token");
+        assert_eq!(mc.memory_gb, Some(128));
+
+        // An unreadable CPU model falls back to the hostname, as the reference client does, so two
+        // machines stay distinguishable on the card.
+        let unknown = build_machine_config(
+            &HostFacts {
+                hostname: Some("a-laptop".into()),
+                cpu_brand: Some("unknown".into()),
+                cores: Some(4),
+                ..HostFacts::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(unknown.cpu, "a-laptop (4 cores)");
     }
 
     // ── consent gate ─────────────────────────────────────────────────────────────────────
@@ -2873,6 +3672,7 @@ mod tests {
             report_days: 7,
             data: vec![],
             session_stats: rollup_activity(&totals(), true, 7, today()),
+            machine_config: None,
         };
         let json = serde_json::to_string(&body).unwrap();
         assert!(!json.contains("session_stats"), "{json}");
@@ -2992,6 +3792,7 @@ mod tests {
             report_days: 7,
             data: vec![],
             session_stats: None,
+            machine_config: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&body).unwrap()).unwrap();
@@ -3126,6 +3927,9 @@ mod tests {
             report_days: 1,
             data,
             session_stats,
+            // The real thing, not `None`: this probe exists to see what the SERVER does with a
+            // genuine payload, and `machine_config` is the half that carries the SKILLS row.
+            machine_config: build_machine_config(&host_facts(), reported_skills()),
         };
         let payload = serde_json::to_string(&body).expect("serialize");
 

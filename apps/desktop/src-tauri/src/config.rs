@@ -859,11 +859,11 @@ const OFFICIAL_SOURCE: MarketplaceSource =
 const SPARKLE_SOURCE: MarketplaceSource =
     MarketplaceSource { name: SPARKLE_MARKETPLACE, repo: SPARKLE_MARKETPLACE_REPO };
 
-/// The plugins Sparkle knows how to pre-enable. Both current entries live in the official
-/// marketplace (verified against anthropics/claude-plugins-official's marketplace.json on
-/// 2026-07-24) — the official listing for `superpowers` pins the exact same commit obra/superpowers
-/// is at, and official marketplaces auto-update by default, so sourcing it there costs nothing in
-/// freshness.
+/// The plugins Sparkle knows how to pre-enable. Two live in Anthropic's official marketplace
+/// (verified against anthropics/claude-plugins-official's marketplace.json on 2026-07-24) — the
+/// official listing for `superpowers` pins the exact same commit obra/superpowers is at, and
+/// official marketplaces auto-update by default, so sourcing it there costs nothing in freshness.
+/// The rest live in Sparkle's own marketplace ([`SPARKLE_MARKETPLACE`]).
 ///
 /// Every row carries its `source`. It was tempting to leave the official rows at `None` ("Claude
 /// Code pre-registers it"), but that only holds on a machine where Claude Code has already been run
@@ -912,6 +912,86 @@ pub const KNOWN_PLUGINS: &[KnownPlugin] = &[
     KnownPlugin {
         toggle: "sparkle_mutation_check",
         plugin: "sparkle-mutation-check",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: false,
+    },
+    // The four rows below ship OFF, and — unlike the two above — NOT on their own merits. Each one
+    // earns an eventual ON (the per-row notes say why), but the plugin CONTENT does not exist yet:
+    // `try-sparkle/marketplace`'s `.claude-plugin/marketplace.json` lists only `sparkle-guardrails`,
+    // `sparkle-mutation-check` and `sparkle-freshness`. Verified against GitHub, not the local
+    // read-only clone at `~/.claude/plugins/marketplaces/sparkle`, which can be stale.
+    //
+    // Shipping a row ON before its content is published is not a no-op that resolves itself. The
+    // install pass iterates the ENABLED set, so each missing plugin fails `claude plugin install`,
+    // is deliberately left out of the ledger, and is therefore retried on EVERY launch — four extra
+    // sequential subprocess round-trips at startup, a `plugin pre-enable: not installed` warn per
+    // launch, and four of the nine rows in Settings → Tools rendering a persistent "Sparkle couldn't
+    // install this plugin" hint with raw stderr attached. Four of nine rows reading as broken is a
+    // worse first impression than four rows a user has to opt into.
+    //
+    // So the ordering is: catalog rows + their mirrors land first (this commit), the content lands
+    // in the separate marketplace repo, and then these flip to `true`. That flip is the point at
+    // which they become detectable — a plugin has to be INSTALLED to be observable at all, since the
+    // Builder Index profile's SKILLS row is computed from the keys of
+    // `~/.claude/plugins/installed_plugins.json` and enabling a plugin in settings does not fetch it
+    // (see the AUTO-INSTALL note at the top of this section). Tracked as a bead; do not flip one of
+    // these ON without first confirming its name appears in that marketplace listing.
+    //
+    // THE FLIP IS NOT ONE LINE PER ROW, AND ASSUMING IT IS SILENTLY STRANDS AN ENTIRE COHORT.
+    // `DEFAULT_TEMPLATE` below is not documentation: `load_document_for_write` falls back to it on
+    // `NotFound` and the caller persists the whole rendered document, so the FIRST settings write on
+    // a fresh machine materializes a real `config.toml` containing the literal lines
+    // `sparkle_conflict_watch = false`, `sparkle_secrets = false`, `sparkle_review_probes = false`,
+    // `sparkle_pusher = false`. A key PRESENT in the user's file beats `default_on`, so every user
+    // who touched settings during this interim keeps all four OFF forever — silently, and precisely
+    // in the undetectable state the paragraph above argues against. `every_known_plugin_has_a_live_toggle`
+    // forces the table and the template to flip together, but neither reaches a file already on disk.
+    //
+    // So the flip commit MUST also carry a one-shot migration that removes these four keys from an
+    // existing `config.toml` (dropping the key, not rewriting its value — a user who deliberately
+    // set `false` keeps that, because the key they wrote is indistinguishable from ours only if we
+    // stop at the value; prefer keying the migration on the template's exact rendered line). The
+    // tripwire test that goes red on the flip repeats this, so it cannot be missed.
+    //
+    // Earns ON: a PR that cannot merge is a PR that was never TESTED, and nothing on the PR page
+    // says so — a conflicting PR never fires GitHub's `pull_request` event, so no CI run is ever
+    // created and its checks are absent rather than failing. That is a standing hazard on every
+    // branch, not something to reach for.
+    KnownPlugin {
+        toggle: "sparkle_conflict_watch",
+        plugin: "sparkle-conflict-watch",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: false,
+    },
+    // Earns ON: this is the SKILL (how to back a project's `.env` up and, more importantly, how to
+    // restore it without the traps that bite in practice). It is knowledge an agent needs at the
+    // moment it is about to touch a secret, which is never a moment it thinks to go install
+    // something. Distinct from `[tools].onepassword`, which ships OFF because that one needs an
+    // account, the `op` CLI and a chosen vault before it can do anything — and which is the switch
+    // that actually performs backups. This row only carries the knowledge.
+    KnownPlugin {
+        toggle: "sparkle_secrets",
+        plugin: "sparkle-secrets",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: false,
+    },
+    // Earns ON: an unanswered `[blocking]` review probe is only useful if it is checked BEFORE the
+    // merge, and the merge is exactly when nobody stops to install a plugin.
+    KnownPlugin {
+        toggle: "sparkle_review_probes",
+        plugin: "sparkle-review-probes",
+        marketplace: SPARKLE_MARKETPLACE,
+        source: Some(SPARKLE_SOURCE),
+        default_on: false,
+    },
+    // Earns ON: the whole point is surfacing a fleet condition to a human PROACTIVELY. A version of
+    // this that has to be asked for first has already failed at the one thing it does.
+    KnownPlugin {
+        toggle: "sparkle_pusher",
+        plugin: "sparkle-pusher",
         marketplace: SPARKLE_MARKETPLACE,
         source: Some(SPARKLE_SOURCE),
         default_on: false,
@@ -1043,6 +1123,33 @@ pub struct ImprovementConfig {
     /// (`"always"|"case_by_case"|"never"`) is the contract, and the reader fail-closes on anything
     /// outside it.
     pub consent: Option<String>,
+}
+
+/// Settings for the Builder Index REPORTER (`builder_index.rs`) — what it publishes, once the
+/// separate `[tools].builder_index` switch has turned it on.
+///
+/// Two different questions, deliberately two sections. `[tools].builder_index` is the master
+/// on/off, alongside every other tool toggle; this section is the reporter's own behaviour and is
+/// meaningless when the tool is off. Merging them would have put a name list inside a table
+/// documented as one-boolean-per-tool.
+///
+/// Machine-wide, like [tools] and [roborev]: a cloned repo does not get to decide what this machine
+/// publishes about its owner — in either direction. A per-project `[builder_index]` is ignored with
+/// a warning.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct BuilderIndexConfig {
+    /// Skill names to withhold from the profile's SKILLS row — a DENYLIST applied on top of the
+    /// allowlist that the installed-plugin manifest already is.
+    ///
+    /// Stored NORMALIZED (trimmed, lowercased, empties dropped), which is what makes matching total:
+    /// the reporter lowercases and trims the candidate too, so `" WARP "` here excludes `warp` on
+    /// the wire. That is not a stylistic choice — it is tkmx-client's `applyExclusions` semantics
+    /// (`reporter/skills.ts`: `.trim().toLowerCase()` on both sides), and the two reporters MUST
+    /// agree. They alternate posting for the same profile, and the server replaces `claude_skills`
+    /// wholesale, so a name one of them drops and the other keeps makes the badge flap every couple
+    /// of hours instead of disappearing.
+    pub skills_exclude: Vec<String>,
 }
 
 /// Branch/build freshness rules — guardrails against doing work on (or shipping a DMG from) a
@@ -1281,6 +1388,9 @@ pub struct SparkleConfig {
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
     pub delivered: DeliveredConfig,
+    /// What the Builder Index reporter publishes, once `[tools].builder_index` has turned it on.
+    /// Machine-wide (see BuilderIndexConfig).
+    pub builder_index: BuilderIndexConfig,
 }
 
 impl Default for SparkleConfig {
@@ -1407,6 +1517,10 @@ impl Default for SparkleConfig {
                 learned: false,
                 criteria: Vec::new(),
             },
+            // Nothing withheld by default. An empty denylist is the honest default: the reporter's
+            // allowlist is already "plugins you installed", so a name only reaches the profile
+            // because the user put it on this machine.
+            builder_index: BuilderIndexConfig { skills_exclude: Vec::new() },
         }
     }
 }
@@ -1728,6 +1842,19 @@ struct PartialDelivered {
     criteria: Option<Vec<PartialStageCriterion>>,
 }
 
+/// `[builder_index]` as read from TOML.
+///
+/// `skills_exclude` is a bare `toml::Value` for the reason recorded on [`PartialConcierge::tools`]
+/// (roborev 54240): with a typed `Vec<String>`, one hand-edit — `skills_exclude = "warp"`, the
+/// comma-separated spelling tkmx-client's env var uses, which is the FIRST thing a user coming from
+/// that reporter will type — fails `toml::from_str::<PartialConfig>` for the WHOLE FILE. That
+/// discards the entire global layer and reverts every unrelated setting to its default. Here both
+/// spellings are accepted and anything else costs exactly this one key.
+#[derive(Debug, Default, Deserialize)]
+struct PartialBuilderIndex {
+    skills_exclude: Option<toml::Value>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PartialConfig {
     workflow: Option<PartialWorkflow>,
@@ -1751,6 +1878,7 @@ struct PartialConfig {
     pushers: Option<PartialPushers>,
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
+    builder_index: Option<PartialBuilderIndex>,
 }
 
 /// Parse one layer's TOML text into a partial config. Err carries a human-readable reason —
@@ -2446,6 +2574,93 @@ fn apply_delivered(into: &mut DeliveredConfig, p: Option<PartialDelivered>) {
     }
 }
 
+/// Normalize one denylist entry for MATCHING: trimmed and lowercased, `None` when nothing is left.
+///
+/// The single place the comparison shape is decided, called on BOTH sides (here for the configured
+/// entry, and by the reporter for the candidate skill name), so the two can never drift apart into
+/// a denylist that silently matches nothing. Mirrors tkmx-client's `applyExclusions`
+/// (`reporter/skills.ts`), whose `.trim().toLowerCase()` this exists to reproduce exactly.
+pub fn normalize_skill_name(raw: &str) -> Option<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_lowercase())
+    }
+}
+
+/// Read `[builder_index].skills_exclude` in either accepted spelling, normalized and deduped.
+///
+/// Total: every input shape yields a list, and anything unusable yields an empty one plus a
+/// warning. A denylist that could fail the layer parse would be the worst possible shape for this
+/// key — the user reaches for it precisely when they want something GONE from a public profile, and
+/// a whole-file parse error would revert their config while continuing to publish the name.
+///
+/// Two spellings, because two reporters:
+///   • a TOML array — `skills_exclude = ["warp"]` — idiomatic here, and what the template shows;
+///   • a comma-separated string — `skills_exclude = "warp, frontend-design"` — the shape
+///     tkmx-client's `SKILLS_EXCLUDE` env var takes, which is what someone consolidating the two
+///     reporters copies across.
+fn resolve_skills_exclude(v: &toml::Value, warnings: &mut Vec<String>) -> Vec<String> {
+    let raw: Vec<String> = match v {
+        toml::Value::String(s) => s.split(',').map(str::to_string).collect(),
+        toml::Value::Array(items) => {
+            let mut out = Vec::new();
+            for item in items {
+                match item.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    // One bad element costs that element, not the list. Dropping it is also the
+                    // SAFE direction for a denylist read backwards: the name stays published, which
+                    // is visible on the profile, rather than silently excluding something else.
+                    None => warnings.push(format!(
+                        "[builder_index].skills_exclude has a {} entry, not a skill name; \
+                         ignoring that entry",
+                        item.type_str()
+                    )),
+                }
+            }
+            out
+        }
+        other => {
+            warnings.push(format!(
+                "[builder_index].skills_exclude is a {}, not a list of skill names like \
+                 [\"warp\"]; nothing is being excluded",
+                other.type_str()
+            ));
+            Vec::new()
+        }
+    };
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.iter().filter_map(|s| normalize_skill_name(s)) {
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Test-only: resolve config layers the way `current_effective` does, without touching disk or the
+/// process-wide cache. Exposed to sibling modules so a consumer of a setting (e.g.
+/// `builder_index`'s denylist) can test against the REAL resolution path rather than hand-building
+/// the struct the resolver was supposed to produce — a hand-built value passes whether or not the
+/// TOML key is even wired up.
+#[cfg(test)]
+pub(crate) fn test_effective(
+    global: Option<&str>,
+    project: Option<&str>,
+) -> (SparkleConfig, Vec<String>, bool) {
+    build_effective(SparkleConfig::default(), global, project)
+}
+
+fn apply_builder_index(into: &mut BuilderIndexConfig, p: Option<PartialBuilderIndex>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+    if let Some(v) = p.skills_exclude {
+        into.skills_exclude = resolve_skills_exclude(&v, &mut warnings);
+    }
+    warnings
+}
+
 // ============================ memory-aware concurrency ============================
 // `max_concurrent` is a raw process count: it knows nothing about how much RAM the machine has or
 // how big each agent can get. That combination is what killed a machine on 2026-07-20 (sparkle-01xv
@@ -3129,6 +3344,9 @@ fn build_effective(
                 warnings.extend(apply_pushers(&mut cfg.pushers, p.pushers));
                 // Global-only like [pushers], so its warnings cannot interleave with a repo layer's.
                 warnings.extend(apply_babysit(&mut cfg.babysit, p.babysit));
+                // Global-only like [babysit]/[pushers], so its warnings cannot interleave with a
+                // repo layer's — the project layer only ever reports that it was ignored.
+                warnings.extend(apply_builder_index(&mut cfg.builder_index, p.builder_index));
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -3177,6 +3395,17 @@ fn build_effective(
                     warnings.push(
                         "[roborev] in a per-project .sparkle/config.toml is ignored — it is a \
                          machine-wide setting; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.builder_index.is_some() {
+                    // Machine-wide in BOTH directions, which is the point: a cloned repo must not
+                    // be able to un-exclude a skill its owner withheld from a public profile, any
+                    // more than it can flip [tools].builder_index on.
+                    warnings.push(
+                        "[builder_index] in a per-project .sparkle/config.toml is ignored — what \
+                         this machine publishes about you is machine-wide, not something a repo \
+                         gets to set; put it in the global config.toml"
                             .to_string(),
                     );
                 }
@@ -3910,6 +4139,31 @@ onepassword = false # back your .env* files up to a 1Password vault. Also ships 
                     # it needs a 1Password account, the `op` CLI, and a chosen vault, so you opt in
                     # from ⋯ Settings → "Tools" once those exist.
 
+# --- What the Builder Index reporter publishes (per-machine; ignored in a project file) --
+# Only read when [tools] builder_index above is true. That flag is the on/off switch; this section
+# is what goes out once it's on.
+#
+# Your profile's SKILLS row lists the Claude Code PLUGINS installed on this machine, read from
+# ~/.claude/plugins/installed_plugins.json. That file is the whole list — Sparkle never scans your
+# transcripts to see which skills you actually invoked, and never reports a skill you did not
+# install. skills_exclude drops names from it before they leave the machine.
+#
+# Matching is case-insensitive and ignores surrounding spaces, so "WARP", " warp " and "warp" are
+# the same entry. The list REPLACES the row on every report, so removing a name here makes the badge
+# disappear from your profile on the next cycle (up to 2h) rather than needing anything cleared
+# server-side.
+#
+# If you ALSO run the community tkmx-client reporter, set its SKILLS_EXCLUDE to the same names —
+# the two alternate posting to the same profile, so a name excluded in only one of them keeps coming
+# back every other cycle. But matching the two lists is NOT a complete fix, because the two
+# reporters do not publish the same set: tkmx-client also publishes every ~/.claude/skills/<name>/
+# directory you have and the names of your configured MCP servers, neither of which Sparkle ever
+# sends. Those extra names keep flapping no matter what you put here (the MCP names are added after
+# its exclusions are applied, so SKILLS_EXCLUDE may not suppress them at all). To stop that half,
+# leave tkmx-client's REPORT_MACHINE_CONFIG off or retire it — it is the only writer of those names.
+[builder_index]
+# skills_exclude = ["warp"]   # e.g. a plugin that's installed but that you don't want on show
+
 # --- 1Password env backup (per-machine; ignored in a project file) ----------------------
 # Where Sparkle backs your .env* files up to, and whether it restores them into fresh agent
 # worktrees. .env/.env.* are gitignored, so a git worktree NEVER carries one — seed_worktrees is
@@ -3958,6 +4212,18 @@ frontend_design        = true    # Anthropic's official UI-quality skill
 sparkle_guardrails     = false   # public copy of the built-in guardrails; on only if you want it as a skill
 sparkle_freshness      = true    # warn when your branch is far behind the default branch
 sparkle_mutation_check = false   # /mutation-check — prove a given test can actually fail
+# The four below are OFF because their content is not published yet, not because they are optional
+# in the way the two rows above are. Turning one on today makes Sparkle retry a failing install on
+# every launch and the row shows a "couldn't install" hint; they flip to true once each name appears
+# in github.com/try-sparkle/marketplace's listing.
+sparkle_conflict_watch = false   # catch a PR that cannot merge and is therefore UNTESTED: a conflicting
+                                 # PR never fires GitHub's pull_request event, so no CI run is ever
+                                 # created — its checks are ABSENT, not failing
+sparkle_secrets        = false   # the SKILL for restoring a project's .env from 1Password without the
+                                 # traps that bite in practice. It does not back anything up on its own —
+                                 # the [tools].onepassword switch above is what performs backups
+sparkle_review_probes  = false   # don't merge a PR that still carries unanswered [blocking] review probes
+sparkle_pusher         = false   # surface a fleet condition to you proactively instead of waiting to be asked
 
 # --- roborev first-run consent (per-machine; ignored in a project file) -----------------
 # roborev reviews your BUILD-agent commits locally. The first time it's about to turn on, Sparkle
@@ -5044,6 +5310,175 @@ quit_app = 42
         );
     }
 
+    /// The four newer Sparkle rows, pinned by their EXACT `<plugin>@<marketplace>` id and by the
+    /// fact that they ship OFF while `try-sparkle/marketplace` does not yet carry the content.
+    ///
+    /// Three assertions, each failing differently — and the third is what stops the second from
+    /// being vacuous:
+    ///   * A wrong `@marketplace` half writes a settings file Claude Code SILENTLY ignores — no
+    ///     error, no missing-plugin message, the plugin simply never loads.
+    ///   * ABSENCE from the shipped enabled set is the default being pinned. Shipping one ON before
+    ///     its content is published makes the install pass retry a failing `claude plugin install`
+    ///     on every launch and renders the row with a "couldn't install" hint. This assertion is
+    ///     therefore meant to go RED on the eventual flip — that is the tripwire, not collateral:
+    ///     flipping a row means confirming its name is in the marketplace listing and re-pointing
+    ///     this test in the same commit.
+    ///   * Absence ALONE would be satisfied by a row that does not exist, or whose toggle was never
+    ///     wired into `PluginsConfig` — the two ways this catalog silently loses a plugin. So each
+    ///     row is also asserted LIVE: with every toggle forced on it resolves to that same exact id.
+    ///     Without this, deleting all four rows outright would leave the test green.
+    #[test]
+    fn the_newer_sparkle_plugins_resolve_to_their_exact_marketplace_ids_and_ship_off() {
+        let (cfg, _, _) = effective(None, None);
+        let shipped: Vec<String> = cfg.plugins.enabled().iter().map(|p| p.id()).collect();
+        let when_on: Vec<String> = PluginsConfig::with_all(true)
+            .enabled()
+            .iter()
+            .map(|p| p.id())
+            .collect();
+
+        for (toggle, want_id) in [
+            ("sparkle_conflict_watch", "sparkle-conflict-watch@sparkle"),
+            ("sparkle_secrets", "sparkle-secrets@sparkle"),
+            ("sparkle_review_probes", "sparkle-review-probes@sparkle"),
+            ("sparkle_pusher", "sparkle-pusher@sparkle"),
+        ] {
+            let row = KNOWN_PLUGINS
+                .iter()
+                .find(|p| p.toggle == toggle)
+                .unwrap_or_else(|| panic!("no KNOWN_PLUGINS row for `{toggle}`"));
+            assert_eq!(row.id(), want_id, "`{toggle}` must resolve to the exact Claude Code key");
+            assert!(
+                when_on.contains(&want_id.to_string()),
+                "`{toggle}` must be a LIVE toggle — turning it on has to enable `{want_id}`"
+            );
+            assert!(
+                !shipped.contains(&want_id.to_string()),
+                "`{toggle}` must ship OFF until `{want_id}` exists in try-sparkle/marketplace — \
+                 an enabled row whose content is unpublished retries a failing install every launch.\n\
+                 \n\
+                 IF YOU ARE FLIPPING THIS ON, THE FLIP IS NOT ONE LINE. DEFAULT_TEMPLATE has already \
+                 written `{toggle} = false` into the config.toml of every user who touched settings \
+                 during the interim, and a key present in that file beats `default_on` — so those \
+                 users stay OFF forever unless the SAME commit carries a one-shot migration that \
+                 removes the key. See the flip note above KNOWN_PLUGINS' four newer rows."
+            );
+        }
+    }
+
+    /// The frontend's `PLUGIN_DEFAULTS` must agree with this table's `default_on` column, row for
+    /// row — and NOTHING enforced that until this test, which is exactly how it drifted.
+    ///
+    /// The four newer rows were flipped to `default_on: false` here while `settingsStore.ts` kept
+    /// them `true`, and every suite stayed green: the Rust tests cannot see the TS file, the TS
+    /// tests had no assertion on `PLUGIN_DEFAULTS` at all, and the mirror's own doc comment
+    /// ("Rust is the authority") reads as a licence to let them diverge. The consequence is small
+    /// but real and user-visible — four toggles paint ON for the first frame, then flip OFF when
+    /// the config hydrate answers — and the comment sitting above the values kept asserting the
+    /// retracted "these ship ON" reasoning, which is what the next reader would have believed.
+    ///
+    /// Read from disk rather than duplicated, because a hand-copied expectation is one more mirror
+    /// to drift. Same technique as `vendored_roborev_post_commit_keeps_its_skip_guards`.
+    ///
+    /// Both directions are asserted. A missing key catches a Rust row the frontend never learned
+    /// about; the count check catches a TS key with no Rust row behind it. A value mismatch is the
+    /// drift this exists for.
+    #[test]
+    fn the_frontend_plugin_defaults_mirror_matches_this_tables_default_on_column() {
+        let src = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../src/stores/settingsStore.ts"
+        ))
+        .expect("settingsStore.ts must be readable — it is the frontend mirror of KNOWN_PLUGINS");
+
+        let start = src
+            .find("export const PLUGIN_DEFAULTS")
+            .expect("settingsStore.ts must still export PLUGIN_DEFAULTS");
+        let body = &src[start..];
+        let end = body.find("\n};").expect("PLUGIN_DEFAULTS must be a closed object literal");
+        let body = &body[..end];
+
+        // `key: true,` / `key: false,` — comment lines and the declaration head are skipped, so the
+        // prose above each group cannot be mistaken for an entry.
+        //
+        // AN UNREADABLE LINE IS FATAL, NOT SKIPPED, and that is what gives the count assertion below
+        // its teeth. A parser that drops what it cannot read makes the "extra TS key" direction
+        // unable to fail in exactly the case it guards: `sparkleFoo: true, // flips once content
+        // ships` parses to a value of `true, // flips once content ships`, matches neither literal,
+        // and would vanish silently — leaving the counts equal and an orphan frontend toggle
+        // shipping green. The sibling helper `template_toggle_value` strips its trailing `#` comment
+        // for the same reason; this one has to strip `//`.
+        let mut ts: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.is_empty()
+                || line.starts_with("//")
+                || line.starts_with("/*")
+                || line.starts_with('*')
+                || line.starts_with("export const")
+            {
+                continue;
+            }
+            let unparsed = || panic!("unparsed PLUGIN_DEFAULTS line: {line:?}");
+
+            let Some((key, val)) = line.split_once(':') else { unparsed() };
+            let key = key.trim().trim_matches('"');
+            // Strip a trailing `// comment` before reading the value.
+            let val = val.split("//").next().unwrap_or("").trim().trim_end_matches(',').trim();
+            if key.is_empty() {
+                unparsed()
+            }
+            match val {
+                "true" => drop(ts.insert(key.to_string(), true)),
+                "false" => drop(ts.insert(key.to_string(), false)),
+                // A value that is neither literal (a constant, an expression) is not something this
+                // guard can compare, so it must be loud rather than ignored.
+                _ => unparsed(),
+            }
+        }
+
+        assert!(!ts.is_empty(), "parsed no entries out of PLUGIN_DEFAULTS — has its shape changed?");
+
+        for row in KNOWN_PLUGINS {
+            // `sparkle_conflict_watch` -> `sparkleConflictWatch`, the frontend's key spelling.
+            let mut camel = String::new();
+            let mut upper = false;
+            for c in row.toggle.chars() {
+                if c == '_' {
+                    upper = true;
+                } else if upper {
+                    camel.push(c.to_ascii_uppercase());
+                    upper = false;
+                } else {
+                    camel.push(c);
+                }
+            }
+
+            let got = ts.get(&camel).unwrap_or_else(|| {
+                panic!(
+                    "PLUGIN_DEFAULTS has no `{camel}` — every KNOWN_PLUGINS row needs a frontend \
+                     mirror, or the toggle renders with no default at first paint"
+                )
+            });
+            assert_eq!(
+                *got, row.default_on,
+                "`{}` ships default_on={} in KNOWN_PLUGINS but `{camel}` is {got} in \
+                 settingsStore.ts — the toggle would paint wrong until the config hydrate lands, \
+                 and the two must flip in the SAME commit",
+                row.toggle, row.default_on
+            );
+        }
+
+        assert_eq!(
+            ts.len(),
+            KNOWN_PLUGINS.len(),
+            "PLUGIN_DEFAULTS has {} entries but KNOWN_PLUGINS has {} — a frontend key with no Rust \
+             row behind it is a toggle the backend will never honor",
+            ts.len(),
+            KNOWN_PLUGINS.len()
+        );
+    }
+
     /// The `<toggle> = <bool>` assignment for `toggle` in a TOML source, or None if there is no
     /// such assignment line. Used to check the shipped template ACTUALLY sets a key, rather than
     /// merely mentioning its name somewhere in prose.
@@ -5314,6 +5749,98 @@ quit_app = 42
         let (cfg, warns, _) = effective(None, Some(p));
         assert!(!cfg.tools.builder_index);
         assert!(warns.iter().any(|w| w.contains("[tools]")));
+    }
+
+    // ── [builder_index] — what the reporter publishes ────────────────────────────────────
+
+    #[test]
+    fn nothing_is_excluded_from_the_skills_row_by_default() {
+        let (cfg, warns, hard) = effective(None, None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(cfg.builder_index.skills_exclude.is_empty());
+        // And a file that mentions the tool toggle does not implicitly configure the reporter.
+        let (cfg, _, _) = effective(Some("[tools]\nbuilder_index = true\n"), None);
+        assert!(cfg.builder_index.skills_exclude.is_empty());
+    }
+
+    #[test]
+    fn skills_exclude_normalizes_case_and_whitespace_on_the_way_in() {
+        // tkmx-client's `applyExclusions` does `.trim().toLowerCase()` on both sides. Sparkle
+        // normalizes the CONFIGURED side here and the candidate side in the reporter, through the
+        // same function — the two reporters post to one profile alternately, and the server
+        // replaces `claude_skills` wholesale, so a name excluded by only one of them comes back
+        // every other cycle instead of disappearing.
+        let g = "[builder_index]\nskills_exclude = [\" WARP \", \"Frontend-Design\"]\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.builder_index.skills_exclude, vec!["warp", "frontend-design"]);
+    }
+
+    #[test]
+    fn skills_exclude_also_accepts_the_comma_separated_spelling() {
+        // The shape tkmx-client's SKILLS_EXCLUDE env var takes, which is what someone consolidating
+        // the two reporters copies across. Accepting it costs nothing; rejecting it would have cost
+        // the whole config layer (see the next test).
+        let (cfg, warns, hard) = effective(Some("[builder_index]\nskills_exclude = \"warp, WARP , \"\n"), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        // Empties dropped, and the duplicate collapses once both are normalized.
+        assert_eq!(cfg.builder_index.skills_exclude, vec!["warp"]);
+    }
+
+    #[test]
+    fn a_malformed_skills_exclude_costs_that_key_and_nothing_else() {
+        // roborev 54240's rule, applied to a key whose failure mode is worse than most: the user
+        // reaches for a denylist precisely when they want something GONE from a public profile, so
+        // a whole-file parse error would revert their config while still publishing the name.
+        let g = "[workflow]\nrequire_pr = false\n\n[builder_index]\nskills_exclude = 7\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "one bad key must not fail the layer");
+        assert!(cfg.builder_index.skills_exclude.is_empty());
+        assert!(
+            warns.iter().any(|w| w.contains("[builder_index].skills_exclude")),
+            "and it must say so: {warns:?}"
+        );
+        // The headline side effect: the unrelated setting in the same file SURVIVED.
+        assert!(!cfg.workflow.require_pr, "an unrelated setting must not revert to its default");
+
+        // A non-string element inside an otherwise good list costs that element only.
+        let g = "[builder_index]\nskills_exclude = [\"warp\", 7]\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(cfg.builder_index.skills_exclude, vec!["warp"]);
+        assert!(warns.iter().any(|w| w.contains("skills_exclude")), "{warns:?}");
+    }
+
+    #[test]
+    fn a_project_cannot_change_what_this_machine_publishes_about_you() {
+        // Machine-wide in BOTH directions. The dangerous half is un-excluding: a cloned repo must
+        // not be able to put a name back onto its owner's public profile.
+        let g = "[builder_index]\nskills_exclude = [\"warp\"]\n";
+        let p = "[builder_index]\nskills_exclude = []\n";
+        let (cfg, warns, _) = effective(Some(g), Some(p));
+        assert_eq!(cfg.builder_index.skills_exclude, vec!["warp"], "the global layer stands");
+        assert!(warns.iter().any(|w| w.contains("[builder_index]")), "{warns:?}");
+    }
+
+    #[test]
+    fn the_generated_template_documents_the_denylist_and_parses() {
+        // The template is what a user actually edits, so a key misspelled there is a key that
+        // silently does nothing. Round-trip it through the real resolver.
+        let (cfg, warns, hard) = effective(Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert!(cfg.builder_index.skills_exclude.is_empty(), "the example ships COMMENTED OUT");
+        assert!(DEFAULT_TEMPLATE.contains("[builder_index]"));
+        // Seeded with the founder's actual case: `warp@claude-code-warp` is installed but unwanted.
+        assert!(DEFAULT_TEMPLATE.contains("skills_exclude = [\"warp\"]"));
+
+        // Uncommenting that exact line is what the user will do — prove it works verbatim.
+        let uncommented = DEFAULT_TEMPLATE.replace("# skills_exclude = [\"warp\"]", "skills_exclude = [\"warp\"]");
+        let (cfg, _, hard) = effective(Some(&uncommented), None);
+        assert!(!hard);
+        assert_eq!(cfg.builder_index.skills_exclude, vec!["warp"]);
     }
 
     #[test]

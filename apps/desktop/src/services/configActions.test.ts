@@ -96,6 +96,29 @@ describe("setPluginEnabled — the [plugins] flags", () => {
     expect(setConfigValue).toHaveBeenCalledWith("plugins.superpowers", false);
   });
 
+  it("maps every sparkle* plugin key to its exact [plugins] TOML key", () => {
+    // The camelCase→snake_case boundary is where a plugin row dies silently: a wrong leaf writes a
+    // key Rust's KNOWN_PLUGINS does not claim, which parses fine, applies nothing, and is only
+    // reported as an "unknown [plugins] key" warning in a log nobody is reading. The switch still
+    // moves, so the row looks like it works.
+    //
+    // Asserted as literal strings rather than derived from the map under test — deriving both
+    // sides would make this agree with any mapping at all, including a wrong one.
+    for (const [key, path] of [
+      ["sparkleGuardrails", "plugins.sparkle_guardrails"],
+      ["sparkleFreshness", "plugins.sparkle_freshness"],
+      ["sparkleMutationCheck", "plugins.sparkle_mutation_check"],
+      ["sparkleConflictWatch", "plugins.sparkle_conflict_watch"],
+      ["sparkleSecrets", "plugins.sparkle_secrets"],
+      ["sparkleReviewProbes", "plugins.sparkle_review_probes"],
+      ["sparklePusher", "plugins.sparkle_pusher"],
+    ] as const) {
+      vi.mocked(setConfigValue).mockClear();
+      void setPluginEnabled(key, false);
+      expect(setConfigValue).toHaveBeenCalledWith(path, false);
+    }
+  });
+
   it("updates the store optimistically, before the write resolves", () => {
     useSettingsStore.setState({ pluginsEnabled: { ...useSettingsStore.getState().pluginsEnabled, superpowers: true } });
     const pending = setPluginEnabled("superpowers", false);

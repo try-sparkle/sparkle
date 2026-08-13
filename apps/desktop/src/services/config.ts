@@ -130,6 +130,10 @@ interface PluginsConfig {
   sparkle_guardrails?: boolean;
   sparkle_freshness?: boolean;
   sparkle_mutation_check?: boolean;
+  sparkle_conflict_watch?: boolean;
+  sparkle_secrets?: boolean;
+  sparkle_review_probes?: boolean;
+  sparkle_pusher?: boolean;
 }
 /** roborev machine-wide state (the one-time consent flag), its own section so Rust can gate the
  *  first-run modal on it. Machine-wide (like [tools]); ignored in a per-project file. */
@@ -268,6 +272,20 @@ export interface SparkleConfig {
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */
   delivered: DeliveredConfig;
+  /** What the Builder Index reporter publishes, once `tools.builder_index` has turned it on.
+   *  Optional for the same back-compat reason as `pushers?`/`babysit?` above: a payload from a Rust
+   *  backend predating `[builder_index]` omits it. An absent section reads as "nothing excluded",
+   *  which is also the shipped default. */
+  builder_index?: BuilderIndexConfig;
+}
+/** The `[builder_index]` table as Rust serializes it. Machine-wide; ignored in a per-project file —
+ *  and here that is a boundary, not tidiness: a repo must not be able to change what its owner's
+ *  machine publishes about them, in either direction. */
+export interface BuilderIndexConfig {
+  /** Skill names withheld from the public profile's SKILLS row. Already normalized by Rust
+   *  (trimmed, lowercased, empties dropped), matching tkmx-client's `applyExclusions` so the two
+   *  reporters agree on what a name means. */
+  skills_exclude: string[];
 }
 /** The merged effective config plus any non-fatal load warnings (malformed layer, ignored keys). */
 export interface EffectiveConfig {

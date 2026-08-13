@@ -168,11 +168,23 @@ export type PluginKey =
   | "frontendDesign"
   | "sparkleGuardrails"
   | "sparkleFreshness"
-  | "sparkleMutationCheck";
+  | "sparkleMutationCheck"
+  | "sparkleConflictWatch"
+  | "sparkleSecrets"
+  | "sparkleReviewProbes"
+  | "sparklePusher";
 
-/** Defaults, mirroring the `default_on` column of Rust's `KNOWN_PLUGINS`. Used only until the
- *  first config hydrate answers for real; `PLUGIN_DEFAULTS` and the Rust table disagreeing is a
- *  first-paint flicker, not a correctness bug, because Rust is the authority. */
+/** Defaults, mirroring the `default_on` column of Rust's `KNOWN_PLUGINS`. Used until the first
+ *  config hydrate answers for real.
+ *
+ *  THE TWO MUST FLIP IN THE SAME COMMIT. This comment used to say a disagreement here was "a
+ *  first-paint flicker, not a correctness bug, because Rust is the authority" — which read as
+ *  licence to defer the mirror update, and is how all four sparkle* rows below sat at `true` for a
+ *  commit after the Rust table moved them to `false`. Two things make it wrong: the flicker is
+ *  user-visible (the toggle paints the wrong state until hydrate lands, which on a slow start is
+ *  long enough to read and click), and it is now a hard `cargo test` failure —
+ *  `the_frontend_plugin_defaults_mirror_matches_this_tables_default_on_column` in `config.rs` reads
+ *  THIS FILE from disk and compares it to `KNOWN_PLUGINS` row for row, in both directions. */
 export const PLUGIN_DEFAULTS: Record<PluginKey, boolean> = {
   superpowers: true,
   frontendDesign: true,
@@ -181,6 +193,15 @@ export const PLUGIN_DEFAULTS: Record<PluginKey, boolean> = {
   sparkleFreshness: true,
   // A deliberate, targeted act ("prove THIS test can fail"), not a background discipline.
   sparkleMutationCheck: false,
+  // The four below ship OFF, and — unlike the two above — not on their own merits: each earns an
+  // eventual ON, but try-sparkle/marketplace does not carry the content yet, so an enabled row
+  // makes the install pass retry a failing `claude plugin install` on every launch and renders a
+  // "couldn't install" hint. They flip to true once each name appears in that listing, in the same
+  // commit that flips Rust's `default_on`. See the KNOWN_PLUGINS block in config.rs.
+  sparkleConflictWatch: false,
+  sparkleSecrets: false,
+  sparkleReviewProbes: false,
+  sparklePusher: false,
 };
 
 // --- Chief sync state (replacing the legacy markdown-sync watermark) -----------------------
@@ -1121,6 +1142,12 @@ export const useSettingsStore = create<SettingsState>()(
             sparkleFreshness: config.plugins?.sparkle_freshness ?? PLUGIN_DEFAULTS.sparkleFreshness,
             sparkleMutationCheck:
               config.plugins?.sparkle_mutation_check ?? PLUGIN_DEFAULTS.sparkleMutationCheck,
+            sparkleConflictWatch:
+              config.plugins?.sparkle_conflict_watch ?? PLUGIN_DEFAULTS.sparkleConflictWatch,
+            sparkleSecrets: config.plugins?.sparkle_secrets ?? PLUGIN_DEFAULTS.sparkleSecrets,
+            sparkleReviewProbes:
+              config.plugins?.sparkle_review_probes ?? PLUGIN_DEFAULTS.sparkleReviewProbes,
+            sparklePusher: config.plugins?.sparkle_pusher ?? PLUGIN_DEFAULTS.sparklePusher,
           },
           // NOTE THE ASYMMETRY: every tool above falls back to `?? true`, this one to `?? false`.
           // 1Password backup needs an external account, the `op` CLI, and a chosen vault before it

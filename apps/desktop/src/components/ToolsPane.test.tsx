@@ -128,11 +128,15 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the thirteen toggleable tools carry a switch. Superpowers is one of them: it used
+    // Exactly the seventeen toggleable tools carry a switch. Superpowers is one of them: it used
     // to be an info-only showcase row, and is a real [plugins] toggle since the plugin pre-enable
     // work — a stale showcase copy would claim Sparkle ships something the user can't turn off.
-    // The three "sparkle*" rows come from Sparkle's own published marketplace.
-    expect(screen.getAllByRole("switch")).toHaveLength(13);
+    // The seven "sparkle*" rows come from Sparkle's own published marketplace.
+    //
+    // Hand-listed on purpose, unlike the derived counts further down: this is the one assertion
+    // that says WHICH rows the pane offers, so a new plugin must be added here deliberately. A
+    // count derived from the store's key set would accept any row set at all.
+    expect(screen.getAllByRole("switch")).toHaveLength(17);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
@@ -143,6 +147,10 @@ describe("ToolsPane", () => {
       "Guardrails skill",
       "Branch freshness",
       "Mutation check",
+      "Conflict watch",
+      "Secrets skill",
+      "Review probes",
+      "Pusher",
       "1Password env backup",
       "Beads",
       "GitHub import",

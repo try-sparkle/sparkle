@@ -22,10 +22,21 @@ import {
   type BuilderIndexStatus,
 } from "../services/builderIndex";
 
-/** Exactly what leaves the machine, itemized. Vague reassurance is worse than a list. */
+/** Exactly what leaves the machine, itemized. Vague reassurance is worse than a list.
+ *
+ *  THIS LIST IS PART OF THE FEATURE, not a description of it — it is the only thing the user reads
+ *  before consenting, so anything the reporter starts publishing has to arrive here in the SAME
+ *  change. `machine_config` (hostname / OS / CPU / RAM, and the installed plugin names) was added to
+ *  the payload while this list still named only the token rows and the ids, which left the user
+ *  agreeing to a list that no longer described what was sent — and the hostname is the more
+ *  identifying of the two, since a Mac's default is commonly its owner's real name.
+ *  Mirrors `builder_index.rs`'s module header; if you change one, change both. */
 const SENDS = [
   "One row per day, per model: input / output / cache tokens and an estimated cost.",
   "Your tokenmaxxing username and a per-machine id.",
+  "This machine's name, OS, CPU and RAM — what the profile's Machines card displays.",
+  "The names of the Claude Code plugins installed here, read from Claude's own installed-plugins list. Not which skills you used — that list comes from Claude's own installed-plugins file, not from your history. Use skills_exclude in config.toml to hold names back.",
+  "Session counts and rates: how many sessions were yours vs. automated, how often you used plan mode, how many subagents you dispatched, how many distinct skills you used, and tool calls grouped by category. Counting these means reading your local transcripts — the COUNTS are sent, never the content.",
 ];
 const NEVER = "Never your code, prompts, file paths, project names, or API keys.";
 

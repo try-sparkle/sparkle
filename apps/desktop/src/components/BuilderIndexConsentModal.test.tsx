@@ -84,6 +84,54 @@ describe("BuilderIndexConsentModal", () => {
     ).toBeTruthy();
   });
 
+  // This screen is the ONLY thing the user reads before consenting, so a field the reporter starts
+  // sending has to appear here in the same change. `machine_config` was added to the payload while
+  // this list still named only the token rows and the ids — the user agreed to a list that no
+  // longer described what was sent. These two assertions are what make that regression loud.
+  //
+  // They pin the DISTINGUISHING words, not whole sentences, so the copy can be reworded without a
+  // false red; the hostname line is the load-bearing one, since a Mac's default machine name is
+  // commonly its owner's real name and it is the most identifying thing in the payload.
+  it("names the machine facts the reporter publishes, not just the token rows", () => {
+    render(<BuilderIndexConsentModal />);
+    expect(screen.getByText(/machine's name, OS, CPU and RAM/)).toBeTruthy();
+  });
+
+  it("says the installed plugin names are published, and where that list comes from", () => {
+    render(<BuilderIndexConsentModal />);
+    const row = screen.getByText(/Claude Code plugins installed here/);
+    expect(row).toBeTruthy();
+    // The provenance has to travel WITH the disclosure: "we publish your plugin names" reads far
+    // worse without "and that list is Claude's own installed-plugins file, not your history".
+    expect(row.textContent).toMatch(/not from your history/i);
+  });
+
+  // `session_stats` is the OTHER field that shipped before this list described it, and it is the
+  // more sensitive of the two: building those counts means READING the local transcripts. The copy
+  // therefore has to do two things at once — name the counts, and be honest that producing them
+  // involves reading history while none of that history is sent.
+  //
+  // This also guards a subtler regression the previous version of this file introduced: the plugin
+  // row used to claim "nothing reads your transcripts", which was true of that row and false of the
+  // payload as a whole. A blanket denial sitting next to a field that does read them is worse than
+  // no disclaimer, so the assertion below pins the honest pairing rather than the denial.
+  it("discloses the session counts AND that producing them reads transcripts, content excluded", () => {
+    render(<BuilderIndexConsentModal />);
+    const row = screen.getByText(/Session counts and rates/);
+    expect(row).toBeTruthy();
+    expect(row.textContent).toMatch(/plan mode/i);
+    expect(row.textContent).toMatch(/subagents/i);
+    expect(row.textContent).toMatch(/reading your local transcripts/i);
+    expect(row.textContent).toMatch(/never the content/i);
+  });
+
+  it("carries no blanket claim that transcripts are never read — one field does read them", () => {
+    const { container } = render(<BuilderIndexConsentModal />);
+    // The exact wording that was wrong before, asserted as ABSENT. Without this the honest copy
+    // above could be reworded back to a blanket denial and every other assertion here would pass.
+    expect(container.textContent).not.toMatch(/nothing reads your transcripts/i);
+  });
+
   it("blocks Confirm until a username and a key are supplied", async () => {
     render(<BuilderIndexConsentModal />);
     const confirm = screen.getByRole("button", { name: "Publish my totals" }) as HTMLButtonElement;

@@ -461,6 +461,10 @@ const PLUGINS_CONFIG_PATH: Record<PluginKey, string> = {
   sparkleGuardrails: "plugins.sparkle_guardrails",
   sparkleFreshness: "plugins.sparkle_freshness",
   sparkleMutationCheck: "plugins.sparkle_mutation_check",
+  sparkleConflictWatch: "plugins.sparkle_conflict_watch",
+  sparkleSecrets: "plugins.sparkle_secrets",
+  sparkleReviewProbes: "plugins.sparkle_review_probes",
+  sparklePusher: "plugins.sparkle_pusher",
 };
 
 /** Store key → the `[plugins]` TOML key Rust reports back in a `PluginInstallOutcome`.

@@ -397,6 +397,35 @@ fn claude_config_dir_env() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// The `plugins` map's KEYS out of a parsed `installed_plugins.json` document — Claude Code's own
+/// record of what is installed, as `<plugin>@<marketplace>` ids.
+///
+/// `None` means the document is not the shape we know (no `plugins` object); `Some(vec![])` means
+/// it parsed and records nothing installed. Both callers lean on that distinction rather than on an
+/// empty list, so keep them apart: [`observe_installed_plugins`] uses it to decide whether an empty
+/// result is trustworthy, and [`crate::builder_index`] uses it to decide whether it may publish a
+/// skills list at all (an empty array REPLACES the profile's row wholesale, so "we could not look"
+/// must never render as "this machine has no skills").
+///
+/// Pure — takes the already-parsed JSON, reads no environment and no disk — so both callers'
+/// behaviour is unit-testable without a fixture directory.
+pub(crate) fn installed_plugin_ids(doc: &Value) -> Option<Vec<String>> {
+    let map = doc.get("plugins")?.as_object()?;
+    Some(map.keys().cloned().collect())
+}
+
+/// [`installed_plugin_ids`] against a manifest file. `None` for missing, unreadable, non-JSON, or
+/// unrecognized-shape — every one of which is "we could not look", never "nothing is installed".
+///
+/// Takes the FULL path rather than a directory so each caller keeps its own path policy: the
+/// install-skip path resolves `CLAUDE_CONFIG_DIR` first, while the Builder Index reporter reads
+/// `~/.claude` unconditionally (see `builder_index::reporting_manifest_path` for why).
+pub(crate) fn read_installed_plugin_ids(manifest: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(manifest).ok()?;
+    let doc = serde_json::from_str::<Value>(&text).ok()?;
+    installed_plugin_ids(&doc)
+}
+
 /// What is ACTUALLY installed on this machine, as `<plugin>@<marketplace>` ids — or `None` when we
 /// can't tell (no plugins dir at all is *not* "can't tell", it is a definitive "nothing").
 ///
@@ -426,13 +455,9 @@ fn observe_installed_plugins(config_dir: Option<&Path>, home: &Path) -> Option<V
 
     // Signal 1: Claude Code's own installed record. Parsing it at all is what makes an empty
     // result trustworthy.
-    let record_parsed = match std::fs::read_to_string(plugins.join("installed_plugins.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v.get("plugins").and_then(Value::as_object).cloned())
-    {
-        Some(map) => {
-            ids.extend(map.keys().cloned());
+    let record_parsed = match read_installed_plugin_ids(&plugins.join("installed_plugins.json")) {
+        Some(recorded) => {
+            ids.extend(recorded);
             true
         }
         None => false,
@@ -1791,6 +1816,28 @@ mod tests {
         );
         assert!(got.contains("superpowers@claude-plugins-official"));
         assert!(got.contains("sparkle-freshness@sparkle"));
+
+        // The four newer Sparkle rows are absent from the default set, by their exact Claude Code
+        // keys. Named literally, not derived from the table, because this test is the deliberate
+        // record of WHICH plugins land in every worktree — deriving both sides would make it agree
+        // with any table at all.
+        //
+        // They are OFF because `try-sparkle/marketplace` does not carry the content yet, so an
+        // enabled row would put an unresolvable key into every worktree's settings and make the
+        // install pass retry a failing `claude plugin install` on every launch. This assertion is
+        // the tripwire for the eventual flip: when the content publishes, these move to the
+        // `got.contains(..)` block above in the same commit that flips `default_on`.
+        for id in [
+            "sparkle-conflict-watch@sparkle",
+            "sparkle-secrets@sparkle",
+            "sparkle-review-probes@sparkle",
+            "sparkle-pusher@sparkle",
+        ] {
+            assert!(
+                !got.contains(id),
+                "{id} must NOT ship on until it exists in try-sparkle/marketplace"
+            );
+        }
     }
 
     #[test]
@@ -2108,6 +2155,47 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_manifest_parser_separates_could_not_look_from_nothing_installed() {
+        // The distinction both callers are built on. `None` must never be reachable from a
+        // well-formed record, and `Some(vec![])` must never be reachable from a broken one — the
+        // Builder Index reporter publishes an empty array on `Some(vec![])`, which REPLACES the
+        // profile's SKILLS row, so collapsing the two would wipe it on a parse failure.
+        let parsed = |s: &str| serde_json::from_str::<Value>(s).ok().as_ref().and_then(installed_plugin_ids);
+
+        assert_eq!(
+            parsed(r#"{"version":2,"plugins":{"superpowers@claude-plugins-official":[{"scope":"user"}]}}"#),
+            Some(vec!["superpowers@claude-plugins-official".to_string()])
+        );
+        // Parsed and records nothing: a real, trustworthy "nothing installed".
+        assert_eq!(parsed(r#"{"version":2,"plugins":{}}"#), Some(Vec::new()));
+        // Shapes we do not recognize are all "could not look".
+        assert_eq!(parsed(r#"{"version":2}"#), None, "no plugins key");
+        assert_eq!(parsed(r#"{"plugins":[]}"#), None, "plugins is an array, not an object");
+        assert_eq!(parsed("not json"), None);
+    }
+
+    #[test]
+    fn reading_a_missing_or_malformed_manifest_is_none_not_an_empty_list() {
+        let dir = std::env::temp_dir().join(format!("sparkle-manifest-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("installed_plugins.json");
+
+        assert_eq!(read_installed_plugin_ids(&manifest), None, "absent file");
+
+        std::fs::write(&manifest, "{ truncated").unwrap();
+        assert_eq!(read_installed_plugin_ids(&manifest), None, "malformed file");
+
+        std::fs::write(&manifest, r#"{"plugins":{"warp@claude-code-warp":[]}}"#).unwrap();
+        assert_eq!(
+            read_installed_plugin_ids(&manifest),
+            Some(vec!["warp@claude-code-warp".to_string()])
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The multi-account bug: Sparkle sets `CLAUDE_CONFIG_DIR` per-spawn and `accounts.rs`/`claude.rs`
