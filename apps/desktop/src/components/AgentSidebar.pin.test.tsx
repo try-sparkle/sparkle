@@ -23,6 +23,7 @@ import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import type { AgentTab, Project } from "../types";
+import { renameViaRowMenu } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -49,7 +50,7 @@ describe("AgentSidebar — agent pinning is REMOVED", () => {
   it("renaming a top-level agent freezes its name but does NOT anchor its row", () => {
     const project = seed([mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")]);
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(screen.getByText("Alpha"));
+    renameViaRowMenu(screen.getByText("Alpha"));
     const input = screen.getByDisplayValue("Alpha");
     fireEvent.change(input, { target: { value: "Alpha2" } });
     fireEvent.blur(input);

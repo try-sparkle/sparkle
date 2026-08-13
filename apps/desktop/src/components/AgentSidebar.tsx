@@ -1058,6 +1058,34 @@ export function AgentSidebar({
    */
   const selectAndWire = (id: string | null) => {
     if (!project) return;
+    // ── NO `showBuildStage` HERE, AND THAT IS A MEASURED CONCLUSION, NOT AN OVERSIGHT ──────────
+    // Seating an agent is only half of putting it in front of the user: `Workspace` derives
+    //
+    //   paneVisibleAgentId.right = sparkleActive || boardActive || previewActive ? null : activeAgentId
+    //
+    // and `null` means NO AgentPane is visible on that side. So a path that moves the selection
+    // while this column shows its Plan board, its Preview slot, or the Improve-Sparkle pane seats
+    // an agent whose terminal never appears — the bug this helper looks like it should fix.
+    //
+    // It must not fix it here, because ALL THREE of this helper's callers already guarantee the
+    // stage, and a fourth copy would be a line no test can hold (a `mutation-check` on it stays
+    // green, since breaking it leaves the real guarantee untouched):
+    //
+    //   • `onMount`      — every route to it is preceded by `onSelect`, which reveals the stage
+    //                      itself. `AgentRow.onRowClick` calls `onSelect()` unconditionally on its
+    //                      first line (AgentRow.tsx:458) for EVERY click, `detail: 0` AT
+    //                      activations included, and the keyboard path seats before it mounts the
+    //                      same way. A `dblclick` is by construction preceded by two of those.
+    //   • `onPickBuild`  — calls `showBuildStage(pairSide)` explicitly before it gets here.
+    //   • `spawnBuildAgent` → `spawnBuildAgentInProject` → `landInAgent`, whose steps 1 and 2 are
+    //                      `setActiveSpecial(null)` + `setWorkMode(side, "build")` — the same two
+    //                      writes, from the helper whose entire job is "the thing you just asked
+    //                      for is what you are now looking at" (services/landInAgent.ts:47-55).
+    //
+    // THE DEPENDENCY IN THE FIRST BULLET IS REAL AND IS GUARDED, not assumed: if AgentRow ever
+    // stops seating a row before mounting it, the double-click case in
+    // Workspace.mountRevealsTerminal.test.tsx goes red, because it asserts the mounted agent's pane
+    // is actually PAINTED rather than merely selected.
     selectAgent(project.id, id);
     // NOTHING TO PLUG INTO — SEAT NOTHING, PATCH NOTHING. `id` is nullable because `onPickBuild`
     // passes null on purpose: a pair with no build rows clears the selection and shows the empty
@@ -1095,19 +1123,70 @@ export function AgentSidebar({
    * must still put you somewhere useful, and the terminal is the agent's own input surface. The pane
    * consumes it once it is visible and its PTY is up — see stores/paneFocusStore for why the pane's
    * existing auto-focus cannot cover this on its own.
+   *
+   * WHICH IS WHY THE STAGE MATTERS MORE HERE THAN ANYWHERE, and why this is the ONE handler that
+   * reveals it. "Put you somewhere useful" and "hand the caret to a pane you cannot see" are
+   * opposites: under Plan/Preview (or the Improve-Sparkle pane) `paneVisibleAgentId` is forced to
+   * `null`, so this used to focus a terminal that renders nowhere. A seat with no stage is not a
+   * seat. {@link onMount} and {@link selectAndWire} carry no copy of the call and explain why.
    */
   const onSelect = (id: string) => {
     if (!project) return;
-    // Switching to a normal project agent leaves the special (Sparkle) view.
-    setActiveSpecial(null);
+    // ── SHOW THIS COLUMN'S BUILD STAGE. THE ONE SITE THAT REVEALS IT FOR A ROW GESTURE ─────────
+    // This replaces a bare `setActiveSpecial(null)`, which handled only ONE of the three surfaces
+    // that can hide a pane. `Workspace` forces `paneVisibleAgentId[side]` to `null` while a column
+    // shows its Plan board, its Preview slot, OR the Improve-Sparkle pane — so clearing the special
+    // alone left a column sitting in Plan/Preview, and the click seated an agent whose terminal
+    // never appeared. The concierge said "Chatting with X" over a stage still showing something
+    // else, and nothing recovered it: `reconcileWorkMode` returns null for any non-Build mode.
+    //
+    // `showBuildStage`, not `setWorkMode` and not a bare clear. Its declaration
+    // (stores/uiStore.ts:350-352) states the rule this call site was breaking: *"put a column into
+    // Build **and** make its stage actually visible. Same rule — anything meaning 'show me the
+    // terminal/rows' uses this."* Both writes live in the store so they cannot drift apart again.
+    //
+    // AND IT COVERS THE MOUNT TOO, which is why `onMount`/`selectAndWire` carry no copy: `AgentRow`
+    // seats a row before it ever mounts one — `onRowClick` calls `onSelect()` on its first line for
+    // every click (AgentRow.tsx:458), and a double press is two of those before the `dblclick`. See
+    // the note in `selectAndWire` for the full caller audit.
+    //
+    // SCOPED TO THIS PAIR rather than global, which is the one deliberate behaviour change here:
+    // `showBuildStage` yields the Sparkle pane only for the side that owns it (SPARKLE_PANE_SIDE),
+    // so a LEFT column's row click no longer reaches across to close a RIGHT-pair surface. That
+    // matches how visibility is derived (`paneVisibleAgentId.left` does not read `sparkleActive` at
+    // all) and the cross-pair reach `openPlanBoard`'s scoping exists to prevent (roborev 55878).
+    showBuildStage(pairSide);
     selectAgent(project.id, id);
     open(id);
     requestPaneFocus(id);
   };
-  /** Patch the cable onto a row — the DOUBLE click, and the activations with no double form. */
+  /**
+   * Patch the cable onto a row — the DOUBLE click, and the activations with no double form.
+   *
+   * NO `setActiveSpecial(null)` OF ITS OWN ANY MORE. It used to run one here before delegating, and
+   * that bare clear was the bug: it yielded the Improve-Sparkle pane but said nothing about the work
+   * MODE, so double-clicking a row while the column showed its Plan board or Preview slot mounted an
+   * agent whose terminal never appeared — the founder's report, with the concierge announcing
+   * "Chatting with X" over a stage that was still showing something else.
+   *
+   * NOTHING REPLACES IT HERE, and that is deliberate. `onSelect` reveals the stage, and every route
+   * into this function has already been through it: `AgentRow.onRowClick` seats the row on its first
+   * line for EVERY click (AgentRow.tsx:458) — `detail: 0` assistive-tech activations included — and
+   * the keyboard path seats before it mounts too, so by the time a `dblclick` reaches here the
+   * column is already showing its Build stage. A second call would be a line no test could hold:
+   * breaking it leaves `onSelect` covering for it, so `mutation-check` reports it green and the
+   * "covered" verdict would be false. Measured, not assumed — that is exactly what a first cut of
+   * this fix did, and the check caught it.
+   *
+   * The founder, 2026-08-13, asked what the pane should show when you mount onto agent X: *"X's
+   * terminal, always — Mounting is also a selection: the terminal pane follows the MOUNTED agent,
+   * and shows X's live terminal immediately."* Note what that does NOT say: the stage is not FROZEN
+   * to X. A later single click on row Y still moves the terminal to Y — only the CABLE stays pinned
+   * to X (c60b17e46, "look at B without changing who you're talking to"). Revealing the stage on
+   * every seat is what makes both halves true at once.
+   */
   const onMount = (id: string) => {
     if (!project) return;
-    setActiveSpecial(null);
     selectAndWire(id);
     // ── PATCH THE CABLE ──────────────────────────────────────────────────────────────────────
     // THE GESTURE THAT MAKES THE WHOLE CONNECTION FEATURE REACHABLE. Everything downstream of

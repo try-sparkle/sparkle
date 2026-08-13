@@ -39,6 +39,7 @@ import { useUiStore } from "../stores/uiStore";
 import { useAuthStore } from "../stores/authStore";
 import { useCloudAuthStore } from "../stores/cloudAuthStore";
 import type { AgentTab, Project } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -93,7 +94,7 @@ function cloudAdvertised(over: { cloudAgentsEnabled?: boolean; signedIn?: boolea
  *  picker, the path reveal), and right-click is how it opens. */
 function openCard(name: string) {
   const row = screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.contextMenu(row);
+  openAgentCard(row);
 }
 
 const item = () => screen.queryByTestId("promote-to-cloud");

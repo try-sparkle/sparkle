@@ -43,7 +43,7 @@ import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { settleFold } from "../testing/rowGestures";
+import { openAgentCard, settleFold } from "../testing/rowGestures";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
@@ -257,7 +257,7 @@ describe("AgentSidebar — worker child rows", () => {
 
     const rowSlot = leadingSlotWidth(rowFor("Alpha"));
     expect(rowSlot).toBeTruthy(); // guard: an empty selector must not pass silently
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     const cardSlot = leadingSlotWidth(screen.getByTestId("agent-hover-card"));
 
     // Same leading slot width → nothing shifts when the card stands over the row.

@@ -24,6 +24,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -65,7 +66,7 @@ function seed(opts: { workerStatus: AgentTabStatus }): {
 // Click the orchestrator's head row to open its detail card (the "modal").
 function openHeadCard() {
   const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.contextMenu(head);
+  openAgentCard(head);
   return head;
 }
 

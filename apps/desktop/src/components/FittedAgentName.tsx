@@ -3,7 +3,6 @@
 // ("Remove Sparkle Fad…"). The full title + the description are revealed by the row's hover
 // slide-out (see AgentSidebar), so this component carries no tooltip of its own. Legacy/manual
 // agents with no title just render their canonical `name`.
-import { type MouseEvent as ReactMouseEvent } from "react";
 import { FONT_WEIGHT } from "../theme/colors";
 
 /** The size EVERY row title in the Build column is set at. Exported because the pinned "Improve
@@ -143,7 +142,6 @@ export function FittedAgentName({
   name,
   color,
   active,
-  onContextMenu,
   minWidthPx = AGENT_NAME_MIN_WIDTH_PX,
 }: {
   /** The auto-name title to show, or null for legacy/manual agents (falls back to `name`). */
@@ -157,32 +155,31 @@ export function FittedAgentName({
   color: string;
   /** Selected row takes bold; every other row takes regular. See `rowTitleWeight`. */
   active: boolean;
-  /** RIGHT click = rename. See the span below for why it is not the double click any more. */
-  onContextMenu: (e: ReactMouseEvent) => void;
 }) {
   const display = title?.trim() || name;
   return (
     <span
       data-testid="row-agent-name"
-      // RIGHT-CLICK TO RENAME, and the gesture moved here on 2026-08-12 for a reason that is not
-      // about renaming at all. Founder, asked how the row's two gestures should resolve: *"double
-      // click mounts. right click to rename."*
+      // THIS SPAN CLAIMS NO GESTURE OF ITS OWN, AND THAT IS THE POINT. It has now swallowed two.
       //
-      // This span is `flex: 1`, so it covers the row's ENTIRE flexible width. While it owned
-      // `dblclick` — and stopped that event's propagation — the row's own double-click-to-mount was
-      // dead over the biggest target on the row: the founder's new gesture worked on the disc and
-      // the chips and nowhere a person would actually aim (roborev 63145). Moving rename to a
-      // gesture the row does not use is what makes the mount reachable everywhere; nothing about the
-      // double click had to be special-cased.
+      // It owned `dblclick` for rename until 2026-08-12 — and stopped that event propagating — so
+      // the row's double-click-to-mount was dead over the biggest target on the row: the gesture
+      // worked on the disc and the chips and nowhere a person would actually aim (roborev 63145).
+      // Rename moved to `contextmenu` here, which had the same shape one gesture over: the row uses
+      // `contextmenu` too, so the name had to claim it, and a right click meant "rename" over this
+      // span and "open the detail card" everywhere else on the same row.
       //
-      // ON THE OUTER SPAN, NOT THE INNER ONE THE DOUBLE CLICK SAT ON. The inner span is only as tall
-      // and wide as the LETTERS after ellipsis; the flexible width the name reserves is this
-      // element's. Right-clicking the gap after a short name is still right-clicking the name.
+      // Founder, 2026-08-13: *"Renaming of the builder row should now go into right click of the
+      // builder row. It should be an option in the right click menu."* So rename is an ITEM now,
+      // and this span handles nothing: every gesture on it propagates to the row, which is the only
+      // thing that decides what a press means. This span is `flex: 1` and its bounds are drawn
+      // nowhere — nothing whose extent the user cannot see should behave differently from the row
+      // it covers.
       //
-      // A single click must still NOT enter edit mode — it selects the agent (the row's onClick), so
-      // clicking a tab never accidentally renames it. No title tooltip — the hover-to-rename hint was
-      // distracting on every row.
-      onContextMenu={onContextMenu}
+      // A single click still must not enter edit mode — it selects the agent (the row's onClick),
+      // so clicking a tab never accidentally renames it. No title tooltip — the hover-to-rename hint
+      // was distracting on every row.
+      //
       // `minWidth` is the whole fix — see AGENT_NAME_MIN_WIDTH_PX. `overflow: hidden` plus the
       // inner span's ellipsis still truncate a long name; what they can no longer do is truncate
       // it to nothing.

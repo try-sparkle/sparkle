@@ -46,7 +46,7 @@ vi.mock("../services/branchStatus", () => ({
 
 import { AgentSidebar } from "./AgentSidebar";
 import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
-import { settleFold } from "../testing/rowGestures";
+import { openAgentCard, openRowMenu, renameViaRowMenu, rowMenu, settleFold } from "../testing/rowGestures";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -213,7 +213,7 @@ describe("Build column — the row is the title and nothing else", () => {
   it("keeps the activity line on the detail card", () => {
     const project = seed({}, { activity: "Wiring the control listener" });
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     expect(card()!.textContent).toContain("Wiring the control listener");
   });
 
@@ -227,7 +227,7 @@ describe("Build column — the row is the title and nothing else", () => {
   it("keeps the progress bar on the detail card", () => {
     const project = seed({}, {}, { a1: "building_saved" });
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     expect(card()!.querySelector('[role="img"]')).toBeTruthy();
   });
 
@@ -391,17 +391,29 @@ describe("Build column — left-click selects and folds, right-click opens the c
     expect(card()).toBeNull();
   });
 
-  it("opens the detail card on a right click", () => {
+  // A right click opens the row's MENU now, not the card directly — the card moved behind its
+  // "Open details…" item (founder, 2026-08-13). `openAgentCard` carries that whole gesture, so these
+  // two keep asserting what they always asserted: the card opens, and the agent is selected first.
+  // The menu itself is `AgentSidebar.rowContextMenu.test.tsx`.
+  it("opens the detail card from the row's menu", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     expect(card()).toBeTruthy();
   });
 
-  it("selects the agent on a right click too, so the card matches the terminal", () => {
+  it("…and a bare right click does NOT open it — it opens the menu", () => {
     const project = seed();
     render(<AgentSidebar project={project} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openRowMenu(rowFor("Alpha"));
+    expect(card()).toBeNull();
+    expect(rowMenu()).toBeTruthy();
+  });
+
+  it("selects the agent when the card opens, so the card matches the terminal", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    openAgentCard(rowFor("Alpha"));
     expect(liveProject().selectedAgentId).toBe("a1");
   });
 
@@ -762,13 +774,16 @@ describe("Build column — the rename input keeps its own context menu", () => {
     // Grab the row BEFORE renaming: once the input mounts, the title text is gone from the DOM and
     // rowFor() (which looks the row up by its visible name) can no longer find it.
     const row = rowFor("Alpha");
-    fireEvent.contextMenu(screen.getByText("Alpha"));
+    renameViaRowMenu(screen.getByText("Alpha"));
     expect(screen.getByDisplayValue("Alpha")).toBeTruthy(); // in rename mode
 
     const ev = createEvent.contextMenu(row);
     fireEvent(row, ev);
     expect(ev.defaultPrevented).toBe(false);
     expect(card()).toBeNull();
+    // …and no ROW MENU either, which is what the row's right click opens now. Same rule, one
+    // surface later: the field keeps cut/copy/paste, so the row hands the gesture off entirely.
+    expect(rowMenu()).toBeNull();
   });
 });
 
@@ -804,7 +819,7 @@ describe("Build column — the card stands over its row without anything jumping
       // read post-open below. Looking it up by name afterwards is ambiguous: the open card renders
       // the same agent name a second time.
       const row = rowFor("Alpha");
-      fireEvent.contextMenu(row);
+      openAgentCard(row);
 
       const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
       const border = parseInt(strip.style.border, 10);
@@ -829,7 +844,7 @@ describe("Build column — the card stands over its row without anything jumping
     const project = seed();
     render(<AgentSidebar project={project} />);
     const row = rowFor("Alpha");
-    fireEvent.contextMenu(row);
+    openAgentCard(row);
     const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
     const border = parseInt(strip.style.border, 10);
     expect(border + parseInt(strip.style.paddingRight, 10)).toBe(
@@ -845,7 +860,7 @@ describe("Build column — the card stands over its row without anything jumping
     const project = seedExpanded();
     render(<AgentSidebar project={project} />);
     const worker = rowFor("Parser Worker");
-    fireEvent.contextMenu(worker);
+    openAgentCard(worker);
     const strip = screen.getByTestId("agent-hover-card").firstElementChild as HTMLElement;
     const border = parseInt(strip.style.border, 10);
     expect(border + parseInt(strip.style.paddingRight, 10)).toBe(
@@ -879,7 +894,7 @@ describe("Build column — the card stands over its row without anything jumping
       },
     });
 
-    fireEvent.contextMenu(row);
+    openAgentCard(row);
     const card = screen.getByTestId("agent-hover-card") as HTMLElement;
     const strip = card.firstElementChild as HTMLElement;
     const border = parseInt(strip.style.border, 10);
@@ -1104,7 +1119,7 @@ describe("a red row names the founder's next action, not the agent's condition",
 
   it("a waiting row says ANSWER, and does not say the generic status word", () => {
     render(<AgentSidebar project={seedExpanded({ a1: "waiting" })} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     const pill = askPill()!;
     expect(pill.getAttribute("data-ask")).toBe("answer");
     expect(pill.textContent).toMatch(/^Answer a question/);
@@ -1114,7 +1129,7 @@ describe("a red row names the founder's next action, not the agent's condition",
 
   it("an errored row is marked a PROBLEM, not a confirmation", () => {
     render(<AgentSidebar project={seedExpanded({ a1: "errored" })} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     const pill = askPill()!;
     expect(pill.getAttribute("data-ask")).toBe("unstick");
     // A PROBLEM keeps the row's own status ink, so "something is wrong" still looks wrong — and
@@ -1132,7 +1147,7 @@ describe("a red row names the founder's next action, not the agent's condition",
     // exactly the way its own comment warned against (roborev on 8148084b6). `askFor` now reads
     // ONLY the status, so an idle row is the honest statement of the property.
     render(<AgentSidebar project={seedExpanded({ a1: "idle" })} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     expect(askPill()).toBeNull();
   });
 
@@ -1140,7 +1155,7 @@ describe("a red row names the founder's next action, not the agent's condition",
     // roborev 59545's defect, reintroduced on a new element and caught again: an aria-label on a
     // role-less span is not reliably exposed, and a click-only handler cannot be reached at all.
     render(<AgentSidebar project={seedExpanded({ a1: "waiting" })} />);
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     const pill = askPill()!;
     expect(pill.getAttribute("role")).toBe("button");
     expect(pill.getAttribute("tabindex")).toBe("0");

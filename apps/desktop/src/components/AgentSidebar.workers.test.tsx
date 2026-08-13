@@ -29,6 +29,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
 import type { BranchStatus } from "../services/branchStatus";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -61,12 +62,13 @@ function seedOrchestratorWithWorker(bs: BranchStatus): Project {
   return project;
 }
 
-// Expanding = CLICKING the orchestrator's in-flow row, which mounts the detail card (a portal)
-// carrying each worker's detail block + Status pill. (Hovering only activates the terminal now.)
+// Expanding = opening the orchestrator row's detail card (a portal) carrying each worker's detail
+// block + Status pill. `openAgentCard` owns the gesture that gets there — a right click on the row
+// followed by its "Open details…" item. (Hovering only activates the terminal now.)
 function openOrchestratorCard() {
   const card = document.querySelector<HTMLElement>('[draggable="true"]');
   if (!card) throw new Error("orchestrator card not found");
-  fireEvent.contextMenu(card);
+  openAgentCard(card);
 }
 
 beforeEach(() => useUiStore.setState({ collapsedOrchestrators: {} }));
@@ -121,7 +123,7 @@ describe("AgentSidebar — inline worker pills are scoped to the worker", () => 
     // Clicking opens the card: the strip is HIDDEN (visibility:hidden — keeps its layout slot so rows
     // below don't jump) while the single card, anchored at the same spot and widening into the
     // terminal area, stands in for it. This is what keeps the name + progress bar from duplicating.
-    fireEvent.contextMenu(row);
+    openAgentCard(row);
     expect(strip.style.visibility).toBe("hidden");
     // And the detail renders in the card — the Status line is present (the orchestrator's own + the
     // worker's both read "Up to date with main").

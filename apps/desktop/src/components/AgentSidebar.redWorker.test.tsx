@@ -25,6 +25,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import { dotInk, expectedDotColor, filterOn } from "./statusDotTestUtils";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -67,7 +68,7 @@ function seed(
 
 function openHeadCard() {
   const head = screen.getByText("Alpha").closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.contextMenu(head);
+  openAgentCard(head);
 }
 
 beforeEach(() => {

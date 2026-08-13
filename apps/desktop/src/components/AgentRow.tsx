@@ -1,5 +1,6 @@
 import {
   useState,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
@@ -73,6 +74,7 @@ import { AgentInboxBadge } from "./AgentInboxBadge";
 import { AlertToggleButton } from "./AlertToggleButton";
 import { StatusDot } from "./StatusDot";
 import { ModelPill } from "./ModelPill";
+import { RowContextMenu } from "./RowContextMenu";
 import { WorkflowLine } from "./WorkflowLine";
 import {
   FittedAgentName,
@@ -189,6 +191,10 @@ export const ROW_CONTROL_SELECTOR =
  */
 export const FOLD_DOUBLE_PRESS_GRACE_MS = 350;
 
+/** How far in from the row's left edge a KEYBOARD-raised context menu opens (Shift+F10 / the Menu
+ *  key carry no cursor). Flush with the edge reads as a menu belonging to the column, not the row. */
+const KEY_MENU_INSET = 12;
+
 export const AgentRow = memo(function AgentRow({
   project,
   a,
@@ -264,6 +270,9 @@ export const AgentRow = memo(function AgentRow({
   const cancelNextBlur = useRef(false);
   const [hover, setHover] = useState(false);
   const [rect, setRect] = useState<{ left: number; top: number; width: number } | null>(null);
+  // Where this row's context menu is anchored, or null when it is closed. Viewport coordinates —
+  // the menu is portalled to `document.body` and positioned `fixed`. See `openRowMenu`.
+  const [menuAt, setMenuAt] = useState<{ x: number; y: number } | null>(null);
   // The list's auto-scroll coordinator (see SidebarScrollContext): lets this row nudge the column up
   // so its full hover card fits, then ease back when the cursor leaves.
   // Subscribed HERE rather than threaded down as a prop: AgentRow is memoized, and a per-agent
@@ -623,48 +632,62 @@ export const AgentRow = memo(function AgentRow({
       }
     }
   };
-  // RIGHT click = the detail card. It is the only home for the model picker, Land, branch rebase,
-  // the path reveal and the per-worker breakdown, so the card survives — it just stopped being what
-  // a plain click does. Left-click used to open it, which meant every glance at an agent threw a
-  // full-width overlay across the terminal you were trying to read. preventDefault suppresses the
-  // native context menu; selecting first keeps the card and the terminal showing the same agent.
-  const openCard = (e: React.MouseEvent) => {
-    // Hands off during a rename. This is the column's only text field, and preventDefault here
-    // suppresses the NATIVE context menu inside it — i.e. cut/copy/paste. Returning early also
-    // avoids arming `hover`, which `showOverlay = hover && !editing` merely masks: the card would
-    // spring open the instant the rename committed (roborev 53814).
-    if (editing) return;
-    e.preventDefault();
+  // OPEN THE DETAIL CARD. It is the only home for the model picker, Land, branch rebase, the path
+  // reveal and the per-worker breakdown, so the card survives every change to how it is reached —
+  // and it has been reached three ways now. A left click opened it once, which meant every glance at
+  // an agent threw a full-width overlay across the terminal you were trying to read; then a bare
+  // right click on the row; and since 2026-08-13 it is the menu's "Open details…" item. Selecting
+  // first keeps the card and the terminal showing the same agent.
+  const openCard = () => {
     onSelect();
     show();
   };
   /**
-   * RIGHT click ON THE NAME = rename. Founder, 2026-08-12, asked how the row's two gestures should
-   * resolve: *"double click mounts. right click to rename."*
+   * RIGHT click ANYWHERE ON THE ROW = the row's context menu. Founder, 2026-08-13: *"Renaming of the
+   * builder row should now go into right click of the builder row. It should be an option in the
+   * right click menu."*
    *
-   * ══ WHY IT IS NOT THE DOUBLE CLICK ANY MORE ═══════════════════════════════════════════════════
-   * Rename owned `dblclick` on the name and stopped it propagating, and the name span covers the
-   * row's whole flexible width in BOTH layouts — so the mount gesture that shipped the same day was
-   * dead over the largest target on the row (roborev 63145). Two gestures cannot share one event;
-   * one of them had to move, and the founder chose which.
+   * ══ WHAT THIS REPLACES, AND WHY ONE HANDLER RATHER THAN TWO ═══════════════════════════════════
+   * A right click had two different answers depending on where on the row it landed. Over the agent
+   * NAME it began an inline rename instantly (the gesture rename moved to on 2026-08-12, when the
+   * double click had to be freed for the mount — roborev 63145). Anywhere ELSE it opened the detail
+   * card. Both are real verbs and neither was discoverable: the name span is `flex: 1`, so the two
+   * zones are wildly unequal and their boundary is drawn nowhere. Now there is ONE answer, and both
+   * old outcomes are items inside it — plus Close agent, which previously had no keyboard route and
+   * no route at all on a row that was not selected or hovered.
    *
-   * ══ WHY IT STOPS PROPAGATION, WHERE THE OLD HANDLER MUST NOT HAVE ═════════════════════════════
-   * `contextmenu` IS a gesture the row uses — it is how the detail card opens (`openCard`) — so a
-   * right click on the name has to claim the event or it would rename AND throw the card across the
-   * pane. That is the opposite of the old `stopPropagation`, which was blocking an event the row
-   * needed and nothing else wanted. `preventDefault` for the same reason `openCard` calls it: no
-   * native menu is left standing behind the editor.
+   * ══ IT STILL HANDS OFF DURING A RENAME, FOR THE REASON `openCard` DID ═════════════════════════
+   * The rename `<input>` is the column's only text field, and `preventDefault` here would suppress
+   * the NATIVE menu inside it — i.e. cut/copy/paste (roborev 53814). Returning early also avoids
+   * opening a menu whose Rename item is the state you are already in.
    *
-   * The consequence, stated because it is a real cost of the founder's rule rather than an oversight:
-   * the detail card is now reached by right-clicking the row OUTSIDE the name — the disc, the chips,
-   * the trailing gutter. The card is still the only home for the model picker, Land and the path
-   * reveal, so if that gets hard to hit, the card needs its own affordance, not the name back.
+   * ══ THE ANCHOR ════════════════════════════════════════════════════════════════════════════════
+   * The cursor, except when there isn't one: the row is focusable, so it receives `contextmenu` from
+   * Shift+F10 and the Menu key, which carry no coordinates. Those anchor to the row's own rect
+   * instead — a menu pinned to the viewport's top-left corner for a keyboard user is not a menu they
+   * can associate with the row it acts on. That path is also this app's FIRST keyboard route to
+   * rename; there has never been a shortcut for it.
    */
-  const beginRename = (e: React.MouseEvent) => {
+  const openRowMenu = (e: React.MouseEvent) => {
+    if (editing) return;
     e.preventDefault();
-    e.stopPropagation();
-    setEditing(a.id);
+    // DELIBERATELY NOT STOPPED, where the rename handler this replaces did stop it. That
+    // `stopPropagation` was claiming the event FROM the row, which no longer needs claiming: the
+    // name has no handler at all now, and the card's title line is inside a portal that is a
+    // SIBLING of the row, so neither can reach this handler twice. What propagation DOES still
+    // reach is the window listener that abandons a push-to-talk hold on any context menu
+    // (voice/usePushToTalk) — behaviour that predates this change and has no reason to stop.
+    if (e.clientX !== 0 || e.clientY !== 0) {
+      setMenuAt({ x: e.clientX, y: e.clientY });
+      return;
+    }
+    const r = rowRef.current?.getBoundingClientRect();
+    setMenuAt(r ? { x: r.left + KEY_MENU_INSET, y: r.bottom } : { x: 0, y: 0 });
   };
+  const beginRename = () => setEditing(a.id);
+  // Stable, because the menu subscribes document-level listeners keyed on it — a fresh closure each
+  // render would tear those down and re-add them on every unrelated row re-render.
+  const dismissRowMenu = useCallback(() => setMenuAt(null), []);
   useEffect(
     () => () => {
       if (hideTimer.current) clearTimeout(hideTimer.current);
@@ -1748,7 +1771,10 @@ export const AgentRow = memo(function AgentRow({
             // "Title:  description" on ONE row-height line — the bold title followed by the
             // regular-weight description. The whole line is nowrap + ellipsis, so a long
             // description truncates ("…") rather than wrapping and growing the strip over the column
-            // rows beneath it. RIGHT-click the line to edit (rename) — same affordance as collapsed.
+            // rows beneath it. RIGHT-click the line for the row's menu — same affordance as
+            // collapsed, and it needs its OWN handler rather than inheriting the row's: this line
+            // is drawn inside the card, which is `createPortal`'d as a SIBLING of the row element,
+            // so nothing here propagates to the row's `onContextMenu` at all.
             // No title tooltip (the user finds it noise). gap:8 matches the collapsed row.
             <div style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0, height: GLYPH_SLOT_H }}>
               {lastTouchAt != null && (
@@ -1756,7 +1782,7 @@ export const AgentRow = memo(function AgentRow({
               )}
               <div style={{ flex: 1, minWidth: 0, display: "flex", alignItems: "center", gap: 4 }}>
                 <div
-                  onContextMenu={beginRename}
+                  onContextMenu={openRowMenu}
                   style={{
                     flex: "0 1 auto",
                     minWidth: 0,
@@ -1884,7 +1910,6 @@ export const AgentRow = memo(function AgentRow({
                   // rule documented at 220 and so applied the 16px floor across the whole 220–259
                   // band — including the default width. See AGENT_NAME_TIGHT_FLOOR_BELOW_PX.
                   minWidthPx={agentNameFloorFor(columnWidth ?? 0)}
-                  onContextMenu={beginRename}
                 />
                 {workerCountBadge}
                 {/* "Someone has queued instructions for this agent, and it has not seen them yet."
@@ -2436,7 +2461,7 @@ export const AgentRow = memo(function AgentRow({
         {...dragProps}
         onClick={onRowClick}
         onDoubleClick={onRowDoubleClick}
-        onContextMenu={openCard}
+        onContextMenu={openRowMenu}
         onKeyDown={onRowKeyDown}
         // The row absorbed the chevron's job, so it absorbs the chevron's SEMANTICS. Without this,
         // deleting the button quietly deleted the feature for anyone not using a mouse.
@@ -2733,6 +2758,37 @@ export const AgentRow = memo(function AgentRow({
           </div>,
           document.body,
         )}
+      {/* THE ROW'S CONTEXT MENU — a SIBLING of the row element, never a child of it, and that
+          placement is load-bearing rather than tidiness.
+
+          A portal's React events bubble through the OWNER tree, not the DOM one. Rendering this
+          inside the row `<div>` would therefore send every press in the menu through the row's own
+          `onClick` / `onDoubleClick` — and the row's control bail (`ROW_CONTROL_SELECTOR`) could not
+          stop it, because that test is `e.currentTarget.contains(hit)` and a portalled node is
+          contained by nothing in the row. A double press on an item would select the row and patch
+          the cable onto it, which is roborev 63145's leak reopened through a new surface. As a
+          sibling — the arrangement the hover card above already uses — nothing in the menu can reach
+          the row at all. `AgentSidebar.rowContextMenu.test.tsx` pins it. */}
+      {menuAt && (
+        <RowContextMenu
+          at={menuAt}
+          label={`Actions for ${a.name}`}
+          onDismiss={dismissRowMenu}
+          items={[
+            // The founder's order. Rename leads because it is the verb this menu was created to
+            // hold — it had no home at all once the double click became the mount.
+            { id: "rename", label: "Rename", onSelect: beginRename },
+            { id: "open-details", label: "Open details…", onSelect: openCard },
+            {
+              id: "close-agent",
+              label: "Close agent",
+              onSelect: onClose,
+              danger: true,
+              separatorBefore: true,
+            },
+          ]}
+        />
+      )}
     </>
   );
 }, agentRowPropsEqual);

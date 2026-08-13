@@ -44,6 +44,7 @@ import { useUiStore } from "../stores/uiStore";
 import { usePreviewStore } from "../stores/previewStore";
 import { useProjectStore } from "../stores/projectStore";
 import type { AgentTab, Project } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -64,7 +65,7 @@ function mkProject(agents: AgentTab[]): Project {
 /** Open the row's detail card — right-click, the same gesture the neighbouring cloud items use. */
 function openCard(name: string) {
   const row = screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.contextMenu(row);
+  openAgentCard(row);
 }
 const item = () => screen.queryByTestId("open-preview");
 

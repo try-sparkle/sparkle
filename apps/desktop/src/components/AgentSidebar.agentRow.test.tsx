@@ -31,7 +31,7 @@ import { landAgentBranch, refreshAgentBranch } from "../services/branchStatus";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { Project, AgentTab } from "../types";
 import type { BranchStatus } from "../services/branchStatus";
-import { openAgentCard } from "../testing/rowGestures";
+import { openAgentCard, renameViaRowMenu } from "../testing/rowGestures";
 
 // Both collapsed and hover render the same TITLE; the one-sentence DESCRIPTION (and the
 // Location/Status/Progress detail lines) appear ONLY in the hover overlay. Tests use the
@@ -120,7 +120,7 @@ describe("AgentRow — rename input is a single instance across hover", () => {
     // disappears (input stands in for it). After hover the title exists twice (hidden in-flow +
     // overlay); the overlay copy is the last one.
     const titles = screen.getAllByText(TITLE);
-    fireEvent.contextMenu(titles[titles.length - 1]!);
+    renameViaRowMenu(titles[titles.length - 1]!);
     expect(screen.getAllByRole("textbox")).toHaveLength(1);
     expect(screen.queryByText(TITLE)).toBeNull();
 
@@ -133,7 +133,7 @@ describe("AgentRow — rename input is a single instance across hover", () => {
 
   it("Escape cancels the rename without committing (no second input, edit dropped)", () => {
     render(<AgentSidebar project={mkProject([mkAgent()])} />);
-    fireEvent.contextMenu(screen.getByText(TITLE));
+    renameViaRowMenu(screen.getByText(TITLE));
     const input = screen.getByRole("textbox") as HTMLInputElement;
     fireEvent.change(input, { target: { value: "scratch-typing" } });
     fireEvent.keyDown(input, { key: "Escape" });
@@ -244,7 +244,7 @@ describe("AgentRow — hover card title + description and detail lines", () => {
     expect(row.style.background).toBe("var(--c-forest)");
     expect(row.style.marginRight).toBe("-8px");
     // Hover → the card is the terminal color with NO drop-shadow (it merges into the terminal).
-    fireEvent.contextMenu(row);
+    openAgentCard(row);
     const card = screen.getByTestId("agent-hover-card");
     expect(["none", ""]).toContain(card.style.filter);
     const strip = (Array.from(card.children) as HTMLElement[])[0]!;

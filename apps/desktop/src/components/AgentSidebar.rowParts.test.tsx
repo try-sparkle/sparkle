@@ -16,7 +16,7 @@
 //     is "structure is drawn, not filled"; a filled chip on every row would put a second wall of
 //     colour beside the status dots, which is the treatment this column has already been walked
 //     back from twice.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { C } from "../theme/colors";
 import { FONT_MONO, RADIUS, TYPE } from "../theme/scale";
@@ -46,6 +46,7 @@ import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import type { AgentTab, Project } from "../types";
 import type { WorkflowStageId } from "../engine/workflowStage";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -203,7 +204,7 @@ describe("`.spark` — cut by the founder, and staying cut", () => {
 // pass cannot make the whole line uniform in either direction.
 describe("status is text, action is a button", () => {
   const openCard = () => {
-    fireEvent.contextMenu(rowFor("Alpha"));
+    openAgentCard(rowFor("Alpha"));
     return screen.getByTestId("agent-hover-card");
   };
 

@@ -252,9 +252,16 @@ describe("a double click on a build row", () => {
 // else (roborev 63145). Nothing covered a double click landing on the name.
 //
 // Founder, asked how the two gestures should resolve: *"double click mounts. right click to
-// rename."* Both halves are asserted here, and both fail against the code as it shipped: the double
-// click never reached the row, and a right click on the name opened the detail card rather than the
-// editor.
+// rename."* The double-click half is unchanged and still fails against the code as it shipped.
+//
+// THE RIGHT-CLICK HALF MOVED AGAIN ON 2026-08-13, and the reason is the same shape one gesture over.
+// Rename-on-right-click had to CLAIM the event from the row, which used `contextmenu` to open the
+// detail card — so one row had two different right-click answers, split along the invisible edge of
+// a `flex: 1` span. Founder: *"Renaming of the builder row should now go into right click of the
+// builder row. It should be an option in the right click menu."* So the name claims nothing now:
+// every gesture on it reaches the row, and the row opens ONE menu wherever it is pressed. The menu
+// and its items are `AgentSidebar.rowContextMenu.test.tsx`; what stays here is the property this
+// block has always been about — the name does not swallow the row's gestures.
 describe("the two gestures on the agent name", () => {
   // ══ AIMED AT THE LETTERS, NOT THE OUTER SPAN — roborev 63223 ══════════════════════════════════
   // These two cases dispatched on `nameIn(...)`, the OUTER span, and were vacuous: they passed
@@ -323,10 +330,14 @@ describe("the two gestures on the agent name", () => {
     expect(wired()).toBe("right");
   });
 
-  it("a RIGHT click on the name opens the rename editor", () => {
+  it("a RIGHT click on the name opens the ROW'S MENU, and renames from it", () => {
+    // Not an instant rename any more — the name has no gesture of its own. The editor is still one
+    // press away, which is the half of the old behaviour that had to survive.
     render(<AgentSidebar project={PROJECT} />);
     expect(screen.queryByDisplayValue(OTHER)).toBeNull();
     fireEvent.contextMenu(nameIn(rowFor(OTHER)));
+    expect(screen.getByTestId("row-context-menu")).toBeTruthy();
+    fireEvent.click(screen.getByTestId("row-menu-rename"));
     expect(screen.getByDisplayValue(OTHER)).toBeInstanceOf(HTMLInputElement);
   });
 
@@ -344,12 +355,13 @@ describe("the two gestures on the agent name", () => {
   });
 
   it("…and does NOT also open the detail card", () => {
-    // `contextmenu` is a gesture the ROW uses — it is how the card opens — so the name has to claim
-    // the event. `openCard` selects the row first, so a selection that never moves is the proof it
-    // did not run. Without the `stopPropagation` this reads "a2".
+    // The card is behind "Open details…" now, and that item is what selects the row. So a selection
+    // that never moves is the proof the card did not spring open behind the menu — the outcome this
+    // case has always asserted, through two different mechanisms for reaching it.
     render(<AgentSidebar project={PROJECT} />);
     expect(selectedAgentId()).toBe("a1");
     fireEvent.contextMenu(nameIn(rowFor(OTHER)));
+    expect(screen.queryByTestId("agent-hover-card")).toBeNull();
     expect(selectedAgentId()).toBe("a1");
   });
 
@@ -364,12 +376,16 @@ describe("the two gestures on the agent name", () => {
     openAgentCard(rowFor(OTHER));
     const card = screen.getByTestId("agent-hover-card");
     fireEvent.contextMenu(within(card).getByText(OTHER));
+    // The card is `createPortal`'d as a SIBLING of the row element, so nothing in it propagates to
+    // the row's own `onContextMenu` — this line needs its own handler or it silently does nothing,
+    // which is exactly the divergence this case was written to catch.
+    fireEvent.click(screen.getByTestId("row-menu-rename"));
     expect(screen.getByDisplayValue(OTHER)).toBeInstanceOf(HTMLInputElement);
   });
 
-  it("…and leaves no native context menu standing behind the editor", () => {
-    // `fireEvent` returns false when a handler called `preventDefault`. The founder's rule is a
-    // rename editor, not a rename editor with the OS menu on top of it.
+  it("…and leaves no native context menu standing behind our own", () => {
+    // `fireEvent` returns false when a handler called `preventDefault`. The founder's rule is one
+    // menu, not our menu with the OS menu on top of it.
     render(<AgentSidebar project={PROJECT} />);
     expect(fireEvent.contextMenu(nameIn(rowFor(OTHER)))).toBe(false);
   });

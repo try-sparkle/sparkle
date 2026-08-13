@@ -46,6 +46,7 @@ import { useUiStore } from "../stores/uiStore";
 import { useAuthStore } from "../stores/authStore";
 import { useCloudAuthStore } from "../stores/cloudAuthStore";
 import type { AgentTab, Project } from "../types";
+import { openAgentCard } from "../testing/rowGestures";
 
 function mkAgent(over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -100,7 +101,7 @@ function cloudAdvertised(
 /** Open the row's detail card — the card is where a row's actions live, and right-click opens it. */
 function openCard(name: string) {
   const row = screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
-  fireEvent.contextMenu(row);
+  openAgentCard(row);
 }
 
 const item = () => screen.queryByTestId("demote-to-local");

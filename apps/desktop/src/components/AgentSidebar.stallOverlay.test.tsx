@@ -13,7 +13,7 @@
 // Every assertion is on the row's DOM, not on an input to it. Asserting that the store holds an
 // open PR would pass against the code as it was before this change and prove nothing; asserting
 // that the text "PR unmerged" appears inside that agent's row would not.
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS, C, DANGER, FONT_WEIGHT } from "../theme/colors";
 import { alertControlKind } from "../engine/alertDismissal";
@@ -44,6 +44,7 @@ import { DEFAULT_GOAL_TTL_MS, escalateGoal, markGoalMet, newGoal } from "../engi
 import type { AgentGoal } from "../engine/agentGoal";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
+import { openAgentCard } from "../testing/rowGestures";
 
 const CLEAN_BS: BranchStatus = {
   ahead: 0,
@@ -711,9 +712,11 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
   it("inks the card's STALL chip and detail amber — the third surface of one fact", () => {
     // roborev 60018, and the correction that produced it is worth keeping: an earlier version of
     // this file carried a comment claiming these two inks COULD NOT be pinned because nothing
-    // renders a card. That was false — `fireEvent.contextMenu` on a row opens `agent-hover-card`,
-    // which several suites already assert against — and a false impossibility claim is worse than
-    // the gap it describes, because it reads as an instruction not to close it.
+    // renders a card. That was false — `openAgentCard` on a row opens `agent-hover-card`, which
+    // several suites already assert against — and a false impossibility claim is worse than the gap
+    // it describes, because it reads as an instruction not to close it. (The gesture underneath that
+    // helper has since become a right click plus the menu's "Open details…"; the helper is what kept
+    // this note true across that change rather than stale a second time.)
     //
     // `stallChipFor` sets `escalated` from the same `escalated-goal` cause as the goal chip, and
     // these render in the card strip and its detail block, beside `card-goal`. While they stayed
@@ -734,7 +737,7 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     // Captured BEFORE the card opens: the card repeats the agent's name, so a name lookup afterwards
     // is ambiguous.
     const row = rowFor("Stalled One");
-    fireEvent.contextMenu(row);
+    openAgentCard(row);
     const card = screen.getByTestId("agent-hover-card");
     // EVERY LOOKUP IS `getByTestId`, WHICH THROWS — no `query…`/`??`/`if` hedging (roborev 60040).
     // All three render behind the same `stallChip &&` / goalBadge conditions, so the hedging bought
