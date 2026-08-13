@@ -35,6 +35,7 @@ import { askWithoutActionCheck } from "./checks/askWithoutAction";
 import { defectWithoutDispositionCheck } from "./checks/defectWithoutDisposition";
 import { hedgeWordsCheck } from "./checks/hedgeWords";
 import { nakedFileRefCheck } from "./checks/nakedFileRef";
+import { replyWithoutQuoteCheck } from "./checks/replyWithoutQuote";
 import { restatedStateCheck } from "./checks/restatedState";
 import { unbackedClaimCheck } from "./checks/unbackedClaim";
 
@@ -78,6 +79,11 @@ export const CHECKS: Check[] = [
   // attached nothing to it: no bead, no agent, no stated reason. It is the only one of the three
   // whose trigger is not a first-person sentence about the concierge itself.
   defectWithoutDispositionCheck,
+  // Fourth, and the second check here that BLOCKS. It sits after the trio above because they judge
+  // WHAT THE TURN OWED THE HUMAN and this one judges the reply's SHAPE — so when a reply both
+  // withholds an action and buries the quote, the withheld action is the finding worth leading the
+  // correction prompt with. Ordering matters for nothing else: this check never rewrites the text.
+  replyWithoutQuoteCheck,
   hedgeWordsCheck,
   nakedFileRefCheck,
   restatedStateCheck,

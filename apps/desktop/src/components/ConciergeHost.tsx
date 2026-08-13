@@ -2510,6 +2510,11 @@ export function ConciergeHost({
         // The corpus the HELD reply was linted against, not the held reply itself: `restated-state`
         // would otherwise fire on every correction, since a corrected reply says the same thing.
         prevReply: held.prevReply,
+        // FROZEN AT HOLD TIME, not recomputed. `held.answers` is the answer set as it was when the
+        // original reply was linted; the thread has moved on since (that is exactly what
+        // {@link LintHold.answers} exists to record), so recomputing here would judge the correction
+        // against messages the held reply was never answering.
+        founderMessages: held.answers?.map((a) => a.quote) ?? [],
         policy: lintPolicyRef.current,
       });
       const text = retry?.text ?? corrected;
@@ -2712,6 +2717,15 @@ export function ConciergeHost({
             turnId: e.id,
             toolCalls: e.toolCalls,
             prevReply: prevReplyRef.current,
+            // ══ WHICH OF HIS MESSAGES THIS REPLY IS ANSWERING (bead sparkle-j6jra) ═══════════════
+            // Computed HERE and not read off the bubble, because the bubble does not have it yet:
+            // `answerFields` runs inside `upsert`, which is several statements below this one. From
+            // `chatRef.current` for the same reason `takeHold` reads it — "the thread as it stands
+            // right now" — and through the SAME `answerFields` the stub is drawn from, so the
+            // linter can never demand a quote of a message the affordance does not claim.
+            //
+            // A push returns `{}` from `answerFields`, so this is `[]` and the check stands down.
+            founderMessages: answerFields(chatRef.current, e.id).answers?.map((a) => a.quote) ?? [],
             policy: lintPolicyRef.current,
           })
         : null;

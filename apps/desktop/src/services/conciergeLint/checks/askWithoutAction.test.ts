@@ -38,6 +38,7 @@ function ctx(toolCalls: LintToolCall[] = [], over: Partial<LintContext> = {}): L
     toolCalls,
     refusals: [],
     prevReply: null,
+    founderMessages: [],
     policy: policy(),
     ...over,
   };

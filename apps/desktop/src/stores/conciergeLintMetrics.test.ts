@@ -125,6 +125,10 @@ describe("useConciergeLintMetrics — session-scoped increments", () => {
         // real defect and attached nothing to it. Its trigger is not a sentence about the concierge
         // at all — it is an assertion that something is broken.
         "defect-without-disposition",
+        // The founder's presentation rule as a structural check: the reply must OPEN by quoting the
+        // message it answers. Added to the union, to LINT_CHECK_IDS and to this row in one change —
+        // a check present in the first two and missing here is uncounted exactly as described above.
+        "reply-without-quote",
         "bare-agent-name",
         "bare-pr-number",
         "fat-pill-label",

@@ -200,11 +200,18 @@ async function flush() {
   });
 }
 
+/** What the user types when a case does not care what was asked. */
+const ASKED = "what's the fleet doing?";
+
 /** Drive one whole turn through the real event path. */
-async function turn(text: string, toolCalls: { name: string; input: string }[]) {
+async function turn(
+  text: string,
+  toolCalls: { name: string; input: string }[],
+  userText: string = ASKED,
+) {
   render(<ConciergeHost feed={feed()} />);
   await flush();
-  fireEvent.change(screen.getByRole("textbox"), { target: { value: "what's the fleet doing?" } });
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: userText } });
   fireEvent.click(screen.getByText("Send"));
   await flush();
   await act(async () => {
@@ -371,5 +378,51 @@ describe("ask-without-action, end to end through the real mount", () => {
     });
     await turn("The branch is 92 commits behind. Want me to rebase it?", []);
     expect(useConciergeLintMetrics.getState().checks["ask-without-action"]).toBe(0);
+  });
+});
+
+// ══ THE SEAM `reply-without-quote` HANGS ON, WHICH NO UNIT TEST CAN REACH ═══════════════════════
+// The check is a pure function of `ctx.founderMessages`, and its own suite supplies that array
+// directly — so every row over there passes even if `ConciergeHost` never computes it. That is the
+// defaulted-seam shape this repo has a standing warning about: delete the one line in the mount that
+// calls `answerFields(chatRef.current, e.id)` and the check's whole suite stays green while the
+// feature is dead, because an absent answer set makes the check stand down by design.
+//
+// These two rows are the only thing in the tree that would go red. They drive the REAL send path, so
+// the message under test is a genuine `you` bubble that `pendingAnchors` has to find, and they share
+// one user message and differ only in whether the reply opens by quoting it.
+describe("reply-without-quote, end to end through the real mount", () => {
+  const QUOTE_ON = {
+    ...CHECKS_PAYLOAD,
+    // `warn`, not the shipped `block`: the block path is `ConciergeHost.lintBlock.test.tsx`'s
+    // subject, and holding the reply here would put a correction turn between the violation and the
+    // counter that these rows are reading.
+    checks: { "reply-without-quote": { enabled: true, severity: "warn", autofix: false } },
+  };
+
+  beforeEach(() => {
+    h.getConfig.mockResolvedValue({ config: { concierge: { checks: QUOTE_ON } } });
+  });
+
+  it("FIRES when the reply does not open by quoting the message it is answering", async () => {
+    await turn("The fleet is quiet — three agents idle, nothing red.", [], "how is the fleet doing?");
+    expect(
+      useConciergeLintMetrics.getState().checks["reply-without-quote"],
+      "the mount must hand the check the message this reply answers; with an empty answer set the " +
+        "check stands down and this reads zero",
+    ).toBeGreaterThan(0);
+  });
+
+  it("stays SILENT when it opens with a blockquote of that same message", async () => {
+    await turn(
+      "> how is the fleet doing\n\nQuiet — three agents idle, nothing red.",
+      [],
+      "how is the fleet doing?",
+    );
+    expect(
+      useConciergeLintMetrics.getState().checks["reply-without-quote"],
+      "a reply that opens by quoting him is the compliant form and must not be flagged",
+    ).toBe(0);
+    expect(loggedViolations()).toEqual([]);
   });
 });

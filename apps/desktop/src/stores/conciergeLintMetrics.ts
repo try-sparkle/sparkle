@@ -38,6 +38,11 @@ export type LintCheckId =
   // bead, no agent, no stated reason. Unlike the two above, its trigger is not a sentence about the
   // concierge at all; it is an assertion that something is broken.
   | "defect-without-disposition"
+  // The founder's own presentation rule, made structural: a reply must OPEN by quoting the message
+  // it answers. Unlike the three above it judges the reply's SHAPE rather than its claims, and it is
+  // the first check whose evidence is a fact about the thread (which messages are outstanding)
+  // rather than about the turn.
+  | "reply-without-quote"
   | "bare-agent-name"
   | "bare-pr-number"
   | "fat-pill-label"
@@ -66,6 +71,7 @@ export const LINT_CHECK_IDS: readonly LintCheckId[] = [
   "ask-without-action",
   "unbacked-claim",
   "defect-without-disposition",
+  "reply-without-quote",
   "bare-agent-name",
   "bare-pr-number",
   "fat-pill-label",
@@ -106,6 +112,7 @@ const emptyChecks = (): Record<LintCheckId, number> => ({
   "ask-without-action": 0,
   "unbacked-claim": 0,
   "defect-without-disposition": 0,
+  "reply-without-quote": 0,
   "bare-agent-name": 0,
   "bare-pr-number": 0,
   "fat-pill-label": 0,

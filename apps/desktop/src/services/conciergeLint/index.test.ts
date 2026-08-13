@@ -27,6 +27,7 @@ const ctx = (over: Partial<LintContext> = {}): LintContext => ({
   toolCalls: [],
   refusals: [],
   prevReply: null,
+  founderMessages: [],
   policy: policy(),
   ...over,
 });
@@ -50,11 +51,14 @@ describe("lintReply — the registry", () => {
     // `unbacked-claim` sits second because it is the other half of the same pair — took no action
     // and said so, versus took no action and said it did. `defect-without-disposition` completes
     // that into a triple over one axis (what the turn owed the human): named a defect and attached
-    // nothing to it — no bead, no agent, no stated reason.
+    // nothing to it — no bead, no agent, no stated reason. `reply-without-quote` follows them as the
+    // second blocking check: it judges the reply's SHAPE rather than what the turn owed, so when a
+    // reply both withholds an action and buries the quote, the withheld action leads.
     expect(CHECKS.map((c) => c.id)).toEqual([
       "ask-without-action",
       "unbacked-claim",
       "defect-without-disposition",
+      "reply-without-quote",
       "hedge-words",
       "naked-file-ref",
       "restated-state",

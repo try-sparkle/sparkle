@@ -555,6 +555,27 @@ const DEFAULT_CONCIERGE_CHECKS: &[DefaultCheck] = &[
         threshold: None,
         words: None,
     },
+    // Did not OPEN by quoting the message it is answering. The rule is the founder's own and has
+    // been in `concierge-guidelines.md` — injected into the system prompt on every single turn — for
+    // as long as that file has existed; it is violated anyway, repeatedly, which is the same
+    // evidence `ask-without-action` rests on: a rule in prose competes with the task and loses
+    // exactly when the turn is busiest. He asked for it to be reject-based (bead sparkle-j6jra).
+    //
+    // Deterministic and needs no model: the app already knows which of his messages were
+    // outstanding when the reply began (`Concierge/replyAnchors.pendingAnchors` — the same fact the
+    // "Answered below" stub is drawn from), so the check is a similarity test between the reply's
+    // opening blockquote and those messages. An unprompted push answers nothing and is never flagged.
+    //
+    // `"block"`, and never autofix. Prepending a blockquote mechanically is the one thing the app
+    // must NOT do here: the quote's value is that the model demonstrably read the message, and an
+    // app-written quote asserts that on its behalf. Only the model can produce the compliant form.
+    DefaultCheck {
+        id: "reply-without-quote",
+        severity: "block",
+        autofix: false,
+        threshold: None,
+        words: None,
+    },
     DefaultCheck {
         id: "hedge-words",
         severity: "warn",
@@ -4127,6 +4148,19 @@ autofix   = false
 # warning would hand you a note about a dropped bug to read and act on, which is the labour this
 # check exists to remove.
 [concierge.checks.defect-without-disposition]
+enabled   = true
+severity  = "block"
+autofix   = false
+
+# Did not OPEN by quoting what you said. Every reply is supposed to start with a short blockquote
+# of your own words — one for each message it is answering — before anything else; a quote buried
+# under a preamble does not count, and neither does one at the end. Nothing is required of a reply
+# that answers nothing (an unprompted push), or of one answering a send that was only attachments.
+# The match is fuzzy on purpose: a reply quoting a cleaned-up version of something you dictated
+# passes, a quote about a different subject does not.
+# This one BLOCKS: the reply is held and the concierge is asked once for a corrected one. Sparkle
+# will not write the quote for it — the point of the quote is that it read what you sent.
+[concierge.checks.reply-without-quote]
 enabled   = true
 severity  = "block"
 autofix   = false
@@ -7707,6 +7741,12 @@ quit_app = 42
         ("hedge-words", "warn", false, None, Some("should, deserves to")),
         ("naked-file-ref", "warn", false, None, None),
         ("relay-paste", "off", false, Some(240), None),
+        // THE SECOND SHIPPED `"block"`, on the same entitlement as the one above: the mount holds a
+        // blocked reply and spends one correction turn on it. It blocks rather than warns because
+        // the founder asked for it to be reject-based after the prompt-level rule failed repeatedly
+        // (bead sparkle-j6jra) — a warning would hand him a note saying the reply he is already
+        // reading did not quote him, which is not the thing he asked for.
+        ("reply-without-quote", "block", false, None, None),
         ("restated-state", "warn", false, Some(200), None),
         ("unbacked-claim", "warn", false, None, None),
         ("unreported-refusal", "off", false, None, None),

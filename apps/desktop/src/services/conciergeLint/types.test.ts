@@ -69,6 +69,7 @@ describe("the pinned public contract", () => {
       toolCalls: [toolCall],
       refusals: [refusal],
       prevReply: null,
+      founderMessages: [],
       policy,
       resolvePrOwner: (prNumber: string) => (prNumber === "918" ? "a1" : null),
     };

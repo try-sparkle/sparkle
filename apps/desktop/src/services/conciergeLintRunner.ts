@@ -70,6 +70,15 @@ export interface ReplyLintInput {
   toolCalls?: readonly ConciergeToolCall[];
   /** The previous concierge reply in this thread, or null when this is the first. */
   prevReply?: string | null;
+  /** The user message(s) this reply is answering, oldest first — each one already reduced to the
+   *  same one-line excerpt the reply's anchor stub shows (`ReplyAnchor.quote`). Omitted or `[]`
+   *  means the reply answers nothing, which is the honest state for a proactive push and the state
+   *  `reply-without-quote` stands down on.
+   *
+   *  MAPPED AT THE BOUNDARY, deliberately: `LintContext` is a leaf contract with no dependency on
+   *  `components/`, so `ConciergeHost` hands over `ReplyAnchor[]` reduced to their quotes and this
+   *  module is the only place that knows both shapes. */
+  founderMessages?: readonly string[];
   policy: LintPolicy;
 }
 
@@ -127,6 +136,12 @@ export function runReplyLint(input: ReplyLintInput, sinks: LintSinks = {}): Lint
       toolCalls: toLintToolCalls(input?.toolCalls),
       refusals: [],
       prevReply: typeof input?.prevReply === "string" ? input.prevReply : null,
+      // `[]` when the caller said nothing, and that is the SAFE default here rather than merely the
+      // tidy one: an empty answer set makes `reply-without-quote` stand down, so a caller that has
+      // not been taught to supply this loses a finding instead of manufacturing one.
+      founderMessages: Array.isArray(input?.founderMessages)
+        ? input.founderMessages.filter((m): m is string => typeof m === "string")
+        : [],
       policy: input.policy,
     });
     // Counters are session-scoped and in-memory; `log = false` governs the DISK sink ONLY, so the
@@ -245,6 +260,8 @@ const CHECK_CORRECTIONS: Record<string, string> = {
     "You offered to do something instead of doing it. Carry it out with the tools you have and report what happened, or say plainly what is stopping you — do not ask permission for something you can just do.",
   "unbacked-claim":
     "You said you had already done something, but this turn made no call that would have done it. Either do it now and report the result, or drop the claim.",
+  "reply-without-quote":
+    "You did not open by quoting what I said. Start your reply with a short blockquote (`> ...`) of my own words — one for each message you are answering — and put it before anything else.",
   "hedge-words": "You hedged. Say what happened, or what you are about to do, in plain words.",
   "restated-state": "You repeated something you had already said. Cut it and lead with what is new.",
   "naked-file-ref":

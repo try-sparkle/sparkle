@@ -7,6 +7,7 @@ const ctx = (prevReply: string | null, policy: Partial<CheckPolicy> = {}): LintC
   toolCalls: [],
   refusals: [],
   prevReply,
+  founderMessages: [],
   policy: {
     enabled: true,
     log: false,

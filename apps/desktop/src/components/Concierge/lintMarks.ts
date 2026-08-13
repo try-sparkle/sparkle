@@ -103,6 +103,11 @@ const CHECK_SENTENCES: Record<string, string> = {
   // disposition. "Nothing attached" rather than "no bead" so the sentence stays true of the other two
   // dispositions the check accepts (an agent spawned, a message sent).
   "defect-without-disposition": "Named a bug — nothing attached to it",
+  // His own standing rule, read back to him in his own terms: every reply opens with a blockquote of
+  // what he said. Worded as the OMISSION and in the second person like its neighbours, and it names
+  // the OPENING rather than the quote, because a reply with the quote buried three paragraphs down
+  // is the exact shape the rule exists against.
+  "reply-without-quote": "Didn't open by quoting what you said",
   "bare-agent-name": "Named an agent you can't click",
   "bare-pr-number": "Named a PR you can't click",
   "fat-pill-label": "Put a whole sentence inside a pill",

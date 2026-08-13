@@ -7,6 +7,7 @@ const ctx = (policy: Partial<CheckPolicy> = {}): LintContext => ({
   toolCalls: [],
   refusals: [],
   prevReply: null,
+  founderMessages: [],
   policy: {
     enabled: true,
     log: false,

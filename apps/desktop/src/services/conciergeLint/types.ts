@@ -138,6 +138,24 @@ export interface LintContext {
   refusals: readonly LintRefusal[];
   /** The previous concierge reply in this thread, or null when this is the first. */
   prevReply: string | null;
+  /**
+   * The user's message(s) THIS reply is answering, oldest first — EMPTY when it answers nothing.
+   *
+   * Each entry is one message as `Concierge/replyAnchors.anchorQuote` renders it: whitespace
+   * collapsed to one line and capped at 120 characters. That is deliberately the SAME string the
+   * reply's anchor stub shows above the bubble, not a second extraction of the raw message — the
+   * two must not be able to disagree about what the user said.
+   *
+   * EMPTY MEANS "ANSWERING NOTHING", and it is a real state rather than a missing value: a
+   * proactive push (`services/conciergeProactive`) is unprompted, so there is no message to quote
+   * and `reply-without-quote` stands down. A caller that cannot work out the answer set must pass
+   * `[]` for the same reason — a check that fires on a guess is worse than one that stays quiet.
+   *
+   * The type is `string[]` and not `ReplyAnchor[]` on purpose: this file is a leaf contract with no
+   * React, no stores and no Tauri (see the header), and `ReplyAnchor` lives under `components/`.
+   * `conciergeLintRunner` does the one-line mapping at the boundary.
+   */
+  founderMessages: readonly string[];
   policy: LintPolicy;
   /** Owning build agent for a PR number. Returning `null` means UNRESOLVED OR AMBIGUOUS and NEVER
    *  a guess — a pill carrying the wrong id opens the wrong agent and the reader cannot tell,
