@@ -22,6 +22,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  MAX_RENDERED_NO_FINDINGS,
   MAX_STAGED_TURNS,
   RESEARCH_FAILED_PREAMBLE_HEADER,
   RESEARCH_PREAMBLE_HEADER,
@@ -164,6 +165,82 @@ describe("buildResearchFailurePreamble", () => {
     expect(p).not.toContain("No reason was recorded");
   });
 
+  // ── THE SAFETY CASE (roborev 63268, Medium) ─────────────────────────────────────────────────
+  //
+  // The concierge OWNS A DISPATCH TOOL, so a line telling it to re-dispatch is an action, not a
+  // description. The first version put "re-dispatch it … nothing else is going to retry it" in the
+  // shared header, which fired for CANCELLED tasks too — runs the founder deliberately killed, often
+  // to stop them burning tokens. That is the remedy-string trap in AGENTS.md: the suggested
+  // alternative has to be safe under the same conditions that produced the item.
+  it("tells the brain NOT to re-dispatch a run the founder cancelled", () => {
+    const p = buildResearchFailurePreamble([CANCELLED]);
+    expect(p).toContain("Do NOT re-dispatch");
+    // The failure arm's instruction must not appear anywhere in a cancelled-only section.
+    expect(p).not.toContain("Nothing will retry it");
+    expect(p).not.toMatch(/Re-dispatch it —/);
+  });
+
+  it("DOES tell it to re-dispatch a run that actually broke", () => {
+    const p = buildResearchFailurePreamble([FAILED]);
+    expect(p).toContain("Nothing will retry it");
+    expect(p).not.toContain("Do NOT re-dispatch");
+  });
+
+  // The two arms in ONE section, which is the case the shared header could not express: the same
+  // prompt must carry opposite instructions, each attached to its own item.
+  it("carries opposite guidance for a cancelled and a failed task in the same section", () => {
+    const p = buildResearchFailurePreamble([CANCELLED, FAILED]);
+    expect(p).toContain("Do NOT re-dispatch");
+    expect(p).toContain("Nothing will retry it");
+    // ...and the DON'T is attached to the cancelled item, not floating loose above both.
+    expect(p.indexOf("Do NOT re-dispatch")).toBeLessThan(p.indexOf("Nothing will retry it"));
+  });
+
+  // "RESEARCH DID NOT COME BACK" was a claim about the world, and for this shape it was false: it
+  // did come back, and it found nothing. A header asserting otherwise teaches the brain to report a
+  // completed search as a breakage.
+  it("does not call a completed-but-empty run a failure", () => {
+    const empty = task({ status: "done", findings: null, error: null });
+    const p = buildResearchFailurePreamble([empty]);
+    expect(p).toContain("ran to completion and found nothing");
+    expect(p).toContain("Treat that as the answer");
+    expect(p).not.toContain("No reason was recorded");
+  });
+
+  // ── THE FIRST-DRAIN BLAST (roborev 63268, Medium) ───────────────────────────────────────────
+  //
+  // No failed/cancelled/empty task has ever carried a `readAt`, because nothing ever claimed one
+  // until this feature existed. So the FIRST peek after this ships sees the install's entire
+  // history at once — 11 red rows plus every cancelled run ever, on the founder's own machine.
+  it("renders at most MAX_RENDERED_NO_FINDINGS items, keeping the NEWEST", () => {
+    const many = Array.from({ length: MAX_RENDERED_NO_FINDINGS + 4 }, (_, i) =>
+      task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i }),
+    );
+    const p = buildResearchFailurePreamble(many);
+    // Handed oldest-first, so the tail is the recent end — that is what a reader needs.
+    expect(p).toContain("q8");
+    expect(p).not.toContain("q0");
+    expect(p.match(/What happened:/g)).toHaveLength(MAX_RENDERED_NO_FINDINGS);
+  });
+
+  // A CAP WITHOUT A DISCLOSURE reports a partial list as a whole one — the defect
+  // `buildNoticeSection` was rewritten to remove, and `buildResearchPreamble`'s own rule.
+  it("discloses how many it withheld, and that they will not come back", () => {
+    const many = Array.from({ length: MAX_RENDERED_NO_FINDINGS + 3 }, (_, i) =>
+      task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i }),
+    );
+    const p = buildResearchFailurePreamble(many);
+    expect(p).toContain("3 older item(s) not listed here");
+    // The count of the WHOLE set is still stated, so the brain knows the section is a sample.
+    expect(p).toContain(`${MAX_RENDERED_NO_FINDINGS + 3} of them`);
+    // And it says they are already claimed — otherwise "3 more" implies they are still coming.
+    expect(p).toContain("will NOT be shown again");
+  });
+
+  it("says nothing about withholding when everything fits", () => {
+    expect(buildResearchFailurePreamble([FAILED])).not.toContain("not listed here");
+  });
+
   // A failed task whose error never got written still has to say something honest.
   it("admits when no reason was recorded rather than inventing one", () => {
     expect(buildResearchFailurePreamble([task({ status: "failed", error: null })])).toContain(
@@ -240,6 +317,34 @@ describe("peek — what reaches the prompt", () => {
     const { preamble, taskIds } = createResearchDrain(h.deps).peek();
     expect(preamble).toBe("");
     expect(taskIds).toEqual([]);
+  });
+
+  // ══ THE CAP IS ON RENDERING ONLY — CLAIMING IS NEVER CAPPED (roborev 63268) ═══════════════════
+  //
+  // This is the case that makes the cap safe rather than a new bug. If the cap reached `taskIds`,
+  // the withheld tasks would never be claimed, so their rows would never retire, so the backlog
+  // would sit on screen forever — the exact complaint the whole feature exists to fix — while a
+  // capped prompt made it look handled.
+  it("still CLAIMS every withheld failure, so every row retires", () => {
+    const many = Array.from({ length: MAX_RENDERED_NO_FINDINGS + 6 }, (_, i) =>
+      task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i, readAt: null }),
+    );
+    const h = harness(many);
+    const d = createResearchDrain(h.deps);
+
+    const { preamble, taskIds } = d.peek();
+    // Rendered: capped. Claimed: all of them.
+    expect(preamble.match(/What happened:/g)).toHaveLength(MAX_RENDERED_NO_FINDINGS);
+    expect(taskIds).toHaveLength(many.length);
+    expect(taskIds).toEqual(many.map((t) => t.id));
+
+    d.stage("11", taskIds);
+    d.settle("11");
+
+    // THE SIDE EFFECT: every row is gone, including the ones the prompt never printed.
+    expect(visibleTasks(h.list)).toEqual([]);
+    // ...and nothing is offered a second time.
+    expect(d.peek().taskIds).toEqual([]);
   });
 
   it("keeps the store's OLDEST-FIRST order — the story is told forwards", () => {

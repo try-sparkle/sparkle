@@ -110,12 +110,20 @@ export function agentStatusForResearch(status: ResearchStatus): AgentTabStatus {
 /**
  * What the header's disc rolls up: the LIVE tasks only.
  *
- * Terminal tasks are history — they stay in the expanded list, where the founder is deliberately
- * looking, and they do not paint the collapsed row. That is not tidiness, it is the `unmerged`
- * lesson from `engine/workerRollup` applied one row over: a red that can never be cleared stops
- * being a signal. A failed research task has no "read" concept (`readAt` is stamped for `done`
- * only), so escalating it here would leave the row permanently red after the first failure, for
- * everyone, with no gesture that calms it.
+ * Terminal tasks are history — they do not paint the collapsed row. That is not tidiness, it is the
+ * `unmerged` lesson from `engine/workerRollup` applied one row over: a red that can never be cleared
+ * stops being a signal.
+ *
+ * THE ORIGINAL GROUNDS FOR THIS HAVE BEEN RETRACTED, so the decision is re-stated on ones that
+ * survive. It used to read "a failed research task has no 'read' concept (`readAt` is stamped for
+ * `done` only) … no gesture that calms it". That is now false in both halves: `readAt` is stamped
+ * for EVERY terminal status, and the calming gesture exists — the concierge being told, which also
+ * retires the row. A future editor reasoning from the old premise would conclude the opposite.
+ *
+ * The decision stands anyway, on the simpler ground: a terminal task is FINISHED, and a rollup disc
+ * is about what is happening now. A row that has stopped needs no attention from the collapsed
+ * header, and it removes itself shortly afterwards, so escalating it would paint a red that is
+ * already on its way out.
  *
  * Consequence, stated so it is a decision rather than an oversight: the collapsed row is GREEN while
  * anything is live and GRAY otherwise, and it never goes red. If research ever grows a state that

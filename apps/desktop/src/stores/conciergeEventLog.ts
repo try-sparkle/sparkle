@@ -120,10 +120,15 @@ export const CONCIERGE_EVENT_WIRING: Record<ConciergeEventKind, "wired" | "named
   // is the one thing that reads the whole list on a schedule tied to turns; the sidebar row renders
   // the same list but is a view, and a view that emitted would emit again on every re-render.
   //
-  // IT CARRIES WHAT THE PREAMBLE CANNOT. `isUnread` is `done`-only, so a `failed` or `cancelled`
-  // task never reaches a prompt — and a concierge waiting on findings that are never coming has no
-  // other way to learn that. `done` is recorded too, so the stream is a complete account of how
-  // each task ended rather than a failure-only channel a reader would misread as "nothing finished".
+  // IT IS A SECOND ACCOUNT, NOT THE ONLY ONE — and it used to be the only one. `isUnread` is
+  // `done`-only, so a `failed` or `cancelled` task reached no prompt at all; that is what this
+  // existed for. It is no longer true: those tasks now get their own preamble section
+  // (`research/drain.buildResearchFailurePreamble`), because THIS log does not survive an app
+  // reload — it is plain module state, per the header — so it could never have been the durable
+  // channel a failure needs.
+  //
+  // Still recorded, and `done` with it, so the stream is a complete account of how each task ended,
+  // replayable from a cursor, where the preamble is a one-shot claimed on delivery and then gone.
   research_completed: "wired",
   // NAMED, NOT WIRED. `pr_checks_status` (services/conciergeTools/workflow.ts) is an ON-DEMAND read
   // the concierge performs itself; there is no background poller watching PR checks, so there is no

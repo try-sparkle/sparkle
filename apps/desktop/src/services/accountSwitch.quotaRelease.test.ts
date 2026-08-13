@@ -33,6 +33,7 @@ import {
 import { decideContinuation } from "./../engine/goalContinuation";
 import { newGoal } from "./../engine/agentGoal";
 import { moveAgent } from "./accountSwitch";
+import type { AgentTabStatus } from "@sparkle/ui";
 import { CONCIERGE_ACCOUNT_KEY } from "./accountSelection";
 import { setPinFromSwitch } from "./accountStore";
 
@@ -71,9 +72,14 @@ afterEach(() => {
 });
 
 /** An agent sitting behind a live account-limit wall, registered in the engine registry exactly as a
- *  mounted Terminal registers it. Returns the engine so the caller can unregister it. */
+ *  mounted Terminal registers it. Returns the engine so the caller can unregister it.
+ *
+ *  The status is CAPTURED (`lastStatus`) because one case below turns on whether the sticky red is
+ *  still up, and the wall alone cannot tell you — see that case. */
+let lastStatus: AgentTabStatus | null = null;
 function walledAgent(agentId: string): StatusEngine {
-  const engine = new StatusEngine({ agentId, onStatus: () => {} });
+  lastStatus = null;
+  const engine = new StatusEngine({ agentId, onStatus: (s) => { lastStatus = s; } });
   registerStatusEngine(agentId, engine);
   engine.ingest(SPINNER);
   engine.ingest(`\r⏺ ${SESSION_LIMIT}`);
@@ -161,6 +167,24 @@ describe("an account switch retires the wall it is switching AWAY from", () => {
       // asserting nothing. Probed directly: unterminated → `kind=quota`; terminated → `kind=null`,
       // wall still up, which is the state this test exists to reach.
       engine.ingest("\n⏺ Reading file src/foo.ts\n");
+
+      // ── PIN THE PRECONDITION THIS CASE TURNS ON (roborev 63242, Medium) ──────────────────────
+      //
+      // Everything here rests on `failureKind` NO LONGER being "quota" at the move — that is the
+      // only difference from the case above, and the only reason this reds against the unfixed
+      // guard. But the wall assertion below cannot see it: the wall is present either way. So the
+      // non-vacuity rested on an UNSTATED dependency — that `classifier.SAFE` still matches
+      // "Reading file", and that within this one chunk the flushed banner re-trips the red before
+      // the second line clears it again. Narrow that pattern, or let the TUI's line shape drift to
+      // `⏺ Read src/foo.ts`, and this case silently collapses into a duplicate of the one above:
+      // it would pass against BOTH the fixed and the unfixed code, retiring the regression guard
+      // for a High defect that was live on main, with nothing going red to say so.
+      //
+      // A spinner frame discriminates directly. With the red still up, the mid-stream-failure arm
+      // paints `blocked`; with it cleared, ordinary classification paints `working`. So a classifier
+      // change now fails the SETUP loudly instead of quietly reverting the case to a duplicate.
+      engine.ingest(SPINNER);
+      expect(lastStatus).toBe("working");
 
       // HALF ONE, and it is what makes the other half mean anything: the wall survived the recovery.
       expect(quotaBlockForAgent(agentId, NOW + 60_000)).toBeDefined();

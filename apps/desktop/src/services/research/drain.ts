@@ -89,12 +89,83 @@ export function buildResearchPreamble(tasks: readonly ResearchTask[]): string {
 }
 
 /**
- * The opening line of the FAILURE section — research that stopped without an answer.
+ * The opening line of the NO-FINDINGS section.
+ *
+ * ══ PURELY DESCRIPTIVE, AND THE GUIDANCE LIVES PER ITEM (roborev 63268) ═════════════════════════
+ *
+ * The first version put one instruction here — "re-dispatch it rather than waiting: nothing else is
+ * going to retry it" — and that was a REMEDY STRING WITH NO SAFETY ANALYSIS, which `AGENTS.md` calls
+ * out as needing the same scrutiny as the code path it replaces. The section carries `cancelled`
+ * tasks, i.e. runs the founder deliberately KILLED, and the concierge owns a dispatch tool. So the
+ * copy told the model to re-spawn the exact run he had just stopped to save tokens — while the rest
+ * of the stack states the opposite invariant explicitly (`research.rs::cancel_task` records no
+ * `error` because "a task the founder killed is not a broken one", and a test asserts "a task he
+ * killed is never re-narrated"). The only hedge, "if it bears on what he is asking", attaches
+ * grammatically to "say so", not to "re-dispatch".
+ *
+ * The header was also FALSE for one of the three shapes it covers: a `done` task with no findings
+ * DID come back — it found nothing. "Did not come back" is a claim about the world, and it was wrong.
+ *
+ * So the header now only says what is true of all three, and what to do is decided per item against
+ * that item's actual status. See {@link noFindingsLine}.
  */
 export const RESEARCH_FAILED_PREAMBLE_HEADER =
-  "RESEARCH DID NOT COME BACK — research you dispatched stopped without an answer, and the founder " +
-  "has NOT seen this. Say so plainly if it bears on what he is asking, and re-dispatch it (deeper, " +
-  "or as a narrower question) rather than waiting: nothing else is going to retry it. Oldest first.";
+  "RESEARCH WITHOUT FINDINGS — research you dispatched has ended without an answer, and the founder " +
+  "has NOT seen this. Say so plainly if it bears on what he is asking. Each item says what happened " +
+  "and what to do about it; follow that per item rather than treating them alike. Oldest first.";
+
+/**
+ * How many items the section RENDERS before it starts withholding.
+ *
+ * ══ WHY A CAP EXISTS AT ALL, AND WHY IT IS NOT A CAP ON WHAT IS CLAIMED (roborev 63268) ═════════
+ *
+ * This section is unlike the findings one in a way that only bites once: findings accumulate a few
+ * at a time, but NO failed/cancelled/empty task has ever carried a `readAt`, because until this
+ * feature existed nothing ever claimed one. `list_tasks` returns every JSON record on disk with no
+ * cap and nothing prunes the research dir — so the FIRST peek after this ships folds every such task
+ * in the install's entire history into a single prompt. On the founder's own machine that is the 11
+ * red rows plus every cancelled or empty run ever dispatched; on an older install it is unbounded.
+ *
+ * The cap is on the RENDERING only. Every id still goes into `taskIds`, so every one is still
+ * claimed and every row still retires — capping the claim instead would leave the backlog on screen
+ * forever, which is the bug this whole change exists to fix.
+ *
+ * And it DISCLOSES what it withheld, per `buildResearchPreamble`'s own standing rule: "if this ever
+ * has to bound its length, it must say what it withheld and how much — a cap without a disclosure is
+ * the defect `buildNoticeSection` was rewritten to remove."
+ */
+export const MAX_RENDERED_NO_FINDINGS = 5;
+
+/**
+ * What to tell the brain about ONE task that produced no findings — decided by its actual status.
+ *
+ * The three shapes are genuinely different events and the guidance is not interchangeable:
+ *
+ *   • `failed` — the run broke. Nothing retries it, so re-dispatching is the useful move, and the
+ *     runner's own sentence usually names the cap or the cause it should adjust for.
+ *   • `cancelled` — the FOUNDER stopped it. Re-dispatching is undoing a decision he made, on his
+ *     behalf, without being asked. The instruction is explicitly NOT to.
+ *   • `done` with no findings — it ran fine and found nothing. That is an answer, not a fault, and
+ *     saying "it did not come back" about it would be false.
+ */
+function noFindingsLine(task: ResearchTask): { what: string; then: string } {
+  if (task.status === "cancelled") {
+    return {
+      what: "You stopped it.",
+      then: "Do NOT re-dispatch it — he chose to stop it. Only run it again if he asks.",
+    };
+  }
+  if (task.status === "done") {
+    return {
+      what: "It ran to completion and found nothing.",
+      then: "Treat that as the answer. Re-dispatch only if a narrower question would help.",
+    };
+  }
+  return {
+    what: task.error ?? "No reason was recorded.",
+    then: "Nothing will retry it. Re-dispatch it — deeper, or as a narrower question — if it still matters.",
+  };
+}
 
 /**
  * Render unclaimed FAILED/CANCELLED tasks into their own short section. `""` when there is nothing.
@@ -124,12 +195,35 @@ export const RESEARCH_FAILED_PREAMBLE_HEADER =
  */
 export function buildResearchFailurePreamble(tasks: readonly ResearchTask[]): string {
   if (tasks.length === 0) return "";
-  const items = tasks.map((t, i) => {
-    // `cancelled` has no error by construction — the founder killed it, and that is the whole story.
-    const why = t.status === "cancelled" ? "You stopped it." : (t.error ?? "No reason was recorded.");
-    return `${i + 1}. You asked: ${t.question}\n   What happened: ${why}`;
+  // NEWEST KEPT, OLDEST WITHHELD. The caller hands these oldest-first (the narrative order), so the
+  // tail is the recent end — and on the first drain after this ships, the head is years of history
+  // while the tail is what just happened. Rendered back in the caller's order.
+  const shown = tasks.slice(Math.max(0, tasks.length - MAX_RENDERED_NO_FINDINGS));
+  const withheld = tasks.length - shown.length;
+
+  const items = shown.map((t, i) => {
+    const { what, then } = noFindingsLine(t);
+    return `${i + 1}. You asked: ${t.question}\n   What happened: ${what}\n   What to do: ${then}`;
   });
-  return [`${RESEARCH_FAILED_PREAMBLE_HEADER} ${tasks.length} of them:`, "", ...items].join("\n");
+  // THE DISCLOSURE IS NOT OPTIONAL — a cap that stays quiet reports a partial list as a whole one.
+  // It names the count AND that they are gone from the queue, because they ARE claimed: every id is
+  // still returned by `peek`, so a withheld task's row still retires and it will not be offered
+  // again. Saying only "5 more" would imply they are still coming.
+  const note =
+    withheld > 0
+      ? [
+          "",
+          `(${withheld} older item(s) not listed here, oldest first — they have been marked as told ` +
+            `and their rows retired, so they will NOT be shown again. Ask for the research list if ` +
+            `he needs them.)`,
+        ]
+      : [];
+  return [
+    `${RESEARCH_FAILED_PREAMBLE_HEADER} ${tasks.length} of them:`,
+    "",
+    ...items,
+    ...note,
+  ].join("\n");
 }
 
 /**
@@ -200,10 +294,14 @@ export interface ResearchDrain {
    * Note the current state of the task list, recording a `research_completed` event for anything
    * that has newly reached a terminal state.
    *
-   * Separate from `peek` because it covers what the preamble deliberately cannot: `isUnread` is
-   * `done`-only, so a task that FAILED or was CANCELLED never appears in a prompt — and the
-   * concierge that dispatched it would otherwise wait forever on an answer that is never coming.
-   * The event log is the surface for that (see `stores/conciergeEventLog`).
+   * Separate from `peek` because it records a DIFFERENT account of the same fact. It used to be the
+   * only channel for a failure — `isUnread` is `done`-only, so a FAILED or CANCELLED task reached no
+   * prompt at all — and that is no longer true: `buildResearchFailurePreamble` now carries them, and
+   * `isNoticePending` is what selects them. So this is a duplicate record, not the sole one.
+   *
+   * It is still worth keeping, and not merely for symmetry: it records `done` too, so the stream is
+   * a complete account of how each task ENDED, on a cursor a turn can replay — where the preamble is
+   * a one-shot that is claimed on delivery and then gone. What changed is which one is load-bearing.
    */
   observe(tasks?: readonly ResearchTask[]): void;
   /** Build the preamble. STAMPS NOTHING — see this file's header. */

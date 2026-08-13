@@ -140,19 +140,42 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/**
+ * ONE SETUP, SHARED BY ALL THREE CASES — and it is shared because a comment claiming they matched
+ * was WRONG (roborev 63242/63243, Medium, twice).
+ *
+ * The plain case's docstring said its setup was "character-for-character the inverted cases' setup",
+ * which is what made it the thing covering their absorbed-throw residue. It was not: the plain case
+ * ingested a spinner frame first and the inverted ones went straight to the banner, so the two took
+ * DIFFERENT branches of `ingest`'s arrival diff — the plain case reaching the banner with a non-empty
+ * carry, the inverted ones with an empty one.
+ *
+ * That gap is exactly the silent-green `it.fails` was chosen to prevent. If banner-only ever stopped
+ * arming a wall, both inverted cases would keep passing — their assertion still throws, now for the
+ * wrong reason — the plain case would keep passing because its spinner masked the difference, and
+ * after the durable store lands the intended flip-to-red would never happen. The file would go on
+ * reporting "the Pusher still cannot see the wall" long after it could.
+ *
+ * A shared function makes the claim true by construction rather than by a comment nobody re-checks.
+ */
+function walled(agent: string): StatusEngine {
+  const engine = mount(agent);
+  engine.ingest("✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)");
+  engine.ingest(`\r⏺ ${SPEND_LIMIT}`);
+  return engine;
+}
+
 describe("the Pusher can still see a quota wall after the pane that saw it is gone", () => {
   /**
    * THE PRECONDITION, and it lives OUT HERE for the reason in the header: an assertion inside an
    * `it.fails` can never red, so carrying it there would make it decoration. This is the half that
    * works today — and it is exactly why the defect is invisible to every existing test, so a
-   * regression in it would otherwise be silent. The setup is character-for-character the inverted
-   * cases' setup, which is what makes this cover their absorbed-throw residue.
+   * regression in it would otherwise be silent. It runs {@link walled}, the SAME function the
+   * inverted cases run, which is what makes it cover their absorbed-throw residue.
    */
   it("maps a MOUNTED pane's wall onto the snapshot — the half that already works", () => {
     const agent = freshAgent();
-    const engine = mount(agent);
-    engine.ingest("✻ Cogitating… (12s · ↑ 1.2k tokens · esc to interrupt)");
-    engine.ingest(`\r⏺ ${SPEND_LIMIT}`);
+    walled(agent);
 
     const snaps = buildFleetSnapshots(inputFor(agent));
     expect(snaps[0]?.quota?.message).toBe(SPEND_LIMIT);
@@ -165,8 +188,7 @@ describe("the Pusher can still see a quota wall after the pane that saw it is go
   // deliberately: everything else this case used to assert now lives in the plain case above.
   it.fails("keeps the wall on the snapshot once the agent's pane tears down", () => {
     const agent = freshAgent();
-    const engine = mount(agent);
-    engine.ingest(`\r⏺ ${SPEND_LIMIT}`);
+    const engine = walled(agent);
 
     // THE INCIDENT'S ACTUAL SEQUENCE. The banner ended the turn (`exit_code=Some(1)` in the logs),
     // and the row was closed — which is exactly Terminal.tsx's teardown pair.
@@ -183,8 +205,7 @@ describe("the Pusher can still see a quota wall after the pane that saw it is go
     // The half the founder actually reads. Same teardown, then the real condition evaluator — no
     // hand-built snapshot anywhere, so this cannot pass on a fixture that already had the field.
     const agent = freshAgent();
-    const engine = mount(agent);
-    engine.ingest(`\r⏺ ${SPEND_LIMIT}`);
+    const engine = walled(agent);
     unregisterStatusEngine(agent, engine);
     engine.dispose();
 

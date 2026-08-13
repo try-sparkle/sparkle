@@ -2897,10 +2897,12 @@ export function ConciergeHost({
   // looked", never "there is nothing". And a subscription so `research_completed` is recorded when
   // a task actually reaches its terminal state rather than whenever a turn happens to start.
   //
-  // The event log is what carries a FAILED or CANCELLED task to the concierge at all: the prompt
-  // preamble is `done`-only by design (`isUnread`), so without this a concierge that dispatched a
-  // task would wait forever on an answer that was never coming. `observe` is idempotent per task —
-  // it reports each id once — so a subscription that fires on every store write is safe.
+  // The event log used to be the ONLY thing carrying a FAILED or CANCELLED task to the concierge,
+  // because the prompt preamble was `done`-only (`isUnread`). It is not any more: those tasks now
+  // get their own preamble section, which is also what lets their rows retire. This subscription
+  // still earns its place as the replayable account of how each task ended — but it is no longer
+  // the thing standing between a failure and silence. `observe` is idempotent per task — it reports
+  // each id once — so a subscription that fires on every store write is safe.
   // ── AND A POLL, WITHOUT WHICH THE WHOLE FEATURE IS INERT ────────────────────────────────────
   //
   // The store is written by the mount refresh and by the refresh that follows a claim — and a claim
