@@ -1492,48 +1492,232 @@ fn live_usage_passes() -> &'static std::sync::Mutex<HashSet<u64>> {
     LIVE.get_or_init(|| std::sync::Mutex::new(HashSet::new()))
 }
 
+// ---- the transcript directory-listing cache -------------------------------------
+//
+// Four commands walk the SAME `projects/**` tree — `accounts_usage`, `accounts_spend`,
+// `accounts_ceilings`, `accounts_limit_events` — and every one of them used to `read_dir` the whole
+// thing from scratch, on every call. Measured on the founder's machine (2026-08-13), one root:
+//
+//     20,515 directories · 56,060 dirents · 17,470 `.jsonl`  →  2.4-4.0 s per walk
+//
+// against a caller that re-asks every `ACCOUNT_CACHE_TTL_MS` (5 s, `accountSelection.ts`) and sits
+// on the agent-spawn path. A walk that takes longer than the interval which triggers it IS a pinned
+// worker, which is what a `sample` of v0.103.0 caught: 4354/4354 samples of one tokio blocking
+// worker inside `collect_usage_files`, bottoming out in `__getdirentries64`. It scales with the
+// fleet — those 20,515 dirs are one session sidecar dir plus one `tool-results/` dir per session,
+// and 56 live agents mint them continuously.
+//
+// So: stop re-reading directories that did not change. A directory's own mtime is bumped by every
+// create / unlink / rename INSIDE it — exactly the set of changes that can alter the listing — so it
+// is a sound validity key for that listing. An APPEND to a transcript does NOT bump it, and that is
+// fine: the walker stats every `.jsonl` the listing hands back regardless, because that stat is what
+// feeds both the 7d cutoff filter and the parse memo. Nothing about which files are found, or in
+// what order they are parsed, changes — this is a syscall cut, not a policy change.
+//
+// Measured steady state on the same tree: 20,515 dir stats + 17,470 file stats ≈ 0.36-0.60 s, a
+// 5-7x cut, and only the handful of directories that actually changed are re-listed.
+
+/// How settled a directory's mtime must be before its listing may be cached.
+///
+/// The one race an mtime key has: we stat at t0 and `read_dir` at t1, so a create landing in
+/// (t0, t1) that our listing missed must still leave a mtime DIFFERENT from the one we recorded, or
+/// the next pass takes the cached listing and never learns the file exists. That holds whenever the
+/// filesystem's timestamp granularity is finer than t1-t0 (APFS is nanoseconds) and fails on a
+/// 1-second-granularity one. Refusing to cache a directory whose mtime is younger than this closes
+/// it on ANY granularity: a directory being written to right now is simply re-listed every pass —
+/// which is both correct and nearly free, since on a live machine that is a handful of active
+/// session dirs out of twenty thousand.
+const DIR_CACHE_SETTLE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Working-set bound for the listing cache. The founder's primary tree alone is ~20,500 directories
+/// and a pass spans several roots, so this is several trees' worth. Past it the least-recently-used
+/// listings go: a dropped listing costs one `read_dir`, never a wrong answer.
+const DIR_CACHE_MAX: usize = 100_000;
+
+/// One directory's `.jsonl` children and real subdirectories, valid while its mtime is unchanged.
+struct DirListing {
+    /// The directory's mtime when we listed it — the validity key.
+    modified: SystemTime,
+    /// NAMES, not full paths, and behind an `Arc` so a cache hit is two refcount bumps rather than a
+    /// deep clone under the lock. Storing paths would duplicate this map's own keys (~150 bytes
+    /// each on a worktree tree) for no gain: the walker builds a `PathBuf` per child regardless, to
+    /// stat it.
+    dirs: std::sync::Arc<[std::ffi::OsString]>,
+    files: std::sync::Arc<[std::ffi::OsString]>,
+    /// LRU key for [`crate::spend::evict_two_tier`] — the same bound both transcript memos use.
+    last_touch: u64,
+}
+
+type DirCache = std::collections::HashMap<PathBuf, DirListing>;
+
+/// Process-wide, like the parse memo beside it: every window's `accounts_usage` and every concurrent
+/// `accounts_spend` walk the same tree, so a per-call cache would help none of them.
+fn dir_cache() -> &'static std::sync::Mutex<DirCache> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<DirCache>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(DirCache::new()))
+}
+
+/// Monotonic LRU stamp, so recency is a comparison rather than a clock read.
+fn dir_cache_tick() -> u64 {
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `dir`'s real subdirectories and `.jsonl` children, served from the mtime-keyed cache when the
+/// directory has not changed since we last listed it. `None` when it cannot be read at all.
+///
+/// `now` is the WALK's start instant, handed in rather than read per directory: one clock read per
+/// pass instead of twenty thousand, and every directory of one walk judges "settled" against the
+/// same instant.
+///
+/// The third element is whether this call actually performed a `read_dir`. That is the side effect
+/// this cache exists to remove, so the walkers report it upward and the tests assert on it — the
+/// records come back identical either way, which is precisely why a records-only assertion could
+/// not tell a working cache from a missing one.
+fn list_transcript_dir(
+    dir: &Path,
+    now: SystemTime,
+) -> Option<(
+    std::sync::Arc<[std::ffi::OsString]>,
+    std::sync::Arc<[std::ffi::OsString]>,
+    bool,
+)> {
+    // FOLLOWS symlinks, matching `read_dir` (which follows the directory it is handed): an account
+    // `projects/` symlinked at another tree must be judged by the TARGET's mtime, or its listing
+    // would be pinned on a link node that never changes.
+    let modified = std::fs::metadata(dir).ok().and_then(|m| m.modified().ok());
+    if let Some(modified) = modified {
+        let tick = dir_cache_tick();
+        if let Ok(mut cache) = dir_cache().lock() {
+            if let Some(hit) = cache.get_mut(dir) {
+                if hit.modified == modified {
+                    hit.last_touch = tick;
+                    return Some((hit.dirs.clone(), hit.files.clone(), false));
+                }
+            }
+        }
+    }
+
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut dirs: Vec<std::ffi::OsString> = Vec::new();
+    let mut files: Vec<std::ffi::OsString> = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let name = entry.file_name();
+        // `file_type()` reports the LINK itself (it does not follow), so `is_dir()` is true only for
+        // a true directory and a symlinked dir is never descended into. That is the cycle guard the
+        // walkers document; splitting the listing out must not quietly relax it.
+        if ft.is_dir() {
+            dirs.push(name);
+        } else if Path::new(&name)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
+        {
+            files.push(name);
+        }
+    }
+    let dirs: std::sync::Arc<[std::ffi::OsString]> = dirs.into();
+    let files: std::sync::Arc<[std::ffi::OsString]> = files.into();
+    if let Some(modified) = modified {
+        if now
+            .duration_since(modified)
+            .is_ok_and(|age| age >= DIR_CACHE_SETTLE)
+        {
+            if let Ok(mut cache) = dir_cache().lock() {
+                cache.insert(
+                    dir.to_path_buf(),
+                    DirListing {
+                        modified,
+                        dirs: dirs.clone(),
+                        files: files.clone(),
+                        last_touch: dir_cache_tick(),
+                    },
+                );
+            }
+        }
+    }
+    Some((dirs, files, true))
+}
+
+/// Bound the listing cache at the end of a walk. Plain LRU: unlike the parse memo there is no live
+/// pass to exempt, because evicting an entry a running walk still wants costs it one `read_dir` and
+/// nothing else. Reuses [`crate::spend::evict_two_tier`] so the bound has one implementation across
+/// all three caches on this path.
+fn evict_dir_cache() {
+    if let Ok(mut cache) = dir_cache().lock() {
+        crate::spend::evict_two_tier(
+            &mut cache,
+            DIR_CACHE_MAX,
+            DIR_CACHE_MAX,
+            |_| false,
+            |l| (l.last_touch, l.modified),
+        );
+    }
+}
+
 /// The walk half of [`collect_usage_records_across`]: every in-window `.jsonl` under `root`, with the stat
 /// that both filtered it and keys the memo, plus its mtime as the sort key.
+///
+/// Returns how many directories it actually `read_dir`ed — see [`list_transcript_dir`] for why that
+/// is the number a test has to assert on.
 fn collect_usage_files(
     root: &Path,
     cutoff_epoch: i64,
     out: &mut Vec<(PathBuf, Option<std::fs::Metadata>, SystemTime)>,
-) {
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
+) -> usize {
+    let reads = collect_usage_files_at(root, cutoff_epoch, out, SystemTime::now());
+    evict_dir_cache();
+    reads
+}
+
+/// [`collect_usage_files`] with the walk's start instant injected, so the recursion reads the clock
+/// once and every directory judges [`DIR_CACHE_SETTLE`] against the same value.
+///
+/// Subdirectories are descended BEFORE this level's files are stat'd, where the old `read_dir` loop
+/// interleaved them. Emission order is not observable: `collect_usage_records_across` sorts the
+/// whole set by (mtime, path), a TOTAL order, before anything is parsed.
+fn collect_usage_files_at(
+    root: &Path,
+    cutoff_epoch: i64,
+    out: &mut Vec<(PathBuf, Option<std::fs::Metadata>, SystemTime)>,
+    now: SystemTime,
+) -> usize {
+    let Some((dirs, files, did_read)) = list_transcript_dir(root, now) else {
+        return 0;
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() {
-            collect_usage_files(&path, cutoff_epoch, out);
-        } else if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
-        {
-            // Skip transcripts untouched since before the 7d window (all their records are stale).
-            // Use std::fs::metadata (which FOLLOWS symlinks) rather than DirEntry::metadata (an
-            // lstat that returns the symlink node's own mtime): a symlinked transcript must be
-            // judged by its TARGET's mtime — the real file we'd otherwise parse — or a link node
-            // older than the window would wrongly skip a target being appended today (under-count).
-            // Fail open: if the stat/mtime read errors (e.g. broken symlink), we don't skip.
-            // The same stat also keys the parse memo below, so an in-window file costs one stat.
-            let meta = std::fs::metadata(&path).ok();
-            let modified = meta.as_ref().and_then(|m| m.modified().ok());
-            if cutoff_epoch > 0 {
-                if let Some(modified) = modified {
-                    if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
-                        if (dur.as_secs() as i64) < cutoff_epoch {
-                            continue;
-                        }
+    let mut reads = usize::from(did_read);
+    for name in dirs.iter() {
+        reads += collect_usage_files_at(&root.join(name), cutoff_epoch, out, now);
+    }
+    for name in files.iter() {
+        let path = root.join(name);
+        // Skip transcripts untouched since before the 7d window (all their records are stale).
+        // Use std::fs::metadata (which FOLLOWS symlinks) rather than DirEntry::metadata (an
+        // lstat that returns the symlink node's own mtime): a symlinked transcript must be
+        // judged by its TARGET's mtime — the real file we'd otherwise parse — or a link node
+        // older than the window would wrongly skip a target being appended today (under-count).
+        // Fail open: if the stat/mtime read errors (e.g. broken symlink), we don't skip.
+        // The same stat also keys the parse memo below, so an in-window file costs one stat.
+        //
+        // This stat is NOT cacheable on the directory's mtime, and that is the whole reason the
+        // listing cache is sound: an append leaves the parent directory untouched, so the file has
+        // to be stat'd on every pass no matter how settled its directory is.
+        let meta = std::fs::metadata(&path).ok();
+        let modified = meta.as_ref().and_then(|m| m.modified().ok());
+        if cutoff_epoch > 0 {
+            if let Some(modified) = modified {
+                if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                    if (dur.as_secs() as i64) < cutoff_epoch {
+                        continue;
                     }
                 }
             }
-            // Unreadable mtime sorts oldest — it already failed OPEN into the window above, and an
-            // arbitrary-but-fixed position keeps the order deterministic.
-            out.push((path, meta, modified.unwrap_or(UNIX_EPOCH)));
         }
+        // Unreadable mtime sorts oldest — it already failed OPEN into the window above, and an
+        // arbitrary-but-fixed position keeps the order deterministic.
+        out.push((path, meta, modified.unwrap_or(UNIX_EPOCH)));
     }
+    reads
 }
 
 // ---- structured rate-limit events ---------------------------------------------
@@ -1624,42 +1808,57 @@ fn latest_limit_event_in_file(path: &Path, since_epoch: i64) -> Option<(i64, Str
 
 /// Recursively find the newest rate-limit event under `projects_root` at or after `since_epoch`.
 /// Mirrors [`collect_usage_records`]'s traversal, including its symlink-cycle guard (real
-/// subdirectories only) and its mtime pre-filter.
+/// subdirectories only) and its mtime pre-filter — and, since both walk the same tree on their own
+/// cadences, its [`list_transcript_dir`] listing cache. `accounts_limit_events` is polled by the
+/// frontend, so this is the same pinned-worker shape `collect_usage_files` documents, on a second
+/// command.
+///
+/// Returns how many directories it actually `read_dir`ed, for the same reason that function does.
 fn latest_limit_event(
     projects_root: &Path,
     since_epoch: i64,
     best: &mut Option<(i64, String)>,
-) {
-    let Ok(entries) = std::fs::read_dir(projects_root) else {
-        return;
+) -> usize {
+    let reads = latest_limit_event_at(projects_root, since_epoch, best, SystemTime::now());
+    evict_dir_cache();
+    reads
+}
+
+/// [`latest_limit_event`] with the walk's start instant injected — one clock read per pass.
+fn latest_limit_event_at(
+    root: &Path,
+    since_epoch: i64,
+    best: &mut Option<(i64, String)>,
+    now: SystemTime,
+) -> usize {
+    let Some((dirs, files, did_read)) = list_transcript_dir(root, now) else {
+        return 0;
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() {
-            latest_limit_event(&path, since_epoch, best);
-        } else if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
-        {
-            // Transcripts are append-only, so a file untouched since before the lookback cannot
-            // hold an in-window event. Fail OPEN on a stat error (parse it) — missing a real limit
-            // is worse than an extra read. `metadata` (not `DirEntry::metadata`) so a symlinked
-            // transcript is judged by its target's mtime.
-            if let Some(modified) = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()) {
-                if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
-                    if (dur.as_secs() as i64) < since_epoch {
-                        continue;
-                    }
-                }
-            }
-            if let Some((ts, msg)) = latest_limit_event_in_file(&path, since_epoch) {
-                if best.as_ref().is_none_or(|(bts, _)| ts > *bts) {
-                    *best = Some((ts, msg));
+    let mut reads = usize::from(did_read);
+    for name in dirs.iter() {
+        reads += latest_limit_event_at(&root.join(name), since_epoch, best, now);
+    }
+    for name in files.iter() {
+        let path = root.join(name);
+        // Transcripts are append-only, so a file untouched since before the lookback cannot
+        // hold an in-window event. Fail OPEN on a stat error (parse it) — missing a real limit
+        // is worse than an extra read. `metadata` (not `DirEntry::metadata`) so a symlinked
+        // transcript is judged by its target's mtime. Not cacheable on the directory's mtime: an
+        // append leaves the parent untouched, which is exactly why the listing cache is sound.
+        if let Some(modified) = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()) {
+            if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                if (dur.as_secs() as i64) < since_epoch {
+                    continue;
                 }
             }
         }
+        if let Some((ts, msg)) = latest_limit_event_in_file(&path, since_epoch) {
+            if best.as_ref().is_none_or(|(bts, _)| ts > *bts) {
+                *best = Some((ts, msg));
+            }
+        }
     }
+    reads
 }
 
 /// The transcript root for one account, resolved the SAME way session detection does.
@@ -1763,51 +1962,66 @@ pub struct AccountCeiling {
 
 /// Every rate-limit event time under `projects_root` at or after `since_epoch` (not just the
 /// newest, unlike [`latest_limit_event`]) — the raw material for learning.
-fn collect_limit_event_times(projects_root: &Path, since_epoch: i64, out: &mut Vec<i64>) {
-    let Ok(entries) = std::fs::read_dir(projects_root) else {
-        return;
+///
+/// Third walker over the SAME tree, so it shares the [`list_transcript_dir`] listing cache with the
+/// other two. Its own per-file work is already gated behind a 30d mtime pre-filter, which left the
+/// directory traversal as the whole of its steady-state cost.
+///
+/// Returns how many directories it actually `read_dir`ed — see [`collect_usage_files`].
+fn collect_limit_event_times(projects_root: &Path, since_epoch: i64, out: &mut Vec<i64>) -> usize {
+    let reads = collect_limit_event_times_at(projects_root, since_epoch, out, SystemTime::now());
+    evict_dir_cache();
+    reads
+}
+
+/// [`collect_limit_event_times`] with the walk's start instant injected — one clock read per pass.
+fn collect_limit_event_times_at(
+    root: &Path,
+    since_epoch: i64,
+    out: &mut Vec<i64>,
+    now: SystemTime,
+) -> usize {
+    let Some((dirs, files, did_read)) = list_transcript_dir(root, now) else {
+        return 0;
     };
-    for entry in entries.flatten() {
-        let Ok(ft) = entry.file_type() else { continue };
-        let path = entry.path();
-        if ft.is_dir() {
-            collect_limit_event_times(&path, since_epoch, out);
-        } else if path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("jsonl"))
-        {
-            if let Some(modified) = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()) {
-                if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
-                    if (dur.as_secs() as i64) < since_epoch {
-                        continue;
-                    }
+    let mut reads = usize::from(did_read);
+    for name in dirs.iter() {
+        reads += collect_limit_event_times_at(&root.join(name), since_epoch, out, now);
+    }
+    for name in files.iter() {
+        let path = root.join(name);
+        if let Some(modified) = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()) {
+            if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                if (dur.as_secs() as i64) < since_epoch {
+                    continue;
                 }
             }
-            let Ok(text) = std::fs::read_to_string(&path) else {
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            if !line.contains("\"rate_limit\"") {
+                continue;
+            }
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 continue;
             };
-            for line in text.lines() {
-                if !line.contains("\"rate_limit\"") {
-                    continue;
-                }
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                if v.get("error").and_then(serde_json::Value::as_str) != Some("rate_limit") {
-                    continue;
-                }
-                if let Some(ts) = v
-                    .get("timestamp")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(parse_iso8601_to_epoch)
-                {
-                    if ts >= since_epoch {
-                        out.push(ts);
-                    }
+            if v.get("error").and_then(serde_json::Value::as_str) != Some("rate_limit") {
+                continue;
+            }
+            if let Some(ts) = v
+                .get("timestamp")
+                .and_then(serde_json::Value::as_str)
+                .and_then(parse_iso8601_to_epoch)
+            {
+                if ts >= since_epoch {
+                    out.push(ts);
                 }
             }
         }
     }
+    reads
 }
 
 /// Collapse raw limit-event timestamps into distinct EPISODES. A single limit produces a burst of
@@ -5545,6 +5759,254 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].input, 111, "oldest mtime first, whichever root it is in");
         assert_eq!(out[1].input, 222, "so last-copy-wins still means the newer transcript");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- the directory-listing cache ------------------------------------------------
+    //
+    // These assert the SIDE EFFECT — how many directories the walk actually `read_dir`ed — and not
+    // the records it returned. That distinction is the whole point: the records are byte-identical
+    // with the cache working, missing, or subtly wrong, so an assertion on them would have passed
+    // against the pinned-worker version this cache replaces and proved nothing at all.
+
+    /// mtime on a DIRECTORY. `set_mtime` opens `write(true)`, which is `EISDIR` on a directory, so
+    /// the read-only open is not a stylistic difference — it is the only one that works.
+    fn set_dir_mtime(path: &Path, epoch_secs: u64) {
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(epoch_secs);
+        let f = std::fs::File::open(path).unwrap();
+        f.set_times(std::fs::FileTimes::new().set_modified(t)).unwrap();
+    }
+
+    /// Age every directory in `dirs` well past [`DIR_CACHE_SETTLE`], so the listing cache is allowed
+    /// to memoize it. Slept-for time would be the alternative and is both slower and flakier.
+    fn settle(dirs: &[PathBuf]) {
+        let old = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 3600;
+        for d in dirs {
+            set_dir_mtime(d, old);
+        }
+    }
+
+    fn walked_names(files: &[(PathBuf, Option<std::fs::Metadata>, SystemTime)]) -> Vec<String> {
+        let mut v: Vec<String> = files
+            .iter()
+            .map(|(p, _, _)| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// THE REGRESSION. Every caller of this walk — `accounts_usage` on the agent-spawn path,
+    /// `accounts_spend`, `accounts_ceilings` — re-`read_dir`ed the entire transcript tree on every
+    /// single call. Measured on the founder's machine: 20,515 directories, 56,060 dirents, 2.4-4.0s
+    /// a pass, against a caller that re-asks every 5s — so a tokio blocking worker sat at 100%
+    /// continuously, which is precisely what a `sample` of v0.103.0 caught (4354/4354 samples inside
+    /// `collect_usage_files`, bottoming out in `__getdirentries64`).
+    ///
+    /// The assertion is the syscall count, not the records: an unchanged tree must be walked with
+    /// ZERO directory reads. Before the listing cache that number was 4 both times while the records
+    /// were identical, so nothing about the returned data could have caught this.
+    #[test]
+    fn a_second_walk_of_an_unchanged_tree_reads_no_directories() {
+        let base = unique_dir("dir-cache-unchanged");
+        // The real shape: projects/<slug>/<session>/tool-results — `tool-results` is the one that
+        // dominates on a live machine (8,267 of them, holding no `.jsonl` at all).
+        let root = base.join("projects");
+        let slug = root.join("p");
+        let session = slug.join("s");
+        let tool_results = session.join("tool-results");
+        std::fs::create_dir_all(&tool_results).unwrap();
+        std::fs::write(slug.join("a.jsonl"), "").unwrap();
+        std::fs::write(session.join("b.jsonl"), "").unwrap();
+        std::fs::write(tool_results.join("blob.txt"), "not a transcript").unwrap();
+        settle(&[root.clone(), slug.clone(), session.clone(), tool_results.clone()]);
+
+        let mut first = Vec::new();
+        let cold = collect_usage_files(&root, 0, &mut first);
+        assert_eq!(cold, 4, "cold: root + slug + session + tool-results are all listed");
+        assert_eq!(walked_names(&first), vec!["a.jsonl", "b.jsonl"]);
+
+        let mut second = Vec::new();
+        let warm = collect_usage_files(&root, 0, &mut second);
+        assert_eq!(warm, 0, "nothing changed, so nothing is re-listed — this is the fix");
+        assert_eq!(
+            walked_names(&second),
+            walked_names(&first),
+            "and the walk still finds exactly the same transcripts"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The PAIRED half of the test above, and the one that makes it mean something. "The second walk
+    /// read no directories" is also what a walk that had quietly stopped looking would report, so on
+    /// its own it is ambiguous. This pins the cause: the same setup, one new transcript, and the walk
+    /// finds it — because creating a file bumps its directory's mtime, which is the cache's key.
+    #[test]
+    fn a_new_transcript_invalidates_only_its_own_directory() {
+        let base = unique_dir("dir-cache-new-file");
+        let root = base.join("projects");
+        let slug = root.join("p");
+        let session = slug.join("s");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(slug.join("a.jsonl"), "").unwrap();
+        settle(&[root.clone(), slug.clone(), session.clone()]);
+
+        let mut first = Vec::new();
+        assert_eq!(collect_usage_files(&root, 0, &mut first), 3);
+        assert_eq!(walked_names(&first), vec!["a.jsonl"]);
+
+        std::fs::write(session.join("new.jsonl"), "").unwrap();
+
+        let mut second = Vec::new();
+        let reads = collect_usage_files(&root, 0, &mut second);
+        assert_eq!(
+            walked_names(&second),
+            vec!["a.jsonl", "new.jsonl"],
+            "a transcript written into a CACHED directory is still found"
+        );
+        assert_eq!(
+            reads, 1,
+            "and only the directory that changed is re-listed — root and slug stay cached"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Removal is the other direction, and it is not symmetric with creation for free: a cache keyed
+    /// on anything but the directory itself would keep serving a transcript that no longer exists,
+    /// and every later pass would stat a missing path.
+    #[test]
+    fn a_deleted_transcript_leaves_the_cached_listing() {
+        let base = unique_dir("dir-cache-delete");
+        let root = base.join("projects");
+        let slug = root.join("p");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join("a.jsonl"), "").unwrap();
+        std::fs::write(slug.join("gone.jsonl"), "").unwrap();
+        settle(&[root.clone(), slug.clone()]);
+
+        let mut first = Vec::new();
+        collect_usage_files(&root, 0, &mut first);
+        assert_eq!(walked_names(&first), vec!["a.jsonl", "gone.jsonl"]);
+
+        std::fs::remove_file(slug.join("gone.jsonl")).unwrap();
+
+        let mut second = Vec::new();
+        collect_usage_files(&root, 0, &mut second);
+        assert_eq!(walked_names(&second), vec!["a.jsonl"]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// [`DIR_CACHE_SETTLE`] is not decoration. A directory written to within the window is refused
+    /// the cache entirely, which is what closes the stat-then-`read_dir` race on a filesystem whose
+    /// timestamps are coarser than that gap. Delete the settle check and this test goes red while
+    /// every other one here stays green — the live session dirs are exactly the ones at risk.
+    #[test]
+    fn a_directory_written_to_right_now_is_never_cached() {
+        let base = unique_dir("dir-cache-unsettled");
+        let root = base.join("projects");
+        let slug = root.join("p");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(slug.join("a.jsonl"), "").unwrap();
+        // Deliberately NOT settled: both directories carry a mtime of a moment ago.
+
+        let mut first = Vec::new();
+        assert_eq!(collect_usage_files(&root, 0, &mut first), 2);
+        let mut second = Vec::new();
+        assert_eq!(
+            collect_usage_files(&root, 0, &mut second),
+            2,
+            "a just-touched directory is re-listed every pass rather than memoized on a mtime that \
+             may not yet be able to distinguish a concurrent write"
+        );
+        assert_eq!(walked_names(&second), vec!["a.jsonl"]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// THREE commands walk this one tree on three different cadences — `accounts_usage`,
+    /// `accounts_limit_events`, `accounts_ceilings` — and each had its own copy of the recursion.
+    /// Wiring only the walker the profile happened to name would have left the other two re-listing
+    /// the same 20,515 directories, so the worker stays hot and the sample just moves to a different
+    /// frame. They share ONE cache: a tree the usage walk just listed leaves the other two nothing
+    /// to list.
+    ///
+    /// Both halves are asserted, and the second is what stops the first from being vacuous: zero
+    /// directory reads is also what a walker that had quietly stopped looking would report, so the
+    /// limit event must still be FOUND off the cached listing.
+    #[test]
+    fn all_three_walkers_share_one_listing_cache() {
+        let base = unique_dir("dir-cache-shared");
+        let root = base.join("projects");
+        let slug = root.join("p");
+        std::fs::create_dir_all(&slug).unwrap();
+        std::fs::write(
+            slug.join("a.jsonl"),
+            format!("{}\n", limit_line("2026-07-26T15:00:00.000Z", "you've hit your limit")),
+        )
+        .unwrap();
+        settle(&[root.clone(), slug.clone()]);
+
+        let mut files = Vec::new();
+        assert_eq!(
+            collect_usage_files(&root, 0, &mut files),
+            2,
+            "the usage walk lists root + slug cold"
+        );
+
+        let mut best = None;
+        assert_eq!(
+            latest_limit_event(&root, 0, &mut best),
+            0,
+            "`accounts_limit_events` re-lists nothing — it reads the usage walk's listing"
+        );
+        assert!(best.is_some(), "and it still finds the limit event off that listing");
+
+        let mut times = Vec::new();
+        assert_eq!(
+            collect_limit_event_times(&root, 0, &mut times),
+            0,
+            "nor does the ceiling learner"
+        );
+        assert_eq!(times.len(), 1, "which still sees the event too");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The cache must not change the ANSWER, only the syscalls — including the property the walk's
+    /// own doc leans on: a symlinked directory is never descended into (the cycle guard), while a
+    /// symlinked `.jsonl` is still counted. Splitting the listing out of the recursion is exactly the
+    /// kind of refactor that relaxes that quietly.
+    #[test]
+    fn the_listing_cache_preserves_the_symlink_rules() {
+        let base = unique_dir("dir-cache-symlink");
+        let root = base.join("projects");
+        let real = base.join("outside");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(real.join("hidden.jsonl"), "").unwrap();
+        std::fs::write(real.join("target.jsonl"), "").unwrap();
+        // A symlinked DIR under the root: never descended, so `hidden.jsonl` is not counted.
+        std::os::unix::fs::symlink(&real, root.join("linkdir")).unwrap();
+        // A symlinked FILE: real usage, still counted.
+        std::os::unix::fs::symlink(real.join("target.jsonl"), root.join("link.jsonl")).unwrap();
+        settle(&[root.clone()]);
+
+        for pass in 0..2 {
+            let mut out = Vec::new();
+            collect_usage_files(&root, 0, &mut out);
+            assert_eq!(
+                walked_names(&out),
+                vec!["link.jsonl"],
+                "pass {pass}: symlinked dir not descended, symlinked transcript counted"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }
