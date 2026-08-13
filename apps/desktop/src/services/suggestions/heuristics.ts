@@ -2,12 +2,21 @@ import type { SuggestionButton } from "./types";
 // The picker-footer regex is owned by the engine's screenClassifier (the single retune point for
 // Claude Code TUI drift) and re-exported here for approvalClassifier, so the option detector, the
 // category classifier, and the red-vs-gray status check can never desync on what marks a picker.
-import {
-  PICKER_FOOTER,
-  pickerFooterSpan,
-  SELECTION_CURSOR,
-  LIVE_TAIL_LINES,
-} from "../../engine/screenClassifier";
+import { PICKER_FOOTER, pickerFooterSpan, SELECTION_CURSOR } from "../../engine/screenClassifier";
+// The ambient-chrome vocabulary, from the dependency-free module that is its documented shared
+// source of truth — the same one `screenClassifier` imports it from, so there is one definition of
+// "a row that is Claude Code's own furniture" rather than a second copy that can drift.
+import { AMBIENT_CHROME_LINE } from "../sessionLimitScreen";
+
+/** How many rows the shared vocabulary does NOT recognise may sit below a cursor-anchored option run
+ *  before it stops counting as the menu the screen is waiting on.
+ *
+ *  EIGHT, sized on the one real screen that needs an allowance at all: the theme picker draws a live
+ *  diff PREVIEW of the theme under its options — six non-empty rows that are neither chrome nor a
+ *  border, but are the menu's OWN output. Chrome itself is not counted here at any depth, so this is
+ *  not a bound on how far up the grid a menu may sit; it is a bound on how much genuine new output
+ *  can appear beneath one before it is a menu the human has already answered. */
+const UNRECOGNISED_BELOW_RUN = 8;
 
 export { PICKER_FOOTER };
 
@@ -73,13 +82,21 @@ const CONTINUE_PROMPT =
  *  `CONTINUE_PROMPT` matched the whole line and returned false unconditionally, so
  *  "Press Enter to continue, or 2 for details" and "Select 1-3, or press Enter to continue" both
  *  went silent — a LIVE numbered menu with no buttons, which this module's header calls strictly
- *  worse than a false red. (The `[^.?]{0,40}?` hop is lazy, so it skips happily past "to select" to
- *  reach "to continue"; the first cut's only negative test, "press 1 or 2 to choose", carries no
- *  continue verb and so could not catch this.)
+ *  worse than a false red.
  *
- *  So the continue-prompt exemption applies only when the line offers NOTHING ELSE. A digit that is
- *  part of a key name ("ctrl+2") does not count; a bare numeral does. */
-const NUMBERED_CHOICE_ON_LINE = /(?<![+\w])\d/;
+ *  ══ A CHOICE CONTEXT, NOT MERELY A DIGIT (roborev 63294) ══════════════════════════════════════
+ *  The first cut was `(?<![+\w])\d` — ANY bare numeral anywhere on the line. Ordinary continue
+ *  prompts routinely carry an incidental number: "Press Enter to continue (1 of 3)", "Press any key
+ *  to continue — 2 files skipped", a version string, a clock rendered on the same row. Each of those
+ *  lifted the exemption, `CHOICE_KEYWORD` then matched on "press"/"enter", and any numbered prose
+ *  above became a menu — which is defect (c), the false menu locking an agent behind the one key the
+ *  screen is asking for, restored through a third door. The `1.`/`2.` bullets of SECURITY_NOTES are
+ *  the canonical shape, so the regression would have landed on the exact screen this work fixes.
+ *
+ *  So the digit has to sit in a CHOICE context: directly after a verb that offers it, or as a range.
+ *  "or 2", "press 1", "select 1-3", "type 2" qualify; "(1 of 3)" and "v2.1.229" do not. */
+const NUMBERED_CHOICE_ON_LINE =
+  /\b(?:or|press|select|choose|enter|hit|type|pick)\b[ \t]*(?<![+\w])\d|(?<![+\w])\d[ \t]*[-–][ \t]*\d\b/i;
 
 function tail(scrollback: string, n: number = TAIL_LINES): string[] {
   const lines = scrollback.replace(/\r/g, "").split("\n").filter((l) => l.trim().length > 0);
@@ -328,10 +345,34 @@ function cursorAnchoredRunEnd(lines: readonly string[]): number {
       end = j;
       want += 1;
     }
-    // Everything below the run has to fit in the live tail, or this menu is not what the screen is
-    // waiting on. Counted from the END of the run, not from the cursor: the cursor may sit on the
-    // first of seven options, and the rows between it and the last are the menu's own.
-    return lines.length - end <= LIVE_TAIL_LINES ? end + 1 : -1;
+    // ══ COUNT WHAT IS *UNRECOGNISED* BELOW, NOT HOW MANY ROWS THERE ARE (roborev 63294) ════════
+    // The first cut bounded TOTAL rows below the run, which is the mechanism `screenAnswerable`
+    // explicitly rejected and reverted for this very question: "A fixed budget therefore rejects
+    // live, fully-visible, pressable dialogs… The discriminator is WHAT is below the footer, not HOW
+    // MUCH." On a real grid a footerless menu sits above Claude Code's persistent chrome tail AND
+    // whatever checklist is rendered; once that passes the budget, the menu stops parsing and defect
+    // (b) is back — no options, no attention dot — for exactly the screens this arm exists to serve.
+    // Both captured fixtures hide it, because each was captured with nothing below them.
+    //
+    // Composing `nothingUnrecognizedBelowFooter` was tried and is WORTHLESS here: it admits at most
+    // MAX_CHROME_BELOW_FOOTER (8) chrome rows plus one border, which always fits inside
+    // LIVE_TAIL_LINES (12) — so it can never accept anything the budget would reject, and a
+    // mutation-check proved the arm dead by surviving its removal.
+    //
+    // So the budget applies ONLY to rows the shared vocabulary does not recognise. Chrome below is
+    // free, however deep; genuine agent output is what ends a menu's life. `AMBIENT_CHROME_LINE`
+    // comes from `services/sessionLimitScreen`, which is the documented shared source of truth for
+    // this vocabulary (the same module `screenClassifier` imports it from), so this is reuse rather
+    // than the second copy that would drift.
+    let unrecognisedBelow = 0;
+    for (let j = end + 1; j < lines.length; j++) {
+      const below = lines[j] ?? "";
+      if (!below.trim() || AMBIENT_CHROME_LINE.test(below)) continue;
+      unrecognisedBelow++;
+    }
+    // The allowance exists for one real screen: the theme picker renders a live DIFF PREVIEW of the
+    // theme under its options, which is neither chrome nor a border but IS the menu's own output.
+    return unrecognisedBelow <= UNRECOGNISED_BELOW_RUN ? end + 1 : -1;
   }
   return -1;
 }

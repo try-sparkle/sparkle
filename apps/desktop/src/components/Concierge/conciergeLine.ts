@@ -120,6 +120,20 @@ function escapeLabel(name: string): string {
 }
 
 /**
+ * THE ONE PLACE THE ANONYMOUS-SUBJECT WORDING LIVES (roborev 63525).
+ *
+ * It had three independent copies — here in {@link ref}, in `actionReceiptLine.who()`, and as
+ * `receiptRuns.ANONYMOUS_SUBJECT`. That is a drift hazard with a specific, reachable failure: edit
+ * the wording in `who()` (the natural place, since that is what an INDIVIDUAL row renders) and a
+ * FOLDED run keeps saying the old words beside unfolded rows saying the new ones — breaking the
+ * fold's own invariant that it never shows words the rows it replaced did not.
+ *
+ * `conciergeLine` is the right home because both readers already depend on it, so neither has to
+ * import the other. `receiptRuns` re-exports it under its local name for its guards.
+ */
+export const ANONYMOUS_SUBJECT = "that agent";
+
+/**
  * Reference an agent — the only way to put an agent's name into a concierge line.
  *
  * The `@` sigil is written into the label because that is the form the persona emits and the form
@@ -130,7 +144,7 @@ export function ref(agent: ReferencableAgent): Slot {
   // A nameless agent would render as a bare `@`. There is nothing to click TO that is worth a pill
   // the reader cannot identify, so it degrades to the same words the app used before pills existed.
   if (name === "" || !WRITABLE_AGENT_ID.test(agent.id)) {
-    return { kind: PLAIN_SLOT, text: name === "" ? "that agent" : name };
+    return { kind: PLAIN_SLOT, text: name === "" ? ANONYMOUS_SUBJECT : name };
   }
   return {
     kind: AGENT_SLOT,

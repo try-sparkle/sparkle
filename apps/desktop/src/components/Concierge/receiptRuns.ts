@@ -19,7 +19,14 @@
 // has to act on — "I couldn't" is the answer to "why didn't it do the thing I asked". So:
 //
 //   • successes fold;
-//   • a refusal (`ok: false`) NEVER folds, and never counts toward a success total;
+//   • a refusal the FOUNDER must read never folds, and no refusal ever counts toward a success
+//     total. This bullet used to read "a refusal (`ok: false`) NEVER folds" flat, and that is no
+//     longer the rule (roborev 63295): a refusal aimed at the CONCIERGE — a review gate, running
+//     checks, no free agent slot — is one it read and routed around, so there is nothing owed and
+//     nothing to act on, and those repeat by construction until N identical rows rebuild the very
+//     wall this module exists to end. Those fold, keyed on `kind + gist`. The test is whether
+//     `Concierge/refusalAudience` gave the reason a gist; a founder-actionable refusal has none;
+//   • …and a folded refusal still never claims the action happened, and never drops its reason;
 //   • a partial fan-out (`failed > 0`) never folds either — `inboxBroadcast` reports a partial
 //     failure as an OK reply carrying counts, so keying on `ok` alone would swallow the failures
 //     into a number that claims flat delivery;
@@ -42,7 +49,13 @@
 // ONE agent, the sentence counts DISTINCT SUBJECTS for the agent noun and says so separately when
 // the number of sends exceeds it: "Sent to 12 agents' terminals" is a different claim from "Sent 16
 // messages to 12 agents' terminals", and only one of them is true at a time.
-import { line, plain, ref, type Line } from "./conciergeLine";
+import {
+  ANONYMOUS_SUBJECT,
+  line,
+  plain,
+  ref,
+  type Line,
+} from "./conciergeLine";
 import type {
   ConciergeMessage,
   ConciergeReceiptMark,
@@ -152,7 +165,7 @@ export function foldKeyOf(
       return "closed";
     case "goal":
       return "goal";
-    // `filed`, `merged` AND `retired` DELIBERATELY NEVER FOLD, and it is not an oversight to
+    // `filed`, `merged` AND `retired` NEVER FOLD **AS SUCCESSES**, and it is not an oversight to
     // revisit. Each of their lines carries a DISTINCT identifier the reader came for — a bead pill,
     // a PR number — so an honest folded sentence would have to enumerate exactly what folding was
     // meant to save. And a merge is high-consequence: "Merged 3 PRs" hides which three, which is the
@@ -164,6 +177,19 @@ export function foldKeyOf(
     // watched it happen and nobody will remember asking for it, so the line is the only account of
     // why an agent is gone. "Retired 6 agents." is precisely the sentence that would make an
     // unattended verb unauditable — it hides the six judgements the reason field exists to expose.
+    //
+    // SCOPED TO SUCCESSES, and that scoping is load-bearing rather than pedantic (roborev 63364).
+    // This function is only reached for `ok === true` — the refusal arm returns above it — so a
+    // REFUSED merge does fold, on `kind + gist`, and after roborev 63295 it is the commonest fold
+    // there is. Read as a flat "never", this comment is a live trap in a file whose block comments
+    // are explicitly the spec the next agent pins tests against. The `retired` reasoning above is
+    // unaffected: a retirement that was REFUSED never happened, so there is no judgement to hide.
+    //
+    // THE IDENTIFIER CAVEAT SURVIVES THE CARVE-OUT, and is the known cost: `ConciergeReceiptMark`
+    // carries no `prNumber`/`beadId`, so three refusals against three different PRs collapse into
+    // one "Didn't merge, 3 times" whose expansion shows three identical sentences. That is tolerable
+    // only because the individual refusal line carries no PR number either — the fold loses nothing
+    // the rows had. Carrying the identifier into the mark is the fix if that ever stops being true.
     case "filed":
     case "merged":
     case "retired":
@@ -244,14 +270,44 @@ export function foldReceiptRuns(
   return rows;
 }
 
+/**
+ * The words a member with no showable name renders as — RE-EXPORTED from `conciergeLine`, which
+ * owns them (roborev 63525).
+ *
+ * Exported so the residue guards assert the SYMBOL, not the string (roborev 63515): every one was
+ * `not.toContain("that agent")`, and a copy edit — this repo treats copy as code — would have made
+ * the count-shaped arms render the new wording while all ten assertions stayed green, since they
+ * were asserting the absence of a word the code no longer emitted.
+ *
+ * DEFINED ELSEWHERE, though, because owning it here only moved the drift one module over: the words
+ * an INDIVIDUAL row uses come from `actionReceiptLine.who()`, and a fold that says something else is
+ * the very invariant this module exists to hold.
+ */
+export { ANONYMOUS_SUBJECT } from "./conciergeLine";
+
+/**
+ * The NAME this member will actually be shown as, or `null` when it renders as
+ * {@link ANONYMOUS_SUBJECT}.
+ *
+ * THE SINGLE DERIVATION of "does this render as a real name?" — and it exists because re-deriving
+ * that rule is how this defect recurred four rounds running (63364 → 63476 → 63482 → 63506), each
+ * time as a predicate that no longer matched what the slot drew. {@link subjectSlot} and
+ * {@link namedMembers} both read THIS, so they cannot answer differently.
+ */
+function renderedName(mark: ConciergeReceiptMark): string | null {
+  const name = mark.subjectName?.trim() ?? "";
+  return name === "" ? null : name;
+}
+
 /** The subject slot for one member: a pill when the receipt resolved to an openable agent at post
  *  time, the words the line itself used otherwise. Deliberately reads the SAME two fields the
  *  individual line rendered from, so a folded row can never name an agent the row it replaced did
  *  not — and never invents a reference. */
 function subjectSlot(mark: ConciergeReceiptMark) {
-  const name = mark.subjectName?.trim() ?? "";
-  if (mark.subjectId && name !== "") return ref({ id: mark.subjectId, name });
-  return plain(name === "" ? "that agent" : name);
+  const name = renderedName(mark);
+  if (name === null) return plain(ANONYMOUS_SUBJECT);
+  if (mark.subjectId) return ref({ id: mark.subjectId, name });
+  return plain(name);
 }
 
 /**
@@ -274,6 +330,36 @@ function subjectKey(mark: ConciergeReceiptMark): string | null {
   const name = mark.subjectName?.trim();
   if (name !== undefined && name !== "") return `name:${name}`;
   return null;
+}
+
+/**
+ * The members that would render as a REAL NAME rather than as the words "that agent".
+ *
+ * KEYED ON WHAT WILL ACTUALLY RENDER, NOT ON `subjectKey` (roborev 63506), AND DERIVED FROM THE ONE
+ * FUNCTION THAT DECIDES IT rather than restating its rule (roborev 63515). `subjectKey` is non-null
+ * as soon as `subjectId` is a non-empty string, while a chip only reads as a real name when
+ * {@link renderedName} returns one. So a member with an id and an empty name passed the old
+ * predicate and rendered precisely the invented chip this filter exists to drop — and because
+ * `subjectList` dedupes by `subjectKey`, two such members with different ids produced
+ * `that agent, that agent` all over again.
+ *
+ * That shape is reachable from production, not hypothetical: `receiptMark` writes
+ * `subjectId: found.id` alongside `subjectName: found.name`, so any resolved agent whose feed name
+ * is empty yields `{subjectId: "…", subjectName: ""}`.
+ *
+ * The name test covers both renderable cases — pill (id + name) and plain name (name, no id) — and
+ * excludes only the fallback. A named function rather than an inline `.filter(…)` so the caller's
+ * decision lands on a line a mutation check can judge (`sparkle-2gd7b`).
+ */
+function namedMembers(
+  members: readonly ReceiptMessage[],
+): readonly ReceiptMessage[] {
+  const out: ReceiptMessage[] = [];
+  for (const m of members) {
+    // THROUGH `renderedName`, never a second copy of its rule — see that function.
+    if (m.actionReceipt && renderedName(m.actionReceipt) !== null) out.push(m);
+  }
+  return out;
 }
 
 /** How many DISTINCT agents a run touched. Two sends to one agent are two sends and one agent, and
@@ -376,31 +462,102 @@ export function receiptRunLine(run: ReceiptRun): Line {
     const gist =
       run.members.find((m) => m.actionReceipt?.gist)?.actionReceipt?.gist ?? "";
     const kind = run.members[0]?.actionReceipt?.kind;
+    /**
+     * DOES ANY MEMBER NAME SOMEONE? (roborev 63364, Medium — shipped, fixed forward.)
+     *
+     * `withSubjects` unconditionally appends `subjectList(members)`, and `subjectSlot` falls back to
+     * the words `"that agent"` for a member with no identifiable subject — deliberately, because an
+     * anonymous member must still be COUNTED. But the `merged` and `filed` SENTENCES name nobody,
+     * and their receipts usually carry no agent either (`merge_pr` gets a `prNumber`, not an
+     * `agentId`) — while `land_agent_branch` also classifies to `merged` and DOES carry one, which
+     * is why the rule below keys on the sentence's shape rather than on what resolved. So a run of
+     * three gated merge refusals rendered:
+     *
+     *     Didn't merge, 3 times — waiting on checks — that agent, that agent, that agent
+     *
+     * naming three agents the rows it replaced never named — breaking this module's own invariant
+     * ("a folded row can never name an agent the row it replaced did not") and rebuilding the
+     * identical-chip wall roborev 59145 removed, inside the fold that exists to end walls.
+     *
+     * The tests could not see it because they asserted a PREFIX and a `toContain`, both of which
+     * hold with the residue attached. They now assert the whole string.
+     */
+    /**
+     * WHETHER THE SENTENCE HAS A SUBJECT SLOT AT ALL — set per arm below.
+     *
+     * DECIDED BY THE SENTENCE, NOT BY WHO HAPPENED TO RESOLVE (roborev 63476, Medium). The first
+     * repair asked "did anyone resolve?" and suppressed the chips only when NOBODY did. That is
+     * all-or-nothing, and one member is enough to break it: `land_agent_branch` also classifies to
+     * `kind: "merged"` and DOES carry an `agentId`, so a run mixing one of those with two `merge_pr`
+     * refusals on the same gist folds together — a single named member flips the guard and the
+     * residue comes back for the other two:
+     *
+     *     Didn't merge, 3 times — waiting on checks — @Alpha, that agent, that agent
+     *
+     * The same invariant break, one member short of the case the tests covered.
+     *
+     * WHAT EACH SHAPE DOES — stated once here and applied at the return below; do not restate it a
+     * third time. The WHO-SHAPED arms (`spawned`, `closed`, `goal`) say "N agents" from
+     * `distinctSubjects`, so their chips and their count come from the same members and the list
+     * goes out WHOLE — filtering there would contradict the count, which is the failure roborev
+     * 59145 fixed. The COUNT-SHAPED arms (`merged`, `filed`, `sent`, default) say "N times" from
+     * `total`, so their residue is FILTERED to the members that actually named someone: real pills
+     * survive (a `sent` fan-out's rows did name their agents) and only invented chips are dropped.
+     *
+     * This paragraph said "suppressed unconditionally" for one commit, which was wrong for `sent`
+     * and is corrected here rather than left to disagree with the code — the stale-spec trap this
+     * module keeps setting for itself (roborev 63476, then 63506).
+     */
+    let subjectShaped = false;
     const tail = gist ? plain(` — ${gist}`) : plain("");
     const times = plain(`${total} times`);
+    let sentence: Line;
     switch (kind) {
       case "merged":
-        return withSubjects(line`Didn't merge, ${times}${tail}`, run.members);
+        sentence = line`Didn't merge, ${times}${tail}`;
+        break;
       case "spawned":
-        return withSubjects(
-          line`Couldn't spawn ${who}${tail}`,
-          run.members,
-        );
+        // WHO-SHAPED: the sentence counts agents, so its chips must come from the same members.
+        sentence = line`Couldn't spawn ${who}${tail}`;
+        subjectShaped = true;
+        break;
       case "sent":
-        return withSubjects(line`Not sent, ${times}${tail}`, run.members);
+        sentence = line`Not sent, ${times}${tail}`;
+        break;
       case "closed":
-        return withSubjects(line`Couldn't close ${who}${tail}`, run.members);
+        sentence = line`Couldn't close ${who}${tail}`;
+        subjectShaped = true;
+        break;
       case "goal":
-        return withSubjects(
-          line`Couldn't set a goal on ${who}${tail}`,
-          run.members,
-        );
+        sentence = line`Couldn't set a goal on ${who}${tail}`;
+        subjectShaped = true;
+        break;
       case "filed":
-        return withSubjects(line`Couldn't file, ${times}${tail}`, run.members);
+        sentence = line`Couldn't file, ${times}${tail}`;
+        break;
       default:
         // Same rule as the switch's own default: state the bare truth rather than guess a verb.
-        return withSubjects(line`${n} actions didn't go through${tail}`, run.members);
+        sentence = line`${n} actions didn't go through${tail}`;
+        break;
     }
+    // WHO-SHAPED: chips and count come from the same members, so the list goes out whole.
+    if (subjectShaped) return withSubjects(sentence, run.members);
+    // COUNT-SHAPED: FILTER, DO NOT SUPPRESS (roborev 63482, Medium — a regression this fixes).
+    //
+    // Blanket suppression was wrong for `sent`. Unlike `merged`/`filed`, a `sent` refusal mark DOES
+    // carry a real subject — `subjectOf` reads `agentId`/`agentName` off the args for every
+    // non-`spawned` kind — and a per-recipient fan-out refusing on one shared gist folds under
+    // `refusal:sent:<gist>`, which is exactly the shape this fold was built for. Suppressing there
+    // rendered `Not sent, 3 times — no free agent slot right now` and threw away three genuine
+    // `@Alpha, @Beta, @Gamma` pills the unfolded rows had shown: it loses WHICH agents never got the
+    // message, and costs the navigation `subjectList` exists to preserve. The invariant is "never
+    // name an agent the row it replaced did NOT" — and those rows did name them.
+    //
+    // Filtering is safe on these arms precisely because their sentence counts `total` ("3 times"),
+    // never `distinctSubjects`. The roborev 59145 objection — a filtered list contradicting its own
+    // count — applies only to the who-shaped arms above, where the count IS subject-derived.
+    const named = namedMembers(run.members);
+    return named.length > 0 ? withSubjects(sentence, named) : sentence;
   }
 
   switch (run.key) {

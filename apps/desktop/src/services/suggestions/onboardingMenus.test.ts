@@ -27,7 +27,11 @@ import {
   SECURITY_NOTES_2_1_229,
   LOGIN_SUCCESS_CONTINUE_2_1_229,
 } from "../../engine/onboardingScreens.fixture";
-import { APPROVAL_2_1_220, MODEL_PICKER_2_1_220 } from "../../engine/capturedScreens.fixture";
+import {
+  APPROVAL_2_1_220,
+  MODEL_PICKER_2_1_220,
+  PERSISTENT_CHROME_TAIL_2_1_220,
+} from "../../engine/capturedScreens.fixture";
 import { screenOffersAnswer } from "../../engine/screenAnswerable";
 
 describe("(b) a real onboarding menu is a menu, even with no picker footer", () => {
@@ -99,6 +103,30 @@ describe("(b) a real onboarding menu is a menu, even with no picker footer", () 
     expect(detectClaudeCodePicker(stale)).toEqual([]);
   });
 
+  // ══ …BUT "WHAT IS BELOW" COMES BEFORE "HOW MUCH" (roborev 63294) ══════════════════════════════
+  // The bound above was a FIXED LINE BUDGET, which is the mechanism `screenAnswerable` rejected and
+  // reverted for this exact question: "A fixed budget therefore rejects live, fully-visible,
+  // pressable dialogs… The discriminator is WHAT is below the footer, not HOW MUCH." On a REAL grid
+  // a footerless menu sits above Claude Code's persistent chrome tail plus whatever checklist is
+  // rendered — and once that passes the budget, the menu stops parsing and defect (b) is back.
+  //
+  // Both captured onboarding fixtures were captured with NOTHING below them, so neither can see
+  // this. That is what makes this test necessary rather than redundant: it composes a real captured
+  // menu with a real captured chrome tail, which is what the screen actually looks like in the app.
+  it("still parses a live menu sitting above Claude Code's persistent chrome", () => {
+    const onRealGrid = [
+      ONBOARDING_LOGIN_METHOD_2_1_229,
+      PERSISTENT_CHROME_TAIL_2_1_220,
+      ...Array.from({ length: 8 }, (_, i) => `  ⎿ checklist row ${i + 1}`),
+    ].join("\n");
+    // DELIBERATELY MORE THAN A TOTAL-ROW BUDGET WOULD ALLOW. Counting every row below the run puts
+    // this well past LIVE_TAIL_LINES, so the original bound rejected it and the menu vanished —
+    // defect (b), on a menu that is plainly still up. Counting only what the vocabulary does not
+    // recognise is what keeps it: the chrome tail is free at any depth.
+    expect(pickerBlockBounds(onRealGrid)).not.toBeNull();
+    expect(detectClaudeCodePicker(onRealGrid).length).toBeGreaterThan(0);
+  });
+
   // …AND THE DIAGNOSIS STAYS HONEST ABOUT WHAT IT SAW (roborev 63244, Medium). `footer-without-
   // options` tells the concierge "a dialog IS up, ask a human" — it must never be the answer for a
   // screen that draws no footer, or the arm manufactures the false escalations that got the
@@ -163,5 +191,20 @@ describe("(c) numbered PROSE under a continue-prompt is not a menu", () => {
   ])("still offers the menu when the prompt carries %s", (_label, prompt) => {
     const menu = ["1. keep", "2. discard", prompt].join("\n");
     expect(detectTerminalPrompts(menu).map((b) => b.label)).toEqual(["1", "2"]);
+  });
+
+  // ══ AN INCIDENTAL NUMERAL IS NOT A CHOICE (roborev 63294) ═════════════════════════════════════
+  // The escape hatch above was first written as "any bare digit on the line", and ordinary continue
+  // prompts carry one all the time — a step counter, a skipped-file count, a version string. Each
+  // lifted the exemption, `CHOICE_KEYWORD` matched on "press"/"enter", and the numbered prose above
+  // became a menu again: defect (c) restored through a third door, on the very screen it names.
+  // These use the REAL captured bullets, so the regression would fail here exactly as it would ship.
+  const securityBullets = SECURITY_NOTES_2_1_229.split("\n").slice(0, -1).join("\n");
+  it.each([
+    ["a step counter", "Press Enter to continue (1 of 3)"],
+    ["an incidental count", "Press any key to continue — 2 files skipped"],
+    ["a version string", "Press Enter to continue…  v2.1.229"],
+  ])("offers nothing when a continue prompt merely contains %s", (_label, prompt) => {
+    expect(detectTerminalPrompts([securityBullets, prompt].join("\n"))).toEqual([]);
   });
 });

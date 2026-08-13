@@ -8,11 +8,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   MIN_RUN,
+  ANONYMOUS_SUBJECT,
   foldKeyOf,
   foldReceiptRuns,
   receiptRunLine,
   type ReceiptRun,
 } from "./receiptRuns";
+import { actionReceiptLine } from "./actionReceiptLine";
 import type { ConciergeMessage, ConciergeReceiptMark } from "./types";
 
 /** A successful terminal send to `name`, as the thread would hold it. */
@@ -297,7 +299,7 @@ describe("receiptRunLine — the count has to be true", () => {
     );
     const l = receiptRunLine(run);
     expect(l.spoken).toContain("Sent to 3 agents' terminals.");
-    expect(l.spoken.match(/that agent/g) ?? []).toHaveLength(3);
+    expect(l.spoken.match(new RegExp(ANONYMOUS_SUBJECT, "g")) ?? []).toHaveLength(3);
   });
 
   it("agrees with ONE agent — the count the repeats wording is easiest to get wrong", () => {
@@ -458,11 +460,149 @@ describe("internal-gate refusals fold; founder-facing ones never do", () => {
     const run = runOf([gated("a"), gated("b"), gated("c")]);
     expect(run.members).toHaveLength(3);
     const line = receiptRunLine(run);
-    // Never claims it merged, and never drops the reason.
-    expect(line.spoken).toMatch(/^Didn't merge/);
+    // THE WHOLE STRING, not a prefix plus `toContain` (roborev 63364). Those weaker assertions all
+    // held while the line ended `— that agent, that agent, that agent`: `merged` carries no agent
+    // subject, and `withSubjects` was appending a phantom chip per member. An assertion that cannot
+    // see a residue is not guarding the sentence, it is guarding its opening words.
+    expect(line.spoken).toBe("Didn't merge, 3 times — waiting on checks");
+    expect(line.md).toBe("Didn't merge, 3 times — waiting on checks");
     expect(line.spoken).not.toMatch(/^Merged/);
-    expect(line.spoken).toContain("waiting on checks");
-    expect(line.spoken).toContain("3");
+  });
+
+  it("suppresses the residue on a MIXED run — one named member must not revive it", () => {
+    // roborev 63476. `land_agent_branch` also classifies to `kind: "merged"` and DOES carry an
+    // agentId, so a run mixing one of those with two `merge_pr` refusals on the same gist folds
+    // together. An all-or-nothing "did anyone resolve?" guard flips on that single member and
+    // restores the residue for the other two:
+    //     Didn't merge, 3 times — waiting on checks — @Alpha, that agent, that agent
+    // Both earlier cases used FULLY anonymous runs, so neither could see it.
+    const named = gated("a", {
+      subjectId: "11111111-2222-3333-4444-555555555555",
+      subjectName: "Alpha",
+    });
+    const l = receiptRunLine(runOf([named, gated("b"), gated("c")]));
+    // THE INVENTED CHIPS GO; THE REAL ONE STAYS (roborev 63482 refined this). @Alpha's row really
+    // did name @Alpha — `land_agent_branch` classifies to `merged` WITH an agentId — so dropping it
+    // would lose navigation the unfolded row had, which is the same invariant pointed the other
+    // way. What must never appear is a chip for a member that named nobody.
+    expect(l.spoken).not.toContain(ANONYMOUS_SUBJECT);
+    expect(l.md).not.toContain(ANONYMOUS_SUBJECT);
+    expect(l.md).toContain("Alpha");
+    // The count still speaks for all three, named or not — it counts `total`, not subjects.
+    expect(l.spoken).toContain("Didn't merge, 3 times — waiting on checks");
+  });
+
+  it("KEEPS real pills on a `sent` fan-out — those rows DID name their agents", () => {
+    // roborev 63482. `sent` is count-shaped ("Not sent, 3 times") but its marks carry REAL subjects:
+    // `subjectOf` reads agentId/agentName off the args for every non-spawned kind, and a
+    // per-recipient fan-out refusing on one shared gist folds under `refusal:sent:<gist>` — exactly
+    // the shape this fold was built for. Blanket suppression threw away three genuine pills and
+    // with them WHICH agents never got the message. Filtering is safe here because the sentence
+    // counts `total`, not `distinctSubjects`.
+    const who = (n: string, id: string) =>
+      gated("m" + n, {
+        kind: "sent",
+        gist: "no free agent slot right now",
+        subjectId: id,
+        subjectName: n,
+      });
+    const l = receiptRunLine(
+      runOf([
+        who("Alpha", "11111111-2222-3333-4444-555555555555"),
+        who("Beta", "22222222-2222-3333-4444-555555555555"),
+        who("Gamma", "33333333-2222-3333-4444-555555555555"),
+      ]),
+    );
+    expect(l.spoken).toContain("Not sent, 3 times");
+    expect(l.spoken).toContain("no free agent slot right now");
+    for (const n of ["Alpha", "Beta", "Gamma"]) expect(l.md, n).toContain(n);
+    // …and still no invented chip alongside the real ones.
+    expect(l.spoken).not.toContain(ANONYMOUS_SUBJECT);
+  });
+
+  it("drops ONLY the invented chips on a mixed `sent` run, keeping the real one", () => {
+    const l = receiptRunLine(
+      runOf([
+        gated("a", {
+          kind: "sent",
+          subjectId: "11111111-2222-3333-4444-555555555555",
+          subjectName: "Alpha",
+        }),
+        gated("b", { kind: "sent" }),
+        gated("c", { kind: "sent" }),
+      ]),
+    );
+    expect(l.md).toContain("Alpha");
+    expect(l.spoken).not.toContain(ANONYMOUS_SUBJECT);
+    // The COUNT still speaks for every member, named or not — it counts `total`, not subjects.
+    expect(l.spoken).toContain("3 times");
+  });
+
+  it("drops an ID-WITHOUT-NAME member — it renders as 'that agent', not as a name", () => {
+    // roborev 63506. The filter used to key on `subjectKey`, which is satisfied by an id alone —
+    // but `subjectSlot` draws a pill only when the id AND a non-empty name are present, and falls
+    // back to the literal words otherwise. So an id-without-name member passed the filter and
+    // rendered exactly the invented chip the filter exists to drop; and because `subjectList`
+    // dedupes by `subjectKey`, two of them with different ids produced "that agent, that agent".
+    // Reachable in production: `receiptMark` writes subjectId alongside a possibly-empty name.
+    for (const kind of ["merged", "sent"] as const) {
+      const l = receiptRunLine(
+        runOf([
+          gated("a", { kind, subjectId: "11111111-2222-3333-4444-555555555555" }),
+          gated("b", { kind, subjectId: "22222222-2222-3333-4444-555555555555" }),
+          gated("c", { kind, subjectId: "33333333-2222-3333-4444-555555555555", subjectName: "   " }),
+        ]),
+      );
+      expect(l.spoken, kind).not.toContain(ANONYMOUS_SUBJECT);
+      expect(l.md, kind).not.toContain(ANONYMOUS_SUBJECT);
+    }
+  });
+
+  it("still keeps a NAME-ONLY member, which the row really did show", () => {
+    // The other side of the same predicate: no id means no pill, but the words are the words the
+    // unfolded row used, so dropping them would lose something real.
+    const l = receiptRunLine(
+      runOf([
+        gated("a", { kind: "sent", subjectName: "Alpha" }),
+        gated("b", { kind: "sent" }),
+      ]),
+    );
+    expect(l.md).toContain("Alpha");
+    expect(l.spoken).not.toContain(ANONYMOUS_SUBJECT);
+  });
+
+  it("KEEPS the subject list on the who-shaped arms, where chips and count share a source", () => {
+    // The other half, and the reason this is decided by sentence shape rather than by suppressing
+    // chips everywhere: "Couldn't spawn 2 agents" counts via `distinctSubjects`, so dropping its
+    // chips would leave a count with nothing behind it (the failure roborev 59145 fixed).
+    const a = gated("a", {
+      kind: "spawned",
+      subjectId: "11111111-2222-3333-4444-555555555555",
+      subjectName: "Alpha",
+    });
+    const b = gated("b", {
+      kind: "spawned",
+      subjectId: "22222222-2222-3333-4444-555555555555",
+      subjectName: "Beta",
+    });
+    const l = receiptRunLine(runOf([a, b]));
+    expect(l.spoken).toContain("Couldn't spawn 2 agents");
+    expect(l.md).toContain("Alpha");
+    expect(l.md).toContain("Beta");
+  });
+
+  it("names NOBODY when the kind carries no subject — no phantom 'that agent' chips", () => {
+    // `merged` and `filed` get a prNumber/beadId, never an agentId, so a folded run of them has no
+    // one to name. `subjectSlot` falls back to the words "that agent" for an anonymous member, which
+    // is right for a COUNT and wrong here: it invents subjects the unfolded rows never showed, and
+    // rebuilds the identical-chip wall roborev 59145 removed.
+    for (const kind of ["merged", "filed"] as const) {
+      const l = receiptRunLine(
+        runOf([gated("a", { kind }), gated("b", { kind }), gated("c", { kind })]),
+      );
+      expect(l.spoken, kind).not.toContain(ANONYMOUS_SUBJECT);
+      expect(l.md, kind).not.toContain(ANONYMOUS_SUBJECT);
+    }
   });
 
   it("keeps founder-facing refusals as separate rows in the same feed", () => {
@@ -500,6 +640,102 @@ describe("internal-gate refusals fold; founder-facing ones never do", () => {
       ]);
       expect(receiptRunLine(run).spoken, kind).toMatch(pattern);
       expect(receiptRunLine(run).spoken, kind).toContain("waiting on checks");
+      // NO INVENTED SUBJECTS ON THE COUNT-SHAPED ARMS. Scoped deliberately: `spawned`/`closed`/
+      // `goal` say "N agents" from `distinctSubjects`, so an anonymous member there is counted AND
+      // slotted, and the two agree — that is the pre-existing contract, not the residue bug. The
+      // count-shaped arms name nobody, so any chip under them is invented.
+      if (kind === "merged" || kind === "filed")
+        expect(receiptRunLine(run).spoken, kind).not.toContain(ANONYMOUS_SUBJECT);
     }
+  });
+});
+
+
+// ── THE GUARDS KEY ON THE SYMBOL, AND THE SYMBOL IS WHAT THE CODE EMITS ────────────────────────
+//
+// roborev 63515. Every residue guard above reads `ANONYMOUS_SUBJECT` rather than the literal
+// "that agent", so a copy edit to the fallback moves the assertions with it instead of leaving
+// them asserting the absence of a word nothing emits any more. That indirection is only worth
+// anything if the symbol really is what an anonymous member renders as — which is what this pins.
+describe("ANONYMOUS_SUBJECT is the fallback the renderer actually uses", () => {
+  it("is what a member with no showable name renders as", () => {
+    const anon: ConciergeMessage = {
+      id: "x",
+      kind: "sparkle",
+      text: "Couldn't spawn that agent — no free agent slot right now",
+      actionReceipt: { kind: "spawned", ok: false, gist: "no free agent slot right now" },
+    };
+    // `spawned` is who-shaped, so its residue is emitted whole — including the fallback slot.
+    const l = receiptRunLine(runOf([anon, { ...anon, id: "y" }]));
+    expect(l.spoken).toContain(ANONYMOUS_SUBJECT);
+  });
+
+  it("is a non-empty string, so the guards above cannot be trivially satisfied", () => {
+    // A blank constant would make every `not.toContain(ANONYMOUS_SUBJECT)` assertion meaningless.
+    expect(ANONYMOUS_SUBJECT.trim().length).toBeGreaterThan(0);
+  });
+});
+
+
+// ── THE FOLDED ROW'S WORDS ARE THE UNFOLDED ROW'S WORDS (roborev 63525, fixed 63529) ──────────
+//
+// The fold's core invariant is that it never shows a reader something the rows it replaced did not.
+// The anonymous fallback used to exist as FOUR separate literals — `ref()`, `actionReceiptLine`'s
+// `who()`, its `spawned` refusal arm, and this module's own constant — so editing the wording where
+// an individual row renders it left the fold saying the old words beside rows saying the new ones.
+//
+// THE FIRST VERSION OF THIS TEST COULD NOT SEE THAT, and the way it failed is worth keeping: it fed
+// a `{kind: "spawned", ok: false}` receipt, whose refusal arm returned a HARD-CODED
+// "Couldn't spawn that agent" and never called `who()` at all. So the one line the commit changed
+// was not reached by the test written to cover it — revert `who()` and everything stayed green. An
+// earlier branch short-circuiting the mechanism under test is the exact vacuous shape AGENTS.md
+// names, and driving the real entry point was necessary but not sufficient.
+//
+// `closed` is used instead because BOTH sides genuinely render the fallback: the unfolded arm is
+// `Couldn't close ${subject}` with `subject` coming from `who()`, and the folded arm is who-shaped,
+// so its residue emits `subjectSlot`. A count-shaped kind (`sent`, `merged`) would not work — those
+// filter their residue away entirely, so the fold would have no words to compare.
+describe("the fold's anonymous wording is the same wording an individual row uses", () => {
+  it("matches actionReceiptLine's own fallback, through who() on one side and subjectSlot on the other", () => {
+    // ONE row, for a receipt naming nobody — this really does go through `who()`.
+    const single = actionReceiptLine(
+      {
+        id: "r1",
+        kind: "closed",
+        ok: false,
+        at: 1,
+        op: "fleet.close_agent",
+        reason: "a code review is still running",
+      },
+      () => null,
+    );
+    expect(single?.spoken).toBe(`Couldn't close ${ANONYMOUS_SUBJECT} — a code review is still running`);
+
+    // …and the FOLD of a run of them. Same words, by construction now.
+    const anon: ConciergeMessage = {
+      id: "x",
+      kind: "sparkle",
+      text: single?.md ?? "",
+      actionReceipt: { kind: "closed", ok: false, gist: "a code review is still running" },
+    };
+    const folded = receiptRunLine(runOf([anon, { ...anon, id: "y" }]));
+    expect(folded.spoken).toContain(ANONYMOUS_SUBJECT);
+  });
+
+  it("covers the spawned refusal arm too, which had its own literal", () => {
+    // roborev 63529: this arm bypassed `who()` and hard-coded the words. It is subject-less by
+    // design, so the assertion is that it uses the CONSTANT rather than a copy of it.
+    const l = actionReceiptLine(
+      {
+        id: "r2",
+        kind: "spawned",
+        ok: false,
+        at: 1,
+        op: "fleet.spawn_agent",
+        reason: "no free agent slot right now",
+      },
+      () => null,
+    );
+    expect(l?.spoken).toBe(`Couldn't spawn ${ANONYMOUS_SUBJECT} — no free agent slot right now`);
   });
 });

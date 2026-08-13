@@ -31,7 +31,8 @@ import {
   MODEL_PICKER_2_1_220,
   PERSISTENT_CHROME_TAIL_2_1_220,
 } from "../engine/capturedScreens.fixture";
-import { detectTerminalPrompts } from "./suggestions/heuristics";
+import { detectTerminalPrompts, pickerBlockBounds } from "./suggestions/heuristics";
+import { ONBOARDING_LOGIN_METHOD_2_1_229 } from "../engine/onboardingScreens.fixture";
 
 // The one ambient read `pickerFingerprint` makes. Driving it is what lets a test move the screen
 // under a caller the way a live agent does.
@@ -174,5 +175,41 @@ describe("pickerFingerprint is stable while the question is static", () => {
     const first = pickerFingerprint("agent-1", options);
     screen = screenWith(withElapsed("2m 40s"), "✻", "13s", "1.4k");
     expect(pickerFingerprint("agent-1", options)).toBe(first);
+  });
+});
+
+// ══ THE UPPER SIDE OF THE TOP-BORDER BOUND — THE SIDE THE DEFECT LIVES ON (roborev 63294) ═══════
+// Every fixture above is a BORDERED dialog whose rule sits within `DIALOG_TOP_SPAN` of its first
+// option, so all of them stay green if the bound is widened back to `PICKER_SPAN` (30). That leaves
+// the actual defect untested: `DIALOG_RULE` cannot tell a dialog's border from the TUI's full-width
+// transcript divider, so with a loose bound a BORDERLESS menu locks onto that divider and hashes
+// every moving status row between them — the churning fingerprint the bound exists to prevent, and
+// the one that made a readable menu permanently unanswerable.
+//
+// A borderless menu is not hypothetical: it is exactly what Claude Code's onboarding draws, which
+// this same work taught the parser to accept. So the pin uses the real captured one.
+describe("a borderless menu does not adopt the transcript divider as its border", () => {
+  beforeEach(() => {
+    screen = "";
+  });
+
+  /** The login menu with a full-width divider well above it — far enough that only a loose bound
+   *  would reach up and claim it. `SATURATING_TRANSCRIPT` supplies the moving rows in between. */
+  const borderlessUnderDivider = [
+    "────────────────────────────────────────────────────────────────────────────",
+    ...Array.from({ length: 10 }, (_, i) => `  ⏺ earlier transcript line ${i + 1}`),
+    ONBOARDING_LOGIN_METHOD_2_1_229,
+  ].join("\n");
+
+  it("reports no top border rather than the divider above it", () => {
+    const bounds = pickerBlockBounds(borderlessUnderDivider);
+    expect(bounds).not.toBeNull();
+    // -1 is the honest answer, and it is what sends `questionBlock` to its own bounded fallback
+    // instead of hashing everything down from the divider.
+    expect(bounds!.top).toBe(-1);
+  });
+
+  it("and so keeps one fingerprint while the status rows above it move", () => {
+    expect(new Set(fingerprintsAcrossTicks(borderlessUnderDivider)).size).toBe(1);
   });
 });

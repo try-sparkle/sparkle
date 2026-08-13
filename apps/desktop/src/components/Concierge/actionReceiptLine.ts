@@ -35,7 +35,14 @@
 //    its own when the id is unusable, so this module never has to guess — and never invents a
 //    reference, because a pill carrying a wrong id opens the wrong agent and the reader cannot tell.
 
-import { bead, line, plain, ref, type Line } from "./conciergeLine";
+import {
+  ANONYMOUS_SUBJECT,
+  bead,
+  line,
+  plain,
+  ref,
+  type Line,
+} from "./conciergeLine";
 import { refusalGist } from "./refusalAudience";
 import type { ConciergeActionReceipt } from "../../services/conciergeReceipts";
 import type { ConciergeReceiptMark } from "./types";
@@ -51,9 +58,13 @@ function who(receipt: ConciergeActionReceipt, resolve: ResolveReceiptAgent) {
   const found = receipt.agentId ? resolve(receipt.agentId) : null;
   if (found) return ref(found);
   // `agentName` is what the TOOL CALL said, so it is worth showing even with no id to open — it is
-  // still more useful than "that agent". It just cannot be a pill.
+  // still more useful than the anonymous fallback. It just cannot be a pill.
+  //
+  // THE FALLBACK COMES FROM `conciergeLine`, not a literal here (roborev 63525). A folded run must
+  // show the same words this row does, and three separate copies of them is how that quietly stops
+  // being true — editing this one is the natural move, and it used to leave the fold behind.
   const named = receipt.agentName?.trim();
-  return plain(named ? named : "that agent");
+  return plain(named ? named : ANONYMOUS_SUBJECT);
 }
 
 /**
@@ -162,7 +173,11 @@ export function actionReceiptLine(
     const tail = why ? plain(` — ${why}`) : plain("");
     switch (receipt.kind) {
       case "spawned":
-        return line`Couldn't spawn that agent${tail}`;
+        // THROUGH THE CONSTANT, not a literal (roborev 63529). This arm is subject-less by design
+        // — a spawn that was REFUSED has no agent to name — but hard-coding the words made it a
+        // fourth copy of them, and the drift it enables is the same one: edit the wording and this
+        // row keeps the old text while the folded run beside it uses the new.
+        return line`Couldn't spawn ${plain(ANONYMOUS_SUBJECT)}${tail}`;
       case "sent":
         // THE REFUSAL ARM NEEDS THE PLURAL TOO (roborev 57888). `inboxBroadcast` refuses with
         // `no-recipients` and `broadcast-failed`, both subject-less — so this rendered "Not sent to
