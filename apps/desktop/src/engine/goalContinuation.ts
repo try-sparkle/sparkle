@@ -114,6 +114,10 @@ export const CLOUD_MIN_CONTINUE_CENTS = 1;
 export type NoContinueReason =
   | "no-goal"
   | "goal-met"
+  /** Sparkle itself closed the goal after git proved the work reached the default branch. Distinct
+   *  from `goal-met`, which is somebody's CLAIM — the concierge reading these out should be able to
+   *  say which of the two happened, because only one of them is auditable. */
+  | "goal-discharged"
   | "goal-expired"
   | "already-escalated"
   | "not-idle"
@@ -309,6 +313,10 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   const state = goalStateOf(goal, now);
   if (state === "none") return { action: "none", reason: "no-goal" };
   if (state === "met") return { action: "none", reason: "goal-met" };
+  // BESIDE `met`, NOT AFTER THE STATUS GATES. A discharged goal is finished work; without this arm
+  // `discharged` falls past every goal gate to the status checks and a proven-complete agent is
+  // auto-continued — restarted to do a job git has already confirmed it did.
+  if (state === "discharged") return { action: "none", reason: "goal-discharged" };
   if (state === "expired") return { action: "none", reason: "goal-expired" };
   if (state === "escalated") return { action: "none", reason: "already-escalated" };
   // `state === "unmet"` here, which `goalStateOf` only returns for a defined goal — but that

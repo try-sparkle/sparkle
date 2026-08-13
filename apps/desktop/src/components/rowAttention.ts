@@ -122,6 +122,10 @@ export const STALL_CAUSE_LABEL: Record<StallCause, string> = {
   // THE ONLY LABEL THAT ADDRESSES THE READER. Every other phrase here names a state; this one names
   // an action, because it is the one cause where he is the only actor who can clear it.
   "human-verified-goal": "needs your sign-off",
+  // The second label that addresses the reader, and for the same reason: nothing else can clear it.
+  // "abandoned" rather than "expired" deliberately — the clock is not the fact worth three words
+  // here, the stranded branch is.
+  "abandoned-goal": "gave up, work stranded",
   "escalated-goal": "auto-continue gave up",
   "unmet-goal": "goal unmet",
   "expired-goal": "goal expired",
@@ -285,6 +289,20 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
       };
     case "met":
       return { state, text: goal.text, escalated: false, label: "met" };
+    case "discharged":
+      // NAMES THE PROOF, because that is the whole difference from `met` one case up. `met` is a
+      // CLAIM — the agent's, or a human's — and this is git's: Sparkle closed the goal itself after
+      // reading that the work reached the default branch. Showing the sha is what makes the claim
+      // auditable by the person reading the row, which is the entire justification for closing a
+      // goal with nobody watching.
+      return {
+        state,
+        text: goal.text,
+        escalated: false,
+        label: goal.dischargedSha
+          ? `finished — ${goal.dischargedSha.slice(0, 7)} landed on main`
+          : "finished — the work landed on main",
+      };
     case "expired":
       // Deliberately NOT worded as "done". An expired goal is unfinished work whose auto-continue
       // MANDATE ran out — the same two facts engine/agentStall keeps apart in its `expired-goal`

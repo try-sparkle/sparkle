@@ -136,6 +136,13 @@ pub enum DeathEvidence {
     ApiBanner,
     BlockingTool,
     GoalMetMarked,
+    /// `goalExpiry` DISCHARGED the goal: git proved the work is contained in the default branch and
+    /// the worktree is clean (`dischargedAt`, with both proving shas). Distinct from
+    /// `GoalMetMarked` because the CLAIMANT differs — that one is the agent's assertion about
+    /// itself, this one is evidence about its branch — and a reader deciding whether to resurrect
+    /// should be able to tell which it has. Both mean FINISHED, so `cause_of` maps both to
+    /// `CleanGoalMet`.
+    GoalDischargedOnGitProof,
     EpochDead,
     /// The PTY session was ABSENT from the app's own session map while the epoch was still
     /// alive — the reaper's inference, made with no observer. Distinct from `PtyExit`, which means
@@ -154,7 +161,9 @@ pub fn cause_of(evidence: DeathEvidence) -> Option<DeathCause> {
         DeathEvidence::QuotaBlock | DeathEvidence::Transcript429 => None,
         DeathEvidence::ApiBanner => Some(DeathCause::TransportTransient),
         DeathEvidence::BlockingTool => Some(DeathCause::BlockedOnHuman),
-        DeathEvidence::GoalMetMarked => Some(DeathCause::CleanGoalMet),
+        DeathEvidence::GoalMetMarked | DeathEvidence::GoalDischargedOnGitProof => {
+            Some(DeathCause::CleanGoalMet)
+        }
         DeathEvidence::EpochDead => Some(DeathCause::AppRestart),
         DeathEvidence::SessionVanished => Some(DeathCause::ProcessGone),
         DeathEvidence::PtyExit | DeathEvidence::SessionEndHook | DeathEvidence::None => {
@@ -233,6 +242,7 @@ fn serde_name_evidence(evidence: DeathEvidence) -> &'static str {
         DeathEvidence::ApiBanner => "api-banner",
         DeathEvidence::BlockingTool => "blocking-tool",
         DeathEvidence::GoalMetMarked => "goal-met-marked",
+        DeathEvidence::GoalDischargedOnGitProof => "goal-discharged-on-git-proof",
         DeathEvidence::EpochDead => "epoch-dead",
         DeathEvidence::SessionVanished => "session-vanished",
         DeathEvidence::PtyExit => "pty-exit",
@@ -1447,18 +1457,7 @@ mod tests {
              an unknown variant"
         );
 
-        let evidence = [
-            DeathEvidence::QuotaBlock,
-            DeathEvidence::Transcript429,
-            DeathEvidence::ApiBanner,
-            DeathEvidence::BlockingTool,
-            DeathEvidence::GoalMetMarked,
-            DeathEvidence::EpochDead,
-            DeathEvidence::SessionVanished,
-            DeathEvidence::PtyExit,
-            DeathEvidence::SessionEndHook,
-            DeathEvidence::None,
-        ];
+        let evidence = EVERY_EVIDENCE;
         for e in evidence {
             assert_eq!(
                 serde_json::to_string(&e).unwrap(),
@@ -1837,6 +1836,123 @@ mod tests {
         assert!(!r.resurrectable);
         assert_eq!(r.not_before_ms, None);
         assert_eq!(r.reaper_verdict, ReaperVerdict::Reapable);
+    }
+
+    /// EVERY `DeathEvidence` VARIANT, in one place.
+    ///
+    /// Hand-written, because Rust cannot enumerate an enum's variants without `strum` — that
+    /// residual is stated on `DeathCause` and is unchanged. What IS closed here: the list used to be
+    /// duplicated per test, so a new variant could be added to one and missed by the other. Both the
+    /// serde guard and the `cause_of` mapping test walk THIS array, so a variant added to one and
+    /// missed by the other is no longer possible.
+    ///
+    /// COVERAGE, STATED EXACTLY, because an earlier version of this paragraph claimed more: a TS
+    /// member with no Rust variant fails the mapping test (it looks each parsed member up here), and
+    /// a STALE EXTRA entry here is caught by the sibling serde guard, which round-trips every element
+    /// through serde. The `len` equality inside the mapping test compares the TS switch against the
+    /// TS union — both TypeScript-side — and says nothing about this array.
+    const EVERY_EVIDENCE: [DeathEvidence; 11] = [
+        DeathEvidence::QuotaBlock,
+        DeathEvidence::Transcript429,
+        DeathEvidence::ApiBanner,
+        DeathEvidence::BlockingTool,
+        DeathEvidence::GoalMetMarked,
+        DeathEvidence::GoalDischargedOnGitProof,
+        DeathEvidence::EpochDead,
+        DeathEvidence::SessionVanished,
+        DeathEvidence::PtyExit,
+        DeathEvidence::SessionEndHook,
+        DeathEvidence::None,
+    ];
+
+    /// Parse `causeOf`'s switch out of `deathTypes.ts` — the labels run as regularly as the union
+    /// members `ts_union_members` already handles: `case "x":` lines accumulate until a `return`
+    /// names the cause they share.
+    fn ts_cause_of(src: &str) -> std::collections::BTreeMap<String, Option<String>> {
+        let body = src
+            .split("export function causeOf")
+            .nth(1)
+            .expect("causeOf not found in deathTypes.ts");
+        let mut out = std::collections::BTreeMap::new();
+        let mut pending: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("case \"") {
+                if let Some(end) = rest.find('"') {
+                    pending.push(rest[..end].to_string());
+                }
+            } else if let Some(rest) = t.strip_prefix("return ") {
+                let cause = rest.strip_prefix('"').and_then(|r| r.find('"').map(|e| r[..e].to_string()));
+                for evidence in pending.drain(..) {
+                    out.insert(evidence, cause.clone());
+                }
+            } else if t == "}" && !out.is_empty() && pending.is_empty() {
+                break;
+            }
+        }
+        assert!(!out.is_empty(), "parsed no arms from causeOf — the parser, not the switch, is probably wrong");
+        out
+    }
+
+    /// THE EVIDENCE→CAUSE MAPPING, ASSERTED AGAINST `deathTypes.ts` ITSELF.
+    ///
+    /// `the_serde_strings_match_deathtypes_ts` compares the two vocabularies as SETS OF STRINGS, so
+    /// it is structurally blind to this mapping — and the mapping is the half hand-mirrored from
+    /// `deathTypes.causeOf`, i.e. the half that can drift.
+    ///
+    /// ⚠️ AN EARLIER VERSION OF THIS TEST WAS A THIRD HAND-WRITTEN COPY of the same table. It pinned
+    /// the Rust side against itself and could not see the drift its own name claimed to guard: edit
+    /// `causeOf` in the TypeScript, update `deathTypes.test.ts` beside it, and the Rust table still
+    /// agreed with the Rust `match` — both suites green, the mirrors diverged. It reads the source
+    /// now, which is what the name always promised.
+    ///
+    /// COVERAGE, STATED EXACTLY — the same statement `EVERY_EVIDENCE`'s own doc makes, because a
+    /// reader lands HERE and an earlier version of this paragraph claimed more than the code does.
+    /// What this test fails on is a PARSED TS member with no Rust variant: it looks each one up in
+    /// `EVERY_EVIDENCE` and panics if none serialises to it, which is the added-variant hole the
+    /// old fixed-length array left. The REVERSE direction — a stale extra entry in
+    /// `EVERY_EVIDENCE` — is enforced by `the_serde_strings_match_deathtypes_ts`, not here; do not
+    /// weaken that guard on the strength of this one. And the `len` equality below compares the TS
+    /// switch against the TS union, both TypeScript-side, so it is a parse-completeness check and
+    /// says nothing about the Rust array.
+    #[test]
+    fn cause_of_maps_every_evidence_the_way_deathtypes_ts_does() {
+        let src = include_str!("../../src/engine/deathTypes.ts");
+        let expected = ts_cause_of(src);
+
+        // Every evidence in the TS union must appear in the switch — otherwise the parse is partial
+        // and everything below is vacuous.
+        let members = ts_union_members(src, "DeathEvidence");
+        for m in &members {
+            assert!(expected.contains_key(m), "causeOf has no arm for {m:?}");
+        }
+        assert_eq!(expected.len(), members.len(), "causeOf and the union disagree on membership");
+
+        for (evidence_str, want) in &expected {
+            // No membership lookup here: the key sets were proven equal above, so one would be a
+            // no-op wearing the costume of a guard — and in a test whose whole value is that a
+            // reader can tell what it guards, that is worse than nothing.
+            let evidence = evidence_str.as_str();
+            // Round-trip through the serde name so this compares the SAME identity the wire uses.
+            let rust = EVERY_EVIDENCE
+                .iter()
+                .find(|e| serde_name_evidence(**e) == evidence)
+                .unwrap_or_else(|| panic!("no Rust variant serialises as {evidence:?}"));
+            let got = cause_of(*rust).map(|c| serde_name_cause(c).to_string());
+            assert_eq!(&got, want, "cause_of({evidence:?}) drifted from deathTypes.causeOf");
+        }
+    }
+
+    #[test]
+    fn a_discharged_close_is_accepted_end_to_end() {
+        let (_td, dir, app_data) = dirs();
+        open(&dir, "a1", "e");
+        let mut d = death(DeathCause::CleanGoalMet, DeathEvidence::GoalDischargedOnGitProof);
+        d.goal_met_at = Some(NOW - 1_000);
+        close_at(&dir, "a1", d, None).unwrap();
+
+        let r = read_at(&dir, &app_data, "a1", NOW).unwrap().unwrap();
+        assert!(!r.resurrectable, "a goal git PROVED landed must never come back");
     }
 
     #[test]

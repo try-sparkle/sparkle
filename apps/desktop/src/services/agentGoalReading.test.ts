@@ -10,7 +10,13 @@
 // shifting — would have turned confident verdicts into `unknown`, or `unknown` into "genuinely done",
 // with both suites green.
 import { beforeEach, describe, expect, it } from "vitest";
-import { correctedStatusFor, stallEvidenceFor, stallReadingFor } from "./agentGoalReading";
+import {
+  correctedStatusFor,
+  expiryProofFor,
+  stallEvidenceFor,
+  stallReadingFor,
+} from "./agentGoalReading";
+import { decideExpiry } from "../engine/goalExpiry";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useInteractionStore } from "../stores/interactionStore";
@@ -260,5 +266,73 @@ describe("the unlanded rule is SHARED with the sidebar, not a second copy", () =
     seedRoster({ lastPrompt: "go build the thing" });
     seed({ workflowState: { [A]: { ...BARE_WS, prState: "open" } } });
     expect("hasUnlandedWork" in stallEvidenceFor(A)).toBe(false);
+  });
+});
+
+describe("expiryProofFor — the evidence a goal can be latched permanently closed on", () => {
+  // THE SEAM, covered directly. Both of its shipped defects were store-shape bugs invisible from the
+  // pure-decider suite: the proof was gathered wrongly, so `decideExpiry` was fed `undefined` and
+  // refused — correct behaviour on evidence that should never have been missing. Neither half's tests
+  // could see the other, which is the split-halves failure AGENTS.md describes.
+  const LAPSED = NOW + 5 * 3_600_000;
+  const expiredGoal = () => ({ ...newGoal("Land the retry PR", NOW), ttlMs: 4 * 3_600_000 });
+
+  it("answers NOTHING when this window has no branch reading", () => {
+    // The post-relaunch state: the workflow watermarks persist while `branchStatus` boots clean.
+    seed({ workflowState: { [A]: { ...BARE_WS, prState: "closed" } } });
+    expect(expiryProofFor(A)).toBeUndefined();
+  });
+
+  it("answers a USABLE proof when the PR state is unknown — the case that shipped it inert", () => {
+    // `prState: null` is what a branch with no PR reports, so this is the ordinary reading, not an
+    // edge one. Requiring `hasOpenPr` here withheld the whole proof and left an agent walled by an
+    // outage unrecoverable — the exact population the mechanism exists for.
+    seed({ branchStatus: { [A]: { ...CLEAN_BS, ahead: 3 } } });
+    const proof = expiryProofFor(A);
+    expect(proof).toBeDefined();
+    expect("hasOpenPr" in proof!).toBe(false);
+    // …and the round trip: that proof must actually drive a re-arm, which is the whole point.
+    expect(
+      decideExpiry({
+        goal: expiredGoal(),
+        now: LAPSED,
+        runtime: "local",
+        hasWorktree: true,
+        proof,
+      }).action,
+    ).toBe("rearm");
+  });
+
+  it("reports a DIRTY PARKED tree as parked, not as unreadable", () => {
+    // `readUncommitted` returns `undefined` for exactly `dirty && !worktreeOnBranch`, so this — the
+    // MAJORITY of parked worktrees, since a tree is parked because someone is working in it — tripped
+    // the all-or-nothing gate and collapsed into `evidence-unreadable`. Only a parked-and-pristine
+    // tree ever reached the refusal written for it, and the two say different things to a human.
+    seed({ branchStatus: { [A]: { ...CLEAN_BS, dirty: true, worktreeOnBranch: false } } });
+    const proof = expiryProofFor(A);
+    expect(proof).toBeDefined();
+    expect(proof!.worktreeOnBranch).toBe(false);
+    const d = decideExpiry({
+      goal: expiredGoal(),
+      now: LAPSED,
+      runtime: "local",
+      hasWorktree: true,
+      proof,
+    });
+    expect(d.action).toBe("none");
+    if (d.action !== "none") throw new Error("unreachable");
+    expect(d.reason).toBe("worktree-parked");
+  });
+
+  it("…and that parked proof is fail-closed in every field, not merely ignored", () => {
+    // `decideExpiry` returns before reading them today. These values are chosen so that if it ever
+    // stopped doing so, no latch could be written from a tree whose contents belong to another
+    // branch: not a discharge (needs landed AND clean), and not an abandonment (needs unlanded).
+    seed({ branchStatus: { [A]: { ...CLEAN_BS, dirty: true, worktreeOnBranch: false } } });
+    const proof = expiryProofFor(A)!;
+    expect(proof.landed).toBe(false);
+    expect(proof.clean).toBe(false);
+    expect(proof.unlanded).toBe(false);
+    expect("hasOpenPr" in proof).toBe(false);
   });
 });

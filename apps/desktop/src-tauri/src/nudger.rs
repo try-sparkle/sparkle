@@ -479,15 +479,23 @@ struct AgentFacts {
     stage: Option<&'static str>,
 }
 
-/// Is this agent's goal MET? Only the exact token counts.
+/// Is this agent's goal FINISHED? Only the exact tokens count.
 ///
 /// Free function so the tri-state is assertable. `None` is a window that predates the field and
-/// "unmet"/"expired"/"escalated"/"none" are all live goals — every one of them must read as NOT met,
-/// because a false "met" is the only reading here that can silence an agent that still needs help.
-/// `engine/agentGoal.ts::GoalState` is the vocabulary; a typo on either side reads as unmet, which
-/// is the safe direction.
+/// "unmet"/"expired"/"escalated"/"none" are all live goals — every one of them must read as NOT
+/// finished, because a false "finished" is the only reading here that can silence an agent that
+/// still needs help. `engine/agentGoal.ts::GoalState` is the vocabulary; a typo on either side reads
+/// as unfinished, which is the safe direction.
+///
+/// ⚠️ "discharged" IS FINISHED TOO, and leaving it out was a live defect rather than an omission.
+/// It is the terminal state `goalExpiry` writes when git PROVED the work landed and the tree is
+/// clean — a stronger claim than "met", which the agent asserts about itself. `useRosterPublisher`
+/// publishes `goalStateOf` verbatim, so a discharged goal arrived here as an unrecognised token,
+/// read as a live goal, and the agent was pinged to "resume your goal" over work git had already
+/// confirmed landed: the founder's fourteen-ping screenshot, reproduced on the new state. This is a
+/// VALUE enumeration over a string, so TypeScript could not flag it when the state was added.
 fn goal_is_met(goal_state: Option<&str>) -> bool {
-    goal_state == Some("met")
+    matches!(goal_state, Some("met") | Some("discharged"))
 }
 
 /// Start the nudger. Idempotent; safe to call more than once.
@@ -2051,15 +2059,23 @@ mod tests {
 
     // ══ THE GOAL FACT AND THE AGENT'S ANSWER ════════════════════════════════════════════════════
 
-    /// ONLY `"met"` MEANS DONE, and this is the one reading in the whole change that can silence an
-    /// agent that still needs help — so every other state is asserted explicitly rather than left to
-    /// a default. `expired` and `escalated` are the dangerous pair: both have `metAt` unset and both
-    /// describe UNFINISHED work, so an implementation that tested "not unmet" would silence exactly
-    /// the agents that most need a human.
+    /// ONLY THE TWO FINISHED STATES READ AS DONE, and this is the one reading in the whole change
+    /// that can silence an agent that still needs help — so every other state is asserted explicitly
+    /// rather than left to a default. `expired` and `escalated` are the dangerous pair: both have
+    /// `metAt` unset and both describe UNFINISHED work, so an implementation that tested "not unmet"
+    /// would silence exactly the agents that most need a human.
+    ///
+    /// `discharged` is the second finished state, and it is asserted here because it was MISSING —
+    /// a goal git proved landed read as live and the agent was nudged to resume it. The list is a
+    /// value enumeration over a string, so nothing but this test can catch the next such addition.
     #[test]
-    fn only_an_explicitly_met_goal_reads_as_met() {
+    fn only_an_explicitly_finished_goal_reads_as_met() {
         assert!(goal_is_met(Some("met")));
-        for live in ["unmet", "expired", "escalated", "none", "", "Met", "MET"] {
+        assert!(
+            goal_is_met(Some("discharged")),
+            "discharged is git's own proof the work landed — a stronger claim than the agent's own"
+        );
+        for live in ["unmet", "expired", "escalated", "none", "", "Met", "MET", "Discharged"] {
             assert!(!goal_is_met(Some(live)), "{live:?} is not a finished goal");
         }
         assert!(

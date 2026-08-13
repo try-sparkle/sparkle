@@ -26,6 +26,10 @@ function seed() {
   useProjectStore.setState({ projects: [project] } as never);
 }
 
+/** The instant an escalation is stamped at in these tests. Explicit because the action REQUIRES
+ *  the deciding instant — the sweep's judged `now`, never the wall clock; see projectStore. */
+const ESC_AT = 1_700_000_000_000;
+
 const agent = () => useProjectStore.getState().projects[0]!.agents[0]!;
 const store = () => useProjectStore.getState();
 
@@ -96,7 +100,7 @@ describe("setAgentGoal", () => {
 
   it("re-asserting does NOT clear an escalation — that is the human's call", () => {
     store().setAgentGoal("p1", "a1", "hard");
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
     store().setAgentGoal("p1", "a1", "hard");
     expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
   });
@@ -122,7 +126,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
 
   it("a self-set NEW goal cannot cancel an escalation a human owns", () => {
     store().setAgentGoal("p1", "a1", "hard thing");
-    store().escalateAgentGoal("p1", "a1", "three tries, no progress");
+    store().escalateAgentGoal("p1", "a1", "three tries, no progress", ESC_AT);
     store().setAgentGoal("p1", "a1", "hard thing, take two", undefined, "agent");
     expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
     expect(agent().goal?.escalationReason).toBe("three tries, no progress");
@@ -131,7 +135,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
   it("...but a HUMAN setting new text does start clean — that is the point of the distinction", () => {
     store().setAgentGoal("p1", "a1", "hard thing");
     burn(4);
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
     store().setAgentGoal("p1", "a1", "different work entirely");
     expect(agent().goal?.totalContinues).toBe(0);
     expect(goalStateOf(agent().goal, Date.now())).toBe("unmet");
@@ -167,7 +171,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
 
   it("clear-then-set cannot cancel an escalation either", () => {
     store().setAgentGoal("p1", "a1", "hard thing");
-    store().escalateAgentGoal("p1", "a1", "three tries, no progress");
+    store().escalateAgentGoal("p1", "a1", "three tries, no progress", ESC_AT);
     store().setAgentGoal("p1", "a1", "", undefined, "agent");
     store().setAgentGoal("p1", "a1", "hard thing", undefined, "agent");
     expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
@@ -214,7 +218,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
     // resumes — not that a field changed, because the field was never the thing that was broken.
     store().setAgentGoal("p1", "a1", "land the PR");
     burn(MAX_CONTINUES_TOTAL);
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
     const ask = () =>
       decideContinuation({
         goal: agent().goal,
@@ -253,7 +257,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
     const stampedAt = agent().terminalBriefedAt;
     expect(stampedAt).toEqual(expect.any(Number));
     burn(MAX_CONTINUES_TOTAL);
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
 
     store().noteTerminalBrief("p1", "a1"); // …and types again, now to unstick it
 
@@ -277,7 +281,7 @@ describe("the AGENT's own set is weaker than the human's", () => {
     // happened unattended, refilling the ceiling indefinitely.
     store().setAgentGoal("p1", "a1", "land the PR");
     burn(MAX_CONTINUES_TOTAL);
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
 
     // Machine-authored: the concierge's own tool layer writing prose it composed.
     store().appendPrompt("p1", "a1", "continue", "composer", false);
@@ -387,7 +391,7 @@ describe("setAgentGoalMet", () => {
   it("un-marking does NOT un-latch an escalation", () => {
     // Otherwise an agent could take back a goal a human had already been handed.
     store().setAgentGoal("p1", "a1", "g");
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
     store().setAgentGoalMet("p1", "a1", true);
     store().setAgentGoalMet("p1", "a1", false);
     expect(goalStateOf(agent().goal, Date.now())).toBe("escalated");
@@ -407,15 +411,15 @@ describe("escalation and the human's reset", () => {
 
   it("escalate latches, keeping the first reason", () => {
     store().setAgentGoal("p1", "a1", "g");
-    store().escalateAgentGoal("p1", "a1", "first reason");
-    store().escalateAgentGoal("p1", "a1", "second reason");
+    store().escalateAgentGoal("p1", "a1", "first reason", ESC_AT);
+    store().escalateAgentGoal("p1", "a1", "second reason", ESC_AT);
     expect(agent().goal?.escalationReason).toBe("first reason");
   });
 
   it("resetAgentGoalRetries — the HUMAN's lever — clears everything and re-enables continues", () => {
     store().setAgentGoal("p1", "a1", "g");
     burn(MAX_CONTINUES_WITHOUT_PROGRESS);
-    store().escalateAgentGoal("p1", "a1", "gave up");
+    store().escalateAgentGoal("p1", "a1", "gave up", ESC_AT);
     store().resetAgentGoalRetries("p1", "a1");
 
     expect(agent().goal?.continues).toBe(0);
@@ -441,7 +445,7 @@ describe("escalation and the human's reset", () => {
 
   it("the three counter actions no-op on an agent with no goal", () => {
     store().noteAgentGoalContinue("p1", "a1", "m");
-    store().escalateAgentGoal("p1", "a1", "why");
+    store().escalateAgentGoal("p1", "a1", "why", ESC_AT);
     store().setAgentGoalMet("p1", "a1", true);
     expect(agent().goal).toBeUndefined();
   });
@@ -472,4 +476,48 @@ describe("persistence", () => {
     expect(revived.goal?.totalContinues).toBe(2);
     expect(goalStateOf(revived.goal, Date.now())).toBe("unmet");
   });
+});
+
+describe("the three expiry actions stamp the DECIDING instant, not the wall clock", () => {
+  // ⚠️ THE VALUE, NOT THE PRESENCE, and each action separately. The sweep decides against an injected
+  // `now` while these actions used to stamp `Date.now()`, and `rearmedAt` is the deadline ORIGIN — so
+  // the two clocks could disagree and no test would notice, which is AGENTS.md's "control only one of
+  // two coupled clocks". A `toBeDefined()` assertion cannot catch a dropped `now`: the `?? Date.now()`
+  // fallback supplies a perfectly plausible number. Asserting equality is what makes the seam real.
+  //
+  // Covered HERE rather than only through the sweep because the mount cannot reach a discharge at all
+  // (`BranchStatus` carries no shas, so `decideExpiry` always answers `proof-unauditable`) — so
+  // without this the discharge call site's `now` had no coverage anywhere.
+  const T = 1_700_000_000_000;
+  beforeEach(seed);
+
+  it("rearmAgentGoal", () => {
+    store().setAgentGoal("p1", "a1", "land it");
+    store().rearmAgentGoal("p1", "a1", 60_000, T);
+    expect(agent().goal!.rearmedAt).toBe(T);
+  });
+
+  it("dischargeAgentGoal", () => {
+    store().setAgentGoal("p1", "a1", "land it");
+    store().dischargeAgentGoal("p1", "a1", "a1b2c3d", "d4e5f6a", T);
+    expect(agent().goal!.dischargedAt).toBe(T);
+    expect(agent().goal!.dischargedSha).toBe("a1b2c3d");
+    expect(agent().goal!.dischargedBaseSha).toBe("d4e5f6a");
+  });
+
+  it("abandonAgentGoal", () => {
+    store().setAgentGoal("p1", "a1", "land it");
+    store().abandonAgentGoal("p1", "a1", "3 commits, none on origin/main", T);
+    expect(agent().goal!.abandonedAt).toBe(T);
+    // It rides on the escalation, so that stamp takes the same instant.
+    expect(agent().goal!.escalatedAt).toBe(T);
+  });
+
+  // ⚠️ A FALLBACK CASE WAS DELETED HERE, and the reason is worth more than the case was. It pinned the
+  // `?? Date.now()` arm and justified itself with "resetGoalRetries and any future non-sweep caller
+  // has no instant of its own" — which is false in both halves: `resetGoalRetries` routes through
+  // `releaseGoalDebt` and never touches these actions, and all three production call sites pass
+  // `now`. So the arm had no caller, and the test pinned an unreachable branch behind a claim a
+  // future reader would take at face value. The parameter is REQUIRED now, which deletes the branch
+  // rather than testing it.
 });

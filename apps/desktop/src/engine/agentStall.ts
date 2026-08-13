@@ -54,6 +54,15 @@ export type StallVerdict = "stalled" | "finished" | "unknown" | "active" | "quot
  *  inherit a tier by falling through — answer the question there when you add one. */
 export type StallCause =
   | "human-verified-goal"
+  /** The goal lapsed its whole re-arm budget and git POSITIVELY showed committed work the default
+   *  branch does not contain, with no PR carrying it. Sparkle has stopped, cannot restart it, and
+   *  nobody else is coming for the branch — so what is left is a disposition call (land it or drop
+   *  it) on someone's unfinished work, which is the founder's.
+   *
+   *  ⚠️ This is the ONLY expiry-shaped cause in the RED tier, and its narrowness is the entire
+   *  argument for it — see `engine/goalExpiry.decideExpiry`, which is the only writer of the latch it
+   *  reads. Plain `expired-goal` below stays calm gray exactly as it was. */
+  | "abandoned-goal"
   | "unmet-goal"
   | "escalated-goal"
   | "expired-goal"
@@ -271,6 +280,39 @@ export function stallReport(input: StallInput): StallReport {
   // the human's problem, not less. Folding it into `finished` would hide precisely the agent the
   // escalation was raised about.
   if (goalState === "escalated") causes.push("escalated-goal");
+  // READ OFF THE LATCH, not re-derived from evidence. `goalExpiry.decideExpiry` is the sole writer,
+  // and it only reaches an abandon after clearing seven gates (expired, local runtime, has a
+  // worktree, evidence readable, worktree not parked, budget spent, no open PR, and BOTH the
+  // unlanded and not-landed readings agreeing). Recomputing any of that here would be a second copy
+  // of a rule whose whole safety property is that it is stated once — and the two copies would
+  // disagree in exactly the case that paints a row red by mistake.
+  //
+  // It rides ALONGSIDE `escalated-goal` rather than replacing it: `abandonGoal` writes through
+  // `escalateGoal`, so an abandoned goal is always also escalated. That is deliberate — the amber
+  // cause is a FLOOR, so if this red cause is ever demoted the row still cannot fall back to calm.
+  //
+  // ⚠️ AND IT IS GATED ON THAT STATE STILL HOLDING, which every other goal cause here already is.
+  // Read off the raw latch alone, this fired in EVERY goal state, forever, on a point-in-time git
+  // reading nothing re-evaluates. The gate fixes ONE of the two false reds it was written for, and
+  // the second is stated here rather than implied fixed:
+  //
+  //   ✅ FIXED — `goalStateOf` returns `met` BEFORE `escalated`, and `markGoalMet` does not clear
+  //      `abandonedAt`. So an abandoned agent whose branch is later landed, and whose
+  //      `{kind:"landed"}` goal then self-marks met, pushed `abandoned-goal` while `escalated-goal`
+  //      was skipped: RED, alone, claiming "it gave up holding work nobody landed" about work that
+  //      demonstrably landed — and with the amber floor GONE, so a later demotion would drop the row
+  //      straight to calm. Gating on the state follows `markGoalMet`, so this case now clears itself.
+  //
+  //   ❌ NOT FIXED — the concierge landing the stranded branch. Nothing auto-verifies a
+  //      `{kind:"landed"}` goal (`pusherVerifier` says so in terms), the only production writer of
+  //      `metAt` is the MCP tool an agent calls about ITSELF, and `escalatedAt`'s only clearer is
+  //      `resetGoalRetries`, reachable solely from a human-authored prompt. So when someone else
+  //      lands the work and nobody types to the agent, `goalStateOf` keeps answering `escalated` and
+  //      the row stays red until a human touches it. Tracked as `sparkle-xv9ge`. The real fix is a
+  //      clearer driven by the landed proof, not a second gate here.
+  //
+  // The latch itself stays as the evidence for WHY this escalation happened.
+  if (goalState === "escalated" && goal?.abandonedAt !== undefined) causes.push("abandoned-goal");
   // An EXPIRED goal is unfinished work whose auto-continue MANDATE ran out — the two are different
   // facts, and only the first one this surface reports on (roborev 55252). The TTL is a bound on
   // SPEND (see agentGoal.DEFAULT_GOAL_TTL_MS); reusing it to silence the human surface said
@@ -394,9 +436,25 @@ function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): strin
           `its goal can only be closed by a person and nothing is coming to retry it` +
           `${goal?.text ? ` ("${goal.text}")` : ""}`
         );
+      case "abandoned-goal":
+        // The EVIDENCE, verbatim, because this is the loudest sentence the surface can say and the
+        // reader's first question is "on what basis". `abandonedEvidence` already names the shas and
+        // the count, written by the only code that can reach this latch.
+        return (
+          `it gave up holding work nobody landed` +
+          `${goal?.abandonedEvidence ? ` — ${goal.abandonedEvidence}` : ""}`
+        );
       case "unmet-goal":
         return `its goal is not met ("${goal?.text ?? ""}")`;
       case "escalated-goal":
+        // ⚠️ THE REASON IS SUPPRESSED WHEN IT IS THE ABANDON EVIDENCE, because the two causes ALWAYS
+        // coexist (`abandonGoal` writes through `escalateGoal` with the SAME string in both fields)
+        // and this detail is attached verbatim to every pill. Unguarded, a reader saw the same
+        // ~40-word evidence paragraph twice in one string, and twice per pill. Same "said the same
+        // fact twice" defect that folded `unlanded-work` into `open-pr` (roborev 55298); the
+        // abandoned-goal arm above already carries the evidence, so this one keeps the short clause.
+        if (goal?.abandonedEvidence !== undefined && goal.escalationReason === goal.abandonedEvidence)
+          return "auto-continue gave up on its goal";
         return `auto-continue gave up on its goal${goal?.escalationReason ? ` — ${goal.escalationReason}` : ""}`;
       case "expired-goal":
         return `its goal ran out of time without being met ("${goal?.text ?? ""}")`;

@@ -314,11 +314,23 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
     // force. The expected tier is written out per cause so the answer is reviewable as data.
     const EXPECTED = {
       "human-verified-goal": "blocked",
+      // RED, and the argument is who can clear it: nobody but him. Sparkle has stopped (the re-arm
+      // budget is spent and the goal is escalated, so nothing retries it), the agent will not restart
+      // itself, and no PR is carrying the work — so what is left is a disposition call on an
+      // unfinished branch. It is reachable ONLY through `goalExpiry.decideExpiry`, which clears seven
+      // gates first and discharges a clean-and-landed agent three rules earlier, so a finished agent
+      // cannot wear it. Demotion trigger, stated so it is not rediscovered as a false red: the day
+      // the concierge auto-lands abandoned branches, this becomes "lapsed".
+      "abandoned-goal": "blocked",
       "unmet-goal": "lapsed",
       "open-pr": "lapsed",
       "unlanded-work": "lapsed",
       "uncommitted-changes": "lapsed",
       "escalated-goal": "lapsed",
+      // ⚠️ STILL `undefined`, and this change did NOT touch it. The sibling above is not a promotion
+      // of expiry — it is a different cause with a far narrower gate. Expiry remains a fact about the
+      // CLOCK that fires on a finished agent and an abandoned one identically, which is exactly why
+      // sparkle-biezi cut it from the red tier; see `stallEscalation.OUTSTANDING` for the derivation.
       "expired-goal": undefined,
     } satisfies Record<StallCause, AgentTabStatus | undefined>;
 

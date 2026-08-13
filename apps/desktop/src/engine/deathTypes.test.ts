@@ -19,6 +19,7 @@ const ALL_EVIDENCE = [
   "api-banner",
   "blocking-tool",
   "goal-met-marked",
+  "goal-discharged-on-git-proof",
   "epoch-dead",
   "session-vanished",
   "pty-exit",

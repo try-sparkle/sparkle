@@ -45,6 +45,13 @@ export const GOAL_CHIP_ICON: Record<GoalChipState, IconType> = {
   escalated: FiAlertOctagon,
   expired: FiClock,
   met: FiCheckCircle,
+  // SHARES `met`'s CHECK DELIBERATELY, and it is the one place this table's "a distinct glyph per
+  // state" rule is not followed. The glyph answers "does this row still want something from me",
+  // and for both of these the answer is no — met and discharged are the same fact to a scanning eye,
+  // differing only in WHO proved it (the agent said so / git showed it). That distinction belongs in
+  // the words, where `goalBadgeFor` puts it along with the proving sha, not in a fifth shape the
+  // reader has to learn.
+  discharged: FiCheckCircle,
   unmet: FiTarget,
 };
 
@@ -86,6 +93,10 @@ export const GOAL_CHIP_COLOR: Record<GoalChipState, string> = {
   // Amber, not danger: the mandate ran out on unfinished work. Loud, but not the top of the row.
   expired: C.amberInk,
   met: C.successInk,
+  // The same success ink as `met`: a discharged goal is a finished one, and the row is calm. The
+  // founder's 2026-08-06 rule survives here unchanged — expiry that resolves into PROVEN completion
+  // is gray/green, and only expiry that resolves into proven UNLANDED work is loud.
+  discharged: C.successInk,
   unmet: C.accentInk,
 };
 
@@ -103,6 +114,9 @@ export const GOAL_CHIP_SIZE: Record<GoalChipState, number> = {
   escalated: 12,
   expired: 10,
   met: 10,
+  // 10, with the rest. Escalated is the ONLY exceptional one and the size is now the sole signal
+  // that says so — raising anything else to 12 would spend that distinction.
+  discharged: 10,
   unmet: 10,
 };
 
@@ -113,6 +127,10 @@ export const GOAL_CHIP_A11Y: Record<GoalChipState, (b: GoalBadge) => string> = {
   escalated: () => "Goal escalated",
   expired: () => "Goal expired, never met",
   met: () => "Goal met",
+  // Borrows the badge's own words the way `unmet` does, so the proving sha is SPOKEN rather than
+  // being a visual-only detail. A reader who cannot see the chip is exactly the one who cannot go
+  // and check the sha for themselves.
+  discharged: (b) => `Goal ${b.label}`,
   unmet: (b) => `Goal ${b.label.replace(" · ", ", ")}`,
 };
 

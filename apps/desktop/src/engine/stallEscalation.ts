@@ -175,7 +175,31 @@ export const LAPSED_STATUS: AgentTabStatus = "lapsed";
  * Do NOT fix a future "expiry is invisible" report by adding it back here — the affordance exists,
  * one layer up, and now also in {@link LIFECYCLE}'s own amber tier.
  */
-const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>(["human-verified-goal"]);
+const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
+  "human-verified-goal",
+  // ── `abandoned-goal` IS THE "OWN CHANGE WITH ITS OWN EVIDENCE" THE EXPIRY ARGUMENT INVITES ──────
+  // The block above ends "If expiry ever needs to be louder, that is its own change with its own
+  // evidence." This is it, and it is NOT a promotion of `expired-goal` — that cause is untouched and
+  // still in neither set. The distinction is exactly the one the expiry argument turns on: expiry is
+  // a fact about the CLOCK and fires on a finished agent and an abandoned one identically, which is
+  // what made it a wall of false red. This cause is a fact about the WORK, and it can only be
+  // written after `goalExpiry.decideExpiry` clears seven gates — expired, local runtime, has a
+  // worktree, evidence readable, worktree not parked, re-arm budget spent, no open PR, and BOTH the
+  // "unlanded" and "not landed" readings agreeing. A finished agent cannot reach it by construction:
+  // clean + landed is discharged three rules earlier.
+  //
+  // WHY RED RATHER THAN THE AMBER TIER, in this file's own terms — who can clear it. Nobody. Sparkle
+  // has stopped (the budget is spent and the goal is escalated, so nothing retries it), the agent is
+  // not going to restart itself, and no PR is carrying the work. What remains is a disposition call
+  // on somebody's unfinished branch — land it or drop it — and that is the founder's, which is the
+  // definition this tier is built on.
+  //
+  // ⚠️ ITS DEMOTION TRIGGER, stated now so it is not rediscovered as a false red later: the day the
+  // concierge is wired to auto-land or auto-triage abandoned branches, this cause has an actor other
+  // than the founder and belongs in LIFECYCLE. The reason `unlanded-work` is amber is precisely that
+  // the concierge already landed 15 stranded branches in one night without him.
+  "abandoned-goal",
+]);
 
 /**
  * The causes ANOTHER ACTOR CAN CLEAR — the concierge, the agent itself, CI, or auto-continue.

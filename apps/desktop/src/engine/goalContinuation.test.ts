@@ -3,13 +3,16 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import {
   DEFAULT_GOAL_TTL_MS,
+  dischargeGoal,
   escalateGoal,
   goalStateOf,
   markGoalMet,
   newGoal,
   noteContinue,
+  rearmGoal,
   resetGoalRetries,
 } from "./agentGoal";
+import { REARM_TTL_MS } from "./goalExpiry";
 import { isSystemAuthoredPrompt } from "./agentOriginated";
 import {
   CLOUD_MIN_CONTINUE_CENTS,
@@ -751,3 +754,71 @@ function cloudWith(over: Partial<CloudEvidence>): CloudEvidence {
     ...over,
   };
 }
+
+describe("the expiry outcomes reach this gate correctly", () => {
+  // These two states did not exist when the gate chain above was written, and BOTH of them arrive
+  // here through `goalStateOf` rather than through any call this module makes. The chain is a
+  // sequence of early returns over a union, so a new member is not a compile error — it simply falls
+  // through every goal gate to the STATUS gates below them, where a resting agent qualifies. That is
+  // the whole reason these tests exist: the failure is silent and it restarts finished agents.
+  it("does NOT continue a goal Sparkle discharged on git's proof", () => {
+    const goal = dischargeGoal(newGoal("Land the retry PR", T0), T0 + 1, "a1b2c3d", "d4e5f6a");
+    const d = decideContinuation(ready({ goal }));
+    expect(d.action).toBe("none");
+    if (d.action !== "none") throw new Error("unreachable");
+    // The REASON, not just the refusal: `goal-met` would also be a refusal, and the concierge reads
+    // this field out to a human. "It said it was done" and "git showed it was done" are different
+    // sentences and only one of them is checkable.
+    expect(d.reason).toBe("goal-discharged");
+  });
+
+  it("DOES continue that same agent once the discharge is taken back", () => {
+    // The control. Without it, the refusal above is ambiguous between "the discharge gate stopped
+    // it" and "this fixture was never continuable" — and every other assertion in this file rests on
+    // `ready()` qualifying.
+    expect(decideContinuation(ready()).action).toBe("continue");
+  });
+
+  it("resumes a RE-ARMED goal through the ordinary path, spending an ordinary retry", () => {
+    // Re-arm deliberately does not send. It returns the goal to `unmet` and leaves the resume to
+    // this gate, so the restart is bound by the same budget every other restart is. If a bespoke
+    // sender were ever added beside it, this test would still pass while the fleet quietly got three
+    // free resumes per goal — so it asserts the ATTEMPT NUMBER, which is what the budget moves.
+    //
+    // ⚠️ THE GOAL MUST ARRIVE WITH RETRIES ALREADY SPENT, and that is the whole assertion. A virgin
+    // goal has `continues: 0`, so `attempt === 1` holds whether or not the re-arm preserved the
+    // budget — mutate `rearmGoal` to also zero `continues`/`totalContinues` (exactly the
+    // "consequence someone will try to fix" its own docstring warns about) and the vacuous version
+    // of this test stayed green. Spending two retries first makes the re-armed resume land on
+    // attempt THREE, which is false the moment a re-arm launders the budget.
+    let lapsed = newGoal("Land the retry PR", T0);
+    lapsed = noteContinue(noteContinue(lapsed, "m0"), "m0");
+    const now = T0 + DEFAULT_GOAL_TTL_MS;
+    expect(goalStateOf(lapsed, now)).toBe("expired");
+
+    const armed = rearmGoal(lapsed, now, REARM_TTL_MS);
+    const d = decideContinuation(ready({ goal: armed, now, idleSince: now - IDLE_SETTLE_MS - 1 }));
+    expect(d.action).toBe("continue");
+    if (d.action !== "continue") throw new Error("unreachable");
+    expect(d.attempt).toBe(3);
+    expect(d.prompt).toContain("Land the retry PR");
+  });
+
+  it("and a re-armed goal at the total ceiling escalates on the very next sweep", () => {
+    // The documented consequence of NOT refilling the budget, which had no test at all: re-arm
+    // restores the mandate, not the retries, so a goal that had already spent its total budget is
+    // handed to a human immediately rather than getting three more rounds on the clock. Without this
+    // the "does NOT refill the retry budget" rule is only asserted one caller away from where it
+    // actually decides anything.
+    let goal = newGoal("Land the retry PR", T0);
+    for (let i = 0; i < MAX_CONTINUES_TOTAL; i++) goal = noteContinue(goal, `m${i}`);
+    const now = T0 + DEFAULT_GOAL_TTL_MS;
+    const armed = rearmGoal(goal, now, REARM_TTL_MS);
+    expect(goalStateOf(armed, now)).toBe("unmet");
+
+    const d = decideContinuation(
+      ready({ goal: armed, now, mark: "m0", idleSince: now - IDLE_SETTLE_MS - 1 }),
+    );
+    expect(d.action).toBe("escalate");
+  });
+});

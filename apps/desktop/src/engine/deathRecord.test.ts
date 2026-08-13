@@ -130,6 +130,33 @@ describe("clean-goal-met — the verdict that must never be resurrected", () => 
     expect(v.goalMetAt).toBe(metAt);
   });
 
+  it("a DISCHARGED goal is finished too — on git's proof rather than the agent's word", () => {
+    // The gate tested only `met`, so a goal `goalExpiry` discharged (git PROVED the work is in the
+    // default branch and the tree is clean) fell through to a resurrectable cause and the fleet could
+    // restart work already confirmed landed — the "undoes a completed decision" failure this gate is
+    // FIRST in order to prevent, arriving through the one door it did not check. `GoalState` is a
+    // union but this is a VALUE comparison, so adding the state was not a compile error here.
+    const dischargedAt = NOW - 5_000;
+    const v = classifyDeath(
+      obs({
+        goal: goal({ dischargedAt, dischargedSha: "a1b2c3d", dischargedBaseSha: "d4e5f6a" }),
+        terminator: "pty-exit",
+      }),
+    );
+    expect(v.cause).toBe("clean-goal-met");
+    expect(v.goalMetAt).toBe(dischargedAt);
+    // The evidence names WHICH claimant proved it — the agent's own assertion and git's are different
+    // facts, and a reader deciding whether to resurrect should be able to tell them apart.
+    expect(v.evidence).toBe("goal-discharged-on-git-proof");
+  });
+
+  it("…but a goal in NEITHER finished state still falls through — the pair, not a blanket calm", () => {
+    // The control leg. Without it, "discharged is finished" is satisfied by an implementation that
+    // calls every goal finished.
+    const v = classifyDeath(obs({ goal: goal({ escalatedAt: NOW - 5_000 }), terminator: "pty-exit" }));
+    expect(v.cause).not.toBe("clean-goal-met");
+  });
+
   it("does NOT call it clean when a wall ended the session after the goal was met", () => {
     // A stale met-mark plus a wall is not a clean exit, and treating it as one would make the agent
     // permanently unresurrectable on the strength of that mark.

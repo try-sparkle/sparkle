@@ -123,6 +123,12 @@ export type DeathEvidence =
   | "blocking-tool"
   /** `agentGoal.markGoalMet` recorded a positive `metAt`. A turn merely ENDING is not this. */
   | "goal-met-marked"
+  /** `goalExpiry` discharged the goal: GIT proved the work is contained in the default branch and
+   *  the tree is clean, recorded as `dischargedAt` with both proving shas. Distinct from
+   *  `goal-met-marked` because the claimant differs — that one is the agent's assertion about
+   *  itself, this one is evidence about its branch — and a reader deciding whether to resurrect
+   *  should be able to tell which it has. Both mean FINISHED. */
+  | "goal-discharged-on-git-proof"
   /** The owning app instance's epoch is provably dead (a kernel-released lock, not a timeout). */
   | "epoch-dead"
   /**
@@ -191,6 +197,7 @@ export function causeOf(evidence: DeathEvidence): DeathCause | null {
     case "blocking-tool":
       return "blocked-on-human";
     case "goal-met-marked":
+    case "goal-discharged-on-git-proof":
       return "clean-goal-met";
     case "epoch-dead":
       return "app-restart";

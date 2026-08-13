@@ -32,6 +32,13 @@ import {
   decideContinuation,
   progressMark,
 } from "../engine/goalContinuation";
+import {
+  REARM_TTL_MS,
+  decideExpiry,
+  type ExpiryDecision,
+  type NoExpiryReason,
+} from "../engine/goalExpiry";
+import { expiryProofFor } from "./agentGoalReading";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
@@ -335,8 +342,56 @@ const suppressedUntil = new Map<string, number>();
 
 /** Test seam: forget the idle clock, any in-flight sends, the undelivered streaks, and any
  *  suppressions. */
+/** Agents whose expiry refusal has already been logged, so a 15-second sweep does not shout.
+ *
+ *  ONCE PER AGENT PER REASON, not once per sweep: a given refusal is a steady state — an unreadable
+ *  PR probe stays unreadable — so a line per pass would be ~5,700 a day per stuck agent and would
+ *  bury the one that matters. But NOT once per agent either: see `noteExpiryRefusal` for why the
+ *  narrower key silently hid every reason after the first.
+ *
+ *  ⚠️ BOUNDED BY THE LIVE ROSTER × REASONS **BECAUSE IT IS GARBAGE-COLLECTED**, not by assertion —
+ *  an earlier version of this comment claimed the bound while nothing pruned it, so the real bound
+ *  was every agent id seen since app start. It is swept beside `undelivered` on every pass;
+ *  `_resetGoalContinuationRunnerForTests` is a TEST seam and was never the production answer. */
+const loggedExpiryRefusal = new Set<string>();
+
+/**
+ * Is this refusal worth telling anyone about?
+ *
+ * Only the ones that describe a STUCK agent. `not-expired` is every healthy goal on every sweep, and
+ * `cloud-runtime` / `no-worktree` are permanent facts about what an agent IS rather than states it
+ * can leave — surfacing those would be a wall of noise that trains the reader to skip the band
+ * entirely, which is how the signal that matters gets lost.
+ */
+function isStuckRefusal(reason: NoExpiryReason): boolean {
+  return reason !== "not-expired" && reason !== "cloud-runtime" && reason !== "no-worktree";
+}
+
+/** Log an expiry refusal that would otherwise be invisible — once per agent; see the Set above. */
+function noteExpiryRefusal(agent: AgentTab, reason: NoExpiryReason, now: number): void {
+  // ⚠️ KEYED ON AGENT **AND REASON**, not on the agent alone. Keyed on the id, only the FIRST reason
+  // an agent ever refused with is ever logged — and the first one is systematically the least
+  // informative: `expiryProofFor` answers `undefined` whenever `branchStatus` is absent, which is
+  // exactly the state a freshly-launched window is in (it boots clean by design). So an expired goal
+  // swept before the branch probe lands logs `evidence-unreadable`, latches the id, and the true
+  // steady-state reason that arrives seconds later — `landed-but-dirty`, `worktree-parked`,
+  // `pr-state-unknown` — is suppressed for the life of the process. That is the opposite of the
+  // point. The comment above is also corrected: `evidence-unreadable` is the ONE refusal here that
+  // is reliably TRANSIENT, so it must not be able to shadow the ones that are not.
+  const key = `${agent.id}:${reason}`;
+  if (loggedExpiryRefusal.has(key)) return;
+  loggedExpiryRefusal.add(key);
+  log.warn("goals", "expiry could not decide", {
+    agentId: agent.id,
+    reason,
+    goalAgeMs: agent.goal === undefined ? undefined : now - agent.goal.setAt,
+    ttlRearms: agent.goal?.ttlRearms ?? 0,
+  });
+}
+
 export function _resetGoalContinuationRunnerForTests(): void {
   idleClock = new Map();
+  loggedExpiryRefusal.clear();
   inFlight.clear();
   undelivered.clear();
   suppressedUntil.clear();
@@ -607,6 +662,15 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
   // never deliver, so leaving its streak behind would both leak and, if the id were ever reused,
   // start the next agent partway to an escalation.
   for (const id of undelivered.keys()) if (!composite.has(id)) undelivered.delete(id);
+  // …and the refusal log's keys, for the SAME two reasons. Left ungathered this grows with every
+  // agent id ever seen since app start (not with the live roster), and — the part that matters more
+  // than the leak — a row torn down and recreated under the same id would be permanently silent for
+  // any reason it had already emitted, which is the exact suppression the key widening exists to
+  // remove. The key is `<agentId>:<reason>`, and a reason never contains a colon, so the id is
+  // everything before the LAST one.
+  for (const key of loggedExpiryRefusal) {
+    if (!composite.has(key.slice(0, key.lastIndexOf(":")))) loggedExpiryRefusal.delete(key);
+  }
 
   const outcomes: SweepOutcome[] = [];
   const pending: Promise<void>[] = [];
@@ -653,6 +717,51 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
       // record of where the agent runs, and the same field `getTransport` selects a transport by.
       const runtime = agent.runtime === "cloud" ? "cloud" : "local";
 
+      // ══ THE EXPIRY ARM ══════════════════════════════════════════════════════════════════════
+      // Expiry used to be a dead letter: `decideContinuation` answered `goal-expired` and NOTHING in
+      // the app ever wrote to an expired goal again, so an agent whose clock lapsed — most cheaply
+      // during a spend outage, where the quota gate correctly refuses to spend retries while the TTL
+      // keeps running — was never resumed by anything, ever.
+      //
+      // PLACED HERE, and both bounds matter. AFTER the `inFlight` and `suppressedUntil` skips above,
+      // because those mean "do not touch this agent at all" and a latch write is touching it. BEFORE
+      // `decideContinuation`, because a re-arm changes the answer that call would give — the goal
+      // goes back to `unmet` and the ordinary continue path picks it up on the NEXT sweep.
+      //
+      // IT NEVER SENDS. That is the whole reason the resume is left to the next pass: a bespoke send
+      // here would be a second sender, costing nothing from `totalContinues` and bypassing the
+      // in-flight guard, the undelivered ceiling and the idle-settle window this file is arranged
+      // around. One sender, one budget.
+      const expiry = decideExpiry({
+        goal: agent.goal,
+        now,
+        runtime: agent.runtime === "cloud" ? "cloud" : "local",
+        hasWorktree: typeof agent.worktreePath === "string" && agent.worktreePath !== "",
+        proof: expiryProofFor(agent.id),
+      });
+      if (expiry.action !== "none") {
+        // `now` travels with the decision: the instant that JUDGED the goal expired is the instant
+        // the latch is stamped with, so the two clocks cannot drift apart. See the store actions.
+        applyExpiry(project.id, agent, expiry, now);
+        outcomes.push({ agentId: agent.id, action: "none", detail: `expiry:${expiry.action}` });
+        continue;
+      }
+      // ── THE REFUSAL IS RECORDED, NOT DROPPED ────────────────────────────────────────────────────
+      // `decideExpiry` names every refusal precisely so a human can be told WHICH reading was
+      // missing — and until now that name was computed and thrown away: `applyExpiry` is skipped for
+      // `none`, the sweep falls through, and the outcome said only `goal-expired`. So the module's
+      // most careful distinctions ("we could not read its git state" vs "we never asked about its
+      // PR") reached nobody, and the silent gap at `sparkle-nmqcb` was uncountable — you could not
+      // even ask how many agents were in it, which is the evidence its fix needs.
+      if (isStuckRefusal(expiry.reason)) {
+        outcomes.push({
+          agentId: agent.id,
+          action: "none",
+          detail: `expiry:none:${expiry.reason}`,
+        });
+        noteExpiryRefusal(agent, expiry.reason, now);
+      }
+
       const decision = decideContinuation({
         goal: agent.goal,
         status: composite.get(agent.id) ?? "stopped",
@@ -686,7 +795,7 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
       }
 
       if (decision.action === "escalate") {
-        escalateToHuman(project.id, agent, decision.reason);
+        escalateToHuman(project.id, agent, decision.reason, "escalate", now);
         outcomes.push({ agentId: agent.id, action: "escalate", detail: decision.reason });
         continue;
       }
@@ -762,13 +871,13 @@ async function continueAgent(
       useProjectStore.getState().noteAgentGoalContinue(projectId, agent.id, mark);
       log.info("goals", "auto-continued a stalled agent", { agentId: agent.id, path: result.path });
     } else {
-      noteUndelivered(projectId, agent, result.path);
+      noteUndelivered(projectId, agent, result.path, now);
     }
   } catch (e) {
     outcome.detail = "threw";
     outcome.sent = false;
     log.warn("goals", "auto-continue threw", { agentId: agent.id, error: String(e) });
-    noteUndelivered(projectId, agent, "threw");
+    noteUndelivered(projectId, agent, "threw", now);
   } finally {
     // RE-ARM ON BOTH PATHS. On success this is the one-send-per-turn rule. On FAILURE it is a
     // backoff: a refused or dead-PTY send that left the clock alone would be retried on every
@@ -791,7 +900,12 @@ async function continueAgent(
  * retrying; it matters if a human un-escalates the goal, which should start the count over rather
  * than re-escalate on the first refusal.
  */
-function noteUndelivered(projectId: string, agent: AgentTab, path: UndeliveredPath): void {
+function noteUndelivered(
+  projectId: string,
+  agent: AgentTab,
+  path: UndeliveredPath,
+  now: number,
+): void {
   const count = (undelivered.get(agent.id)?.count ?? 0) + 1;
   undelivered.set(agent.id, { count, path });
   log.warn("goals", "auto-continue did not reach the terminal", {
@@ -805,6 +919,8 @@ function noteUndelivered(projectId: string, agent: AgentTab, path: UndeliveredPa
     projectId,
     agent,
     undeliverableReason(agent.goal?.text ?? "", path, agent.runtime === "cloud"),
+    "escalate",
+    now,
   );
 }
 
@@ -820,16 +936,51 @@ function noteUndelivered(projectId: string, agent: AgentTab, path: UndeliveredPa
  *
  * FIRES ONCE by construction rather than by a flag here: `escalateGoal` is latched, so the next
  * sweep reads `already-escalated` and never reaches this function again.
+ *
+ * ⚠️ BOTH `via` AND `now` ARE REQUIRED, and neither was at first — `via` defaulted to "escalate" and
+ * `now` to `Date.now()`. The second default was the interesting mistake: it was introduced by a
+ * commit whose whole point was deleting the same default one frame DOWN, in the store actions, and
+ * whose comment claimed "required is the whole guarantee". It was not. The abandon path — the one
+ * call site that actually reads `now` — still compiled without an instant, so a future
+ * `escalateToHuman(projectId, agent, reason, "abandon")` would stamp `abandonedAt` from the wall
+ * clock while the sweep judged at an injected one: exactly the split clock the change existed to
+ * make unrepresentable, moved up a stack frame rather than removed. A default that serves the
+ * callers which never read the value, while disarming the one that does, is worse than no parameter.
+ *
+ * And the escalate branch USED to discard `now` entirely — `escalateAgentGoal` took no instant and
+ * stamped `Date.now()` — so the required parameter here was dead on the more common of the two
+ * paths while two comments claimed the seam was closed. It is threaded all the way to the
+ * transition now.
+ *
+ * `via` SELECTS THE LATCH, NOT A SECOND PATH. An abandoned goal is an escalation — `abandonGoal`
+ * writes THROUGH `escalateGoal` — so both variants inherit the retry suppression, the once-only
+ * property above, and the amber floor. What `"abandon"` adds is `abandonedAt`, the annotation
+ * `engine/agentStall` keys the red `abandoned-goal` cause on. It is a parameter rather than its own
+ * function so there stays exactly ONE `notifyAttention` call site for a goal giving out; the first
+ * version of the expiry arm called `escalateToHuman` directly and therefore never wrote
+ * `abandonedAt` at all, leaving `abandonAgentGoal` with zero callers and the red cause unreachable.
  */
-function escalateToHuman(projectId: string, agent: AgentTab, reason: string): void {
-  useProjectStore.getState().escalateAgentGoal(projectId, agent.id, reason);
+function escalateToHuman(
+  projectId: string,
+  agent: AgentTab,
+  reason: string,
+  via: "escalate" | "abandon",
+  now: number,
+): void {
+  const store = useProjectStore.getState();
+  if (via === "abandon") store.abandonAgentGoal(projectId, agent.id, reason, now);
+  else store.escalateAgentGoal(projectId, agent.id, reason, now);
   notifyAttention({
     projectId,
     agentId: agent.id,
     title: `${agent.name} needs you`,
     body: reason,
   });
-  log.warn("goals", "auto-continue escalated to the human", { agentId: agent.id, reason });
+  log.warn(
+    "goals",
+    via === "abandon" ? "goal abandoned — escalated to the human" : "auto-continue escalated to the human",
+    { agentId: agent.id, reason },
+  );
 }
 
 // ── The mount ───────────────────────────────────────────────────────────────────────────────────
@@ -880,4 +1031,45 @@ export function stopGoalContinuationRunner(): void {
 /** Test/introspection helper: is the sweep armed? */
 export function isGoalContinuationRunnerRunning(): boolean {
   return timer !== null;
+}
+
+/**
+ * Write ONE expiry outcome to the store.
+ *
+ * The rules live in `engine/goalExpiry.decideExpiry` and are not re-checked here — a second copy of
+ * a gate is how the two copies come to disagree in exactly the case that closes an unfinished agent
+ * or reddens a finished one.
+ *
+ * ONLY `abandon` NOTIFIES. A re-arm is Sparkle quietly doing its job and must not page anyone; a
+ * discharge is good news about work that already landed. Abandonment routes through the SAME
+ * `escalateToHuman` path an ordinary escalation uses — `abandonGoal` writes through `escalateGoal`,
+ * so the row inherits the `already-escalated` circuit breaker and the once-only notification latch
+ * rather than getting a parallel set of its own.
+ *
+ * ⚠️ IT MUST PASS `"abandon"`, and the plain call was a real defect rather than a nicety: without it
+ * the escalation is written by `escalateAgentGoal`, `abandonedAt` is never set, and the red
+ * `abandoned-goal` cause (`engine/agentStall`, which keys on exactly that field) can never fire — so
+ * the loudest outcome this module can reach rendered identically to an ordinary give-up.
+ */
+function applyExpiry(
+  projectId: string,
+  agent: AgentTab,
+  decision: ExpiryDecision,
+  now: number,
+): void {
+  const store = useProjectStore.getState();
+  switch (decision.action) {
+    case "rearm":
+      store.rearmAgentGoal(projectId, agent.id, REARM_TTL_MS, now);
+      return;
+    case "discharge":
+      store.dischargeAgentGoal(projectId, agent.id, decision.sha, decision.baseSha, now);
+      return;
+    case "abandon":
+      escalateToHuman(projectId, agent, decision.evidence, "abandon", now);
+      return;
+
+    case "none":
+      return;
+  }
 }

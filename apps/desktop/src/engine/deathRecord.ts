@@ -24,7 +24,7 @@
 import type { AgentGoal } from "./agentGoal";
 import { goalStateOf } from "./agentGoal";
 import { classifyApiFailure } from "./apiRecovery";
-import type { DeathVerdict, DeathWall } from "./deathTypes";
+import type { DeathEvidence, DeathVerdict, DeathWall } from "./deathTypes";
 import type { QuotaBlock } from "./quotaBlock";
 import { quotaBlocksIn } from "./quotaBlock";
 import type { AgentLiveness } from "../services/agentLiveness";
@@ -89,6 +89,36 @@ export interface DeathObservation {
 /** The verdict a window writes when it did not watch the agent. Named because several paths return
  *  it and they must all return the SAME thing — an unobserved death is one shape, not several. */
 const UNOBSERVED: DeathVerdict = { cause: "unknown", evidence: "none" };
+
+/**
+ * The proof that a goal is FINISHED, or `undefined` if it is not — the two states and the stamp that
+ * evidences each.
+ *
+ * ⚠️ THERE ARE TWO, and testing only `met` was a live defect. `met` is the AGENT's assertion about
+ * itself (`metAt`); `discharged` is `goalExpiry`'s, written only when git proved the work is
+ * contained in the default branch with a clean tree (`dischargedAt`, with both proving shas) — the
+ * stronger of the two claims. A discharged agent could not reach `clean-goal-met`, so it fell through
+ * to a resurrectable cause and the fleet could restart work git had already confirmed landed: the
+ * "undoes a completed decision" failure that gate is FIRST in order to prevent, arriving through the
+ * one door it did not check. `GoalState` is a union, but this is a VALUE comparison, so adding a
+ * member was not a compile error here or at `nudger.rs::goal_is_met`, which carried the same hole.
+ *
+ * The evidence differs per state deliberately: a reader deciding whether to resurrect should be able
+ * to tell "the agent said so" from "git said so".
+ */
+function finishedProof(
+  goal: AgentGoal | undefined,
+  now: number,
+): { at: number; evidence: DeathEvidence } | undefined {
+  const state = goalStateOf(goal, now);
+  if (state === "met" && goal?.metAt !== undefined) {
+    return { at: goal.metAt, evidence: "goal-met-marked" };
+  }
+  if (state === "discharged" && goal?.dischargedAt !== undefined) {
+    return { at: goal.dischargedAt, evidence: "goal-discharged-on-git-proof" };
+  }
+  return undefined;
+}
 
 /** Build the wall half of a verdict from a `QuotaBlock`.
  *
@@ -170,14 +200,22 @@ export function classifyDeath(o: DeathObservation): DeathVerdict {
   // TRANSPORT_FAILURE_WINDOW_MS afterwards. Letting that reach this gate would demote a finished
   // agent to a resurrectable cause and have the fleet restart work that was already done — the exact
   // "undoes a completed decision" failure this gate is first in order to prevent.
+  // ⚠️ TWO STATES ARE FINISHED, NOT ONE, and the stamp that proves it differs per state. `met` is the
+  // agent's own assertion (`metAt`); `discharged` is `goalExpiry`'s, written only when git PROVED the
+  // work landed on the default branch with a clean tree (`dischargedAt`) — the stronger of the two.
+  // Testing only `met` meant a discharged agent could never reach this gate, fell through to a
+  // resurrectable cause, and the fleet restarted work git had already confirmed landed. That is the
+  // "undoes a completed decision" failure this gate is FIRST in order to prevent, arriving through
+  // the one door it did not check. `GoalState` is a union, but this is a value comparison, so adding
+  // a member was not a compile error anywhere.
+  const finished = finishedProof(o.goal, o.now);
   if (
-    goalStateOf(o.goal, o.now) === "met" &&
+    finished !== undefined &&
     wall === undefined &&
     o.lastFailure === undefined &&
-    o.terminator !== undefined &&
-    o.goal?.metAt !== undefined
+    o.terminator !== undefined
   ) {
-    return { cause: "clean-goal-met", evidence: "goal-met-marked", goalMetAt: o.goal.metAt };
+    return { cause: "clean-goal-met", evidence: finished.evidence, goalMetAt: finished.at };
   }
 
   // ── 2. Walls ────────────────────────────────────────────────────────────────────────────────

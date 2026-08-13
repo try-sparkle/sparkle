@@ -24,7 +24,10 @@ import {
   chargeGoalDebt,
   type GoalDebt,
   clearGoalMet,
+  abandonGoal,
+  dischargeGoal,
   escalateGoal,
+  rearmGoal,
   goalDebtOf,
   markGoalMet,
   newGoal,
@@ -255,7 +258,39 @@ export interface ProjectState {
   /** Hand the goal to the human — auto-continue has given up. Latched; only `resetAgentGoalRetries`
    *  or a HUMAN's new goal clears it. An AGENT's own `setAgentGoal` does not, however it rephrases or
    *  clears first — see `GoalDebt` in engine/agentGoal for why that distinction is load-bearing. */
-  escalateAgentGoal: (projectId: string, agentId: string, reason: string) => void;
+  escalateAgentGoal: (projectId: string, agentId: string, reason: string, now: number) => void;
+  /** Extend a lapsed goal's clock. The three expiry outcomes owned by `engine/goalExpiry`; the
+   *  continuation sweep is their only caller.
+   *
+   *  ⚠️ EACH TAKES THE DECIDING INSTANT, AND IT IS REQUIRED. The two clocks are COUPLED: the sweep
+   *  decides against an injected `now`, and `rearmedAt` is the new deadline ORIGIN (`goalDeadline` =
+   *  `(rearmedAt ?? setAt) + ttlMs`) — so a write stamped from `Date.now()` re-arms to a deadline
+   *  computed from a different instant than the one that judged the goal expired, and a test driving
+   *  the sweep at a synthetic `now` then passes under either behaviour. That is AGENTS.md's "control
+   *  only one of two coupled clocks" shape.
+   *
+   *  It was briefly `now?: number` with a `?? Date.now()` fallback "for callers with no decision
+   *  instant of their own". There are none: all three production call sites are in `applyExpiry`/
+   *  `escalateToHuman` and every one passes `now`. An optional parameter would have been an
+   *  unreachable branch defended by a false comment — and, worse, a way for a future caller to
+   *  reintroduce the split clock without changing a signature.
+   *
+   *  ⚠️ A CLOCK THREADED THROUGH N FRAMES IS ONLY AS REQUIRED AS ITS WEAKEST SIGNATURE, and this
+   *  comment has twice claimed a guarantee one frame short of where it actually held. First:
+   *  deleting the default here pushed it up into `escalateToHuman`'s `now = Date.now()`. Then, with
+   *  that fixed, `escalateAgentGoal` below still took no instant at all and stamped the wall clock —
+   *  so the sweep judged at `now` while the more common of the two escalation branches wrote
+   *  `Date.now()`. It takes `now` too, now. Every frame from the sweep to the transition is
+   *  required; that is what makes the split clock unrepresentable rather than merely discouraged. */
+  rearmAgentGoal: (projectId: string, agentId: string, ttlMs: number, now: number) => void;
+  dischargeAgentGoal: (
+    projectId: string,
+    agentId: string,
+    sha: string,
+    baseSha: string,
+    now: number,
+  ) => void;
+  abandonAgentGoal: (projectId: string, agentId: string, evidence: string, now: number) => void;
   /** Clear the retry budget and any escalation, because a human acted on this agent. */
   resetAgentGoalRetries: (projectId: string, agentId: string) => void;
   /** Bind the epic an orchestrator is building (set at sendToBuild handoff — drives the sidebar
@@ -1672,11 +1707,44 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      escalateAgentGoal: (projectId, agentId, reason) =>
+      escalateAgentGoal: (projectId, agentId, reason, now) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             mapAgent(p, agentId, (a) =>
-              a.goal ? { ...a, goal: escalateGoal(a.goal, Date.now(), reason) } : a,
+              a.goal ? { ...a, goal: escalateGoal(a.goal, now, reason) } : a,
+            ),
+          ),
+        })),
+
+      // ── THE THREE EXPIRY OUTCOMES ────────────────────────────────────────────────────────────
+      // Each is a thin wrapper over the matching pure transition in `engine/agentGoal`, in exactly
+      // the shape `escalateAgentGoal` above uses. The RULES live in `engine/goalExpiry.decideExpiry`
+      // and nowhere else — these actions do not re-check anything, deliberately, because a second
+      // copy of a gate is how the two copies come to disagree in precisely the case that closes an
+      // unfinished agent or paints a finished one red.
+      rearmAgentGoal: (projectId, agentId, ttlMs, now) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.goal ? { ...a, goal: rearmGoal(a.goal, now, ttlMs) } : a,
+            ),
+          ),
+        })),
+
+      dischargeAgentGoal: (projectId, agentId, sha, baseSha, now) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.goal ? { ...a, goal: dischargeGoal(a.goal, now, sha, baseSha) } : a,
+            ),
+          ),
+        })),
+
+      abandonAgentGoal: (projectId, agentId, evidence, now) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.goal ? { ...a, goal: abandonGoal(a.goal, now, evidence) } : a,
             ),
           ),
         })),

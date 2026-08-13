@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import {
   agentNotices,
   withoutSeparatelyDrawn,
+  GOAL_NOTICE_LABEL,
   GOAL_STALL_ALIAS,
   NOTICE_EXPLAINER,
   resolveNoticeId,
@@ -98,6 +99,7 @@ describe("agentNotices", () => {
     // omitting one a type error at this line instead of a silent gap.
     const ALL = Object.keys({
       "human-verified-goal": 0,
+      "abandoned-goal": 0,
       "unmet-goal": 0,
       "open-pr": 0,
       "unlanded-work": 0,
@@ -551,6 +553,29 @@ describe("NOTICE_EXPLAINER", () => {
     for (const [verdict, label] of Object.entries(THRASH_VERDICT_LABEL)) {
       const text = NOTICE_EXPLAINER[`thrash:${verdict}`]!;
       expect(text.toLowerCase().startsWith(label.toLowerCase())).toBe(false);
+    }
+  });
+});
+
+describe("every goal pill the producer can emit has an explainer", () => {
+  // ⚠️ DERIVED FROM THE CODE, NOT FROM A LIST WRITTEN HERE. `NOTICE_EXPLAINER` is a
+  // `Record<string, string>` — an untyped key space — so `discharged` shipped with its glyph, its
+  // label and its chip while its explainer was simply missing, and nothing failed to compile.
+  // Clicking that pill expanded to the goal text with no explanation of what it meant (bead
+  // sparkle-tyter). A hand-written list here would have the identical hole: it would need the same
+  // edit the omission proves nobody makes. `GOAL_NOTICE_LABEL` is `Record<GoalBadge["state"], …>`,
+  // so TypeScript forces IT to be complete — walking its keys makes this test complete too, for
+  // free, on the day a new state is added.
+  it("covers every state in the type-checked label table", () => {
+    const states = Object.keys(GOAL_NOTICE_LABEL);
+    expect(states).toContain("discharged");
+    for (const state of states) {
+      const explainer = NOTICE_EXPLAINER[`goal:${state}`];
+      expect(explainer, `goal:${state} has no explainer — clicking its pill explains nothing`)
+        .toBeDefined();
+      // Not merely present: an empty or stub string renders as a blank panel, which is the same
+      // dead end from the reader's side.
+      expect(explainer!.length).toBeGreaterThan(80);
     }
   });
 });

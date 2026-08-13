@@ -23,6 +23,7 @@ import {
 } from "../engine/agentGoal";
 import { describeGoalVerify } from "@sparkle/core";
 import { stallReport, type StallReport } from "../engine/agentStall";
+import type { ExpiryProof } from "../engine/goalExpiry";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { thrashReportFor, type ThrashReport } from "../engine/agentThrash";
 import { unlandedWorkEvidence, type WorkflowStageId } from "../engine/workflowStage";
@@ -201,6 +202,86 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
   if (bs === undefined) return undefined;
   if (shipped !== true) return false;
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
+}
+
+/**
+ * The evidence `engine/goalExpiry.decideExpiry` adjudicates an expired goal on — or `undefined`,
+ * meaning WE DID NOT LOOK.
+ *
+ * ALL-OR-NOTHING, and that is the safety property rather than a convenience. Every boolean below is
+ * a verdict, and `decideExpiry` can latch a goal permanently closed on them, so a partially-known
+ * proof must not exist: absent evidence has to be indistinguishable from "not looked up" at the
+ * boundary, or a missing reading gets read as a negative finding. This is the same
+ * `undefined`-is-not-`false` discipline {@link stallEvidenceFor} is built on, held one notch
+ * stricter because the consumer WRITES rather than merely renders.
+ *
+ * NOT A NEW GIT CALL. Every input is already-polled, window-local store state, exactly as
+ * {@link stallEvidenceFor} and {@link landedEvidenceFor} are — this runs on the 15s continuation
+ * sweep for every agent on the roster, so an answer costing a subprocess per agent would cost more
+ * than the stalls it resolves.
+ *
+ * THE TWO SHAS AND `hasOpenPr` ARE ALLOWED TO BE ABSENT, and the exemption is earned by a test each
+ * one passes: `decideExpiry` reads them from exactly ONE arm apiece, so their absence withholds that
+ * single decision (`proof-unauditable`, `pr-state-unknown`) instead of colouring any other. Nothing
+ * is inferred from it anywhere else.
+ *
+ * ⚠️ `hasOpenPr` WAS REQUIRED HERE, AND THAT SHIPPED THE WHOLE MECHANISM INERT for the population it
+ * exists to rescue. `readOpenPr` answers `undefined` unless `workflowState` is present AND
+ * `prState !== null` — and `null` is the ordinary reading for a branch that simply has no PR, since
+ * the probe cannot tell "no PR" from "did not ask". So the target case (an agent walled by an
+ * outage, work committed, no PR yet) produced NO proof at all, `decideExpiry` refused with
+ * `evidence-unreadable`, and the goal was never re-armed — the dead letter this module was written
+ * to end, reconstructed one layer down. Same reasoning as the shas, same fix: withhold the one
+ * decision, not the evidence.
+ */
+export function expiryProofFor(agentId: string): ExpiryProof | undefined {
+  const rt = useRuntimeStore.getState();
+  const bs = rt.branchStatus?.[agentId];
+  // The live reading is required, for the reason spelled out at `landedEvidenceFor`: `workflowStage`
+  // and `workflowShipped` are PERSISTED across relaunch while `branchStatus` deliberately boots
+  // clean, so without this an answer could be served from months-old localStorage — the false "done"
+  // roborev 57794 restored once already.
+  if (bs === undefined) return undefined;
+
+  // ⚠️ PARKED IS ANSWERED HERE, BEFORE THE GATE, or the refusal it exists to name never happens.
+  // `readUncommitted` returns `undefined` for precisely `dirty && worktreeOnBranch === false` — and a
+  // parked worktree is parked BECAUSE someone checked a topic branch into it and is working there,
+  // so dirty-and-parked is the majority of that population (21 of ~48 worktrees, measured). Those
+  // therefore tripped the all-or-nothing gate and degraded into `evidence-unreadable`, which is the
+  // exact outcome the pass-through below was written to prevent: only a parked-and-pristine tree
+  // ever reached `worktree-parked`, and the two refusals say different things to a human.
+  //
+  // THE OTHER FIELDS ARE FAIL-CLOSED VALUES, not readings. `decideExpiry` returns at
+  // `!proof.worktreeOnBranch` without consulting them, and these are chosen so that even a future
+  // arm which did consult them could not write a latch: `landed:false` and `clean:false` refuse a
+  // discharge, `unlanded:false` refuses an abandonment, and an absent `hasOpenPr` refuses one again.
+  // A parked tree's evidence belongs to another branch; nothing here is attributable to this agent.
+  if (bs.worktreeOnBranch === false) {
+    return { landed: false, clean: false, unlanded: false, worktreeOnBranch: false };
+  }
+
+  const landed = landedEvidenceFor(agentId);
+  const ev = stallEvidenceFor(agentId);
+  const { hasOpenPr, hasUnlandedWork, hasUncommittedChanges } = ev;
+  if (landed === undefined || hasUnlandedWork === undefined || hasUncommittedChanges === undefined) {
+    return undefined;
+  }
+
+  return {
+    landed,
+    clean: hasUncommittedChanges === false,
+    unlanded: hasUnlandedWork,
+    // SPREAD-WHEN-KNOWN, the shape `stallEvidenceFor` already uses: a key present with the value
+    // `undefined` reads as a supplied answer to anything inspecting the object, and the whole point
+    // of this field being optional is that a missing key means "not looked up".
+    ...(hasOpenPr === undefined ? {} : { hasOpenPr }),
+    // Always `true` by the time we reach here — the `false` case returned above. Kept as a field
+    // rather than dropped because `decideExpiry` owns the parked rule and names it in its refusal
+    // (`worktree-parked`), which is a sentence a human can act on; this reader only supplies the
+    // fact. `undefined` (a Rust build predating the field) reads as "on branch", the same
+    // back-compat direction `BranchStatus` documents for it.
+    worktreeOnBranch: true,
+  };
 }
 
 /** `prState: null` is ambiguous — see {@link stallEvidenceFor}. Only "open" is a positive reading. */

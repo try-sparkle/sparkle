@@ -176,6 +176,11 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "Auto-continue has given up on this agent's goal and handed it back. Nothing is coming for it " +
     "— no retry is scheduled and no other agent is watching it. The other marks on this row say " +
     "whether anything is still owed.",
+  "stall:abandoned-goal":
+    "This agent's goal ran out of time repeatedly, Sparkle extended it as many times as it is " +
+    "allowed to, and git still shows committed work that never reached main — with no pull request " +
+    "carrying it. Nothing further is scheduled and nothing else is watching the branch, so the " +
+    "remaining decision is yours: land the work, or drop it.",
   "stall:expired-goal":
     "The time budget for this agent's goal ran out before the goal was met. The work is unfinished; " +
     "only the window auto-continue was allowed to spend on it has closed.",
@@ -222,6 +227,21 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "Auto-continue GAVE UP on this agent and handed it back to you — that is what the red octagon " +
     "means. It retried, hit its ceiling, and stopped rather than looping forever. Nothing further " +
     "will happen on its own; the agent needs a person to look at why it could not finish.",
+  // `discharged` shipped with its pill (glyph, label, chip) but NOT this entry, because
+  // NOTICE_EXPLAINER is a `Record<string, string>` — an untyped key space, so the omission compiled.
+  // Clicking the pill then expanded to the goal text with no explanation, which is bead
+  // sparkle-tyter's complaint exactly: a mark the founder clicks and cannot recover the meaning of.
+  // It is also the state most in need of the paragraph, being the one nobody asked for.
+  // ⚠️ THE COPY MUST NOT POINT AT A MARK THAT IS NOT THERE. The first version said "a stronger finish
+  // than the green check beside it" — but `discharged` and `met` SHARE the check glyph (see
+  // GOAL_GLYPH), so there is no second mark beside anything; the check the reader is looking at IS
+  // this one. Describing a UI that does not exist is the same class of defect as describing behaviour
+  // that does not: the reader goes looking, finds nothing, and trusts the surface less.
+  "goal:discharged":
+    "Sparkle closed this goal itself, on GIT'S evidence rather than the agent's word: the branch's " +
+    "work is contained in the default branch and the worktree is clean, so there is nothing left " +
+    "holding. The check means the same thing here as on a goal the agent marked met — finished — " +
+    "but nobody had to take anyone's word for it. The proving commits are recorded on the goal.",
 
   inbox:
     "The concierge has queued instructions for this agent that it has not picked up yet. Messages " +
@@ -252,20 +272,25 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
 const STALL_CAUSE_RANK: Record<StallCause, number> = {
   // RED — `stallEscalation.OUTSTANDING`: the founder is the only actor who can clear it.
   "human-verified-goal": 0,
+  // Also RED. Second because it is the less immediate of the two: a sign-off is a question already
+  // put to him, while an abandoned branch is a disposition he can take at his leisure. Everything
+  // below shifted down one to make room rather than being re-ranked — their relative order is a
+  // genuine actionability ordering and this change has no opinion about it.
+  "abandoned-goal": 1,
   // NEVER RED. The four below are `stallEscalation.LIFECYCLE` → the amber `lapsed` status; they were
   // in the RED group until 2026-08-07 and moved together (see OUTSTANDING for who clears each). Their
   // relative order is unchanged — it is a genuine actionability ordering among things somebody else
   // will do, and `uncommitted-changes` stays last of them for the same reason it always did.
-  "unmet-goal": 1,
-  "open-pr": 2,
-  "unlanded-work": 3,
-  "uncommitted-changes": 4,
+  "unmet-goal": 2,
+  "open-pr": 3,
+  "unlanded-work": 4,
+  "uncommitted-changes": 5,
   // `escalated-goal` is LIFECYCLE too, and sorts BELOW the work causes: it says our retry budget ran
   // out, which is the quietest thing on this list. `expired-goal` is in NEITHER engine set → calm
   // gray. Do not "keep them in step" by adding expiry to LIFECYCLE; that module's own ⚠️ block
   // explains at length why it must stay out.
-  "escalated-goal": 5,
-  "expired-goal": 6,
+  "escalated-goal": 6,
+  "expired-goal": 7,
 };
 
 // NO THRASH RANK HERE, deliberately (roborev 58710/58721). A `ThrashReport` carries exactly ONE
@@ -343,15 +368,22 @@ const GOAL_GLYPH: Record<GoalBadge["state"], NoticeGlyph> = {
   expired: "clock",
   unmet: "target",
   met: "check",
+  // Same `check` as `met`, matching `GOAL_CHIP_ICON` — see the note there for why these two states
+  // share a shape while every other pair does not. The rule this table exists to keep is that the
+  // pill and the chip agree, and they do.
+  discharged: "check",
 };
 
 /** The pill's visible words for each goal state. PLAIN, not the engine's token: "escalated" is the
  *  word the founder could not act on, and "auto-continue gave up" is the same fact said usefully. */
-const GOAL_NOTICE_LABEL: Record<GoalBadge["state"], string> = {
+export const GOAL_NOTICE_LABEL: Record<GoalBadge["state"], string> = {
   escalated: "Auto-continue gave up",
   expired: "Goal expired, never met",
   unmet: "Goal not met yet",
   met: "Goal met",
+  // Says WHO closed it, because this is the one goal state no person and no agent asked for — the
+  // reader's first question on seeing a goal they did not close is who closed it.
+  discharged: "Closed — the work landed on main",
 };
 
 /** Everything a surface needs to gather. Every field optional and every one meaning "not looked

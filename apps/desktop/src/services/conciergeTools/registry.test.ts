@@ -1136,7 +1136,7 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const agentId = seedBuild(projectId);
     const store = useProjectStore.getState();
     store.setAgentGoal(projectId, agentId, "the original objective that was escalated");
-    store.escalateAgentGoal(projectId, agentId, "auto-continue gave up after 3 restarts");
+    store.escalateAgentGoal(projectId, agentId, "auto-continue gave up after 3 restarts", Date.now());
     const before = useProjectStore
       .getState()
       .projects.find((p) => p.id === projectId)!
@@ -1171,7 +1171,7 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
     const agentId = seedBuild(projectId);
     const store = useProjectStore.getState();
     store.setAgentGoal(projectId, agentId, "the original objective that was escalated");
-    store.escalateAgentGoal(projectId, agentId, "auto-continue gave up after 3 restarts");
+    store.escalateAgentGoal(projectId, agentId, "auto-continue gave up after 3 restarts", Date.now());
     store.setAgentGoal(projectId, agentId, "", undefined, "agent"); // the agent clears it
     const cleared = useProjectStore
       .getState()

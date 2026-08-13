@@ -40,8 +40,44 @@ export interface AgentGoal {
   text: string;
   /** Epoch ms the goal was set. With `ttlMs`, fixes the expiry. */
   setAt: number;
-  /** Lifetime from `setAt`. Defaults to {@link DEFAULT_GOAL_TTL_MS}. */
+  /** Lifetime from {@link goalDeadline}'s origin — `rearmedAt` when present, else `setAt`.
+   *  Defaults to {@link DEFAULT_GOAL_TTL_MS}. */
   ttlMs: number;
+  /** Epoch ms of the last TTL RE-ARM, and the clock's origin once present. See {@link rearmGoal}.
+   *
+   *  A SEPARATE FIELD RATHER THAN AN OVERWRITE OF `setAt`, deliberately. `setAt` is the goal's birth
+   *  fact, and it is what `goalRemainingMs` and the row's "active · 3h 20m left" badge are derived
+   *  from; extending the clock by moving it would make a four-hour-old goal report as newborn, which
+   *  is precisely the reading a human uses to decide whether an agent is worth waiting for. */
+  rearmedAt?: number;
+  /** TTL re-arms spent on this goal, bounded by `goalExpiry.MAX_TTL_REARMS`.
+   *
+   *  ⚠️ OPTIONAL, AND IT MUST STAY OPTIONAL. Every goal already in the persisted store deserializes
+   *  without it. Read undefined-unsafely, `undefined >= MAX` is `false` (so a re-arm is always
+   *  allowed) and `undefined + 1` is `NaN` (so the counter never climbs) — an unbounded re-arm loop
+   *  that typechecks cleanly. Always read it as `?? 0`, at BOTH the compare and the write. */
+  ttlRearms?: number;
+  /** Epoch ms the goal was DISCHARGED — closed by Sparkle because git proved the work landed and the
+   *  tree was clean. Latched, and distinct from `metAt`: `metAt` is a CLAIM (the agent's or a
+   *  human's), this is a PROOF, and only the proof carries the shas below.
+   *
+   *  Named `discharged` rather than `retired` on purpose — "retirement" is already taken by the
+   *  build-list feature whose contract is the opposite of this one ("no build agent leaves the build
+   *  list without a retro on file and a human confirm"). `discharge` is this module's own existing
+   *  word for an obligation settled by evidence. */
+  dischargedAt?: number;
+  /** The agent's branch tip that was proven contained. */
+  dischargedSha?: string;
+  /** The `origin/<default>` tip it was proven AGAINST — because "X is contained in origin/main" is
+   *  unfalsifiable after a force-push, while "X was contained when origin/main was Y" stays checkable
+   *  forever. A discharge nobody can audit is an assertion, not a proof. */
+  dischargedBaseSha?: string;
+  /** Epoch ms this goal was ABANDONED: it expired, its re-arm budget was spent, and git positively
+   *  showed work nobody had landed. An ANNOTATION on an escalation rather than a state beside one —
+   *  see {@link abandonGoal} for why that is what keeps it from becoming a second dead letter. */
+  abandonedAt?: number;
+  /** One sentence naming what git said, for the human who now owns the disposition call. */
+  abandonedEvidence?: string;
   /** Epoch ms the goal was declared MET — by the agent itself, or by the human. Absent while unmet.
    *  This is the ONLY thing that makes an idle agent legitimately "done": a turn ending does not
    *  set it, which is precisely the distinction the whole feature rests on. */
@@ -123,7 +159,19 @@ export interface AgentGoal {
 
 /** Where a goal is in its life. `none` is the absence of a goal, kept in the union so every
  *  consumer branches over one exhaustive vocabulary rather than juggling `undefined`. */
-export type GoalState = "none" | "unmet" | "met" | "expired" | "escalated";
+export type GoalState = "none" | "unmet" | "met" | "discharged" | "expired" | "escalated";
+
+/**
+ * When this goal's clock runs out.
+ *
+ * ONE PLACE, because the deadline is now computed from two possible origins and the arithmetic was
+ * previously inlined at both {@link goalStateOf} and {@link goalRemainingMs}. Two copies of a rule
+ * that has just grown a case is how the badge comes to disagree with the state machine about whether
+ * an agent is still live.
+ */
+export function goalDeadline(goal: AgentGoal): number {
+  return (goal.rearmedAt ?? goal.setAt) + goal.ttlMs;
+}
 
 /** Build a fresh goal. Counters start at zero; a new goal is never born escalated or met.
  *
@@ -170,12 +218,26 @@ export function newGoal(
  * ESCALATED goal is likewise still unmet work — but it is no longer OURS to retry, so it gets its
  * own state rather than folding back into `unmet`, where the continuation engine would pick it up
  * again and defeat the escalation.
+ *
+ * `escalated` IS CHECKED BEFORE `discharged`, and that ordering is the same argument pointed the
+ * other way. The two are mutually exclusive by the writer's gate (`goalExpiry.decideExpiry` cannot
+ * reach a discharge on a goal it has already escalated), but a record that can EXPRESS both must
+ * resolve the impossible combination toward the LOUD reading rather than the calm one: a row wrongly
+ * left red costs a glance, a row wrongly painted finished costs the work.
+ *
+ * `expired` REMAINS DERIVED FROM THE CLOCK, and that is load-bearing rather than incidental. The only
+ * thing that could write it is the continuation sweep, which runs only for projects the current
+ * window owns and only while a window is up. Were expiry a written state, an agent in a background
+ * project — or on a laptop that slept through its TTL, which is the motivating case — would never
+ * receive the write, would read `unmet` forever, and would go on being auto-continued against a
+ * mandate that had lapsed. Deriving it is what makes the sweeper's ABSENCE safe.
  */
 export function goalStateOf(goal: AgentGoal | undefined, now: number): GoalState {
   if (goal === undefined) return "none";
   if (goal.metAt !== undefined) return "met";
   if (goal.escalatedAt !== undefined) return "escalated";
-  if (now >= goal.setAt + goal.ttlMs) return "expired";
+  if (goal.dischargedAt !== undefined) return "discharged";
+  if (now >= goalDeadline(goal)) return "expired";
   return "unmet";
 }
 
@@ -194,7 +256,73 @@ export function hasUnmetGoal(goal: AgentGoal | undefined, now: number): boolean 
  *  "active (4h)" style label the PRD described. */
 export function goalRemainingMs(goal: AgentGoal | undefined, now: number): number {
   if (goal === undefined) return 0;
-  return Math.max(0, goal.setAt + goal.ttlMs - now);
+  return Math.max(0, goalDeadline(goal) - now);
+}
+
+/**
+ * Extend a lapsed goal's clock, WITHOUT giving anything else back.
+ *
+ * Re-arm restores the MANDATE — the agent is still meant to be working on this — and deliberately not
+ * the BUDGET. `continues` / `totalContinues` bound how much Sparkle may spend restarting an agent
+ * that is getting nowhere, and a clock running out is not evidence that restarting has started
+ * working. So this is shaped like {@link noteContinue} (purely additive) and pointedly NOT like
+ * {@link resetGoalRetries} (the human's lever, which clears everything).
+ *
+ * THE CONSEQUENCE SOMEONE WILL TRY TO "FIX": a goal that lapses having already spent its twenty
+ * continues re-arms to `unmet` and is then escalated on the very next sweep by the `MAX_CONTINUES_TOTAL`
+ * arm of `decideContinuation`. That is correct and is the point — it reaches a human through the
+ * existing, tested escalation path instead of quietly looping.
+ *
+ * IT DOES NOT SEND ANYTHING. The resume is left to the ordinary sweep, which sees `unmet` on its next
+ * pass and restarts the agent through `continueAgent` like any other unmet goal. A bespoke send here
+ * would be a SECOND sender: it would cost nothing from the retry budget (three free resumes per
+ * goal) and would bypass the in-flight guard, the undelivered-send ceiling, and the idle-settle
+ * window that the runner is arranged around. One sender, one budget.
+ *
+ * `ttlMs` is required rather than defaulted, so the re-arm policy (a shorter clock than the original)
+ * lives with the rest of the expiry policy instead of being silently inherited here.
+ */
+export function rearmGoal(goal: AgentGoal, now: number, ttlMs: number): AgentGoal {
+  return { ...goal, rearmedAt: now, ttlMs, ttlRearms: (goal.ttlRearms ?? 0) + 1 };
+}
+
+/**
+ * Close the goal on GIT'S evidence rather than on anybody's say-so.
+ *
+ * Idempotent in the same shape as {@link markGoalMet}: a second discharge keeps the first timestamp,
+ * so "when was this proven finished" does not drift each time something re-asserts it.
+ *
+ * The two shas are the audit trail — see {@link AgentGoal.dischargedBaseSha} for why one is not
+ * enough. A caller that cannot supply both has not proven anything and must not call this.
+ */
+export function dischargeGoal(
+  goal: AgentGoal,
+  now: number,
+  sha: string,
+  baseSha: string,
+): AgentGoal {
+  if (goal.dischargedAt !== undefined) return goal;
+  return { ...goal, dischargedAt: now, dischargedSha: sha, dischargedBaseSha: baseSha };
+}
+
+/**
+ * Give up on a goal that lapsed repeatedly while visibly holding work nobody landed.
+ *
+ * IT WRITES THROUGH {@link escalateGoal}, and that is the whole design rather than an implementation
+ * detail. A fresh terminal state would need its own retry suppression, its own notification, its own
+ * ager, and its own tier membership — i.e. it would be a second dead letter one state over from the
+ * one this module is being changed to fix. Riding on the escalation inherits all four for free:
+ * `decideContinuation` already answers `already-escalated`, the runner already notifies exactly once
+ * by latch, the amber `escalated-goal` cause is already a FLOOR (so the row can never fall back to
+ * calm even if the red cause is later demoted), and anything built to age escalations covers this too.
+ *
+ * `abandonedAt` is therefore an ANNOTATION: it says WHY this particular escalation happened, and it is
+ * what the red `abandoned-goal` stall cause keys on.
+ */
+export function abandonGoal(goal: AgentGoal, now: number, evidence: string): AgentGoal {
+  const escalated = escalateGoal(goal, now, evidence);
+  if (goal.abandonedAt !== undefined) return escalated;
+  return { ...escalated, abandonedAt: now, abandonedEvidence: evidence };
 }
 
 /** Mark the goal met. Idempotent — a second call keeps the FIRST timestamp, so "when was this
@@ -234,7 +362,28 @@ export function escalateGoal(goal: AgentGoal, now: number, reason: string): Agen
  *  can do reaches it — see {@link clearGoalMet} for the agent-facing counterpart, which
  *  deliberately cannot refill the ceiling. */
 export function resetGoalRetries(goal: AgentGoal): AgentGoal {
-  const { escalatedAt: _e, escalationReason: _r, mark: _m, ...rest } = goal;
+  const {
+    escalatedAt: _e,
+    escalationReason: _r,
+    mark: _m,
+    // The expiry latches and the re-arm budget go the same way and for the same reason: a human who
+    // has just engaged with this agent has overtaken every conclusion Sparkle reached about it in
+    // their absence. Leaving `dischargedAt` latched would be roborev 55254 (a `metAt` that stayed
+    // latched forever) reproduced on the new field — the human retypes the goal and gets back an
+    // agent the machine still considers finished.
+    dischargedAt: _d,
+    dischargedSha: _ds,
+    dischargedBaseSha: _db,
+    abandonedAt: _a,
+    abandonedEvidence: _ae,
+    ttlRearms: _tr,
+    ...rest
+  } = goal;
+  // ⚠️ `rearmedAt` and `ttlMs` SURVIVE, and dropping them would be a regression rather than a
+  // tidy-up. A re-arm leaves a SHORTER `ttlMs` behind it, so clearing the origin while keeping that
+  // lifetime recomputes the deadline from the goal's original birth — moving it EARLIER, and usually
+  // into the past, so the human's own lever would hand back a goal that is instantly expired again.
+  // The clock is not part of the retry budget; this lever is about the budget.
   return { ...rest, continues: 0, totalContinues: 0 };
 }
 

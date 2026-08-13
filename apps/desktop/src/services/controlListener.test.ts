@@ -752,7 +752,7 @@ describe("controlListener", () => {
       useProjectStore.getState().setAgentGoal(projectId, callerId, "fix the flake");
       useProjectStore
         .getState()
-        .escalateAgentGoal(projectId, callerId, "Auto-continued 3 times with no sign of progress.");
+        .escalateAgentGoal(projectId, callerId, "Auto-continued 3 times with no sign of progress.", Date.now());
       useRuntimeStore.getState().setStatus(callerId, "idle");
       fire({ reqId: "g4", op: "get_state", callerAgentId: callerId, payload: {} });
       await flush();
@@ -2451,7 +2451,7 @@ describe("controlListener", () => {
       store.setAgentGoal(projectId, callerId, "land the PR");
       store.noteAgentGoalContinue(projectId, callerId, "stuck");
       store.noteAgentGoalContinue(projectId, callerId, "stuck");
-      store.escalateAgentGoal(projectId, callerId, "two tries, no progress");
+      store.escalateAgentGoal(projectId, callerId, "two tries, no progress", Date.now());
 
       fire({
         reqId: "sgL",

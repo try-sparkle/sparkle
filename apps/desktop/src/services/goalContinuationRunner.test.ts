@@ -382,6 +382,24 @@ describe("escalation", () => {
     const goal = goalOf(projectId, agentId)!;
     expect(goal.escalatedAt).toBeDefined();
     expect(goal.escalationReason).toContain("land the PR");
+
+    // ⚠️ AND IT IS NOT AN ABANDONMENT. `escalateToHuman` takes a `via` variant defaulting to
+    // "escalate", and `abandonGoal` writes THROUGH `escalateGoal` — so both variants set
+    // `escalatedAt`/`escalationReason` identically and the ONLY observable difference is this field,
+    // which `engine/agentStall` turns into the RED `abandoned-goal` cause. Until this assertion
+    // existed, flipping that default (or a future caller passing the wrong variant) left the whole
+    // suite green while every ordinary give-up painted its row red as work nobody landed — the exact
+    // inverse of the bug the variant was added to fix, and the "defaulted seam every test injects"
+    // shape from AGENTS.md. An ordinary give-up says auto-continue stopped; it asserts NOTHING about
+    // where the branch's work ended up.
+    expect(goal.abandonedAt).toBeUndefined();
+    expect(goal.abandonedEvidence).toBeUndefined();
+
+    // ⚠️ THE VALUE, NOT THE PRESENCE. Every other assertion on `escalatedAt` in this file is
+    // `toBeDefined()`, which cannot fail when the instant is dropped — and it WAS dropped, all the
+    // way to `escalateAgentGoal`, while comments upstream claimed the clock was threaded. The sweep
+    // judged at SETTLED, so that is what the latch must carry.
+    expect(goal.escalatedAt).toBe(SETTLED);
   });
 
   it("fires ONCE — a later sweep neither re-announces nor restarts", async () => {
