@@ -126,6 +126,23 @@ vi.mock("./conciergeTools/registry", async (importOriginal) => {
 // touch their spies inside an arrow, so they get away with it; this one would be a TDZ error.
 const { classifyReceiptMock } = vi.hoisted(() => ({ classifyReceiptMock: vi.fn() }));
 vi.mock("./sparkleBusy", () => ({ sparkleActivityLine: vi.fn(() => null) }));
+/**
+ * The Chief TRANSPORT seam, mocked for the whole file so app startup can be driven for real.
+ *
+ * `resolveChiefPat` defaults to "" — no token — which is exactly what every non-Chief test in this
+ * file already assumed implicitly (no keychain in jsdom), so the default changes nothing for them:
+ * `connectChief` clears the client and the suite proceeds as before. The startup test below is the
+ * one case that hands it a PAT, and it restores the default afterwards.
+ */
+const { chiefResolvePat, chiefCreateClient } = vi.hoisted(() => ({
+  chiefResolvePat: vi.fn(async () => ""),
+  chiefCreateClient: vi.fn(),
+}));
+vi.mock("./chiefMcp", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./chiefMcp")>()),
+  resolveChiefPat: () => chiefResolvePat(),
+  createChiefMcpClient: (...a: unknown[]) => chiefCreateClient(...(a as [never])),
+}));
 vi.mock("./conciergeReceiptClassifier", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./conciergeReceiptClassifier")>();
   classifyReceiptMock.mockImplementation(actual.classifyConciergeActionReceipt);
@@ -136,19 +153,29 @@ vi.mock("./conciergeReceiptClassifier", async (importOriginal) => {
 });
 
 import { configuredToolPolicy } from "./conciergeTools/policyBinding";
+import {
+  clearConciergeApprovals,
+  pendingApprovals,
+  useConciergeApprovals,
+} from "../stores/conciergeApprovals";
 import { useSettingsStore } from "../stores/settingsStore";
 import {
   startControlListener,
   isControlOpSuccess,
   CONCIERGE_CALLER_AGENT_ID,
+  setChiefClient,
   controlExpiredSkipCounts,
   _resetControlExpiredSkipsForTests,
   type ControlRequest,
 } from "./controlListener";
-// The human-facing side effect of the concierge's `ask` tier. Asserted by the expiry suite below
-// because "skipped BEFORE the policy gate" is only provable by the absence of the thing the gate
-// produces — a refusal reply alone looks identical whichever gate wrote it.
-import { clearConciergeApprovals, pendingApprovals } from "../stores/conciergeApprovals";
+// The FROZEN Chief contract. Imported for its types only — the cases below drive the real handler
+// through the real `dispatch`, and the stub they inject is the same seam production writes.
+import type { ChiefClient, ChiefProject } from "./chiefScope";
+// NOTE for the expiry suite that main added below: the human-facing side effect of the concierge's
+// `ask` tier is asserted there because "skipped BEFORE the policy gate" is only provable by the
+// absence of the thing the gate produces — a refusal reply alone looks identical whichever gate
+// wrote it. `clearConciergeApprovals` / `pendingApprovals` come from the import above rather than a
+// second one; the Chief suite already needed them, and duplicating the specifier is a syntax error.
 import { useSelfReportMetrics } from "../stores/selfReportMetrics";
 // The thrash accumulator is module-level and window-local — fed here so a case can tell "no hook
 // events seen for this agent" apart from a real looping verdict.
@@ -4243,6 +4270,450 @@ describe("controlListener", () => {
         expect(lastReply()).toMatchObject({ ok: true });
         expect(received).toHaveLength(0);
       });
+    });
+  });
+
+  // ── CHIEF: who may reach which Chief project ───────────────────────────────────────────────────
+  //
+  // THIS IS THE ENFORCEMENT POINT, and it is the only one there can be. `--allowedTools` DOES NOT
+  // GATE MCP TOOLS (measured on CLI 2.1.220, bead `sparkle-xbka`) — only `--disallowedTools` blocks
+  // — so scoping cannot be enforced by a spawn flag, by a tool description, or by persona prose.
+  // It is this handler or it is nothing, which is why these cases are written as security tests
+  // rather than as behaviour tests.
+  //
+  // EVERY REFUSAL CASE ASSERTS THAT NO CHIEF CALL WAS MADE, not merely that a refusal came back.
+  // "The message said no" and "nothing reached Chief" are different facts and only the second is
+  // the property being protected: a handler that refused AFTER calling `client.callTool` would
+  // satisfy a message-only assertion while having already read (or written) another client's data.
+  /**
+   * THE SEAM THAT SHIPPED INERT TWICE. Every other Chief test in this file injects a stub through
+   * `setChiefClient`, which is the correct way to test the GATES — but it means all of them pass
+   * identically whether or not anything ever calls `connectChief` in production. It did not: the
+   * function carried a doc-comment calling itself "the line that makes the feature exist" and was
+   * referenced by nothing but its own test, so `chiefClient` was `null` in every real run and all
+   * twelve Chief tools answered `chief_unavailable` with three suites green (roborev 63105).
+   *
+   * So this test injects NOTHING. It boots the app's real entry point — the same
+   * `startControlListener()` Workspace calls once at mount — and asserts the side effect: a Chief
+   * call reaches a transport that only startup could have installed. Delete the `connectChief` line
+   * from `doStart` and this is the test that goes red.
+   */
+  describe("Chief transport wiring at startup", () => {
+    afterEach(() => {
+      chiefResolvePat.mockResolvedValue("");
+      chiefCreateClient.mockReset();
+      setChiefClient(null);
+    });
+
+    it("startControlListener connects Chief, so a tool call reaches the real transport", async () => {
+      // Drop the listener the outer beforeEach started with no PAT, so the boot under test is a
+      // genuine cold start rather than a re-entry into the singleton's memoised promise.
+      cleanup?.();
+      cleanup = undefined;
+
+      const callTool = vi.fn(async () => ({ text: "3 asset(s) returned" }));
+      const listProjects = vi.fn(async () => [{ project_id: "chief_p1", name: "Acme Rebrand" }]);
+      chiefResolvePat.mockResolvedValue("pat_live_token");
+      chiefCreateClient.mockReturnValue({ listProjects, callTool });
+
+      cleanup = await startControlListener();
+
+      useProjectStore.setState(
+        (s) => ({
+          projects: s.projects.map((p) =>
+            p.id === projectId
+              ? { ...p, chiefProjectIds: ["chief_p1"], chiefPrimaryId: "chief_p1" }
+              : p,
+          ),
+        }),
+        false as never,
+      );
+
+      fire({
+        reqId: "boot1",
+        op: "chief_tool",
+        callerAgentId: callerId,
+        payload: { chiefTool: "list_assets", project: "chief_p1" },
+      });
+      await flush();
+
+      // Not "it did not say chief_unavailable" — the transport was actually reached, with the verb
+      // and project the caller asked for.
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(callTool).toHaveBeenCalledWith("chief_p1", "list_assets", {});
+      // …and it was built from the resolved PAT, not constructed with no credential.
+      expect(chiefCreateClient).toHaveBeenCalledTimes(1);
+    });
+
+    // THE PAIR (bead `sparkle-rvf6n`). Alone, the case above is satisfied by a boot that connects
+    // Chief unconditionally — including with no token, which would send every call to the network
+    // to come back unauthorized and read to a model as "Chief is broken" rather than "not set up".
+    // Same boot, same call, only the PAT differs.
+    it("…and leaves Chief unconfigured — not half-connected — when no PAT resolves", async () => {
+      cleanup?.();
+      cleanup = undefined;
+      chiefResolvePat.mockResolvedValue("");
+
+      cleanup = await startControlListener();
+
+      fire({
+        reqId: "boot2",
+        op: "chief_tool",
+        callerAgentId: callerId,
+        payload: { chiefTool: "list_assets", project: "chief_p1" },
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "chief_unavailable" });
+      expect(chiefCreateClient).not.toHaveBeenCalled();
+    });
+
+    // A keychain read can throw (locked, denied, no Rust side). Chief is optional, so that is a
+    // state and not an error — it must not take the control listener down with it, which is the
+    // assertion that matters here: the listener still came up and still serves non-Chief ops.
+    it("survives a throwing PAT read and still starts the listener", async () => {
+      cleanup?.();
+      cleanup = undefined;
+      chiefResolvePat.mockRejectedValue(new Error("keychain locked"));
+
+      cleanup = await startControlListener();
+
+      fire({ reqId: "boot3", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      expect((lastReply() as { agents: unknown[] }).agents.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe("chief_tool", () => {
+    const CATALOG: ChiefProject[] = [
+      { project_id: "chief_p1", name: "Acme Rebrand" },
+      { project_id: "chief_p2", name: "Globex Retainer" },
+    ];
+    let listProjects: ReturnType<typeof vi.fn>;
+    let chiefCallTool: ReturnType<typeof vi.fn>;
+    /** True when the stub was touched AT ALL — the assertion for a gate that must refuse before the
+     *  catalog is even read (the destructive-verb gate). Catalog reads are not project-scoped, so
+     *  the scope cases below assert only that `callTool` stayed untouched. */
+    const chiefUntouched = () =>
+      listProjects.mock.calls.length === 0 && chiefCallTool.mock.calls.length === 0;
+
+    /** A second Sparkle project + an agent inside it, so "another agent's binding" is a real
+     *  binding rather than a hypothetical one. Returned rather than hoisted into the outer
+     *  `beforeEach` so the default fixtures stay exactly as every other suite here sees them. */
+    let otherProjectId: string;
+    let otherProjectAgentId: string;
+
+    const bindChief = (pid: string, ids: string[], primary: string | null) =>
+      useProjectStore.setState(
+        (s) => ({
+          projects: s.projects.map((p) =>
+            p.id === pid ? { ...p, chiefProjectIds: ids, chiefPrimaryId: primary } : p,
+          ),
+        }),
+        false as never,
+      );
+
+    beforeEach(() => {
+      listProjects = vi.fn(async () => CATALOG);
+      chiefCallTool = vi.fn(async () => ({ text: "3 asset(s) returned", data: [{ id: "a1" }] }));
+      // The INJECTED seam, and the same one production writes — see `setChiefClient`'s doc. A stub
+      // here is not a mock of the thing under test: the thing under test is the two gates in front
+      // of it, and the stub is how "did anything reach Chief" becomes observable at all.
+      setChiefClient({
+        listProjects: listProjects as unknown as ChiefClient["listProjects"],
+        callTool: chiefCallTool as unknown as ChiefClient["callTool"],
+      });
+      const store = useProjectStore.getState();
+      otherProjectId = store.addProject("Other", "/tmp/other");
+      otherProjectAgentId = store.addAgent(otherProjectId, { kind: "build" })!;
+      bindChief(projectId, ["chief_p1"], "chief_p1");
+      bindChief(otherProjectId, ["chief_p2"], "chief_p2");
+      // `addProject` selects the project it created. The concierge's default comes from the SELECTED
+      // project, so pin it back to the fixture project or every concierge case silently reads the
+      // other one's binding.
+      useProjectStore.setState({ selectedProjectId: projectId } as never);
+    });
+    afterEach(() => setChiefClient(null));
+
+    // The approval ledger is module-level state. Without this a card raised by one case would be
+    // counted by the next, and — worse — a spent-or-pending entry would change what the gate does.
+    beforeEach(() => clearConciergeApprovals());
+
+    const fireChief = (
+      reqId: string,
+      callerAgentId: string,
+      payload: Record<string, unknown>,
+    ) => fire({ reqId, op: "chief_tool", callerAgentId, payload });
+
+    it("REFUSES an agent bound to P1 that asks for P2 — and makes no Chief call", async () => {
+      fireChief("c1", callerId, { chiefTool: "list_assets", project: "chief_p2" });
+      await flush();
+
+      const reply = lastReply();
+      expect(reply).toMatchObject({ ok: false, code: "out_of_scope" });
+      // Names what this agent CAN reach, and NOT the project it asked for by id. This assertion
+      // used to require the opposite, which pinned the id→name oracle as the contract and would
+      // have made fixing the leak a test change rather than a code change (roborev 63043).
+      expect(reply.error).toContain("Acme Rebrand");
+      expect(reply.error).not.toContain("Globex Retainer");
+      // THE ACTUAL SECURITY PROPERTY. The message above is how the agent learns why; this is what
+      // makes the refusal mean anything.
+      expect(chiefCallTool).not.toHaveBeenCalled();
+    });
+
+    // THE PAIR (bead `sparkle-rvf6n`). One test proving absence is ambiguous about WHICH guard
+    // refused — an unrelated earlier gate (an unresolvable caller, a missing client, a typo'd tool
+    // name) produces the identical "no Chief call" observation. This is the same agent, the same
+    // tool and the same setup, differing only in the project asked for, so the pair pins the cause.
+    it("PERMITS that same agent asking for its own P1 — the stub IS called, with P1", async () => {
+      fireChief("c2", callerId, { chiefTool: "list_assets", project: "chief_p1" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(chiefCallTool).toHaveBeenCalledTimes(1);
+      expect(chiefCallTool).toHaveBeenCalledWith("chief_p1", "list_assets", {});
+    });
+
+    it("resolves a project by NAME as well as by id — 348 opaque ids are not quotable", async () => {
+      fireChief("c3", callerId, { chiefTool: "list_assets", project: "  acme rebrand  " });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(chiefCallTool).toHaveBeenCalledWith("chief_p1", "list_assets", {});
+    });
+
+    it("REFUSES a destructive verb for an agent — before it even reads the catalog", async () => {
+      fireChief("c4", callerId, { chiefTool: "delete_asset", project: "chief_p1" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "destructive_denied" });
+      // Stronger than the scope cases above, and deliberately so: the verb gate runs FIRST, so a
+      // denied verb costs Chief nothing at all — not even the catalog read.
+      expect(chiefUntouched()).toBe(true);
+    });
+
+    // THE CONCIERGE IS NOT EXEMPT (roborev 63072). `checkChiefTool` passes a concierge caller
+    // unconditionally and `chiefCallerFor` hands it `allowed: "all"`, so BOTH of this op's own gates
+    // are no-ops for it — which is why the autonomy gate in `dispatch` has to be the one that stops a
+    // destructive verb, and why this case asserts the CALL DID NOT HAPPEN rather than that a message
+    // came back. Each concierge turn's prompt is a snapshot of terminal output this app did not
+    // author; an ungated `delete_asset` here is that text reaching a real client's data.
+    it("ASKS before a destructive verb for the concierge — and reaches Chief with nothing", async () => {
+      fireChief("c5", CONCIERGE_CALLER_AGENT_ID, {
+        chiefTool: "delete_asset",
+        project: "chief_p2",
+        args: { asset_id: "a1" },
+      });
+      await flush();
+
+      expect(lastReply().ok).toBe(false);
+      expect(lastReply().error).toContain("needs your go-ahead");
+      // THE SECURITY PROPERTY. Not "it said no" — nothing was sent, not even the catalog read.
+      expect(chiefUntouched()).toBe(true);
+      // …and the question is actually on the human's screen, named by the op that governs it. A
+      // refusal with no card is a dead end: the remedy the message names would not exist.
+      const card = pendingApprovals(useConciergeApprovals.getState().entries);
+      expect(card.map((e) => e.op)).toEqual(["chief_call"]);
+      // THE CARD MUST CARRY THE WHOLE CALL, not just the verb. `rawArgs` is what the approval's
+      // fingerprint is computed over and what `resumeApprovedCall` replays, so a field missing here
+      // is a field the human never saw and never scoped their yes to — approving "delete this asset
+      // in Globex" would silently also approve deleting a DIFFERENT asset, or the same verb in
+      // another client's project. Asserting the whole object rather than one key is deliberate: a
+      // per-key check goes green while a sibling key is dropped.
+      expect(card[0]!.rawArgs).toEqual({
+        tool: "delete_asset",
+        arguments: { asset_id: "a1" },
+        project: "chief_p2",
+      });
+    });
+
+    // THE PAIR (bead `sparkle-rvf6n`). Without it the case above is ambiguous: a gate that refused
+    // EVERY concierge Chief call would satisfy it exactly as well as one that refuses destructive
+    // verbs. Same caller, same project, same setup — only the verb differs, so the pair pins the
+    // cause to the verb and proves the concierge still has the reach the founder asked for.
+    it("…and still runs a READ for the concierge with no approval at all", async () => {
+      fireChief("c5r", CONCIERGE_CALLER_AGENT_ID, {
+        chiefTool: "list_assets",
+        project: "chief_p2",
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(chiefCallTool).toHaveBeenCalledWith("chief_p2", "list_assets", {});
+      expect(pendingApprovals(useConciergeApprovals.getState().entries)).toEqual([]);
+    });
+
+    // THE FLOOR UNDER THE HATCH. `chief_call` is `outward-facing`, which an explicit `allow` covers —
+    // so without the per-call escalation reading the VERB out of the arguments, one Settings toggle
+    // would hand the model every destructive verb Chief has. This asserts the escalation survives the
+    // trip through the control op, which is the half no unit test of `policy.ts` can see: it depends
+    // on `dispatch` reshaping the payload into the `tool` key that reader looks for.
+    it("keeps asking for a destructive verb even when chief_call is set to Allow", async () => {
+      useSettingsStore.setState({
+        conciergeToolPolicy: { chief_call: "allow" },
+        conciergeToolPolicyHydrated: true,
+      });
+      fireChief("c5a", CONCIERGE_CALLER_AGENT_ID, {
+        chiefTool: "delete_chat",
+        project: "chief_p2",
+        args: { chat_id: "k1" },
+      });
+      await flush();
+
+      expect(lastReply().ok).toBe(false);
+      expect(lastReply().error).toContain("needs your go-ahead");
+      expect(chiefUntouched()).toBe(true);
+    });
+
+    // A payload naming no verb cannot reach Chief — the handler refuses it before it reads the client
+    // — so the gate deliberately steps aside rather than raising a card for a call that provably does
+    // nothing. The assertion that matters is the SECOND one: an approval prompt here would be a
+    // prompt the human learns to dismiss, which is how the real ones stop being read.
+    it("answers a verb-less concierge payload as bad-args, without raising an approval", async () => {
+      fireChief("c5b", CONCIERGE_CALLER_AGENT_ID, { project: "chief_p2" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "bad-args" });
+      expect(pendingApprovals(useConciergeApprovals.getState().entries)).toEqual([]);
+      expect(chiefUntouched()).toBe(true);
+    });
+
+    // THE ESCAPE HATCH IS NOT A BYPASS. `chief_call { tool: "delete_asset" }` frames to exactly this
+    // payload — pinned on the other side of the wire by `server.test.ts`'s "chief_call carries a
+    // destructive verb to the gate verbatim" — so firing it here is firing what the hatch produces.
+    // Both routes are one function by construction; this is the test that would catch someone
+    // splitting them.
+    it("REFUSES the same verb reached through chief_call — one gate, not two", async () => {
+      fireChief("c6", callerId, { chiefTool: "delete_asset", args: { asset_id: "a1" } });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "destructive_denied" });
+      expect(chiefUntouched()).toBe(true);
+    });
+
+    it("falls back to the agent's chiefPrimaryId when no project is named", async () => {
+      fireChief("c7", callerId, { chiefTool: "list_chats" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, project: { id: "chief_p1", source: "primary" } });
+      expect(chiefCallTool).toHaveBeenCalledWith("chief_p1", "list_chats", {});
+    });
+
+    // NEVER SILENTLY SERVE THE WRONG PROJECT. An unbound agent has no default, and "no default" must
+    // resolve to a refusal rather than to Chief's own `default: true` project or to the first of the
+    // catalog — either of which would hand a build agent someone else's live client work.
+    it("REFUSES an unbound agent that names no project, rather than defaulting one", async () => {
+      bindChief(projectId, [], null);
+      fireChief("c8", callerId, { chiefTool: "list_chats" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(lastReply().code).toBe("unbound");
+      expect(chiefCallTool).not.toHaveBeenCalled();
+    });
+
+    // ANTI-SPOOFING, the reason the caller is derived from `req.callerAgentId` and nothing else.
+    // The payload here claims — in every spelling a model might reach for — to be the agent in the
+    // OTHER Sparkle project, which really is bound to P2. Judged on the stamped id, this is the
+    // P1 agent asking for P2 and is refused.
+    it("judges the STAMPED caller, not an agentId the payload claims", async () => {
+      fireChief("c9", callerId, {
+        chiefTool: "list_assets",
+        project: "chief_p2",
+        agentId: otherProjectAgentId,
+        targetAgentId: otherProjectAgentId,
+        callerAgentId: otherProjectAgentId,
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "out_of_scope" });
+      expect(chiefCallTool).not.toHaveBeenCalled();
+    });
+
+    // THE CONTROL for the case above. Without it, the refusal proves only that the request failed —
+    // not that the STAMP is what decided it. Same payload, same claimed ids; only the stamped caller
+    // changes, and the answer flips.
+    it("…and the same claim succeeds when the STAMP really is that agent", async () => {
+      fireChief("c10", otherProjectAgentId, {
+        chiefTool: "list_assets",
+        project: "chief_p2",
+        agentId: callerId,
+        targetAgentId: callerId,
+        callerAgentId: callerId,
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(chiefCallTool).toHaveBeenCalledWith("chief_p2", "list_assets", {});
+    });
+
+    // The tool surface asks the model to STATE which Chief project it used. A reply that does not
+    // name one makes that instruction unfollowable, so the agent would have to guess — and guessing
+    // is precisely what the project gate exists to stop.
+    it("names the project it used — id AND name — on the successful reply", async () => {
+      fireChief("c11", callerId, { chiefTool: "list_assets", project: "chief_p1" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({
+        ok: true,
+        tool: "list_assets",
+        project: { id: "chief_p1", name: "Acme Rebrand", source: "requested" },
+        text: "3 asset(s) returned",
+      });
+    });
+
+    // `list_projects` is the one Chief tool that is not project-scoped, so it skips the project gate
+    // — but it is still SCOPED: an agent sees its binding, never the catalog. Reporting all 348 to a
+    // build agent would make the tool an enumeration of the human's client list.
+    it("scopes chief_list_projects to the caller's binding, and says so", async () => {
+      fireChief("c12", callerId, { chiefTool: "list_projects" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, scope: "bound" });
+      expect(lastReply().projects).toEqual([{ id: "chief_p1", name: "Acme Rebrand", description: undefined, default: undefined }]);
+      expect(chiefCallTool).not.toHaveBeenCalled();
+    });
+
+    it("gives the concierge the WHOLE catalog for chief_list_projects", async () => {
+      fireChief("c13", CONCIERGE_CALLER_AGENT_ID, { chiefTool: "list_projects" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, scope: "all" });
+      expect((lastReply().projects as unknown[]).length).toBe(2);
+    });
+
+    it("REFUSES a caller that resolves to no agent — scope is never defaulted", async () => {
+      fireChief("c14", "ghost-agent", { chiefTool: "list_assets", project: "chief_p1" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "unknown_caller" });
+      expect(chiefUntouched()).toBe(true);
+    });
+
+    it("reports a disconnected Chief as a wiring state, not as a scope refusal", async () => {
+      setChiefClient(null);
+      fireChief("c15", callerId, { chiefTool: "list_assets", project: "chief_p1" });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "chief_unavailable" });
+    });
+
+    // The concierge's second policy gate classifies ops by NAME, and `chief_tool` — the wrapper — is
+    // in no vocabulary. Judging the wrapper would refuse every Chief call with "no concierge policy
+    // entry", which reads as a bug report about a feature that is working. That was once avoided by
+    // exempting the op outright (the hole above); it is now avoided by judging the INNER verb
+    // through `chiefPolicyOpFor`, which is classified. This case is what tells the two apart: an
+    // exemption and a correct translation both let a read through, but only the translation can also
+    // stop the destructive verb, and both properties have to hold at once.
+    it("does not answer the concierge with a policy refusal for the wrapper op name", async () => {
+      fireChief("c16", CONCIERGE_CALLER_AGENT_ID, {
+        chiefTool: "list_assets",
+        project: "chief_p1",
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(JSON.stringify(lastReply())).not.toMatch(/policy entry/);
     });
   });
 

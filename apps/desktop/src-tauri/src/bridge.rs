@@ -833,6 +833,18 @@ const CONTROL_OPS: &[&str] = &[
     // on every single turn. The fine-grained allow/ask/deny decision is made frontend-side on
     // the INNER `op`, not on this outer name.
     "concierge_tool",
+    // The Chief tool surface (bead `sparkle-8rr0c`). ONE op for all twelve first-class `chief_*`
+    // tools AND the `chief_call` escape hatch, for the same token-cost reason as `concierge_tool`
+    // above — and for a second reason that is load-bearing here: because the hatch frames to the
+    // identical wire payload a named tool sends, the app cannot tell the two apart, so the hatch
+    // cannot be a route to a verb the named surface denies.
+    //
+    // Scoping is NOT enforced here. `--allowedTools` does not gate MCP tools (measured on CLI
+    // 2.1.220, bead `sparkle-xbka`), so the concierge-reaches-all / agent-reaches-its-binding rule
+    // is a refusal inside controlListener's `handleChiefTool`, judged against the `callerAgentId`
+    // this bridge stamps from the socket. This entry is only the coarse existence gate — but
+    // without it every Chief call dies at "unknown op" before the frontend is ever reached.
+    "chief_tool",
 ];
 
 /// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
@@ -2083,13 +2095,15 @@ mod tests {
             // `set_agent_goal` is deliberately not repeated here — it is asserted once, in the
             // Phase-1 line above, matching where CONTROL_OPS lists it.
             "set_agent_goal_met", "claim_pr", "release_pr",
+            // The Chief tool surface — one op carrying every `chief_*` tool and `chief_call`.
+            "chief_tool",
         ] {
             assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            18,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, and the three intent ops"
+            19,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, and the Chief tool op"
         );
     }
 
@@ -2338,6 +2352,49 @@ mod tests {
             "concierge_tool must be in CONTROL_OPS or the entire tool spine is unreachable: {v}"
         );
         assert_eq!(v["error"], "no app handle", "expected to reach the round-trip: {v}");
+    }
+
+    #[test]
+    fn chief_tool_survives_the_transport_on_both_sockets() {
+        // The same hole as `concierge_tool_survives_the_transport_not_just_the_frontend` above, in
+        // the Chief spine (bead `sparkle-8rr0c`) — and it was really there: the tool surface and its
+        // handler landed with `chief_tool` absent from CONTROL_OPS, so every one of the twelve
+        // `chief_*` tools plus `chief_call` would have died at "unknown op" in production while both
+        // owning suites stayed green. They stay green because neither drives this transport: the
+        // desktop tests hand the `control:request` payload straight to the dispatcher, and the
+        // mcp-control tests mock `Bridge`. Nothing between them tests the socket, which is exactly
+        // the seam this repo keeps shipping broken.
+        //
+        // BOTH sockets, because Chief is the first op that genuinely needs both: the concierge
+        // reaches every project, and a build agent reaches its bound set. A version of this test
+        // that checked only the concierge would go green while every BUILD AGENT's Chief call — the
+        // half the scoping rules exist for — died at the socket.
+        //
+        // "no app handle" means the request got PAST the allowlist and reached the frontend
+        // round-trip (there is no Tauri app in tests); "unknown op" would mean the spine is dead.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        for (caller, line) in [
+            (
+                ControlCaller::Concierge,
+                r#"{"id":"1","token":"T","op":"chief_tool","chiefTool":"list_chats"}"#,
+            ),
+            (
+                ControlCaller::Shared,
+                r#"{"id":"1","token":"T","op":"chief_tool","callerAgentId":"a1","chiefTool":"list_chats"}"#,
+            ),
+        ] {
+            let v: Value = serde_json::from_str(&handle_control_request_line(
+                line, "T", caller, &None, &pending,
+            )).unwrap();
+            assert_ne!(
+                v["error"], "unknown op",
+                "chief_tool must be in CONTROL_OPS or the entire Chief spine is unreachable on {caller:?}: {v}"
+            );
+            assert_eq!(
+                v["error"], "no app handle",
+                "expected to reach the round-trip on {caller:?}: {v}"
+            );
+        }
     }
 
     #[test]

@@ -63,6 +63,7 @@ import {
   type ToolPolicyOverrides,
 } from "./policy";
 import type { ConciergeToolPolicy, ToolPolicyQuery } from "./registry";
+import type { ChiefOp } from "./chief";
 
 /** Read the human's `[concierge.tools]` rules off the live settings store, WITH whether we have
  *  actually read their config yet.
@@ -264,11 +265,17 @@ function evaluateWithHydrationHold(
   // The TOOL surface asks the entitlement question, not the inference-cost one — see
   // `conciergeToolsEnabled`.
   //
-  // `args` goes in for ONE reason: `search_history` is the only op whose risk depends on what was
-  // asked for rather than on which tool was asked for (policy.ts `perCallRiskFor`), and this is the
-  // seam that has the call in hand. The policy module stays pure — it reads no store and inspects
-  // nothing but the value handed to it — and it reads these arguments only to answer "is this the
-  // wider request?", never to find consent in them.
+  // `args` goes in for ONE reason: a couple of ops have a risk that depends on what was asked for
+  // rather than on which tool was asked for (policy.ts `perCallRiskFor` — `search_history`'s
+  // `scope: "all"`, and a `chief_call` naming a destructive Chief verb), and this is the seam that
+  // has the call in hand. The policy module stays pure — it reads no store and inspects nothing but
+  // the value handed to it — and it reads these arguments only to answer "is this the wider
+  // request?", never to find consent in them.
+  //
+  // NOT PASSING `args` SILENTLY DISABLES THOSE FLOORS (roborev 63045). Both escalations are the
+  // mechanism that stops an explicit `allow` from covering the wide read / the destructive verb, so
+  // an `args`-less call here reads as the ordinary case and auto-allows it. Anything routed through
+  // this binding must keep handing the raw arguments over.
   const evaluation = evaluateToolPolicy(op, {
     overrides,
     aiEnabled: conciergeToolsEnabled(),
@@ -322,6 +329,39 @@ export function appOpPolicy(
   op: string,
   ctx?: { requestId?: string; args?: unknown },
 ): ToolPolicyDecision {
+  return controlOpPolicy("app", op, ctx);
+}
+
+/**
+ * The same decision for a CHIEF call, which arrives on a control op exactly as the `app` ops do.
+ *
+ * A separate entry point rather than a second argument to {@link appOpPolicy} because the domain is
+ * not cosmetic: it is half of the approval FINGERPRINT (`resolveAskTier`), so an approval granted
+ * for a Chief call must not be spendable on an `app` op that happens to share a name, and the
+ * approval card is grouped and labelled by it. `op` is a {@link ChiefOp} rather than a `string` so
+ * a caller cannot hand this the raw upstream verb — `chief_tool`'s payload names `delete_asset`,
+ * which is not a policy op and would evaluate to `deny`-as-unclassified, turning a call the human
+ * COULD have approved into a refusal that reads like a bug. Translate with `chiefPolicyOpFor`.
+ *
+ * `ctx.args` MUST carry the call's raw arguments including the `chief_call` tool name — the
+ * destructive-verb floor is read out of them, and omitting them silently downgrades an
+ * `irreversible` call to the ordinary `outward-facing` one an explicit `allow` covers. See
+ * `evaluateWithHydrationHold`.
+ */
+export function chiefOpPolicy(
+  op: ChiefOp,
+  ctx?: { requestId?: string; args?: unknown },
+): ToolPolicyDecision {
+  return controlOpPolicy("chief", op, ctx);
+}
+
+/** The shared body of the two above. One implementation so a fix to the hold/ask sequencing cannot
+ *  land on one control-op domain and miss the other. */
+function controlOpPolicy(
+  domain: string,
+  op: string,
+  ctx?: { requestId?: string; args?: unknown },
+): ToolPolicyDecision {
   const { evaluation, held } = evaluateWithHydrationHold(op, ctx?.args);
   if (held) return HYDRATION_HOLD;
   if (evaluation.decision !== "ask") {
@@ -329,7 +369,7 @@ export function appOpPolicy(
   }
   return resolveAskTier({
     id: ctx?.requestId ?? "",
-    domain: "app",
+    domain,
     op,
     args: ctx?.args,
     evaluation,

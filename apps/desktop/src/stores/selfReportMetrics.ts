@@ -38,7 +38,19 @@ export type ControlOp =
   // { domain, op, args } envelope, so this counter answers "is the concierge actually using its
   // tools?" without recording WHICH tool — the op name is all that is stored, same as every other
   // key here, and the domain/op inside the payload is deliberately not tallied.
-  | "concierge_tool";
+  | "concierge_tool"
+  // The Chief tool spine (services/chiefScope + controlListener's handleChiefTool). ONE op for all
+  // twelve first-class `chief_*` tools and the `chief_call` hatch, same envelope reasoning as
+  // `concierge_tool` above.
+  //
+  // IT IS A MEMBER FOR A REASON BEYOND TALLYING (roborev 63142). `CONTROL_OP_TIERS` is
+  // `Record<ControlOp, …>`, and `dispatch` reads it as `CONTROL_OP_TIERS[req.op as ControlOp]` —
+  // so an op named OUTSIDE this union does not fail the typecheck the tier table's doc-comment
+  // promises it will. It silently evaluates to `undefined`, the `=== "privileged"` test is false,
+  // and `callerMayAdminister` is skipped by OMISSION rather than by decision. `chief_tool` was in
+  // exactly that state: free by accident. Adding it here is what makes the exhaustiveness claim
+  // true again, and what forces the next op to state its tier.
+  | "chief_tool";
 
 /** The mutually-exclusive result of one auto-naming trigger (see agentNaming.namingOutcome). */
 export type NamingOutcome =
@@ -75,6 +87,7 @@ interface SelfReportMetricsState {
 }
 
 const emptyControlOps = (): Record<ControlOp, number> => ({
+  chief_tool: 0,
   rename_agent: 0,
   set_agent_activity: 0,
   set_agent_goal: 0,

@@ -111,6 +111,21 @@ export const EXEMPT_SYNONYMS: Readonly<Record<string, string>> = {
   "push to origin": "push_agent_branch",
   "save the agent": "save_agent",
   "save this agent": "save_agent",
+  // outward-facing, Chief (bead sparkle-8rr0c) — a write lands in a real client's project, in front
+  // of someone who is not the user, and nothing here takes it back out of their inbox. Asking first
+  // is exactly right, so the check stands down. Every term names Chief or the client explicitly:
+  // bare "upload" or "send the message" would exempt half the replies this check exists to catch.
+  "message the client": "chief_send_message",
+  "send it to the client": "chief_send_message",
+  "post it to chief": "chief_send_message",
+  "start a chief chat": "chief_create_chat",
+  "open a chief chat": "chief_create_chat",
+  "upload it to chief": "chief_upload_file",
+  "upload the file to chief": "chief_upload_file",
+  "remember it in chief": "chief_create_memory",
+  "save it to chief": "chief_create_memory",
+  "call a chief tool": "chief_call",
+  "run a chief tool": "chief_call",
   // irreversible
   delete: "delete_agent_branch",
   destroy: "delete_agent_branch",

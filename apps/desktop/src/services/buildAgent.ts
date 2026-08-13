@@ -90,6 +90,15 @@ export function sparkleControlProtocol(): string {
     "  `rename_agent` and `set_agent_activity` both default to YOU when `targetAgentId` is omitted.",
     "- `set_theme(...)`, `get_config()` / `set_config(...)`: adjust appearance / app config ONLY when",
     "  the user explicitly asks — never change theme or config on your own initiative.",
+    "- IF you have `chief_*` tools (only some setups do — if you don't see them, this bullet doesn't",
+    "  apply): they reach REAL CLIENT WORK, and one account can see hundreds of projects that are not",
+    "  yours to touch. When this Sparkle project is BOUND to a Chief project, just use it and SAY",
+    "  WHICH ONE you used — don't ask. With no binding, or a request that could plausibly mean more",
+    "  than one project, call `chief_list_projects` and ASK the human which to use, offering that",
+    "  list. NEVER pick one silently.",
+    "  A Chief call outside your scope, or a destructive one, is REFUSED by the app — a policy",
+    "  decision, not a transient error. Don't retry it or reach for it another way; say what was",
+    "  refused and ask the human.",
   ].join("\n");
 }
 

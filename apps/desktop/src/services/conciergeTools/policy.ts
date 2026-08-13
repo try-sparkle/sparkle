@@ -81,6 +81,16 @@ import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
 import {
+  CHIEF_OPS,
+  CHIEF_RISK,
+  chiefCallToolName,
+  type ChiefOp,
+} from "./chief";
+// The DESTRUCTIVE-VERB predicate, read by `PER_CALL_RISK`'s `chief_call` floor. chiefScope.ts is a
+// pure module that imports nothing, so this adds no cycle and no IO to a module whose purity is a
+// stated property.
+import { isDestructiveChiefTool } from "../chiefScope";
+import {
   ACCOUNTS_OPS,
   ACCOUNTS_RISK,
   ACCOUNTS_TOOL_SUMMARY,
@@ -186,6 +196,7 @@ export type ConciergeToolDomain =
   | "diff"
   | "fleet"
   | "research"
+  | "chief"
   | "accounts"
   | "app";
 
@@ -205,6 +216,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "diff", label: "Diff" },
   { id: "fleet", label: "Fleet awareness" },
   { id: "research", label: "Background research" },
+  { id: "chief", label: "Chief (client work)" },
   { id: "accounts", label: "Claude accounts" },
   { id: "app", label: "App & settings" },
 ] as const satisfies readonly { id: ConciergeToolDomain; label: string }[];
@@ -415,6 +427,38 @@ const WORKSPACE_TOOL_SUMMARY: Partial<Record<WorkspaceOp, string>> = {
     "which always asks first — even if you allow this tool.",
 };
 
+/**
+ * The Chief domain's rows — and like research's, a summary is REQUIRED rather than nice to have.
+ *
+ * Two reasons, both about the human at the settings pane. First, the risk-note fallback for a read
+ * is "Observes only — changes nothing", which is true and tells them nothing about WHOSE data is
+ * being read: Chief holds live client work, and that is the entire fact someone deciding to gate
+ * these rows needs. Second, four of these rows are the only tools in the whole catalog that put
+ * content in front of a person who is not the user — so each one says where it lands, in words,
+ * rather than leaving the `outward-facing` note ("Reaches the outside world (a push or a pull
+ * request)") to describe a client message as if it were a git push.
+ */
+const CHIEF_TOOL_SUMMARY: Record<ChiefOp, string> = {
+  chief_list_projects: "List the Chief projects this account can reach — the choice list to ask you from.",
+  chief_list_assets: "List the files stored in a Chief project.",
+  chief_get_asset: "Read one file out of a Chief project.",
+  chief_list_chats: "List a Chief project's conversations.",
+  chief_list_messages: "Read the messages in one Chief conversation.",
+  chief_list_memories: "Read what Chief remembers about a project.",
+  chief_list_skills: "List the skills configured on a Chief project.",
+  chief_create_chat: "Start a new conversation in a client's Chief project.",
+  chief_send_message: "Post a message into a client's Chief conversation — they will see it.",
+  chief_upload_file: "Upload a file into a client's Chief project.",
+  chief_create_memory: "Save a note into a Chief project's long-term memory.",
+  // The "even if you allow it" clause is load-bearing, exactly as it is on `search_history`: the
+  // sentence describes the floor in `PER_CALL_RISK` below, and the two move together or the row is
+  // promising something the rule does not keep.
+  chief_call:
+    "Call any other Chief tool by name — the escape hatch, so it could be anything Chief offers, " +
+    "including a write. Naming a Chief tool that DELETES or reconfigures always asks first, even " +
+    "if you allow this tool.",
+};
+
 /** The attachment domain's rows. Keyed on that domain's own op union, so an op added there is a
  *  typecheck failure here rather than a settings row that silently falls back to a risk note. */
 const ATTACHMENTS_TOOL_SUMMARY: Record<AttachmentsOp, string> = {
@@ -515,6 +559,7 @@ export type ConciergeToolName =
   | PlansOp
   | FleetOp
   | ResearchOp
+  | ChiefOp
   | AccountsOp
   | AppToolName;
 
@@ -596,6 +641,12 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   // research.ts's header records the reasoning, including why `dispatch` is not `costs-money` and
   // why `cancel` is not the `disruptive` that RISK_OVERRIDES gives close_agent/stop_agent.
   ...translateRisk(RESEARCH_RISK, WORKSPACE_RISK_TO_CLASS),
+  // Chief publishes two of WORKFLOW's five risk words, so it reuses that translation. The split is
+  // the load-bearing part: the seven reads are `read-only` and auto-allow, while the four writes and
+  // the `chief_call` hatch are `outward-facing` and ask — because what they write lands in a real
+  // client's project, in front of someone who is not the user, and nothing in this app takes it back.
+  // See chief.ts for why the hatch is classified by what it COULD name rather than by its usual use.
+  ...translateRisk(CHIEF_RISK, WORKFLOW_RISK_TO_CLASS),
   ...TERMINAL_TOOL_RISK,
   // The attachments domain publishes the same four risk words as workspace, so it reuses that
   // translation rather than declaring a fifth identical one.
@@ -606,7 +657,7 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
 };
 
 // ---------------------------------------------------------------------------------------------
-// PER-CALL RISK — the one place a tool's danger lives in its ARGUMENTS, not in its name
+// PER-CALL RISK — where a tool's danger lives in its ARGUMENTS, not in its name
 // ---------------------------------------------------------------------------------------------
 
 /**
@@ -616,8 +667,15 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
  * catalog: `merge_pr` is `mutates-main` on every call anyone will ever make. `RISK_OVERRIDES` bends
  * that by name too — it corrects a domain's vocabulary, it does not look at a call.
  *
- * `search_history` is the exception, and it is worth stating why it is an exception rather than the
- * start of a pattern. Its two modes are not two degrees of the same thing: the default searches
+ * TWO ops are exceptions, and they qualify for the SAME reason rather than by accumulation: the
+ * model chooses the argument, and for these two the argument decides which of two genuinely
+ * different questions the human is being asked. `search_history` is described below;
+ * `chief_call` is described at its entry — it is a hatch that NAMES the verb it wants, so the name
+ * it sends is the only thing that says whether the call destroys a client's data. Anything whose
+ * danger is knowable from its op name alone does NOT belong here.
+ *
+ * `search_history` is the older of the two, and it is worth stating why it was an exception rather
+ * than the start of a pattern. Its two modes are not two degrees of the same thing: the default searches
  * BUILD history — logs, prompts, agent chatter, regenerable and unremarkable — while
  * `scope: "all"` additionally reaches `concierge`-sourced rows, which are to hold the founder's own
  * private conversations with his minder (services/history.ts's `HistorySource`). The founder's
@@ -668,7 +726,7 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
  * model must not be able to vacuum those rows silently, and one click on an approval card is the
  * price of the wide read.
  *
- * Returns null for "no per-call opinion", which is the answer for every tool but one.
+ * Returns null for "no per-call opinion", which is the answer for every tool but the two below.
  */
 const PER_CALL_RISK: Partial<
   Record<ConciergeToolName, (args: unknown) => ConciergeRiskClass | null>
@@ -686,6 +744,44 @@ const PER_CALL_RISK: Partial<
     // user's own conversations runs as an auto-allowed `read-only` call with no approval card. The
     // failure is silent and in the permissive direction, which is the worst pair.
     return (args as { scope?: unknown }).scope === WIDE_HISTORY_SCOPE ? "privacy-sensitive" : null;
+  },
+  // THE SECOND OP WHOSE DANGER IS IN ITS ARGUMENTS, and the reasoning is `search_history`'s exactly
+  // (roborev 63041, Medium). `chief_call` names an ARBITRARY upstream tool, and it is the ONLY route
+  // the concierge has to Chief's destructive verbs — `checkChiefTool` returns `{ok:true}`
+  // unconditionally for a concierge caller, by design, because the founder's model is that a
+  // destructive Chief act is something the HUMAN does from the concierge. That design puts the whole
+  // weight on this layer: with the hatch classified `outward-facing` by name alone, one
+  // `[concierge.tools] chief_call = "allow"` — or one click on "Allow every concierge tool?" — would
+  // grant unprompted `chief_call {tool: "delete_chat"}` against a real client's project.
+  //
+  // The bulk dialog cannot warn about it either: `ConciergeToolsPane` derives its inventory from
+  // `riskClass === "irreversible"` in the CATALOG, and the catalog class here is `outward-facing` —
+  // the same by-construction blindness that made the `search_history` case a floor rather than a
+  // default (roborev 61894-H1).
+  //
+  // ESCALATING ON MODEL-SUPPLIED ARGUMENTS IS FINE; RELAXING ON THEM IS NOT. chief.ts's header
+  // refuses to let the hatch argue its way DOWN to `allow` by naming a read — that would be the model
+  // approving itself. This is the opposite direction: an unrecognised, missing or malformed `tool`
+  // escalates NOTHING and falls through to the name-keyed `outward-facing` (which already asks), so a
+  // mis-parse can never hand out more than the name alone would.
+  //
+  // Asked of `isDestructiveChiefTool` itself rather than of a copy of its contents, for the reason
+  // the block above gives: a rule re-spelled here would go silently false, and silently false in the
+  // permissive direction is the worst pair. That predicate is the frozen contract's own answer to
+  // "is this verb destructive", so this floor and the build-agent gate can never disagree about a
+  // verb — which they DID while this read the bare name set: `update_memory` was `outward-facing`
+  // here (an explicit `allow` covered it) at the same time as it became refused there (roborev
+  // 63036/63043). It is a structural rule over a name floor, so a destructive verb Chief ships
+  // tomorrow escalates without anyone editing a list.
+  // THE SHAPE COMES FROM chief.ts AND IS NOT RE-IMPLEMENTED HERE (roborev 63045). The argument key
+  // is a constant the registry's schema is meant to be derived from — a floor reading `tool` while
+  // the schema shipped `toolName` returns null silently and the `allow` covers the delete again,
+  // with every test still green because the fixture would match this reader rather than the
+  // producer. Normalization (padding, case, an `mcp__…__` wire prefix) now happens INSIDE the
+  // predicate, next to the set it guards.
+  chief_call: (args) => {
+    const tool = chiefCallToolName(args);
+    return tool && isDestructiveChiefTool(tool) ? "irreversible" : null;
   },
 };
 
@@ -720,6 +816,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(DIFF_RISK, "diff" as const),
   ...constantOver(FLEET_RISK, "fleet" as const),
   ...constantOver(RESEARCH_RISK, "research" as const),
+  ...constantOver(CHIEF_RISK, "chief" as const),
   ...constantOver(ACCOUNTS_RISK, "accounts" as const),
   ...constantOver(APP_TOOL_RISK, "app" as const),
 };
@@ -744,6 +841,7 @@ export const SUMMARY_BY_TOOL: Partial<Record<ConciergeToolName, string>> = {
   ...SCREENSHOT_TOOL_SUMMARY,
   ...TERMINAL_TOOL_SUMMARY,
   ...ATTACHMENTS_TOOL_SUMMARY,
+  ...CHIEF_TOOL_SUMMARY,
   ...APP_TOOL_SUMMARY,
   ...ACCOUNTS_TOOL_SUMMARY,
   ...Object.fromEntries(WORKFLOW_OPERATIONS.map((op) => [op, WORKFLOW_RISK[op].summary])),
@@ -765,6 +863,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   diff: DIFF_OPS,
   fleet: FLEET_OPS,
   research: RESEARCH_OPS,
+  chief: CHIEF_OPS,
   accounts: ACCOUNTS_OPS,
   app: APP_TOOL_NAMES,
 };
@@ -922,8 +1021,9 @@ export interface ToolPolicyContext {
   /**
    * The model's RAW, UNVALIDATED arguments for this call, when the caller has them.
    *
-   * Read by exactly one thing — {@link perCallRiskFor} — and only to answer "is this the wider
-   * request?" for the one op whose risk lives in its arguments. Nothing here reads a `confirm`
+   * Read by exactly one thing — {@link perCallRiskFor} — and only to ask "is this the wider
+   * request?" (`search_history`) or "does this hatch name a destructive verb?" (`chief_call`), for
+   * the two ops whose risk lives in their arguments. Nothing here reads a `confirm`
    * flag or any other model-supplied consent: those arrive inside the model's own arguments, so
    * treating one as permission would let the model approve itself.
    *
@@ -984,12 +1084,16 @@ export interface ToolPolicyEvaluation {
  *   evaluateToolPolicy("teleport_agent", { overrides: {} })
  *     → { decision: "deny", source: "unclassified", riskClass: null, … }
  *
- * `ctx.args` is consulted ONLY by `perCallRiskFor`, and today only for `search_history`:
+ * `ctx.args` is consulted ONLY by `perCallRiskFor`, and today only for `search_history` and
+ * `chief_call`:
  *
  *   evaluateToolPolicy("search_history", { overrides: {} })
  *     → { decision: "allow", riskClass: "read-only", … }
  *   evaluateToolPolicy("search_history", { overrides: {}, args: { query: "x", scope: "all" } })
  *     → { decision: "ask",   riskClass: "privacy-sensitive", … }
+ *   evaluateToolPolicy("chief_call", { overrides: { chief_call: "allow" },
+ *                                      args: { tool: "delete_chat" } })
+ *     → { decision: "ask",   riskClass: "irreversible", source: "per-call-escalation", … }
  */
 export function evaluateToolPolicy(
   toolName: string,
@@ -1033,8 +1137,10 @@ export function evaluateToolPolicy(
   }
 
   // THE CALL'S risk, not merely the op's — see `perCallRiskFor`. Identical to `RISK_BY_TOOL` for
-  // every tool but `search_history`, and identical for that one too unless this call asked for
-  // `scope: "all"`. Everything downstream (the derived default, the reason sentence, the risk note
+  // every tool but the two with per-call rules, and identical for those two as well unless this
+  // call asked for the wider thing: `scope: "all"` on `search_history`, or a destructive verb named
+  // in `chief_call`'s `tool` argument. Everything downstream (the derived default, the reason
+  // sentence, the risk note
   // on the approval card) reads from here, so the human is told about the call they are being asked
   // to rule on rather than about the op in the abstract.
   const riskClass = riskForCall(toolName, ctx.args);
@@ -1078,8 +1184,8 @@ export function evaluateToolPolicy(
   }
 
   // AN `allow` DOES NOT COVER AN ESCALATED CALL. The human's rule is a statement about the tool's
-  // ordinary use — and for the one op with a per-call rule, the escalated call is by construction
-  // not what they were shown when they set it. See `perCallRiskFor`. `deny` and `ask` fall through
+  // ordinary use — and for the ops with a per-call rule (`search_history`, `chief_call`), the
+  // escalated call is by construction not what they were shown when they set it. See `perCallRiskFor`. `deny` and `ask` fall through
   // untouched: tightening is always the human's, and this only ever tightens.
   if (parsed === "allow" && perCallRiskFor(toolName, ctx.args) !== null) {
     return {

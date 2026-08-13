@@ -56,6 +56,8 @@ import { PLANS_OPS } from "./plans";
 import { DIFF_OPS } from "./diff";
 import { FLEET_OPS } from "./fleet";
 import { RESEARCH_OPS } from "./research";
+import { CHIEF_CALL_TOOL_ARG, CHIEF_OPS, CHIEF_RISK, chiefCallToolName } from "./chief";
+import { CHIEF_DESTRUCTIVE_TOOLS } from "../chiefScope";
 import { ACCOUNTS_OPS } from "./accounts";
 import { toConciergeToolPolicy } from "../../stores/settingsStore";
 
@@ -162,10 +164,12 @@ describe("nothing resolves to allow by accident", () => {
 });
 
 // -----------------------------------------------------------------------------------------------
-// PER-CALL RISK. `search_history` is the only op whose danger is in its ARGUMENTS: `scope: "all"`
-// also reads `concierge`-sourced rows — the founder's own conversations with the minder — while the
-// default searches build history. The founder's call is that those rows are recorded and findable
-// by him, and not silently vacuumable by the model.
+// PER-CALL RISK. TWO ops have a danger that lives in their ARGUMENTS. `search_history`: `scope:
+// "all"` also reads `concierge`-sourced rows — the founder's own conversations with the minder —
+// while the default searches build history, and the founder's call is that those rows are recorded
+// and findable by him, and not silently vacuumable by the model. `chief_call`: the hatch NAMES the
+// upstream verb it wants, so its `tool` argument is the only thing that says whether the call
+// deletes a client's data (its cases are in the Chief block below).
 // -----------------------------------------------------------------------------------------------
 describe("risk that depends on the CALL, not on the op name", () => {
   const withScope = (scope?: unknown) => ({
@@ -328,6 +332,7 @@ describe("risk that depends on the CALL, not on the op name", () => {
       ["workflow", WORKFLOW_OPERATIONS],
       ["terminal", TERMINAL_TOOL_NAMES],
       ["app", APP_TOOL_NAMES],
+      ["chief", CHIEF_OPS],
       ["workspace(search_history)", ["search_history"]],
     ];
     for (const [domain, ops] of prosePublishing) {
@@ -446,6 +451,7 @@ describe("the tool set is derived from the domains", () => {
       "diff",
       "fleet",
       "research",
+      "chief",
       "accounts",
       "app",
     ]);
@@ -462,6 +468,7 @@ describe("the tool set is derived from the domains", () => {
     expect(of("workspace")).toEqual([...WORKSPACE_OPS]);
     expect(of("terminal")).toEqual([...TERMINAL_TOOL_NAMES]);
     expect(of("attachments")).toEqual([...ATTACHMENTS_OPS]);
+    expect(of("chief")).toEqual([...CHIEF_OPS]);
   });
 
   it("the terminal seam agrees with the terminal domain's own descriptor list", () => {
@@ -501,6 +508,7 @@ describe("the tool set is derived from the domains", () => {
         DIFF_OPS.length +
         FLEET_OPS.length +
         RESEARCH_OPS.length +
+        CHIEF_OPS.length +
         ACCOUNTS_OPS.length +
         APP_TOOL_NAMES.length,
     );
@@ -527,6 +535,298 @@ describe("the tool set is derived from the domains", () => {
     for (const name of CONCIERGE_TOOL_NAMES) {
       expect(evaluateToolPolicy(name, NONE).source, name).not.toBe("unclassified");
     }
+  });
+});
+
+// -----------------------------------------------------------------------------------------------
+// THE CHIEF DOMAIN (bead sparkle-8rr0c). Chief holds live client work, so the split the concierge is
+// judged on is read-versus-write, not tool-by-tool: reading a client's project changes nothing, and
+// writing to one puts content in front of a person who is not the user.
+//
+// Every assertion here reads the DECISION back out of `evaluateToolPolicy` rather than checking that
+// a row exists in the map. An existence check would have passed against the map alone — before the
+// domain was wired into `RISK_BY_TOOL`, `DOMAIN_BY_TOOL` and `NAMES_BY_DOMAIN` — which is precisely
+// the state in which no Chief call is governed by anything.
+// -----------------------------------------------------------------------------------------------
+describe("the Chief domain derives its decisions from its own risk map", () => {
+  const READS = [
+    "chief_list_projects",
+    "chief_list_assets",
+    "chief_get_asset",
+    "chief_list_chats",
+    "chief_list_messages",
+    "chief_list_memories",
+    "chief_list_skills",
+  ] as const;
+
+  const WRITES = [
+    "chief_create_chat",
+    "chief_send_message",
+    "chief_upload_file",
+    "chief_create_memory",
+  ] as const;
+
+  it("names every Chief op exactly once, so a new one cannot arrive untested", () => {
+    // The two lists below are written out by hand ON PURPOSE — deriving them from `CHIEF_RISK` would
+    // make every assertion in this block a restatement of the map it is supposed to be checking.
+    // This is the guard that keeps the hand-written lists honest instead.
+    expect([...READS, ...WRITES, "chief_call"].sort()).toEqual([...CHIEF_OPS].sort());
+    expect(Object.keys(CHIEF_RISK).sort()).toEqual([...CHIEF_OPS].sort());
+  });
+
+  it("a READ Chief tool resolves to allow", () => {
+    for (const name of READS) {
+      const v = evaluateToolPolicy(name, NONE);
+      expect(v.decision, name).toBe("allow");
+      expect(v.riskClass, name).toBe("read-only");
+      expect(v.domain, name).toBe("chief");
+      expect(v.source, name).toBe("default");
+      expect(v.requiresConfirmation, name).toBe(false);
+    }
+  });
+
+  it("a WRITE Chief tool resolves to ask — it lands in a real client's project", () => {
+    for (const name of WRITES) {
+      const v = evaluateToolPolicy(name, NONE);
+      expect(v.decision, name).toBe("ask");
+      expect(v.riskClass, name).toBe("outward-facing");
+      expect(v.domain, name).toBe("chief");
+      expect(v.defaultDecision, name).toBe("ask");
+      expect(v.requiresConfirmation, name).toBe(true);
+    }
+  });
+
+  it("`chief_call` resolves to ask — an escape hatch cannot be classified read-only", () => {
+    // It names an arbitrary upstream tool, so its risk is not knowable from the call site. If this
+    // ever auto-allowed, every verb the eleven named tools were split apart to gate would be
+    // reachable through one un-prompted call.
+    const v = evaluateToolPolicy("chief_call", NONE);
+    expect(v.decision).toBe("ask");
+    expect(v.riskClass).not.toBe("read-only");
+    expect(v.requiresConfirmation).toBe(true);
+  });
+
+  it("and its arguments cannot talk it down — naming a read tool is still ask", () => {
+    // The per-call table only ever TIGHTENS (see `perCallRiskFor`); a hatch that argued its way to
+    // `allow` on model-supplied arguments would be the model approving itself.
+    for (const args of [
+      { tool: "list_projects" },
+      { tool: "list_chats", arguments: {} },
+      { tool: "delete_chat" },
+    ]) {
+      const v = evaluateToolPolicy("chief_call", { overrides: NO_TOOL_POLICY_OVERRIDES, args });
+      expect(v.decision, JSON.stringify(args)).toBe("ask");
+    }
+    expect(perCallRiskFor("chief_call", { tool: "list_projects" })).toBeNull();
+  });
+
+  // roborev 63041, Medium. `chief_call` is the ONLY route the concierge has to Chief's destructive
+  // verbs — `checkChiefTool` passes a concierge caller unconditionally by design — so with the hatch
+  // classified by NAME alone, one `chief_call = "allow"` (or one click on "Allow every concierge
+  // tool?") granted unprompted, permanent destruction of a real client's data. Same shape and same
+  // remedy as the `search_history` floor above: an `allow` is a statement about the tool's ordinary
+  // use, and the destructive call is by construction not what the human was shown when they set it.
+  it("an explicit ALLOW does not cover a chief_call naming a DESTRUCTIVE verb", () => {
+    const overrides = { chief_call: "allow" };
+    // The ordinary hatch call IS covered — that is what someone setting that row is asking for.
+    const ordinary = evaluateToolPolicy("chief_call", {
+      overrides,
+      args: { tool: "list_chats" },
+    });
+    expect(ordinary.decision).toBe("allow");
+    expect(ordinary.source).toBe("override");
+
+    for (const tool of [...CHIEF_DESTRUCTIVE_TOOLS]) {
+      const v = evaluateToolPolicy("chief_call", { overrides, args: { tool } });
+      expect(v.decision, tool).toBe("ask");
+      expect(v.source, tool).toBe("per-call-escalation");
+      expect(v.riskClass, tool).toBe("irreversible");
+      expect(v.requiresConfirmation, tool).toBe(true);
+      // The human DID set a rule; saying otherwise would render the row as untouched.
+      expect(v.overridden, tool).toBe(true);
+    }
+    // Non-vacuity: an empty destructive set would make the loop above prove nothing.
+    expect(CHIEF_DESTRUCTIVE_TOOLS.size).toBeGreaterThan(5);
+  });
+
+  it("the destructive floor applies to the DEFAULT decision too, and says so on the card", () => {
+    // With no rule at all the hatch already asks — so the fact this test pins is not the decision
+    // but the RISK CLASS the approval card is headlined with: "outward-facing" describes a push,
+    // and what is about to happen is permanent deletion of someone else's data.
+    const v = evaluateToolPolicy("chief_call", {
+      overrides: NO_TOOL_POLICY_OVERRIDES,
+      args: { tool: "delete_chat" },
+    });
+    expect(v.decision).toBe("ask");
+    expect(v.riskClass).toBe("irreversible");
+    expect(v.defaultDecision).toBe("ask");
+    expect(v.reason).toContain(CONCIERGE_RISK_NOTE.irreversible);
+  });
+
+  it("the floor never fires on a near-miss, and is total over garbage arguments", () => {
+    // `args` reaches the policy RAW — before the registry's zod — so every reader must be total, and
+    // anything it cannot positively recognise must escalate NOTHING. That is safe in this direction
+    // only: falling through lands on `outward-facing`, which already asks.
+    for (const args of [
+      undefined,
+      null,
+      "delete_chat",
+      42,
+      ["delete_chat"],
+      { tool: ["delete_chat"] },
+      { tool: true },
+      { tool: null },
+      { tool: "" },
+      { notTool: "delete_chat" },
+      { tool: "list_chats" },
+      { tool: "create_chat" },
+      { tool: "send_message" },
+    ]) {
+      expect(perCallRiskFor("chief_call", args), JSON.stringify(args) ?? "undefined").toBeNull();
+    }
+  });
+
+  it("DOES escalate an unlisted verb that is shaped like a destruction", () => {
+    // `delete_chat_v2` was asserted here as a "near-miss" that must NOT fire, back when the floor
+    // read a bare 13-name list. That reading is now the wrong one (roborev 63036/63043): the list is
+    // a denylist over a vocabulary Chief owns, so everything nobody enumerated was permitted — and
+    // "permitted" for a concierge with `chief_call = "allow"` means deleting a real client's data
+    // with no approval. `isDestructiveChiefTool` layers a structural rule over the list, so an
+    // unrecognised `delete_*` from a future Chief release asks instead of running. Being wrong in
+    // this direction costs one approval click; being wrong in the other cost the data.
+    for (const tool of [
+      "delete_chat_v2",
+      "update_memory",
+      "remove_project_member",
+      "archive_chat",
+      "revoke_api_key",
+    ]) {
+      expect(perCallRiskFor("chief_call", { tool }), tool).toBe("irreversible");
+    }
+  });
+
+  it("the same verb in a different coat still escalates — padding, case, the wire prefix", () => {
+    // roborev 63045. These are not near-misses, they are spellings: a model that types the MCP wire
+    // name or shouts the verb is asking for the same deletion. The floor normalizes (chief.ts's
+    // `normalizeChiefToolName`) rather than comparing raw, which is deliberately STRICTER than the
+    // frozen contract's own `checkChiefTool` — matching more names can only ask more often.
+    for (const tool of [
+      "delete_chat",
+      " delete_chat ",
+      "DELETE_CHAT",
+      "Delete_Chat",
+      "mcp__chief__delete_chat",
+      "  MCP__CHIEF__delete_chat\t",
+    ]) {
+      expect(perCallRiskFor("chief_call", { tool }), tool).toBe("irreversible");
+      expect(
+        evaluateToolPolicy("chief_call", { overrides: { chief_call: "allow" }, args: { tool } })
+          .decision,
+        tool,
+      ).toBe("ask");
+    }
+  });
+
+  it("reads the tool name through the SHARED argument key, not a literal spelled here", () => {
+    // The key is a constant in chief.ts because the registry's zod schema (another file, another
+    // author) has to agree with this reader. A schema that shipped `toolName` would make the floor
+    // return null silently and the `allow` cover the delete again — with fixtures like the ones
+    // above still green, because they would be matching the reader rather than the producer.
+    expect(CHIEF_CALL_TOOL_ARG).toBe("tool");
+    expect(chiefCallToolName({ [CHIEF_CALL_TOOL_ARG]: "delete_chat" })).toBe("delete_chat");
+    expect(perCallRiskFor("chief_call", { [CHIEF_CALL_TOOL_ARG]: "delete_chat" })).toBe(
+      "irreversible",
+    );
+  });
+
+  it("no OTHER Chief tool grows an opinion from a `tool` argument", () => {
+    // A blanket "any call naming a destructive verb is irreversible" would be the easy
+    // implementation and would mislabel calls that cannot reach one — the first-class ops take no
+    // `tool` argument at all.
+    for (const name of CHIEF_OPS) {
+      if (name === "chief_call") continue;
+      expect(perCallRiskFor(name, { tool: "delete_chat" }), name).toBeNull();
+    }
+  });
+
+  it("the hatch's row promises what the floor delivers", () => {
+    // Copy is code, and this row's sentence is a claim about the rule above it — the same pairing
+    // `search_history`'s summary and floor are held to.
+    const entry = CONCIERGE_TOOL_CATALOG.find((t) => t.name === "chief_call");
+    expect(entry?.summary).toContain("even if you allow this tool");
+    expect(
+      evaluateToolPolicy("chief_call", {
+        overrides: { chief_call: "allow" },
+        args: { tool: "delete_chat" },
+      }).decision,
+    ).toBe("ask");
+  });
+
+  it("an UNREADABLE rule for a Chief tool resolves to ask, not to its allow default", () => {
+    // Same property as `list_projects` above, asserted on this domain because its reads are the ones
+    // whose default is permissive: a typo'd rule is most likely someone taking that permission away.
+    expect(defaultDecisionFor("chief_list_chats")).toBe("allow");
+    for (const bad of ["allwo", "read-only", "ALLOW", "true", ""]) {
+      const v = evaluateToolPolicy("chief_list_chats", { overrides: { chief_list_chats: bad } });
+      expect(v.decision, bad).toBe("ask");
+      expect(v.source, bad).toBe("unreadable-override");
+      expect(v.requiresConfirmation, bad).toBe(true);
+    }
+  });
+
+  it("an unknown chief_* name is DENIED — including the destructive verbs", () => {
+    // The destructive Chief tools are deliberately not first-class concierge tools (chiefScope.ts
+    // refuses them for build agents; the concierge reaches them only through `chief_call`). So a
+    // model that invents the obvious name for one must be refused outright rather than prompted
+    // about — property 2 of this module's header, on the names most worth getting right.
+    for (const name of [
+      "chief_delete_chat",
+      "chief_delete_memory",
+      "chief_update_project",
+      "chief_create_project_invitation",
+      "chief_send_message_v2",
+      "chief_",
+      "chief_list_chats ", // trailing space — a near-miss, not a match
+    ]) {
+      const v = evaluateToolPolicy(name, NONE);
+      expect(v.decision, name).toBe("deny");
+      expect(v.source, name).toBe("unclassified");
+      expect(v.riskClass, name).toBeNull();
+    }
+  });
+
+  it("an override for an unknown chief_* name cannot grant it anything", () => {
+    const v = evaluateToolPolicy("chief_delete_chat", {
+      overrides: { chief_delete_chat: "allow", chief_list_chats: "allow" },
+    });
+    expect(v.decision).toBe("deny");
+  });
+
+  it("the human can still gate a Chief read or wave a Chief write through", () => {
+    // The derived defaults are a starting point, not the mechanism — per-tool control is the point.
+    expect(
+      evaluateToolPolicy("chief_list_messages", { overrides: { chief_list_messages: "deny" } })
+        .decision,
+    ).toBe("deny");
+    expect(
+      evaluateToolPolicy("chief_send_message", { overrides: { chief_send_message: "allow" } })
+        .decision,
+    ).toBe("allow");
+  });
+
+  it("every Chief row says whose data it touches, not just that it observes something", () => {
+    // Copy is code: the risk-note fallback ("Observes only — changes nothing") is true of a Chief
+    // read and useless on a settings row about a client's project. The writes matter more — the
+    // `outward-facing` note talks about a push and a pull request, which is the wrong description of
+    // a message someone will receive.
+    for (const name of CHIEF_OPS) {
+      const entry = CONCIERGE_TOOL_CATALOG.find((t) => t.name === name)!;
+      expect(entry, name).toBeTruthy();
+      expect(entry.summary, name).not.toBe(CONCIERGE_RISK_NOTE[entry.riskClass]);
+    }
+    const say = (name: string) => CONCIERGE_TOOL_CATALOG.find((t) => t.name === name)!.summary;
+    expect(say("chief_send_message")).toContain("client");
+    expect(say("chief_list_projects")).toContain("Chief");
   });
 });
 

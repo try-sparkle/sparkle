@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useCallback, useMemo, useState } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, ON_BRAND_FILL, SCRIM } from "../theme/colors";
 import { FONT_UI, RADIUS } from "../theme/scale";
 import { MODAL_MAX_HEIGHT } from "./ModalShell";
@@ -10,6 +10,9 @@ import { resolveDefaultBranch } from "../services/branchStatus";
 import { killPty } from "../pty";
 import { pickProjectFolder } from "../services/dialog";
 import { ModalLayer } from "./ModalLayer";
+import { ChiefBindingPicker } from "./ChiefBindingPicker";
+import { useSettingsStore, effectiveChiefPat } from "../stores/settingsStore";
+import { listProjects } from "../services/chief";
 
 function dirname(p: string): string {
   const trimmed = p.replace(/[/\\]+$/, "");
@@ -31,6 +34,25 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
   const [branch, setBranch] = useState(project.defaultBranch ?? "");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+
+  // THE CHIEF PAT NEVER LEAVES THIS CLOSURE. `ChiefBindingPicker` takes a zero-argument loader
+  // precisely so the token stays here: the picker cannot render it, log it, or reach it, and it
+  // stays testable without one. Reading it via the store selector (rather than getState()) keeps
+  // the loader identity stable across renders, which is what stops the picker's mount effect from
+  // re-fetching 348 projects on every keystroke in the fields above.
+  const chiefPat = useSettingsStore((s) =>
+    effectiveChiefPat(s.keychainChiefPat, s.chiefPat, s.runtimeChiefPat),
+  );
+  const loadChiefProjects = useCallback(async () => {
+    // An absent key is an ERROR, not an empty catalog — "you have no Chief projects" is a different
+    // and wrong answer, and it is the one that would look finished.
+    if (!chiefPat) {
+      throw new Error(
+        "No Chief API key is configured. Add one in Settings › Chief, then reopen this dialog.",
+      );
+    }
+    return listProjects(chiefPat);
+  }, [chiefPat]);
 
   const newRootPath = useMemo(
     () => `${parent.replace(/[/\\]+$/, "")}/${name.trim()}`,
@@ -225,6 +247,12 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
           <div style={{ color: C.muted, fontSize: 12, marginBottom: 18 }}>
             New agents are branched from this. Leave blank to auto-detect.
           </div>
+
+          {/* Which Chief projects this project's agents may reach (bead `sparkle-8rr0c`). It writes
+              through to the store on each click rather than waiting for Save, because the binding
+              is an ACCESS-CONTROL fact and a half-applied one is the failure the feature exists to
+              prevent — Cancel must never leave "I unbound that" only half true. */}
+          <ChiefBindingPicker projectId={project.id} loadChiefProjects={loadChiefProjects} />
 
           {error && (
             <div style={{ color: C.sienna, fontSize: 13, marginBottom: 14 }}>{error}</div>

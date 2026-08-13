@@ -108,12 +108,14 @@ async function parseOrThrow(res: Response): Promise<unknown> {
   return body;
 }
 
-export interface ChiefProject {
-  project_id: string;
-  name: string;
-  description?: string;
-  default?: boolean;
-}
+// ONE DECLARATION, not two (roborev 63036). This shape used to be declared identically here and in
+// `chiefScope.ts`, which defeats the stated purpose of that module — four implementation units built
+// against ONE frozen interface. With two structurally-identical definitions each unit could import
+// either, and a required field added to one side would not surface as a type error on the other.
+// The declaration lives in `chiefScope.ts` because that is the frozen contract; the import is
+// type-only, so the pure module's purity is unaffected in both directions.
+import type { ChiefProject } from "./chiefScope";
+export type { ChiefProject };
 
 /** Create a Chief project. No X-Project-Id needed — it lands in the caller's org/workspace. */
 export async function createProject(

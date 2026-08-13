@@ -42,6 +42,9 @@
           "url": "https://api.storytell.ai/*"
         },
         {
+          "url": "https://mcp.storytell.ai/*"
+        },
+        {
           "url": "https://storage.googleapis.com/*"
         },
         {

@@ -92,10 +92,11 @@ describe("policy binding — the human's settings reach the dispatch gate", () =
     expect(conciergeToolAuthority("call-1", d)).toBeNull();
   });
 
-  // The binding is the ONLY thing that carries a call's arguments into the policy layer, and
-  // `search_history` is the only op whose verdict depends on them. Drop `q.args` from the
-  // `evaluateToolPolicy` call and every other test in this file stays green while the founder's
-  // private concierge history becomes silently readable — so the wire gets its own assertions.
+  // The binding is the ONLY thing that carries a call's arguments into the policy layer, and TWO
+  // ops have a verdict that depends on them: `search_history` (below) and `chief_call` (the test
+  // after it). Drop `q.args` from the `evaluateToolPolicy` call and every other test in this file
+  // stays green while the founder's private concierge history becomes silently readable AND a
+  // destructive Chief verb runs unprompted — so the wire gets its own assertions, one per floor.
   it("carries the CALL's arguments through, so scope: all asks and scope: default does not", () => {
     expect(configuredToolPolicy(query("search_history", false, { query: "widget" })).tier).toBe(
       "allow",
@@ -121,6 +122,40 @@ describe("policy binding — the human's settings reach the dispatch gate", () =
     // summary and which would read as "Observes only — changes nothing." on a privacy card.
     expect(card!.summary).toContain("scope");
     expect(card!.configPath).toBe("concierge.tools.search_history");
+  });
+
+  // THE SECOND FLOOR ON THE SAME WIRE (roborev 63051). The test above proves `args` reaches the
+  // policy layer for `search_history`; that is now only half of what dropping `q.args` would cost.
+  // `chief_call` names its upstream verb in its arguments, so without the wire a destructive Chief
+  // call arrives as the ordinary hatch call — `outward-facing`, which an explicit `allow` covers —
+  // and deletes a real client's data with no card. Asserting it HERE rather than only against
+  // `evaluateToolPolicy` is the point: the binding is the production call site, and a floor proven
+  // only through the pure function is a floor whose delivery path is untested.
+  it("carries the arguments through for the OTHER floor too — a destructive chief_call asks", () => {
+    useSettingsStore.setState({
+      conciergeToolPolicy: { chief_call: "allow" },
+      conciergeToolPolicyHydrated: true,
+    });
+
+    // The ordinary hatch call is covered by the human's allow, and raises nothing.
+    expect(configuredToolPolicy(query("chief_call", true, { tool: "list_chats" })).tier).toBe(
+      "allow",
+    );
+    expect(pending()).toEqual([]);
+
+    // Naming a destructive verb is not, however the human spelled their rule.
+    const destructive = configuredToolPolicy(query("chief_call", true, { tool: "delete_chat" }));
+    expect(destructive).toEqual({ tier: "ask", approvedByUser: false });
+    expect(conciergeToolAuthority("call-1", destructive)).toBeNull();
+
+    const [card] = pending();
+    expect(card).toBeDefined();
+    expect(card!.op).toBe("chief_call");
+    // The CALL's risk, so the card says what is about to happen rather than "reaches the outside
+    // world (a push or a pull request)".
+    expect(card!.riskClass).toBe("irreversible");
+    expect(card!.riskNote).toContain("Permanently destroys");
+    expect(card!.configPath).toBe("concierge.tools.chief_call");
   });
 
   it("fails CLOSED on a tool name the policy layer does not classify", () => {

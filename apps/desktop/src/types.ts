@@ -200,6 +200,19 @@ export interface Project {
    *  Absent for every project that has never run a cloud agent, i.e. all of them until the
    *  feature is switched on for the account. */
   cloudProjectId?: string | null;
+  /** The CHIEF projects this Sparkle project is bound to (bead `sparkle-8rr0c`). An agent running
+   *  here reaches these and nothing else; the concierge reaches every project the token can see,
+   *  regardless of this field. One-to-MANY was the founder's call — "each build agent can access
+   *  specific projects" — so a strict 1:1 is just the case where this holds one id.
+   *  Absent/empty means UNBOUND, which is a refusal rather than an open door: with 348 reachable
+   *  projects, defaulting an unbound agent to any of them is the failure this feature exists to
+   *  prevent (see services/chiefScope.ts). Optional, so every pre-existing persisted project reads
+   *  as unbound without a store migration — same shape as `cloudProjectId` above. */
+  chiefProjectIds?: string[];
+  /** The member of `chiefProjectIds` used when an agent names no project. `null`/absent means "no
+   *  default — ask". Kept separate from the array's order so re-ordering the binding in the UI
+   *  can't silently change which project agents read. */
+  chiefPrimaryId?: string | null;
   /** The REPOSITORY this project's folder belongs to — the canonical `.git` common dir, resolved
    *  once by `services/repoKey` (Rust `project_repo_key`). It is what makes "already open" mean the
    *  same repo rather than the same folder: a linked git worktree has its OWN `rootPath` but shares

@@ -120,6 +120,17 @@ export default defineConfig(({ mode, command }) => {
         secure: true,
         rewrite: (path) => path.replace(/^\/chief-api/, ""),
       },
+      // Chief's hosted MCP server — a DIFFERENT host from the REST API above, so it needs its own
+      // proxy entry here and its own allow-list entry in src-tauri/capabilities/default.json.
+      // Missing either one surfaces as a bare "Load failed" rather than a CORS/CSP message (the
+      // failure mode bead `` documents for api.storytell.ai). Streamable HTTP, so the
+      // proxy must not buffer: `text/event-stream` responses are read incrementally.
+      "/chief-mcp": {
+        target: "https://mcp.storytell.ai",
+        changeOrigin: true,
+        secure: true,
+        rewrite: (path) => path.replace(/^\/chief-mcp/, ""),
+      },
     },
   },
   // Most tests run under node; test-setup.ts shims localStorage so the persist

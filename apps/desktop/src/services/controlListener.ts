@@ -46,6 +46,15 @@ import { getConfig, setConfigValue, setConfigValues } from "./config";
 import { appendConciergeGuideline } from "./conciergeGuidelines";
 import { getModelCatalog } from "./models";
 import { dispatchConciergeTool, type ConciergeToolReply } from "./conciergeTools/registry";
+// THE CHIEF ACCESS-CONTROL CORE — pure, IO-free, and deliberately in its own module so the two gates
+// can be unit-tested without a socket or a live token. This file is the ENFORCEMENT POINT that calls
+// them; see the block above `handleChiefTool` for why the refusal cannot live anywhere else.
+import {
+  checkChiefTool,
+  resolveChiefProject,
+  type ChiefCaller,
+  type ChiefClient,
+} from "./chiefScope";
 // What the concierge is doing right now, for the thread's thinking indicator. Recorded from the one
 // call site that both sees every tool call and knows it came from the concierge — and read back by
 // `selfIdentity` below, so the concierge can be told what it is doing rather than only the human.
@@ -60,7 +69,14 @@ import { settleConciergeReceipt } from "./conciergeReceiptSettle";
 import { currentConciergeTurnOrigin } from "./conciergeReceipts";
 import { CONCIERGE_RECEIPT_APP_OPS } from "./conciergeReceiptClassifier";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
-import { appOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
+import { appOpPolicy, chiefOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
+import {
+  CHIEF_CALL_TOOL_ARG,
+  chiefPolicyOpFor,
+  type ChiefOp,
+} from "./conciergeTools/chief";
+import { createChiefMcpClient, resolveChiefPat } from "./chiefMcp";
+import { chiefCallerFor, createChiefRegistry, type ChiefRegistry } from "./chiefRegistry";
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
@@ -132,6 +148,9 @@ const TALLY: Record<ControlOp, boolean> = {
   // Counts how often the concierge actually reaches for a tool. The op name only — the domain and
   // op INSIDE the payload are not recorded (see selfReportMetrics' privacy note).
   concierge_tool: true,
+  // Counts how often Chief is reached at all. The op name only — never the Chief tool, the project
+  // or the arguments, all of which name real client work (see selfReportMetrics' privacy note).
+  chief_tool: true,
   // Intent signals — see the mergeGuard module. Tallied like the rest; the op name only, never the
   // goal text or the claim note.
   set_agent_goal: true,
@@ -202,6 +221,14 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // caller. Both gates matter — this op reaches agent lifecycle, git, the workspace and a PTY, so a
   // near-miss caller id must not get within reach of it. See the handler.
   concierge_tool: "privileged",
+  // FREE, AND THAT IS NOW A DECISION RATHER THAN AN OMISSION (roborev 63142). Until `chief_tool`
+  // joined the `ControlOp` union this lookup returned `undefined` for it, so the privileged branch
+  // was skipped by accident. Free is nonetheless the right tier: Chief is work an unattended build
+  // agent legitimately does, and the thing that must gate it is not "is this caller interactive"
+  // but WHICH project and WHICH verb — `handleChiefTool`'s two gates, plus the concierge autonomy
+  // gate in `dispatch`. A `privileged` tier here would deny every worker its bound project while
+  // leaving the concierge (which clears that check outright) exactly as reachable as before.
+  chief_tool: "free",
   // FREE because it is SELF-REPORT — an agent saying what it is trying to finish, the same class of
   // thing as `set_agent_activity`. It also has to be reachable by an UNATTENDED worker: the
   // auto-continue prompt tells a resumed agent to report through this family, and a tier that denied
@@ -266,7 +293,16 @@ type ControlOpExemptFromConciergePolicy =
   | "concierge_tool"
   | "pin_agent"
   | "set_agent_ordering"
-  | "unpin_agent";
+  | "unpin_agent"
+  // EXEMPT FROM *THIS* CHECK ONLY, AND NOT FROM THE GATE — the one place these two lists differ,
+  // so read the difference rather than pattern-matching the name (roborev 63142). This type asks
+  // "is the op classified in `APP_TOOL_NAMES`", and `chief_tool` deliberately is not: its policy
+  // rows live in the CHIEF domain (`conciergeTools/chief.ts`), keyed by the inner verb, because the
+  // wrapper name is not something a human would ever set a rule for. `dispatch` gates it by
+  // translating to that inner verb via `chiefPolicyOpFor`. Note it is absent from the RUNTIME
+  // `CONCIERGE_EXEMPT_OPS` set above, and that asymmetry is the whole point: adding it there would
+  // skip the gate and restore the hole this branch just closed.
+  | "chief_tool";
 // Instantiating it is what makes the mapped type actually check.
 const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   get_state: true,
@@ -1955,6 +1991,341 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   }
 }
 
+// ── CHIEF: the ONE enforcement point for who may reach which Chief project ───────────────────────
+//
+// WHY THE REFUSAL IS HERE AND NOWHERE ELSE (bead `sparkle-8rr0c`). `--allowedTools` DOES NOT GATE
+// MCP TOOLS — measured on CLI 2.1.220 (bead `sparkle-xbka`; see the comment at
+// src-tauri/src/concierge.rs:57-68), where only `--disallowedTools` blocks. So Chief scoping cannot
+// be enforced by a spawn flag, cannot be enforced by a tool description, and certainly cannot be
+// enforced by persona prose, which is a suggestion an agent is free to talk itself out of. The only
+// mechanism left is a refusal inside this handler, judged against the identity the APP stamps
+// (`req.callerAgentId`, minted by Rust from WHICH SOCKET the request arrived on) rather than any
+// value the caller supplies. Every other op on this surface already works that way; this one has to.
+//
+// The decisions themselves are NOT here. They live in the pure `./chiefScope` module, which reads no
+// store and does no IO, so the security core is unit-testable without a socket or a live token. This
+// file supplies the two things that module cannot know: WHO is calling (from the stamped id) and
+// WHAT the token can see (from the injected client).
+
+/** The control op every Chief tool call travels on — first-class tools and the `chief_call` escape
+ *  hatch alike. ONE op, deliberately: the hatch takes the same gates as the named tools because it
+ *  arrives here in the same shape, so there is no second path to keep in step. */
+export const CHIEF_TOOL_OP = "chief_tool";
+
+/** Chief's project catalog is not scoped to a project, so it does not travel through the project
+ *  gate — see the early return in {@link handleChiefTool}. */
+const CHIEF_LIST_PROJECTS_TOOL = "list_projects";
+
+/**
+ * The live Chief client, or `null` when Chief is not connected.
+ *
+ * INJECTED, NOT REACHED FOR. `handleChiefTool` never constructs a client and never imports a
+ * transport — it reads this. That is the shape bead `sparkle-lgbwf` asks for: the seam a test drives
+ * is the SAME seam production writes, so there is no defaulted-at-the-call-site line that only the
+ * shipped app executes. The proxy module registers the real client here at startup; a test registers
+ * a stub. Neither path is special-cased.
+ *
+ * `null` is a real state and gets its own refusal rather than a thrown error: an agent that asks for
+ * Chief before the token is wired deserves to be told that, not to read a stack trace.
+ */
+let chiefClient: ChiefClient | null = null;
+/**
+ * The catalog cache in front of {@link chiefClient}, rebuilt whenever the client is replaced.
+ *
+ * WHY IT IS HERE AND NOT AT THE CALL SITE. `createChiefRegistry` exists precisely because "fetching
+ * 348 rows per tool call is the obvious waste", and after the four Chief branches merged it was
+ * referenced by nothing but its own test — so the handler fetched the whole catalog from the network
+ * on EVERY Chief call, including the burst reads the surface is meant for, and the half of the
+ * feature built to prevent that was dead code (roborev 63105, 63043). Wrapping here rather than
+ * asking every caller to remember means there is no second path that bypasses the cache.
+ *
+ * It is rebuilt on every `setChiefClient` because a cache keyed to a retired client would serve one
+ * token's catalog to the next — and the PAT changing is exactly when the visible project set does.
+ */
+let chiefRegistry: ChiefRegistry | null = null;
+
+/** Register (or clear, with `null`) the Chief client this handler calls. Idempotent; last write
+ *  wins. Called by {@link connectChief} at startup and by tests with a stub — see {@link chiefClient}. */
+export function setChiefClient(client: ChiefClient | null): void {
+  chiefClient = client;
+  chiefRegistry = client ? createChiefRegistry(client) : null;
+}
+
+/**
+ * Connect the real Chief transport, or clear it when no PAT is reachable.
+ *
+ * THE LINE THAT MAKES THE FEATURE EXIST. Until this landed, `createChiefMcpClient` was referenced
+ * only by `chiefMcp.test.ts` and `setChiefClient` only by `controlListener.test.ts`, so `chiefClient`
+ * was `null` in every real run and all twelve Chief tools answered `chief_unavailable` — the whole
+ * surface inert, end to end, with three suites green (roborev 63105). That is the same
+ * shipped-inert-seam failure as the missing `CONTROL_OPS` entry, one layer up, and it is why the
+ * test below drives THIS function rather than calling `setChiefClient` itself.
+ *
+ * Returns whether Chief ended up connected, so the caller can log it; never throws, because a
+ * missing token is an ordinary state (Chief is optional) and must not take the control listener
+ * down with it.
+ */
+export async function connectChief(
+  deps: { createClient?: typeof createChiefMcpClient; resolvePat?: () => Promise<string> } = {},
+): Promise<boolean> {
+  const create = deps.createClient ?? createChiefMcpClient;
+  const resolve = deps.resolvePat ?? resolveChiefPat;
+  try {
+    // GUARDED ON THE PAT BEING RESOLVABLE. With no token every call would reach the network and come
+    // back unauthorized, which reads to a model as "Chief is broken" rather than "Chief is not set
+    // up" — and `handleChiefTool`'s `chief_unavailable` says the latter, correctly, when the client
+    // is null.
+    const pat = await resolve();
+    if (!pat) {
+      setChiefClient(null);
+      return false;
+    }
+    setChiefClient(create({ resolvePat: resolve }));
+    return true;
+  } catch {
+    // A keychain read can fail (locked, denied, no Rust side in a test harness). Chief is optional,
+    // so this is a state, not an error: clear the client and let the refusal explain itself.
+    setChiefClient(null);
+    return false;
+  }
+}
+
+/** The reply shape for {@link CHIEF_TOOL_OP}. `ok: false` always carries `code` + `error`; `ok: true`
+ *  always names the project it ran against, because the tool surface asks the model to STATE which
+ *  Chief project it used and a reply that omits it makes that instruction unfollowable. */
+export interface ChiefToolReply {
+  ok: boolean;
+  /** The UPSTREAM tool name that was judged — the same string both gates were applied to. */
+  tool: string;
+  code?: string;
+  error?: string;
+  /** Which Chief project the call ran against, and whether it was asked for or came from the
+   *  binding. Present on every success except `list_projects`, which is not project-scoped. */
+  project?: { id: string; name: string; source: "requested" | "primary" };
+  text?: string;
+  data?: unknown;
+  /** `list_projects` only: what this caller may reach, and whether that is everything. */
+  projects?: Array<{ id: string; name: string; description?: string; default?: boolean }>;
+  scope?: "all" | "bound";
+  detail?: string;
+}
+
+/**
+ * Build the caller's Chief scope from the STAMPED identity — the anti-spoofing property, and the
+ * whole reason this function takes a `ControlRequest` rather than an agent id.
+ *
+ * `req.callerAgentId` is written by the Rust bridge from the socket the request arrived on and is
+ * stripped from the payload before the frontend sees it (`CONTROL_RESERVED_FIELDS` in bridge.rs), so
+ * a tool payload naming a different agent cannot change the answer here. Nothing in the payload is
+ * consulted. A caller that resolves to no agent gets `null` — fail closed, never a default scope.
+ */
+function callerScopeFor(req: ControlRequest): ChiefCaller | null {
+  const { projects, selectedProjectId } = useProjectStore.getState();
+  // ONE DEFINITION OF SCOPE, IMPORTED (roborev 63105). This function used to build the `ChiefCaller`
+  // itself, so the merge landed TWO implementations named `chiefCallerFor` — one here on the
+  // production path, one in `chiefRegistry.ts` reachable from nothing — that disagreed on two real
+  // cases, and the merge was textually clean because each lived in its own file. The registry's
+  // version is the one whose rules are documented and tested, so this resolves WHO the caller is
+  // (the part that needs the request and the store) and delegates WHAT THEY MAY REACH to it.
+  //
+  // The two divergences that were live: a project with `chiefProjectIds: []` but a leftover
+  // `chiefPrimaryId` was refused as `out_of_scope` "the binding is inconsistent" instead of the
+  // intended `unbound` "ask the human to bind one"; and a binding holding `[""]` read as a
+  // NON-EMPTY allowed set, so `isChiefBound` (the UI's answer) and the refusal path disagreed about
+  // whether the project was bound at all — the exact disagreement `isChiefBound`'s doc-comment says
+  // must not exist.
+  //
+  // The anti-spoofing property is unchanged and is why this still takes a `ControlRequest`:
+  // `req.callerAgentId` is stamped by the Rust bridge from the socket and stripped from the payload
+  // (`CONTROL_RESERVED_FIELDS` in bridge.rs), so a payload naming another agent cannot move the
+  // answer. Nothing in the payload is consulted, and a caller resolving to no agent gets `null` —
+  // fail closed, never a default scope.
+  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
+    // The concierge reaches every project the token can see, so its binding contributes only a
+    // DEFAULT — the selected Sparkle project's primary, if it has one. With no primary it is asked
+    // to name a project rather than served one of 348 (see `resolveChiefProject`'s "ambiguous").
+    return chiefCallerFor(
+      "concierge",
+      projects.find((p) => p.id === selectedProjectId),
+    );
+  }
+  const found = findAgent(req.callerAgentId);
+  if (!found) return null;
+  return chiefCallerFor(
+    "agent",
+    projects.find((p) => p.id === found.projectId),
+    found.agent.id,
+  );
+}
+
+/**
+ * Run one Chief tool call through both gates, then — and only then — through the network.
+ *
+ * THE ORDER IS LOAD-BEARING, and it is why the verb gate runs before the catalog is fetched:
+ *   1. resolve the caller from the stamped identity (never from the payload);
+ *   2. `checkChiefTool` — WHICH VERB. A denied verb makes NO Chief call at all, not even the
+ *      catalog read, so a build agent asking for `delete_asset` costs Chief nothing;
+ *   3. `resolveChiefProject` — WHICH PROJECT, against the catalog the token can actually see. An
+ *      out-of-scope project makes no project-scoped call;
+ *   4. `client.callTool` — the only line that reaches a project's data.
+ *
+ * `chief_call` is not a second path. The escape hatch sends its `tool` argument in the same
+ * `chiefTool` field a first-class tool sends, so it is judged by the same two gates in the same
+ * order — there is no route to a denied verb through it.
+ */
+/** One Chief call, read out of a raw control payload. */
+interface ParsedChiefCall {
+  /** The upstream tool name, trimmed. Empty when the payload named none. */
+  tool: string;
+  /** The project the caller asked for, by id or by name. Absent means "use my binding". */
+  requested?: string;
+  /** The named tool's own arguments. Always an object — a non-object is read as `{}`. */
+  args: Record<string, unknown>;
+}
+
+/**
+ * Read a `chief_tool` payload. ONE parser, called by BOTH the concierge policy gate and the handler.
+ *
+ * Shared rather than duplicated because the two readings must agree by construction: the gate judges
+ * a tool name and the handler runs one, and a second copy that trimmed differently (or read a
+ * differently-spelled key) would let the human approve one verb while another executed. That is not
+ * hypothetical — it is the same two-readers-of-one-shape failure `conciergeTools/chief.ts` documents
+ * at `CHIEF_CALL_TOOL_ARG`, and it fails silently in the direction that matters.
+ *
+ * Read defensively: this payload was assembled by a model's MCP client. Note the field names —
+ * `chiefTool`, not `tool`-as-`op`: bridgeClient flattens the payload into the wire envelope and
+ * writes `id`/`token`/`op`/`callerAgentId` AFTER the spread, so a payload field with one of those
+ * names is overwritten and then stripped (the v0.55.0 `unknown-op` bug; see envelopeCollision).
+ */
+function parseChiefCall(payload: Record<string, unknown>): ParsedChiefCall {
+  const rawArgs = payload.args;
+  return {
+    tool: typeof payload.chiefTool === "string" ? payload.chiefTool.trim() : "",
+    requested: typeof payload.project === "string" ? payload.project : undefined,
+    args:
+      typeof rawArgs === "object" && rawArgs !== null && !Array.isArray(rawArgs)
+        ? (rawArgs as Record<string, unknown>)
+        : {},
+  };
+}
+
+async function handleChiefTool(req: ControlRequest): Promise<ChiefToolReply> {
+  const { tool, requested, args } = parseChiefCall(req.payload);
+
+  if (!tool) {
+    return {
+      ok: false,
+      tool,
+      code: "bad-args",
+      error:
+        "Refused: no Chief tool was named. A first-class tool sends its own name; `chief_call` " +
+        "needs its `tool` argument. No Chief call was made.",
+    };
+  }
+
+  const caller = callerScopeFor(req);
+  if (!caller) {
+    return {
+      ok: false,
+      tool,
+      code: "unknown_caller",
+      error:
+        `Refused: caller ${req.callerAgentId || "(unidentified)"} resolves to no agent, so its ` +
+        `Chief scope cannot be established. Scope is never defaulted. No Chief call was made.`,
+    };
+  }
+
+  // GATE 1 — THE VERB. Before the client is even read, so a denied verb cannot be told apart from a
+  // denied verb on a disconnected Chief by making a call.
+  const verb = checkChiefTool(caller, tool);
+  if (!verb.ok) return { ok: false, tool, code: verb.reason, error: verb.message };
+
+  const client = chiefClient;
+  const registry = chiefRegistry;
+  if (!client || !registry) {
+    return {
+      ok: false,
+      tool,
+      code: "chief_unavailable",
+      error:
+        "Chief is not connected in this app right now, so no Chief tool can run. This is a wiring " +
+        "or credential state, not a scope refusal — ask the human to connect Chief in Settings.",
+    };
+  }
+
+  try {
+    // THROUGH THE CACHE, not the raw client. `list_projects` is the same 348 rows for every call in
+    // a burst, and the TTL registry in front of it is the whole reason it is not re-fetched per
+    // tool call (roborev 63105/63043). The one tool that must see through the cache is the catalog
+    // read itself — a human who just created a Chief project and asks for the list expects to see
+    // it — so that one forces a refresh.
+    const catalog = await registry.listProjects(tool === CHIEF_LIST_PROJECTS_TOOL);
+
+    // `list_projects` is not project-scoped — Chief reads `X-Project-Id` per request and this tool
+    // takes none — so it skips the project gate by construction. It is still SCOPED: an agent is
+    // shown its bound set and nothing else, which is the honest answer to "what can I reach" and
+    // stops the catalog itself from being an enumeration of 348 client projects.
+    if (tool === CHIEF_LIST_PROJECTS_TOOL) {
+      // Spelled out as a loop rather than a ternary + `.filter(p => …)`, because this is a SCOPING
+      // decision and has to be provable like the two gates above. A ternary arm is not its own line,
+      // and `mutation-check.sh` cannot mutate an arrow function (its `<`/`>` inversion turns `=>`
+      // into `=<` and the mutant never parses) — so both of the idiomatic spellings are lines a
+      // mutation check can never judge, which would leave the filter covered by nothing but a
+      // reviewer's eye.
+      let visible = catalog;
+      if (caller.allowed !== "all") {
+        const reachable = caller.allowed;
+        visible = [];
+        for (const p of catalog) if (reachable.includes(p.project_id)) visible.push(p);
+      }
+      return {
+        ok: true,
+        tool,
+        scope: caller.allowed === "all" ? "all" : "bound",
+        projects: visible.map((p) => ({
+          id: p.project_id,
+          name: p.name,
+          description: p.description,
+          default: p.default,
+        })),
+        // An empty list for a bound caller is genuinely ambiguous — no binding, or a binding whose
+        // ids the token cannot see — so say which rather than letting it read as "Chief is empty".
+        detail:
+          caller.allowed !== "all" && visible.length === 0
+            ? "This Sparkle project is not bound to any Chief project the token can see, so there " +
+              "is nothing to reach. Ask the human to bind one."
+            : undefined,
+      };
+    }
+
+    // GATE 2 — WHICH PROJECT.
+    const decision = resolveChiefProject(caller, requested, catalog);
+    if (!decision.ok) return { ok: false, tool, code: decision.reason, error: decision.message };
+
+    const result = await client.callTool(decision.projectId, tool, args);
+    return {
+      // Chief's own error flag is carried through rather than flattened: a tool that ran and failed
+      // upstream is a different fact from one this app refused, and a caller must be able to tell.
+      ok: result.isError !== true,
+      tool,
+      project: {
+        id: decision.projectId,
+        name: decision.projectName,
+        source: decision.source,
+      },
+      text: result.text,
+      data: result.data,
+    };
+  } catch (e) {
+    return {
+      ok: false,
+      tool,
+      code: "chief_error",
+      error: `Chief call failed: ${errMsg(e)}`,
+    };
+  }
+}
+
 /** Did a handler's result represent a successful op? A `{ error }` reply (unknown op, thrown error)
  *  is a failure; an explicit `{ ok }` reply follows its flag; the read ops (get_state / get_config)
  *  carry neither field and always succeed when they return. Pure. */
@@ -2097,44 +2468,90 @@ async function dispatch(req: ControlRequest): Promise<void> {
     // `concierge_tool` is exempt because its own handler applies the SAME policy to the inner
     // { domain, op } — the thing that actually needs gating. Applying it here as well would judge
     // the outer wrapper name, which no policy entry describes, and deny everything.
+    //
+    // `chief_tool` IS GATED, and the exemption that used to sit here was a hole (roborev 63072). Its
+    // stated reasoning — "the op applies its OWN two gates" — is false for this one caller:
+    // `checkChiefTool` returns `{ ok: true }` unconditionally for `kind: "concierge"` BEFORE the
+    // destructive denylist, and `chiefCallerFor` hands the concierge `allowed: "all"`, so both of the
+    // gates it was trusted to apply are no-ops for it and the net was ZERO. That made `delete_asset`
+    // against ~348 live client projects reachable from the same injected terminal text this block
+    // exists to defend against.
+    //
+    // The other half of the old reasoning — "no policy entry describes it" — was true of the WRAPPER
+    // name only. The inner Chief verbs are classified (`conciergeTools/chief.ts`), so the op judged
+    // here is the inner one via `chiefPolicyOpFor`, exactly as `concierge_tool`'s handler judges its
+    // inner `{ domain, op }` rather than the wrapper. `concierge_tool` stays exempt because it
+    // re-applies the policy itself; this one has no such handler, so the gate is here.
     if (
       req.callerAgentId === CONCIERGE_CALLER_AGENT_ID &&
       !CONCIERGE_EXEMPT_OPS.has(req.op as ControlOp)
     ) {
-      // `reqId` is the approval's handle, and it has to be one the MODEL cannot choose: Rust mints
-      // it as a fresh 32-hex token per round trip (bridge.rs `generate_token`), exactly as the MCP
-      // server mints `toolCallId` for the concierge_tool path. Passing the payload alongside is what
-      // scopes the human's answer to THIS call — approving one `set_config` write must not approve
-      // the next one.
-      const decision = appOpPolicy(req.op, { requestId: req.reqId, args: req.payload });
-      if (decision.tier === "deny") {
-        // Distinguish "the human switched this off" from "nobody classified this op" — the second
-        // is a BUG, and blaming a Settings toggle the human never touched sends them hunting for a
-        // row that isn't there (roborev 54255, finding 3).
-        const known = APP_TOOL_NAMES.includes(req.op as AppToolName);
-        await respond(req.reqId, {
-          ok: false,
-          // Three different refusals wear the `deny` tier, and telling a human the wrong one sends
-          // them hunting for a Settings row that isn't there:
-          //   - a HELD verdict carries its own reason (config not read yet — transient, retry);
-          //   - an op nobody classified is a BUG, and says so rather than blaming the human;
-          //   - anything else really is a switch they threw, so name the exact config path.
-          error: decision.reason
-            ? `${req.op}: ${decision.reason}`
-            : known
-              ? `${req.op} is turned off for the concierge in Settings → Concierge tools (${conciergeToolConfigPath(req.op)}).`
-              : `${req.op} has no concierge policy entry, so it is refused. This is a bug — the op needs classifying in conciergeTools/policy.ts.`,
-        });
-        return;
-      }
-      if (decision.tier === "ask" && decision.approvedByUser !== true) {
-        // Say what is pending, say how to retry, and name the setting. The call is NOT held open —
-        // see policyBinding's header for why a concierge turn cannot wait on a human.
-        await respond(req.reqId, {
-          ok: false,
-          error: `${req.op} needs your go-ahead. I've put an approval request in your Sparkle column — approve it there and then tell me to go ahead, and I'll run it. To stop being asked each time, set ${conciergeToolConfigPath(req.op)} to "Allow" in Settings → Concierge tools.`,
-        });
-        return;
+      // A Chief call is judged on the verb it will actually run, read by the SAME parser the handler
+      // uses, so the name on the human's approval card is the name that executes.
+      const chief = req.op === CHIEF_TOOL_OP ? parseChiefCall(req.payload) : null;
+      // A `chief_tool` naming no verb is the one case that skips the gate, and it is safe for a
+      // reason that does not depend on remembering this: `handleChiefTool` refuses an empty tool as
+      // `bad-args` before it so much as reads the client, so there is no call to approve. Gating it
+      // anyway would put an approval card in front of a malformed request that provably cannot do
+      // anything — and cards a human learns to dismiss are how the real ones stop being read.
+      if (!chief || chief.tool) {
+        // `reqId` is the approval's handle, and it has to be one the MODEL cannot choose: Rust mints
+        // it as a fresh 32-hex token per round trip (bridge.rs `generate_token`), exactly as the MCP
+        // server mints `toolCallId` for the concierge_tool path. Passing the payload alongside is what
+        // scopes the human's answer to THIS call — approving one `set_config` write must not approve
+        // the next one.
+        //
+        // For Chief the arguments handed over are RESHAPED, not the raw payload, and that is
+        // load-bearing rather than tidying: `PER_CALL_RISK.chief_call` reads the upstream verb out of
+        // `args[CHIEF_CALL_TOOL_ARG]` to escalate a destructive one to `irreversible`. Passing
+        // `req.payload` (which spells it `chiefTool`) would leave that reader empty, the call would
+        // fall back to the ordinary `outward-facing` class, and an explicit `chief_call = "allow"`
+        // would cover `delete_chat` — the exact hole the floor exists to close, silently.
+        const policyOp = chief ? chiefPolicyOpFor(chief.tool) : req.op;
+        const decision = chief
+          ? chiefOpPolicy(policyOp as ChiefOp, {
+              requestId: req.reqId,
+              args: {
+                [CHIEF_CALL_TOOL_ARG]: chief.tool,
+                arguments: chief.args,
+                // The project the caller ASKED for, so one approval cannot be spent on a different
+                // one. KNOWN LIMIT: when the payload names none this is `undefined`, and the project
+                // is resolved from the binding later — inside the handler, after the catalog read the
+                // verb gate deliberately runs before. So an unnamed-project approval is scoped to
+                // "whatever this caller's binding resolves to", not to a fixed id.
+                project: chief.requested,
+              },
+            })
+          : appOpPolicy(req.op, { requestId: req.reqId, args: req.payload });
+        if (decision.tier === "deny") {
+          // Distinguish "the human switched this off" from "nobody classified this op" — the second
+          // is a BUG, and blaming a Settings toggle the human never touched sends them hunting for a
+          // row that isn't there (roborev 54255, finding 3).
+          const known = chief !== null || APP_TOOL_NAMES.includes(req.op as AppToolName);
+          await respond(req.reqId, {
+            ok: false,
+            // Three different refusals wear the `deny` tier, and telling a human the wrong one sends
+            // them hunting for a Settings row that isn't there:
+            //   - a HELD verdict carries its own reason (config not read yet — transient, retry);
+            //   - an op nobody classified is a BUG, and says so rather than blaming the human;
+            //   - anything else really is a switch they threw, so name the exact config path.
+            error: decision.reason
+              ? `${policyOp}: ${decision.reason}`
+              : known
+                ? `${policyOp} is turned off for the concierge in Settings → Concierge tools (${conciergeToolConfigPath(policyOp)}).`
+                : `${policyOp} has no concierge policy entry, so it is refused. This is a bug — the op needs classifying in conciergeTools/policy.ts.`,
+          });
+          return;
+        }
+        if (decision.tier === "ask" && decision.approvedByUser !== true) {
+          // Say what is pending, say how to retry, and name the setting. The call is NOT held open —
+          // see policyBinding's header for why a concierge turn cannot wait on a human.
+          await respond(req.reqId, {
+            ok: false,
+            error: `${policyOp} needs your go-ahead. I've put an approval request in your Sparkle column — approve it there and then tell me to go ahead, and I'll run it. To stop being asked each time, set ${conciergeToolConfigPath(policyOp)} to "Allow" in Settings → Concierge tools.`,
+          });
+          return;
+        }
       }
     }
     let result: unknown;
@@ -2193,6 +2610,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
       case "concierge_tool":
         result = await handleConciergeTool(req);
         break;
+      case CHIEF_TOOL_OP:
+        result = await handleChiefTool(req);
+        break;
       default:
         result = { error: `unknown op ${req.op}` };
     }
@@ -2248,6 +2668,12 @@ function teardown(): void {
   void safeUnlisten(unlisten);
   unlisten = undefined;
   startPromise = undefined;
+  // DROP THE CHIEF CLIENT TOO, for the same reason `setChiefClient` rebuilds the registry: a client
+  // is bound to the PAT that was resolvable when it was built, and a teardown is exactly when that
+  // may be changing (sign-out, HMR after a token edit). Holding it would serve the retired token's
+  // catalog to the next start. Between teardown and re-arm, Chief fails closed as `chief_unavailable`
+  // — the honest answer — and `doStart` reconnects from the current PAT.
+  setChiefClient(null);
 }
 
 async function doStart(): Promise<() => void> {
@@ -2258,6 +2684,19 @@ async function doStart(): Promise<() => void> {
   await startControlBridge().catch((e) =>
     console.error("[control] start_control_bridge failed", e),
   );
+  // CONNECT CHIEF HERE, or the twelve Chief tools are decoration. `connectChief` was written with a
+  // doc-comment calling itself "the line that makes the feature exist" and was then called from
+  // nothing but its own test — so `chiefClient` stayed `null` in every real run and the whole
+  // surface answered `chief_unavailable`, with three suites green. That is the identical
+  // shipped-inert-seam this file has now hit twice (the missing `CONTROL_OPS` entry, the unreferenced
+  // registry cache); the difference is that this one is load-bearing for a feature the founder is
+  // waiting on, so `startControlListener` — the app's ONE boot call — is where it belongs.
+  //
+  // Best-effort and un-awaited-for-failure, exactly like the bridge above: Chief is optional, a
+  // missing PAT is an ordinary state, and `connectChief` never throws. Awaited (not fire-and-forget)
+  // so the client is in place before the listener can dispatch a Chief op against it.
+  const chiefUp = await connectChief();
+  console.info(`[control] chief ${chiefUp ? "connected" : "not configured"}`);
   unlisten = await listen<ControlRequest>(EVENT, (event) => void dispatch(event.payload));
   return teardown;
 }

@@ -708,6 +708,47 @@ describe("beadsProtocol", () => {
   });
 });
 
+// ══ CHIEF PROJECT SELECTION (bead sparkle-8rr0c, roborev 63041) ═════════════════════════════════
+// Same standing as the other pins in this file, and the same caveat: this is PROSE, not a mechanism.
+// The mechanism is `services/chiefScope.ts` — `resolveChiefProject` refuses rather than guessing, and
+// `checkChiefTool` refuses destructive verbs for an agent — both separately tested. These assertions
+// exist because the prose is what a fresh agent reads, and because the founder's rule here was an
+// explicit decision (use the binding and SAY which project; ask when unbound or ambiguous; never
+// pick silently) rather than a default anyone can re-derive from the code.
+describe("sparkleControlProtocol — choosing a Chief project", () => {
+  const p = sparkleControlProtocol();
+
+  it("says to use the binding and NAME the project rather than asking", () => {
+    expect(p).toMatch(/chief_\*/);
+    expect(p).toMatch(/BOUND/);
+    expect(p).toMatch(/SAY\s+WHICH ONE/);
+  });
+
+  it("says to ask with the project list when there is no binding, and never to pick silently", () => {
+    // The two halves are one rule: "ask" without "never pick silently" is satisfied by a model that
+    // asks sometimes, and that is the failure — a wrong pick reaches a real client's project.
+    expect(p).toMatch(/chief_list_projects/);
+    expect(p).toMatch(/ASK the human/);
+    expect(p).toMatch(/NEVER pick one silently/);
+  });
+
+  it("says a refused Chief call is a POLICY decision, so nobody burns turns retrying it", () => {
+    expect(p).toMatch(/REFUSED by the app/);
+    expect(p).toMatch(/not a transient error/);
+    expect(p).toMatch(/retry/i);
+  });
+
+  it("does not assert the reader HAS Chief — this rides in every agent's prompt", () => {
+    // roborev 63041, Medium: `sparkleControlProtocol()` is appended unconditionally, for every user
+    // and project, so a paragraph asserting "the account reaches hundreds of projects" states as
+    // fact something untrue for anyone without a Chief account — and points an agent at tools that
+    // may not exist on its surface. The bullet is therefore conditional in its own first clause.
+    expect(p).toMatch(/IF you have `chief_\*` tools/);
+    expect(p).toMatch(/only some setups do/i);
+    expect(p).not.toMatch(/the account reaches hundreds/);
+  });
+});
+
 describe("KEYCHAIN_SAFETY_RULE", () => {
   it("names the security CLI, the generic-password surface, and the app keychain item", () => {
     expect(KEYCHAIN_SAFETY_RULE).toMatch(/security/);

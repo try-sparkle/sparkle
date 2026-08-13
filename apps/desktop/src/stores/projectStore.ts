@@ -170,6 +170,29 @@ export interface ProjectState {
   /** Cache the ORCHESTRATION-side project id this local project maps to (cloud agents). Resolved
    *  once by services/cloudAgents/projectLink.ts, then reused for every start/list call. */
   setCloudProjectId: (projectId: string, cloudProjectId: string) => void;
+  /**
+   * Bind this Sparkle project to a set of CHIEF projects (bead `sparkle-8rr0c`).
+   *
+   * ONE INVARIANT, enforced here rather than trusted from the caller: a non-null `chiefPrimaryId`
+   * MUST be a member of `chiefProjectIds`. `services/chiefScope.resolveChiefProject` treats a
+   * primary outside the allowed set as a store-consistency BUG and refuses the call outright — so a
+   * binding that violates it is not a slightly-wrong binding, it is a project whose agents can no
+   * longer reach Chief at all, with a message telling the human to re-bind. A primary that is not
+   * in the list is therefore CORRECTED to `null` (which reads as "no default — ask") rather than
+   * stored: clearing the default costs one prompt, an inconsistent one costs every call.
+   *
+   * Consequences that fall out of the same rule: emptying the list also clears the primary, and
+   * unbinding entirely is `{ chiefProjectIds: [], chiefPrimaryId: null }` — an empty array is a
+   * REFUSAL, never a fallback to any of the 348 reachable projects.
+   *
+   * Ids are de-duplicated and blank-trimmed on the way in, because the array is what the scope
+   * check does `includes` against and a stray duplicate would silently double-count the binding in
+   * the UI's own summary.
+   */
+  setChiefBinding: (
+    projectId: string,
+    binding: { chiefProjectIds: string[]; chiefPrimaryId: string | null },
+  ) => void;
 
   /** Create an agent tab in `projectId`. Returns its id, or NULL when no such project exists in
    *  this window's store (nothing is created — see the guard in the implementation). */
@@ -1279,6 +1302,22 @@ export const useProjectStore = create<ProjectState>()(
       setCloudProjectId: (projectId, cloudProjectId) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) => ({ ...p, cloudProjectId })),
+        })),
+
+      setChiefBinding: (projectId, binding) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => {
+            const chiefProjectIds = [
+              ...new Set(binding.chiefProjectIds.map((id) => id.trim()).filter(Boolean)),
+            ];
+            // The invariant. An out-of-set primary is corrected to null, never stored — see the
+            // interface doc for why the read path treats the violation as a hard refusal.
+            const chiefPrimaryId =
+              binding.chiefPrimaryId && chiefProjectIds.includes(binding.chiefPrimaryId)
+                ? binding.chiefPrimaryId
+                : null;
+            return { ...p, chiefProjectIds, chiefPrimaryId };
+          }),
         })),
 
       addAgent: (projectId, opts) => {
