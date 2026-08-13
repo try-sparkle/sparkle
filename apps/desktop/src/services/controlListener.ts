@@ -102,6 +102,9 @@ import {
 import { createChiefMcpClient, resolveChiefPat } from "./chiefMcp";
 import { chiefCallerFor, createChiefRegistry, type ChiefRegistry } from "./chiefRegistry";
 import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
+// The lifecycle op NAMES, read from their one definition rather than re-listed here, so a new
+// lifecycle op inherits the refusal remedy that tells the truth about it (see refusedCallerRemedy).
+import { LIFECYCLE_OPS } from "./conciergeTools/lifecycle";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
 // The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
@@ -2203,36 +2206,72 @@ function handleNavigate(req: ControlRequest): Record<string, unknown> {
  * prose, exactly as it does for `unknown-op` or `bad-args`.
  *
  * The refusal's PROSE half is not one fixed sentence, because "use the ordinary sparkle-control ops"
- * is false for one domain — see {@link refusedCallerRemedy}.
+ * is false for two domains — see {@link refusedCallerRemedy}.
  */
 /**
  * WHAT A REFUSED CALLER SHOULD DO INSTEAD — derived from the tool it asked for, not fixed prose.
  *
- * The generic half ("drive the app through the ordinary sparkle-control ops") is true for every
- * domain but ONE. There is no ordinary control op that photographs anything: the `screenshot`
- * domain (`capture_window`, `capture_agent`) exists only behind `concierge_tool`. So an agent asked
- * for a before/after screenshot read a refusal that named a remedy which does not exist for what it
- * wanted, and had to go find the real path by reading the scripts directory.
+ * The generic half ("drive the app through the ordinary sparkle-control ops") is true for most
+ * domains and FALSE for two, each in the same way: the domain has no ordinary counterpart at all,
+ * so the sentence names a remedy that does not exist for what the caller asked for. A remedy is an
+ * instruction the reader will follow, which is why a wrong one costs more than no remedy at all.
+ *
+ * SCREENSHOT. There is no ordinary control op that photographs anything: the `screenshot` domain
+ * (`capture_window`, `capture_agent`) exists only behind `concierge_tool`. So an agent asked for a
+ * before/after screenshot read a refusal naming a path that does not exist, and had to go find the
+ * real one by reading the scripts directory.
  *
  * Naming the visual harness closes that. It is safe under the SAME condition that produced the
  * refusal — the harness renders app surfaces in a headless browser inside the caller's own checkout,
  * so it reaches neither the human's screen nor the running app, which is the whole reason
  * `capture_window` is concierge-only (it photographs a screen region; see conciergeTools/screenshot).
  *
- * And it says what the harness CANNOT do. A remedy is an instruction the reader will follow, so an
- * agent told "capture the app" that silently gets fixture-rendered surfaces would report live state
- * it never saw. The limitation belongs in the sentence, not in the README it may not open.
+ * And it says what the harness CANNOT do. An agent told "capture the app" that silently gets
+ * fixture-rendered surfaces would report live state it never saw. The limitation belongs in the
+ * sentence, not in the README it may not open.
+ *
+ * LIFECYCLE (bead `sparkle-nz55o`). Same shape, found later and costlier, because here the generic
+ * sentence is not merely unhelpful — it asserts a capability the wire contract does not have.
+ * `CONTROL_OPS` in `bridge.rs` is self-report, config, ordering, navigation, goal and PR-claim; not
+ * one entry spawns, closes, ships, saves, discards, retires or spins down an agent. Every one of
+ * those is a `lifecycle` op behind `concierge_tool`. So an agent refused here and told to "drive the
+ * app through the ordinary sparkle-control ops" goes looking for an op that has never existed.
+ *
+ * What it gets told instead is the truth plus the one thing that actually blocks it: the running app
+ * is a packaged build, so an agent that just landed a lifecycle fix cannot observe it from here even
+ * with a working call. Saying so is the point — the finding that produced this was an agent burning
+ * a pass hunting a verification path, and "there is no such path from here" is a fast, actionable
+ * answer where a false one is not. There is deliberately no agent-callable substitute invented here:
+ * a lifecycle call spawns or discards work, and widening who may make one is a policy decision for
+ * the human, not a consolation prize attached to a refusal.
  */
 function refusedCallerRemedy(domain: string, op: string): string {
   const wantsAPicture =
     domain === "screenshot" || op === "capture_window" || op === "capture_agent";
-  return wantsAPicture
-    ? "No ordinary control op takes a picture, so there is nothing here to fall back to. The " +
-        "supported path for an agent is the visual harness — `pnpm --filter @sparkle/desktop " +
-        "visual:capture` (see apps/desktop/scripts/visual/README.md). Note what it is: it renders " +
-        "the app's surfaces in a headless browser from its own fixtures, so it shows what the code " +
-        "draws, NOT the live window or the human's screen. Do not report its output as live state."
-    : "Agents drive the app through the ordinary sparkle-control ops.";
+  if (wantsAPicture) {
+    return (
+      "No ordinary control op takes a picture, so there is nothing here to fall back to. The " +
+      "supported path for an agent is the visual harness — `pnpm --filter @sparkle/desktop " +
+      "visual:capture` (see apps/desktop/scripts/visual/README.md). Note what it is: it renders " +
+      "the app's surfaces in a headless browser from its own fixtures, so it shows what the code " +
+      "draws, NOT the live window or the human's screen. Do not report its output as live state."
+    );
+  }
+  // Recognised by DOMAIN or by OP, matching the capture branch above: a caller that names the op
+  // without the domain (or vice versa) asked for the same thing and deserves the same answer.
+  const wantsLifecycle =
+    domain === "lifecycle" || (LIFECYCLE_OPS as readonly string[]).includes(op);
+  if (wantsLifecycle) {
+    return (
+      "No ordinary control op spawns, closes, ships, saves, discards, retires or spins down an " +
+      "agent — the whole lifecycle surface exists only behind `concierge_tool`, so there is " +
+      "nothing here to fall back to. Ask the human, or ask the concierge to make the call. And if " +
+      "you were trying to VERIFY a lifecycle change you just landed: the running app is a packaged " +
+      "build that does not pick up your edit, so there is no path from here to observing it — say " +
+      "the change is unverified rather than looking for one."
+    );
+  }
+  return "Agents drive the app through the ordinary sparkle-control ops.";
 }
 
 async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolReply> {

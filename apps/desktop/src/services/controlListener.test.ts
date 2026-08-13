@@ -4295,6 +4295,32 @@ describe("controlListener", () => {
       expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
     });
 
+    // The SECOND domain the generic sentence is false for (bead `sparkle-nz55o`). `CONTROL_OPS` in
+    // bridge.rs has no op that spawns, closes or retires an agent, so telling a refused lifecycle
+    // caller to "drive the app through the ordinary sparkle-control ops" sends it looking for
+    // something that has never existed. Asserted on the DOMAIN and on a bare OP separately: the
+    // branch recognises either, and a caller that names only one must not fall through to the
+    // generic sentence.
+    it.each([
+      ["the domain", { domain: "lifecycle", op: "retire_agent" }],
+      ["the op alone", { domain: "", op: "spin_down_worker" }],
+    ])("points a refused LIFECYCLE caller (%s) away from the control ops", async (_label, call) => {
+      fire({
+        reqId: `t9-${call.op}`,
+        op: "concierge_tool",
+        callerAgentId: callerId,
+        payload: { ...call, args: {}, toolCallId: `tc-${call.op}` },
+      });
+      await flush();
+      const message = String(lastReply().message);
+      expect(message).toContain("No ordinary control op spawns");
+      // The limitation travels WITH the remedy, same as the capture branch: an agent that landed a
+      // lifecycle fix must be told the packaged build cannot show it, not sent hunting for a path.
+      expect(message).toContain("packaged build");
+      expect(message).not.toContain("Agents drive the app through the ordinary sparkle-control ops");
+      expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
     it("still points a refused NON-capture caller at the ordinary control ops", async () => {
       fire({ reqId: "t8", op: "concierge_tool", callerAgentId: callerId, payload: toolPayload });
       await flush();
