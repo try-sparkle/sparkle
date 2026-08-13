@@ -682,6 +682,86 @@ fn import_default_at(
     Ok(acct)
 }
 
+/// Re-register config dirs that hold a REAL login but have no `accounts.json` record.
+///
+/// ══ WHY ORPHANS EXIST AT ALL ═══════════════════════════════════════════════════════════════════
+/// An account's dir is `accounts/<random id>` minted at add time, and the macOS keychain credential
+/// is keyed by `sha256(<that path>)[:8]`. So the credential is bound to a path containing a random
+/// id, and NOTHING binds an account record to the Anthropic identity it holds. Remove the record —
+/// or lose it any other way — and a fully credentialed directory is left on disk that no code can
+/// find, while re-adding "the same" account mints a brand new empty dir and prompts for a fresh
+/// login. Measured on the founder's machine: 6 of 12 dirs were orphans, 4 of them holding valid
+/// logins for identities he was actively trying to use.
+///
+/// That is also the answer to the founder's own clue — "when I add new accounts, we don't have this
+/// issue". The ADD path seeds a dir correctly; there was simply no path that ever looked at a dir
+/// again afterwards.
+///
+/// ══ ADOPT ONLY A COMPLETED LOGIN ═══════════════════════════════════════════════════════════════
+/// The signed-in test is [`read_oauth_identity_at`], the same one the identity badge uses: a real
+/// `oauthAccount.emailAddress`. A dir WITHOUT one is deliberately left alone, and that exclusion is
+/// load-bearing rather than tidiness. An un-logged-in dir has no transcripts, so its usage tally is
+/// zero — the most headroom there is — and adopting it would hand the auto-picker an account that
+/// wins every spawn and drops each agent at a login prompt. That is bead `sparkle-gms0`, and
+/// adopting empty dirs would re-open it from a new direction. Two such dirs existed on the founder's
+/// machine (Claude Code's own `projects/` + `file-history/` footprint, no `.claude.json`), so this
+/// is the common case, not a corner.
+///
+/// Keyed by the DIR NAME as the account id, which preserves the `account_config_dir` invariant that
+/// an account's dir is `accounts/<its id>`. Idempotent: a dir already referenced by a record is
+/// skipped, so re-running adopts nothing. Returns the records it added.
+fn adopt_orphan_dirs_at(
+    app_data: &Path,
+    accounts_path: &Path,
+    now: i64,
+) -> Result<Vec<Account>, String> {
+    let mut accounts = read_accounts_at(accounts_path)?;
+    // Match on the config_dir PATH, not the id: that is the field a spawn actually exports, so a
+    // record pointing at this dir under any id means the dir is already claimed.
+    let claimed: HashSet<PathBuf> = accounts.iter().map(|a| PathBuf::from(&a.config_dir)).collect();
+
+    let root = app_data.join("accounts");
+    let entries = match std::fs::read_dir(&root) {
+        Ok(e) => e,
+        // No accounts dir yet is a clean install, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("read accounts dir: {e}")),
+    };
+
+    let mut adopted = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() || claimed.contains(&dir) {
+            continue;
+        }
+        let Some(name) = dir.file_name().and_then(|n| n.to_str()) else { continue };
+        // A completed login, or nothing. See the header — adopting an empty dir would give the
+        // picker a zero-usage account that wins every spawn and lands agents in a login prompt.
+        let Some(identity) = read_oauth_identity_at(Some(&dir), None) else { continue };
+        // Id collision with an existing record would break the dir↔id invariant; skip rather than
+        // mint a second record for one id.
+        if accounts.iter().any(|a| a.id == name) {
+            continue;
+        }
+        adopted.push(Account {
+            id: name.to_string(),
+            nickname: identity.email.clone(),
+            config_dir: dir.to_string_lossy().into_owned(),
+            is_default: false,
+            created_at: now,
+            exhausted_until: None,
+            exhausted_identity: None,
+        });
+    }
+
+    if adopted.is_empty() {
+        return Ok(Vec::new()); // nothing to write — do not rewrite accounts.json for nothing
+    }
+    accounts.extend(adopted.iter().cloned());
+    write_accounts_at(accounts_path, &accounts)?;
+    Ok(adopted)
+}
+
 /// Whether a pre-fix default record should be normalized to the empty "no override" sentinel.
 ///
 /// True when the record is the default, points literally at `<home>/.claude`, and that directory
@@ -2368,6 +2448,26 @@ fn identities_at(
 pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
+        // ══ ADOPT ORPHANED CREDENTIALED DIRS — ONCE PER PROCESS ══════════════════════════════════
+        // A dir holding a real login with no `accounts.json` record is invisible to everything, and
+        // re-adding "the same" account mints a fresh empty one instead of reusing it. See
+        // `adopt_orphan_dirs_at` for how they arise.
+        //
+        // ONCE, not on every call, and the reason is cost rather than correctness: this list is
+        // polled on a 5s TTL by the whole app, and the scan reads each dir's `.claude.json` — files
+        // that reach 35 KB apiece on a real machine. Orphans appear when a record is removed or
+        // lost, which is rare and always precedes a restart in practice, so first-call is the right
+        // cadence. Best-effort: an adoption failure must never hide the user's accounts.
+        static ADOPTED: std::sync::Once = std::sync::Once::new();
+        ADOPTED.call_once(|| {
+            match adopt_orphan_dirs_at(&app_data, &accounts_json_path(&app_data), now_secs()) {
+                Ok(a) if !a.is_empty() => {
+                    tracing::info!(count = a.len(), "adopted orphaned credentialed account dirs");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "could not scan for orphaned account dirs"),
+            }
+        });
         let accounts = read_accounts_at(&accounts_json_path(&app_data))?;
         // Heal accounts added BEFORE Sparkle seeded its allowlist at creation. Seeding only on
         // `accounts_add` would leave every already-registered identity permanently grant-less, and
@@ -5062,6 +5162,124 @@ mod tests {
             v["oauthAccount"]["organizationName"], "Org",
             "the concurrent write must survive WHOLE, not be partially merged"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- orphan adoption ------------------------------------------------------------------
+    //
+    // A credentialed dir with no `accounts.json` record is invisible to every surface, and
+    // re-adding "the same" account mints a fresh empty dir rather than reusing it. 6 of 12 dirs on
+    // the founder's machine were orphans; 4 held valid logins he was actively trying to use.
+
+    /// Writes one orphan dir holding a completed login, and one holding none.
+    fn seed_orphans(root: &Path) {
+        let signed_in = root.join("accounts").join("aaa111");
+        std::fs::create_dir_all(&signed_in).unwrap();
+        std::fs::write(
+            signed_in.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"recovered@example.com","organizationName":"Org"}}"#,
+        )
+        .unwrap();
+
+        // Claude Code's own footprint for a dir it was launched into but never signed into.
+        let never = root.join("accounts").join("bbb222");
+        std::fs::create_dir_all(never.join("projects")).unwrap();
+    }
+
+    #[test]
+    fn adoption_registers_a_credentialed_dir_that_has_no_record() {
+        let tmp = unique_dir("adopt-basic");
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_orphans(&tmp);
+        let accounts_path = tmp.join("accounts.json");
+
+        let adopted = adopt_orphan_dirs_at(&tmp, &accounts_path, 1_700_000_000).unwrap();
+
+        assert_eq!(adopted.len(), 1, "expected exactly the signed-in orphan: {adopted:?}");
+        assert_eq!(adopted[0].id, "aaa111");
+        assert_eq!(adopted[0].nickname, "recovered@example.com");
+        // ASSERTS THE SIDE EFFECT — the record is on disk, not merely in the return value.
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert!(on_disk.iter().any(|a| a.id == "aaa111"), "not persisted: {on_disk:?}");
+        // The dir↔id invariant `account_config_dir` relies on.
+        assert_eq!(
+            PathBuf::from(&adopted[0].config_dir),
+            account_config_dir(&tmp, "aaa111")
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// NEVER adopt a dir with no completed login — this keeps `sparkle-gms0` closed.
+    ///
+    /// An un-logged-in dir has no transcripts, so its usage tally is zero: the most headroom in the
+    /// pool. Adopting one would hand the auto-picker an account that wins EVERY spawn and drops each
+    /// agent at a login prompt — the exact fleet-wide failure the signed-in filter exists to stop,
+    /// re-opened from a new direction. Two such dirs existed on the founder's machine, so this is
+    /// the common case rather than a corner.
+    #[test]
+    fn adoption_skips_a_dir_that_was_never_signed_into() {
+        let tmp = unique_dir("adopt-skips-empty");
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_orphans(&tmp);
+        let accounts_path = tmp.join("accounts.json");
+
+        adopt_orphan_dirs_at(&tmp, &accounts_path, 1_700_000_000).unwrap();
+
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert!(
+            !on_disk.iter().any(|a| a.id == "bbb222"),
+            "adopted a dir with no login — it would win every auto-pick and prompt each agent: {on_disk:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Idempotent: a second pass adopts nothing and does not duplicate the first pass's record.
+    #[test]
+    fn adoption_is_idempotent() {
+        let tmp = unique_dir("adopt-idempotent");
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_orphans(&tmp);
+        let accounts_path = tmp.join("accounts.json");
+
+        assert_eq!(adopt_orphan_dirs_at(&tmp, &accounts_path, 1).unwrap().len(), 1);
+        let second = adopt_orphan_dirs_at(&tmp, &accounts_path, 2).unwrap();
+
+        assert!(second.is_empty(), "second pass re-adopted: {second:?}");
+        let on_disk = read_accounts_at(&accounts_path).unwrap();
+        assert_eq!(
+            on_disk.iter().filter(|a| a.id == "aaa111").count(),
+            1,
+            "duplicate record for one dir: {on_disk:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A dir an existing record ALREADY points at is not adopted a second time — matched on the
+    /// config_dir path, since that is the field a spawn actually exports.
+    #[test]
+    fn adoption_leaves_an_already_registered_dir_alone() {
+        let tmp = unique_dir("adopt-claimed");
+        std::fs::create_dir_all(&tmp).unwrap();
+        seed_orphans(&tmp);
+        let accounts_path = tmp.join("accounts.json");
+        // Register the dir under a DIFFERENT id, so only path-matching can catch it.
+        write_accounts_at(
+            &accounts_path,
+            &[Account {
+                id: "some-other-id".to_string(),
+                nickname: "Mine".to_string(),
+                config_dir: account_config_dir(&tmp, "aaa111").to_string_lossy().into_owned(),
+                is_default: false,
+                created_at: 1,
+                exhausted_until: None,
+                exhausted_identity: None,
+            }],
+        )
+        .unwrap();
+
+        let adopted = adopt_orphan_dirs_at(&tmp, &accounts_path, 2).unwrap();
+
+        assert!(adopted.is_empty(), "re-adopted a claimed dir: {adopted:?}");
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
