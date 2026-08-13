@@ -22,6 +22,7 @@
 import type { AgentTabStatus } from "../types";
 import { setPin } from "./accountStore";
 import { CONCIERGE_ACCOUNT_KEY } from "./accountSelection";
+import { releaseQuotaBlockForAgent } from "../engine/engineRegistry";
 
 /** Statuses at which an agent can be re-spawned without losing in-flight work. Everything except
  *  `working`; see the module note. */
@@ -131,6 +132,18 @@ export function moveAgent(
   restart: (agentId: string) => boolean,
 ): boolean {
   setPin(agentId, toAccountId);
+  // THE WALL BELONGED TO THE ACCOUNT WE JUST LEFT. A quota block is a claim about an account
+  // ("you've hit your session limit · resets 4pm"), and this agent is no longer running under that
+  // account — so the claim stops describing it here, at the moment of the move.
+  //
+  // Without this the agent stays walled for whatever the ABANDONED account's window had left (up to
+  // five hours for a session limit): the sidebar keeps painting "Rate limited", `stallReport` keeps
+  // returning `quota-blocked`, and `decideContinuation` keeps refusing to resume it — all about an
+  // account it stopped using. Switching accounts is precisely what a human does to get an agent
+  // moving again, so leaving it blocked defeats the switch.
+  //
+  // Before the restart, mirroring the pin: both are state the re-spawned agent must come up WITHOUT.
+  releaseQuotaBlockForAgent(agentId);
   return restart(agentId);
 }
 

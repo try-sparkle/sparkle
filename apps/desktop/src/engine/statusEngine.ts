@@ -533,15 +533,45 @@ export class StatusEngine {
     this.quotaTimer = setTimeout(
       () => {
         this.quotaTimer = null;
-        if (this.disposed || this.failureKind !== "quota") return;
-        this.clearStreamFailure();
-        this.quotaBlock = null;
-        // Settle rather than forcing a colour: the wall is down, but whether the agent is working or
-        // resting is a question for the ordinary classifier, not for this timer to assert.
-        this.settle("quiet-settle");
+        this.retireQuotaWall();
       },
       Math.max(0, resetAt - Date.now()),
     );
+  }
+
+  /**
+   * Take the wall down and let the row re-classify itself. The ONE implementation shared by both
+   * things that can retire a wall early or on time — the stated-reset timer above and
+   * {@link releaseQuotaWallOnAccountChange} — so the two can never drift on what "the wall is gone"
+   * means.
+   *
+   * The `failureKind` guard is why this is a method rather than three inlined lines: it makes the
+   * release a no-op unless a QUOTA wall is what is actually up, so neither caller can clear an
+   * unrelated api/churn failure it never observed.
+   */
+  private retireQuotaWall(): void {
+    if (this.disposed || this.failureKind !== "quota") return;
+    this.clearStreamFailure();
+    this.releaseQuotaBlock();
+    // Settle rather than forcing a colour: the wall is down, but whether the agent is working or
+    // resting is a question for the ordinary classifier, not for this caller to assert.
+    this.settle("quiet-settle");
+  }
+
+  /**
+   * The agent has been re-pinned to a DIFFERENT Claude account and re-spawned.
+   *
+   * A wall is a claim about an ACCOUNT ("you've hit your session limit · resets 4pm"), not about an
+   * agent. The instant the agent stops running under that account the claim no longer describes it,
+   * so holding the wall strands a healthy agent on an account with full headroom for whatever the
+   * ABANDONED account's window had left — up to five hours for a session limit.
+   *
+   * PUBLIC because no other release path can see this event. The wall otherwise falls only to its
+   * stated reset (the timer above), to positive evidence a command ran, or to a human typing — and
+   * an account switch is none of those three. `services/accountSwitch.moveAgent` is the caller.
+   */
+  releaseQuotaWallOnAccountChange(): void {
+    this.retireQuotaWall();
   }
 
   // The ONE way into the sticky mid-stream failure, so the flag and the kind that governs its

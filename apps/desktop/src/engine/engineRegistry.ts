@@ -49,6 +49,22 @@ export function quotaBlockForAgent(agentId: string, now: number): QuotaBlock | u
 }
 
 /**
+ * Retire this agent's account-limit wall because it has been MOVED to a different Claude account.
+ *
+ * Reached through the registry for the same reason `noteUserInputForAgent` is: the mover
+ * (`services/accountSwitch`) and the StatusEngine that holds the wall (owned by `Terminal`) have no
+ * prop chain between them, and an agent id is the only handle the switch loop carries.
+ *
+ * A no-op when no engine is registered here (a Think agent, a pane this window never mounted) and a
+ * no-op when the agent is not behind a quota wall — see `StatusEngine.retireQuotaWall`. The failure
+ * direction is the opposite of {@link quotaBlockForAgent}'s and deliberately so: a missed release
+ * costs one agent a wait it did not need, which the stated-reset timer still ends on its own.
+ */
+export function releaseQuotaBlockForAgent(agentId: string): void {
+  engines.get(agentId)?.releaseQuotaWallOnAccountChange();
+}
+
+/**
  * The API-error banner this agent is currently sitting in, verbatim, or `undefined`.
  *
  * Sibling of {@link quotaBlockForAgent}, reached the same way and `undefined` for the same two
