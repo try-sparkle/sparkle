@@ -911,6 +911,34 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       // is to ask for the identities again. Whatever comes back drives the row: the resolved email
       // if there is one, an explicit "Not signed in" if there isn't.
       await refresh();
+      // IDENTITY-KEYED RECONCILIATION. `claude auth login` grants whatever identity the browser is
+      // currently signed into at claude.ai — it does NOT force account selection — so "Add account"
+      // routinely resolves to a login the user ALREADY has, producing a duplicate slot that shares
+      // one quota (the founder hit this four times over on one identity). The rule is one identity =
+      // one account: if this fresh slot shares a login with a PRE-EXISTING account, discard the
+      // redundant slot silently and tell the user which account it already is + how to add a
+      // different one. A cancelled/failed login has no resolved identity, so `duplicateAccountGroups`
+      // never groups it — that path is untouched and the slot stays as an un-signed-in row.
+      const [freshAccounts, freshIdentities] = await Promise.all([
+        listAccountsFn(),
+        getIdentitiesFn(),
+      ]);
+      const dupGroup = duplicateAccountGroups(freshAccounts, freshIdentities).find((g) =>
+        g.accounts.some((x) => x.id === created.id),
+      );
+      if (dupGroup) {
+        // The group only exists because `created` matched an existing login, so there is always at
+        // least one OTHER account in it — name it so the message is actionable.
+        const existing = dupGroup.accounts.find((x) => x.id !== created.id);
+        await io.removeAccount(created.id);
+        await refresh();
+        setError(
+          existing
+            ? `You're already signed in to this account as “${existing.nickname}”. To add a different account, switch accounts in your browser (or use a private window) and try again.`
+            : `You're already signed in to this account. To add a different one, switch accounts in your browser (or use a private window) and try again.`,
+        );
+        return;
+      }
       // A login just completed — re-fetch live usage for it. The account's id/configDir did not
       // change, so only this nonce moves the live-usage effect (covers a null-uuid email-only login
       // and a same-account re-login, neither of which an identity-signature key would catch).
