@@ -6954,40 +6954,54 @@ mod tests {
     #[test]
     fn a_surviving_grandchild_cannot_hold_the_drain_past_the_deadline() {
         let root = unique_root("grandchild-kill");
-        let marker = root.join("grandchild-survived");
-        // Single-quoted in the script: a TMPDIR containing a space would otherwise make `: >` fail,
-        // the marker would never appear, and the "grandchild is dead" assertion below would hold
-        // VACUOUSLY. (No `'` can appear in it — `unique_root` builds the name from a literal and a
-        // pid — so simple quoting is sufficient here.)
-        let marker_arg = format!("'{}'", marker.to_string_lossy());
-        // Prove the marker is actually creatable, so a green run means "killed", not "couldn't
-        // write". This is the assertion that keeps the real one honest.
-        std::fs::write(&marker, "").unwrap();
-        std::fs::remove_file(&marker).unwrap();
-
+        let pidfile = root.join("grandchild.pid");
         let mut cmd = Command::new("/bin/sh");
-        // The backgrounded subshell is the GRANDCHILD: it inherits the pipes and, if it survives the
-        // kill, touches the marker. `exec sleep 30` is the direct child that hangs past the deadline.
-        cmd.arg("-c").arg(format!("(sleep 1; : > {marker_arg}) & exec sleep 30"));
+        // The backgrounded subshell is the GRANDCHILD: it records its own pid and then sleeps far past
+        // the deadline. `exec sleep 30` is the direct child that hangs past the deadline. `/bin/sh`
+        // throughout so nothing depends on the developer's own shell. The pidfile path is double-quoted
+        // inside the inner script so a TMPDIR containing a space still redirects correctly (no `"` or
+        // `$` can appear in it — `unique_root` builds the name from a literal and a pid).
+        cmd.arg("-c").arg(format!(
+            r#"sh -c 'echo $$ > "{}"; sleep 30' & exec sleep 30"#,
+            pidfile.display()
+        ));
         let started = Instant::now();
         let err = output_with_timeout(cmd, Duration::from_millis(300))
             .expect_err("a hung child must expire, not block");
         assert!(err.contains("timed out"), "expiry should say so: {err}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_millis(300) + DRAIN_GRACE + Duration::from_secs(3),
             "must return at the deadline (+ the drain grace), not after the grandchild's own sleep: \
              took {:?}",
             started.elapsed()
         );
 
         // The timing above is satisfied by the drain grace alone; THIS is what proves the kill
-        // actually reached the process GROUP rather than just the direct child.
-        std::thread::sleep(Duration::from_millis(1500));
-        let survived = marker.exists();
+        // actually reached the process GROUP rather than just the direct child. We observe the
+        // grandchild's death DIRECTLY (poll `kill(pid, 0)`) instead of inferring it from a marker it
+        // would only touch after a sleep. The old marker version raced the group kill (fired at the
+        // 300ms deadline) against a 1s marker touch, and flaked under CI load when the whole test was
+        // starved past the marker instant — a false "the kill did not reach the group". The grandchild
+        // sleeps far past any plausible scheduling delay, so during the poll it is unambiguously ALIVE
+        // if the kill missed it and GONE if it landed, with no timing race. `.expect` on the pidfile
+        // keeps a green run honest: it means "killed", never "the grandchild never ran".
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("the grandchild should have written its pid before the kill")
+            .trim()
+            .parse()
+            .expect("pid");
+        let mut alive = true;
+        for _ in 0..40 {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         let _ = std::fs::remove_dir_all(&root);
         assert!(
-            !survived,
-            "the grandchild outlived the expiry — the kill did not reach the process group"
+            !alive,
+            "the grandchild (pid {pid}) outlived the expiry — the kill did not reach the process group"
         );
     }
 
@@ -6995,11 +7009,15 @@ mod tests {
     /// grandchild keeps the pipes open. This is the live shape for these callers, since git spawns
     /// `ssh` ControlPersist and `git credential-cache--daemon` helpers that outlive it.
     ///
-    /// The timeout is deliberately LONG (10s) and the assertion tight (2s): the command exits
-    /// immediately, so everything it wrote is already in the pipe and the only thing left to wait on
-    /// is the lingering descendant. That wait is `POST_EXIT_SETTLE` + a group kill, NOT the
-    /// remaining deadline — with a 300ms timeout and a 5s window, bounding by the full deadline
-    /// would have passed just as well, which is the whole distinction being pinned.
+    /// The timeout is deliberately LONG (10s) and the assertion is derived from the code's own
+    /// bound: the command exits immediately, so everything it wrote is already in the pipe and the
+    /// only thing left to wait on is the lingering descendant. That wait is `POST_EXIT_SETTLE` + a
+    /// group kill, NOT the remaining deadline — so the guaranteed ceiling is
+    /// `POST_EXIT_SETTLE + DRAIN_GRACE` (each `await_threads` may consume its full grace), and the
+    /// assertion is that plus slack, still far under the 10s deadline. Bounding by the full deadline
+    /// would blow past it, which is the whole distinction being pinned. (An earlier version asserted
+    /// a flat `< 2s`, which is BELOW the 2.25s ceiling the path can legitimately take, so it flaked
+    /// under CI load — observed at 2.51s — while the production code was correctly bounded.)
     #[cfg(unix)]
     #[test]
     fn a_cleanly_exited_child_cannot_hang_the_call_by_leaving_a_grandchild_on_the_pipes() {
@@ -7016,9 +7034,10 @@ mod tests {
         let out = output_with_timeout(cmd, Duration::from_secs(10))
             .expect("the command SUCCEEDED — a lingering descendant must not turn that into an error");
         assert!(
-            started.elapsed() < Duration::from_secs(2),
-            "the post-exit drain must be bounded by the settle + kill, not by the remaining \
+            started.elapsed() < POST_EXIT_SETTLE + DRAIN_GRACE + Duration::from_secs(3),
+            "the post-exit drain must be bounded by the settle + kill ({:?}), not by the remaining \
              deadline; took {:?}",
+            POST_EXIT_SETTLE + DRAIN_GRACE,
             started.elapsed()
         );
         // The output survives the bounding: killing the group is what closes the pipe, which is what
