@@ -49,6 +49,9 @@ function setup(overrides: Partial<Props> = {}) {
     autoSend: true,
     micLive: true,
     composedText: DONE,
+    // No `@` half-written — the ordinary case every pre-existing row below assumes. The pause rows
+    // opt in explicitly.
+    composingMention: false,
     interim: "",
     targetName: "Concierge",
     onFire,
@@ -813,5 +816,109 @@ describe("auto-send OFF holds the message instead of sending it", () => {
     await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
     expect(onAnnounce.mock.calls.map(([l]) => String(l)).some((l) => /\bSent\b/.test(l))).toBe(true);
+  });
+});
+
+describe("typing an @-address PAUSES the countdown (sparkle-14dtu)", () => {
+  // The founder: "when I start to type the name of an agent with the at sign, I want the countdown
+  // timer to pause as I'm typing the name of the agent. Right now, it doesn't pause until I finish
+  // typing the name of the agent, and it often sends before I'm done."
+  //
+  // The seam these rows own is that the box's report REACHES the reducer's pause. `composingMention`
+  // is what ComposeBox sends when the caret sits inside an unfinished mention — see
+  // ./ComposeBox.mentionPause.test.tsx for the other half (that a bare `@` produces it).
+
+  it("A BARE @ WITH NOTHING AFTER IT STOPS THE SEND — the exact report", async () => {
+    // THE FAILING ROW. Before the fix this fires at HIGH with `@` sitting in the box, which is the
+    // send-mid-name he describes: the `@` is one keystroke old and no name exists yet, so nothing
+    // derived from a RESOLVED mention could have known to hold it.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @`, composingMention: true });
+    await tick(HIGH * 4 + AUTO_SEND_TICK_MS);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("stays paused for the whole time the name is being typed", async () => {
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @`, composingMention: true });
+    for (const q of ["B", "Bl", "Blue", "Blueprint U"]) {
+      update({ composedText: `${DONE} @${q}`, composingMention: true });
+      await tick(HIGH);
+    }
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("holds the fill still while paused, rather than draining behind a clock that cannot fire", async () => {
+    const { result, update } = setup({ composedText: PLAIN }); // normal → a longer, visible drain
+    speechEnds();
+    await tick(AUTO_SEND_TICK_MS * 2);
+    update({ composedText: `${PLAIN} @`, composingMention: true });
+    const frozen = result.current.remainingFraction;
+    expect(frozen).toBeGreaterThan(0);
+    await tick(NORMAL);
+    expect(result.current.remainingFraction).toBe(frozen);
+    expect(result.current.phase).toBe("counting");
+  });
+
+  it("RESUMES on a finished mention — and gives back a whole fresh threshold", async () => {
+    // Completing the name is `composingMention` going false (ComposeBox's rule: a known label plus
+    // the trailing space `insertMention` leaves). The send must not land on the space keypress.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @`, composingMention: true });
+    await tick(HIGH * 3);
+    update({ composedText: `@Kraken Auth ${DONE}`, composingMention: false });
+    // Not instantly, even though the original deadline is long past.
+    await tick(HIGH / 2);
+    expect(onFire).not.toHaveBeenCalled();
+    // …but it does end on its own, one full threshold later. This half is what makes the row above
+    // a PAUSE rather than a wedge.
+    await tick(HIGH / 2 + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("RESUMES when the @ is deleted — the composer never wedges silently", async () => {
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @`, composingMention: true });
+    await tick(HIGH * 2);
+    expect(onFire).not.toHaveBeenCalled();
+    update({ composedText: DONE, composingMention: false }); // backspaced it away
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("an @ typed BEFORE speaking still holds the countdown that utterance starts", async () => {
+    // He addresses first, then talks. The clock must not start running under an open name — and the
+    // speech-end must not be thrown away either, or that utterance could never send at all.
+    const { onFire, result, update } = setup({ composedText: "@", composingMention: true });
+    speechEnds();
+    await tick(HIGH * 3);
+    expect(onFire).not.toHaveBeenCalled();
+    update({ composedText: `@Kraken Auth ${DONE}`, composingMention: false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+    expect(result.current.phase).toBe("listening");
+  });
+
+  it("a paused countdown is not lost to STALENESS while he thinks about the name", async () => {
+    // AUTO_SEND_STALE_MS abandons a countdown nobody was present for. Someone mid-word is present.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @`, composingMention: true });
+    await tick(40_000); // well past AUTO_SEND_STALE_MS
+    update({ composedText: `@Kraken Auth ${DONE}`, composingMention: false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not disturb a countdown when no address is being written — the control row", async () => {
+    // Everything above must be attributable to the pause and nothing else.
+    const { onFire } = setup({ composingMention: false });
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
   });
 });

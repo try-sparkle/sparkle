@@ -118,6 +118,27 @@ export interface AutoSendState {
    * second drop — the user is owed one visible moment, not one per late chunk.
    */
   fireNoEarlierThan: number | null;
+  /**
+   * The instant the clock was FROZEN, or null when it is running. See {@link pauseCountdown}.
+   *
+   * THE WHOLE CLOCK STOPS, not just the send: every reader of elapsed time below measures against
+   * `pausedAt ?? now`, so silence does not accumulate, the fill does not drain, the staleness bound
+   * does not creep, and `evaluate` refuses outright. A guard on the fire branch alone would leave
+   * the deadline sliding past underneath the pause, and the send would land the instant it lifted —
+   * which is the same surprise send from one moment later.
+   */
+  pausedAt: number | null;
+}
+
+/**
+ * The instant this state's clock is measured at: frozen while paused, `now` otherwise.
+ *
+ * One helper rather than a `pausedAt ?? now` at five call sites, because a reader that forgets it
+ * does not fail loudly — it silently un-pauses one of elapsed/remaining/fraction/staleness while
+ * the others stay frozen, and the rail then disagrees with itself about the same clock.
+ */
+function clockAt(state: AutoSendState, now: number): number {
+  return state.pausedAt ?? now;
 }
 
 /** A fresh, disarmed rail. */
@@ -128,6 +149,7 @@ export function initialState(): AutoSendState {
     tier: "verylow",
     silenceStartedAt: null,
     fireNoEarlierThan: null,
+    pausedAt: null,
   };
 }
 
@@ -160,7 +182,9 @@ export function noteTranscript(
   // lag, not new speech; the caller signals real speech separately via `noteSpeechResumed`. See the
   // module header for how the two are told apart.
   if (next.silenceStartedAt === null) return next;
-  const elapsed = now - next.silenceStartedAt;
+  // Against the FROZEN clock while paused: a grace window granted on a stale elapsed would outlive
+  // the pause, and `remainingMs` can only be delayed by it.
+  const elapsed = clockAt(next, now) - next.silenceStartedAt;
   // The grace window only exists while the threshold is genuinely behind the elapsed time.
   if (elapsed < sweepThresholdMs(tier)) next.fireNoEarlierThan = null;
   else if (state.fireNoEarlierThan === null) next.fireNoEarlierThan = now + THRESHOLD_DROP_GRACE_MS;
@@ -200,10 +224,66 @@ export function noteSpeechResumed(state: AutoSendState): AutoSendState {
   return { ...state, phase: "listening", silenceStartedAt: null, fireNoEarlierThan: null };
 }
 
-/** Silence accumulated so far, or 0 when no clock is running. NEVER reset by re-evaluation. */
+/** Silence accumulated so far, or 0 when no clock is running. NEVER reset by re-evaluation, and it
+ *  stops accumulating while the clock is paused (see {@link pauseCountdown}). */
 export function elapsedMs(state: AutoSendState, now: number): number {
   if (state.silenceStartedAt === null) return 0;
-  return Math.max(0, now - state.silenceStartedAt);
+  return Math.max(0, clockAt(state, now) - state.silenceStartedAt);
+}
+
+/**
+ * FREEZE the clock — the user is writing an `@`-address and the message is not finished (bead
+ * sparkle-14dtu).
+ *
+ * ══ THE FOUNDER'S REPORT ════════════════════════════════════════════════════════════════════════
+ * *"When I'm in speak mode and I start to type the name of an agent with the at sign, I want the
+ * countdown timer to pause as I'm typing the name of the agent. Right now, it doesn't pause until I
+ * finish typing the name of the agent, and it often sends before I'm done."* A dictated sentence
+ * ends, the clock starts, and he reaches for the keyboard to address it — so the countdown he is
+ * racing is one that started before he began typing, and the half-typed `@Blue` goes out aimed at
+ * nobody. `Concierge/mentions.isComposingMention` is the trigger, and it is true from the `@`
+ * keystroke itself rather than from a name that has resolved.
+ *
+ * ── PAUSE, NOT CANCEL, AND NOT MERELY "DON'T FIRE" ─────────────────────────────────────────────
+ * `noteSpeechResumed` also stops a countdown, and reaching for it here would be the obvious
+ * implementation — but it is the wrong statement: it CLEARS `silenceStartedAt`, so nothing but a
+ * fresh speech-end can ever count again, and a user who addresses a sentence he has already spoken
+ * would find the rail permanently quiet with his words still in the box. He asked for a pause.
+ *
+ * IDEMPOTENT: a second pause must not re-anchor at a later instant, which would hand back the
+ * silence accumulated between the two and shorten the countdown the pause exists to protect.
+ */
+export function pauseCountdown(state: AutoSendState, now: number): AutoSendState {
+  if (state.pausedAt !== null) return state;
+  return { ...state, pausedAt: now };
+}
+
+/**
+ * Un-freeze the clock — the address is finished, or the `@` is gone.
+ *
+ * ══ THE COUNTDOWN RESTARTS FROM FULL. IT DOES NOT RESUME WHERE IT STOPPED ═══════════════════════
+ * A literal resume is the reading the name suggests, and it is the one that would surprise him: he
+ * types `@` with 200ms left on the clock, writes the name, presses space — and the message goes the
+ * moment his finger leaves the spacebar, which from where he is sitting is indistinguishable from
+ * the bug this fixes. *"He must not be surprised by a send he did not expect"* is the governing
+ * rule, so the pause is worth a whole fresh threshold on the way out.
+ *
+ * It is also the honest reading of what happened: the draft CHANGED while the clock was stopped —
+ * it has a new address on the front of it — so the silence being measured is silence since that
+ * edit, not since the utterance before it. Re-anchoring is the same statement `noteSpeechEnd` makes
+ * about a new utterance. Note this does NOT contradict the module header's "re-evaluation never
+ * resets the clock": that rule is about a transcript CHUNK arriving on its own (transcription lag,
+ * which must not push the deadline out), and this is an explicit edit gesture the user made.
+ *
+ * The drop-grace goes with it: {@link THRESHOLD_DROP_GRACE_MS} buys one visible moment against an
+ * elapsed time that no longer exists.
+ */
+export function resumeCountdown(state: AutoSendState, now: number): AutoSendState {
+  if (state.pausedAt === null) return state;
+  if (state.phase !== "counting" || state.silenceStartedAt === null) {
+    return { ...state, pausedAt: null };
+  }
+  return { ...state, pausedAt: null, silenceStartedAt: now, fireNoEarlierThan: null };
 }
 
 /**
@@ -216,8 +296,9 @@ export function elapsedMs(state: AutoSendState, now: number): number {
  */
 export function remainingMs(state: AutoSendState, now: number): number {
   if (state.phase !== "counting" || state.silenceStartedAt === null) return Infinity;
-  const byThreshold = state.silenceStartedAt + sweepThresholdMs(state.tier) - now;
-  const byGrace = state.fireNoEarlierThan === null ? -Infinity : state.fireNoEarlierThan - now;
+  const at = clockAt(state, now);
+  const byThreshold = state.silenceStartedAt + sweepThresholdMs(state.tier) - at;
+  const byGrace = state.fireNoEarlierThan === null ? -Infinity : state.fireNoEarlierThan - at;
   // The grace window can only DELAY. A drop-guard that had expired must not pull the deadline in
   // ahead of the threshold.
   return Math.max(0, Math.max(byThreshold, byGrace));
@@ -235,7 +316,9 @@ export function remainingFraction(state: AutoSendState, now: number): number {
   if (state.phase !== "counting" || state.silenceStartedAt === null) return 1;
   const total = sweepThresholdMs(state.tier);
   if (total <= 0) return 0;
-  const left = Math.max(0, state.silenceStartedAt + total - now);
+  // Frozen while paused, so the fill visibly STOPS rather than draining behind a countdown that
+  // cannot fire — the picture and the deadline are one fact (see SendModeTray).
+  const left = Math.max(0, state.silenceStartedAt + total - clockAt(state, now));
   return Math.min(1, left / total);
 }
 
@@ -261,6 +344,13 @@ export function evaluate(state: AutoSendState, now: number): AutoSendDecision {
   if (state.phase !== "counting" || state.silenceStartedAt === null) {
     return { action: "wait", state };
   }
+  // PAUSED — the user is writing an `@`-address (see `pauseCountdown`). The frozen clock already
+  // makes `remainingMs` stand still, so this is belt-and-braces for ONE window the freeze cannot
+  // close on its own: the tick runs every AUTO_SEND_TICK_MS, so a deadline can pass in the interval
+  // BEFORE the pause is applied and be sitting at zero when the pause arrives. Then the first tick
+  // after it would fire on an already-expired clock — a send at the exact moment he reached for the
+  // keyboard, which is the report this exists to answer.
+  if (state.pausedAt !== null) return { action: "wait", state };
   // NOTHING LEFT TO SEND. `noteSpeechEnd` refuses to start a clock on an empty transcript, but
   // until now nothing enforced that once the clock was already running: the composer being cleared
   // mid-countdown (a store reset, a send from elsewhere, a chunk that trims to whitespace) left

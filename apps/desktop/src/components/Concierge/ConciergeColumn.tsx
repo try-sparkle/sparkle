@@ -198,6 +198,7 @@ export function ConciergeColumn({
   trayInert,
   pttHeld,
   onComposedText,
+  onMentionComposing,
   registerSubmit,
   onOpenAgent,
   onSeeAgentHistory,
@@ -1020,6 +1021,7 @@ export function ConciergeColumn({
           trayInert={trayInert}
           pttHeld={pttHeld}
           onComposedText={onComposedText}
+          onMentionComposing={onMentionComposing}
           registerSubmit={registerSubmit}
         />
       )}

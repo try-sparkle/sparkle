@@ -1285,6 +1285,11 @@ export function ConciergeHost({
   // to see it to pick a tier, and dictated text is the only kind it ever fires on.
   const [composedText, setComposedText] = useState("");
   const onComposedText = useCallback((t: string) => setComposedText(t), []);
+  // …and whether an `@`-address is HALF-WRITTEN at the caret, which pauses the countdown
+  // (sparkle-14dtu). Reported by the box rather than derived here: the rule needs the caret, and
+  // the caret is the textarea's. See ComposeBox's `onMentionComposing`.
+  const [composingMention, setComposingMention] = useState(false);
+  const onMentionComposing = useCallback((v: boolean) => setComposingMention(v), []);
 
   // The compose box hands us its own submit, so an expired countdown fires the SAME path the button
   // does — clearing the box, resolving mentions, restoring the draft on failure. Sending the text
@@ -1435,6 +1440,10 @@ export function ConciergeHost({
     // whatever half-finished draft happens to be sitting in this box (roborev, High).
     micLive: dictation.micLive,
     composedText,
+    // THE PAUSE THE FOUNDER ASKED FOR (sparkle-14dtu): while he is typing `@Blueprint UI/UX` the
+    // message is not finished, so the clock freezes — from the `@` itself, not from the name
+    // resolving. Straight from the box, which is the only holder of the caret this depends on.
+    composingMention,
     interim: dictation.interim,
     // THE MIS-ROUTE SAFETY NET: the rail's only label is where this send would land, so the
     // countdown is also the moment you can notice you are about to dictate into the wrong agent.
@@ -6119,6 +6128,9 @@ export function ConciergeHost({
         // this one line is the difference between the held treatment existing and running.
         pttHeld={sendTray.held}
         onComposedText={onComposedText}
+        // The countdown's pause signal (sparkle-14dtu). Drop this one line and the rail goes back
+        // to sending mid-name with a green suite — which is why the hook's own arg is required.
+        onMentionComposing={onMentionComposing}
         registerSubmit={registerSubmit}
         // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME
         // reveal the notifications and the command palette use — `openProjectTab` opens the owning

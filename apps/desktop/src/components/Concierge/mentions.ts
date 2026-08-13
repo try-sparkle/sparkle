@@ -682,6 +682,47 @@ export function isCompletedMention(query: string, agents: readonly MentionAgent[
   return agents.some((a) => labelOf(a).toLowerCase() === done);
 }
 
+/**
+ * Is the user PART-WAY THROUGH WRITING an address — i.e. is there an `@` at the caret whose name is
+ * not finished yet?
+ *
+ * ══ WHY THIS IS A SEPARATE PREDICATE FROM "THE PICKER IS OPEN" (bead sparkle-14dtu) ══════════════
+ * The auto-send countdown pauses on this, and the founder's report is precisely about WHEN it
+ * starts being true: *"when I start to type the name of an agent with the at sign, I want the
+ * countdown timer to pause as I'm typing the name… it often sends before I'm done."* So the answer
+ * must be true from the `@` KEYSTROKE, before a single name character exists and before anything
+ * has resolved to an agent. A signal derived from a RESOLVED mention is true only once the name
+ * already matches, which is the instant after the one that matters.
+ *
+ * `mentionQuery` already answers "is the caret inside a mention being typed" from the raw text, and
+ * it says yes to a bare `@` (the query is simply `""`). That is the whole trigger.
+ *
+ * TWO THINGS ARE DELIBERATELY NOT PART OF IT, both because the countdown must err toward staying
+ * paused — an unexpected send into a live PTY is the failure this exists to prevent, and a
+ * countdown that stayed paused a beat too long costs one keypress:
+ *
+ *   • WHETHER THE PICKER IS SHOWING. Escape closes the list (`dismissedAnchor` in ComposeBox), and
+ *     a query that matches no agent shows nothing — in both cases the user is still typing a name.
+ *   • WHETHER THE QUERY MATCHES ANYTHING. `@Blu` names no agent yet; that is what mid-name means.
+ *
+ * A FINISHED mention is not in progress, which is what gives this a way back: {@link
+ * isCompletedMention} is true once the name is complete AND followed by a space — exactly what
+ * {@link insertMention} leaves behind — so picking from the picker, or typing the name and pressing
+ * space, resumes the countdown. The other ways out are ordinary edits: delete the `@`, move the
+ * caret off the mention, or run past {@link MAX_MENTION_QUERY}. There is no state this stays true
+ * in that a keystroke cannot leave.
+ *
+ * Takes the query rather than `(text, caret)` so the one caller that needs both — ComposeBox, per
+ * keystroke — walks the text once. See `mentionScanStats` for why that is worth stating.
+ */
+export function isComposingMention(
+  pending: MentionQuery | null,
+  agents: readonly MentionAgent[],
+): boolean {
+  if (pending === null) return false;
+  return !isCompletedMention(pending.query, agents);
+}
+
 // ══ THE CONCIERGE IS ADDRESSABLE TOO ═════════════════════════════════════════════════════════════
 
 /**

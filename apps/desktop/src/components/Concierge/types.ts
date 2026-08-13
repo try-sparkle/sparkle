@@ -991,6 +991,9 @@ export interface ConciergeColumnProps {
   /** The compose box's contents changed, whatever wrote them — the countdown's only view of what
    *  it would send. Distinct from `onTextEdit`, which is narrower on purpose; see ComposeBox. */
   onComposedText?: (text: string) => void;
+  /** An `@`-address is part-way written at the caret, so the countdown must pause (sparkle-14dtu).
+   *  A conduit like the rest: the box owns the caret, the host owns the clock. */
+  onMentionComposing?: (composing: boolean) => void;
   /** Receives the compose box's submit, so an expired countdown fires the SAME path the button
    *  does — clearing the box and resolving mentions exactly as a manual send would.
    *  Must be referentially stable.

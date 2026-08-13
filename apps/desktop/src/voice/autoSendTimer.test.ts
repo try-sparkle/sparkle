@@ -7,6 +7,8 @@ import {
   noteSpeechResumed,
   noteCountdownHeld,
   noteManualSend,
+  pauseCountdown,
+  resumeCountdown,
   elapsedMs,
   remainingMs,
   remainingFraction,
@@ -475,5 +477,99 @@ describe("announcements never claim a send that auto-send withheld", () => {
       const line = autoSendAnnouncement(event, "Build 4", false);
       expect(line.replace(/Build 4/g, "")).not.toMatch(/\d/);
     }
+  });
+});
+
+describe("PAUSED while an @-address is being typed (sparkle-14dtu)", () => {
+  // The founder: "when I start to type the name of an agent with the at sign, I want the countdown
+  // timer to pause as I'm typing the name of the agent… it often sends before I'm done." These rows
+  // are the reducer half — that a frozen clock cannot fire, cannot drain, and cannot go stale — and
+  // that there is always a way back out of it.
+
+  it("does not fire while paused, however long the deadline has been past", () => {
+    // THE ROW THIS EXISTS FOR. Without the pause this fires at HIGH and the half-typed name goes out.
+    const s = pauseCountdown(counting("Deploy the staging branch.", 0), 10);
+    expect(evaluate(s, 10 + HIGH * 5).action).toBe("wait");
+  });
+
+  it("freezes the accumulated silence rather than merely withholding the send", () => {
+    // The distinction is the whole design: withhold only the fire and the deadline slides past
+    // underneath, so the send lands the instant the pause lifts — the same surprise, one moment on.
+    const s = pauseCountdown(counting("ship it now", 0), 500);
+    expect(elapsedMs(s, 500)).toBe(500);
+    expect(elapsedMs(s, 500 + NORMAL * 3)).toBe(500);
+    expect(remainingMs(s, 500 + NORMAL * 3)).toBe(NORMAL - 500);
+  });
+
+  it("stops the fill draining, so the picture and the deadline stay one fact", () => {
+    const s = pauseCountdown(counting("ship it now", 0), NORMAL / 2);
+    const frozen = remainingFraction(s, NORMAL / 2);
+    expect(remainingFraction(s, NORMAL / 2 + 5_000)).toBe(frozen);
+    expect(frozen).toBeGreaterThan(0);
+  });
+
+  it("cannot go STALE while paused — composing an address is not an absent user", () => {
+    // `AUTO_SEND_STALE_MS` abandons a countdown nobody was present for. Someone typing a name is
+    // present; a creeping staleness bound would throw their countdown away mid-word.
+    const s = pauseCountdown(counting("ship it now", 0), 100);
+    expect(evaluate(s, 100 + AUTO_SEND_STALE_MS * 2).action).toBe("wait");
+  });
+
+  it("is IDEMPOTENT — a second pause does not hand back the silence in between", () => {
+    const once = pauseCountdown(counting("ship it now", 0), 500);
+    const twice = pauseCountdown(once, 2_000);
+    expect(twice.pausedAt).toBe(500);
+    expect(elapsedMs(twice, 9_999)).toBe(500);
+  });
+
+  it("RESUMES with a full fresh threshold, not with the sliver that was left", () => {
+    // He types `@` with 200ms on the clock and finishes the name: resuming where it stopped would
+    // send the moment his finger left the spacebar, which is indistinguishable from the bug.
+    const paused = pauseCountdown(counting("ship it now", 0), NORMAL - 200);
+    const resumed = resumeCountdown(paused, 60_000);
+    expect(resumed.pausedAt).toBeNull();
+    expect(elapsedMs(resumed, 60_000)).toBe(0);
+    expect(evaluate(resumed, 60_000 + NORMAL - 1).action).toBe("wait");
+    expect(evaluate(resumed, 60_000 + NORMAL).action).toBe("fire");
+  });
+
+  it("resuming clears a drop-grace granted against an elapsed that no longer exists", () => {
+    let s = counting("Deploy the staging branch and", 0); // verylow → 12s
+    s = pauseCountdown(s, VERYLOW - 100);
+    // A late chunk cleans the sentence up: the threshold drops below the elapsed, so a grace opens.
+    s = noteTranscript(s, "Deploy the staging branch.", VERYLOW - 100);
+    expect(s.fireNoEarlierThan).not.toBeNull();
+    expect(resumeCountdown(s, 50_000).fireNoEarlierThan).toBeNull();
+  });
+
+  it("resuming a rail that was never counting just un-freezes it — no clock is invented", () => {
+    const s = resumeCountdown(pauseCountdown(setArmed(initialState(), true), 0), 1_000);
+    expect(s.pausedAt).toBeNull();
+    expect(s.phase).toBe("listening");
+    expect(s.silenceStartedAt).toBeNull();
+  });
+
+  it("resuming when nothing was paused is a no-op — it cannot restart a live countdown", () => {
+    // The hook calls resume on every render where no mention is in progress, so this runs constantly
+    // against a normally-counting rail. Re-anchoring there would make the countdown unable to end.
+    const live = counting("ship it now", 0);
+    expect(resumeCountdown(live, 5_000)).toBe(live);
+  });
+
+  it("a pause started while merely LISTENING still freezes the clock a speech-end then starts", () => {
+    // He types `@` first and speaks afterwards. The clock must not run away while the name is open —
+    // and the boundary must not be refused either, or nothing would ever count for that utterance.
+    let s = pauseCountdown(setArmed(initialState(), true), 0);
+    s = noteTranscript(s, "ship it now", 10);
+    s = noteSpeechEnd(s, 20);
+    expect(s.phase).toBe("counting");
+    expect(evaluate(s, 20 + NORMAL * 3).action).toBe("wait");
+    const resumed = resumeCountdown(s, 100_000);
+    expect(evaluate(resumed, 100_000 + NORMAL).action).toBe("fire");
+  });
+
+  it("DISARMING clears the pause — an armed-later rail is never born frozen", () => {
+    const s = setArmed(pauseCountdown(counting("ship it now", 0), 100), false);
+    expect(s.pausedAt).toBeNull();
   });
 });

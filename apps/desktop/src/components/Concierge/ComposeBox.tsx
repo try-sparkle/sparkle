@@ -153,7 +153,7 @@ import {
   backspaceMention,
   dictatedSparkleAddress,
   insertMention,
-  isCompletedMention,
+  isComposingMention,
   mentionQuery,
   mentionRoster,
   mentionsIn,
@@ -582,6 +582,7 @@ export function ComposeBox({
   pttHeld = false,
   sendChord = DEFAULT_SEND_CHORD,
   onComposedText,
+  onMentionComposing,
   registerSubmit,
   quote = null,
   onRemoveQuote,
@@ -725,6 +726,16 @@ export function ComposeBox({
    * the rail blind to speech (PRD §4).
    */
   onComposedText?: (text: string) => void;
+  /**
+   * An `@`-address is part-way written at the caret — the auto-send countdown must PAUSE
+   * (sparkle-14dtu). True from the bare `@` keystroke, false again once the name is complete (or
+   * the `@` is gone, or the caret leaves it).
+   *
+   * Separate from {@link onComposedText} because it is a fact about the CARET, which is this
+   * component's alone — see the effect that reports it, and ./mentions.isComposingMention for the
+   * rule. Optional like every other seam here: a box mounted without the rail simply never asks.
+   */
+  onMentionComposing?: (composing: boolean) => void;
   /**
    * Hand the host this box's submit, so the auto-send rail can fire the SAME path the button does.
    *
@@ -1033,13 +1044,18 @@ export function ComposeBox({
     }).kind === "agent";
   const textMetrics = aimedAtTerminal ? COMPOSE_TEXT_METRICS_TERMINAL : COMPOSE_TEXT_METRICS;
   const pending = mentionQuery(text, caret);
+  // IS AN ADDRESS BEING WRITTEN RIGHT NOW — true from the bare `@`, before any name exists. The
+  // auto-send countdown pauses on this (sparkle-14dtu); see ./mentions.isComposingMention for why
+  // it is deliberately NOT "the picker is showing", and for the ways back out of it.
+  //
+  // A finished mention closes the picker's list too — without that the list re-opens over the pill
+  // it just inserted, because `@Kraken Auth ` still matches "Kraken Auth" at the top tier. So the
+  // two questions share this one term rather than each spelling out `isCompletedMention`: the list
+  // is the narrower of the two (Escape closes it; a pause must survive Escape), and stating that
+  // difference once is what keeps it from being read as an oversight.
+  const composingMention = isComposingMention(pending, roster);
   const matches =
-    pending &&
-    pending.anchor !== dismissedAnchor &&
-    // A finished mention closes its own list — without this the picker re-opens over the pill it
-    // just inserted, because `@Kraken Auth ` still matches "Kraken Auth" at the top tier. See
-    // ./mentions.isCompletedMention for why the trailing space, and not the exact match, is the tell.
-    !isCompletedMention(pending.query, roster)
+    pending && composingMention && pending.anchor !== dismissedAnchor
       ? orderMentionAgents(roster, pending.query, preferredAgentId)
       : [];
   const pickerOpen = matches.length > 0;
@@ -1696,6 +1712,15 @@ export function ComposeBox({
   useEffect(() => {
     onComposedText?.(text);
   }, [text, onComposedText]);
+
+  // …and whether an `@`-address is being written RIGHT NOW, which is the countdown's pause signal
+  // (sparkle-14dtu). A SECOND callback rather than a field on the first, because it is a different
+  // fact about a different input: `onComposedText` reports the TEXT, and this depends on the CARET
+  // — the same string is mid-mention or not depending on where the insertion point sits, so the
+  // host cannot derive it and only this component knows it.
+  useEffect(() => {
+    onMentionComposing?.(composingMention);
+  }, [composingMention, onMentionComposing]);
 
   // Hand the host something stable that always runs the CURRENT submit.
   //

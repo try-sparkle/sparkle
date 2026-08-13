@@ -8,10 +8,12 @@ import {
   findMentionSpans,
   insertMention,
   isCompletedMention,
+  isComposingMention,
   matchScore,
   MATCH_NONE,
   mentionFreeText,
   mentionQuery,
+  MAX_MENTION_QUERY,
   mentionsIn,
   mentionScanStats,
   orderMentionAgents,
@@ -1010,5 +1012,42 @@ describe("classifyComposerRoute ignores spans that do not describe the text", ()
     const without = classifyComposerRoute({ text, mentions, mountedAgentId: "mounted-1" });
     expect(withSpans).toEqual({ kind: "agent", agentId: "a2", via: "address" });
     expect(withSpans).toEqual(without);
+  });
+});
+
+describe("isComposingMention — what the auto-send countdown pauses on (sparkle-14dtu)", () => {
+  // "It doesn't pause until I finish typing the name of the agent, and it often sends before I'm
+  // done." So the question this answers is not "which agent is meant" — it is "is the user still
+  // writing an address", and it has to be answerable one character in.
+  const composing = (text: string, caret = text.length) =>
+    isComposingMention(mentionQuery(text, caret), FLEET);
+
+  it("is TRUE for a bare @ with nothing after it", () => {
+    // The row the fix exists for. Nothing has resolved and nothing can — that is the point.
+    expect(composing("@")).toBe(true);
+  });
+
+  it("is true through every partial spelling, matching or not", () => {
+    for (const q of ["@K", "@Kraken", "@Kraken ", "@Kraken Aut", "@zzz"]) {
+      expect(composing(q), q).toBe(true);
+    }
+  });
+
+  it("is FALSE once the address is finished — the name plus its trailing space", () => {
+    expect(composing("@Kraken Auth ")).toBe(false);
+  });
+
+  it("is false with no @ at all, and false for an email", () => {
+    expect(composing("deploy the staging branch")).toBe(false);
+    expect(composing("mail me at drodio@example.com")).toBe(false);
+  });
+
+  it("depends on the CARET, which is why the host cannot derive it from the text", () => {
+    expect(composing("@Krak ship it", 5)).toBe(true); // caret inside the query
+    expect(composing("@Krak ship it", 0)).toBe(false); // caret before the sigil
+  });
+
+  it("gives up past MAX_MENTION_QUERY, so an abandoned @ cannot pause forever", () => {
+    expect(composing("@" + "x".repeat(MAX_MENTION_QUERY + 1))).toBe(false);
   });
 });

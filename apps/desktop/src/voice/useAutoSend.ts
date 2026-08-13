@@ -54,7 +54,9 @@ import {
   noteSpeechEnd,
   noteSpeechResumed,
   noteTranscript,
+  pauseCountdown,
   remainingFraction,
+  resumeCountdown,
   elapsedMs,
   setArmed as setArmedState,
   type AutoSendState,
@@ -152,6 +154,22 @@ export interface UseAutoSendArgs {
   micLive: boolean;
   /** Current compose-box contents — typed OR dictated. See the header: this moves the threshold. */
   composedText: string;
+  /**
+   * The user is part-way through typing an `@`-address, so the message is NOT finished — freeze the
+   * clock (bead sparkle-14dtu).
+   *
+   * ── WHY THIS CANNOT BE DERIVED FROM `composedText` ───────────────────────────────────────────
+   * It depends on the CARET, which only the textarea has: `@Blue` with the caret after it is a
+   * mention being typed, and the same string with the caret three words later is not. So the box
+   * reports it (ComposeBox's `onMentionComposing`), exactly as it reports its text, and the rule
+   * itself is the pure `Concierge/mentions.isComposingMention`.
+   *
+   * REQUIRED, not optional-defaulting-false, and the difference is this repo's most-repeated
+   * failure: an omitted prop makes a feature inert with a fully green suite. There is one caller;
+   * making it spell out the answer is cheap, and a `= false` default would let the pause be dropped
+   * in a refactor with nothing going red.
+   */
+  composingMention: boolean;
   /** Live uncommitted transcript; non-empty means the user is speaking into THIS box right now. */
   interim: string;
   /** Who this send would reach. The rail's only label, and the mis-route safety net. */
@@ -189,6 +207,7 @@ export function useAutoSend({
   autoSend,
   micLive,
   composedText,
+  composingMention,
   interim,
   targetName,
   onFire,
@@ -298,6 +317,30 @@ export function useAutoSend({
     }
     apply(next);
   }, [composedText, apply]);
+
+  // ── (2b) AN ADDRESS IS BEING TYPED — freeze the clock ───────────────────────────────────────
+  // The founder's report (sparkle-14dtu) in one effect: a dictated sentence has ended, the clock is
+  // draining, and he reaches for the keyboard to say WHO it is for. Until that name is finished the
+  // message is not finished, so nothing may go out.
+  //
+  // DECLARED AFTER (1) AND (2), and `armed` is a dependency of it, both deliberately:
+  //   • effects run in declaration order, so in a commit that arms the rail this re-establishes a
+  //     pause that `setArmed`'s reset would otherwise have dropped — a mention typed against a tray
+  //     parked on Send must still be paused when the tray moves to Speak;
+  //   • (2) has already folded the new text into the state, so a pause and the keystroke that
+  //     caused it land in the same commit rather than one apart.
+  //
+  // Both directions run through one effect rather than an edge check, because both reducers are
+  // idempotent no-ops when they do not apply — and an edge check is what would leave the composer
+  // WEDGED (paused with no way back) the first time a state change slipped past its comparison.
+  useEffect(() => {
+    const now = Date.now();
+    apply(
+      composingMention
+        ? pauseCountdown(stateRef.current, now)
+        : resumeCountdown(stateRef.current, now),
+    );
+  }, [composingMention, armed, apply]);
 
   // ── (3) SPEECH END — starts the clock, but only for OUR speech ──────────────────────────────
   // Keyed on the sequence number, not a boolean: two consecutive utterances must be two signals,
