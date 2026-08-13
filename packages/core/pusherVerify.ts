@@ -196,10 +196,14 @@ export function claimsForConditions(
           if (byId.get(agentId)?.goalMetAt !== undefined) add({ kind: "goal-unmet", agentId });
         }
         break;
-      // No observable that a re-read can contradict — see the note above.
+      // No observable that a re-read can contradict — see the note above. `queue-unfanned` joins
+      // them: a counted depth plus a live-agent count, both re-read from the store on every sweep
+      // and both already bounded by `queueUnfanned`'s staleness floor. There is no second source for
+      // a re-read to disagree with, so a claim here would spend I/O to learn nothing.
       case "quota-blocked":
       case "shared-failure":
       case "duty-overdue":
+      case "queue-unfanned":
         break;
     }
   }

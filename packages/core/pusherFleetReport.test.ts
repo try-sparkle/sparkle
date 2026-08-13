@@ -380,6 +380,59 @@ describe("standing duties reach the report", () => {
   });
 });
 
+// THE CONCIERGE QUEUE REACHING THE REPORT, THROUGH THE REAL GATE — and the case that decides whether
+// this class is safe to add at all. `decideFleetReport` unions `measured` across every fresh
+// condition and hands the union to ONE `gateChallenge`, so a condition whose sentence contains an
+// uncited number does not fail alone: it refuses the whole message, and the refusal presents as a
+// fleet that looks healthy. The zero in "0 concierge agents are running" is the number at risk, so
+// the batched case below is asserted alongside the class's own.
+describe("the concierge queue reaches the report", () => {
+  const MINUTE = 60_000;
+  const queue = { queued: 6, liveAgents: 0, oldestAt: T0 - 12 * MINUTE };
+
+  it("delivers the count AND the zero, with every number cited", () => {
+    const d = decide({
+      snapshots: [],
+      queue,
+      memory: {
+        ...emptyFleetMemory(),
+        lastConditions: evaluateFleetConditions([], T0, [], undefined, queue),
+      },
+    });
+    if (d.action !== "send") throw new Error("expected a send");
+    expect(d.conditionIds).toEqual(["queue-unfanned"]);
+    expect(d.text).toContain("6 messages are queued and 0 concierge agents are running");
+    expect(d.cited).toContain("6");
+    expect(d.cited).toContain("0");
+  });
+
+  // THE ONE THAT WOULD HAVE BEEN CAUGHT LATE. An uncited zero here takes `quota-blocked` down with
+  // it — two unrelated conditions silenced by a third, with nothing logged and nothing to see.
+  it("does not silence the conditions it is batched with", () => {
+    const snapshots = [walled("a")];
+    const d = decide({
+      snapshots,
+      queue,
+      memory: {
+        ...emptyFleetMemory(),
+        lastConditions: evaluateFleetConditions(snapshots, T0, [], undefined, queue),
+      },
+    });
+    if (d.action !== "send") throw new Error("expected a send");
+    expect(d.conditionIds).toEqual(["quota-blocked", "queue-unfanned"]);
+    // The union is COMPLETE, not merely non-empty — the property a per-condition list can silently
+    // get wrong, and the exact shape of the failure this class was warned about.
+    expect(new Set(d.cited)).toEqual(new Set(numbersIn(d.text)));
+  });
+
+  it("stays silent when nobody looked at the queue", () => {
+    expect(decide({ snapshots: [], queue: undefined })).toMatchObject({
+      action: "quiet",
+      reason: "no-condition",
+    });
+  });
+});
+
 // A CONFLICTING PR REACHING THE REPORT, THROUGH THE REAL GATE. The evaluator's own tests prove the
 // sentence is composed and citable; this proves it survives `gateChallenge` and is DELIVERED. The
 // distinction is not academic — every failure this path has is silent, and a `fabricated-citation`

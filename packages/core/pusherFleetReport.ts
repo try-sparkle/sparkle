@@ -87,6 +87,7 @@ import {
   evaluateFleetConditions,
   persistedConditions,
   type StandingDuty,
+  type ConciergeQueue,
   type ConflictingPr,
   type FleetCondition,
   type FleetConditionId,
@@ -274,6 +275,22 @@ export interface FleetReportInput {
    * Here the omission is worse, because it is indistinguishable from an all-clear.
    */
   conflicts: readonly ConflictingPr[] | undefined;
+  /**
+   * The concierge's inbound queue, for the `queue-unfanned` condition — or `undefined` for WE DID
+   * NOT LOOK.
+   *
+   * OPTIONAL RATHER THAN REQUIRED-BUT-NULLABLE, which is a deliberate exception to the rule the two
+   * fields above state, and it is a staging decision rather than a change of mind. The producer is a
+   * persisted app-wide store that does not exist yet; making the field required would break every
+   * existing call site in a package that cannot see them. When the store lands, tighten this to
+   * `ConciergeQueue | undefined` so a caller that forgets it is a type error rather than a condition
+   * that can never fire — which is exactly the defect roborev 57323 made `duties` required to fix.
+   *
+   * Until then, note what the optionality costs: an omission here is indistinguishable from an
+   * all-clear, so the seam is covered by a test that drives `decideFleetReport` with a real queue
+   * rather than by the evaluator's tests alone.
+   */
+  queue?: ConciergeQueue;
   memory: FleetMemory;
   /** The RECIPIENT's mailbox — the surface the report is delivered to, not any partner's. */
   inbox: InboxReading;
@@ -287,9 +304,9 @@ export interface FleetReportInput {
  * path and `memoryOnDelivered` only once the transport confirms.
  */
 export function decideFleetReport(input: FleetReportInput): FleetReportDecision {
-  const { policy, snapshots, duties, conflicts, memory, inbox, now } = input;
+  const { policy, snapshots, duties, conflicts, queue, memory, inbox, now } = input;
 
-  const current = evaluateFleetConditions(snapshots, now, duties, conflicts);
+  const current = evaluateFleetConditions(snapshots, now, duties, conflicts, queue);
 
   // COMPUTED FIRST AND UNCONDITIONALLY, exactly as `decidePusherAction` does it: every early return
   // below carries this sweep's sighting, so there is no path on which the two-observation rule loses

@@ -83,6 +83,8 @@ export type FleetConditionId =
   | "died-holding-work"
   /** Goals auto-continue gave up on. Reserved for the human by design, so a dead end until seen. */
   | "goals-escalated"
+  /** Messages queued for a concierge with nothing running to take them. Stacking, not progressing. */
+  | "queue-unfanned"
   /** A standing recurring duty that has silently stopped running. */
   | "duty-overdue"
   /** An open PR that cannot merge — and therefore has never run CI at all. */
@@ -226,6 +228,111 @@ export interface ConflictingPr {
 }
 
 /**
+ * The concierge's inbound queue — messages waiting to be fanned out, and how many concierge agents
+ * exist to take them.
+ *
+ * ── WHAT NOTHING WAS WATCHING ────────────────────────────────────────────────────────────────────
+ * The founder watched six messages queue with ZERO concierge agents running. In his words: *"I want
+ * the watcher to be watching whether there are any queued messages and when there are I want the
+ * pusher to be pushing you to send them to concierge agents instead of letting them stack up."*
+ *
+ * This is the `duty-overdue` shape rather than an agent's: nothing is errored, no goal is escalated,
+ * and every row on the surface is its normal colour. The queue is not BLOCKED by anything — it is
+ * simply not being served, and a depth that only ever grows looks identical to a depth that is being
+ * worked through unless somebody is also counting what is running.
+ *
+ * ── WHY THIS IS A SIBLING OF {@link StandingDuty}, NOT A FIELD ON {@link FleetSnapshot} ───────────
+ * The same reason {@link ConflictingPr} is, arrived at from the other direction. A `FleetSnapshot` is
+ * keyed by `agentId` and describes ONE agent, so anything living there needs an agent to hang off.
+ * This queue is APP-GLOBAL — it is one thing, and in the case that motivated it the number of agents
+ * it could be attributed to is exactly zero. Hanging it off a snapshot would mean either inventing a
+ * carrier agent (whose id would then poison the cooldown's membership key) or, in the founder's own
+ * case, having nowhere to put it at all and reporting an all-clear about the very queue the class was
+ * written to find.
+ *
+ * ── THREE-VALUED, AND THE THIRD VALUE IS THE WHOLE INPUT ─────────────────────────────────────────
+ * An `undefined` {@link ConciergeQueue} is WE DID NOT LOOK — no store read, or a store that has not
+ * hydrated — and it reports nothing. That is distinct from a looked-at queue that is empty, which is
+ * an all-clear. The same distinction `evaluateFleetConditions` refuses to default away for
+ * `conflicts`, and for the same reason: only one of the two may be manufactured by a caller, and it
+ * is not the one that says the app is fine.
+ *
+ * ── A PERSISTED, APP-WIDE STORE IS THE ONLY PRODUCER THAT WORKS ──────────────────────────────────
+ * Recorded because this class was specified against a measured failure in a sibling one. A fleet
+ * condition fires IFF its evidence lives somewhere that outlives a pane: `goals-escalated` reads
+ * `agent.goal.escalatedAt` off the persisted project store and fires reliably, while `quota-blocked`
+ * reads a per-window live engine registry and has never fired in production at all — the wall dies
+ * with the pane that saw it. So a producer for these fields that reads a live in-memory registry
+ * would type-check, test green, and be permanently silent. It has to be persisted and app-wide.
+ */
+export interface ConciergeQueue {
+  /** How many messages are waiting to be fanned out. Counted, and quoted in the report. */
+  queued: number;
+  /**
+   * How many concierge agents are actually RUNNING right now — not configured, not spawnable.
+   *
+   * This is the half that turns a depth into a condition. Six queued messages with three concierge
+   * agents working is a backlog being served; six with none is a queue that will still be six
+   * tomorrow. The report says both numbers for exactly that reason.
+   */
+  liveAgents: number;
+  /**
+   * When the OLDEST waiting message was enqueued, or `null` when nothing is waiting and when no
+   * enqueue time was recorded.
+   *
+   * REQUIRED BUT NULLABLE, which is the shape the fail-closed rule needs at a call site — the same
+   * choice `FleetReportInput.conflicts` makes. Optional would let a producer that simply forgot the
+   * field compile into permanent silence, indistinguishable from one that genuinely has no clock;
+   * `null` makes the omission a decision somebody wrote down. Either way {@link queueUnfanned}
+   * declines to fire, because the age is the only thing separating a queue that has stopped moving
+   * from a fan-out that is one tick away from happening.
+   *
+   * The producer is a persisted JSON store, so this type is a promise rather than an enforcement: a
+   * payload written before the field existed arrives as `undefined`, and a corrupt one as `NaN`.
+   * {@link queueUnfanned} treats all three the same way at runtime, which is what makes the promise
+   * safe to write down here.
+   */
+  oldestAt: number | null;
+}
+
+/**
+ * How long a queue must have been standing before it is worth a word.
+ *
+ * ── WHY A FLOOR ON TOP OF THE TWO-OBSERVATION RULE ───────────────────────────────────────────────
+ * The two-observation rule bounds this by the SWEEP interval, and a sweep is short. A message that
+ * arrives and is fanned out normally can easily be present for two consecutive sweeps, so without a
+ * floor the ordinary, healthy path — a message lands, an agent is started, the message is taken —
+ * would produce a report every time. That is precisely the tune-out the anti-noise machinery exists
+ * to prevent, and it would be self-defeating here: the founder's case is a queue standing for a long
+ * time, and a channel that also fires on the two-second case is one he stops reading.
+ *
+ * ── WHY THREE MINUTES ────────────────────────────────────────────────────────────────────────────
+ * Long enough that a fan-out which is merely IN PROGRESS has finished — spawning a concierge agent
+ * and handing it a message is seconds, not minutes — and short enough that the founder is told while
+ * he is still looking at the screen where he noticed it. It is deliberately not the four-hour
+ * cooldown's order of magnitude: this class is about something that should have happened already.
+ */
+export const QUEUE_UNFANNED_MIN_AGE_MS = 3 * 60_000;
+
+/**
+ * The depths at which a queue counts as materially DEEPER than it was.
+ *
+ * ── WHY BUCKETS AND NOT THE COUNT ────────────────────────────────────────────────────────────────
+ * {@link FleetCondition.members} is an identity set and the report cooldown re-opens on GROWTH, so
+ * whatever goes in it decides when a standing queue is allowed to speak again inside the four-hour
+ * window. A raw `queue:depth:6` would make every single arriving message a new member — the same
+ * paragraph re-sent on the queue's own timer, which is a measurement masquerading as an identity and
+ * is exactly what {@link FleetCondition.members} says never to put there. Publishing nothing but a
+ * bare `concierge:queue` has the opposite failure: a queue that doubles inside the cooldown is
+ * invisible for four hours, which is the blind spot `pr-conflicting` had to close.
+ *
+ * Buckets are the middle: crossing 10 after being reported at 6 is a real change in the situation,
+ * and each threshold can only be crossed once per episode. Roughly doubling, so the fifth message and
+ * the fiftieth do not cost the same attention.
+ */
+export const QUEUE_DEPTH_BUCKETS: readonly number[] = [2, 5, 10, 20, 50];
+
+/**
  * What one sweep knows about one agent, for the fleet report.
  *
  * Every field is optional and three-valued in the same way `PartnerSnapshot`'s are: present-and-true,
@@ -240,6 +347,10 @@ export interface ConflictingPr {
  * an all-clear about the very PRs it was written to find. A parallel input (like `StandingDuty`,
  * for the same reason: it describes a CAPABILITY rather than an agent) has no such requirement, and
  * it also lets one agent own several PRs without inventing a shape for that.
+ *
+ * {@link ConciergeQueue} is the third, and it is the clearest case of the three: the queue is ONE
+ * app-global thing, and the situation worth reporting is the one where the number of agents it could
+ * be attached to is zero.
  */
 export interface FleetSnapshot {
   agentId: string;
@@ -615,6 +726,59 @@ export function overdueDuties(
 }
 
 /**
+ * A concierge queue that is standing still because nothing is running to take it — or `undefined`.
+ *
+ * Returns the READING rather than a boolean, clamped to what the report may quote, so that the
+ * decision and the numbers in the sentence cannot drift apart. Four things must all hold, and each
+ * one is a different claim being made honestly:
+ *
+ *   • WE LOOKED. `undefined` in means `undefined` out — see {@link ConciergeQueue}'s header.
+ *   • SOMETHING IS WAITING. A looked-at empty queue is an all-clear, and saying so is the point of
+ *     distinguishing it from the case above.
+ *   • NOTHING IS RUNNING. `liveAgents` must be zero. This is the claim the class exists to make: a
+ *     queue with a concierge working it is a backlog being served, and reporting it would spend the
+ *     founder's attention on the healthy path.
+ *   • IT HAS BEEN THAT WAY A WHILE. See {@link QUEUE_UNFANNED_MIN_AGE_MS}. An unrecorded `oldestAt`
+ *     fails this, because "we cannot establish the age" is not "it is old" — the same fail-closed
+ *     reading `overdueDuties` gives an unseeded `lastRunAt`.
+ *
+ * CLAMPED AND TRUNCATED for exactly the reason `behindOf` and `dirtyCountOf` are: a negative count
+ * renders as `-6`, `numbersIn` reads `6` from it while `measured` holds `-6`, the two never match,
+ * and the gate refuses the WHOLE batched report as `fabricated-citation`. That refusal presents as
+ * SILENCE, so one nonsensical field from the producer would mute every condition in the message.
+ *
+ * ── AND NON-FINITE READINGS ARE REJECTED BEFORE THE CLAMPS, NOT BY THEM ─────────────────────────
+ * A clamp defends against a number that is WRONG. `NaN` is not a number that is wrong, it is not a
+ * number, and it walks through every guard here: `Math.trunc(NaN)` is `NaN`, so `=== 0` is false and
+ * `> 0` is false — both admit — and `NaN < QUEUE_UNFANNED_MIN_AGE_MS` is false, so the staleness
+ * floor is SKIPPED rather than enforced. `undefined` reaches the same place by a different road:
+ * `=== null` does not catch an absent field, and `now - undefined` is `NaN`.
+ *
+ * That is not a theoretical hardening. This shape crosses a hydration boundary from a persisted JSON
+ * store, where TypeScript enforces nothing — a payload written before `oldestAt` existed arrives as
+ * `undefined`, not as the `null` the type promises. And failing open manufactures the one claim this
+ * class must never make: `liveAgents: NaN` passes the "nothing is running" test, so a queue that IS
+ * being served gets reported as abandoned. The delivered sentence is no defence either — `numbersIn`
+ * finds no digits in "NaN", so "waiting NaNh NaNm" is perfectly citable and would be sent.
+ */
+export function queueUnfanned(
+  queue: ConciergeQueue | undefined,
+  now: number,
+): { queued: number; liveAgents: number; waitedMs: number } | undefined {
+  if (queue === undefined) return undefined;
+  if (!Number.isFinite(queue.queued) || !Number.isFinite(queue.liveAgents)) return undefined;
+  const queued = Math.max(0, Math.trunc(queue.queued));
+  const liveAgents = Math.max(0, Math.trunc(queue.liveAgents));
+  if (queued === 0 || liveAgents > 0) return undefined;
+  // `== null` on purpose, and it is the one place in this file that loose equality earns its keep:
+  // it catches the `undefined` an older store payload sends as well as the `null` the type states.
+  if (queue.oldestAt == null || !Number.isFinite(queue.oldestAt)) return undefined;
+  const waitedMs = now - queue.oldestAt;
+  if (waitedMs < QUEUE_UNFANNED_MIN_AGE_MS) return undefined;
+  return { queued, liveAgents, waitedMs };
+}
+
+/**
  * The conditions that hold across the fleet, most-blocking first.
  *
  * ORDER IS A PRIORITY. Quota-blocked leads because it is the only one where the ordinary remedy is
@@ -658,6 +822,27 @@ export function overdueDuties(
  * blocked fleet above a rescue. That is the trade quota and shared-failure already win. Below them,
  * "this will still be there tomorrow" is true of every remaining class except this one.
  *
+ * ── WHERE `queue-unfanned` SITS, AND WHY ─────────────────────────────────────────────────────────
+ * Directly after `died-holding-work` and ahead of `duty-overdue`. Three comparisons decide it:
+ *
+ *   • BELOW quota, shared-failure and died-holding-work, which is not close. Those are agents that
+ *     cannot execute at all, and one whose evidence a spin-down deletes. Nothing is destroyed by a
+ *     queue waiting, and nothing is stuck behind it either — it is work that has not started.
+ *   • ABOVE `duty-overdue`, which is the comparison it has to win, and the two are near-twins: both
+ *     are capabilities that have stopped while every agent row looks fine. What separates them is
+ *     WHOSE work is waiting. A stopped duty is the app failing to do something it promised itself;
+ *     a queued message is a person having already asked, and being neither served nor told. It also
+ *     DECAYS, which a duty does not: the queue only gets deeper, and every message added is another
+ *     the eventual fan-out has to place.
+ *   • ABOVE `pr-conflicting` and everything under it by the same reasoning that puts `duty-overdue`
+ *     there — a PR that cannot merge is past work rotting, and this is present work not starting.
+ *
+ * The counter-argument, recorded because it is real: nothing here is BROKEN. One concierge agent
+ * started by hand clears the whole condition, which makes it the cheapest thing on this list to fix
+ * — and one could rank cheap-to-fix last. That is backwards for a report whose job is to save the
+ * founder a glance: a condition that is invisible, growing, and one action away from resolved is the
+ * best return on a paragraph the report has.
+ *
  * ── WHERE `pr-conflicting` SITS, AND WHY ─────────────────────────────────────────────────────────
  * Between `duty-overdue` and `goals-escalated`. Three comparisons decide it:
  *
@@ -690,6 +875,10 @@ export function evaluateFleetConditions(
   // the value a caller genuinely has whenever the conflict probe has not run or could not read `gh`.
   // Defaulting it to `[]` would erase the distinction at the one seam where it is load-bearing.
   conflicts?: readonly ConflictingPr[],
+  // NO DEFAULT either, and for the same reason: `undefined` is WE DID NOT LOOK — no store read, or a
+  // store that has not hydrated — and `{queued: 0, ...}` is a looked-at all-clear. Defaulting would
+  // make a caller that forgot to thread it indistinguishable from one reporting a healthy queue.
+  queue?: ConciergeQueue,
 ): FleetCondition[] {
   const out: FleetCondition[] = [];
 
@@ -703,6 +892,11 @@ export function evaluateFleetConditions(
   // see the ordering note above.
   const dead = diedHoldingWork(snapshots);
   if (dead.length > 0) out.push(diedHoldingWorkCondition(dead));
+
+  // AHEAD OF `duty-overdue`: both are capabilities that stopped while every row looks fine, and this
+  // one is the human's own request waiting rather than the app's promise to itself.
+  const unfanned = queueUnfanned(queue, now);
+  if (unfanned !== undefined) out.push(queueCondition(unfanned));
 
   const overdue = overdueDuties(duties, now);
   if (overdue.length > 0) out.push(dutyCondition(overdue));
@@ -810,6 +1004,64 @@ function sharedFailureCondition(
       ...quotedNumbers(...cohorts.map((c) => c.message), ...agents.map((s) => s.label)),
     ],
     text: `${head}\n${lines.join("\n")}`,
+  };
+}
+
+/**
+ * Messages waiting for a concierge that does not exist.
+ *
+ * ── THE SENTENCE CARRIES BOTH NUMBERS, AND THE SECOND ONE IS THE CLAIM ──────────────────────────
+ * "6 messages are queued" is a backlog, and a backlog is a normal thing a reader skims past. "…and 0
+ * concierge agents are running" is what makes it a condition: nobody is going to take them. The two
+ * are one fact and are never split, the same discipline `conflictCondition` follows for
+ * "conflicting — and therefore untested".
+ *
+ * ── THE ZERO IS CITED, AND SPELLING IT OUT WOULD BE WORSE THAN NOT SAYING IT ─────────────────────
+ * `numbersIn` matches `\d+`, so the `0` in that clause is a number the gate will look for, and a
+ * `measured` that carries only the count gets the ENTIRE batched report refused as
+ * `fabricated-citation` — `decideFleetReport` unions `measured` across every fresh condition, so a
+ * miss here silences `quota-blocked` and `goals-escalated` too, and the refusal presents as silence.
+ * The fix is to MEASURE the zero, not to write it as "zero": the word would slip past the gate while
+ * making the load-bearing half of the sentence uncheckable, which is the citation rule defeated
+ * rather than satisfied.
+ *
+ * ── THE REMEDY CLAUSE ────────────────────────────────────────────────────────────────────────────
+ * Same register as `quotaCondition`'s `notRestartable`, and load-bearing for the same reason. There,
+ * the fact that cost hours was that retrying does not work; here it is that WAITING does not work. A
+ * queue is the one shape a reader instinctively assumes is being drained by something, so the report
+ * says plainly that nothing is draining it and that the depth is not going to fall on its own.
+ */
+function queueCondition(reading: {
+  queued: number;
+  liveAgents: number;
+  waitedMs: number;
+}): FleetCondition {
+  const { queued, liveAgents, waitedMs } = reading;
+  const { h, m } = splitHoursMinutes(Math.max(0, waitedMs));
+  const plural = queued === 1 ? "message is" : "messages are";
+
+  // The DEPTHS ALREADY CROSSED, never the raw count — see {@link QUEUE_DEPTH_BUCKETS} for why a
+  // count in the fingerprint would re-send this paragraph on the queue's own timer.
+  const buckets = QUEUE_DEPTH_BUCKETS.filter((b) => queued >= b).map(
+    (b) => `concierge:queue:depth-${b}`,
+  );
+
+  return {
+    id: "queue-unfanned",
+    // A queue is not an agent, and in the case this was built for there is no agent to name — that
+    // is the condition. Borrowing an id would put an unrelated agent in the cooldown's key.
+    agentIds: [],
+    // The bare member is what the class always publishes, so a queue that never crosses a bucket
+    // still has a fingerprint and is not failed open into repeating every sweep.
+    members: ["concierge:queue", ...buckets],
+    measured: [String(queued), String(liveAgents), String(h), String(m)],
+    text:
+      `${queued} ${plural} queued and ${liveAgents} concierge agents are running. The oldest has ` +
+      `been waiting ${h}h ${m}m. Nothing is errored and no goal is escalated — the messages are ` +
+      `simply stacking up with nothing to take them.\n` +
+      `The queue does not drain itself while nothing is running: a queued message waits for a ` +
+      `concierge agent to exist, so the depth only falls once one is started. Fan them out to ` +
+      `concierge agents rather than letting them stack up.`,
   };
 }
 

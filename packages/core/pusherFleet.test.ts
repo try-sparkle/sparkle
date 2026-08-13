@@ -18,7 +18,11 @@ import {
   isQuotaWalled,
   persistedConditions,
   quotedNumbers,
+  queueUnfanned,
   retirableAgents,
+  QUEUE_DEPTH_BUCKETS,
+  QUEUE_UNFANNED_MIN_AGE_MS,
+  type ConciergeQueue,
   type ConflictingPr,
   type FleetSnapshot,
 } from "./pusherFleet";
@@ -715,6 +719,203 @@ describe("duty overdue", () => {
   });
 });
 
+// ── MESSAGES STACKING UP WITH NOBODY TO FAN THEM OUT TO ─────────────────────────────────────────
+// The founder watched six messages queue with zero concierge agents running. Nothing was errored,
+// no goal was escalated, and every agent row was its normal colour — the queue simply grew, and the
+// one fact worth knowing (that nothing is going to take them) existed on no surface at all.
+//
+// Every assertion below is on the EMITTED CONDITION, never on the fixture: a test that read the
+// input object back would pass against a `queueCondition` that returned an empty string. And the
+// citation assertions are load-bearing rather than hygiene — `numbersIn` matches the ZERO in "0
+// concierge agents are running", so a `measured` that carries only the six gets the WHOLE batched
+// report refused as `fabricated-citation`, taking `quota-blocked` and `goals-escalated` down with a
+// condition neither of them has anything to do with.
+describe("queue-unfanned", () => {
+  const MINUTE = 60_000;
+  /** The founder's case: six waiting, nobody running, and it has been that way for twelve minutes. */
+  const queue = (over: Partial<ConciergeQueue> = {}): ConciergeQueue => ({
+    queued: 6,
+    liveAgents: 0,
+    oldestAt: T0 - 12 * MINUTE,
+    ...over,
+  });
+
+  const fire = (over: Partial<ConciergeQueue> = {}) =>
+    evaluateFleetConditions([], T0, [], undefined, queue(over));
+
+  it("fires for a deep queue with zero live concierge agents", () => {
+    const [c] = fire();
+    expect(c!.id).toBe("queue-unfanned");
+    // The founder's sentence, verbatim. BOTH halves are pinned: a count with no "and 0 running"
+    // reads as a healthy backlog, which is the reading that let this sit unnoticed.
+    expect(c!.text).toContain("6 messages are queued and 0 concierge agents are running");
+  });
+
+  // THE CITATION TRAP, asserted twice on purpose. `citable` is the real gate check, and the explicit
+  // "0" assertion is what fails loudly if someone later spells the zero as "zero" to dodge the gate
+  // — which would pass `citable` while making the load-bearing half of the sentence uncheckable.
+  //
+  // THE AGE IS DELIBERATELY 2h 5m RATHER THAN THE FIXTURE'S 0h 12m. With a sub-hour wait the "0" in
+  // `measured` is also produced by the hours component, so `toContain("0")` would hold even if the
+  // live-agent count were never measured at all — the assertion would be true for a reason that has
+  // nothing to do with what it claims to check. An age with no zero in it leaves exactly one source.
+  it("is citable, and cites the ZERO as well as the six", () => {
+    const [c] = fire({ oldestAt: T0 - (2 * 60 + 5) * MINUTE });
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    expect(c!.measured).toContain("6");
+    expect(c!.measured).toContain("0");
+    // Nothing else in this reading is a zero, so the count above is the live-agent one.
+    expect(c!.measured.filter((n) => n === "0")).toHaveLength(1);
+  });
+
+  // The remedy clause, in the register of `quotaCondition`'s notRestartable: the reader has to be
+  // told that waiting is not a strategy, or the count alone reads as something that will resolve.
+  it("says plainly that the queue does not drain itself", () => {
+    const [c] = fire();
+    expect(c!.text).toContain("does not drain itself");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  it("quotes how long the oldest message has been waiting", () => {
+    const [c] = fire({ oldestAt: T0 - (2 * 60 + 5) * MINUTE });
+    expect(c!.text).toContain("2h 5m");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+  });
+
+  // THE WHOLE POINT OF THE CLASS. A queue with a concierge running is a queue being served; the
+  // condition is about there being nobody to take them, not about the depth on its own.
+  it("is SILENT when a concierge agent is running", () => {
+    expect(fire({ liveAgents: 1 })).toEqual([]);
+    expect(queueUnfanned(queue({ liveAgents: 1 }), T0)).toBeUndefined();
+  });
+
+  // A queue that formed seconds ago is the ordinary shape of a fan-out about to happen. Reporting it
+  // is the tune-out the two-observation rule exists to prevent — and the sweep interval is short
+  // enough that two observations alone would not cover the gap.
+  it("is SILENT while the queue has only just formed", () => {
+    expect(fire({ oldestAt: T0 - 30_000 })).toEqual([]);
+    expect(fire({ oldestAt: T0 - (QUEUE_UNFANNED_MIN_AGE_MS - 1) })).toEqual([]);
+  });
+
+  it("fires exactly at the staleness floor, and that boundary is real", () => {
+    expect(fire({ oldestAt: T0 - QUEUE_UNFANNED_MIN_AGE_MS })).toHaveLength(1);
+  });
+
+  // FAIL CLOSED. `undefined` is WE DID NOT LOOK — no store read, or a store that has not hydrated —
+  // and it must never manufacture the claim that the app has stopped serving its queue.
+  it("is SILENT when nobody looked", () => {
+    expect(evaluateFleetConditions([], T0, [], undefined, undefined)).toEqual([]);
+    expect(queueUnfanned(undefined, T0)).toBeUndefined();
+  });
+
+  // The other side of the same three-valued rule: a queue that WAS read and is empty is an all-clear,
+  // and it is a different fact from never having looked.
+  it("is SILENT for a looked-at empty queue", () => {
+    expect(fire({ queued: 0 })).toEqual([]);
+  });
+
+  // No enqueue time recorded means the age cannot be established, and the floor above is the only
+  // thing keeping a just-formed queue quiet. Fail closed rather than treat unknown as old.
+  it("is SILENT when no enqueue time was recorded", () => {
+    expect(fire({ oldestAt: null })).toEqual([]);
+  });
+
+  // A queue is not an agent — it is app-global, and borrowing an agent id would put an unrelated
+  // agent in the cooldown's membership key. Same rule `duty-overdue` follows.
+  it("claims no agent ids", () => {
+    const [c] = fire();
+    expect(c!.agentIds).toEqual([]);
+  });
+
+  // THE TWO-MEMBER TRICK, borrowed from `pr-conflicting`. A queue that DEEPENS inside the four-hour
+  // cooldown has to be able to re-open it, and the growth rule only sees NEW members — so depth is
+  // published as crossed buckets rather than as a raw count (which would re-send the same paragraph
+  // every time one more message landed).
+  it("re-opens the cooldown when the queue crosses a deeper bucket", () => {
+    const shallow = fire({ queued: 6 })[0]!;
+    const deeper = fire({ queued: 12 })[0]!;
+    expect(deeper.members).toEqual(expect.arrayContaining(shallow.members));
+    expect(deeper.members.length).toBeGreaterThan(shallow.members.length);
+  });
+
+  // ...and the reverse trip is an IMPROVEMENT, so it must be a strict subset and stay quiet.
+  it("stays quiet when the queue merely shrinks", () => {
+    const deeper = fire({ queued: 12 })[0]!;
+    const shallow = fire({ queued: 6 })[0]!;
+    expect(shallow.members.every((m) => deeper.members.includes(m))).toBe(true);
+  });
+
+  it("publishes a bucket for every depth it has crossed, and none it has not", () => {
+    const [c] = fire({ queued: QUEUE_DEPTH_BUCKETS[1]! });
+    expect(c!.members).toContain(`concierge:queue:depth-${QUEUE_DEPTH_BUCKETS[1]}`);
+    expect(c!.members).not.toContain(`concierge:queue:depth-${QUEUE_DEPTH_BUCKETS[2]}`);
+  });
+
+  // A nonsensical count from the producer must not mute the detector: a negative renders as `-6`,
+  // from which `numbersIn` reads `6` while `measured` would hold `-6` — the refusal `behindOf` and
+  // `dirtyCountOf` are both clamped against, and it presents as silence.
+  it("stays citable when the producer sends a nonsensical count", () => {
+    const [c] = fire({ liveAgents: -2 });
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    expect(c!.text).toContain("0 concierge agents are running");
+  });
+
+  // ── NON-FINITE READINGS FAIL CLOSED, WHICH CLAMPING ALONE DOES NOT GIVE YOU ────────────────────
+  // A clamp defends against a number that is WRONG; these are the values that are not numbers at
+  // all, and every guard in `queueUnfanned` admits them if it only clamps. `Math.trunc(NaN)` is
+  // `NaN`, so `=== 0` is false and `> 0` is false — both tests pass a `NaN` straight through — and
+  // `NaN < QUEUE_UNFANNED_MIN_AGE_MS` is false, so the staleness floor, the one guard keeping the
+  // healthy path quiet, is skipped entirely rather than enforced.
+  //
+  // This is not a hypothetical hardening pass. The producer is a persisted app-wide JSON store built
+  // separately against this contract, and TypeScript cannot enforce a shape at a hydration boundary
+  // — a payload written before a field existed arrives as `undefined`, not as the `null` the type
+  // promises. Failing open here manufactures exactly the claim this class's header says it must
+  // never make: "nothing is running" said over a queue that is being served.
+  it("is SILENT when the enqueue time is missing rather than null", () => {
+    expect(fire({ oldestAt: undefined })).toEqual([]);
+  });
+
+  it("is SILENT when a count is not a number at all", () => {
+    expect(fire({ queued: NaN })).toEqual([]);
+    expect(fire({ liveAgents: NaN })).toEqual([]);
+    expect(fire({ oldestAt: NaN })).toEqual([]);
+  });
+
+  // The delivered sentence is the reason this matters more than tidiness: `numbersIn` finds no digits
+  // in "NaN", so a report reading "waiting NaNh NaNm" passes the citation gate and is DELIVERED. A
+  // garbage sentence that survives the gate costs the channel the credibility it runs on.
+  it("never composes a sentence out of non-numbers", () => {
+    for (const over of [{ queued: NaN }, { liveAgents: NaN }, { oldestAt: NaN }, { oldestAt: undefined }]) {
+      for (const c of fire(over)) expect(c.text).not.toContain("NaN");
+    }
+  });
+
+  it("still fires on the finite reading beside them", () => {
+    // The pair the three cases above need: the same fixture, one field made finite again, reaching
+    // the effect. Without it "returns []" is satisfied by a function that returns [] for everything.
+    expect(fire({ queued: 6, liveAgents: 0 })).toHaveLength(1);
+  });
+
+  it("ranks below the classes whose evidence a spin-down deletes, and above a stopped duty", () => {
+    const ids = evaluateFleetConditions(
+      [{ agentId: "w", label: "W", sessionEnded: true, dirty: true, dirtyCount: 3 }],
+      T0,
+      [{ name: "the hourly improvement pass", intervalMs: HOUR, lastRunAt: T0 - 7 * HOUR }],
+      undefined,
+      queue(),
+    ).map((c) => c.id);
+    expect(ids).toEqual(["died-holding-work", "queue-unfanned", "duty-overdue"]);
+  });
+
+  // The generic anti-noise rule applies to this class like every other: one sweep is not enough.
+  it("is subject to the two-observation rule", () => {
+    const current = fire();
+    expect(persistedConditions([], current)).toEqual([]);
+    expect(persistedConditions(current, current).map((c) => c.id)).toEqual(["queue-unfanned"]);
+  });
+});
+
 // THE HEADLINE FACT, AND THE FAIL-CLOSED RULE THAT GUARDS IT.
 //
 // Every assertion here is on the EMITTED TEXT, never on the fixture that produced it — a test that
@@ -1116,11 +1317,13 @@ describe("the condition fingerprint", () => {
       T0,
       [hourly],
       [conflicting],
+      { queued: 6, liveAgents: 0, oldestAt: T0 - 12 * 60_000 },
     );
     expect(conditions.map((c) => c.id)).toEqual([
       "quota-blocked",
       "shared-failure",
       "died-holding-work",
+      "queue-unfanned",
       "duty-overdue",
       "pr-conflicting",
       "goals-escalated",
@@ -1129,7 +1332,7 @@ describe("the condition fingerprint", () => {
     for (const c of conditions) {
       expect(c.members.length, `${c.id} publishes no fingerprint`).toBeGreaterThan(0);
       // Namespaced, so two classes can never collide on a bare id.
-      for (const m of c.members) expect(m).toMatch(/^(agent|duty|pr):/);
+      for (const m of c.members) expect(m).toMatch(/^(agent|duty|pr|concierge):/);
     }
   });
 
@@ -1165,6 +1368,16 @@ describe("the condition fingerprint", () => {
     const [c] = evaluateFleetConditions([walled("q1"), walled("q2")], T0);
     expect(c!.agentIds).toEqual(["q1", "q2"]);
     expect(c!.members).toEqual(["agent:q1", "agent:q2"]);
+  });
+
+  it("fingerprints the concierge queue by its depth, which is the only identity a queue has", () => {
+    const [c] = evaluateFleetConditions([], T0, [], undefined, {
+      queued: 6,
+      liveAgents: 0,
+      oldestAt: T0 - 12 * 60_000,
+    });
+    expect(c!.agentIds).toEqual([]);
+    expect(c!.members).toEqual(["concierge:queue", "concierge:queue:depth-2", "concierge:queue:depth-5"]);
   });
 
   // `shared-failure` flattens cohorts, so one agent can arrive twice; a duplicated member would make
