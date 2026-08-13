@@ -171,6 +171,48 @@ const BOX_PROMPT = /^\s*[│|]\s*[❯›>]\s*[│|]?\s*$|^\s*[│|]\s*[❯›>]\
  *  status row (`less`'s `:` prompt, a filename, a percentage), which is not ambient Claude chrome,
  *  so the walk rejects it. `vim` and `htop` never satisfy the footer grammar at all — htop's
  *  "F1Help F2Setup" carries no `<key> to <verb>` hint. */
+/** ══ FAMILY F — THE BACKGROUND-TASK LIST, WHICH ALSO REPLACES THE COMPOSER (bead sparkle-tbsvf) ═══
+ *  THE DEFECT THIS CLOSES. Claude Code draws a live roster of its own background subagents as a
+ *  block of `◯ <kind>  <label>  <elapsed>` rows under a `⏺ <branch>` header — see the founder's own
+ *  screenshot, transcribed below as `BACKGROUND_TASK_LIST`. `⏺ <branch>` alone trips family B, but
+ *  one family is not enough, and this block is drawn in place of the ordinary composer the same way
+ *  a permission dialog is (family E's own header explains that substitution) — so `hasComposerBox`
+ *  reads false and a screen showing only this list scored 1, failing `isClaudeCodeScreen`. The
+ *  concierge's own `send_to_agent_terminal`, aimed at this exact pane, was refused four times in a
+ *  row with "has a full-screen app open" while the pane was doing nothing but listing its own
+ *  subagents.
+ *
+ *  ── WHY A ROW HERE IS EVIDENCE OF A LIVE TUI, NOT OF TEXT ABOUT ONE ──────────────────────────────
+ *  `◯` is not a glyph this codebase's prose or any captured impostor (vim, less, htop, lazygit) uses
+ *  anywhere, and the ELAPSED-TIME SUFFIX is what makes the row structural rather than lexical: a
+ *  document can easily quote a bullet character, but "some sentence … 21m 55s" at the end of a
+ *  gutter-glyph line is Claude Code's own live clock, not prose. Anchored to line start for the same
+ *  reason `TOOL_GLYPH` is.
+ *
+ *  ── WHY THIS STANDS ALONE, LIKE FAMILY E, RATHER THAN CORROBORATING FAMILY D ────────────────────
+ *  Requiring the mandatory composer box here would fail on exactly the screen this family exists
+ *  for: the one where the task list is what replaced it.
+ *
+ *  ── AND WHY IT STILL NEEDS `nothingUnrecognizedBelowFooter`, THE SAME WALK FAMILY E USES ────────
+ *  A bare row match alone would be family D's original mistake repeated: this bead's own text
+ *  reproduces `◯ general-purpose  Concierge agents as clickable rows  21m 55s` verbatim, so a pager
+ *  displaying this file — or any doc quoting the founder's screenshot — trips the row pattern too.
+ *  Position is what tells a LIVE list apart from a QUOTED one: Claude Code's list is always the
+ *  last thing drawn while it is live, so requiring the LAST matching row to terminate the grid
+ *  (nothing below it but blanks and Claude's own ambient chrome — which, notably, already includes
+ *  a bare rule and an empty composer caret, so this still fires when the ordinary composer sits
+ *  below the list) keeps a pager's trailing prose or `:` prompt out, exactly as it does for E. */
+const BACKGROUND_TASK_ROW = /^\s*◯\s+\S.*\d+m\s*\d+s\s*$/;
+
+function hasBackgroundTaskList(lines: readonly string[]): boolean {
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (BACKGROUND_TASK_ROW.test(lines[i] ?? "")) {
+      return nothingUnrecognizedBelowFooter(lines, i);
+    }
+  }
+  return false;
+}
+
 function hasLiveDialog(lines: readonly string[]): boolean {
   // The LAST footer on the grid, matching the option parser's own rule: an earlier, already
   // answered dialog higher up is stale, and it is the bottom-most one that has to terminate the
@@ -357,6 +399,9 @@ export function claudeCodeMarkerFamilies(snapshot: string): number {
   // clears the live-TUI bar and then fails `>= 2` on the tool-call glyphs alone, which is the same
   // refusal arriving one line later.
   if (hasLiveDialog(lines)) n += 1;
+  // Family F, same reasoning: a screen showing only the background-task list scores 1 on the
+  // `⏺ <branch>` header (family B) alone without this, which is the exact gap sparkle-tbsvf found.
+  if (hasBackgroundTaskList(lines)) n += 1;
   return n;
 }
 
@@ -404,6 +449,11 @@ export function isClaudeCodeScreen(snapshot: string): boolean {
   // add safety; it only fails the screens whose dialog is the entire viewport.
   if (hasLiveDialog(lines)) return true;
 
+  // ── THE BACKGROUND-TASK LIST STANDS ALONE TOO, FOR THE SAME REASON (bead sparkle-tbsvf) ────────
+  // It replaces the composer exactly as a live dialog does, so requiring family D below would fail
+  // on precisely the screen this family exists for.
+  if (hasBackgroundTaskList(lines)) return true;
+
   // ── OTHERWISE THE COMPOSER BOX IS MANDATORY, PLUS ONE CORROBORATING FAMILY ───────────────────
   // Unchanged, and still the rule for every screen without a live dialog: a pasted transcript in a
   // pager carries Claude's glyphs and its status bar — two families — without being Claude Code.
@@ -415,5 +465,5 @@ export function isClaudeCodeScreen(snapshot: string): boolean {
  *  applies, split out so callers and tests can ask for it directly. */
 export function hasClaudeCodeLiveTui(snapshot: string): boolean {
   const lines = snapshot.split("\n");
-  return hasComposerBox(lines) || hasLiveDialog(lines);
+  return hasComposerBox(lines) || hasLiveDialog(lines) || hasBackgroundTaskList(lines);
 }

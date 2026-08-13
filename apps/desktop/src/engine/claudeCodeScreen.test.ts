@@ -8,6 +8,17 @@ import { claudeCodeMarkerFamilies, isClaudeCodeScreen } from "./claudeCodeScreen
 import { screenBlocksWrite } from "../voice/dictationTerminalRoute";
 import { APPROVAL_2_1_220, IDLE_AFTER_TURN_2_1_220 } from "./capturedScreens.fixture";
 
+// ══ THE FOUNDER'S SECOND SCREEN (bead sparkle-tbsvf) ═══════════════════════════════════════════
+// RECONSTRUCTED from the concierge's own read of the Improve Sparkle pane, not a captured viewport
+// — same provenance rule BUSY_RUNNING_COMMAND above follows and the same reason it lives here
+// rather than in capturedScreens.fixture.ts. Claude Code's live roster of its own background
+// subagents, drawn in place of the ordinary composer the same way a permission dialog is.
+const BACKGROUND_TASK_LIST = [
+  "⏺ main",
+  "◯ general-purpose  Concierge agents as clickable rows  21m 55s",
+  "◯ general-purpose  Trustworthy status dot: bg-task si… 10m 29s",
+].join("\n");
+
 // ══ THE FOUNDER'S SCREEN ════════════════════════════════════════════════════════════════════════
 // RECONSTRUCTED from the screenshot in sparkle-v7k3y — NOT a captured viewport, which is why it
 // lives here and not in `capturedScreens.fixture.ts` (that file's provenance note is a promise that
@@ -71,6 +82,22 @@ describe("isClaudeCodeScreen — the founder's busy agent is not an editor", () 
   it("...and the write is still refused, by the guard that names the real obstacle", () => {
     expect(screenBlocksWrite(APPROVAL_2_1_220)).toBe(true);
   });
+
+  // ══ THE BACKGROUND-TASK LIST IS ALSO NOT AN EDITOR (bead sparkle-tbsvf) ═════════════════════════
+  // THE HEADLINE ROW. This exact screen produced four consecutive "has a full-screen app open"
+  // refusals against `__sparkle_self__` while the pane was doing nothing but listing its own
+  // background subagents — no editor, no pager, ordinary busy Claude Code.
+  it("recognises Claude Code showing its own background-task list", () => {
+    expect(isClaudeCodeScreen(BACKGROUND_TASK_LIST)).toBe(true);
+  });
+
+  // The list replaces the composer box (family D) the same way a permission dialog does, so it must
+  // stand on its own rather than needing a corroborating family — pinning the count keeps a later
+  // edit from silently making this depend on the composer box being present too.
+  it("recognises it from the task-list family alone, with no composer box on screen", () => {
+    expect(claudeCodeMarkerFamilies(BACKGROUND_TASK_LIST)).toBeGreaterThanOrEqual(1);
+    expect(isClaudeCodeScreen(BACKGROUND_TASK_LIST)).toBe(true);
+  });
 });
 
 // ══ THE REFUSAL THE BEAD REQUIRES US TO KEEP ════════════════════════════════════════════════════
@@ -127,6 +154,25 @@ describe("isClaudeCodeScreen — genuine full-screen apps are not Claude Code", 
       "\n",
     );
     expect(isClaudeCodeScreen(doc)).toBe(false);
+  });
+
+  // ══ THE BACKGROUND-TASK LIST HAS THE SAME QUOTING HAZARD FAMILY D/E ALREADY GUARD AGAINST ══════
+  // (bead sparkle-tbsvf). A pager showing a document that quotes the founder's screenshot — this
+  // bead itself is exactly such a document — must not be read as a LIVE task list. Position is the
+  // discriminator: the pager keeps its own trailing prompt below the quoted rows, which is neither
+  // blank nor Claude's ambient chrome, so `hasBackgroundTaskList`'s below-footer walk rejects it.
+  it("rejects a pager showing a document that quotes the background-task list", () => {
+    const paging = [
+      "⏺ main",
+      "◯ general-purpose  Concierge agents as clickable rows  21m 55s",
+      "That screen produced four consecutive refusals.",
+      ":",
+    ].join("\n");
+    // Family B still fires on the line-start `⏺` — one family, same as the status-bar fool above —
+    // proving family F's rejection is doing real positional work rather than the glyph simply
+    // failing to match at all.
+    expect(claudeCodeMarkerFamilies(paging)).toBe(1);
+    expect(isClaudeCodeScreen(paging)).toBe(false);
   });
 
   // ══ THE TWO-FAMILY DOCUMENT FOOL (roborev 57704) ═════════════════════════════════════════════

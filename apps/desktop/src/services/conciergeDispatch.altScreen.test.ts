@@ -168,6 +168,25 @@ describe("a busy Claude Code is not a full-screen app", () => {
     expect(r.path).toBe("alternate-screen");
     expectNothingWritten();
   });
+
+  // ══ A THIRD SCREEN THAT REPLACES THE COMPOSER: THE BACKGROUND-TASK LIST (sparkle-tbsvf) ═══════
+  // The founder's own report — typing into the mounted Improve Sparkle pane silently failed — and
+  // the concierge's own `send_to_agent_terminal` toward that same pane were both refused
+  // `alternate-screen` while the pane was doing nothing but listing its live background subagents.
+  // This is THE chokepoint every text→PTY path shares (the mounted composer's route included, per
+  // `Concierge/composerRoute`), so a fix at `engine/claudeCodeScreen` only counts once it lands
+  // here too.
+  it("delivers into a pane showing only its own background-task list, no composer visible", async () => {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: ["⏺ main", "◯ general-purpose  Concierge agents as clickable rows  21m 55s"].join(
+        "\n",
+      ),
+      alternateBuffer: true,
+    });
+    const r = await dispatchConciergeAnswer(AGENT, "give me an update after you do", OPTS);
+    expect(r.path).not.toBe("alternate-screen");
+    expect(r.ok).toBe(true);
+  });
 });
 
 // ══ A CREDENTIAL PROMPT BLOCKS ON ANY BUFFER (bead sparkle-p9hs5) ═══════════════════════════════
