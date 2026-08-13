@@ -23,6 +23,7 @@ import {
   listCeilings,
   setPreferredAccountId,
   clearSwitchWrittenPins,
+  type Usage,
 } from "../services/accountStore";
 import { switchRecommendation, type SwitchRecommendation, type Ceiling } from "../services/headroom";
 import {
@@ -57,9 +58,22 @@ export interface AccountSwitchState {
 export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwitchState {
   const [recommendation, setRecommendation] = useState<SwitchRecommendation | null>(null);
   const [plan, setPlan] = useState<SwitchPlan | null>(null);
-  // Accounts the user has waved off. Keyed by account id so a fresh recommendation about a
-  // DIFFERENT account still shows, but the dismissed one stays quiet.
-  const dismissed = useRef<Set<string>>(new Set());
+  // Recommendations the user has waved off: `dismissKey` (account AND reason) -> the reason, which
+  // `retireStaleWallDismissals` needs to tell the two LIFETIMES apart. Three things are keyed here
+  // and each closes a different silence:
+  //
+  //  - by ACCOUNT, so a fresh recommendation about a DIFFERENT account still shows;
+  //  - by REASON, so a wave-off of the ESTIMATE ("stop nagging me that acct-a is getting close")
+  //    cannot silence the later, different claim that acct-a HAS hit its wall. Those are not the
+  //    same statement and the user only declined one of them;
+  //  - and a wall wave-off EXPIRES with the wall it declined, because "I know acct-a is walled
+  //    right now" is a statement about one episode, not a standing preference. See the retirement
+  //    helper for why an estimate's wave-off is the opposite and does survive the session.
+  //
+  // The value carries the account and reason rather than having the retirement helper parse them
+  // back out of the key: a `key.endsWith(":exhausted")` / `key.split(":")` pair would re-introduce
+  // exactly the write/read coupling `dismissKey` exists to remove.
+  const dismissed = useRef<Map<string, DismissedClaim>>(new Map());
   // The live plan, readable from both interval loops without re-subscribing them on every advance:
   // phase 1 reads it to stay quiet while a switch is running, phase 2 reads it as the input to the
   // next advance. Every path that sets `plan` writes this ref in the same breath, so it never lags;
@@ -95,6 +109,11 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         // Suppress while a switch is already running — the answer is "we're on it", not a new ask.
         if (planRef.current) return;
 
+        // Retire wall wave-offs the moment they stop describing anything true. Runs on EVERY
+        // evaluation, before either branch reads the map, and judges against the OBSERVED
+        // exhaustion in `state.usage` rather than against `rec` — see the helper for why.
+        retireStaleWallDismissals(dismissed.current, state.usage);
+
         // ══ AN OBSERVED WALL MOVES THE FLEET BY ITSELF; AN ESTIMATE STILL ASKS ═══════════════════
         // `reason: "exhausted"` comes from an observed rate-limit event, and `headroom.ts` says so
         // in its own words: it "is authoritative … so it outranks any estimate". `"approaching"` is
@@ -125,7 +144,14 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           }
         }
 
-        setRecommendation(rec && !dismissed.current.has(rec.from.id) ? rec : null);
+        // THE DISMISSAL IS MATCHED ON REASON AS WELL AS ACCOUNT, for the same reason the block
+        // above acts. The fall-through gets here in one case that matters: the account HAS hit its
+        // wall but nothing mounted can be moved (e.g. every agent on it carries a human pin, so
+        // `planSwitch` finds no candidates). That is the case where the automation cannot help and
+        // the banner is the ONLY signal left — so a wave-off of the *estimate* must not silence it.
+        // A wave-off of the wall banner itself carries the matching key and still does.
+        const silenced = rec !== null && dismissed.current.has(dismissKey(rec));
+        setRecommendation(silenced ? null : rec);
       } catch (e) {
         console.warn("headroom check failed", e);
       }
@@ -181,7 +207,12 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   }, [recommendation]);
 
   const dismiss = useCallback(() => {
-    if (recommendation) dismissed.current.add(recommendation.from.id);
+    if (recommendation) {
+      dismissed.current.set(dismissKey(recommendation), {
+        accountId: recommendation.from.id,
+        reason: recommendation.reason,
+      });
+    }
     setRecommendation(null);
   }, [recommendation]);
 
@@ -246,6 +277,67 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   }, [switchTo]);
 
   return { recommendation, plan, accept, dismiss, switchTo };
+}
+
+/** The key a wave-off is recorded under: the account AND the kind of claim being waved off.
+ *
+ *  Both halves are load-bearing — see the `dismissed` ref. Deriving it in ONE place is what keeps
+ *  the write (`dismiss`) and the read (phase 1) from drifting apart; keying them differently is the
+ *  whole defect this replaces. Adding a third `reason` needs no change here: a new kind of claim
+ *  gets its own key and inherits the right behaviour by construction. */
+function dismissKey(rec: SwitchRecommendation): string {
+  return `${rec.from.id}:${rec.reason}`;
+}
+
+/** One recorded wave-off. Both fields come straight off the recommendation that was declined, so
+ *  {@link retireStaleWallDismissals} never has to parse them back out of {@link dismissKey}'s
+ *  string. */
+interface DismissedClaim {
+  accountId: string;
+  reason: SwitchRecommendation["reason"];
+}
+
+/** Drop each recorded WALL wave-off once the wall it declined is over.
+ *
+ *  THE TWO WAVE-OFFS HAVE DIFFERENT LIFETIMES because they decline different KINDS of statement:
+ *
+ *   - `"approaching"` is a standing preference — "stop nagging me about this account's estimate."
+ *     Nothing makes that stop being what the user meant, so it survives the session, by design.
+ *   - `"exhausted"` is about ONE episode — "I know acct-a is walled right now." An episode ends.
+ *     Keeping it forever means the account walls AGAIN after its window resets, phase 1 finds the
+ *     old key, and says nothing — the same fleet-parked-behind-a-live-wall silence the fall-through
+ *     banner exists to prevent, displaced by one window. The user declined the 09:00 wall; nobody
+ *     asked them about the 19:00 one.
+ *
+ *  IT JUDGES ON `exhaustedUntil`, NOT ON WHETHER THIS TICK PRODUCED A RECOMMENDATION, and the
+ *  difference is the whole correctness of the thing. "No recommendation this tick" looks like a
+ *  proxy for "the wall is over" and is not one: `switchRecommendation` also returns null when there
+ *  is simply nowhere to go — `candidates` is empty because every other account is itself exhausted
+ *  **or merely `warn`** — and when `busiestPaneAccount()` momentarily names someone else. On that
+ *  proxy a wave-off gets retired mid-episode, and because a rival account's 5h fraction flaps across
+ *  `WARN_FRACTION` on a 120s poll it retires repeatedly, re-raising a banner the user already
+ *  declined for the whole ~5h wall. That is the "dismiss button that visibly does nothing" defect
+ *  the reason-keying fixed, walking back in through a different door.
+ *
+ *  `exhaustedUntil` is the observable truth the wave-off was about: it can never expire mid-episode,
+ *  and a later wall writes a NEW one, so the next episode is a new claim by construction. Same
+ *  authority `assessHeadroom` uses for `state: "exhausted"`, so the two cannot disagree.
+ *
+ *  An account absent from `usage` is treated as not walled. That is the honest reading — no usage
+ *  row means no observed rate-limit event — and it errs toward speaking, which is the safe side
+ *  here: a spurious re-raise costs a click, a spurious silence costs a fleet idle for five hours. */
+function retireStaleWallDismissals(
+  dismissed: Map<string, DismissedClaim>,
+  usage: readonly Pick<Usage, "id" | "exhaustedUntil">[],
+  now: number = Date.now(),
+): void {
+  const walled = new Set<string>();
+  for (const u of usage) {
+    if (u.exhaustedUntil != null && u.exhaustedUntil > now) walled.add(u.id);
+  }
+  for (const [key, claim] of [...dismissed]) {
+    if (claim.reason === "exhausted" && !walled.has(claim.accountId)) dismissed.delete(key);
+  }
 }
 
 /** The `switchTo` of the currently mounted hook, or null when none is mounted. It returns how many

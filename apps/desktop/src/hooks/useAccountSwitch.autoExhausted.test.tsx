@@ -26,7 +26,14 @@ import type { Account } from "../services/accountStore";
 import type { AgentTabStatus } from "../types";
 
 const h = vi.hoisted(() => ({
-  reason: "approaching" as "exhausted" | "approaching",
+  // null = `switchRecommendation` finds nothing to suggest. That is NOT the same as "no wall":
+  // it also fires when every other account is itself exhausted or merely `warn`, which is the
+  // exact confusion `retireStaleWallDismissals` must not make.
+  reason: "approaching" as "exhausted" | "approaching" | null,
+  from: "acct-a",
+  // The OBSERVED exhaustion, which is what the retirement helper judges on. Only the two fields it
+  // reads; `loadAccountState` supplies the rest in production.
+  usage: [] as { id: string; exhaustedUntil: number | null }[],
   restart: vi.fn((_agentId: string) => true),
   setPin: vi.fn((_agentId: string, _accountId: string) => {}),
   statuses: {} as Record<string, AgentTabStatus | undefined>,
@@ -47,7 +54,7 @@ vi.mock("../services/accountStore", async (importOriginal) => ({
 
 vi.mock("../services/accountSelection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/accountSelection")>()),
-  loadAccountState: async () => ({ accounts: [], usage: [], identities: [] }),
+  loadAccountState: async () => ({ accounts: [], usage: h.usage, identities: [] }),
   invalidateAccountState: () => {},
 }));
 
@@ -62,19 +69,22 @@ const acct = (id: string): Account => ({
 // The ONE thing this suite varies. Everything else is held constant so the reason is the only
 // possible cause of a difference between the two tests.
 vi.mock("../services/headroom", () => ({
-  switchRecommendation: () => ({
-    from: acct("acct-a"),
-    to: acct("acct-b"),
-    fraction: 0.95,
-    reason: h.reason,
-  }),
+  switchRecommendation: () =>
+    h.reason === null
+      ? null
+      : {
+          from: acct(h.from),
+          to: acct("acct-b"),
+          fraction: 0.95,
+          reason: h.reason,
+        },
 }));
 
 vi.mock("../stores/runtimeStore", () => ({
   useRuntimeStore: { getState: () => ({ status: h.statuses }) },
 }));
 
-const { useAccountSwitch } = await import("./useAccountSwitch");
+const { useAccountSwitch, SWITCH_ADVANCE_MS } = await import("./useAccountSwitch");
 
 /** How often phase 1 re-evaluates in this suite. Short so a test can drive a SECOND evaluation. */
 const POLL_MS = 1_000;
@@ -86,6 +96,17 @@ async function settle() {
     await Promise.resolve();
     await Promise.resolve();
   });
+}
+
+/** A five-hour session wall, live as of now. Fake timers move `Date.now()`, so this is computed at
+ *  use rather than hoisted. */
+function wall(id: string) {
+  return { id, exhaustedUntil: Date.now() + 5 * 60 * 60 * 1_000 };
+}
+
+/** The same account with its window reset — the wall episode is over. */
+function reset(id: string) {
+  return { id, exhaustedUntil: null };
 }
 
 /** Mount and let the first phase-1 evaluation land. */
@@ -103,6 +124,24 @@ async function repoll() {
   await settle();
 }
 
+/** Mount with phase 1's interval effectively disabled, so a later `advance()` is the only thing
+ *  that runs. Phase 1 still evaluates once at mount — that is what raises the plan — but it never
+ *  re-fires to re-plan agents the fixture's static `paneAccountMap` still reports on the old
+ *  account. Use this for anything asserting on phase 2. */
+async function mountedQuiet() {
+  const view = renderHook(() => useAccountSwitch(10 * SWITCH_ADVANCE_MS));
+  await settle();
+  return view;
+}
+
+/** Drive one PHASE-2 advance. `settle()` only flushes microtasks, so without this the 3s interval
+ *  that actually moves agents never fires and every `restart` assertion is vacuous. */
+async function advance() {
+  await act(async () => {
+    vi.advanceTimersByTime(SWITCH_ADVANCE_MS);
+  });
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   h.restart.mockClear();
@@ -110,6 +149,8 @@ beforeEach(() => {
   h.paneAccounts = { a1: "acct-a", a2: "acct-a" };
   h.statuses = { a1: "idle", a2: "idle" };
   h.reason = "approaching";
+  h.from = "acct-a";
+  h.usage = [wall("acct-a")];
 });
 
 describe("an OBSERVED wall migrates running agents without being asked", () => {
@@ -162,9 +203,190 @@ describe("an OBSERVED wall migrates running agents without being asked", () => {
     h.reason = "exhausted";
     h.statuses = { a1: "working", a2: "working" };
 
+    const view = await mountedQuiet();
+    expect(view.result.current.plan?.pending.length).toBe(2);
+
+    // WITHOUT THIS THE ASSERTION BELOW IS VACUOUS. Phase 2 moves agents on a 3s interval and
+    // `settle()` only flushes microtasks — so `restart` is un-called at mount no matter what
+    // `isSafeToSwitch` says, and the test stays green against a hook with no safety rule at all.
+    await advance();
+
+    expect(h.restart).not.toHaveBeenCalled();
+    // Still enrolled, still waiting — not dropped from the plan.
+    expect(view.result.current.plan?.pending.length).toBe(2);
+  });
+
+  it("re-spawns those same agents once their turn ends", async () => {
+    // The paired positive for the test above. Identical fixture but for the statuses, so that one
+    // staying green can only be `isSafeToSwitch` excluding `working` — not phase 2 never running.
+    h.reason = "exhausted";
+    h.statuses = { a1: "idle", a2: "idle" };
+
+    const view = await mountedQuiet();
+    expect(view.result.current.plan?.pending.length).toBe(2);
+
+    await advance();
+
+    expect(h.restart).toHaveBeenCalledWith("a1");
+    expect(h.restart).toHaveBeenCalledWith("a2");
+    // Everyone moved, so the plan retires — which is also what re-arms recommendations.
+    expect(view.result.current.plan).toBeNull();
+  });
+
+  it("raises the banner instead of spinning an EMPTY plan when nothing can be moved", async () => {
+    // Reachable whenever the wall is real but `planSwitch` finds no candidates — e.g. every agent
+    // on the account carries a human pin, so `unpinnedRunning` drops them all. Phase 2 never
+    // retires a plan with no pending agents, so an empty one would poll forever AND suppress every
+    // later recommendation via the `planRef` guard.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+
     const view = await mounted();
 
-    expect(view.result.current.plan?.pending.length).toBe(2);
-    expect(h.restart).not.toHaveBeenCalled();
+    expect(view.result.current.plan).toBeNull();
+    expect(view.result.current.recommendation).not.toBeNull();
+  });
+
+  it("still raises that banner when the ESTIMATE for the same account was dismissed", async () => {
+    // The fall-through's half of "a dismissal waves off the prediction, not an observed wall".
+    // Nothing is movable here, so the banner is the ONLY signal left — and silencing it on the
+    // strength of an earlier impatient click leaves the fleet parked behind a live wall with
+    // nothing said at all, which is the exact harm the automation exists to remove.
+    h.reason = "approaching";
+    h.paneAccounts = {};
+    const view = await mounted();
+    expect(view.result.current.recommendation).not.toBeNull();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    h.reason = "exhausted";
+    await repoll();
+
+    expect(view.result.current.plan).toBeNull();
+    expect(view.result.current.recommendation).not.toBeNull();
+  });
+
+  it("but dismissing the WALL banner itself does stick", async () => {
+    // The other side of keying `dismissed` by reason, and the reason it is keyed that way rather
+    // than exempting `"exhausted"` from the filter. Nothing is movable, so phase 1 re-evaluates
+    // every `pollMs` for as long as the account stays walled — up to a ~5h session window. An
+    // exempt reason would re-raise this banner on every one of those ticks, making its dismiss
+    // button a control that visibly does nothing.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    const view = await mounted();
+    expect(view.result.current.recommendation).not.toBeNull();
+
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    await repoll();
+
+    // Still down — the wave-off was recorded against THIS claim, so it matches on the next pass.
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
+  it("but it does NOT survive the wall it declined — a later wall speaks again", async () => {
+    // The LIFETIME half. A wall wave-off means "I know acct-a is walled right now", not a standing
+    // preference: acct-a walls at 09:00 with a fully pinned fleet and the user waves it off; the
+    // window resets; acct-a walls again at 19:00. That second wall is a claim nobody declined, and
+    // the test above's key would silence it — the same fleet-behind-a-live-wall silence this banner
+    // exists to prevent, displaced by one window.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+
+    // The window RESETS. `exhaustedUntil` clearing is the observable fact that ends the episode —
+    // not the recommendation changing, which the two tests below pin as a different question.
+    h.usage = [reset("acct-a")];
+    h.reason = "approaching";
+    await repoll();
+
+    // The SAME account walls again. New episode, new `exhaustedUntil`, claim nobody declined.
+    h.usage = [wall("acct-a")];
+    h.reason = "exhausted";
+    await repoll();
+
+    expect(view.result.current.recommendation?.reason).toBe("exhausted");
+  });
+
+  it("and it survives a tick with NO recommendation while the wall is still live", async () => {
+    // "No recommendation this tick" is NOT "the wall is over", and treating it as one is the whole
+    // defect this pins. `switchRecommendation` also returns null when there is simply nowhere to
+    // go — every other account exhausted, or merely past WARN_FRACTION. A rival's 5h fraction flaps
+    // across that threshold on a 120s poll, so retiring on the proxy re-raises a declined banner
+    // over and over for the full ~5h wall: the "dismiss button that does nothing" defect again.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+
+    // No eligible target this tick — but acct-a is still walled, so nothing about the wave-off
+    // has stopped being true.
+    h.reason = null;
+    await repoll();
+    expect(view.result.current.recommendation).toBeNull();
+
+    // A target reappears and the SAME live wall is recommended against again.
+    h.reason = "exhausted";
+    await repoll();
+
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
+  it("and a wall on a DIFFERENT account does not retire it either", async () => {
+    // The other way the proxy leaked: keying retirement off "the one key this tick claims" deletes
+    // every other account's wave-off outright, so a momentary `busiestPaneAccount()` flip to acct-c
+    // and back re-raises acct-a's declined banner. Observed exhaustion is per-account, so it can't.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    h.usage = [wall("acct-a"), wall("acct-c")];
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+
+    h.from = "acct-c";
+    await repoll();
+    expect(view.result.current.recommendation?.from.id).toBe("acct-c");
+
+    h.from = "acct-a";
+    await repoll();
+
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
+  it("while an ESTIMATE wave-off is a standing preference and outlives a wall", async () => {
+    // The paired asymmetry. Both wave-offs expiring on the same rule would make this one useless —
+    // "stop nagging me that acct-a is getting close" is not a statement about one episode, so
+    // nothing about a wall coming and going revokes it.
+    h.reason = "approaching";
+    h.paneAccounts = {};
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+
+    // A wall comes...
+    h.reason = "exhausted";
+    await repoll();
+    expect(view.result.current.recommendation?.reason).toBe("exhausted");
+    // ...and goes.
+    h.reason = "approaching";
+    await repoll();
+
+    // The estimate is still waved off.
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
+  it("and that wave-off does not silence a DIFFERENT account", async () => {
+    // The account half of the composite key, kept honest alongside the reason half.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    h.from = "acct-c";
+    await repoll();
+
+    expect(view.result.current.recommendation?.from.id).toBe("acct-c");
   });
 });
