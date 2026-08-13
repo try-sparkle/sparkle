@@ -1,4 +1,5 @@
 export * from "./risk";
+export * from "./bridgeRetry";
 export * from "./historyScope";
 export * from "./classifier";
 export * from "./analytics";
