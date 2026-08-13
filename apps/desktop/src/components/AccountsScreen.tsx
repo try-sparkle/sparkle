@@ -16,6 +16,7 @@ import {
   removeAccount,
   accountDisplay,
   duplicateAccountGroups,
+  identityKey,
   getPreferredAccountId,
   clearPreferredAccount,
   clearSwitchWrittenPins,
@@ -954,13 +955,86 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // verdict, so wait for it and re-read. Without this the row keeps showing the identity from
   // before the switch — which, for a user who just re-pointed an account at a different Claude
   // login, is the wrong email presented as the current one.
+  //
+  // IDENTITY-KEYED RECONCILIATION on re-login (the twin of handleAdd's guard, for the EXISTING-slot
+  // path). `claude auth login` grants whatever identity the browser is signed into at claude.ai — it
+  // does NOT force account selection — so re-authing slot A while the browser is signed into a
+  // DIFFERENT identity Y silently overwrites slot A's login: its old identity X is gone from the
+  // config dir, and if Y is one another slot already holds you now have two slots on one login. The
+  // add path could just discard the redundant slot; here the user deliberately acted on an EXISTING
+  // account, so we never auto-delete it — we surface every identity change loudly instead, so a
+  // wrong-browser re-login can neither silently duplicate nor silently lose an account.
   async function handleLogin(a: Account) {
     try {
+      // What slot A was signed into BEFORE this re-login — the yardstick for "did the identity
+      // change". Read from the last-refreshed identities state (closed over fresh each render).
+      const priorKey = identityKey(identities.find((i) => i.id === a.id));
+
       await onLogin(a);
       await refresh();
-      // Re-fetch live usage for the account just (re-)authenticated — including re-logging into the
-      // SAME account to recover a row that had failed with a 401 / offline error, where neither the
-      // account set nor the identity changes.
+
+      // Re-read — never infer (same reasoning as handleAdd). A closed login window is equally a
+      // cancelled OAuth, a failed one, and a real sign-in; only re-fetching identities tells them
+      // apart. Fetch synchronously here because refresh()'s setState above is not yet visible.
+      const [freshAccounts, freshIdentities] = await Promise.all([
+        listAccountsFn(),
+        getIdentitiesFn(),
+      ]);
+      const newIdentity = freshIdentities.find((i) => i.id === a.id);
+      const newKey = identityKey(newIdentity);
+
+      // Nothing resolved (cancelled/failed login, or a login that recorded no identity): leave the
+      // slot exactly as it was — unchanged, as before this guard existed. Still bump live-usage in
+      // case this was a same-account re-auth recovering a 401/offline row.
+      if (newKey == null) {
+        setLiveNonce((n) => n + 1);
+        return;
+      }
+
+      // Case 1 — SAME identity as before. The legit "my token expired, re-auth" case: nothing to
+      // warn about. (A slot that had NO prior identity falls through to the change handling below,
+      // where the "account lost" branch is correctly suppressed because there was no X to lose.)
+      if (priorKey != null && newKey === priorKey) {
+        setLiveNonce((n) => n + 1);
+        return;
+      }
+
+      // The identity CHANGED (or slot A had none before and now resolves one). Two sub-cases, and
+      // both are surfaced loudly — a re-login must never silently duplicate or lose an account.
+
+      // Case 2 — the new identity is one ANOTHER slot already holds → a duplicate-via-relogin. Do
+      // NOT leave two slots on one login pretending all is well, and do NOT auto-delete slot A (the
+      // user acted on it deliberately). Make it loud and recoverable: the row now shows Y and the
+      // duplicate banner lights up, and this message names the slot Y already is.
+      const dupGroup = duplicateAccountGroups(freshAccounts, freshIdentities).find((g) =>
+        g.accounts.some((x) => x.id === a.id),
+      );
+      if (dupGroup) {
+        const existing = dupGroup.accounts.find((x) => x.id !== a.id);
+        const asLabel = newIdentity?.email ?? "another account you already have";
+        setLiveNonce((n) => n + 1);
+        setError(
+          existing
+            ? `This logged in as ${asLabel}, which is already “${existing.nickname}”. Switch your browser to the account you meant and try again.`
+            : `This logged in as ${asLabel}, which is already one of your other accounts. Switch your browser to the account you meant and try again.`,
+        );
+        return;
+      }
+
+      // Case 3 — a DIFFERENT identity no other slot holds. The slot's account genuinely changed,
+      // which just made the OLD identity X disappear from the account set. When there WAS a prior
+      // identity, warn loudly so a wrong-browser login can't silently drop an account — the founder
+      // can see it happened and re-add X. When there was NO prior identity (an empty slot getting
+      // its first login), nothing was lost, so this is an ordinary successful login.
+      if (priorKey != null) {
+        const priorLabel =
+          identities.find((i) => i.id === a.id)?.email ?? "its previous account";
+        const newLabel = newIdentity?.email ?? "a different account";
+        setError(
+          `“${a.nickname}” was signed into ${priorLabel}; it's now ${newLabel}. ${priorLabel} is no longer in your accounts — switch your browser to it and re-add it if that wasn't intended.`,
+        );
+      }
+      // A login just completed — re-fetch live usage for the (now changed) account.
       setLiveNonce((n) => n + 1);
     } catch (e) {
       setError(errText(e, "Failed to log in"));
@@ -1177,7 +1251,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
             : display.primary;
         const alias = primary !== display.nickname ? display.nickname : null;
         return (
-          <div key={a.id} style={card}>
+          <div key={a.id} data-testid={`account-row-${a.id}`} style={card}>
             {/* ══ CONTROLS ROW — ON TOP, AND THE TEXT BELOW IT ═══════════════════════════════════
                 The buttons and the identity text used to share ONE flex row, with the text at
                 `flex: 1` beside them. At any width where the buttons did not fit on their own line,
