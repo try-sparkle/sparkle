@@ -96,13 +96,25 @@ export const MAX_RADIUS_PX = 6;
  * boxes are compared as half-open ranges so two boxes that merely touch (`icon.right === rule.left`)
  * pass — which is the tightest legitimate layout and must not read as a failure.
  */
-export function gradeCollision({ theme, icon, rule }) {
+export function gradeCollision({ theme, icon, rule, iconFloat }) {
   const failures = [];
   if (!icon || !rule) {
     return [
       `${theme}: could not measure the ${!icon ? "copy glyph" : "blockquote rule"} — ` +
         `a missing measurement is not a pass`,
     ];
+  }
+  // THE FIXTURE MUST STILL REPRODUCE THE PRODUCT. `main()` checks that the ROW still floats the
+  // glyph; this checks that the HARNESS does. Without both, the guard is one-directional and a
+  // harness that quietly stopped floating would make every collision impossible and every run
+  // green (roborev 63277). `undefined` is not checked — only an explicit reading that disagrees —
+  // so a caller that cannot measure it still gets the geometry verdict rather than a false alarm.
+  if (iconFloat !== undefined && iconFloat !== null && iconFloat !== "left") {
+    failures.push(
+      `${theme}: the harness's copy glyph is not floating (cssFloat=${JSON.stringify(iconFloat)}), ` +
+        `so no collision with the quote rule is possible and this measurement proves nothing — ` +
+        `the fixture has stopped reproducing ConciergeMessageRow`,
+    );
   }
   if (!(rule.width > 0)) {
     // The rule vanishing would satisfy "no overlap" perfectly and is not the fix that was asked
@@ -175,6 +187,20 @@ async function measureTheme(page, serverUrl, theme, { keepShots }) {
        const q = document.querySelector('[data-testid="answer"] blockquote');
        const btn = document.querySelector('[data-testid="answer"] button');
        const chiclet = document.querySelector('[data-testid="quote-chiclet"]');
+       // WALK UP TO THE FLOATED ANCESTOR, do not assume the parent. CopyAnswerButton wraps its own
+       // button in a flex div, so the floated span is the GRANDparent -- reading the immediate
+       // parent returns "none" and reports a healthy fixture as broken. (Caught by this very guard
+       // on its first run, which is the argument for it existing.) Bounded by the answer container
+       // so this can never walk out to the document.
+       const floatOf = (el) => {
+         let n = el?.parentElement ?? null;
+         while (n && n.dataset.testid !== "answer") {
+           const f = getComputedStyle(n).cssFloat;
+           if (f && f !== "none") return f;
+           n = n.parentElement;
+         }
+         return "none";
+       };
        const box = (el) => {
          if (!el) return null;
          const r = el.getBoundingClientRect();
@@ -192,13 +218,25 @@ async function measureTheme(page, serverUrl, theme, { keepShots }) {
          icon: box(btn),
          rule,
          quote: box(q),
+         // IS THE FIXTURE'S OWN GLYPH STILL FLOATING? The drift guard in main() reads the
+         // PRODUCT's source; this reads the HARNESS's rendered state, and without it that guard is
+         // one-directional -- drop the float in the harness and the glyph stops being a float, no
+         // block can collide with it, the collision verdict comes back clean, and the probe reports
+         // PASS while measuring a shape that reproduces nothing (roborev 63277).
+         // NO BACKTICKS IN HERE: this comment is inside a template literal, and one would end it.
+         iconFloat: floatOf(btn),
          radiusPx: chiclet ? parseFloat(getComputedStyle(chiclet).borderTopLeftRadius) : NaN,
        };
      })()`,
   );
 
   const failures = [
-    ...gradeCollision({ theme, icon: measured.icon, rule: measured.rule }),
+    ...gradeCollision({
+      theme,
+      icon: measured.icon,
+      rule: measured.rule,
+      iconFloat: measured.iconFloat,
+    }),
     ...gradeRadius({ theme, radiusPx: measured.radiusPx }),
   ];
 

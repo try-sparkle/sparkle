@@ -2502,6 +2502,31 @@ describe("the quote-surface probe's verdict logic", () => {
       expect(gradeCollision({ theme: "dark", icon, rule: rule(24, 3, 28, 70) })).toEqual([]);
     });
 
+    // ── THE GUARD IS TWO-DIRECTIONAL (roborev 63277) ─────────────────────────────────────────
+    // main() checks the PRODUCT still floats the glyph; this checks the HARNESS does. Without the
+    // second, a fixture that quietly stopped floating makes every collision impossible and every
+    // run green — the same silent drift, from the other side.
+    it("FAILS when the harness's own glyph has stopped floating", () => {
+      const f = gradeCollision({
+        theme: "dark",
+        icon: box(20, 37),
+        rule: rule(43),
+        iconFloat: "none",
+      });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("not floating");
+      expect(f[0]).toContain("proves nothing");
+    });
+
+    it("still grades the geometry when the float could not be read at all", () => {
+      // An unread float is not evidence of a broken fixture, so it must not manufacture a failure —
+      // and it must not suppress the real verdict either.
+      expect(gradeCollision({ theme: "dark", icon: box(20, 37), rule: rule(43) })).toEqual([]);
+      const f = gradeCollision({ theme: "dark", icon: box(20, 37), rule: rule(24), iconFloat: null });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("painted ON the blockquote rule");
+    });
+
     it("FAILS when the rule has vanished — deleting it is not the fix that was asked for", () => {
       const f = gradeCollision({ theme: "dark", icon: box(20, 37), rule: rule(43, 0) });
       expect(f.some((m) => m.includes("no left rule at all"))).toBe(true);

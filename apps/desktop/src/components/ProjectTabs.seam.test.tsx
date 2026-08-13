@@ -117,10 +117,14 @@ describe("the active tab opens into the content area", () => {
     // …and the rule is still THERE. Dropping it entirely would satisfy the line above perfectly and
     // is a different design from the one asked for: the strip keeps its rule, the ACTIVE tab opens
     // through it.
-    const shadow = bar().style.boxShadow;
-    expect(shadow).toContain("inset");
-    expect(shadow).toContain(`${TAB_RULE_PX}px`);
-    expect(shadow).toContain(C.muted);
+    //
+    // THE WHOLE DECLARATION, NOT THREE SUBSTRINGS (roborev 63275). This read `toContain("inset")`
+    // + `toContain("1px")` + `toContain(C.muted)`, and every one of those survives a shadow that
+    // would put the rule back where it cannot be covered: `inset 0 1px 0 …` paints along the bar's
+    // TOP edge, and `0 -1px 0 …` next to an unrelated inset term is not inset at all. The OFFSET'S
+    // SIGN is the entire mechanism — a shadow one pixel UP from the padding box's bottom is the
+    // thing a tab covers — and a substring match cannot see a sign.
+    expect(bar().style.boxShadow).toBe(`inset 0 -${TAB_RULE_PX}px 0 ${C.muted}`);
   });
 
   it("does not nudge the slots down — the old overlap that the strip's clip ate", () => {

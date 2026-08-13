@@ -121,6 +121,29 @@ describe("Markdown blockquotes", () => {
     return Array.from(container.querySelectorAll("blockquote"));
   }
 
+  // ── THE QUOTE MUST NOT SLIDE UNDER A FLOAT (founder screenshot, 2026-08-12) ─────────────────
+  //
+  // He sent a picture of a concierge answer whose COPY GLYPH was painted on top of this quote's blue
+  // rule. The cause is a CSS rule with no jsdom implementation at all: a float shortens the LINE
+  // BOXES beside it and NEVER a following BLOCK's box, so a `<blockquote>`'s border box — its rule
+  // included — was laid at the container's left edge underneath `ConciergeMessageRow`'s floated
+  // glyph, while its inline text was pushed clear.
+  //
+  // `display: flow-root` makes the quote a block formatting context, and a BFC's border box may not
+  // overlap a float in the same context, so the whole quote is placed clear of the glyph.
+  //
+  // WHAT THIS CASE IS AND IS NOT (roborev 63277). jsdom cannot evaluate a float, so this proves
+  // nothing about the resulting geometry — `scripts/visual/quote-surface-probe.mjs` measures the two
+  // boxes in Chrome, in both themes, and that is the real verification. What jsdom CAN do is read
+  // the declaration, and that is worth a case on its own: the probe needs Chrome and a dev server
+  // and is wired into neither `pnpm verify` nor CI, so without this line a refactor that dropped the
+  // declaration — plausible, since it reads as a stray style beside `margin` and `padding` — would
+  // reinstate the founder's reported defect with every suite green.
+  it("is a block formatting context, so a floated sibling cannot paint over its rule", () => {
+    const { container } = render(<Markdown text="> quoted" />);
+    expect(quotes(container)[0]!.style.display).toBe("flow-root");
+  });
+
   it("renders blank-line-separated quoted lines as ONE bar, not one per line", () => {
     const { container } = render(<Markdown text={blankSeparated} mergeQuotes />);
     expect(quotes(container)).toHaveLength(1);

@@ -309,7 +309,15 @@ async function measureScale(page, serverUrl, scale, { keepShots }) {
   // of flow and grows INWARD over its neighbour, so the neighbour you are aiming at can be under it
   // when you press — and the strip takes another `TAB_EXPAND_DELAY_MS` to notice the pointer moved.
   // Clicking inside that window is not an edge case, it is the normal speed of a hand.
-  const order = ids.filter((id) => geo.tabs[id]);
+  // RE-MEASURE FIRST. `geo` was read before the settled click, and that click CHANGED the strip: a
+  // different tab is active, so the min-width floor moves (the active tab is floored higher), the
+  // chrome re-measures, and the newly-selected tab is scrolled into view. Aiming this second
+  // gesture with the old coordinates would press wherever those tabs USED to be — which is a
+  // dropped click reported as a landed one, or a landed one reported for the wrong tab
+  // (roborev 63275).
+  const geo2 = await geometry(page, ids);
+  if (!geo2) throw new Error("the tab bar vanished after the first click");
+  const order = ids.filter((id) => geo2.tabs[id]);
   const restIdx = Math.max(1, order.indexOf(target));
   const rest = order[restIdx];
   // The neighbour the expansion grows OVER. `settleNow` anchors a tab in the strip's right half to
@@ -331,13 +339,13 @@ async function measureScale(page, serverUrl, scale, { keepShots }) {
     await unhover(page);
     await sleep(300);
     // Rest on `rest` long enough that it expands…
-    await movePointer(page, geo.tabs[rest].x, geo.tabs[rest].y);
+    await movePointer(page, geo2.tabs[rest].x, geo2.tabs[rest].y);
     await sleep(300);
     // …then move to the neighbour and press straight away, well inside the settle delay.
     fastTarget = covered;
-    await movePointer(page, geo.tabs[fastTarget].x, geo.tabs[fastTarget].y);
+    await movePointer(page, geo2.tabs[fastTarget].x, geo2.tabs[fastTarget].y);
     await sleep(30);
-    await clickAt(page, geo.tabs[fastTarget].x, geo.tabs[fastTarget].y);
+    await clickAt(page, geo2.tabs[fastTarget].x, geo2.tabs[fastTarget].y);
     await sleep(400);
     fastSelected = await page.evaluate("window.__selected");
     failures.push(

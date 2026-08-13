@@ -89,8 +89,9 @@ vi.mock("./Terminal", async (importOriginal) => {
 });
 // The stand-in for the OLD BESPOKE compose surface. See the header. It renders the affordances the
 // founder pointed at on 2026-07-29 — the mic placeholder and the screenshot button — plus its own
-// textarea, so a returning composer is caught by three independent tells rather than by the fact
-// that a textbox exists (which is now true by design).
+// textarea, so a returning composer is caught by three INDEPENDENT tells. The bare textbox is one
+// of them and is asserted below in its own case; the other two matter because an inlined
+// replacement that reworded or dropped the textarea would still carry the affordances.
 vi.mock("./Composer", () => ({
   Composer: () => (
     <div data-testid="pane-composer">
@@ -173,9 +174,12 @@ describe("SparkleAgentPane — the OLD bespoke composer is gone", () => {
     await readyPane();
     // The import path…
     expect(screen.queryByTestId("pane-composer")).toBeNull();
-    // …and the affordances, so an inlined replacement is caught too. NOT "no textbox exists" any
-    // more — see the header: that assertion recorded a reading of the July instruction the founder
-    // has since corrected, and it is what kept this agent unanswerable.
+    // …and the affordances, so an inlined replacement that never imports `./Composer` is caught
+    // too. The bare "no textbox" assertion is a SEPARATE case below (`has NO text box at all`),
+    // deliberately: these two tells survive a rewording of the box, and that one survives a
+    // composer whose affordances were renamed. Its own comment records why it has been reverted
+    // twice; and neither is safe to read without `SparkleAgentPane.terminal.test.tsx`, which is
+    // what stops "nothing rendered" from satisfying all of them.
     expect(screen.queryByTitle("Capture a region of your screen")).toBeNull();
     expect(screen.queryByPlaceholderText(/i'm listening/i)).toBeNull();
   });
