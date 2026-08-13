@@ -434,22 +434,90 @@ export function nothingUnrecognizedBelowFooter(
   return true;
 }
 
+/** How far from the bottom a cursor / shell prompt must sit to count as LIVE rather than as
+ *  scrollback. Owned here so `screenAnswerable` and this module cannot drift on what "live" means —
+ *  it imports this rather than keeping a second copy (the direction is forced: screenAnswerable
+ *  already depends on this module, so the constant cannot live there without a cycle). */
+export const LIVE_TAIL_LINES = 12;
+
+/** The last `n` NON-EMPTY rendered lines — the unit both bottom-anchored predicates reason in. */
+export function tailContent(snapshot: string, n: number): string[] {
+  return snapshot
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .slice(-n);
+}
+
 /**
  * True when the rendered screen shows the agent blocked on a specific answer from the
  * user (a Claude selection menu or a shell prompt). False for a finished turn at the idle
  * input box, conversational prose, or an empty screen.
+ *
+ * ══ AWAITING IS A CLAIM ABOUT THE BOTTOM OF THE GRID, NOT ABOUT ANYWHERE ON IT ═══════════════════
+ *
+ * All three arms were once WHOLE-SNAPSHOT scans, and that is what made `waiting` — the RED "Needs
+ * you" band — fire on agents that were plainly working. Measured 2026-08-12 on a live fleet: 31 of
+ * 80 rows red, at most 4 addressed to a human, and 27 of them `waiting` while their own activity
+ * line read "Fast-forwarding my parked branch to origin/main" or "Running claude doctor health
+ * check". Any viewport that merely CONTAINED prompt-shaped text was red — a dialog the agent had
+ * already answered and scrolled past, a `(y/n)` inside a file it read or a diff it printed, its own
+ * prose quoting a menu. The founder: *"Why are all these agents showing as red when they're not
+ * blocked by me? As a human."*
+ *
+ * `engine/screenAnswerable` had ALREADY learned this exact lesson for the `approval` band — "any
+ * `❯ 1. …` anywhere on the grid … satisfied them" (roborev 58159) — and bottom-anchored its arms.
+ * The band next door never got the same treatment, and it is the one painting the 27 rows. This is
+ * that fix, not a new policy: the taxonomy (`bandOfStatus`, tokens.ts, stallEscalation) is
+ * unchanged and deliberately so.
+ *
+ * ⚠️ THE FIX IS STRUCTURAL, NOT A LINE BUDGET, and `screenAnswerable` records why: on a real grid
+ * the /model picker's cursor sits 13 non-empty lines from the bottom, so a naive tail window
+ * REJECTS a live, fully-visible dialog. Hence arm 1 asks whether the footer is still LIVE — is
+ * there nothing unrecognized below it — with the bottom-anchored arms as fallbacks for a menu whose
+ * footer could not be found. Every captured live dialog still classifies TRUE, with and without the
+ * five persistent chrome rows that render beneath one; that is pinned by test.
+ *
+ * ⚠️ THE OPPOSITE FAILURE IS STILL THE MORE EXPENSIVE ONE. An unrecognized prompt is a blocked
+ * agent nobody is told about, which this file has always called strictly worse than a false red.
+ * Nothing here weakens that: this narrows WHERE a prompt is looked for, never WHICH prompts count,
+ * and the ingest() path is unaffected because it feeds one freshly-streamed line at a time — a
+ * single line is its own tail.
  */
 export function screenAwaitsInput(snapshot: string): boolean {
   if (!snapshot.trim()) return false;
-  if (SELECTION_CURSOR.test(snapshot)) return true;
-  // The footer is scanned across the WHOLE snapshot, intentionally — the same whole-snapshot scan
-  // SELECTION_CURSOR has always used, and it inherits that exact staleness profile (no worse). This
-  // is safe on both call paths: (a) ingest() tests one freshly-streamed line at a time, so a footer
-  // only ever matches as it arrives, never a stale one re-read from scrollback; (b) settle() tests
-  // the RENDERED viewport, where a live Ink picker is the bottom-most frame and its footer is
-  // cleared by the redraw when the menu is dismissed. A menu answered mid-turn also resumes the
-  // spinner, which routes to `working` before settle re-checks the screen. Bias here is toward RED
-  // (a blocked agent needs a human) — the founder-reported failure was the opposite, a false gray.
-  if (textHasPickerFooter(snapshot)) return true;
-  return SHELL_PROMPTS.some((re) => re.test(snapshot));
+  const lines = snapshot.replace(/\r/g, "\n").split("\n");
+
+  // ARM 1 — A PICKER FOOTER THAT IS STILL LIVE. Structural, never budgeted (see above). The
+  // discriminator is WHAT is below the footer, not HOW MUCH: persistent chrome means the dialog is
+  // still up, genuine new agent output means it has been answered. Same rule, same function, as
+  // `screenOffersAnswer` arm 1 and `isSessionLimitPicker`.
+  for (let i = 0; i < lines.length; i++) {
+    const span = pickerFooterSpan(lines, i);
+    // `i + span - 1` is footerLast: a footer that wrapped onto a second line must not have its own
+    // continuation counted as unrecognised content below it (roborev 61827).
+    if (span > 0 && nothingUnrecognizedBelowFooter(lines, i + span - 1)) return true;
+  }
+
+  const tail = tailContent(snapshot, LIVE_TAIL_LINES);
+  // ARM 2 — a cursored option row near the bottom, for a live menu whose footer we could not match.
+  if (tail.some(isCursoredOptionRow)) return true;
+  // ARM 3 — a bare shell prompt near the bottom. Per line, so prose or a file's contents scrolled up
+  // the grid ("Overwrite existing file? (y/n)" inside a diff) cannot arm the band.
+  return tail.some(isShellPrompt);
+}
+
+// Arms 2 and 3 are NAMED PREDICATES rather than inline arrow bodies so each is independently
+// mutable: `mutation-check --line` could not judge them inline (no comparison to invert, and
+// commenting out an `if`/`return` broke parsing), which meant neither arm could be honestly
+// claimed as covered. Both are now pinned per-site.
+function isCursoredOptionRow(line: string): boolean {
+  return SELECTION_CURSOR.test(line);
+}
+
+// `.filter(…).length > 0` rather than `.some(…)`: the nested arrow left no top-level expression for
+// `mutation-check --line` to mutate, so this arm could not be judged at all. The comparison gives it
+// one. Same meaning, and the arm is now pinned per-site like the other two.
+function isShellPrompt(line: string): boolean {
+  return SHELL_PROMPTS.filter((re) => re.test(line)).length > 0;
 }

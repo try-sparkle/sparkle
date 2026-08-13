@@ -28,6 +28,36 @@ export function expectedDotColor(status: AgentTabStatus): string {
   return asRgb(AGENT_STATUS[status].color);
 }
 
+/** THE COLOR A DISC IS PAINTED, whichever variant it is drawn in.
+ *
+ *  `StatusDot` has two: a FILL (this row is in that state) writes `background`, and a RING (a row
+ *  UNDER this one is, and this head stands in for it) writes an inset `box-shadow` over a
+ *  transparent background. Reading `.style.background` alone therefore answers `"transparent"` for
+ *  every rolled-up head — which is how adding the ring turned three green rollup guards red while
+ *  the behaviour they guard (a worker's red reaching its head) was completely intact.
+ *
+ *  So assertions about WHICH COLOR a row is showing go through this, and assertions about WHICH
+ *  VARIANT it is drawn in read `background`/`boxShadow` directly (see
+ *  AgentSidebar.rollupRing.test.tsx). Keeping those two questions apart is the point: a rollup test
+ *  should not fail because the fill style changed, and a ring test should not pass because the
+ *  color happens to match.
+ *
+ *  NORMALIZED TO `rgb()`, so every caller compares the same way — `expectedDotColor(status)` works
+ *  against a ring and a fill alike. jsdom normalizes `background` but leaves a `box-shadow` color as
+ *  authored, and leaving that asymmetry to callers is a trap in BOTH directions: a positive
+ *  assertion fails on form rather than value, and a NEGATIVE one (`not.toBe(...)`) passes
+ *  vacuously against `"transparent"` — which is worse, because it looks like a guard and is not.
+ *  A themed `var(--…)` has no resolvable value in jsdom and is returned as authored. */
+export function dotInk(el: HTMLElement): string {
+  const bg = el.style.background;
+  if (bg && bg !== "transparent") return bg;
+  // "inset 0 0 0 2.64px #e0533f" → "#e0533f" (or a var(--…) / rgb(…) form).
+  const shadow = el.style.boxShadow ?? "";
+  const m = shadow.match(/(#[0-9a-f]{3,8}|var\([^)]*\)|rgba?\([^)]*\))\s*$/i);
+  const ink = m?.[1] ?? bg;
+  return ink.startsWith("#") ? asRgb(ink) : ink;
+}
+
 /** Every `-webkit-` property `SparkleWordmark` actually sets. Widen it as more masked elements
  *  arrive — a union that admits what the components write is what keeps the next test from
  *  re-inlining the cast below. */

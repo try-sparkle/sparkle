@@ -2907,6 +2907,13 @@ export function AgentSidebar({
               isTabStop={a.id === tabStopId}
               dotColor={rollupOverrides ? ROLLUP_DOT_COLOR[rollup] : undefined}
               dotLabel={rollupOverrides ? rollupLabel(rollup) : undefined}
+              // A BORROWED RED IS DRAWN AS A RING, an own red as a fill. `rollupOverrides` already
+              // means "this disc is reporting the SUBTREE, not this row", so a red/orange under it
+              // is by construction a worker's, never the head's own — own-red short-circuits
+              // `rollupDot` before any worker is counted, which makes the bands agree and the
+              // override never fire. So no new state is consulted: this reads the same truth the
+              // color and the tooltip already read. See StatusDot's `variant`.
+              dotRing={rollupOverrides && (rollup === "red" || rollup === "orange")}
               alertControl={alertControl}
               onDismissAlert={() => dismissAlert(project.id, a.id, trueSt)}
               onReenableAlert={() => reenableAlert(project.id, a.id)}

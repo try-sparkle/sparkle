@@ -24,7 +24,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
-import { expectedDotColor, filterOn } from "./statusDotTestUtils";
+import { dotInk, expectedDotColor, filterOn } from "./statusDotTestUtils";
 
 function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentTab {
   return {
@@ -155,8 +155,8 @@ describe("AgentSidebar — a head row's color agrees with the concierge feed", (
     render(<AgentSidebar project={project} />);
     // a1 has no status of its own — it reads `stopped`, which is GRAY. Red here can only have come
     // from the worker overlay, so this asserts the overlay chain end-to-end at the render site.
-    expect(headDot()?.style.background).toBe(expectedDotColor("errored"));
-    expect(headDot()?.style.background).not.toBe(expectedDotColor("stopped"));
+    expect(dotInk(headDot()!)).toBe(expectedDotColor("errored"));
+    expect(dotInk(headDot()!)).not.toBe(expectedDotColor("stopped"));
     expect(filterOn(headRow())).toBe("");
   });
 
@@ -166,12 +166,12 @@ describe("AgentSidebar — a head row's color agrees with the concierge feed", (
     // CONTRAST CASE, not a guard — see the per-layer note above. Its job is to stop "always red"
     // from passing the case above: a working worker is not an ATTENTION signal and must not bubble
     // as one. That is what this test has always been for, and it still holds.
-    expect(headDot()?.style.background).not.toBe(expectedDotColor("errored"));
+    expect(dotInk(headDot()!)).not.toBe(expectedDotColor("errored"));
     // What changed is the calm end. This used to assert GRAY, because a1 has no status of its own
     // and so reads `stopped`. The head's disc now rolls its workers up (engine/workerRollup): a
     // subtree is folded by default, so painting this row gray said "nothing happening here" about
     // an orchestrator with live work under it. Working workers → green.
-    expect(headDot()?.style.background).toBe(expectedDotColor("working"));
+    expect(dotInk(headDot()!)).toBe(expectedDotColor("working"));
     expect(filterOn(headRow())).toBe("");
   });
 
@@ -180,7 +180,7 @@ describe("AgentSidebar — a head row's color agrees with the concierge feed", (
     render(<AgentSidebar project={project} />);
     // withUnstartedWorkerAttention synthesizes the red; a stranded worker that signalled nothing is
     // the failure this overlay exists for.
-    expect(headDot()?.style.background).toBe(expectedDotColor("errored"));
+    expect(dotInk(headDot()!)).toBe(expectedDotColor("errored"));
     expect(filterOn(headRow())).toBe("");
   });
 
@@ -209,7 +209,7 @@ describe("AgentSidebar — a head row's color agrees with the concierge feed", (
     } as never);
     render(<AgentSidebar project={project} />);
 
-    expect(headDot()?.style.background).toBe(expectedDotColor("stopped"));
-    expect(headDot()?.style.background).not.toBe(expectedDotColor("errored"));
+    expect(dotInk(headDot()!)).toBe(expectedDotColor("stopped"));
+    expect(dotInk(headDot()!)).not.toBe(expectedDotColor("errored"));
   });
 });

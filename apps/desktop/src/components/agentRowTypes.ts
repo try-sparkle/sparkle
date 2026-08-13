@@ -51,6 +51,9 @@ export type AgentRowProps = {
   isTabStop: boolean;
   dotColor?: string;
   dotLabel?: string;
+  /** Draw the leading disc as a RING rather than a fill: the color describes a row UNDER this one,
+   *  not this one. Set exactly where `dotColor` is — see StatusDot's `variant`. */
+  dotRing?: boolean;
   /** The alert toggle to show on this row's expanded card: "dismiss" (truly red, not dismissed),
    *  "reenable" (red-underneath but dismissed), or null (not red). Computed from the TRUE status. */
   alertControl: "dismiss" | "reenable" | null;
@@ -180,6 +183,7 @@ export function agentRowPropsEqual(prev: AgentRowProps, next: AgentRowProps): bo
     prev.isTabStop === next.isTabStop &&
     prev.dotColor === next.dotColor &&
     prev.dotLabel === next.dotLabel &&
+    prev.dotRing === next.dotRing &&
     prev.alertControl === next.alertControl &&
     prev.bs === next.bs &&
     prev.trackerStage === next.trackerStage &&

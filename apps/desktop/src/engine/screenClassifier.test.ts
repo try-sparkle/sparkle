@@ -13,6 +13,7 @@ import {
   ASK_USER_QUESTION_2_1_220,
   MODEL_PICKER_2_1_220,
   IDLE_AFTER_TURN_2_1_220,
+  PERSISTENT_CHROME_TAIL_2_1_220,
   NON_PICKER_HINT_LINES_2_1_220,
   OTHER_PICKER_FOOTERS_2_1_220,
   SESSION_LIMIT_PICKER,
@@ -922,5 +923,116 @@ describe("a split footer is a picker to every matcher, not just the option detec
 
   it("reads as awaiting input, not calm", () => {
     expect(screenAwaitsInput(SPLIT_PICKER)).toBe(true);
+  });
+});
+
+// ── AWAITING INPUT IS A CLAIM ABOUT THE BOTTOM OF THE GRID, NOT ABOUT ANYWHERE ON IT ─────────────
+//
+// THE FOUNDER'S REPORT (2026-08-12): essentially every row in the sidebar carried the red
+// "Needs you" dot, including agents spawned seconds earlier that were visibly executing. A live
+// `get_state` over 80 agents found 31 red rows of which at most 4 were addressed to a human; 27
+// read `status: "waiting"` while their own activity line said they were working ("Fast-forwarding
+// my parked branch to origin/main", "Running claude doctor health check").
+//
+// THE MECHANISM. `waiting` is claimed from `screenAwaitsInput`, and all three of its arms were
+// WHOLE-SNAPSHOT scans. So any agent whose viewport merely CONTAINED prompt-shaped text was red:
+// a dialog it had already answered and scrolled past, a `(y/n)` inside a file it read or a diff it
+// printed, its own prose quoting a menu. `engine/screenAnswerable` had already learned this exact
+// lesson for the `approval` band — "any `❯ 1. …` anywhere on the grid … satisfied them"
+// (screenAnswerable.ts:29-32, roborev 58159) — and bottom-anchored its arms. The band next door
+// never got the same treatment, and it is the one that paints 27 rows red.
+//
+// WHY THE FIX IS NOT A LINE BUDGET. `screenAnswerable` records that too: on a real grid the /model
+// picker's cursor sits 13 non-empty lines from the bottom, so a naive tail window REJECTS a live,
+// fully-visible dialog. The discriminator is STRUCTURAL — is this footer still live, i.e. is there
+// nothing unrecognized below it — with the bottom-anchored arms as fallbacks for a menu whose
+// footer could not be found. That keeps every captured live dialog above classifying TRUE.
+describe("screenAwaitsInput — prompt-shaped scrollback is not a live prompt", () => {
+  it("does not flag a dialog the agent already answered and scrolled past", () => {
+    // The captured approval dialog, then the agent's own output continuing below it. The `❯ 1. Yes`
+    // cursor and the real footer are both still ON the grid — they are simply no longer live.
+    const answered = [
+      APPROVAL_2_1_220,
+      "",
+      "⏺ Done — created probe_ok.txt.",
+      "",
+      ...Array.from({ length: 12 }, (_, i) => `  ⎿  wrote fixture-${i}.txt`),
+      "",
+      "✻ Churned for 2s",
+      PERSISTENT_CHROME_TAIL_2_1_220,
+    ].join("\n");
+    // Guard against a vacuous pass: the prompt shapes really are present in the snapshot.
+    expect(answered).toContain("❯ 1. Yes");
+    expect(answered).toContain("Esc to cancel · Tab to amend · ctrl+e to explain");
+    expect(screenAwaitsInput(answered)).toBe(false);
+  });
+
+  it("does not flag a shell prompt that has scrolled up the grid", () => {
+    const scrolled = [
+      "⏺ Running the installer.",
+      "  ⎿  $ ./install.sh",
+      "Overwrite existing file? (y/n) y",
+      "     installed 41 packages",
+      ...Array.from({ length: 14 }, (_, i) => `     linking module-${i}`),
+      "⏺ Install finished cleanly.",
+      PERSISTENT_CHROME_TAIL_2_1_220,
+    ].join("\n");
+    expect(scrolled).toContain("(y/n)"); // not vacuous
+    expect(screenAwaitsInput(scrolled)).toBe(false);
+  });
+
+  // ── THE RESIDUAL, PINNED SO NOBODY "FIXES" IT THE EXPENSIVE WAY ───────────────────────────────
+  //
+  // Bottom-anchoring removes SCROLLBACK false positives. It cannot remove a prompt-shaped line
+  // sitting at the very BOTTOM of the grid, because by text alone that is indistinguishable from a
+  // real prompt: an agent whose last output line is literally "Overwrite existing file? (y/n)" —
+  // reading this file, printing a diff of it — still reads as awaiting input.
+  //
+  // ⚠️ DO NOT close this by narrowing SHELL_PROMPTS. Arm 3 is what catches the prompt that follows a
+  // DESTRUCTIVE command, and this file's standing rule is that an unrecognized prompt (a blocked
+  // agent nobody is told about) is strictly worse than a false red. The honest fix is structural —
+  // telling a persistent status BAR from turn prose by shape, tracked in sparkle-7js2c — not a
+  // smaller vocabulary. This test states the boundary so the next reader knows it is known.
+  it("KNOWN RESIDUAL: a prompt-shaped line at the bottom of the grid still flags", () => {
+    const src = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "screenClassifier.ts"),
+      "utf8",
+    );
+    // Not vacuous: this source documents real prompt literals verbatim in its comments.
+    expect(src).toContain("Enter to select · ↑/↓ to navigate · Esc to cancel");
+    // The whole file scrolled past: everything prompt-shaped is far above the last screenful, so
+    // the scrollback arms are correctly quiet. This is the half bottom-anchoring DOES fix.
+    const scrolledPast = [src, ...Array.from({ length: 20 }, (_, i) => `⏺ line ${i}`)].join("\n");
+    expect(screenAwaitsInput(scrolledPast)).toBe(false);
+    // But a viewport that happens to END on one of those lines still reads as awaiting input.
+    expect(screenAwaitsInput("⏺ Reading the classifier.\nOverwrite existing file? (y/n)")).toBe(
+      true,
+    );
+  });
+
+  // ── THE OPPOSITE FAILURE, WHICH IS THE MORE EXPENSIVE ONE ──────────────────────────────────────
+  // Narrowing this predicate must never lose a real dialog. Every captured live screen keeps
+  // classifying TRUE, including with the five persistent chrome rows that render BELOW any live
+  // dialog — the composition `screenAnswerable` needs its structural walk for.
+  it("still flags every captured live dialog, including under the persistent chrome tail", () => {
+    for (const screen of [
+      APPROVAL_2_1_220,
+      APPROVAL_OPTION_2_2_1_220,
+      ASK_USER_QUESTION_2_1_220,
+      MODEL_PICKER_2_1_220,
+      SESSION_LIMIT_PICKER,
+    ]) {
+      expect(screenAwaitsInput(screen), `live dialog must still flag:\n${screen}`).toBe(true);
+      const withChrome = [screen, PERSISTENT_CHROME_TAIL_2_1_220].join("\n");
+      expect(
+        screenAwaitsInput(withChrome),
+        `live dialog under chrome must still flag:\n${withChrome}`,
+      ).toBe(true);
+    }
+  });
+
+  it("still flags a bare shell prompt sitting at the bottom of the grid", () => {
+    expect(screenAwaitsInput("$ ./configure\nOverwrite existing file? (y/n)")).toBe(true);
+    expect(screenAwaitsInput("Enter passphrase for key '/Users/me/.ssh/id_ed25519':")).toBe(true);
   });
 });

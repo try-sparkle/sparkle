@@ -23,7 +23,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
 import { C } from "../theme/colors";
-import { asRgb } from "./statusDotTestUtils";
+import { asRgb, dotInk } from "./statusDotTestUtils";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -450,10 +450,14 @@ describe("Build column — the head's disc rolls up its workers", () => {
   const dotFor = (name: string) =>
     rowFor(name).querySelector<HTMLElement>('span[title]')!;
 
+  // BORROWED RED, so the disc is a RING (transparent fill + inset shadow) rather than a fill —
+  // `dotInk` reads the color out of whichever variant is drawn. What this guards is that the
+  // worker's red REACHES the head at all; which variant draws it is pinned separately, in
+  // AgentSidebar.rollupRing.test.tsx.
   it("paints a head with a red worker RED, though the head itself is calm", () => {
     const project = seed({ a1: "idle", w1: "blocked", w2: "idle" });
     render(<AgentSidebar project={project} />);
-    expect(dotFor("Alpha").style.background).toBe(asRgb(AGENT_STATUS.waiting.color));
+    expect(dotInk(dotFor("Alpha"))).toBe(asRgb(AGENT_STATUS.waiting.color));
   });
 
   it("paints a head with only working workers GREEN", () => {
@@ -467,7 +471,7 @@ describe("Build column — the head's disc rolls up its workers", () => {
   it("paints a head with BOTH a running and a red worker orange", () => {
     const project = seed({ a1: "idle", w1: "working", w2: "waiting" });
     render(<AgentSidebar project={project} />);
-    expect(dotFor("Alpha").style.background).toBe("var(--c-mixed-ink)");
+    expect(dotInk(dotFor("Alpha"))).toBe("var(--c-mixed-ink)");
   });
 
   it("leaves a childless row reading its own status", () => {
@@ -951,7 +955,7 @@ describe("Build column — the rollup's exceptions are actually wired up", () =>
   it("a working head with a WAITING worker still goes orange", () => {
     const project = seed({ a1: "working", w1: "waiting", w2: "working" });
     render(<AgentSidebar project={project} />);
-    expect(dotFor("Alpha").style.background).toBe("var(--c-mixed-ink)");
+    expect(dotInk(dotFor("Alpha"))).toBe("var(--c-mixed-ink)");
   });
 });
 

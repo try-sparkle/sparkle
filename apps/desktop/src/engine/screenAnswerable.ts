@@ -18,6 +18,8 @@ import {
   SELECTION_CURSOR,
   SHELL_PROMPTS,
   nothingUnrecognizedBelowFooter,
+  LIVE_TAIL_LINES,
+  tailContent,
 } from "./screenClassifier";
 import {
   RENDERED_OPTION_ROW,
@@ -30,7 +32,14 @@ import {
 // anywhere on the grid — the agent's own prose quoting a menu, an already-answered dialog still
 // visible, a typed line — satisfied them. `isSessionLimitPicker` learned this exact lesson and now
 // tests per option row (roborev 58159); re-adopting the rejected form re-opened the hole.
-const LIVE_TAIL_LINES = 12;
+//
+// ⚠️ `LIVE_TAIL_LINES` and `tailContent` MOVED TO screenClassifier (2026-08-12) and are imported
+// above rather than defined here. `screenAwaitsInput` — the predicate that gates the RED `waiting`
+// band — was still the rejected whole-snapshot form, which is what painted 27 working agents red on
+// the founder's fleet. Fixing it meant it needed this same notion of "live", and a second copy of a
+// definition these two must agree on is exactly the drift this family keeps paying for. The
+// direction is forced: screenAnswerable already depends on screenClassifier, so the shared
+// definition cannot live here without an import cycle.
 
 // A NOTE ON WHAT THIS DELIBERATELY DOES NOT DO — an accepted residual, not an oversight.
 //
@@ -54,14 +63,6 @@ const LIVE_TAIL_LINES = 12;
 // finds nothing to parse there. Fixing the residual properly means separating a persistent status
 // BAR from turn prose by shape, which belongs in AMBIENT_CHROME_LINE and its Rust twin, not in a
 // call-site denylist. Tracked in sparkle-7js2c.
-
-function tailContent(snapshot: string, n: number): string[] {
-  return snapshot
-    .replace(/\r/g, "\n")
-    .split("\n")
-    .filter((l) => l.trim().length > 0)
-    .slice(-n);
-}
 
 /**
  * True when the screen offers the human a keystroke that answers it.

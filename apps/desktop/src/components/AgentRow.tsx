@@ -123,6 +123,7 @@ export const AgentRow = memo(function AgentRow({
   isTabStop,
   dotColor,
   dotLabel,
+  dotRing,
   alertControl,
   onDismissAlert,
   onReenableAlert,
@@ -1489,6 +1490,7 @@ export const AgentRow = memo(function AgentRow({
               status={st}
               size={DOT_SIZE}
               color={dotColor}
+              variant={dotRing ? "ring" : "fill"}
               label={dotLabel ?? (founderAsk ? FOUNDER_ASK_LABEL[founderAsk] : undefined)}
             />
           )}
