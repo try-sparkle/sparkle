@@ -218,3 +218,211 @@ export const NON_PICKER_HINT_LINES_2_1_220 = [
   "Connect Claude to your IDE · /ide",
   " ⚠ 1 MCP server needs authentication · run /mcp",
 ];
+
+// ══ CAPTURED FROM CLAUDE CODE 2.1.231 ═══════════════════════════════════════════════════════════
+// Everything above was captured at 2.1.220/2.2.1, where the composer is only ever EMPTY. These four
+// were captured the same way (a real pty stream replayed through `@xterm/headless` and this repo's
+// own `snapshotScreen`) to cover the composer WITH CONTENT, plus the two full-screen apps the guard
+// exists to refuse. See `claudeCodeScreen.composerBody.test.ts`.
+/** A LIVE Claude Code 2.1.231 whose composer HOLDS AN UNSUBMITTED MESSAGE that wrapped onto a
+ *  second row — the exact production shape behind bead sparkle-v7k3y's third occurrence.
+ *
+ *  Captured by replaying a real `claude` pty stream through `@xterm/headless` and this repo's own
+ *  `snapshotScreen`, not hand-written. THE POINT: the composer box here is FOUR rows —
+ *
+ *      ──────────…──────────      the opening rule
+ *      ❯ Please give me an update on where you are with the alternate screen investigation, …
+ *        open yet and what is still outstanding before it can land on main.
+ *      ──────────…──────────      the closing rule
+ *
+ *  — because Claude Code soft-wraps the composer's own contents. Every screen captured at 2.1.220
+ *  has an EMPTY composer, so it is always the tight rule/❯/rule sandwich, and `hasComposerBox` was
+ *  written to that. This is the same affordance with a message in it. */
+export const CLAUDE_COMPOSER_WRAPPED_TEXT_2_1_231 = [
+  "",
+  " ▐▛███▜▌   Claude Code v2.1.231",
+  "▝▜█████▛▘  Opus 5 (1M context) · Claude Max",
+  "  ▘▘ ▝▝    ~/…/worktrees/ed5d0ece-8a38-4649-9f7c-0ab6203a7467/fbe6b1ec-0d5c-48a6-848d-8a80be3d8765",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "                                                                                                       ● high · /effort",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ Please give me an update on where you are with the alternate screen investigation, and let me know whether the PR is",
+  "  open yet and what is still outstanding before it can land on main.",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+].join("\n");
+
+/** The same 2.1.231 composer holding a SHORT unsubmitted message — one that fits on one row.
+ *  Claude Code still reserves a blank row beneath it, so the box is four rows rather than three:
+ *
+ *      ──────────…──────────
+ *      ❯ Think carefully then explain backpropagation in exactly 3 sentences.
+ *                                  ← reserved, blank
+ *      ──────────…──────────
+ *
+ *  Kept ALONGSIDE the wrapped case because the two interior shapes differ — a blank row and a
+ *  continuation row — and a fix that handled only one of them would leave the other refused. */
+export const CLAUDE_COMPOSER_PADDED_TEXT_2_1_231 = [
+  "",
+  " ▐▛███▜▌   Claude Code v2.1.231",
+  "▝▜█████▛▘  Opus 5 (1M context) · Claude Max",
+  "  ▘▘ ▝▝    ~/…/worktrees/ed5d0ece-8a38-4649-9f7c-0ab6203a7467/fbe6b1ec-0d5c-48a6-848d-8a80be3d8765",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ Think carefully then explain backpropagation in exactly 3 sentences.",
+  "",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+].join("\n");
+
+/** A REAL `vim` session, captured from a pty exactly like the Claude Code screens above.
+ *  This is the screen the alternate-screen guard EXISTS to refuse: typed text here runs as
+ *  normal-mode commands. It must never satisfy `isClaudeCodeScreen`. */
+export const VIM_ON_A_MARKDOWN_FILE = [
+  "<!-- BEGIN:nextjs-agent-rules -->",
+  "# This is NOT the Next.js you know",
+  "",
+  "This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.",
+  "<!-- END:nextjs-agent-rules -->",
+  "",
+  "# Parallelize aggressively — time is the only scarce resource",
+  "",
+  "**Optimize for wall-clock time, not token or compute spend.** Burning 10× the tokens to finish in a",
+  "fifth of the time is a win, every time — treat compute as free and time as the only thing you can't",
+  "get back. This is the founder's explicit priority.",
+  "",
+  "**Fan out by default; serial is the exception you must justify.** The moment work splits into",
+  "independent units, spawn a concurrent agent for each — one per unit, immediately. Do not do N",
+  "independent things yourself in sequence when N agents could do them at once. Do not \"spin up a few",
+  "and wait to see how it goes\" — **saturate the whole independent backlog in one move.** When you are",
+  "unsure whether to spawn, spawn. There is no such thing as too many agents while they are on",
+  "independent work.",
+  "",
+  "The **only two** reasons to hold back — both real, neither about cost:",
+  "",
+  "- **File collision.** Two units editing the same file(s) produce conflicts and duplicated work — the",
+  "  most expensive recurring failure in this repo. Scope each agent to a **disjoint** set of files, or",
+  "  sequence only the overlapping pair. Never idle the rest of the fleet for a clash that involves just",
+  "  two of them.",
+  "- **Shared-resource contention.** Parallel agents collide on shared state; two rules make it vanish.",
+  "  **(1)** Give each agent its **own** fresh worktree — `git worktree add -b <name> <path> origin/main`",
+  "  — **on a named branch, never `--detach`.** A detached HEAD is a ref-less checkout, so its commits",
+  "\"AGENTS.md\" 1061L, 78092B",
+].join("\n");
+
+/** A REAL `less` session on the same file. The adversarial case this module's header names: the
+ *  document being paged is AGENTS.md, which QUOTES Claude Code's own chrome — so a content
+ *  heuristic that keyed on wording alone could be fooled by it. It must stay refused. */
+export const LESS_ON_A_MARKDOWN_FILE = [
+  "<!-- BEGIN:nextjs-agent-rules -->",
+  "# This is NOT the Next.js you know",
+  "",
+  "This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.",
+  "<!-- END:nextjs-agent-rules -->",
+  "",
+  "# Parallelize aggressively — time is the only scarce resource",
+  "",
+  "**Optimize for wall-clock time, not token or compute spend.** Burning 10× the tokens to finish in a",
+  "fifth of the time is a win, every time — treat compute as free and time as the only thing you can't",
+  "get back. This is the founder's explicit priority.",
+  "",
+  "**Fan out by default; serial is the exception you must justify.** The moment work splits into",
+  "independent units, spawn a concurrent agent for each — one per unit, immediately. Do not do N",
+  "independent things yourself in sequence when N agents could do them at once. Do not \"spin up a few",
+  "and wait to see how it goes\" — **saturate the whole independent backlog in one move.** When you are",
+  "unsure whether to spawn, spawn. There is no such thing as too many agents while they are on",
+  "independent work.",
+  "",
+  "The **only two** reasons to hold back — both real, neither about cost:",
+  "",
+  "- **File collision.** Two units editing the same file(s) produce conflicts and duplicated work — the",
+  "  most expensive recurring failure in this repo. Scope each agent to a **disjoint** set of files, or",
+  "  sequence only the overlapping pair. Never idle the rest of the fleet for a clash that involves just",
+  "  two of them.",
+  "- **Shared-resource contention.** Parallel agents collide on shared state; two rules make it vanish.",
+  "  **(1)** Give each agent its **own** fresh worktree — `git worktree add -b <name> <path> origin/main`",
+  "  — **on a named branch, never `--detach`.** A detached HEAD is a ref-less checkout, so its commits",
+  "AGENTS.md",
+].join("\n");
+
+
+/** A LIVE Claude Code 2.1.231 holding a PASTED message that has not been submitted — the state
+ *  `services/conciergeDispatch` itself creates when a paste lands and the submit does not.
+ *
+ *  TWO THINGS MAKE THIS ITS OWN FIXTURE. The composer body is four rows (so it needs the bounded
+ *  body `hasComposerBox` grew), AND the persistent chrome bar is GONE: Claude Code replaces it with
+ *  the transient `paste again to expand` hint. That left the composer box as the ONLY family on a
+ *  screen that is unmistakably Claude Code, so the mandatory-box-plus-one-corroborator rule failed
+ *  at `>= 2` and the screen was refused `alternate-screen` anyway — the original defect surviving
+ *  its own fix, one condition further down. */
+export const CLAUDE_COMPOSER_PASTED_TEXT_2_1_231 = [
+  "",
+  " ▐▛███▜▌   Claude Code v2.1.231",
+  "▝▜█████▛▘  Opus 5 (1M context) · Claude Max",
+  "  ▘▘ ▝▝    ~/…/worktrees/ed5d0ece-8a38-4649-9f7c-0ab6203a7467/fbe6b1ec-0d5c-48a6-848d-8a80be3d8765",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "",
+  "                                                                                                       ● high · /effort",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ [Pasted text #1]found, what you changed, which tests you added, whether the PR is open, what CI says, and what",
+  "  remains outstanding before it can land on main. Please give me a detailed update on the alternate screen",
+  "  investigation including what you found, what you changed, which tests you added, whether the PR is open, what CI",
+  "  says, and what remains outstanding before it can land on main.",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  paste again to expand",
+].join("\n");

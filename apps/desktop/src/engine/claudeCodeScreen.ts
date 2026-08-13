@@ -92,6 +92,21 @@ const CHROME_BAR: RegExp[] = [
   /\bmanual mode on\b/i,
   /\btranscript saving is off\b/i,
   /\bclaude is using your computer\b/i,
+  // ── THE PASTE HINT, WHICH REPLACES THE BAR ABOVE RATHER THAN JOINING IT ──────────────────────
+  // Captured in CLAUDE_COMPOSER_PASTED_TEXT_2_1_231. When a paste lands in the composer, Claude
+  // Code swaps the persistent chrome line for this hint. Without it, a pasted-and-unsubmitted
+  // message leaves the composer box as the ONLY family on the screen and `isClaudeCodeScreen`'s
+  // `>= 2` fails — on precisely the state `services/conciergeDispatch` creates when its own paste
+  // does not submit. It is an Ink affordance with no reason to appear in a document a pager shows.
+  //
+  // THE SIBLING MARKER `[Pasted text #N]` IS DELIBERATELY *NOT* HERE (roborev 63610, Medium). It
+  // was, and that was a hole: Claude Code renders it INSIDE the box, on the prompt line itself, so
+  // counting it here collapses family C into family D — the precise weakening
+  // `claudeCodeMarkerFamilies`' own doc warns about, where `>= 2` is satisfied by a single marker.
+  // A pager showing a document that QUOTES a composer capture (a rule, `❯ [Pasted text #1] …`, a
+  // closing rule) would then score 2 and be written into. This hint sits BELOW the closing rule,
+  // which is what makes it independent evidence rather than box content.
+  /\bpaste again to expand\b/i,
 ];
 
 /** ══ FAMILY D — THE COMPOSER BOX ════════════════════════════════════════════════════════════════
@@ -170,13 +185,119 @@ function hasLiveDialog(lines: readonly string[]): boolean {
   return false;
 }
 
+/** ── THE COMPOSER HAS A BODY, AND IT IS USUALLY WHY THE BOX IS NOT THREE ROWS ────────────────────
+ *  THE DEFECT THIS CLOSES (bead sparkle-v7k3y, third occurrence). This function used to require the
+ *  box to be exactly three CONSECUTIVE rows — rule, prompt, rule. That is the shape of an EMPTY
+ *  composer, and an empty composer is the only one any 2.1.220 capture in `capturedScreens.fixture`
+ *  contains, so the entire suite was green against a predicate that could not recognise an input box
+ *  with a MESSAGE in it.
+ *
+ *  A composer holding text is four or more rows, in two shapes both captured at 2.1.231:
+ *
+ *      ──────────…──────────              ──────────…──────────
+ *      ❯ a message long enough to wrap    ❯ a short message
+ *        onto a second row                                        ← a reserved blank row
+ *      ──────────…──────────              ──────────…──────────
+ *
+ *  Family D is MANDATORY in `isClaudeCodeScreen`, so this made an agent UNRECOGNISABLE the moment
+ *  anything was typed into it and left unsubmitted — a state THIS APP CREATES, via
+ *  `services/conciergeDispatch` and the nudger. Every later write was refused `alternate-screen`,
+ *  the auto-resume escalated after three failed reaches, and the agent stranded.
+ *
+ *  ── WHY THE BOUND, AND WHY IT IS NOT "ANY TWO RULES" ──────────────────────────────────────────
+ *  The body is bounded because an unbounded one is not a box at all: any full-width rule near the
+ *  top of a document, a `❯` line after it, and any second rule anywhere below would match, which is
+ *  an ordinary page in a pager. A rule INSIDE the body also terminates it — Claude Code does not
+ *  draw a full-width rule inside its own input box, so the first rule after the prompt is the
+ *  closing one.
+ *
+ *  This widens family D rather than weakening the corroboration rule above it: a screen without a
+ *  live dialog still needs the box PLUS one other Claude Code family, so a document that merely
+ *  happens to form this shape does not clear `isClaudeCodeScreen` on its own. */
+const MAX_COMPOSER_BODY_ROWS = 24;
+
+/** ── THE BODY IS SHAPED, NOT MERELY BOUNDED (roborev 63601, Medium) ────────────────────────────
+ *  A length cap alone is not enough, and the first cut of this fix had only that. "Any rule, a
+ *  prompt, then ANY rows, then any rule" is a shape ordinary documents DO produce — a boxed shell
+ *  transcript is literally `────…` / `❯ some command` / a few output rows / `────…`. Family D is
+ *  this module's only proof of a LIVE TUI, so widening it that far would have let a pager clear the
+ *  bar it exists to hold.
+ *
+ *  The captured screens say what the body actually looks like, and it is narrow: EVERY body row in
+ *  `CLAUDE_COMPOSER_WRAPPED_TEXT_2_1_231`, `..._PADDED_TEXT_...` and `..._PASTED_TEXT_...` is either
+ *  blank (the reserved row) or a leading-whitespace CONTINUATION of the prompt line. Claude Code
+ *  indents the wrap; it never puts left-aligned text inside its own input box. Requiring that is
+ *  what keeps the transcript above out, because command OUTPUT is flush left.
+ *
+ *  The row cap stays as a second, independent bound — a runaway scan is not something to leave to
+ *  the shape rule — but it is no longer the only thing standing between a pager and a write. */
+const CONTINUATION_ROW = /^\s+\S/;
+const BLANK_ROW = /^\s*$/;
+
+/** Is `line` a legal row INSIDE the bare-rule composer? */
+function isComposerBodyRow(line: string): boolean {
+  return BLANK_ROW.test(line) || CONTINUATION_ROW.test(line);
+}
+
+/** ── THE ROUNDED ARM GETS A REAL SHAPE TOO, AND A SMALLER BOUND (roborev 63623/63626) ──────────
+ *  The first cut of this used `/^\s*[│|]/`, which FILTERS NOTHING: everything drawn between `╭…╮`
+ *  and `╰…╯` starts with a side border by construction, so the rounded arm inherited the 12 → 24
+ *  widening on a justification ("shape, not length, bounds false positives") that did not apply to
+ *  it. A bordered TUI panel, or a document quoting a rounded-box composer, would have cleared
+ *  family D over twice the previous window with nothing given back.
+ *
+ *  So the border must be followed by PADDING or an INDENTED continuation — the same distinction the
+ *  bare-rule arm draws, which is what keeps flush-left command output out.
+ *
+ *  ── AND ITS BOUND STAYS AT 12, DELIBERATELY ──────────────────────────────────────────────────
+ *  Every rounded-box screen this repo has captured is the tight three-row EMPTY composer, so unlike
+ *  the bare-rule arm there is no capture showing what a rounded body actually looks like. The
+ *  indent rule below is therefore reasoned, not measured, and a bound raised on reasoning alone is
+ *  exactly what this review caught. If the guess is wrong the cost is a false NEGATIVE — one
+ *  refusal, which is the behaviour shipping today — whereas a false positive is text pasted AND
+ *  submitted into a pager. Re-measure against a real rounded-box build before widening it. */
+const MAX_BOX_BODY_ROWS = 12;
+
+/** Is `line` a legal row inside the ROUNDED box? Border, then padding or an indented continuation. */
+function isBoxBodyRow(line: string): boolean {
+  return BLANK_ROW.test(line) || /^\s*[│|]\s*$/.test(line) || /^\s*[│|]\s{2,}\S/.test(line);
+}
+
+/**
+ * Does a closing rule follow `promptIdx` within the body bound, with every intervening row a legal
+ * body row? A row that is neither the closing rule nor legal body ENDS the search — the box is not
+ * a window to hunt in, it is a contiguous structure.
+ */
+function closesWithinBody(
+  lines: readonly string[],
+  promptIdx: number,
+  isRule: (line: string) => boolean,
+  isBody: (line: string) => boolean,
+  maxBodyRows: number,
+): boolean {
+  const last = Math.min(promptIdx + 1 + maxBodyRows, lines.length - 1);
+  for (let j = promptIdx + 1; j <= last; j += 1) {
+    const line = lines[j] ?? "";
+    if (isRule(line)) return true;
+    if (!isBody(line)) return false;
+  }
+  return false;
+}
+
 function hasComposerBox(lines: readonly string[]): boolean {
   for (let i = 0; i + 2 < lines.length; i += 1) {
     const top = lines[i] ?? "";
     const mid = lines[i + 1] ?? "";
-    const bottom = lines[i + 2] ?? "";
-    if (RULE_LINE.test(top) && PROMPT_LINE.test(mid) && RULE_LINE.test(bottom)) return true;
-    if (BOX_TOP.test(top) && BOX_PROMPT.test(mid) && BOX_BOTTOM.test(bottom)) return true;
+    if (RULE_LINE.test(top) && PROMPT_LINE.test(mid)) {
+      const rule = (l: string) => RULE_LINE.test(l);
+      if (closesWithinBody(lines, i + 1, rule, isComposerBodyRow, MAX_COMPOSER_BODY_ROWS)) {
+        return true;
+      }
+    }
+    if (BOX_TOP.test(top) && BOX_PROMPT.test(mid)) {
+      const bottom = (l: string) => BOX_BOTTOM.test(l);
+      if (closesWithinBody(lines, i + 1, bottom, isBoxBodyRow, MAX_BOX_BODY_ROWS)) return true;
+    }
   }
   return false;
 }
