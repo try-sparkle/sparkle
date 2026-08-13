@@ -1257,31 +1257,34 @@ pub fn dry_run_args<I: IntoIterator<Item = String>>(args: I) -> Option<DryRunArg
 /// migration untouched is not something a diagnostic should be able to mint.
 pub fn dry_run(args: &DryRunArgs) -> String {
     let app_data = args.app_data.clone().or_else(default_app_data_dir);
-    let state = app_data.as_deref().map(load_state);
-    // The REPORTER's window when `--days` is absent, not this module's default constant.
-    let days = args
-        .days
-        .unwrap_or_else(|| state.as_ref().map_or(DEFAULT_REPORT_DAYS, |s| s.window()));
     // The one line this function's seam leaves untested (`dry_run_over` is what the tests drive).
     // `transcript_roots` has its own coverage in spend.rs — including the account-store ordering
     // this feature exists for — so the untested surface here is the call, not the behavior.
     let roots = crate::spend::transcript_roots(app_data.as_deref());
-    dry_run_over(app_data.as_deref(), state.as_ref(), days, &roots)
+    dry_run_over(args, app_data.as_deref(), &roots)
 }
 
-/// [`dry_run`] with the scan roots handed in.
+/// [`dry_run`] with ONLY the scan roots handed in.
 ///
 /// Split out for the same reason `spend::scan_window` is: without it the only way to exercise this
 /// is to scan whatever `$HOME/.claude` the machine happens to have — 3,697 project directories on
 /// the machine this was written on. That makes the test slow, machine-dependent, and quietly
 /// dependent on the tester's own `CLAUDE_CONFIG_DIR`, which is the exact contamination the
 /// `warning` field below exists to flag.
-fn dry_run_over(
-    app_data: Option<&Path>,
-    state: Option<&BuilderIndexState>,
-    days: u32,
-    roots: &[PathBuf],
-) -> String {
+///
+/// THE SEAM IS DELIBERATELY CUT BELOW `load_state` AND THE DAY RESOLUTION (roborev 62729). An
+/// earlier cut took the already-loaded state and the already-resolved `days` as parameters, which
+/// left both behaviors the tests claim to guard on the untested side of it: the "writes nothing"
+/// assertion ran against a function that provably never opens the state file, and the
+/// `--days`-defers-to-`report_days` test asserted a value it had itself passed in. Everything
+/// this function's tests assert on must therefore be computed HERE, not by the caller.
+fn dry_run_over(args: &DryRunArgs, app_data: Option<&Path>, roots: &[PathBuf]) -> String {
+    let state = app_data.map(load_state);
+    // The REPORTER's window when `--days` is absent, not this module's default constant.
+    let days = args
+        .days
+        .unwrap_or_else(|| state.as_ref().map_or(DEFAULT_REPORT_DAYS, |s| s.window()));
+    let state = state.as_ref();
     let scan = crate::spend::scan_window(roots, days);
     let data = rollup(scan.records(), scan.today, days);
     let session_stats = rollup_activity(&scan.activity(), scan.truncated, days, scan.today);
@@ -3602,15 +3605,30 @@ mod tests {
     fn a_dry_run_with_no_days_flag_uses_the_reporters_persisted_window() {
         // The finding this fixes: it used to print DEFAULT_REPORT_DAYS regardless, so a machine
         // configured for a 14-day window was shown 7 days of usage labelled as what it reports.
+        // The resolution has to happen INSIDE the function under test — passing in an
+        // already-resolved `days` would make `window_days == 14` true by construction and the
+        // assertion would hold against the buggy code too (roborev 62729).
+        let window_days = |days: Option<u32>, app_data: &Path| -> serde_json::Value {
+            let args = DryRunArgs { days, app_data: None };
+            let out = dry_run_over(&args, Some(app_data), &[]);
+            serde_json::from_str::<serde_json::Value>(&out).unwrap()["window_days"].clone()
+        };
+
         let tmp = tempfile::tempdir().unwrap();
-        let state = BuilderIndexState { report_days: 14, ..Default::default() };
-        save_state(tmp.path(), &state).unwrap();
-        let out = dry_run_over(Some(tmp.path()), Some(&state), state.window(), &[]);
-        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["window_days"], 14);
-        // ...and `window()` is what resolves it, so the two surfaces cannot drift apart.
-        assert_eq!(state.window(), 14);
-        assert_eq!(BuilderIndexState::default().window(), DEFAULT_REPORT_DAYS);
+        save_state(tmp.path(), &BuilderIndexState { report_days: 14, ..Default::default() })
+            .unwrap();
+        // No `--days` ⇒ the persisted 14, read off disk by the function itself.
+        assert_eq!(window_days(None, tmp.path()), 14);
+        // An explicit `--days` still wins over the persisted window.
+        assert_eq!(window_days(Some(28), tmp.path()), 28);
+
+        // No state file at all ⇒ the module default, not a panic and not 0.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(window_days(None, empty.path()), DEFAULT_REPORT_DAYS);
+        // ...and no app_data at all takes the same default.
+        let args = DryRunArgs { days: None, app_data: None };
+        let v: serde_json::Value = serde_json::from_str(&dry_run_over(&args, None, &[])).unwrap();
+        assert_eq!(v["window_days"], DEFAULT_REPORT_DAYS);
     }
 
     #[test]
@@ -3619,8 +3637,12 @@ mod tests {
         // without posting — and both of these fields fail SILENTLY on the wire (a wrong team files
         // the history under a group nobody reads; a wrong version is answered 200 and discarded).
         let tmp = tempfile::tempdir().unwrap();
+        // The state is written to disk rather than injected: `dry_run_over` opens it itself
+        // (roborev 62729), so an injected struct would assert on a value the test supplied.
         let read = |state: &BuilderIndexState| -> serde_json::Value {
-            serde_json::from_str(&dry_run_over(Some(tmp.path()), Some(state), 7, &[])).unwrap()
+            save_state(tmp.path(), state).unwrap();
+            let args = DryRunArgs { days: Some(7), app_data: None };
+            serde_json::from_str(&dry_run_over(&args, Some(tmp.path()), &[])).unwrap()
         };
 
         let v = read(&BuilderIndexState { team: "  Chief  ".into(), ..Default::default() });
@@ -3648,7 +3670,8 @@ mod tests {
         let b = tmp.path().join("root-b");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let out = dry_run_over(Some(tmp.path()), None, 7, &[a.clone(), b.clone()]);
+        let args = DryRunArgs { days: Some(7), app_data: None };
+        let out = dry_run_over(&args, Some(tmp.path()), &[a.clone(), b.clone()]);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let roots: Vec<String> =
             serde_json::from_value(v["roots"].clone()).expect("roots must be a string list");
@@ -3785,12 +3808,28 @@ mod tests {
             team: "Chief".into(),
         };
         save_state(tmp.path(), &before).unwrap();
+        // Then plant a forward-compatible key that `load_state` DROPS, so that even a faithful
+        // round-trip rewrite changes the bytes. Without it the comparison below cannot fail:
+        // re-saving the state just loaded produces a byte-identical file, so a `save_state`
+        // creeping into the dry-run path would go unnoticed — confirmed by mutation, which added
+        // exactly that write and left the whole suite green.
+        {
+            let p = state_path(tmp.path());
+            let mut v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap();
+            v["a_key_a_future_version_added"] = serde_json::json!("must survive a dry run");
+            std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+        }
         let raw_before = std::fs::read(state_path(tmp.path())).unwrap();
 
-        // Empty roots on purpose: `dry_run` proper resolves them from `$HOME/.claude`, and a test
-        // that scanned the tester's real 3,697-project store would be slow, machine-dependent, and
-        // silently sensitive to whether the tester's own CLAUDE_CONFIG_DIR happened to be set.
-        let out = dry_run_over(Some(tmp.path()), Some(&before), 7, &[]);
+        // Empty ROOTS on purpose, but a real `app_data`: `dry_run` proper resolves roots from
+        // `$HOME/.claude`, and a test that scanned the tester's real 3,697-project store would be
+        // slow, machine-dependent, and silently sensitive to whether the tester's own
+        // CLAUDE_CONFIG_DIR happened to be set. The state file is NOT injected — the function
+        // opens it itself, which is the only way "it wrote nothing" and "it printed the id it
+        // READ" can fail if the wiring regresses (roborev 62729).
+        let args = DryRunArgs { days: None, app_data: None };
+        let out = dry_run_over(&args, Some(tmp.path()), &[]);
 
         assert_eq!(
             std::fs::read(state_path(tmp.path())).unwrap(),
@@ -3799,10 +3838,12 @@ mod tests {
         );
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["posted"], false);
-        // It reports the PINNED id it read — never a freshly derived one.
+        // It reports the PINNED id it read off disk — never a freshly derived one.
         assert_eq!(v["client_id"], "pinned-id-do-not-mint-a-new-one");
         assert_eq!(v["username"], "DROdio");
-        assert_eq!(v["window_days"], 7);
+        // `report_days: 0` is the "never configured" sentinel, so the window resolves to the
+        // module default rather than a zero-day scan.
+        assert_eq!(v["window_days"], DEFAULT_REPORT_DAYS);
         // The parity comparison is read off these two, so they have to be present even when the
         // scan found nothing.
         assert!(v["totals"]["totalTokens"].is_number(), "{out}");
