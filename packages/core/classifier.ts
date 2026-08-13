@@ -61,7 +61,9 @@ const NEGATION_BEFORE =
 // --- CAUTION: queue for next app open ---
 const CAUTION: RegExp[] = [
   /git push/i,
-  /deploy.*staging/i,
+  // `deploy … staging` is NOT here — it is `deployStagingIndex` below. As a regex it was
+  // `/deploy.*staging/i`, which is QUADRATIC on the full line this battery is deliberately
+  // scanned against, and it froze the app. See that function for the measurement.
   /ALTER TABLE|CREATE TABLE/i,
   // Destructive SQL by its distinctive multi-word syntax — catches `DELETE FROM x`,
   // `TRUNCATE TABLE x`, `INSERT INTO x`, `UPDATE x SET …` issued inside a live psql/mysql
@@ -118,6 +120,57 @@ function matchIndex(line: string, patterns: RegExp[]): number {
     if (m && (best === -1 || m.index < best)) best = m.index;
   }
   return best;
+}
+
+/** CAUTION's `deploy … staging` rule, in LINEAR time. Returns the index of the `deploy` that
+ *  starts the match, or -1.
+ *
+ *  ── WHY THIS IS NOT A REGEX ──────────────────────────────────────────────────────────────────
+ *  It used to be `/deploy.*staging/i` inside `CAUTION`. That is QUADRATIC, and CAUTION is scanned
+ *  against the FULL untruncated line on purpose (see `classifyLine`), so there was no length bound
+ *  to save it. For each `deploy` the greedy `.*` runs to end-of-line and backtracks hunting
+ *  `staging`; with k occurrences of `deploy` in a line of length n that is O(k·n).
+ *
+ *  Measured on a warmed JIT, one line, no `staging` present:
+ *      1,700 chars →     0.14 ms
+ *      6,800 chars →     2.72 ms
+ *     27,200 chars →   217.71 ms
+ *    108,800 chars → 3,977.15 ms      ← the whole UI is frozen for four seconds
+ *
+ *  This ran on the renderer's main thread for every line of every pty chunk of every pane, and a
+ *  long line carrying `deploy` but not `staging` is the ORDINARY shape of a deployment/CI log —
+ *  the two controls confirm it: with no `deploy` literal the JIT prefilter does 1 MB in 0.098 ms,
+ *  and with `staging` present 108 KB matches in 0.062 ms. Only the no-`staging` case explodes.
+ *
+ *  ── WHY ONE PASS IS ENOUGH ───────────────────────────────────────────────────────────────────
+ *  If `staging` follows ANY `deploy`, it follows the FIRST one. So the earliest `deploy` is the
+ *  only start worth trying, and a single forward search settles it — no backtracking, O(n).
+ *
+ *  ── THE ONE BEHAVIOURAL DELTA, STATED ────────────────────────────────────────────────────────
+ *  `.` does not match line terminators, so the old regex would NOT pair a `deploy` and a `staging`
+ *  separated by a bare `\r`; this does. That is the SAFE direction for this battery — its own rule
+ *  is that erring toward queuing is fine and under-queuing is the risk — and it is nearly
+ *  unreachable anyway, since callers split on `/\r?\n/` before classifying.
+ */
+function deployStagingIndex(line: string): number {
+  const l = line.toLowerCase();
+  const i = l.indexOf("deploy");
+  if (i === -1) return -1;
+  return l.indexOf("staging", i + "deploy".length) === -1 ? -1 : i;
+}
+
+/** CAUTION membership: the regex battery, plus the linear `deploy … staging` rule. */
+function matchesCaution(line: string): boolean {
+  return matches(line, CAUTION) || deployStagingIndex(line) !== -1;
+}
+
+/** Earliest CAUTION trigger index across both halves of the rule, or -1. */
+function cautionIndex(line: string): number {
+  const viaRegex = matchIndex(line, CAUTION);
+  const viaDeploy = deployStagingIndex(line);
+  if (viaRegex === -1) return viaDeploy;
+  if (viaDeploy === -1) return viaRegex;
+  return Math.min(viaRegex, viaDeploy);
 }
 
 // SECURITY — this guard FAILS CLOSED, by deliberate design. It gates auto-approve+resume, so a
@@ -191,11 +244,11 @@ export function classifyLine(
   // CAUTION is scanned against the FULL line (not the bounded prefix) — same as the SAFE
   // shell-chain guard below — so a caution signal (e.g. `git push`) past the scan window
   // can't slip through unqueued. Erring toward queuing is safe; under-queuing is the risk.
-  if (matches(line, CAUTION)) {
+  if (matchesCaution(line)) {
     return {
       event_type: "approval_needed",
       risk_class: "caution",
-      description: describe(line, Math.max(0, matchIndex(line, CAUTION))),
+      description: describe(line, Math.max(0, cautionIndex(line))),
       payload: { raw: line },
     };
   }

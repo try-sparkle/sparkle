@@ -304,3 +304,51 @@ describe("classifyLine — hard DANGEROUS is scanned on the full line (roborev #
     expect(ev!.description.startsWith("…")).toBe(true);
   });
 });
+
+describe("classifyLine — the `deploy … staging` CAUTION rule is LINEAR, not quadratic", () => {
+  // REGRESSION GUARD for the app-freeze this rule caused. It was `/deploy.*staging/i` inside the
+  // CAUTION battery, which `classifyLine` scans against the FULL untruncated line on purpose. For
+  // each `deploy` the greedy `.*` ran to end-of-line and backtracked hunting `staging`, i.e. O(k·n).
+  //
+  // This ran on the renderer main thread for every line of every pty chunk of every pane. A long
+  // line carrying `deploy` but NOT `staging` is the ordinary shape of a deployment/CI log, and it
+  // pinned the UI: 27KB measured at 218ms and 108KB at 3,977ms against the old pattern.
+  //
+  // The budget below is deliberately ~16x looser than the old 27KB timing and ~290x looser than the
+  // old 108KB timing, so this fails LOUDLY on a reintroduced quadratic while staying immune to
+  // ordinary CI noise — the linear implementation lands here in well under a millisecond.
+  const PATHOLOGICAL = "deploy the thing ".repeat(6400); // ~108KB, many `deploy`, no `staging`
+  const BUDGET_MS = 250;
+
+  it("classifies a 108KB `deploy`-heavy line with no `staging` well inside the frame budget", () => {
+    expect(PATHOLOGICAL.length).toBeGreaterThan(100_000);
+    const t0 = performance.now();
+    const ev = classifyLine(PATHOLOGICAL, ctx);
+    const elapsed = performance.now() - t0;
+    // The SIDE EFFECT under test is the elapsed time: the old pattern took ~4s on this exact input.
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+    // …and it must still not be a false caution — there is no `staging` here.
+    expect(ev?.risk_class).not.toBe("caution");
+  });
+
+  it("still flags `deploy … staging` at any distance on the same line (no narrowing)", () => {
+    // The fix must NOT bound how far apart the two words may sit — under-queuing is the risk this
+    // battery's full-line scan exists to prevent, so a bounded-gap 'fix' would be a regression.
+    const far = `deploy ${"x ".repeat(20_000)} staging`;
+    expect(far.length).toBeGreaterThan(40_000);
+    const ev = classifyLine(far, ctx);
+    expect(ev).not.toBeNull();
+    expect(ev!.risk_class).toBe("caution");
+  });
+
+  it.each([
+    ["deploy to staging", true],
+    ["deploying the staging cluster", true],
+    ["deploy the thing", false], // `deploy` alone is not caution under THIS rule
+    ["staging is green", false], // `staging` alone is not caution
+    ["staging must precede deploy to not match", false], // order matters: staging before deploy
+  ])("%j → caution=%s", (line, expected) => {
+    const ev = classifyLine(line as string, ctx);
+    expect(ev?.risk_class === "caution").toBe(expected);
+  });
+});
