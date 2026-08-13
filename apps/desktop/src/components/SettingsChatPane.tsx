@@ -447,8 +447,9 @@ export function SettingsChatPane() {
     // hardcoded and frozen, so painting "Looks free — the server decides when you save." over
     // `admin` was the client asserting the one thing it does know to be wrong. Like the format
     // check this only decides what is SAID and whether a round trip is worth it: `save()` does not
-    // consult it, the Save button stays enabled, and a name with a designated owner (`drodio`) is
-    // absent from the list on purpose so it probes and commits normally. See
+    // consult it and the Save button stays enabled, so a name this frozen copy gets WRONG still
+    // probes and commits normally — which is the property that matters, since the copy can only
+    // ever lag the server. `drodio` is deliberately absent from it; see
     // `engine/social.ADVISORY_RESERVED_USERNAMES`.
     if (isReservedUsername(local.key)) {
       setCheck({ kind: "invalid", reason: "reserved" });

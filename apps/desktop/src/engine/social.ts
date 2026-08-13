@@ -169,35 +169,24 @@ export function validateUsernameFormat(raw: string): UsernameCheck {
   return { ok: true, key };
 }
 
-// ── Reserved names (ADVISORY, and DELIBERATELY NOT the server's whole list) ──────────────────────
+// ── Reserved names (ADVISORY mirror of the server's list) ────────────────────────────────────────
 
 /**
- * Reserved handles that nonetheless have a **designated owner**, so the SERVER may accept a claim
- * on them from the right account and this client must never say otherwise.
- *
- * `drodio` is the worked example and today the only entry: it is in the server's
- * `RESERVED_USERNAMES` (it is a `PROTECTED_HANDLES` spelling, so an exact claim reports `reserved`
- * rather than the misleading `impersonation`), and the orchestration half exempts its owner so the
- * real person can claim it. A client list that included it would paint "That name is reserved."
- * for the one human the exemption exists for — telling him he is locked out of a fix built to
- * unlock him. So the exemption is subtracted here, the pane stays advisory for these names, and the
- * SERVER decides.
- *
- * This is the ONE direction the split is safe in: subtracting from an advisory list can only ever
- * make the client say LESS than the server will. Adding to it is what would make the client lie.
- */
-export const OWNER_EXEMPT_HANDLES: readonly string[] = Object.freeze(["drodio"]);
-
-/**
- * The server's `RESERVED_USERNAMES` **minus {@link OWNER_EXEMPT_HANDLES}**, duplicated here so the
- * pane can say "That name is reserved." before Save is pressed rather than painting "Looks free"
- * for `admin`.
+ * The server's `RESERVED_USERNAMES`, duplicated here so the pane can say "That name is reserved."
+ * before Save is pressed rather than painting "Looks free" for `admin`.
  *
  * ⚠️ **ADVISORY, exactly like {@link validateUsernameFormat}, and for the same reason.** It changes
  * what the user is TOLD and nothing else: it must never gate the Save button, never suppress or
  * reinterpret a server `400`/`409`, and never keep a claim off the network. The server's list is
- * the authority, plus a confusable-skeleton check and an owner exemption that are not knowable
- * here. A client that disagrees with the server always loses.
+ * the authority, plus a confusable-skeleton check that is not knowable here. A client that disagrees
+ * with the server always loses.
+ *
+ * THIS USED TO BE THE SERVER'S LIST **MINUS** AN `OWNER_EXEMPT_HANDLES` SET. That set held exactly
+ * one name — `drodio`, which was reserved server-side but claimable by its owner — and subtracting
+ * it was what stopped this pane from telling the founder "That name is reserved." before any request
+ * went out. The reservation and its owner exemption were both removed at his request, so the
+ * subtraction has nothing left to subtract and the two lists are now identical. Keep them that way:
+ * the drift test below compares them exactly, with no exempt set to explain a difference.
  *
  * Duplicating a security list across two apps is a drift hazard, and it is only acceptable because
  * the server's copy is HARDCODED AND FROZEN (its own header says so: "changing the set is a code
@@ -247,8 +236,8 @@ export const ADVISORY_RESERVED_USERNAMES: readonly string[] = Object.freeze([
   "anonymous",
   "guest",
   "you",
-  // NOTE: "drodio" is in the server's list and is deliberately ABSENT here — see
-  // {@link OWNER_EXEMPT_HANDLES}.
+  // NOTE: "drodio" is absent from BOTH this list and the server's, and that is deliberate — see the
+  // docstring above and the note on the server's `RESERVED_USERNAMES`. Do not add it here.
 ]);
 
 const ADVISORY_RESERVED_SET = new Set(ADVISORY_RESERVED_USERNAMES);
@@ -262,9 +251,11 @@ const ADVISORY_RESERVED_SET = new Set(ADVISORY_RESERVED_USERNAMES);
  *
  * **Kept OUT of {@link validateUsernameFormat} on purpose.** That function's `ok: false` is what
  * `SettingsChatPane.save()` refuses on, so folding this in would make an advisory list the commit
- * gate — the one thing the header forbids — and would mean an owner-exempt handle could never be
- * sent to the server that is willing to accept it. This is a separate question with a separate
- * answer: it decides what the user is TOLD while typing, never whether the claim is sent.
+ * gate — the one thing the header forbids — and a name this frozen copy calls reserved could then
+ * never be sent to a server that is willing to accept it. That is not hypothetical: this list once
+ * held `drodio`'s reservation and the server's did not by the time the founder tried to claim it.
+ * This is a separate question with a separate answer: it decides what the user is TOLD while
+ * typing, never whether the claim is sent.
  */
 export function isReservedUsername(raw: string): boolean {
   return ADVISORY_RESERVED_SET.has(usernameKey(raw));

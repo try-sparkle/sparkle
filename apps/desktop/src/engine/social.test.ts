@@ -14,7 +14,6 @@ import {
   validateUsernameFormat,
   isReservedUsername,
   ADVISORY_RESERVED_USERNAMES,
-  OWNER_EXEMPT_HANDLES,
   USERNAME_MIN_LENGTH,
   USERNAME_MAX_LENGTH,
 } from "./social";
@@ -169,24 +168,33 @@ describe("engine/social — the advisory reserved list", () => {
     }
   });
 
-  // ── THE OWNER EXEMPTION ───────────────────────────────────────────────────────────────────────
-  // The headline fix of bead sparkle-3g97m is that the founder can claim `drodio`. The server half
-  // exempts its owner; if the CLIENT list carried the handle, this pane would tell the very person
-  // being unblocked "That username is reserved." and gate him out of his own fix — with no server
-  // round trip to correct it, since the check runs before Save. This is the assertion that stops a
-  // future sync-the-lists commit from pasting the entry back in.
-  it("does NOT claim an owner-exempt handle is reserved, in any casing", () => {
-    for (const handle of OWNER_EXEMPT_HANDLES) {
-      expect(isReservedUsername(handle)).toBe(false);
-      expect(isReservedUsername(handle.toUpperCase())).toBe(false);
-    }
-    // Named explicitly as well as looped: the loop is vacuous if the exempt list is ever emptied.
-    expect(OWNER_EXEMPT_HANDLES).toContain("drodio");
+  // ── `drodio` IS AN ORDINARY NAME ──────────────────────────────────────────────────────────────
+  // The headline fix of bead sparkle-3g97m was that the founder can claim `drodio`. It was first
+  // built as an OWNER EXEMPTION — the handle stayed reserved server-side and one identity was let
+  // through — and this block used to subtract that exemption from the client copy so the pane would
+  // not tell the very person being unblocked "That username is reserved." The exemption keyed off
+  // the super-admin email allowlist, which the address he actually signs in with is not on, so it
+  // never unblocked him; at his instruction the RESERVATION itself was removed instead, and the
+  // exemption machinery went with it. So there is nothing to subtract any more: the handle is
+  // absent from both lists and this asserts it stays that way, because the pane's check runs BEFORE
+  // Save and no server round trip can correct it.
+  it("does NOT claim `drodio` is reserved, in any casing", () => {
     expect(isReservedUsername("drodio")).toBe(false);
     expect(isReservedUsername("DROdio")).toBe(false);
+    expect(isReservedUsername("DRODIO")).toBe(false);
+    expect(isReservedUsername("  drodio  ")).toBe(false);
   });
 
-  it("still passes the FORMAT check for an exempt handle — nothing about it is refused locally", () => {
+  it("does not claim a CONFUSABLE of it is reserved either — skeleton protection went too", () => {
+    // The client never knew how to skeletonize, so this half was always the server's to answer;
+    // what changed is the server's answer. Asserted here so the client copy is not "helpfully"
+    // widened to re-add by hand what the server no longer refuses.
+    for (const name of ["dr0dio", "dr_odio", "drod1o"]) {
+      expect(isReservedUsername(name)).toBe(false);
+    }
+  });
+
+  it("still passes the FORMAT check — nothing about the handle is refused locally", () => {
     // The two checks are independent, and the claim must be able to reach the network. A `reserved`
     // reason may never come out of the format validator (see its docstring).
     expect(validateUsernameFormat("DROdio")).toEqual({ ok: true, key: "drodio" });
@@ -200,7 +208,12 @@ describe("engine/social — the advisory reserved list", () => {
 // frozen ("changing the set is a code change + PR"), and that promise is worth exactly as much as
 // this test: it reads the orchestration file FROM DISK and pins
 //
-//     ADVISORY_RESERVED_USERNAMES  ===  RESERVED_USERNAMES  minus  the owner-exempt handles
+//     ADVISORY_RESERVED_USERNAMES  ===  RESERVED_USERNAMES
+//
+// EXACT equality, with nothing subtracted. It used to be "minus the owner-exempt handles", a set
+// holding exactly one name (`drodio`); the reservation and its exemption were both retired, so the
+// subtraction has nothing left to subtract and an escape hatch that can explain away a difference
+// is precisely what a drift guard must not have.
 //
 // It reads the source text rather than importing the module on purpose. `apps/orchestration` is a
 // separate package with its own build and its own deps; a static import here would couple the
@@ -246,24 +259,6 @@ describe("engine/social — the reserved list does not drift from the server's",
     return [...block.matchAll(/["'`]([a-z0-9_]+)["'`]/g)].flatMap((m) => (m[1] ? [m[1]] : []));
   })();
 
-  /**
-   * The exempt set, read from the server's `HANDLE_OWNERS` map when it is there.
-   *
-   * ⚠️ It may NOT be there: the orchestration half of this bead adds that map in a PARALLEL branch,
-   * and this test has to be correct on a base that predates it as well as on the merge. So it falls
-   * back to the desktop's own {@link OWNER_EXEMPT_HANDLES} — which still pins the RESERVED half in
-   * full, and still fails the moment the two lists disagree about anything else. The fallback is
-   * reported in the failure message so a red run is never ambiguous about which mode it ran in.
-   */
-  const exempt = (() => {
-    const block = blockFor("HANDLE_OWNERS", "{", "}");
-    if (block === null) return { handles: [...OWNER_EXEMPT_HANDLES], fromServer: false };
-    const keys = [...block.matchAll(/(?:[{,]|^)\s*["'`]?([a-z0-9_]+)["'`]?\s*:/gm)].flatMap((m) =>
-      m[1] ? [m[1]] : [],
-    );
-    return { handles: keys, fromServer: true };
-  })();
-
   // THE VACUITY GUARD, and it is not decoration: every assertion below compares two sets, and two
   // EMPTY sets are equal. A regex that silently stopped matching (the server reformats the literal,
   // switches quote style, wraps it differently) would turn this whole block green while the lists
@@ -274,45 +269,59 @@ describe("engine/social — the reserved list does not drift from the server's",
     // Spot-checks, so a regex that matched the wrong literal is caught too.
     expect(serverReserved).toContain("admin");
     expect(serverReserved).toContain("sparkle");
-    expect(serverReserved).toContain("drodio");
   });
 
-  it("every owner-exempt handle IS reserved server-side — otherwise the exemption is about nothing", () => {
-    expect(exempt.handles.length).toBeGreaterThan(0);
-    for (const handle of exempt.handles) {
-      expect(
-        serverReserved,
-        `"${handle}" is treated as owner-exempt but is not in the server's RESERVED_USERNAMES`,
-      ).toContain(handle);
-    }
-  });
-
-  it("the desktop list is EXACTLY the server's minus the owner-exempt handles", () => {
-    const expected = [...serverReserved!].filter((n) => !exempt.handles.includes(n)).sort();
+  it("the desktop list is EXACTLY the server's — nothing subtracted", () => {
+    const expected = [...serverReserved!].sort();
     const actual = [...ADVISORY_RESERVED_USERNAMES].sort();
 
     const missing = expected.filter((n) => !actual.includes(n));
     const extra = actual.filter((n) => !expected.includes(n));
-    const how = exempt.fromServer
-      ? "exempt handles read from the server's HANDLE_OWNERS"
-      : `HANDLE_OWNERS not present yet — exempt handles taken from OWNER_EXEMPT_HANDLES (${OWNER_EXEMPT_HANDLES.join(", ")})`;
 
     expect(
       { missing, extra },
       `apps/desktop/src/engine/social.ts ADVISORY_RESERVED_USERNAMES has drifted from ` +
         `apps/orchestration/src/lib/usernamePolicy.ts RESERVED_USERNAMES.\n` +
-        `  ${how}\n` +
         `  MISSING from the desktop copy: ${missing.join(", ") || "(none)"}\n` +
         `  EXTRA in the desktop copy:     ${extra.join(", ") || "(none)"}\n` +
         `Fix the desktop list — do NOT delete an entry from the server's to make this pass.`,
     ).toEqual({ missing: [], extra: [] });
   });
 
-  it("no owner-exempt handle leaked into the desktop copy", () => {
-    // The specific regression the headline fix cannot survive, asserted on its own so the diff
-    // above is not the only thing standing between the founder and his handle.
-    for (const handle of exempt.handles) {
-      expect(ADVISORY_RESERVED_USERNAMES).not.toContain(handle);
+  it("`drodio` is in NEITHER list — the retirement holds on both sides", () => {
+    // The specific regression the headline fix cannot survive, asserted on its own so the exact-set
+    // comparison above is not the only thing standing between the founder and his handle: that test
+    // stays green if a well-meaning sync-the-lists commit re-adds the entry to BOTH copies, which is
+    // exactly the shape such a commit takes.
+    expect(
+      serverReserved,
+      "`drodio` was re-added to the server's RESERVED_USERNAMES — see the ⚠️ note on that list",
+    ).not.toContain("drodio");
+    expect(ADVISORY_RESERVED_USERNAMES).not.toContain("drodio");
+  });
+
+  it("no PROTECTED_HANDLES entry names a person — every one of them is Sparkle or a role", () => {
+    // The other half of the retirement: skeleton protection is derived from PROTECTED_HANDLES and
+    // nothing else, so leaving `drodio` there would keep `dr0dio`/`dr_odio` refused as
+    // `impersonation` while the plain spelling was free — the confusing half-state the removal
+    // exists to avoid.
+    const block = blockFor("PROTECTED_HANDLES", "[", "]");
+    expect(block, `could not find PROTECTED_HANDLES in ${policyPath}`).not.toBeNull();
+    const protectedHandles = [...block!.matchAll(/["'`]([a-z0-9_]+)["'`]/g)].flatMap((m) =>
+      m[1] ? [m[1]] : [],
+    );
+    expect(protectedHandles.length).toBeGreaterThan(3);
+    expect(protectedHandles).toContain("sparkle");
+    expect(protectedHandles).not.toContain("drodio");
+
+    // And the containment the server's own header promises, re-checked from here because the two
+    // lists are read from one file but consumed by two apps.
+    for (const handle of protectedHandles) {
+      expect(
+        serverReserved,
+        `"${handle}" is protected but absent from RESERVED_USERNAMES — its legitimate holder ` +
+          `would be told they were impersonating themselves`,
+      ).toContain(handle);
     }
   });
 });
