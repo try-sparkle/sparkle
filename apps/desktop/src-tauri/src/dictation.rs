@@ -2686,12 +2686,29 @@ impl DictationSession {
     /// `checked_duration_since`, which this function does not call; the property it was arguing for
     /// is the one the comparison above actually has.
     ///
-    /// Its three behaviours are pinned in `tests::capture_warm_now_*`. They were unpinned until
-    /// roborev 62000: the neighbouring tests exercise the pure `capture_should_be_live` with
-    /// hand-passed booleans, so the boolean the production path actually computes was untested by
-    /// construction — mutating this to `is_some()`, or to `>=`, left the whole suite green.
+    /// Pinned in `tests::capture_warm_now_*`. Untested by construction until roborev 62000 — the
+    /// neighbouring tests exercise the pure `capture_should_be_live` with hand-passed booleans, so
+    /// the boolean the production path actually computes was reachable by no test at all, and
+    /// mutating this to `is_some()`, or deleting the comparison outright, left the whole suite green.
+    ///
+    /// THE STRICTNESS ITSELF STAYED UNPINNED FOR ONE MORE ROUND, and this note claimed otherwise
+    /// (roborev 63699). Relaxing `>` to `>=` is the one mutation the elapsed-stamp and future-stamp
+    /// cases cannot see: only `until == now` at the instant of the read separates the two operators,
+    /// and that instant is unreachable while the comparison samples the clock internally. So the
+    /// property this doc argues hardest for — "warm forever" is the failure direction to avoid, read
+    /// it the strict way — was the single behaviour the tests did not have. Hence `capture_warm_now_at`
+    /// below: the clock is a parameter, the boundary case is constructible, and `>=` now goes red.
     fn capture_warm_now(&self) -> bool {
-        self.warm_capture_until.is_some_and(|until| until > std::time::Instant::now())
+        self.capture_warm_now_at(std::time::Instant::now())
+    }
+
+    /// `capture_warm_now` against a caller-supplied clock — the seam that makes `until == now`
+    /// constructible. Only the boundary test injects; the two behaviour tests keep calling
+    /// `capture_warm_now()`, so the delegation above is a real entry point rather than the
+    /// defaulted-seam shape `sparkle-lgbwf` records (a line every test injects past, silently
+    /// deletable while the suite stays green).
+    fn capture_warm_now_at(&self, now: std::time::Instant) -> bool {
+        self.warm_capture_until.is_some_and(|until| until > now)
     }
 
     /// Clear every per-capture audio-fault latch.

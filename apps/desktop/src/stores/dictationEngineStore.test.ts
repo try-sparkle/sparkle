@@ -208,6 +208,54 @@ describe("dictationEngineStore", () => {
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 
+  // ══ THE SIBLING PERISHABLE REASON, AND THIS ONE PAINTS: `too_many_streams` (roborev 63698) ═════
+  // Same rule as the block above, one lap later, and the failure it removes is strictly worse. The
+  // `too-slow` case costs a corroborated outage its banner (silence); this one REPLACES that banner
+  // with "close another Sparkle window" — a remedy the user has already carried out, since a still-
+  // capped account would have got another 429, which is definitive and never reaches this seam.
+  // Deliberately NO `noteSessionStart`: the cross-session half was already covered by `staleClaim`
+  // (`too_many_streams` is not an account fact), so only a within-session run discriminates. Drop
+  // `stated !== "too_many_streams"` from the conjunction and this reads `too_many_streams`.
+  // Fake timers for the same reason the preserved-clock test above uses them, and here they are
+  // load-bearing twice over: on a real clock the two stamps land in the same millisecond, so the
+  // renewal assertion reads as a false failure — and the SECOND half, which is the part that
+  // actually matters to a user, is unreachable without advancing time at all.
+  it("reports a corroborated outage that follows a cap refusal in the SAME session", () => {
+    vi.useFakeTimers();
+    try {
+      read().noteCloudUnavailable("too_many_streams");
+      expect(read().fallbackReason).toBe("too_many_streams");
+      const capStamp = read().observedAt;
+      vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS - 1_000);
+      for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+      // The cleared-cap claim yields to what this seam can actually see now…
+      expect(read().fallbackReason).toBe("unavailable");
+      // …and the seam OBSERVED that, so it stamps rather than dragging the cap's dead stamp along.
+      expect(read().observedAt).not.toBe(capStamp);
+      expect(read().observedSession).toBe(read().captureSession);
+      expect(shouldWarnLocalEngine(read())).toBe(true);
+      // THE CONSEQUENCE THE STAMP DECIDES, and the reason preserving here is not merely a wording
+      // bug: on the cap's clock the live outage would retire one second from now, having been
+      // announced (as the wrong thing) for the whole TTL it never had. On its own clock it still
+      // speaks.
+      vi.advanceTimersByTime(2_000);
+      expect(shouldWarnLocalEngine(read())).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // …AND THE PAIRED CASE, which is what stops the exclusion above from being written as "drop every
+  // stated reason". A single refusal short of the threshold is NOT corroboration, so the cap claim
+  // is still the best account of the moment and must stand — with its own stamp untouched.
+  it("keeps a cap refusal that the seam has not yet corroborated", () => {
+    read().noteCloudUnavailable("too_many_streams");
+    const capStamp = read().observedAt;
+    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING - 1; i++) read().noteCloudOpenRefused();
+    expect(read().fallbackReason).toBe("too_many_streams");
+    expect(read().observedAt).toBe(capStamp);
+  });
+
   // AND THE ACCOUNT-FACT EXEMPTION IS WHAT THE GUARD IS *NOT* ALLOWED TO SWEEP UP. A cross-session
   // `exhausted` must still outrank the seam's own `unavailable`, or the refill remedy disappears
   // behind "can't reach the cloud transcription service" — the misdirection roborev 59930 fixed.

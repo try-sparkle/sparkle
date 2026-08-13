@@ -570,8 +570,14 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // two new reasons: an unentitled user was told to retry forever while "Unlock Sparkle" —
         // the one remedy that works — disappeared from the banner.
         //
-        // The test is "did anything state this?", so `unavailable` is the only reason NOT preserved:
-        // it is what this ambiguous seam itself reports, so it can never outrank a named answer.
+        // The test STARTED as "did anything state this?", under which `unavailable` was the only
+        // reason not preserved — it is what this ambiguous seam itself reports, so it can never
+        // outrank a named answer. THREE MORE HAVE JOINED IT SINCE, and this sentence claimed
+        // otherwise for two laps after they did (roborev 63698). The current exclusion set is
+        // `unavailable`, `too-slow`, `too_many_streams`, and any non-account-fact reason left over
+        // from an EARLIER capture session (`staleClaim`); each is argued in its own block below.
+        // Keep this list and the conjunction in step — it is the sentence a future reader will take
+        // as the rule.
         //
         // Bound to a local first so the narrowing survives: TypeScript's aliased-condition analysis
         // follows a `const` initialised from a condition on ANOTHER const, but not one written
@@ -606,9 +612,42 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // The late-connect seam has excluded it since it was introduced; this is the refusal seam
         // catching up. It costs nothing: `too-slow` never paints, so nothing is downgraded — the
         // banner goes from silent to reporting the outage that is actually happening.
+        //
+        // ── `too_many_streams` IS THE SIBLING PERISHABLE REASON, AND IT PAINTS (roborev 63698) ────
+        // The lap above generalised the rule correctly — a perishable claim must not outrank this
+        // seam's corroborated verdict, with or without a session boundary — and then applied it to
+        // one of the TWO perishable reasons that reach this line. `isAccountFact`'s own doc block
+        // classifies `too_many_streams` exactly as it classifies `too-slow`: "another window held
+        // the cap at that instant. It self-clears the moment that window stops, so it too is a
+        // claim about a moment rather than about the account." The cross-session half was therefore
+        // already covered by `staleClaim`; the WITHIN-session half was not, and that is the half
+        // that is reachable in Speak mode, where the mic stays armed across many utterances inside
+        // one capture session.
+        //
+        // AND HERE THE CONSEQUENCE IS STRICTLY WORSE THAN THE `too-slow` SILENCE ABOVE, because
+        // `too_many_streams` PAINTS: it names a remedy the user has already carried out while a
+        // real outage is happening. Relay answers 429 → "close another Sparkle window"; the user
+        // closes it (or the other socket's standby lapses); the network then drops, so the next two
+        // attempts arrive here as `unreachable` → the threshold is crossed, the reason is preserved,
+        // and `observedAt` is not renewed — so for the remainder of the OLD stamp's TTL the bar
+        // reports a window-count problem that has been cleared instead of the connectivity failure
+        // that is live.
+        //
+        // TWO CONSECUTIVE AMBIGUOUS REFUSALS ARE THE ONE THING THE CAP CANNOT EXPLAIN, which is what
+        // makes this an exclusion rather than a coin-flip between two claims. `classifyCloudOutcome`
+        // routes a 429 to `{kind: "definitive", reason: "too_many_streams"}` — a still-capped
+        // account gets another 429, which never reaches this seam at all and re-states the reason on
+        // its own fresh stamp. Reaching this line twice means no cap answer arrived, i.e. fresh
+        // evidence AGAINST the preserved claim, not for it. Same standing as the late seam's
+        // exclusion, reached by a different proof: there a completed handshake disproves the cap,
+        // here two answers that are not a 429 do.
         const staleClaim = isFromEarlierSession(s) && !isAccountFact(stated);
         const preserved =
-          stated !== null && stated !== "unavailable" && stated !== "too-slow" && !staleClaim;
+          stated !== null &&
+          stated !== "unavailable" &&
+          stated !== "too-slow" &&
+          stated !== "too_many_streams" &&
+          !staleClaim;
         const reason: DictationFallbackReason = preserved ? stated : "unavailable";
         return {
           // THE COUNT KEEPS CLIMBING ONCE THE WARNING IS UP, AND THAT IS DELIBERATE (roborev 59971).

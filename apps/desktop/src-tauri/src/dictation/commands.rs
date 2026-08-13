@@ -837,8 +837,18 @@ pub async fn start_cloud_stream(
 /// decision to report, and a refusal it hits says nothing about the hold that has not happened yet.
 ///
 /// Sharing the enum would have made that a matter of the frontend remembering to filter. Keeping
-/// them apart makes it a matter of types: there is no value this command can return that the
-/// metering seam knows how to read.
+/// them apart makes it a matter of TYPES — `classifyCloudOutcome` takes a `CloudStreamOutcome`, so
+/// handing it one of these does not compile.
+///
+/// IT IS NOT A MATTER OF THE WIRE FORMAT, and the difference is the whole safety argument if you
+/// ever touch the frontend seam. An earlier version of this note said "there is no value this
+/// command can return that the metering seam knows how to read", which is false: `Raced` and
+/// `SignedOut` serialize to `raced` and `signed_out`, `CloudStreamOutcome` has both of those
+/// tokens, and `classifyCloudOutcome` has a case for each. So the guarantee that a pre-connect
+/// never meters rests on THE CALL SITE DISCARDING THIS VALUE (`useDictation.ts` — a bare `.catch`,
+/// no `.then`, the resolved value reaches nothing), not on the names being unreadable. Were the
+/// result ever wired up, `signed_out` would raise a "sign in" banner at a user who has not pressed
+/// anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PreconnectOutcome {
@@ -883,10 +893,17 @@ pub enum PreconnectOutcome {
 ///
 /// **It does not meter, and cannot.** The socket is banked by `park_preconnected_stream`, which is
 /// `park_raced_stream` plus a mark — `cloud_active` is never passed to it, let alone set. Parked is
-/// not routing: the capture callback reads that flag to decide where frames go, and the frontend
-/// reads the command's answer to decide whether to bill. This command's answers are not in the
-/// vocabulary the metering seam speaks (see `PreconnectOutcome`), and the one place a socket starts
-/// billing — `start_cloud_stream` answering `Opened`/`Resumed` — is reached only by a real hold.
+/// not routing: the capture callback reads that flag to decide where frames go, and the one place a
+/// socket starts billing — `start_cloud_stream` answering `Opened`/`Resumed` — is reached only by a
+/// real hold.
+///
+/// The frontend half of that guarantee is that THE CALL SITE DISCARDS THIS COMMAND'S ANSWER
+/// (`useDictation.ts` — a bare `.catch`, no `.then`, the resolved value reaches nothing). It is
+/// specifically NOT that the answers are unreadable to the metering seam, which is what this
+/// paragraph used to claim: `PreconnectOutcome` serializes `raced` and `signed_out` exactly as
+/// `CloudStreamOutcome` does, and `classifyCloudOutcome` has a case for both. The TYPE would stop
+/// you, the STRING would not — see `PreconnectOutcome`'s own doc comment, which carries the long
+/// form of this.
 ///
 /// **It does not bump `cloud_epoch`.** That token means "is MY install attempt still current", and
 /// this command never installs. Bumping it would invalidate a concurrent `start_cloud_stream` — a

@@ -112,6 +112,99 @@
         }
     }
 
+    /// THE PRE-CONNECT VOCABULARY OVERLAPS THE METERING ONE, AND THREE COMMENTS DEPEND ON THAT FACT.
+    ///
+    /// `preconnect_cloud_stream` answers its own `PreconnectOutcome` rather than a
+    /// `CloudStreamOutcome`, and for a long time three doc blocks explained the safety of that by
+    /// saying the metering seam cannot READ a pre-connect's answer. It can. `Raced` and `SignedOut`
+    /// serialize to `raced` and `signed_out`, both of which are members of the frontend's
+    /// `CloudStreamOutcome` union and both of which `classifyCloudOutcome` has a live case for. The
+    /// TYPE is what stops you (`classifyCloudOutcome` takes a `CloudStreamOutcome`, so handing it
+    /// one of these does not compile); the STRING would sail straight through.
+    ///
+    /// So the real guarantee is that the CALL SITE DISCARDS the answer — `useDictation.ts` invokes
+    /// with a bare `.catch(() => {})` and no `.then`. This test exists to keep that reasoning
+    /// honest: it asserts the overlap is exactly the two tokens the comments name.
+    ///
+    /// WHAT A FAILURE MEANS — it is a prompt to re-read three comments, not automatically a bug:
+    ///   * the set GREW — a pre-connect can now impersonate one more metering outcome, so check
+    ///     that nothing has started reading this command's result;
+    ///   * the set SHRANK — the comments now overstate the danger and should be corrected, the same
+    ///     way they were corrected when they understated it.
+    /// Either way the fix is to update `PreconnectOutcome`'s doc, `preconnect_cloud_stream`'s doc,
+    /// and the `useDictation.ts` call-site comment together with this list.
+    ///
+    /// Exhaustive by compiler for the same reason as the test above: `preconnect_token`'s match has
+    /// no `_` arm, so a new variant cannot be added without naming its wire token here — which is
+    /// also the moment to ask whether that token collides with a metering one.
+    #[test]
+    fn a_preconnect_answer_can_impersonate_exactly_two_metering_outcomes() {
+        use super::commands::PreconnectOutcome as P;
+
+        // No `_` arm: adding a variant fails to COMPILE until its token is written here.
+        fn preconnect_token(o: P) -> &'static str {
+            match o {
+                P::Connected => "connected",
+                P::Released => "released",
+                P::Idle => "idle",
+                P::Busy => "busy",
+                P::Raced => "raced",
+                P::SignedOut => "signed_out",
+                P::Unavailable => "unavailable",
+            }
+        }
+
+        // HAND-MAINTAINED, exactly as `outcome_wire_tokens_are_pinned`'s list is, and for the same
+        // reason its doc gives: Rust cannot enumerate an enum's variants without a derive this
+        // crate does not depend on, and a faked tie is worse than an accurate comment.
+        let all = [P::Connected, P::Released, P::Idle, P::Busy, P::Raced, P::SignedOut, P::Unavailable];
+
+        // Assert the SERIALIZED form, not the variant name — serde's output is what crosses the IPC
+        // boundary, and a `format!("{:?}")` comparison would pass through a lost `rename_all`.
+        for outcome in all {
+            let wire = serde_json::to_string(&outcome).expect("preconnect outcome serializes");
+            assert_eq!(
+                wire,
+                format!("\"{}\"", preconnect_token(outcome)),
+                "wire token for {outcome:?} must match what the frontend would receive",
+            );
+        }
+
+        // The metering vocabulary, taken from the enum itself rather than restated, so this cannot
+        // drift out of step with the test above.
+        let metering: std::collections::HashSet<String> = [
+            CloudStreamOutcome::Opened,
+            CloudStreamOutcome::Resumed,
+            CloudStreamOutcome::AlreadyRouting,
+            CloudStreamOutcome::Raced,
+            CloudStreamOutcome::SignedOut,
+            CloudStreamOutcome::Unauthorized,
+            CloudStreamOutcome::NotEntitled,
+            CloudStreamOutcome::InsufficientCredits,
+            CloudStreamOutcome::RelayUnconfigured,
+            CloudStreamOutcome::TooManyStreams,
+            CloudStreamOutcome::Unreachable,
+        ]
+        .into_iter()
+        .map(|o| serde_json::to_string(&o).expect("outcome serializes"))
+        .collect();
+
+        let mut shared: Vec<String> = all
+            .into_iter()
+            .map(|o| serde_json::to_string(&o).expect("preconnect outcome serializes"))
+            .filter(|w| metering.contains(w))
+            .collect();
+        shared.sort();
+
+        assert_eq!(
+            shared,
+            vec!["\"raced\"".to_string(), "\"signed_out\"".to_string()],
+            "the pre-connect/metering token overlap changed — re-read PreconnectOutcome's doc, \
+             preconnect_cloud_stream's doc, and the useDictation.ts call-site comment, all three of \
+             which explain the metering guarantee in terms of this exact set",
+        );
+    }
+
     /// Every relay refusal must reach a DISTINCT outcome, or naming the cause buys nothing. The
     /// three no-answer variants deliberately converge on `Unreachable` — that is the one collapse
     /// the design asks for, so it is asserted rather than left to inspection.
@@ -1956,9 +2049,19 @@
     // The three cases above pin the pure `capture_should_be_live` with HAND-PASSED booleans, so the
     // one place `hold_recent` is really derived — `DictationSession::capture_warm_now()` — was
     // untested by construction (roborev 62000). That is the guard-vacuity shape `sparkle-lgbwf`
-    // records: mutating the reader to `warm_capture_until.is_some()`, or relaxing `>` to `>=`, or
-    // deleting the comparison outright, left every one of those tests green because none of them
-    // ever calls it. `tests` is a child module of `dictation`, so it can set the private field.
+    // records: mutating the reader to `warm_capture_until.is_some()`, or deleting the comparison
+    // outright, left every one of those tests green because none of them ever calls it. `tests` is a
+    // child module of `dictation`, so it can set the private field.
+    //
+    // THE TWO TESTS BELOW DO NOT CATCH `>=`, and this comment used to claim they did (roborev
+    // 63699). An elapsed stamp (`now - 1s`) and a future one (`now + 30s`) read the same under
+    // either operator; `until == now` is the ONLY input that separates them, and it was unreachable
+    // while `capture_warm_now` sampled the clock inside itself. So the strict-`>` property — the one
+    // its doc argues hardest for, because the failure direction to avoid is a microphone warm
+    // forever — was the single behaviour left unpinned, under a comment saying it was covered.
+    // `capture_warm_now_at(now)` is the seam that makes the boundary constructible; the third test
+    // is the one that uses it, and it is the only one that does. The two here keep calling the real
+    // `capture_warm_now()`, so the delegation is not a defaulted seam every test injects past.
 
     #[test]
     fn capture_warm_now_is_false_with_no_stamp_and_stays_false_once_the_window_elapses() {
@@ -1988,6 +2091,28 @@
         assert!(
             capture_should_be_live(false, true, sess.capture_warm_now()),
             "the warm reader must be what turns the between-holds row live"
+        );
+    }
+
+    #[test]
+    fn capture_warm_now_reads_cold_at_the_exact_expiry_instant() {
+        // THE OPERATOR ITSELF, which the two tests above cannot see (roborev 63699): an elapsed
+        // stamp and a future stamp read identically under `>` and under `>=`, so only `until == now`
+        // tells them apart. Injecting the clock is what makes that instant constructible at all.
+        let mut sess = DictationSession::default();
+        let t = Instant::now();
+        sess.warm_capture_until = Some(t);
+        assert!(
+            !sess.capture_warm_now_at(t),
+            "a stamp that has JUST expired must read cold — `until > now`, never `>=`; the failure \
+             direction to avoid on a live microphone is one extra tick of warm, not one too few"
+        );
+        // PAIRED, one nanosecond the other side of the same boundary: without this the assertion
+        // above also passes against a reader hard-wired to `false`, which would delete the warm
+        // window entirely rather than tighten it.
+        assert!(
+            sess.capture_warm_now_at(t - Duration::from_nanos(1)),
+            "one nanosecond BEFORE the stamp is still inside the window"
         );
     }
 

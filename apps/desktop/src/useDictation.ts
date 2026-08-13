@@ -1269,10 +1269,16 @@ export function useAmbientVoice(): void {
     if (lastPreconnectWant.current === wantPreconnect) return;
     lastPreconnectWant.current = wantPreconnect;
     // Fire-and-forget, and deliberately NOT routed through `openCloud`/`openCloudDictationWindow`:
-    // that is the metering path, and nothing here is streaming. The command answers its own
-    // `PreconnectOutcome` — a vocabulary `classifyCloudOutcome` cannot read — so a pre-connect can
-    // never start a meter, retire a fallback notice, or charge a refusal to the corroboration
-    // counter on behalf of an utterance the user has not spoken yet.
+    // that is the metering path, and nothing here is streaming. THE RESULT IS DISCARDED — no
+    // `.then`, nothing reads the resolved value — which is what makes it impossible for a
+    // pre-connect to start a meter, retire a fallback notice, or charge a refusal to the
+    // corroboration counter on behalf of an utterance the user has not spoken yet.
+    //
+    // State it that way rather than "the outcome vocabularies differ", which is what this comment
+    // used to say, because they do NOT differ enough to lean on: `PreconnectOutcome` serializes
+    // `raced` and `signed_out`, and `classifyCloudOutcome` has a case for both. The TYPE would stop
+    // you, the STRING would not — so if you ever wire this result up, `signed_out` would put a
+    // "sign in" banner in front of someone who never touched the microphone. Keep discarding it.
     invoke("preconnect_cloud_stream", {
       want: wantPreconnect,
       project: selectedProjectName(),
