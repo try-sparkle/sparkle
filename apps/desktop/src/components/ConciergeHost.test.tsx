@@ -296,6 +296,7 @@ import type { Project } from "../types";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { PINNED_BLOCKERS_TESTID, PINNED_BLOCKER_TESTID } from "./Concierge/PinnedBlockers";
 import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
+import { ANONYMOUS_SUBJECT } from "./Concierge/conciergeLine";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
 // and the column locks that half — thread and composer both — whenever the AI gate is shut
@@ -2556,14 +2557,29 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     expect(queryInThread(/terminal closed before I could send|never came up/)).toBeNull();
   });
 
-  // The `?? "that agent"` fallback is a LIVE path: the outcome can arrive after the agent has left
-  // the feed. Nothing covered it, so a change to a non-guarding form would render
+  // The anonymous fallback is a LIVE path: the outcome can arrive after the agent has left the
+  // feed. Nothing covered it, so a change to a non-guarding form would render
   // "undefined is up — I sent your message" — the same literal-undefined report the matchedLabel
   // guard was added to prevent one commit ago (roborev 53123).
+  //
+  // PINNED ON THE SYMBOL, NOT THE LITERAL (roborev 63539, Medium). Written as `/^that agent is up/`
+  // this test kept passing while an edit to `ANONYMOUS_SUBJECT` split the thread's wording — the row
+  // here saying the old words two lines above receipt rows saying the new ones. A literal
+  // expectation for shared copy does not guard the copy; it pins the drift.
+  //
+  // Built as a STRING, not a regex. `findInThread`'s string arm is an exact-text match, so it needs
+  // no anchors — and interpolating user-facing copy into a `new RegExp` is the hazard the sibling
+  // guard in `receiptRuns.test.ts` was flagged for: the whole premise of the symbol is that this
+  // wording gets edited, and the first metacharacter in it either throws or silently loosens the
+  // match.
   it("names an agent that has left the feed generically, never 'undefined'", async () => {
     renderHost();
     act(() => h.deferred?.({ ok: true, path: "free-text", agentId: "gone-from-feed", sent: "x" }));
-    expect(await findInThread(/^that agent is up — I sent your message \("x"\)\.$/)).toBeTruthy();
+    expect(
+      await findInThread(
+        `${ANONYMOUS_SUBJECT} is up — I sent your message ("x").`,
+      ),
+    ).toBeTruthy();
     expect(queryInThread(/undefined/)).toBeNull();
   });
 

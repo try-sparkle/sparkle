@@ -122,11 +122,23 @@ function escapeLabel(name: string): string {
 /**
  * THE ONE PLACE THE ANONYMOUS-SUBJECT WORDING LIVES (roborev 63525).
  *
- * It had three independent copies — here in {@link ref}, in `actionReceiptLine.who()`, and as
- * `receiptRuns.ANONYMOUS_SUBJECT`. That is a drift hazard with a specific, reachable failure: edit
- * the wording in `who()` (the natural place, since that is what an INDIVIDUAL row renders) and a
- * FOLDED run keeps saying the old words beside unfolded rows saying the new ones — breaking the
- * fold's own invariant that it never shows words the rows it replaced did not.
+ * It had FIVE independent copies, found one at a time across four review rounds: here in {@link ref},
+ * in `actionReceiptLine.who()`, in that module's `spawned` refusal arm, as `receiptRuns`'s own
+ * constant, and — the last one, and the one every earlier enumeration missed —
+ * `ConciergeHost.tsx`'s deferred-send outcome arm (roborev 63525, 63529, 63539). That is a drift
+ * hazard with a specific, reachable failure: edit the wording in `who()` (the natural place, since
+ * that is what an INDIVIDUAL row renders) and a FOLDED run keeps saying the old words beside
+ * unfolded rows saying the new ones — breaking the fold's own invariant that it never shows words
+ * the rows it replaced did not.
+ *
+ * THE COUNT IS THE PART THAT KEPT BEING WRONG, which is why it is stated precisely rather than
+ * loosely. Each round's doc block asserted a total ("three", then "four"), a future reader trusted
+ * it when judging a wording edit safe, and the survivor was in a file nobody thought to grep. The
+ * check that actually answers it, uncapped — a `head` on this is how the fifth copy was missed:
+ *
+ *     grep -rn '"that agent"' --include='*.ts' --include='*.tsx' apps/desktop/src | grep -v '\.test\.'
+ *
+ * It should return exactly ONE producer: the declaration below.
  *
  * `conciergeLine` is the right home because both readers already depend on it, so neither has to
  * import the other. `receiptRuns` re-exports it under its local name for its guards.

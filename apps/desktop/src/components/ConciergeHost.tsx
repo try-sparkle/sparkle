@@ -217,7 +217,13 @@ import {
 } from "../services/dispatchIntent";
 import { ConciergeApprovals } from "./Concierge/ConciergeApprovals";
 import { CountdownBanner } from "./Concierge/CountdownBanner";
-import { flat, line, plain, ref } from "./Concierge/conciergeLine";
+import {
+  ANONYMOUS_SUBJECT,
+  flat,
+  line,
+  plain,
+  ref,
+} from "./Concierge/conciergeLine";
 import type { Line } from "./Concierge/conciergeLine";
 import { actionReceiptLine, receiptMark } from "./Concierge/actionReceiptLine";
 import {
@@ -3486,11 +3492,18 @@ export function ConciergeHost({
         // very same agent, named by the concierge's brain a line above, was clickable.
         //
         // Resolved from the feed, so the id travels with the name. When the agent is NO LONGER in
-        // the feed there is no id to carry and the copy falls back to the words it always used —
-        // "that agent" — rather than inventing a reference. A pill carrying a guessed id opens the
-        // wrong agent and the reader cannot tell, which is strictly worse than no pill.
+        // the feed there is no id to carry and the copy falls back to the shared anonymous wording
+        // rather than inventing a reference. A pill carrying a guessed id opens the wrong agent and
+        // the reader cannot tell, which is strictly worse than no pill.
+        //
+        // THROUGH THE CONSTANT — this was the FIFTH copy of that wording (roborev 63539, Medium),
+        // and the last one outside `conciergeLine`. It is not a lookalike: it renders into the same
+        // thread column as the receipt rows, through the same primitives, and re-implements the
+        // fallback `ref()` already performs for a nameless agent. Hard-coded, an edit to
+        // `ANONYMOUS_SUBJECT` left this row saying the old words two lines above rows saying the
+        // new ones — silently, because the test below pinned the literal rather than the symbol.
         const found = allAgents(feedRef.current).find((a) => a.id === r.agentId);
-        const who = found ? ref(found) : plain("that agent");
+        const who = found ? ref(found) : plain(ANONYMOUS_SUBJECT);
         // The files that rode this held send: handed back when it never landed, dropped when it
         // did. Taken either way so the queue can't outlive the promise it belongs to.
         const held = takeHeldAttachments(r.agentId);

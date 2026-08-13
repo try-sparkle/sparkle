@@ -304,7 +304,14 @@ describe("receiptRunLine — the count has to be true", () => {
     );
     const l = receiptRunLine(run);
     expect(l.spoken).toContain("Sent to 3 agents' terminals.");
-    expect(l.spoken.match(new RegExp(ANONYMOUS_SUBJECT, "g")) ?? []).toHaveLength(3);
+    // COUNTED BY SPLITTING, NOT BY `new RegExp(ANONYMOUS_SUBJECT, "g")` (roborev 63529, then 63539
+    // — raised twice before it was addressed). The whole premise of the shared symbol is that this
+    // copy gets EDITED, and interpolating it into a pattern breaks the moment it contains a
+    // metacharacter: an unbalanced `(` throws and takes the file down, while `.`, `?`, `+` or `|`
+    // silently change what is counted. This is the one assertion holding the count-truth invariant
+    // — three unidentifiable members must yield three fallback slots — so a quietly loose match is
+    // a hole in exactly the rule it guards. `split` treats the constant as the literal text it is.
+    expect(l.spoken.split(ANONYMOUS_SUBJECT).length - 1).toBe(3);
   });
 
   it("agrees with ONE agent — the count the repeats wording is easiest to get wrong", () => {
@@ -685,9 +692,15 @@ describe("ANONYMOUS_SUBJECT is the fallback the renderer actually uses", () => {
 // ── THE FOLDED ROW'S WORDS ARE THE UNFOLDED ROW'S WORDS (roborev 63525, fixed 63529) ──────────
 //
 // The fold's core invariant is that it never shows a reader something the rows it replaced did not.
-// The anonymous fallback used to exist as FOUR separate literals — `ref()`, `actionReceiptLine`'s
-// `who()`, its `spawned` refusal arm, and this module's own constant — so editing the wording where
-// an individual row renders it left the fold saying the old words beside rows saying the new ones.
+// The anonymous fallback used to exist as FIVE separate literals — `ref()`, `actionReceiptLine`'s
+// `who()`, its `spawned` refusal arm, this module's own constant, and `ConciergeHost`'s
+// deferred-send outcome arm — so editing the wording where an individual row renders it left the
+// fold saying the old words beside rows saying the new ones.
+//
+// EVERY EARLIER VERSION OF THIS SENTENCE UNDERCOUNTED, and that is the durable lesson rather than
+// the number: it said "three", then "four", each time naming the copies someone had found so far,
+// and each time a future reader took the enumeration as complete. Do not trust it — re-run the
+// uncapped grep in `conciergeLine.ts`'s block comment, which must return exactly one producer.
 //
 // TWO VERSIONS OF THIS TEST FAILED TO SEE IT, and both failures are worth keeping.
 //
