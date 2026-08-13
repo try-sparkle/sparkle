@@ -9140,6 +9140,15 @@ mesages_per_hour = 9
     // overwriting this file with the upstream version. Behaviour for all of it is covered end-to-end
     // in scripts/tests/roborev-hook-guard.test.sh, which drives the hook as a real git hook; these
     // are cheap token assertions that fail fast at the Rust layer.
+    //
+    // THE `sparkle-{test,self-test,accounts,bridge}-` NEEDLES ARE GONE ON PURPOSE (2026-08-12,
+    // bead sparkle-60gr7) — do not "restore" them. The guard they pinned was a name allowlist, and
+    // an allowlist only ever stops the harnesses someone remembered to name: with all four in
+    // place the daemon still showed 2,907 failed jobs, all `chdir <temp path>: no such file or
+    // directory`, from roots named `posture-*`, `.tmp*` and `tmp.*`. The hook now skips ANY repo
+    // under a temp root, so the names are no longer load-bearing and asserting them would pin a
+    // heuristic the hook has stopped using. What replaces them below is the machinery that
+    // heuristic became: the guard function, a temp root it recognises, and the opt-in.
     #[test]
     fn vendored_roborev_post_commit_keeps_its_skip_guards() {
         let hook = std::fs::read_to_string(concat!(
@@ -9148,16 +9157,23 @@ mesages_per_hour = 9
         ))
         .expect("vendored resources/roborev/post-commit must exist (bundled Tauri resource)");
         for needle in [
-            "pytest-of-",         // pytest tmp_path_factory fixture repos
-            "sparkle-test-",      // Sparkle Rust/TS suite throwaway repos
-            "sparkle-accounts-",
-            "sparkle-bridge-",
+            "pytest-of-",         // pytest fixture repos aimed OUTSIDE a temp root
             "\" post-commit",     // the ACTUAL delegation invocation `"$ROBOREV" post-commit` —
                                   // not the bare word "post-commit", which also appears in comments
             // ── Sparkle-only, and the reason a seed re-sync must fail this test ──────────────
-            "sparkle-self-test-", // the nested <tmp>/sparkle-self-test-*/sparkle-self/repo layout
+            // CODE-SHAPED, deliberately. A bare `/var/folders/` or `ROBOREV_REVIEW_TEMP_REPOS`
+            // also appears in the hook's own comments — the error message it quotes, the prose
+            // explaining the opt-in — so a hook that kept the comments and lost the guard would
+            // satisfy those needles and this test would pass over a hook that reviews nothing.
+            // Every needle below matches only the executable line it comes from.
+            // The definition AND its first body line. The bare `is_ephemeral_repo() {` is not
+            // enough: the hook's own self-heal greps for the guard, so that literal also appears
+            // on the heal's assertion line, and a hook that lost the function but kept the heal
+            // would satisfy it. Two lines pin the definition itself.
+            "is_ephemeral_repo() {\n    _p=$1",
+            "/tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*", // the temp-root case arm
+            "\"${ROBOREV_REVIEW_TEMP_REPOS:-}\" != \"1\"",                 // the opt-in condition
             "--git-common-dir",   // owner-repo resolution (linked-worktree blind spot)
-            "*/sparkle-test-*",   // path-COMPONENT matching, not basename-only
             "heal-failed",        // the self-heal's visible-failure sentinel
         ] {
             assert!(

@@ -83,7 +83,22 @@ if [ -w "$_self" ] &&
        # guards AND the delegation. That truncated file is non-empty and stub-free, so the two checks
        # above would happily install a hook that silently stops reviewing anything.
        grep -q '"\$ROBOREV" post-commit' "$_heal" &&
-       grep -q 'sparkle-test-' "$_heal" &&
+       # Assert on a CODE token from the guard block, never on prose — and note that the delegation
+       # grep above does NOT already cover this. A range that opens above the temp-root guard and
+       # closes below it (but above the delegation) deletes the guard while leaving the delegation
+       # intact, so only this line can reject it.
+       #
+       # ANCHORED, and that is the whole trick. Three versions of this line were satisfiable by
+       # something other than the guard:
+       #   1. `sparkle-test-` — a guard string until the guard stopped being name-based, after
+       #      which it survived only in a historical comment about the 2026-07-26 flood;
+       #   2. the bare function name — which appears in this comment block, ABOVE the code it
+       #      protects, so a candidate truncated in between kept the mention and lost the function;
+       #   3. the literal definition `is_ephemeral_repo() {` — which appears ON THIS VERY LINE.
+       # (3) is the general trap: the checker lives inside the file it checks, so ANY literal needle
+       # is self-satisfying and no amount of picking a better literal escapes it. `^` does: this
+       # line is indented, the definition sits at column 0, and so does nothing else in the file.
+       grep -q '^is_ephemeral_repo' "$_heal" &&
        [ -x "$_heal" ]; then
         # Clear a previous failure's note ONLY if the install actually happened. Running the `rm`
         # unconditionally meant a failed `mv` left the injection in place, wrote no new note AND
@@ -111,13 +126,12 @@ fi
 # commits real fixture data there (e.g. a backfill exporter under test) floods
 # the roborev DB with reviews that are pure noise and have to be closed by hand.
 #
-# Skip ONLY a confirmed pytest path. This is deliberately NARROWER than the
-# display-side _EPHEMERAL_ROOT_PREFIXES in _roborev_hooklib.py (/tmp, /var/folders,
-# …): verify.sh proves the live loop by committing in a generic `mktemp -d` repo
-# under /tmp and asserting the hook enqueued a review, so a blanket temp-dir skip
-# would break that proof. (The display filter still hides any such review from the
-# agent backlog.) If the toplevel can't be resolved we DELEGATE, never skip — so
-# the only divergence from roborev's unguarded stub is for confirmed pytest repos.
+# This guard now catches only the pytest repos that live OUTSIDE a temp root — a
+# `pytest --basetemp=<dir>` run pointed somewhere permanent. Everything under a temp
+# root is handled by the broader ephemeral-root guard below, which subsumes pytest's
+# default `tmp_path_factory` layout. It is kept because the two cover different
+# ground: this one is name-based and root-agnostic, that one is root-based and
+# name-agnostic. If the toplevel can't be resolved we DELEGATE, never skip.
 #
 # Require BOTH a `pytest-of-<user>` and a `pytest-<N>` path component (pytest's
 # tmp_path_factory always produces both), not just a bare `pytest-of-` substring —
@@ -125,9 +139,11 @@ fi
 # `*` spans `/`, so the two components are NOT required to be adjacent; that's a
 # deliberately loose heuristic, not a precise layout match.
 #
-# Known, accepted narrowness (favoring verify.sh's live-loop proof over breadth):
-#   - a `pytest --basetemp=<dir>` run produces no `pytest-of-` component, so it is
-#     NOT skipped here — if such noise recurs, that's the gap, not a regression;
+# Known, accepted narrowness:
+#   - a `pytest --basetemp=<dir>` run aimed OUTSIDE a temp root produces no
+#     `pytest-of-` component, so it is NOT skipped — if such noise recurs, that's
+#     the gap, not a regression (aimed at the default temp root it is skipped, by
+#     the ephemeral-root guard rather than by this one);
 #   - conversely, an (improbable) long-lived repo that happens to carry both a
 #     `pytest-of-*` and a later `pytest-*` path component is silently skipped.
 #   Both are deliberate trade-offs, not bugs.
@@ -169,24 +185,48 @@ if is_pytest_repo "$top" || is_pytest_repo "$owner"; then
     exit 0
 fi
 
-# Skip Sparkle's throwaway test-fixture repos, the JS/Rust-suite analogue of the
-# pytest guard above. Sparkle's Rust + TS test suites `git init` repos named
-# sparkle-{test,accounts,bridge}-* under a temp root, commit fixture data, then
-# delete them before the daemon can review — pure failed-counter + daemon-log
-# noise (the display filter in _roborev_hooklib.py already hides them from the
-# agent backlog, but they still inflate `roborev status` and the logs). Gated on
-# a temp root AND one of those exact name prefixes, so a genuine Sparkle checkout
-# (never under a temp root) can't be skipped, and verify.sh's generic `mktemp`
-# (tmp.XXXX) loop-proof repo is intentionally NOT matched. Same delegate-if-
-# unresolved posture as the pytest guard: an empty $top falls through, never skips.
+# Skip a repo that lives under a system temp root, UNLESS the caller opts in with
+# ROBOREV_REVIEW_TEMP_REPOS=1. A repo under $TMPDIR is a throwaway fixture by
+# construction — nobody keeps a real checkout in /var/folders — and the daemon
+# reviews it asynchronously, so by the time a worker chdir's into it the suite has
+# already torn it down.
 #
-# Checked against BOTH this checkout and the repo that OWNS it (see $owner above).
-is_fixture_repo() {
+# WHY THIS IS AN OPT-IN AND NOT A NAME ALLOWLIST. It used to be one: a temp root AND
+# one of `sparkle-{test,self-test,accounts,bridge}-*`. That shape only ever stops the
+# harnesses someone remembered to name, and it fails SILENTLY for every other one —
+# nothing reports the gap except the daemon's own error log, which nobody reads. On
+# 2026-08-12, with all four prefixes in place, `roborev status` showed 2,907 failed
+# jobs and 31 errors in 24h, every one of them the same shape:
+#
+#   job <id> failed after 3 retries: build prompt: get commit info: git log:
+#   chdir /var/folders/.../T/posture-fwlBr5/deny-sudo: no such file or directory
+#
+# and none of those roots matched an allowlisted prefix: `posture-XXXXXX/<branch>`
+# (a shell harness), `.tmpXXXXXX/main` (Rust `tempfile`'s default prefix) and
+# `tmp.XXXXXXXX/c` (bare `mktemp -d`). The registry had accreted hundreds of such
+# repos. Inverting the default retires the whole class instead of adding a fifth
+# prefix that the sixth harness will not match (bead sparkle-60gr7).
+#
+# THE COST, STATED PLAINLY. roborev's own verify.sh proves the live loop by
+# committing in a generic `mktemp -d` repo under the temp root and asserting a review
+# was enqueued; under this guard that proof must now export
+# ROBOREV_REVIEW_TEMP_REPOS=1 to keep passing. That is the deliberate trade: a
+# liveness proof can say it wants to be reviewed, whereas a fixture flood cannot say
+# it does not. The opt-in exists precisely so the proof stays possible.
+#
+# Same delegate-if-unresolved posture as the pytest guard: an unresolved owner and
+# $top fall through and are reviewed, never skipped.
+#
+# WHICH PATH IS JUDGED is decided at the call site below, not here — read that block
+# before changing this one. In short: the repo that OWNS the checkout, because a
+# linked worktree cut inside a fixture repo reports its own arbitrary directory
+# (which is how the 2026-07-26 flood got past a $top-only test), while a worktree of
+# a REAL repo cut under a temp root is ordinary work that must stay reviewable.
+is_ephemeral_repo() {
     _p=$1
     [ -n "$_p" ] || return 1
-    _in_temp=""
     case "$_p" in
-        /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) _in_temp=1 ;;
+        /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*) return 0 ;;
     esac
     # Consult TMPDIR only when it is actually set: an empty "${TMPDIR%/}"/* expands to
     # `/*`, and a case glob's `*` spans `/`, so `/*` matches EVERY absolute path — the
@@ -197,25 +237,36 @@ is_fixture_repo() {
     _t="${TMPDIR:-}"; _t="${_t%/}"   # strip trailing slash FIRST, then require non-empty:
     # an unset TMPDIR *or* TMPDIR="/" both reduce to "" and must NOT become the `/*` glob
     # (which, case globs spanning `/`, would match every absolute path and skip real reviews).
-    [ -n "$_t" ] && case "$_p" in "$_t"/*) _in_temp=1 ;; esac
-    [ -n "$_in_temp" ] || return 1
-    # ANY path component, not just the basename. Several fixture layouts nest the git repo BELOW
-    # the tagged root — `<tmp>/sparkle-self-test-reuse-<pid>/sparkle-self/repo` (sparkle_agent.rs
-    # `unique_dir`) and `<tmp>/sparkle-test-<tag>-<pid>/repo` (worktree.rs) both end in a basename
-    # of `repo`, so a basename-only test missed them at BOTH $top and $owner. Measured against the
-    # pre-fix enqueue log, the `sparkle-self-test-*/sparkle-self/repo` shape alone accounted for 820
-    # of them. In a `case` glob `*` spans `/`, so `*/prefix-*` matches a component starting with
-    # that prefix at any depth — while still requiring the `/`, so `notsparkle-test-x` is no match.
-    #
-    # `sparkle-self-test-` is its own prefix, NOT covered by `sparkle-test-*`: the component is
-    # `sparkle-self-test-<tag>-<pid>`, which does not start with `sparkle-test-`.
-    case "$_p" in
-        */sparkle-test-*|*/sparkle-self-test-*|*/sparkle-accounts-*|*/sparkle-bridge-*) return 0 ;;
-    esac
+    [ -n "$_t" ] && case "$_p" in "$_t"/*) return 0 ;; esac
     return 1
 }
 
-if is_fixture_repo "$top" || is_fixture_repo "$owner"; then
+# Judge the OWNER when it resolves, falling back to $top only when it does not — NOT either-or.
+#
+# `is_ephemeral_repo "$top" || is_ephemeral_repo "$owner"` looks equivalent and is not: a linked
+# worktree of a PERMANENT repo, cut under a temp root (`git worktree add "$(mktemp -d)/wt"`), has
+# $top under /var/folders and $owner in the real checkout. Either-or skips it, so real commits
+# carrying real work would be dropped from review — silently, which is the exact property this
+# whole change exists to remove. It is not hypothetical: scratch worktrees are a documented habit.
+#
+# Preferring the owner costs nothing in the other direction. For an ordinary repo $owner == $top,
+# so a fixture directly under the temp root is unaffected; and a worktree of a FIXTURE repo has its
+# owner under the temp root too, so it is still skipped.
+#
+# THE OBJECTION THIS SURVIVED, since it will be raised again. A review argued that owner-preference
+# merely trades a silent skip for a job that must die in `chdir`, on the premise that roborev
+# records the commit's own toplevel — and cited `scripts/land.sh`, which commits in a `mktemp -d`
+# worktree of the real repo and deletes it seconds later. The premise is false, and the measurement
+# is one command: commit in a temp-rooted worktree of this repo, delete the worktree immediately,
+# and watch the job. Done, in 21s — roborev attributed it to the OWNER (`sparkle`, the permanent
+# checkout), where the sha still resolves through the shared object store, and created no registry
+# entry for the temp path. The same holds for every commit on this branch: they are made in a
+# linked worktree under Application Support and recorded against `/Users/drodio/Projects/sparkle`.
+# So a temp $top is NOT unreviewable — only a temp OWNER is, which is exactly what this skips.
+# land.sh's merge commit is the shape in question, and under this rule it gets reviewed.
+_ephemeral_target=$owner
+[ -n "$_ephemeral_target" ] || _ephemeral_target=$top
+if [ "${ROBOREV_REVIEW_TEMP_REPOS:-}" != "1" ] && is_ephemeral_repo "$_ephemeral_target"; then
     exit 0
 fi
 
