@@ -9,10 +9,15 @@ import { AccountSwitchBanner } from "./AccountSwitchBanner";
 import { useAccountSwitch } from "../hooks/useAccountSwitch";
 import { loadAccountState } from "../services/accountSelection";
 import { accountDisplay, type Account, type Identity } from "../services/accountStore";
+import { useUiStore } from "../stores/uiStore";
 
 export function AccountSwitchHost() {
   const { recommendation, plan, accept, dismiss } = useAccountSwitch();
   const [identities, setIdentities] = useState<Identity[] | null>(null);
+  const [accounts, setAccounts] = useState<Account[]>([]);
+  // The account id whose in-progress notice the user has dismissed with the ✕. Keyed by target so a
+  // NEW switch (different destination) shows its own notice again; dismissing only hides THIS one.
+  const [hiddenSwitchTo, setHiddenSwitchTo] = useState<string | null>(null);
 
   // `null` = NOT LOADED YET, which is a third state and not "nobody is signed in". With `[]` as the
   // initial value every account resolved to NOT_SIGNED_IN on first paint and the banner read "An
@@ -28,7 +33,9 @@ export function AccountSwitchHost() {
     if (!recommendation && !plan) return;
     let cancelled = false;
     void loadAccountState().then((s) => {
-      if (!cancelled) setIdentities(s.failed ? null : s.identities);
+      if (cancelled) return;
+      setIdentities(s.failed ? null : s.identities);
+      setAccounts(s.failed ? [] : s.accounts);
     });
     return () => {
       cancelled = true;
@@ -57,13 +64,27 @@ export function AccountSwitchHost() {
 
   const display = (a: Account) => accountDisplay(a, identities!.find((i) => i.id === a.id));
 
+  // The user's nickname for the account this switch is moving TO — the friendly label the progress
+  // notice names. Resolved from the plan's real target account, so it is never a guessed name.
+  const targetName = plan
+    ? (accounts.find((a) => a.id === plan.toAccountId)?.nickname ?? null)
+    : null;
+
+  // Hide the in-progress notice if the user dismissed THIS switch's target. A fresh switch to a
+  // different account resets to a visible notice by construction (the key no longer matches).
+  const planForBanner = plan && plan.toAccountId !== hiddenSwitchTo ? plan : null;
+  if (!planForBanner && !recommendation) return null;
+
   return (
     <AccountSwitchBanner
       recommendation={recommendation}
-      plan={plan}
+      plan={planForBanner}
       display={display}
+      targetName={targetName}
       onAccept={accept}
       onDismiss={dismiss}
+      onManage={() => useUiStore.getState().openSettings("accounts")}
+      onDismissProgress={() => plan && setHiddenSwitchTo(plan.toAccountId)}
     />
   );
 }
