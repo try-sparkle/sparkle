@@ -35,14 +35,29 @@
 
 /** What the concierge did. One entry per user-meaningful action — deliberately NOT one per op:
  *  `merge_pr` and `land_agent_branch` are both `merged` to the reader, and a vocabulary the human
- *  reads should be sized for them rather than for the registry. */
+ *  reads should be sized for them rather than for the registry.
+ *
+ *  `retired` IS NOT `closed`, and the distinction is the reason it earned an arm of its own rather
+ *  than riding the one that already existed. `closed` covers the ops the founder asked for while
+ *  watching — he pointed at an agent and it went away. A RETIREMENT is the concierge deciding, on
+ *  its own initiative and typically overnight, that a finished agent is done with; nobody watched it
+ *  happen and nobody will remember asking for it. Collapsing the two would leave him reading "Closed
+ *  Kraken Auth" in the morning with no way to tell which of the two it was — whether he had asked
+ *  for it and forgotten, or whether the app did it while he slept. That is the same
+ *  did-it-really-happen ambiguity this module exists to end, and the whole point of the unattended
+ *  verb is that the record is the only witness.
+ *
+ *  It also has a REASON on the success path, which `closed` does not: a retirement is a judgement
+ *  ("its PR merged four hours ago"), and the judgement is the part he would want to check. See
+ *  {@link ConciergeActionReceipt.reason}. */
 export type ConciergeActionKind =
   | "spawned"
   | "sent"
   | "closed"
   | "goal"
   | "filed"
-  | "merged";
+  | "merged"
+  | "retired";
 
 /** How a message reached an agent. The two channels behave differently enough that collapsing them
  *  would make the receipt lie by omission: a TERMINAL write lands in the agent's PTY immediately,
@@ -107,7 +122,16 @@ export interface ConciergeActionReceipt {
    *  STORED VERBATIM, ALWAYS. A refusal aimed at the concierge (a review gate, running checks, no
    *  free agent slot) is shown to the founder as a short gist rather than these words, but that is a
    *  RENDERING decision made in `Concierge/refusalAudience` — the record keeps the original so the
-   *  audit trail is never lossy. */
+   *  audit trail is never lossy. THE GIST NEVER REPLACES WHAT IS STORED HERE; a renderer that
+   *  shortened the record instead of its own output would make the audit trail agree with the
+   *  summary by construction, which is the one thing an audit trail may not do.
+   *
+   *  IT IS NOT ONLY A REFUSAL'S FIELD. Two success paths already write it, and both for the same
+   *  reason: the reader has to know something the standard sentence does not say. A spawn that came
+   *  up UNBRIEFED stays `ok` and carries the shortfall here; and a `retired` receipt carries WHY the
+   *  concierge retired that agent — the judgement it made unattended, verbatim as it made it. On a
+   *  retirement that is the most checkable part of the record, so it is stored on success and on
+   *  refusal alike. */
   reason?: string;
   /** Epoch ms, stamped by the recorder at the moment the call settled. */
   at: number;
@@ -312,6 +336,30 @@ export function claimReceiptForDisplay(id: string): boolean {
   if (postedReceiptIds.has(id)) return false;
   postedReceiptIds.add(id);
   return true;
+}
+
+/**
+ * The retirements out of a receipt list, newest first, capped at `limit`.
+ *
+ * LIVES HERE RATHER THAN IN THE PANE, and roborev 55406 is the reason: `conciergeAudit` owned
+ * "newest first, capped at N" while `ConciergeAuditPane` re-derived it, so the tested helper had no
+ * caller and the used one had no test. One rule, one implementation — the pane calls this.
+ *
+ * PURE over the array it is given rather than reading module state, so the caller's own list is a
+ * real `useMemo` dependency instead of an invisible one, and so this is testable without a renderer.
+ *
+ * The filter is part of the rule, not a convenience: this is the surface that answers "what did it
+ * do while I was away", and a retirement is the only kind that happens with nobody watching.
+ */
+export function retirementsNewestFirst(
+  receipts: readonly ConciergeActionReceipt[],
+  limit: number,
+): readonly ConciergeActionReceipt[] {
+  const retired = receipts.filter((r) => r.kind === "retired");
+  // Sliced from the END, exactly as `newestFirstCapped` does: the cap keeps the NEWEST `limit`, and
+  // taking the first `limit` instead would pin the oldest rows on screen forever while every fresh
+  // retirement fell off — a report that goes stale the moment it matters.
+  return retired.slice(Math.max(0, retired.length - limit)).reverse();
 }
 
 /** Drop the posted-id set. Called by the identity reset alongside the backlog. */

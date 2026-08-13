@@ -550,6 +550,8 @@ mod tests {
             attempts_at: Vec::new(),
             retired_at: None,
             retired_reason: None,
+            retired_by: None,
+            retired_evidence: None,
             prior: Vec::new(),
         }
     }

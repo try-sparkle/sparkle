@@ -61,14 +61,10 @@ import { killPty } from "../pty";
 import { landAgentBranch } from "../services/branchStatus";
 import { closeDecision, selectionAfterClose } from "../engine/closeAgent";
 import { retroSettled } from "../engine/retroReceiptTypes";
-import {
-  feedbackEvidence,
-  retroStanding,
-  mayRecordRetroGap,
-  type FeedbackEvidence,
-  type RetroStanding,
-} from "../engine/retroEvidence";
-import { useBeadsStore, beadsPolledAt } from "../stores/beadsStore";
+import { retroStanding, mayRecordRetroGap, type RetroStanding } from "../engine/retroEvidence";
+// ONE implementation, shared with the concierge's retire path — see that module's header for why a
+// second hand-written copy of this rule is the specific defect shape in this area.
+import { feedbackEvidenceFor } from "../services/feedbackEvidenceRead";
 import { canAnswerRetroPing } from "../engine/retirementReadiness";
 import {
   cachedReceipt,
@@ -211,32 +207,6 @@ const NEW_AGENT_SLOT_STYLE: React.CSSProperties = {
   // cloud row from its block-reason line when one is shown.
   gap: 6,
 };
-
-/**
- * Did this agent file feedback? — read from the beads snapshot the poller already fetched.
- *
- * ── IT NEVER SHELLS OUT, AND THAT IS DELIBERATE (bead `sparkle-y2p4f`) ───────────────────────────
- * Both readers below are on the retire path, which ends in an irreversible teardown, so this must
- * not be able to block: every input here is already in memory, there is no `bd` invocation and
- * nothing to await. A retire dialog that hung waiting on the (routinely starved, shared, single-
- * writer) beads store would be worse than one that was merely wrong.
- *
- * The cost of not blocking is that the answer can be MISSING, which is exactly why
- * `feedbackEvidence` is three-valued: a snapshot we could not get resolves to `unknown`, never to
- * "this agent reported nothing".
- *
- * `beadsPolledAt` — NOT `snapshot.loadedAt`. `loadedAt` records when the CONTENT last changed and
- * deliberately stands still on a healthy-but-quiet backlog, so it cannot answer "is this data
- * stale". `beadsPolledAt` is stamped only on a successful read, which is the freshness clock.
- */
-function feedbackEvidenceFor(projectId: string, agentId: string): FeedbackEvidence {
-  return feedbackEvidence({
-    beads: useBeadsStore.getState().byProject[projectId]?.beads,
-    polledAt: beadsPolledAt(projectId),
-    agentId,
-    now: Date.now(),
-  });
-}
 
 export function AgentSidebar({
   project,

@@ -33,15 +33,20 @@
  *                    agent that hit no friction still completed the step, and saying so is what
  *                    stops "nothing worth reporting" from becoming an excuse.
  *   • `excused`    — no retro, but the agent recorded a reason that passed muster (engine/retroMuster).
- *   • `overridden` — a human retired an agent that could not answer (dead, crashed, quota-blocked).
- *                    The ONLY state a person can write. It does NOT file a bead — an earlier version
- *                    of this comment said it "always files a bead alongside", and no production path
- *                    ever did (knightwatch probe 8). The receipt is the whole record. */
+ *   • `overridden` — an agent that could not answer (dead, crashed, quota-blocked) was retired anyway
+ *                    and the gap was accepted. Written by a PERSON **or** by the CONCIERGE acting on
+ *                    the founder's standing authorization — `source` is what tells them apart
+ *                    (`human-override` vs `concierge-override`), and nothing else does, so never read
+ *                    `state: "overridden"` as proof a human looked at it. It does NOT file a bead —
+ *                    an earlier version of this comment said it "always files a bead alongside", and
+ *                    no production path ever did (knightwatch probe 8). The receipt is the whole
+ *                    record. */
 export type RetroReceiptState = "captured" | "excused" | "overridden";
 
-/** Where the receipt came from. Kept because the three writers have very different trust:
+/** Where the receipt came from. Kept because the writers have very different trust:
  *  a parsed PR marker is evidence, an agent's own declaration is a claim, a human override is a
- *  decision. The confirm dialog words itself differently for each. */
+ *  decision, and a concierge override is a decision NO PERSON TOOK. The confirm dialog words itself
+ *  differently for each. */
 export type RetroReceiptSource =
   /** Parsed from `<!-- sparkle:retro {json} -->` in a PR body — the frozen emit contract. */
   | "pr-marker"
@@ -50,7 +55,13 @@ export type RetroReceiptSource =
   /** The agent said so itself, through the lifecycle tool. */
   | "agent-declared"
   /** A human retired an unreachable agent and accepted the gap. */
-  | "human-override";
+  | "human-override"
+  /** The CONCIERGE retired an agent that had no retro anywhere — no receipt, no feedback beads — on
+   *  the founder's standing authorization. A machine-authored counterpart to `human-override`: same
+   *  `overridden` state, same permanent mark, but nobody read the row before it was written. It is a
+   *  separate member precisely so that mark cannot masquerade as a human decision — an audit asking
+   *  "who accepted this gap?" gets the honest answer here rather than a person's name it invented. */
+  | "concierge-override";
 
 /** The enumerated reasons an agent may have no retro.
  *

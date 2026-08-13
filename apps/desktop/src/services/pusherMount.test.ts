@@ -212,7 +212,12 @@ describe("the notifier registration", () => {
     setConciergeNotifier(newSink); // new mount
     clearConciergeNotifier(oldSink); // old cleanup, arriving late
     expect(notifyConcierge("hello")).toBe(true);
-    expect(newSink).toHaveBeenCalledWith("hello");
+    // The KIND rides along now (services/conciergeProactive.NoticeKind). A Pusher finding is the
+    // default, and asserting it here rather than loosening the matcher keeps this test's real
+    // subject — WHICH sink survived the remount — while pinning that the default did not drift:
+    // a report reaching the Pusher's "act on each one now" preamble would tell the concierge to
+    // go and undo work that already finished.
+    expect(newSink).toHaveBeenCalledWith("hello", "pusher");
     expect(oldSink).not.toHaveBeenCalled();
   });
 

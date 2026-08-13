@@ -25,8 +25,10 @@ import {
 import { StatusEngine } from "../engine/statusEngine";
 import {
   type DeathRecordDeps,
+  type RetiredEvidence,
   liveDeps,
   openDeathRecord,
+  recordAgentRetirement,
   recordDeath,
 } from "./deathRecordWriter";
 
@@ -478,5 +480,179 @@ describe("a transport-killed agent is classified as such, even though its retrie
 
     expect(liveDeps().lastFailure("t-live")).toBeUndefined();
     expect(liveDeps().recentFailure("t-live", Date.now())).toMatchObject({ message: ENOTFOUND });
+  });
+});
+
+// ── THE RETIREMENT AUDIT TRAIL ────────────────────────────────────────────────────────────────
+//
+// The concierge's `retire_agent` verb closes finished agents unattended and with NO cap. The
+// founder's condition for that autonomy is a record he can read afterwards — which agent, why, and
+// what safety reading was in hand — and the caller TEARS THE ROW DOWN on this function's boolean.
+// So the two things worth testing are the payload that reaches the ledger and, above everything
+// else, that a failed write cannot come back as `true`.
+describe("retiring an agent records who did it and what they saw", () => {
+  /** A fully-populated reading, so an assertion cannot pass on a half-built object. */
+  const FULL: RetiredEvidence = {
+    worktreeRisk: "clean",
+    landed: true,
+    stage: "merged",
+    branch: "sparkle/agent-42",
+    ahead: 0,
+    retroStanding: "settled",
+    gapReceiptWritten: false,
+    terminalEvidence: "  PR #1776 merged.\n  goal met\n",
+    terminalEvidenceObservedAt: NOW - 5_000,
+  };
+
+  const retires = (c: Calls) =>
+    c.invoked.filter(([cmd]) => cmd === "agent_life_retire").map(([, args]) => args);
+
+  it("sends the retirer and the whole evidence object to the durable ledger", async () => {
+    const c = deps();
+    const ok = await recordAgentRetirement(
+      { agentId: "a1", reason: "finished", retiredBy: "concierge", evidence: FULL },
+      c.deps,
+    );
+
+    expect(ok).toBe(true);
+    // The SIDE EFFECT: what actually reached the command, field for field. `toEqual` rather than
+    // `toMatchObject` on purpose — a dropped evidence field is exactly the defect that would leave
+    // the founder reading a retirement with no reading behind it, and `toMatchObject` would not
+    // notice.
+    expect(retires(c)).toEqual([
+      { agentId: "a1", reason: "finished", retiredBy: "concierge", evidence: FULL },
+    ]);
+  });
+
+  it("keeps the terminal excerpt VERBATIM — the independent check on the retirer's summary", async () => {
+    const c = deps();
+    const verbatim = "  ⏵⏵ accept edits on\n\n> [2mwaiting[0m   \n";
+    await recordAgentRetirement(
+      {
+        agentId: "a1",
+        reason: "idle",
+        retiredBy: "concierge",
+        evidence: { ...FULL, terminalEvidence: verbatim },
+      },
+      c.deps,
+    );
+
+    const sent = retires(c)[0]?.evidence as RetiredEvidence;
+    expect(sent.terminalEvidence).toBe(verbatim);
+  });
+
+  it("RETURNS FALSE when the durable write fails — the caller gates a teardown on this", async () => {
+    // THE ONE THAT MATTERS. A `true` here destroys the row AND the record that was supposed to
+    // outlive it, which is the exact failure this record exists to prevent. The write is made to
+    // genuinely fail (a rejected invoke, the shape a missing Tauri host or a full disk produces),
+    // not stubbed to return false.
+    const attempted: string[] = [];
+    const c = deps({
+      invoke: (cmd) => {
+        attempted.push(cmd);
+        return Promise.reject(new Error("io: no space left on device"));
+      },
+    });
+    const ok = await recordAgentRetirement(
+      { agentId: "a1", reason: "finished", retiredBy: "concierge", evidence: FULL },
+      c.deps,
+    );
+
+    expect(ok).toBe(false);
+    // …and it did not throw either: an accountability affordance that crashes its caller is worse
+    // than none. And the attempt was really MADE: without this, a future short-circuit that skips
+    // the durable write entirely would satisfy the `false` above while writing nothing at all.
+    expect(attempted).toEqual(["agent_life_retire"]);
+  });
+
+  it("a human retirement is attributed to the human, not left blank", async () => {
+    const c = deps();
+    await recordAgentRetirement(
+      {
+        agentId: "a1",
+        reason: "I'm done with this one",
+        retiredBy: "human",
+        evidence: { ...FULL, worktreeRisk: "dirty", retroStanding: "absent" },
+      },
+      c.deps,
+    );
+
+    expect(retires(c)[0]?.retiredBy).toBe("human");
+    expect(retires(c)[0]?.evidence).toMatchObject({
+      worktreeRisk: "dirty",
+      retroStanding: "absent",
+    });
+  });
+
+  // ── THE TS→RUST SEAM ────────────────────────────────────────────────────────────────────────
+  //
+  // `agent_life::RetiredEvidence` carries `skip_serializing_if` on every optional field, so the
+  // wire can present an optional as an explicit `null` OR as an absent key. Both must reach serde
+  // as `None`. These two payloads are the exact fixtures
+  // `the_wire_accepts_both_an_explicit_null_and_an_omitted_key` parses on the Rust side — asserted
+  // AFTER a `JSON.stringify` round trip, because that is the transform Tauri applies and it is what
+  // silently turns an `undefined` into an absent key.
+  it("an undefined optional leaves the key ABSENT, which is what serde reads as None", async () => {
+    const c = deps();
+    const evidence: RetiredEvidence = {
+      worktreeRisk: "dirty",
+      retroStanding: "reported",
+      gapReceiptWritten: true,
+      landed: undefined,
+      stage: undefined,
+    };
+    await recordAgentRetirement(
+      { agentId: "a1", reason: "unknown state", retiredBy: "concierge", evidence },
+      c.deps,
+    );
+
+    const onTheWire = JSON.parse(JSON.stringify(retires(c)[0]?.evidence));
+    expect(onTheWire).toEqual({
+      worktreeRisk: "dirty",
+      retroStanding: "reported",
+      gapReceiptWritten: true,
+    });
+    expect("landed" in onTheWire).toBe(false);
+  });
+
+  it("an explicit null survives the round trip and means the same thing", async () => {
+    const c = deps();
+    const evidence: RetiredEvidence = {
+      worktreeRisk: "dirty",
+      landed: null,
+      stage: null,
+      branch: null,
+      ahead: null,
+      retroStanding: "reported",
+      gapReceiptWritten: true,
+      terminalEvidence: null,
+      terminalEvidenceObservedAt: null,
+    };
+    await recordAgentRetirement(
+      { agentId: "a1", reason: "unknown state", retiredBy: "concierge", evidence },
+      c.deps,
+    );
+
+    const onTheWire = JSON.parse(JSON.stringify(retires(c)[0]?.evidence));
+    // `null`, NOT dropped — this is the half of the wire an `?: T` type would have rejected.
+    expect(onTheWire.landed).toBeNull();
+    expect(onTheWire.terminalEvidenceObservedAt).toBeNull();
+    expect(onTheWire.worktreeRisk).toBe("dirty");
+  });
+
+  it("the PRODUCTION default deps are wired, and they too refuse to report a false success", async () => {
+    // The defaulted-seam trap (AGENTS.md): every test above injects `deps`, so the one line that
+    // supplies `liveDeps()` at the real call site is covered by nothing — delete it and the suite
+    // stays green while every real retirement writes through a dep that does not exist. Driven with
+    // NO deps argument, exactly as the concierge caller invokes it. There is no Tauri host under
+    // vitest, so the real `invoke` genuinely fails, and the answer must be `false`.
+    await expect(
+      recordAgentRetirement({
+        agentId: "a1",
+        reason: "finished",
+        retiredBy: "concierge",
+        evidence: FULL,
+      }),
+    ).resolves.toBe(false);
   });
 });

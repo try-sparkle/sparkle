@@ -603,6 +603,21 @@ const RISK_OVERRIDES: Partial<Record<ConciergeToolName, ConciergeRiskClass>> = {
   // Registers an ARBITRARY absolute path as a project. Not destructive, but it is the one
   // workspace op that takes a filesystem path from the model and gives it standing in the app.
   add_project_from_folder: "disruptive",
+  // ── `retire_agent` IS DELIBERATELY ABSENT FROM THIS TABLE ──────────────────────────────────────
+  // Not an omission — the one entry worth explaining is the one that ISN'T here. `close_agent` and
+  // `spin_down_worker` are raised above because they can stop work IN FLIGHT, which is the property
+  // this tier gates on. `retire_agent` cannot, and that is enforced rather than asserted:
+  // `engine/retirementPredicate.mayRetire` refuses a dirty worktree, unlanded commits, an unreadable
+  // reading of EITHER, and an agent that is still mid-exchange — each from a reading taken live at
+  // the moment of the decision rather than from a cache. What survives all of that is an agent that
+  // finished, landed, and went quiet, and asking a human to approve tearing that down is what left
+  // the founder's fleet at ~78 of 81 slots on 2026-08-12 with nobody awake to click.
+  //
+  // So it keeps its domain word `routine` and derives to `allow`. THIS IS NOT A HOLE IN THE
+  // NAME-KEYED GATE. The module header's worry — that a gate keyed on a tool name is only as strong
+  // as the model's willingness to pick the gated name — runs the other way here: choosing
+  // `retire_agent` is STRICTLY MORE RESTRICTIVE than choosing `close_agent`, which still asks. There
+  // is no laxer path to escape into by picking it.
 };
 
 const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {

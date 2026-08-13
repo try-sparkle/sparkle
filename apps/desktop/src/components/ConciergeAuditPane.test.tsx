@@ -15,8 +15,19 @@
 import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ConciergeAuditPane, AUDIT_ROWS_SHOWN, clockTime } from "./ConciergeAuditPane";
+import {
+  ConciergeAuditPane,
+  AUDIT_ROWS_SHOWN,
+  RETIREMENT_ROWS_SHOWN,
+  clockTime,
+} from "./ConciergeAuditPane";
 import { noteConciergeAuditCall, _resetConciergeAuditForTests } from "../services/conciergeAudit";
+import {
+  nextReceiptId,
+  recordConciergeActionReceipt,
+  _resetConciergeReceiptsForTests,
+  type ConciergeActionReceipt,
+} from "../services/conciergeReceipts";
 
 beforeEach(() => _resetConciergeAuditForTests());
 afterEach(cleanup);
@@ -272,5 +283,147 @@ describe("the list is bounded, and says so", () => {
 
     render(<ConciergeAuditPane />);
     expect(screen.queryByTestId("concierge-audit-more")).toBeNull();
+  });
+});
+
+// ══ THE RETIREMENT LOG — the overnight half of "what did the concierge do" ══════════════════════
+//
+// The call log above records `lifecycle.retire_agent` truthfully and unreadably: a `domain.op` row
+// at 03:14 cannot say WHICH agent or WHY. A retirement is the one concierge action taken with nobody
+// watching — it decides on its own initiative that a finished agent is done with — so the receipt,
+// which carries the agent's name and the concierge's own reason, is what this section renders.
+//
+// The receipts module is REAL here, driven through its own recorder, for the same reason the audit
+// store is: the record's shape is the claim. Every assertion reads what a human would read on
+// screen, and each would fail against a pane that dropped the section.
+describe("what it retired on its own is on screen, not just in the call log", () => {
+  beforeEach(() => _resetConciergeReceiptsForTests());
+
+  const retirement = (over: Partial<ConciergeActionReceipt> = {}): ConciergeActionReceipt => ({
+    id: nextReceiptId(),
+    kind: "retired",
+    ok: true,
+    agentId: "a9",
+    agentName: "Kraken Auth",
+    at: new Date(2026, 6, 27, 3, 14, 0).getTime(),
+    op: "lifecycle.retire_agent",
+    ...over,
+  });
+
+  /** The rendered retirement rows, in the order they appear on screen. */
+  function retirementRows(): HTMLElement[] {
+    return screen.queryAllByTestId("concierge-retirement-entry");
+  }
+
+  it("names the agent it retired and the reason it gave — neither is in the call log's row", () => {
+    recordConciergeActionReceipt(
+      retirement({ reason: "Its PR #1774 merged 4h ago; nothing is unmerged." }),
+    );
+
+    render(<ConciergeAuditPane />);
+    const row = retirementRows()[0]!;
+    expect(within(row).getByTestId("concierge-retirement-agent").textContent).toBe("Kraken Auth");
+    // VERBATIM. This pane is the audit trail; a gist here would make the record agree with the
+    // summary by construction, which is the one thing an audit trail may not do.
+    expect(
+      within(row).getByTestId("concierge-retirement-reason").textContent,
+    ).toBe("Its PR #1774 merged 4h ago; nothing is unmerged.");
+    expect(within(row).getByTestId("concierge-retirement-outcome").textContent).toMatch(/retired/i);
+  });
+
+  it("renders a retirement recorded BEFORE the pane was ever opened", () => {
+    // Every overnight retirement is this case: the dialog was closed when it happened. The receipts
+    // module replays its backlog to a new subscriber, and a section that only listened forward
+    // would show an empty pane in the morning — the exact false negative receipts exist to prevent.
+    recordConciergeActionReceipt(retirement({ agentName: "Left Pair" }));
+    render(<ConciergeAuditPane />);
+    expect(within(retirementRows()[0]!).getByText("Left Pair")).toBeTruthy();
+  });
+
+  it("re-renders when a retirement lands while the pane is open", () => {
+    render(<ConciergeAuditPane />);
+    expect(retirementRows()).toHaveLength(0);
+
+    // From OUTSIDE React, which is how the real one arrives (the tool settle path).
+    act(() => recordConciergeActionReceipt(retirement()));
+
+    expect(retirementRows()).toHaveLength(1);
+  });
+
+  it("shows a REFUSED retirement as refused, rather than silently omitting it", () => {
+    // "It tried and could not" must not look identical to "it never tried" — the absence of a
+    // record is what this whole surface treats as evidence.
+    recordConciergeActionReceipt(
+      retirement({ ok: false, reason: "Kraken Auth still has unmerged commits." }),
+    );
+
+    render(<ConciergeAuditPane />);
+    const row = retirementRows()[0]!;
+    expect(within(row).getByTestId("concierge-retirement-outcome").textContent).toMatch(
+      /couldn't retire/i,
+    );
+    expect(within(row).getByText("Kraken Auth still has unmerged commits.")).toBeTruthy();
+  });
+
+  it("renders NOTHING at all when the concierge has retired nothing", () => {
+    // No permanent "no retirements" line above a dialog full of policy rows: an app that has never
+    // retired anything has nothing to disclose.
+    recordConciergeActionReceipt({
+      id: nextReceiptId(),
+      kind: "sent",
+      ok: true,
+      agentName: "Kraken Auth",
+      channel: "inbox",
+      at: 1_000,
+      op: "fleet.inbox_send",
+    });
+
+    render(<ConciergeAuditPane />);
+    expect(screen.queryByTestId("concierge-retirement-log")).toBeNull();
+    expect(retirementRows()).toHaveLength(0);
+  });
+
+  it("lists them newest first", () => {
+    recordConciergeActionReceipt(retirement({ agentName: "first", at: 1_000 }));
+    recordConciergeActionReceipt(retirement({ agentName: "second", at: 2_000 }));
+
+    render(<ConciergeAuditPane />);
+    const names = retirementRows().map(
+      (r) => within(r).getByTestId("concierge-retirement-agent").textContent,
+    );
+    expect(names).toEqual(["second", "first"]);
+  });
+
+  it("caps the list and says how many it is not showing", () => {
+    const total = RETIREMENT_ROWS_SHOWN + 3;
+    for (let i = 0; i < total; i++) {
+      recordConciergeActionReceipt(retirement({ agentName: `agent-${i}`, at: 1_000 + i }));
+    }
+
+    render(<ConciergeAuditPane />);
+    expect(retirementRows()).toHaveLength(RETIREMENT_ROWS_SHOWN);
+    // Truncating silently is the failure — the reader would take the oldest visible row as the
+    // whole of the night's work.
+    expect(screen.getByTestId("concierge-retirement-more").textContent).toContain("3");
+  });
+
+  it("counts only RETIREMENTS as older, never other receipts the module replayed", () => {
+    // The cut's disclosure is derived from the same filter the rows are: counting the raw receipt
+    // list would report "older retirements" the record does not hold.
+    for (let i = 0; i < RETIREMENT_ROWS_SHOWN; i++) {
+      recordConciergeActionReceipt(retirement({ agentName: `agent-${i}`, at: 1_000 + i }));
+    }
+    recordConciergeActionReceipt({
+      id: nextReceiptId(),
+      kind: "sent",
+      ok: true,
+      channel: "inbox",
+      at: 9_000,
+      op: "fleet.inbox_send",
+    });
+
+    render(<ConciergeAuditPane />);
+    expect(retirementRows()).toHaveLength(RETIREMENT_ROWS_SHOWN);
+    expect(screen.queryByTestId("concierge-retirement-more")).toBeNull();
   });
 });

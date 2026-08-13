@@ -4,6 +4,7 @@ import {
   nextReceiptId,
   onConciergeActionReceipt,
   recordConciergeActionReceipt,
+  retirementsNewestFirst,
   type ConciergeActionReceipt,
 } from "./conciergeReceipts";
 
@@ -249,5 +250,114 @@ describe("the turn origin a receipt carries", () => {
     expect(currentConciergeTurnOrigin()).toBe("bubble-9");
     setConciergeTurnOrigin(null);
     expect(currentConciergeTurnOrigin()).toBeNull();
+  });
+});
+
+// ══ THE RETIREMENT ARM — the one action taken with nobody watching ══════════════════════════════
+//
+// `retire_agent` retires finished agents unattended and overnight. Every other receipt records
+// something the founder asked for while he was there; this one records a judgement the app made on
+// its own, which makes the receipt the ONLY witness. Two properties follow, and both are asserted
+// here rather than assumed: it is its own kind (so a morning reader can tell it from a close he
+// asked for), and its `reason` — the judgement — is stored on the SUCCESS path, verbatim.
+describe("a retirement is its own kind of receipt", () => {
+  afterEach(() => _resetConciergeReceiptsForTests());
+
+  it("fans out with the agent it retired and the concierge's own reason, verbatim", () => {
+    const seen: ConciergeActionReceipt[] = [];
+    onConciergeActionReceipt((r) => void seen.push(r));
+
+    const verbatim = "Its PR #1774 merged 4h ago and its branch is an ancestor of main.";
+    recordConciergeActionReceipt(
+      receipt({
+        kind: "retired",
+        ok: true,
+        agentId: "a9",
+        agentName: "Kraken Auth",
+        channel: undefined,
+        reason: verbatim,
+        op: "lifecycle.retire_agent",
+      }),
+    );
+
+    const r = seen.at(-1)!;
+    expect(r.kind).toBe("retired");
+    // NOT `closed`. A reader who cannot tell the two apart cannot tell whether he asked for this.
+    expect(r.kind).not.toBe("closed");
+    expect(r.agentName).toBe("Kraken Auth");
+    // THE JUDGEMENT SURVIVES ON A SUCCESS. `reason` was documented as the refusal's field; a
+    // retirement that dropped it would leave the morning reader a bare "Retired Kraken Auth" with
+    // no way to check whether the app was right to.
+    expect(r.reason).toBe(verbatim);
+    expect(r.ok).toBe(true);
+  });
+
+  it("records a REFUSED retirement too, with the tool's own words", () => {
+    const seen: ConciergeActionReceipt[] = [];
+    onConciergeActionReceipt((r) => void seen.push(r));
+
+    recordConciergeActionReceipt(
+      receipt({
+        kind: "retired",
+        ok: false,
+        agentName: "Kraken Auth",
+        channel: undefined,
+        reason: "That agent still has unmerged commits on its branch.",
+        op: "lifecycle.retire_agent",
+      }),
+    );
+
+    const r = seen.at(-1)!;
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("That agent still has unmerged commits on its branch.");
+  });
+});
+
+describe("retirementsNewestFirst — the ordering rule the pane calls rather than re-derives", () => {
+  afterEach(() => _resetConciergeReceiptsForTests());
+
+  const retirement = (name: string, at: number) =>
+    receipt({ kind: "retired", ok: true, agentName: name, channel: undefined, at });
+
+  it("keeps only the retirements, dropping every other kind", () => {
+    const list = [
+      receipt({ kind: "sent" }),
+      retirement("Kraken Auth", 1_000),
+      receipt({ kind: "merged", prNumber: 12 }),
+      receipt({ kind: "closed" }),
+    ];
+    expect(retirementsNewestFirst(list, 10).map((r) => r.agentName)).toEqual(["Kraken Auth"]);
+  });
+
+  it("returns them NEWEST FIRST — the reverse of the order they were recorded in", () => {
+    const list = [retirement("first", 1_000), retirement("second", 2_000), retirement("third", 3_000)];
+    expect(retirementsNewestFirst(list, 10).map((r) => r.agentName)).toEqual([
+      "third",
+      "second",
+      "first",
+    ]);
+  });
+
+  it("caps at `limit` by keeping the NEWEST, never the oldest", () => {
+    // Which end the cap takes is the whole question: keeping the first N would pin the oldest rows
+    // on screen forever while every fresh retirement fell off — a report that goes stale exactly
+    // when it starts to matter.
+    const list = [
+      retirement("oldest", 1_000),
+      retirement("middle", 2_000),
+      retirement("newest", 3_000),
+    ];
+    expect(retirementsNewestFirst(list, 2).map((r) => r.agentName)).toEqual(["newest", "middle"]);
+  });
+
+  it("does not mutate the list it was given", () => {
+    const list = [retirement("first", 1_000), retirement("second", 2_000)];
+    retirementsNewestFirst(list, 10);
+    expect(list.map((r) => r.agentName)).toEqual(["first", "second"]);
+  });
+
+  it("is empty when nothing has been retired", () => {
+    expect(retirementsNewestFirst([receipt({ kind: "sent" })], 10)).toEqual([]);
+    expect(retirementsNewestFirst([], 10)).toEqual([]);
   });
 });

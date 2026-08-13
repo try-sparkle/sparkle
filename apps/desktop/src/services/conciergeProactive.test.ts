@@ -11,7 +11,10 @@ import {
   PROACTIVE_MIN_INTERVAL_MS,
   MAX_PENDING_NOTICES,
   PENDING_NOTICE_HARD_CAP,
+  PUSHER_NOTICE_PREAMBLE,
+  REPORT_NOTICE_PREAMBLE,
   accountedNeedsYou,
+  buildNoticeSection,
   buildProactivePrompt,
   createProactiveScheduler,
   markStaleProactive,
@@ -19,6 +22,12 @@ import {
   surfacedDigest,
   type ProactiveDeps,
 } from "./conciergeProactive";
+import {
+  setConciergeNotifier,
+  clearConciergeNotifier,
+  notifyConcierge,
+  _resetConciergeNotifierForTests,
+} from "./conciergeNotifier";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
 import type { ConciergeMessage } from "../components/Concierge/types";
 
@@ -1008,5 +1017,327 @@ describe("research findings ride a proactive turn", () => {
     // line, on the overwhelmingly common turn.
     expect(withDrain.fired[0]!.prompt).toBe(without.fired[0]!.prompt);
     expect(withDrain.fired[0]!.researchTaskIds).toEqual([]);
+  });
+});
+
+// ══ THE OWED CHANNEL'S SECOND KIND — A REPORT, NOT A PUSH ═══════════════════════════════════════
+//
+// `retire_agent` retires finished agents unattended and overnight, and the founder asked to be told
+// what it did while he was away. The owed-notice channel is the right transport — it survives a
+// decline, it is deduplicated, it is rate-limited — but its ONE preamble said "Act on each one now
+// … do not simply relay them to him", which is the exact inverse of what a report needs. These
+// already happened; relaying them plainly IS the deliverable.
+//
+// Every assertion below is on the EMITTED PROMPT, because the prompt is the only thing the concierge
+// ever sees, and each one is written to be RED against a single-preamble build: a report rendered
+// under the pusher instruction contains the pusher preamble, which `not.toContain` catches.
+
+/** Where `text` sits in `prompt` — the position tests below compare against the preambles'. */
+function at(prompt: string, text: string): number {
+  const i = prompt.indexOf(text);
+  expect(i, `expected the prompt to contain ${JSON.stringify(text)}`).toBeGreaterThanOrEqual(0);
+  return i;
+}
+
+describe("buildNoticeSection renders one section per KIND present", () => {
+  it("renders nothing at all for an empty list", () => {
+    expect(buildNoticeSection([])).toBe("");
+  });
+
+  it("a report-only list carries the REPORT instruction and NOT the pusher one", () => {
+    // THE SIDE EFFECT, and the one that would have passed before this change only if the function
+    // ignored its input entirely: a report list must not be introduced by "Act on each one now".
+    const out = buildNoticeSection([
+      { kind: "report", text: "Retired Kraken Auth — its PR merged 4h ago" },
+    ]);
+    expect(out).toContain(REPORT_NOTICE_PREAMBLE);
+    expect(out).not.toContain(PUSHER_NOTICE_PREAMBLE);
+    expect(out).toContain("• Retired Kraken Auth — its PR merged 4h ago");
+  });
+
+  it("a pusher-only list is byte-identical to what it always was", () => {
+    // The additive half. A caller that never mentions a kind must get the old string exactly —
+    // same preamble, same bullets, no report section, no stray separator.
+    const out = buildNoticeSection([
+      { kind: "pusher", text: "Agent A is quota-walled" },
+      { kind: "pusher", text: "Agent B has an expired goal" },
+    ]);
+    expect(out).toBe(
+      PUSHER_NOTICE_PREAMBLE + "• Agent A is quota-walled\n• Agent B has an expired goal",
+    );
+  });
+
+  it("puts each notice under ITS OWN preamble when both kinds are present", () => {
+    const out = buildNoticeSection([
+      { kind: "report", text: "Retired Kraken Auth" },
+      { kind: "pusher", text: "Agent A is quota-walled" },
+      { kind: "report", text: "Retired Left Pair" },
+      { kind: "pusher", text: "Agent B has an expired goal" },
+    ]);
+    // BOTH instructions are present — one section cannot swallow the other's notices.
+    const pusherAt = at(out, PUSHER_NOTICE_PREAMBLE);
+    const reportAt = at(out, REPORT_NOTICE_PREAMBLE);
+    // WORK FIRST, REPORT SECOND.
+    expect(pusherAt).toBeLessThan(reportAt);
+    // Each notice sits inside the right section — the assertion a single mixed section fails.
+    expect(at(out, "• Agent A is quota-walled")).toBeGreaterThan(pusherAt);
+    expect(at(out, "• Agent A is quota-walled")).toBeLessThan(reportAt);
+    expect(at(out, "• Agent B has an expired goal")).toBeLessThan(reportAt);
+    expect(at(out, "• Retired Kraken Auth")).toBeGreaterThan(reportAt);
+    expect(at(out, "• Retired Left Pair")).toBeGreaterThan(reportAt);
+  });
+
+  it("EVERY notice of both kinds survives the split — nothing is dropped by grouping", () => {
+    const notices = [
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "pusher" as const, text: `finding ${i}` })),
+      ...Array.from({ length: 5 }, (_, i) => ({ kind: "report" as const, text: `did ${i}` })),
+    ];
+    const out = buildNoticeSection(notices);
+    for (let i = 0; i < 5; i++) {
+      expect(out).toContain(`• finding ${i}`);
+      expect(out).toContain(`• did ${i}`);
+    }
+    expect(out.match(/^• /gm)).toHaveLength(10);
+  });
+});
+
+describe("the withheld-nothing count is honest about the SECTION it stands over", () => {
+  // The disclosure sentence is an assertion `buildNoticeSection` has to keep true. Split into two
+  // sections, a count taken over the WHOLE list would print "All 14 are listed below" above three
+  // bullets — the reader would take the other eleven as withheld, which is the same concealment the
+  // sentence exists to deny, wearing the disclosure's own clothes.
+  const many = (kind: "pusher" | "report", n: number, label: string) =>
+    Array.from({ length: n }, (_, i) => ({ kind, text: `${label} ${i}` }));
+
+  it("states each section's OWN count, not the combined one", () => {
+    const reports = MAX_PENDING_NOTICES + 4;
+    const out = buildNoticeSection([...many("pusher", 2, "finding"), ...many("report", reports, "did")]);
+
+    // The long section discloses its own number...
+    expect(out).toContain(`All ${reports} are listed below`);
+    expect(out).toContain("none has been withheld");
+    // ...and never the combined one, which is the number a whole-list count would have printed.
+    expect(out).not.toContain(`All ${reports + 2} are listed below`);
+  });
+
+  it("applies the readability threshold per section — a short section keeps the short form", () => {
+    const reports = MAX_PENDING_NOTICES + 4;
+    const out = buildNoticeSection([...many("pusher", 2, "finding"), ...many("report", reports, "did")]);
+    // Exactly ONE disclosure sentence: the two-item pusher section did not grow a header just
+    // because the report section is long.
+    expect(out.match(/none has been withheld/g)).toHaveLength(1);
+    // ...and the disclosure belongs to the REPORT section, not the pusher one.
+    expect(at(out, "none has been withheld")).toBeGreaterThan(at(out, REPORT_NOTICE_PREAMBLE));
+    // Every entry of both sections is still named.
+    expect(out.match(/^• /gm)).toHaveLength(reports + 2);
+  });
+
+  it("discloses in BOTH sections when both are long, each with its own number", () => {
+    const findings = MAX_PENDING_NOTICES + 1;
+    const reports = MAX_PENDING_NOTICES + 5;
+    const out = buildNoticeSection([
+      ...many("pusher", findings, "finding"),
+      ...many("report", reports, "did"),
+    ]);
+    expect(out).toContain(`All ${findings} are listed below`);
+    expect(out).toContain(`All ${reports} are listed below`);
+    expect(out.match(/none has been withheld/g)).toHaveLength(2);
+    expect(out.match(/^• /gm)).toHaveLength(findings + reports);
+  });
+});
+
+describe("notify carries the kind, and defaults to the behaviour every caller already had", () => {
+  it("DEFAULTS TO pusher — a caller that names no kind is unchanged", () => {
+    // The additive requirement, asserted through the scheduler rather than the pure function:
+    // `ConciergeHost` hands `(text) => s.notify(text)` to the notifier sink, and that call site was
+    // not edited by this change.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is quota-walled");
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain(PUSHER_NOTICE_PREAMBLE);
+    expect(prompt).not.toContain(REPORT_NOTICE_PREAMBLE);
+  });
+
+  it("a report reaches the prompt under the report instruction", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    expect(s.notify("Retired Kraken Auth — its PR merged 4h ago", "report")).toBe(true);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain(REPORT_NOTICE_PREAMBLE);
+    expect(prompt).not.toContain(PUSHER_NOTICE_PREAMBLE);
+    expect(prompt).toContain("• Retired Kraken Auth — its PR merged 4h ago");
+  });
+
+  it("a report alone is enough to buy a turn, exactly as a finding is", () => {
+    // The whole point of the second input: a retirement moves no roster digest, so requiring a feed
+    // change would mean the overnight report could only ever ride an unrelated one.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Retired Kraken Auth", "report");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+  });
+
+  it("mixes a live finding and an overnight report into ONE turn, each under its own preamble", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is quota-walled");
+    s.notify("Retired Kraken Auth", "report");
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    const prompt = h.fired[0]!.prompt;
+    expect(at(prompt, "• Agent A is quota-walled")).toBeLessThan(at(prompt, REPORT_NOTICE_PREAMBLE));
+    expect(at(prompt, "• Retired Kraken Auth")).toBeGreaterThan(at(prompt, REPORT_NOTICE_PREAMBLE));
+  });
+
+  it("rides the same turn as a feed change, with the roster section still first", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    s.notify("Retired Kraken Auth", "report");
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toMatch(/needs you|Approve/i);
+    expect(at(prompt, "The user has not asked you anything")).toBeLessThan(
+      at(prompt, REPORT_NOTICE_PREAMBLE),
+    );
+  });
+});
+
+describe("two kinds carrying the SAME text are two notices, not a duplicate", () => {
+  it("keeps both, because the two instructions contradict each other", () => {
+    // Deduplicating on text alone would drop whichever arrived second while telling its caller the
+    // message had been delivered — the false-success this path was rewritten to remove. "Kraken
+    // Auth is stuck" owed as live work and as a report of something already done are opposite
+    // claims; only one of them can be true, and the concierge has to see which one it was handed.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    expect(s.notify("Kraken Auth is finished")).toBe(true);
+    expect(s.notify("Kraken Auth is finished", "report")).toBe(true);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt.match(/^• Kraken Auth is finished$/gm)).toHaveLength(2);
+    expect(at(prompt, PUSHER_NOTICE_PREAMBLE)).toBeLessThan(at(prompt, REPORT_NOTICE_PREAMBLE));
+  });
+
+  it("still deduplicates WITHIN a kind — a re-measured report is one bullet", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    expect(s.notify("Retired Kraken Auth", "report")).toBe(true);
+    expect(s.notify("Retired Kraken Auth", "report")).toBe(true);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired[0]!.prompt.match(/^• Retired Kraken Auth$/gm)).toHaveLength(1);
+  });
+});
+
+describe("delivery and decline behave the same for a report as for a finding", () => {
+  it("clears BOTH kinds on delivery — neither is re-sent on the next turn", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.notify("Agent A is quota-walled");
+    s.notify("Retired Kraken Auth", "report");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    // A later, unrelated feed change buys the next turn; the delivered notices must not ride it.
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).not.toContain("Retired Kraken Auth");
+    expect(h.fired[1]!.prompt).not.toContain("Agent A is quota-walled");
+    expect(h.fired[1]!.prompt).not.toContain(REPORT_NOTICE_PREAMBLE);
+  });
+
+  it("a DECLINED report stays owed, with its kind intact", () => {
+    // The kind has to survive the re-pend as well as the text: a report that came back under the
+    // pusher preamble would tell the concierge to act on a retirement that already happened.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    h.decline();
+    s.notify("Retired Kraken Auth", "report");
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    h.acceptAgain();
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).toContain("• Retired Kraken Auth");
+    expect(h.fired[1]!.prompt).toContain(REPORT_NOTICE_PREAMBLE);
+    expect(h.fired[1]!.prompt).not.toContain(PUSHER_NOTICE_PREAMBLE);
+  });
+
+  it("refuses the newcomer at the hard ceiling whichever kind it is, and keeps every incumbent", () => {
+    // The ceiling bounds this scheduler's MEMORY, which is not per-kind — so a full list refuses a
+    // report too, and refuses it in the direction that keeps what is already owed.
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    for (let i = 0; i < PENDING_NOTICE_HARD_CAP; i++) expect(s.notify(`finding ${i}`)).toBe(true);
+    expect(s.notify("Retired Kraken Auth", "report")).toBe(false);
+
+    h.advance(PROACTIVE_COALESCE_MS);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt.match(/^• finding \d+$/gm)).toHaveLength(PENDING_NOTICE_HARD_CAP);
+    expect(prompt).not.toContain("Retired Kraken Auth");
+    expect(prompt).not.toContain(REPORT_NOTICE_PREAMBLE);
+  });
+});
+
+// ══ THE SEAM: A RETIREMENT REPORT ACTUALLY REACHES A PROACTIVE TURN ══════════════════════════════
+// Both halves of the digest were unit-tested in isolation — `retire_agent` calls `notifyConcierge`
+// with kind "report", and `buildNoticeSection` renders a report section — and NEITHER test proves
+// the two are joined. That is the exact shape AGENTS.md warns about (two suites green, the merge
+// clean, the shipped feature never once running), so this drives the real production path:
+// notifyConcierge -> the registered sink -> the scheduler -> the prompt a turn is actually given.
+describe("a retirement report reaches the turn, under the REPORT preamble", () => {
+  it("carries the text and the report instruction, not the Pusher's", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a" })]));
+    // THE PRODUCTION CALL. `retire_agent` reaches the scheduler through exactly this seam, so the
+    // sink registration is part of what is under test rather than something stubbed around.
+    setConciergeNotifier((text, kind) => s.notify(text, kind));
+    const owed = notifyConcierge(
+      "Retired “Kraken Auth” — landed and idle (72 of 81 agent slots now in use).",
+      "report",
+    );
+    expect(owed).toBe(true);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain("Retired “Kraken Auth”");
+    // The instruction is the whole point of the kind: handed the Pusher preamble, a FINISHED
+    // retirement becomes an instruction to go and act on it — to undo or re-do completed work.
+    expect(prompt).toContain(REPORT_NOTICE_PREAMBLE.trim().slice(0, 40));
+    expect(prompt).not.toContain("do not simply relay them to him");
+    clearConciergeNotifier(() => true);
+    s.dispose();
+  });
+
+  it("a Pusher finding still gets the Pusher instruction — the kinds do not bleed", () => {
+    const h = harness();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a" })]));
+    setConciergeNotifier((text, kind) => s.notify(text, kind));
+    notifyConcierge("Two agents are walled and cannot act.", "pusher");
+    h.advance(PROACTIVE_COALESCE_MS);
+    const prompt = h.fired[0]!.prompt;
+    expect(prompt).toContain("Two agents are walled");
+    expect(prompt).toContain("do not simply relay them to him");
+    s.dispose();
   });
 });

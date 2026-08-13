@@ -130,9 +130,18 @@ export interface ProactiveScheduler {
    * six-an-hour cap — because a finding is an interruption exactly like a push is. What it is NOT
    * subject to is the digest: a notice speaks on its own, which is the whole reason it exists.
    *
-   * IDEMPOTENT ON TEXT. The Pusher re-measures the same fleet every sweep, so the identical
-   * sentence arrives repeatedly while the condition holds; re-sending it is a no-op until the one
-   * that is already owed has been delivered.
+   * IDEMPOTENT ON TEXT — PER KIND. The Pusher re-measures the same fleet every sweep, so the
+   * identical sentence arrives repeatedly while the condition holds; re-sending it is a no-op until
+   * the one that is already owed has been delivered. Two notices of DIFFERENT kinds carrying the
+   * same text are NOT duplicates: "Kraken Auth was retired" owed as a live thing to act on and as a
+   * report of something already done are opposite statements, and collapsing them would silently
+   * drop whichever arrived second — the concealment {@link PENDING_NOTICE_HARD_CAP} exists to
+   * refuse at the door rather than commit quietly.
+   *
+   * `kind` DEFAULTS TO `"pusher"`, so every caller written before reports existed keeps its exact
+   * behaviour with no edit. That is not merely convenience: `conciergeNotifier`'s registered sink is
+   * typed `(text: string) => boolean`, and a required second parameter would have made this method
+   * unassignable to it — the change had to be additive at the call sites to stay inside one seam.
    *
    * RETURNS WHETHER THE FINDING IS NOW OWED — i.e. whether it will reach a prompt. This used to
    * return `void`, and the caller chain assumed that meant success: `notifyConcierge` did
@@ -142,7 +151,7 @@ export interface ProactiveScheduler {
    * silently refused the text, the finding was destroyed AND suppressed at source for four hours.
    * `false` here is the caller's instruction to keep it owed and offer it again next sweep.
    */
-  notify(text: string): boolean;
+  notify(text: string, kind?: NoticeKind): boolean;
   /** Stop scheduling and drop any armed timer. */
   dispose(): void;
   stats(): ProactiveStats;
@@ -160,6 +169,48 @@ export const PUSHER_NOTICE_PREAMBLE =
   "The Pusher measured these and they are yours to act on — the agents involved cannot. " +
   "Act on each one now (read the job, arbitrate, restart, or say the one thing the founder has to " +
   "decide); do not simply relay them to him.\n";
+
+/**
+ * WHICH KIND OF OWED NOTICE THIS IS — and the two are opposite instructions, which is the only
+ * reason the channel needed a second one at all.
+ *
+ * `pusher` is the original: a condition that is STILL TRUE and that only the concierge can move, so
+ * {@link PUSHER_NOTICE_PREAMBLE} says act and says outright "do not simply relay them to him".
+ *
+ * `report` is the inverse: something that ALREADY HAPPENED, unattended, while the founder was away —
+ * `retire_agent` retiring finished agents overnight is the producer this was built for. There is
+ * nothing left to act on, so relaying it plainly IS the deliverable. Handed to the `pusher` preamble
+ * a report becomes an instruction to re-do work that is already done, or to arbitrate a state that no
+ * longer exists; handed to the `report` preamble a live blocker becomes a status line nobody acts on.
+ * Neither preamble can carry the other's notices, which is why the kind travels with the text rather
+ * than being guessed from it.
+ */
+export type NoticeKind = "pusher" | "report";
+
+/** One owed notice: what to say, and which of the two instructions it must be said under. */
+export interface PendingNotice {
+  kind: NoticeKind;
+  text: string;
+}
+
+/**
+ * How a REPORT is introduced to the concierge — the mirror of {@link PUSHER_NOTICE_PREAMBLE}, and
+ * deliberately its opposite in the one respect that matters.
+ *
+ * Written as an instruction for the same reason that one is, and pointed the other way: the failure
+ * mode here is not a concierge that reads something and does nothing, it is a concierge that reads a
+ * finished action and tries to act on it — restarting an agent it retired an hour ago, or asking the
+ * founder to decide something that is already decided. The founder asked to be TOLD what happened
+ * while he was away; for these, telling him is the whole job.
+ *
+ * It still says "every one of them", because the disclosure rule in {@link buildNoticeSection}
+ * applies to a report exactly as it does to a finding: a summary that quietly names fewer than
+ * arrived is the same concealment whatever tense it is written in.
+ */
+export const REPORT_NOTICE_PREAMBLE =
+  "These already HAPPENED while the founder was away — they are a report, not work. Nothing below " +
+  "is yours to act on and none of it needs a decision; do not re-do, undo, or ask about any of it. " +
+  "Relay them to him plainly, in his words, and account for every one.\n";
 
 /**
  * A READABILITY THRESHOLD, NOT A DROP THRESHOLD — and the difference is the whole of bead
@@ -223,18 +274,66 @@ export const PENDING_NOTICE_HARD_CAP = 200;
  * The "none has been withheld" sentence is an assertion this function has to keep true. If a future
  * change ever does withhold something here, that sentence must become an exact count of what was
  * withheld and why — a cap without a disclosure is the bug this function was written to remove.
+ *
+ * ── TWO KINDS, TWO SECTIONS, TWO COUNTS ─────────────────────────────────────────────────────────
+ * A {@link NoticeKind} is an INSTRUCTION, not a label, and the two instructions contradict each
+ * other — so the kinds cannot share a section, and a single preamble over a mixed list would tell
+ * the concierge to act on things that are already finished (or to merely relay a live blocker).
+ * Each kind present renders its own section under its own preamble, carrying EVERY one of its own
+ * notices; one kind present renders one section; an empty list renders "".
+ *
+ * AND THE COUNT IS PER SECTION, which is what keeps the disclosure honest once the list is split.
+ * "All 9 are listed below" printed over a section holding 3 of the 9 would be the withholding
+ * sentence this function exists to prevent, wearing the disclosure's own clothes: the reader would
+ * take the six that are under the OTHER preamble as missing. So each section states the number it
+ * actually contains, and the readability threshold is applied to that number too — a section is long
+ * or short on its own terms.
  */
-export function buildNoticeSection(notices: readonly string[]): string {
+export function buildNoticeSection(notices: readonly PendingNotice[]): string {
   if (notices.length === 0) return "";
-  const body = notices.map((n) => `• ${n}`).join("\n");
-  if (notices.length <= MAX_PENDING_NOTICES) return PUSHER_NOTICE_PREAMBLE + body;
-  return (
-    PUSHER_NOTICE_PREAMBLE +
-    `There are ${notices.length} of them — more than usual. All ${notices.length} are listed below; ` +
-    "none has been withheld. Work the list: act on what you can, group what is the same underlying " +
-    "problem, and name plainly the ones you cannot move.\n" +
-    body
-  );
+  // ORDERED, NOT GROUPED-AS-ENCOUNTERED: the work comes before the report, always. `pusher` notices
+  // are the ones with something still to do, and a concierge that reads an overnight report first
+  // has already spent its attention by the time it reaches the blocker.
+  return NOTICE_ORDER.map((kind) => renderNoticeKind(kind, notices.filter((n) => n.kind === kind)))
+    .filter((section) => section !== "")
+    .join("\n\n");
+}
+
+/** The order the sections appear in. See {@link buildNoticeSection}. */
+const NOTICE_ORDER: readonly NoticeKind[] = ["pusher", "report"];
+
+/**
+ * The preamble each kind is introduced by, and the sentence that carries a long list of it.
+ *
+ * The overflow sentence differs per kind for the same reason the preamble does — "act on what you
+ * can" is meaningless over a list of finished actions — but BOTH keep the count and the words "none
+ * has been withheld" verbatim, because that half is the disclosure rule rather than the instruction,
+ * and it is not the kind's to vary.
+ */
+const NOTICE_SHAPE: Record<NoticeKind, { preamble: string; overflow: (n: number) => string }> = {
+  pusher: {
+    preamble: PUSHER_NOTICE_PREAMBLE,
+    overflow: (n) =>
+      `There are ${n} of them — more than usual. All ${n} are listed below; none has been ` +
+      "withheld. Work the list: act on what you can, group what is the same underlying problem, " +
+      "and name plainly the ones you cannot move.\n",
+  },
+  report: {
+    preamble: REPORT_NOTICE_PREAMBLE,
+    overflow: (n) =>
+      `There are ${n} of them — more than usual. All ${n} are listed below; none has been ` +
+      "withheld. Group what is the same kind of thing so the account is readable, but the total " +
+      `you give him has to be ${n} — a summary that names fewer is one he cannot check.\n`,
+  },
+};
+
+/** One kind's section, or "" when nothing of that kind is owed. */
+function renderNoticeKind(kind: NoticeKind, notices: readonly PendingNotice[]): string {
+  if (notices.length === 0) return "";
+  const { preamble, overflow } = NOTICE_SHAPE[kind];
+  const body = notices.map((n) => `• ${n.text}`).join("\n");
+  if (notices.length <= MAX_PENDING_NOTICES) return preamble + body;
+  return preamble + overflow(notices.length) + body;
 }
 
 /** What a scheduler with no research drain wired sees: nothing unread, nothing to claim. Frozen
@@ -444,8 +543,14 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
    * while the caller was told the delivery had succeeded. If you are adding a second remover,
    * you are re-introducing that defect; the ceiling is enforced at the DOOR instead
    * (see {@link PENDING_NOTICE_HARD_CAP}), where a refusal can still be reported to the caller.
+   *
+   * ── ONE LIST FOR BOTH KINDS, SPLIT ONLY AT RENDER TIME ─────────────────────────────────────────
+   * A {@link PendingNotice} carries its own kind, so the lifecycle above — arrival order, the hard
+   * ceiling, the single removal on delivery — is one set of rules rather than two that could drift.
+   * `buildNoticeSection` is the only thing that separates them, and it separates them for the
+   * prompt's sake, not for the bookkeeping's.
    */
-  let pendingNotices: string[] = [];
+  let pendingNotices: PendingNotice[] = [];
   /** The digest we last seeded or spoke about. */
   let baseline: string | null = null;
   /** The SURFACED projection of that same moment — what a push would actually have said about it.
@@ -594,6 +699,9 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
         }
         // THE ONLY PLACE NOTICES ARE CLEARED. Removed by identity rather than by truncating the
         // list, so a notice that arrived while this turn was in flight is still owed afterwards.
+        // Identity is the OBJECT's now rather than the string's, which is strictly more precise:
+        // two notices of different kinds sharing one sentence are two entries, and delivering one
+        // of them can no longer clear the other.
         const sent = new Set(notices);
         pendingNotices = pendingNotices.filter((n) => !sent.has(n));
         // ...AND THE "SOMETHING IS OWED" FLAG COMES BACK DOWN WITH THEM (roborev 57705).
@@ -727,7 +835,7 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
      *
      * There is deliberately NO path that returns `true` for text this scheduler did not accept.
      */
-    notify(text) {
+    notify(text, kind = "pusher") {
       // (1) DISPOSED — see above.
       if (disposed) return false;
       const finding = text.trim();
@@ -737,11 +845,18 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
       // re-arming also means a Pusher sweeping every five minutes against a condition that lasts
       // hours cannot keep pushing the coalescing window out in front of itself. TRUE, because the
       // finding really is pending and really will be delivered.
-      if (pendingNotices.includes(finding)) return true;
+      //
+      // THE KIND IS PART OF THE IDENTITY. Matching on text alone would silently swallow a report of
+      // something already done whenever a live finding happened to word it the same way — a drop,
+      // reported to the caller as a delivery, which is the exact defect this whole path was
+      // rewritten to remove. The two would be rendered under contradictory instructions, so they
+      // are not the same notice however identical the sentence.
+      if (pendingNotices.some((n) => n.kind === kind && n.text === finding)) return true;
       // (4) THE HARD CEILING — refuse the newcomer, never destroy an incumbent. This replaces a
-      // `shift()` that discarded the oldest owed finding with no residue of any kind.
+      // `shift()` that discarded the oldest owed finding with no residue of any kind. Counted over
+      // BOTH kinds, because what it bounds is this scheduler's memory, and memory is not per-kind.
       if (pendingNotices.length >= PENDING_NOTICE_HARD_CAP) return false;
-      pendingNotices.push(finding);
+      pendingNotices.push({ kind, text: finding });
       // Opens the coalescing window if nothing else has. A finding that arrives while a feed change
       // is already pending rides the same turn, which is the cheaper outcome for both.
       if (pendingSince === null) {

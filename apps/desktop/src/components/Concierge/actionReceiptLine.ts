@@ -173,6 +173,8 @@ export function actionReceiptLine(
           : line`Not sent to ${subject}${tail}`;
       case "closed":
         return line`Couldn't close ${subject}${tail}`;
+      case "retired":
+        return line`Couldn't retire ${subject}${tail}`;
       case "goal":
         return line`Couldn't set a goal on ${subject}${tail}`;
       case "filed":
@@ -244,6 +246,22 @@ export function actionReceiptLine(
 
     case "closed":
       return line`Closed ${subject}.`;
+
+    // NOT folded into `closed`, and the reason is the whole point of the kind: a close is something
+    // the founder asked for while watching, a RETIREMENT is the concierge deciding on its own —
+    // typically overnight — that a finished agent is done with. Reading "Closed X" in the morning he
+    // cannot tell whether he asked for it and forgot.
+    //
+    // It is also the ONE success line that carries a reason. Every other kind here describes an act
+    // he requested, so the act is its own explanation; this one describes a judgement he was not
+    // present for, and the judgement is the part worth checking. Verbatim, never a gist.
+    case "retired": {
+      const why = receipt.reason?.trim();
+      // `plain()`, not a bare string: the reason is model-authored prose that routinely contains
+      // brackets, and only a wrapped slot gets escaped. The module's rule is that the absence of a
+      // pill is a decision someone made rather than one they forgot.
+      return why ? line`Retired ${subject} — ${plain(why)}` : line`Retired ${subject}.`;
+    }
 
     case "goal":
       return line`Set a goal on ${subject}.`;

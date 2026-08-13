@@ -193,6 +193,7 @@ import {
   clearConciergeNotifier,
   notifyConcierge,
 } from "../services/conciergeNotifier";
+import type { NoticeKind } from "../services/conciergeProactive";
 import {
   initialState as initialDelegationState,
   noteToolCall as noteDelegationToolCall,
@@ -2931,7 +2932,9 @@ export function ConciergeHost({
     // so `markStaleProactive` can strike the message when the state moves past it. A caller reaching
     // `concierge_proactive_turn` directly would get an unretractable push, which the scheduler's own
     // header warns about. Handing over `s.notify` keeps every cost control and that guarantee here.
-    const notify = (text: string) => s.notify(text);
+    // The kind rides through: a retirement report must not arrive under the Pusher preamble, which
+    // tells the concierge to ACT on each item rather than relay it. Defaulted, so nothing else moves.
+    const notify = (text: string, kind?: NoticeKind) => s.notify(text, kind);
     setConciergeNotifier(notify);
     return () => {
       clearConciergeNotifier(notify);

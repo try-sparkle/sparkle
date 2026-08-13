@@ -47,7 +47,12 @@ pub struct RetroReceipt {
     pub state: String,
     /// Epoch ms.
     pub at: i64,
-    /// `pr-marker` | `result-json` | `agent-declared` | `human-override`.
+    /// `pr-marker` | `result-json` | `agent-declared` | `human-override` | `concierge-override`.
+    ///
+    /// `human-override` and `concierge-override` share the `overridden` state and differ ONLY here:
+    /// one gap was accepted by a person, the other by the concierge on the founder's standing
+    /// authorization. Preserving this string verbatim is what keeps the second from reading as the
+    /// first — see the module header for why nothing in this file validates it against an enum.
     pub source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pr_number: Option<u64>,
@@ -294,11 +299,67 @@ mod tests {
         }
     }
 
+    /// The machine-authored counterpart to `human-override`: same `overridden` state, written by the
+    /// concierge rather than by a person.
+    fn concierge_override() -> RetroReceipt {
+        RetroReceipt {
+            state: "overridden".into(),
+            at: 1_700_000_000_001,
+            source: "concierge-override".into(),
+            pr_number: None,
+            tldr: None,
+            pain_point_count: None,
+            reason_code: Some("other".into()),
+            reason_text: Some("Retired with no retro anywhere; no receipt and no feedback beads.".into()),
+            branch_evidence: Some("0 ahead, clean".into()),
+        }
+    }
+
     #[test]
     fn round_trips_a_receipt_through_the_file() {
         let d = tmp();
         record_at(d.path(), "p1", "a1", captured()).unwrap();
         assert_eq!(get_at(d.path(), "p1", "a1"), Some(captured()));
+    }
+
+    #[test]
+    fn round_trips_a_concierge_override_with_its_source_intact() {
+        // `state` alone cannot tell a concierge-written gap mark from a human-written one — `source`
+        // is the ONLY thing that does. So the bit worth pinning is not that the receipt survives but
+        // that this exact string does, byte for byte, out to disk and back. Anything that normalized
+        // or defaulted it would silently attribute a machine's decision to a person, permanently.
+        let d = tmp();
+        record_at(d.path(), "p1", "a1", concierge_override()).unwrap();
+        assert_eq!(get_at(d.path(), "p1", "a1"), Some(concierge_override()));
+
+        let text = std::fs::read_to_string(store_path(d.path())).unwrap();
+        assert!(text.contains("\"source\": \"concierge-override\""), "got: {text}");
+        assert!(!text.contains("human-override"), "attributed to a person: {text}");
+        // camelCase across the wire, and the optional fields this variant actually carries are
+        // present rather than skipped — `branchEvidence` is what the dialog shows beside the mark.
+        assert!(text.contains("\"branchEvidence\": \"0 ahead, clean\""), "got: {text}");
+        assert!(!text.contains("branch_evidence"), "snake_case leaked: {text}");
+
+        let got = get_at(d.path(), "p1", "a1").expect("receipt present");
+        assert_eq!(got.state, "overridden");
+        assert_eq!(got.source, "concierge-override");
+    }
+
+    #[test]
+    fn a_concierge_override_deserializes_from_the_camel_case_wire_shape() {
+        // The other direction of the frozen contract: a receipt authored by the TypeScript writer
+        // (`recordRetroConciergeOverride`) arrives as camelCase JSON. A receipt this side failed to
+        // deserialize would be dropped, and a dropped receipt reads downstream as "never reported".
+        let wire = r#"{
+            "state": "overridden",
+            "at": 1700000000001,
+            "source": "concierge-override",
+            "reasonCode": "other",
+            "reasonText": "Retired with no retro anywhere; no receipt and no feedback beads.",
+            "branchEvidence": "0 ahead, clean"
+        }"#;
+        let parsed: RetroReceipt = serde_json::from_str(wire).expect("deserialize");
+        assert_eq!(parsed, concierge_override());
     }
 
     #[test]

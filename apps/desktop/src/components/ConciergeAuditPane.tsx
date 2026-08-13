@@ -1,4 +1,4 @@
-import { useMemo, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { FiCheck, FiClock, FiSlash } from "react-icons/fi";
 
 import { C } from "../theme/colors";
@@ -10,6 +10,11 @@ import {
   type AuditOutcome,
   type ConciergeAuditEntry,
 } from "../services/conciergeAudit";
+import {
+  onConciergeActionReceipt,
+  retirementsNewestFirst,
+  type ConciergeActionReceipt,
+} from "../services/conciergeReceipts";
 
 // THE READER for services/conciergeAudit — the half of the concierge safety surface that answers
 // "what did it just do?", and the half that did not exist. The store has recorded every
@@ -76,6 +81,41 @@ const OUTCOME_ICON: Record<AuditOutcome, typeof FiCheck> = {
   refused: FiSlash,
 };
 
+/** How many retirement rows render. Same cut, same disclosure rule as the call log below it. */
+export const RETIREMENT_ROWS_SHOWN = AUDIT_ROWS_SHOWN;
+
+/**
+ * The retirement receipts this window has seen, oldest first.
+ *
+ * ══ WHY THIS PANE SUBSCRIBES TO RECEIPTS AT ALL ═════════════════════════════════════════════════
+ * The call log below answers "what did the concierge do", and it answers it for someone who was
+ * THERE — a row reading `lifecycle.retire_agent` at 03:14 is a true record and an unreadable one.
+ * A retirement is the one concierge action taken with nobody watching: it decides on its own
+ * initiative, overnight, that a finished agent is done with. The founder asked to be told what it
+ * did while he was away, and a `domain.op` row cannot say WHICH agent or WHY. The receipt can — it
+ * carries the agent's name and the concierge's own reason, verbatim — so this section renders the
+ * receipt rather than re-deriving a sentence from the log's arguments.
+ *
+ * ══ IT DOES NOT CLAIM THE RECEIPT ═══════════════════════════════════════════════════════════════
+ * `claimReceiptForDisplay` is the THREAD's claim, and calling it here would take a receipt the
+ * thread has not drawn yet and suppress its line forever — turning a second reader into a silent
+ * deletion of the first. Two surfaces may show one receipt; that is not a duplicate, it is a record
+ * consulted twice. So this dedupes on `id` in its own state, which is also what makes the replay on
+ * mount (and StrictMode's double-subscribe) idempotent.
+ */
+function useRetirementReceipts(): readonly ConciergeActionReceipt[] {
+  const [seen, setSeen] = useState<readonly ConciergeActionReceipt[]>([]);
+  useEffect(() => {
+    // `onConciergeActionReceipt` replays the backlog synchronously before returning, so a retirement
+    // recorded while this dialog was closed — which is every overnight one — still lands here.
+    return onConciergeActionReceipt((r) => {
+      if (r.kind !== "retired") return;
+      setSeen((prev) => (prev.some((p) => p.id === r.id) ? prev : [...prev, r]));
+    });
+  }, []);
+  return seen;
+}
+
 export function ConciergeAuditPane() {
   // The whole list, not a slice: eviction and settling both replace the array, and the component
   // needs to re-render for either. `entries` is a stable reference between writes, so this is one
@@ -97,6 +137,7 @@ export function ConciergeAuditPane() {
 
   return (
     <section style={pane} data-testid="concierge-audit-pane">
+      <RetirementLog />
       <h3 style={groupHeading}>What the concierge did</h3>
       {shown.length === 0 ? (
         <p style={emptyBox} data-testid="concierge-audit-empty">
@@ -120,6 +161,79 @@ export function ConciergeAuditPane() {
         </>
       )}
     </section>
+  );
+}
+
+/**
+ * What the concierge retired while nobody was watching — rendered only when it retired something.
+ *
+ * NO EMPTY STATE, unlike the call log below. The log's empty box exists to promise that refusals
+ * will appear there, because a reader who opens it after a refusal and sees nothing would conclude
+ * the record does not keep them. This section makes no such promise to make: an app that has never
+ * retired anything has nothing to disclose, and a permanent "no retirements" line above a pane full
+ * of policy rows is chrome rather than evidence.
+ */
+function RetirementLog() {
+  const receipts = useRetirementReceipts();
+  const shown = useMemo(
+    () => retirementsNewestFirst(receipts, RETIREMENT_ROWS_SHOWN),
+    [receipts],
+  );
+  // Counted off the SAME filter the rows came from, not off `receipts.length` — that array holds
+  // every kind, so an unrelated `sent` receipt would inflate this into "3 older retirements" over a
+  // record that holds none.
+  const older = receipts.filter((r) => r.kind === "retired").length - shown.length;
+  if (shown.length === 0) return null;
+
+  return (
+    <div style={pane} data-testid="concierge-retirement-log">
+      <h3 style={groupHeading}>Agents it retired on its own</h3>
+      <div style={{ display: "flex", flexDirection: "column" }}>
+        {shown.map((r) => (
+          <RetirementRow key={r.id} receipt={r} />
+        ))}
+      </div>
+      {older > 0 && (
+        <p style={moreLine} data-testid="concierge-retirement-more">
+          {older === 1 ? "1 older retirement" : `${older} older retirements`} not shown. This list
+          keeps the most recent {RETIREMENT_ROWS_SHOWN}.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** One retirement: which agent, whether it actually happened, when, and the concierge's own reason. */
+function RetirementRow({ receipt }: { receipt: ConciergeActionReceipt }) {
+  // A REFUSED RETIREMENT IS STILL A ROW, on the same rule the call log follows and for the same
+  // reason: the absence of a record is what this whole surface treats as evidence, so "it tried and
+  // could not" must not look identical to "it never tried".
+  const outcome: AuditOutcome = receipt.ok ? "ok" : "refused";
+  const Icon = OUTCOME_ICON[outcome];
+  // The tool's OWN words, printed as the record holds them. `Concierge/refusalAudience` shortens a
+  // refusal for the thread; this pane is the audit trail, which is the one place a gist would be a
+  // loss rather than a kindness.
+  const reason = receipt.reason?.trim();
+
+  return (
+    <div style={row} data-testid="concierge-retirement-entry">
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
+        <span style={outcomePill(OUTCOME_INK[outcome])} data-testid="concierge-retirement-outcome">
+          <Icon size={10} aria-hidden /> {receipt.ok ? "Retired" : "Couldn't retire"}
+        </span>
+        <span style={callName} data-testid="concierge-retirement-agent">
+          {receipt.agentName?.trim() || receipt.agentId || "an agent"}
+        </span>
+        <span style={meta}>{clockTime(receipt.at)}</span>
+      </div>
+      {reason && (
+        <div style={reasonRow}>
+          <span style={reasonText} data-testid="concierge-retirement-reason">
+            {reason}
+          </span>
+        </div>
+      )}
+    </div>
   );
 }
 

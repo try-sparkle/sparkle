@@ -152,13 +152,21 @@ export function foldKeyOf(
       return "closed";
     case "goal":
       return "goal";
-    // `filed` AND `merged` DELIBERATELY NEVER FOLD, and it is not an oversight to revisit. Each of
-    // their lines carries a DISTINCT identifier the reader came for — a bead pill, a PR number — so
-    // an honest folded sentence would have to enumerate exactly what folding was meant to save. And
-    // a merge is high-consequence: "Merged 3 PRs" hides which three, which is the same class of
-    // omission as hiding a refusal.
+    // `filed`, `merged` AND `retired` DELIBERATELY NEVER FOLD, and it is not an oversight to
+    // revisit. Each of their lines carries a DISTINCT identifier the reader came for — a bead pill,
+    // a PR number — so an honest folded sentence would have to enumerate exactly what folding was
+    // meant to save. And a merge is high-consequence: "Merged 3 PRs" hides which three, which is the
+    // same class of omission as hiding a refusal.
+    //
+    // `retired` is the strongest case of the three, and it is listed EXPLICITLY rather than left to
+    // the `default` arm so that it reads as a decision. Its distinguishing detail is not an id but
+    // the REASON, and unlike every other kind here the founder was not present for the act: nobody
+    // watched it happen and nobody will remember asking for it, so the line is the only account of
+    // why an agent is gone. "Retired 6 agents." is precisely the sentence that would make an
+    // unattended verb unauditable — it hides the six judgements the reason field exists to expose.
     case "filed":
     case "merged":
+    case "retired":
       return null;
     default:
       return null;

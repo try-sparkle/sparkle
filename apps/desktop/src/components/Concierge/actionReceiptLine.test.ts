@@ -398,3 +398,54 @@ describe("the terminal channel is never pluralised", () => {
     expect(l?.spoken).not.toContain("agents");
   });
 });
+
+// ══ THE UNATTENDED VERB'S LINE ═════════════════════════════════════════════════════════════════
+// A retirement is the ONE act in this vocabulary the founder was not present for. Nobody watched it
+// happen and nobody will remember asking for it, so this line is the only account of why an agent
+// is gone — which is why it is the only success arm that carries a reason.
+describe("a retirement is reported as its own act, with its reason", () => {
+  const retired = (over: Partial<ConciergeActionReceipt> = {}): ConciergeActionReceipt =>
+    receipt({ kind: "retired", op: "lifecycle.retire_agent", channel: undefined, ...over });
+
+  it("says WHY, verbatim", () => {
+    const l = actionReceiptLine(retired({ reason: "its PR merged four hours ago" }), resolve);
+    expect(l?.spoken).toContain("Retired");
+    expect(l?.spoken).toContain("Left Pair");
+    // NOT a gist. A shortened reason leaves him unable to check a decision nobody watched.
+    expect(l?.spoken).toContain("its PR merged four hours ago");
+  });
+
+  it("is NOT worded as a close — he has to be able to tell the two apart", () => {
+    // "Closed X" reads as something he asked for and might have forgotten; a retirement is the app
+    // deciding on its own. That ambiguity is the whole reason `retired` is a separate kind.
+    const l = actionReceiptLine(retired({ reason: "idle with a met goal" }), resolve);
+    expect(l?.spoken).not.toMatch(/^Closed /);
+    // Positive control: the `closed` kind still produces exactly that wording.
+    const closed = actionReceiptLine(receipt({ kind: "closed", channel: undefined }), resolve);
+    expect(closed?.spoken).toBe("Closed Left Pair.");
+  });
+
+  it("still names the agent when no reason came through", () => {
+    const l = actionReceiptLine(retired(), resolve);
+    expect(l?.spoken).toContain("Retired");
+    expect(l?.spoken).toContain("Left Pair");
+  });
+
+  it("reports a refusal as a refusal, never as a retirement that happened", () => {
+    const l = actionReceiptLine(retired({ ok: false, reason: "it has uncommitted changes" }), resolve);
+    expect(l?.spoken).toMatch(/couldn't retire/i);
+    expect(l?.spoken).not.toMatch(/^Retired /);
+  });
+
+  it("NEVER FOLDS into a count, however many there are", () => {
+    // "Retired 6 agents." is exactly the sentence that would make an unattended verb unauditable —
+    // it deletes the six judgements the reason field exists to expose.
+    const mark = receiptMark(retired({ reason: "landed and idle" }), resolve);
+    expect(foldKeyOf(mark)).toBeNull();
+    // Positive control: a foldable kind still folds, so this is a property of `retired` and not of
+    // the mark-building in this test.
+    expect(foldKeyOf(receiptMark(receipt({ kind: "closed", channel: undefined }), resolve))).toBe(
+      "closed",
+    );
+  });
+});

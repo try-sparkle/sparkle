@@ -80,6 +80,7 @@ import {
   DISCARD_CONFIRM_TOKEN,
   LIFECYCLE_OPS,
   closeAgent,
+  retireAgent,
   discardAgent,
   previewClose,
   previewDiscard,
@@ -659,6 +660,28 @@ const closeAgentArgs = z
     noRetro: z.object({ reasonCode: z.unknown(), reasonText: z.unknown() }).optional(),
   })
   .strict();
+/**
+ * retire_agent — the unattended close. `reason` is REQUIRED and non-empty here as well as in the
+ * domain, because it lands verbatim on the permanent record the founder reads afterwards.
+ *
+ * `deadClaim` is optional and, when present, fully specified: an agent asserting "this one is dead"
+ * owes the excerpt it read, when it read it, and which terminal tier produced it. The DOMAIN judges
+ * those (only the live scrollback describes the present, and only inside a freshness window) — this
+ * layer only guarantees the fields are there to judge, so the refusal can name what was wrong.
+ */
+const retireAgentArgs = z
+  .object({
+    agentId: agentIdArg,
+    reason: z.string().min(1, "a reason is required — it goes on the permanent record"),
+    deadClaim: z
+      .object({
+        evidence: z.string(),
+        observedAt: z.number(),
+        source: z.string(),
+      })
+      .nullish(),
+  })
+  .strict();
 const projectOnly = z.object({ projectId: projectIdArg }).strict();
 
 /** The confirmation flag on workspace's destructive ops. Optional so the DOMAIN produces the
@@ -759,6 +782,15 @@ const LIFECYCLE_ROUTES: Record<LifecycleOp, Handler> = {
   close_agent: route(closeAgentArgs, async (a, ctx) =>
     fromLifecycle(ctx, await closeAgent(a.agentId, a.noRetro)),
   ),
+  // The unattended close. Every safety reading is taken LIVE inside the domain — this layer must not
+  // pre-read anything from the stores and pass it down, or the staleness the op exists to avoid
+  // comes straight back in through its own arguments.
+  retire_agent: route(retireAgentArgs, async (a, ctx) =>
+    fromLifecycle(
+      ctx,
+      await retireAgent(a.agentId, { reason: a.reason, deadClaim: a.deadClaim ?? null }),
+    ),
+  ),
   ship_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await shipAgent(a.agentId))),
   save_agent: route(agentOnly, async (a, ctx) => fromLifecycle(ctx, await saveAgent(a.agentId))),
   discard_agent: route(discardArgs, async (a, ctx) =>
@@ -799,6 +831,7 @@ const LIFECYCLE_WRITE: Record<LifecycleOp, boolean> = {
   preview_close: false,
   preview_discard: false,
   close_agent: true,
+  retire_agent: true,
   ship_agent: true,
   save_agent: true,
   discard_agent: true,

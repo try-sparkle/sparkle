@@ -77,10 +77,37 @@ import { classifyStartError } from "../cloudAgents/startError";
 import type { CategoryId } from "../../stores/uiStore";
 import { localAgentCapacity, type CapacityReading } from "../agentCapacity";
 import { closeDecision, worktreeRiskOf, type WorktreeRisk } from "../../engine/closeAgent";
-import { agentBranchStatus } from "../branchStatus";
+import {
+  agentBranchStatus,
+  agentWorkflowState,
+  type BranchStatus,
+  type WorkflowState,
+} from "../branchStatus";
 import { retroSettled } from "../../engine/retroReceiptTypes";
 import { cachedReceipt } from "../retroReceipts";
-import { resolveStage, stageIndex, type WorkflowStageId } from "../../engine/workflowStage";
+import {
+  resolveStage,
+  stageIndex,
+  unlandedWorkEvidence,
+  type WorkflowStageId,
+} from "../../engine/workflowStage";
+// THE `retire_agent` SAFETY RULE, kept pure and unit-tested as arithmetic. Read its header before
+// changing anything on the retire path — every rung in it has a measured failure behind it.
+import {
+  mayRetire,
+  type DeadClaim,
+  type LiveActivity,
+} from "../../engine/retirementPredicate";
+import {
+  mayRecordRetroGap,
+  retroStanding,
+  type RetroStanding,
+} from "../../engine/retroEvidence";
+import { feedbackEvidenceFor } from "../feedbackEvidenceRead";
+import { recordRetroConciergeOverride } from "../retroReceipts";
+import { recordAgentRetirement } from "../deathRecordWriter";
+import { recordConciergeActionReceipt, nextReceiptId } from "../conciergeReceipts";
+import { notifyConcierge } from "../conciergeNotifier";
 import { spawnBuildAgentInProject } from "../buildAgentSpawn";
 import { awaitBriefDelivery, type BriefDeliveryOutcome } from "../agentBrief";
 import { getModelCatalog, isDefaultModel, DEFAULT_MODEL_ID } from "../models";
@@ -113,8 +140,30 @@ import { sparkleBusyNow } from "../sparkleBusy";
 
 // ── Operations + their risk ─────────────────────────────────────────────────────────────────────
 
-/** Every lifecycle operation the concierge can name. The runtime list is the source of truth for
- *  the union below, so a new op is classified in `LIFECYCLE_RISK` or the build fails. */
+/**
+ * Every lifecycle operation the concierge can name. The runtime list is the source of truth for the
+ * union below, so a new op is classified in `LIFECYCLE_RISK` or the build fails.
+ *
+ * ── ADDING ONE? FOUR TABLES ARE EXHAUSTIVE OVER `LifecycleOp`, AND THE COMPILER FINDS THEM ONE AT
+ *    A TIME. Doing all four in a single edit is much cheaper than four round trips:
+ *
+ *      LIFECYCLE_RISK          (this file)                      — how much thought it needs
+ *      LIFECYCLE_ROUTES        conciergeTools/registry.ts        — the arg schema + handler
+ *      LIFECYCLE_WRITE         conciergeTools/registry.ts        — does it mutate?
+ *      LIFECYCLE_RULES         services/conciergeReceiptClassifier.ts — its audit receipt kind
+ *      LIFECYCLE_PHRASES       engine/conciergeActivityLine.ts   — how the live column says it
+ *
+ *    (`grep -n "Record<LifecycleOp" apps/desktop/src apps/mcp-control/src` is the authority; this
+ *    list is a convenience and the grep is what to trust if they ever disagree.)
+ *
+ *    The op ALSO has to be added to `LIFECYCLE_OPS` in `apps/mcp-control/src/tools.ts`, which is a
+ *    hand-kept duplicate of this list — `conciergeOps.test.ts` reads this file and fails on drift,
+ *    so that one is caught by a test rather than by the compiler.
+ *
+ * WHY THIS NOTE EXISTS. Adding `retire_agent` missed `LIFECYCLE_PHRASES`, and the resulting single
+ * typecheck error failed FOUR CI checks — including both Desktop Rust jobs, which run the frontend
+ * build before they reach Rust and so report a TypeScript error as a Rust failure.
+ */
 export const LIFECYCLE_OPS = [
   "spawn_build_agent",
   "spawn_cloud_build_agent",
@@ -125,6 +174,11 @@ export const LIFECYCLE_OPS = [
   "save_agent",
   "discard_agent",
   "spin_down_worker",
+  // THE NARROW, UNATTENDED CLOSE — see `retireAgent` for the whole rationale. It is deliberately a
+  // SEPARATE op rather than a loosening of `close_agent`, so that op keeps its `ask` tier and both
+  // of its refusals and the human close paths cannot regress. Choosing this name is strictly MORE
+  // restrictive than choosing `close_agent`, so nothing is escapable by picking it.
+  "retire_agent",
   // THE TWO OPS THAT ACT ON A RUNNING PROCESS WITHOUT TOUCHING ITS RECORDS (bead sparkle-x0pvw).
   // Every op above resolves its target through `locate`, a scan of `projects[].agents` — which is
   // why all of them answer `unknown-agent` for the app-owned Improve Sparkle agent, an agent
@@ -172,6 +226,12 @@ export const LIFECYCLE_RISK: Record<LifecycleOp, LifecycleRisk> = {
   discard_agent: "irreversible",
   // Drops a worker's tab, PTY and worktree; its branch is kept.
   spin_down_worker: "routine",
+  // `routine`, AND — unlike close_agent/spin_down_worker — deliberately NOT raised to `disruptive`
+  // by policy.ts's RISK_OVERRIDES. That table exists to ask a human before work is stopped IN
+  // FLIGHT, and this op cannot stop work in flight: `mayRetire` refuses a dirty tree, unlanded
+  // commits, an unreadable reading of either, and an agent that is still producing output. What is
+  // left is an agent that finished, landed, and went quiet. See policy.ts for the paired reasoning.
+  retire_agent: "routine",
   // Re-spawns the PTY in place. `routine` because it is genuinely reversible: the spawn path
   // resumes the agent's Claude session (`--resume <id>`), so the conversation survives — see
   // services/paneControl, which calls this "safe by construction". It is the remedy for a pane
@@ -227,12 +287,39 @@ export type LifecycleRefusalReason =
   //                            being told there were changes to commit. Unlike `uncommitted-work`
   //                            this is ESCAPABLE without destroying anything: `allowUnknownStatus`
   //                            retires the worker while still refusing a positively-dirty tree.
+  // ── THE `retire_agent` REFUSALS ────────────────────────────────────────────────────────────────
+  // Each is the concierge stopping ITSELF, so each one's `message` must name the remedy: this verb
+  // runs unattended, and a refusal nobody can clear is the fleet-wide deadlock of bead
+  // sparkle-plxhx rather than a safety property.
+  | "not-retirable-kind" //     a shell has no worktree or branch, so there is nothing to retire.
+  //                            Distinct from `not-a-build-agent`: a WORKER is retirable here.
+  | "unlanded-work" //          committed work that never reached main. Retiring keeps the branch,
+  //                            but nobody would be left finishing it. Established from
+  //                            `unlandedWorkEvidence`, NEVER from the ahead count — see `mayRetire`.
+  | "unlanded-unknown" //       we could not establish whether the work landed. Same split as
+  //                            `uncommitted-work` / `status-unknown`, for the same reason: absence
+  //                            of evidence must never be reported as evidence of unlanded work.
+  | "activity-unknown" //       we could not read whether the agent is still working. COMMON, not
+  //                            exotic: `runtimeStore.status` is window-local, so a whole project
+  //                            reads `undefined` after a restart. Cleared by reading the terminal.
+  | "reason-required" //        a retirement with no stated reason. The reason is what goes on the
+  //                            permanent record the founder reads afterwards.
+  | "stale-evidence" //         the retirement claimed the agent was dead but backed it with a
+  //                            reading that is not about the present — a lower terminal tier (a
+  //                            snapshot, history, the transcript), one outside the freshness window,
+  //                            a future-dated one, or an empty excerpt. This is the founder's
+  //                            2026-08-12 rule: a quota reading never authorizes a close by itself.
   | "intent-required" //        discard was called without a well-formed DiscardIntent
   | "intent-mismatch" //        the intent names a different agent than the one targeted
   | "unknown-model" //          a spawn named a model this app does not offer (never downgraded)
   | "project-torn-out" //      ANY spawn into a project owned by a satellite (neither window mounts it)
   | "agent-busy" //             restart/stop aimed at the app-owned agent while its hourly
-  //                            improvement pass is mutating the worktree it shares with its pane
+  //                            improvement pass is mutating the worktree it shares with its pane.
+  //                            ALSO `retire_agent` aimed at an agent still mid-exchange. Same word
+  //                            because it is the same answer — "it is doing something, come back" —
+  //                            but note what is NOT at stake there: retirement has already proved
+  //                            the tree clean and the work landed, so this rung protects the turn in
+  //                            flight, not any file.
   | "no-pane" //                restart/stop aimed at an agent with no mounted pane — nothing to act
   //                            on, and NOT an error: a closed agent simply has no PTY
   | "action-failed"; //         the underlying path failed (details in `message`)
@@ -1322,7 +1409,7 @@ export interface ClosedAgents {
   agentIds: string[];
   projectId: string;
   /** Which outcome actually ran. */
-  outcome: "close" | "ship" | "save" | "spin-down";
+  outcome: "close" | "ship" | "save" | "spin-down" | "retire";
 }
 
 /**
@@ -1393,6 +1480,302 @@ export async function closeAgent(
   const closed = await closeBuildAgent(agentId, false);
   if (!closed.ok) return refuse("close_agent", closed.reason, closed.message);
   return ok("close_agent", { agentIds: ids, projectId: found.project.id, outcome: "close" });
+}
+
+// ── Retire: the unattended close ────────────────────────────────────────────────────────────────
+//
+// THE OP THE FOUNDER ASKED FOR ON 2026-08-12, verbatim: *"no i absolutely do not want close_agent to
+// be human only. let's fix that so you can close agents that need to be closed"* — said with ~78 of
+// 81 agent slots held, many by agents that had finished.
+//
+// `close_agent` above is UNCHANGED. It keeps its `ask` policy tier, its `needs-decision` refusal and
+// its `needs-human-confirm` refusal, so the sidebar ×, the phone tap and the green suggestion button
+// cannot regress through this change. This is a second, NARROWER door, and everything that makes it
+// safe is in `engine/retirementPredicate.mayRetire` — read that file's header before touching this.
+//
+// ── THE ONE THING TO GET RIGHT: EVERY READING IS TAKEN LIVE ──────────────────────────────────────
+// `previewClose` answers from `runtimeStore`, which is a 30-second cache with two states that never
+// recover on their own, alongside a `status` map that is window-local and reads `undefined` for a
+// whole project after a restart. This op must not answer from either. See `readRetirementFacts`.
+//
+// ── AND WHAT IT WRITES BEFORE IT DESTROYS ANYTHING ───────────────────────────────────────────────
+// The durable record is written FIRST and its failure ABORTS the retirement. That ordering is the
+// whole point: `AgentSidebar.confirmRetire` already follows it for the human path, because
+// destroying the row and the record of why it went, together, is the failure worth designing
+// against — and this path runs while nobody is watching.
+
+/** What a retirement did. */
+export interface RetiredAgents extends ClosedAgents {
+  outcome: "retire";
+  /** Whether a "no retro was on file" mark was written. See `mayRecordRetroGap`. */
+  gapReceiptWritten: boolean;
+  /** The retro standing that was resolved at retirement, for the concierge to report. */
+  retroStanding: RetroStanding["kind"];
+}
+
+/**
+ * The three writes this op makes outside itself, as an INJECTED object.
+ *
+ * On the deps object rather than inline at the call site, deliberately (bead sparkle-lgbwf, seen
+ * 4×): a seam that every test supplies and production writes inline is a seam whose production line
+ * is covered by nothing — delete it and the suite stays green while the bug comes back. Defaulted
+ * here, so one test can drive the real path.
+ */
+export interface RetireDeps {
+  /** Writes the permanent "no retro on file" mark. Resolves FALSE when the write failed. */
+  recordGap: typeof recordRetroConciergeOverride;
+  /** Writes the durable audit record. Resolves FALSE when the write failed — and that ABORTS. */
+  recordRetirement: typeof recordAgentRetirement;
+  /** The live "is this agent still mid-exchange" reading. */
+  readActivity: (agentId: string) => LiveActivity;
+}
+
+const DEFAULT_RETIRE_DEPS: RetireDeps = {
+  recordGap: recordRetroConciergeOverride,
+  recordRetirement: recordAgentRetirement,
+  readActivity: liveActivityOf,
+};
+
+/**
+ * Map the live status map onto the predicate's three-valued activity reading.
+ *
+ * `undefined` BECOMES `unknown`, NEVER `quiet`. `runtimeStore.status` is written only by a mounted
+ * pane, so after a relaunch — or for any project no window hosts — every agent in the fleet reads
+ * `undefined`. Collapsing that to "quiet" would make the entire fleet retirable on the strength of a
+ * map nobody had populated, which is the exact shape of the staleness bug this verb was built after.
+ *
+ * The RED tier (`waiting`/`approval`/`questions`) counts as busy rather than quiet. Those agents are
+ * not emitting tokens, but each is holding an exchange open with a human, and retiring one silently
+ * discards a question somebody was going to answer.
+ */
+export function liveActivityOf(agentId: string): LiveActivity {
+  const status = useRuntimeStore.getState().status[agentId];
+  if (status === undefined) return "unknown";
+  if (status === "working" || status === "questions" || status === "waiting" || status === "approval")
+    return "working";
+  return "quiet";
+}
+
+/**
+ * Take every safety reading LIVE, at the moment of the decision.
+ *
+ * A worktree that is GONE is not an ambiguity — there is no checkout left, so a teardown destroys
+ * nothing, and `isWorktreeGoneError` already owns that signature. Any OTHER failure falls back to
+ * the cached reading (a stale-but-real observation beats none) and only then to `unknown`, which
+ * refuses. Same ladder `readAgentWorktreeRisk` uses, for the same reasons.
+ */
+async function readRetirementFacts(
+  project: { id: string; rootPath: string; defaultBranch?: string | null },
+  agentId: string,
+): Promise<{ worktreeRisk: WorktreeRisk; unlanded: boolean | undefined; bs?: BranchStatus }> {
+  const rt = useRuntimeStore.getState();
+  const cached = rt.branchStatus[agentId];
+  const base = project.defaultBranch ?? "";
+  let bs: BranchStatus | undefined;
+  let worktreeRisk: WorktreeRisk;
+  try {
+    bs = await agentBranchStatus(project.rootPath, project.id, agentId, base);
+    // Keep the store honest, so the sidebar stops rendering the stale reading the moment this runs.
+    rt.setBranchStatus(agentId, bs);
+    worktreeRisk = worktreeRiskOf(bs);
+  } catch (e) {
+    bs = cached;
+    worktreeRisk = isWorktreeGoneError(e) ? "clean" : worktreeRiskOf(cached);
+  }
+  let ws: WorkflowState | undefined;
+  try {
+    // `probePrState: false` — the PR probe reaches GitHub, and `unlandedWorkEvidence` deliberately
+    // does not consult `prState` anyway (it is the state of the branch's PR, not of the branch).
+    ws = await agentWorkflowState(project.rootPath, agentId, "", false, project.id);
+  } catch {
+    ws = rt.workflowState[agentId];
+  }
+  return {
+    worktreeRisk,
+    // REUSED, NOT RE-DERIVED. This function already yields to direct reachability over the ahead
+    // count, which is the only way a squash-landed branch (ahead: N forever) reads as landed.
+    unlanded: unlandedWorkEvidence({ bs, ws, stageOverride: rt.workflowStage[agentId] }),
+    bs,
+  };
+}
+
+/** A one-line branch measurement for the audit record, in the same shape `branchEvidence` uses. */
+function branchEvidenceOf(bs: BranchStatus | undefined): string | null {
+  if (!bs) return null;
+  return `${bs.ahead} ahead, ${bs.dirty ? "dirty" : "clean"}`;
+}
+
+/**
+ * Retire an agent that has finished — unattended, and with NO CAP.
+ *
+ * The no-cap decision is the founder's, made explicitly on 2026-08-12 and matching the "no cap,
+ * trust the concierge" call already recorded for research dispatch. `mayRetire`'s header carries the
+ * reasoning; do not add a limit here without taking it back to him.
+ */
+export async function retireAgent(
+  agentId: string,
+  args: { reason: string; deadClaim?: DeadClaim | null },
+  deps: RetireDeps = DEFAULT_RETIRE_DEPS,
+): Promise<LifecycleResult<RetiredAgents>> {
+  const found = locate(agentId);
+  if (!found) return refuse("retire_agent", "unknown-agent", unknownAgent(agentId));
+  const { project, agent } = found;
+
+  const facts = await readRetirementFacts(project, agentId);
+  const verdict = mayRetire({
+    kind: agent.kind,
+    worktreeRisk: facts.worktreeRisk,
+    unlanded: facts.unlanded,
+    liveActivity: deps.readActivity(agentId),
+    reason: args.reason,
+    deadClaim: args.deadClaim ?? null,
+    now: Date.now(),
+  });
+  if (!verdict.ok) {
+    return refuse("retire_agent", verdict.refusal, `I won't retire “${agent.name}”. ${verdict.message}`);
+  }
+
+  // ── THE RETRO STANDING ──────────────────────────────────────────────────────────────────────────
+  // Resolved for BUILD agents only: workers report to an orchestrator, not to the build list, and
+  // have never been part of the retro gate (`closeDecision` answers `silent` for them).
+  //
+  // ALL FOUR ARMS RETIRE — the founder's boundary choice on 2026-08-12, which explicitly extended
+  // this to landed rows carrying no retro at all. What differs is what gets WRITTEN, and the split
+  // is not cosmetic: `mayRecordRetroGap` answers true ONLY for `absent`, the one arm where a
+  // trustworthy read affirmatively found nothing. A receipt has no delete path anywhere in this app,
+  // and 19 of the 29 receipts once on disk were false marks written on absence-of-evidence. So an
+  // `unknown` standing — the backlog was unreadable — retires WITHOUT accusing, and says so in the
+  // durable record instead. Retiring on an unreadable backlog is fine; accusing on one is not.
+  //
+  // A WORKER RECORDS `unknown`, NOT `settled`. Both suppress the gap write, so the behaviour is the
+  // same either way — but the value lands in the permanent record, and `settled` would assert a
+  // retro standing that was never determined. `unknown` is the honest word for "not established
+  // here", and it is what the record should say to anyone reading it later.
+  const standing: RetroStanding =
+    agent.kind === "build"
+      ? retroStanding(
+          retroSettled(cachedReceipt(project.id, agentId)),
+          feedbackEvidenceFor(project.id, agentId),
+        )
+      : { kind: "unknown" };
+
+  let gapReceiptWritten = false;
+  if (agent.kind === "build" && mayRecordRetroGap(standing)) {
+    gapReceiptWritten = await deps.recordGap(project.id, agentId, {
+      // NAMES ITS AUTHOR. The founder's own gap note says "Retired by the founder"; a machine-written
+      // one that borrowed that sentence would put words in his mouth on a permanent record.
+      reasonText:
+        "Retired by the concierge with no retro receipt on file, and no agent-feedback beads " +
+        "attributed to this agent in a fresh read of the backlog at the time.",
+      branchEvidence: branchEvidenceOf(facts.bs),
+    });
+    // A FAILED GAP WRITE IS NOT FATAL — and that is the opposite call from the audit write below.
+    // The two records answer different questions. This one is a claim ABOUT THE AGENT that we were
+    // unable to file; the retirement is still safe and still fully recorded by the audit write,
+    // which carries `gapReceiptWritten: false` so the gap is visible as unfiled rather than implied.
+  }
+
+  // ── THE DURABLE RECORD, BEFORE ANYTHING IS DESTROYED ───────────────────────────────────────────
+  const recorded = await deps.recordRetirement({
+    agentId,
+    reason: args.reason,
+    retiredBy: "concierge",
+    evidence: {
+      worktreeRisk: facts.worktreeRisk,
+      landed: facts.unlanded === undefined ? null : !facts.unlanded,
+      stage: stageOf(agentId),
+      branch: agent.branch ?? null,
+      ahead: facts.bs?.ahead ?? null,
+      retroStanding: standing.kind,
+      gapReceiptWritten,
+      terminalEvidence: args.deadClaim?.evidence ?? null,
+      terminalEvidenceObservedAt: args.deadClaim?.observedAt ?? null,
+    },
+  });
+  if (!recorded) {
+    return refuse(
+      "retire_agent",
+      "action-failed",
+      `I couldn't write the record of why I was retiring “${agent.name}”, so I've left it open. ` +
+        `Retiring it now would take the row and the reason it went at the same time, and this runs ` +
+        `while you're not watching — the record is the only thing that would have told you.`,
+    );
+  }
+
+  // ── THE READABLE RECORD ─────────────────────────────────────────────────────────────────────────
+  // The durable write above is the one that survives a restart and gates the teardown; this is the
+  // one the founder actually SEES, in the audit pane, without opening a file. `retired` is its own
+  // receipt kind rather than a flavour of `closed`, because "I asked for this and forgot" and "the
+  // app did it while I slept" are the two readings he must be able to tell apart.
+  //
+  // WRITTEN ONLY AFTER THE TEARDOWN ACTUALLY HAPPENED, which is the opposite ordering from the
+  // durable record above, and deliberately so — the two answer different questions. The durable one
+  // must precede the destruction, because its whole job is to make sure nothing is destroyed
+  // unrecorded. This one is a report of what DID happen, so recording it up front would put a
+  // cheerful `ok: true` in the founder's audit pane for a retirement that then failed and left the
+  // row sitting in front of him. A receipt that disagrees with the roster is exactly the
+  // did-it-really-happen ambiguity this module exists to end.
+  //
+  // NOT gated on: a failed receipt is a rendering loss, and the fact is already durable above.
+  const noteReceipt = (): void => {
+    recordConciergeActionReceipt({
+      id: nextReceiptId(),
+      kind: "retired",
+      ok: true,
+      agentId,
+      agentName: agent.name,
+      // VERBATIM, never a gist — the judgement is the part worth checking.
+      reason: args.reason,
+      at: Date.now(),
+      op: "retire_agent",
+    });
+    // ── AND TELL HIM ────────────────────────────────────────────────────────────────────────────
+    // The founder asked to be told what was retired while he was away, which is the half a record
+    // alone does not deliver: a log answers a question he has to think to ask.
+    //
+    // `"report"`, NEVER the default `"pusher"` kind. The Pusher preamble instructs the concierge to
+    // "act on each one now … do not simply relay them to him" — handed a finished retirement that
+    // becomes an instruction to undo or re-do completed work. A retirement already happened, and
+    // relaying it plainly IS the deliverable.
+    //
+    // Capacity is named because relieving it is the entire point of the verb, and "I retired six
+    // agents" means nothing without the number it bought back.
+    const cap = localAgentCapacity();
+    notifyConcierge(
+      `Retired “${agent.name}” — ${args.reason} (${cap.used} of ${cap.limit} agent slots now in use).`,
+      "report",
+    );
+  };
+
+  // ── THE TEARDOWN ────────────────────────────────────────────────────────────────────────────────
+  if (agent.kind === "worker") {
+    const r = await spinDownWorkerAgent(agentId);
+    if (!r.ok) return refuse("retire_agent", r.reason, r.message);
+    noteReceipt();
+    return ok("retire_agent", {
+      ...r.data,
+      outcome: "retire" as const,
+      gapReceiptWritten,
+      retroStanding: standing.kind,
+    });
+  }
+  const ids = [agentId, ...childrenOf(project, agentId).map((a) => a.id)];
+  // `true` — AND THIS IS THE FIRST PRODUCTION CALLER OF THAT BRANCH, which closeBuildAgent's header
+  // has reserved since bead sparkle-0l9xk for "the day one of them earns a human confirm of its
+  // own". What earns it is not a human standing behind this call; it is the founder's standing
+  // authorization plus `mayRetire`, which refuses everything his confirm was protecting — work at
+  // risk, unlanded commits, an unreadable reading of either, an agent still mid-exchange — and the
+  // durable record above, which cannot fail silently because it is written first and gates this line.
+  const closed = await closeBuildAgent(agentId, true);
+  if (!closed.ok) return refuse("retire_agent", closed.reason, closed.message);
+  noteReceipt();
+  return ok("retire_agent", {
+    agentIds: ids,
+    projectId: project.id,
+    outcome: "retire",
+    gapReceiptWritten,
+    retroStanding: standing.kind,
+  });
 }
 
 // ── Ship ────────────────────────────────────────────────────────────────────────────────────────
@@ -1694,7 +2077,7 @@ export async function spinDownWorkerAgent(
       `“${found.agent.name}” is a ${found.agent.kind} agent, not a worker — closing it is a different operation with different consequences.`,
     );
   }
-  const risk = await readWorkerWorktreeRisk(found.project, workerId);
+  const risk = await readAgentWorktreeRisk(found.project, workerId);
   if (risk === "dirty" && !opts.discardUncommitted) {
     return refuse(
       "spin_down_worker",
@@ -1747,8 +2130,10 @@ export async function spinDownWorkerAgent(
  * Any OTHER failure is a genuine unknown, and rather than give up immediately we fall back to the
  * cached reading — a stale-but-real observation beats no observation — and only then to `"unknown"`.
  */
-async function readWorkerWorktreeRisk(
+async function readAgentWorktreeRisk(
   project: { id: string; rootPath: string; defaultBranch?: string | null },
+  // Any agent that owns a worktree — a worker on the spin-down path, a worker or a build agent on
+  // the retirement path. Nothing in here was ever worker-specific; the name was.
   workerId: string,
 ): Promise<WorktreeRisk> {
   const cached = useRuntimeStore.getState().branchStatus[workerId];

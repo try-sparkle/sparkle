@@ -243,6 +243,12 @@ const LIFECYCLE_PHRASES: Record<LifecycleOp, OpPhrase> = {
   preview_close: phrase("Checking what closing %s would do", "Checked what closing %s would do", AGENT),
   preview_discard: phrase("Checking what discarding %s would lose", "Checked what discarding %s would lose", AGENT),
   close_agent: phrase("Closing %s", "Closed %s", AGENT),
+  // "Retiring", NOT "Closing", and for the reason the whole `retired` vocabulary exists: a close is
+  // something the founder asked for while watching, a retirement is the concierge deciding on its
+  // own that a finished agent is done with. He is reading this column precisely to catch the app
+  // doing things he did not ask for, so the one op he did not request must not borrow the wording of
+  // the ops he did.
+  retire_agent: phrase("Retiring %s", "Retired %s", AGENT),
   // "Restarting", not "Closing" or "Starting": a human reading this column must not think their
   // agent was torn down and replaced. It is the same terminal with the same resumed conversation.
   restart_agent: phrase("Restarting %s's terminal", "Restarted %s's terminal", AGENT),

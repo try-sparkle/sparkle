@@ -90,6 +90,13 @@ const LIFECYCLE_RULES: Record<LifecycleOp, OpRule> = {
   preview_close: null,
   preview_discard: null,
   close_agent: { kind: "closed" },
+  // `retired`, NOT `closed`, and the split is the whole reason that arm exists. `closed` reads as
+  // something the founder asked for while watching — he pointed at a row and it went away. A
+  // retirement is the concierge deciding on its own initiative, typically overnight, that a
+  // finished agent is done with. Reported as `closed` he would read "Closed Kraken Auth" in the
+  // morning with no way to tell whether he had asked for it and forgotten, which is precisely the
+  // did-it-really-happen ambiguity this module exists to end. The receipt is the only witness.
+  retire_agent: { kind: "retired" },
   ship_agent: null,
   save_agent: null,
   discard_agent: { kind: "closed" },

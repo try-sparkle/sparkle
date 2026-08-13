@@ -302,6 +302,54 @@ pub struct Claim {
     pub attempts: u32,
 }
 
+/// WHAT THE RETIRER ACTUALLY LOOKED AT — the audit trail the founder reads after the fact.
+///
+/// The concierge's `retire_agent` verb closes finished agents unattended and with NO cap. The
+/// founder's condition for that autonomy is a record he can read afterwards: which agent, why, and
+/// what safety reading was in hand at the moment the call was made. That record has to survive an
+/// app restart — the single largest killer of state in this app, per this module's header — which is
+/// why it is a field on the durable ledger and not a row in the concierge's in-memory audit log.
+///
+/// EVERY FIELD IS AN OBSERVATION, NEVER A CONCLUSION. `worktree_risk` carries an explicit
+/// `"unknown"` rather than defaulting to `"clean"`, and `landed`/`stage`/`branch`/`ahead` are
+/// `Option` rather than zero-valued, for the same reason `Wip::dirty_files` is: a read that FAILED
+/// must never be indistinguishable from a read that came back safe. A retirement made on an unknown
+/// worktree is a legitimate thing to do and a legitimate thing to be held to — but only if the
+/// record says that is what happened.
+///
+/// `terminal_evidence` is VERBATIM live scrollback, kept exactly as `Death::message` is and for the
+/// same reason: it is the raw thing a human re-reads, and trimming or normalising it destroys the
+/// only independent check on the retirer's summary. `terminal_evidence_observed_at` is what stops it
+/// being passed off as fresher than it was.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetiredEvidence {
+    /// `"clean" | "dirty" | "unknown"`. A free-form `String` rather than an enum on purpose: an
+    /// unrecognised reading from a future probe must round-trip into the record a human reads,
+    /// not fail the whole retirement write at the serde boundary.
+    pub worktree_risk: String,
+    /// `None` is NOT `false` — it means nobody could tell whether the work landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// Commits ahead of the base. `None` is a failed read; `Some(0)` is a branch with nothing on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ahead: Option<i64>,
+    /// `"settled" | "reported" | "unknown" | "absent"`. Free-form for the same reason as
+    /// `worktree_risk`.
+    pub retro_standing: String,
+    pub gap_receipt_written: bool,
+    /// VERBATIM live-scrollback excerpt. Never trimmed, normalised or re-cased.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_evidence: Option<String>,
+    /// Epoch ms at which the excerpt above was read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_evidence_observed_at: Option<i64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentLifeRecord {
@@ -328,6 +376,15 @@ pub struct AgentLifeRecord {
     pub retired_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retired_reason: Option<String>,
+    /// WHO retired this agent — `"concierge"` or `"human"`. `None` on every record written before
+    /// this field existed, and on any retirement whose caller declined to say, which is exactly the
+    /// distinction the founder needs: an unattributed retirement must not read as a human one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_by: Option<String>,
+    /// What the retirer was looking at. `None` means no evidence was recorded, NOT that the agent
+    /// was safe to retire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retired_evidence: Option<RetiredEvidence>,
     #[serde(default)]
     pub prior: Vec<Death>,
 }
@@ -499,6 +556,8 @@ pub fn open_at(
         attempts_at,
         retired_at: None,
         retired_reason: None,
+        retired_by: None,
+        retired_evidence: None,
         prior,
     };
     write_record_at(dir, &rec)?;
@@ -731,10 +790,29 @@ pub fn release_at(
     Ok(rec)
 }
 
+/// Retire a record: this agent is finished with, and its worktree may be reaped.
+///
+/// `retired_by` / `evidence` are the AUDIT TRAIL for an unattended retirement — see
+/// {@link RetiredEvidence}. Both are `Option` so a plain human retirement (`None`, `None`) writes
+/// exactly what it wrote before this pair existed.
+///
+/// ── ONE SIGNATURE, NOT A SIBLING `retire_with_evidence_at` (deliberate) ───────────────────────
+/// A sibling would have left the old zero-argument path in place, and a caller reaching for it —
+/// the obvious, shorter one — would retire an agent with the audit trail silently empty. That is
+/// precisely the failure this record exists to prevent, so the parameters are made unavoidable at
+/// the compiler instead. There was exactly one caller (`agent_life_retire`), so the cost was one
+/// line.
+///
+/// All four retirement fields are written TOGETHER on every call, including back to `None`. A
+/// second retirement is a new fact about who retired the agent and what they saw; leaving a
+/// previous `retired_by` standing beside a fresh `retired_reason` would attribute one caller's
+/// reason to another caller's name, which is worse than a blank.
 pub fn retire_at(
     dir: &Path,
     agent_id: &str,
     reason: &str,
+    retired_by: Option<&str>,
+    evidence: Option<RetiredEvidence>,
     now_ms: i64,
 ) -> Result<(), LifeError> {
     let mut rec = read_record_at(dir, agent_id)?
@@ -742,6 +820,8 @@ pub fn retire_at(
     rec.state = LifeState::Retired;
     rec.retired_at = Some(now_ms);
     rec.retired_reason = Some(reason.to_string());
+    rec.retired_by = retired_by.map(str::to_string);
+    rec.retired_evidence = evidence;
     write_record_at(dir, &rec)
 }
 
@@ -1225,18 +1305,26 @@ pub async fn agent_life_release(
 }
 
 /// Retire a record: this agent is finished with, and its worktree may be reaped.
+///
+/// `retired_by` and `evidence` are OPTIONAL on the wire — an omitted key and an explicit `null` both
+/// deserialize to `None`, which is what lets a plain human retirement send neither and get exactly
+/// the record this command wrote before they existed.
 #[tauri::command]
 pub async fn agent_life_retire(
     app: tauri::AppHandle,
     agent_id: String,
     reason: String,
+    retired_by: Option<String>,
+    evidence: Option<RetiredEvidence>,
 ) -> Result<(), String> {
     let (dir, _) = dirs_of(&app)?;
     let now = now_ms();
-    tauri::async_runtime::spawn_blocking(move || retire_at(&dir, &agent_id, &reason, now))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        retire_at(&dir, &agent_id, &reason, retired_by.as_deref(), evidence, now)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -2488,5 +2576,239 @@ mod tests {
             base.join("hook-events").parent(),
             "the ledger must be a sibling of hook-events, not a child of any worktree"
         );
+    }
+
+    // ── the retirement audit trail ───────────────────────────────────────────────────────────
+
+    /// A fully-populated reading, so a test asserting the write cannot pass by accident on a
+    /// half-empty struct.
+    fn full_evidence() -> RetiredEvidence {
+        RetiredEvidence {
+            worktree_risk: "clean".into(),
+            landed: Some(true),
+            stage: Some("merged".into()),
+            branch: Some("sparkle/agent-42".into()),
+            ahead: Some(0),
+            retro_standing: "settled".into(),
+            gap_receipt_written: false,
+            terminal_evidence: Some("  PR #1776 merged.\n  goal met\n".into()),
+            terminal_evidence_observed_at: Some(NOW - 5_000),
+        }
+    }
+
+    /// THE WHOLE POINT OF THIS CHANGE: a concierge retirement must be readable off DISK afterwards.
+    ///
+    /// Asserts the record that came back through `read_record_at` — a real parse of the real file
+    /// `retire_at` wrote — rather than the value handed in, because the failure this guards is a
+    /// field that serializes but does not deserialize (or vice versa) and so is silently absent by
+    /// the time the founder looks.
+    #[test]
+    fn a_concierge_retirement_records_who_and_what_they_saw() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "e1");
+        retire_at(&dir, "a1", "finished", Some("concierge"), Some(full_evidence()), NOW)
+            .expect("retire");
+
+        let rec = read_record_at(&dir, "a1").expect("read").expect("record");
+        assert_eq!(rec.state, LifeState::Retired);
+        assert_eq!(rec.retired_reason.as_deref(), Some("finished"));
+        assert_eq!(
+            rec.retired_by.as_deref(),
+            Some("concierge"),
+            "an unattended retirement that does not name its retirer is the audit gap this closes"
+        );
+        assert_eq!(
+            rec.retired_evidence,
+            Some(full_evidence()),
+            "every field of the safety reading must survive the round trip, verbatim"
+        );
+    }
+
+    /// The honest-limits half: an UNKNOWN worktree reading must round-trip as `"unknown"` and a
+    /// failed git read as `None` — never collapsing into the reassuring value.
+    ///
+    /// Paired with the test above on purpose. That one shows the fields land when they are known;
+    /// this one shows an absence stays an absence, which is the reading a reviewer would otherwise
+    /// mistake for "the retirer checked and it was fine".
+    #[test]
+    fn an_unknown_reading_is_stored_as_unknown_not_as_clean() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "e1");
+        let ev = RetiredEvidence {
+            worktree_risk: "unknown".into(),
+            landed: None,
+            stage: None,
+            branch: None,
+            ahead: None,
+            retro_standing: "absent".into(),
+            gap_receipt_written: true,
+            terminal_evidence: None,
+            terminal_evidence_observed_at: None,
+        };
+        retire_at(&dir, "a1", "no signal", Some("concierge"), Some(ev.clone()), NOW).expect("retire");
+
+        let got = read_record_at(&dir, "a1")
+            .expect("read")
+            .expect("record")
+            .retired_evidence
+            .expect("evidence");
+        assert_eq!(got, ev);
+        assert_eq!(got.worktree_risk, "unknown");
+        assert_eq!(got.landed, None, "a failed landed-read must not read as `false`");
+        assert!(got.gap_receipt_written, "a bool must not be defaulted away by the round trip");
+    }
+
+    /// EXISTING BEHAVIOUR FOR A PLAIN HUMAN RETIREMENT IS UNCHANGED — asserted against the BYTES on
+    /// disk, because "unchanged" here means the stored JSON has no new keys in it at all.
+    ///
+    /// The positive half (`retiredReason` present) is what stops this passing on a file the test
+    /// failed to find: an assertion made only of `!contains` is satisfied by an empty string.
+    #[test]
+    fn a_human_retirement_writes_exactly_what_it_wrote_before() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "e1");
+        retire_at(&dir, "a1", "done with it", None, None, NOW).expect("retire");
+
+        let raw = std::fs::read_to_string(dir.join("a1.json")).expect("stored file");
+        assert!(raw.contains("\"retiredReason\": \"done with it\""), "stored: {raw}");
+        assert!(raw.contains("\"retiredAt\""), "stored: {raw}");
+        assert!(
+            !raw.contains("retiredBy"),
+            "an unattributed retirement must not emit the key at all: {raw}"
+        );
+        assert!(
+            !raw.contains("retiredEvidence"),
+            "no evidence means the key is absent, not an empty object: {raw}"
+        );
+
+        let rec = read_record_at(&dir, "a1").expect("read").expect("record");
+        assert_eq!(rec.state, LifeState::Retired);
+        assert_eq!(rec.retired_by, None);
+        assert_eq!(rec.retired_evidence, None);
+    }
+
+    /// A RE-RETIREMENT REPLACES THE WHOLE SET, so a reason can never be attributed to a name that
+    /// belongs to a different call. Pins the choice `retire_at`'s doc states.
+    #[test]
+    fn a_later_retirement_replaces_the_attribution_with_its_own() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "e1");
+        retire_at(&dir, "a1", "auto-closed", Some("concierge"), Some(full_evidence()), NOW)
+            .expect("first retire");
+        retire_at(&dir, "a1", "and I agree", Some("human"), None, NOW + 1_000).expect("second");
+
+        let rec = read_record_at(&dir, "a1").expect("read").expect("record");
+        assert_eq!(rec.retired_reason.as_deref(), Some("and I agree"));
+        assert_eq!(rec.retired_by.as_deref(), Some("human"));
+        assert_eq!(
+            rec.retired_evidence, None,
+            "the previous retirer's evidence must not stand beside a new retirer's reason"
+        );
+        assert_eq!(rec.retired_at, Some(NOW + 1_000));
+    }
+
+    /// THE TS→RUST SEAM, PINNED IN BOTH DIRECTIONS (AGENTS.md: "a Rust `Option` crosses the wire as
+    /// `null`, NEVER as an absent key").
+    ///
+    /// `deathRecordWriter.recordAgentRetirement` builds this object in TypeScript, where an optional
+    /// field can arrive as an explicit `null` (the caller wrote one) OR be dropped entirely by
+    /// `JSON.stringify` (the caller wrote `undefined`). Serde must accept BOTH and produce the same
+    /// value, or the concierge's retirement fails at the command boundary and the row is torn down
+    /// with no record — the exact failure the boolean return exists to prevent.
+    ///
+    /// The two literals below are the fixture the TS test asserts it sends.
+    #[test]
+    fn the_wire_accepts_both_an_explicit_null_and_an_omitted_key() {
+        let with_nulls = r#"{
+            "worktreeRisk": "dirty",
+            "landed": null,
+            "stage": null,
+            "branch": null,
+            "ahead": null,
+            "retroStanding": "reported",
+            "gapReceiptWritten": true,
+            "terminalEvidence": null,
+            "terminalEvidenceObservedAt": null
+        }"#;
+        let omitted = r#"{
+            "worktreeRisk": "dirty",
+            "retroStanding": "reported",
+            "gapReceiptWritten": true
+        }"#;
+
+        let a: RetiredEvidence = serde_json::from_str(with_nulls).expect("nulls must parse");
+        let b: RetiredEvidence = serde_json::from_str(omitted).expect("omitted keys must parse");
+        assert_eq!(a, b, "null and absent must be the same value on this side of the wire");
+        assert_eq!(a.worktree_risk, "dirty");
+        assert_eq!(a.landed, None);
+        assert!(a.gap_receipt_written);
+    }
+
+    /// And the emitted shape, so a TS reader written against this record is written against what
+    /// serde ACTUALLY produces rather than what the TS type made its author expect.
+    #[test]
+    fn the_emitted_record_is_camel_case_and_omits_what_it_does_not_know() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "e1");
+        retire_at(
+            &dir,
+            "a1",
+            "finished",
+            Some("concierge"),
+            Some(RetiredEvidence {
+                worktree_risk: "clean".into(),
+                landed: Some(false),
+                stage: None,
+                branch: Some("feat/x".into()),
+                ahead: None,
+                retro_standing: "settled".into(),
+                gap_receipt_written: true,
+                terminal_evidence: None,
+                terminal_evidence_observed_at: Some(NOW),
+            }),
+            NOW,
+        )
+        .expect("retire");
+
+        let raw = std::fs::read_to_string(dir.join("a1.json")).expect("stored file");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("stored json");
+        let ev = v.get("retiredEvidence").expect("retiredEvidence key");
+        assert_eq!(v.get("retiredBy").and_then(|x| x.as_str()), Some("concierge"));
+        assert_eq!(ev.get("worktreeRisk").and_then(|x| x.as_str()), Some("clean"));
+        assert_eq!(ev.get("landed").and_then(|x| x.as_bool()), Some(false));
+        assert_eq!(ev.get("retroStanding").and_then(|x| x.as_str()), Some("settled"));
+        assert_eq!(ev.get("gapReceiptWritten").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(ev.get("terminalEvidenceObservedAt").and_then(|x| x.as_i64()), Some(NOW));
+        assert_eq!(ev.get("branch").and_then(|x| x.as_str()), Some("feat/x"));
+        // …and the unknown ones are ABSENT, not `null` — `skip_serializing_if` is on, matching every
+        // other optional field in this file.
+        assert!(ev.get("stage").is_none(), "stage should be omitted, got: {ev}");
+        assert!(ev.get("ahead").is_none(), "ahead should be omitted, got: {ev}");
+        assert!(
+            ev.get("terminalEvidence").is_none(),
+            "terminalEvidence should be omitted, got: {ev}"
+        );
+    }
+
+    /// Scrollback is kept VERBATIM, for the same reason `Death::message` is: it is the independent
+    /// check on the retirer's own summary, and a trim destroys exactly the whitespace a reader uses
+    /// to see where an excerpt was cut.
+    #[test]
+    fn the_terminal_excerpt_is_stored_byte_for_byte() {
+        let (_td, dir, _app_data) = dirs();
+        open(&dir, "a1", "e1");
+        let verbatim = "  ⏵⏵ accept edits on\n\n> \u{1b}[2mwaiting\u{1b}[0m   \n";
+        let mut ev = full_evidence();
+        ev.terminal_evidence = Some(verbatim.to_string());
+        retire_at(&dir, "a1", "finished", Some("concierge"), Some(ev), NOW).expect("retire");
+
+        let got = read_record_at(&dir, "a1")
+            .expect("read")
+            .expect("record")
+            .retired_evidence
+            .expect("evidence")
+            .terminal_evidence
+            .expect("excerpt");
+        assert_eq!(got, verbatim, "the excerpt was normalised; cohort reading depends on the bytes");
     }
 }

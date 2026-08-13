@@ -134,6 +134,84 @@ export async function openDeathRecord(
 }
 
 /**
+ * WHAT THE RETIRER WAS LOOKING AT — the durable half of the concierge's `retire_agent` verb.
+ *
+ * Mirrors `agent_life::RetiredEvidence`. The concierge closes finished agents unattended and with NO
+ * cap; the founder's condition for that is a record he can read afterwards, and it has to outlive an
+ * app restart, which is why it goes to the ledger rather than to the in-memory concierge audit log.
+ *
+ * ── EVERY OPTIONAL FIELD IS `?: T | null`, NOT `?: T` (AGENTS.md, and it is load-bearing) ──────
+ * A Rust `Option` crosses the wire as `null` unless its field carries `skip_serializing_if`, and
+ * TypeScript's `?: T` means `T | undefined` — which does NOT include `null`. A type written `?: T`
+ * therefore describes a shape the wire can produce and the parser rejects. Read `null` and absent as
+ * the SAME thing; the Rust side accepts both on the way in (`the_wire_accepts_both_an_explicit_null_
+ * and_an_omitted_key` pins that) and omits unknown fields on the way out.
+ *
+ * `worktreeRisk` and `retroStanding` carry an explicit `"unknown"` rather than defaulting to the
+ * reassuring value: a reading that FAILED must never be indistinguishable from one that came back
+ * safe.
+ */
+export type RetiredEvidence = {
+  worktreeRisk: "clean" | "dirty" | "unknown";
+  landed?: boolean | null;
+  stage?: string | null;
+  branch?: string | null;
+  ahead?: number | null;
+  retroStanding: "settled" | "reported" | "unknown" | "absent";
+  gapReceiptWritten: boolean;
+  /** VERBATIM live-scrollback excerpt. Never trimmed or normalised on either side of the wire. */
+  terminalEvidence?: string | null;
+  /** Epoch ms at which the excerpt above was read. */
+  terminalEvidenceObservedAt?: number | null;
+};
+
+/**
+ * Retire an agent's durable record, stamped with WHO did it and what they acted on.
+ *
+ * ── THE RETURN VALUE IS A GATE, NOT A LOG LINE ────────────────────────────────────────────────
+ * `true` means the durable write ACTUALLY LANDED. The caller tears the agent's row down on the
+ * strength of it, so a `true` on a failed write destroys the row and its record together — which is
+ * precisely the failure this record exists to prevent. The `catch` below therefore returns `false`;
+ * it must never widen into a swallowed success.
+ *
+ * NEVER THROWS, for the same reason `openDeathRecord` does not: this is an accountability
+ * affordance, and one that can crash its caller is worse than none. The boolean is how the caller
+ * learns, rather than an exception it might not be positioned to handle.
+ *
+ * `deps` is an optional trailing parameter so a test can drive a genuinely failing write; the
+ * contract callers are written against is the single `args` object.
+ */
+export async function recordAgentRetirement(
+  args: {
+    agentId: string;
+    reason: string;
+    retiredBy: "concierge" | "human";
+    evidence: RetiredEvidence;
+  },
+  deps: DeathRecordDeps = liveDeps(),
+): Promise<boolean> {
+  const { agentId, reason, retiredBy, evidence } = args;
+  try {
+    await deps.invoke("agent_life_retire", { agentId, reason, retiredBy, evidence });
+    log.info("resurrection", "retired an agent", {
+      agentId,
+      retiredBy,
+      worktreeRisk: evidence.worktreeRisk,
+      retroStanding: evidence.retroStanding,
+    });
+    return true;
+  } catch (e) {
+    // NOT `true`. The caller gates a teardown on this.
+    log.warn("resurrection", "could not record the retirement", {
+      agentId,
+      retiredBy,
+      error: String(e),
+    });
+    return false;
+  }
+}
+
+/**
  * Classify what just ended this agent's session and write the verdict.
  *
  * Returns the verdict it wrote, or `null` when nothing was written — which is what lets the tests

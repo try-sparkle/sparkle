@@ -25,18 +25,33 @@
 // four `false`s above plus this paragraph, not a compiler guarantee. Read it that way before adding
 // a caller: if a machine door ever needs `true`, it needs a human confirm of its own first.
 //
-// ── AND `true` HAS NO PRODUCTION CALLER AT ALL (roborev 59153) ───────────────────────────────────
-// This header used to say "the sidebar passes `true` only from inside RetireAgentConfirm's
-// callback". It does not, and never did: the human path is `AgentSidebar.confirmRetire`, which
-// writes the override receipt and then calls `teardownAgent` directly — it does not come through
-// here. `confirmedByHuman: true` is passed only by this module's own tests.
+// ── `true` NOW HAS EXACTLY ONE PRODUCTION CALLER: `retire_agent` (2026-08-12) ────────────────────
+// This header used to say `true` had none, and that the branch was "the reserved shape for the day
+// one of them earns a human confirm of its own". That day came. `conciergeTools/lifecycle.retireAgent`
+// passes `true`, and it is the ONLY caller that may — the other three machine doors above still pass
+// `false` and still get their typed refusal.
 //
-// That is deliberate and worth stating rather than "fixing" by routing the × through here: the two
-// doors do genuinely different work. `confirmRetire` must AWAIT the receipt write and ABORT the
-// teardown when it fails (knightwatch probe 4 — proceeding would destroy the row and the record
-// together), which is a policy this choke point does not and should not carry. What this file is
-// for is REFUSING the four machine doors, and the `true` branch is the reserved shape for the day
-// one of them earns a human confirm of its own. Read it as reserved, not as exercised.
+// WHAT EARNED IT, precisely, because "the concierge asked nicely" is not it:
+//
+//   1. THE FOUNDER LIFTED THE RULE. On 2026-08-12, with ~78 of 81 agent slots held by agents that
+//      had finished: *"no i absolutely do not want close_agent to be human only. let's fix that so
+//      you can close agents that need to be closed"*. The gate below was his instruction; so is this.
+//   2. THE PROTECTED POPULATION IS STILL PROTECTED. `engine/retirementPredicate.mayRetire` refuses a
+//      dirty worktree, commits that never reached main, an unreadable reading of either, and an
+//      agent still mid-exchange — each from a LIVE reading rather than a cache. It is a strictly
+//      narrower door than the `false` path, not a wider one.
+//   3. THE RECORD IS WRITTEN FIRST AND GATES THE TEARDOWN. That is the same policy `confirmRetire`
+//      carries on the human side (knightwatch probe 4 — proceeding would destroy the row and the
+//      record together), and it matters MORE here, because this path runs while nobody is watching.
+//
+// Note what did NOT change: this is still a plain `boolean`, so nothing stops a sixth caller from
+// passing `true`. The gate is the four `false`s above plus this paragraph, not a compiler guarantee.
+// Read it before adding a caller — if a new machine door needs `true`, it needs its own equivalent
+// of (2) and (3), not merely a reference to this one.
+//
+// The human × still does not come through here at all: `AgentSidebar.confirmRetire` writes the
+// override receipt and calls `teardownAgent` directly. The two doors do genuinely different work,
+// and routing one through the other would give the founder's confirm the concierge's policy.
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";

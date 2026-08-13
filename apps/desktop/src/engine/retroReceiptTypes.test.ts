@@ -5,6 +5,7 @@ import {
   retroSettled,
   RETRO_RECEIPT_STORE_VERSION,
   type RetroReceipt,
+  type RetroReceiptSource,
 } from "./retroReceiptTypes";
 
 describe("the no-retro reason vocabulary is CLOSED", () => {
@@ -84,6 +85,46 @@ describe("retroSettled is FAIL-CLOSED", () => {
   it("counts an excused and an overridden receipt as settled", () => {
     expect(retroSettled({ state: "excused", at: 1, source: "agent-declared", reasonCode: "no-changes" })).toBe(true);
     expect(retroSettled({ state: "overridden", at: 1, source: "human-override", reasonCode: "other" })).toBe(true);
+  });
+
+  it("counts a CONCIERGE-written override as settled, exactly like the human one", () => {
+    // The concierge writes the same `overridden` state, so nothing downstream of `retroSettled`
+    // should treat it differently — the distinction lives in `source`, and only for attribution.
+    expect(
+      retroSettled({ state: "overridden", at: 1, source: "concierge-override", reasonCode: "other" }),
+    ).toBe(true);
+  });
+});
+
+describe("the receipt SOURCE vocabulary distinguishes who accepted a gap", () => {
+  // Typed exhaustively rather than as a bare array: `Record<RetroReceiptSource, true>` fails
+  // TYPECHECK if a member is added to or removed from the union without this list moving with it.
+  // There is no runtime list of sources to pin (unlike NO_RETRO_REASONS), so the compiler is the
+  // only thing that can hold them together.
+  const ALL: Record<RetroReceiptSource, true> = {
+    "pr-marker": true,
+    "result-json": true,
+    "agent-declared": true,
+    "human-override": true,
+    "concierge-override": true,
+  };
+
+  it("is exactly the five writers, including the concierge's own", () => {
+    expect(Object.keys(ALL).sort()).toEqual([
+      "agent-declared",
+      "concierge-override",
+      "human-override",
+      "pr-marker",
+      "result-json",
+    ]);
+  });
+
+  it("keeps the two override writers as SEPARATE members", () => {
+    // The whole point of the new member: a gap mark the concierge wrote must not be readable as a
+    // decision a person took. If these ever collapse onto one string, that honesty is gone and
+    // nothing on disk records that it was lost.
+    const overrides = Object.keys(ALL).filter((s) => s.endsWith("-override"));
+    expect(overrides.sort()).toEqual(["concierge-override", "human-override"]);
   });
 });
 

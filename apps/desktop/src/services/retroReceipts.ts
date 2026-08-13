@@ -197,7 +197,9 @@ export async function recordRetroExcused(
   return wrote ? { status: "recorded" } : { status: "write-failed" };
 }
 
-/** A human retired an agent that could not answer. THE ONLY state a person writes.
+/** A human retired an agent that could not answer. The `overridden` state a PERSON writes — the
+ *  concierge writes the same state through `recordRetroConciergeOverride`, and `source` is the only
+ *  thing that tells the two apart.
  *
  *  Must be awaited BEFORE the row is removed: `removeAgent` is a hard delete, so once it runs the
  *  agent id is gone from the store and there is nothing left to attribute the gap to. */
@@ -213,6 +215,42 @@ export function recordRetroOverridden(
     reasonCode: "other",
     reasonText: reason.reasonText,
     ...(reason.branchEvidence ? { branchEvidence: reason.branchEvidence } : {}),
+  });
+}
+
+/** The CONCIERGE retired an agent that had no retro anywhere, on the founder's standing
+ *  authorization. Same `overridden` state as the human path above, but honestly attributed.
+ *
+ *  ── WHY A SEPARATE WRITER RATHER THAN REUSING `recordRetroOverridden` ────────────────────────────
+ *  Because the gap note is a PERMANENT, undeletable mark (there is no receipt delete path anywhere),
+ *  and reusing the human writer would stamp `source: "human-override"` on a decision no person took.
+ *  Anyone later auditing who accepted a gap would read a human's judgement into a machine's, with
+ *  nothing on disk to contradict it. `engine/retroEvidence.mayRecordRetroGap` is what decides
+ *  whether this may be called at all — it permits only `absent`, i.e. no receipt AND a trustworthy
+ *  read of the backlog that found nothing.
+ *
+ *  ── THE RETURN VALUE GATES A TEARDOWN ────────────────────────────────────────────────────────────
+ *  `true` ONLY when the write actually landed, exactly like `recordRetroOverridden` — the caller
+ *  removes the row on the strength of it, and `removeAgent` is a hard delete. Answering `true` over
+ *  a failed write would destroy the row and its record in the same breath, leaving no trace that the
+ *  agent ever existed, let alone that its retro was missing. `record` already reports it that way
+ *  and caches nothing on failure; do not wrap it in anything more optimistic.
+ *
+ *  `branchEvidence` accepts `null` as well as `undefined`: it is measured upstream and a measurement
+ *  that could not be taken arrives as `null`. Both mean "no evidence to show", so both leave the
+ *  field ABSENT rather than writing an empty one. */
+export function recordRetroConciergeOverride(
+  projectId: string,
+  agentId: string,
+  fields: { reasonText: string; branchEvidence?: string | null },
+): Promise<boolean> {
+  return record(projectId, agentId, {
+    state: "overridden",
+    at: Date.now(),
+    source: "concierge-override",
+    reasonCode: "other",
+    reasonText: fields.reasonText,
+    ...(fields.branchEvidence ? { branchEvidence: fields.branchEvidence } : {}),
   });
 }
 
