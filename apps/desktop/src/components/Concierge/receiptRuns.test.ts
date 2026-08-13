@@ -56,8 +56,10 @@ const runOf = (messages: ConciergeMessage[]): ReceiptRun => {
 };
 
 describe("foldKeyOf — which receipts may fold at all", () => {
-  it("REFUSES to fold a refusal, whatever else matches", () => {
-    // The rule the whole feature is subordinate to. `ok: false` is the reader's to-do item.
+  it("REFUSES to fold a refusal the FOUNDER must read, whatever else matches", () => {
+    // The rule the whole feature is subordinate to — now stated precisely. A refusal with no `gist`
+    // is one `refusalAudience` judged the founder's: its verbatim words are the to-do item, and a
+    // count cannot say them. (An INTERNAL gate carries a gist and does fold; see the block below.)
     expect(
       foldKeyOf({ kind: "sent", ok: false, channel: "terminal" }),
     ).toBeNull();
@@ -406,5 +408,98 @@ describe("receiptRunLine — the count has to be true", () => {
     expect(receiptRunLine(run).spoken).toContain(
       "Sent to 3 agents' terminals.",
     );
+  });
+});
+
+
+// ── AN INTERNAL-GATE REFUSAL FOLDS ON `kind + gist` (roborev 63295, Medium) ────────────────────
+//
+// Keeping every refusal row is right — it is the only thing that can contradict a turn claiming the
+// action succeeded — but these repeat BY CONSTRUCTION: a merge re-attempted while checks settle, a
+// five-agent fan-out refusing per spawn at capacity. The founder's own report said he saw them
+// "verbatim and repeatedly". Unfoldable, that trades N paragraphs for N identical rows, which is
+// the same column-of-identical-rows this module exists to end.
+describe("internal-gate refusals fold; founder-facing ones never do", () => {
+  const gated = (
+    id: string,
+    over: Partial<ConciergeReceiptMark> = {},
+  ): ConciergeMessage => ({
+    id,
+    kind: "sparkle",
+    text: "Didn't merge — waiting on checks",
+    actionReceipt: {
+      kind: "merged",
+      ok: false,
+      gist: "waiting on checks",
+      ...over,
+    },
+  });
+
+  it("gives a gist-carrying refusal a key, and a bare one none", () => {
+    expect(foldKeyOf({ kind: "merged", ok: false, gist: "waiting on checks" })).toBe(
+      "refusal:merged:waiting on checks",
+    );
+    expect(foldKeyOf({ kind: "merged", ok: false })).toBeNull();
+  });
+
+  it("does NOT collapse two different reasons into one count", () => {
+    // The reason is the whole content of the folded sentence; merging "waiting on checks" with
+    // "no free agent slot right now" would state something neither row said.
+    expect(foldKeyOf({ kind: "merged", ok: false, gist: "waiting on checks" })).not.toBe(
+      foldKeyOf({ kind: "merged", ok: false, gist: "no free agent slot right now" }),
+    );
+    // …nor two different KINDS that happen to share a gist.
+    expect(foldKeyOf({ kind: "merged", ok: false, gist: "waiting on checks" })).not.toBe(
+      foldKeyOf({ kind: "spawned", ok: false, gist: "waiting on checks" }),
+    );
+  });
+
+  it("collapses a run of identical gate refusals into ONE row that still says the reason", () => {
+    const run = runOf([gated("a"), gated("b"), gated("c")]);
+    expect(run.members).toHaveLength(3);
+    const line = receiptRunLine(run);
+    // Never claims it merged, and never drops the reason.
+    expect(line.spoken).toMatch(/^Didn't merge/);
+    expect(line.spoken).not.toMatch(/^Merged/);
+    expect(line.spoken).toContain("waiting on checks");
+    expect(line.spoken).toContain("3");
+  });
+
+  it("keeps founder-facing refusals as separate rows in the same feed", () => {
+    // The mixed case: three gate refusals fold, and a refusal he must act on stands alone beside
+    // them rather than being counted into the run.
+    const rows = foldReceiptRuns([
+      gated("a"),
+      gated("b"),
+      gated("c"),
+      {
+        id: "d",
+        kind: "sparkle" as const,
+        text: "Didn't merge — GraphQL: unauthorized",
+        actionReceipt: { kind: "merged" as const, ok: false },
+      },
+    ]);
+    const runs = rows.filter((r) => r.type === "receipt-run");
+    expect(runs).toHaveLength(1);
+    // The un-gisted one is still its own message row.
+    expect(rows.some((r) => r.type !== "receipt-run")).toBe(true);
+  });
+
+  it("uses the right verb per kind — a fold never borrows another action's wording", () => {
+    for (const [kind, pattern] of [
+      ["merged", /^Didn't merge/],
+      ["spawned", /^Couldn't spawn/],
+      ["closed", /^Couldn't close/],
+      ["goal", /^Couldn't set a goal/],
+      ["filed", /^Couldn't file/],
+    ] as const) {
+      const run = runOf([
+        gated("a", { kind }),
+        gated("b", { kind }),
+        gated("c", { kind }),
+      ]);
+      expect(receiptRunLine(run).spoken, kind).toMatch(pattern);
+      expect(receiptRunLine(run).spoken, kind).toContain("waiting on checks");
+    }
   });
 });

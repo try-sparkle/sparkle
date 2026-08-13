@@ -292,6 +292,20 @@ export interface ConciergeReceiptMark {
    */
   subjectId?: string;
   subjectName?: string;
+  /**
+   * For a REFUSAL aimed at the concierge: the short phrase its line showed in place of the tool's
+   * paragraph (`Concierge/refusalAudience.refusalGist`). Absent on a success, and absent on a
+   * refusal the founder must read — whose verbatim words never fold.
+   *
+   * WHY THE FOLD NEEDS IT (roborev 63295, Medium). These refusals repeat BY CONSTRUCTION — a merge
+   * re-attempted while checks settle, a five-agent fan-out refusing per spawn at capacity — and the
+   * founder's original report was that he saw them "verbatim and repeatedly". Keeping every row (as
+   * it must, so a refusal can still contradict a turn claiming success) therefore trades N
+   * paragraphs for N identical rows, which is the same column-of-identical-rows this module exists
+   * to end. Folding on `kind + gist` collapses them without merging two different reasons, and a
+   * founder-actionable refusal still never folds because it has no gist.
+   */
+  gist?: string;
 }
 
 /** Left-aligned plain Sparkle reply. No "Sparkle" label, no glow — just warm text. */

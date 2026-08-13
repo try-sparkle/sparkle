@@ -727,8 +727,14 @@ function roborevCode(v: RoborevGateVerdict): WorkflowFailureCode {
 }
 
 /** What to TELL the caller — including, for each arm, the thing it can actually do next. A refusal
- *  that does not name its remedy just gets retried verbatim. */
-function roborevRefusalMessage(
+ *  that does not name its remedy just gets retried verbatim.
+ *
+ *  EXPORTED FOR ONE REASON: `Concierge/refusalAudience` classifies these very strings to decide
+ *  whether a refusal is thread material, and it does so by matching their literal phrasings. Its
+ *  test imports this function and asserts every arm still classifies — so rewording a refusal here
+ *  turns that test RED instead of silently un-classifying the gate and putting the paragraph back
+ *  in the founder's feed (roborev 63295). Do not inline it back. */
+export function roborevRefusalMessage(
   v: RoborevGateVerdict,
   branch: string,
   acknowledged: boolean,

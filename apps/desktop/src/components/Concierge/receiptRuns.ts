@@ -103,7 +103,21 @@ export function foldKeyOf(
   if (!mark) return null;
   // ══ THE REFUSAL ARM, FIRST — mirroring actionReceiptLine, which checks `ok` before every success
   // wording for the same reason. Everything below this line describes something that HAPPENED.
-  if (mark.ok !== true) return null;
+  //
+  // A REFUSAL FOLDS ONLY WHEN IT CARRIES A GIST (roborev 63295, Medium). The rule used to be a flat
+  // "a refusal never folds — it is the action he owes", and that premise is exactly what an
+  // INTERNAL gate falsifies: the concierge read it and took another route, so there is nothing owed
+  // and nothing to act on. Those refusals also repeat by construction — a merge re-attempted while
+  // checks settle, a five-agent fan-out refusing per spawn at capacity — so leaving them unfoldable
+  // trades the founder's wall of paragraphs for a wall of identical rows, which is the same
+  // complaint wearing different clothes.
+  //
+  // KEYED ON `kind + gist`, never on kind alone: "waiting on checks" and "no free agent slot right
+  // now" are different reasons and must not collapse into one count. And a founder-actionable
+  // refusal has NO gist (see `refusalAudience`), so it still never folds — its verbatim words are
+  // the thing he has to read, and a count cannot say them.
+  if (mark.ok !== true)
+    return mark.gist ? `refusal:${mark.kind}:${mark.gist}` : null;
   // A PARTIAL FAN-OUT IS NOT A SUCCESS. `ok` is true on a broadcast some inboxes rejected; the
   // failures live in `failed`. Folding it would roll a reported failure into a success count — the
   // one outcome this module is forbidden to produce.
@@ -339,6 +353,47 @@ export function receiptRunLine(run: ReceiptRun): Line {
   /** A noun each of them owns one of, agreeing with them: `terminal` / `terminals`. */
   const theirs = (word: string) => plain(many ? `${word}s` : word);
   const repeats = total > agents;
+
+  // ══ A FOLDED RUN OF INTERNAL-GATE REFUSALS (roborev 63295) ══════════════════════════════════
+  //
+  // Handled before the switch because its key carries DATA — the gist — rather than being one of a
+  // closed set. The sentence keeps the individual row's verb, so the fold reads as the same fact
+  // said once: "Didn't merge — waiting on checks" becomes "Didn't merge, 6 times — waiting on
+  // checks". It never claims the action happened, and it never drops the reason.
+  //
+  // The gist comes off a MEMBER, not off the key, so nothing has to parse a delimiter back out of a
+  // string that contains free text. Every member of a run shares the key by construction, so any
+  // member's gist is the run's.
+  if (run.key.startsWith("refusal:")) {
+    const gist =
+      run.members.find((m) => m.actionReceipt?.gist)?.actionReceipt?.gist ?? "";
+    const kind = run.members[0]?.actionReceipt?.kind;
+    const tail = gist ? plain(` — ${gist}`) : plain("");
+    const times = plain(`${total} times`);
+    switch (kind) {
+      case "merged":
+        return withSubjects(line`Didn't merge, ${times}${tail}`, run.members);
+      case "spawned":
+        return withSubjects(
+          line`Couldn't spawn ${who}${tail}`,
+          run.members,
+        );
+      case "sent":
+        return withSubjects(line`Not sent, ${times}${tail}`, run.members);
+      case "closed":
+        return withSubjects(line`Couldn't close ${who}${tail}`, run.members);
+      case "goal":
+        return withSubjects(
+          line`Couldn't set a goal on ${who}${tail}`,
+          run.members,
+        );
+      case "filed":
+        return withSubjects(line`Couldn't file, ${times}${tail}`, run.members);
+      default:
+        // Same rule as the switch's own default: state the bare truth rather than guess a verb.
+        return withSubjects(line`${n} actions didn't go through${tail}`, run.members);
+    }
+  }
 
   switch (run.key) {
     case "sent:terminal":

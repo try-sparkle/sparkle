@@ -136,13 +136,29 @@ const FOUNDER_SIGNALS: readonly RegExp[] = [
 const INTERNAL_GATES: readonly { re: RegExp; gist: string }[] = [
   // ── The roborev review gate, by its actual sentences (mergeGuard/roborev.ts, workflow.ts) ──
   { re: /review round is still IN FLIGHT/i, gist: "a code review is still running" },
-  { re: /reviews? in flight on this branch/i, gist: "a code review is still running" },
+  // `review\(s\)?` — NOT `reviews?`. `mergeGuard/roborev.ts` emits the literal
+  // `roborev has 2 review(s) in flight on this branch`, so the parenthesised plural sits between
+  // "review" and the space. The first version of this entry could never fire for ANY input, and its
+  // blast radius was zero only by luck: `workflow.ts` happens to substitute its own "IN FLIGHT"
+  // wording for the same verdict. That is exactly the drift the producer-bound tests below now
+  // catch (roborev 63295).
+  {
+    re: /reviews?(\(s\))? in flight on this branch/i,
+    gist: "a code review is still running",
+  },
   {
     re: /open FAIL-verdict roborev reviews/i,
     gist: "there are review findings to work through",
   },
   {
     re: /carry open FAIL verdicts that have not been read/i,
+    gist: "there are review findings to work through",
+  },
+  // The acknowledged-but-incomplete arm of the same gate — found by the producer-bound tests, not
+  // by reading the code (roborev 63295). It tells the CONCIERGE to name the remaining findings; the
+  // founder has nothing to do with it, and it is one `roborev-unresolved` away from the entry above.
+  {
+    re: /findings you acknowledged do not cover everything/i,
     gist: "there are review findings to work through",
   },
   {
@@ -181,19 +197,19 @@ const INTERNAL_GATES: readonly { re: RegExp; gist: string }[] = [
 ];
 
 /**
- * Who should see this refusal.
- *
- * `reason` is the tool's own refusal text off the receipt. Undefined, empty or whitespace-only is
- * `"founder"`: a refusal that stated no reason gives us no grounds to call it internal, and the
- * existing line for it ("Couldn't close X", with no tail) is already quiet.
- */
-/**
  * The SHORT phrase that stands in for an internal gate's paragraph, or `null` when the reason is the
  * founder's to read and must be shown verbatim.
+ *
+ * THE MODULE'S REAL ENTRY POINT — `actionReceiptLine` calls this one, and {@link refusalAudience}
+ * below is the named vocabulary derived from it.
  *
  * The whole answer to "do I need to be seeing that": the row survives — so a refused action still
  * contradicts a turn that claims it succeeded — while the roborev job ids, the check names and the
  * slot arithmetic do not.
+ *
+ * `reason` is the tool's own refusal text off the receipt. Undefined, empty or whitespace-only
+ * yields `null`: a refusal that stated no reason gives us no grounds to call it internal, and the
+ * line it produces ("Couldn't close X", with no tail) is already quiet.
  */
 export function refusalGist(reason: string | undefined | null): string | null {
   const text = (reason ?? "").trim();
@@ -202,6 +218,18 @@ export function refusalGist(reason: string | undefined | null): string | null {
   return null;
 }
 
+/**
+ * WHO should see this refusal — the named vocabulary for {@link refusalGist}'s answer.
+ *
+ * DERIVED, NOT A SECOND LIST, so the two cannot disagree about what counts as internal; a test
+ * asserts the equivalence over both populations.
+ *
+ * Kept exported even though `actionReceiptLine` now calls `refusalGist` instead: this is the name
+ * the module's whole contract is written in ("founder" vs "internal"), the exhaustive classifier
+ * suite is expressed in it, and reading a `"founder"`/`"internal"` verdict is what a future caller
+ * deciding whether to surface something will reach for. It is a vocabulary, not dead code — but if
+ * it ever stops earning that, delete it and re-point the suite at `refusalGist`.
+ */
 export function refusalAudience(reason: string | undefined | null): RefusalAudience {
   // NO SEPARATE EMPTY-STRING GUARD, deliberately. An early `if (!text) return "founder"` reads as
   // defensive but is behaviourally inert: the default at the bottom is already "founder", so

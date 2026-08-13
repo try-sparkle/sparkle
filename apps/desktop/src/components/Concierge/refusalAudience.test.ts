@@ -179,3 +179,101 @@ describe("a roborev that is DOWN reaches the founder", () => {
     ).toBe("founder");
   });
 });
+
+// ── THE GATES ARE BOUND TO THEIR PRODUCERS, NOT RE-TYPED (roborev 63295, Medium) ───────────────
+//
+// INTERNAL_GATES matches literal sentences that live in two OTHER modules. Nothing coupled them, so
+// a routine copy edit on a refusal message would silently reclassify that gate as "founder" and put
+// the wall of text back in the founder's feed — with the whole suite green.
+//
+// That drift had ALREADY happened when this was written: `/reviews? in flight on this branch/`
+// could never match `roborev has 2 review(s) in flight on this branch`, because the parenthesised
+// plural sits between "review" and the space. Its blast radius was zero only because `workflow.ts`
+// substitutes its own "IN FLIGHT" wording for the same verdict — luck, not coverage.
+//
+// So these tests take the strings FROM the producers. Reword a refusal and this goes red.
+import { roborevRefusalMessage } from "../../services/conciergeTools/workflow";
+import { roborevMergeGate } from "../../services/mergeGuard/roborev";
+import type {
+  RoborevBranchState,
+  RoborevGateCode,
+  RoborevGateVerdict,
+} from "../../services/mergeGuard/types";
+
+describe("every real roborev refusal string classifies as an internal gate", () => {
+  const BRANCH = "sparkle/agent-0000";
+  const verdict = (code: RoborevGateCode, jobIds: number[]): RoborevGateVerdict => ({
+    canMerge: false,
+    code,
+    reason: null,
+    jobIds,
+  });
+
+  // `workflow.ts` — what the concierge tool actually hands back.
+  const codes: RoborevGateCode[] = [
+    "roborev-pending",
+    "roborev-unresolved",
+    "roborev-unknown",
+  ];
+  for (const code of codes)
+    for (const jobIds of [[], [5], [5, 6]])
+      for (const acknowledged of [false, true]) {
+        const reason = roborevRefusalMessage(verdict(code, jobIds), BRANCH, acknowledged);
+        const label = `${code} ids=${jobIds.length} ack=${acknowledged}`;
+        it(`classifies workflow's ${label}`, () => {
+          // `roborev-unknown` WITH NO JOB IDS is the "we could not read roborev at all" arm, and
+          // that one is deliberately the FOUNDER's — a dead daemon must never be withheld. Every
+          // other arm names a condition the concierge itself resolves.
+          const expected =
+            code === "roborev-unknown" && jobIds.length === 0 ? "founder" : "internal";
+          expect(refusalAudience(reason), reason.slice(0, 80)).toBe(expected);
+        });
+      }
+
+  // `mergeGuard/roborev.ts` — the gate underneath it, whose own `reason` strings differ.
+  const branchState = (over: Partial<RoborevBranchState>): RoborevBranchState => ({
+    applicable: true,
+    known: true,
+    inFlight: [],
+    errored: [],
+    blocking: [],
+    openPassing: 0,
+    total: 0,
+    error: null,
+    ...over,
+  });
+  const job = (id: number) => ({ id }) as unknown as RoborevBranchState["inFlight"][number];
+
+  it("classifies roborevMergeGate's in-flight, unread and open-FAIL reasons", () => {
+    const cases: [string, Partial<RoborevBranchState>][] = [
+      ["in flight", { inFlight: [job(2), job(3)], total: 2 }],
+      ["ended without a verdict", { errored: [job(4)], total: 1 }],
+      ["open FAIL", { blocking: [job(5)], total: 1 }],
+    ];
+    for (const [label, over] of cases) {
+      const reason = roborevMergeGate(branchState(over)).reason;
+      expect(reason, `${label} must produce a reason`).toBeTruthy();
+      // THE ASSERTION THAT WOULD HAVE CAUGHT THE DEAD PATTERN: this is the literal
+      // "roborev has 2 review(s) in flight on this branch", straight from the producer.
+      expect(refusalAudience(reason), `${label}: ${reason}`).toBe("internal");
+      expect(refusalGist(reason), `${label}: ${reason}`).toBeTruthy();
+    }
+  });
+
+  it("a DEAD roborev still reaches the founder, whatever the gate wraps it in", () => {
+    // The same producer, carrying a probe error rather than a job state — the shape that splices a
+    // tool failure into the gate's own vocabulary.
+    const reason = roborevMergeGate(
+      branchState({ known: false, error: "failed to connect to daemon (is it running?)" }),
+    ).reason;
+    expect(reason).toContain("failed to connect");
+    expect(refusalAudience(reason)).toBe("founder");
+  });
+
+  it("an unreadable roborev with NO error text also reaches the founder", () => {
+    // The generic arm: "its state could not be read". Both a repairable store and a dead daemon
+    // produce it, so it is deliberately unmatched and defaults to showing.
+    const reason = roborevMergeGate(branchState({ known: false })).reason;
+    expect(refusalAudience(reason)).toBe("founder");
+  });
+});

@@ -92,6 +92,13 @@ export function receiptMark(
     ...(receipt.ok === true && receipt.reason?.trim()
       ? { hasDetail: true as const }
       : {}),
+    // THE GIST THE LINE ACTUALLY SHOWED, so the fold buckets on the same phrase the reader saw.
+    // Read off the SAME call the refusal arm makes, for the same reason `hasDetail` is read off the
+    // same field its arm reads: a mark that recomputed this differently could fold two rows the
+    // reader can tell apart, or refuse to fold two that are identical on screen.
+    ...(receipt.ok !== true && refusalGist(receipt.reason)
+      ? { gist: refusalGist(receipt.reason)! }
+      : {}),
     // ONLY WHEN THE LOOKUP HIT. A `subjectId` present means the sentence drew a real pill, so the
     // fold may draw one too; absent means it did not, and the fold shows the same words it did.
     subjectId: found ? found.id : undefined,

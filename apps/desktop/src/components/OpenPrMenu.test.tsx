@@ -40,7 +40,7 @@ import {
   PANEL_MAX_W,
   type PrAgentLink,
 } from "./OpenPrMenu";
-import type { PrRow } from "../services/openPrs";
+import { OPEN_PR_POLL_MS, type PrRow } from "../services/openPrs";
 import { __resetProbeGateCacheForTests } from "../services/probeGate";
 import type { FleetTotals, PrScope } from "../services/fleetPrs";
 import type { AgentTab, Project } from "../types";
@@ -2636,6 +2636,106 @@ describe("OpenPrMenu — unanswered knightwatch probes", () => {
     expect(h.openUrl).toHaveBeenCalledWith(
       "https://github.com/o/r/pull/1176#issuecomment-5182769304",
     );
+  });
+
+  // ── THE PROBE OVERRIDE IS PART OF THE `unverified` GATE TOO (roborev 63297, Medium) ──────────
+  //
+  // The row's action slot is `probeRefusal ? <probe-override> : (…)`, and that first arm ignored
+  // `ready` entirely — the last route around the stamp. `probeRefusals` is cleared on panel open, on
+  // Refresh and on a successful merge, deliberately NOT inside `refetch`, so a refusal recorded
+  // before a failed poll outlives it and the row kept an ENABLED "Override probes…" whose second
+  // click calls runMerge against a cache that may have merged hours ago.
+  it("withdraws the PROBE override once the row can no longer be re-read", async () => {
+    let listed = 0;
+    h.invoke.mockImplementation(
+      (cmd: string, args?: Record<string, unknown>) => {
+        // Succeed until the refusal is recorded, then fail every probe after it.
+        if (cmd === "project_open_prs")
+          return Promise.resolve(listed++ < 2 ? [GREEN_A] : null);
+        if (cmd === "merge_pr")
+          return typeof args?.knightwatchOverride === "string"
+            ? Promise.resolve(null)
+            : Promise.reject(new Error(REFUSAL));
+        return Promise.resolve(null);
+      },
+    );
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    fireEvent.click(await screen.findByTestId("merge-1176"));
+    // `runMerge` records the refusal and then AWAITS a refetch — which fails here, exactly as it
+    // does when `gh` is the reason the merge failed in the first place. So the row ends up carrying
+    // a probe refusal AND the `unverified` stamp at once, which is the state the ternary got wrong.
+    await waitFor(() => expect(screen.getByTestId("pr-stale-notice")).toBeTruthy());
+    // Without the `!pr.unverified` guard this renders an ENABLED "Override probes…" — two clicks
+    // from a merge against a cache that may have merged hours ago.
+    expect(screen.queryByTestId("probe-override-1176")).toBeNull();
+    // What it falls through to is the DISABLED merge button, so the row still has an action slot
+    // that says no rather than nothing at all.
+    const merge = screen.getByTestId("merge-1176") as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    const before = mergeCalls().length;
+    fireEvent.click(merge);
+    expect(mergeCalls()).toHaveLength(before);
+  });
+
+  // ── AN ARM DOES NOT SURVIVE ITS OWN BUTTON (roborev 63297, Medium) ───────────────────────────
+  //
+  // `overrideArmed` was cleared only when the armed row left `groups`. An unverified row is still
+  // RENDERED, so the arm outlived the affordance: arm, let a poll fail (the override vanishes), let
+  // the next poll succeed, and the button returns already reading "Merge anyway?" — one click from
+  // a merge whose deliberate second act happened minutes ago against a state that changed twice.
+  it("disarms a probe override that disappears on a failed poll and comes back", async () => {
+    // DRIVEN BY THE POLL, NOT BY REFRESH, and that is the whole reason this hazard exists. Refresh
+    // already calls `clearProbeRefusals()` AND `setOverrideArmed(null)`, so it cannot reach the bad
+    // state — using it here would make this test vacuous. The 3-minute poll does neither, which is
+    // precisely the gap the reviewer identified.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let listed = 0;
+      h.invoke.mockImplementation(
+        (cmd: string, args?: Record<string, unknown>) => {
+          // ok, ok(open), ok(post-merge refetch → override appears), FAIL(poll), ok(poll)
+          if (cmd === "project_open_prs")
+            return Promise.resolve(listed++ === 3 ? null : [GREEN_A]);
+          if (cmd === "merge_pr")
+            return typeof args?.knightwatchOverride === "string"
+              ? Promise.resolve(null)
+              : Promise.reject(new Error(REFUSAL));
+          return Promise.resolve(null);
+        },
+      );
+      render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+      await openMenu();
+      fireEvent.click(await screen.findByTestId("merge-1176"));
+      const btn = await screen.findByTestId("probe-override-1176");
+      // ARM it — the deliberate first act of the two-step.
+      fireEvent.click(btn);
+      await waitFor(() =>
+        expect(
+          screen.getByTestId("probe-override-1176").getAttribute("data-armed"),
+        ).toBe("yes"),
+      );
+
+      // A POLL FAILS: the row is stamped `unverified` and the override is withdrawn — while the
+      // row itself stays on screen, which is why the visibility-only disarm never fired.
+      await act(async () => {
+        vi.advanceTimersByTime(OPEN_PR_POLL_MS + 1000);
+      });
+      await waitFor(() =>
+        expect(screen.queryByTestId("probe-override-1176")).toBeNull(),
+      );
+
+      // The next poll succeeds and the button returns. It must NOT come back pre-armed: without the
+      // affordance-derived disarm it reads "Merge anyway?" with data-armed="yes", and ONE click
+      // spends a waiver authorised before the row changed state twice.
+      await act(async () => {
+        vi.advanceTimersByTime(OPEN_PR_POLL_MS + 1000);
+      });
+      const back = await screen.findByTestId("probe-override-1176");
+      expect(back.getAttribute("data-armed")).toBe("no");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("turns the refused row's Merge into a two-step written override", async () => {

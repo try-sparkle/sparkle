@@ -1305,16 +1305,51 @@ export function OpenPrMenu({
    * only version that works, and deriving it from the rendered set (rather than clearing inside
    * `runDismiss`/`runRestore`) means a future path that removes a row cannot forget to disarm.
    */
+  /**
+   * …AND WHENEVER IT NO LONGER OFFERS THE BUTTON THAT WAS ARMED (roborev 63297, Medium).
+   *
+   * VISIBILITY IS THE WRONG TEST ON ITS OWN, and the `unverified` stamp is what proved it. An
+   * unverified row is still RENDERED — it merely swaps the enabled `merge-override-${n}` for the
+   * disabled `merge-${n}` — so the row never leaves `groups` and the check above never fires. The
+   * standing authorisation outlives the affordance:
+   *
+   *   arm "Merge anyway" on a failing+unstable row  →  a poll FAILS, the row is stamped
+   *   `unverified`, `githubWouldAccept` goes false and the override vanishes  →  the next poll
+   *   SUCCEEDS and the button comes back already reading "Merge anyway?" with `data-armed="yes"`,
+   *   so ONE click reaches `runMerge` — spending a two-step whose second act was authorised
+   *   minutes earlier, against a state that has since changed twice.
+   *
+   * That route did not exist before the stamp, because an override never disappeared on a transient
+   * probe failure. It is the same hazard the Refresh handler already defends against ("one click
+   * would then merge a red PR whose two-step the user never performed"); the poll path simply had no
+   * equivalent. So the arm is derived from the AFFORDANCE — gone means disarmed — which also covers
+   * any future branch that withdraws an override for a reason nobody has thought of yet.
+   */
   useEffect(() => {
     if (!overrideArmed) return;
-    const visible = groups.some((g) =>
-      g.prs.some((pr) => prKeyOf(g.key, pr.number) === overrideArmed),
-    );
-    if (!visible) {
+    let stillOffered = false;
+    for (const g of groups)
+      for (const pr of g.prs) {
+        if (prKeyOf(g.key, pr.number) !== overrideArmed) continue;
+        // EITHER affordance counts: the `unstable` "Merge anyway" comes off `prMergeReadiness`, and
+        // the probe override comes off the refusal ledger. Both read `overrideArmed`, so both have
+        // to keep it alive or arming one would be cleared by the other's absence.
+        //
+        // THE `!unverified` TERM MIRRORS THE RENDER EXACTLY (`probeRefusal && !pr.unverified`), and
+        // leaving it out is not a near-miss — it is the whole bug, restated. The refusal LEDGER is
+        // not cleared by a poll, so without it this reads "still offered" for a row whose button the
+        // renderer has just withdrawn, and the arm survives precisely in the case this effect was
+        // extended to catch. `prMergeReadiness` already returns a null override for an unverified
+        // row, so the first term needs no such guard.
+        stillOffered =
+          prMergeReadiness(pr).override !== null ||
+          (!pr.unverified && probeRefusals.has(prKeyOf(g.key, pr.number)));
+      }
+    if (!stillOffered) {
       setOverrideArmed(null);
       setOverrideReason("");
     }
-  }, [groups, overrideArmed]);
+  }, [groups, overrideArmed, probeRefusals]);
 
   if (compact ? scopes.length === 0 : !wideLabel) return null;
 
@@ -2323,7 +2358,17 @@ export function OpenPrMenu({
                             with one thing added: the second step COSTS A SENTENCE, because unlike
                             "GitHub would accept this anyway" there is a reviewer's unanswered
                             question here and the reason is recorded on the PR beside it. */}
-                          {probeRefusal ? (
+                          {/* …EXCEPT WHEN WE COULD NOT RE-READ THE ROW (roborev 63297, Medium).
+                              This arm ignores `ready` entirely, so it was the last route around the
+                              `unverified` gate: `probeRefusals` is cleared on panel open, on
+                              Refresh and on a successful merge — deliberately NOT inside `refetch`
+                              — so a refusal recorded before a failed poll outlives it, and the row
+                              kept an ENABLED "Override probes…" whose second click calls `runMerge`
+                              against a cache that may have merged hours ago. That is the same
+                              `GraphQL: Merge already in progress` click the stamp exists to remove.
+                              Falling through hands the row the disabled `merge-${n}`, whose title
+                              already explains the staleness. */}
+                          {probeRefusal && !pr.unverified ? (
                             <button
                               data-testid={`probe-override-${pr.number}`}
                               data-project-id={group.scope.projectId}
