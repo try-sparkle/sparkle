@@ -33,10 +33,48 @@ const MAX_SCAN = 200;
 // Unambiguous, command-shaped patterns — flagged regardless of surrounding prose.
 const DANGEROUS: RegExp[] = [
   /\bdeploy\b[\w\s-]{0,20}?--?prod(?:uction)?\b/i, // `vercel deploy --prod`, `deploy prod`
-  /stripe.*charge|create.*payment/i,
   /rm -rf/i,
-  /curl.*--upload|POST.*external-api/i,
-  /secrets.*write|\.env.*production/i,
+  // The six `a.*b` alternatives that used to live here — stripe/charge, create/payment,
+  // curl/--upload, POST/external-api, secrets/write, .env/production — are now
+  // DANGEROUS_ORDERED below. Every one was quadratic on the full line this battery is
+  // deliberately scanned against. See ORDERED_PAIR_NOTE.
+];
+
+/** ── ORDERED_PAIR_NOTE ────────────────────────────────────────────────────────────────────────
+ *  `a.*b` is QUADRATIC when the line is long and `b` is absent, and BOTH of this file's
+ *  full-line batteries (DANGEROUS via `isDangerous`, CAUTION via `matchesCaution`) are scanned
+ *  against the whole untruncated line on purpose — under-queuing is the risk that policy exists
+ *  to prevent, so there is no length bound to contain a greedy pattern. For each `a` the `.*`
+ *  runs to end-of-line and backtracks hunting `b`: O(k·n) for k occurrences of `a`.
+ *
+ *  Measured warmed, one line, `b` never present (the ordinary shape of a long log line):
+ *      stripe…charge        57,600 chars → 2,988.9 ms
+ *      create…payment       57,600 chars → 2,566.1 ms
+ *      secrets…write        64,000 chars → 2,178.7 ms
+ *      curl…--upload        44,800 chars → 1,776.1 ms
+ *      .env…production      44,800 chars → 1,502.7 ms
+ *      POST…external-api    44,800 chars → 1,252.1 ms
+ *  (`deploy…staging`, the CAUTION entry fixed first in 66e615601, was 3,977 ms at 108KB.)
+ *
+ *  This runs on the renderer's main thread for every line of every pty chunk of every pane, so
+ *  each of these is an app freeze. The replacement is linear: if `b` follows ANY `a`, it follows
+ *  the FIRST `a`, so one forward search settles it with no backtracking.
+ *
+ *  DO NOT "fix" a future one by bounding the gap (`a[\s\S]{0,200}?b`). That is also linear but it
+ *  NARROWS what gets queued, which is the under-queuing these full-line scans exist to prevent.
+ *
+ *  One behavioural delta, the same one `deployStagingIndex` carries: `.` does not match line
+ *  terminators, so the old regexes would not pair `a` and `b` across a bare `\r`; these do. That
+ *  is the SAFE direction for both batteries, and near-unreachable since callers split on
+ *  `/\r?\n/` before classifying.
+ */
+const DANGEROUS_ORDERED: ReadonlyArray<readonly [string, string]> = [
+  ["stripe", "charge"],
+  ["create", "payment"],
+  ["curl", "--upload"],
+  ["post", "external-api"],
+  ["secrets", "write"],
+  [".env", "production"],
 ];
 
 // Prose-prone DANGEROUS heuristics: a verb…noun pair that also shows up in Claude's
@@ -153,10 +191,40 @@ function matchIndex(line: string, patterns: RegExp[]): number {
  *  unreachable anyway, since callers split on `/\r?\n/` before classifying.
  */
 function deployStagingIndex(line: string): number {
-  const l = line.toLowerCase();
-  const i = l.indexOf("deploy");
+  return orderedPairIndex(line.toLowerCase(), "deploy", "staging");
+}
+
+/** Index of `a` when `b` also occurs at or after the end of that first `a`, else -1. The linear
+ *  stand-in for a quadratic `a.*b` — see ORDERED_PAIR_NOTE. `lower` must already be lowercased
+ *  (both call sites scan several pairs over one line, so hoisting the copy out matters).
+ *
+ *  Only the FIRST `a` is tried, and that is not an approximation: if `b` follows any `a`, it
+ *  follows the earliest one, so a single forward search is exact. */
+function orderedPairIndex(lower: string, a: string, b: string): number {
+  const i = lower.indexOf(a);
   if (i === -1) return -1;
-  return l.indexOf("staging", i + "deploy".length) === -1 ? -1 : i;
+  return lower.indexOf(b, i + a.length) === -1 ? -1 : i;
+}
+
+/** Earliest DANGEROUS trigger index across the regex battery AND the ordered pairs, or -1.
+ *  Mirrors `cautionIndex` — the description must centre on whichever half actually fired. */
+function dangerousIndex(line: string): number {
+  const viaRegex = matchIndex(line, DANGEROUS);
+  const viaOrdered = dangerousOrderedIndex(line);
+  if (viaRegex === -1) return viaOrdered;
+  if (viaOrdered === -1) return viaRegex;
+  return Math.min(viaRegex, viaOrdered);
+}
+
+/** Earliest DANGEROUS_ORDERED trigger index, or -1. */
+function dangerousOrderedIndex(line: string): number {
+  const lower = line.toLowerCase();
+  let best = -1;
+  for (const [a, b] of DANGEROUS_ORDERED) {
+    const i = orderedPairIndex(lower, a, b);
+    if (i !== -1 && (best === -1 || i < best)) best = i;
+  }
+  return best;
 }
 
 /** CAUTION membership: the regex battery, plus the linear `deploy … staging` rule. */
@@ -194,7 +262,7 @@ function isDangerous(line: string, scanned: string): boolean {
   // interrupts instead of falling through to discard (dangerous must never be weaker than
   // caution). Only the prose-prone heuristics stay bounded to the prefix, since that bound
   // exists precisely to stop them matching across a whole paragraph of narration.
-  if (matches(line, DANGEROUS)) return true;
+  if (matches(line, DANGEROUS) || dangerousOrderedIndex(line) !== -1) return true;
   for (const re of PROSE_PRONE_DANGEROUS) {
     const m = re.exec(scanned);
     if (!m) continue;
@@ -237,7 +305,7 @@ export function classifyLine(
     return {
       event_type: "approval_needed",
       risk_class: "dangerous",
-      description: describe(line, Math.max(0, matchIndex(line, DANGEROUS))),
+      description: describe(line, Math.max(0, dangerousIndex(line))),
       payload: { raw: line },
     };
   }

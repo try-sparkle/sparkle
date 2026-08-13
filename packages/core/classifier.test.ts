@@ -352,3 +352,57 @@ describe("classifyLine — the `deploy … staging` CAUTION rule is LINEAR, not 
     expect(ev?.risk_class === "caution").toBe(expected);
   });
 });
+
+describe("classifyLine — the DANGEROUS ordered-pair rules are LINEAR, not quadratic", () => {
+  // Companion to the `deploy … staging` guard above. DANGEROUS is ALSO scanned against the full
+  // untruncated line (see `isDangerous`), and it carried six more `a.*b` alternatives with the
+  // same quadratic shape. Measured against the old patterns, one line, `b` never present:
+  //   stripe…charge 57,600 chars → 2,988.9ms | create…payment 57,600 → 2,566.1ms
+  //   secrets…write 64,000 → 2,178.7ms       | curl…--upload  44,800 → 1,776.1ms
+  //   .env…production 44,800 → 1,502.7ms     | POST…external-api 44,800 → 1,252.1ms
+  // Each one is an app freeze, since this runs per line of every pty chunk of every pane.
+  const BUDGET_MS = 250;
+
+  it.each([
+    ["stripe ", "stripe…charge"],
+    ["create ", "create…payment"],
+    ["curl ", "curl…--upload"],
+    ["POST ", "POST…external-api"],
+    ["secrets ", "secrets…write"],
+    [".env ", ".env…production"],
+  ])("a long line of %j with no partner literal stays inside budget (%s)", (seed) => {
+    const line = (`${seed}x `).repeat(6400);
+    expect(line.length).toBeGreaterThan(40_000);
+    const t0 = performance.now();
+    const ev = classifyLine(line, ctx);
+    const elapsed = performance.now() - t0;
+    // SIDE EFFECT under test: elapsed time. The old patterns took 1.2–3.0s on these exact inputs.
+    expect(elapsed).toBeLessThan(BUDGET_MS);
+    // …and no false DANGEROUS — the second literal never appears.
+    expect(ev?.risk_class).not.toBe("dangerous");
+  });
+
+  it.each([
+    "stripe charge customer $50",
+    "create a payment intent",
+    "curl https://x --upload-file ./secrets.tar",
+    "POST /v1/things to external-api.example.com",
+    "secrets write prod/db",
+    "cp .env staging.env && push to production",
+  ])("still classifies %j as dangerous (no narrowing)", (line) => {
+    expect(classifyLine(line, ctx)?.risk_class).toBe("dangerous");
+  });
+
+  it("still flags an ordered DANGEROUS pair at any distance on one line", () => {
+    // The full-line reach must survive the fix — a bounded-gap rewrite would silently under-flag.
+    const far = `stripe ${"y ".repeat(20_000)} charge`;
+    expect(far.length).toBeGreaterThan(40_000);
+    expect(classifyLine(far, ctx)?.risk_class).toBe("dangerous");
+  });
+
+  it("does not flag the pair in the wrong order", () => {
+    expect(classifyLine("charge the customer before stripe onboarding", ctx)?.risk_class).not.toBe(
+      "dangerous",
+    );
+  });
+});
