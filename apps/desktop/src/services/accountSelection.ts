@@ -364,13 +364,17 @@ export async function chooseAccountForAgent(
   const preferredAccountId = pinnedAccountId
     ? undefined
     : usablePreferredAccount(agentId, state, base.signedInIds, opts.now);
-  // TRANSCRIPT AFFINITY, evaluated only when neither human choice above already answered. Its own
-  // gate lives in the helper; here it is just one more id fed through `pickAccount`'s pin slot, the
-  // same way `preferredAccountId` is.
+  // TRANSCRIPT AFFINITY. The PROBE runs whenever a worktree was named — even under a pin or a
+  // preference, which cannot be overridden — because its answer is needed for TWO different things
+  // and only one of them is the choice. The other is the warning below, and that is precisely the
+  // case a human choice creates: activating an account fleet-wide moves every agent off its own
+  // conversation at once, and skipping the probe there would make the largest instance of this
+  // failure the one nothing reports.
+  const holders = await accountsHoldingTranscript(state, opts);
   const transcriptAccountId =
     pinnedAccountId || preferredAccountId
       ? undefined
-      : await accountHoldingTranscript(agentId, state, base, opts);
+      : firstUsableHolder(holders, state, base, opts.now)?.id;
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
     : preferredAccountId
@@ -397,7 +401,35 @@ export async function chooseAccountForAgent(
             : candidates != null && candidates.length === 0
               ? "fallback"
               : "auto";
+  // NEVER SILENT. We are about to launch under an account that does NOT hold this agent's
+  // conversation, so it will come up FRESH — the exact state that read as "spawned with no task",
+  // and the one thing no UI surface can show (the row, the header and the brief all keep rendering).
+  //
+  // Placed AFTER `chosen` rather than inside the affinity helper on purpose: the question is about
+  // the account we actually settled on, so this fires for a pin and for the fleet preference too,
+  // not just for the exhausted-holder case. Those are the instances that move MANY agents at once.
+  if (holders.length > 0 && chosen && !holders.some((h) => h.id === chosen.id)) {
+    console.warn(
+      "the account holding this agent's conversation is not the one it will run under — it will " +
+        "start a FRESH session and its prior context (including any opening brief) is not resumed",
+      {
+        agentId,
+        worktreePath: opts.worktreePath,
+        chosen: chosen.id,
+        reason,
+        holders: holders.map((h) => h.id),
+      },
+    );
+  }
   logSelection(agentId, chosen, reason, state, candidates);
+  // STICKY BOOKKEEPING, for the branches that never reach `autoPick` — which is the only writer of
+  // `stickySelections`. Affinity made that gap load-bearing: Improve Sparkle is resolved by BOTH an
+  // ordinary `AgentPane` (which now names a worktree, so affinity can answer) and the headless
+  // hourly pass (which names none, so it cannot). Without this line the pane's affinity answer would
+  // leave the sticky slot unwritten and the pass would auto-pick fresh — landing the two on
+  // DIFFERENT accounts for ONE SHARED WORKTREE, which is the precise failure `isStickyAccountKey`
+  // exists to prevent, reintroduced through the door affinity opened.
+  if (chosen && isStickyAccountKey(agentId)) stickySelections.set(agentId, chosen.id);
   // Remember it so the branch above can carry this key through a later hiccup.
   if (chosen) lastResolvedAccount.set(agentId, chosen);
   return { chosen, state };
@@ -436,76 +468,70 @@ export async function chooseAccountForAgent(
  * ══ WHAT IT DELIBERATELY DOES NOT DO ══════════════════════════════════════════════════════════
  *
  * It does not outrank a human. A pin and the fleet preference are both decisions someone made on
- * purpose, and this runs only when neither answered.
+ * purpose, and affinity only DECIDES when neither answered. The probe still runs under both, because
+ * its answer also drives the "this agent will come up blank" warning — and a fleet-wide preference
+ * is the single biggest instance of that, moving every agent off its own conversation at once.
  *
  * It does not park an agent on a dead account: an exhausted holder is skipped, exactly as
  * `usablePreferredAccount` skips an exhausted preference. That case is REAL — the measured agent's
  * account was rate-limiting when it moved — and it is a genuine loss of continuity that no selection
- * rule can prevent. What it must not be is SILENT, which is what cost the day. So the skip is
- * logged, loudly and by name, rather than degrading quietly into an ordinary auto-pick.
+ * rule can prevent. What it must not be is SILENT, which is what cost the day.
  *
- * Best-effort throughout: a probe that throws yields undefined and selection proceeds on usage
+ * Best-effort throughout: a probe that throws yields no holders and selection proceeds on usage
  * alone. A resume that could not be arranged is worth a warning, never a failed spawn.
+ *
+ * Returns ACCOUNTS, newest-transcript first, WITHOUT filtering for usability — the caller needs the
+ * unfiltered set to tell "no account holds this" (nothing to preserve) from "the holder is unusable"
+ * (continuity is being lost right now).
  */
-async function accountHoldingTranscript(
-  agentId: string,
+async function accountsHoldingTranscript(
   state: AccountState,
-  base: PickOptions,
   opts: {
-    now?: number;
     worktreePath?: string;
     sessionAccounts?: (worktreePath: string, configDirs: string[]) => Promise<string[]>;
   },
-): Promise<string | undefined> {
+): Promise<Account[]> {
   const worktreePath = opts.worktreePath;
-  if (!worktreePath) return undefined;
+  if (!worktreePath) return [];
   // No accounts configured → nothing to be loyal to, and the spawn omits CLAUDE_CONFIG_DIR anyway.
   // `state.failed` means the account list is UNKNOWN rather than empty: probing it would ask about
   // an empty set and answer "no account holds this", which is a measured-sounding claim produced by
   // a read that never happened — the same trap `candidates: null` exists for above.
-  if (state.failed || state.accounts.length === 0) return undefined;
-  const probe = opts.sessionAccounts ?? claudeSessionAccounts;
+  if (state.failed || state.accounts.length === 0) return [];
+  // DEDUPED, because two registered accounts can share one config dir (the same login added twice).
+  // The probe answers per DIRECTORY, so sending a duplicate would return that directory twice and
+  // make the same conversation look like two holders.
+  const configDirs = [...new Set(state.accounts.map((a) => a.configDir ?? ""))];
   let holders: string[];
   try {
-    holders = await probe(
-      worktreePath,
-      state.accounts.map((a) => a.configDir ?? ""),
-    );
+    holders = await (opts.sessionAccounts ?? claudeSessionAccounts)(worktreePath, configDirs);
   } catch (e) {
     console.warn("transcript affinity probe failed; selecting on usage alone", e);
-    return undefined;
+    return [];
   }
-  if (holders.length === 0) return undefined; // a fresh worktree: nothing to keep continuity with
-  const now = opts.now ?? Date.now();
-  // Map each holding config dir back to the account that named it, NEWEST FIRST (the probe's order).
-  // Comparing on `configDir` is what makes the default account's `""` resolve to itself rather than
-  // to whichever other account also records no override.
-  const holdingAccounts = holders
-    .map((dir) => state.accounts.find((a) => (a.configDir ?? "") === dir))
-    .filter((a): a is Account => a != null);
-  for (const account of holdingAccounts) {
-    // The SAME two gates the preference passes through: an account nobody signed into strands the
-    // agent at a login prompt, and an exhausted one strands it at a wall.
-    if (base.signedInIds && base.signedInIds.length > 0 && !base.signedInIds.includes(account.id)) {
-      continue;
-    }
-    if (isAccountExhausted(state.usage, account.id, now)) continue;
-    return account.id;
-  }
-  // NEVER SILENT. Reaching here means this agent has a conversation on disk that the spawn we are
-  // about to build cannot resume — the exact state that read as "spawned with no task" — and the
-  // agent will come up blank. Say so by name, because nothing downstream can: the pane still renders
-  // the row, the header and the brief, so the UI shows an agent that looks fully briefed.
-  console.warn(
-    "account holding this agent's conversation is unusable — it will start a FRESH session and " +
-      "its prior context (including any opening brief) will not be resumed",
-    {
-      agentId,
-      worktreePath,
-      holders: holdingAccounts.map((a) => a.id),
-    },
+  // Map each holding config dir back to EVERY account naming it, newest-transcript order preserved.
+  // `flatMap` rather than `find`: when several accounts share a dir they are all equally holders of
+  // that conversation, and collapsing onto the first would hide a usable one behind an exhausted
+  // duplicate. Comparing on `configDir` is also what makes the default account's `""` resolve to
+  // itself rather than to whichever other account also records no override.
+  return holders.flatMap((dir) => state.accounts.filter((a) => (a.configDir ?? "") === dir));
+}
+
+/** The first holder we may actually launch under, or undefined when none is usable.
+ *
+ *  The SAME two gates the fleet preference passes through: an account nobody signed into strands the
+ *  agent at a login prompt, and an exhausted one strands it at a wall. */
+function firstUsableHolder(
+  holders: Account[],
+  state: AccountState,
+  base: PickOptions,
+  now: number = Date.now(),
+): Account | undefined {
+  return holders.find(
+    (a) =>
+      !(base.signedInIds && base.signedInIds.length > 0 && !base.signedInIds.includes(a.id)) &&
+      !isAccountExhausted(state.usage, a.id, now),
   );
-  return undefined;
 }
 
 /** Append this resolution to the on-disk ledger (`accountLedger.ts`), best-effort.

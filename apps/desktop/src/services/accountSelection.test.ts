@@ -659,6 +659,32 @@ describe("transcript affinity", () => {
     expect(chosen?.id).toBe("hist");
   });
 
+  it("drives the REAL probe when no `sessionAccounts` is injected — the production seam, exercised", async () => {
+    // roborev finding (the `sparkle-lgbwf` shape). Every other test here injects `sessionAccounts`,
+    // and `AgentPane` — the one caller that does not — is covered by nothing. So the default arm
+    // `opts.sessionAccounts ?? claudeSessionAccounts` and `preflight.claudeSessionAccounts`'s
+    // `invoke("claude_session_accounts", { worktreePath, configDirs })` were untested by
+    // construction: delete the fallback, misspell an argument key, or drop the `lib.rs`
+    // registration, and the whole suite still passed. The failure is silent by design — a rejected
+    // invoke is caught and downgraded to a `console.warn`, and selection falls back to
+    // lowest-usage, i.e. THIS BUG, permanently, with green tests.
+    //
+    // So this test injects nothing and answers the command from the `invoke` mock instead, which is
+    // the real IPC boundary. It asserts the command NAME and the ARGUMENT SHAPE (a misnamed key
+    // would reach the backend as undefined and probe the wrong thing), then that `hist` wins.
+    const inner = invoke.getMockImplementation()!;
+    invoke.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "claude_session_accounts") {
+        expect(args).toEqual({ worktreePath: WT, configDirs: ["/data/accounts/fresh", "/data/accounts/hist"] });
+        return Promise.resolve(["/data/accounts/hist"]);
+      }
+      return inner(cmd, args);
+    });
+    const { chosen } = await chooseAccountForAgent("agent-1", { now: 1_000, worktreePath: WT });
+    expect(chosen?.id).toBe("hist");
+    expect(invoke.mock.calls.some((c) => c[0] === "claude_session_accounts")).toBe(true);
+  });
+
   it("still lets a human PIN override the account holding the conversation", async () => {
     // Affinity is a default, not a veto: a pin is someone deciding on purpose, and it outranks this
     // the same way it outranks every other judgement here.
@@ -669,6 +695,101 @@ describe("transcript affinity", () => {
       sessionAccounts: async () => ["/data/accounts/hist"],
     });
     expect(chosen?.id).toBe("fresh");
+  });
+
+  it("warns even under a PIN — the human choice stands, the silent context loss does not", async () => {
+    // roborev finding: the warning used to live inside the affinity helper, which is skipped
+    // entirely when a pin or the fleet preference already answered. That made the LARGEST instance
+    // of this failure the one nothing reported — activating an account fleet-wide moves every agent
+    // off its own conversation at once. The pin still wins; it just no longer wins quietly.
+    setPin("agent-1", "fresh");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("fresh");
+    expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toContain("FRESH session");
+    warn.mockRestore();
+  });
+
+  it("does NOT warn when the account it settled on is the one holding the conversation", async () => {
+    // The negative half. Without it the test above passes against a warning that fires every spawn,
+    // which would be noise indistinguishable from the signal.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("hist");
+    expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).not.toContain("FRESH session");
+    warn.mockRestore();
+  });
+
+  it("records a STICKY key's affinity answer, so the headless caller cannot diverge from the pane", async () => {
+    // roborev finding, and the sharpest of the three. `autoPick` is the only writer of
+    // `stickySelections`, and affinity bypasses it. Improve Sparkle is resolved by BOTH an
+    // AgentPane (which now names a worktree, so affinity can answer) and the headless hourly pass
+    // (which names none, so it cannot) — for ONE SHARED WORKTREE. With the slot left unwritten the
+    // pass auto-picks fresh and the two land on different accounts, which is the precise failure
+    // `isStickyAccountKey` exists to prevent.
+    const pane = await chooseAccountForAgent(SPARKLE_AGENT_ID, {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(pane.chosen?.id).toBe("hist");
+    // The headless caller names no worktree, so affinity cannot answer for it. It must still land on
+    // `hist` — via the sticky slot the pane just wrote — rather than on the emptier `fresh`.
+    const headless = await chooseAccountForAgent(SPARKLE_AGENT_ID, { now: 1_100 });
+    expect(headless.chosen?.id).toBe("hist");
+  });
+
+  it("does not let two accounts sharing one config dir collapse onto the first", async () => {
+    // roborev finding. A login registered twice yields two accounts with one config dir. The probe
+    // answers per DIRECTORY, so `find` would return whichever account was listed first — hiding a
+    // usable duplicate behind an exhausted one.
+    const DUP_ACCOUNTS = [
+      { id: "dup-a", nickname: "A", configDir: "/data/accounts/hist", isDefault: false, createdAt: 1 },
+      { id: "dup-b", nickname: "B", configDir: "/data/accounts/hist", isDefault: false, createdAt: 2 },
+      { id: "fresh", nickname: "Fresh", configDir: "/data/accounts/fresh", isDefault: false, createdAt: 3 },
+    ];
+    const probe = vi.fn(async () => ["/data/accounts/hist"]);
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(DUP_ACCOUNTS);
+      if (cmd === "accounts_usage")
+        // The FIRST duplicate is exhausted; the second is fine. Collapsing onto the first would skip
+        // both and lose the conversation for no reason.
+        //
+        // `dup-b` also carries the HIGHEST tally, which is what makes this test non-vacuous: with a
+        // flat tally the auto-pick fallback lands on `dup-b` by accident, so the assertion held even
+        // with the collapse restored (measured — the mutation passed). Now lowest-usage would answer
+        // `fresh`, so only affinity reaching THROUGH the exhausted duplicate can produce `dup-b`.
+        return Promise.resolve([
+          { id: "dup-a", tokens5h: 0, tokens7d: 0, exhaustedUntil: 9_000_000 },
+          { id: "dup-b", tokens5h: 900_000, tokens7d: 900_000, exhaustedUntil: null },
+          { id: "fresh", tokens5h: 0, tokens7d: 0, exhaustedUntil: null },
+        ]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve([
+          { id: "dup-a", email: "a@x.com", organization: null, accountUuid: "u" },
+          { id: "dup-b", email: "a@x.com", organization: null, accountUuid: "u" },
+          { id: "fresh", email: "f@x.com", organization: null, accountUuid: "u2" },
+        ]);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    const { chosen } = await chooseAccountForAgent("agent-dup", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: probe,
+    });
+    expect(chosen?.id).toBe("dup-b");
+    // And the shared dir is sent ONCE — a duplicate would make one conversation look like two.
+    expect(probe).toHaveBeenCalledWith(WT, ["/data/accounts/hist", "/data/accounts/fresh"]);
   });
 
   it("refuses to park the agent on an EXHAUSTED holder, and says the context will be lost", async () => {

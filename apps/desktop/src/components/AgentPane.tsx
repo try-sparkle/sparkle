@@ -594,8 +594,10 @@ function AgentPaneInner({
       // WARM ONLY — the account is no longer CHOSEN here. Selection now needs this agent's worktree
       // path (transcript affinity: the account holding an existing conversation wins over a lower
       // usage tally, or a remount starts a blank session beside the real one), and the worktree does
-      // not exist yet at this point. So the overlap this line was written for is kept by pre-loading
-      // the accounts+usage snapshot into the module cache, and the pick itself moves below `wt`.
+      // not exist yet at this point. So the overlap splits in two: this line pre-loads the
+      // accounts+usage snapshot alongside worktree creation, and the pick itself starts the moment
+      // `wt` exists (see `accountP` below) rather than at the point it is consumed. `loadAccountState`
+      // de-dupes an in-flight load, so the pick joins THIS request instead of issuing a second one.
       // Resolving early and re-resolving later would be worse than either: two ledger entries for
       // one spawn, the first recording an account the agent never ran under.
       const accountWarmP = loadAccountState();
@@ -635,6 +637,20 @@ function AgentPaneInner({
       const wt = await prepareAgentWorkspace(project.rootPath, project.id, agent.id, agentBase);
       perfMark(agent.id, "worktree ready");
       setAgentWorktree(project.id, agent.id, wt.path, wt.branch);
+      // START THE PICK HERE, the instant its only input (`wt.path`) exists — not at the `await`
+      // below. The pick needs the worktree path and nothing else from the guard/hooks/integrity
+      // block that follows, and that block routinely outruns `ACCOUNT_CACHE_TTL_MS` (a cold
+      // `git worktree add` plus three read-modify-writes of the same settings file). Awaiting it
+      // down there would let the warm snapshot above EXPIRE, so `chooseAccountForAgent` would
+      // re-issue the whole 4-command load serially — including the `accounts_identities` leg that
+      // JSON-parses every account's `.claude.json` — and would run the new `claude_session_accounts`
+      // probe (one read_dir per account) with nothing overlapping it. On a resurrection sweep that
+      // is added latency in exactly the place the original early pick existed to avoid.
+      // Still ONE resolution, so still one ledger entry: this is the same promise awaited below.
+      const accountP = chooseAccountForAgent(agent.id, { worktreePath: wt.path });
+      // Documented never to throw; guard symmetrically anyway so a rejection here cannot surface as
+      // an unhandled rejection when an await between here and its consumption throws first.
+      accountP.catch(() => {});
 
       // Defense in depth: install the write-guard, then refuse to spawn a broken sandbox.
       // NOTE: guard + hooks both read-modify-write the SAME `.claude/settings.local.json`, so they
@@ -708,8 +724,9 @@ function AgentPaneInner({
       // account holding it wins over a lower usage tally. Without it a remount — most often the
       // resurrection sweep after an app restart — re-picks by usage, lands on an account whose tree
       // is empty, and launches claude fresh while the agent's real history (and the opening brief it
-      // carried) sits intact under the previous account. See accountSelection.accountHoldingTranscript.
-      const { chosen, state } = await chooseAccountForAgent(agent.id, { worktreePath: wt.path });
+      // carried) sits intact under the previous account. See accountSelection.accountsHoldingTranscript.
+      // Started right after the worktree existed, so it has been running under the block above.
+      const { chosen, state } = await accountP;
       perfMark(agent.id, "account resolved");
       setAccounts(state.accounts);
       setIdentities(state.identities);
