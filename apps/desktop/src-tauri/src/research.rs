@@ -9,7 +9,7 @@
 //! ══ THE FEATURE IS THAT `research_dispatch` RETURNS BEFORE THE CHILD FINISHES ══════════════════
 //!
 //! Everything else in this module is support for that one property. The concierge dispatches a
-//! 15-minute research pass and answers the founder's next sentence immediately; the finding lands
+//! long research pass and answers the founder's next sentence immediately; the finding lands
 //! later, on disk, and is folded into a subsequent turn. A version of this that awaited the child
 //! would be INDISTINGUISHABLE at the call site — same signature, same returned task — and would
 //! reintroduce exactly the blocking the feature replaces. So it is pinned by a test that runs
@@ -39,9 +39,9 @@
 //! ══ ITS OWN POOL, NOT `claude_oneshot`'s ══════════════════════════════════════════════════════
 //!
 //! Same RAII permit / bounded-waiting-room shape, separate counters. `claude_oneshot`'s pool is
-//! MAX_CONCURRENT=4 / MAX_BACKGROUND=3 tuned for 2-60s classify calls; one 15-minute research child
-//! holding a background permit there would starve agent auto-naming and the followup judge for
-//! fifteen minutes. The founder asked for NO CAP on dispatch, and that is what this delivers: a
+//! MAX_CONCURRENT=4 / MAX_BACKGROUND=3 tuned for 2-60s classify calls; one long-running research
+//! child holding a background permit there would starve agent auto-naming and the followup judge for
+//! the whole pass. The founder asked for NO CAP on dispatch, and that is what this delivers: a
 //! dispatch is NEVER refused. Over the pool bound the BACKGROUND runner queues in a bounded waiting
 //! room and drains; only at the far edge of that room does a task fail, and it says so honestly
 //! rather than silently vanishing.
@@ -77,7 +77,9 @@ impl ResearchStatus {
     }
 }
 
-/// The two tiers: cheap by default, escalate on demand.
+/// The two tiers. KEPT as a wire contract with the TS side (the shared fixture exercises both), but
+/// they no longer differ in model or wall clock — the founder collapsed cheap/deep into one capable,
+/// unthrottled tier. See [`RESEARCH_MODEL`] and [`RESEARCH_TIMEOUT`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ResearchDepth {
@@ -85,32 +87,45 @@ pub enum ResearchDepth {
     Deep,
 }
 
-/// The model a tier pins.
+/// The model EVERY research child runs on — ONE capable tier, not a cheap/deep split.
 ///
-/// PINNED rather than inherited (the opposite of concierge, which deliberately omits `--model` so
-/// the session follows the user's choice). A `quick` pass that silently ran on Opus because that is
-/// what the user's CLI defaults to would burn ~30x their subscription quota on the cheap tier.
-const QUICK_MODEL: &str = "claude-sonnet-4-6";
-const DEEP_MODEL: &str = "claude-opus-4-8";
+/// The founder asked for dispatched agents "as capable as the concierge" and added "I don't know
+/// that we need cheap or deep," so both depths now pin the SAME Opus-class model. The `Quick`/`Deep`
+/// enum stays (it is a wire contract with the TS side — see the shared fixture), but the tier no
+/// longer buys a smaller model, only a label.
+///
+/// PINNED rather than inherited: the concierge omits `--model` so its interactive session follows
+/// the user's Claude Code default, but a background research child has no session to inherit from,
+/// and the argv builder + its ordering test both require a concrete `--model` value. `claude-opus-5`
+/// is the Opus-5-class id the rest of this repo already dispatches (concierge default included), so
+/// this pins capability parity with the concierge without depending on the CLI's ambient default.
+const RESEARCH_MODEL: &str = "claude-opus-5";
 
-/// Wall clock for one child, by tier. WALL CLOCK, not a read timeout — this bounds forking node,
-/// booting the CLI, and a whole multi-tool research pass.
-const QUICK_TIMEOUT: Duration = Duration::from_secs(3 * 60);
-const DEEP_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Wall-clock BACKSTOP for one child — a safety ceiling, deliberately NOT a throttle.
+///
+/// The founder's instruction was "remove the time limits completely — it takes as long as it
+/// takes." So this replaces the old 3-minute/15-minute walls with a ceiling so high nothing
+/// legitimate reaches it (a real research pass finishes in minutes). Its ONLY job is to guarantee a
+/// genuinely wedged `node` eventually releases its pool permit instead of leaking it forever — an
+/// unbounded wait would let one hung child pin a slot for the life of the process.
+///
+/// CANCELLATION IS UNAFFECTED. `research_cancel` flips the flag the child-watch loop polls every
+/// `CHILD_POLL`, so a task is killable the instant the founder asks — long, long before this ceiling
+/// — and killing the process group still reaps the whole tree. This lifts the *automatic* wall, not
+/// the ability to cancel.
+const RESEARCH_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 impl ResearchDepth {
+    /// Both depths run the same capable model now — see [`RESEARCH_MODEL`].
     pub fn model(self) -> &'static str {
-        match self {
-            Self::Quick => QUICK_MODEL,
-            Self::Deep => DEEP_MODEL,
-        }
+        let _ = self;
+        RESEARCH_MODEL
     }
 
+    /// Both depths share the huge safety backstop, not an artificial wall — see [`RESEARCH_TIMEOUT`].
     pub fn timeout(self) -> Duration {
-        match self {
-            Self::Quick => QUICK_TIMEOUT,
-            Self::Deep => DEEP_TIMEOUT,
-        }
+        let _ = self;
+        RESEARCH_TIMEOUT
     }
 }
 
@@ -317,10 +332,17 @@ fn is_a_reconcile_guess(t: &ResearchTask) -> bool {
 // THE POOL — its own counters, never `claude_oneshot`'s
 // ═══════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Concurrent research children. Two, not four: each is a full node process doing tool-heavy work
-/// for minutes against the same subscription rate limit the user's REAL agents draw on, and the
-/// founder's build agents are what he actually cares about. A burst does not fail — it queues.
-const MAX_CONCURRENT_RESEARCH: usize = 2;
+/// Concurrent research children. SIXTEEN — the founder uncorked this pool: the concierge fans ~20
+/// questions out at once and expects most of them running in parallel, not draining two at a time.
+/// Each child is still a full node process doing tool-heavy work against the same subscription rate
+/// limit, so this is a real load; the trade is deliberate and is the whole point of this change. A
+/// burst past 16 does not fail — it queues in the bounded waiting room below.
+///
+/// Tunable by intent: raise or lower this ONE constant to change the parallelism. (It is not a
+/// `.sparkle/config.toml` value because that layer is per-project-overridable policy — freshness,
+/// review, approvals — and dispatch parallelism is a global runtime property of this machine, not a
+/// per-repo rule; a plain constant is the honest home for it.)
+const MAX_CONCURRENT_RESEARCH: usize = 16;
 
 /// How many dispatched tasks may WAIT for a permit on top of those holding one.
 ///
@@ -382,7 +404,7 @@ struct Pool<'a> {
 }
 
 /// THE research pool. Its counters are this module's own statics — see the module header for why
-/// sharing `claude_oneshot`'s would starve agent naming and the followup judge for fifteen minutes.
+/// sharing `claude_oneshot`'s would starve agent naming and the followup judge for a whole pass.
 fn research_pool() -> Pool<'static> {
     Pool {
         inflight: &RESEARCH_INFLIGHT,
@@ -543,7 +565,7 @@ fn build_research_args(question: &str, model: &str, persona: &str) -> Vec<String
         // A single JSON object on stdout. Nothing here streams to a UI.
         "--output-format".to_string(),
         "json".to_string(),
-        // Pinned per tier — see QUICK_MODEL.
+        // One capable model for both tiers — see RESEARCH_MODEL.
         "--model".to_string(),
         model.to_string(),
         // APPEND, not replace: the child needs its normal tool-use behaviour.
@@ -637,12 +659,19 @@ fn cli_failure_message(result_text: &str) -> String {
     }
 }
 
-/// The message a task carries when its wall clock ran out.
+/// The message a task carries when it hit the wall-clock BACKSTOP (see [`RESEARCH_TIMEOUT`]) — a
+/// rare safety stop, not the old automatic wall. Rendered in the largest sensible unit so a
+/// multi-day ceiling does not read as an absurd minute count.
 fn timeout_message(timeout: Duration) -> String {
-    format!(
-        "The research run hit its {} minute limit and was stopped.",
-        timeout.as_secs() / 60
-    )
+    let secs = timeout.as_secs();
+    let span = if secs >= 24 * 60 * 60 {
+        format!("{}-day", secs / (24 * 60 * 60))
+    } else if secs >= 60 * 60 {
+        format!("{}-hour", secs / (60 * 60))
+    } else {
+        format!("{}-minute", secs / 60)
+    };
+    format!("The research run hit its {span} safety limit and was stopped.")
 }
 
 /// The cancellation + child handle for ONE running task.
@@ -947,7 +976,7 @@ pub(crate) fn dispatch_with(
     }
 
     // A REAL OS THREAD, not a tokio task. The work is blocking start to finish (a pool wait of up
-    // to an hour, then a child of up to fifteen minutes), and parking a tokio worker on it would
+    // to an hour, then a child that runs as long as the pass takes), and parking a tokio worker would
     // starve every other command.
     let bg = Arc::clone(&runner);
     let id = task.id.clone();
@@ -1088,8 +1117,8 @@ fn finish(
 /// badge, and nothing drains it: this module deliberately opts out of `retention::reap_inbox`, and
 /// `research_cancel` is the only other exit — which needs the founder to notice and click.
 ///
-/// This is the COMMON case, not an edge one: a deep pass runs up to 15 minutes, so a restart landing
-/// inside one is ordinary.
+/// This is the COMMON case, not an edge one: a pass now runs as long as it needs (the automatic wall
+/// was lifted), so a restart landing inside one is ordinary.
 ///
 /// ══ AND ITS VERDICT IS A GUESS, WHICH IS WHY `finish` MAY OVERTURN IT ═══════════════════════════
 ///
@@ -1857,6 +1886,20 @@ mod tests {
         assert_eq!(RESEARCH_INFLIGHT.load(Ordering::Acquire), before);
     }
 
+    /// THE POOL IS UNCORKED. The founder raised the cap so ~16 research children run at once instead
+    /// of draining two at a time. Read off the PRODUCTION pool (`research_pool()`), not the raw
+    /// constant, so it proves the value the acquire path actually enforces — a revert to the old
+    /// throttle of 2 reds here.
+    #[test]
+    fn the_dispatch_pool_runs_many_children_in_parallel() {
+        let _pool = pool_guard();
+        assert!(
+            research_pool().cap >= 16,
+            "the concierge fans ~20 questions out and expects ~16 running at once, got a cap of {}",
+            research_pool().cap
+        );
+    }
+
     /// POOL ISOLATION, STRUCTURAL HALF — and this is the one that catches the regression that
     /// matters. The behavioural test above cannot see a rewiring onto `claude_oneshot`'s pool,
     /// because `claude_oneshot::INFLIGHT` is private and there is nothing to read it with. The way
@@ -2110,15 +2153,37 @@ mod tests {
         }
     }
 
+    /// ONE capable, unthrottled tier. The founder collapsed cheap/deep: both depths now run the same
+    /// Opus-class model with no artificial wall. This asserts the values the child is actually
+    /// LAUNCHED with — the model in its argv and the deadline it runs under — via the same `model()`
+    /// / `timeout()` the spawner calls, so a revert to the old sonnet/opus tiering or the 3/15-minute
+    /// walls reds here.
     #[test]
-    fn the_tiers_are_cheap_by_default_and_longer_when_escalated() {
-        assert_eq!(ResearchDepth::Quick.model(), "claude-sonnet-4-6");
-        assert_eq!(ResearchDepth::Quick.timeout(), Duration::from_secs(180));
-        assert_eq!(ResearchDepth::Deep.timeout(), Duration::from_secs(900));
-        assert_ne!(
-            ResearchDepth::Deep.model(),
+    fn both_depths_run_the_same_capable_model_with_no_artificial_wall() {
+        // Both tiers pin the SAME capable model — cheap/deep collapsed.
+        assert_eq!(ResearchDepth::Quick.model(), RESEARCH_MODEL);
+        assert_eq!(ResearchDepth::Deep.model(), RESEARCH_MODEL);
+        assert_eq!(
             ResearchDepth::Quick.model(),
-            "deep escalates to a larger model, not just a longer clock"
+            ResearchDepth::Deep.model(),
+            "the tiers no longer buy different models — both are as capable as the concierge"
+        );
+        assert!(
+            RESEARCH_MODEL.starts_with("claude-opus-"),
+            "the dispatched child must be Opus-class, got {RESEARCH_MODEL}"
+        );
+        // …and the model reaches the argv the CLI is actually launched with.
+        let args = build_research_args("q", ResearchDepth::Quick.model(), "p");
+        let model_at = args.iter().position(|a| a == "--model").map(|i| args[i + 1].clone());
+        assert_eq!(model_at.as_deref(), Some(RESEARCH_MODEL), "--model must carry the pinned id");
+
+        // The automatic time wall is GONE. Neither depth is bounded by the old 3/15-minute throttle;
+        // what remains is only a multi-day safety backstop.
+        assert_eq!(ResearchDepth::Quick.timeout(), RESEARCH_TIMEOUT);
+        assert_eq!(ResearchDepth::Deep.timeout(), RESEARCH_TIMEOUT);
+        assert!(
+            ResearchDepth::Deep.timeout() >= Duration::from_secs(24 * 60 * 60),
+            "the wall is lifted — a research pass runs as long as it takes, not a 15-minute cap"
         );
     }
 
