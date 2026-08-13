@@ -34,6 +34,7 @@ vi.mock("../services/branchStatus", () => ({
 
 import { AgentSidebar } from "./AgentSidebar";
 import { FOLD_DOUBLE_PRESS_GRACE_MS } from "./AgentRow";
+import { AGENT_NAME_MIN_WIDTH_PX } from "./FittedAgentName";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -303,7 +304,14 @@ describe("the two gestures on the agent name", () => {
     expect(outer.style.flexGrow).toBe("1");
     // A floor, so a long sibling cannot truncate the name to nothing — the reason the padding is
     // reserved at all rather than merely left over.
-    expect(outer.style.minWidth).not.toBe("");
+    //
+    // THE EXACT VALUE, not `.not.toBe("")` (roborev 63497). The regression this line claims to floor
+    // is the name going back to `minWidth: 0` — and `"0"` is not `""`, so the loose form stayed green
+    // against precisely the state it was written to catch. jsdom measures the column at 0, which
+    // `agentNameFloorFor` maps to the WIDE floor (see FittedAgentName), so the value is pinned rather
+    // than layout-dependent.
+    expect(AGENT_NAME_MIN_WIDTH_PX).toBeGreaterThan(0);
+    expect(outer.style.minWidth).toBe(`${AGENT_NAME_MIN_WIDTH_PX}px`);
     expect(outer.style.display).toBe("block");
   });
 
