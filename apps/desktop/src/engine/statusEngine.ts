@@ -34,6 +34,11 @@
 import { classifyLine } from "@sparkle/core";
 import type { AgentTabStatus } from "@sparkle/ui";
 import { isSessionLimitPicker, screenAwaitsInput } from "./screenClassifier";
+import { parseBackgroundTaskCount } from "./backgroundTaskFooter";
+import {
+  noteBackgroundTasks,
+  forgetBackgroundTasks,
+} from "../services/backgroundTaskRegistry";
 import { screenOffersAnswer, streamOffersAnswer } from "./screenAnswerable";
 import { withScreenReason, type StatusReason } from "./statusRouter";
 import { forgetAgent, noteProcessExit, noteSpinnerSeen, trackAgent } from "./turnEndAuthority";
@@ -855,6 +860,14 @@ export class StatusEngine {
     // only the logged verdict distinguishes them.
     const snapshot = this.opts.getScreen?.();
     const blank = snapshot === undefined || !snapshot.trim();
+    // BACKGROUND-TASK FOOTER (bead sparkle-262p7): a SEPARATE signal, never a status. Read from the
+    // SAME viewport snapshot settle already took — if Claude's "N background task(s) live" footer is
+    // on it, this agent's turn closed while its delegated work runs on, and the rollup keeps the row
+    // GREEN off the parked count. Deliberately NOT folded into WORKING_PATTERNS (inMotion.ts:20-24 /
+    // engine/backgroundTaskFooter): a spinner-path entry would fire the status router's watchdog on a
+    // healthy delegating session. Runs on every settle, so Claude's follow-up-turn-on-task-finish
+    // self-corrects the count down to zero through the ordinary turn cycle.
+    this.noteBackgroundTasksFromScreen(snapshot);
     const awaiting = blank ? false : screenAwaitsInput(snapshot);
     // The VIEWPORT is the only surface this question may be asked of — never the streamed lines
     // `ingest` scans. See isSessionLimitPicker's header: bottom-anchoring is what keeps prose that
@@ -905,6 +918,21 @@ export class StatusEngine {
     }
     this.sawSessionLimitPicker = picker;
     return picker;
+  }
+
+  /**
+   * Park (or clear) this agent's live-background-task count from a settled viewport snapshot.
+   *
+   * `undefined` snapshot → LEAVE THE REGISTRY UNTOUCHED: getScreen is absent on many constructions,
+   * and "we did not look" is not "the footer is gone". A real (possibly blank) screen with no footer
+   * DOES clear the entry — that is how the count returns to zero and the row goes gray when the last
+   * background task finishes. A footer present writes its count. See services/backgroundTaskRegistry.
+   */
+  private noteBackgroundTasksFromScreen(snapshot: string | undefined): void {
+    if (snapshot === undefined) return;
+    const count = parseBackgroundTaskCount(snapshot);
+    if (count !== null) noteBackgroundTasks(this.opts.agentId, count);
+    else forgetBackgroundTasks(this.opts.agentId);
   }
 
   // A LATE re-read of the rendered screen, armed alongside the settle timer on the fallback path.
@@ -1342,6 +1370,9 @@ export class StatusEngine {
     // A late exit from a PTY this engine no longer owns is not this agent's news — see `disposed`.
     if (this.disposed) return;
     this.clearTimers();
+    // The PTY is gone, so no background-task footer can be live — drop any parked count (bead
+    // sparkle-262p7). Without this a promoted GREEN would outlive the process it was reporting.
+    forgetBackgroundTasks(this.opts.agentId);
     // A dead process is the strongest turn-end witness there is: nothing can still be writing the
     // worktree. Without this, an agent that exited on the fallback path (no hooks, no spinner) would
     // be refused every destructive op FOREVER — a dead PTY never emits the spinner frame or hook
@@ -1362,6 +1393,9 @@ export class StatusEngine {
   dispose(): void {
     this.disposed = true;
     this.clearTimers();
+    // Pane gone → stop reporting this agent's background tasks (bead sparkle-262p7), same reasoning
+    // as forgetAgent below: a stale entry would keep a torn-down row painted GREEN.
+    forgetBackgroundTasks(this.opts.agentId);
     // The quota release timer is kept OUT of `clearTimers()` on purpose (that runs on every
     // classification, including the `blocked` arm that arms it), so it has to be dropped here
     // explicitly. Its callback already checks `disposed`, but the timer itself can be up to 5h out

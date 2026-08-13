@@ -369,3 +369,53 @@ export function withWorkerRollupGreen<
   }
   return out ?? statusMap;
 }
+
+/**
+ * Promote an idle agent that is WAITING ON LIVE BACKGROUND TASKS to `working` (bead sparkle-262p7).
+ *
+ * The sibling of {@link withWorkerRollupGreen}, for the motion that overlay cannot see. That one
+ * keeps a parent green when a `kind:"worker"` child TAB is working; this one keeps an agent green
+ * when its motion is carried by background work that spawned no tab — a `run_in_background` Bash, a
+ * backgrounded Task subagent, a backgrounded MCP call. `engine/inMotion`'s own header names that gap
+ * and why the hook stream cannot close it; the signal instead comes from Claude Code's
+ * "N background task(s) live" footer, parked per agent by `services/backgroundTaskRegistry` and read
+ * here through `hasBackgroundTasks`.
+ *
+ * ONE SOURCE OF TRUTH, and that is why it upgrades the agent's OWN status rather than only patching a
+ * dot: applied early on the base map (see useAttentionNotifications.composeRollup) the `working` it
+ * writes flows through every downstream reader identically — `rollupDot` paints the disc green,
+ * `isInMotion` reads it as motion (so a non-asking worker red is suppressed on a parent that is
+ * visibly delegating, exactly as a spinner-working parent already suppresses it), `withUnmergedWork`
+ * declines to call a still-delegating agent "finished", and the published map the sidebar, TopBar and
+ * concierge feed all read carries the same green. No surface can disagree with another.
+ *
+ * PROMOTES `idle` ONLY, and that narrowness is deliberate:
+ *   • RED (waiting/approval/blocked/errored) is never touched — the founder's rule is that red means
+ *     only he can unblock it, and a live background task does not clear a question the agent is
+ *     asking. Red wins over motion, always.
+ *   • AMBER (`lapsed`), `unmerged` and `new` stay as they are — each is a distinct calm meaning
+ *     ("machinery stopped", "PR owed", "never briefed") that background motion must not paint over.
+ *   • `done`/`stopped` are terminal: the PTY is gone, so no footer can be live and the registry is
+ *     cleared on exit — promoting them would risk resurrecting a finished agent to green off a stale
+ *     entry, so they are excluded by construction.
+ * `idle` — "finished its turn, nothing left for you" — is the ONE gray the bug produces: the turn
+ * closed (Stop) while delegated work runs on. That is precisely the case to repaint green, and only
+ * that one.
+ *
+ * Returns the SAME reference when nothing is promoted, so an unchanged frame costs no re-render.
+ */
+export function withBackgroundTaskGreen<
+  T extends { id: string },
+  M extends Record<string, AgentTabStatus>,
+>(agents: readonly T[], statusMap: M, hasBackgroundTasks: (id: string) => boolean): M {
+  let out: M | null = null;
+  for (const a of agents) {
+    // ONLY `idle` — see the header. Not `working` (already there), not red, amber, unmerged, new,
+    // done or stopped. This single guard encodes every exclusion above.
+    if (statusMap[a.id] !== "idle") continue;
+    if (!hasBackgroundTasks(a.id)) continue;
+    out ??= { ...statusMap };
+    (out as Record<string, AgentTabStatus>)[a.id] = "working";
+  }
+  return out ?? statusMap;
+}

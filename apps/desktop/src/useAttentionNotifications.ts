@@ -57,8 +57,10 @@ import { isInMotion } from "./engine/inMotion";
 import {
   rollupDotAccessor,
   withWorkerRollupGreen,
+  withBackgroundTaskGreen,
   type RollupDot,
 } from "./engine/workerRollup";
+import { hasLiveBackgroundTasksForAgent } from "./services/backgroundTaskRegistry";
 import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withNewAgentCalm } from "./engine/newAgentAttention";
 import { withDeadSessionCalm } from "./engine/deadSessionAttention";
@@ -145,6 +147,12 @@ export function publishedStatusFor(
    *  caller drives the real de-redding without passing anything, while `composeRollup` itself stays
    *  pure. `undefined` from it means "no reading", never "alive". */
   deathCauseOf: (id: string) => DeathCause | undefined = deathCauseForAgent,
+  /** agentId → does it have live background tasks (a `run_in_background` Bash, a backgrounded Task
+   *  subagent, a backgrounded MCP call)? Defaults to the live window-local registry at this
+   *  OUTERMOST boundary, exactly as `deathCauseOf` does — so every production caller drives the real
+   *  green-while-delegating without passing anything, while `composeRollup` itself stays pure.
+   *  `false` from it means "no live background work", never "we did not look". See bead sparkle-262p7. */
+  hasBackgroundTasksOf: (id: string) => boolean = hasLiveBackgroundTasksForAgent,
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -157,6 +165,7 @@ export function publishedStatusFor(
     thrashOf,
     isFinishedOf,
     deathCauseOf,
+    hasBackgroundTasksOf,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -194,6 +203,10 @@ export function rollupViewFor(
    *  agent's row must read amber HERE as well, or the column would paint red while every other
    *  surface had calmed it — the column↔feed drift this file exists to prevent. */
   deathCauseOf: (id: string) => DeathCause | undefined = deathCauseForAgent,
+  /** See `publishedStatusFor`'s parameter of the same name. The Build column needs it too: `dotOf`
+   *  reads the background-promoted map, so a column that skipped this would paint an idle-but-
+   *  delegating head gray while every other surface had turned it green. */
+  hasBackgroundTasksOf: (id: string) => boolean = hasLiveBackgroundTasksForAgent,
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -206,6 +219,7 @@ export function rollupViewFor(
     thrashOf,
     isFinishedOf,
     deathCauseOf,
+    hasBackgroundTasksOf,
   );
   return { own, dotOf };
 }
@@ -247,6 +261,12 @@ function composeRollup(
    *  with no evidence to give. The real registry is wired in at the two OUTERMOST boundaries above,
    *  so no production path relies on this default. */
   deathCauseOf: (id: string) => DeathCause | undefined = () => undefined,
+  /** agentId → does it have live background tasks? Injected for the same reason `deathCauseOf` is —
+   *  this composition is consumed by `buildConciergeFeed`, which documents itself as pure, and the
+   *  backing store (`services/backgroundTaskRegistry`) is module state. Defaults to `() => false`
+   *  ("no background work"), which promotes nothing: exactly today's behaviour for a caller with no
+   *  evidence to give. The real registry is wired in at the OUTERMOST boundaries above. */
+  hasBackgroundTasksOf: (id: string) => boolean = () => false,
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -261,10 +281,25 @@ function composeRollup(
   // reaches only agents that have never been briefed, (0b) only agents whose session has ended.
   // See engine/deadSessionAttention — `blocked-on-human` stays RED by construction, because the
   // gate is `isResurrectable` and that cause is not.
-  const calm = withDeadSessionCalm(
+  // (0c): an agent whose turn CLOSED (idle) while its own background work runs on — a
+  // `run_in_background` Bash, a backgrounded Task subagent, a backgrounded MCP call — is promoted
+  // back to `working` (GREEN). This is the missing motion `engine/inMotion` never covered: it keeps
+  // a parent green for a `kind:"worker"` child TAB, but the "Improve Sparkle" agent (and any agent
+  // that delegates through background tasks with no tab) holds zero such children and so settled to
+  // GRAY the instant its turn closed. See engine/workerRollup.withBackgroundTaskGreen and bead
+  // sparkle-262p7. LAST of the three base-map overlays, on purpose: it promotes only `idle`, so it
+  // cannot touch the `new` (0) and `lapsed` (0b) an agent may have just been corrected to, and it
+  // runs BEFORE the bubbles/unmerged/rollup so the single `working` it writes is the one source of
+  // truth every downstream surface reads — the dot, isInMotion's worker-red suppression, the
+  // withUnmergedWork "is this agent finished?" test, and the published map itself.
+  const calm = withBackgroundTaskGreen(
     agents,
-    withNewAgentCalm(agents, status, now, interaction),
-    deathCauseOf,
+    withDeadSessionCalm(
+      agents,
+      withNewAgentCalm(agents, status, now, interaction),
+      deathCauseOf,
+    ),
+    hasBackgroundTasksOf,
   );
   // (1)+(2): the two worker-attention bubbles. Kept as its own binding because the rollup below
   // needs exactly this map — pre-unmerged, pre-dismissal — to answer "is this parent in motion?" and

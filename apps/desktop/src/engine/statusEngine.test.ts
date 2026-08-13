@@ -20,6 +20,10 @@ import type { AgentTabStatus } from "../types";
 // silent code — the exact failure they exist to prevent.
 import { log } from "../logger";
 import { STATUS_TRANSITION_MARKER } from "./statusTransitionLog";
+import {
+  backgroundTasksForAgent,
+  _resetBackgroundTaskRegistryForTests,
+} from "../services/backgroundTaskRegistry";
 
 // Every transition now emits a log line, so spy for the WHOLE file: the transition suite reads the
 // calls, and every other suite gets a quiet console instead of a line per flip.
@@ -166,6 +170,44 @@ const PERMISSION_SCREEN = [
   "│   2. No, and tell Claude what to do differently    │",
 ].join("\n");
 const IDLE_SCREEN = ["╭───────────────╮", "│ >             │", "╰───────────────╯"].join("\n");
+// The idle box with Claude's "N background task(s) live" footer beneath it.
+const bgScreen = (n: number) =>
+  [...IDLE_SCREEN.split("\n"), `${n} background task${n === 1 ? "" : "s"} live [ctrl+b to manage]`].join("\n");
+
+describe("StatusEngine parks background-task footer counts (bead sparkle-262p7)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    _resetBackgroundTaskRegistryForTests();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("notes the live count on settle, and CLEARS it when the footer is gone on a later settle", () => {
+    let screen = bgScreen(2);
+    const { engine, last } = makeEngine(() => screen);
+    // Turn runs, then settles with the footer on screen.
+    engine.ingest("delegating work\n");
+    vi.advanceTimersByTime(2500); // legacy settle → reads getScreen
+    // The STATUS is still idle — this is a SEPARATE signal, never a status (inMotion.ts:20-24).
+    expect(last()).toBe("idle");
+    // The SIDE EFFECT: the registry the rollup reads carries the live count.
+    expect(backgroundTasksForAgent("test")).toBe(2);
+
+    // Footer gone (all tasks finished) → next settle clears the entry, so the row can go gray.
+    screen = IDLE_SCREEN;
+    engine.ingest("follow-up turn\n");
+    vi.advanceTimersByTime(2500);
+    expect(backgroundTasksForAgent("test")).toBeUndefined();
+  });
+
+  it("clears the parked count when the process exits", () => {
+    const { engine } = makeEngine(() => bgScreen(3));
+    engine.ingest("delegating\n");
+    vi.advanceTimersByTime(2500);
+    expect(backgroundTasksForAgent("test")).toBe(3);
+    engine.exit();
+    expect(backgroundTasksForAgent("test")).toBeUndefined();
+  });
+});
 
 describe("StatusEngine", () => {
   beforeEach(() => vi.useFakeTimers());
