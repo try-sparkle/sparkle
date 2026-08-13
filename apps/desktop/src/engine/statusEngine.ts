@@ -118,8 +118,34 @@ const SPINNER_GLYPH = /^\s*[✻✽✢✶✳·*∗+]\s/;
 const SPINNER_ELAPSED = /\(\s*(?:\d+\s*h\s*)?(?:\d+\s*m\s*)?\d+\s*s\b|\(\s*\d+\s*m\b/;
 
 /** Accepted tails for a glyph-led frame. The token counter is the strongest of these — it only
- *  climbs while the model is generating — and `esc to interrupt` is the legacy shape. */
-const WORKING_PATTERNS: RegExp[] = [SPINNER_ELAPSED, /\d+(?:\.\d+)?\s*[km]?\s*tokens/i, /esc to interrupt/i];
+ *  climbs while the model is generating — and `esc to interrupt` is the legacy shape.
+ *
+ *  ══ THE TOKEN PATTERN IS BOUNDED ON PURPOSE — DO NOT RESTORE `\d+` / `\s*` (bead sparkle-70btv) ══
+ *  The unbounded form `/\d+(?:\.\d+)?\s*[km]?\s*tokens/i` is QUADRATIC on a long digit run: `\d+`
+ *  swallows the run, fails to find `tokens`, gives back one digit and retries — from EVERY offset,
+ *  because nothing stops the match restarting inside the run. Measured on a 2026-08-13 renderer
+ *  `sample` of the shipped v0.103.0 app, this single `.test()` was 38.8% of the WebContent main
+ *  thread (2985 of 7694 samples in JSC::RegExpObject::match) while the founder saw 3-10s input lag.
+ *  Standalone: 8k digits = 319ms, 32k = 20.3s, 64k = 61s.
+ *
+ *  It is REACHABLE because `SPINNER_GLYPH` accepts `*` and `+` — an ordinary markdown bullet or a
+ *  diff line — so any long glyph-led line of an agent's output runs this pattern over its whole
+ *  length. With a fleet streaming diffs, that is constant.
+ *
+ *  Two changes kill the backtracking without moving the match set: `(?<!\d)` forbids restarting
+ *  inside a DIGIT RUN (so the scan is linear, not quadratic), and the counted quantifiers bound the
+ *  work at each start. 20_280ms → 0.4ms on a 32k flood, with identical verdicts and captures across
+ *  the realistic corpus below.
+ *
+ *  THE LOOKBEHIND IS `(?<!\d)` AND NOT `(?<![\d.])` — the wider one is wrong and the suite catches
+ *  it. A leading-punctuation figure (`↑ ..5 tokens` → 5) and a malformed one (`1.2.3k tokens` →
+ *  2300) both match starting at a digit that FOLLOWS A DOT, so excluding `.` here silently returns
+ *  null for both. Only a digit-after-digit restart is the quadratic one; a dot resets the run. */
+const WORKING_PATTERNS: RegExp[] = [
+  SPINNER_ELAPSED,
+  /(?<!\d)\d{1,12}(?:\.\d{1,6})?\s{0,4}[km]?\s{0,4}tokens/i,
+  /esc to interrupt/i,
+];
 
 /** Is ONE redraw frame Claude's live status line? Glyph-led AND carrying a clock/counter/legacy
  *  tail. Feed it a single frame — never a whole chunk: the glyph is anchored, so a chunk whose
@@ -147,7 +173,11 @@ function hasSpinnerFrame(chunk: string): boolean {
 // sticky failure (roborev on da7c80c). `latestSpinnerTokens` below is the live path; it does the
 // frame-splitting for you.
 // Retune point: like WORKING_PATTERNS, this tracks a Claude Code TUI detail that may drift.
-const SPINNER_TOKENS = /(?:↑|↓)?\s*(\d+(?:\.\d+)?)\s*([km])?\s*tokens/i;
+// BOUNDED FOR THE SAME REASON AS WORKING_PATTERNS — see the header there. This pattern carries the
+// identical `\d+(?:\.\d+)?\s*([km])?\s*tokens` tail and was independently measured at 312ms on 8k
+// digits / 13.8s on 32k. Fixing only the WORKING_PATTERNS copy would have left the hot path half
+// open: `latestSpinnerTokens` runs this over frames from the same stream. Captures are unchanged.
+const SPINNER_TOKENS = /(?:↑|↓)?\s{0,4}(?<!\d)(\d{1,12}(?:\.\d{1,6})?)\s{0,4}([km])?\s{0,4}tokens/i;
 // `| undefined` is deliberate: under noUncheckedIndexedAccess an unknown suffix reads as undefined,
 // and the `?? 1` below turns that into "no scaling" rather than a silent NaN that would compare false
 // in every advance check and quietly disable the recovery (roborev 46783).

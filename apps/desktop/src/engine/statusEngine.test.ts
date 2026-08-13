@@ -37,6 +37,49 @@ function transitionLines(): string[] {
     .filter((line) => line.startsWith(STATUS_TRANSITION_MARKER));
 }
 
+// ══ ReDoS REGRESSION — these two bound TIME, which is the whole defect (bead sparkle-70btv) ══════
+//
+// The token patterns used to be `\d+(?:\.\d+)?\s*[km]?\s*tokens`, which is QUADRATIC on a long run
+// of digits: `\d+` eats the run, fails to find `tokens`, gives back a digit and retries, and
+// nothing stops the match restarting inside the run. On a 2026-08-13 `sample` of the shipped
+// v0.103.0 renderer this one `.test()` held 38.8% of the WebContent main thread (2985/7694 samples
+// in JSC::RegExpObject::match) while typing lagged 3-10s.
+//
+// THE INPUT IS GLYPH-LED ON PURPOSE. `SPINNER_GLYPH` accepts `*` and `+`, so a markdown bullet or a
+// diff line is enough to reach `WORKING_PATTERNS` — that is why an ordinary agent's output could
+// trip this at all. A test feeding a bare digit run would never enter the hot path and would pass
+// against the broken code, which is the vacuous shape AGENTS.md warns about.
+//
+// These assert the SIDE EFFECT (the call returns in bounded time) rather than a precondition. The
+// margin is ~4 orders of magnitude — 20_280ms before vs 0.4ms after at this size — so the 2s bound
+// is not a flake risk even on a loaded machine; it is simply "not catastrophic".
+describe("spinner token patterns — backtracking is bounded", () => {
+  const DIGIT_FLOOD = `* ${"1234567890".repeat(3200)}`; // 32k digits behind a bullet glyph
+
+  it("isSpinnerFrame returns promptly on a long glyph-led digit run", () => {
+    const started = performance.now();
+    expect(isSpinnerFrame(DIGIT_FLOOD)).toBe(false);
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  it("parseSpinnerTokens returns promptly on the same input", () => {
+    const started = performance.now();
+    expect(parseSpinnerTokens(DIGIT_FLOOD)).toBeNull();
+    expect(performance.now() - started).toBeLessThan(2000);
+  });
+
+  // The bound above is worthless if it were bought by narrowing what the patterns match, so pin the
+  // match set too: every shape the old pattern accepted must still be accepted, with the same value.
+  it("still parses every counter shape the unbounded pattern accepted", () => {
+    expect(parseSpinnerTokens("✢ Metamorphosing… (40m 17s · ↓ 66.9k tokens)")).toBe(66_900);
+    expect(parseSpinnerTokens("· Working… (1h 2m 3s · 15m tokens)")).toBe(15_000_000);
+    expect(parseSpinnerTokens("+ Pondering… (5s · 900 tokens)")).toBe(900);
+    expect(parseSpinnerTokens("↑2.1ktokens")).toBe(2100);
+    expect(parseSpinnerTokens("  ↑  12  k  tokens  ")).toBe(12_000);
+    expect(isSpinnerFrame("* Cogitating… (12s · 1.2k tokens · esc to interrupt)")).toBe(true);
+  });
+});
+
 describe("parseSpinnerTokens", () => {
   it("parses k-suffixed and bare token counts from a spinner frame", () => {
     expect(parseSpinnerTokens("✻ Incubating… (1m 24s · ↓ 2.1k tokens · esc to interrupt)")).toBe(2100);

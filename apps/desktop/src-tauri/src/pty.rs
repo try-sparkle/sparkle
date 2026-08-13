@@ -348,7 +348,26 @@ impl PtyManager {
         }
         let epoch = next_pty_epoch();
         session.epoch = epoch;
-        sessions.insert(id, session);
+        // KILL WHATEVER THIS REPLACED. `insert` hands back the displaced session, and dropping it
+        // on the floor does NOT stop its child: the map is the only handle any verb has, so a
+        // replaced child keeps running with nothing able to reach it — still holding whatever it
+        // held (bead sparkle-osgvl: an orphan kept an OAuth callback port bound and completed a
+        // login into the wrong config dir long after its terminal was gone).
+        //
+        // The epoch invariant is what makes this safe rather than a second race: the orphan's
+        // reader wakes on EOF and asks to reap, and [`PtyManager::remove_if_epoch`] refuses it
+        // because the id is now owned by the higher epoch we just minted. So the orphan tears
+        // itself down and emits its own `pty:exit`, which the frontend already filters by epoch.
+        let displaced = sessions.insert(id, session);
+        // Same order as `take_and_signal_session`, and for the same reasons: drop the map lock
+        // before the kill, then un-park the reader (`pause`) and open the credit gate (`inflight`)
+        // so a session parked on either one can observe the EOF and run its teardown at all.
+        drop(sessions);
+        if let Some(mut orphan) = displaced {
+            orphan.pause.set(false);
+            orphan.inflight.close();
+            let _ = orphan.killer.kill();
+        }
         epoch
     }
 
@@ -2178,6 +2197,76 @@ mod tests {
             let _ = s.killer.kill();
             let _ = child.wait();
         }
+    }
+
+    /// A REPLACED SESSION'S CHILD MUST DIE, not merely leave the map.
+    ///
+    /// The map is the ONLY handle `pty_write`/`pty_resize`/`pty_kill` have, so a child that is
+    /// silently replaced is not just untracked — it is unreachable, and it keeps every resource it
+    /// held. The measured case is an OAuth callback port: a signin PTY spawned under an id that
+    /// omitted the account scope replaced its predecessor, which stayed bound to the port and
+    /// completed the login into the wrong config dir (bead sparkle-osgvl).
+    ///
+    /// Asserted on the CHILD's exit status, not on the map: "the id now holds the winner" was
+    /// already true before this fix and proves nothing about the orphan.
+    #[test]
+    fn replacing_a_session_kills_the_child_it_displaced() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let size = PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 };
+        // `cat` holds its PTY open forever, so it exits only if something kills it.
+        let mut made = Vec::new();
+        for _ in 0..2 {
+            let Ok(pair) = sys.openpty(size) else { return };
+            let Ok(child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+                return;
+            };
+            let killer = child.clone_killer();
+            let Ok(writer) = pair.master.take_writer() else { return };
+            made.push((
+                PtySession {
+                    writer: Arc::new(Mutex::new(writer)),
+                    master: pair.master,
+                    killer,
+                    pause: Arc::new(PauseState::new()),
+                    inflight: Arc::new(InflightState::new()),
+                    pid: None,
+                    epoch: NO_EPOCH,
+                },
+                child,
+            ));
+        }
+        let mgr = PtyManager::default();
+        let mut children = Vec::new();
+        for (session, child) in made {
+            // A paused, credit-exhausted predecessor is the hard case: both gates have to be
+            // released or its reader could never observe the kill.
+            session.pause.set(true);
+            mgr.insert_session("agent-displaced".to_string(), session);
+            children.push(child);
+        }
+
+        // Poll rather than `wait()`: without the kill the orphan lives forever, and a test that
+        // FAILS is worth more than one that hangs the suite.
+        let orphan = &mut children[0];
+        let mut exited = false;
+        for _ in 0..100 {
+            if matches!(orphan.try_wait(), Ok(Some(_))) {
+                exited = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = orphan.kill();
+        let _ = children[1].kill();
+        for child in children.iter_mut() {
+            let _ = child.wait();
+        }
+        assert!(
+            exited,
+            "the session replaced under this id left its child running: nothing can reach it \
+             again, and it still holds every resource it had (ports, locks, fds)"
+        );
     }
 
     /// A LOSER'S REAPER MUST NOT DELETE THE WINNER.

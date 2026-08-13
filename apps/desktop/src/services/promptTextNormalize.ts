@@ -27,8 +27,20 @@ export const ANSI = /\x1b\[[0-9;?]*[a-zA-Z]/g;
  *  line by this pattern) and discarding it collapsed two different prompts onto one empty block
  *  (roborev 55170/55172). Replacing just the moving SPAN keeps what distinguishes one ask from
  *  another and neutralises the movement. */
+// ══ THE `(?<!\d)` ON THE FIRST ALTERNATIVE IS LOAD-BEARING — do not drop it (bead sparkle-70btv) ══
+// Every other alternative here opens with `\b` or a literal, which already forbids the match
+// restarting in the middle of a digit run. The percentage arm was the one exception: a bare `\d+`
+// can restart at EVERY offset of a long number, and since `\d+` re-scans the rest of the run each
+// time, `steady()` went quadratic — 18.2s on a 32k digit run, measured, in a `.replace` that runs
+// over terminal text. That is the same defect class as the token counters in engine/statusEngine.ts
+// (see the header there), which held 38.8% of the renderer main thread during a 3-10s input-lag
+// hang; this one was found by sweeping for the shape rather than by a second sample.
+//
+// It does not narrow the match set: a digit directly preceded by a digit is already covered by the
+// greedy match that starts at the run's head, and a dot resets the run (`1.2.3%` still normalises
+// exactly as before). Pinned by promptTextNormalize.test.ts.
 export const VOLATILE_SPAN =
-  /\d+(?:\.\d+)?\s*%|\(\s*\d+\s*\/\s*\d+\s*\)|\b\d+(?:\.\d+)?\s*[KMG]i?B\b|\b\d+m\s*\d+s\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/g;
+  /(?<!\d)\d+(?:\.\d+)?\s*%|\(\s*\d+\s*\/\s*\d+\s*\)|\b\d+(?:\.\d+)?\s*[KMG]i?B\b|\b\d+m\s*\d+s\b|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏◐◓◑◒]/g;
 
 /** Neutralise the moving parts of a line, keeping everything else. */
 export function steady(line: string): string {
