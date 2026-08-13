@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Project tabs — column-fill probe</title>
+    <style>
+      /* A page colour that is NEITHER plane, so a reading that ran off the element it meant to
+         measure is obvious rather than plausible. */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #ff00ff;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      The page tab-column-probe.mjs measures: does the ACTIVE project tab paint the plane of the
+      column DIRECTLY BENEATH IT, in both themes and over both columns?
+
+      The unit test (ProjectTabs.columnFill.test.tsx) pins the rule, but jsdom cannot resolve the
+      CSS custom properties the real columns declare their backgrounds with — so it cannot prove the
+      component's `getComputedStyle(column).backgroundColor` read returns a colour at all in a real
+      engine. This page uses the shipped `var(--c-*)` tokens so that link is covered too.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./tab-column-harness.jsx"></script>
+  </body>
+</html>

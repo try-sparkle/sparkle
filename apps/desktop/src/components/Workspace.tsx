@@ -59,6 +59,7 @@ import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
+import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { focusedZoomColumn, installColumnFocusTracker } from "../services/columnFocusTracker";
 import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
@@ -1905,6 +1906,8 @@ export function Workspace() {
               // covers both the panes and the empty stage around them — and it cannot accidentally
               // claim a terminal rendered outside the cockpit (see Terminal.tsx).
               {...{ [ZOOM_COLUMN_ATTR]: "terminal-left" }}
+              // The pair's OTHER column — see the right stage below, and engine/pairColumns.
+              {...{ [PAIR_COLUMN_ATTR]: "terminal" }}
               data-calm="false"
               style={{ flex: 1, position: "relative", minHeight: 0, background: C.forest }}
             >
@@ -2105,6 +2108,12 @@ export function Workspace() {
             // THE RIGHT TERMINAL for Cmd +/- — see the left stage for why the marker lives on the
             // stage rather than on the xterm surface.
             {...{ [ZOOM_COLUMN_ATTR]: "terminal-right" }}
+            // ONE OF THE PAIR'S COLUMNS — a project tab sitting above the terminal paints its face
+            // in whatever plane THIS element carries, by reading it rather than by naming
+            // `C.forest` a second time. That second naming was the bug: the tab named the terminal's
+            // token unconditionally, so it was right here and wrong over the build column. See
+            // engine/pairColumns.
+            {...{ [PAIR_COLUMN_ATTR]: "terminal" }}
             // Files dropped anywhere on the stage attach to the VISIBLE agent's next message
             // (hooks/useTerminalDrop). Tauri's drag events are window-global and carry no target
             // element, so this marker is what the hit-test resolves against (services/dndTargets).

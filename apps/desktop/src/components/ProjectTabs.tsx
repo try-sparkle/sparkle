@@ -28,6 +28,7 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import { TYPE } from "../theme/scale";
 import { PROJECT_TAB_HINT } from "../keyboardHints/hintTargets";
 import { resolveTabDrag, type TabDragResult, type TabRect } from "./tabDrag";
+import { PAIR_COLUMN_ATTR, columnUnder } from "../engine/pairColumns";
 import { StaleCheckoutPanel, type StaleTarget } from "./StaleCheckoutPanel";
 
 export interface ProjectTabItem {
@@ -661,6 +662,46 @@ export const TAB_RULE_PX = 1;
  *     reach the old border — and with the rule inside the padding box a tab reaches it without
  *     moving. Leaving it would push every tab a pixel into the clip for no benefit.
  */
+/**
+ * A computed `background-color` that actually PAINTS, or `null`.
+ *
+ * `getComputedStyle` reports `rgba(0, 0, 0, 0)` for an element with no background set, and `""` for
+ * one the engine never styled — which in jsdom is every element that carries no INLINE background,
+ * since it neither lays out nor loads the stylesheet (docs/jsdom-test-caveats.md). Painting the
+ * active tab with either would turn its face into a hole onto the bar rather than a lip of the
+ * column, so both are refused and the caller keeps its fallback.
+ */
+export function paintedColor(value: string | null | undefined): string | null {
+  if (!value) return null;
+  const v = value.trim();
+  if (v === "" || v === "transparent") return null;
+  // A fully transparent colour is not a plane, whatever its channels — `rgba(0, 0, 0, 0)` is only
+  // the most common spelling of it.
+  const m = /^rgba\(([^)]*)\)$/.exec(v);
+  if (m) {
+    const parts = (m[1] ?? "").split(",").map((s) => s.trim());
+    const alpha = parts[3];
+    if (parts.length === 4 && alpha !== undefined && Number(alpha) === 0) return null;
+  }
+  return v;
+}
+
+/**
+ * The ACTIVE tab's face: the plane of the column beneath it.
+ *
+ * `C.forest` — the TERMINAL plane — is the FALLBACK and nothing more. It is what this line said
+ * unconditionally before, which is the bug the founder reported: right over the terminal by luck,
+ * a visible seam over the build column in both themes. Keeping it as the fallback means a strip
+ * that cannot be measured (first paint, a hidden pane, a torn-off window mid-mount) paints exactly
+ * as it always did rather than taking a colour from a rect nobody has laid out.
+ *
+ * Its own function, rather than a ternary arm inline in the style object, so the choice is a line a
+ * mutation can be applied to — see the note at the `columnUnder` call.
+ */
+export function activeTabFill(columnFill: string | null): string {
+  return columnFill ?? C.forest;
+}
+
 const barStyle: CSSProperties = {
   flex: "none",
   display: "flex",
@@ -961,6 +1002,82 @@ export function ProjectTabs({
     // here is only the did-anything-change guard that stops the write from looping.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [metricsKey]);
+
+  // ── THE ACTIVE TAB IS A LIP OF THE COLUMN BENEATH IT ────────────────────────────────────────
+  //
+  // *"So you need to be aware of where the tab sits and shade it the correct color based on where
+  // it sits."* The face was `C.forest` — the TERMINAL plane — no matter which column it sat above,
+  // so it was right over the terminal by luck and visibly wrong over the build column in BOTH
+  // themes (light: #d9e3f3 against a #f2f6fd column; dark: #030913 against #091426).
+  //
+  // WHAT IS READ IS THE COLUMN ELEMENT'S OWN BACKGROUND, not a token chosen from a second table.
+  // A `isBuild ? C.deepForest : C.forest` would match today's screenshots and drift the next time
+  // either column is restyled; there is nothing to drift when the tab holds no opinion about the
+  // colour. `engine/pairColumns` resolves WHICH element; this reads WHAT it is painted.
+  const [activeFill, setActiveFill] = useState<string | null>(null);
+
+  /** The column fill for the active tab, or `null` when it cannot be told (unlaid-out strip, no
+   *  pair, a column painted in something with no resolved colour). */
+  function readActiveFill(): string | null {
+    if (typeof window === "undefined") return null;
+    const bar = barRef.current;
+    const tab = selectedProjectId ? tabEls.current.get(selectedProjectId) : null;
+    if (!bar || !tab) return null;
+    // SCOPED TO THIS PAIR. The cockpit renders two pairs, each with its own build+terminal, so an
+    // unscoped query would let the left pair's columns answer for the right pair's tabs.
+    const scope: ParentNode = bar.closest("[data-pair]") ?? bar.ownerDocument;
+    const cols = Array.from(scope.querySelectorAll<HTMLElement>(`[${PAIR_COLUMN_ATTR}]`));
+    if (cols.length === 0) return null;
+    // Split across statements rather than nested into one call, so each is a line a mutation can
+    // be applied to — the same discipline `settleNow` follows, and for the same reason: a
+    // commented-out fragment of a multi-line expression does not parse, so `mutation-check.sh`
+    // cannot judge the site at all and reports it as unreached rather than as covered.
+    const rects = cols.map((c) => c.getBoundingClientRect());
+    const i = columnUnder(tab.getBoundingClientRect(), rects);
+    const col = cols[i];
+    if (!col) return null;
+    return paintedColor(window.getComputedStyle(col).backgroundColor);
+  }
+
+  useLayoutEffect(() => {
+    if (typeof window === "undefined") return;
+    const apply = () => setActiveFill(readActiveFill());
+    apply();
+
+    // THREE THINGS MOVE THIS ANSWER, and none of them re-renders this component on its own:
+    //   • the columns RESIZE — the build column has its own drag rail and both pairs are elastic,
+    //     so the seam between the two columns slides under a stationary tab.
+    //   • the window resizes, which moves that seam without resizing any observed box in some
+    //     layouts (a scrollbar appearing, a pair opening).
+    //   • the THEME flips. `index.css` re-themes from `<html data-theme>` in pure CSS precisely so
+    //     that no React render is needed — which means the resolved colour cached here would
+    //     otherwise stay on the old palette until something unrelated happened to re-measure.
+    const bar = barRef.current;
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => apply());
+    if (ro && bar) {
+      ro.observe(bar);
+      const scope: ParentNode = bar.closest("[data-pair]") ?? document;
+      for (const c of scope.querySelectorAll(`[${PAIR_COLUMN_ATTR}]`)) ro.observe(c);
+    }
+    const mo = new MutationObserver(() => apply());
+    mo.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
+    window.addEventListener("resize", apply);
+    // …and the strip SCROLLS (roborev 63620). Once the label floor stops the tabs shrinking, a
+    // crowded strip is `overflow-x: auto` — so a tab crosses the seam between the two columns with
+    // its own size unchanged and the window's unchanged, which is exactly the case neither observer
+    // above can see. Scroll does not bubble, so this is a CAPTURE listener: it catches the strip's
+    // own scroll (and any ancestor's) without this component needing a ref to the scroller.
+    window.addEventListener("scroll", apply, true);
+    return () => {
+      ro?.disconnect();
+      mo.disconnect();
+      window.removeEventListener("resize", apply);
+      window.removeEventListener("scroll", apply, true);
+    };
+    // `readActiveFill` closes over the refs, which are stable; the inputs that change the ANSWER
+    // are the selection and the strip's own layout key.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedProjectId, metricsKey]);
 
   /** Keep the selected tab on screen. Once the floor stops tabs shrinking, a crowded strip scrolls —
    *  and the one tab that must never be the one scrolled out of sight is the one you are in. */
@@ -1291,7 +1408,11 @@ export function ProjectTabs({
                 // is fine until it is floating over a NEIGHBOUR — then the covered tab's own label
                 // and badges read straight through it. `barSurface` is the bar's own colour, so the
                 // expansion reads as the tab having grown rather than as a card dropped on top.
-                background: active ? C.forest : exp ? C.barSurface : "transparent",
+                // THE COLUMN BENEATH THIS TAB, not a token named here — see `activeFill`. The
+                // fallback is `C.forest` because that is what this line said before, so a strip
+                // that cannot be measured (first paint, a hidden pane) paints exactly as it
+                // shipped rather than something derived from a rect nobody has laid out yet.
+                background: active ? activeTabFill(activeFill) : exp ? C.barSurface : "transparent",
                 // Longhand per edge: mixing the `border` shorthand with a `borderBottom` override
                 // makes React warn (and can style-bug) when only one of them changes on re-render.
                 borderTop: `1px solid ${active || exp ? C.muted : "transparent"}`,

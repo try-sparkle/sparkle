@@ -22,6 +22,7 @@
     "visual:tab-crowded": "node scripts/visual/tab-crowded-probe.mjs",
     "visual:tab-click": "node scripts/visual/tab-click-probe.mjs",
     "visual:tab-seam": "node scripts/visual/tab-seam-probe.mjs",
+    "visual:tab-column": "node scripts/visual/tab-column-probe.mjs",
     "visual:quote-surface": "node scripts/visual/quote-surface-probe.mjs",
     "visual": "pnpm visual:capture && pnpm visual:compare",
     "lint": "eslint src --max-warnings 12",

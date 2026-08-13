@@ -30,6 +30,7 @@ import {
 import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
 import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
 import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
+import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { formatElapsed, useRowClock, ROLLUP_DOT_COLOR } from "./rowClock";
 import { useColumnZoom, useZoomColumnForSide } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
@@ -2433,6 +2434,11 @@ export function AgentSidebar({
       // clamp resolves against, and asking the DOM for it cannot disagree with the stylesheet.
       ref={columnRef}
       data-testid="agent-sidebar-column"
+      // ONE OF THE PAIR'S COLUMNS — so the project tab sitting above this column can find it and
+      // paint its face in whatever plane this column is painted in. The tab reads THIS element's
+      // background rather than naming `C.deepForest` itself, which is what stops the two drifting
+      // apart when the column is restyled. See engine/pairColumns.
+      {...{ [PAIR_COLUMN_ATTR]: "build" }}
       data-overlay={String(overlay)}
       // THIS BUILD COLUMN, for Cmd +/- — and PER SIDE, which is the whole point: the two builders
       // are independent, so zooming the left one must leave the right one alone. Routed through
