@@ -172,10 +172,20 @@ pub fn intern_stage(stage: &str) -> Option<&'static str> {
     WORKFLOW_STAGES.iter().copied().find(|s| *s == stage)
 }
 
-/// The row discs `rollup_dot` can carry, interned the same way. `None` for anything else —
-/// including the empty string a window that cannot compute the rollup publishes.
+/// The row discs `rollup_dot` can carry — the Rust twin of `workerRollup.ts::RollupDot`.
+///
+/// `blue` (the `questions` band) is in here, and its absence was a HOLE rather than an omission:
+/// a dot missing from this list interns to `None`, which every rule below reads as no evidence, so
+/// an agent asking a question while holding unlanded work — not green, and exactly the founder's
+/// condition — could never be seen on this path at all. `dot_vocabulary_matches_the_frontend` pins
+/// the list against the TypeScript union so the next dot added there cannot go silently missing
+/// here; nothing pinned it before, which is why `blue` did.
+pub const ROLLUP_DOTS: [&str; 5] = ["green", "gray", "red", "orange", "blue"];
+
+/// Intern a roster dot to its `'static` form. `None` for anything else — including the empty string
+/// a window that cannot compute the rollup publishes.
 pub fn intern_dot(dot: &str) -> Option<&'static str> {
-    ["green", "gray", "red", "orange"].into_iter().find(|d| *d == dot)
+    ROLLUP_DOTS.into_iter().find(|d| *d == dot)
 }
 
 /// Does this stage mean "there IS committed work that has not landed on ORIGIN main yet"?
@@ -393,6 +403,22 @@ pub struct Observation {
     /// The agent's own one-line answer to the most recent nudge, per `parse_reply`. `None` when it
     /// has not answered, or when the screen cannot be read unambiguously.
     pub reply: Option<Reply>,
+    /// The wall clock that has actually passed since the previous look at this agent, in seconds.
+    ///
+    /// BOTH CLOCKS IN THIS MODULE MEASURE TIME, so they must be GIVEN time rather than allowed to
+    /// re-derive it from the schedule. Two independent things break that derivation, and neither is
+    /// visible from in here:
+    ///   * the stand-down paths override `next_look_secs` (quota backs off to half an hour) while
+    ///     leaving the rung where it stood, so a rung-derived interval under-credits by up to 100×;
+    ///   * `nudger` REBASELINES every deadline on a detected machine suspend, precisely because the
+    ///     silence across a freeze means nothing — so the interval that was scheduled is not the
+    ///     interval that was observed, and crediting the schedule would charge the whole frozen span
+    ///     to an agent that was never running.
+    ///
+    /// `None` means the caller did not measure it, and the clocks then fall back to the schedule.
+    /// That is the ladder's own unit tests, which drive synthetic looks with no wall clock at all —
+    /// production always measures.
+    pub elapsed_secs: Option<u64>,
     /// This agent's ROW DISC once the workers folded under it are counted — `rollup_dot` on the
     /// roster slice. `None` when the window could not say, which is NOT the same as gray.
     ///
@@ -484,7 +510,19 @@ pub struct AgentState {
     unlanded_secs: u64,
     /// The best stage rank seen this episode, so an ADVANCE can be told from a repeat. High-water,
     /// so a roster blink that drops the stage cannot read as regress and re-arm the clock.
+    ///
+    /// Cleared whenever the unlanded condition stops holding, which is what makes "this episode"
+    /// true — see `tick_unlanded_clock`. Retaining it across a merge boundary made the second and
+    /// every later unit of work on a branch unable to clear its own clock.
     stage_high_water: Option<usize>,
+    /// The `next_look_secs` the PREVIOUS decision scheduled — i.e. how much wall clock the look now
+    /// running actually represents.
+    ///
+    /// The unlanded clock needs the interval that ELAPSED, and the rung does not answer that: the
+    /// stand-down paths override `next_look_secs` (quota backs off to 30 minutes, external waits a
+    /// full last rung) while leaving the rung where it was. `None` on the very first look, which is
+    /// credited the opening rung.
+    last_scheduled_secs: Option<u64>,
     /// Looks spent parked on a screen only a human can clear, for that path's escalation ladder.
     ///
     /// Deliberately NOT `attempts`, which means "nudges we tried to send" and is both the
@@ -625,6 +663,11 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         decision.flagged = decision.flagged.max(Some(Escalation::Concierge));
     }
     decision.escalate = decision.escalate.max(rose);
+    // Recorded LAST, and read by `tick_unlanded_clock` at the top of the NEXT look, so that clock
+    // credits the interval that was really scheduled rather than one re-derived from the rung.
+    // Every return site inside `step_inner` funnels through here, so a path added later cannot
+    // forget it — the same reason the flag above is folded in at this level.
+    state.last_scheduled_secs = Some(decision.next_look_secs);
     decision
 }
 
@@ -638,27 +681,56 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
 /// work landing. Output does NOT clear it, which is what makes it catch the agent the silence clock
 /// cannot see — the one whose pane keeps repainting while nothing lands.
 fn tick_unlanded_clock(state: &mut AgentState, obs: &Observation) -> Option<Escalation> {
-    // An ADVANCE is real progress. High-water, so a roster blink that drops or lowers the stage
-    // reads as "no news" rather than as a regression that re-arms the clock.
-    if let Some(rank) = obs.stage.and_then(stage_rank) {
+    // ── ABSENCE IS NOT EVIDENCE, IN EITHER DIRECTION ──────────────────────────────────────────
+    // `None` is NOT gray, and it is not green either. A window that could not tell us the disc or
+    // the stage has said NOTHING about this agent, so the look neither raises the flag nor clears
+    // one: the clock HOLDS and we return before touching it.
+    //
+    // Zeroing here was the bug, and it bit in precisely the outage this clock exists for: a
+    // reloading or wedged WebView drops agents out of the published roster, so a single undescribed
+    // look discarded a nearly-full clock and the accrual could never finish. It also contradicted
+    // this field's own stated contract — frontend facts are trusted to RAISE a flag and never to
+    // SUPPRESS one — which is the asymmetry that makes a stale value safe to read at all.
+    let (Some(dot), Some(stage)) = (obs.rollup_dot, obs.stage) else {
+        return None;
+    };
+
+    // An ADVANCE is real progress. High-water, so a roster blink that lowers the stage reads as
+    // "no news" rather than as a regression that re-arms the clock.
+    if let Some(rank) = stage_rank(stage) {
         if state.stage_high_water.is_none_or(|best| rank > best) {
             state.stage_high_water = Some(rank);
             state.unlanded_secs = 0;
         }
     }
 
-    // `None` is NOT gray. A window that could not tell us the disc is no evidence at all, and this
-    // clock only ever runs on positive evidence of a problem.
-    let not_green = matches!(obs.rollup_dot, Some("gray" | "red" | "orange"));
-    let unlanded = obs.stage.is_some_and(holds_unlanded_work);
+    // Every dot in the vocabulary except `green` is the founder's condition, so this is written as
+    // "known, and not green" rather than as a list — a dot added to `ROLLUP_DOTS` then counts here
+    // by construction instead of silently interning to `None` and disappearing, which is exactly
+    // how `blue` was lost.
+    let not_green = dot != "green";
+    let unlanded = holds_unlanded_work(stage);
     if !not_green || !unlanded {
         state.unlanded_secs = 0;
+        // …AND THE HIGH-WATER GOES WITH IT, because the frontend stage deliberately REGRESSES.
+        // `workflowStage.ts::deriveLiveStage` drops a branch from `merged` back to `building_saved`
+        // when the agent keeps committing after its PR lands — the ordinary "merge, keep working"
+        // cycle. A high-water retained across that boundary can never be beaten again by the second
+        // cycle's own `building_saved`→`merged_local`, so real progress stopped clearing the clock
+        // and a normally-moving agent was escalated 30 minutes into every unit of work after its
+        // first. Cleared only HERE, on positive evidence of health, so a blink — which arrives as
+        // absence and is held above — still cannot re-arm anything.
+        state.stage_high_water = None;
         return None;
     }
 
-    // The interval that just elapsed is the one the PREVIOUS decision scheduled, which is this
-    // rung's entry — `state.rung` has not been advanced yet at this point in the look.
-    let elapsed = LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)];
+    // MEASURED time first, and it is the only fully correct answer — see `Observation::elapsed_secs`
+    // for the two ways the schedule and the observation come apart. The scheduled interval is the
+    // fallback for a caller that did not measure (the ladder's own unit tests), and it is still
+    // strictly better than the rung it replaced: the stand-down paths override `next_look_secs`
+    // while leaving the rung alone, so a rung-derived interval under-credited an agent that answered
+    // `blocked-on-quota` by up to 100× and `UNLANDED_STALL_SECS` was not the bound it claims.
+    let elapsed = obs.elapsed_secs.or(state.last_scheduled_secs).unwrap_or(LADDER_SECS[0]);
     let before = state.unlanded_secs;
     state.unlanded_secs = state.unlanded_secs.saturating_add(elapsed);
 
@@ -887,7 +959,15 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
     // Unchanged: climb. A quiet look ends any run of activity -- `LIVE_LOOKS_TO_RESET` counts
     // CONSECUTIVE emitting looks, so an intermittent flicker never accumulates into one.
     state.live_looks = 0;
-    state.silent_secs += LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)];
+    // MEASURED, for the same reason the unlanded clock is — and this one is the number a HUMAN
+    // reads. `silent_secs` reaches the founder's row through `NudgeFlag`, and it is the "no output
+    // for D" clause of the nudge itself; while a stand-down holds it is explicitly *the* figure the
+    // row reports. Re-deriving it from the rung meant an agent that answered `blocked-on-quota` was
+    // looked at every half hour and credited five seconds a look, so the row under-reported a real
+    // wait by up to 100× to the one audience that cannot check it.
+    state.silent_secs += obs
+        .elapsed_secs
+        .unwrap_or(LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)]);
     state.rung = (state.rung + 1).min(LADDER_SECS.len() - 1);
     let rung = state.rung;
     let rung_1based = (rung + 1) as u32;
@@ -1370,6 +1450,7 @@ mod tests {
             goal_met: false,
             reply: None,
             answerable: false,
+            elapsed_secs: None,
             rollup_dot: None,
             stage: None,
         }
@@ -2691,6 +2772,220 @@ mod tests {
         }
     }
 
+    /// …BUT ABSENCE MUST NOT CLEAR ONE EITHER, which is the other half of that contract and the
+    /// half that was missing. The reset branch could not tell "positive evidence of health" from
+    /// "the roster did not describe this agent", so one undescribed look discarded the whole
+    /// accrued clock — in exactly the outage this watcher exists for, where a reloading WebView
+    /// drops agents out of the published roster for a look or two at a time. The test above only
+    /// ever covered PERMANENTLY absent facts, so a gap mid-accrual went unseen.
+    #[test]
+    fn a_look_the_roster_cannot_describe_holds_the_clock_rather_than_clearing_it() {
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+        for _ in 0..3 {
+            hash += 1;
+            step(
+                &mut s,
+                &Observation {
+                    hash,
+                    rollup_dot: Some("gray"),
+                    stage: Some("building_saved"),
+                    ..stalled()
+                },
+            );
+        }
+        let held = s.unlanded_secs();
+        assert!(held > 0 && held < UNLANDED_STALL_SECS, "premise: partway up, not yet crossed");
+
+        // The window reloads and stops describing this agent at all.
+        for _ in 0..5 {
+            hash += 1;
+            let d = step(
+                &mut s,
+                &Observation { hash, rollup_dot: None, stage: None, ..stalled() },
+            );
+            assert_eq!(d.escalate, None, "an undescribed look still raises nothing");
+        }
+        assert_eq!(s.unlanded_secs(), held, "a look that says nothing must not clear the clock");
+    }
+
+    /// BLUE IS NOT GREEN. `RollupDot` carries a fifth disc for the `questions` band, and it was
+    /// missing from the interned vocabulary — so an agent ASKING A QUESTION while holding unlanded
+    /// work interned to `None` and was read as no evidence, on a path whose entire subject is rows
+    /// that are not green. Worse than inert: a transient blue look also took the reset branch and
+    /// zeroed an already-accrued clock, so a row flickering gray↔blue never accumulated at all.
+    #[test]
+    fn a_blue_row_holding_unlanded_work_is_still_escalated() {
+        assert_eq!(intern_dot("blue"), Some("blue"), "premise: blue is in the vocabulary");
+
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+        let mut raised = None;
+        let mut looks = 0;
+        while raised.is_none() && looks < 4000 {
+            hash += 1;
+            let d = step(
+                &mut s,
+                &Observation {
+                    hash,
+                    rollup_dot: Some("blue"),
+                    stage: Some("building_saved"),
+                    ..stalled()
+                },
+            );
+            raised = d.escalate;
+            looks += 1;
+        }
+        assert_eq!(
+            raised,
+            Some(Escalation::Concierge),
+            "a row parked on a question with unlanded work is the founder's condition too"
+        );
+    }
+
+    /// THE SECOND UNIT OF WORK. `deriveLiveStage` deliberately REGRESSES a branch from `merged`
+    /// back to `building_saved` when the agent keeps committing after its PR lands — the ordinary
+    /// "merge, keep working" cycle. A high-water rank retained across that boundary can never be
+    /// beaten again by the second cycle's own `building_saved`→`merged_local`, so real progress
+    /// stopped clearing the clock and a normally-moving agent was escalated 30 minutes into every
+    /// unit of work after its first. `a_stage_that_keeps_advancing_never_trips_the_clock` starts
+    /// from a default state and so cannot see this.
+    #[test]
+    fn a_second_unit_of_work_on_the_same_branch_still_clears_its_own_clock() {
+        let mut s = AgentState::default();
+        let mut hash = 0u64;
+
+        // CYCLE ONE: walk the whole band and land it.
+        for stage in ["building_saved", "pushed", "pull_request", "merged_local", "merged"] {
+            for _ in 0..40 {
+                hash += 1;
+                step(
+                    &mut s,
+                    &Observation {
+                        hash,
+                        rollup_dot: Some("gray"),
+                        stage: Some(stage),
+                        ..stalled()
+                    },
+                );
+            }
+        }
+        assert_eq!(s.unlanded_secs(), 0, "premise: landing the work cleared the clock");
+
+        // The agent commits again, so the row drops back into the unlanded band. Measure a third
+        // of the budget against THIS machine rather than hard-coding a look count, so the test
+        // cannot rot when the ladder's intervals change.
+        let mut per_stage = 0usize;
+        while s.unlanded_secs().saturating_mul(3) < UNLANDED_STALL_SECS {
+            hash += 1;
+            let d = step(
+                &mut s,
+                &Observation {
+                    hash,
+                    rollup_dot: Some("gray"),
+                    stage: Some("building_saved"),
+                    ..stalled()
+                },
+            );
+            assert_eq!(d.escalate, None, "a fresh unit of work is not a stall");
+            per_stage += 1;
+            assert!(per_stage < 10_000, "the clock must run at all on a regressed stage");
+        }
+
+        // Three more stages, each the same stretch. Every one is an ADVANCE, so every one must
+        // restart the clock — which it cannot do while cycle one's high-water is still standing.
+        for stage in ["pushed", "pull_request", "merged_local"] {
+            for _ in 0..per_stage {
+                hash += 1;
+                let d = step(
+                    &mut s,
+                    &Observation {
+                        hash,
+                        rollup_dot: Some("gray"),
+                        stage: Some(stage),
+                        ..stalled()
+                    },
+                );
+                assert_eq!(d.escalate, None, "advancing again is progress (at {stage})");
+            }
+        }
+        assert!(
+            s.unlanded_secs() < UNLANDED_STALL_SECS,
+            "only the last stage's own stretch should be on the clock"
+        );
+    }
+
+    /// THE CLOCK MEASURES WALL TIME, so it must credit the interval that was actually SCHEDULED.
+    /// Re-deriving it from the rung was wrong for the two paths that override `next_look_secs`:
+    /// `blocked-on-quota` backs off to half an hour and `blocked-on-ci` to a full last rung, both
+    /// while leaving the rung where it stood. An agent that answered `blocked-on-quota` while
+    /// holding unlanded work — a prime target for this rule, not an edge case — therefore accrued
+    /// up to 100× slower than real time, and `UNLANDED_STALL_SECS` was not the bound it claims.
+    #[test]
+    fn a_quota_stand_down_credits_the_interval_it_actually_scheduled() {
+        let mut s = AgentState::default();
+        let broke = Observation {
+            hash: 0x0e55,
+            rollup_dot: Some("gray"),
+            stage: Some("building_saved"),
+            reply: Some(Reply::Quota),
+            ..stalled()
+        };
+        // Settle onto the stand-down: the reply latches, and the schedule backs all the way off.
+        let mut settled = 0;
+        loop {
+            let d = step(&mut s, &broke);
+            settled += 1;
+            if d.next_look_secs == QUOTA_BACKOFF_SECS {
+                break;
+            }
+            assert!(settled < 20, "premise: quota must back all the way off, whatever the rung says");
+        }
+
+        // So the look AFTER it represents half an hour of wall clock, not this rung's few seconds.
+        let before = s.unlanded_secs();
+        step(&mut s, &broke);
+        let credited = s.unlanded_secs() - before;
+        assert!(
+            credited >= QUOTA_BACKOFF_SECS,
+            "a look scheduled 30 minutes out must credit 30 minutes, not the rung (credited {credited})"
+        );
+    }
+
+    /// MEASURED TIME BEATS THE SCHEDULE, for BOTH clocks.
+    ///
+    /// The schedule is only ever an estimate of what will elapse, and two things break it: a
+    /// stand-down overrides `next_look_secs` without moving the rung, and `nudger` rebaselines every
+    /// deadline across a machine suspend precisely because the frozen span must not be read as
+    /// elapsed. So when the caller has actually measured the interval, that measurement governs —
+    /// and `silent_secs` needs it as much as `unlanded_secs` does, because it is the figure a HUMAN
+    /// reads off the row and out of the nudge text.
+    #[test]
+    fn a_measured_interval_governs_both_clocks() {
+        let mut s = AgentState::default();
+        let obs = Observation {
+            elapsed_secs: Some(900),
+            rollup_dot: Some("gray"),
+            stage: Some("building_saved"),
+            ..stalled()
+        };
+        step(&mut s, &obs); // the baseline look
+        step(&mut s, &obs);
+        let (silent, unlanded) = (s.silent_secs(), s.unlanded_secs());
+
+        step(&mut s, &obs);
+        assert_eq!(
+            s.silent_secs() - silent,
+            900,
+            "the silence clock must credit the measured quarter hour, not the rung"
+        );
+        assert_eq!(
+            s.unlanded_secs() - unlanded,
+            900,
+            "and so must the unlanded clock — it is the same wall clock"
+        );
+    }
+
     /// The unlanded band, pinned against `workflowStage.ts::hasUnmergedCommittedWork`: committed
     /// but not on ORIGIN main. `merged_local` counts as unlanded — the workflow lands via a PR to
     /// origin, so local-only work still needs a human to finish it.
@@ -2711,23 +3006,65 @@ mod tests {
 
     /// The vocabulary itself, in order, against the TypeScript source it mirrors. A stage inserted
     /// on one side and not the other silently moves the unlanded band.
+    ///
+    /// SET-AND-ORDER EQUALITY, not containment. The one-directional form this replaces could only
+    /// see a stage deleted from the frontend; a stage ADDED there was invisible to it — and that is
+    /// the drift that actually costs something, because a new stage inside the committed-but-
+    /// unlanded band is published by the roster, interns to `None` here, and is read as no evidence.
+    /// The feature would then stop flagging exactly the agents that stage describes, with the guard
+    /// still green — the vacuity this repo's #1 finding is about.
     #[test]
     fn stage_vocabulary_matches_the_frontend() {
         let ts = std::fs::read_to_string("../src/engine/workflowStage.ts")
             .expect("engine/workflowStage.ts must be readable from the crate root");
-        for (i, stage) in WORKFLOW_STAGES.iter().enumerate() {
-            let needle = format!("id: \"{stage}\"");
-            assert!(ts.contains(&needle), "{stage} (rank {i}) is missing from workflowStage.ts");
-        }
-        // …and in the SAME order, which is what the band's arithmetic rests on.
-        let mut at = 0usize;
-        for stage in WORKFLOW_STAGES {
-            let needle = format!("id: \"{stage}\"");
-            let found = ts[at..].find(&needle).map(|i| at + i).unwrap_or_else(|| {
-                panic!("{stage} is out of order relative to workflowStage.ts")
-            });
-            at = found;
-        }
+        // Scoped to the array, so an `id:` field elsewhere in the file cannot join the vocabulary.
+        let body = ts
+            .split_once("export const WORKFLOW_STAGES")
+            .expect("workflowStage.ts must declare WORKFLOW_STAGES")
+            .1
+            .split_once("] as const;")
+            .expect("the WORKFLOW_STAGES array must be terminated by `] as const;`")
+            .0;
+        let from_ts: Vec<&str> = body
+            .match_indices("id: \"")
+            .map(|(i, m)| {
+                let rest = &body[i + m.len()..];
+                &rest[..rest.find('"').expect("an unterminated stage id")]
+            })
+            .collect();
+        assert_eq!(
+            WORKFLOW_STAGES.to_vec(),
+            from_ts,
+            "the stage vocabulary must match workflowStage.ts exactly and in the same order — the \
+             unlanded band is arithmetic over that order"
+        );
+    }
+
+    /// …and the same guard for the row DISCS, which had none at all. That is why `blue` was missing
+    /// from `ROLLUP_DOTS` for the whole life of this feature: nothing tied the Rust list to the
+    /// TypeScript union, and a dot missing here interns to `None`, which every rule reads as no
+    /// evidence. Order does not matter for the discs (no arithmetic rests on it), membership does.
+    #[test]
+    fn dot_vocabulary_matches_the_frontend() {
+        let ts = std::fs::read_to_string("../src/engine/workerRollup.ts")
+            .expect("engine/workerRollup.ts must be readable from the crate root");
+        let union = ts
+            .split_once("export type RollupDot =")
+            .expect("workerRollup.ts must declare RollupDot")
+            .1
+            .split_once(';')
+            .expect("the RollupDot union must be terminated")
+            .0;
+        let mut from_ts: Vec<&str> =
+            union.split('|').map(|s| s.trim().trim_matches('"')).filter(|s| !s.is_empty()).collect();
+        from_ts.sort_unstable();
+        let mut ours: Vec<&str> = ROLLUP_DOTS.to_vec();
+        ours.sort_unstable();
+        assert_eq!(
+            ours, from_ts,
+            "ROLLUP_DOTS must be exactly workerRollup.ts::RollupDot — a disc missing here is a row \
+             this watcher can never see"
+        );
     }
 
     // ══ A MET GOAL IS NOT A LIFETIME EXEMPTION ══════════════════════════════════════════════════

@@ -433,6 +433,10 @@ fn send_escape_with<W: FnOnce(&str) -> Result<(), String>>(
 struct Tracked {
     state: AgentState,
     due_at_ms: u64,
+    /// When we last actually LOOKED at this agent, so the ladder can be handed the wall clock that
+    /// really passed rather than the interval that was scheduled. Rebaselined alongside `due_at_ms`
+    /// on a detected suspend — see the loop — because the two facts go stale together.
+    last_look_ms: u64,
 }
 
 /// Read the agent status table. `None` when this agent is not in it at all.
@@ -516,15 +520,37 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             if overshoot > SUSPEND_OVERSHOOT_MS {
                 // We were frozen alongside everything else, so the silence means nothing. Push
                 // every deadline out rather than reading a suspend as eight rungs of stall.
-                for t in tracked.values_mut() {
-                    t.due_at_ms = now.saturating_add(nudge_ladder::LADDER_SECS[0] * 1000);
-                }
+                //
+                // THE LOOK CLOCK IS REBASELINED WITH IT, and it has to be: the ladder's clocks are
+                // handed `now - last_look_ms`, so leaving this at its pre-suspend value would charge
+                // the entire frozen span — hours, potentially — to an agent that was not running for
+                // any of it. That is the same misreading the deadline push exists to prevent, one
+                // field over, and it defeats it completely: `UNLANDED_STALL_SECS` is half an hour,
+                // so a single post-resume look could carry the unlanded clock from zero across the
+                // threshold and flag a healthy agent for having been asleep.
+                rebaseline_after_suspend(&mut tracked, now);
                 tracing::debug!(target: "nudger", overshoot_ms = overshoot, "suspend detected; rebaselined");
                 continue;
             }
             tick(&app, &mut tracked, now);
         }
     });
+}
+
+/// Forget everything the freeze made us believe about time.
+///
+/// BOTH FIELDS, and the second is not an afterthought. Pushing `due_at_ms` out stops a suspend from
+/// reading as eight rungs of stall; rebaselining `last_look_ms` stops it from being CREDITED as
+/// elapsed wall clock to the ladder's clocks, which are handed `now - last_look_ms`. Moving only
+/// the deadline leaves the whole frozen span — hours, potentially — charged to an agent that was
+/// not running for any of it, and `UNLANDED_STALL_SECS` is only half an hour, so one post-resume
+/// look could carry that clock from zero across the threshold and flag a perfectly healthy agent.
+/// Extracted from the loop so it is reachable by a test at all; the loop itself runs on a thread.
+fn rebaseline_after_suspend(tracked: &mut HashMap<String, Tracked>, now: u64) {
+    for t in tracked.values_mut() {
+        t.due_at_ms = now.saturating_add(nudge_ladder::LADDER_SECS[0] * 1000);
+        t.last_look_ms = now;
+    }
 }
 
 fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, now: u64) {
@@ -551,6 +577,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         let entry = tracked.entry(agent_id.clone()).or_insert_with(|| Tracked {
             state: AgentState::default(),
             due_at_ms: now,
+            last_look_ms: now,
         });
         if now < entry.due_at_ms {
             // NOTHING BETWEEN LOOKS. A repair here was tried and reverted (roborev 59061, High): its
@@ -582,7 +609,20 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         // evidence — so an unobserved agent is never flagged on this path, only on the ordinary one.
         let rollup_dot = facts.and_then(|f| f.rollup_dot);
         let stage = facts.and_then(|f| f.stage);
-        let obs = observe(observer, status_str, goal_met, rollup_dot, stage, now);
+        // THE WALL CLOCK THIS LOOK REPRESENTS, measured rather than re-derived from the schedule.
+        // The ladder's two clocks both count seconds, and the interval that was SCHEDULED is not
+        // the interval that PASSED whenever a stand-down overrode it or a suspend rebaselined it.
+        let elapsed_secs = now.saturating_sub(entry.last_look_ms) / 1000;
+        entry.last_look_ms = now;
+        let obs = observe(
+            observer,
+            status_str,
+            goal_met,
+            rollup_dot,
+            stage,
+            now,
+            Some(elapsed_secs),
+        );
 
         let decision = nudge_ladder::step(&mut entry.state, &obs);
         entry.due_at_ms = now.saturating_add(decision.next_look_secs * 1000);
@@ -753,6 +793,7 @@ fn observe(
     rollup_dot: Option<&'static str>,
     stage: Option<&'static str>,
     now: u64,
+    elapsed_secs: Option<u64>,
 ) -> Observation {
     let hash = observer.hash_with_status(status);
     let (text, alternate) = observer.render();
@@ -774,6 +815,7 @@ fn observe(
     };
     Observation {
         hash,
+        elapsed_secs,
         // Either signal saying "working" stands us down. The screen is authoritative and
         // WebView-independent; the roster is the corroborating veto that can go stale.
         working: status == "working" || nudge_gate::screen_is_working(&text),
@@ -1004,6 +1046,47 @@ mod tests {
 
     fn observer() -> PtyObserver {
         PtyObserver::new(DEFAULT_COLS, DEFAULT_ROWS)
+    }
+
+    /// A SUSPEND IS NOT ELAPSED TIME — and the deadline is only half of saying so.
+    ///
+    /// The loop pushes every `due_at_ms` out on a detected freeze so a suspend is not read as eight
+    /// rungs of stall. `last_look_ms` has to move with it, because the ladder is handed
+    /// `now - last_look_ms` as the wall clock a look represents: leaving it stale charges the entire
+    /// frozen span — six hours here — to an agent that was not running for any of it. The unlanded
+    /// clock's whole budget is thirty minutes, so that ONE post-resume look would carry a perfectly
+    /// healthy agent from zero across the threshold and raise a flag, which is precisely the
+    /// misreading the deadline push exists to prevent.
+    #[test]
+    fn a_suspend_rebaselines_the_look_clock_as_well_as_the_deadline() {
+        let woke = 6 * 60 * 60 * 1000;
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        tracked.insert(
+            "agent-1".to_string(),
+            Tracked {
+                state: AgentState::default(),
+                due_at_ms: 1_000,
+                last_look_ms: 0,
+            },
+        );
+
+        rebaseline_after_suspend(&mut tracked, woke);
+
+        let t = &tracked["agent-1"];
+        assert_eq!(
+            t.due_at_ms,
+            woke + nudge_ladder::LADDER_SECS[0] * 1000,
+            "the deadline still moves"
+        );
+
+        // THE SIDE EFFECT THAT MATTERS: what the very next look reports as its own duration, read
+        // exactly the way `tick` computes it.
+        let next_look = woke + 5_000;
+        let elapsed_secs = next_look.saturating_sub(t.last_look_ms) / 1000;
+        assert_eq!(
+            elapsed_secs, 5,
+            "the first look after a resume represents five seconds, not the whole sleep"
+        );
     }
 
     // ══ THE DETECTOR, OVER A FAKE PTY ═══════════════════════════════════════════════════════════
@@ -1295,21 +1378,21 @@ mod tests {
         // A screen that is unambiguously SAFE to write to, so the only thing under test is the park.
         o.ingest("\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────");
         assert_eq!(
-            observe(&o, "idle", false, None, None, now_ms()).refusal,
+            observe(&o, "idle", false, None, None, now_ms(), None).refusal,
             None,
             "precondition: screen permits"
         );
 
         o.set_reader_parked(true);
         assert_eq!(
-            observe(&o, "idle", false, None, None, now_ms()).refusal,
+            observe(&o, "idle", false, None, None, now_ms(), None).refusal,
             Some("reader-parked"),
             "a screen that is not being updated must be refused, not trusted"
         );
 
         // ...and it must clear, or one burst of backpressure mutes the nudger for the session.
         o.set_reader_parked(false);
-        assert_eq!(observe(&o, "idle", false, None, None, now_ms()).refusal, None);
+        assert_eq!(observe(&o, "idle", false, None, None, now_ms(), None).refusal, None);
     }
 
     /// END TO END, the wedged-mid-turn case: a spinner frozen on a parked reader's grid must not
@@ -1325,7 +1408,7 @@ mod tests {
         o.ingest("\x1b[2J\x1b[H✻ Churning… (1m 24s · esc to interrupt)");
         o.set_reader_parked(true);
 
-        let obs = observe(&o, "working", false, None, None, now_ms());
+        let obs = observe(&o, "working", false, None, None, now_ms(), None);
         assert!(obs.working, "the frozen screen and the stale roster both still say working");
         assert!(!obs.screen_readable, "but nothing read off that grid is current");
 
@@ -1347,13 +1430,13 @@ mod tests {
     fn either_the_roster_or_the_screen_can_veto_as_working() {
         let idle = observer();
         idle.ingest("\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────");
-        assert!(!observe(&idle, "idle", false, None, None, now_ms()).working);
-        assert!(observe(&idle, "working", false, None, None, now_ms()).working, "roster veto");
+        assert!(!observe(&idle, "idle", false, None, None, now_ms(), None).working);
+        assert!(observe(&idle, "working", false, None, None, now_ms(), None).working, "roster veto");
 
         let spinning = observer();
         spinning.ingest("\x1b[2J\x1b[H✻ Churning… (1m 24s · esc to interrupt)");
         assert!(
-            observe(&spinning, "", false, None, None, now_ms()).working,
+            observe(&spinning, "", false, None, None, now_ms(), None).working,
             "screen veto, with the roster saying nothing at all — the wedged-WebView case"
         );
     }
@@ -1769,6 +1852,7 @@ mod tests {
             let mut state = AgentState::default();
             // Climb to a nudge rung so the ladder has counted an attempt, exactly as `tick` would.
             let stalled = nudge_ladder::Observation {
+                elapsed_secs: None,
                 hash: 1,
                 working: false,
                 refusal: None,
@@ -1908,6 +1992,7 @@ mod tests {
     fn wedged_state(looks: usize) -> AgentState {
         let mut state = AgentState::default();
         let stalled = nudge_ladder::Observation {
+            elapsed_secs: None,
             hash: 1,
             working: false,
             refusal: None,
@@ -2101,6 +2186,7 @@ mod tests {
     fn the_flag_carries_the_agents_own_answer() {
         let mut state = AgentState::default();
         let stalled = nudge_ladder::Observation {
+            elapsed_secs: None,
             hash: 1,
             working: false,
             refusal: None,
@@ -2119,6 +2205,7 @@ mod tests {
         }
         // It answers: a person is needed.
         let asking = nudge_ladder::Observation {
+            elapsed_secs: None,
             hash: 2,
             reply: Some(nudge_ladder::Reply::Human),
             ..stalled
