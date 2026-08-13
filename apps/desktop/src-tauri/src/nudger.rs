@@ -2018,7 +2018,7 @@ mod tests {
     /// its `stalled_on_a_prompt` hand-copies two tokens out of `nudge_gate::Refusal::as_str()` with
     /// nothing but this test holding them together. Rename a variant's string and the ladder
     /// silently stops escalating parked agents: no compile error, no red test, and the failure mode
-    /// is the exact silent inertness the instant-escalation path exists to remove. THIS module is
+    /// is the exact silent inertness the parked-screen flag exists to remove. THIS module is
     /// where the guard belongs because it is the one that imports both.
     #[test]
     fn the_ladder_and_the_gate_agree_on_the_prompt_tokens() {

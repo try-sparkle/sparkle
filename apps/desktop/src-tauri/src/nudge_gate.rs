@@ -1434,6 +1434,27 @@ mod tests {
         assert_eq!(plain(working), Some(Refusal::Working));
     }
 
+    /// THE SECOND ARM, ON ITS OWN — the one a reader of `parked_flag_rung` used to be told did not
+    /// exist (roborev 63327). Neither of these screens has a line ending `password:`, so
+    /// `write_block_password_colon` cannot fire; they are refused entirely by the wrap-tolerant
+    /// tail arm. That matters twice over: it is why `credential-prompt` waits for
+    /// `FIRST_NUDGE_RUNG` rather than the first writing rung, and it is why narrowing the per-line
+    /// regex alone would not make the token precise enough to earn a faster one.
+    #[test]
+    fn the_wrap_tolerant_arm_refuses_on_its_own() {
+        for prompt in ["Refreshing token:", "Set your PIN:", "Enter your username:"] {
+            assert!(
+                !write_block_password_colon().is_match(prompt),
+                "premise: the per-line arm must NOT be what catches {prompt:?}"
+            );
+            assert_eq!(
+                plain(prompt),
+                Some(Refusal::CredentialPrompt),
+                "the tail arm alone must still refuse: {prompt:?}"
+            );
+        }
+    }
+
     #[test]
     fn credential_prompts_block_even_when_they_wrap() {
         // Every one of these was a real miss on the TS side before its list grew.

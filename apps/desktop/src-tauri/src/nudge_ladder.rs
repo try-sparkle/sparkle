@@ -1191,10 +1191,13 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
 
 /// The flag level `n` counted attempts has earned, on the ordinary thresholds.
 ///
-/// Factored out because the instant-escalation path must LAYER ON TOP of it rather than replace
-/// it. Forcing a flat `Concierge` there capped a permanently parked agent at the concierge level
+/// Factored out because the PARKED-SCREEN path must LAYER ON TOP of it rather than replace it.
+/// Forcing a flat `Concierge` there capped a permanently parked agent at the concierge level
 /// forever -- an agent sitting on a permission prompt all night would never have reached the
-/// founder, which is the opposite of what instant escalation is for.
+/// founder, which is the opposite of what flagging a parked screen is for.
+///
+/// (It was written as "the instant-escalation path" when such a path existed. Nothing escalates
+/// instantly now: both parked tokens flag at `FIRST_NUDGE_RUNG` -- see `parked_flag_rung`.)
 fn ordinary_target(n: u32) -> Option<Escalation> {
     if n >= ESCALATE_FOUNDER_AFTER {
         Some(Escalation::Founder)
@@ -1244,11 +1247,17 @@ pub(crate) fn stalled_on_a_prompt(reason: &str) -> bool {
 ///
 ///   * `awaiting-input` collapses any `question_opener` / `menu_line` match in the live region,
 ///     including an agent's own rhetorical "Should I ...?" that it clears on its next turn.
-///   * `credential-prompt` is `write_block_password_colon`, which is `(?im)`-anchored PER LINE over
-///     the WHOLE screen rather than the tail. Any visible line ending `password:` / `passphrase:`
-///     matches -- a diff of this repo's own credential code, a scrolled-up `gh auth` transcript,
-///     the agent's own prose. And `write_refusal` tests credentials at gate 4, AHEAD of
-///     `screen_awaits_input` at gate 3, so such a screen is reported as `credential-prompt`.
+///   * `credential-prompt` has TWO arms, and naming only the first is how a reader concludes "no
+///     line ending `password:`, so no `credential-prompt`" -- which is false (roborev 63327):
+///       - `write_block_password_colon`, `(?im)`-anchored PER LINE over the WHOLE screen rather
+///         than the tail. Any visible line ending `password:` / `passphrase:` matches -- a diff of
+///         this repo's own credential code, a scrolled-up `gh auth` transcript, the agent's prose.
+///       - a WRAP-TOLERANT arm over the last `CREDENTIAL_TAIL_ROWS` non-blank rows: any
+///         `credential_word` (`pass(word|phrase|code)`, `username`, `token`, `otp`, `verification
+///         code`, `2fa`, `pin`) anywhere in that region, and the region ending in `:`. So an
+///         ordinary `Refreshing token:` or `Set your PIN:` produces the token too.
+///     And `write_refusal` tests credentials at gate 4, AHEAD of `screen_awaits_input` at gate 3,
+///     so such a screen is reported as `credential-prompt`.
 ///
 /// An earlier revision gave `credential-prompt` the first WRITING rung, reasoning that a password
 /// field has no self-clearing variant (roborev 63247). True of a real password field -- but the
@@ -1259,7 +1268,14 @@ pub(crate) fn stalled_on_a_prompt(reason: &str) -> bool {
 /// THE COST OF THE UNIFORM RUNG IS STATED HONESTLY: a genuine password prompt now waits ~245s
 /// rather than ~35s. That is the right trade while the recogniser is whole-screen -- a false page
 /// on a healthy agent is how a signal stops being read, which this module's header treats as the
-/// failure that matters. Narrow the matcher to the live tail region and this can be revisited.
+/// failure that matters.
+///
+/// THE REVISIT CONDITION IS "NARROW **BOTH** ARMS", and stating it as one was itself a trap
+/// (roborev 63327). The wrap-tolerant arm is ALREADY tail-scoped, so narrowing
+/// `write_block_password_colon` alone changes nothing about it -- and anyone who then restores the
+/// faster rung on the strength of "the matcher is tail-scoped now" reintroduces the exact ~35s
+/// false page this constant exists to remove, through the arm they did not touch. A faster rung is
+/// earned only when NEITHER arm can fire on a screen that is not a live credential prompt.
 fn parked_flag_rung(reason: &str) -> Option<usize> {
     match reason {
         "credential-prompt" | "awaiting-input" => Some(FIRST_NUDGE_RUNG),
