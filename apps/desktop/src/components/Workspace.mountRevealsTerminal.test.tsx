@@ -53,7 +53,7 @@
 // they stay laid out and hide with `visibility` — see components/paneVisibility.ts), so what is
 // checked is the thing the founder is looking at: is agent X's terminal painted.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve(null)) }));
 vi.mock("@tauri-apps/api/event", () => ({
@@ -161,7 +161,7 @@ import { useConnectionStore } from "../stores/connectionStore";
 import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable } from "../stores/cableStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
-import { doubleClickRow, singleClickRow } from "../testing/rowGestures";
+import { doubleClickRow, openRowMenu, singleClickRow } from "../testing/rowGestures";
 import type { AgentTab, Project } from "../types";
 
 const MOUNTED = "Stripe checkout retry"; // a1
@@ -184,6 +184,16 @@ function mkProject(id: string, name: string, agents: AgentTab[], selectedAgentId
 
 const rowFor = (name: string) =>
   screen.getByText(name).closest('[data-hint="agent"]') as HTMLElement;
+
+/**
+ * IS THERE A SIDEBAR ROW FOR THIS AGENT? Used to prove a close actually tore the row down.
+ *
+ * Deliberately NOT `queryByText(name)`. An agent's NAME appears in surfaces that outlive its row —
+ * the concierge names the agent it is mounted on — so a bare text query reports "still there" after
+ * a perfectly correct close. Every match is walked, and only a `[data-hint="agent"]` ancestor counts.
+ */
+const rowExistsFor = (name: string) =>
+  screen.queryAllByText(name).some((el) => el.closest('[data-hint="agent"]') !== null);
 
 /**
  * The Improve-Sparkle row, which is NOT a `[data-hint="agent"]`.
@@ -408,5 +418,181 @@ describe("Improve Sparkle still reveals the SPARKLE pane, even from a Plan board
     // The user's Plan choice is KEPT — leaving Sparkle brings their board back (Workspace.tsx's note
     // on `boardActive`). A row click that forced Build here would silently discard it.
     expect(useUiStore.getState().workModeBySide.right).toBe("plan");
+  });
+});
+
+// ══ CLOSING THE MOUNTED AGENT MUST NOT TAKE THE SURVIVING TERMINAL OFF SCREEN ═══════════════════
+//
+// THE GAP THIS FILLS (bead sparkle-4uw52). `Workspace.conciergeMountWiring.test.tsx` already pins
+// that closing the pinned agent drops the cable — and its own comment says what it asserts:
+// "ASSERTED AS THE STORE GOING OFF". That is the PRECONDITION, not the side effect. It proves the
+// unbind fired; it cannot see whether anything is still painted afterwards, because that suite stubs
+// the panes away entirely.
+//
+// The founder's report is the other half: after v0.103.0, panes stopped showing their terminal. The
+// unbind added in PR #1817 is a NEW, gesture-free way for `wired` to flip, and `wired` feeds the
+// shell's layout — so "the store went off" and "a terminal is still on screen" are two different
+// facts, and only the second one is the thing he sees. This file owns pane visibility, so the
+// user-visible half belongs here.
+//
+// Deliberately asserted on the SURVIVING agent. Asserting that the closed agent's pane is gone would
+// pass against a shell that tore down every pane in the pair, which is the regression itself.
+//
+// ══ THE CLOSE IS DRIVEN THROUGH THE × BUTTON, NOT WRITTEN INTO THE STORE ═══════════════════════
+//
+// The first draft of this file hand-wrote the post-close state (`projects: [only a2]`,
+// `selectedAgentId: "a2"`, `openAgentIds: ["a2"]`) and then asserted a2 was painted. roborev killed
+// it, correctly: `paneVisibleAgentId.right` derives from `activeAgentId` (Workspace.tsx:1733), so
+// that fixture made a2 visible BECAUSE THE TEST SAID SO. It asserted the post-close selection
+// instead of exercising the code that computes it.
+//
+// And that code is the single most likely producer of the founder's report. The real path is
+//
+//   close gesture → AgentSidebar.requestClose → teardownAgent → close(id) + removeAgent
+//                 → reselectAfterClose → engine/closeAgent.selectionAfterClose
+//
+// where `selectionAfterClose` decides who is selected afterwards and CAN legitimately return null
+// (the blank first-load state, AgentSidebar.tsx:1403-1426), and `firstRenderedRowId` can land on a
+// filtered/hidden row. Either outcome paints no terminal — exactly the symptom — and the hand-written
+// fixture could not see it, because it replaced that computation with its own answer.
+//
+// ══ WHAT THIS STILL DOES NOT GRIP — measured, not assumed ══════════════════════════════════════
+//
+// Driving the real teardown is a genuine improvement over the fixture, but `mutation-check` says it
+// does NOT yet grip the reselect: blanking `AgentSidebar.tsx:1427`
+// (`if (decision.reselect) selectAgent(...)`) leaves this file GREEN.
+//
+// The reason is a SECOND fallback underneath it. `projectStore.removeAgent` re-points selection at
+// `agents[0]?.id ?? null` on its own, so with exactly two agents the survivor gets selected whether
+// or not `reselectAfterClose` runs at all. The reselect is only load-bearing when those two answers
+// DIFFER — which is precisely the filtered/hidden-row case roborev named: `firstRenderedRowId` skips
+// rows the status filter hides, while `removeAgent`'s fallback does not, so `agents[0]` can be a row
+// the user cannot see (or the decision can be `null`). That is still untested, and it remains the
+// best open candidate for the founder's symptom. Tracked on bead sparkle-4uw52.
+//
+// What this file DOES grip is the visibility seam it was written for: mutating `Workspace.tsx:292`
+// (`agent.id === visibleAgentId[side]`) turns it red. So the cases below are meaningful about
+// WHICH PANE IS PAINTED, and silent about who gets selected when the two fallbacks disagree.
+//
+// THE GESTURE IS THE CONTEXT MENU'S "Close agent", NOT THE ×, and that is a jsdom constraint rather
+// than a preference. The × renders only when the row is `expanded` (hover) or when
+// `isActive && stageChipShows(columnWidth)` (AgentRow.tsx:2080) — and **jsdom never lays out**, so
+// every measured width is 0 and the hover card is positioned from an all-zero rect
+// (docs/jsdom-test-caveats.md). Clicking the × here silently found no button and the row survived.
+// The menu item is the SAME production entry point — `AgentSidebar.rowContextMenu.test.tsx` pins it
+// as "the same outcome as the × on it", both landing in `requestClose` — and it needs no geometry.
+describe("closing the MOUNTED agent leaves the surviving agent's terminal on screen", () => {
+  // PREVIEW, not the default Build. Under `seed()`'s defaults (`mode: "build"`, `selectedAgentId:
+  // "a1"`) a1's terminal is ALREADY painted before any gesture, so the premise below held identically
+  // with the double-click deleted — vacuous, and its comment claimed the opposite. Preview starts the
+  // terminal hidden behind the dev-server slot, so the mount is a genuine transition.
+  beforeEach(() => {
+    seed({ mode: "preview" });
+    // A CLEAN, POLLED BRANCH STATUS FOR BOTH ROWS — required for the close to be silent, and the
+    // requirement is real production logic rather than test scaffolding. `closeDecision` answers
+    // `work-at-risk-prompt` when `branchStatus` is UNDEFINED (engine/closeAgent.ts:110 — "we can't
+    // rule out work at risk"), so without this the × / menu item opens the Ship-Save-Discard dialog
+    // and no teardown runs at all. That is what the first version of this case actually exercised.
+    useRuntimeStore.setState({
+      branchStatus: {
+        a1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+        a2: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+      },
+      workflowStage: {},
+    } as never);
+  });
+
+  // THE PREMISE, so the case below is a genuine transition rather than a lucky default: the terminal
+  // starts OFF screen, and the mount is what puts it there.
+  it("starts with the mounted agent's terminal hidden, and the mount paints it", async () => {
+    await mount();
+    expect(terminalOnScreen("a1")).toBe(false);
+    doubleClickRow(rowFor(MOUNTED));
+    expect(terminalOnScreen("a1")).toBe(true);
+  });
+
+  it("still paints the surviving agent's terminal once the mounted one is closed", async () => {
+    await mount();
+    doubleClickRow(rowFor(MOUNTED));
+    expect(terminalOnScreen("a1")).toBe(true);
+
+    // THE REAL TEARDOWN. `mkAgent` leaves `branch`/`worktreePath` null and the runtime store carries
+    // no branchStatus, so `closeDecision` returns neither the work-at-risk prompt nor the retirement
+    // confirm and `requestClose` goes straight to `teardownAgent` — one click, no dialog.
+    // TWO SEPARATE `act`s, deliberately. The menu is rendered from state the right-click sets, so
+    // querying for its item inside the SAME act finds nothing — React has not re-rendered yet.
+    await act(async () => {
+      openRowMenu(rowFor(MOUNTED));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("row-menu-close-agent"));
+    });
+
+    // THE CLOSE REALLY HAPPENED — otherwise the assertion below is about a teardown that never ran.
+    // Scoped to a ROW rather than `queryByText(MOUNTED)`: the mounted agent's NAME survives the close
+    // in other surfaces (the concierge names who it is talking to), so a bare text query fails here
+    // against a perfectly correct close. The row is the thing that must be gone.
+    expect(rowExistsFor(MOUNTED)).toBe(false);
+    expect(rowExistsFor(OTHER)).toBe(true);
+
+    // THE USER-VISIBLE FACT, and now it is the SHELL's answer rather than the fixture's: whatever
+    // `selectionAfterClose` chose, the survivor's terminal is on screen. Not `paneFor("a2") !== null`
+    // — a pane that is portalled but hidden is precisely the reported symptom, and `terminalOnScreen`
+    // is what tells the two apart.
+    expect(terminalOnScreen("a2")).toBe(true);
+  });
+});
+
+// ══ SWITCHING THE WIRED PAIR'S PROJECT TAB, WITH AN AGENT MOUNTED ══════════════════════════════
+//
+// THE SECOND PATH PR #1817's OWN COMMENT NAMES as no longer self-healing (bead sparkle-4uw52). Its
+// note lists two click-reachable states that used to recover on their own and no longer do, because
+// the control pressed is itself inside the circuit so no unbind fires from the gesture:
+//
+//   1. closing the mounted agent  — covered by the describe above
+//   2. switching the wired pair's project tab  — THIS ONE, previously untested
+//
+// The tab bar renders INSIDE the wired pair, so the cable survives the press while `wiredProject`
+// becomes a project the pin has no agent in. #1817's new effect is what is supposed to notice that
+// and drop the cable. What no test asked is the founder-visible question: with the cable dropped out
+// from under it, does the newly-selected project still PAINT a terminal?
+//
+// Asserted on the ARRIVING project's agent — that is the pane the user is looking at after the
+// click. Asserting the departed project's pane went hidden would pass against a shell that painted
+// nothing at all, which is the reported symptom rather than a guard against it.
+describe("switching the project tab while an agent is MOUNTED still paints the new tab's terminal", () => {
+  beforeEach(() => {
+    seed();
+    // A second project with its own open agent, so there is somewhere to switch TO. `seed` builds a
+    // single-project shell; everything else about it is reused unchanged.
+    useProjectStore.setState({
+      projects: [
+        mkProject("p1", "Alpha", [mkAgent("a1", MOUNTED), mkAgent("a2", OTHER)], "a1"),
+        mkProject("p2", "Beta", [mkAgent("a3", "Beta agent")], "a3"),
+      ],
+      selectedProjectId: "p1",
+    } as never);
+    useRuntimeStore.setState({ openAgentIds: ["a1", "a2", "a3"], status: {} } as never);
+  });
+
+  // THE PREMISE: the mount really did paint a1, and the other project's pane is NOT showing yet.
+  // Both halves matter — without the second, "a3 is visible later" could be true from the start.
+  it("starts with the mounted agent painted and the other project's agent not", async () => {
+    await mount();
+    doubleClickRow(rowFor(MOUNTED));
+    expect(terminalOnScreen("a1")).toBe(true);
+    expect(terminalOnScreen("a3")).toBe(false);
+  });
+
+  it("paints the arriving project's terminal after the tab switch", async () => {
+    await mount();
+    doubleClickRow(rowFor(MOUNTED));
+    expect(terminalOnScreen("a1")).toBe(true);
+
+    await act(async () => {
+      useProjectStore.getState().selectProject("p2");
+    });
+
+    expect(terminalOnScreen("a3")).toBe(true);
   });
 });
