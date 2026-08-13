@@ -2610,6 +2610,105 @@ mod tests {
         assert_eq!(roots, vec![a.display().to_string(), b.display().to_string()]);
     }
 
+    /// THE property the whole Builder Index rests on, asserted through the REPORTER'S OWN CHAIN:
+    /// tokens from EVERY Sparkle account store reach the published payload.
+    ///
+    /// NINE stores, because that is what the machine this was written for has, and because the
+    /// community client's measured defect is reading exactly ONE of them. A two-store test — which
+    /// is what `spend.rs` already has — passes for a scanner that stops after two.
+    ///
+    /// Written so a DROPPED STORE CANNOT PASS. Each account carries its own model name and a
+    /// distinct power-of-two token count, so the payload is a bitmask: omit any single store and
+    /// its row vanishes AND the total falls to a value no other subset of stores can produce. That
+    /// is deliberate belt-and-braces — an assertion on the grand total ALONE goes green for a scan
+    /// that reads one store twice and another not at all, and a per-row assertion alone goes green
+    /// for a scan that also invents a tenth.
+    ///
+    /// The roots are the ones [`crate::spend::transcript_roots`] RESOLVES from the app-data dir,
+    /// not a list this test hands in — handing them in would assert the summing and prove nothing
+    /// about the enumeration, which is the half that breaks. They are then narrowed to the temp
+    /// app_data, which drops exactly one entry: the tester's own `$HOME/.claude` primary (3,697
+    /// project dirs on this machine). Scanning that would make the test slow, machine-dependent,
+    /// and quietly sensitive to the tester's `CLAUDE_CONFIG_DIR` — the same contamination
+    /// [`dry_run_warning`] exists to flag. The narrowing cannot mask the bug being guarded against:
+    /// the account stores are enumerated by production code and asserted EXACTLY, first, and it is
+    /// that enumeration the scan below consumes.
+    #[test]
+    fn the_reporter_publishes_tokens_from_every_account_store() {
+        const ACCOUNTS: usize = 9;
+        let tmp = tempfile::tempdir().unwrap();
+        let app_data = tmp.path();
+
+        // Dated TODAY rather than at a fixed anchor: a hardcoded date eventually falls out of the
+        // reporter's window, and this test would then pass over an empty scan — green, and proving
+        // nothing at all.
+        let today_day =
+            (SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() / 86_400) as i64;
+        let stamp = format!("{}T10:00:00Z", crate::spend::epoch_day_label(today_day));
+
+        for i in 0..ACCOUNTS {
+            let projects = app_data.join(format!("accounts/acct-{i}/projects/proj"));
+            std::fs::create_dir_all(&projects).unwrap();
+            std::fs::write(
+                projects.join("session.jsonl"),
+                format!(
+                    r#"{{"type":"assistant","timestamp":"{stamp}","message":{{"id":"msg-{i}","model":"probe-model-{i}","usage":{{"input_tokens":{tokens},"output_tokens":0}}}}}}"#,
+                    tokens = 1u64 << i
+                ) + "\n",
+            )
+            .unwrap();
+        }
+        // Two entries under `accounts/` that must NOT become roots, so "reads every store" cannot
+        // quietly degrade into "reads every directory".
+        std::fs::create_dir_all(app_data.join("accounts/no-projects-yet")).unwrap();
+        std::fs::write(app_data.join("accounts/stray.txt"), "x").unwrap();
+
+        let roots = crate::spend::transcript_roots(Some(app_data));
+        let enumerated: Vec<String> = roots
+            .iter()
+            .filter_map(|p| p.strip_prefix(app_data).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let expected: Vec<String> = (0..ACCOUNTS)
+            .map(|i| format!("accounts/acct-{i}/projects"))
+            .collect();
+        assert_eq!(
+            enumerated, expected,
+            "transcript_roots must enumerate all {ACCOUNTS} account stores — sorted, and nothing \
+             else from accounts/"
+        );
+
+        // The reporter's two lines: scan the resolved roots, then roll up. `report_once_sync` runs
+        // exactly this pair via `load_window_records`.
+        let scoped: Vec<PathBuf> = roots.into_iter().filter(|p| p.starts_with(app_data)).collect();
+        let scan = crate::spend::scan_window(&scoped, DEFAULT_REPORT_DAYS);
+        let data = rollup(scan.records(), scan.today, DEFAULT_REPORT_DAYS);
+
+        let mut published: std::collections::BTreeMap<String, u64> = Default::default();
+        for day in &data {
+            for m in &day.model_breakdowns {
+                *published.entry(m.model_name.clone()).or_default() += m.input_tokens;
+            }
+        }
+        for i in 0..ACCOUNTS {
+            assert_eq!(
+                published.get(&format!("probe-model-{i}")).copied(),
+                Some(1u64 << i),
+                "account store {i}'s tokens never reached the payload — published: {published:?}"
+            );
+        }
+        assert_eq!(
+            published.len(),
+            ACCOUNTS,
+            "the payload must carry one row per account store and no others: {published:?}"
+        );
+        assert_eq!(
+            published.values().sum::<u64>(),
+            (1u64 << ACCOUNTS) - 1,
+            "the bitmask total pins WHICH stores were read, not merely how many: {published:?}"
+        );
+    }
+
     #[test]
     fn a_dry_run_under_claude_config_dir_says_its_total_is_low() {
         // The 32x undercount this warning exists for: with CLAUDE_CONFIG_DIR set, the primary
