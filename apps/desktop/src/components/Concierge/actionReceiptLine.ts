@@ -173,11 +173,34 @@ export function actionReceiptLine(
     const tail = why ? plain(` — ${why}`) : plain("");
     switch (receipt.kind) {
       case "spawned":
-        // THROUGH THE CONSTANT, not a literal (roborev 63529). This arm is subject-less by design
-        // — a spawn that was REFUSED has no agent to name — but hard-coding the words made it a
-        // fourth copy of them, and the drift it enables is the same one: edit the wording and this
-        // row keeps the old text while the folded run beside it uses the new.
-        return line`Couldn't spawn ${plain(ANONYMOUS_SUBJECT)}${tail}`;
+        // THROUGH `who()`, LIKE EVERY OTHER ARM — not a second reader of the fallback (roborev
+        // 63529, then 63540). "A refused spawn has no agent to name" is true of today's producers,
+        // not of the sentence: this arm reading the anonymous words DIRECTLY made the claim
+        // structural, and the fold does not make it. `receiptMark` sets `subjectName` from
+        // `agentName` for every kind, and the folded `spawned` refusal is WHO-SHAPED (./receiptRuns
+        // — "N agents" from `distinctSubjects`, residue emitted whole), so the moment a producer
+        // does name one, the fold says the name while this row says "that agent" — a folded line
+        // naming an agent the rows it replaced did not, the one thing folding may never do.
+        // Reading the same `who()` makes the two agree by construction instead of by both happening
+        // to hard-code the same fallback.
+        //
+        // AND ONE PRODUCER ALREADY SHIPS A SUBJECT HERE, so "no producer names a refused spawn" was
+        // too broad as first written (roborev 63571, Medium). `spawn_build_agent` always returns
+        // `agentId`, and the classifier's fatal `spawnShortfall` arm turns a transport-level ok into
+        // `ok: false` when `agentExists === false` — so a REFUSED spawn carrying an `agentId` is a
+        // live shape. That makes `who()`'s PILL branch reachable on this arm, which it was not while
+        // the words were hard-coded, and it is the right rendering: a pill appears only when the
+        // lookup HITS, i.e. the agent is openable right now whatever it was at reply time.
+        //
+        // THE SUBJECT-CARRYING REFUSAL AND THE FOLDABLE ONE ARE DISJOINT, and saying otherwise is
+        // the error the round after 63571 had to correct (roborev 63613, Medium). That same
+        // `spawnShortfall` arm OVERWRITES `reason` with its own words, which match no `INTERNAL_GATES`
+        // entry — so it has no gist and `foldKeyOf` refuses it. The capacity sentence that DOES fold
+        // comes only from `refuse()`, which carries no data and hence no `agentId`. So the drift this
+        // arm guards against is real but SEQUENTIAL: it bites the first producer to pair a subject
+        // with a gate-phrased reason, not any receipt shipping today. `receiptMark` reads the same
+        // `resolve` for `subjectId`, so that day the row and the fold already agree.
+        return line`Couldn't spawn ${subject}${tail}`;
       case "sent":
         // THE REFUSAL ARM NEEDS THE PLURAL TOO (roborev 57888). `inboxBroadcast` refuses with
         // `no-recipients` and `broadcast-failed`, both subject-less — so this rendered "Not sent to

@@ -14,7 +14,12 @@ import {
   receiptRunLine,
   type ReceiptRun,
 } from "./receiptRuns";
-import { actionReceiptLine } from "./actionReceiptLine";
+import {
+  actionReceiptLine,
+  receiptMark,
+  type ResolveReceiptAgent,
+} from "./actionReceiptLine";
+import type { ConciergeActionReceipt } from "../../services/conciergeReceipts";
 import type { ConciergeMessage, ConciergeReceiptMark } from "./types";
 
 /** A successful terminal send to `name`, as the thread would hold it. */
@@ -684,58 +689,187 @@ describe("ANONYMOUS_SUBJECT is the fallback the renderer actually uses", () => {
 // `who()`, its `spawned` refusal arm, and this module's own constant — so editing the wording where
 // an individual row renders it left the fold saying the old words beside rows saying the new ones.
 //
-// THE FIRST VERSION OF THIS TEST COULD NOT SEE THAT, and the way it failed is worth keeping: it fed
-// a `{kind: "spawned", ok: false}` receipt, whose refusal arm returned a HARD-CODED
+// TWO VERSIONS OF THIS TEST FAILED TO SEE IT, and both failures are worth keeping.
+//
+// The first fed a `{kind: "spawned", ok: false}` receipt, whose refusal arm returned a HARD-CODED
 // "Couldn't spawn that agent" and never called `who()` at all. So the one line the commit changed
 // was not reached by the test written to cover it — revert `who()` and everything stayed green. An
 // earlier branch short-circuiting the mechanism under test is the exact vacuous shape AGENTS.md
 // names, and driving the real entry point was necessary but not sufficient.
 //
-// `closed` is used instead because BOTH sides genuinely render the fallback: the unfolded arm is
-// `Couldn't close ${subject}` with `subject` coming from `who()`, and the folded arm is who-shaped,
-// so its residue emits `subjectSlot`. A count-shaped kind (`sent`, `merged`) would not work — those
-// filter their residue away entirely, so the fold would have no words to compare.
+// The second migrated that arm to `plain(ANONYMOUS_SUBJECT)` and asserted the row equalled
+// `Couldn't spawn ${ANONYMOUS_SUBJECT}` — an expectation that is BYTE-IDENTICAL to what the literal
+// produced, so it passed against the very code it existed to replace, and renaming the constant
+// moved both sides together. An assertion that reads the same symbol the code reads cannot fail
+// (roborev 63540). The arm now takes `subject` from `who()` like every other one, and the cases
+// below compare the two modules' words AGAINST EACH OTHER instead of against a shared constant.
+//
+// `closed` carries the anonymous case because BOTH sides genuinely render the fallback: the unfolded
+// arm is `Couldn't close ${subject}` with `subject` coming from `who()`, and the folded arm is
+// who-shaped, so its residue emits `subjectSlot`. A count-shaped kind (`sent`, `merged`) would not
+// work — those filter their residue away entirely, so the fold would have no words to compare.
+// ONE RECEIPT, RENDERED TWICE — never two independently-constructed inputs (roborev 63540, Medium).
+// The row half is `actionReceiptLine`, the fold half is `receiptMark` → `subjectSlot`, and both are
+// derived from the SAME receipt object here. A hand-built mark can be given a `gist` no producer
+// writes, and then the fold half is a shape production cannot reach: the first version of the case
+// below set `reason: "a code review is still running"`, which is a gist OUTPUT rather than a gate's
+// own phrasing, so `refusalGist` returns null, `receiptMark` writes no `gist`, `foldKeyOf` returns
+// null at the refusal arm, and a run of those never folds at all. The reason strings here are the
+// producers' sentences, so the gist is derived rather than asserted into place.
+function bothWays(
+  receipt: ConciergeActionReceipt,
+  // ONE resolver for both halves, never two. `who()` and `receiptMark` each call it, and the whole
+  // correspondence being tested is that they get the same answer — handing them different lookups
+  // would let the test pass while production drew a pill on one side and words on the other.
+  resolve: ResolveReceiptAgent = () => null,
+): {
+  row: string;
+  md: string;
+  folded: string;
+  foldedMd: string;
+} {
+  const asMessage = (r: ConciergeActionReceipt): ConciergeMessage => ({
+    id: r.id,
+    kind: "sparkle",
+    text: actionReceiptLine(r, resolve)?.md ?? "",
+    actionReceipt: receiptMark(r, resolve),
+  });
+  const single = actionReceiptLine(receipt, resolve);
+  // `runOf` THROWS when nothing folded, which is what makes the derived mark load-bearing: a
+  // reason whose gist is null cannot reach the assertions below, it fails here instead.
+  const fold = receiptRunLine(
+    runOf([asMessage(receipt), asMessage({ ...receipt, id: `${receipt.id}b` })]),
+  );
+  // BOTH RENDERINGS, because `.spoken` cannot see a pill at all — it flattens one to the bare name,
+  // so a row that minted a chip and a row that printed words read identically there. The pill case
+  // below is only visible in `.md`, and a test asserting `.spoken` alone is how a residue bug got
+  // past this file once before.
+  return {
+    row: single?.spoken ?? "",
+    md: single?.md ?? "",
+    folded: fold.spoken,
+    foldedMd: fold.md,
+  };
+}
+
 describe("the fold's anonymous wording is the same wording an individual row uses", () => {
   it("matches actionReceiptLine's own fallback, through who() on one side and subjectSlot on the other", () => {
-    // ONE row, for a receipt naming nobody — this really does go through `who()`.
-    const single = actionReceiptLine(
-      {
-        id: "r1",
-        kind: "closed",
-        ok: false,
-        at: 1,
-        op: "fleet.close_agent",
-        reason: "a code review is still running",
-      },
-      () => null,
+    // A receipt naming nobody, so the row really does go through `who()`'s fallback.
+    const { row, folded } = bothWays({
+      id: "r1",
+      kind: "closed",
+      ok: false,
+      at: 1,
+      op: "fleet.close_agent",
+      reason: "roborev has 2 review(s) in flight on this branch",
+    });
+    expect(row).toBe(
+      `Couldn't close ${ANONYMOUS_SUBJECT} — a code review is still running`,
     );
-    expect(single?.spoken).toBe(`Couldn't close ${ANONYMOUS_SUBJECT} — a code review is still running`);
 
-    // …and the FOLD of a run of them. Same words, by construction now.
-    const anon: ConciergeMessage = {
-      id: "x",
-      kind: "sparkle",
-      text: single?.md ?? "",
-      actionReceipt: { kind: "closed", ok: false, gist: "a code review is still running" },
-    };
-    const folded = receiptRunLine(runOf([anon, { ...anon, id: "y" }]));
-    expect(folded.spoken).toContain(ANONYMOUS_SUBJECT);
+    // THE WORDS ARE COMPARED AGAINST EACH OTHER, not against the constant a second time. Restating
+    // `ANONYMOUS_SUBJECT` on both sides passes however far the two modules have drifted, as long as
+    // each drifted to something containing it; taking the row's OWN subject phrase and requiring the
+    // fold's residue to be made of it is what reds when `who()` is re-hardcoded.
+    const subjectWords = row
+      .replace(/^Couldn't close /, "")
+      .replace(/ — .*$/, "");
+    expect(folded).toBe(
+      `Couldn't close 2 agents — a code review is still running — ${subjectWords}, ${subjectWords}`,
+    );
   });
 
-  it("covers the spawned refusal arm too, which had its own literal", () => {
-    // roborev 63529: this arm bypassed `who()` and hard-coded the words. It is subject-less by
-    // design, so the assertion is that it uses the CONSTANT rather than a copy of it.
-    const l = actionReceiptLine(
-      {
-        id: "r2",
-        kind: "spawned",
-        ok: false,
-        at: 1,
-        op: "fleet.spawn_agent",
-        reason: "no free agent slot right now",
-      },
-      () => null,
+  // ══ THE REFUSED SPAWN THAT CARRIES A SUBJECT IS EXACTLY ONE SHAPE, AND IT DOES NOT FOLD ═════════
+  //
+  // `agentId` reaches a refused `spawned` receipt through ONE door: the classifier's fatal
+  // `spawnShortfall` arm, which flips a transport-level ok to `ok: false` when the reply says
+  // `agentExists === false`. That arm also OVERWRITES `reason` with its own words — `briefFailureCopy`'s
+  // sentence, or the literal "that agent is already gone". Neither matches an `INTERNAL_GATES` entry,
+  // so `refusalGist` is null, `receiptMark` writes no `gist`, and `foldKeyOf` refuses at its refusal
+  // arm. Meanwhile the capacity sentence that DOES yield a gist comes only from `refuse()`, which
+  // carries no `data` and therefore no `agentId`.
+  //
+  // So the subject-carrying refusal and the foldable refusal are DISJOINT populations, and the two
+  // facts are pinned separately below rather than smuggled into one fold assertion. The previous
+  // version paired an `agentId` with the capacity reason — a combination no producer emits — and
+  // asserted the FOLD on it, which is the very hazard `bothWays`' header warns about, one round after
+  // that header was written (roborev 63613, Medium).
+  const shortfall = (): ConciergeActionReceipt => ({
+    id: "r4",
+    kind: "spawned",
+    ok: false,
+    at: 1,
+    op: "fleet.spawn_build_agent",
+    agentId: "atlas-1",
+    reason: "that agent is already gone",
+  });
+
+  it("pins that the subject-carrying refusal is UNFOLDABLE, rather than assuming it", () => {
+    // Stated as an assertion because everything below depends on it: if a future gate entry ever
+    // matched the shortfall's words, this reds and the two cases after it need a fold half.
+    const mark = receiptMark(shortfall(), () => null);
+    expect(mark.gist).toBeUndefined();
+    expect(foldKeyOf(mark)).toBeNull();
+  });
+
+  it("draws a PILL on that refusal when its id resolves — the shape spawnShortfall really ships", () => {
+    // NOT HYPOTHETICAL (roborev 63571). Routing this arm through `who()` makes its PILL branch
+    // reachable for the first time; the hard-coded words could never draw one.
+    //
+    // Asserted on `.md`, because `.spoken` flattens a pill to the bare name and so cannot tell a chip
+    // from plain text. The correspondence is asserted on `receiptMark`'s `subjectId` instead of on a
+    // folded line, because this receipt never reaches a fold — but the two still read the SAME
+    // resolver, which is the property that matters: whatever the row drew, the mark agrees with.
+    const resolve = (id: string) =>
+      id === "atlas-1" ? { id: "atlas-1", name: "Atlas" } : null;
+    const r = shortfall();
+    const rendered = actionReceiptLine(r, resolve);
+    expect(rendered?.md).toBe(
+      "Couldn't spawn [@Atlas](sparkle-agent:atlas-1) — that agent is already gone",
     );
-    expect(l?.spoken).toBe(`Couldn't spawn ${ANONYMOUS_SUBJECT} — no free agent slot right now`);
+    expect(receiptMark(r, resolve).subjectId).toBe("atlas-1");
+  });
+
+  it("…and falls back to the shared wording when that same id no longer resolves", () => {
+    // THE COMMONER HALF: `agentExists === false` is precisely why this spawn was refused, so by the
+    // time the row renders the lookup usually MISSES. One case proving the pill appears is half the
+    // evidence — a `who()` that always minted a pill passes that one and fails this one. The mark
+    // misses with it, so nothing downstream can mint a chip pointing at a row the store no longer has.
+    const r = shortfall();
+    const rendered = actionReceiptLine(r, () => null);
+    expect(rendered?.spoken).toBe(
+      `Couldn't spawn ${ANONYMOUS_SUBJECT} — that agent is already gone`,
+    );
+    expect(rendered?.md).not.toContain("sparkle-agent:");
+    expect(receiptMark(r, () => null).subjectId).toBeUndefined();
+  });
+
+  it("…and the subject-less capacity refusal, which is the one that DOES fold", () => {
+    // A capacity refusal comes from `refuse()`, so it carries no data and names nobody — and its
+    // sentence DOES match a gate, so a run of them folds. This is the spawned refusal the founder
+    // actually sees repeated (a fan-out refusing per spawn at capacity), and the only one where a row
+    // and a fold of it both exist to be compared.
+    const { row, md, folded, foldedMd } = bothWays({
+      id: "r3",
+      kind: "spawned",
+      ok: false,
+      at: 1,
+      op: "fleet.spawn_build_agent",
+      reason: "This machine has 90 of its 81 agent slots taken.",
+    });
+    expect(row).toBe(
+      `Couldn't spawn ${ANONYMOUS_SUBJECT} — no free agent slot right now`,
+    );
+    const subjectWords = row
+      .replace(/^Couldn't spawn /, "")
+      .replace(/ — .*$/, "");
+    expect(folded).toBe(
+      `Couldn't spawn 2 agents — no free agent slot right now — ${subjectWords}, ${subjectWords}`,
+    );
+    // WHOLE STRINGS ON BOTH RENDERINGS, never a prefix or a `toContain` (`receiptRuns.ts` records
+    // why: the residue bug shipped because the tests asserted a prefix and a `toContain`, and both
+    // hold with stray residue attached). Neither side may mint a chip for a receipt that named nobody.
+    expect(md).not.toContain("sparkle-agent:");
+    expect(foldedMd).not.toContain("sparkle-agent:");
   });
 });
