@@ -34,6 +34,11 @@ const h = vi.hoisted(() => ({
   // The OBSERVED exhaustion, which is what the retirement helper judges on. Only the two fields it
   // reads; `loadAccountState` supplies the rest in production.
   usage: [] as { id: string; exhaustedUntil: number | null }[],
+  // `loadAccountState` RESOLVES to EMPTY with this set rather than throwing, so a broken bridge
+  // reaches the hook looking exactly like a healthy account list that happens to be empty. Carrying
+  // the flag here is what lets a test tell those two apart — see `accountSelection.ts`: "the
+  // coercion above would quietly launder 'the bridge is broken' into 'you have no accounts'".
+  failed: false,
   restart: vi.fn((_agentId: string) => true),
   setPin: vi.fn((_agentId: string, _accountId: string) => {}),
   statuses: {} as Record<string, AgentTabStatus | undefined>,
@@ -54,7 +59,12 @@ vi.mock("../services/accountStore", async (importOriginal) => ({
 
 vi.mock("../services/accountSelection", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/accountSelection")>()),
-  loadAccountState: async () => ({ accounts: [], usage: h.usage, identities: [] }),
+  loadAccountState: async () => ({
+    accounts: [],
+    usage: h.usage,
+    identities: [],
+    failed: h.failed,
+  }),
   invalidateAccountState: () => {},
 }));
 
@@ -151,6 +161,7 @@ beforeEach(() => {
   h.reason = "approaching";
   h.from = "acct-a";
   h.usage = [wall("acct-a")];
+  h.failed = false;
 });
 
 describe("an OBSERVED wall migrates running agents without being asked", () => {
@@ -335,6 +346,146 @@ describe("an OBSERVED wall migrates running agents without being asked", () => {
     expect(view.result.current.recommendation).toBeNull();
   });
 
+  it("and it survives a tick whose account load FAILED — we could not look is not the wall is over", async () => {
+    // The same defect as the test above, through the one door that door's fix left open. A failed
+    // load does NOT throw: `loadAccountState` RESOLVES to `EMPTY = { …, usage: [], failed: true }`
+    // on any IPC rejection, and sets `failed: !shapeOk` on a malformed reply — so the `catch` never
+    // sees it and the tick reads `usage: []`. By row alone that is indistinguishable from "no
+    // account is walled", which would retire EVERY live wave-off on one transient hiccup. The tick
+    // itself is silent (no accounts ⇒ no recommendation), so the damage only shows on the next
+    // healthy tick, which re-raises the banner the user already declined — and a flapping bridge
+    // repeats that for the whole ~5h window.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    // Held in a local so the recovery below can restore the SAME row. `exhaustedUntil` is a fixed
+    // timestamp the backend already decided; our failure to read it does not move it, so minting a
+    // fresh `wall()` here would be staging a different episode and testing the wrong thing.
+    const episode = wall("acct-a");
+    h.usage = [episode];
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    // The bridge hiccups. Empty usage, but `failed` says we did not LOOK — not that nothing is
+    // there. `accountSelection.ts` keeps this distinction for exactly this reason.
+    h.failed = true;
+    h.usage = [];
+    await repoll();
+
+    // It recovers, and the SAME episode's wall is still live. Nobody asked the user about a new
+    // one, so the wave-off they gave for this one must still hold.
+    h.failed = false;
+    h.usage = [episode];
+    await repoll();
+
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
+  it("and it does NOT survive a new episode whose gap no tick ever observed", async () => {
+    // `retireStaleWallDismissals` asks "is this account walled RIGHT NOW", which can only tell two
+    // episodes apart if some evaluation happens to land in the gap between them. Nothing guarantees
+    // one does: the poll is 120s, and retirement sits after `if (planRef.current) return`, so it
+    // does not run AT ALL while a switch plan is outstanding — and a plan is held open until every
+    // pending agent reaches a safe boundary, which one agent stuck `working` can stretch for hours.
+    // Dismiss acct-a's wall, let the window reset and acct-a re-wall inside that blind stretch, and
+    // set membership sees acct-a walled on every tick that runs: the stale wave-off is kept and a
+    // wall nobody declined is silenced — the fleet-parked-behind-a-live-wall silence this banner
+    // exists to prevent. `exhaustedUntil` is the episode's own identity, so comparing it is exact
+    // no matter which ticks ran.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    // A wall that LAPSES inside a single poll interval, so the reset and the re-wall both fall
+    // between two ticks and no evaluation ever observes acct-a unwalled. Re-walling while the
+    // declined wall is still live would be a different scenario entirely — that is an in-place
+    // EXTENSION, which the test below pins as the opposite answer.
+    h.usage = [{ id: "acct-a", exhaustedUntil: Date.now() + POLL_MS / 2 }];
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    // The window resets and acct-a walls AGAIN, both inside that one blind stretch.
+    h.usage = [wall("acct-a")];
+    await repoll();
+
+    // A claim nobody declined.
+    expect(view.result.current.recommendation?.reason).toBe("exhausted");
+  });
+
+  it("but an in-place EXTENSION of the same wall does not revoke it", async () => {
+    // `exhaustedUntil` is NOT immutable within one episode, which is what makes comparing it subtle.
+    // `pendingExhaustions` extends a LIVE bench in place when a fresh limit lands — its docblock:
+    // "A LATER reset does update — a fresh limit after a partial recovery extends it" — it polls at
+    // 60s, FASTER than this hook's 120s, and it fans the same extension across sibling accounts.
+    // So a continuously-walled account's `exhaustedUntil` moves from T1 to T2 with the wall never
+    // once ending and no new claim the user could have been asked about.
+    //
+    // Reading that as a new episode would re-raise a banner the user declined for a wall that never
+    // stopped — and would be strictly WORSE than the plain membership rule this replaced, which
+    // could not see the change at all. So the episode comparison has to tell "extended" from "new",
+    // and the discriminator is whether the declined wall had already lapsed.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    const first = wall("acct-a");
+    h.usage = [first];
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    // The SAME wall, still live, now benched an hour longer.
+    h.usage = [{ id: "acct-a", exhaustedUntil: first.exhaustedUntil + 60 * 60 * 1_000 }];
+    await repoll();
+
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
+  it("and with NO episode recorded it falls back to plain is-it-walled-now", async () => {
+    // The fallback arm. A claim is stamped with the `exhaustedUntil` observed for its account, but
+    // that can be `null` — nothing was known about the account when the user acted. Episode identity
+    // is then unavailable and the only honest question left is the weaker one, "is it walled right
+    // now". This pins that arm on its own: without it, a null-episode claim would match no
+    // retirement rule at all and outlive every wall forever, which is the permanent version of the
+    // silence the whole helper exists to prevent.
+    //
+    // It errs toward SPEAKING, deliberately — the same trade the docblock names. A spurious re-raise
+    // costs a click; a spurious silence costs a fleet idle for five hours.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    h.usage = []; // no row for acct-a, so `dismiss` has no episode to stamp
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    // acct-a is not walled as far as anything observable says, so there is no live episode for that
+    // wave-off to still be about.
+    await repoll();
+
+    expect(view.result.current.recommendation?.reason).toBe("exhausted");
+  });
+
+  it("and a NULL-episode wave-off still holds while the account IS walled", async () => {
+    // The OTHER arm of the same fallback, and the one that actually pins the null check. The test
+    // above is retired by the "no live wall at all" rule, which fires for every claim whatever its
+    // episode — so on its own it asserts nothing about `episode === null` and the null guard could
+    // be deleted with the suite still green. This is the case that separates them: with no episode
+    // recorded there is nothing to compare, so the weaker membership rule is all that is left and it
+    // must KEEP the wave-off while the account is walled. Without it a null-episode claim would be
+    // retired on every tick and the banner would re-raise forever — the exact defect the docblock
+    // promises does not happen.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+    h.usage = []; // no row for acct-a, so `dismiss` has no episode to stamp
+    const view = await mounted();
+    act(() => view.result.current.dismiss());
+    expect(view.result.current.recommendation).toBeNull();
+
+    // Now acct-a is observably walled. Nothing can say whether this is the episode that was
+    // declined, so the only safe reading of an un-comparable claim is that it still stands.
+    h.usage = [wall("acct-a")];
+    await repoll();
+
+    expect(view.result.current.recommendation).toBeNull();
+  });
+
   it("and a wall on a DIFFERENT account does not retire it either", async () => {
     // The other way the proxy leaked: keying retirement off "the one key this tick claims" deletes
     // every other account's wave-off outright, so a momentary `busiestPaneAccount()` flip to acct-c
@@ -359,20 +510,33 @@ describe("an OBSERVED wall migrates running agents without being asked", () => {
     // The paired asymmetry. Both wave-offs expiring on the same rule would make this one useless —
     // "stop nagging me that acct-a is getting close" is not a statement about one episode, so
     // nothing about a wall coming and going revokes it.
+    //
+    // THE FIXTURE HAS TO MOVE WITH THE NARRATIVE, not just `h.reason`. Retirement judges on the
+    // OBSERVED `exhaustedUntil` in `usage`, so if acct-a stayed walled for the whole test — as the
+    // `beforeEach` default leaves it — `!walled.has("acct-a")` would be false at every step and the
+    // `reason === "exhausted"` half of the predicate could never decide anything. Deleting that
+    // clause, i.e. expiring BOTH kinds of wave-off and destroying the asymmetry this test names,
+    // would then leave this test and the entire file green. Unwalling acct-a when the wall "goes"
+    // is what makes the reason the only thing keeping this wave-off alive.
     h.reason = "approaching";
     h.paneAccounts = {};
+    h.usage = [reset("acct-a")];
     const view = await mounted();
     act(() => view.result.current.dismiss());
 
     // A wall comes...
     h.reason = "exhausted";
+    h.usage = [wall("acct-a")];
     await repoll();
     expect(view.result.current.recommendation?.reason).toBe("exhausted");
-    // ...and goes.
+    // ...and goes. The episode is now observably over, which is exactly what retires a WALL
+    // wave-off — so this is the instant an estimate's wave-off has to prove it is made of
+    // something else.
     h.reason = "approaching";
+    h.usage = [reset("acct-a")];
     await repoll();
 
-    // The estimate is still waved off.
+    // The estimate is still waved off. It was never a statement about that episode.
     expect(view.result.current.recommendation).toBeNull();
   });
 

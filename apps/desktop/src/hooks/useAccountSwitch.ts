@@ -74,6 +74,11 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
   // back out of the key: a `key.endsWith(":exhausted")` / `key.split(":")` pair would re-introduce
   // exactly the write/read coupling `dismissKey` exists to remove.
   const dismissed = useRef<Map<string, DismissedClaim>>(new Map());
+  // accountId -> the `exhaustedUntil` last OBSERVED for it, so `dismiss` can stamp the episode it is
+  // declining onto the claim. Written only on a tick we can believe (`!state.failed`), for the same
+  // reason retirement is skipped on one: an unreadable tick would otherwise erase every account's
+  // episode and silently downgrade the next wave-off to the weaker membership rule.
+  const observedWalls = useRef<Map<string, number | null>>(new Map());
   // The live plan, readable from both interval loops without re-subscribing them on every advance:
   // phase 1 reads it to stay quiet while a switch is running, phase 2 reads it as the input to the
   // next advance. Every path that sets `plan` writes this ref in the same breath, so it never lags;
@@ -98,6 +103,12 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           // No ceilings → every account reads "unknown" → no recommendation. Degrade quietly.
         }
         if (cancelled) return;
+        // Record what this tick SAW before the plan guard below can return early — `dismiss` needs
+        // the current episode whenever the user acts, and a banner can still be on screen from an
+        // earlier tick while a plan is running.
+        if (!state.failed) {
+          observedWalls.current = new Map(state.usage.map((u) => [u.id, u.exhaustedUntil ?? null]));
+        }
         const current = busiestPaneAccount();
         const rec = switchRecommendation(
           current,
@@ -110,9 +121,15 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
         if (planRef.current) return;
 
         // Retire wall wave-offs the moment they stop describing anything true. Runs on EVERY
-        // evaluation, before either branch reads the map, and judges against the OBSERVED
-        // exhaustion in `state.usage` rather than against `rec` — see the helper for why.
-        retireStaleWallDismissals(dismissed.current, state.usage);
+        // evaluation we can BELIEVE, before either branch reads the map, and judges against the
+        // OBSERVED exhaustion in `state.usage` rather than against `rec` — see the helper for why.
+        //
+        // `state.failed` is skipped because a failed load RESOLVES rather than throwing — it hands
+        // us `usage: []`, which by row alone is indistinguishable from "nobody is walled" and would
+        // retire every live wave-off on one transient hiccup. "We could not look" is not evidence a
+        // wall ended, and it costs nothing to skip: `state.accounts` is empty on that tick, so `rec`
+        // is null and neither branch below has anything to say anyway.
+        if (!state.failed) retireStaleWallDismissals(dismissed.current, state.usage);
 
         // ══ AN OBSERVED WALL MOVES THE FLEET BY ITSELF; AN ESTIMATE STILL ASKS ═══════════════════
         // `reason: "exhausted"` comes from an observed rate-limit event, and `headroom.ts` says so
@@ -211,6 +228,9 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
       dismissed.current.set(dismissKey(recommendation), {
         accountId: recommendation.from.id,
         reason: recommendation.reason,
+        // WHICH episode is being declined. Retirement compares this against the live
+        // `exhaustedUntil`, so a later wall is a different claim even if no tick ever saw the gap.
+        episode: observedWalls.current.get(recommendation.from.id) ?? null,
       });
     }
     setRecommendation(null);
@@ -289,12 +309,18 @@ function dismissKey(rec: SwitchRecommendation): string {
   return `${rec.from.id}:${rec.reason}`;
 }
 
-/** One recorded wave-off. Both fields come straight off the recommendation that was declined, so
- *  {@link retireStaleWallDismissals} never has to parse them back out of {@link dismissKey}'s
- *  string. */
+/** One recorded wave-off. The first two fields come straight off the recommendation that was
+ *  declined, so {@link retireStaleWallDismissals} never has to parse them back out of
+ *  {@link dismissKey}'s string. */
 interface DismissedClaim {
   accountId: string;
   reason: SwitchRecommendation["reason"];
+  /** For a WALL wave-off, the `exhaustedUntil` of the EPISODE it declined — the episode's own
+   *  identity, and the thing that makes retirement exact rather than dependent on tick timing. See
+   *  {@link retireStaleWallDismissals}. `null` when no usage row for that account had been observed
+   *  at dismiss time, which falls the helper back to plain "is it walled now". Meaningless for an
+   *  `"approaching"` claim, which declines an estimate rather than an episode. */
+  episode: number | null;
 }
 
 /** Drop each recorded WALL wave-off once the wall it declined is over.
@@ -323,20 +349,69 @@ interface DismissedClaim {
  *  and a later wall writes a NEW one, so the next episode is a new claim by construction. Same
  *  authority `assessHeadroom` uses for `state: "exhausted"`, so the two cannot disagree.
  *
+ *  SO IT COMPARES THE EPISODE, NOT JUST "IS IT WALLED NOW" — and that is a stronger claim than it
+ *  looks. Plain set membership can only tell two episodes apart if some evaluation happens to land
+ *  in the GAP between them, and nothing guarantees one does. The poll is 120s, and the caller
+ *  returns early while a switch plan is outstanding, so retirement does not run at all for as long
+ *  as that plan lives — which one agent stuck `working` can stretch to hours. Let acct-a's window
+ *  reset and re-wall anywhere inside that blind stretch and every tick that runs sees acct-a walled,
+ *  keeps the stale wave-off, and silences a wall nobody declined. Comparing the recorded
+ *  `exhaustedUntil` against the live one is exact no matter which ticks ran, so the "new episode is
+ *  a new claim by construction" guarantee above is now true by construction rather than by luck.
+ *
+ *  A claim with no recorded episode (`null` — nothing was known about that account at dismiss time)
+ *  falls back to the membership test, which is the weaker rule but never the wrong-way one.
+ *
+ *  BUT `exhaustedUntil` IS NOT IMMUTABLE WITHIN AN EPISODE, so "it changed" is not "a new wall".
+ *  `pendingExhaustions` EXTENDS a live bench in place when a fresh limit lands — "a fresh limit
+ *  after a partial recovery extends it" — polls at 60s (faster than this hook), and fans the same
+ *  extension across sibling accounts. A continuously walled account's value therefore moves from T1
+ *  to T2 without the wall ever ending, and reading that as a new episode would re-raise a banner the
+ *  user declined for a wall that never stopped: strictly worse than the membership rule, which could
+ *  not see the change at all.
+ *
+ *  The discriminator is whether the DECLINED wall had already lapsed. A later value observed while
+ *  the recorded episode is still in the future is that same wall extended, so the claim is re-stamped
+ *  and kept. Only once the recorded episode has passed does a different live wall mean a genuinely
+ *  new one. Anything else — notably a live wall ending EARLIER than the one recorded, which
+ *  `pendingExhaustions` never writes — is treated as a new claim, erring toward speaking, per the
+ *  trade named above.
+ *
  *  An account absent from `usage` is treated as not walled. That is the honest reading — no usage
  *  row means no observed rate-limit event — and it errs toward speaking, which is the safe side
- *  here: a spurious re-raise costs a click, a spurious silence costs a fleet idle for five hours. */
+ *  here: a spurious re-raise costs a click, a spurious silence costs a fleet idle for five hours.
+ *
+ *  THAT READING IS ONLY HONEST FOR A READ THAT HAPPENED, which is why the caller will not run this
+ *  at all on a tick with `state.failed`. A failed load resolves to `usage: []` rather than throwing,
+ *  so "the bridge is broken" arrives here wearing the exact shape of "nobody is walled" — and on
+ *  that shape the paragraph above would retire EVERY live wave-off at once. `accountSelection.ts`
+ *  keeps `failed` for precisely this conflation; the guard is at the call site because that is where
+ *  the flag lives, and the helper stays a pure function of the usage it is handed. */
 function retireStaleWallDismissals(
   dismissed: Map<string, DismissedClaim>,
   usage: readonly Pick<Usage, "id" | "exhaustedUntil">[],
   now: number = Date.now(),
 ): void {
-  const walled = new Set<string>();
+  // accountId -> the `exhaustedUntil` of the wall that is live RIGHT NOW. The value, not just
+  // membership, is what identifies the episode.
+  const walled = new Map<string, number>();
   for (const u of usage) {
-    if (u.exhaustedUntil != null && u.exhaustedUntil > now) walled.add(u.id);
+    if (u.exhaustedUntil != null && u.exhaustedUntil > now) walled.set(u.id, u.exhaustedUntil);
   }
   for (const [key, claim] of [...dismissed]) {
-    if (claim.reason === "exhausted" && !walled.has(claim.accountId)) dismissed.delete(key);
+    if (claim.reason !== "exhausted") continue; // an estimate's wave-off is a standing preference
+    const live = walled.get(claim.accountId);
+    if (live === undefined) {
+      dismissed.delete(key); // no live wall at all: the declined episode is over
+    } else if (claim.episode === null || live === claim.episode) {
+      // Nothing to compare, or the very episode that was declined. Either way it still stands.
+    } else if (claim.episode > now && live > claim.episode) {
+      // SAME wall, benched longer — not a new claim. Re-stamp so the comparison stays exact as the
+      // bench keeps moving; without this the next extension would be measured against a stale value.
+      claim.episode = live;
+    } else {
+      dismissed.delete(key); // the declined episode lapsed and another one is live: a new claim
+    }
   }
 }
 
