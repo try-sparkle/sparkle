@@ -1182,3 +1182,73 @@ describe("runtimeStore — one-time roborev consent trigger", () => {
     expect(settings.useSettingsStore.getState().roborevConsentOpen).toBe(false);
   });
 });
+
+// ── WHEN DID THIS AGENT'S WORK CROSS INTO `merged`? (roborev 63931) ──────────────────────────────
+//
+// `workflowShippedAt` dates the merge so a reader can ask whether it happened before or after some
+// other event — specifically, whether it predates the goal it is being used as evidence for.
+//
+// The first version of this dated the `workflowShipped` LATCH, which is one-shot ("set once, never
+// cleared until the agent closes"). That records an agent's FIRST merge forever, so every goal after
+// the first compares against a date in the distant past and the evidence field goes permanently
+// absent — for exactly the repeat-use agents it exists to serve. Absent-but-advertised is worse than
+// never shipped: the caller is told to look for a signal that never arrives.
+//
+// The STAGE is what cycles (`deriveLiveStage` drops back to Committed when fresh work lands on a
+// branch that already shipped), so the upward crossing is what carries the date.
+describe("workflowShippedAt — the date on the merge, not on the first latch", () => {
+  const freshStore = async () => {
+    const runtime = await import("./runtimeStore");
+    runtime.useRuntimeStore.setState({
+      workflowStage: {},
+      workflowShipped: {},
+      workflowShippedAt: {},
+    } as never);
+    return runtime.useRuntimeStore;
+  };
+
+  it("dates EVERY crossing into merged, not just the first", async () => {
+    const store = await freshStore();
+    store.getState().setWorkflowStage("a1", "building_saved");
+    store.getState().setWorkflowStage("a1", "merged");
+    const first = store.getState().workflowShippedAt["a1"];
+    expect(first).toEqual(expect.any(Number));
+
+    // A NEW cycle: fresh work lands on the already-shipped branch, then merges again. This is the
+    // shape the one-shot version could not see — and the whole repeat-use population lives here.
+    vi.setSystemTime(new Date(Date.now() + 60_000));
+    store.getState().setWorkflowStage("a1", "building_saved");
+    store.getState().setWorkflowStage("a1", "merged");
+
+    expect(store.getState().workflowShippedAt["a1"]).toBeGreaterThan(first!);
+  });
+
+  it("does not re-date a stage that was already at or above merged", async () => {
+    // Re-stamping without a crossing would make the date read "now" on every poll, and every
+    // "did this merge predate that goal?" comparison would answer yes forever — vacuous.
+    const store = await freshStore();
+    store.getState().setWorkflowStage("a2", "building_saved");
+    store.getState().setWorkflowStage("a2", "merged");
+    const at = store.getState().workflowShippedAt["a2"];
+
+    vi.setSystemTime(new Date(Date.now() + 60_000));
+    store.getState().setWorkflowStage("a2", "shipped");
+    expect(store.getState().workflowShippedAt["a2"]).toBe(at);
+  });
+
+  it("refuses to date a crossing it has no PREVIOUS stage for", async () => {
+    // After close()/resetProgress() the stage map is cleared, so the next poll looks like a fresh
+    // crossing. Stamping there dates a merge that may be months old as "now" — re-manufacturing the
+    // false positive the anchor exists to remove. No history means no claim.
+    const store = await freshStore();
+    store.getState().setWorkflowStage("a3", "merged");
+    expect(store.getState().workflowShippedAt["a3"]).toBeUndefined();
+  });
+
+  it("does not date a stage that stops BELOW merged", async () => {
+    const store = await freshStore();
+    store.getState().setWorkflowStage("a4", "building_saved");
+    store.getState().setWorkflowStage("a4", "merged_local");
+    expect(store.getState().workflowShippedAt["a4"]).toBeUndefined();
+  });
+});

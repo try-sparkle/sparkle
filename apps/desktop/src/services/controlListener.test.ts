@@ -3668,8 +3668,16 @@ describe("controlListener", () => {
         .setAgentGoal(projectId, callerId, "the founder likes the new column", undefined, "agent", {
           kind: "human",
         });
-      // The same two facts `landedEvidenceFor` consumes on the self-mark path: the sticky watermark
-      // set the first time the stage reached ORIGIN main, and a clean branch holding nothing back.
+      // The facts `landedEvidenceFor` consumes on the self-mark path — the sticky watermark and a
+      // clean branch holding nothing back — PLUS the stage crossing that dates the merge.
+      //
+      // The crossing is driven for real (`building_saved` → `merged`) rather than by poking the
+      // timestamp in, because the date is the whole anchor: an earlier version stamped it off the
+      // one-shot `workflowShipped` latch, which made `landed` permanently absent from an agent's
+      // SECOND goal onward. A test that seeded the timestamp directly would have passed against
+      // that build (roborev 63931).
+      useRuntimeStore.getState().setWorkflowStage(callerId, "building_saved");
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
       useRuntimeStore.getState().setWorkflowShipped(callerId, true);
       useRuntimeStore.getState().setBranchStatus(callerId, {
         ahead: 0,

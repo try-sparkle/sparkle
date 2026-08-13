@@ -735,13 +735,23 @@ interface RuntimeState {
   // RESETS to a new cycle (deriveLiveStage drops back to Committed when fresh work lands on a branch
   // that already shipped). PERSISTED alongside workflowStage so the ✓ survives a relaunch.
   workflowShipped: Record<string, boolean>;
-  // WHEN that watermark first latched, so a reader can ask whether the merge happened before or
-  // after some other event. The boolean alone cannot answer that, and the gap is not cosmetic: the
-  // latch is monotonic and survives into the agent's NEXT goal, so "this agent shipped something"
-  // reads as true from the first second of a goal no work has been done on yet. Anything closing a
-  // goal on the strength of the watermark needs this to avoid acting on a merge that predates it
-  // (roborev 63905). Stamped only on the FALSE -> TRUE transition; re-stamping on every poll would
-  // make the timestamp mean "now" and the comparison vacuous. Persisted with the watermark.
+  // agentId -> WHEN this agent's work was last observed to CROSS into `merged`, so a reader can ask
+  // whether that merge happened before or after some other event. The boolean above cannot answer
+  // it, and the gap is not cosmetic: the watermark survives into the agent's next goal, so "this
+  // agent shipped something" reads as true from the first second of a goal no work has been done on
+  // yet — and anything closing a goal on that basis acts on a merge that predates it (roborev
+  // 63905).
+  //
+  // ⚠️ WRITTEN BY `setWorkflowStage` ON THE UPWARD CROSSING, not by the `workflowShipped` latch.
+  // That latch is one-shot ("set once, never cleared until the agent closes"), so dating IT records
+  // an agent's FIRST merge forever and the comparison then reports "predates this goal" for every
+  // goal after the first — the field would be permanently absent for repeat-use agents, which is
+  // worse than absent altogether because the caller is told to look for it (roborev 63931). The
+  // STAGE is what cycles, so it is what carries the date.
+  //
+  // Absent means NO CLAIM, never "never merged": a cleared stage map (close/resetProgress) gives
+  // the next poll no `prev` to cross from, and stamping there would date an old merge as now.
+  // Persisted with the watermark, or a relaunch silently disables the anchor.
   workflowShippedAt: Record<string, number>;
   // agentId -> the LIVE WorkflowState from the last poll (reachability + PR probe + hasRemote). The
   // stage watermark above is monotonic and lossy by design; the composer CTA needs the raw signals
@@ -1018,26 +1028,50 @@ export const useRuntimeStore = create<RuntimeState>()(
         set((st) => ({ branchStatus: { ...st.branchStatus, [agentId]: s } })),
 
       setWorkflowStage: (agentId, stage) =>
-        set((st) => ({ workflowStage: { ...st.workflowStage, [agentId]: stage } })),
+        set((st) => {
+          // STAMPING THE TRANSITION INTO `merged`, NOT THE FIRST-EVER LATCH (roborev 63931).
+          //
+          // `workflowShipped` is documented as "set once, never cleared until the agent closes", and
+          // its single production call site only ever passes `true`. So a timestamp written there
+          // records an agent's FIRST merge, forever — and an anchor comparing it against `goal.setAt`
+          // then reports "the merge predates this goal" for every goal after the first. The evidence
+          // field would be permanently absent for exactly the repeat-use agents it exists to serve,
+          // which is worse than not shipping it: the caller is told to look for a signal that never
+          // arrives.
+          //
+          // The STAGE is the thing that actually cycles — `deriveLiveStage` drops back to Committed
+          // when fresh work lands on a branch that already shipped — so an upward crossing of
+          // `merged` happens once per merge, which is the event worth dating.
+          const prev = st.workflowStage[agentId];
+          // ⚠️ AN ABSENT `prev` DOES NOT STAMP, and that is the second half of the fix. After
+          // `close()`/`resetProgress()` the stage map is cleared, so the next poll would look like a
+          // fresh crossing and date a merge that may be months old as "now" — re-manufacturing the
+          // false positive this anchor removes. No history means no claim.
+          const crossedIntoMerged =
+            prev !== undefined &&
+            stageIndex(prev) < stageIndex("merged") &&
+            stageIndex(stage) >= stageIndex("merged");
+          return {
+            workflowStage: { ...st.workflowStage, [agentId]: stage },
+            ...(crossedIntoMerged
+              ? { workflowShippedAt: { ...st.workflowShippedAt, [agentId]: Date.now() } }
+              : {}),
+          };
+        }),
 
       setWorkflowShipped: (agentId, shipped) =>
         set((st) => {
-          // STAMPED ON THE TRANSITION ONLY. Call sites already guard on `!workflowShipped[id]`, but
-          // the guard is repeated here because the whole value of the timestamp is that it does not
-          // move: re-stamping while `shipped` stays true would make it read "now" on every poll, and
-          // every "did this merge predate that goal?" comparison would answer yes forever.
-          const alreadyShipped = st.workflowShipped[agentId] === true;
-          if (shipped && alreadyShipped) return {};
+          // DOES NOT STAMP `workflowShippedAt` — see that field's note. This latch is one-shot, so a
+          // date written here would be the agent's FIRST merge forever and would read as "predates
+          // this goal" for every later goal. `setWorkflowStage` owns the date because the stage is
+          // what cycles.
           if (!shipped) {
-            // Cleared together, so the pair cannot disagree — a timestamp outliving its watermark
-            // would claim a merge that the watermark says never happened.
+            // Cleared together, so the pair cannot disagree — a date outliving its watermark would
+            // claim a merge the watermark says never happened.
             const { [agentId]: _drop, ...workflowShippedAt } = st.workflowShippedAt;
             return { workflowShipped: { ...st.workflowShipped, [agentId]: false }, workflowShippedAt };
           }
-          return {
-            workflowShipped: { ...st.workflowShipped, [agentId]: true },
-            workflowShippedAt: { ...st.workflowShippedAt, [agentId]: Date.now() },
-          };
+          return { workflowShipped: { ...st.workflowShipped, [agentId]: true } };
         }),
 
       setWorkflowState: (agentId, ws) =>
