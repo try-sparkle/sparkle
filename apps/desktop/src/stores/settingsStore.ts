@@ -23,7 +23,9 @@ import type { PolicyDecision, ToolPolicyOverrides } from "../services/conciergeT
 import {
   toApprovalMap,
   asResumeRule,
+  asConciergeAnswers,
   DEFAULT_RESUME_RULE,
+  DEFAULT_CONCIERGE_ANSWERS,
   type ApprovalCategory,
   type ApprovalMap,
   type ApprovalRule,
@@ -512,6 +514,17 @@ interface SettingsState {
    *  Per-project overrides live in approvalsStore; this is the all-projects layer / the effective
    *  value when no project is in context. Config-mirrored, NOT persisted. */
   resumeRule: ResumeRule;
+  /** GLOBAL (all-projects) concierge-routing flag, mirrored from config.toml's
+   *  `[approvals].concierge_answers`. The second SIBLING of `approvals` with its own value domain
+   *  (a plain boolean, not "always"/"never"): may a prompt the local classifier declines to answer
+   *  be handed to the concierge, which reads it and answers?
+   *
+   *  NOT the same switch as `aiAutoApprove` above, on purpose. That one lets a purely local REGEX
+   *  press buttons with nobody reading them; this one lets a reasoning agent read the question
+   *  first. One switch for both would mean turning off the blind presser also silences the thing
+   *  that reads. On by default — false sends every unclassified prompt to the human.
+   *  Config-mirrored, NOT persisted. */
+  conciergeAnswers: boolean;
   /** The concierge's explicit PER-TOOL autonomy rules, mirrored from config.toml's
    *  `[concierge.tools]`. Tool name → "allow" | "ask" | "deny", holding ONLY the rules the human
    *  set: a tool with no entry sits on the default derived from its risk class
@@ -801,6 +814,7 @@ export const useSettingsStore = create<SettingsState>()(
       conciergeToolPolicy: {},
       conciergeToolPolicyHydrated: false,
       resumeRule: DEFAULT_RESUME_RULE,
+      conciergeAnswers: DEFAULT_CONCIERGE_ANSWERS,
       autoApplyUpdates: true,
       windowSpanMode: "safe",
       windowAutoRespan: true,
@@ -1111,6 +1125,10 @@ export const useSettingsStore = create<SettingsState>()(
           // GLOBAL session-resume rule (sibling of approvals; own value domain). Coerced so an
           // absent/unknown value degrades to "ask".
           resumeRule: asResumeRule(config.approvals?.resume),
+          // GLOBAL concierge-routing flag (the other sibling of approvals; a plain boolean). Coerced
+          // so an absent value — an older backend predating the key — degrades to the ON default
+          // rather than silently disabling routing.
+          conciergeAnswers: asConciergeAnswers(config.approvals?.concierge_answers),
           // Workflow rules (display / advanced).
           requirePr: config.workflow.require_pr,
           worktreeIsolation: config.workflow.worktree_isolation,

@@ -601,3 +601,22 @@ export function pickerParseDiagnosis(scrollback: string): PickerBlindness {
   const { footerIdx } = parsePickerOptionsWithBounds(scrollback);
   return footerIdx >= 0 ? "footer-without-options" : "no-menu";
 }
+
+/**
+ * A stable signature of the picker instance in `scrollback` — its option keystrokes + labels. Used
+ * to act on each distinct picker at most once (a re-rendered scrollback keeps the same options, so
+ * it hashes identically and the repeat is suppressed). Empty string when there is no picker.
+ *
+ * LIVES HERE, not in `approvalsRuntime`, which is where it was written and which still re-exports it
+ * for its existing callers. TWO modules need it now — the auto-answerer de-duping its keystrokes and
+ * `conciergeHandoff` de-duping its hand-offs — and having the second import it from the first closes
+ * a runtime import cycle (`approvalsRuntime` → `conciergeHandoff` → `approvalsRuntime`). Copying it
+ * instead would be exactly the drift a shared definition exists to prevent, so it moves down to the
+ * module both already depend on. The separator stays NUL: it cannot occur in a parsed option label,
+ * so two different option sets cannot collide by concatenation.
+ */
+export function pickerSignature(scrollback: string): string {
+  return detectClaudeCodePicker(scrollback)
+    .map((b) => `${b.value}\u0000${b.label}`)
+    .join("|");
+}

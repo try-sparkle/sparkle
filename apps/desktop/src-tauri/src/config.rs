@@ -170,6 +170,26 @@ pub struct ApprovalsConfig {
     /// from summary"), or `"full"` (auto-pick "Resume full session"). Any unrecognized value is
     /// treated as "ask". Project [approvals].resume overrides the global value, like the categories.
     pub resume: Option<String>,
+    /// May a prompt the local classifier declines to answer be handed to the CONCIERGE, which reads
+    /// it and answers? Default true (see `impl Default`). Project [approvals].concierge_answers
+    /// overrides the global value, exactly like the categories and `resume`.
+    ///
+    /// DELIBERATELY SEPARATE FROM `[ai].auto_approve`, and the distinction is the whole point:
+    /// `auto_approve` means "let a purely local REGEX press buttons without anyone reading them".
+    /// Routing to the concierge is a DIFFERENT act — a reasoning agent reads the question first,
+    /// then answers. Coupling them onto one switch would mean that turning off the blind presser
+    /// also silences the thing that reads, which is the opposite of what someone reaching for that
+    /// switch wants. So: two switches, two honest meanings. `true` lets the concierge be handed the
+    /// prompts the classifier won't answer; `false` sends every one of them to the founder.
+    ///
+    /// A plain `bool`, NOT an `Option<bool>` like its siblings above, on purpose. serde's derive
+    /// emits `Option::None` as an explicit `null` (it omits the key only under
+    /// `skip_serializing_if`), so an `Option` here would force the TypeScript mirror to tell `null`
+    /// apart from absent for a value that has no third state to express. A bare bool crosses the
+    /// wire as `true`/`false` and nothing else — see AGENTS.md, "A Rust `Option` crosses the wire as
+    /// `null`". The per-layer "was this key set?" question still gets its `Option`, on
+    /// `PartialApprovals`, which is where it belongs.
+    pub concierge_answers: bool,
 }
 
 impl Default for ApprovalsConfig {
@@ -192,6 +212,15 @@ impl Default for ApprovalsConfig {
             // resume mode has a real cost (a full resume can burn a big slice of usage limits), so
             // Sparkle stays hands-off until the user opts into "summary" or "full".
             resume: Some("ask".to_string()),
+            // Concierge routing defaults ON. The problem this exists to solve, in the founder's own
+            // framing, is prompts landing on HIM that something else should have answered — so the
+            // safe default is that the concierge is ASKED, not that it is skipped. Note this is the
+            // opposite reasoning to `resume` directly above, and for a good reason: an unanswered
+            // prompt has a cost too (an agent stalls, a human is interrupted), so "do nothing" is
+            // not the neutral choice here the way it is for a resume mode. Opting out is one key —
+            // `concierge_answers = false` — which restores today's behaviour of routing every
+            // unclassified prompt to the human.
+            concierge_answers: true,
         }
     }
 }
@@ -1655,6 +1684,10 @@ struct PartialApprovals {
     fetch: Option<String>,
     other: Option<String>,
     resume: Option<String>,
+    /// `Option` HERE, unlike the bare `bool` on `ApprovalsConfig`, because this struct answers a
+    /// different question: not "what is the value" but "did THIS layer say anything?" — which is
+    /// exactly what lets an absent project key fall through to the global one.
+    concierge_answers: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -2123,6 +2156,11 @@ fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
     }
     if let Some(v) = p.resume {
         into.resume = Some(v);
+    }
+    // Same per-key rule as the categories: only a layer that actually wrote the key overrides, so a
+    // project may turn concierge routing off (or back on) without disturbing the global value.
+    if let Some(v) = p.concierge_answers {
+        into.concierge_answers = v;
     }
 }
 
@@ -3942,10 +3980,17 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # The `resume` key is a SIBLING with its own value domain (not "always"/"never"): how to answer
 # Claude Code's session-resume prompt. "ask" (default) surfaces it; "summary" auto-picks "Resume
 # from summary"; "full" auto-picks "Resume full session". Only fires while [ai].auto_approve is on.
+# The `concierge_answers` key is a second SIBLING, and it is NOT the same switch as
+# [ai].auto_approve above: auto_approve lets a purely local REGEX press buttons with nobody reading
+# them, while this lets the CONCIERGE — a reasoning agent that reads the question first — answer the
+# prompts that classifier declines. Two switches so turning off the blind presser doesn't also
+# silence the thing that reads. true (default) = hand those prompts to the concierge;
+# false = send every one of them to you.
 # [approvals]
 # bash   = "never"     # opt bash back out — go back to confirming every command yourself
 # fetch  = "never"     # or turn any other category back to ask-each-time
 # resume = "summary"   # auto-resume from summary on every restart (or "full", or "ask")
+# concierge_answers = false   # never route an unclassified prompt to the concierge — always ask me
 
 # --- Concierge autonomy, PER TOOL (per-machine; ignored in a project file) ---------------
 # How much the concierge may do on its own, tool by tool. Three values:
@@ -7386,6 +7431,52 @@ quit_app = 42
         assert!(!cfg.ai.auto_approve);
         // Untouched [ai] fields keep their defaults.
         assert!(cfg.ai.suggested_actions);
+    }
+
+    #[test]
+    fn approvals_concierge_answers_defaults_on() {
+        // The default is ON because the problem it addresses is prompts landing on the human that
+        // something else should have answered — so "the concierge is asked" is the safe state, not
+        // the adventurous one. Asserts the VALUE, not merely that the config parsed.
+        let (cfg, _, _) = effective(None, None);
+        assert!(
+            cfg.approvals.concierge_answers,
+            "concierge_answers defaults on — an unclassified prompt goes to the concierge, not the human"
+        );
+        // It is a SEPARATE switch from the local-regex presser: a default read of one must not be
+        // the other. (Coupling them is the mistake this key exists to prevent.)
+        assert!(cfg.ai.auto_approve, "the master auto-approve switch is its own, unrelated default");
+    }
+
+    #[test]
+    fn approvals_concierge_answers_can_be_turned_off() {
+        // The opt-out: `false` routes every unclassified prompt to the human, as before this key.
+        let (cfg, _, _) = effective(Some("[approvals]\nconcierge_answers = false\n"), None);
+        assert!(!cfg.approvals.concierge_answers, "an explicit false beats the on-by-default");
+        // Turning concierge routing off must not disturb its neighbours in the same table.
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "a sibling category is untouched");
+        assert_eq!(cfg.approvals.resume.as_deref(), Some("ask"), "the resume sibling is untouched");
+    }
+
+    #[test]
+    fn approvals_concierge_answers_project_overrides_global() {
+        // Per-key layering, exactly like the categories and `resume`: a project decides for itself
+        // in EITHER direction, and an absent project key leaves the global value standing.
+        let g = "[approvals]\nconcierge_answers = true\n";
+        let p = "[approvals]\nconcierge_answers = false\n";
+        let (cfg, _, _) = effective(Some(g), Some(p));
+        assert!(!cfg.approvals.concierge_answers, "project false beats global true");
+
+        let (cfg, _, _) = effective(Some(p), Some(g));
+        assert!(cfg.approvals.concierge_answers, "project true beats global false");
+
+        // A project file that mentions the table but NOT this key falls through to the global one —
+        // the assertion that would fail if the merge replaced the table wholesale.
+        let (cfg, _, _) = effective(Some(p), Some("[approvals]\nbash = \"never\"\n"));
+        assert!(
+            !cfg.approvals.concierge_answers,
+            "an unmentioned key keeps the global value rather than reverting to the built-in default"
+        );
     }
 
     #[test]

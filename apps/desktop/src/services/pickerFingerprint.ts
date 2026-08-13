@@ -102,6 +102,28 @@ const YN_TAIL = 2;
  * The y/n path stays separate because the detector treats it separately: a confirmation has no
  * option rows at all, and `YN` (the detector's own regex) is what tells the two apart.
  */
+// EXPORTED for `suggestions/conciergeEscalation`, which has to answer the SAME question this does:
+// "what text is this dialog actually asking?" It used to answer it with `approvalClassifier
+// .headerRegion`, and that was wrong in a way that made two stated safety properties inert on any
+// real screen (roborev 63621, two High findings):
+//
+//   • `headerRegion` is up to 30 non-empty lines above the footer, and the WHOLE 50-line window when
+//     no footer is found — so on a saturated pane it is mostly transcript. Its "the question could
+//     not be read" test (`region.trim() === ""`) can then only fire on a picker sitting at the very
+//     top of an otherwise empty buffer, i.e. on synthetic fixtures. A dialog whose question genuinely
+//     cannot be read was being delegated with unrelated scrollback quoted as "the question".
+//   • Sweeping a deny-list over those 30 lines matches Claude Code's own chrome — its elapsed
+//     readout and its TOKEN COUNTER — so a router meant to send the rare case to the founder sent
+//     nearly every case to him instead.
+//
+// Both dissolve once the two modules share ONE definition of the dialog's own text, which is what
+// the escalation module's header always CLAIMED ("parity with select_picker_option's empty-
+// fingerprint refusal") without having. This is that parity, made real: same bounds, same
+// normalisation, same "" sentinel meaning the dialog could not be located.
+export function pickerQuestionBlock(scrollback: string, yesNo: boolean): string {
+  return questionBlock(scrollback, yesNo);
+}
+
 function questionBlock(scrollback: string, yesNo: boolean): string {
   const clean = scrollback.replace(ANSI, "");
   if (!yesNo) {

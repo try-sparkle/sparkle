@@ -30,6 +30,20 @@
 // its own a beat later; surfacing it in that beat would put a row in the list whose only content is
 // "this is already resolved" — the exact flicker this module exists to remove.
 //
+// ── AND ONE THING THAT MOVES THE CEILING WITHOUT ENDING THE HOLD ─────────────────────────────────
+//
+//   • THE ANSWERER HANDED IT TO THE CONCIERGE  (`escalated`) — it read the prompt, could not answer
+//     it itself, and passed it to a THIRD PARTY that is not the founder. None of the three arms
+//     above can express that. `handled` is wrong: nothing was typed, so the red will NOT clear on
+//     its own and the hold would run until the ceiling with no answer coming. `declined` is wrong:
+//     it surfaces at once, which is exactly the founder interrupt the escalation exists to spend
+//     instead. `unreachable` is wrong twice over — it is an accident report, and this is a decision.
+//     So it keeps the hold, on a SEPARATE ceiling ({@link CONCIERGE_ESCALATION_GRACE_MS}) that is
+//     longer, because the concierge answers on a proactive turn and that channel cannot fire inside
+//     thirty seconds — and still FINITE, because rule 3 above is not weakened for it: a concierge
+//     that is wedged, out of credits, or simply wrong emits nothing at all, and the founder still
+//     has to get the question. An escalation buys time; it never buys silence.
+//
 // ── THE RULE THAT MATTERS MOST: NEVER SUPPRESS THE SAME PROMPT TWICE ─────────────────────────────
 //
 // A prompt the answerer failed on will be re-drawn, and if a hold could apply to it again the loop
@@ -81,6 +95,30 @@ import type { ConciergeDispatchPath } from "../services/conciergeDispatch";
  */
 export const BLOCKED_PROMPT_GRACE_MS = 30_000;
 
+/**
+ * The ceiling for a prompt that was handed to the CONCIERGE (`escalated`). Four minutes.
+ *
+ * WHY IT IS LONGER THAN THE THIRTY ABOVE. The concierge does not answer inline; it answers on a
+ * PROACTIVE TURN, and that channel is rate-limited by design — `services/conciergeProactive`
+ * enforces a two-minute floor between turns (`PROACTIVE_MIN_INTERVAL_MS`) behind a coalescing
+ * window (`PROACTIVE_COALESCE_MS`), so the earliest an escalation can be answered is often minutes
+ * after it is filed. Leaving these prompts on the thirty-second clock would surface EVERY escalated
+ * prompt to the founder strictly BEFORE the concierge could possibly have answered it — which does
+ * not merely weaken the escalation, it makes it pointless: he pays the interrupt anyway and the
+ * concierge's answer arrives into a question he has already read. Four minutes clears the floor
+ * with room for one coalesced turn to actually run.
+ *
+ * WHY IT IS STILL BOUNDED — AND THIS IS THE SAFETY PROPERTY, NOT A TUNING CHOICE. It is a CEILING,
+ * exactly as {@link BLOCKED_PROMPT_GRACE_MS} is, and for exactly the same reason: an escalation
+ * that is never answered must still reach the founder. A concierge that is wedged, out of credits,
+ * throttled, or simply wrong emits NOTHING — no outcome, no status write, no event — so nothing
+ * above can end the hold and this clock is the only thing standing between the founder and an
+ * invisible prompt. Handing a question to a third party is a reason to wait longer; it is never a
+ * reason to wait forever. {@link nextPromptGraceExpiry} must arm the wake-up at THIS number for an
+ * escalated agent, or the sentence above is a promise with nothing behind it.
+ */
+export const CONCIERGE_ESCALATION_GRACE_MS = 240_000;
+
 /** TWO ceilings on how many holds may begin for one agent in a rolling {@link HOLD_BUDGET_WINDOW_MS},
  *  chosen by how much evidence stands behind the re-open. Every hold is charged against the same
  *  count; only the ceiling differs. See {@link PromptGraceLedger.holds} for why a budget, rather than
@@ -90,12 +128,13 @@ export const BLOCKED_PROMPT_GRACE_MS = 30_000;
  *  is indistinguishable from the same question redrawn. TWO, because that is enough to be sure the
  *  founder sees a churning prompt for the great majority of any ask.
  *
- *  {@link MAX_ANSWERED_HOLDS_PER_WINDOW} — the previous question was reported `handled`, so this is
- *  probably genuinely the next one. Six covers the burst the module exists for (the measured case is
- *  four routine prompts in two minutes) with room to spare, and those holds cost almost nothing in
- *  practice because an answered prompt's red clears in about a second rather than running the full
- *  ceiling. It is a CEILING and not a bypass on purpose: `handled` only means the bytes were written,
- *  so an unbounded allowance would let a retry loop hide behind a stream of them. */
+ *  {@link MAX_ANSWERED_HOLDS_PER_WINDOW} — an answerer ENGAGED with the previous question (reported
+ *  `handled` or `escalated`), so this is probably genuinely the next one. Six covers the burst the
+ *  module exists for (the measured case is four routine prompts in two minutes) with room to spare,
+ *  and those holds cost almost nothing in practice because an answered prompt's red clears in about
+ *  a second rather than running the full ceiling. It is a CEILING and not a bypass on purpose:
+ *  `handled` only means the bytes were written, so an unbounded allowance would let a retry loop
+ *  hide behind a stream of them. */
 const MAX_HOLDS_PER_WINDOW = 2;
 const MAX_ANSWERED_HOLDS_PER_WINDOW = 6;
 const HOLD_BUDGET_WINDOW_MS = 5 * 60_000;
@@ -113,6 +152,11 @@ const BURN_PER_AGENT = 64;
  * human. `unreachable` is an ACCIDENT — nobody decided anything; the keystroke could not land. Only
  * the second one indicts the machinery, so collapsing them would hide a broken write path inside a
  * number that reads like policy working as intended.
+ *
+ * `escalated` is the same distinction drawn one step further out: it is a DECISION like `declined`,
+ * but about a DIFFERENT PARTY. Both say "I am not answering this"; only `declined` says "so the
+ * founder must". Folding it into either neighbour loses the one fact the ceiling below turns on —
+ * whether somebody else is still working on this question.
  */
 export type PromptAnswerOutcome =
   /** Delivered, or held in a queue that will deliver it. The red clears on its own; keep holding. */
@@ -120,13 +164,40 @@ export type PromptAnswerOutcome =
   /** The answerer read it and chose not to answer. Surface immediately. */
   | "declined"
   /** The keystroke could not reach the pane. Surface immediately. */
-  | "unreachable";
+  | "unreachable"
+  /** The answerer read it and handed it to the CONCIERGE. Keep holding it back from the founder —
+   *  someone else is on it — but on a SEPARATE, LONGER, STILL-FINITE ceiling
+   *  ({@link CONCIERGE_ESCALATION_GRACE_MS}), because an escalation nobody answers must still land
+   *  in front of him. */
+  | "escalated";
 
 /**
- * Classify a dispatch path into the three outcomes above. Exhaustive over
- * {@link ConciergeDispatchPath} with a `never` guard, so a new path cannot be added without a
- * deliberate decision about which arm it belongs to — the alternative is a default arm that silently
- * files every future refusal as `handled`, i.e. silently hides it from the founder.
+ * Did the answerer GIVE UP — i.e. say, in one word or another, that the founder is now the only one
+ * left to answer this? True for exactly `declined` and `unreachable`.
+ *
+ * ONE PREDICATE, TWO CALL SITES, and that is the point: {@link isHeld}'s "surface immediately" test
+ * and {@link notePromptEpisodes}'s `gaveUp` latch used to spell this as `outcome !== "handled"`
+ * independently. Written that way, adding a fourth outcome silently joins BOTH arms — `escalated`
+ * would have surfaced the prompt at once and latched the give-up for the rest of the ask, which is
+ * the precise opposite of what it means (rule 2 of the header: a give-up is the statement that the
+ * HUMAN decides this one; an escalation is the statement that somebody else is deciding it).
+ */
+function isGiveUp(outcome: PromptAnswerOutcome): boolean {
+  return outcome === "declined" || outcome === "unreachable";
+}
+
+/**
+ * Classify a dispatch path into the outcomes above. Exhaustive over {@link ConciergeDispatchPath}
+ * with a `never` guard, so a new path cannot be added without a deliberate decision about which arm
+ * it belongs to — the alternative is a default arm that silently files every future refusal as
+ * `handled`, i.e. silently hides it from the founder.
+ *
+ * NO PATH MAPS TO `escalated`, and the exhaustiveness guard is over PATHS, not over outcomes, so
+ * adding the arm does not oblige this function to use it. That is correct rather than an omission:
+ * a dispatch path describes what the DISPATCHER did with a send, and an escalation is a decision
+ * taken by whoever hands the question on — reported through {@link notePromptAnswerOutcome}
+ * directly. If the dispatcher ever grows a path of its own that escalates, this switch is where it
+ * gets named, and the `never` guard is what will force that decision.
  */
 export function answerOutcomeForPath(path: ConciergeDispatchPath): PromptAnswerOutcome {
   switch (path) {
@@ -209,8 +280,14 @@ export interface PromptGraceLedger {
    */
   holds: Map<string, number[]>;
   /**
-   * Agents an answerer has GIVEN UP on — reported `declined` or `unreachable` — for the ask they are
-   * currently in. Cleared only when the agent actually leaves the ask.
+   * Agents an answerer has GIVEN UP on — reported `declined` or `unreachable`, i.e. {@link isGiveUp}
+   * — for the ask they are currently in. Cleared only when the agent actually leaves the ask.
+   *
+   * `escalated` IS NOT A GIVE-UP and must never land here. The latch's job is to keep a prompt the
+   * founder has been made responsible for from sliding back into hiding on the next redraw; an
+   * escalation says the opposite — a third party took responsibility — so latching it would surface
+   * the question at the first churned repaint and undo the whole escalation, ~3.5 minutes before
+   * its own ceiling was due to.
    *
    * ON THE LEDGER, NOT ON THE EPISODE, and the difference is the whole invariant. It was a field on
    * `PromptEpisode` first, documented as living "for the life of the ask … because the episode is
@@ -468,7 +545,12 @@ export function notePromptEpisodes(
     // Dated against the ASK, not against an open episode. An episode is deleted by an unreadable
     // capture, so requiring one lost every give-up that arrived while the screen was unreadable —
     // which is exactly when `unreachable` happens (roborev 62897).
-    if (seen && seen.at >= askedAt && seen.outcome !== "handled") ledger.gaveUp.add(id);
+    // `isGiveUp`, NOT `!== "handled"`. Rule 2 of the header is about the answerer handing the
+    // question to the FOUNDER, and only `declined`/`unreachable` say that. Spelled as the negation
+    // of `handled`, this line swept `escalated` in as well — latching a give-up for the rest of the
+    // ask on the one outcome that means somebody else is still working on it, so the next redraw
+    // force-surfaced a prompt the concierge had not been given its window to answer.
+    if (seen && seen.at >= askedAt && isGiveUp(seen.outcome)) ledger.gaveUp.add(id);
     const key = ask ? promptEpisodeKey(ask.text) : "";
     // No readable question, so no identity. "Never twice" cannot be honoured without one, so do not
     // hold at all — the direction of that error is showing the founder.
@@ -484,6 +566,8 @@ export function notePromptEpisodes(
     //   • answered (`handled`) → the previous question is gone, so this is genuinely the next one.
     //     A burst of routine prompts (`git status` → `ls` → `cargo check` → `gh pr view`) is exactly
     //     this shape, and it is the shape the whole feature exists for.
+    //   • escalated (`escalated`) → an answerer read it and passed it on. Counted WITH `handled`
+    //     below, for the reason given at `engagedPrev`.
     //   • gave up (`declined` / `unreachable`) → the previous question is STILL ON SCREEN, unanswered.
     //     Anything appearing now is overwhelmingly that same question redrawn.
     //   • nothing reported → no evidence either way.
@@ -493,7 +577,31 @@ export function notePromptEpisodes(
     // resets all of this — a genuinely re-raised prompt is refused by the burn set, not by these.
     const rec = ledger.outcome.get(id);
     const decided = prev !== undefined && rec !== undefined && rec.at >= prev.startedAt;
-    const answeredPrev = decided && rec!.outcome === "handled";
+    // WHICH CAP AN `escalated` PREVIOUS QUESTION EARNS — the generous one, WITH `handled`. The cap
+    // is chosen by how much evidence stands behind the re-open, and the two outcomes carry the same
+    // evidence: an answerer looked at the previous question and disposed of it, so a different
+    // question appearing now is probably genuinely the next one rather than the old one redrawn.
+    // That is the whole distinction the tight cap exists to draw — it is `nothing was reported`
+    // that makes a re-open indistinguishable from a redraw, and an escalation is a report.
+    //
+    // Reading it the other way was tempting (an escalated question is not GONE, so the next draw
+    // could be it re-rendering) but it prices the same fact twice and gets the worse failure: the
+    // agent whose prompts are being escalated is by construction the one whose prompts are hard,
+    // so it would take the tight cap exactly when the concierge is doing the most work, and its
+    // NEXT question — a genuinely new one — would go straight to the founder while the previous
+    // escalation is still in flight. The safety property does not depend on this choice either
+    // way: every hold is charged against the same count, and both caps are finite, so an escalated
+    // agent can no more buy an unbounded run of holds than a `handled` one can (roborev 62886).
+    //
+    // SPELLED AS A POSITIVE LIST, not as `!isGiveUp(rec!.outcome)`, even though the two agree over
+    // today's four arms: the negation hands the GENEROUS cap to any fifth outcome by default, and
+    // the direction of that error is more hiding. Each member is covered by its own case in
+    // `blockedPromptGrace.escalated.test.ts` — drop either arm and a test goes red — but note that
+    // `mutation-check --line` cannot show that here: it swaps BOTH `===` at once, which yields
+    // `!== "handled" || !== "escalated"`, a tautology, and a tautology is unobservable because the
+    // only outcomes it newly admits (`declined`/`unreachable`) have already set the `gaveUp` latch
+    // above, which makes `eligible` false whatever the cap says. It reports that line uncaught.
+    const engagedPrev = decided && (rec!.outcome === "handled" || rec!.outcome === "escalated");
     // Sticky for the ask, recorded on the LEDGER so no screen event can erase it. See
     // `PromptGraceLedger.gaveUp`.
     const gaveUp = ledger.gaveUp.has(id);
@@ -511,7 +619,7 @@ export function notePromptEpisodes(
     // different prompt each cycle so the burn set never matches, must not be able to buy an unlimited
     // string of holds off a stream of `handled`s: that is the invisible loop the budget exists to
     // make impossible (roborev 62886). Every hold is charged; only the ceiling differs.
-    const cap = answeredPrev ? MAX_ANSWERED_HOLDS_PER_WINDOW : MAX_HOLDS_PER_WINDOW;
+    const cap = engagedPrev ? MAX_ANSWERED_HOLDS_PER_WINDOW : MAX_HOLDS_PER_WINDOW;
     const eligible = !burns.has(key) && !gaveUp && recent.length < cap;
     ledger.episode.set(id, { key, startedAt: ask?.at ?? now, eligible });
     if (eligible) {
@@ -537,6 +645,39 @@ export function notePromptEpisodes(
   for (const id of [...ledger.burned.keys()]) if (!live.has(id)) ledger.burned.delete(id);
 }
 
+/**
+ * How long THIS episode may be held — the per-agent ceiling, in ms from {@link PromptEpisode.startedAt}.
+ *
+ * THE SINGLE ANSWER BOTH CLOCKS READ, for the same reason {@link isHeld} is the single predicate
+ * both the overlay and the expiry read: `isHeld` decides WHETHER the row is calm and
+ * {@link nextPromptGraceExpiry} decides WHEN something will wake up and re-ask. If those two
+ * disagree about the number, the disagreement is not a cosmetic drift — it is a hold with no ceiling
+ * behind it. Hardcoding `BLOCKED_PROMPT_GRACE_MS` in the expiry while `isHeld` honoured four minutes
+ * would arm the wake-up at thirty seconds, find the prompt still held when it fired, and then have
+ * nothing left to arm: no status write, no outcome, no event ever follows a wedged concierge, so the
+ * memo's inputs never change again and the question stays calm FOREVER. That is strictly worse than
+ * having no escalation arm at all.
+ *
+ * TWO BOUNDS ON WHEN AN ESCALATION MAY EXTEND ANYTHING, and both err toward showing the founder:
+ *
+ *   • It must not PREDATE the episode — same scoping as `isHeld`'s outcome test, or an escalation
+ *     filed about an earlier question would silently buy four minutes for a later one.
+ *   • It must arrive while the prompt is still INSIDE the ordinary thirty, i.e. while it is still
+ *     actually held. Past that the row is already in the founder's list and he may already be
+ *     reading it, and extending the ceiling then does not delay a surfacing — it RETRACTS one that
+ *     already happened, taking a red back out of the band he was looking at. This module exists to
+ *     remove that flicker, not to add a four-minute version of it. An escalation that late has
+ *     missed its window: the concierge is welcome to answer anyway, and the founder simply sees the
+ *     question in the meantime, which is the safe half of the trade.
+ */
+function holdCeilingMs(ledger: PromptGraceLedger, id: string, ep: PromptEpisode): number {
+  const rec = ledger.outcome.get(id);
+  if (!rec || rec.outcome !== "escalated") return BLOCKED_PROMPT_GRACE_MS;
+  const sinceDraw = rec.at - ep.startedAt;
+  if (sinceDraw < 0 || sinceDraw >= BLOCKED_PROMPT_GRACE_MS) return BLOCKED_PROMPT_GRACE_MS;
+  return CONCIERGE_ESCALATION_GRACE_MS;
+}
+
 /** Is this agent's drawn prompt currently held back from the founder? The single predicate both the
  *  overlay and the expiry clock read, so they cannot disagree about who is being held. */
 function isHeld(ledger: PromptGraceLedger, id: string, now: number): boolean {
@@ -555,8 +696,15 @@ function isHeld(ledger: PromptGraceLedger, id: string, now: number): boolean {
   const rec = ledger.outcome.get(id);
   // An outcome from BEFORE this ask began describes a different prompt — ignore it, or one agent's
   // earlier failure would permanently disqualify every later prompt it draws.
-  if (rec && rec.at >= since && rec.outcome !== "handled") return false;
-  return now - since < BLOCKED_PROMPT_GRACE_MS;
+  //
+  // `isGiveUp`, NOT `!== "handled"`: only `declined`/`unreachable` end the hold. `escalated` keeps
+  // it — nothing was typed, so the red will not clear on its own, and surfacing it now would spend
+  // the founder interrupt the escalation exists to avoid — and pays for that by moving the CEILING
+  // instead, which `holdCeilingMs` supplies below. Keeping the hold without moving the ceiling would
+  // be the worst of both: the concierge cannot answer inside thirty seconds, so the prompt would
+  // surface anyway, just fractionally later and having burned the escalation.
+  if (rec && rec.at >= since && isGiveUp(rec.outcome)) return false;
+  return now - since < holdCeilingMs(ledger, id, ep);
 }
 
 /**
@@ -611,7 +759,13 @@ export function nextPromptGraceExpiry<T extends { id: string }>(
     // `notePromptEpisodes` deletes the episode for anything that is not one. A second check could
     // therefore only ever DISAGREE with the first.
     if (!isHeld(ledger, a.id, now)) continue;
-    const at = ledger.episode.get(a.id)!.startedAt + BLOCKED_PROMPT_GRACE_MS;
+    // PER AGENT, via the SAME helper `isHeld` measures against — four minutes for an escalated
+    // prompt, thirty seconds for everything else. A hardcoded `BLOCKED_PROMPT_GRACE_MS` here is not
+    // a wake-up that fires early; it is a wake-up that fires, finds the prompt still held, and then
+    // never fires again, because nothing else will ever change this memo's inputs. See
+    // `holdCeilingMs` and the doc above.
+    const ep = ledger.episode.get(a.id)!;
+    const at = ep.startedAt + holdCeilingMs(ledger, a.id, ep);
     if (at > now && (soonest === null || at < soonest)) soonest = at;
   }
   return soonest;

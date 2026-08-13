@@ -104,6 +104,35 @@ export function resumeRuleComplaint(v: unknown): string | null {
   );
 }
 
+// --- Concierge routing (a SECOND sibling of the six categories, with its own value domain) ------
+// `[approvals].concierge_answers` also lives in the same TOML section and rides the same
+// per-project override machinery, but like `resume` it is NOT an ApprovalCategory: its domain is a
+// plain boolean, not "always"/"never". Kept separate for the same reason — so it can never leak
+// into the category list, the classifier, or toApprovalMap.
+//
+// WHY IT IS NOT `[ai].auto_approve`. That switch means "let a purely local REGEX press buttons
+// without anyone reading them". Routing to the concierge is a DIFFERENT act: a reasoning agent
+// reads the question first, then answers. One switch for both would mean that turning off the
+// blind presser also silences the thing that reads — so they get two switches with two honest
+// meanings. true (the default) hands the concierge the prompts the local classifier will not
+// answer; false sends every one of them to the human, as they go today.
+
+/** The default when the key is absent or holds a non-boolean: the concierge IS asked. On, because
+ *  the problem this key addresses is prompts landing on the human that something else should have
+ *  answered — so being asked is the safe state, not the adventurous one. */
+export const DEFAULT_CONCIERGE_ANSWERS = true;
+
+/** Narrow an arbitrary value (config / an older backend) to the concierge-routing flag.
+ *
+ *  Anything that is not a real boolean — `undefined` (an older Rust backend predating the key),
+ *  `null` (serde's wire form for an absent optional), or a value the user typo'd — degrades to
+ *  {@link DEFAULT_CONCIERGE_ANSWERS} rather than to `false`. Coercing junk to "off" would silently
+ *  disable a feature nobody asked to disable; coercing it to the documented default is the same
+ *  contract `asResumeRule` above keeps. */
+export function asConciergeAnswers(v: unknown): boolean {
+  return typeof v === "boolean" ? v : DEFAULT_CONCIERGE_ANSWERS;
+}
+
 /** The one friendly label per resume choice, as it reads in the approvals pane. */
 export const RESUME_RULE_LABEL: Record<ResumeRule, string> = {
   ask: "Ask me each time",

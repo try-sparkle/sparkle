@@ -16,7 +16,8 @@ import { writePtyChainedStrict } from "../../pty";
 import { notePromptAnswerOutcome } from "../../engine/blockedPromptGrace";
 import { classifyApproval, headerRegion } from "./approvalClassifier";
 import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
-import { detectClaudeCodePicker, detectResumePrompt } from "./heuristics";
+import { detectResumePrompt, pickerSignature } from "./heuristics";
+import { handOffToConcierge } from "./conciergeHandoff";
 import {
   toApprovalMap,
   asResumeRule,
@@ -27,14 +28,11 @@ import {
 } from "./approvalCategories";
 import { log } from "../../logger";
 
-/** A stable signature of the picker instance in `scrollback` — its option keystrokes + labels. Used
- *  to auto-answer each distinct picker at most once (a re-rendered scrollback keeps the same options,
- *  so it hashes identically and the resend is suppressed). Empty string when there is no picker. */
-export function pickerSignature(scrollback: string): string {
-  return detectClaudeCodePicker(scrollback)
-    .map((b) => `${b.value}\u0000${b.label}`)
-    .join("|");
-}
+// MOVED to `./heuristics`, and re-exported here so every existing caller and test keeps its
+// import path. `conciergeHandoff` needs the same signature to de-dupe its hand-offs, and importing
+// it from THIS module would close a runtime import cycle (this module imports the hand-off below).
+// One definition, in the file they both already depend on — see the doc comment there.
+export { pickerSignature } from "./heuristics";
 
 /**
  * "I read this prompt and I am not going to answer it." Records `declined` for the blocked-prompt
@@ -55,6 +53,27 @@ export function pickerSignature(scrollback: string): string {
 function declined(agentId: string): null {
   notePromptAnswerOutcome(agentId, "declined");
   return null;
+}
+
+/**
+ * "I will not answer this — SO ASK THE CONCIERGE BEFORE ASKING THE FOUNDER."
+ *
+ * THE THIRD DESTINATION THAT DID NOT EXIST. Every arm below used to end at {@link declined}, whose
+ * only consequence is to put the row in front of the founder at once. That made "the local regex
+ * will not press this" and "only the human can decide this" the same sentence, and they are not: a
+ * `gh pr view` prompt this module classified perfectly and refused for want of an `always` rule is
+ * not a question that needs him — it is a question that needs SOMEBODY, and the concierge has been
+ * able to answer it (`read_picker_options` + `select_picker_option`) the whole time without ever
+ * being asked. Four separate reports from the founder in one morning, three of them the single
+ * `rule !== "always"` arm below. See `conciergeHandoff` for the full account.
+ *
+ * ORDER MATTERS: the hand-off is tried FIRST and `declined` is the fallback, never both. Reporting a
+ * decline after a successful hand-off would surface the prompt to him anyway (the give-up latch in
+ * `blockedPromptGrace` is sticky for the whole ask), which is the exact behaviour being removed.
+ */
+function declineOrHandOff(agentId: string, scrollback: string): null {
+  if (handOffToConcierge(agentId, scrollback)) return null;
+  return declined(agentId);
 }
 
 /**
@@ -107,11 +126,29 @@ export function maybeAutoApprove(
   const classification = classifyApproval(scrollback);
   // NOT a `declined` report, deliberately — see the note above `maybeAutoApprove`. An unclassifiable
   // screen is not a decision about a prompt; there may be no prompt at all.
-  if (!classification) return null; // not a classifiable permission prompt → never auto-type
+  if (!classification) {
+    // STILL NOT A `declined` REPORT — the note above is unchanged and still governs: most screens
+    // reaching this line are not prompts at all, and stamping an outcome on each would end the hold
+    // for whatever prompt the agent draws next.
+    //
+    // But "I could not classify it" is NOT "there is no question here", and conflating those is the
+    // founder's original report. His plan picker had FOUR options — "1 · 2, progress-gated" …
+    // "4 · 1 — one re-arm only" — which `classifyApproval` refuses because it demands a Yes/No PAIR
+    // (`looksLikePermission`). A readable menu this module cannot answer is precisely what the
+    // concierge exists to answer, so it is offered one. The hand-off returns false for a screen with
+    // no menu on it, which is what keeps this line silent for the ordinary build log.
+    handOffToConcierge(agentId, scrollback);
+    return null; // never auto-type on an unclassified screen
+  }
   // Master toggle only — NOT credit-gated. Auto-approve is a purely local regex classifier that
   // spends no AI credits, so gating it on a positive balance would leave out-of-credit users blocked
   // by prompts forever. The on/off toggle (ai.auto_approve) is the sole gate here.
-  if (!aiFeatureVisibleNow("autoApprove")) return declined(agentId);
+  //
+  // AND ITS "OFF" DOES NOT SILENCE THE CONCIERGE (founder's call, 2026-08-13). Switching off a local
+  // regex that presses buttons nobody read says nothing about whether a reasoning agent may READ the
+  // question and then answer it. That is `[approvals].concierge_answers`, a separate switch, checked
+  // inside the hand-off.
+  if (!aiFeatureVisibleNow("autoApprove")) return declineOrHandOff(agentId, scrollback);
   // ---------------------------------------------------------------------------------------------
   // THE DENY VETO, deliberately ahead of the category branch and independent of it.
   //
@@ -134,6 +171,12 @@ export function maybeAutoApprove(
       category: classification.category,
       tool: namedTool,
     });
+    // THE ONE ARM THAT IS NEVER HANDED TO THE CONCIERGE — deliberately `declined`, not
+    // `declineOrHandOff`. `DENIED_TOOL_PATTERNS` is the set that spawns workers, discards agents,
+    // merges, pushes, or speaks as the founder, and it is refused here EVEN IF he set
+    // `mcp = "always"`. That is the "destructive or irreversible" class of his deny-list already
+    // written down in machine-readable form, so routing it onward would let concierge routing
+    // become a way around a veto that exists precisely to stop an unread press. It goes to him.
     return declined(agentId);
   }
   const root = projectRootForAgent(agentId);
@@ -145,10 +188,17 @@ export function maybeAutoApprove(
   // verified read-only list even with no rule set — which is what stops the narration prompts the
   // founder kept hitting — and it refuses anything that spawns, discards, merges, pushes, or speaks
   // as him EVEN IF he set `mcp = "always"`. An unreadable tool name always asks.
+  //
+  // BOTH ARMS NOW OFFER THE CONCIERGE FIRST. Neither is a statement that the FOUNDER must decide —
+  // each is this module saying it has no standing authorisation to press. The denied-tool veto above
+  // has already claimed everything that must never be pressed unread, so what reaches here is an
+  // ordinary prompt with no rule behind it. That is the shape of three of the founder's four
+  // reports: a read-only `gh pr view`, a read-only `git rev-list --count` sweep, and a PRD file
+  // write — all classified correctly, all refused for want of an `always` rule, all landing on him.
   if (classification.category === "mcp") {
-    if (mcpAutoAnswerable(promptRegion, rule) !== "auto") return declined(agentId);
+    if (mcpAutoAnswerable(promptRegion, rule) !== "auto") return declineOrHandOff(agentId, scrollback);
   } else if (rule !== "always") {
-    return declined(agentId);
+    return declineOrHandOff(agentId, scrollback);
   }
   const sig = pickerSignature(scrollback);
   // Already answered THIS picker instance: keep the buttons suppressed + the note shown, but never

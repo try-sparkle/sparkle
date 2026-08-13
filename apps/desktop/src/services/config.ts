@@ -62,6 +62,15 @@ export interface ApprovalsConfig {
    *  (default "ask"). Governs how the Claude Code session-resume prompt is auto-answered while
    *  [ai].auto_approve is on. Optional so callers guard: a Rust backend predating it omits it. */
   resume?: string | null;
+  /** May a prompt the local classifier declines to answer be handed to the concierge, which reads
+   *  it and answers? Default true. A SEPARATE switch from [ai].auto_approve, which is about a local
+   *  regex pressing buttons unread — see approvalCategories.ts.
+   *
+   *  `boolean`, not `boolean | null`, and that is not an oversight: the Rust side stores this as a
+   *  bare `bool` rather than an `Option<bool>` precisely so it can never cross the wire as `null`
+   *  (serde emits `None` as an explicit null). It stays OPTIONAL only for the usual back-compat
+   *  reason — a Rust backend predating the key omits it outright. */
+  concierge_answers?: boolean;
 }
 /** The concierge's PER-TOOL autonomy policy, mirroring ConciergeConfig in config.rs.
  *
