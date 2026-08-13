@@ -15,13 +15,23 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useProjectStore } from "../stores/projectStore";
-import { loadAccountState, invalidateAccountState } from "../services/accountSelection";
-import { listCeilings } from "../services/accountStore";
+import {
+  loadAccountState,
+  invalidateAccountState,
+} from "../services/accountSelection";
+import {
+  listCeilings,
+  setPreferredAccountId,
+  clearSwitchWrittenPins,
+} from "../services/accountStore";
 import { switchRecommendation, type SwitchRecommendation, type Ceiling } from "../services/headroom";
-import { advanceSwitch, buildSwitchAllPlan, planSwitch, type SwitchPlan } from "../services/accountSwitch";
+import {
+  advanceSwitch,
+  planSwitch,
+  planSwitchToAccount,
+  type SwitchPlan,
+} from "../services/accountSwitch";
 import { busiestPaneAccount, paneAccountMap, restartPane } from "../services/paneControl";
-import { subscribeSwitchAll } from "../services/manualAccountSwitch";
 
 /** How often to re-evaluate headroom. Slower than the limit poll: the ceiling is cached in Rust for
  *  15 minutes and 5h consumption moves gradually, so a tighter loop would just burn IPC. */
@@ -38,9 +48,10 @@ export interface AccountSwitchState {
   plan: SwitchPlan | null;
   accept: () => void;
   dismiss: () => void;
-  /** MANUAL trigger: switch EVERY agent + the concierge to `accountId`, driven by the same
-   *  advanceSwitch loop that carries out an accepted recommendation. See {@link buildSwitchAllPlan}. */
-  switchAllTo: (accountId: string) => void;
+  /** MANUAL "Activate this account": make `accountId` the fleet's preferred account and move the
+   *  agents that aren't on it, each at its own safe boundary. See the callback for the split
+   *  between the persisted half and the migration half. */
+  switchTo: (accountId: string) => void;
 }
 
 export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwitchState {
@@ -126,8 +137,11 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
     if (!recommendation) return;
     const fresh = planSwitch(recommendation.from.id, recommendation.to.id, paneAccountMap());
     setRecommendation(null);
-    // Nothing running on that account: just record the preference so future spawns land correctly,
-    // rather than leaving an empty plan spinning.
+    // Nothing running on that account: dismiss the banner rather than leave an empty plan spinning
+    // (phase 2 never retires a plan with no pending agents). This records NOTHING — the banner is a
+    // recommendation about moving what is running, not a fleet-wide preference; that is what
+    // `switchTo` is for. Phase 1 may therefore re-raise the same recommendation on its next pass,
+    // which is correct: the account it is warning about is still the one agents will spawn on.
     if (fresh.pending.length === 0) return;
     // Write the ref alongside the state — phase 2 reads the plan from the ref, so it must be
     // current the instant a plan exists rather than one commit later.
@@ -140,32 +154,96 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
     setRecommendation(null);
   }, [recommendation]);
 
-  // ---- MANUAL: switch EVERY agent + the concierge to one account ------------------------------
-  //
-  // A human clicked "switch all agents here". Unlike `accept`, this is NOT gated on a recommendation
-  // and is DELIBERATELY not consulted against `dismissed` — the founder asking for it outright always
-  // means it. It builds a plan over the WHOLE fleet (every agent across every project) and pins the
-  // concierge, then hands the plan to the SAME phase-2 loop above; there is no second switch loop.
-  const switchAllTo = useCallback((accountId: string) => {
-    const projects = useProjectStore.getState().projects;
-    // `buildSwitchAllPlan` also pins the concierge (setPin), so that happens even when the fleet has
-    // no panes to enroll.
-    const fresh = buildSwitchAllPlan(projects, accountId);
-    // Clear any live recommendation — the manual action supersedes it, and suppressing the banner is
-    // the honest thing while the switch runs.
+  /** "Activate this account." TWO HALVES, and the first is the one that actually answers the ask.
+   *
+   *  1. PERSIST THE PREFERENCE — fleet-wide, and the only half that governs agents that do not
+   *     exist yet. The switch machinery can only ever reach MOUNTED panes (`paneAccountMap`), so a
+   *     migration alone would have been a control whose effect expired the moment the next agent
+   *     spawned. This is written FIRST and unconditionally, so it holds even when there is nothing
+   *     to move.
+   *  2. MIGRATE WHAT IS ALREADY RUNNING — reusing phase 2 above rather than forking it, so the
+   *     manual path inherits the safe-boundary rule (nothing is re-spawned mid-turn) for free.
+   *
+   *  The advance is computed OUTSIDE any `setPlan` updater and `planRef` is written synchronously
+   *  alongside the state, exactly as `accept` does — bead sparkle-0t2o. An updater here re-pins and
+   *  re-spawns real terminals, and React may replay one.
+   *
+   *  An EMPTY plan returns after step 1 rather than leaving a plan spinning: phase 2's interval
+   *  never retires a plan with no pending agents, so setting one would poll forever. Same reasoning
+   *  as `accept`. */
+  const switchTo = useCallback((accountId: string) => {
+    // The preference, and the sweep of the pins an EARLIER switch wrote. Both are durable and
+    // neither needs this hook, so they live in one place `activateAccount` can reach too.
+    recordActivation(accountId);
+    // Any standing recommendation is now moot — the user just answered the question it was asking,
+    // possibly with a different account than it suggested.
     setRecommendation(null);
-    // No agent panes to move: the concierge pin is already recorded above, so there is nothing to
-    // drive. Leaving an empty plan spinning would just churn the advance loop.
-    if (fresh.pending.length === 0) return;
-    // Write the ref alongside the state — phase 2 reads the plan from the ref (see its note), so it
-    // must be current the instant a plan exists rather than one commit later.
+    // MOUNTED PANES ONLY. An agent with no pane gains nothing from a plan — there is nothing to
+    // re-spawn — and enrolling one would write a pin that OUTRANKS the preference just recorded and
+    // survives its removal. `recordActivation` above is what covers those agents, and covers them
+    // better; see `planSwitchToAccount`.
+    const fresh = planSwitchToAccount(accountId, paneAccountMap());
+    if (fresh.pending.length === 0) {
+      // An in-flight plan toward a DIFFERENT account must not outlive the answer it was asking for.
+      // Phase 2 keeps ticking a surviving plan and re-pins each agent to the OLD target as it
+      // reaches a safe boundary — writing pins that outrank the preference just set, so the
+      // activation would be undone by a plan the user already superseded. (The banner would also
+      // keep reading "Switching accounts…" toward an account nobody chose.)
+      if (planRef.current && planRef.current.toAccountId !== accountId) {
+        planRef.current = null;
+        setPlan(null);
+      }
+      return;
+    }
     planRef.current = fresh;
     setPlan(fresh);
   }, []);
 
-  // The Accounts screen is a transient modal, so it cannot own the long-running switch. It fires a
-  // request through `manualAccountSwitch`; this app-wide host receives it and drives the loop.
-  useEffect(() => subscribeSwitchAll((accountId) => switchAllTo(accountId)), [switchAllTo]);
+  // Publish this hook's lever for the accounts modal, which is nowhere near this hook in the tree
+  // (AccountSwitchHost is mounted in App; the modal lives inside the concierge's kebab menu). Same
+  // tiny-registry shape as `paneControl` — and for a second reason beyond reachability: ONE plan.
+  // Two mounted hooks each holding their own plan would each advance on their own interval, and an
+  // agent in both plans would be torn down and re-spawned twice per tick — sparkle-0t2o's harm
+  // arrived at from the outside. A single published lever means only one instance ever drives a
+  // manual switch.
+  useEffect(() => {
+    liveSwitchTo = switchTo;
+    return () => {
+      if (liveSwitchTo === switchTo) liveSwitchTo = null;
+    };
+  }, [switchTo]);
 
-  return { recommendation, plan, accept, dismiss, switchAllTo };
+  return { recommendation, plan, accept, dismiss, switchTo };
+}
+
+/** The `switchTo` of the currently mounted hook, or null when none is mounted. */
+let liveSwitchTo: ((accountId: string) => void) | null = null;
+
+/** Everything an activation must do that does NOT need a mounted hook: record the preference, and
+ *  drop the pins a previous activation's migration wrote.
+ *
+ *  BOTH halves are durable, and that is why the sweep is here rather than only in `switchTo`. A pin
+ *  outranks the preference (`chooseAccountForAgent` step 1), so an agent still carrying a pin from
+ *  the LAST activation keeps spawning on the old account no matter what the preference says. Leaving
+ *  the sweep on the hook's path made that permanent on the one path with no other remedy — no hook
+ *  is mounted, so nothing arrives later to correct it — which is the same "an activation silently
+ *  defeats the next one" defect the sweep exists to close. Idempotent, so the double call when a
+ *  hook IS mounted costs nothing. */
+function recordActivation(accountId: string): void {
+  setPreferredAccountId(accountId);
+  clearSwitchWrittenPins();
+}
+
+/** Activate `accountId` from outside React (the accounts modal's "Activate this account").
+ *
+ *  Returns whether a mounted hook took the MIGRATION half. Everything durable happens either way
+ *  (see `recordActivation`) — it must not depend on whether a particular component happens to be in
+ *  the tree. Only "move what is already running" needs the hook, and an agent that is not moved now
+ *  still lands on the activated account at its next spawn, so the fallback is a slower path to the
+ *  same place rather than a silent failure. */
+export function activateAccount(accountId: string): boolean {
+  recordActivation(accountId);
+  if (!liveSwitchTo) return false;
+  liveSwitchTo(accountId);
+  return true;
 }

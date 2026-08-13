@@ -56,7 +56,11 @@ function spawns(n: number): SpawnLogEntry[] {
   }));
 }
 
-function deps(entries: SpawnLogEntry[]): AccountsDeps {
+// PARTIAL on purpose: this suite is about IO and layout, so it overrides only the IO. The routing
+// readers ("what runs where") fall through to their real implementations, which read empty global
+// registries under jsdom — no panes mounted, no preference set — i.e. exactly the stubs it would
+// otherwise have to write out.
+function deps(entries: SpawnLogEntry[]): Partial<AccountsDeps> {
   return {
     listAccounts: vi.fn(async () => [acct("personal")]),
     getUsage: vi.fn(async () => []),
@@ -73,7 +77,6 @@ function deps(entries: SpawnLogEntry[]): AccountsDeps {
     setNickname: vi.fn(async () => {}),
     removeAccount: vi.fn(async () => {}),
     readSpawnLog: vi.fn(async () => entries),
-    requestSwitchAll: vi.fn(),
   };
 }
 

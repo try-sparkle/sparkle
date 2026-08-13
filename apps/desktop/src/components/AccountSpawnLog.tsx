@@ -39,6 +39,9 @@ const REASON_LABEL: Record<SelectionReason, string> = {
   auto: "picked automatically",
   sticky: "kept its existing account",
   pinned: "pinned by you",
+  // "you activated this account", not "pinned": the founder chose it for the whole fleet, and the
+  // ledger's job here is to show him that his choice was actually in force at this spawn.
+  preferred: "your activated account",
   fallback: "least-bad — every account was near its limit",
   remembered: "carried over — accounts couldn't be read",
   none: "no account chosen",

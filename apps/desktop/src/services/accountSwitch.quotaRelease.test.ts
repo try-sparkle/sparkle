@@ -33,11 +33,19 @@ import {
 import { decideContinuation } from "./../engine/goalContinuation";
 import { newGoal } from "./../engine/agentGoal";
 import { moveAgent } from "./accountSwitch";
+import { CONCIERGE_ACCOUNT_KEY } from "./accountSelection";
+import { setPinFromSwitch } from "./accountStore";
 
 // `moveAgent` persists a pin as its first effect. That is not what this suite is about, and the real
 // implementation reaches localStorage — stub it so a storage failure can never be mistaken for the
 // wall assertion below failing.
-vi.mock("./accountStore", () => ({ setPin: vi.fn() }));
+// `setPinFromSwitch` is the pin-writer `moveAgent` actually calls — a MACHINERY pin, distinct from
+// the `setPin` a human's own choice writes, so a later activation can clear the ones a previous
+// migration left without touching the ones a person set by hand. Both are stubbed because this
+// suite is about the QUOTA BLOCK, not about pinning: a mock missing the symbol under test throws
+// inside `moveAgent` before the release is ever reached, which is what made these two tests red
+// after the merge that introduced the rename.
+vi.mock("./accountStore", () => ({ setPin: vi.fn(), setPinFromSwitch: vi.fn(), hasHumanPin: vi.fn(() => false) }));
 
 /** Verbatim from the founder's screenshot — the same string `quotaBlock.test.ts` pins. */
 const SESSION_LIMIT =
@@ -198,6 +206,38 @@ describe("an account switch retires the wall it is switching AWAY from", () => {
       unregisterStatusEngine(bystander, bystanderEngine);
       movedEngine.dispose();
       bystanderEngine.dispose();
+    }
+  });
+
+  // ── THE ORDERING, WHICH THE TWO TESTS ABOVE CANNOT SEE ──────────────────────────────────────
+  //
+  // `moveAgent` has an early return for a STICKY consumer — it is rescued by a re-spawn alone and
+  // deliberately writes no pin. The quota release therefore has to sit ABOVE that return, or sticky
+  // consumers are silently skipped.
+  //
+  // Both tests above use non-sticky ids, so moving the release BELOW the early return leaves them
+  // green while restoring exactly the defect the placement exists to prevent. That is the
+  // "git resolves it silently" case from AGENTS.md: the two sides of this merge were orthogonal, the
+  // combination is a judgement call, and a comment is not a guard. This test is the guard.
+  //
+  // It matters most for precisely these agents: the banner rescue fires BECAUSE their account hit
+  // its ceiling, so a sticky consumer reaching `moveAgent` is the one most likely to be carrying a
+  // wall.
+  it("releases the wall for a STICKY consumer too — and still writes it no pin", () => {
+    const engine = walledAgent(CONCIERGE_ACCOUNT_KEY);
+    try {
+      const restarted = moveAgent(CONCIERGE_ACCOUNT_KEY, "account-with-headroom", () => true);
+      expect(restarted).toBe(true);
+
+      // Half one: the release happened, so it is not below the early return.
+      expect(quotaBlockForAgent(CONCIERGE_ACCOUNT_KEY, NOW + 60_000)).toBeUndefined();
+      // Half two: the sticky rescue is intact — no pin was laundered into the slot the modal renders
+      // back as the user's own choice. Asserting only the release would pass for an implementation
+      // that simply deleted the early return.
+      expect(setPinFromSwitch).not.toHaveBeenCalled();
+    } finally {
+      unregisterStatusEngine(CONCIERGE_ACCOUNT_KEY, engine);
+      engine.dispose();
     }
   });
 });

@@ -44,8 +44,9 @@ function makeDeps(
     getIdentities: vi.fn(async () => identities),
     listCeilings: vi.fn(async () => ceilings),
     // Default: live usage is unavailable (no Tauri bridge in these suites). The row degrades to the
-    // "Real usage unavailable" note and the local-estimate bars below stay the only progressbars, so
-    // the counts these tests assert are unaffected. Tests that care override this per case.
+    // "Real usage unavailable" note, and since the two "(local estimate)" bars were removed there is
+    // now NO progressbar at all in that state — Anthropic's figures are the only usage on the card.
+    // Tests that need a bar override this per case.
     getUsageLive: vi.fn(async () => {
       throw new Error("live usage unavailable in test");
     }),
@@ -56,12 +57,87 @@ function makeDeps(
     // that mocks no Tauri bridge: it rejects, resolves to [] outside act() after the assertions
     // have run, and the mount cannot be asserted at all.
     readSpawnLog: vi.fn(async () => []),
-    requestSwitchAll: vi.fn(),
+    // Routing readers default to "nothing activated, nothing running" so every pre-existing test
+    // renders exactly the screen it was written against. The activation suite overrides them.
+    activateAccount: vi.fn((_accountId: string) => true),
+    getPreferredAccountId: vi.fn((): string | undefined => undefined),
+    clearPreferredAccount: vi.fn(),
+    paneAccountMap: vi.fn((): Record<string, string | undefined> => ({})),
+    stickyAccountSnapshot: vi.fn((_key: string): string | undefined => undefined),
+    getPin: vi.fn((_key: string): string | undefined => undefined),
+    setPin: vi.fn(),
+    clearPin: vi.fn(),
+    clearSwitchWrittenPins: vi.fn((): string[] => []),
+    agentNames: vi.fn((): Record<string, string> => ({})),
   };
 }
 
+/** A deps set whose routing readers are backed by MUTABLE state, so a click can actually change
+ *  what the next render reads. A stub that always returns the same value cannot tell "the button
+ *  wrote the preference" from "the badge was hard-coded". */
+function routableDeps(accounts: Account[], identities: Identity[] = []) {
+  const state: {
+    preferred?: string;
+    panes: Record<string, string | undefined>;
+    names: Record<string, string>;
+    pins: Record<string, string>;
+    /** Which of `pins` the MIGRATION wrote, as `setPinFromSwitch` marks them for real. Modelled
+     *  here because "Back to automatic" has to undo one kind and not the other, and a stub with no
+     *  provenance cannot tell a sweep that works from one that deletes everything. */
+    switchWritten: Set<string>;
+    sticky: Record<string, string>;
+  } = { panes: {}, names: {}, pins: {}, switchWritten: new Set(), sticky: {} };
+  const deps = makeDeps(accounts, [], identities);
+  deps.activateAccount = vi.fn((id: string) => {
+    state.preferred = id;
+    // The migration half: every mounted pane not already there is pinned to the new account, which
+    // is what `moveAgent` → `setPinFromSwitch` does in production.
+    for (const agentId of Object.keys(state.panes)) {
+      if (state.panes[agentId] === id) continue;
+      state.pins[agentId] = id;
+      state.switchWritten.add(agentId);
+    }
+    return true;
+  });
+  deps.getPreferredAccountId = vi.fn(() => state.preferred);
+  deps.clearPreferredAccount = vi.fn(() => {
+    state.preferred = undefined;
+  });
+  deps.clearSwitchWrittenPins = vi.fn(() => {
+    const dropped: string[] = [];
+    for (const id of state.switchWritten) {
+      if (id in state.pins) {
+        delete state.pins[id];
+        dropped.push(id);
+      }
+    }
+    state.switchWritten.clear();
+    return dropped;
+  });
+  deps.paneAccountMap = vi.fn(() => state.panes);
+  deps.agentNames = vi.fn(() => state.names);
+  deps.getPin = vi.fn((key: string) => state.pins[key]);
+  deps.setPin = vi.fn((key: string, accountId: string) => {
+    state.pins[key] = accountId;
+    // A person overriding a machinery pin takes ownership of it — same unmark as `setPin` does.
+    state.switchWritten.delete(key);
+  });
+  deps.clearPin = vi.fn((key: string) => {
+    delete state.pins[key];
+  });
+  deps.stickyAccountSnapshot = vi.fn((key: string) => state.pins[key] ?? state.sticky[key]);
+  return { deps, state };
+}
+
+const signedIn = (id: string): Identity => ({
+  id,
+  email: `${id}@example.invalid`,
+  organization: null,
+  accountUuid: `u-${id}`,
+});
+
 describe("AccountsScreen", () => {
-  it("lists accounts with nickname, default tag, and usage bars", async () => {
+  it("lists accounts with nickname and default tag, and shows NO usage bar when the real figure is unavailable", async () => {
     const deps = makeDeps(
       [acct("a", { nickname: "Personal", isDefault: true }), acct("b", { nickname: "Work" })],
       [{ id: "a", tokens5h: 0, tokens7d: 0, exhaustedUntil: null }],
@@ -72,8 +148,10 @@ describe("AccountsScreen", () => {
     expect(await screen.findByText("alias: Personal")).toBeTruthy();
     expect(screen.getByText("alias: Work")).toBeTruthy();
     expect(screen.getByText("default")).toBeTruthy();
-    // Two windows per account × two accounts = 4 progressbars.
-    expect(screen.getAllByRole("progressbar")).toHaveLength(4);
+    // NO bars. `getUsageLive` rejects here, and Anthropic's figures are now the only usage on the
+    // card — so the honest rendering of "we could not read the real number" is the explanatory note,
+    // not a bar drawn from a local estimate that can contradict it.
+    expect(screen.queryAllByRole("progressbar")).toHaveLength(0);
   });
 
   it("renders REAL live usage percentages when the live fetch resolves", async () => {
@@ -93,8 +171,10 @@ describe("AccountsScreen", () => {
     expect(await screen.findByText("42%")).toBeTruthy();
     expect(screen.getByText("15%")).toBeTruthy();
     expect(deps.getUsageLive).toHaveBeenCalledWith("/cfg/a");
-    // The two live bars add to the two local-estimate bars: 4 progressbars for one account.
-    expect(screen.getAllByRole("progressbar")).toHaveLength(4);
+    // Two bars for one account — the 5h and 7d LIVE windows, and nothing else. The two
+    // "(local estimate)" bars that used to bring this to 4 were removed: they were computed from
+    // local transcripts, so they could read 0 for an account Anthropic reported as fully spent.
+    expect(screen.getAllByRole("progressbar")).toHaveLength(2);
   });
 
   it("a plain rename does NOT re-fetch live usage (the effect key excludes the nickname)", async () => {
@@ -225,10 +305,16 @@ describe("AccountsScreen", () => {
   function store(onLoginEffect: (ids: Identity[]) => void) {
     const accounts: Account[] = [];
     const identities: Identity[] = [];
-    const deps: AccountsDeps = {
+    // Held separately from `deps` because the assertions below COUNT its calls. Reading it back off
+    // a `Partial<…>` would be `possibly undefined`, and a `!` there would be a type assertion
+    // standing exactly where the test's evidence comes from.
+    const getIdentities = vi.fn(async () => [...identities]);
+    // PARTIAL: this helper models the add→login→re-read loop, so it overrides only the IO that loop
+    // touches. The routing readers fall through to the real ones, which read empty registries here.
+    const deps: Partial<AccountsDeps> = {
       listAccounts: vi.fn(async () => [...accounts]),
       getUsage: vi.fn(async () => []),
-      getIdentities: vi.fn(async () => [...identities]),
+      getIdentities,
       listCeilings: vi.fn(async () => []),
       getUsageLive: vi.fn(async () => {
         throw new Error("live usage unavailable in test");
@@ -242,14 +328,13 @@ describe("AccountsScreen", () => {
       setNickname: vi.fn(async () => {}),
       removeAccount: vi.fn(async () => {}),
       readSpawnLog: vi.fn(async () => []),
-      requestSwitchAll: vi.fn(),
     };
     let readsAtLoginStart = -1;
     const onLogin = vi.fn(async () => {
-      readsAtLoginStart = vi.mocked(deps.getIdentities).mock.calls.length;
+      readsAtLoginStart = getIdentities.mock.calls.length;
       onLoginEffect(identities);
     });
-    return { deps, onLogin, readsAtLoginStart: () => readsAtLoginStart };
+    return { deps, onLogin, getIdentities, readsAtLoginStart: () => readsAtLoginStart };
   }
 
   async function addAccountNamed(name: string) {
@@ -259,7 +344,7 @@ describe("AccountsScreen", () => {
   }
 
   it("re-reads identities after the login window closes and shows the email signed in as", async () => {
-    const { deps, onLogin, readsAtLoginStart } = store((ids) =>
+    const { deps, onLogin, getIdentities, readsAtLoginStart } = store((ids) =>
       ids.push({ id: "acct-0", email: "drodio@gmail.com", organization: null, accountUuid: "u5" }),
     );
     render(<AccountsScreen onLogin={onLogin} deps={deps} />);
@@ -271,7 +356,7 @@ describe("AccountsScreen", () => {
     expect(slot.textContent).toBe("drodio@gmail.com");
     expect(screen.getByText("alias: Cloud Max")).toBeTruthy();
     // And that read is strictly AFTER onLogin started, not one of the earlier two.
-    expect(vi.mocked(deps.getIdentities).mock.calls.length).toBeGreaterThan(readsAtLoginStart());
+    expect(getIdentities.mock.calls.length).toBeGreaterThan(readsAtLoginStart());
   });
 
   it("leaves the account visibly NOT signed in when the login resolves no identity", async () => {
@@ -340,6 +425,74 @@ describe("AccountsScreen", () => {
     expect(deps.removeAccount).not.toHaveBeenCalled();
     fireEvent.click(screen.getByText("Confirm remove"));
     await waitFor(() => expect(deps.removeAccount).toHaveBeenCalledWith("a"));
+  });
+
+  // ── CONTROLS ABOVE THE TEXT ─────────────────────────────────────────────────────────────────
+  //
+  // The founder screenshotted buttons colliding with the account name and email: they shared one
+  // flex row with the text at `flex: 1`, so at any width where the buttons did not fit, the text
+  // wrapped around them. The fix is two stacked blocks — controls first, then a full-width text
+  // block with no floated sibling.
+  //
+  // WHAT THIS CAN AND CANNOT PROVE. jsdom does not lay out (see docs/jsdom-test-caveats.md), so no
+  // test here can assert the boxes do not overlap — `getBoundingClientRect` is all zeros. What it
+  // CAN pin is the mechanism: the controls precede the identity text in document order, and the two
+  // are siblings rather than one containing the other. Both are exactly what a careless refactor
+  // would undo, and the "one flex row" arrangement fails this test.
+
+  it("renders the controls BEFORE the identity text, as separate blocks", async () => {
+    const deps = makeDeps(
+      [acct("a", { nickname: "Removable" })],
+      [],
+      [signedInAs("a", "someone@example.com")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const identity = await screen.findByTestId("account-identity-a");
+    const remove = screen.getByText("Remove");
+
+    // Neither contains the other — they are siblings in the card, not a button inside the text run.
+    expect(identity.contains(remove)).toBe(false);
+    expect(remove.contains(identity)).toBe(false);
+
+    // DOCUMENT_POSITION_FOLLOWING (4) on `remove.compareDocumentPosition(identity)` means the
+    // identity comes AFTER the button — i.e. the controls row is first.
+    const rel = remove.compareDocumentPosition(identity);
+    expect(rel & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  // ── A REJECTED COMMAND MUST REPORT WHAT THE BACKEND SAID ────────────────────────────────────
+  //
+  // A Tauri command's `Err(String)` arrives in JS as a BARE STRING, not an `Error`. Every catch on
+  // this screen used `e instanceof Error ? e.message : "Failed to …"`, which is false for exactly
+  // that shape — so the real cause was discarded and replaced with a generic line, and the generic
+  // line is not logged either. The founder hit a repeated "Failed to remove" that later succeeded,
+  // and the reason was unrecoverable afterwards.
+
+  it("surfaces the backend's own message when a remove is rejected with a STRING (Tauri's shape)", async () => {
+    const deps = makeDeps([acct("a", { nickname: "Removable" })]);
+    // Rejecting with a string, exactly as `invoke` does for `Err(String)` — NOT `new Error(...)`.
+    deps.removeAccount = vi.fn(async () => {
+      throw "rename accounts.json into place: Device or resource busy";
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(await screen.findByText("Remove"));
+    fireEvent.click(screen.getByText("Confirm remove"));
+    // The CAUSE, not the fallback. Against the old code this read "Failed to remove".
+    expect(await screen.findByText(/Device or resource busy/)).toBeTruthy();
+  });
+
+  it("still falls back to the generic line when the rejection carries no message at all", async () => {
+    // The fallback is not dead code — it is what an empty/objectless rejection must produce, and
+    // `String(e)` would render "[object Object]" here instead, which is its own useless message.
+    const deps = makeDeps([acct("a", { nickname: "Removable" })]);
+    deps.removeAccount = vi.fn(async () => {
+      throw {};
+    });
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(await screen.findByText("Remove"));
+    fireEvent.click(screen.getByText("Confirm remove"));
+    expect(await screen.findByText("Failed to remove")).toBeTruthy();
   });
 
   it("shows the REAL authenticated email as the primary label, nickname as a secondary alias", async () => {
@@ -732,8 +885,11 @@ describe("per-account headroom", () => {
     expect(line.textContent).toContain("Limit unknown");
     expect(line.textContent).not.toMatch(/\d+%/);
     expect(line.querySelector("[role='progressbar']")).toBeNull();
-    // The two cross-account UsageBars are still there; the headroom line added no third one.
-    expect(screen.getAllByRole("progressbar")).toHaveLength(2);
+    // And no bar anywhere on the card: `getUsageLive` rejects in this fixture, and the two
+    // "(local estimate)" bars that used to make this 2 are gone. The point of the assertion is
+    // unchanged — an unknown ceiling must not be drawn as a bar — but it is now stronger, since a
+    // stray bar of ANY origin would fail it rather than being absorbed into an expected count.
+    expect(screen.queryAllByRole("progressbar")).toHaveLength(0);
   });
 
   it("states the ACT line — the fraction at which spawns stop — not the warn line", async () => {
@@ -984,5 +1140,310 @@ describe("the spawn-history panel is actually mounted", () => {
     const deps = makeDeps([acct("a", { nickname: "Personal", isDefault: true })]);
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect(await screen.findByText(/nothing recorded yet/i)).toBeTruthy();
+  });
+});
+
+// ── "Activate this account" — the primary account for agents ─────────────────────────────────
+//
+// The founder's ask, verbatim: "I thought I wanna be able to specify an account that I want to make
+// the primary. For agents." And immediately after: "Then what actual agents would go on to that
+// account? It's not clear to me." Both halves are asserted here — the control, and the list that
+// says what it will affect.
+//
+// Every assertion below is on a state the screen could NOT have rendered before the click: the deps
+// are backed by mutable state (`routableDeps`), so a badge that was hard-coded, or a button wired to
+// nothing, fails rather than passing on a fixture.
+describe("AccountsScreen — activation", () => {
+  it("activating an account records it and badges that card PRIMARY", async () => {
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal", isDefault: true }), acct("b", { nickname: "Work" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    // Before: no card claims to be primary, and both offer the control.
+    // `.textContent`, not jest-dom's `toHaveTextContent` — this repo does not load jest-dom.
+    expect((await screen.findByTestId("account-active-state-b")).textContent).toBe("Inactive");
+    expect(screen.queryByTestId("account-primary-badge-b")).toBeNull();
+
+    const cardB = screen.getByTestId("account-routing-b");
+    fireEvent.click(within(cardB).getByText("Activate this account"));
+
+    // The lever ran with the right account — and the SCREEN now reflects it, which it can only do
+    // by re-reading the preference the lever wrote.
+    expect(deps.activateAccount).toHaveBeenCalledWith("b");
+    expect(state.preferred).toBe("b");
+    expect(await screen.findByTestId("account-primary-badge-b")).toBeTruthy();
+    expect(screen.getByTestId("account-active-state-b").textContent).toBe(
+      "Active — new agents run here",
+    );
+    // …and only that card. The DEFAULT account is a different idea and must not borrow the badge —
+    // an exhausted account badged `default` is the confusion this feature exists to end.
+    expect(screen.queryByTestId("account-primary-badge-a")).toBeNull();
+    expect(screen.getByTestId("account-active-state-a").textContent).toBe("Inactive");
+  });
+
+  it("PRIMARY and default are distinct badges on the same card", async () => {
+    const { deps } = routableDeps([acct("a", { nickname: "Personal", isDefault: true })], [signedIn("a")]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(within(await screen.findByTestId("account-routing-a")).getByText("Activate this account"));
+    // Both render, so "primary" is not silently standing in for "default" or vice versa.
+    expect(await screen.findByText("primary")).toBeTruthy();
+    expect(screen.getByText("default")).toBeTruthy();
+  });
+
+  it("back to automatic clears the preference", async () => {
+    const { deps, state } = routableDeps([acct("a", { nickname: "Personal" })], [signedIn("a")]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    fireEvent.click(within(await screen.findByTestId("account-routing-a")).getByText("Activate this account"));
+    fireEvent.click(await screen.findByText("Back to automatic"));
+
+    expect(state.preferred).toBeUndefined();
+    await waitFor(() => expect(screen.queryByTestId("account-primary-badge-a")).toBeNull());
+  });
+
+  it("…and the pins the activation wrote, or nothing actually goes back to automatic", async () => {
+    // Clearing the preference alone is not automatic. The activation had TWO durable effects, and
+    // the other one outranks the preference: `moveAgent` pins every pane it moves, a pin beats the
+    // fleet preference in `chooseAccountForAgent`, and only an agent CLOSE clears one. So dropping
+    // the preference by itself leaves each of those agents spawning on the activated account
+    // forever — the button reports success and the fleet does not move.
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "AmForge" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.panes = { "agent-1": "a" };
+    state.names = { "agent-1": "Stripe Checkout Flow" };
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    fireEvent.click(within(await screen.findByTestId("account-routing-b")).getByText("Activate this account"));
+    expect(state.pins["agent-1"]).toBe("b"); // the migration half ran
+
+    fireEvent.click(await screen.findByText("Back to automatic"));
+    expect(state.pins["agent-1"]).toBeUndefined();
+  });
+
+  it("…but back to automatic leaves a pin a PERSON set, and the screen still shows it", async () => {
+    // PAIRED with the sweep above and the reason it is not a wrecking ball: the sticky consumers'
+    // own controls in this same modal write pins, and so does `AgentPane`'s per-agent override. A
+    // sweep of "every pin" would silently undo all of them on one click. Asserted on SCREEN, since
+    // the concierge control renders the pin back as the user's own choice.
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "AmForge" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.panes = { "agent-1": "a" };
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const conciergeSelect = (await screen.findByTestId("sticky-account-sparkle:concierge")) as HTMLSelectElement;
+    fireEvent.change(conciergeSelect, { target: { value: "a" } });
+    fireEvent.click(within(await screen.findByTestId("account-routing-b")).getByText("Activate this account"));
+    fireEvent.click(await screen.findByText("Back to automatic"));
+
+    expect(state.pins["agent-1"]).toBeUndefined(); // machinery's — swept
+    expect(state.pins["sparkle:concierge"]).toBe("a"); // the person's — kept
+    await waitFor(() =>
+      expect((screen.getByTestId("sticky-account-sparkle:concierge") as HTMLSelectElement).value).toBe("a"),
+    );
+  });
+
+  it("refuses to activate an account that has never been signed in", async () => {
+    // The selection gate would reject the preference on the very next spawn, so offering the button
+    // would be a control that reports success and changes nothing.
+    const { deps } = routableDeps([acct("a", { nickname: "Personal" })], []);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const button = within(await screen.findByTestId("account-routing-a")).getByText(
+      "Activate this account",
+    ) as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(deps.activateAccount).not.toHaveBeenCalled();
+  });
+
+  it("refuses to offer PRIMARY to a login the selection gate would reject", async () => {
+    // The button's predicate must be the GATE's, not the wider "is this signed in at all". A login
+    // with an accountUuid but no readable email is real — Log in / Switch login beside it treat it
+    // as signed in, correctly — but `usablePreferredAccount` tests `signedInAccountIds`, which keys
+    // on EMAIL. With the wider predicate the button is enabled, the card flips to "Active — new
+    // agents run here", and the very next spawn discards the preference with the ledger recording a
+    // bland "auto": the same silent defeat this feature exists to prevent, wearing a green badge.
+    const uuidOnly: Identity = {
+      id: "a",
+      email: null,
+      organization: null,
+      accountUuid: "u-a",
+    };
+    const { deps } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "Work" })],
+      [uuidOnly, signedIn("b")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const card = await screen.findByTestId("account-routing-a");
+    const button = within(card).getByText("Activate this account") as HTMLButtonElement;
+    expect(button.disabled).toBe(true);
+    fireEvent.click(button);
+    expect(deps.activateAccount).not.toHaveBeenCalled();
+    // PAIRED, in the same render: the account that DOES report an email is still offerable, so this
+    // is evidence about the predicate rather than about the button being broken everywhere.
+    const ok = within(screen.getByTestId("account-routing-b")).getByText(
+      "Activate this account",
+    ) as HTMLButtonElement;
+    expect(ok.disabled).toBe(false);
+  });
+
+  it("names what is running on each account, by the name the user knows", async () => {
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "Work" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.panes = { "id-1": "a", "id-2": "b" };
+    state.names = { "id-1": "Stripe Checkout Flow", "id-2": "Docs Sweep" };
+    state.sticky = { "sparkle:concierge": "a", __sparkle_self__: "b" };
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const cardA = (await screen.findByTestId("account-routing-a")).textContent ?? "";
+    expect(cardA).toContain("Stripe Checkout Flow");
+    expect(cardA).toContain("Concierge");
+    // …and NOT the things that are on the other account. A list that named everything everywhere
+    // would satisfy a "does it mention the agent" assertion while answering nothing.
+    expect(cardA).not.toContain("Docs Sweep");
+    expect(cardA).not.toContain("Improve Sparkle");
+
+    const cardB = screen.getByTestId("account-routing-b").textContent ?? "";
+    expect(cardB).toContain("Docs Sweep");
+    expect(cardB).toContain("Improve Sparkle");
+    expect(cardB).not.toContain("Stripe Checkout Flow");
+  });
+
+  it("lists Improve Sparkle ONCE and never by its internal id, though its pane is in the pane map", async () => {
+    // Improve Sparkle's pane is an ordinary AgentPane whose agent.id IS the sticky key
+    // (`sparkleAgent.ts`), so registerPaneAccount files it under `__sparkle_self__`. Rendering the
+    // pane map verbatim and then appending the sticky label listed it twice — the second time as a
+    // raw internal id, which names nothing the user has ever seen.
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "Work" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.panes = { "id-1": "b", __sparkle_self__: "b" };
+    state.names = { "id-1": "Docs Sweep" };
+    state.sticky = { __sparkle_self__: "b" };
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const cardB = (await screen.findByTestId("account-routing-b")).textContent ?? "";
+    expect(cardB).not.toContain("__sparkle_self__");
+    expect(cardB.match(/Improve Sparkle/g) ?? []).toHaveLength(1);
+    // The ordinary agent beside it is still listed — the fix removes a duplicate, not the list.
+    expect(cardB).toContain("Docs Sweep");
+  });
+
+  it("still lists Improve Sparkle when only a satellite-window pane names it", async () => {
+    // PAIRED with the test above. Satellite panes register under a `-win-<uuid>` VARIANT while
+    // stickyAccountSnapshot is read on the base key, so discarding the pane evidence rather than
+    // folding it in would drop Improve Sparkle off the list entirely here.
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "Work" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.panes = { "__sparkle_self__-win-6f2c": "b" };
+    state.sticky = {};
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const cardB = (await screen.findByTestId("account-routing-b")).textContent ?? "";
+    expect(cardB).not.toContain("__sparkle_self__");
+    expect(cardB.match(/Improve Sparkle/g) ?? []).toHaveLength(1);
+  });
+
+  it("says an account is empty rather than leaving the question unanswered", async () => {
+    const { deps } = routableDeps([acct("a", { nickname: "Personal" })], [signedIn("a")]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect((await screen.findByTestId("account-routing-a")).textContent).toContain(
+      "Nothing is running on this account right now.",
+    );
+  });
+
+  it("admits the lists only cover mounted panes", async () => {
+    // paneAccountMap() holds MOUNTED panes only, so satellite windows and closed tabs are absent.
+    // Overclaiming here would make an account look idle when it is not.
+    const { deps } = routableDeps([acct("a")], [signedIn("a")]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    expect((await screen.findByTestId("routing-coverage-note")).textContent).toMatch(
+      /open tab in this window/i,
+    );
+  });
+});
+
+describe("AccountsScreen — the sticky consumers", () => {
+  it("parks the concierge on a chosen account by pinning its key", async () => {
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "Work" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const select = await screen.findByTestId("sticky-account-sparkle:concierge");
+    fireEvent.change(select, { target: { value: "b" } });
+
+    // A PIN on the concierge's own key — not the fleet preference, which deliberately leaves the
+    // sticky consumers alone.
+    expect(deps.setPin).toHaveBeenCalledWith("sparkle:concierge", "b");
+    expect(state.pins["sparkle:concierge"]).toBe("b");
+    expect(state.preferred).toBeUndefined();
+    // The screen re-reads, so the concierge now shows up on that account's card.
+    expect((await screen.findByTestId("account-routing-b")).textContent).toContain("Concierge");
+  });
+
+  it("names each account in the picker without claiming a signed-in one is not signed in", async () => {
+    // An `oauthAccount` with a uuid but NO readable email IS signed in — `SIGNED_IN_NO_EMAIL` is
+    // the state that exists to say so. The identity slot's `email ?? NOT_SIGNED_IN` fallback is
+    // right for a slot and wrong for an option label, which has to NAME the thing being chosen:
+    // it rendered the literal "Not signed in" as this account's name in the list.
+    const { deps } = routableDeps(
+      [acct("a", { nickname: "Nick" }), acct("b", { nickname: "Work" })],
+      [{ id: "a", email: null, organization: null, accountUuid: "u1" }, signedIn("b")],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const options = Array.from(
+      (await screen.findByTestId("sticky-account-sparkle:concierge")).querySelectorAll("option"),
+    ).map((o) => o.textContent);
+    // The no-email account falls back to its nickname…
+    expect(options).toContain("Nick");
+    // …and is never labelled with the falsehood.
+    expect(options).not.toContain(NOT_SIGNED_IN);
+    // A signed-in account carries both parts, so two accounts are never indistinguishable and the
+    // option text stays distinct from the identity slot's.
+    expect(options).toContain("Work — b@example.invalid");
+  });
+
+  it("hands a sticky consumer back to automatic", async () => {
+    const { deps, state } = routableDeps([acct("a"), acct("b")], [signedIn("a"), signedIn("b")]);
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    const select = await screen.findByTestId("sticky-account-__sparkle_self__");
+    fireEvent.change(select, { target: { value: "b" } });
+    expect(state.pins["__sparkle_self__"]).toBe("b");
+
+    fireEvent.change(select, { target: { value: "" } });
+    expect(deps.clearPin).toHaveBeenCalledWith("__sparkle_self__");
+    expect(state.pins["__sparkle_self__"]).toBeUndefined();
+  });
+
+  it("activating an account does not move the sticky consumers", async () => {
+    const { deps, state } = routableDeps(
+      [acct("a", { nickname: "Personal" }), acct("b", { nickname: "Work" })],
+      [signedIn("a"), signedIn("b")],
+    );
+    state.sticky = { "sparkle:concierge": "a" };
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+
+    fireEvent.click(within(await screen.findByTestId("account-routing-b")).getByText("Activate this account"));
+
+    // The concierge is still listed on `a`, and no pin was written for it. Moving it mid-
+    // conversation nulls both session pointers and re-probes, which is why it gets its own control.
+    await waitFor(() => expect(screen.getByTestId("account-primary-badge-b")).toBeTruthy());
+    expect(screen.getByTestId("account-routing-a").textContent).toContain("Concierge");
+    expect(screen.getByTestId("account-routing-b").textContent).not.toContain("Concierge");
+    expect(deps.setPin).not.toHaveBeenCalled();
   });
 });

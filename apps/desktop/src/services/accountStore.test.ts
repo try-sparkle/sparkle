@@ -47,6 +47,97 @@ describe("pickAccount", () => {
     expect(pickAccount([], [], { now: NOW })).toBeNull();
   });
 
+  // ── Real Anthropic utilization outranks the local estimate ──────────────────────────────────
+  //
+  // The local tally is computed by scanning each account's OWN transcripts, so it measures what
+  // THIS machine ran under that account — not what the account has spent. When those diverge, the
+  // tally is not merely imprecise, it is inverted: an account that spent its whole weekly limit
+  // elsewhere has a local tally of zero, which is the most headroom there is.
+
+  it("does not send spawns to an account Anthropic reports as spent, even when its LOCAL tally is zero", () => {
+    // The founder's card, verbatim: session 0% / weekly 100% real, and BOTH local estimates 0.
+    // Under the token rule `spent` wins outright — it is the emptiest account on the machine — so
+    // the single most exhausted account was next in line for every spawn.
+    const accounts = [acct("spent"), acct("fresh")];
+    const u = [
+      usage("spent", { tokens7d: 0, tokens5h: 0 }),
+      usage("fresh", { tokens7d: 5_000_000, tokens5h: 1_000_000 }),
+    ];
+    const live = [
+      { id: "spent", fiveHourPercent: 0, sevenDayPercent: 100 },
+      { id: "fresh", fiveHourPercent: 12, sevenDayPercent: 20 },
+    ];
+    expect(pickAccount(accounts, u, { now: NOW, live })?.id).toBe("fresh");
+    // PAIRED, so the test above is pinning the live figure rather than some unrelated exclusion:
+    // same accounts, same tallies, live data withheld → the old rule applies and `spent` wins.
+    expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("spent");
+  });
+
+  it("ranks by real utilization among accounts that have it", () => {
+    const accounts = [acct("a"), acct("b"), acct("c")];
+    // Token tallies deliberately ordered AGAINST the live figures, so a pass cannot come from the
+    // fallback path accidentally agreeing.
+    const u = [
+      usage("a", { tokens7d: 1 }),
+      usage("b", { tokens7d: 2 }),
+      usage("c", { tokens7d: 3 }),
+    ];
+    const live = [
+      { id: "a", fiveHourPercent: 10, sevenDayPercent: 80 },
+      { id: "b", fiveHourPercent: 5, sevenDayPercent: 60 },
+      { id: "c", fiveHourPercent: 70, sevenDayPercent: 30 },
+    ];
+    // Ranked on the WORST window: a=80, b=60, c=70.
+    expect(pickAccount(accounts, u, { now: NOW, live })?.id).toBe("b");
+  });
+
+  it("reads the 5-hour window too, not just the 7-day one", () => {
+    // An account at 0% weekly but 100% of its session window cannot take a spawn right now either.
+    // Reading `sevenDayPercent` alone would rank this account as completely free.
+    const accounts = [acct("session-spent"), acct("ok")];
+    const u = [usage("session-spent"), usage("ok")];
+    const live = [
+      { id: "session-spent", fiveHourPercent: 100, sevenDayPercent: 0 },
+      { id: "ok", fiveHourPercent: 30, sevenDayPercent: 40 },
+    ];
+    expect(pickAccount(accounts, u, { now: NOW, live })?.id).toBe("ok");
+  });
+
+  it("treats an unreported live figure as UNKNOWN, never as zero", () => {
+    // `null` is what the wire sends for a window Anthropic did not report. Coercing it to 0 would
+    // recreate the original bug in a new place: the unmeasured account becomes the emptiest one.
+    const accounts = [acct("unknown"), acct("known")];
+    const u = [
+      usage("unknown", { tokens7d: 9_000_000 }), // locally, clearly the busier account
+      usage("known", { tokens7d: 10 }),
+    ];
+    const live = [
+      { id: "unknown", fiveHourPercent: null, sevenDayPercent: null },
+      { id: "known", fiveHourPercent: 50, sevenDayPercent: 50 },
+    ];
+    // `known` is verified at 50%; `unknown` has no figure at all and must not outrank it on a zero
+    // it never reported.
+    expect(pickAccount(accounts, u, { now: NOW, live })?.id).toBe("known");
+  });
+
+  it("falls back to the token rule when NO account has live data (offline)", () => {
+    const accounts = [acct("a"), acct("b")];
+    const u = [usage("a", { tokens7d: 30 }), usage("b", { tokens7d: 10 })];
+    expect(pickAccount(accounts, u, { now: NOW, live: [] })?.id).toBe("b");
+  });
+
+  it("still returns an account when EVERY account is spent, rather than blocking the spawn", () => {
+    // Same reasoning as the exhausted/near-cap fallback: refusing to spawn on the strength of a
+    // utilization reading would let one bad fetch halt the fleet.
+    const accounts = [acct("a"), acct("b")];
+    const u = [usage("a"), usage("b")];
+    const live = [
+      { id: "a", fiveHourPercent: 100, sevenDayPercent: 100 },
+      { id: "b", fiveHourPercent: 99, sevenDayPercent: 99 },
+    ];
+    expect(pickAccount(accounts, u, { now: NOW, live })).not.toBeNull();
+  });
+
   it("picks the LOWEST 7d tally", () => {
     const accounts = [acct("a"), acct("b"), acct("c")];
     const u = [

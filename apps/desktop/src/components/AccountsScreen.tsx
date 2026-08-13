@@ -16,11 +16,26 @@ import {
   removeAccount,
   accountDisplay,
   duplicateAccountGroups,
+  getPreferredAccountId,
+  clearPreferredAccount,
+  clearSwitchWrittenPins,
+  getPin,
+  setPin,
+  clearPin,
   CEILING_AVOID_FRACTION,
   type Account,
   type Usage,
   type Identity,
 } from "../services/accountStore";
+import {
+  stickyAccountSnapshot,
+  isStickyAccountKey,
+  CONCIERGE_ACCOUNT_KEY,
+  SPARKLE_SELF_ACCOUNT_PREFIX,
+} from "../services/accountSelection";
+import { activateAccount } from "../hooks/useAccountSwitch";
+import { paneAccountMap } from "../services/paneControl";
+import { useProjectStore } from "../stores/projectStore";
 import {
   assessHeadroom,
   rotationReadiness,
@@ -31,7 +46,6 @@ import {
   type Headroom,
 } from "../services/headroom";
 import { getAccountUsageLive, type AccountUsageLive } from "../services/accountUsage";
-import { requestSwitchAll } from "../services/manualAccountSwitch";
 
 // Accounts settings screen for multi Claude Max account support (design spec
 // docs/superpowers/specs/2026-06-26-multi-max-account-design.md). Lists each registered Claude
@@ -56,7 +70,7 @@ const DEPS = {
   getUsage,
   getIdentities,
   // Per-account LEARNED ceilings. Without these the screen can show how accounts compare to EACH
-  // OTHER (the relative UsageBars) but never how close any of them is to its OWN limit — which is
+  // OTHER (the removed relative bars) but never how close any of them is to its OWN limit — which is
   // the number that decides whether rotation is about to matter.
   listCeilings,
   // REAL live per-account usage (Anthropic's own 5h/7d utilization), fetched per account by config
@@ -72,11 +86,34 @@ const DEPS = {
   // Tauri bridge, so the call rejected, resolved to [] outside `act()` after the assertions had
   // run, and the mount could not be asserted at all.
   readSpawnLog,
-  // The MANUAL "switch all agents to this account" trigger. Fires a request that the app-wide switch
-  // host (useAccountSwitch) drives — this screen must not own the long-running switch, since it is a
-  // modal that unmounts. Injectable so a component test can assert the CALL (the side effect) without
-  // standing up the host.
-  requestSwitchAll,
+  // ── "Activate this account" and the who-runs-where list ───────────────────────────────────────
+  // All module-level state readers rather than IPC, but injected for exactly the same reason the
+  // IO above is: a component test that cannot substitute them has to reach into three global
+  // registries to set up one assertion.
+  /** Records the fleet-wide preference AND migrates already-running agents at safe boundaries. */
+  activateAccount,
+  getPreferredAccountId,
+  clearPreferredAccount,
+  /** Which account each MOUNTED pane is running under. See the coverage caveat rendered on screen. */
+  paneAccountMap,
+  /** The two sticky consumers' current accounts + their explicit pins. */
+  stickyAccountSnapshot,
+  getPin,
+  setPin,
+  clearPin,
+  /** agentId → the name the user sees in the sidebar, so the list reads "Stripe Checkout Flow"
+   *  rather than a uuid. Missing ids fall back to the id itself. */
+  agentNames: (): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const p of useProjectStore.getState().projects) {
+      for (const a of p.agents ?? []) out[a.id] = a.name;
+    }
+    return out;
+  },
+  /** Drops the pins a PREVIOUS activation's migration wrote, so "Back to automatic" is actually
+   *  automatic. Clearing the preference alone is not enough: a pin outranks it, and every mounted
+   *  pane an activation moved carries one. */
+  clearSwitchWrittenPins,
 };
 export type AccountsDeps = typeof DEPS;
 
@@ -124,6 +161,20 @@ const primaryBtn: CSSProperties = {
 };
 
 const tagStyle: CSSProperties = { ...tag(C.accentInk), borderColor: C.teal };
+
+/** The PRIMARY badge — the account the user activated for the fleet.
+ *
+ *  DELIBERATELY A FILLED PILL while `default` stays an outline tag, and that contrast is the point
+ *  rather than decoration. In the founder's screenshot an EXHAUSTED account was still badged
+ *  `default`, because "default" means "the config dir Sparkle registers as `~/.claude`" and has
+ *  nothing to do with where agents run. Two outline tags of the same weight would read as two
+ *  spellings of one idea; a solid one reads as the answer to "which account are my agents on". */
+const primaryTagStyle: CSSProperties = {
+  ...tag(ON_BRAND_FILL),
+  background: C.teal,
+  borderColor: C.teal,
+  color: ON_BRAND_FILL,
+};
 
 /** The screen's title bar, PINNED. "+ Add account" is the remedy every banner on this screen
  *  recommends, and it used to scroll with the page: the spawn ledger at the bottom grew unbounded,
@@ -173,47 +224,26 @@ function fmtTokens(n: number): string {
   return `${n}`;
 }
 
-/** A labelled usage bar showing this account's token usage for a window, filled RELATIVE to the
- *  busiest account (`peakTokens`) — there's no real Anthropic cap to read, so the comparison is
- *  cross-account: the heaviest-used account fills the bar and the emptiest reads shortest, making
- *  "which account has the most headroom" (where new jobs go) obvious at a glance. The raw count is
- *  shown alongside. A lone account (peak == its own usage) reads full — there's nothing to compare
- *  it against. */
-function UsageBar({
-  label,
-  tokens,
-  peakTokens,
-}: {
-  label: string;
-  tokens: number;
-  peakTokens: number;
-}) {
-  const pct = peakTokens > 0 ? Math.min(100, (tokens / peakTokens) * 100) : 0;
-  return (
-    <div style={{ marginTop: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted }}>
-        <span>{label}</span>
-        <span>{fmtTokens(tokens)}</span>
-      </div>
-      <div
-        role="progressbar"
-        aria-label={`${label} usage`}
-        aria-valuenow={Math.round(pct)}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        style={{
-          height: 6,
-          borderRadius: 3,
-          background: C.deepForest,
-          border: `1px solid ${C.muted}`,
-          marginTop: 2,
-          overflow: "hidden",
-        }}
-      >
-        <div style={{ width: `${pct}%`, height: "100%", background: C.teal }} />
-      </div>
-    </div>
-  );
+/** The human-readable cause of a rejected IO call, or `fallback` when there is genuinely nothing.
+ *
+ * ══ A TAURI COMMAND REJECTS WITH A STRING, NOT AN `Error` ═══════════════════════════════════════
+ * `Err(String)` on the Rust side arrives here as a bare JS string, so the reflex
+ * `e instanceof Error ? e.message : "Failed to …"` is FALSE on exactly the errors this screen
+ * exists to report — and it then discards the real message and shows its own generic one.
+ *
+ * That is not cosmetic. The founder hit a repeated "Failed to remove" that succeeded on a later
+ * attempt, and the cause could not be recovered afterwards: the string Rust produced ("read
+ * accounts.json: …", "rename accounts.json into place: …") was thrown away at this line, and the
+ * generic fallback is not written to the log either. A whole class of backend failure on this
+ * screen was unreportable by construction. Every catch site here now routes through this, so the
+ * message the user sees is the message the backend actually sent.
+ *
+ * Deliberately not `String(e)`, which renders a plain object as "[object Object]" — that is how a
+ * useless message gets ANOTHER way to happen. */
+function errText(e: unknown, fallback: string): string {
+  if (typeof e === "string" && e.trim() !== "") return e;
+  if (e instanceof Error && e.message.trim() !== "") return e.message;
+  return fallback;
 }
 
 /** Wall-clock time in the user's own locale ("8:20 PM"). One formatter, so the per-account line and
@@ -241,7 +271,7 @@ function resetLabel(iso: string | null): string | null {
 
 /** A REAL usage bar filled by Anthropic's actual utilization percent (0–100), with an optional reset
  *  caption. `percent: null` (a window the server didn't report) renders "—" and an empty bar, never
- *  a fabricated 0%. Distinct from {@link UsageBar}, whose fill is RELATIVE across accounts; this one
+ *  a fabricated 0%. Unlike the removed relative cross-account bar, this one
  *  is the account's honest standing against its own real limit. */
 function LiveUsageBar({
   label,
@@ -342,7 +372,7 @@ const HEADROOM_TONE: Record<Headroom["state"], { ink: string; label: string }> =
 };
 
 /** Where ONE account stands against its OWN learned ceiling — the per-account half of rotation
- *  visibility. Distinct from {@link UsageBar}, which compares accounts to each other; this one
+ *  visibility. Unlike the removed relative cross-account bar, this one
  *  answers "how much room does this account have left", which is what decides when rotation bites.
  *
  *  With no ceiling learned yet it renders words and NO bar. A bar implies a denominator we do not
@@ -511,6 +541,40 @@ function isSignedIn(identity: Identity | undefined): boolean {
  *  belongs there, beside `NOT_SIGNED_IN`, and both callers should defer to it. */
 export const SIGNED_IN_NO_EMAIL = "Signed in — no email on this login";
 
+/** Everything the modal knows about WHERE WORK ACTUALLY RUNS, read in one go.
+ *
+ *  Held as one state object rather than six because every field comes from the same instant and is
+ *  re-read by the same actions; splitting them invites a render where the PRIMARY badge has moved
+ *  and the consumer lists underneath it have not. */
+interface RoutingSnapshot {
+  /** The fleet-wide activated account, if any. */
+  preferredId?: string;
+  /** agentId → accountId, for MOUNTED panes only (see the caveat rendered on screen). */
+  panes: Record<string, string | undefined>;
+  /** agentId → the name shown in the sidebar. */
+  names: Record<string, string>;
+  /** Explicit pins on the two sticky keys — what the selects below show as their value. */
+  conciergePin?: string;
+  sparklePin?: string;
+  /** What those two keys are currently parked on, pin or not. */
+  conciergeOn?: string;
+  sparkleOn?: string;
+}
+
+/** The two consumers that are sticky by design and are NOT moved by "Activate this account". */
+const STICKY_CONSUMERS = [
+  {
+    key: CONCIERGE_ACCOUNT_KEY,
+    label: "Concierge",
+    note: "Moving it mid-conversation drops its session and re-probes.",
+  },
+  {
+    key: SPARKLE_SELF_ACCOUNT_PREFIX,
+    label: "Improve Sparkle",
+    note: "The hourly pass and its pane share one worktree, so they must share one account.",
+  },
+] as const;
+
 export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScreenProps) {
   const io: AccountsDeps = { ...DEPS, ...deps };
   const [accounts, setAccounts] = useState<Account[]>([]);
@@ -542,14 +606,6 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // Two-step confirm for re-logging in the DEFAULT account, whose config dir is the user's real
   // ~/.claude — see the button below.
   const [confirmLogin, setConfirmLogin] = useState<string | null>(null);
-  // Two-step confirm for "Switch all agents here" — the second click re-spawns every agent (at its
-  // next safe boundary), so it takes the same confirm step as Remove / default-login. Holds the id
-  // of the account awaiting confirmation.
-  const [confirmSwitchAll, setConfirmSwitchAll] = useState<string | null>(null);
-  // The account a manual switch-all was just fired for, so the row can say it's underway. Cleared
-  // when the user picks a different account or re-opens the screen; the honest, app-wide progress
-  // ("N of M moved") is the AccountSwitchHost banner, which this note points at.
-  const [switchingAllTo, setSwitchingAllTo] = useState<string | null>(null);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -566,9 +622,8 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   const refresh = useCallback(async () => {
     setError(null);
     try {
-      const [a, u, ids, cs] = await Promise.all([
+      const [a, ids, cs] = await Promise.all([
         listAccountsFn(),
-        getUsageFn(),
         getIdentitiesFn(),
         // Ceilings are an ENRICHMENT, not a prerequisite: they add the "% of its own limit" numbers.
         // Sharing the rejection path with `listAccounts` would let a backend that cannot answer
@@ -577,16 +632,31 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         listCeilingsFn().catch(() => [] as Ceiling[]),
       ]);
       setAccounts(a);
-      setUsage(u);
       setIdentities(ids);
       setCeilings(cs);
+      // ══ THE LOCAL TALLY IS NO LONGER AWAITED — THIS IS THE TEN-SECOND LOAD ═══════════════════
+      // `accounts_usage` walks EVERY account's `projects/**/*.jsonl` and sums tokens. On the
+      // founder's machine that is 17,316 files and 5.7 GB for the default account alone, which is
+      // the ten seconds the screen took to appear. Nothing above needs it, and since the two
+      // "(local estimate)" bars were removed the only thing that still does is the amber
+      // "Exhausted until …" line — a detail, not a reason to hold the whole screen blank.
+      //
+      // Note which call was actually slow: the REAL Anthropic fetch was never the problem. It was
+      // already concurrent per account and already off this path, so removing the local bars makes
+      // the screen faster rather than more network-bound, which is the opposite of the obvious
+      // guess. Fired without `await`, its own `catch` so a failed tally cannot fail the load.
+      void getUsageFn()
+        .then((u) => setUsage(u))
+        .catch(() => {
+          /* the exhausted line simply does not render; the screen is already up */
+        });
       // NOTE: the REAL live-usage fetch is deliberately NOT awaited here. It reads each account's
       // OAuth secret (a keychain read that can raise a macOS prompt) and hits the network per
       // account — up to 15s each — so folding it into refresh's critical path would gate every
       // add/rename/remove/login flow (each awaits refresh) behind N blocking round-trips. It runs in
       // its own effect below, keyed on the account SET so a rename doesn't re-hit the endpoint.
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to load accounts");
+      setError(errText(e, "Failed to load accounts"));
     }
   }, [listAccountsFn, getUsageFn, getIdentitiesFn, listCeilingsFn]);
 
@@ -629,6 +699,70 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountsKey, liveNonce, getUsageLiveFn]);
 
+  // ── Where work actually runs ────────────────────────────────────────────────────────────────
+  // Same "pull the individual functions" discipline as `refresh` above: an integrator passing an
+  // inline `deps={{…}}` literal must not respin these on every render.
+  const activateAccountFn = deps?.activateAccount ?? DEPS.activateAccount;
+  const getPreferredAccountIdFn = deps?.getPreferredAccountId ?? DEPS.getPreferredAccountId;
+  const clearPreferredAccountFn = deps?.clearPreferredAccount ?? DEPS.clearPreferredAccount;
+  const clearSwitchWrittenPinsFn = deps?.clearSwitchWrittenPins ?? DEPS.clearSwitchWrittenPins;
+  const paneAccountMapFn = deps?.paneAccountMap ?? DEPS.paneAccountMap;
+  const stickySnapshotFn = deps?.stickyAccountSnapshot ?? DEPS.stickyAccountSnapshot;
+  const getPinFn = deps?.getPin ?? DEPS.getPin;
+  const setPinFn = deps?.setPin ?? DEPS.setPin;
+  const clearPinFn = deps?.clearPin ?? DEPS.clearPin;
+  const agentNamesFn = deps?.agentNames ?? DEPS.agentNames;
+
+  const readRouting = useCallback(
+    (): RoutingSnapshot => ({
+      preferredId: getPreferredAccountIdFn(),
+      panes: paneAccountMapFn(),
+      names: agentNamesFn(),
+      conciergePin: getPinFn(CONCIERGE_ACCOUNT_KEY),
+      sparklePin: getPinFn(SPARKLE_SELF_ACCOUNT_PREFIX),
+      conciergeOn: stickySnapshotFn(CONCIERGE_ACCOUNT_KEY),
+      sparkleOn: stickySnapshotFn(SPARKLE_SELF_ACCOUNT_PREFIX),
+    }),
+    [getPreferredAccountIdFn, paneAccountMapFn, agentNamesFn, getPinFn, stickySnapshotFn],
+  );
+  const [routing, setRouting] = useState<RoutingSnapshot>({ panes: {}, names: {} });
+  useEffect(() => {
+    setRouting(readRouting());
+  }, [readRouting]);
+
+  /** Make this account the fleet's primary. The preference is persisted by `activateAccount` even
+   *  when no switch controller is mounted — that half is what governs agents that don't exist yet,
+   *  which is the whole ask. */
+  function handleActivate(id: string) {
+    activateAccountFn(id);
+    setRouting(readRouting());
+  }
+
+  /** Back to automatic: unpreferred, so every unpinned spawn returns to lowest-usage auto-pick.
+   *  Agents already running stay where they are — nothing is re-spawned to undo a preference.
+   *
+   *  BOTH WRITES, because clearing the preference alone does not make anything automatic. The
+   *  activation this undoes had two durable effects: the preference, and a per-agent pin on every
+   *  pane its migration moved (`moveAgent` → `setPinFromSwitch`). A pin OUTRANKS the preference in
+   *  `chooseAccountForAgent`, so dropping only the preference leaves each of those agents spawning
+   *  on the activated account forever — the button reports success and the fleet does not move.
+   *  Provenance-keyed, so a per-agent override a HUMAN set (the pane picker, the sticky consumers'
+   *  own controls) survives: this undoes the machinery's choice, not theirs. */
+  function handleClearPreferred() {
+    clearPreferredAccountFn();
+    clearSwitchWrittenPinsFn();
+    setRouting(readRouting());
+  }
+
+  /** Park a sticky consumer on one account, or `""` to hand it back to automatic. Writes a PIN on
+   *  that consumer's key rather than touching the fleet preference, which is exactly the
+   *  distinction the section explains on screen. */
+  function handleStickyChoice(key: string, accountId: string) {
+    if (accountId) setPinFn(key, accountId);
+    else clearPinFn(key);
+    setRouting(readRouting());
+  }
+
   const usageFor = (id: string) => usage.find((u) => u.id === id);
   const identityFor = (id: string) => identities.find((i) => i.id === id);
   // Registrations that resolve to the SAME Anthropic account (same identity key: uuid when
@@ -637,16 +771,88 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   const duplicates = duplicateAccountGroups(accounts, identities);
   const duplicateIds = new Set(duplicates.flatMap((g) => g.accounts.map((a) => a.id)));
   const now = Date.now();
-  // Each window's bar fills RELATIVE to the busiest account, so the emptiest account reads shortest
-  // (= most headroom). Floor at 1 so an all-zero set divides cleanly to empty bars, not NaN.
-  const peak5h = Math.max(1, ...usage.map((u) => u.tokens5h));
-  const peak7d = Math.max(1, ...usage.map((u) => u.tokens7d));
+  // The cross-account peaks that scaled the relative usage bars are gone with the bars themselves.
+  // `usage` is still read, for ONE thing: the amber "Exhausted until …" line, which reports an
+  // OBSERVED rate limit rather than a token estimate.
 
   // ── Rotation visibility ─────────────────────────────────────────────────────────────────────
   // Every number below is DERIVED from the same pure policy the spawn path uses. Nothing here
   // decides anything; it reports what selection is already doing, which is the entire point — the
   // bug was never that selection was wrong, it was that its input pool was invisible.
   const displayFor = (a: Account) => accountDisplay(a, identityFor(a.id));
+  /** How an account reads as one entry in a PICKER — deliberately not `displayFor().primary`.
+   *
+   *  That field is an IDENTITY SLOT's text, and its `email ?? NOT_SIGNED_IN` fallback is honest
+   *  there and wrong here twice over. An option's job is to NAME the thing you are choosing, so:
+   *
+   *   • "Not signed in" is not a name. Worse, it is a false one for an `oauthAccount` that carries a
+   *     uuid but no readable email — an account that IS signed in — which is exactly the state
+   *     `SIGNED_IN_NO_EMAIL` exists to describe. Falling back to the NICKNAME says which config dir
+   *     this is without claiming anything about its login, which the row above already reports.
+   *   • Two accounts with no email would both render "Not signed in" and be indistinguishable in
+   *     the list — a picker in which the options are not telling apart is not a picker.
+   *
+   *  Carrying BOTH parts when both exist also keeps each option's text distinct from the identity
+   *  slot's, so a query for an email still resolves to the one element that is claiming to be that
+   *  account's identity rather than to a menu entry that merely mentions it. */
+  const accountOptionLabel = (a: Account) => {
+    const d = displayFor(a);
+    return d.signedIn ? `${d.nickname} — ${d.primary}` : d.nickname;
+  };
+  /** How an account id reads in a sentence ("On <name>"), or null when the id names nothing.
+   *
+   *  Uses the same label as the picker beside it, for the reason above and one more: the sentence
+   *  and the `<select>` describe the SAME choice, so naming one account two ways across two
+   *  adjacent controls reads as two different accounts. */
+  const nameOfAccount = (id: string | undefined) => {
+    const a = id ? accounts.find((x) => x.id === id) : undefined;
+    return a ? accountOptionLabel(a) : null;
+  };
+  /** Everything currently running on this account, by the name the user knows it by.
+   *
+   *  THE FOUNDER'S ACTUAL QUESTION — "Then what actual agents would go on to that account? It's not
+   *  clear to me." The two sticky consumers are appended after the agents because they are the two
+   *  that "Activate this account" will NOT move, and seeing them listed on an account is what makes
+   *  their separate control below make sense. */
+  /*  A STICKY CONSUMER CAN ALSO BE A MOUNTED PANE, so the pane map is not a list of "other" agents.
+   *  Improve Sparkle's pane is an ordinary `AgentPane` whose `agent.id` IS `SPARKLE_AGENT_ID`
+   *  (`sparkleAgent.ts`), so `registerPaneAccount` files it under the sticky key itself. Listing the
+   *  pane map verbatim and THEN appending the sticky labels therefore printed it twice — once as the
+   *  raw internal id `__sparkle_self__`, which names nothing the user has ever seen, since
+   *  `routing.names` only carries sidebar agents. So sticky keys are pulled out of the pane list and
+   *  folded into the one label each.
+   *
+   *  Presence is the OR of the two sources rather than the snapshot alone, and that matters for
+   *  satellite windows: those panes register under a `-win-<uuid>` variant while
+   *  `stickyAccountSnapshot` is read on the BASE key, so a variant that resolved without the base
+   *  key ever resolving would drop off the list entirely if the pane evidence were discarded. */
+  const stickyLabel = (paneId: string): string | null => {
+    if (paneId === CONCIERGE_ACCOUNT_KEY) return "Concierge";
+    return isStickyAccountKey(paneId) ? "Improve Sparkle" : null;
+  };
+  const consumersOn = (accountId: string): string[] => {
+    const here = Object.entries(routing.panes).filter(([, acct]) => acct === accountId);
+    // ONE function decides which sticky consumer a pane id is, so the exclusion below and the
+    // inclusion under it cannot disagree about the same id — the way to get the duplicate back.
+    const agents = here
+      .filter(([id]) => stickyLabel(id) == null)
+      .map(([id]) => routing.names[id] ?? id)
+      .sort((x, y) => x.localeCompare(y));
+    const paneHere = (label: string) => here.some(([id]) => stickyLabel(id) === label);
+    // The two sticky consumers last: they are the two "Activate this account" will NOT move, and
+    // seeing them here is what makes their separate control below make sense.
+    //
+    // ASYMMETRIC ON PURPOSE. The concierge has no pane — `registerPaneAccount`'s only production
+    // caller is `AgentPane`, keyed by `agent.id`, and the concierge is `controlListener`'s caller
+    // identity rather than anything mounted — so its account is knowable only from the snapshot. An
+    // `|| paneHere("Concierge")` arm here would read as symmetry with the line below while being
+    // unreachable by construction, which is worse than the asymmetry: it would tell a later reader
+    // that both consumers are covered by pane evidence when only one can be.
+    if (routing.conciergeOn === accountId) agents.push("Concierge");
+    if (routing.sparkleOn === accountId || paneHere("Improve Sparkle"))
+      agents.push("Improve Sparkle");
+    return agents;
+  };
   const readiness = rotationReadiness(accounts, identities);
   const headroomById = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
   const outlook = exhaustionOutlook(
@@ -709,7 +915,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       // and a same-account re-login, neither of which an identity-signature key would catch).
       setLiveNonce((n) => n + 1);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to add account");
+      setError(errText(e, "Failed to add account"));
     } finally {
       setBusy(false);
     }
@@ -728,7 +934,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       // account set nor the identity changes.
       setLiveNonce((n) => n + 1);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to log in");
+      setError(errText(e, "Failed to log in"));
     }
   }
 
@@ -760,18 +966,8 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       await io.setNickname(id, nickname);
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to rename");
+      setError(errText(e, "Failed to rename"));
     }
-  }
-
-  // MANUAL "switch all agents here". The confirm is already past by the time this runs. Fires the
-  // request the app-wide host drives — it does NOT switch anything here, on purpose: the modal
-  // unmounts, and the switch outlives it (busy agents migrate as their turns end). Records
-  // `switchingAllTo` so the row can say it's underway.
-  function handleSwitchAll(id: string) {
-    setConfirmSwitchAll(null);
-    setSwitchingAllTo(id);
-    io.requestSwitchAll(id);
   }
 
   async function handleRemove(id: string) {
@@ -780,7 +976,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
       await io.removeAccount(id);
       await refresh();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to remove");
+      setError(errText(e, "Failed to remove"));
     }
   }
 
@@ -914,6 +1110,17 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         <div style={{ ...card, color: C.muted, fontSize: 13 }}>No accounts yet. Add one to get started.</div>
       )}
 
+      {/* BE HONEST ABOUT COVERAGE. `paneAccountMap` holds only MOUNTED panes, so an agent in a
+          satellite window or a closed tab is running somewhere and appears in no list below. Saying
+          so in one line is cheaper than a reader concluding the lists are exhaustive and that an
+          account is idle when it is not. */}
+      {accounts.length > 0 && (
+        <div data-testid="routing-coverage-note" style={{ fontSize: 12, color: C.muted, margin: "0 0 8px" }}>
+          The lists below cover agents with an open tab in this window; agents in other windows or
+          closed tabs aren&rsquo;t shown.
+        </div>
+      )}
+
       {accounts.map((a) => {
         const u = usageFor(a.id);
         const identity = identityFor(a.id);
@@ -931,6 +1138,9 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         // pointed the other way — it gets its own honest string instead.
         const display = accountDisplay(a, identity);
         const signedIn = isSignedIn(identity);
+        // Can this account be made PRIMARY? Narrower than `signedIn` on purpose — see the Activate
+        // button below: `usablePreferredAccount` gates on `signedInAccountIds`, which keys on email.
+        const canBePrimary = display.signedIn;
         const primary = display.signedIn
           ? display.primary
           : signedIn
@@ -939,54 +1149,25 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         const alias = primary !== display.nickname ? display.nickname : null;
         return (
           <div key={a.id} style={card}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              {isEditing ? (
-                <input
-                  autoFocus
-                  aria-label={`Rename ${a.nickname}`}
-                  value={draftName}
-                  onChange={(e) => setDraftName(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") void handleRename(a.id);
-                    if (e.key === "Escape") exitRename();
-                  }}
-                  onBlur={() => void handleRename(a.id)}
-                  style={{ ...inputStyle, flex: 1 }}
-                />
-              ) : (
-                <span style={{ flex: 1, minWidth: 0 }}>
-                  <span
-                    data-testid={`account-identity-${a.id}`}
-                    style={{
-                      fontSize: 13,
-                      fontWeight: 600,
-                      display: "block",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      ...(signedIn ? {} : { color: C.amber }),
-                    }}
-                    title={
-                      signedIn
-                        ? undefined
-                        : "This config folder holds no Claude login. Log in to give it a real identity."
-                    }
-                  >
-                    {primary}
-                  </span>
-                  {alias && (
-                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>alias: {alias}</span>
-                  )}
-                  {identity?.organization && (
-                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>{identity.organization}</span>
-                  )}
-                  {/* The separate amber "Not signed in" badge is gone: the identity slot above now
-                      says it literally, and rendering the same words twice in one card was both
-                      noise and an ambiguous target for tests. `isSignedIn` (uuid OR email) still
-                      drives the Log in / Switch login affordance below — it is deliberately WIDER
-                      than the identity slot's rule (email only), so an account holding an
-                      `oauthAccount` with no readable `emailAddress` offers "Switch login" while its
-                      identity slot honestly reports it has no email to show. */}
+            {/* ══ CONTROLS ROW — ON TOP, AND THE TEXT BELOW IT ═══════════════════════════════════
+                The buttons and the identity text used to share ONE flex row, with the text at
+                `flex: 1` beside them. At any width where the buttons did not fit on their own line,
+                the name and email wrapped AROUND them and the two collided — which is what the
+                founder screenshotted.
+
+                Splitting them into two stacked blocks removes the failure mode rather than tuning
+                it: the controls take a full-width wrapping row of their own, so they reflow among
+                THEMSELVES at a narrow width, and the text block below is full-width with no
+                floated sibling to wrap around. No breakpoint to pick, and nothing to re-tune the
+                next time a button is added to this card. */}
+            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+              {/* PRIMARY before `default`, and filled rather than outlined. They answer different
+                  questions and the founder's screenshot is why that has to be legible at a glance:
+                  an EXHAUSTED account was badged `default` there, which reads as "this is the one
+                  in use" when it means nothing of the kind. */}
+              {routing.preferredId === a.id && (
+                <span data-testid={`account-primary-badge-${a.id}`} style={primaryTagStyle}>
+                  primary
                 </span>
               )}
               {a.isDefault && <span style={tagStyle}>default</span>}
@@ -1083,47 +1264,72 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                   </button>
                 ))}
 
-              {/* MANUAL "switch every agent + the concierge to THIS account, now". Shown only for a
-                  SIGNED-IN account (a login-less config dir cannot receive agents) and never for the
-                  account the fleet is already on (`currentAccountId`) — switching to it is a no-op.
-                  Two-step, like Remove: the confirm names the cost (agents re-spawn, at their next
-                  safe boundary, so no in-flight work is lost). */}
-              {!isEditing &&
-                signedIn &&
-                a.id !== currentAccountId &&
-                (switchingAllTo === a.id ? (
+              {/* The duplicate "Switch all agents here" control that used to render here was REMOVED
+                  when this branch merged, along with the `manualAccountSwitch` request channel it
+                  published on. It and "Activate this account" below were built in parallel for the
+                  same ask, and shipping both put two buttons with overlapping meaning on one card —
+                  one of which promised, in its own tooltip, to "move every agent and the concierge",
+                  which is the exact opposite of what the sticky section two blocks down tells the
+                  user. The channel went with it rather than being left wired: nothing published on
+                  it once the button was gone, and a module whose comment says it is live while no
+                  caller exists is worse than no module. `activateAccount` is now the ONE entry point
+                  — it records the preference with or without a mounted host, and hands the migration
+                  to the same `switchTo` this screen's button reaches. */}
+            </div>
+
+            {/* IDENTITY TEXT — full width, BELOW the controls. `minWidth: 0` still matters: it is
+                what lets the ellipsis rule inside actually clip a long email rather than forcing
+                the card wider than its container. */}
+            <div style={{ minWidth: 0, marginTop: 8 }}>
+              {isEditing ? (
+                <input
+                  autoFocus
+                  aria-label={`Rename ${a.nickname}`}
+                  value={draftName}
+                  onChange={(e) => setDraftName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void handleRename(a.id);
+                    if (e.key === "Escape") exitRename();
+                  }}
+                  onBlur={() => void handleRename(a.id)}
+                  style={{ ...inputStyle, width: "100%" }}
+                />
+              ) : (
+                <>
                   <span
-                    data-testid={`switching-all-${a.id}`}
-                    style={{ fontSize: 12, color: C.teal, whiteSpace: "nowrap" }}
+                    data-testid={`account-identity-${a.id}`}
+                    style={{
+                      fontSize: 13,
+                      fontWeight: 600,
+                      display: "block",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      ...(signedIn ? {} : { color: C.amber }),
+                    }}
+                    title={
+                      signedIn
+                        ? undefined
+                        : "This config folder holds no Claude login. Log in to give it a real identity."
+                    }
                   >
-                    <FiRotateCw size={12} aria-hidden style={{ verticalAlign: "-1px", marginRight: 4 }} />
-                    Switching all agents here…
+                    {primary}
                   </span>
-                ) : confirmSwitchAll === a.id ? (
-                  <>
-                    <button
-                      type="button"
-                      data-testid={`switch-all-confirm-${a.id}`}
-                      style={{ ...smallBtn, borderColor: C.teal, color: C.teal }}
-                      onClick={() => handleSwitchAll(a.id)}
-                    >
-                      Confirm — move all agents
-                    </button>
-                    <button type="button" style={smallBtn} onClick={() => setConfirmSwitchAll(null)}>
-                      Cancel
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    data-testid={`switch-all-${a.id}`}
-                    style={smallBtn}
-                    onClick={() => setConfirmSwitchAll(a.id)}
-                    title="Move every agent and the concierge onto this account. Busy agents switch when they finish their current turn, so no work is lost."
-                  >
-                    Switch all agents here
-                  </button>
-                ))}
+                  {alias && (
+                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>alias: {alias}</span>
+                  )}
+                  {identity?.organization && (
+                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>{identity.organization}</span>
+                  )}
+                  {/* The separate amber "Not signed in" badge is gone: the identity slot above now
+                      says it literally, and rendering the same words twice in one card was both
+                      noise and an ambiguous target for tests. `isSignedIn` (uuid OR email) still
+                      drives the Log in / Switch login affordance above — it is deliberately WIDER
+                      than the identity slot's rule (email only), so an account holding an
+                      `oauthAccount` with no readable `emailAddress` offers "Switch login" while its
+                      identity slot honestly reports it has no email to show. */}
+                </>
+              )}
             </div>
 
             {exhausted && (
@@ -1169,6 +1375,77 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               </div>
             )}
 
+            {/* ── ACTIVATE, and WHAT IS ON THIS ACCOUNT ────────────────────────────────────────
+                The control the founder asked for, and immediately under it the answer to the
+                question he asked next. A button that silently re-routes an invisible fleet is the
+                thing that was unclear; the list is most of the feature. */}
+            {(() => {
+              const isPrimary = routing.preferredId === a.id;
+              const here = consumersOn(a.id);
+              return (
+                <div data-testid={`account-routing-${a.id}`} style={{ marginTop: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <span
+                      data-testid={`account-active-state-${a.id}`}
+                      style={{
+                        fontSize: 12,
+                        fontWeight: 600,
+                        color: isPrimary ? C.successInk : C.muted,
+                      }}
+                    >
+                      {isPrimary ? "Active — new agents run here" : "Inactive"}
+                    </span>
+                    {isPrimary ? (
+                      <button
+                        type="button"
+                        style={smallBtn}
+                        onClick={handleClearPreferred}
+                        // Says what it does NOT do, because the opposite is the natural assumption:
+                        // nothing already running is dragged back off this account.
+                        title="Stop sending new agents here. Agents already running stay where they are."
+                      >
+                        Back to automatic
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        style={canBePrimary ? primaryBtn : { ...smallBtn, opacity: 0.5 }}
+                        // An account the selection gate would reject cannot receive agents, so
+                        // offering the button would be a control that reports success and changes
+                        // nothing — the card would flip to "Active — new agents run here" and the
+                        // very next spawn would discard the preference, recording a bland "auto".
+                        //
+                        // Gated on `display.signedIn` (EMAIL-ONLY) rather than the wider `signedIn`
+                        // (uuid OR email) precisely so this button and `usablePreferredAccount`
+                        // cannot disagree: that gate tests `signedInAccountIds`, which keys on
+                        // email. The wider predicate is right for Log in / Switch login beside it —
+                        // a uuid-only login IS real — but promising primacy this screen cannot
+                        // deliver is the failure mode here.
+                        disabled={!canBePrimary}
+                        onClick={() => handleActivate(a.id)}
+                        title={
+                          canBePrimary
+                            ? "Run agents on this account. New agents start here; ones already running move as each finishes its turn."
+                            : "Sign in to this account first — it cannot receive agents yet."
+                        }
+                      >
+                        Activate this account
+                      </button>
+                    )}
+                  </div>
+                  <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
+                    {here.length === 0 ? (
+                      "Nothing is running on this account right now."
+                    ) : (
+                      <>
+                        Running here: <span style={{ color: C.cream }}>{here.join(", ")}</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              );
+            })()}
+
             {/* Where this account stands against its OWN learned ceiling. An account with no usage
                 row yet has nothing measured — rendered as "unknown", never as 0%. */}
             <HeadroomLine
@@ -1184,16 +1461,78 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               }
             />
 
-            {/* REAL server-side usage from Anthropic (the account's actual 5h/7d percent + reset),
-                augmenting the relative token-tally bars below. Best-effort per account: an errored
-                fetch degrades this block only, and the local estimate below stays the fallback. */}
-            <LiveUsageSection live={liveUsage[a.id]} />
+            {/* REAL server-side usage from Anthropic — the account's actual 5h/7d percent + reset.
+                THE ONLY usage figures on this card now.
 
-            <UsageBar label="5-hour window (local estimate)" tokens={u?.tokens5h ?? 0} peakTokens={peak5h} />
-            <UsageBar label="7-day window (local estimate)" tokens={u?.tokens7d ?? 0} peakTokens={peak7d} />
+                The two "(local estimate)" bars that used to sit below were REMOVED at the founder's
+                instruction ("we can remove the local estimates, they're not useful — let's just go
+                with the actual cloud data"), and they were worse than merely unhelpful. They were
+                computed by scanning each account's OWN transcripts, so they measured what THIS
+                machine ran under an account rather than what the account had spent. On the card that
+                prompted this, the real figures read session 0% / weekly 100% while BOTH local bars
+                read 0 — the estimate described a fully exhausted account as completely idle. Showing
+                a number that confidently contradicts the real one beside it is a liability, not a
+                fallback. (The same inversion was steering the ROUTER; that is fixed separately, in
+                `accountStore.pickAccount`.) */}
+            <LiveUsageSection live={liveUsage[a.id]} />
           </div>
         );
       })}
+
+      {/* ── The two consumers "Activate this account" deliberately leaves alone ─────────────────
+          accountSelection.ts conceded this control was owed: "giving the concierge a visible
+          account control belongs with the rest of the Phase 2 account UI. Stickiness is what makes
+          that absence tolerable rather than a hole." Without it, activating an account would look
+          like it moved everything while these two silently stayed put — the exact "two systems"
+          confusion the founder described. Each writes a PIN on its own key, which is a deliberate
+          per-consumer decision rather than a side effect of a fleet-wide setting. */}
+      {accounts.length > 0 && (
+        <div data-testid="sticky-consumers" style={{ ...card, marginTop: 12 }}>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>Sparkle&rsquo;s own helpers</div>
+          <div style={{ fontSize: 12, color: C.muted, marginTop: 2, lineHeight: 1.5 }}>
+            These two stay on one account on purpose, so activating an account does not move them.
+            Park them here instead.
+          </div>
+          {STICKY_CONSUMERS.map((c) => {
+            const pin = c.key === CONCIERGE_ACCOUNT_KEY ? routing.conciergePin : routing.sparklePin;
+            const on = c.key === CONCIERGE_ACCOUNT_KEY ? routing.conciergeOn : routing.sparkleOn;
+            const onName = nameOfAccount(on);
+            return (
+              <div
+                key={c.key}
+                style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, flexWrap: "wrap" }}
+              >
+                <span style={{ flex: 1, minWidth: 180 }}>
+                  <span style={{ fontSize: 13, fontWeight: 600, display: "block" }}>{c.label}</span>
+                  <span style={{ fontSize: 12, color: C.muted, display: "block" }}>
+                    {/* "Not chosen yet" is a real third state and must not read as an account
+                        name: these keys resolve lazily, so before the concierge's first turn there
+                        is genuinely no answer. */}
+                    {onName
+                      ? `On ${onName}${pin ? " (you set this)" : " (chosen automatically)"}`
+                      : "No account chosen yet"}
+                  </span>
+                  <span style={{ fontSize: 12, color: C.muted, display: "block" }}>{c.note}</span>
+                </span>
+                <select
+                  aria-label={`Account for ${c.label}`}
+                  data-testid={`sticky-account-${c.key}`}
+                  value={pin ?? ""}
+                  onChange={(e) => handleStickyChoice(c.key, e.target.value)}
+                  style={inputStyle}
+                >
+                  <option value="">Automatic</option>
+                  {accounts.map((acc) => (
+                    <option key={acc.id} value={acc.id}>
+                      {accountOptionLabel(acc)}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {/* The RETROSPECTIVE half of rotation. Everything above says what Sparkle will do next; this
           says what it actually did — which account each recent agent ran under, read from the

@@ -63,7 +63,9 @@ pub struct SpawnLogEntry {
     pub config_dir: Option<String>,
     /// The account's real authenticated identity, when known.
     pub email: Option<String>,
-    /// `"pinned" | "auto" | "sticky" | "fallback" | "remembered" | "none"`.
+    /// `"pinned" | "preferred" | "auto" | "sticky" | "fallback" | "remembered" | "none"`.
+    /// (`"preferred"` = the fleet-wide account the user activated in the accounts modal, as
+    /// distinct from `"pinned"`, which is one human choice about one agent.)
     pub reason: String,
     pub tokens5h: u64,
     /// Learned ceiling; `None` = not enough evidence to have learned one.

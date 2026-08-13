@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   /** Turn the updater replay on/off per test. */
   replayUpdaters: false,
   restart: vi.fn((_agentId: string) => true),
+  /** Stands in for `setPinFromSwitch` — the pin a MIGRATION writes. */
   setPin: vi.fn((_agentId: string, _accountId: string) => {}),
   invalidate: vi.fn(),
   statuses: {} as Record<string, AgentTabStatus | undefined>,
@@ -58,13 +59,22 @@ vi.mock("../services/paneControl", () => ({
   busiestPaneAccount: () => "acct-a",
 }));
 
+// `setPinFromSwitch` is what a migration writes — NOT `setPin`. The distinction is the whole point
+// of the provenance mark: a later activation clears the pins the machinery wrote and must leave a
+// human's `AgentPane` override alone. Spying on `setPin` here would keep passing if `moveAgent`
+// silently went back to writing unmarked pins, which is the regression this suite should catch.
 vi.mock("../services/accountStore", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/accountStore")>()),
-  setPin: (agentId: string, accountId: string) => h.setPin(agentId, accountId),
+  setPinFromSwitch: (agentId: string, accountId: string) => h.setPin(agentId, accountId),
   listCeilings: async () => [],
 }));
 
-vi.mock("../services/accountSelection", () => ({
+// The two functions this suite drives are stubbed; everything else is the REAL module. In
+// particular `isStickyAccountKey` — the plan builders exclude the sticky consumers through it, and
+// a hand-written stub here would let this suite disagree with the one definition of "sticky" and
+// keep passing while an activation swept the concierge.
+vi.mock("../services/accountSelection", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/accountSelection")>()),
   loadAccountState: async () => ({ accounts: [], usage: [], identities: [] }),
   invalidateAccountState: () => h.invalidate(),
 }));

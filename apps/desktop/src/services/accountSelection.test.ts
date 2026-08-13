@@ -30,12 +30,28 @@ function mockBackend() {
     if (cmd === "accounts_usage") return Promise.resolve([]); // no usage rows → all zero headroom
     if (cmd === "accounts_identities") return Promise.resolve([]); // no identities → nickname fallback
     if (cmd === "accounts_ceilings") return Promise.resolve([]); // nothing learned → lowest-usage rule
+    // REAL Anthropic utilization, fetched per account on its OWN longer TTL and never awaited by a
+    // load. Rejecting is a realistic answer here (no OAuth token in a test environment) and is the
+    // path `refreshLiveUsage` absorbs per account, so selection degrades to the local tally.
+    if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
     return Promise.reject(new Error(`unexpected command ${cmd}`));
   });
 }
 
 // listAccounts + getUsage + getIdentities + listCeilings fire together per (uncached) load.
 const CALLS_PER_LOAD = 4;
+
+/** The four commands that make up ONE account-snapshot load.
+ *
+ *  These suites are about the ACCOUNT cache's IPC economy, so they must count that cache's calls and
+ *  nothing else. `account_usage_live` rides a separate cache with a much longer TTL and fires once
+ *  per account, so folding it into a raw `invoke` count would make the assertions depend on how many
+ *  accounts the fixture happens to have — and would go red for a background refresh that is working
+ *  exactly as designed. */
+const SNAPSHOT_COMMANDS = ["accounts_list", "accounts_usage", "accounts_identities", "accounts_ceilings"];
+function snapshotCalls(): number {
+  return invoke.mock.calls.filter((c) => SNAPSHOT_COMMANDS.includes(c[0] as string)).length;
+}
 
 describe("accountSelection cache", () => {
   beforeEach(() => {
@@ -52,14 +68,14 @@ describe("accountSelection cache", () => {
     await loadAccountState({ now: t0 + 100 });
     await loadAccountState({ now: t0 + ACCOUNT_CACHE_TTL_MS - 1 });
     // One uncached load's worth of calls total — the later reads hit the cache.
-    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD);
+    expect(snapshotCalls()).toBe(CALLS_PER_LOAD);
   });
 
   it("re-fetches after the TTL expires", async () => {
     const t0 = 2_000_000;
     await loadAccountState({ now: t0 });
     await loadAccountState({ now: t0 + ACCOUNT_CACHE_TTL_MS + 1 });
-    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD * 2); // two loads
+    expect(snapshotCalls()).toBe(CALLS_PER_LOAD * 2); // two loads
   });
 
   it("invalidateAccountState forces the next load to re-fetch", async () => {
@@ -67,13 +83,13 @@ describe("accountSelection cache", () => {
     await loadAccountState({ now: t0 });
     invalidateAccountState();
     await loadAccountState({ now: t0 + 1 });
-    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD * 2);
+    expect(snapshotCalls()).toBe(CALLS_PER_LOAD * 2);
   });
 
   it("de-dupes concurrent loads into a single IPC batch", async () => {
     const t0 = 4_000_000;
     await Promise.all([loadAccountState({ now: t0 }), loadAccountState({ now: t0 }), loadAccountState({ now: t0 })]);
-    expect(invoke).toHaveBeenCalledTimes(CALLS_PER_LOAD);
+    expect(snapshotCalls()).toBe(CALLS_PER_LOAD);
   });
 
   // ── withIdentities: false — the poller's opt-out (sparkle-608gg) ──────────────────────────────

@@ -425,6 +425,154 @@ pub(crate) fn ensure_account_allowlist_at(config_dir: &Path) -> Result<(), Strin
         .map_err(|e| format!("write account settings.json: {e}"))
 }
 
+/// The Claude Code state file inside a config dir. Holds the onboarding markers and, once a login
+/// completes, `oauthAccount`.
+const CLAUDE_JSON: &str = ".claude.json";
+
+/// The `lastOnboardingVersion` written into a FRESH marker. A stale value is harmless: it does not
+/// re-run the wizard (`hasCompletedOnboarding` is the gate), it only lets Claude Code offer steps
+/// added since. Deliberately not bumped automatically — nothing here should claim the user has seen
+/// a screen that did not exist when this was written.
+const ONBOARDING_VERSION: &str = "2.1.229";
+
+/// Mark Claude Code's first-run onboarding as ALREADY DONE for `config_dir`.
+///
+/// `CLAUDE_CONFIG_DIR` replaces `$HOME/.claude` wholesale, so a config dir Sparkle mints starts with
+/// no `.claude.json` at all — and Claude Code reads that as a first run. An agent spawned there gets
+/// the theme picker and then "Select login method", and **the brief Sparkle types is consumed by the
+/// wizard**. The agent reports as running and executes nothing. That is how one restart put an
+/// entire 80-agent fleet into onboarding and cost the founder an evening.
+///
+/// ENSURES A KEY, RATHER THAN CREATING A FILE, and the distinction is the whole point. The obvious
+/// shape — write the marker when `.claude.json` is absent — silently skips the worse case: a file
+/// that EXISTS, carries a real `oauthAccount`, and simply has no `hasCompletedOnboarding`. Claude
+/// Code runs the wizard for those too, and a create-if-missing pass steps right over them. Measured
+/// on the founder's machine: two dirs were missing the file, but THREE signed-in dirs had the file
+/// without the key — including a registered, actively-routed account. Fixing only the first two left
+/// the fleet still landing in the picker.
+///
+/// Non-destructive, mirroring [`ensure_account_allowlist_at`] exactly, because this file holds the
+/// login and there is no second copy:
+///   * only `NotFound` counts as absent — an unreadable file is propagated, never treated as missing
+///     and then overwritten;
+///   * an unparseable file is refused and left byte-for-byte intact;
+///   * an existing object is MERGED into (every other key survives), never replaced;
+///   * a dir already marked complete is not rewritten at all;
+///   * the write goes through [`crate::hooks::atomic_write_settings`], so a reader never sees a
+///     partial file — and, because that is NOT the same guarantee, the read-modify-write is also
+///     guarded against a LOST UPDATE (see below).
+///
+/// ══ ATOMIC WRITES DO NOT PREVENT A LOST UPDATE, AND THIS FILE HAS A LIVE SECOND WRITER ═════════
+/// `.claude.json` is not `settings.json`. Claude Code OWNS it and rewrites the whole file itself —
+/// on startup, on project-history updates, and at the moment a login completes. So this heal's
+/// read → modify → rename has a window: anything `claude` writes between our read and our rename is
+/// discarded wholesale, and the write most likely to land in that window is the freshly-completed
+/// `oauthAccount`. Losing that is the unrecoverable case this function is otherwise written to
+/// avoid, and it applies to precisely the population the heal targets — an already-signed-in dir
+/// missing the key, healed by `accounts_list` while agents are live on it.
+///
+/// Atomicity answers concurrent READERS only, so it does not cover this; the guard is a
+/// compare-and-swap on the file's (len, mtime). If either changed between the read and the write,
+/// someone else wrote and we ABORT rather than clobber. The caller is best-effort and simply logs,
+/// and the next `accounts_list` retries — a heal deferred by one pass costs nothing, while a heal
+/// that eats a login costs the account.
+///
+/// It narrows the window rather than closing it: a write landing inside the stat-to-rename gap is
+/// still lost, and mtime granularity can hide a same-instant write. There is no file lock available
+/// across our process and Claude Code's, so this is the strongest guard on offer — stated plainly
+/// so the next reader does not mistake it for mutual exclusion.
+pub(crate) fn ensure_onboarding_marker_at(config_dir: &Path) -> Result<(), String> {
+    ensure_onboarding_marker_with(config_dir, || {})
+}
+
+/// [`ensure_onboarding_marker_at`] with a seam that runs AFTER the read and BEFORE the write.
+///
+/// The seam exists so the lost-update guard can actually be tested. The race it defends against is
+/// a write landing inside that exact window, and there is no way to produce that interleaving from
+/// outside the function: writing the file before the call simply means the function reads the newer
+/// content, whose stamp then matches at write time — a test written that way passes whether or not
+/// the guard exists, which is the vacuous shape AGENTS.md warns about. Production passes a no-op, so
+/// this is a seam on the real path rather than a second implementation.
+fn ensure_onboarding_marker_with(
+    config_dir: &Path,
+    between_read_and_write: impl FnOnce(),
+) -> Result<(), String> {
+    let file = config_dir.join(CLAUDE_JSON);
+    let existing = match std::fs::read_to_string(&file) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "cannot read account {CLAUDE_JSON} ({e}), leaving it untouched: {}",
+                file.display()
+            ))
+        }
+    };
+    // The stamp we will re-check right before writing. `None` when the file is absent, which the
+    // check below treats as "must still be absent" — a file that APPEARED since the read is a write
+    // by someone else, and the empty object we built is not a merge of it.
+    let stamp_at_read = file_stamp(&file);
+
+    let mut obj = match existing.as_deref() {
+        None => serde_json::Map::new(),
+        Some(s) => match serde_json::from_str::<serde_json::Value>(s) {
+            Ok(serde_json::Value::Object(m)) => m,
+            _ => {
+                return Err(format!(
+                    "account {CLAUDE_JSON} is not a JSON object, leaving it untouched: {}",
+                    file.display()
+                ))
+            }
+        },
+    };
+
+    if obj.get("hasCompletedOnboarding") == Some(&serde_json::Value::Bool(true)) {
+        return Ok(()); // already complete — do not rewrite the file for nothing
+    }
+
+    obj.insert("hasCompletedOnboarding".into(), serde_json::Value::Bool(true));
+    // `entry`-style defaults: fill these ONLY when absent, so a user's own theme or a real
+    // `projects` map is never overwritten by a heal.
+    for (k, v) in [
+        ("lastOnboardingVersion", serde_json::json!(ONBOARDING_VERSION)),
+        ("theme", serde_json::json!("dark")),
+        ("hasSeenAutoModeEntryWarning", serde_json::json!(true)),
+        ("hasResetAutoModeOptInForDefaultOffer", serde_json::json!(true)),
+        ("projects", serde_json::json!({})),
+    ] {
+        obj.entry(k).or_insert(v);
+    }
+
+    std::fs::create_dir_all(config_dir).map_err(|e| format!("mkdir account dir: {e}"))?;
+    let json = serde_json::to_string(&serde_json::Value::Object(obj))
+        .map_err(|e| format!("serialize {CLAUDE_JSON}: {e}"))?;
+    between_read_and_write(); // no-op in production; the test's simulated concurrent login
+    // COMPARE-AND-SWAP: refuse if anyone wrote since we read. See the header — the write we are most
+    // likely to be racing is a completed login, and overwriting that is unrecoverable.
+    if file_stamp(&file) != stamp_at_read {
+        return Err(format!(
+            "{CLAUDE_JSON} changed while healing it (a live claude wrote to it); \
+             leaving it alone and retrying on the next pass: {}",
+            file.display()
+        ));
+    }
+    crate::hooks::atomic_write_settings(&file, &json)
+        .map_err(|e| format!("write account {CLAUDE_JSON}: {e}"))?;
+    tighten_mode(&file, 0o600); // it holds the login once one completes
+    Ok(())
+}
+
+/// `(len, mtime)` for `path`, or `None` when it does not exist / cannot be stat'd.
+///
+/// The change-detection stamp for the compare-and-swap in [`ensure_onboarding_marker_at`]. Both
+/// components matter: a rewrite that happens to preserve the byte length still moves mtime, and a
+/// same-mtime rewrite (coarse filesystem timestamps) usually changes the length. Neither is
+/// sufficient alone and together they are still only a narrowing — which the caller's doc says.
+fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
 /// Create the account's config dir, append it (non-default) to `accounts.json`,
 /// and return it. The frontend launches `claude login` against `config_dir`
 /// separately — we never spawn it here.
@@ -449,6 +597,12 @@ fn add_account_at(
     // account, so this must never be the reason adding one fails.
     if let Err(e) = ensure_account_allowlist_at(&dir) {
         tracing::warn!(error = %e, "could not seed the account's Sparkle allowlist");
+    }
+    // Onboarding marker, for the same reason and on the same best-effort terms: an account whose
+    // dir has no `.claude.json` sends every agent spawned on it into Claude Code's first-run wizard,
+    // which SWALLOWS the brief. See `ensure_onboarding_marker_at`.
+    if let Err(e) = ensure_onboarding_marker_at(&dir) {
+        tracing::warn!(error = %e, "could not seed the account's onboarding marker");
     }
     let acct = Account {
         id,
@@ -2224,6 +2378,13 @@ pub async fn accounts_list(app: AppHandle) -> Result<Vec<Account>, String> {
             if let Err(e) = ensure_account_allowlist_at(Path::new(&a.config_dir)) {
                 tracing::warn!(account = %a.id, error = %e, "could not heal the account's Sparkle allowlist");
             }
+            // Heal the onboarding marker on the SAME pass, and for a strictly larger population than
+            // "accounts added before the fix": a dir can lose the marker at any time, because
+            // `.claude.json` is Claude Code's own file and a fresh one starts without it. This runs
+            // before the picker chooses, so an account is repaired before it can be spawned on.
+            if let Err(e) = ensure_onboarding_marker_at(Path::new(&a.config_dir)) {
+                tracing::warn!(account = %a.id, error = %e, "could not heal the account's onboarding marker");
+            }
         }
         Ok(accounts)
     })
@@ -2279,7 +2440,17 @@ pub fn accounts_remove(
     let removed = read_accounts_at(&accounts_json_path(&app_data))
         .ok()
         .and_then(|v| v.into_iter().find(|a| a.id == id));
-    remove_account_at(&accounts_json_path(&app_data), &id)?;
+    // LOG THE CAUSE BEFORE RETURNING IT. A removal that fails and then succeeds on a later attempt
+    // is a race or a lock, not a fluke, and diagnosing it needs the error that actually occurred —
+    // but the only copy used to be the string handed to the frontend, which discarded it (a Tauri
+    // command rejects with a bare STRING, so the screen's `e instanceof Error` test was false and it
+    // substituted its own generic "Failed to remove"). The founder hit exactly that: repeated
+    // failures, a later success, and nothing in the log to say why. Now the reason survives the
+    // attempt regardless of what any caller does with it.
+    if let Err(e) = remove_account_at(&accounts_json_path(&app_data), &id) {
+        tracing::warn!(account = %id, error = %e, "accounts_remove failed");
+        return Err(e);
+    }
     // Drop this directory's identity history too, so a removed account's absolute path and every
     // email/uuid that ever held it do not outlive it with nothing reading them (knightwatch probe 3).
     //
@@ -4744,6 +4915,175 @@ mod tests {
             std::fs::read(&file).unwrap(),
             raw,
             "the heal overwrote a file it could not read — this is the data-loss path"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ---- onboarding marker ----------------------------------------------------------------
+    //
+    // The fleet-into-the-wizard bug. A config dir with no `hasCompletedOnboarding: true` makes
+    // Claude Code run its first-run wizard, which CONSUMES the brief Sparkle types — the agent
+    // reports as running and executes nothing.
+
+    /// A dir with no `.claude.json` at all gets the marker written.
+    #[test]
+    fn an_absent_claude_json_gets_an_onboarding_marker() {
+        let tmp = unique_dir("onboard-absent");
+        std::fs::create_dir_all(&tmp).unwrap();
+        assert!(!tmp.join(".claude.json").exists(), "precondition: no marker yet");
+
+        ensure_onboarding_marker_at(&tmp).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            v["hasCompletedOnboarding"], true,
+            "an agent spawned here would still get the first-run wizard"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// THE CASE A CREATE-IF-MISSING PASS SKIPS, and the reason the first hotfix did not work.
+    ///
+    /// A `.claude.json` that EXISTS and holds a real login, but carries no `hasCompletedOnboarding`,
+    /// still sends Claude Code into the wizard. Measured on the founder's machine: two dirs were
+    /// missing the file entirely, but THREE signed-in dirs had the file WITHOUT the key — one of
+    /// them a registered account the router was actively selecting. Seeding only the absent ones
+    /// left the fleet landing in the picker.
+    ///
+    /// Asserts BOTH halves, because they are the two ways this can be wrong: the marker must be
+    /// added (or the wizard still runs), and `oauthAccount` must survive (or the fix logs the user
+    /// out — strictly worse than the bug, and unrecoverable, since the credential is keychain-keyed
+    /// by the dir path).
+    #[test]
+    fn healing_onboarding_preserves_an_existing_login() {
+        let tmp = unique_dir("onboard-existing-login");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(
+            tmp.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"someone@example.com"},"theme":"light","numStartups":7}"#,
+        )
+        .unwrap();
+
+        ensure_onboarding_marker_at(&tmp).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(
+            v["hasCompletedOnboarding"], true,
+            "a present-but-unmarked file must be HEALED, not skipped — this is the whole bug"
+        );
+        assert_eq!(
+            v["oauthAccount"]["emailAddress"], "someone@example.com",
+            "the heal destroyed the login; the credential cannot be recovered"
+        );
+        assert_eq!(v["theme"], "light", "a user's own theme must not be overwritten by the default");
+        assert_eq!(v["numStartups"], 7, "unrelated Claude Code state must survive");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Already complete → not rewritten AT ALL. Asserts the bytes, not just the `Ok`: rewriting a
+    /// live `.claude.json` on every `accounts_list` would churn the file Claude Code is reading.
+    #[test]
+    fn healing_onboarding_does_not_rewrite_a_dir_already_complete() {
+        let tmp = unique_dir("onboard-already");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // Deliberately compact and key-ordered unlike our own writer's output, so a rewrite shows up.
+        let original = r#"{"hasCompletedOnboarding":true,"zzz":1}"#;
+        std::fs::write(tmp.join(".claude.json"), original).unwrap();
+
+        ensure_onboarding_marker_at(&tmp).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".claude.json")).unwrap(),
+            original,
+            "an already-complete marker must be left byte-for-byte alone"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Unparseable → refused, bytes intact. Same data-loss reasoning as the settings.json twin: this
+    /// file holds the login, and there is no prior copy.
+    #[test]
+    fn healing_onboarding_leaves_an_unparseable_claude_json_intact() {
+        let tmp = unique_dir("onboard-garbage");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join(".claude.json"), "{ not json").unwrap();
+
+        assert!(ensure_onboarding_marker_at(&tmp).is_err());
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".claude.json")).unwrap(),
+            "{ not json",
+            "an unparseable .claude.json must be left byte-for-byte intact"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A CONCURRENT WRITE MUST NOT BE CLOBBERED — the lost-update case atomicity does not cover.
+    ///
+    /// `.claude.json` is Claude Code's own file and it rewrites the whole thing, including at the
+    /// instant a login completes. A read → modify → rename therefore has a window in which someone
+    /// else's write is discarded wholesale, and the one most likely to land in it is the freshly
+    /// written `oauthAccount` — the unrecoverable loss this whole function is shaped to avoid.
+    ///
+    /// The write is driven through the `between_read_and_write` seam so it lands in the ONE window
+    /// that matters. Writing the file before the call would not test this at all: the function would
+    /// read the newer content and its stamp would match at write time, so the test would pass with
+    /// the guard deleted.
+    ///
+    /// ASSERTS THE SIDE EFFECT — the login on disk — not merely the returned `Err`. An
+    /// implementation that returned an error and still wrote would satisfy an `is_err()` check while
+    /// destroying the credential.
+    #[test]
+    fn healing_onboarding_refuses_to_clobber_a_write_that_landed_mid_heal() {
+        let tmp = unique_dir("onboard-lost-update");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let file = tmp.join(".claude.json");
+        // Pre-existing signed-in dir with no marker — the exact population the heal targets.
+        std::fs::write(&file, r#"{"oauthAccount":{"emailAddress":"before@example.com"}}"#).unwrap();
+
+        // A login completing while the heal is in flight. Longer body so the length differs, and a
+        // slept mtime so the stamp moves even on a coarse-timestamp filesystem.
+        let after = r#"{"oauthAccount":{"emailAddress":"after@example.com","organizationName":"Org"}}"#;
+        let f = file.clone();
+        let res = ensure_onboarding_marker_with(&tmp, move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&f, after).unwrap();
+        });
+
+        assert!(res.is_err(), "the heal must ABORT when the file changed under it");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(
+            v["oauthAccount"]["emailAddress"], "after@example.com",
+            "the heal overwrote a login written while it was in flight — unrecoverable"
+        );
+        assert_eq!(
+            v["oauthAccount"]["organizationName"], "Org",
+            "the concurrent write must survive WHOLE, not be partially merged"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The PRODUCTION call site, not just the helper: adding an account must leave a dir an agent
+    /// can actually be spawned into. Without this, the seam is defaulted-and-untested by
+    /// construction — delete the call in `add_account_at` and every unit test above still passes.
+    #[test]
+    fn adding_an_account_seeds_the_onboarding_marker() {
+        let tmp = unique_dir("onboard-add-account");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let accounts_path = tmp.join("accounts.json");
+
+        let acct =
+            add_account_at(&tmp, &accounts_path, "Test".to_string(), "abc123".to_string(), 1_700_000_000)
+                .unwrap();
+
+        let marker = Path::new(&acct.config_dir).join(".claude.json");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+        assert_eq!(
+            v["hasCompletedOnboarding"], true,
+            "a freshly added account still spawns agents into the first-run wizard"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }

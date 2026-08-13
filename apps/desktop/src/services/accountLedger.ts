@@ -73,6 +73,12 @@ export interface SpawnLogEntry {
  *  chose this" and "there was nothing else it could have chosen". */
 export type SelectionReason =
   | "pinned" // a human pinned this agent to this account; the pin overrides every judgement
+  // A human ACTIVATED this account for the whole fleet ("Activate this account" in the accounts
+  // modal) and it is still real, signed in and not rate-limited. Distinct from "pinned" — that is
+  // one agent, this is every future spawn — and distinct from "auto", which is what this degrades
+  // to the moment the preference stops describing a usable account. Recording them apart is the
+  // only way to read back whether the founder's choice was actually in force at a given spawn.
+  | "preferred"
   | "auto" // ordinary auto-pick: lowest usage among healthy, signed-in accounts
   | "sticky" // a sticky key (concierge / Improve Sparkle) reusing its still-healthy account
   | "fallback" // every account was exhausted or near its ceiling; this was the least-bad one

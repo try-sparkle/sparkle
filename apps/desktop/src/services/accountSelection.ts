@@ -15,12 +15,16 @@ import {
   pickAccount,
   eligibleAccounts,
   getPin,
+  getPreferredAccountId,
+  isAccountExhausted,
   signedInAccountIds,
   type Account,
   type Usage,
   type Identity,
   type PickOptions,
+  type LiveUsage,
 } from "./accountStore";
+import { getAccountUsageLive } from "./accountUsage";
 import type { Ceiling } from "./headroom";
 import {
   recordSelection,
@@ -53,6 +57,82 @@ const EMPTY: AccountState = { accounts: [], usage: [], identities: [], ceilings:
 /** How long a loaded (accounts, usage) snapshot is reused before re-fetching. Short: usage drifts
  *  as agents run, but a few seconds collapses a mount storm into one IPC pair. */
 export const ACCOUNT_CACHE_TTL_MS = 5_000;
+
+// ── REAL Anthropic utilization, cached OFF the spawn's critical path ────────────────────────────
+//
+// `pickAccount` needs this to avoid routing at the most exhausted account on the machine (see
+// `PickOptions.live`), but fetching it is expensive in a way the local tally is not: it reads an
+// OAuth secret — a keychain read that can raise a macOS confidential-info prompt — and then makes a
+// network call with a 15s ceiling, PER ACCOUNT. Awaiting that before every spawn would gate each
+// agent behind N blocking round-trips and, worse, would make a spawn fail when the network does.
+//
+// So it is a BACKGROUND cache with a read that never blocks. `liveUsageRows()` returns whatever is
+// currently known, and an empty result is a perfectly good answer: `pickAccount` degrades to the
+// local-tally rule exactly as it behaved before this existed. The refresh is kicked off by
+// `loadAccountState` and never awaited by it.
+//
+// The TTL is much longer than the account cache's 5s because utilization moves on the scale of a
+// window (hours), not a mount storm (milliseconds) — and because each refresh costs N network calls.
+export const LIVE_USAGE_TTL_MS = 120_000;
+
+let liveCache: { at: number; rows: LiveUsage[] } | null = null;
+let liveInflight: Promise<void> | null = null;
+
+/** The live rows currently known. Never fetches, never blocks, never throws. Empty means "we don't
+ *  know yet", which selection treats as "judge these accounts by the local tally" — NOT as zero. */
+export function liveUsageRows(): LiveUsage[] {
+  return liveCache?.rows ?? [];
+}
+
+/** Drop the cache so the next {@link loadAccountState} refetches. Called by `invalidateAccounts`,
+ *  since an add/remove/login changes which accounts exist and what they've spent. */
+function invalidateLiveUsage(): void {
+  liveCache = null;
+}
+
+/** Kick a background refresh if the cache is cold. Fire-and-forget by design: the returned promise
+ *  is for tests, and no production caller awaits it.
+ *
+ *  Per-account failures are ABSORBED rather than dropping the whole batch — one account whose token
+ *  is missing or whose fetch 401s must not blind selection to the other nine. A failed account
+ *  simply has no row, which reads as "unknown".
+ *
+ *  `now` is INJECTED rather than read from `Date.now()` inside, and both clocks in this module have
+ *  to move together: `loadAccountState` already takes one, so a refresh reading the real clock while
+ *  the account cache reads a fake one leaves the two indistinguishable in a test — the suite passes
+ *  whichever way the TTL is written. */
+export function refreshLiveUsage(
+  accounts: Account[],
+  now: number = Date.now(),
+  deps = { fetch: getAccountUsageLive },
+): Promise<void> {
+  if (liveCache && now - liveCache.at < LIVE_USAGE_TTL_MS) return Promise.resolve();
+  if (liveInflight) return liveInflight;
+  const p = (async () => {
+    const rows = await Promise.all(
+      accounts.map((a) =>
+        deps
+          .fetch(a.configDir)
+          .then((r): LiveUsage | null => ({
+            id: a.id,
+            fiveHourPercent: r?.fiveHourPercent ?? null,
+            sevenDayPercent: r?.sevenDayPercent ?? null,
+          }))
+          .catch(() => null),
+      ),
+    );
+    liveCache = { at: now, rows: rows.filter((r): r is LiveUsage => r !== null) };
+  })()
+    .catch(() => {
+      // Whole-batch failure: leave whatever was cached rather than pinning an empty result, so a
+      // transient outage doesn't discard usable figures.
+    })
+    .finally(() => {
+      liveInflight = null;
+    });
+  liveInflight = p;
+  return p;
+}
 
 let cache: { at: number; state: AccountState } | null = null;
 let inflight: Promise<AccountState> | null = null;
@@ -130,6 +210,10 @@ export async function loadAccountState(
       // strand every spawn at a login prompt. A `withIdentities: false` reader is opting out for
       // itself, not for the app.
       if (withIdentities && gen === generation) cache = { at: now, state }; // skip if invalidated mid-load
+      // Kick the live-usage refresh, deliberately NOT awaited — see `refreshLiveUsage`. It costs a
+      // keychain read and a network call per account, and a spawn must never wait on either. The
+      // rows land for the NEXT pick; this one uses whatever is already cached.
+      void refreshLiveUsage(state.accounts, now);
       return state;
     } catch {
       if (gen === generation) cache = null; // don't pin a failure; the next call retries
@@ -152,11 +236,22 @@ export function invalidateAccountState(): void {
   cache = null;
   inflight = null;
   generation++;
+  // An add/remove/login changes WHICH accounts exist and which credentials resolve, so the live
+  // rows keyed by account id are stale too. Dropping them is safe: until the refresh lands,
+  // selection falls back to the local tally rather than to a stale percentage.
+  invalidateLiveUsage();
 }
 
 /** Choose the account `agentId` should spawn under (honoring its manual pin) plus the loaded state
  *  (for the pane's account badge/dropdown). `chosen` is null only when no accounts exist — then the
  *  spawn omits CLAUDE_CONFIG_DIR and behaves exactly as before accounts existed.
+ *
+ *  PRECEDENCE, narrowest scope first:
+ *    1. this agent's own PIN — one human choice about one agent, and it wins unconditionally;
+ *    2. the fleet-wide PREFERRED account ("Activate this account"), when it is still usable —
+ *       see `usablePreferredAccount` for why "usable" is a gate here and not for a pin;
+ *    3. AUTO-PICK — lowest usage among healthy, signed-in accounts, sticky for the two keys that
+ *       need it.
  *
  *  The loaded identities gate auto-pick: only accounts actually `claude login`ed are candidates, so
  *  a config dir that exists but was never signed into can't win on its (necessarily zero) usage and
@@ -206,6 +301,11 @@ export async function chooseAccountForAgent(
     signedInIds: signedInAccountIds(state.identities),
     now: opts.now,
     ceilings: state.ceilings,
+    // REAL Anthropic utilization, and it rides the shared base for exactly the reason the two above
+    // do: both the pinned and the auto-pick branch read it, and building it per-branch is how
+    // `signedInIds` got silently lost from one of them once. Whatever the background refresh has —
+    // possibly nothing, which degrades to the local-tally rule rather than to a guess.
+    live: liveUsageRows(),
   };
   // A pin only counts if it still names a REAL account. Branching on the pin's mere presence let a
   // STALE pin — one left behind by a deleted account — bypass everything below it: `pickAccount`
@@ -215,7 +315,7 @@ export async function chooseAccountForAgent(
   // while the only `clearPin` caller is the doomed-agent path — nothing prunes a pin when its
   // account is removed. The result was the divergence `isStickyAccountKey` exists to prevent, on
   // the very key it was written for.
-  const pin = getPin(agentId);
+  const pin = stickyPin(agentId);
   const pinnedAccountId = pin && state.accounts.some((a) => a.id === pin) ? pin : undefined;
   // Read BEFORE `autoPick`, which writes it. Comparing the sticky key's account across the call is
   // the only way to tell "reused the account it already had" from "picked one fresh" — and that
@@ -236,18 +336,32 @@ export async function chooseAccountForAgent(
   const candidates = state.failed
     ? null
     : eligibleAccounts(state.accounts, state.usage, base);
+  // The FLEET-WIDE preference, third in precedence and only when the pin did not already answer.
+  // Evaluated here rather than inside `autoPick` so the ledger can name it: "the human activated
+  // this account" and "it happened to have the lowest tally" are different facts about the same
+  // outcome, and a reader of the log needs to tell them apart.
+  const preferredAccountId = pinnedAccountId
+    ? undefined
+    : usablePreferredAccount(agentId, state, base.signedInIds, opts.now);
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
-    : autoPick(agentId, state, base);
+    : preferredAccountId
+      ? // Routed through `pickAccount`'s pin slot rather than plucked out of the list, so the
+        // preferred account is resolved by the SAME function every other path uses. The gate above
+        // is what keeps this from inheriting the pin's override power.
+        pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId: preferredAccountId })
+      : autoPick(agentId, state, base);
   const reason: SelectionReason = pinnedAccountId
     ? "pinned"
-    : !chosen
-      ? "none"
-      : isStickyAccountKey(agentId) && previousSticky === chosen.id
-        ? "sticky"
-        : candidates != null && candidates.length === 0
-          ? "fallback"
-          : "auto";
+    : preferredAccountId
+      ? "preferred"
+      : !chosen
+        ? "none"
+        : isStickyAccountKey(agentId) && previousSticky === chosen.id
+          ? "sticky"
+          : candidates != null && candidates.length === 0
+            ? "fallback"
+            : "auto";
   logSelection(agentId, chosen, reason, state, candidates);
   // Remember it so the branch above can carry this key through a later hiccup.
   if (chosen) lastResolvedAccount.set(agentId, chosen);
@@ -349,6 +463,66 @@ function autoPick(agentId: string, state: AccountState, base: PickOptions): Acco
   return chosen;
 }
 
+/** The fleet-wide preferred account, IF it is safe to honour for this key right now — else
+ *  undefined, and the caller falls through to auto-pick.
+ *
+ *  THE GATE IS THE FEATURE. A pin beats everything: `pickAccount` honours it for an account that is
+ *  exhausted, near its cap, or never signed into, because one human named one agent and one account
+ *  (see `PickOptions.pinnedAccountId`). Giving the FLEET-WIDE preference that same power would turn
+ *  a one-agent mistake into an outage — activate an account, sign out of it, and every subsequent
+ *  spawn in the app opens on a login prompt with nothing on screen explaining why. So the preference
+ *  is honoured only while it still describes a usable account, and the moment it does not, selection
+ *  behaves exactly as it did before the feature existed.
+ *
+ *  Four conditions, each a way this has to be able to fail safely:
+ *
+ *  1. NOT FOR A STICKY KEY. The concierge and Improve Sparkle are sticky by design
+ *     (`isStickyAccountKey`) and moving the concierge mid-conversation makes `rebindSessionToAccount`
+ *     null both session pointers and re-probe. "Activate this account" is about the agent fleet; the
+ *     two sticky consumers get their own explicit control in the accounts modal, which writes a PIN
+ *     on their key — a deliberate, per-consumer choice rather than a side effect of a fleet setting.
+ *  2. THE BACKEND MUST HAVE ANSWERED. With `state.failed` every account looks absent, so both the
+ *     "is it real" and "is it signed in" tests below would fail for reasons that say nothing about
+ *     the account. Decline to act — and, critically, decline to CLEAR (see 3).
+ *  3. IT MUST NAME A REAL ACCOUNT — ignored here, and PRUNED where the account is actually removed
+ *     (`removeAccount`), not here. The prune matters: nothing prunes a stale pin when its account is
+ *     deleted, which is precisely how a sticky key silently stopped being sticky (see the pin note
+ *     in `chooseAccountForAgent`), and a preference outliving its account would be the same bug with
+ *     a wider blast radius. But this is the wrong PLACE to do it, because `state` is served from a
+ *     cache `loadAccountState` documents as up to `ACCOUNT_CACHE_TTL_MS` stale and invalidated only
+ *     by the window that made the change. A preference set on a freshly added account would be
+ *     observable as "not a real account" by another window and permanently erased from shared
+ *     `localStorage` — a silent, irreversible write derived from a stale read. `removeAccount` is
+ *     authoritative about a removal in a way a spawn-path snapshot can never be, so the deletion
+ *     happens there and the spawn path merely declines to act.
+ *  4. SIGNED IN, AND NOT AT AN OBSERVED LIMIT. Never strand a spawn at a login prompt, and never
+ *     send work to an account that just answered with a rate limit. Deliberately NOT the full
+ *     `eligibleAccounts` test: near-cap and near-ceiling are ESTIMATES, and a human who explicitly
+ *     activated an account is entitled to keep using it while it is merely busy. Only observed fact
+ *     overrides an explicit choice. */
+function usablePreferredAccount(
+  agentId: string,
+  state: AccountState,
+  signedInIds: readonly string[],
+  now: number | undefined,
+): string | undefined {
+  if (isStickyAccountKey(agentId)) return undefined; // (1)
+  const preferred = getPreferredAccountId();
+  if (!preferred) return undefined;
+  if (state.failed) return undefined; // (2) — unreadable, so nothing below means anything
+  if (!state.accounts.some((a) => a.id === preferred)) return undefined; // (3)
+  // (4) — and ONLY when the signal exists. See `signedInAccountIds`: it keys on `Identity.email`,
+  // which `accounts.rs` leaves null for any config dir whose `.claude.json` carries no
+  // `oauthAccount` or could not be parsed. On such an install EVERY account reads "not signed in",
+  // and a bare `includes` would silently drop the founder's choice on every spawn, permanently,
+  // with the ledger recording a bland "auto". `partitionAccounts` already refuses to let an absent
+  // signal mean "nothing is usable" (`eligible = authed.length > 0 ? authed : accounts`); the gate
+  // degrades the same way, so the two cannot disagree about what an empty list means.
+  if (signedInIds.length > 0 && !signedInIds.includes(preferred)) return undefined;
+  if (isAccountExhausted(state.usage, preferred, now ?? Date.now())) return undefined; // (4)
+  return preferred;
+}
+
 // ── Consumers that have no agent pane ────────────────────────────────────────────────────────
 //
 // Sparkle runs `claude` from THREE places, not one: build-agent panes, the hourly Improve Sparkle
@@ -383,7 +557,7 @@ export const CONCIERGE_ACCOUNT_KEY = "sparkle:concierge";
 /** The app-owned Improve Sparkle namespace (`sparkleAgent.ts`'s `SPARKLE_AGENT_ID`, plus its
  *  per-window `-win-<uuid>` variants). Re-declared for the same no-cycle reason as the concierge key
  *  above; `accountSelection.test.ts` pins it against `isSparkleAgentId`. */
-const SPARKLE_SELF_ACCOUNT_PREFIX = "__sparkle_self__";
+export const SPARKLE_SELF_ACCOUNT_PREFIX = "__sparkle_self__";
 
 /** Does this key get a STICKY account — one that persists until it stops being a healthy choice —
  *  rather than a fresh auto-pick each time?
@@ -409,6 +583,32 @@ export function isStickyAccountKey(key: string): boolean {
     key === SPARKLE_SELF_ACCOUNT_PREFIX ||
     key.startsWith(`${SPARKLE_SELF_ACCOUNT_PREFIX}-`)
   );
+}
+
+/** This key's pin, with ONE namespace rule: an Improve Sparkle window variant
+ *  (`__sparkle_self__-win-<uuid>`) inherits the pin written on the base key.
+ *
+ *  Without it the modal's "Improve Sparkle" control would be a lie in satellite windows. That
+ *  control can only write a pin on the key it can name — the base one — while the hourly pass and
+ *  the main pane resolve under that key and each satellite window resolves under its own variant.
+ *  Pinning would then park some of the namespace and leave the rest auto-picking, which is exactly
+ *  the split-across-accounts-in-one-worktree failure `isStickyAccountKey` exists to prevent. The
+ *  variant's OWN pin still wins if one is ever written; this is a fallback, not an override. */
+function stickyPin(agentId: string): string | undefined {
+  const own = getPin(agentId);
+  if (own) return own;
+  return agentId.startsWith(`${SPARKLE_SELF_ACCOUNT_PREFIX}-`)
+    ? getPin(SPARKLE_SELF_ACCOUNT_PREFIX)
+    : undefined;
+}
+
+/** What account a key is currently parked on, for DISPLAY only — its pin if it has one, else the
+ *  account it last settled on in this process. READ-ONLY BY DESIGN: the accounts modal needs to say
+ *  "the concierge is on Work" without *causing* a resolution, and calling `chooseAccountForAgent`
+ *  to find out would write `stickySelections`, append a ledger line, and record a spawn that never
+ *  happened. Undefined means "nothing chosen yet in this process", not "no account". */
+export function stickyAccountSnapshot(key: string): string | undefined {
+  return stickyPin(key) ?? stickySelections.get(key);
 }
 
 /** The account each sticky key settled on, so a later call reuses it instead of re-picking.

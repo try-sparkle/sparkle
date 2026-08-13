@@ -122,9 +122,18 @@ export function setNickname(id: string, nickname: string): Promise<void> {
   return invoke("accounts_set_nickname", { id, nickname });
 }
 
-/** Remove an account (the Rust side refuses to remove the default; the UI also guards). */
-export function removeAccount(id: string): Promise<void> {
-  return invoke("accounts_remove", { id });
+/** Remove an account (the Rust side refuses to remove the default; the UI also guards).
+ *
+ *  ALSO PRUNES THE FLEET PREFERENCE when it named this account, and only after the removal actually
+ *  succeeded. This is the authoritative place for that: the spawn path sees accounts through a
+ *  5-second per-window cache, so a preference set on a freshly added account can look like it names
+ *  nothing there — deleting on that evidence would be a silent, irreversible write derived from a
+ *  stale read (see `usablePreferredAccount`, condition 3). Here the removal is a fact. Pins are NOT
+ *  pruned in the same breath: that is a pre-existing hazard with its own owner, and widening this
+ *  function to fix it would hide the change. */
+export async function removeAccount(id: string): Promise<void> {
+  await invoke("accounts_remove", { id });
+  if (getPreferredAccountId() === id) clearPreferredAccount();
 }
 
 /** Import the existing `~/.claude` as the default account (by reference, not copied). */
@@ -507,6 +516,40 @@ function ceilingFraction(u: Usage, ceiling: number | null | undefined): number |
   return u.tokens5h / ceiling;
 }
 
+/** REAL server-side utilization for one account, as Anthropic reports it (Rust `AccountUsageLive`,
+ *  from `GET /api/oauth/usage`). Percentages, 0–100.
+ *
+ *  Both fields are `number | null` rather than optional, because the wire genuinely sends `null` for
+ *  a window that is absent — a Rust `Option` crosses as the key with a null VALUE, never as a
+ *  missing key. `null` means "Anthropic did not tell us", which is NOT the same as 0 and must never
+ *  be coerced to it: that coercion is the entire bug this type exists to fix. */
+export interface LiveUsage {
+  id: string;
+  fiveHourPercent: number | null;
+  sevenDayPercent: number | null;
+}
+
+/** Utilization (percent of Anthropic's OWN limit) at or above which an account stops receiving new
+ *  spawns.
+ *
+ *  Distinct from {@link CEILING_AVOID_FRACTION} because the two measure different things. That one
+ *  is a fraction of a LEARNED ceiling — an estimate with a measured CoV of 0.24, which is why it
+ *  acts at 0.9 rather than at the wall. This is Anthropic's own number for its own limit, so it can
+ *  sit much closer to 100 without risking a false exclusion. 95 leaves a margin for the usage
+ *  endpoint lagging the spend that a running agent is generating right now. */
+export const LIVE_AVOID_PERCENT = 95;
+
+/** The higher of an account's two live windows, or null when neither was reported.
+ *
+ *  The MAX, not the 7-day figure alone: an account at 0% weekly but 100% of its 5-hour session is
+ *  just as unable to take a spawn right now. The founder's measured card showed exactly this split
+ *  (session 0%, weekly 100%), so reading either window on its own would have missed one of them. */
+function liveWorstPercent(l: LiveUsage | undefined): number | null {
+  if (!l) return null;
+  const vals = [l.fiveHourPercent, l.sevenDayPercent].filter((v): v is number => v != null);
+  return vals.length === 0 ? null : Math.max(...vals);
+}
+
 export interface PickOptions {
   /** Manual per-agent override. If set and it names an existing account, that account wins
    *  unconditionally (even if exhausted/near-cap/not signed in) — a human chose it on purpose. */
@@ -526,6 +569,15 @@ export interface PickOptions {
    *  supplied and at least one listed account matches, auto-pick considers ONLY these. Omit (or pass
    *  a set matching no account) to skip the filter entirely — see the rationale on `pickAccount`. */
   signedInIds?: readonly string[];
+  /** REAL per-account utilization from Anthropic. When supplied, this OUTRANKS the local token
+   *  tally for every account it covers — see {@link pickAccount}.
+   *
+   *  It exists because the local tally and the truth can disagree completely, and did: an account
+   *  reading 100% of its weekly limit server-side had a LOCAL tally of zero, because the tally is
+   *  computed by scanning that account's own transcripts and this machine had run none of its work.
+   *  Zero tokens is the most headroom there is, so the single most exhausted account on the machine
+   *  won auto-pick for every spawn. Omitting this leaves selection exactly as it was. */
+  live?: readonly LiveUsage[];
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
 }
@@ -595,14 +647,20 @@ export function pickAccount(
     return leastBad(eligible, usageFor, ceilingFor, now);
   }
 
-  // Lowest 7d tally wins; tie-break on lowest 5h. Stable — equal entries keep input order.
-  return candidates.reduce((best, a) => {
-    const ua = usageFor(a);
-    const ub = usageFor(best);
-    if (ua.tokens7d !== ub.tokens7d) return ua.tokens7d < ub.tokens7d ? a : best;
-    if (ua.tokens5h !== ub.tokens5h) return ua.tokens5h < ub.tokens5h ? a : best;
-    return best;
-  });
+  // Lowest rank wins — Anthropic's real utilization where we have it, the local 7d/5h tally where we
+  // do not. Stable: equal entries keep input order, since a tie returns `best`.
+  const liveFor = liveLookup(opts.live);
+  return candidates.reduce((best, a) =>
+    compareRank(pickRank(a, usageFor, liveFor), pickRank(best, usageFor, liveFor)) < 0 ? a : best,
+  );
+}
+
+/** Is this usage row an OBSERVED rate limit that has not yet reset? The single definition of
+ *  "exhausted" in this module — {@link partitionAccounts} and the exported
+ *  {@link isAccountExhausted} both call it, so eligibility and the preferred-account gate can never
+ *  answer the same question two different ways. A missing row is "nothing observed", not exhausted. */
+function usageExhausted(u: Usage | undefined, now: number): boolean {
+  return u?.exhaustedUntil != null && u.exhaustedUntil > now;
 }
 
 /** Usage row per account, treating a missing row as "no usage yet" (the most headroom). */
@@ -638,7 +696,7 @@ function partitionAccounts(
 
   const usageFor = usageLookup(usage);
   const ceilingFor = ceilingLookup(ceilings);
-  const isExhausted = (u: Usage) => u.exhaustedUntil != null && u.exhaustedUntil > now;
+  const isExhausted = (u: Usage) => usageExhausted(u, now);
   // Two independent tests, and an account trips on EITHER.
   //
   // The static one is the historical behaviour, still defaulting to no cap at all. The learned one
@@ -652,11 +710,66 @@ function partitionAccounts(
     return f != null && f >= CEILING_AVOID_FRACTION;
   };
 
+  // ANTHROPIC'S OWN NUMBER, and it outranks every estimate above. The two token-based tests are
+  // computed from local transcripts, which is why they cannot see this case at all: an account whose
+  // work ran on another machine has a local tally of zero however spent it really is.
+  //
+  // `null` (window not reported, or no live row for this account) is NOT an exclusion — an
+  // unreadable figure must never look like a full one, exactly as it must never look like an empty
+  // one. It simply leaves the account to be judged by the tests above.
+  const liveFor = liveLookup(opts.live);
+  const isLiveSpent = (a: Account) => {
+    const p = liveWorstPercent(liveFor(a));
+    return p != null && p >= LIVE_AVOID_PERCENT;
+  };
+
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
-    return !isExhausted(u) && !isNearStaticCap(u) && !isNearLearnedCeiling(a, u);
+    return !isExhausted(u) && !isNearStaticCap(u) && !isNearLearnedCeiling(a, u) && !isLiveSpent(a);
   });
   return { eligible, candidates };
+}
+
+/** Live-usage row per account id, or undefined when there is none. */
+function liveLookup(live: readonly LiveUsage[] | undefined): (a: Account) => LiveUsage | undefined {
+  const byId = new Map((live ?? []).map((l) => [l.id, l]));
+  return (a: Account) => byId.get(a.id);
+}
+
+/** Sort key for auto-pick, lowest wins. A TOTAL order in two tiers, which is what keeps the two
+ *  incomparable units from being compared.
+ *
+ *  Tier 0 — accounts Anthropic gave us a real figure for, ranked by that figure.
+ *  Tier 1 — accounts it did not, ranked by the local token tally as before.
+ *
+ *  Tier 0 sorts ahead of tier 1 wholesale, and that ordering is deliberate rather than incidental: a
+ *  verified 20% is better evidence of headroom than an unverified zero, and preferring what we can
+ *  actually check is the safer bias. It also degrades correctly at both ends — with no live data at
+ *  all every account lands in tier 1, which is exactly the behaviour that shipped before, and with
+ *  live data for everything tier 1 is empty.
+ *
+ *  Percent and tokens never meet inside a comparison: two tier-0 accounts compare percentages, two
+ *  tier-1 accounts compare tokens, and a cross-tier pair is decided by the tier alone. */
+function pickRank(
+  a: Account,
+  usageFor: (a: Account) => Usage,
+  liveFor: (a: Account) => LiveUsage | undefined,
+): [number, number, number] {
+  const p = liveWorstPercent(liveFor(a));
+  if (p != null) {
+    const l = liveFor(a);
+    // Secondary key is the OTHER window's figure, so two accounts tied on their worst window are
+    // still separated by the one with more room on the other.
+    const other = Math.min(l?.fiveHourPercent ?? p, l?.sevenDayPercent ?? p);
+    return [0, p, other];
+  }
+  const u = usageFor(a);
+  return [1, u.tokens7d, u.tokens5h];
+}
+
+/** Lexicographic compare of two {@link pickRank} keys. */
+function compareRank(x: [number, number, number], y: [number, number, number]): number {
+  return x[0] - y[0] || x[1] - y[1] || x[2] - y[2];
 }
 
 /** The best of a bad pool, when every account is exhausted or near its ceiling.
@@ -789,11 +902,32 @@ export function getPin(agentId: string): string | undefined {
   return readPins().get(agentId);
 }
 
-/** Pin `agentId` to `accountId` (manual override for all of this agent's future spawns). */
+/** Pin `agentId` to `accountId` (manual override for all of this agent's future spawns).
+ *
+ *  A HUMAN PIN, and the provenance mark is dropped to say so: if a switch had written this agent's
+ *  pin earlier, the person overriding it now owns the choice, and `clearSwitchWrittenPins` must stop
+ *  treating it as machinery's to discard. */
 export function setPin(agentId: string, accountId: string): void {
   const m = readPins();
   m.set(agentId, accountId);
   writePins(m);
+  unmarkSwitchWritten(agentId);
+}
+
+/** Pin `agentId` as part of an automated MIGRATION, recording that the machinery wrote it.
+ *
+ *  The distinction exists because "Activate this account" has to clear the pins a PREVIOUS
+ *  activation left behind — otherwise an agent pinned by the last switch and no longer mounted can
+ *  never be re-pinned, and it outranks the fleet preference forever (see `clearSwitchWrittenPins`).
+ *  Sweeping by any broader rule would take the user's own pins with it: `AgentPane` exposes an
+ *  account picker whose comment calls it a "manual override", and `chooseAccountForAgent` honours a
+ *  pin over every judgement it makes precisely because a human chose it on purpose. One click on
+ *  Activate must not delete that, in every project and every window. */
+export function setPinFromSwitch(agentId: string, accountId: string): void {
+  setPin(agentId, accountId); // clears the mark…
+  const marked = readSwitchWritten();
+  marked.add(agentId); // …and this puts it back, so the two calls cannot drift
+  writeSwitchWritten(marked);
 }
 
 /** Clear an agent's pin (revert it to auto-pick). Called when an agent is closed, so persisted
@@ -804,9 +938,174 @@ export function clearPin(agentId: string): void {
   writePins(m);
 }
 
-/** Drop all pins (e.g. on full reset). Exposed mainly for tests/teardown. */
+/** Drop all pins (e.g. on full reset). Exposed mainly for tests/teardown. Clears the provenance
+ *  marks with them — a mark for a pin that no longer exists would make the next sweep's report of
+ *  what it dropped a fiction, and would leak between tests. */
 export function clearAllPins(): void {
   writePins(new Map());
+  writeSwitchWritten(new Set());
+}
+
+/** localStorage key holding the ids whose pin was written by an automated switch rather than by a
+ *  person. Exported for tests. */
+export const SWITCH_WRITTEN_PINS_STORAGE_KEY = "sparkle.accountPins.switchWritten.v1";
+
+function readSwitchWritten(): Set<string> {
+  try {
+    const raw = globalThis.localStorage?.getItem(SWITCH_WRITTEN_PINS_STORAGE_KEY);
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(parsed.filter((x): x is string => typeof x === "string"));
+  } catch {
+    // Unreadable provenance means we cannot prove any pin is machinery's — so we sweep NOTHING and
+    // the user's pins survive. Failing closed here costs a stale pin; failing open costs the user's
+    // explicit choices.
+    return new Set();
+  }
+}
+
+function writeSwitchWritten(ids: Set<string>): void {
+  try {
+    globalThis.localStorage?.setItem(SWITCH_WRITTEN_PINS_STORAGE_KEY, JSON.stringify([...ids]));
+  } catch {
+    // Same degradation as `writePins`: never break a spawn over provenance bookkeeping.
+  }
+}
+
+function unmarkSwitchWritten(agentId: string): void {
+  const marked = readSwitchWritten();
+  if (!marked.delete(agentId)) return; // not marked → don't rewrite storage
+  writeSwitchWritten(marked);
+}
+
+/** Does this agent carry a pin a PERSON set, as opposed to one a migration wrote (or none)?
+ *
+ *  The read side of the same provenance mark {@link clearSwitchWrittenPins} uses, and it answers a
+ *  question the sweep alone cannot: a fleet activation must not MOVE a hand-pinned agent either.
+ *  `chooseAccountForAgent` ranks a pin above the preference precisely because a human chose it, so
+ *  migrating one would overwrite that choice with the fleet's — and re-spawn an agent the
+ *  `AgentPane` picker deliberately leaves running ("we don't restart a running agent out from under
+ *  the user"). Sweeping it later is no remedy: by then the pin already points at the new account. */
+export function hasHumanPin(agentId: string): boolean {
+  if (getPin(agentId) == null) return false;
+  return !readSwitchWritten().has(agentId);
+}
+
+/** Drop every pin an automated switch wrote, leaving human pins untouched. Returns the ids dropped.
+ *
+ *  WHY "Activate this account" needs this: a pin outranks the fleet preference, the switch machinery
+ *  writes one for every agent it moves (`moveAgent` → `setPinFromSwitch`), and only agent CLOSE
+ *  clears one — a pane unmount is not a close. Without the sweep an activation defeats a LATER
+ *  activation: activate A while an agent is mounted (pinning it to A), unmount its pane, activate B,
+ *  and that agent is no longer in `paneAccountMap` to be re-pinned, so it keeps spawning on A
+ *  forever against an explicit fleet-wide choice that says B.
+ *
+ *  WHY IT IS KEYED ON PROVENANCE rather than on "everything but the sticky consumers", which was the
+ *  first cut: `AgentPane` exposes a per-agent account picker its own comment calls a "manual
+ *  override", and a pin beats every judgement selection makes precisely because a human chose it.
+ *  The broader sweep therefore deleted every manual override in every project and window on one
+ *  click — including for a mounted pane the plan does not even move, whose badge would then keep
+ *  rendering a pin that no longer existed.
+ *
+ *  The sticky consumers need no special case here, and the reason is a property of the WRITERS, not
+ *  a happy accident: the only thing that pins those keys is the modal's own per-consumer control,
+ *  i.e. a person. `moveAgent` deliberately re-spawns a sticky consumer WITHOUT pinning it, so no
+ *  machinery-marked pin on those keys exists for this to find. If that ever changes, this claim
+ *  stops being true and they need an explicit exemption. */
+export function clearSwitchWrittenPins(): string[] {
+  const marked = readSwitchWritten();
+  if (marked.size === 0) return [];
+  const m = readPins();
+  // A loop rather than `[...marked].filter((id) => m.delete(id))` for the same reason as
+  // `migratableAgents`: an arrow inside `.filter()` is a line a mutation check can only break
+  // syntactically, so the sweep itself would be unprovable in place.
+  const dropped: string[] = [];
+  for (const id of marked) {
+    if (m.delete(id)) dropped.push(id);
+  }
+  writePins(m);
+  writeSwitchWritten(new Set());
+  return dropped;
+}
+
+// ── The PREFERRED account (fleet-wide) ────────────────────────────────────────────────────────
+//
+// A DIFFERENT CONCEPT FROM A PIN, and the difference is the whole reason this exists.
+//
+//   • A pin is PER AGENT and beats every judgement — `pickAccount` honours it even for an account
+//     that is exhausted, near its cap, or never signed into, because a human named that one agent
+//     and that one account on purpose.
+//   • The preferred account is FLEET-WIDE and governs FUTURE spawns. The founder's ask was "I
+//     wanna be able to specify an account that I want to make the primary. For agents." — one
+//     choice, applied to everything that spawns from now on, not N pins written at the moment the
+//     modal happened to be open (which is all the switch banner could ever do: `planSwitch` sees
+//     only MOUNTED panes).
+//
+// Because it is fleet-wide it deliberately does NOT inherit the pin's override power. A pin
+// stranding ONE agent at a login prompt is a mistake; the same rule applied to the whole fleet is
+// an outage. `accountSelection.chooseAccountForAgent` therefore honours this only while the account
+// is real, signed in and not exhausted, and falls through to auto-pick otherwise.
+//
+// Same read-through-localStorage discipline as the pin map above, for the same reasons: consumed
+// outside React, must survive a restart (a preference that evaporates is not a preference), and
+// must never let another window's write be masked by a cached copy.
+
+/** localStorage key holding the fleet-wide preferred account id. Exported for tests. */
+export const PREFERRED_ACCOUNT_STORAGE_KEY = "sparkle.preferredAccount.v1";
+
+/** The account the user chose to run agents on, or undefined when nothing is chosen (auto-pick).
+ *
+ *  Returns undefined — never `""` — for a blank or non-string stored value, so a corrupt entry
+ *  reads as "no preference" rather than as a preference for an account id that cannot exist. */
+export function getPreferredAccountId(): string | undefined {
+  try {
+    const raw = globalThis.localStorage?.getItem(PREFERRED_ACCOUNT_STORAGE_KEY);
+    return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+  } catch {
+    return undefined; // storage unavailable → no preference, everything auto-picks
+  }
+}
+
+/** Make `accountId` the account future spawns prefer. */
+export function setPreferredAccountId(accountId: string): void {
+  try {
+    globalThis.localStorage?.setItem(PREFERRED_ACCOUNT_STORAGE_KEY, accountId);
+  } catch {
+    // Storage unavailable or over quota. Never let recording a preference break a spawn; the
+    // fleet simply keeps auto-picking.
+  }
+}
+
+/** Forget the preferred account (back to auto-pick for everything unpinned). */
+export function clearPreferredAccount(): void {
+  try {
+    globalThis.localStorage?.removeItem(PREFERRED_ACCOUNT_STORAGE_KEY);
+  } catch {
+    // Same as above.
+  }
+}
+
+/** Is this account currently rate-limited?
+ *
+ *  ONE definition, shared with {@link partitionAccounts} — the preferred-account gate needs exactly
+ *  this question and re-deriving it there would be a second rule that drifts the first time either
+ *  changed (the same drift `partitionAccounts` was extracted to prevent). A missing usage row means
+ *  "nothing observed", i.e. NOT exhausted, matching `usageLookup`'s zero row.
+ *
+ *  Deliberately narrower than eligibility: near-cap and near-learned-ceiling are ESTIMATES, and a
+ *  human who explicitly activated an account is allowed to keep using it while it is merely busy.
+ *  `exhaustedUntil` is an OBSERVED limit, which is the one fact worth overriding a human choice for
+ *  — spawning there would just fail. */
+export function isAccountExhausted(
+  usage: readonly Usage[],
+  accountId: string,
+  now: number = Date.now(),
+): boolean {
+  return usageExhausted(
+    usage.find((x) => x.id === accountId),
+    now,
+  );
 }
 
 /** What a just-completed login into a fresh config dir turned out to be.
