@@ -2992,23 +2992,58 @@ fn merge_adds_nothing(root: &str, target: &str, branch: &str) -> bool {
     }
 }
 
+/// True iff `target..branch` contains NO merge commits — the precondition `cherry_empty` requires
+/// before it may trust `git cherry`'s output at all.
+///
+/// WHY THIS GATE EXISTS (roborev, sparkle-uj037 follow-up). `git cherry` compares commits by PATCH
+/// ID, and a patch-id is UNDEFINED for a multi-parent (merge) commit — so `git cherry` silently
+/// OMITS every merge commit from its output rather than reporting it as unmatched. In THIS repo,
+/// merging `origin/main` into an agent branch (rather than rebasing) is the SANCTIONED way to catch
+/// up — see `AGENTS.md`'s "merge instead" guidance — so a branch whose only unlanded work is a
+/// content-bearing merge commit is the NORMAL shape here, not a corner case. Verified against real
+/// git: a branch `B` cut from `main` whose sole commit is a conflict-resolving merge of `main`
+/// (resolution text that exists on no other ref) makes `git cherry main B` print nothing, even
+/// though `merge-base --is-ancestor B main` is NO and `merge-tree --write-tree main B` differs from
+/// `main^{tree}` — i.e. `B` has NOT landed, and cherry alone would say it has.
+/// That would have been catastrophic here: `cherry_empty` feeds `branch_landed`, which feeds BOTH
+/// the "Remote: Merged to Main" bucket AND `delete_agent_branch_if_merged_at` — a caller that runs
+/// `git branch -D` on the strength of "landed". A missing/unresolvable ref or any git error reads as
+/// "cannot confirm no merges" — fail closed, same posture as every other arm in this file.
+fn range_free_of_merges(root: &str, target: &str, branch: &str) -> bool {
+    match git(root, &["rev-list", "--count", "--min-parents=2", &format!("{target}..{branch}")]) {
+        Ok(n) => n.trim() == "0",
+        Err(_) => false,
+    }
+}
+
 /// True iff every commit `branch` carries beyond `target` is already patch-equivalent to something
-/// in `target` — i.e. `git cherry <target> <branch>` reports no `+` (genuinely new) lines. Unlike
-/// `ref_contains` (exact-SHA ancestry) and `merge_adds_nothing` (whole merge-tree equality against
-/// `target`'s CURRENT tip), this compares commits BY PATCH ID, so it also catches a branch whose work
-/// reached `target` through an out-of-band rebase or cherry-pick where the tree comparison no longer
-/// lines up (e.g. `target` has since drifted with unrelated changes in the same region, so
-/// `merge_adds_nothing`'s three-way merge conflicts even though every one of `branch`'s commits
-/// individually already landed). sparkle-uj037: the founder's own independent verification of a
-/// genuinely-merged branch used exactly this command as one of three proofs ("git cherry origin/main
-/// HEAD" → empty); wiring it in here closes the gap between what the app computes and what a human
-/// checks by hand, including the case a bad rebase silently drops commits — an ancestor check alone
-/// would read the truncated tip as "landed" (it IS an ancestor of whatever it became), while `git
-/// cherry` against the ORIGINAL commit set would surface the dropped ones as unmatched `+` lines. A
-/// missing target/branch or any git error reads as "not confirmed landed" — emptiness is a claim only
-/// an actually-successful, actually-`+`-free run may make.
+/// in `target` — i.e. `git cherry <target> <branch>` reports no `+` (genuinely new) lines, AND the
+/// range contains no merge commit `git cherry` could not have examined (`range_free_of_merges`).
+/// Unlike `ref_contains` (exact-SHA ancestry) and `merge_adds_nothing` (whole merge-tree equality
+/// against `target`'s CURRENT tip), this compares commits BY PATCH ID, so it also catches a branch
+/// whose work reached `target` through an out-of-band rebase or cherry-pick where the tree
+/// comparison no longer lines up (e.g. `target` has since drifted with unrelated changes in the
+/// same region, so `merge_adds_nothing`'s three-way merge conflicts even though every one of
+/// `branch`'s commits individually already landed). sparkle-uj037: the founder's own independent
+/// verification of a genuinely-merged branch used exactly this command as one of three proofs
+/// ("git cherry origin/main HEAD" → empty); wiring it in here closes the gap between what the app
+/// computes and what a human checks by hand.
+///
+/// ⚠️ THIS DOES NOT GUARD AGAINST A BAD REBASE SILENTLY DROPPING COMMITS. An earlier version of
+/// this doc claimed it did; that was false and roborev caught it. `branch_landed` ORs this signal
+/// in, so whenever `ref_contains` already reads true (exactly the case a truncated post-rebase tip
+/// produces — it IS trivially an ancestor of whatever it became) this function is never even
+/// reached. `cherry_empty` can only make `branch_landed` MORE permissive than ancestry alone, never
+/// less — it has no veto power. Detecting a rebase that dropped commits is a genuinely different
+/// question (comparing a branch's PRE-rebase commit set against its post-rebase one) that this
+/// "is X reachable in/equivalent to Y" contract cannot answer; nothing in this file answers it.
+/// A missing target/branch or any git error reads as "not confirmed landed" — emptiness is a claim
+/// only an actually-successful, actually-merge-free, actually-`+`-free run may make.
 fn cherry_empty(root: &str, target: &str, branch: &str) -> bool {
     if target.trim().is_empty() || branch.trim().is_empty() {
+        return false;
+    }
+    if !range_free_of_merges(root, target, branch) {
         return false;
     }
     match git(root, &["cherry", target, branch]) {
@@ -3022,16 +3057,22 @@ fn cherry_empty(root: &str, target: &str, branch: &str) -> bool {
 /// never disagree. Checks fast-forward ancestry into LOCAL or ORIGIN `<target>`, a merge-tree no-op
 /// against either (which catches squash/rebase merges — where the work lands on the remote as a NEW
 /// commit and the branch tip is not an ancestor — and survives an advancing target), OR a
-/// patch-by-patch `git cherry` no-op against either (see `cherry_empty` — the third ground-truth
-/// signal, covering cases the first two can miss). `tip` is the branch's resolved SHA ("" = no tip).
-/// Callers wanting the freshest remote state refresh origin first; `||` short-circuits so the more
-/// expensive merge-tree/cherry probes only run for not-already-reachable branches.
+/// patch-by-patch `git cherry` no-op against ORIGIN `<target>` (see `cherry_empty` — the third
+/// ground-truth signal, covering cases the first two can miss). `tip` is the branch's resolved SHA
+/// ("" = no tip). Callers wanting the freshest remote state refresh origin first; `||`
+/// short-circuits so the more expensive merge-tree/cherry probes only run for not-already-reachable
+/// branches — which means, in steady state, only for branches that are GENUINELY still unlanded.
+///
+/// `cherry_empty` is checked against `origin_ref` ONLY, not `target` too (roborev: cost). `git
+/// cherry` computes a patch-id for every commit in the range — a real cost against the routinely
+/// 50-100+ commit gap between an agent branch and a fast-advancing shared `main` — and doubling it
+/// against a check that rarely differs in practice (a local-only landing without ever touching
+/// origin is the rare case) wasn't worth the extra probe on every still-unlanded agent, every poll.
 fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
     let origin_ref = format!("origin/{target}");
     (!tip.is_empty() && (ref_contains(root, target, tip) || ref_contains(root, &origin_ref, tip)))
         || merge_adds_nothing(root, target, branch)
         || merge_adds_nothing(root, &origin_ref, branch)
-        || cherry_empty(root, target, branch)
         || cherry_empty(root, &origin_ref, branch)
 }
 
@@ -3051,8 +3092,14 @@ struct LandedMemo {
 ///
 /// WHY THIS EXISTS. `branch_landed` is the most expensive single item on the 15s status poll:
 /// two `git merge-tree --write-tree` runs — a FULL THREE-WAY MERGE each — plus their `rev-parse
-/// ^{tree}` companions and two `ref_contains`, so up to SIX subprocesses per agent per tick. At ~35
-/// live agents that alone is ~200 forks every 15s, and the cost is not the CPU: macOS's xzone
+/// ^{tree}` companions and two `ref_contains`, so up to SIX subprocesses per agent per tick — NINE
+/// once `cherry_empty` (sparkle-uj037) is reached: a `rev-list --count --min-parents=2` guard plus
+/// (only when that guard passes) one `git cherry`, itself a full patch-id computation over every
+/// commit `target..branch` — routinely 50-100+ against a fast-advancing shared `main`. `||`
+/// short-circuits this whole chain the instant an earlier, cheaper check succeeds, so in steady
+/// state it is paid only by branches that are GENUINELY still unlanded, not by the whole fleet.
+/// At ~35 live agents the base six-subprocess cost alone is ~200 forks every 15s, and the cost is
+/// not the CPU: macOS's xzone
 /// allocator takes a PROCESS-WIDE lock around `fork`/`posix_spawn`, so every spawn blocks `malloc`
 /// for every other thread in this process — including the main thread, inside WebKit IPC decode and
 /// `CA::Layer::commit_if_needed`. A spindump of a live wedge measured 159 threads parked in
@@ -7811,10 +7858,18 @@ mod tests {
     /// of the existing ancestor/merge-tree checks: cherry-pick `feature`'s commit onto `main` under a
     /// DIFFERENT sha (so `ref_contains` is false — the tip is provably not an ancestor, exactly the
     /// shape an out-of-band rebase/cherry-pick produces) and confirm `branch_landed` still reports
-    /// landed, driven by the cherry signal.
+    /// landed, driven by the cherry signal. `branch_landed` checks cherry against `origin/<target>`
+    /// only (roborev: cost — see its doc comment), so this fixture carries a real origin remote and
+    /// the cherry-picked commit is pushed there, not just landed on local `main`.
     #[test]
     fn branch_landed_recognizes_a_cherry_picked_equivalent_even_when_the_tip_is_not_an_ancestor() {
         let r = init_repo("cherry-landed");
+        let origin = unique_root("cherry-landed-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
         git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
         std::fs::write(format!("{r}/feature.txt"), "agent work").unwrap();
         git(&r, &["add", "."]).unwrap();
@@ -7822,9 +7877,9 @@ mod tests {
         let tip = rev_parse_tip(&r, "feature");
 
         // Sanity: before landing, cherry reports the commit as genuinely new (a `+` line).
-        let unmerged = git(&r, &["cherry", "main", "feature"]).unwrap();
+        let unmerged = git(&r, &["cherry", "origin/main", "feature"]).unwrap();
         assert!(unmerged.starts_with('+'), "PRECONDITION: unmerged work must read as a '+' commit");
-        assert!(!cherry_empty(&r, "main", "feature"), "PRECONDITION: not yet landed");
+        assert!(!cherry_empty(&r, "origin/main", "feature"), "PRECONDITION: not yet landed");
         assert!(!branch_landed(&r, "main", "feature", &tip), "PRECONDITION: branch_landed agrees");
 
         // Cherry-pick the SAME patch onto main under a NEW sha — `-x` appends a "(cherry picked
@@ -7832,19 +7887,126 @@ mod tests {
         // regardless of whether author/committer timestamps happen to coincide with the original.
         git(&r, &["checkout", "-q", "main"]).unwrap();
         git(&r, &["cherry-pick", "-x", &tip]).unwrap();
+
+        // Then land an UNRELATED commit on main that ALSO edits feature.txt, so a naive three-way
+        // merge of origin/main into feature would CONFLICT. roborev caught the prior fixture here:
+        // without this, main and feature converge to byte-identical content, so `merge_adds_nothing`
+        // already reads true before `branch_landed` ever reaches the cherry probe — proving nothing
+        // about the cherry signal specifically. This divergence defeats that easier arm (and
+        // ancestry, which was already false), so "landed" below can only come from cherry.
+        std::fs::write(format!("{r}/feature.txt"), "main diverges after the cherry-pick").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "main diverges on feature.txt"]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
         assert!(
-            !ref_contains(&r, "main", &tip),
-            "PRECONDITION: the original tip must NOT be an ancestor of main after a cherry-pick"
+            !ref_contains(&r, "origin/main", &tip),
+            "PRECONDITION: the original tip must NOT be an ancestor of origin/main after a cherry-pick"
+        );
+        assert!(
+            !merge_adds_nothing(&r, "main", "feature"),
+            "PRECONDITION: main's later divergence must defeat the merge-tree arm too"
+        );
+        assert!(
+            !merge_adds_nothing(&r, "origin/main", "feature"),
+            "PRECONDITION: same, against origin/main — the ref branch_landed actually checks"
         );
 
         assert!(
-            cherry_empty(&r, "main", "feature"),
-            "the patch reached main by cherry-pick; git cherry must recognize it as equivalent"
+            cherry_empty(&r, "origin/main", "feature"),
+            "the patch reached origin/main by cherry-pick; git cherry must recognize it as equivalent"
         );
         assert!(
             branch_landed(&r, "main", "feature", &tip),
-            "branch_landed must report landed via the cherry signal even though ancestry says no"
+            "branch_landed must report landed via the cherry signal even though ancestry and merge-tree both fail"
         );
+
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// THE BUG roborev caught before this shipped further: `git cherry` computes patch-ids, which
+    /// are UNDEFINED for a merge commit, so it OMITS merges from its output outright — verified
+    /// directly (`git cherry` on a fixture with a lone conflict-resolving merge commit lists
+    /// nothing for it at all, confirmed by comparing against `git rev-list` for the same range,
+    /// which DOES include the merge sha). Depending on what ELSE is in the range, that omission can
+    /// surface as a a `+` line for some other, unrelated commit (cherry still isn't reporting on
+    /// the MERGE itself) rather than a wholly empty result — but either way, nothing about cherry's
+    /// output can be trusted to mean "the merge's own content landed", because cherry never looked
+    /// at it. A branch whose UNLANDED work is entirely inside such a merge — the NORMAL shape here
+    /// (`AGENTS.md`: merge `origin/main` in, don't rebase) — must not read as landed on the strength
+    /// of cherry's silence. This feeds `branch_landed`, which feeds
+    /// `delete_agent_branch_if_merged_at` — a caller that `git branch -D`s on "landed", so the
+    /// stakes are a destructive, unrecoverable delete.
+    ///
+    /// This pins the guard (`range_free_of_merges`) unconditionally: ANY range containing a merge
+    /// commit must refuse the cherry signal — not merely when raw `git cherry` happens to print
+    /// nothing for the rest of that range, but even (as constructed here) when the range's ONLY
+    /// non-merge-reachable content is the merge commit itself, so raw cherry has NOTHING ELSE to
+    /// examine and reports a wholly empty range. roborev caught a prior version of this fixture
+    /// (which gave `feature` its own separate content-bearing commit ahead of the merge) never
+    /// actually isolating the guard: `git cherry` marks any commit reachable from `head` but not
+    /// `upstream` as `+` the moment `upstream`'s tip becomes fully reachable from `head` (its
+    /// merge-base against `head` collapses to itself, so the pool of `upstream`-only commits cherry
+    /// could match against is empty) — so that prior fixture's "+"-line already made `cherry_empty`
+    /// false with or without the guard, proving nothing about the guard's own necessity.
+    #[test]
+    fn cherry_empty_refuses_to_trust_a_range_containing_a_merge_commit() {
+        let r = init_repo("cherry-merge-blindspot");
+        let origin = unique_root("cherry-merge-blindspot-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        // `feature` is cut here with NO commits of its own — everything it carries beyond the fork
+        // point is the merge commit below, so cherry has nothing non-merge left to examine at all.
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+
+        // main advances independently.
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        std::fs::write(format!("{r}/shared.txt"), "main line\n").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "main work"]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        // feature merges origin/main in — cleanly, since feature never touched shared.txt, so this
+        // auto-commits as a plain (non-conflicted) merge — then the SAME merge commit is amended
+        // (same two parents, new tree) to carry content unique to the merge's own resolution.
+        git(&r, &["checkout", "-q", "feature"]).unwrap();
+        git(&r, &["merge", "-q", "--no-ff", "-m", "merge origin/main", "origin/main"]).unwrap();
+        std::fs::write(format!("{r}/shared.txt"), "resolved: unique to this merge\n").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "--amend", "-q", "--no-edit"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+
+        // PRECONDITION: genuinely NOT landed by either existing signal, and a merge commit IS in
+        // the range under test — the exact shape the guard exists to catch.
+        assert!(!ref_contains(&r, "origin/main", &tip), "PRECONDITION: tip is not an ancestor");
+        assert!(
+            !merge_adds_nothing(&r, "origin/main", "feature"),
+            "PRECONDITION: the resolution content is unique to this merge, so merging still changes origin/main"
+        );
+        assert!(!range_free_of_merges(&r, "origin/main", "feature"), "PRECONDITION: a merge commit is in range");
+
+        // PRECONDITION (the actual blind spot, not an implementation detail): raw `git cherry` sees
+        // NOTHING AT ALL for this range — no `+`, no `-` — because the merge commit is the range's
+        // only entry and cherry silently skips merge commits outright. Without the guard, that
+        // emptiness alone is exactly what `cherry_empty` would read as "nothing new".
+        let raw = git(&r, &["cherry", "origin/main", "feature"]).unwrap();
+        assert!(raw.is_empty(), "PRECONDITION: raw cherry sees NOTHING for this range — the blind spot");
+
+        // THE ASSERTION THAT MATTERS: the guard must refuse the cherry path here, because a merge
+        // commit is present — not because raw cherry happened to print anything for the rest of the
+        // range (there is no "rest of the range": this fixture's only content IS the merge).
+        assert!(
+            !cherry_empty(&r, "origin/main", "feature"),
+            "cherry_empty must refuse a range containing a merge commit, not trust cherry's blind spot"
+        );
+        assert!(
+            !branch_landed(&r, "main", "feature", &tip),
+            "branch_landed must NOT report this genuinely-unlanded branch as landed"
+        );
+
+        let _ = std::fs::remove_dir_all(&origin);
     }
 
     // Regression: opening a project directory that is an ORPHANED git worktree — a `.git`
@@ -12899,6 +13061,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root_str);
         let _ = std::fs::remove_dir_all(&origin);
         let _ = std::fs::remove_dir_all(&elsewhere);
+    }
+
+    /// THE PATH THE SIDEBAR ACTUALLY POLLS (roborev, sparkle-uj037 follow-up). The test above only
+    /// drives the single-agent `agent_workflow_state_at`, but `AgentSidebar.tsx`'s closed-sweep tick
+    /// goes through `pollProjectStatus` → `projectAgentsStatus` → `project_agents_status_at` — a
+    /// SEPARATE call site carrying its own copy of the fetch-decoupling fix. This file's own
+    /// comments call that batch path "the path the sidebar actually polls" and warn specifically
+    /// that "fixing only the single-agent path would leave the misreport live in the UI" (see
+    /// `agent_workflow_state_in`'s doc comment on why the two are kept in one shared
+    /// `workflow_state_shared` implementation). Without this test, reverting only the batch-path
+    /// hunk would leave every other test in this file green while the user-visible bug returned.
+    /// Same fixture shape as the sibling test, driven through the BATCH entry point with a real
+    /// worktree (the batch path reads the working tree, not just refs) instead of `ctx: None`.
+    #[test]
+    fn a_closed_agent_batch_poll_still_sees_a_merge_that_landed_elsewhere() {
+        let root_str = init_repo("uj037-batch-closed-fetch");
+        let origin = unique_root("uj037-batch-closed-fetch-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&root_str, &["remote", "add", "origin", o]).unwrap();
+        git(&root_str, &["push", "-q", "origin", "main"]).unwrap();
+
+        // A real worktree, cut with PLAIN git (NOT `create_worktree_at` — its own background
+        // origin-refresh would prime this repo's FETCH_COOLDOWN before the test is ready and race
+        // the very fetch under test; see the sibling test's note above).
+        let app_data = unique_root("uj037-batch-closed-fetch-appdata");
+        let wt = worktree_path(&app_data, "p1", "cc3").unwrap();
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        let wt_str = wt.to_string_lossy().to_string();
+        git(&root_str, &["worktree", "add", "-b", "sparkle/agent-cc3", &wt_str, "main"]).unwrap();
+        std::fs::write(wt.join("changelog.txt"), "catch up").unwrap();
+        git(&wt_str, &["add", "-A"]).unwrap();
+        git(&wt_str, &["commit", "-q", "-m", "changelog catch up"]).unwrap();
+        let tip = rev_parse_tip(&root_str, "sparkle/agent-cc3");
+        git(&root_str, &["push", "-q", "origin", "sparkle/agent-cc3"]).unwrap();
+
+        // The PR merges into origin/main via a real merge commit — but FROM ELSEWHERE (another
+        // worktree/session/machine), leaving `root_str`'s own `refs/remotes/origin/main` stale.
+        let elsewhere = unique_root("uj037-batch-closed-fetch-elsewhere");
+        let elsewhere_str = elsewhere.to_string_lossy().to_string();
+        git(&elsewhere_str, &["clone", "-q", o, "."]).unwrap();
+        git(&elsewhere_str, &["config", "user.email", "t@t"]).unwrap();
+        git(&elsewhere_str, &["config", "user.name", "t"]).unwrap();
+        git(&elsewhere_str, &["checkout", "-q", "main"]).unwrap();
+        git(
+            &elsewhere_str,
+            &["merge", "--no-ff", "-m", "Merge pull request: changelog catch up", "origin/sparkle/agent-cc3"],
+        )
+        .unwrap();
+        git(&elsewhere_str, &["push", "-q", "origin", "main"]).unwrap();
+
+        assert!(
+            !ref_contains(&root_str, "origin/main", &tip),
+            "PRECONDITION: this repo's origin/main ref must still be stale"
+        );
+
+        // The CLOSED-SWEEP BATCH poll: probe_pr_state=false, exactly what AgentSidebar.tsx passes
+        // for every closed row every tick.
+        let input = AgentStatusInput {
+            agent_id: "cc3".into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: true,
+        };
+        let results = project_agents_status_at(&root_str, "p1", &[input], false, &app_data);
+        assert_eq!(results.len(), 1);
+        let workflow = results[0]
+            .workflow
+            .as_ref()
+            .expect("a forced, changed agent must carry a fresh workflow state");
+        assert!(
+            workflow.in_origin_main,
+            "the batch/closed-sweep path must also fetch origin and see the merge — pre-fix this \
+             reads false forever, exactly the sparkle-uj037 bug, on the path the sidebar actually polls"
+        );
+        assert!(workflow.landed, "and therefore report landed too");
+
+        let _ = std::fs::remove_dir_all(&root_str);
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&elsewhere);
+        let _ = std::fs::remove_dir_all(&app_data);
     }
 
     /// The full expected `WorkflowState` shape at one step of the e2e walk. Mirrors the TS fixture
