@@ -872,14 +872,273 @@ function findSearchRoots(args) {
 const NAMING_PREDICATES = new Set([
   "-name", "-iname", "-path", "-ipath", "-regex", "-iregex", "-lname", "-samefile",
 ]);
-const MATCHES_EVERYTHING = new Set(["*", ".*", "**", "*.*", "?*"]);
+/** Does this GLOB pattern actually name something, or is it wildcards all the way down?
+ *
+ *  A literal set (`*`, `.*`, …) was too small by construction: `-path '/*'` and `-regex '.+'` bound
+ *  nothing either and were not in it. The question is not "is this one of five strings" but "does
+ *  it contain any literal to match against" — so a pattern made only of glob metacharacters,
+ *  separators and quantifiers names everything, i.e. nothing.
+ *
+ *  A glob's `*` is a SEPARATE token from what precedes it, so `x*` genuinely anchors the prefix `x`
+ *  and an "is there a literal anywhere" test is the right question here. That is exactly what makes
+ *  it the wrong question for a regex — see below.
+ *
+ *  A CHARACTER CLASS is full of alphanumerics and names nothing: `find / -name '[a-z]*' -delete`
+ *  matches every path beginning with a letter, which is the same hole this rule closes for `'*'`
+ *  and `'/*'`, just spelled differently. So classes come out before the literal test — and so do
+ *  escapes, since `\d`/`\w` are metacharacters wearing a letter. A class that sits BESIDE a real
+ *  literal (`log[0-9]`) still narrows: only the class is removed, not the pattern. */
+function globNamesSomething(pattern) {
+  return /[A-Za-z0-9_]/.test(stripBracketClasses(pattern.replace(/\\./g, "")));
+}
 
-function findHasNarrowingPredicate(args) {
+/** Index of the `]` that CLOSES the bracket expression opened at `open`, or -1 if unterminated.
+ *
+ *  ONE implementation, used by the glob path and the regex path, because they had drifted: a regex
+ *  `\[[^\]]*\]` cannot express this rule, and POSIX fnmatch (what `-name`/`-path` use, GNU and BSD
+ *  alike) and BRE/ERE all agree on it — a `]` in the FIRST position, after an optional `!`/`^`, is a
+ *  literal MEMBER of the class, not the terminator. So `[]a-z]` is one class matching `]` or a
+ *  letter, while the naive regex closes at that first `]` and leaves `a-z]` behind as apparent
+ *  literal text — which then counts as a name and re-opens the very bypass the strip closes,
+ *  spelled with one extra character. */
+function bracketClassEnd(pattern, open) {
+  let i = open + 1;
+  if (pattern[i] === "!" || pattern[i] === "^") i++;
+  if (pattern[i] === "]") i++; // a leading `]` is a member, not the close
+  while (i < pattern.length && pattern[i] !== "]") i++;
+  return i < pattern.length ? i : -1;
+}
+
+/** Remove every bracket expression from a GLOB. An unterminated `[` is a literal in glob, so it is
+ *  kept rather than swallowing the rest of the pattern. */
+function stripBracketClasses(pattern) {
+  let out = "";
+  for (let i = 0; i < pattern.length; ) {
+    if (pattern[i] === "[") {
+      const end = bracketClassEnd(pattern, i);
+      if (end !== -1) { i = end + 1; continue; }
+    }
+    out += pattern[i];
+    i += 1;
+  }
+  return out;
+}
+
+/** The same question for a REGEX, where "contains a literal" does not survive contact with
+ *  quantifiers: in `-regex '.*x*'` the `x` is quantified away, so the pattern is `.*` wearing a
+ *  literal and matches every path on the system. `x{0,9}.*` and `.*(x)?` are the same trick.
+ *  So a regex atom counts only if it is REQUIRED — i.e. not followed by `*`, `?`, or an interval
+ *  whose lower bound is zero — and every top-level `|` branch must carry one, for the same reason
+ *  every top-level `-o` branch must (one branch matching everything is enough).
+ *
+ *  A bracket class (`[a-z]`) constrains a position without naming a literal, so it does not count;
+ *  a group counts when its own contents do, recursively. Both sides of that are the safe side. */
+function regexNamesSomething(pattern) {
+  pattern = normalizeRegexDialect(pattern);
+  const branches = splitTopLevel(pattern, "|");
+  if (branches.length > 1) return branches.every(regexNamesSomething);
+  for (let i = 0; i < pattern.length; ) {
+    let atom, inner = null;
+    const c = pattern[i];
+    if (c === "\\") { atom = pattern.slice(i, i + 2); i += 2; }
+    else if (c === "(") {
+      const end = matchingParen(pattern, i);
+      if (end === -1) return false; // unbalanced — cannot reason about it, so refuse
+      inner = pattern.slice(i + 1, end);
+      atom = pattern.slice(i, end + 1);
+      i = end + 1;
+    } else if (c === "[") {
+      // Same rule as the glob path, from the same function — a leading `]` is a member, not the close.
+      const end = bracketClassEnd(pattern, i);
+      if (end === -1) return false; // unterminated — cannot reason about it, so refuse
+      atom = pattern.slice(i, end + 1);
+      inner = null;
+      i = end + 1;
+    } else { atom = c; i += 1; }
+    let quant = "";
+    if (pattern[i] === "*" || pattern[i] === "?" || pattern[i] === "+") { quant = pattern[i]; i += 1; }
+    else if (pattern[i] === "{") {
+      const end = pattern.indexOf("}", i);
+      if (end !== -1) { quant = pattern.slice(i, end + 1); i = end + 1; }
+    }
+    if (quant === "*" || quant === "?" || /^\{\s*0\s*[,}]/.test(quant)) continue; // optional
+    if (atom.startsWith("[")) continue; // a class binds a position, not a name
+    if (inner !== null) { if (regexNamesSomething(inner)) return true; continue; }
+    if (/[A-Za-z0-9_]/.test(atom.replace(/\\./g, ""))) return true;
+  }
+  return false;
+}
+
+/** `-regex` IS NOT EXTENDED REGEX, in either dialect that runs here. GNU find defaults to
+ *  `-regextype emacs` and BSD/macOS find to BRE — that is what `-E` opts OUT of — and in both,
+ *  alternation is `\|`, groups are `\(…\)` and intervals are `\{n,m\}`. So a reader written against
+ *  ERE consumes the backslash form as a two-character LITERAL, never sees the quantifier, and counts
+ *  the first bare character as a required name. That leaves the dangerous spelling of exactly the
+ *  bypass this rule targets wide open, on macOS's own `/usr/bin/find`:
+ *
+ *      find / -regex 'x\{0,9\}.*' -delete     ← BRE interval: matches every path
+ *      find / -regex '\(x\)*.*' -delete       ← BRE group + `*`
+ *      find / -regex 'zzz\|.*' -delete        ← emacs alternation
+ *
+ *  Both spellings are therefore read as OPERATORS. In ERE that is a mis-parse — `\(` there is a
+ *  literal paren — but it errs by treating a literal as a group, i.e. by finding LESS that is
+ *  required, i.e. by refusing. That is the direction to be wrong in, and it means one reader covers
+ *  `find`, `find -E` and `-regextype posix-extended` without knowing which one it is looking at. */
+function normalizeRegexDialect(pattern) {
+  return pattern.replace(/\\([(){}|?+])/g, "$1");
+}
+
+/** Split a regex on a top-level (paren-depth-0, unescaped) separator. */
+function splitTopLevel(pattern, sep) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "(") depth++;
+    else if (c === ")") depth = Math.max(0, depth - 1);
+    else if (c === sep && depth === 0) { out.push(pattern.slice(start, i)); start = i + 1; }
+  }
+  out.push(pattern.slice(start));
+  return out;
+}
+
+function matchingParen(pattern, open) {
+  let depth = 0;
+  for (let i = open; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "\\") { i++; continue; }
+    if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return i;
+  }
+  return -1;
+}
+
+function namesSomething(pattern, predicate) {
+  return predicate === "-regex" || predicate === "-iregex"
+    ? regexNamesSomething(pattern)
+    : globNamesSomething(pattern);
+}
+
+const FIND_OR = new Set(["-o", "-or"]);
+/** find's COMMA is a real operator and the loosest-binding one there is: `expr1 , expr2` evaluates
+ *  both and takes the value of the RIGHT one. So `find / \( -name zzz , -true \) -delete` is always
+ *  true and deletes every file on the system while containing a perfectly good `-name`. A reader that
+ *  models `(`, `!`, `-a` and `-o` but not `,` reports that as narrowed. */
+const FIND_COMMA = new Set([","]);
+const FIND_NOT = new Set(["!", "-not"]);
+const FIND_OPEN = new Set(["(", "\\("]);
+const FIND_CLOSE = new Set([")", "\\)"]);
+/** These carry a COMMAND, whose own words are not find's operators — `-exec grep -o pat {} +` must
+ *  not be read as an OR. The run ends at the `;`/`+` terminator find requires. */
+const FIND_COMMAND_PREDICATES = new Set(["-exec", "-execdir", "-ok", "-okdir"]);
+
+/** Index just past a `-exec`-family run (its terminator included), starting AT the predicate. */
+function findSkipCommandRun(args, i) {
+  let j = i + 1;
+  while (j < args.length && args[j] !== ";" && args[j] !== "\\;" && args[j] !== "+") j++;
+  return Math.min(j + 1, args.length);
+}
+
+/** Index just past the operand that begins at `i` — used to step OVER a negated operand, which
+ *  contributes no narrowing of its own. */
+function findSkipOperand(args, i) {
+  if (i >= args.length) return args.length;
+  if (FIND_NOT.has(args[i])) return findSkipOperand(args, i + 1);
+  if (FIND_OPEN.has(args[i])) {
+    const end = findMatchingClose(args, i);
+    return end === -1 ? args.length : end + 1;
+  }
+  if (FIND_COMMAND_PREDICATES.has(args[i])) return findSkipCommandRun(args, i);
+  if (NAMING_PREDICATES.has(args[i])) return i + 2; // predicate + its pattern
+  return i + 1;
+}
+
+function findMatchingClose(args, open) {
+  let depth = 0;
+  for (let i = open; i < args.length; i++) {
+    if (FIND_OPEN.has(args[i])) depth++;
+    else if (FIND_COMMAND_PREDICATES.has(args[i])) { i = findSkipCommandRun(args, i) - 1; }
+    else if (NAMING_PREDICATES.has(args[i])) i++; // its PATTERN is data, not an operator
+    else if (FIND_CLOSE.has(args[i]) && --depth === 0) return i;
+  }
+  return -1;
+}
+
+/** Split an expression on a top-level operator token. `-o`/`-or` for the OR case; `,` for the comma
+ *  case, which binds even looser. Groups, `-exec` tails and naming patterns are all stepped over so
+ *  a token inside them is never mistaken for an operator. */
+function findSplitOn(args, ops) {
+  const out = [];
+  let depth = 0;
+  let start = 0;
   for (let i = 0; i < args.length; i++) {
-    if (!NAMING_PREDICATES.has(args[i])) continue;
+    const a = args[i];
+    if (FIND_OPEN.has(a)) depth++;
+    else if (FIND_CLOSE.has(a)) depth = Math.max(0, depth - 1);
+    else if (FIND_COMMAND_PREDICATES.has(a)) { i = findSkipCommandRun(args, i) - 1; }
+    else if (NAMING_PREDICATES.has(a)) i++; // its PATTERN is data, not an operator
+    else if (ops.has(a) && depth === 0) { out.push(args.slice(start, i)); start = i + 1; }
+  }
+  out.push(args.slice(start));
+  return out;
+}
+
+/** Does this `find` narrow what it matches to something the author NAMED?
+ *
+ *  This is STRUCTURAL rather than a membership test, and the difference is a whole class of false
+ *  refusals. A flat "does any arg defeat narrowing" scan cannot tell
+ *
+ *      find / \( -name zzz -o -true \) -delete        ← matches every file
+ *
+ *  from the two commonest bounded-cleanup idioms there are:
+ *
+ *      find "$HOME" \( -name '*.log' -o -name '*.tmp' \) -delete
+ *      find "$HOME" -name '*.pyc' -not -path './venv/*' -delete
+ *
+ *  Treating any `-o`/`-not` as a defeat refused both, with no approval path — the same over-block
+ *  this rule's own comments call out for `-type` and for gating on the root alone. The structure is
+ *  what separates them:
+ *
+ *    • OR is a UNION, so EVERY top-level branch must narrow. One branch that names nothing
+ *      (`-true`, a bare `-type f`, an action) re-admits everything the others excluded.
+ *    • AND is an INTERSECTION, so ANY conjunct that narrows bounds the whole. That is why a
+ *      negation beside a real name is harmless: `-not -path x` only SUBTRACTS from the set `-name`
+ *      already bounded.
+ *    • A negation on its own narrows nothing — `! -name zzz` is everything-but-one-thing — so its
+ *      operand is stepped over rather than counted.
+ *
+ *  `-true`/`-false` need no special case under those rules: they contribute nothing, so they fail
+ *  an OR branch (correct — `-name x -o -true` is everything) and are harmless in an AND
+ *  (`-name x -a -true` really is bounded by `-name x`). An expression this cannot parse
+ *  (unbalanced parens) reports NOT narrowed, which is the refusing side.
+ *
+ *  Precedence order matters and is followed: `,` (loosest) then `-o` then the implicit `-a`. */
+function findHasNarrowingPredicate(args) {
+  // The comma's VALUE is its right operand, so only the last segment decides what find matched.
+  const commaSegments = findSplitOn(args, FIND_COMMA);
+  if (commaSegments.length > 1) {
+    return findHasNarrowingPredicate(commaSegments[commaSegments.length - 1]);
+  }
+  const branches = findSplitOn(args, FIND_OR);
+  if (branches.length > 1) return branches.every(findHasNarrowingPredicate);
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (FIND_NOT.has(a)) { i = findSkipOperand(args, i + 1) - 1; continue; }
+    if (FIND_OPEN.has(a)) {
+      const end = findMatchingClose(args, i);
+      if (end === -1) return false;
+      if (findHasNarrowingPredicate(args.slice(i + 1, end))) return true;
+      i = end;
+      continue;
+    }
+    if (FIND_COMMAND_PREDICATES.has(a)) { i = findSkipCommandRun(args, i) - 1; continue; }
+    if (!NAMING_PREDICATES.has(a)) continue;
     const pattern = args[i + 1];
+    i++;
     if (pattern === undefined) continue;
-    if (MATCHES_EVERYTHING.has(pattern)) continue; // names everything = names nothing
+    if (!namesSomething(pattern, a)) continue; // names everything = names nothing
     return true;
   }
   return false;
@@ -892,8 +1151,8 @@ function findHasNarrowingPredicate(args) {
  *  which then swallows every following line, including a real `rm -rf /`. (2) A regex is not
  *  quoting-aware, so `echo "see <<EOF"` — which merely MENTIONS the operator — opened a body too.
  *  Tracking quote state and requiring exactly two `<` outside quotes fixes both. */
-function heredocOpenedBy(line) {
-  let quote = null;
+function heredocOpenedBy(line, quoteIn = null) {
+  let quote = quoteIn;
   for (let i = 0; i < line.length; i++) {
     const c = line[i];
     if (quote !== null) {
@@ -914,13 +1173,17 @@ function heredocOpenedBy(line) {
     const q = line[j];
     if (q === "'" || q === '"') {
       const end = line.indexOf(q, j + 1);
-      if (end === -1) return null;
-      return { terminator: line.slice(j + 1, end), allowIndent };
+      if (end === -1) return { terminator: null, allowIndent, quoteOut: quote };
+      return { terminator: line.slice(j + 1, end), allowIndent, quoteOut: quote };
     }
     const m = /^[A-Za-z_][A-Za-z0-9_]*/.exec(line.slice(j));
-    return m ? { terminator: m[0], allowIndent } : null;
+    return { terminator: m ? m[0] : null, allowIndent, quoteOut: quote };
   }
-  return null;
+  // No heredoc opened on this line; report the quote state it ENDS in so the caller can carry it
+  // to the next one. A quote opened here and closed two lines down means the line between is
+  // inside a string — and treating each line as freshly unquoted let a `<<WORD` in that string
+  // open a body, discarding every following line before the lexer saw it.
+  return { terminator: null, allowIndent: false, quoteOut: quote };
 }
 
 /** Remove HEREDOC BODIES before lexing. A heredoc body is DATA being written, not commands being
@@ -942,14 +1205,16 @@ function stripHeredocBodies(command) {
   const out = [];
   let terminator = null;
   let allowIndent = false;
+  let quote = null; // carried ACROSS lines — a shell string may span them
   for (const line of lines) {
     if (terminator !== null) {
       const candidate = allowIndent ? line.replace(/^[\t ]+/, "") : line;
       if (candidate === terminator) terminator = null;
       continue; // the body (and its terminator) are data
     }
-    const opened = heredocOpenedBy(line);
-    if (opened) {
+    const opened = heredocOpenedBy(line, quote);
+    quote = opened.quoteOut;
+    if (opened.terminator !== null) {
       allowIndent = opened.allowIndent;
       terminator = opened.terminator;
     }

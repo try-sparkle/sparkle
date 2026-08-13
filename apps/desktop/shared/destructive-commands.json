@@ -152,7 +152,28 @@
     { "command": "diskutil secureErase 0 disk2", "why": "overwrites the whole disk" },
     { "command": "diskutil eraseOptical disk2", "why": "erases the medium" },
     { "command": "diskutil apfs deleteVolume disk2s1", "why": "destroys an APFS volume" },
-    { "command": "diskutil apfs eraseVolume disk2s1", "why": "destroys an APFS volume's contents; note `Bash(diskutil eraseVolume:*)` does NOT prefix-match this" }
+    { "command": "diskutil apfs eraseVolume disk2s1", "why": "destroys an APFS volume's contents; note `Bash(diskutil eraseVolume:*)` does NOT prefix-match this" },
+    { "command": "find $HOME -type f -delete", "why": "REGRESSION, HIGH: `-type` is a FILTER, not a name. Counting it as narrowing disabled the rule for a command that deletes every regular file under home." },
+    { "command": "find / -type f -exec rm -rf {} +", "why": "the same, via -exec" },
+    { "command": "find / -name '*' -delete", "why": "a pattern that matches everything names nothing" },
+    { "command": "find -f / -delete", "why": "REGRESSION: `-f <path>` names a root, but skipping the flag AND its value emptied the root list" },
+    { "command": "find / -path '/*' -delete", "why": "REGRESSION: `matches everything` was a five-string literal set, so `/*` counted as a real name and disabled the unbounded-root rule" },
+    { "command": "find / -regex '.+' -delete", "why": "the same, for a regex that names nothing" },
+    { "command": "find / -regex '.*x*' -delete", "why": "REGRESSION: the alnum test saw the `x` and called it a name, but `x*` matches zero `x`s — the pattern is `.*` wearing a literal. Optional-quantified atoms must be stripped before asking whether a regex names anything." },
+    { "command": "find / -regex 'x{0,9}.*' -delete", "why": "the same, with an interval quantifier whose lower bound is zero" },
+    { "command": "find / \\( -name zzz -o -true \\) -delete", "why": "an OR branch re-admits everything the named branch excluded, and a flat scan for `-name` cannot see it" },
+    { "command": "find / \\( -name zzz -o -type f \\) -delete", "why": "every top-level OR branch must narrow; a filter-only branch re-admits every regular file on the system" },
+    { "command": "find / ! -name zzz -delete", "why": "a negated name is the complement of a name — it matches everything EXCEPT one thing" },
+    { "command": "find / -not -name zzz -delete", "why": "the long spelling of the same negation" },
+    { "command": "find / -name '[a-z]*' -delete", "why": "REGRESSION: a character CLASS is full of alphanumerics and names nothing — this matches every path beginning with a letter, the same hole as `'*'` spelled differently" },
+    { "command": "find / -iregex '.*[0-9a-z]*.*' -delete", "why": "the class trick and the quantifier trick at once" },
+    { "command": "find / -regex 'x\\{0,9\\}.*' -delete", "why": "REGRESSION, HIGH: `-regex` is BRE on macOS and emacs on GNU, NOT extended — so `\\{0,9\\}` is the interval and this matches every path. A reader written against ERE ate the backslash form as a literal and counted the `x` as a required name." },
+    { "command": "find / -regex '\\(x\\)*.*' -delete", "why": "the BRE spelling of a quantified-away group" },
+    { "command": "find / -regex 'zzz\\|.*' -delete", "why": "the emacs spelling of alternation — the right branch matches everything, so the left one naming a literal proves nothing" },
+    { "command": "find / \\( -name zzz , -true \\) -delete", "why": "REGRESSION: find's COMMA is the loosest-binding operator and evaluates to its RIGHT operand, so this is always true and deletes every file while containing a perfectly good -name" },
+    { "command": "find / -name zzz , -print -delete", "why": "the same comma, unbracketed" },
+    { "command": "find / -name '[]a-z]*' -delete", "why": "REGRESSION: POSIX fnmatch reads a `]` in the FIRST position as a MEMBER of the class, not the terminator. A `\\[[^\\]]*\\]` strip closes at that `]` and leaves `a-z]*` behind as apparent literal text — the class bypass, spelled with one extra character." },
+    { "command": "find / -name '[^]a-z]*' -delete", "why": "the negated spelling of the same leading-`]` class" }
   ],
 
   "mustAllow": [
@@ -221,6 +242,22 @@
     },
     { "command": "find /Users/alice/dev -name .DS_Store -exec rm -rf {} +", "why": "a home-relative but scoped cleanup" },
     { "command": "find / -name  -delete", "why": "rooted at / but NARROWED by -name — the deletion set is bounded" },
+    {
+      "command": "find \"$HOME\" \\( -name '*.log' -o -name '*.tmp' \\) -delete",
+      "why": "OVER-BLOCK REGRESSION: treating any `-o` as a defeat refused an ordinary two-extension cleanup with no approval path. An OR is only unbounded when SOME branch fails to narrow — here both branches name something, so the union is still bounded."
+    },
+    {
+      "command": "find \"$HOME\" -name '*.pyc' -not -path '*/venv/*' -delete",
+      "why": "OVER-BLOCK REGRESSION: a negation SUBTRACTS from an already-narrowed set. `-not` defeats narrowing only when the naming predicate it negates is the only one there; a negated -path beside a real -name leaves the set bounded by the -name."
+    },
+    {
+      "command": "find \"$HOME\" \\( -name a -o -name b \\) -a ! -path '*/skip/*' -delete",
+      "why": "both idioms at once — every OR branch names something and the negation only subtracts"
+    },
+    { "command": "find ~ \\( -name .DS_Store -o -name Thumbs.db \\) -delete", "why": "the canonical two-name cleanup, rooted at ~ — bounded by both branches naming a literal file" },
+    { "command": "find / -name '*.log' ! -newer stamp -delete", "why": "a negated FILTER beside a real name: the set is still bounded by -name, so the negation only subtracts from it" },
+    { "command": "find / -name 'log[0-9]' -delete", "why": "a class BESIDE a literal still narrows — stripping classes must not strip the pattern" },
+    { "command": "find / -name '*.log' -exec grep -o pat {} + -delete", "why": "an `-o` inside the -exec TAIL is grep's flag, not find's OR. Rooted at / WITH -delete, so the narrowing check really runs — splitting on that `-o` invents an unnarrowed branch out of grep's operands and refuses a bounded cleanup." },
     { "command": "xargs -n 1 grep -l TODO", "why": "the wrapper value-skip must not turn a benign nested command into a block" },
     { "command": "bash -lc 'pnpm -r test'", "why": "bundled -c carrying an ordinary command" },
     {
@@ -239,9 +276,13 @@
       "command": "echo \"see <<EOF\"\nrm -rf /",
       "why": "a QUOTED mention of the operator must not open a body — the stripper has to be quoting-aware, not just anchored"
     },
-    { "command": "find $HOME -type f -delete", "why": "REGRESSION, HIGH: `-type` is a FILTER, not a name. Counting it as narrowing disabled the rule for a command that deletes every regular file under home." },
-    { "command": "find / -type f -exec rm -rf {} +", "why": "the same, via -exec" },
-    { "command": "find / -name '*' -delete", "why": "a pattern that matches everything names nothing" },
-    { "command": "find -f / -delete", "why": "REGRESSION: `-f <path>` names a root, but skipping the flag AND its value emptied the root list" }
+    {
+      "command": "echo \"a\n<<EOF\nb\"\nrm -rf /",
+      "why": "REGRESSION, HIGH: the heredoc scanner was quoting-aware PER LINE ONLY, so a shell string spanning lines left it believing the next line was unquoted — a `<<WORD` inside that string opened a body and discarded every following line, this `rm -rf /` included, before the lexer saw it. Quote state now threads across lines."
+    },
+    {
+      "command": "echo 'a\n<<EOF\nb'\nrm -rf ~",
+      "why": "the same, single-quoted"
+    }
   ]
 }

@@ -32,6 +32,18 @@ describe("blocksDestructiveCommand — the mustBlock corpus", () => {
   it("the fixture actually has entries (a silently empty corpus would make every case vacuous)", () => {
     expect(fixture.mustBlock.length).toBeGreaterThan(20);
     expect(fixture.mustAllow.length).toBeGreaterThan(20);
+    // `it.each([])` produces ZERO tests and a silently green suite — the exact vacuity the two
+    // assertions above exist to prevent, which the multi-line list shipped without.
+    expect(fixture.mustBlockMultiline.length).toBeGreaterThan(0);
+  });
+
+  it("every mustBlockMultiline entry is actually multi-line", () => {
+    // The list earns its separate existence only if its entries carry a newline: a single-line case
+    // belongs in `mustBlock`, where the deny layer's coverage test can see it too. Four entries had
+    // drifted in here with no newline at all, contradicting the list's own documented contract.
+    for (const { command } of fixture.mustBlockMultiline) {
+      expect(command, `not multi-line: ${command}`).toContain("\n");
+    }
   });
 
   it.each(fixture.mustBlockMultiline)("blocks a MULTI-LINE command — $why", ({ command }) => {
