@@ -2676,6 +2676,26 @@ function teardown(): void {
   setChiefClient(null);
 }
 
+/** How long boot will wait on the Chief connect before giving up on it for this start. Generous —
+ *  this is a hang guard, not a latency budget; a keychain that answers at all answers well inside it. */
+export const CHIEF_CONNECT_TIMEOUT_MS = 10_000;
+
+/** Resolve `p`, or `fallback` if it has not settled within `ms`. The loser is abandoned, not
+ *  cancelled (there is nothing to cancel in a Tauri round trip) — it simply stops being awaited. */
+async function withTimeout<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let t: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<T>((resolve) => {
+        t = setTimeout(() => resolve(fallback), ms);
+      }),
+    ]);
+  } finally {
+    if (t) clearTimeout(t);
+  }
+}
+
 async function doStart(): Promise<() => void> {
   // Start the singleton control bridge so the socket + token exist before any agent's control-MCP
   // child connects. Best-effort: a transient bridge failure must not stop us registering the
@@ -2684,20 +2704,30 @@ async function doStart(): Promise<() => void> {
   await startControlBridge().catch((e) =>
     console.error("[control] start_control_bridge failed", e),
   );
-  // CONNECT CHIEF HERE, or the twelve Chief tools are decoration. `connectChief` was written with a
+  // THE LISTENER GOES UP FIRST — Chief is not allowed to delay it (roborev 63315). `startControlBridge`
+  // above has already opened the socket, so between that line and this one the bridge is ACCEPTING
+  // connections with nothing listening for `control:request`; `bridge.rs` emits that event and blocks
+  // on a rendezvous, so every op arriving in the gap dies as a frontend round-trip timeout. This
+  // originally awaited `connectChief()` here, which widened that gap by two unbounded Tauri keychain
+  // round trips — a keychain that is slow, prompts, or never settles would have delayed or
+  // permanently prevented registration of the app's ONLY control listener. Optional subsystems do
+  // not get to gate the mandatory one.
+  unlisten = await listen<ControlRequest>(EVENT, (event) => void dispatch(event.payload));
+  // NOW connect Chief, or the twelve Chief tools are decoration. `connectChief` was written with a
   // doc-comment calling itself "the line that makes the feature exist" and was then called from
   // nothing but its own test — so `chiefClient` stayed `null` in every real run and the whole
-  // surface answered `chief_unavailable`, with three suites green. That is the identical
-  // shipped-inert-seam this file has now hit twice (the missing `CONTROL_OPS` entry, the unreferenced
-  // registry cache); the difference is that this one is load-bearing for a feature the founder is
-  // waiting on, so `startControlListener` — the app's ONE boot call — is where it belongs.
+  // surface answered `chief_unavailable`, with three suites green (roborev 63105). That is the
+  // identical shipped-inert-seam this file has now hit three times (the missing `CONTROL_OPS` entry,
+  // the unreferenced registry cache, and this), so `startControlListener` — the app's ONE boot call —
+  // is where it belongs.
   //
-  // Best-effort and un-awaited-for-failure, exactly like the bridge above: Chief is optional, a
-  // missing PAT is an ordinary state, and `connectChief` never throws. Awaited (not fire-and-forget)
-  // so the client is in place before the listener can dispatch a Chief op against it.
-  const chiefUp = await connectChief();
+  // Awaited rather than fire-and-forget so the client is in place deterministically, but BOUNDED: a
+  // hung keychain read must not leave `startPromise` pending forever, since every later
+  // `startControlListener()` caller shares that one promise. A `chief_tool` op landing inside the
+  // connect window already fails closed to the honest `chief_unavailable`, so a slow connect costs
+  // nothing but Chief itself.
+  const chiefUp = await withTimeout(connectChief(), CHIEF_CONNECT_TIMEOUT_MS, false);
   console.info(`[control] chief ${chiefUp ? "connected" : "not configured"}`);
-  unlisten = await listen<ControlRequest>(EVENT, (event) => void dispatch(event.payload));
   return teardown;
 }
 

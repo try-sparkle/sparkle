@@ -4382,6 +4382,97 @@ describe("controlListener", () => {
       await flush();
       expect((lastReply() as { agents: unknown[] }).agents.length).toBeGreaterThan(0);
     });
+
+    // THE ORDERING, pinned directly (roborev 63315). `startControlBridge` opens the socket, so any
+    // work between it and `listen()` is a window in which the bridge accepts connections while
+    // nothing handles `control:request` — and bridge.rs blocks on a rendezvous, so ops in that gap
+    // die as round-trip timeouts. This boot originally awaited two unbounded keychain round trips
+    // there. Asserting the LISTENER IS UP WHILE THE PAT READ IS STILL PENDING is what makes that
+    // ordering a property rather than a comment: it fails on the old order, and it needs no timers.
+    it("registers the control listener BEFORE waiting on the Chief keychain read", async () => {
+      cleanup?.();
+      cleanup = undefined;
+      firedHandler = undefined;
+
+      let releasePat: (v: string) => void = () => {};
+      chiefResolvePat.mockReturnValue(
+        new Promise<string>((resolve) => {
+          releasePat = resolve;
+        }),
+      );
+      chiefCreateClient.mockReturnValue({
+        listProjects: vi.fn(async () => []),
+        callTool: vi.fn(async () => ({ text: "" })),
+      });
+
+      const starting = startControlListener();
+      await flush();
+
+      // The PAT read has NOT resolved yet — and the listener is already serving.
+      expect(firedHandler).toBeTypeOf("function");
+      fire({ reqId: "ord1", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      expect((lastReply() as { agents: unknown[] }).agents.length).toBeGreaterThan(0);
+
+      releasePat("pat_live_token");
+      cleanup = await starting;
+    });
+
+    // OBSERVES THE TEARDOWN ITSELF, which nothing else here does (roborev 63315). Every other case
+    // in this describe calls `cleanup()` and then immediately re-starts, and `connectChief`
+    // unconditionally rewrites the client on that start — so deleting `setChiefClient(null)` from
+    // `teardown()` left the whole file green, making the guard a vacuous addition inside the very
+    // commit that exists to kill vacuous guards. The gap between teardown and re-arm is the window
+    // this pins: a retired PAT's client must not still be serving in it.
+    it("DROPS the Chief client on teardown — a retired token cannot serve the next start", async () => {
+      cleanup?.();
+      cleanup = undefined;
+      const callTool = vi.fn(async () => ({ text: "ok" }));
+      const listProjects = vi.fn(async () => [{ project_id: "chief_p1", name: "Acme Rebrand" }]);
+      chiefResolvePat.mockResolvedValue("pat_live_token");
+      chiefCreateClient.mockReturnValue({ listProjects, callTool });
+
+      cleanup = await startControlListener();
+      useProjectStore.setState(
+        (s) => ({
+          projects: s.projects.map((p) =>
+            p.id === projectId
+              ? { ...p, chiefProjectIds: ["chief_p1"], chiefPrimaryId: "chief_p1" }
+              : p,
+          ),
+        }),
+        false as never,
+      );
+
+      // THE PAIR: prove the client really is reachable first, or "unavailable after teardown" is
+      // satisfied by a client that was never installed at all.
+      fire({
+        reqId: "td0",
+        op: "chief_tool",
+        callerAgentId: callerId,
+        payload: { chiefTool: "list_assets", project: "chief_p1" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+      expect(callTool).toHaveBeenCalledTimes(1);
+
+      // Tear down and DO NOT restart. `fire()` invokes the captured event callback, which the mock
+      // does not clear on unlisten — so this still lands in the real `dispatch`, and what is being
+      // tested is that the CLIENT is gone rather than that the listener is.
+      cleanup();
+      cleanup = undefined;
+
+      fire({
+        reqId: "td1",
+        op: "chief_tool",
+        callerAgentId: callerId,
+        payload: { chiefTool: "list_assets", project: "chief_p1" },
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "chief_unavailable" });
+      expect(callTool).toHaveBeenCalledTimes(1); // still 1 — nothing reached Chief after teardown
+    });
   });
 
   describe("chief_tool", () => {

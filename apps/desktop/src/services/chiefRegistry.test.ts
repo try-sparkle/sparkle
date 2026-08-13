@@ -253,31 +253,32 @@ describe("catalog TTL cache", () => {
   // `projectStore.persist.test.ts` ping-ponged between exactly these two before landing on the mock
   // below, which depends on no jsdom/Node storage internals and works on every Node version.
   it("does not persist anything (348 rows stay in memory; one call refills them)", async () => {
-    let setItemCalls = 0;
-    const store = new Map<string, string>();
-    vi.stubGlobal("localStorage", {
-      getItem: (k: string) => store.get(k) ?? null,
-      setItem: (k: string, v: string) => {
-        setItemCalls += 1;
-        store.set(k, v);
-      },
-      removeItem: (k: string) => void store.delete(k),
-      clear: () => store.clear(),
-      key: () => null,
-      get length() {
-        return store.size;
-      },
-    });
+    // SPY THE AMBIENT OBJECT, do not REPLACE the binding (roborev 63354). `vi.stubGlobal` swaps the
+    // global *after* ./chiefRegistry is imported, so it only observes writes that re-resolve
+    // `localStorage` at CALL time. An implementation that captures storage at module scope —
+    // `const storage = typeof localStorage === "undefined" ? null : localStorage`, the exact shape
+    // `agentTranscriptRegistry.ts` documents as a live hazard here — would write into the
+    // `MemoryStorage` shim from test-setup.ts with this test still green, i.e. all 348 rows
+    // persisted and nothing observed. Spying the instance every module already holds closes that.
+    const setItem = vi.spyOn(globalThis.localStorage, "setItem");
+    // `sessionStorage` is NOT shimmed by test-setup.ts (only `localStorage` is), so it is absent in
+    // the node environment — spy it only where it exists rather than making this file need jsdom.
+    const session = (globalThis as { sessionStorage?: Storage }).sessionStorage;
+    const sessionSetItem = session ? vi.spyOn(session, "setItem") : null;
     try {
       const reg = createChiefRegistry(fakeClient(), { now: () => 0 });
       await reg.listProjects();
       // Twice, so a cache HIT is covered too — persisting on the refill path only would otherwise
       // slip through.
       await reg.listProjects();
-      expect(setItemCalls).toBe(0);
-      expect(store.size).toBe(0);
+      // Asserted on the SPY, not on `localStorage.length`: the shim is a module-level singleton
+      // shared with every other test in the run, so a length check reads other tests' writes and
+      // fails for reasons that have nothing to do with this registry.
+      expect(setItem).not.toHaveBeenCalled();
+      if (sessionSetItem) expect(sessionSetItem).not.toHaveBeenCalled();
     } finally {
-      vi.unstubAllGlobals();
+      setItem.mockRestore();
+      sessionSetItem?.mockRestore();
     }
   });
 });
