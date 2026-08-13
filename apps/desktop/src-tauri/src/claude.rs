@@ -391,6 +391,72 @@ pub(crate) fn claude_session_info_in(
     )
 }
 
+/// WHICH ACCOUNTS HOLD A CONVERSATION for `worktree_path` — newest transcript first.
+///
+/// ══ WHY THIS EXISTS: THE AGENT THAT CAME BACK BLANK ═══════════════════════════════════════════
+///
+/// A Claude conversation is stored under the `CLAUDE_CONFIG_DIR` it ran with, so an agent's history
+/// belongs to ONE account's tree. The single-account probes above answer "does THIS account have a
+/// session", which is the right question only once the account is already decided. It is the wrong
+/// question at selection time, and that asymmetry lost a real agent's work: an app restart's
+/// resurrection sweep remounted a build agent's pane, `chooseAccountForAgent` re-picked by
+/// lowest-usage and landed on a DIFFERENT account, the resume probe correctly found no session
+/// under that account, and claude launched fresh and empty — while an hour of conversation, and the
+/// opening brief it was carrying, sat intact in the previous account's tree. The pane, the row and
+/// the header all still showed the brief; only the session had nothing. It read as "agents are
+/// being spawned with no task" and as "mounting an agent shows an empty terminal", and it is
+/// neither: it is a conversation orphaned one directory over.
+///
+/// So selection needs to ask the plural question BEFORE it picks, and this is it. Returning each
+/// `config_dirs` entry VERBATIM — including the empty string, which is how the default account
+/// spells "export no `CLAUDE_CONFIG_DIR`" (see [`spawn_env_config_dir`]) — is what lets the caller
+/// map an answer back to the account that named it. Mapping through the RESOLVED path instead would
+/// collapse the default account onto `$HOME/.claude` and lose which account it was.
+///
+/// Ordered by newest transcript mtime, because that is the same rule [`latest_session_file`] already
+/// uses to choose between transcripts WITHIN one account — an agent that legitimately moved accounts
+/// has its live conversation in the one it moved to. Ties keep the caller's order so the result is
+/// deterministic rather than filesystem-dependent.
+///
+/// Pure (config/home injected) so the ordering is unit-testable without touching the real env.
+pub(crate) fn claude_session_accounts_in(
+    config_dirs: &[String],
+    env: Option<&Path>,
+    home: Option<&Path>,
+    worktree_path: &str,
+) -> Vec<String> {
+    let mut found: Vec<(std::time::SystemTime, usize, String)> = Vec::new();
+    for (i, dir) in config_dirs.iter().enumerate() {
+        // The SAME precedence every other reader applies, re-asserted per entry: an explicit dir
+        // wins, an empty one means unset and falls back to the process env then `$HOME/.claude`.
+        // Resolving it here rather than trusting the caller is what keeps a stray `""` from
+        // producing a relative `projects/<slug>` root that silently reads as "no session".
+        let resolved = resolve_session_config_dir(Some(dir.as_str()), env.map(PathBuf::from));
+        let Some(root) = claude_projects_root(resolved.as_deref(), home) else {
+            continue;
+        };
+        let Some(file) = latest_session_file(&claude_session_dir_for(&root, worktree_path)) else {
+            continue;
+        };
+        let Ok(mtime) = file.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        found.push((mtime, i, dir.clone()));
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, _, d)| d).collect()
+}
+
+/// Sync core of [`claude_session_accounts_in`], resolving env/home the way every other probe here
+/// does. `pub(crate)` for `preflight`'s command, which is already on a blocking task.
+pub(crate) fn claude_session_accounts_sync(worktree_path: &str, config_dirs: &[String]) -> Vec<String> {
+    let env = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    claude_session_accounts_in(config_dirs, env.as_deref(), home.as_deref(), worktree_path)
+}
+
 /// Sync core of the combined probe: resolves config/home from the env exactly like
 /// [`claude_has_session_sync`] / [`claude_latest_session_id_sync`], then runs
 /// [`claude_session_info_in`]. `pub(crate)` for `preflight`'s two session-info commands, which are
@@ -909,6 +975,78 @@ mod tests {
                 "app-data cwd {cwd} must resolve to the transcript dir Claude Code actually writes"
             );
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // THE ORPHANED-CONVERSATION PROBE. An agent's history lives under ONE account's config dir, so
+    // selection has to be able to ask which account holds it BEFORE it picks — the single-account
+    // probes can only confirm a choice already made, which is how a resurrected agent got placed on
+    // a fresh account and came up blank beside an hour of intact conversation.
+    #[test]
+    fn session_accounts_reports_every_account_holding_a_conversation_newest_first() {
+        let home = unique_home("session-accounts");
+        let worktree = "/tmp/proj/.sparkle/worktrees/orphan";
+        let older = home.join("acct-older");
+        let newer = home.join("acct-newer");
+        let empty_acct = home.join("acct-none");
+        let dirs = vec![
+            older.to_string_lossy().into_owned(),
+            newer.to_string_lossy().into_owned(),
+            empty_acct.to_string_lossy().into_owned(),
+        ];
+
+        // Nothing seeded: no account holds it, so selection is free to pick on usage alone.
+        assert_eq!(
+            claude_session_accounts_in(&dirs, None, Some(&home), worktree),
+            Vec::<String>::new()
+        );
+
+        for (dir, when) in [(&older, 1_000u64), (&newer, 2_000u64)] {
+            let sess = claude_session_dir_for(
+                &claude_projects_root(Some(dir), Some(&home)).unwrap(),
+                worktree,
+            );
+            seed_session(&sess);
+            set_mtime(&sess.join("b3d4494a-3b98.jsonl"), when);
+        }
+
+        // NEWEST FIRST, and the account that has no transcript is absent rather than ordered last —
+        // "holds this conversation" is the whole answer, so an account with nothing must not appear
+        // as a weak candidate a caller could fall through onto.
+        assert_eq!(
+            claude_session_accounts_in(&dirs, None, Some(&home), worktree),
+            vec![
+                newer.to_string_lossy().into_owned(),
+                older.to_string_lossy().into_owned()
+            ],
+            "the account with the newest transcript must come first"
+        );
+        // Order is by MTIME, not by the caller's order: flipping the input must not flip the answer,
+        // or "newest" would silently mean "first listed" and the affinity rule would be a no-op.
+        let flipped = vec![dirs[1].clone(), dirs[0].clone(), dirs[2].clone()];
+        assert_eq!(
+            claude_session_accounts_in(&flipped, None, Some(&home), worktree),
+            vec![
+                newer.to_string_lossy().into_owned(),
+                older.to_string_lossy().into_owned()
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // The DEFAULT account spells itself `""` (export no CLAUDE_CONFIG_DIR). It must come back as
+    // `""`, not as the `$HOME/.claude` path it resolves to — the caller maps the answer back to the
+    // account that named it, and a resolved path matches no account's `config_dir` at all.
+    #[test]
+    fn session_accounts_returns_the_default_accounts_empty_config_dir_verbatim() {
+        let home = unique_home("session-accounts-default");
+        let worktree = "/tmp/proj/.sparkle/worktrees/default-acct";
+        seed_session(&claude_session_dir_for(&home_root(&home), worktree));
+        assert_eq!(
+            claude_session_accounts_in(&[String::new()], None, Some(&home), worktree),
+            vec![String::new()],
+            "the default account must be reported by the id it uses, not by its resolved path"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 

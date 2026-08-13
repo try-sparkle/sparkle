@@ -587,3 +587,134 @@ describe("proactive rotation on the spawn path", () => {
     expect(dir).toBe("/data/accounts/hot");
   });
 });
+
+// ── TRANSCRIPT AFFINITY ──────────────────────────────────────────────────────────────────────
+//
+// A `claude` conversation lives under the CLAUDE_CONFIG_DIR it ran with, so choosing an account
+// chooses which history the agent can see. These pin the rule that a relaunch must not re-pick its
+// way out of its own conversation.
+//
+// The defect these were written against, measured on one agent: it spawned under account A and took
+// its opening brief; an app restart's resurrection sweep remounted it two hours later;
+// `chooseAccountForAgent` re-picked by lowest usage and returned B; the resume probe correctly found
+// no session under B; claude launched fresh and empty while the agent's hour of work sat intact
+// under A. The UI still rendered the row, the header and the brief — so it read as "build agents are
+// being created with no task", and nothing pointed at the account.
+describe("transcript affinity", () => {
+  // `hist` deliberately carries the HIGHER usage tally, so plain lowest-usage picks `fresh`. Without
+  // that the suite would pass with the affinity rule deleted.
+  const AFF_ACCOUNTS = [
+    { id: "fresh", nickname: "Fresh", configDir: "/data/accounts/fresh", isDefault: false, createdAt: 1 },
+    { id: "hist", nickname: "Historied", configDir: "/data/accounts/hist", isDefault: false, createdAt: 2 },
+  ];
+  const AFF_USAGE: Array<{
+    id: string;
+    tokens5h: number;
+    tokens7d: number;
+    exhaustedUntil: number | null;
+  }> = [
+    { id: "fresh", tokens5h: 0, tokens7d: 0, exhaustedUntil: null },
+    { id: "hist", tokens5h: 900_000, tokens7d: 900_000, exhaustedUntil: null },
+  ];
+  const AFF_IDENTITIES = [
+    { id: "fresh", email: "a@x.com", organization: null, accountUuid: "u-fresh" },
+    { id: "hist", email: "b@x.com", organization: null, accountUuid: "u-hist" },
+  ];
+  const WT = "/worktrees/proj/agent-1";
+
+  function mockAffBackend(usage = AFF_USAGE) {
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(AFF_ACCOUNTS);
+      if (cmd === "accounts_usage") return Promise.resolve(usage);
+      if (cmd === "accounts_identities") return Promise.resolve(AFF_IDENTITIES);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+  }
+
+  beforeEach(() => {
+    invoke.mockReset();
+    invalidateAccountState();
+    resetStickyAccounts();
+    clearAllPins();
+    mockAffBackend();
+  });
+
+  it("would pick the OTHER account on usage alone — the premise these tests rest on", async () => {
+    // The positive control. If `fresh` ever stops winning here for an unrelated reason, the two
+    // tests below stop proving anything and this one says so.
+    const { chosen } = await chooseAccountForAgent("agent-1", { now: 1_000 });
+    expect(chosen?.id).toBe("fresh");
+  });
+
+  it("resumes under the account that HOLDS the conversation, not the emptier one", async () => {
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      // The probe answers with CONFIG DIRS, newest transcript first — the shape
+      // `preflight.claudeSessionAccounts` returns.
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("hist");
+  });
+
+  it("still lets a human PIN override the account holding the conversation", async () => {
+    // Affinity is a default, not a veto: a pin is someone deciding on purpose, and it outranks this
+    // the same way it outranks every other judgement here.
+    setPin("agent-1", "fresh");
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("fresh");
+  });
+
+  it("refuses to park the agent on an EXHAUSTED holder, and says the context will be lost", async () => {
+    // The unavoidable case — the measured agent's own account was rate-limiting when it moved. There
+    // is no selection that keeps the conversation here, so what matters is that the loss is REPORTED
+    // rather than silent: the silence is what made this present as a spawn bug for a day.
+    mockAffBackend([
+      { id: "fresh", tokens5h: 0, tokens7d: 0, exhaustedUntil: null },
+      { id: "hist", tokens5h: 900_000, tokens7d: 900_000, exhaustedUntil: 9_000_000 },
+    ]);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("fresh");
+    expect(warn).toHaveBeenCalled();
+    const said = warn.mock.calls.map((c) => String(c[0])).join(" ");
+    expect(said).toContain("FRESH session");
+    warn.mockRestore();
+  });
+
+  it("selects on usage alone when no account holds a conversation, and never probes without a worktree", async () => {
+    // A fresh worktree has nothing to be loyal to, and a caller with no path to give (the concierge,
+    // the hourly pass) must behave exactly as it did before this rule existed.
+    const probe = vi.fn(async () => []);
+    const fresh = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: probe,
+    });
+    expect(fresh.chosen?.id).toBe("fresh");
+    expect(probe).toHaveBeenCalledTimes(1);
+
+    probe.mockClear();
+    const noPath = await chooseAccountForAgent("agent-2", { now: 1_000, sessionAccounts: probe });
+    expect(noPath.chosen?.id).toBe("fresh");
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it("passes EVERY account's config dir to the probe, so no account can be invisible to it", async () => {
+    // The probe can only report a holder it was asked about. Handing it a filtered list would make
+    // affinity silently miss exactly the account an agent had moved off.
+    const probe = vi.fn(async () => []);
+    await chooseAccountForAgent("agent-1", { now: 1_000, worktreePath: WT, sessionAccounts: probe });
+    expect(probe).toHaveBeenCalledWith(WT, ["/data/accounts/fresh", "/data/accounts/hist"]);
+  });
+});

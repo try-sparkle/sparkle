@@ -742,6 +742,7 @@ pub fn run() {
             preflight::claude_preflight,
             preflight::claude_version,
             preflight::claude_session_info,
+            preflight::claude_session_accounts,
             preflight::concierge_session_info,
             preflight::refresh_preflight,
             preflight::node_preflight,

@@ -649,6 +649,31 @@ pub async fn claude_session_info(
     .unwrap_or_else(|_| ClaudeSessionInfo::none())
 }
 
+/// WHICH ACCOUNTS already hold a conversation for this worktree, newest transcript first.
+///
+/// The plural counterpart of [`claude_session_info`], and it exists because that one can only
+/// CONFIRM an account already chosen. Account selection has to ask the question the other way round
+/// — before it picks — or it can place a relaunched agent on an account whose tree is empty while
+/// the agent's real conversation sits intact under the account it ran on last. See
+/// `claude::claude_session_accounts_in` for the failure that produced this.
+///
+/// ONE round-trip for the whole account list rather than one probe per account: this sits on the
+/// spawn path, which already carries worktree prep and a Claude check, and the founder's machine has
+/// a dozen account dirs. Best-effort in the same way as its sibling — a dead task answers "no
+/// account holds it", which degrades to plain lowest-usage selection rather than to an error the
+/// caller has no branch for.
+#[tauri::command]
+pub async fn claude_session_accounts(
+    worktree_path: String,
+    config_dirs: Vec<String>,
+) -> Vec<String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::claude::claude_session_accounts_sync(&worktree_path, &config_dirs)
+    })
+    .await
+    .unwrap_or_default()
+}
+
 /// The same probe, aimed at the CONCIERGE's conversation instead of an agent worktree's.
 ///
 /// The concierge is not a worktree agent, which is the only reason this needs its own command: it

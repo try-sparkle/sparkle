@@ -25,6 +25,7 @@ import {
   type LiveUsage,
 } from "./accountStore";
 import { getAccountUsageLive } from "./accountUsage";
+import { claudeSessionAccounts } from "../preflight";
 import type { Ceiling } from "./headroom";
 import {
   recordSelection,
@@ -250,7 +251,10 @@ export function invalidateAccountState(): void {
  *    1. this agent's own PIN — one human choice about one agent, and it wins unconditionally;
  *    2. the fleet-wide PREFERRED account ("Activate this account"), when it is still usable —
  *       see `usablePreferredAccount` for why "usable" is a gate here and not for a pin;
- *    3. AUTO-PICK — lowest usage among healthy, signed-in accounts, sticky for the two keys that
+ *    3. TRANSCRIPT AFFINITY — the account that already holds this agent's conversation, when the
+ *       caller passed a `worktreePath` and that account is still usable. See
+ *       `accountHoldingTranscript`;
+ *    4. AUTO-PICK — lowest usage among healthy, signed-in accounts, sticky for the two keys that
  *       need it.
  *
  *  The loaded identities gate auto-pick: only accounts actually `claude login`ed are candidates, so
@@ -265,7 +269,24 @@ export function invalidateAccountState(): void {
  *  be applied in a single place or the paths drift. */
 export async function chooseAccountForAgent(
   agentId: string,
-  opts: { force?: boolean; now?: number } = {},
+  opts: {
+    force?: boolean;
+    now?: number;
+    /**
+     * This agent's worktree, enabling TRANSCRIPT AFFINITY (precedence 3). Optional because two of
+     * the three callers have no worktree to name; omitted → selection behaves exactly as before.
+     *
+     * The caller supplies it rather than the resolver deriving it because only the caller knows the
+     * path — but the RULE lives here, in the one resolver, for the reason this function's header
+     * gives: a rule implemented at a call site is a rule the other call sites silently don't have.
+     */
+    worktreePath?: string;
+    /** Injectable probe, so the affinity rule is testable without Tauri. Defaults to the real IPC. */
+    sessionAccounts?: (
+      worktreePath: string,
+      configDirs: string[],
+    ) => Promise<string[]>;
+  } = {},
 ): Promise<{ chosen: Account | null; state: AccountState }> {
   const state = await loadAccountState(opts);
   // RIDE OUT A HICCUP, HERE, so both callers of a key get the same answer.
@@ -343,6 +364,13 @@ export async function chooseAccountForAgent(
   const preferredAccountId = pinnedAccountId
     ? undefined
     : usablePreferredAccount(agentId, state, base.signedInIds, opts.now);
+  // TRANSCRIPT AFFINITY, evaluated only when neither human choice above already answered. Its own
+  // gate lives in the helper; here it is just one more id fed through `pickAccount`'s pin slot, the
+  // same way `preferredAccountId` is.
+  const transcriptAccountId =
+    pinnedAccountId || preferredAccountId
+      ? undefined
+      : await accountHoldingTranscript(agentId, state, base, opts);
   const chosen = pinnedAccountId
     ? pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId })
     : preferredAccountId
@@ -350,22 +378,134 @@ export async function chooseAccountForAgent(
         // preferred account is resolved by the SAME function every other path uses. The gate above
         // is what keeps this from inheriting the pin's override power.
         pickAccount(state.accounts, state.usage, { ...base, pinnedAccountId: preferredAccountId })
-      : autoPick(agentId, state, base);
+      : transcriptAccountId
+        ? pickAccount(state.accounts, state.usage, {
+            ...base,
+            pinnedAccountId: transcriptAccountId,
+          })
+        : autoPick(agentId, state, base);
   const reason: SelectionReason = pinnedAccountId
     ? "pinned"
     : preferredAccountId
       ? "preferred"
-      : !chosen
-        ? "none"
-        : isStickyAccountKey(agentId) && previousSticky === chosen.id
-          ? "sticky"
-          : candidates != null && candidates.length === 0
-            ? "fallback"
-            : "auto";
+      : transcriptAccountId
+        ? "transcript"
+        : !chosen
+          ? "none"
+          : isStickyAccountKey(agentId) && previousSticky === chosen.id
+            ? "sticky"
+            : candidates != null && candidates.length === 0
+              ? "fallback"
+              : "auto";
   logSelection(agentId, chosen, reason, state, candidates);
   // Remember it so the branch above can carry this key through a later hiccup.
   if (chosen) lastResolvedAccount.set(agentId, chosen);
   return { chosen, state };
+}
+
+/**
+ * The account that already HOLDS this agent's conversation, when it is still a usable choice.
+ *
+ * ══ WHY AN AGENT'S ACCOUNT CANNOT BE RE-PICKED FREELY ═════════════════════════════════════════
+ *
+ * A `claude` conversation is stored under the `CLAUDE_CONFIG_DIR` it ran with. So the account is not
+ * just "whose quota pays" — it decides WHICH HISTORY the agent can see, and moving an agent between
+ * accounts strands its conversation in a tree the new spawn will never look in. `isStickyAccountKey`
+ * already says this for the concierge, in those words. It excluded build agents on a premise stated
+ * in its own comment — *"A build agent resolves its account once, at spawn, so re-picking costs it
+ * nothing"* — and that premise is false. A build agent re-resolves on EVERY remount: a pane
+ * reopening, a "Start again", and above all the resurrection sweep that runs after an app restart.
+ *
+ * Measured, on one agent, on one morning: it spawned at 12:09 under account A and took its opening
+ * brief; A began rate-limiting an hour later; the app restarted at 14:05 and resurrected 111 agents;
+ * the remount re-picked by lowest usage, landed on account B, correctly found no session under B,
+ * and launched claude fresh and empty. Its hour of work and its brief were intact under A the whole
+ * time. Nothing surfaced it — the row, the pane header and the brief all still rendered — so it
+ * presented as *"build agents are being created with no task"* and as *"mounting an agent shows an
+ * empty terminal"*, and was attributed to an unrelated UI change for most of a day.
+ *
+ * ══ WHY NOT JUST MAKE BUILD AGENTS STICKY ═════════════════════════════════════════════════════
+ *
+ * `stickySelections` is process-lifetime memory, and its own comment explains why that is fine for
+ * the keys that use it: *"a restart re-picks, which is correct — there is no live conversation to
+ * keep continuity with."* An app restart is exactly when that stops being true and exactly when this
+ * bug fires, because the resurrection sweep re-mounts agents whose conversations are on disk. Only
+ * the DISK can answer this across a restart, so affinity reads the transcript tree rather than
+ * process memory.
+ *
+ * ══ WHAT IT DELIBERATELY DOES NOT DO ══════════════════════════════════════════════════════════
+ *
+ * It does not outrank a human. A pin and the fleet preference are both decisions someone made on
+ * purpose, and this runs only when neither answered.
+ *
+ * It does not park an agent on a dead account: an exhausted holder is skipped, exactly as
+ * `usablePreferredAccount` skips an exhausted preference. That case is REAL — the measured agent's
+ * account was rate-limiting when it moved — and it is a genuine loss of continuity that no selection
+ * rule can prevent. What it must not be is SILENT, which is what cost the day. So the skip is
+ * logged, loudly and by name, rather than degrading quietly into an ordinary auto-pick.
+ *
+ * Best-effort throughout: a probe that throws yields undefined and selection proceeds on usage
+ * alone. A resume that could not be arranged is worth a warning, never a failed spawn.
+ */
+async function accountHoldingTranscript(
+  agentId: string,
+  state: AccountState,
+  base: PickOptions,
+  opts: {
+    now?: number;
+    worktreePath?: string;
+    sessionAccounts?: (worktreePath: string, configDirs: string[]) => Promise<string[]>;
+  },
+): Promise<string | undefined> {
+  const worktreePath = opts.worktreePath;
+  if (!worktreePath) return undefined;
+  // No accounts configured → nothing to be loyal to, and the spawn omits CLAUDE_CONFIG_DIR anyway.
+  // `state.failed` means the account list is UNKNOWN rather than empty: probing it would ask about
+  // an empty set and answer "no account holds this", which is a measured-sounding claim produced by
+  // a read that never happened — the same trap `candidates: null` exists for above.
+  if (state.failed || state.accounts.length === 0) return undefined;
+  const probe = opts.sessionAccounts ?? claudeSessionAccounts;
+  let holders: string[];
+  try {
+    holders = await probe(
+      worktreePath,
+      state.accounts.map((a) => a.configDir ?? ""),
+    );
+  } catch (e) {
+    console.warn("transcript affinity probe failed; selecting on usage alone", e);
+    return undefined;
+  }
+  if (holders.length === 0) return undefined; // a fresh worktree: nothing to keep continuity with
+  const now = opts.now ?? Date.now();
+  // Map each holding config dir back to the account that named it, NEWEST FIRST (the probe's order).
+  // Comparing on `configDir` is what makes the default account's `""` resolve to itself rather than
+  // to whichever other account also records no override.
+  const holdingAccounts = holders
+    .map((dir) => state.accounts.find((a) => (a.configDir ?? "") === dir))
+    .filter((a): a is Account => a != null);
+  for (const account of holdingAccounts) {
+    // The SAME two gates the preference passes through: an account nobody signed into strands the
+    // agent at a login prompt, and an exhausted one strands it at a wall.
+    if (base.signedInIds && base.signedInIds.length > 0 && !base.signedInIds.includes(account.id)) {
+      continue;
+    }
+    if (isAccountExhausted(state.usage, account.id, now)) continue;
+    return account.id;
+  }
+  // NEVER SILENT. Reaching here means this agent has a conversation on disk that the spawn we are
+  // about to build cannot resume — the exact state that read as "spawned with no task" — and the
+  // agent will come up blank. Say so by name, because nothing downstream can: the pane still renders
+  // the row, the header and the brief, so the UI shows an agent that looks fully briefed.
+  console.warn(
+    "account holding this agent's conversation is unusable — it will start a FRESH session and " +
+      "its prior context (including any opening brief) will not be resumed",
+    {
+      agentId,
+      worktreePath,
+      holders: holdingAccounts.map((a) => a.id),
+    },
+  );
+  return undefined;
 }
 
 /** Append this resolution to the on-disk ledger (`accountLedger.ts`), best-effort.

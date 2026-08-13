@@ -158,6 +158,26 @@ export function claudeSessionInfo(
   return invoke<ClaudeSessionInfo>("claude_session_info", { worktreePath, configDir });
 }
 
+/**
+ * Which of `configDirs` already hold a `claude` conversation for this worktree — NEWEST FIRST, and
+ * only the ones that hold one (an account with no transcript is absent, not ordered last).
+ *
+ * The plural form of {@link claudeSessionInfo}, for the one caller that must ask BEFORE an account
+ * is chosen rather than after: `accountSelection.chooseAccountForAgent`. A conversation lives under
+ * the `CLAUDE_CONFIG_DIR` it ran with, so picking an account picks which history the agent can see —
+ * and picking one that holds nothing starts a blank session beside an intact conversation the UI
+ * still advertises.
+ *
+ * Entries come back VERBATIM, so the default account's `""` stays `""` and the caller can map an
+ * answer back to the account that named it.
+ */
+export function claudeSessionAccounts(
+  worktreePath: string,
+  configDirs: string[],
+): Promise<string[]> {
+  return invoke<string[]>("claude_session_accounts", { worktreePath, configDirs });
+}
+
 /** The same probe aimed at the CONCIERGE's conversation rather than a build agent's worktree.
  *
  *  Takes no path ON PURPOSE. The concierge runs headless `claude -p` with its cwd set to Sparkle's

@@ -79,6 +79,12 @@ export type SelectionReason =
   // to the moment the preference stops describing a usable account. Recording them apart is the
   // only way to read back whether the founder's choice was actually in force at a given spawn.
   | "preferred"
+  // This agent already HAS a conversation, and it lives under this account's transcript tree —
+  // so this is the only account that can resume it. Ranked above "auto" because a lower usage
+  // tally is not worth an agent's history: picking the other account starts a blank session while
+  // the real one sits intact one directory over, which is invisible from the UI (the row, the
+  // header and the brief all still render) and reads as "the agent was spawned with no task".
+  | "transcript"
   | "auto" // ordinary auto-pick: lowest usage among healthy, signed-in accounts
   | "sticky" // a sticky key (concierge / Improve Sparkle) reusing its still-healthy account
   | "fallback" // every account was exhausted or near its ceiling; this was the least-bad one

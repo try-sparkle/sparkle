@@ -44,7 +44,7 @@ import {
   registerPaneAccount,
   unregisterPaneAccount,
 } from "../services/paneControl";
-import { chooseAccountForAgent } from "../services/accountSelection";
+import { chooseAccountForAgent, loadAccountState } from "../services/accountSelection";
 import { readWorkerResult } from "../pty";
 import { judgeNeedsFollowup } from "../services/turnFollowup";
 import { noteAgentSessionId, noteAgentTranscriptPath } from "../services/conciergeTools/terminal";
@@ -591,11 +591,17 @@ function AgentPaneInner({
       // the real `await claudeP` below still observes (and rethrows) a genuine failure.
       const claudeP = checkClaude();
       claudeP.catch(() => {});
-      const accountP = chooseAccountForAgent(agent.id);
-      // chooseAccountForAgent is documented never to throw, but guard symmetrically anyway so a
-      // future regression there can't leak an unhandled rejection when an earlier await throws
-      // before accountP is consumed. The real `await accountP` below still observes any result.
-      accountP.catch(() => {});
+      // WARM ONLY — the account is no longer CHOSEN here. Selection now needs this agent's worktree
+      // path (transcript affinity: the account holding an existing conversation wins over a lower
+      // usage tally, or a remount starts a blank session beside the real one), and the worktree does
+      // not exist yet at this point. So the overlap this line was written for is kept by pre-loading
+      // the accounts+usage snapshot into the module cache, and the pick itself moves below `wt`.
+      // Resolving early and re-resolving later would be worse than either: two ledger entries for
+      // one spawn, the first recording an account the agent never ran under.
+      const accountWarmP = loadAccountState();
+      // Documented never to throw, but guard symmetrically anyway so a future regression there can't
+      // leak an unhandled rejection when an earlier await throws before it is consumed.
+      accountWarmP.catch(() => {});
 
       // Resolve/heal the project's integration branch, then base this agent off it. Two paths keep
       // the common open off the git hot path:
@@ -698,7 +704,12 @@ function AgentPaneInner({
       // Multi Claude Max: pick the account this job runs under (lowest-usage, honoring a manual pin).
       // No accounts configured → chosen is null → configDir undefined → spawn exactly as before.
       // Best-effort: chooseAccountForAgent never throws (it swallows IPC errors to empty state).
-      const { chosen, state } = await accountP;
+      // `worktreePath` enables TRANSCRIPT AFFINITY: when this agent already has a conversation, the
+      // account holding it wins over a lower usage tally. Without it a remount — most often the
+      // resurrection sweep after an app restart — re-picks by usage, lands on an account whose tree
+      // is empty, and launches claude fresh while the agent's real history (and the opening brief it
+      // carried) sits intact under the previous account. See accountSelection.accountHoldingTranscript.
+      const { chosen, state } = await chooseAccountForAgent(agent.id, { worktreePath: wt.path });
       perfMark(agent.id, "account resolved");
       setAccounts(state.accounts);
       setIdentities(state.identities);
