@@ -26,6 +26,7 @@ import type { AgentTabStatus } from "@sparkle/ui";
 import { agentClosableKind } from "@sparkle/core";
 import { type AgentGoal, goalStateOf } from "./agentGoal";
 import { SESSION_LIMIT_FALLBACK_MS, type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
+import { joinList } from "./joinList";
 
 /** What an idle row actually means.
  *
@@ -408,12 +409,6 @@ function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): strin
     }
   });
   return `Resting, but not done: ${joinList(parts)}. Nothing is coming to finish this on its own.`;
-}
-
-/** "a", "a and b", "a, b and c" — the serial comma is omitted to match the app's existing copy. */
-function joinList(parts: string[]): string {
-  if (parts.length <= 1) return parts[0] ?? "";
-  return `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}`;
 }
 
 /** Is this row one a human should be told about? True only for a confident stall. `unknown` is

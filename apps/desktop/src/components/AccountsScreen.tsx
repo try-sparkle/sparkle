@@ -46,6 +46,7 @@ import {
   type Headroom,
 } from "../services/headroom";
 import { getAccountUsageLive, type AccountUsageLive } from "../services/accountUsage";
+import { joinList } from "../engine/joinList";
 
 // Accounts settings screen for multi Claude Max account support (design spec
 // docs/superpowers/specs/2026-06-26-multi-max-account-design.md). Lists each registered Claude
@@ -1100,7 +1101,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
             {g.accounts.length} accounts are the same Claude login
             {g.email ? ` (${g.email})` : ""}.
           </strong>{" "}
-          {g.accounts.map((a) => a.nickname).join(" and ")} share one usage quota, so switching
+          {joinList(g.accounts.map((a) => a.nickname))} share one usage quota, so switching
           between them gains you nothing — they hit the limit together. Log one of them into a
           different Claude account, or remove it.
         </div>

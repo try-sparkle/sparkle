@@ -580,6 +580,35 @@ describe("duplicate-login warning", () => {
     expect(banner?.textContent).toContain("DROdio Gmail");
   });
 
+  // Four registrations of one login is the live-machine state that exposed the join: the names were
+  // `.join(" and ")`-ed, so the banner read "A and B and C and D" — a sentence nobody can parse at a
+  // glance, in the one place the user has to identify WHICH accounts to fix.
+  it("comma-separates the names when more than two accounts share the login", async () => {
+    const deps = makeDeps(
+      [
+        acct("p", { nickname: "DROdio Personal", isDefault: true }),
+        acct("g", { nickname: "DROdio Gmail" }),
+        acct("s", { nickname: "DROdio Storytell II" }),
+        acct("a", { nickname: "DROdio AmForge" }),
+      ],
+      [],
+      ["p", "g", "s", "a"].map((id) => ({
+        id,
+        email: "drodio@gmail.com",
+        organization: null,
+        accountUuid: UUID,
+      })),
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const alert = await screen.findByText(/are the same Claude login/i);
+    const banner = alert.closest("[role='alert']");
+    expect(banner?.textContent).toContain(
+      "DROdio Personal, DROdio Gmail, DROdio Storytell II and DROdio AmForge share one usage quota",
+    );
+    // The defect this replaces, stated directly: no name is introduced by a repeated "and".
+    expect(banner?.textContent).not.toContain("and DROdio Gmail and");
+  });
+
   it("shows no warning when the accounts are genuinely different logins", async () => {
     const deps = makeDeps(
       [acct("s", { nickname: "Storytell" }), acct("g", { nickname: "Gmail" })],
