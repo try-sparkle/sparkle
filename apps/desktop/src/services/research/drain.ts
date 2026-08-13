@@ -137,6 +137,64 @@ export const RESEARCH_FAILED_PREAMBLE_HEADER =
 export const MAX_RENDERED_NO_FINDINGS = 5;
 
 /**
+ * How many withheld ids the disclosure note NAMES, and how much of each question it carries.
+ *
+ * ══ A DISCLOSURE THAT GROWS WITH HISTORY UNDOES THE CAP IT DISCLOSES (roborev 63377) ════════════
+ *
+ * Naming the ids is what makes `research get <id>` reachable (see the note below), but the first
+ * version named ALL of them and carried each question verbatim — so the section grew linearly with
+ * total history again, which is the exact unbounded-prompt problem `MAX_RENDERED_NO_FINDINGS`
+ * exists to stop. What the item cap saves is two fixed guidance strings (~150 constant chars); the
+ * question is the VARIABLE-length part, so keeping every one of them costs more than the cap saved.
+ *
+ * So the id list is bounded too, and the remainder is disclosed in the same sentence rather than
+ * dropped — the standing rule is that a cap must say what it withheld and how much, and that rule
+ * applies to a cap inside a disclosure exactly as it does to the one it is disclosing.
+ *
+ * WHICH ones are named: the NEWEST of the withheld set, mirroring the render cap's own choice. The
+ * withheld are the oldest tasks by construction, so the newest of them are the ones nearest to what
+ * is rendered and the likeliest to still matter.
+ */
+export const MAX_DISCLOSED_IDS = 20;
+export const MAX_DISCLOSED_QUESTION_CHARS = 120;
+
+/**
+ * One question, safe to put on ONE line of the id list.
+ *
+ * Two hazards, both of which break the format rather than merely lengthen it: an embedded newline
+ * splits the entry across lines (so the `   <id> — ` prefix no longer introduces what follows, and
+ * the closing `)` drifts), and an unbounded question is the growth this cap exists to bound.
+ */
+function clipQuestion(question: string): string {
+  const flat = question.replace(/\s+/g, " ").trim();
+  if (flat.length <= MAX_DISCLOSED_QUESTION_CHARS) return flat;
+  return `${flat.slice(0, MAX_DISCLOSED_QUESTION_CHARS - 1).trimEnd()}…`;
+}
+
+/**
+ * What the ID list says about the ids IT could not name — the disclosure of the inner cap.
+ *
+ * Two pieces, and they must agree: the sentence has to stop claiming the list is the whole withheld
+ * set (`Ids of the newest N of them:`), and the count of what is missing has to be stated.
+ *
+ * ══ WHY THIS IS A FUNCTION AND NOT TWO INLINE TERNARIES (roborev 63561) ═════════════════════════
+ *
+ * Inline, neither branch could be mutation-checked: deleting the clause left the note counting 27
+ * and listing 20 with no word about the gap — the untruthful partial disclosure this whole change
+ * exists to remove — and the suite stayed green, because the only case covering the over-cap regime
+ * asserted the remainder LINE and never the sentence clause that pairs with it. The `unnamed <= 0`
+ * guard could not be judged at all: the mutant broke parsing inside the array literal. Pulled out,
+ * each line is an independently mutable statement, which is the thing the check needs to bite on.
+ */
+function subCapDisclosure(named: number, unnamed: number): { clause: string; line: string[] } {
+  if (unnamed <= 0) return { clause: "", line: [] };
+  return {
+    clause: ` of the newest ${named} of them`,
+    line: [`   … and ${unnamed} further item(s) older than these, whose ids are not named here.`],
+  };
+}
+
+/**
  * What to tell the brain about ONE task that produced no findings — decided by its actual status.
  *
  * The three shapes are genuinely different events and the guidance is not interchangeable:
@@ -206,16 +264,46 @@ export function buildResearchFailurePreamble(tasks: readonly ResearchTask[]): st
     return `${i + 1}. You asked: ${t.question}\n   What happened: ${what}\n   What to do: ${then}`;
   });
   // THE DISCLOSURE IS NOT OPTIONAL — a cap that stays quiet reports a partial list as a whole one.
-  // It names the count AND that they are gone from the queue, because they ARE claimed: every id is
-  // still returned by `peek`, so a withheld task's row still retires and it will not be offered
-  // again. Saying only "5 more" would imply they are still coming.
+  //
+  // ══ AND IT MUST BE TRUE AT THE MOMENT IT IS WRITTEN (roborev 63305, two Mediums) ═══════════════
+  //
+  // The first version got both halves wrong, and both are the same trap this function's own header
+  // was rewritten to fix — a remedy the reader cannot act on, and a claim that is not yet a fact:
+  //
+  //   • IT POINTED AT A SURFACE THAT STRUCTURALLY CANNOT RETURN THESE. "Ask for the research list"
+  //     resolves to `conciergeTools/research.listResearchTasks`, which is NEWEST-first capped at
+  //     `MAX_RECENT_RESEARCH`. The items withheld here are by construction the OLDEST, so on the
+  //     very scenario the cap exists for — an install's whole history arriving at once — they are
+  //     precisely the ones that list will never contain. And `research get <id>` was unreachable
+  //     too, because the rows are retired by then and the preamble carried no ids. So the ids are
+  //     now IN the note: one compact `id — question` line each, which is what makes `get` work.
+  //     That still saves the bulk of the cap (the per-item "what happened"/"what to do" pair).
+  //
+  //   • IT ASSERTED A CLAIM ONLY `settle` CAN MAKE. It said the withheld items "have been marked as
+  //     told and their rows retired" — but this string is built by `peek`, and PEEK CLAIMS NOTHING.
+  //     A turn that is superseded, cancelled, errored or killed calls `abandon`, nothing is stamped,
+  //     and the same items come back next turn. This file's header stresses that outcome is the
+  //     ORDINARY one, not an edge case. So the prompt was stating a false state to a model that may
+  //     relay it to the founder and will use it to decide not to mention them. It is now written
+  //     FORWARD-LOOKING: it describes what this reply landing will do, which is true either way.
+  //
+  //   • AND THE DISCLOSURE ITSELF IS BOUNDED (roborev 63377). Naming every withheld id, each with
+  //     its verbatim question, put the unbounded growth straight back — see {@link MAX_DISCLOSED_IDS}
+  //     for why that costs more than the item cap saves, and why the remainder is still disclosed.
+  const named = tasks.slice(Math.max(0, withheld - MAX_DISCLOSED_IDS), withheld);
+  const unnamed = withheld - named.length;
+  const withheldIds = named.map((t) => `   ${t.id} — ${clipQuestion(t.question)}`);
+  const overflow = subCapDisclosure(named.length, unnamed);
   const note =
     withheld > 0
       ? [
           "",
-          `(${withheld} older item(s) not listed here, oldest first — they have been marked as told ` +
-            `and their rows retired, so they will NOT be shown again. Ask for the research list if ` +
-            `he needs them.)`,
+          `(${withheld} older item(s) are not detailed above, oldest first. Delivering this reply ` +
+            `marks them as told, after which they will not be offered again — so if any of them ` +
+            `matter, use \`research get <id>\` now. Ids${overflow.clause}:`,
+          ...withheldIds,
+          ...overflow.line,
+          ")",
         ]
       : [];
   return [

@@ -22,6 +22,8 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
+  MAX_DISCLOSED_IDS,
+  MAX_DISCLOSED_QUESTION_CHARS,
   MAX_RENDERED_NO_FINDINGS,
   MAX_STAGED_TURNS,
   RESEARCH_FAILED_PREAMBLE_HEADER,
@@ -219,26 +221,136 @@ describe("buildResearchFailurePreamble", () => {
     const p = buildResearchFailurePreamble(many);
     // Handed oldest-first, so the tail is the recent end — that is what a reader needs.
     expect(p).toContain("q8");
-    expect(p).not.toContain("q0");
+    // What the cap withholds is the DETAIL, not the item's existence: an oldest item still gets a
+    // compact `id — question` line so `research get` can reach it (see the ids case below). So the
+    // assertion is on the per-item detail pair, which is where the bulk is.
     expect(p.match(/What happened:/g)).toHaveLength(MAX_RENDERED_NO_FINDINGS);
+    expect(p.match(/What to do:/g)).toHaveLength(MAX_RENDERED_NO_FINDINGS);
+    expect(p).not.toContain("boom 0");
   });
 
   // A CAP WITHOUT A DISCLOSURE reports a partial list as a whole one — the defect
   // `buildNoticeSection` was rewritten to remove, and `buildResearchPreamble`'s own rule.
-  it("discloses how many it withheld, and that they will not come back", () => {
+  it("discloses how many it withheld", () => {
     const many = Array.from({ length: MAX_RENDERED_NO_FINDINGS + 3 }, (_, i) =>
       task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i }),
     );
     const p = buildResearchFailurePreamble(many);
-    expect(p).toContain("3 older item(s) not listed here");
+    expect(p).toContain("3 older item(s) are not detailed above");
     // The count of the WHOLE set is still stated, so the brain knows the section is a sample.
     expect(p).toContain(`${MAX_RENDERED_NO_FINDINGS + 3} of them`);
-    // And it says they are already claimed — otherwise "3 more" implies they are still coming.
-    expect(p).toContain("will NOT be shown again");
   });
 
+  // ── THE REMEDY HAS TO WORK UNDER THE CONDITIONS THAT PRODUCED IT (roborev 63305) ─────────────
+  //
+  // The note used to say "ask for the research list". That list is NEWEST-first and capped, and the
+  // items withheld here are by construction the OLDEST — so on the very scenario the cap exists for
+  // it is the one surface that cannot return them. The rows are retired by then too, so without ids
+  // in the note there was no reachable path to them at all.
+  it("names the withheld ids, so `research get` can actually reach them", () => {
+    const many = Array.from({ length: MAX_RENDERED_NO_FINDINGS + 3 }, (_, i) =>
+      task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i }),
+    );
+    const p = buildResearchFailurePreamble(many);
+    // The three OLDEST are the withheld ones, and each is reachable by id.
+    for (const t of many.slice(0, 3)) expect(p).toContain(t.id);
+    expect(p).toContain("research get <id>");
+    // It must NOT point at the list tool, which structurally cannot return these.
+    expect(p).not.toContain("research list");
+    // ── AND THE SUB-CAP SAYS NOTHING WHEN IT WITHHELD NOTHING (roborev 63561) ──────────────────
+    //
+    // This is the COMMON case — every install with at most MAX_DISCLOSED_IDS withheld items — and
+    // it is the direction that pins BOTH halves of the sub-cap's disclosure. Without it, dropping
+    // the `of the newest N` clause goes unnoticed (the note would then count 27 and list 20 with
+    // no word about the gap: the untruthful partial disclosure this whole change exists to remove),
+    // and flipping either guard to `unnamed >= 0` goes unnoticed too (the note would claim ids were
+    // withheld when every one of them was named) — the same mutation class as `withheld >= 0`, one
+    // level down.
+    expect(3).toBeLessThanOrEqual(MAX_DISCLOSED_IDS);
+    expect(p).not.toContain("of the newest");
+    expect(p).not.toContain("further item(s)");
+  });
+
+  // ── A PEEK MAY NOT ASSERT WHAT ONLY A SETTLE CAN MAKE TRUE (roborev 63305) ───────────────────
+  //
+  // The note used to state as accomplished fact that the withheld items "have been marked as told
+  // and their rows retired". This string is built by `peek`, which claims NOTHING — a superseded,
+  // cancelled, errored or killed turn abandons and stamps nothing, which this file's header calls
+  // the ORDINARY outcome. So the prompt asserted a false state to a model that may relay it.
+  it("describes the claim as something this reply WILL do, never as already done", () => {
+    const many = Array.from({ length: MAX_RENDERED_NO_FINDINGS + 2 }, (_, i) =>
+      task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i }),
+    );
+    const p = buildResearchFailurePreamble(many);
+    expect(p).toContain("Delivering this reply marks them as told");
+    // The past-tense assertions are gone: peek cannot truthfully make either of them.
+    expect(p).not.toContain("have been marked as told");
+    expect(p).not.toContain("rows retired");
+    expect(p).not.toContain("will NOT be shown again");
+  });
+
+  // ── THE DISCLOSURE IS BOUNDED TOO, AND SAYS SO (roborev 63377) ───────────────────────────────
+  //
+  // Naming every withheld id, each carrying its verbatim question, grows with total history — the
+  // exact unbounded-prompt problem `MAX_RENDERED_NO_FINDINGS` exists to stop, since the question is
+  // the variable-length part and the two guidance strings the item cap drops are constant. So the
+  // id list has its own cap, and the standing "a cap must disclose what it withheld" rule applies
+  // to it as much as to the cap it is disclosing.
+  it("bounds the id list, and discloses the ones it could not name", () => {
+    const n = MAX_RENDERED_NO_FINDINGS + MAX_DISCLOSED_IDS + 7;
+    const many = Array.from({ length: n }, (_, i) =>
+      task({ status: "failed", error: `boom ${i}`, question: `q${i}`, createdAt: i }),
+    );
+    const p = buildResearchFailurePreamble(many);
+    const withheld = n - MAX_RENDERED_NO_FINDINGS;
+    // Exactly MAX_DISCLOSED_IDS id lines — not one per withheld item.
+    expect(p.match(/^ {3}rsh_/gm) ?? []).toHaveLength(MAX_DISCLOSED_IDS);
+    // The NEWEST of the withheld are the named ones; the 7 oldest are counted, not named.
+    for (const t of many.slice(withheld - MAX_DISCLOSED_IDS, withheld)) expect(p).toContain(t.id);
+    for (const t of many.slice(0, 7)) expect(p).not.toContain(t.id);
+    expect(p).toContain("7 further item(s) older than these");
+    // AND THE SENTENCE STOPS CLAIMING THE LIST IS THE WHOLE SET. Without this the clause could be
+    // dropped unnoticed, leaving the note counting 27 and listing 20 with no word about the gap —
+    // the untruthful partial disclosure this change exists to remove (roborev 63561).
+    expect(p).toContain(`Ids of the newest ${MAX_DISCLOSED_IDS} of them:`);
+    // The total is still stated honestly, so nothing is silently dropped.
+    expect(p).toContain(`${withheld} older item(s) are not detailed above`);
+  });
+
+  // An embedded newline would split an entry across lines, so the `<id> — ` prefix stops
+  // introducing what follows and the closing `)` drifts; an unbounded question is the growth the
+  // cap above exists to stop.
+  it("keeps each named id on ONE bounded line", () => {
+    const oldest = task({
+      status: "failed",
+      error: "boom 0",
+      question: `first\nsecond ${"x".repeat(400)}`,
+      createdAt: 0,
+    });
+    const many = [
+      oldest,
+      ...Array.from({ length: MAX_RENDERED_NO_FINDINGS }, (_, i) =>
+        task({ status: "failed", error: `boom ${i + 1}`, question: `q${i + 1}`, createdAt: i + 1 }),
+      ),
+    ];
+    const prefix = `   ${oldest.id} — `;
+    const p = buildResearchFailurePreamble(many);
+    const idLine = p.split("\n").find((l) => l.startsWith(prefix));
+    expect(idLine).toBeDefined();
+    expect(idLine).toContain("first second");
+    expect(idLine).toMatch(/…$/);
+    expect(idLine!.length).toBeLessThanOrEqual(prefix.length + MAX_DISCLOSED_QUESTION_CHARS);
+  });
+
+  // Asserts the strings the code SHIPS. The previous version asserted `not.toContain("not listed
+  // here")` — a phrase no code path can emit — so it passed against any implementation, including
+  // one that emitted the whole note unconditionally. This is the only guard on the no-withholding
+  // branch, so it has to be able to go red.
   it("says nothing about withholding when everything fits", () => {
-    expect(buildResearchFailurePreamble([FAILED])).not.toContain("not listed here");
+    const p = buildResearchFailurePreamble([FAILED]);
+    expect(p).not.toContain("are not detailed above");
+    expect(p).not.toContain("Delivering this reply");
+    expect(p).not.toContain("research get <id>");
   });
 
   // A failed task whose error never got written still has to say something honest.
