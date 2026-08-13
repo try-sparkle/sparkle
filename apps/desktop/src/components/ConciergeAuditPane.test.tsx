@@ -21,13 +21,22 @@ import {
   RETIREMENT_ROWS_SHOWN,
   clockTime,
 } from "./ConciergeAuditPane";
+import type { RetirementRecord, RetirementLogReading } from "../services/deathRecordWriter";
 import { noteConciergeAuditCall, _resetConciergeAuditForTests } from "../services/conciergeAudit";
 import {
   nextReceiptId,
   recordConciergeActionReceipt,
   _resetConciergeReceiptsForTests,
-  type ConciergeActionReceipt,
 } from "../services/conciergeReceipts";
+
+// THE DURABLE LEDGER, mocked at the module boundary so these tests drive the pane's REAL reader
+// wiring (`useRetirementLog` -> `readRetirementLog`) rather than a hook stubbed in its place. The
+// pane's own source of truth is what is under test here; `deathRecordWriter.test.ts` covers the
+// reader's parsing and its fail-closed `ok` flag.
+let ledger: RetirementLogReading = { records: [], ok: true };
+vi.mock("../services/deathRecordWriter", () => ({
+  readRetirementLog: () => Promise.resolve(ledger),
+}));
 
 beforeEach(() => _resetConciergeAuditForTests());
 afterEach(cleanup);
@@ -296,17 +305,17 @@ describe("the list is bounded, and says so", () => {
 // The receipts module is REAL here, driven through its own recorder, for the same reason the audit
 // store is: the record's shape is the claim. Every assertion reads what a human would read on
 // screen, and each would fail against a pane that dropped the section.
-describe("what it retired on its own is on screen, not just in the call log", () => {
-  beforeEach(() => _resetConciergeReceiptsForTests());
+describe("what it retired on its own comes from the DURABLE ledger", () => {
+  beforeEach(() => {
+    _resetConciergeReceiptsForTests();
+    ledger = { records: [], ok: true };
+  });
 
-  const retirement = (over: Partial<ConciergeActionReceipt> = {}): ConciergeActionReceipt => ({
-    id: nextReceiptId(),
-    kind: "retired",
-    ok: true,
+  const rec = (over: Partial<RetirementRecord> = {}): RetirementRecord => ({
     agentId: "a9",
-    agentName: "Kraken Auth",
-    at: new Date(2026, 6, 27, 3, 14, 0).getTime(),
-    op: "lifecycle.retire_agent",
+    retiredAt: new Date(2026, 6, 27, 3, 14, 0).getTime(),
+    reason: "landed four hours ago and has been idle since",
+    retiredBy: "concierge",
     ...over,
   });
 
@@ -315,115 +324,110 @@ describe("what it retired on its own is on screen, not just in the call log", ()
     return screen.queryAllByTestId("concierge-retirement-entry");
   }
 
-  it("names the agent it retired and the reason it gave — neither is in the call log's row", () => {
-    recordConciergeActionReceipt(
-      retirement({ reason: "Its PR #1774 merged 4h ago; nothing is unmerged." }),
+  async function renderPane(): Promise<void> {
+    render(<ConciergeAuditPane />);
+    // The ledger read is async; flush it before asserting on what is on screen.
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
+
+  it("names the agent and prints the reason VERBATIM", async () => {
+    ledger = { records: [rec()], ok: true };
+    recordConciergeActionReceipt({
+      id: nextReceiptId(),
+      kind: "retired",
+      ok: true,
+      agentId: "a9",
+      agentName: "Kraken Auth",
+      at: Date.now(),
+      op: "lifecycle.retire_agent",
+    });
+    await renderPane();
+    expect(retirementRows()).toHaveLength(1);
+    // The NAME comes from this session's receipt; the RECORD comes from the ledger.
+    expect(screen.getByTestId("concierge-retirement-agent").textContent).toContain("Kraken Auth");
+    expect(screen.getByTestId("concierge-retirement-reason").textContent).toBe(
+      "landed four hours ago and has been idle since",
     );
-
-    render(<ConciergeAuditPane />);
-    const row = retirementRows()[0]!;
-    expect(within(row).getByTestId("concierge-retirement-agent").textContent).toBe("Kraken Auth");
-    // VERBATIM. This pane is the audit trail; a gist here would make the record agree with the
-    // summary by construction, which is the one thing an audit trail may not do.
-    expect(
-      within(row).getByTestId("concierge-retirement-reason").textContent,
-    ).toBe("Its PR #1774 merged 4h ago; nothing is unmerged.");
-    expect(within(row).getByTestId("concierge-retirement-outcome").textContent).toMatch(/retired/i);
   });
 
-  it("renders a retirement recorded BEFORE the pane was ever opened", () => {
-    // Every overnight retirement is this case: the dialog was closed when it happened. The receipts
-    // module replays its backlog to a new subscriber, and a section that only listened forward
-    // would show an empty pane in the morning — the exact false negative receipts exist to prevent.
-    recordConciergeActionReceipt(retirement({ agentName: "Left Pair" }));
-    render(<ConciergeAuditPane />);
-    expect(within(retirementRows()[0]!).getByText("Left Pair")).toBeTruthy();
+  // ══ THE DEFECT THIS SECTION WAS REWRITTEN FOR (roborev 63376) ══════════════════════════════════
+  it("renders a retirement from a PREVIOUS session, with no receipt in the ring at all", async () => {
+    // The old reader took its rows from the in-memory receipt ring, which is empty after a restart.
+    // It therefore rendered nothing — which on this pane's own doctrine reads as "it retired
+    // nothing". This is that exact state: a populated ledger and an empty ring.
+    ledger = { records: [rec({ agentId: "gone-overnight" })], ok: true };
+    await renderPane();
+    expect(retirementRows()).toHaveLength(1);
+    // No receipt means no name is known — the id is shown rather than a guess.
+    expect(screen.getByTestId("concierge-retirement-agent").textContent).toContain("gone-overnight");
   });
 
-  it("re-renders when a retirement lands while the pane is open", () => {
-    render(<ConciergeAuditPane />);
+  it("counts and discloses rows beyond the cap, however large the ledger", async () => {
+    // The ring capped at 64 ACROSS ALL KINDS, so a busy night evicted the earliest retirements
+    // before the pane ever subscribed: they were neither shown NOR counted, and `older` read 0 over
+    // a record that had truncated. A ledger far larger than any ring proves the count is real.
+    const n = RETIREMENT_ROWS_SHOWN + 200;
+    ledger = {
+      records: Array.from({ length: n }, (_, i) => rec({ agentId: `a${i}`, retiredAt: n - i })),
+      ok: true,
+    };
+    await renderPane();
+    expect(retirementRows()).toHaveLength(RETIREMENT_ROWS_SHOWN);
+    expect(screen.getByTestId("concierge-retirement-more").textContent).toContain(String(200));
+  });
+
+  it("says so when the ledger cannot be READ, rather than showing an empty record", async () => {
+    // The one case where rendering nothing would be a claim. "We could not look" must never wear the
+    // same face as "it retired nothing" — that is the distinction the volatile reader destroyed.
+    ledger = { records: [], ok: false };
+    await renderPane();
+    expect(screen.getByTestId("concierge-retirement-unreadable").textContent).toMatch(
+      /not a report that nothing was/i,
+    );
     expect(retirementRows()).toHaveLength(0);
+  });
 
-    // From OUTSIDE React, which is how the real one arrives (the tool settle path).
-    act(() => recordConciergeActionReceipt(retirement()));
+  it("renders NOTHING when the ledger is readable and genuinely empty", async () => {
+    // PAIRED with the case above: same zero rows, opposite meaning, and the pane must distinguish
+    // them. An app that has never retired anything has nothing to disclose.
+    ledger = { records: [], ok: true };
+    await renderPane();
+    expect(screen.queryByTestId("concierge-retirement-log")).toBeNull();
+    expect(screen.queryByTestId("concierge-retirement-unreadable")).toBeNull();
+  });
 
+  it("re-reads the ledger when a retirement lands while the pane is open", async () => {
+    ledger = { records: [], ok: true };
+    await renderPane();
+    expect(screen.queryByTestId("concierge-retirement-log")).toBeNull();
+    ledger = { records: [rec({ agentId: "just-now" })], ok: true };
+    await act(async () => {
+      recordConciergeActionReceipt({
+        id: nextReceiptId(),
+        kind: "retired",
+        ok: true,
+        agentId: "just-now",
+        agentName: "Fresh",
+        at: Date.now(),
+        op: "lifecycle.retire_agent",
+      });
+      await Promise.resolve();
+    });
+    // The receipt is the SIGNAL; the ledger is the DATA. One source of truth, so the two cannot
+    // disagree about a night's record.
     expect(retirementRows()).toHaveLength(1);
   });
 
-  it("shows a REFUSED retirement as refused, rather than silently omitting it", () => {
-    // "It tried and could not" must not look identical to "it never tried" — the absence of a
-    // record is what this whole surface treats as evidence.
-    recordConciergeActionReceipt(
-      retirement({ ok: false, reason: "Kraken Auth still has unmerged commits." }),
-    );
+  it("attributes a human retirement differently from the concierge's own", async () => {
+    ledger = { records: [rec({ retiredBy: "human" })], ok: true };
+    await renderPane();
+    expect(screen.getByTestId("concierge-retirement-outcome").textContent).toMatch(/by you/i);
 
-    render(<ConciergeAuditPane />);
-    const row = retirementRows()[0]!;
-    expect(within(row).getByTestId("concierge-retirement-outcome").textContent).toMatch(
-      /couldn't retire/i,
-    );
-    expect(within(row).getByText("Kraken Auth still has unmerged commits.")).toBeTruthy();
-  });
-
-  it("renders NOTHING at all when the concierge has retired nothing", () => {
-    // No permanent "no retirements" line above a dialog full of policy rows: an app that has never
-    // retired anything has nothing to disclose.
-    recordConciergeActionReceipt({
-      id: nextReceiptId(),
-      kind: "sent",
-      ok: true,
-      agentName: "Kraken Auth",
-      channel: "inbox",
-      at: 1_000,
-      op: "fleet.inbox_send",
-    });
-
-    render(<ConciergeAuditPane />);
-    expect(screen.queryByTestId("concierge-retirement-log")).toBeNull();
-    expect(retirementRows()).toHaveLength(0);
-  });
-
-  it("lists them newest first", () => {
-    recordConciergeActionReceipt(retirement({ agentName: "first", at: 1_000 }));
-    recordConciergeActionReceipt(retirement({ agentName: "second", at: 2_000 }));
-
-    render(<ConciergeAuditPane />);
-    const names = retirementRows().map(
-      (r) => within(r).getByTestId("concierge-retirement-agent").textContent,
-    );
-    expect(names).toEqual(["second", "first"]);
-  });
-
-  it("caps the list and says how many it is not showing", () => {
-    const total = RETIREMENT_ROWS_SHOWN + 3;
-    for (let i = 0; i < total; i++) {
-      recordConciergeActionReceipt(retirement({ agentName: `agent-${i}`, at: 1_000 + i }));
-    }
-
-    render(<ConciergeAuditPane />);
-    expect(retirementRows()).toHaveLength(RETIREMENT_ROWS_SHOWN);
-    // Truncating silently is the failure — the reader would take the oldest visible row as the
-    // whole of the night's work.
-    expect(screen.getByTestId("concierge-retirement-more").textContent).toContain("3");
-  });
-
-  it("counts only RETIREMENTS as older, never other receipts the module replayed", () => {
-    // The cut's disclosure is derived from the same filter the rows are: counting the raw receipt
-    // list would report "older retirements" the record does not hold.
-    for (let i = 0; i < RETIREMENT_ROWS_SHOWN; i++) {
-      recordConciergeActionReceipt(retirement({ agentName: `agent-${i}`, at: 1_000 + i }));
-    }
-    recordConciergeActionReceipt({
-      id: nextReceiptId(),
-      kind: "sent",
-      ok: true,
-      channel: "inbox",
-      at: 9_000,
-      op: "fleet.inbox_send",
-    });
-
-    render(<ConciergeAuditPane />);
-    expect(retirementRows()).toHaveLength(RETIREMENT_ROWS_SHOWN);
-    expect(screen.queryByTestId("concierge-retirement-more")).toBeNull();
+    cleanup();
+    ledger = { records: [rec({ retiredBy: "concierge" })], ok: true };
+    await renderPane();
+    expect(screen.getByTestId("concierge-retirement-outcome").textContent).not.toMatch(/by you/i);
   });
 });

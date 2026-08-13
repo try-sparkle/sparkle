@@ -302,3 +302,97 @@ export async function recordDeath(
     return null;
   }
 }
+
+/**
+ * ONE RETIREMENT, READ BACK OFF THE DURABLE LEDGER.
+ *
+ * The write side of this pair (`recordAgentRetirement`) has existed since the verb landed; this is
+ * the READER, and its absence was a real defect rather than an omission of convenience.
+ *
+ * ── WHY THIS EXISTS (roborev 63376, Medium) ──────────────────────────────────────────────────────
+ * `ConciergeAuditPane`'s retirement log was reading `conciergeReceipts`' in-memory replay ring —
+ * `REPLAY_MAX` entries across EVERY receipt kind, cleared by `clearConciergeReceiptBacklog()` on
+ * identity reset and gone entirely on process restart. Two failures followed, and both are the
+ * silent-truncation shape this app treats as worse than an error:
+ *
+ *   • AFTER A RESTART the pane rendered NOTHING. On this module's own doctrine — the absence of a
+ *     record is evidence — that reads as "it retired nothing", which is the opposite of true and is
+ *     unfalsifiable from the surface.
+ *   • OVERNIGHT, once total receipts passed the ring's cap, the earliest retirements were evicted
+ *     before the pane ever subscribed. They were then neither shown NOR counted, so the "N older
+ *     not shown" disclosure read zero and a partial night presented as the complete record.
+ *
+ * The founder's stated requirement was a PERSISTED log plus a proactive digest, and the data was
+ * already persisted correctly — `agent_life` holds every retirement with its reason and the evidence
+ * the retirer acted on. Only the reader was pointed at the volatile copy.
+ *
+ * ── FAIL-CLOSED, LIKE ITS SIBLINGS ───────────────────────────────────────────────────────────────
+ * A failed read returns an EMPTY list and logs, exactly as `loadRetroReceipts` does — but the caller
+ * must not render an empty list as "nothing was retired". `readRetirementLog` therefore reports
+ * whether the read SUCCEEDED, so the surface can distinguish "no retirements" from "we could not
+ * look", which is the whole distinction the old volatile reader destroyed.
+ */
+export interface RetirementRecord {
+  agentId: string;
+  /** Epoch ms the retirement was recorded. */
+  retiredAt: number;
+  /** The retirer's own words, VERBATIM — never a gist. */
+  reason: string;
+  retiredBy: "concierge" | "human";
+  /** What the retirer was looking at. Absent on records written before the evidence field existed. */
+  evidence?: RetiredEvidence | null;
+}
+
+/** A durable read: the records, and whether the read actually happened. */
+export interface RetirementLogReading {
+  records: readonly RetirementRecord[];
+  /** FALSE means the ledger could not be read — NOT that there were no retirements. */
+  ok: boolean;
+}
+
+/** The shape `agent_life_list` returns per agent. Only the fields this reader needs are named. */
+interface LifeReadingWire {
+  record?: {
+    agentId?: string | null;
+    retiredAt?: number | null;
+    retiredReason?: string | null;
+    retiredBy?: string | null;
+    retiredEvidence?: RetiredEvidence | null;
+  } | null;
+}
+
+/**
+ * Every retirement on the durable ledger, newest first.
+ *
+ * A record counts as a retirement when it carries `retiredAt` — the field the retire path stamps.
+ * `retiredBy` is normalised to `"human"` for anything that is not exactly `"concierge"`: records
+ * written before that field existed carry none, and a person is the only other thing that retires a
+ * row, so guessing "concierge" there would attribute a human's decision to the app.
+ */
+export async function readRetirementLog(
+  deps: DeathRecordDeps = liveDeps(),
+): Promise<RetirementLogReading> {
+  try {
+    const all = await deps.invoke<Record<string, LifeReadingWire>>("agent_life_list", {});
+    const records: RetirementRecord[] = [];
+    for (const [agentId, reading] of Object.entries(all ?? {})) {
+      const r = reading?.record;
+      // `null` AND absent both mean "not retired" — see the header on why every optional field on
+      // this wire is read as `T | null` rather than `T | undefined`.
+      if (!r || r.retiredAt == null) continue;
+      records.push({
+        agentId: r.agentId ?? agentId,
+        retiredAt: r.retiredAt,
+        reason: r.retiredReason ?? "",
+        retiredBy: r.retiredBy === "concierge" ? "concierge" : "human",
+        evidence: r.retiredEvidence ?? null,
+      });
+    }
+    records.sort((a, b) => b.retiredAt - a.retiredAt);
+    return { records, ok: true };
+  } catch (e) {
+    // EMPTY AND `ok: false` — never an empty list that reads as "nothing was retired".
+    log.warn("resurrection", "could not read the retirement ledger", { error: String(e) });
+    return { records: [], ok: false };
+  }
+}

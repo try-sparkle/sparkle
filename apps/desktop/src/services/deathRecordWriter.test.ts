@@ -29,6 +29,7 @@ import {
   liveDeps,
   openDeathRecord,
   recordAgentRetirement,
+  readRetirementLog,
   recordDeath,
 } from "./deathRecordWriter";
 
@@ -654,5 +655,94 @@ describe("retiring an agent records who did it and what they saw", () => {
         evidence: FULL,
       }),
     ).resolves.toBe(false);
+  });
+});
+
+// ══ READING THE DURABLE LEDGER BACK ═════════════════════════════════════════════════════════════
+// The write side has been covered since the verb landed; the READER was missing, and its absence was
+// the defect (roborev 63376): the audit pane was reading the in-memory receipt ring instead, which
+// is capped across all receipt kinds and empty after a restart.
+describe("readRetirementLog", () => {
+  const wire = (over: Record<string, unknown> = {}) => ({
+    record: {
+      agentId: "a1",
+      retiredAt: 1_700_000_000_000,
+      retiredReason: "landed and idle",
+      retiredBy: "concierge",
+      ...over,
+    },
+  });
+
+  it("returns retirements newest first, with the reason verbatim", async () => {
+    const c = deps({
+      invoke: () =>
+        Promise.resolve({
+          old: wire({ agentId: "old", retiredAt: 1_000, retiredReason: "first" }),
+          recent: wire({ agentId: "recent", retiredAt: 9_000, retiredReason: "second" }),
+        } as never),
+    });
+    const r = await readRetirementLog(c.deps);
+    expect(r.ok).toBe(true);
+    expect(r.records.map((x) => x.agentId)).toEqual(["recent", "old"]);
+    expect(r.records[0]!.reason).toBe("second");
+  });
+
+  it("ignores records that were never retired", async () => {
+    // `retiredAt` is the stamp the retire path writes. Absent AND null both mean "still open" —
+    // reading either as a retirement would invent rows for every live agent on the ledger.
+    const c = deps({
+      invoke: () =>
+        Promise.resolve({
+          live: { record: { agentId: "live" } },
+          nulled: { record: { agentId: "nulled", retiredAt: null } },
+          real: wire({ agentId: "real" }),
+        } as never),
+    });
+    const r = await readRetirementLog(c.deps);
+    expect(r.records.map((x) => x.agentId)).toEqual(["real"]);
+  });
+
+  it("attributes anything that is not exactly `concierge` to a HUMAN", async () => {
+    // Records predating the field carry no `retiredBy`. Guessing "concierge" there would credit the
+    // app with a decision a person made, on a permanent record.
+    const c = deps({
+      invoke: () =>
+        Promise.resolve({
+          older: wire({ agentId: "older", retiredBy: undefined }),
+          bot: wire({ agentId: "bot", retiredBy: "concierge", retiredAt: 2 }),
+        } as never),
+    });
+    const r = await readRetirementLog(c.deps);
+    const by = Object.fromEntries(r.records.map((x) => [x.agentId, x.retiredBy]));
+    expect(by).toEqual({ older: "human", bot: "concierge" });
+  });
+
+  it("reports ok:false on a failed read, so an empty list is never mistaken for `nothing retired`", async () => {
+    // THE DISTINCTION THE VOLATILE READER DESTROYED. Both a healthy-but-empty ledger and an
+    // unreadable one produce zero rows; only this flag tells the surface which it is looking at.
+    const c = deps({ invoke: () => Promise.reject(new Error("no tauri host")) });
+    const r = await readRetirementLog(c.deps);
+    expect(r.ok).toBe(false);
+    expect(r.records).toEqual([]);
+
+    const healthy = deps({ invoke: () => Promise.resolve({} as never) });
+    const empty = await readRetirementLog(healthy.deps);
+    expect(empty.ok).toBe(true);
+    expect(empty.records).toEqual([]);
+  });
+
+  it("survives a ledger far larger than the receipt ring — the overnight case", async () => {
+    // The ring caps at 64 ACROSS ALL KINDS, so a busy night evicted the earliest retirements before
+    // the pane ever subscribed: not shown, and not counted either.
+    const many = Object.fromEntries(
+      Array.from({ length: 250 }, (_, i) => [
+        `a${i}`,
+        wire({ agentId: `a${i}`, retiredAt: i + 1, retiredReason: `r${i}` }),
+      ]),
+    );
+    const c = deps({ invoke: () => Promise.resolve(many as never) });
+    const r = await readRetirementLog(c.deps);
+    expect(r.records).toHaveLength(250);
+    expect(r.records[0]!.agentId).toBe("a249");
   });
 });

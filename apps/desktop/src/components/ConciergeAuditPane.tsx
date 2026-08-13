@@ -10,11 +10,14 @@ import {
   type AuditOutcome,
   type ConciergeAuditEntry,
 } from "../services/conciergeAudit";
+import { onConciergeActionReceipt } from "../services/conciergeReceipts";
+// THE DURABLE LEDGER, and the reason this pane no longer reads the receipt ring: see
+// `useRetirementLog` below, and `readRetirementLog`'s own header (roborev 63376).
 import {
-  onConciergeActionReceipt,
-  retirementsNewestFirst,
-  type ConciergeActionReceipt,
-} from "../services/conciergeReceipts";
+  readRetirementLog,
+  type RetirementRecord,
+  type RetirementLogReading,
+} from "../services/deathRecordWriter";
 
 // THE READER for services/conciergeAudit — the half of the concierge safety surface that answers
 // "what did it just do?", and the half that did not exist. The store has recorded every
@@ -103,17 +106,44 @@ export const RETIREMENT_ROWS_SHOWN = AUDIT_ROWS_SHOWN;
  * consulted twice. So this dedupes on `id` in its own state, which is also what makes the replay on
  * mount (and StrictMode's double-subscribe) idempotent.
  */
-function useRetirementReceipts(): readonly ConciergeActionReceipt[] {
-  const [seen, setSeen] = useState<readonly ConciergeActionReceipt[]>([]);
+function useRetirementLog(): {
+  records: readonly RetirementRecord[];
+  ok: boolean;
+  names: ReadonlyMap<string, string>;
+} {
+  const [reading, setReading] = useState<RetirementLogReading>({ records: [], ok: true });
+  // Names are NOT on the ledger — a retired agent's row is gone from the store, which is the whole
+  // point of the record outliving it. Receipts from THIS session carry one, so they are used to put
+  // a name on a row when we happen to have it. A record from a previous session shows its id, which
+  // is honest: we know it was retired and why, and we no longer know what it was called.
+  const [names, setNames] = useState<ReadonlyMap<string, string>>(new Map());
+
   useEffect(() => {
-    // `onConciergeActionReceipt` replays the backlog synchronously before returning, so a retirement
-    // recorded while this dialog was closed — which is every overnight one — still lands here.
-    return onConciergeActionReceipt((r) => {
+    let live = true;
+    const load = (): void => {
+      void readRetirementLog().then((r) => {
+        if (live) setReading(r);
+      });
+    };
+    load();
+    // A `retired` receipt is the SIGNAL that the ledger changed, never the DATA that is rendered.
+    // Keeping one source of truth is what stops the two from disagreeing about a night's record —
+    // and it is why the ring's cap and its reset no longer matter to this surface.
+    const off = onConciergeActionReceipt((r) => {
       if (r.kind !== "retired") return;
-      setSeen((prev) => (prev.some((p) => p.id === r.id) ? prev : [...prev, r]));
+      const name = r.agentName?.trim();
+      if (r.agentId && name) {
+        setNames((prev) => (prev.get(r.agentId!) === name ? prev : new Map(prev).set(r.agentId!, name)));
+      }
+      load();
     });
+    return () => {
+      live = false;
+      off();
+    };
   }, []);
-  return seen;
+
+  return { records: reading.records, ok: reading.ok, names };
 }
 
 export function ConciergeAuditPane() {
@@ -174,15 +204,27 @@ export function ConciergeAuditPane() {
  * of policy rows is chrome rather than evidence.
  */
 function RetirementLog() {
-  const receipts = useRetirementReceipts();
-  const shown = useMemo(
-    () => retirementsNewestFirst(receipts, RETIREMENT_ROWS_SHOWN),
-    [receipts],
-  );
-  // Counted off the SAME filter the rows came from, not off `receipts.length` — that array holds
-  // every kind, so an unrelated `sent` receipt would inflate this into "3 older retirements" over a
-  // record that holds none.
-  const older = receipts.filter((r) => r.kind === "retired").length - shown.length;
+  const { records, ok, names } = useRetirementLog();
+  const shown = useMemo(() => records.slice(0, RETIREMENT_ROWS_SHOWN), [records]);
+  // Counted off the DURABLE list, which is the same list the rows came from. The old count was taken
+  // off a volatile ring that had already evicted the earliest rows, so `older` read 0 over a night
+  // that had truncated — the disclosure suppressed itself exactly when it was needed.
+  const older = records.length - shown.length;
+
+  // AN UNREADABLE LEDGER IS SAID OUT LOUD. It is the one case where rendering nothing would be a
+  // claim rather than an absence: this surface treats a missing record as evidence, so "we could not
+  // look" must never wear the same face as "it retired nothing".
+  if (!ok) {
+    return (
+      <div style={pane} data-testid="concierge-retirement-log">
+        <h3 style={groupHeading}>Agents it retired on its own</h3>
+        <p style={emptyBox} data-testid="concierge-retirement-unreadable">
+          I couldn&apos;t read the retirement record just now, so I can&apos;t tell you what was
+          retired. This is not a report that nothing was.
+        </p>
+      </div>
+    );
+  }
   if (shown.length === 0) return null;
 
   return (
@@ -190,7 +232,7 @@ function RetirementLog() {
       <h3 style={groupHeading}>Agents it retired on its own</h3>
       <div style={{ display: "flex", flexDirection: "column" }}>
         {shown.map((r) => (
-          <RetirementRow key={r.id} receipt={r} />
+          <RetirementRow key={`${r.agentId}-${r.retiredAt}`} record={r} name={names.get(r.agentId)} />
         ))}
       </div>
       {older > 0 && (
@@ -204,27 +246,27 @@ function RetirementLog() {
 }
 
 /** One retirement: which agent, whether it actually happened, when, and the concierge's own reason. */
-function RetirementRow({ receipt }: { receipt: ConciergeActionReceipt }) {
-  // A REFUSED RETIREMENT IS STILL A ROW, on the same rule the call log follows and for the same
-  // reason: the absence of a record is what this whole surface treats as evidence, so "it tried and
-  // could not" must not look identical to "it never tried".
-  const outcome: AuditOutcome = receipt.ok ? "ok" : "refused";
-  const Icon = OUTCOME_ICON[outcome];
-  // The tool's OWN words, printed as the record holds them. `Concierge/refusalAudience` shortens a
-  // refusal for the thread; this pane is the audit trail, which is the one place a gist would be a
-  // loss rather than a kindness.
-  const reason = receipt.reason?.trim();
+function RetirementRow({ record, name }: { record: RetirementRecord; name?: string }) {
+  // EVERY ROW HERE HAPPENED. The ledger is written only on a retirement that went through — a
+  // refused one never reaches it, because the durable write GATES the teardown. So there is no
+  // outcome to render: the presence of the row is the outcome, unlike the call log below, which
+  // carries attempts as well.
+  const Icon = OUTCOME_ICON.ok;
+  // The retirer's OWN words, printed as the record holds them. `Concierge/refusalAudience` shortens
+  // a reason for the thread; this pane is the audit trail, which is the one place a gist is a loss.
+  const reason = record.reason.trim();
+  const by = record.retiredBy === "concierge" ? "Retired" : "Retired by you";
 
   return (
     <div style={row} data-testid="concierge-retirement-entry">
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", minWidth: 0 }}>
-        <span style={outcomePill(OUTCOME_INK[outcome])} data-testid="concierge-retirement-outcome">
-          <Icon size={10} aria-hidden /> {receipt.ok ? "Retired" : "Couldn't retire"}
+        <span style={outcomePill(OUTCOME_INK.ok)} data-testid="concierge-retirement-outcome">
+          <Icon size={10} aria-hidden /> {by}
         </span>
         <span style={callName} data-testid="concierge-retirement-agent">
-          {receipt.agentName?.trim() || receipt.agentId || "an agent"}
+          {name?.trim() || record.agentId}
         </span>
-        <span style={meta}>{clockTime(receipt.at)}</span>
+        <span style={meta}>{clockTime(record.retiredAt)}</span>
       </div>
       {reason && (
         <div style={reasonRow}>
