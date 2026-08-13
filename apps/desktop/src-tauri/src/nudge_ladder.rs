@@ -438,6 +438,12 @@ impl AgentState {
     pub fn escalated(&self) -> Option<Escalation> {
         self.escalated
     }
+    /// Looks charged to the parked-screen path, for tests that must prove an episode did NOT take
+    /// it — the counter is the only thing that distinguishes the two paths at the same rung.
+    #[cfg(test)]
+    pub fn parked_looks_for_test(&self) -> u32 {
+        self.parked_looks
+    }
     pub fn silent_secs(&self) -> u64 {
         self.silent_secs
     }
@@ -839,6 +845,40 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         };
     }
 
+    // -- A SCREEN ONLY A HUMAN CAN CLEAR: STOP NUDGING AND TELL SOMEBODY --------------------------
+    // The gate refuses to type at these by construction, so every rung from here is a guaranteed
+    // no-op and waiting them out is dead time a human spends not knowing. WHEN it fires is
+    // per-token — see `parked_flag_rung`, which is where the reasoning lives.
+    //
+    // `!obs.answerable` is belt-and-braces: an answerable prompt has already returned above.
+    // Stated explicitly so the two rules cannot drift into flagging a screen we can clear.
+    if !obs.answerable {
+        if let Some(reason) = blocked.filter(|r| parked_flag_rung(r).is_some_and(|at| rung >= at)) {
+            // ITS OWN COUNTER, never `attempts` (roborev 63230, Medium). `attempts` means "nudges
+            // we tried to send": it drives `GIVE_UP_AFTER` and is reported to a human as
+            // `nudges:`. Charging silent observations to it made a parked agent burn the whole
+            // give-up budget in 8 looks — so a screen that later became writable could never be
+            // nudged again — while the row read `nudges: 8, delivered: 0` for an agent that was
+            // never nudged once.
+            state.parked_looks = state.parked_looks.saturating_add(1);
+            state.last_blocked = Some(reason);
+            // The HIGHER of "a human, now" and whatever the parked count has earned. This raises
+            // the FLOOR; it must never become a ceiling that pins a permanently parked agent at
+            // the concierge level for the rest of its life.
+            let target = ordinary_target(state.parked_looks).max(Some(Escalation::Concierge));
+            let escalate = raise(state, target);
+            return Decision {
+                action: Action::Observe,
+                escalate,
+                flagged: state.escalated,
+                rung: rung_1based,
+                hash_changed: false,
+                refusal: Some(reason),
+                next_look_secs,
+            };
+        }
+    }
+
     if rung < FIRST_NUDGE_RUNG {
         // Shape A — the bare Enter, and ONLY onto a prompt that already holds text.
         if let Some(reason) = blocked {
@@ -872,49 +912,6 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     // TWO refusals are excluded, because they mean the agent is FINE rather than stuck: a running
     // turn, and somebody else having just typed. Escalating those would page a human about an agent
     // that is working.
-    // -- A SCREEN ONLY A HUMAN CAN CLEAR: STOP NUDGING AND TELL SOMEBODY --------------------------
-    // Fires at the FIRST rung the ladder would otherwise have typed at, replacing that nudge rather
-    // than adding to it -- on these screens the gate refuses by construction, so every remaining
-    // rung is a guaranteed no-op and waiting several of them out is dead time a human spends not
-    // knowing.
-    //
-    // NOT AT THE FIRST WRITING RUNG, and that is a correction (roborev 63230, Medium). The
-    // `awaiting-input` token is COARSE: `write_refusal` collapses onto it any `question_opener` /
-    // `menu_line` match in the live region, including an agent's own rhetorical "Should I ...?"
-    // that it clears itself on its next turn. Flagging that after ~35s is a false page, and a
-    // channel that reports non-problems stops being read -- this module's own header says so.
-    // Requiring the screen to SURVIVE to the nudge rung filters exactly the transient case: a
-    // question the agent answers itself moves the hash and resets the episode long before here.
-    //
-    // `!obs.answerable` is belt-and-braces: an answerable prompt has already returned above. Stated
-    // explicitly so the two rules cannot drift into flagging a screen we can clear ourselves.
-    if !obs.answerable {
-        if let Some(reason) = blocked.filter(|r| stalled_on_a_prompt(r)) {
-            // ITS OWN COUNTER, never `attempts` (roborev 63230, Medium). `attempts` means "nudges
-            // we tried to send": it drives `GIVE_UP_AFTER` and is reported to a human as
-            // `nudges:`. Charging silent observations to it made a parked agent burn the whole
-            // give-up budget in 8 looks -- so a screen that later became writable could never be
-            // nudged again -- while the founder's row read `nudges: 8, delivered: 0` for an agent
-            // that was never nudged once.
-            state.parked_looks = state.parked_looks.saturating_add(1);
-            state.last_blocked = Some(reason);
-            // The HIGHER of "a human, now" and whatever the parked count has earned. Instant
-            // escalation raises the FLOOR; it must never become a ceiling that pins a permanently
-            // parked agent at the concierge level for the rest of its life.
-            let target = ordinary_target(state.parked_looks).max(Some(Escalation::Concierge));
-            let escalate = raise(state, target);
-            return Decision {
-                action: Action::Observe,
-                escalate,
-                flagged: state.escalated,
-                rung: rung_1based,
-                hash_changed: false,
-                refusal: Some(reason),
-                next_look_secs,
-            };
-        }
-    }
-
     let counts_as_attempt = !matches!(blocked, Some("status-working") | Some("recent-other-write"));
     if !counts_as_attempt {
         return observe(blocked.unwrap_or("blocked"));
@@ -967,33 +964,64 @@ fn ordinary_target(n: u32) -> Option<Escalation> {
 
 /// Refusals that describe a screen only a HUMAN can clear, so more nudging cannot help.
 ///
-/// -- WHY THIS IS ESCALATED INSTANTLY RATHER THAN COUNTED ---------------------------------------
-/// The ordinary ladder assumes a nudge might work: it types, waits, types again, and only tells a
-/// human once several identical pings have been ignored. That assumption is FALSE for these two
-/// screens. An agent parked on a permission prompt or a credential prompt is not slow, and it is
-/// not ignoring us -- the gate refuses to type at all (a paste-then-CR at a live picker presses a
-/// button nobody read), so the ladder is guaranteed to write nothing on every remaining rung. The
-/// state cannot resolve on its own, and waiting out four rungs before telling anyone is four rungs
-/// of a human not knowing.
+/// -- WHY THESE ARE FLAGGED INSTEAD OF NUDGED ---------------------------------------------------
+/// The ordinary ladder assumes a nudge might work: it types, waits, types again, and tells a human
+/// only once several identical pings have been ignored. That assumption is FALSE for these
+/// screens. An agent parked on a permission prompt or a credential prompt is not slow and is not
+/// ignoring us -- the gate refuses to type at all (a paste-then-CR at a live picker presses a
+/// button nobody read), so the ladder is guaranteed to write nothing on every remaining rung.
+/// Spending those rungs is dead time a human spends not knowing.
 ///
-/// This is the shape of the outage this fix exists for: on the reported night the fleet sat on
-/// ordinary "Do you want to proceed?" prompts and onboarding screens for HOURS. The counter bug
-/// meant no threshold was ever reached, but even a working counter would only have surfaced them
-/// after several rungs of guaranteed-useless pinging. So the trigger is the OBSERVED SCREEN, not a
-/// count of how many times we have failed to help.
+/// So on these screens the first nudge is REPLACED BY A FLAG rather than sent. WHEN that happens
+/// is `parked_flag_rung`, which is also where the reasoning for the timing lives -- this predicate
+/// only answers "is this that kind of screen".
+///
+/// This is the shape of the outage this path exists for: on the reported night the fleet sat on
+/// ordinary "Do you want to proceed?" prompts and onboarding screens for HOURS.
 ///
 /// -- THE TOKENS ARE `nudge_gate::Refusal::as_str()` --------------------------------------------
 /// Compared as strings because this module is deliberately pure -- the gate verdict arrives as a
 /// parameter and this file imports nothing from `nudge_gate`. That is a real coupling risk, so
-/// `nudger.rs` (which imports both) carries `the_ladder_and_the_gate_agree_on_the_prompt_tokens`,
-/// asserting these tokens still match the enum. That test was CLAIMED here before it existed
-/// (roborev 63230, Medium) -- a documented-but-absent guard is worse than none, because the next
-/// reader trusts it.
+/// `nudger.rs` (which imports both) carries
+/// `the_ladder_and_the_gate_agree_on_the_prompt_tokens`, asserting these tokens still match the
+/// enum. That test was CLAIMED here before it existed (roborev 63230, Medium) -- a
+/// documented-but-absent guard is worse than none, because the next reader trusts it.
+///
 /// `alternate-screen` and `no-viewport` are deliberately EXCLUDED: a full-screen app is exited and
-/// an unreadable grid recovers, so both can clear without a human and neither justifies a flag on
-/// its first look.
+/// an unreadable grid recovers, so both can clear without a human and neither justifies a flag.
 pub(crate) fn stalled_on_a_prompt(reason: &str) -> bool {
-    matches!(reason, "awaiting-input" | "credential-prompt")
+    parked_flag_rung(reason).is_some()
+}
+
+/// The earliest rung at which a human-only screen is flagged. `None` = not one of them.
+///
+/// -- WHY THE SAME RUNG FOR BOTH, AND WHY IT IS NOT THE FIRST WRITING RUNG ----------------------
+/// Because NEITHER recogniser is precise enough to earn a faster one. Both tokens are produced by
+/// whole-screen matchers, so both can fire on a screen that is not the thing they name:
+///
+///   * `awaiting-input` collapses any `question_opener` / `menu_line` match in the live region,
+///     including an agent's own rhetorical "Should I ...?" that it clears on its next turn.
+///   * `credential-prompt` is `write_block_password_colon`, which is `(?im)`-anchored PER LINE over
+///     the WHOLE screen rather than the tail. Any visible line ending `password:` / `passphrase:`
+///     matches -- a diff of this repo's own credential code, a scrolled-up `gh auth` transcript,
+///     the agent's own prose. And `write_refusal` tests credentials at gate 4, AHEAD of
+///     `screen_awaits_input` at gate 3, so such a screen is reported as `credential-prompt`.
+///
+/// An earlier revision gave `credential-prompt` the first WRITING rung, reasoning that a password
+/// field has no self-clearing variant (roborev 63247). True of a real password field -- but the
+/// TOKEN is not that, and the effect was the inverse of the intent: the coarser recogniser got the
+/// FASTER path, so a perfectly healthy agent with a stray `password:` line in scrollback raised a
+/// concierge row at ~35s (roborev 63273).
+///
+/// THE COST OF THE UNIFORM RUNG IS STATED HONESTLY: a genuine password prompt now waits ~245s
+/// rather than ~35s. That is the right trade while the recogniser is whole-screen -- a false page
+/// on a healthy agent is how a signal stops being read, which this module's header treats as the
+/// failure that matters. Narrow the matcher to the live tail region and this can be revisited.
+fn parked_flag_rung(reason: &str) -> Option<usize> {
+    match reason {
+        "credential-prompt" | "awaiting-input" => Some(FIRST_NUDGE_RUNG),
+        _ => None,
+    }
 }
 
 /// Advance the escalation high-water mark, returning a target only when it actually ROSE.
@@ -2261,12 +2289,27 @@ mod tests {
     }
 
     /// A credential prompt is the same class — and the more dangerous one, since it echoes nothing.
+    /// It flags at the SAME rung as `awaiting-input`: its recogniser is whole-screen too, so a
+    /// stray `password:` line in scrollback produces this token on a perfectly healthy agent
+    /// (roborev 63273). See `parked_flag_rung` for why that rules out a faster rung.
+    ///
+    /// THE RUNG IS PINNED EXACTLY (roborev 63247, Medium). Asserting merely "escalates somewhere in
+    /// 12 looks" was VACUOUS: the ordinary path reaches the concierge at rung 8 anyway and, being
+    /// blocked, never types either — so both assertions held with `credential-prompt` removed from
+    /// the set entirely, and the rule this test exists to guard was pinned by nothing.
     #[test]
-    fn a_credential_prompt_is_escalated_and_never_typed_at() {
+    fn a_credential_prompt_is_flagged_when_it_survives_to_the_nudge_rung() {
         let mut s = AgentState::default();
         let parked = Observation { refusal: Some("credential-prompt"), ..stalled() };
         let decisions = run(&mut s, &parked, 12);
-        assert!(decisions.iter().any(|d| d.escalate == Some(Escalation::Concierge)));
+
+        let first = decisions.iter().position(|d| d.escalate.is_some()).expect("must reach a human");
+        assert_eq!(
+            decisions[first].rung,
+            (FIRST_NUDGE_RUNG + 1) as u32,
+            "the flag REPLACES the first nudge — earlier would false-page on a scrollback match"
+        );
+        assert_eq!(decisions[first].escalate, Some(Escalation::Concierge));
         assert!(decisions.iter().all(|d| d.action == Action::Observe));
     }
 
@@ -2295,16 +2338,23 @@ mod tests {
     /// A refusal that CAN clear without a human keeps the ordinary ladder. A full-screen app gets
     /// exited and an unreadable grid recovers, so neither earns a flag on its first look —
     /// otherwise every agent that ran `less` for a minute would raise a row.
+    ///
+    /// THE RUNG IS PINNED EXACTLY (roborev 63247, Medium). `> FIRST_WRITING_RUNG + 1` was vacuous
+    /// once the instant path moved to rung 7: BOTH boundaries satisfied it, so adding
+    /// `alternate-screen` to the human-only set left this test green. The ordinary path's second
+    /// counted attempt — `FIRST_NUDGE_RUNG + 2` — is the number that actually distinguishes them.
     #[test]
-    fn a_self_clearing_refusal_is_not_instantly_escalated() {
+    fn a_self_clearing_refusal_keeps_the_ordinary_ladder() {
         for reason in ["alternate-screen", "no-viewport"] {
             let mut s = AgentState::default();
             let d = run(&mut s, &Observation { refusal: Some(reason), ..stalled() }, 12);
             let first = d.iter().position(|x| x.escalate.is_some()).unwrap();
-            assert!(
-                d[first].rung > (FIRST_WRITING_RUNG + 1) as u32,
-                "{reason} must not escalate on the first writing rung"
+            assert_eq!(
+                d[first].rung,
+                (FIRST_NUDGE_RUNG + 2) as u32,
+                "{reason} can clear without a human, so it must climb the ORDINARY ladder"
             );
+            assert_eq!(s.parked_looks_for_test(), 0, "{reason} is not a parked-screen episode");
         }
     }
 

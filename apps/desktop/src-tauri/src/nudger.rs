@@ -1869,6 +1869,26 @@ mod tests {
 
     /// An agent that has been silent for `looks` looks, driven through the REAL ladder so the
     /// escalation state under test is the one production reaches rather than a hand-set field.
+    fn wedged_state(looks: usize) -> AgentState {
+        let mut state = AgentState::default();
+        let stalled = nudge_ladder::Observation {
+            hash: 1,
+            working: false,
+            refusal: None,
+            screen_readable: true,
+            prompt_has_text: false,
+            since_other_write_ms: u64::MAX,
+            foreign_write_ms: 0,
+            goal_met: false,
+            reply: None,
+            answerable: false,
+        };
+        for _ in 0..looks {
+            nudge_ladder::step(&mut state, &stalled);
+        }
+        state
+    }
+
     /// THE COUPLING NOTHING ELSE PINS (roborev 63230, Medium).
     ///
     /// `nudge_ladder` is deliberately dependency-free -- the gate verdict arrives as a `&str` -- so
@@ -1896,26 +1916,6 @@ mod tests {
                 "{r:?} can clear without a human and must not raise a row on sight"
             );
         }
-    }
-
-    fn wedged_state(looks: usize) -> AgentState {
-        let mut state = AgentState::default();
-        let stalled = nudge_ladder::Observation {
-            hash: 1,
-            working: false,
-            refusal: None,
-            screen_readable: true,
-            prompt_has_text: false,
-            since_other_write_ms: u64::MAX,
-            foreign_write_ms: 0,
-            goal_met: false,
-            reply: None,
-            answerable: false,
-        };
-        for _ in 0..looks {
-            nudge_ladder::step(&mut state, &stalled);
-        }
-        state
     }
 
     /// RE-RAISED IS NOT RE-ESCALATED, and both halves matter.
