@@ -103,6 +103,7 @@ import {
 import type { PairSide } from "../engine/rowGeometry";
 // The shared row anatomy every row type in this column must honour — see that file's header.
 import { useCableStore } from "../stores/cableStore";
+import { usePaneFocusStore } from "../stores/paneFocusStore";
 import { usePairIsLive } from "../hooks/useEffectiveWired";
 import { publishedStatusFor, rollupViewFor } from "../useAttentionNotifications";
 import {
@@ -559,6 +560,9 @@ export function AgentSidebar({
   // scoped write beside an unscoped read.
   const paneCoversMe = pairSide === SPARKLE_PANE_SIDE && activeSpecial !== null;
   const patchCable = useCableStore((s) => s.patch);
+  // "Put the caret in that agent's terminal" — the other half of what a single click now does. The
+  // pane owns the terminal handle, so this is a request it consumes (stores/paneFocusStore).
+  const requestPaneFocus = usePaneFocusStore((s) => s.request);
   // DOES THIS PAIR HOLD THE CABLE? Read from the one enum, never mirrored into local state — the
   // rows use it to open their concierge end (engine/rowGeometry), which is the second half of the
   // circuit the flood and the vanishing seam are the rest of. `pairIsLive` rather than a `===` so
@@ -1075,9 +1079,37 @@ export function AgentSidebar({
     open(id);
     patchCable(pairSide);
   };
+  /**
+   * SEAT THE AGENT AND HAND ITS TERMINAL THE CARET. A SINGLE CLICK, AND NO CABLE.
+   *
+   * Founder, 2026-08-12: *"I had also asked for a single click to not mount the concierge. And to
+   * for a double click to be what mounts it."* This is the single-click half; {@link onMount} is the
+   * other. Which gesture is which is `engine/cable`'s `mountsOnRowActivation`, not a rule the row or
+   * this file may restate.
+   *
+   * IT IS NOT `selectAndWire` MINUS A LINE — the two are deliberately separate helpers rather than
+   * one with a flag. A boolean parameter here is how the split silently collapses back: every future
+   * caller has to pick a value, the safe-looking default is the old behaviour, and the founder's rule
+   * is one careless `true` from being undone. The chevron and the spawn paths keep `selectAndWire`
+   * because putting an agent in front of you by CREATING it, or by switching into Build, is still an
+   * unambiguous "talk to this one" — neither is a press you make while merely reading the column.
+   *
+   * `requestPaneFocus` is the second half of the founder's sentence: a click that no longer mounts
+   * must still put you somewhere useful, and the terminal is the agent's own input surface. The pane
+   * consumes it once it is visible and its PTY is up — see stores/paneFocusStore for why the pane's
+   * existing auto-focus cannot cover this on its own.
+   */
   const onSelect = (id: string) => {
     if (!project) return;
     // Switching to a normal project agent leaves the special (Sparkle) view.
+    setActiveSpecial(null);
+    selectAgent(project.id, id);
+    open(id);
+    requestPaneFocus(id);
+  };
+  /** Patch the cable onto a row — the DOUBLE click, and the activations with no double form. */
+  const onMount = (id: string) => {
+    if (!project) return;
     setActiveSpecial(null);
     selectAndWire(id);
     // ── PATCH THE CABLE ──────────────────────────────────────────────────────────────────────
@@ -1106,9 +1138,16 @@ export function AgentSidebar({
     //
     // "Selection may follow the mouse; the cable may not" was the resolution then. The founder's
     // rule supersedes it: selection may not follow the mouse EITHER. With the hover caller gone the
-    // split has no reason to exist, so the flag went with it — every caller of `onSelect` is now a
-    // deliberate act and every one of them patches. See HOVER_INTENT_MS's headstone,
-    // which lives beside the handlers it governs in ./AgentRow.
+    // split has no reason to exist, so the flag went with it. See HOVER_INTENT_MS's headstone, which
+    // lives beside the handlers it governs in ./AgentRow.
+    //
+    // AND THE SAME ARGUMENT CAME BACK ONE STEP FURTHER IN (2026-08-12). A dwell is not the only
+    // pointer event you make while merely LOOKING at the column — a single click is one too, and it
+    // was mounting. So selection and the cable split again, this time at the gesture: `onSelect`
+    // above seats the row, and this function is reached only from an activation
+    // `mountsOnRowActivation` calls a mount. The predicate lives in `engine/cable` and not here,
+    // because "which gesture patches" is part of the connection feature MAPPING.md forbids
+    // scattering into components.
   };
   // The chevron strip switches the active (colored) mode and filters the sidebar list by kind. Build
   // is two-stage: the FIRST click (when Build isn't already the active section) just switches into
@@ -2941,6 +2980,7 @@ export function AgentSidebar({
               receiptVersion={receiptVersion}
               setEditing={setEditing}
               onSelect={() => onSelect(a.id)}
+              onMount={() => onMount(a.id)}
               onLand={() => onLand(a)}
               onClose={() => requestClose(a.id)}
             />

@@ -32,6 +32,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useInteractionStore } from "../stores/interactionStore";
 import { useCableStore } from "../stores/cableStore";
+import { mountsOnRowActivation } from "../engine/cable";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useCloudAgentsEnabled } from "../hooks/useCloudAgents";
 import { usePreviewStore } from "../stores/previewStore";
@@ -144,6 +145,7 @@ export const AgentRow = memo(function AgentRow({
   editing,
   setEditing,
   onSelect,
+  onMount,
   onLand,
   onClose,
 }: AgentRowProps) {
@@ -359,6 +361,7 @@ export const AgentRow = memo(function AgentRow({
     hide();
   };
   // LEFT click = select this agent. CLICK IT AGAIN = fold/unfold its workers.
+  // DOUBLE click = mount the concierge onto it (`onRowDoubleClick`, below).
   //
   // TWO STAGES, NOT ONE. The toggle used to ride along on EVERY click, so the first click on an
   // unselected head both took the terminal and threw its subtree open — you could not look at an
@@ -384,6 +387,31 @@ export const AgentRow = memo(function AgentRow({
     // `wasActive` — the SECOND click is the one that folds. A jump still never folds (above), and
     // a jump onto an already-selected row is still a jump, so the check stays ahead of this.
     if (subtreeCollapsed !== null && !isHintJump && wasAlreadySelected) onToggleSubtree();
+    // …AND ONLY THEN, THE MOUNT. This is `false` for every ordinary mouse press (detail ≥ 1) — which
+    // is the founder's whole ask — and `true` only for a click with no pointer sequence behind it:
+    // an assistive-tech activation or HintOverlay's synthetic jump, neither of which can produce the
+    // `dblclick` the mouse uses. See `engine/cable`'s block for the full table.
+    //
+    // NOTHING ABOVE IS GATED ON IT, deliberately. The fold rule keeps running on the exact presses it
+    // always ran on, so this change cannot alter which clicks fold — the class of collision that
+    // keying the mount on `detail === 2` would have created.
+    if (mountsOnRowActivation({ type: "click", detail: e.detail })) onMount();
+  };
+  /**
+   * DOUBLE click = MOUNT THE CONCIERGE ONTO THIS ROW. The founder's gesture, 2026-08-12.
+   *
+   * It does NOT re-select first: the browser delivered both clicks before this event, so `onRowClick`
+   * has already run twice and the row is seated and focused. A third `onSelect()` here would be
+   * harmless but would say, wrongly, that this handler is the one that seats the row.
+   *
+   * THE TWO CLICKS DO NOT RACE THE MOUNT, because they cannot overlap it: `click`, `click`, `dblclick`
+   * is a fixed order in every engine, and each is dispatched synchronously. What the clicks do — seat
+   * the agent, ask its terminal for the caret — is idempotent and already complete when this runs. The
+   * one thing that WOULD have contended is the fold-on-second-click rule, which is precisely why the
+   * mount is not keyed on the click count (`engine/cable`).
+   */
+  const onRowDoubleClick = () => {
+    onMount();
   };
   // The row is the disclosure control now, so it has to be a real one: focusable, and operable by
   // Enter/Space like the button it replaced. Without this the `aria-expanded` below is invalid ARIA
@@ -414,6 +442,12 @@ export const AgentRow = memo(function AgentRow({
         // without a second activation has a direct key for it.
         if (subtreeCollapsed !== null && isSelected) onToggleSubtree();
         onSelect();
+        // AND IT STILL MOUNTS, where a single mouse click no longer does. Enter/Space is the
+        // keyboard's deliberate activation and has no double form to promote the mount to — dropping
+        // it would leave keyboard-only users with no way to patch the cable at all, which is a
+        // strictly worse outcome than the one the founder asked to fix. The complaint was about a
+        // press you make while merely LOOKING at a row; nobody presses Enter in passing.
+        if (mountsOnRowActivation({ type: "key" })) onMount();
         return;
       // Standard tree keys: Right opens a closed node, Left closes an open one. Separating them
       // from Enter is the point — a keyboard user can read a subtree without stealing the terminal.
@@ -2233,6 +2267,7 @@ export const AgentRow = memo(function AgentRow({
         data-hint="agent"
         {...dragProps}
         onClick={onRowClick}
+        onDoubleClick={onRowDoubleClick}
         onContextMenu={openCard}
         onKeyDown={onRowKeyDown}
         // The row absorbed the chevron's job, so it absorbs the chevron's SEMANTICS. Without this,

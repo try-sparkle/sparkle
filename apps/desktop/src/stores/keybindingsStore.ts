@@ -70,7 +70,11 @@ export const SHORTCUT_LABELS: Record<ShortcutId, { title: string; blurb: string;
   // Settings copy should say what a shortcut DOES. Since no pane has a prompt box, compose box or
   // composer, the blurb simply never mentions one, and `keybindingsStore.labels.test.ts` can then
   // assert the invariant directly: any wording that promises such a surface has to name it.
-  toggleComposer: { title: "Hold the terminal's keystrokes", blurb: "Held in the terminal so the chord never reaches the running process. To talk to an agent, click its row to mount Sparkle to it.", allowsTap: false },
+  // "DOUBLE-CLICK", since 2026-08-12. This blurb is rendered verbatim in Settings → Shortcuts, so it
+  // is an INSTRUCTION the reader will follow — and a single click stopped mounting the moment the
+  // founder split the two gestures (engine/cable `mountsOnRowActivation`). Copy that narrates the old
+  // trigger of a behaviour that moved is the failure AGENTS.md names under "user-facing copy is code".
+  toggleComposer: { title: "Hold the terminal's keystrokes", blurb: "Held in the terminal so the chord never reaches the running process. To talk to an agent, double-click its row to mount Sparkle to it.", allowsTap: false },
   // NAMES NO TEXT SURFACE EITHER, for the reason above: this blurb is rendered in the same Settings
   // pane, and `keybindingsStore.labels.test.ts` asserts that no wording promises a prompt box.
   unmountCable: { title: "Unmount the concierge", blurb: "Detach the concierge from the build row it is wired to. Works from inside a terminal, where Escape belongs to the running program instead.", allowsTap: false },

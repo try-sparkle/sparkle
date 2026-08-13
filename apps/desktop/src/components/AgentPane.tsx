@@ -60,6 +60,7 @@ import { useHistoryStore } from "../stores/historyStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useScrollIntentStore, applyScrollIntent } from "../stores/scrollIntentStore";
+import { usePaneFocusStore, applyPaneFocus } from "../stores/paneFocusStore";
 import { PinnedPrompt } from "./PinnedPrompt";
 import { composerPrompts } from "./promptHistory";
 import { Terminal, type TerminalApi } from "./Terminal";
@@ -274,6 +275,11 @@ function AgentPaneInner({
   // once the terminal is the visible, ready pane.
   const scrollIntent = useScrollIntentStore((s) => s.intents[agent.id]);
   const consumeScrollIntent = useScrollIntentStore((s) => s.consume);
+  // Pending "put the caret in this agent's terminal" (set by a single click on its build row),
+  // consumed the same way. See stores/paneFocusStore for why the pane's own auto-focus below is not
+  // enough on its own.
+  const paneFocusRequest = usePaneFocusStore((s) => s.requests[agent.id]);
+  const consumePaneFocus = usePaneFocusStore((s) => s.consume);
   // Tracks whether the last spawn was a fresh session (not a --continue resume). Used in the
   // worker exit handler to skip stale result re-reads on resumed sessions.
   const wasFreshLaunchRef = useRef(false);
@@ -1194,6 +1200,50 @@ function AgentPaneInner({
     });
     return () => cancelAnimationFrame(raf);
   }, [visible, ptyReady]);
+
+  // A SINGLE CLICK ON THIS AGENT'S BUILD ROW ASKED FOR THE CARET. Founder, 2026-08-12: a single click
+  // selects the row and moves keyboard focus to that agent's terminal — it no longer mounts the
+  // concierge (engine/cable `mountsOnRowActivation`).
+  //
+  // The effect above cannot serve this, and the reason is easy to miss: it fires on the TRANSITION
+  // into `visible && ptyReady`. Clicking a row whose pane is already up moves nothing — and that is
+  // the common case, because the press leaves focus on the row itself (the row is a focusable
+  // treeitem). The request channel fires on every ask, held until the terminal exists.
+  //
+  // ══ MARKED AS THE APP'S MOVE, NOT THE USER'S — AND THAT IS DELIBERATE ══════════════════════════
+  // `markTerminalAutoFocus`, exactly like the effect above, even though a user gesture set this
+  // request off. Provenance answers "is the user WORKING in this terminal" (services/
+  // terminalFocusIntent, engine/terminalEscape), and they aimed at a ROW in the sidebar — the app is
+  // parking the caret somewhere convenient on their behalf. Recording that as deliberate would flip
+  // the Escape ladder for every row click: ESC-to-unmount would start costing a one-press toll in
+  // the ordinary case, which is founder-confirmed behavior (roborev 55614). The honest reading is
+  // also the safe one, and it self-corrects the moment they type — xterm's `onData` promotes
+  // provenance to deliberate on the first real keystroke.
+  //
+  // Contrast `focusTerminalForDrop`, which IS user-driven: a file dropped on a terminal was aimed at
+  // that terminal. A row click was not.
+  useEffect(() => {
+    if (paneFocusRequest === undefined) return;
+    // rAF for the same reason as the effect above: a pane revealed by this very click needs to mount
+    // before it can take the caret. Re-checked inside the frame, which lands later.
+    const raf = requestAnimationFrame(() => {
+      applyPaneFocus({
+        request: paneFocusRequest,
+        visible,
+        ready: ptyReady,
+        // Re-read INSIDE the frame, not at effect time — the frame lands later, and this is the same
+        // half-typed-message guard the effect above applies. `applyPaneFocus` spends the request when
+        // it declines, so a request refused here cannot resurface later with no gesture behind it.
+        typing: isTypingInProgress(),
+        focusTerminal: () => {
+          markTerminalAutoFocus();
+          termFocusRef.current?.();
+        },
+        consume: () => consumePaneFocus(agent.id),
+      });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [paneFocusRequest, visible, ptyReady, agent.id, consumePaneFocus]);
 
   // Consume a pending "scroll to this prompt" intent (set by history-search navigation) once this
   // agent's terminal is the visible, ready pane. Runs when the intent appears or the pane becomes

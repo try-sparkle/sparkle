@@ -13,6 +13,16 @@
 // drives the store proves the store works and says nothing about whether a user can get there. That
 // distinction is what let the break survive — `ConciergeColumn.wired.test.tsx` asserted the flood in
 // full, supplying the prop itself, and passed the whole time the feature was dead.
+//
+// ══ THE GESTURE IS A DOUBLE CLICK SINCE 2026-08-12 ══════════════════════════════════════════════
+// Founder: *"I had also asked for a single click to not mount the concierge. And to for a double
+// click to be what mounts it."* Every mount below therefore goes through `doubleClickRow`, which
+// fires the click/click/dblclick sequence a browser actually delivers. That the SINGLE click no
+// longer patches — and what it does instead — is `AgentSidebar.rowMountGesture.test.tsx`; the cases
+// here are about which SIDE the cable lands on and what it displaces, which the new gesture did not
+// change. `fireEvent.click` would still have passed them, and that is the trap: its default
+// `detail: 0` is an assistive-tech activation, not a mouse press, so this file would have gone on
+// describing a path no user takes (testing/rowGestures spells out both).
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -33,6 +43,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { resetCable, useCableStore } from "../stores/cableStore";
+import { doubleClickRow } from "../testing/rowGestures";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(id: string, name: string): AgentTab {
@@ -83,7 +94,7 @@ describe("selecting a build row patches the cable", () => {
     // Absent from the assignment map means right — the historical single-pair home, and what every
     // pre-existing project reads as.
     render(<AgentSidebar project={PROJECT} />);
-    fireEvent.click(rowFor("Concierge column layout"));
+    doubleClickRow(rowFor("Concierge column layout"));
     expect(useCableStore.getState().wired).toBe("right");
   });
 
@@ -92,7 +103,7 @@ describe("selecting a build row patches the cable", () => {
     // guess, so it cannot disagree with the stage its panes are mounted in.
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
     render(<AgentSidebar project={PROJECT} />);
-    fireEvent.click(rowFor("Concierge column layout"));
+    doubleClickRow(rowFor("Concierge column layout"));
     expect(useCableStore.getState().wired).toBe("left");
   });
 
@@ -100,12 +111,12 @@ describe("selecting a build row patches the cable", () => {
     // ONE LIVE CIRCUIT. This falls out of `patchCable`'s reducer rather than being re-imposed here,
     // which is why patching the other side is a move and never an addition.
     render(<AgentSidebar project={PROJECT} />);
-    fireEvent.click(rowFor("Concierge column layout"));
+    doubleClickRow(rowFor("Concierge column layout"));
     expect(useCableStore.getState().wired).toBe("right");
     useUiStore.setState({ pairAssignment: { p1: "left" } } as never);
     cleanup();
     render(<AgentSidebar project={PROJECT} />);
-    fireEvent.click(rowFor("Stripe checkout retry"));
+    doubleClickRow(rowFor("Stripe checkout retry"));
     expect(useCableStore.getState().wired).toBe("left");
   });
 
@@ -196,7 +207,7 @@ describe("selecting a build row patches the cable", () => {
     // to be wired to. Asserted through the GESTURE so the guarantee is the user's, not the store's.
     useCableStore.getState().overlayTo("assist");
     render(<AgentSidebar project={PROJECT} />);
-    fireEvent.click(rowFor("Concierge column layout"));
+    doubleClickRow(rowFor("Concierge column layout"));
     expect(useCableStore.getState().overlay).toBe("off");
     expect(useCableStore.getState().wired).toBe("right");
   });

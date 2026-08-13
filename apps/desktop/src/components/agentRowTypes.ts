@@ -108,8 +108,16 @@ export type AgentRowProps = {
   receiptVersion: number;
   setEditing: (id: string | null) => void;
   /** Called on activation — a CLICK, a keyboard Enter/Space, or a right-click opening the card.
-   *  There is no hover caller: selection is click-only (see HOVER_INTENT_MS's headstone). */
+   *  There is no hover caller: selection is click-only (see HOVER_INTENT_MS's headstone).
+   *
+   *  SELECTION ONLY, AND NO LONGER THE MOUNT. It seats the agent and hands the caret to its
+   *  terminal; patching the cable is {@link onMount}'s job. Splitting the two is the founder's
+   *  2026-08-12 rule — see `engine/cable`'s `mountsOnRowActivation` for which gesture does which. */
   onSelect: () => void;
+  /** Patch the cable onto this row — the DOUBLE click (and the activations that have no double
+   *  form: Enter/Space, and an assistive-tech click). Always preceded by an {@link onSelect} for the
+   *  same row, so a mount is a superset of a select rather than an alternative to it. */
+  onMount: () => void;
   onLand: () => void;
   onClose: () => void;
 };

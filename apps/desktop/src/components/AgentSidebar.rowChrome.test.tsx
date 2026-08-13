@@ -125,8 +125,10 @@ beforeEach(() => {
   // The DEFAULT state (helper island enabled) is the one that needs the header gap: with the helper
   // row absent, the Plan/Build strip would otherwise sit flush against the project tab bar.
   useHelperPrefs.setState({ enabled: true } as never);
-  // AT REST, EXPLICITLY. Several tests here click a row, and a row click patches the cable — which
-  // opens every row's CONCIERGE end (engine/rowGeometry: the wired pair bleeds at both ends). The
+  // AT REST, EXPLICITLY. Several tests here click a row, and some of those clicks still patch the
+  // cable — `fireEvent.click`'s default `detail: 0` is the assistive-tech activation, which mounts
+  // even though a plain mouse press no longer does (engine/cable `mountsOnRowActivation`). A patched
+  // cable opens every row's CONCIERGE end (engine/rowGeometry: the wired pair bleeds at both ends). The
   // cable store is module state, so without this the geometry assertions below would read whatever
   // the previous test left patched and pass or fail on test ORDER. These measure the RESTING box.
   resetCable();

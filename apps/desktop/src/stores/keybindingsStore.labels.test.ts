@@ -104,7 +104,9 @@ describe("BOX_NOUN rejects every wording that defeated an earlier guard", () => 
     expect("Held in the terminal so the chord never reaches the running process.").not.toMatch(
       BOX_NOUN,
     );
-    expect("To talk to an agent, click its row to mount Sparkle to it.").not.toMatch(BOX_NOUN);
+    expect("To talk to an agent, double-click its row to mount Sparkle to it.").not.toMatch(
+      BOX_NOUN,
+    );
     // And it is scoped to a per-pane surface: the concierge's box is a different thing that still
     // exists, so plain talk about Sparkle must stay legal.
     expect("Mount Sparkle to a row and type to that agent.").not.toMatch(BOX_NOUN);

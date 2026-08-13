@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 //
-// CLICKING A ROW MOUNTS THE CONCIERGE TO THAT AGENT — end to end, through the REAL sidebar.
+// DOUBLE-CLICKING A ROW MOUNTS THE CONCIERGE TO THAT AGENT — end to end, through the REAL sidebar.
+//
+// It was a SINGLE click until 2026-08-12, when the founder split the two gestures: *"I had also
+// asked for a single click to not mount the concierge. And to for a double click to be what mounts
+// it."* Only the gesture moved — everything this file asserts about the mount's consequences is
+// unchanged, which is why the cases below read the same with `doubleClickRow` in place of the click.
+// The rule itself is `engine/cable`'s `mountsOnRowActivation`, and what a single click does INSTEAD
+// is `AgentSidebar.rowMountGesture.test.tsx`.
 //
 // ── WHY THIS FILE EXISTS: THE SEAM NEITHER SUITE COVERED ──────────────────────────────────────
 //
@@ -107,6 +114,8 @@ import { useAuthStore } from "../stores/authStore";
 import { useConnectionStore } from "../stores/connectionStore";
 import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable, useCableStore } from "../stores/cableStore";
+import { useKeybindingsStore } from "../stores/keybindingsStore";
+import { doubleClickRow } from "../testing/rowGestures";
 import type { AgentTab, Project } from "../types";
 import { C } from "../theme/colors";
 
@@ -190,7 +199,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
   // fails — and it is the only one that can.
   it("projects the mount onto the shell root, from a real row click", () => {
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(shell().getAttribute("data-wired")).toBe("right");
   });
 
@@ -199,7 +208,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
       useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
     });
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(shell().getAttribute("data-wired")).toBe("left");
   });
 
@@ -234,7 +243,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
       render(<Workspace />);
       expect(fill()).toBeNull();
 
-      fireEvent.click(rowFor(SLIDER));
+      doubleClickRow(rowFor(SLIDER));
 
       const el = fill() as HTMLElement | null;
       expect(el).not.toBeNull();
@@ -246,7 +255,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
 
     it("un-paints it when the cable is dropped", () => {
       render(<Workspace />);
-      fireEvent.click(rowFor(SLIDER));
+      doubleClickRow(rowFor(SLIDER));
       expect(fill()).not.toBeNull();
 
       act(() => {
@@ -316,7 +325,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
       });
       render(<Workspace />);
       // Click a row in the RIGHT pair.
-      fireEvent.click(rowFor(SLIDER));
+      doubleClickRow(rowFor(SLIDER));
 
       expect(shell().getAttribute("data-wired")).toBe("right");
       // The left rail is MOUNTED (two pairs), so its empty fill is a real observation.
@@ -331,7 +340,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
         useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
       });
       render(<Workspace />);
-      fireEvent.click(rowFor(SLIDER));
+      doubleClickRow(rowFor(SLIDER));
 
       expect(shell().getAttribute("data-wired")).toBe("left");
 
@@ -357,7 +366,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
   // `data-wired-pair` — which really does appear and disappear with the mount.
   it("bolds the selected row, and lights the pair only while mounted", () => {
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
 
     // Read the weight off the TITLE element specifically. The old helper took the first descendant
     // declaring any inline font-weight, which need not be the title, and its `|| 400` fallbacks
@@ -395,7 +404,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
   // the user has left, and their next message goes somewhere they are not looking.
   it("ESCAPE unmounts, leaving no stale binding behind", () => {
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(shell().getAttribute("data-wired")).toBe("right");
     act(() => {
       fireEvent.keyDown(window, { key: "Escape" });
@@ -406,13 +415,48 @@ describe("clicking an agent row mounts the concierge to it", () => {
     expect(useCableStore.getState().wired).toBe("off");
   });
 
+  // ── AND THE CHORD, READ LIVE ────────────────────────────────────────────────────────────────
+  // The second way out, and the one that works from inside a terminal where Escape belongs to the
+  // running program. Two things are asserted together on purpose:
+  //
+  //   1. It still unmounts a cable patched by the NEW gesture. Changing what mounts must not change
+  //      what unmounts — a mount with no matching exit is the wedge the founder reported as "I could
+  //      not unmount the concierge".
+  //   2. It follows a REBOUND binding rather than a hard-coded ⌘⇧U. The chord is rebindable, so a
+  //      literal would be a shortcut that silently does nothing for anyone who moved it. Rebinding it
+  //      here and firing the NEW keys is what makes that falsifiable: firing ⌘⇧U instead would pass
+  //      against a hard-coded handler.
+  it("the rebindable unmount chord unmounts too, read LIVE from the binding", () => {
+    useKeybindingsStore.getState().setBinding("unmountCable", {
+      kind: "chord",
+      meta: true,
+      ctrl: false,
+      alt: true,
+      shift: false,
+      key: "k",
+    });
+    try {
+      render(<Workspace />);
+      doubleClickRow(rowFor(SLIDER));
+      expect(shell().getAttribute("data-wired")).toBe("right");
+      act(() => {
+        fireEvent.keyDown(window, { key: "k", metaKey: true, altKey: true });
+      });
+      expect(shell().getAttribute("data-wired")).toBe("off");
+      expect(useCableStore.getState().wired).toBe("off");
+    } finally {
+      // PERSISTED store — a rebind left behind follows every later case in this worker.
+      useKeybindingsStore.getState().resetBinding("unmountCable");
+    }
+  });
+
   // OUTSIDE THE CIRCUIT, not merely "off a row". The wired pair's OWN terminal is deliberately part
   // of the live circuit (engine/cable's CIRCUIT_SELECTOR) — patch-then-type is the primary flow, and
   // an earlier cut that unbound on any non-row press dropped the cable on the first click
   // (roborev 54697). So the press that must unmount is one on the shell chrome itself.
   it("clicking outside the circuit unmounts", () => {
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(shell().getAttribute("data-wired")).toBe("right");
     act(() => {
       fireEvent.pointerDown(shell());
@@ -425,7 +469,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
   // the terminal of the agent you are mounted to must KEEP the mount.
   it("pressing the mounted agent's own terminal does NOT unmount", () => {
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     act(() => {
       fireEvent.pointerDown(screen.getByTestId("terminal-stage"));
     });
@@ -482,12 +526,12 @@ describe("clicking an agent row mounts the concierge to it", () => {
     expect(pairOf(SLIDER)).toBe("pair-right");
     expect(pairOf(FAR)).toBe("pair-left");
 
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(shell().getAttribute("data-wired")).toBe("right");
     expect([left(), right()]).toEqual(["false", "true"]);
 
     // The move. `data-wired` flips right → left, which the single-pair version could never observe.
-    fireEvent.click(rowFor(FAR));
+    doubleClickRow(rowFor(FAR));
     expect(shell().getAttribute("data-wired")).toBe("left");
     // AND ONLY ONE IS LIT. Falsifiable now: both attributes exist, so "lighting two" is a state this
     // assertion can actually catch.
@@ -528,7 +572,7 @@ describe("clicking an agent row mounts the concierge to it", () => {
       expect(useCableStore.getState().wired).toBe("off");
 
       // THE POSITIVE CONTROL: the same row, clicked, DOES mount.
-      fireEvent.click(rowFor(SLIDER));
+      doubleClickRow(rowFor(SLIDER));
       expect(useProjectStore.getState().projects[0]?.selectedAgentId).toBe("a2");
       expect(useCableStore.getState().wired).not.toBe("off");
     } finally {

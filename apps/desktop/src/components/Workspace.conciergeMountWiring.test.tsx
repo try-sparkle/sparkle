@@ -141,6 +141,7 @@ import { startConciergeTurn } from "../services/concierge";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { armedIntents, cancelIntent, fireIntent } from "../services/dispatchIntent";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { doubleClickRow } from "../testing/rowGestures";
 import type { AgentTab, Project } from "../types";
 
 function mkAgent(id: string, name: string): AgentTab {
@@ -279,7 +280,7 @@ describe("the mount reaches the concierge column, through the real host", () => 
   it("floods the column when a row is clicked", () => {
     render(<Workspace />);
     expect(columnWired()).toBe("off");
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(columnWired()).toBe("right");
   });
 
@@ -287,7 +288,7 @@ describe("the mount reaches the concierge column, through the real host", () => 
   // leaves the founder looking at terminal material with no cable behind it.
   it("clears the column's flood on Escape", () => {
     render(<Workspace />);
-    fireEvent.click(rowFor(SLIDER));
+    doubleClickRow(rowFor(SLIDER));
     expect(columnWired()).toBe("right");
     act(() => {
       fireEvent.keyDown(window, { key: "Escape" });

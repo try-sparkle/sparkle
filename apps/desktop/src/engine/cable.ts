@@ -59,6 +59,69 @@ export function patchCable(state: CableState, side: PairSide): CableState {
   return { wired: side, overlay: "off" };
 }
 
+// ── WHICH ROW ACTIVATION PATCHES THE CABLE ────────────────────────────────────────────────────
+//
+// Founder, 2026-08-12: *"I had also asked for a single click to not mount the concierge. And to for
+// a double click to be what mounts it."* A single click had been the mount gesture since the cable
+// landed, and the cost was that merely LOOKING at a row — the same press you use to read what an
+// agent is doing — dropped him into a pane he never meant to open.
+//
+// So the row now has two gestures, and this predicate is the whole rule:
+//
+//   SINGLE click  → select the row and put the caret in that agent's terminal. NO cable.
+//   DOUBLE click  → patch the cable onto that row (what the single click used to do).
+//
+// ══ WHY THE RULE LIVES HERE AND NOT IN THE ROW ══════════════════════════════════════════════════
+// MAPPING.md: *"`data-wired` is the whole connection feature … do not implement it as scattered
+// component state."* "Which gesture patches" is part of that feature, not row chrome — and it is the
+// half a component would get subtly wrong, because a double click also fires two single clicks. One
+// predicate, one test file, and `AgentRow` only asks.
+//
+// ══ WHY `key` AND A DETAIL-0 CLICK BOTH MOUNT ═══════════════════════════════════════════════════
+// A double click is a MOUSE gesture. Two activations that reach the row have no double form at all,
+// and dropping them on the floor would remove the only mount path their users have:
+//
+//   • Enter/Space on the focused row. The keyboard's copy of an activation, and unambiguous — nobody
+//     presses Enter on a row while glancing past it, which is the whole complaint above. There is no
+//     "double Enter" convention to lean on either.
+//   • A click with `detail === 0`, i.e. one with NO pointer sequence behind it: an assistive-tech
+//     activation (VoiceOver / Switch Control AXPress) and HintOverlay's synthetic keyboard jump. This
+//     file's neighbour already treats detail 0 as "not a real mouse press" — see `HINT_JUMP_ATTR`'s
+//     note in AgentRow, which exists precisely because AT arrives with detail 0. A jump means "take
+//     me to this agent", which is the mount, and it mounted before this change.
+//
+// The direction of the asymmetry is the safe one: the gesture the founder complained about is a real
+// mouse press, and that is exactly the one narrowed. Nothing that could only ever have been
+// deliberate loses its mount.
+//
+// ══ WHY THE MOUSE HALF IS `dblclick` AND NOT A CLICK-COUNT ══════════════════════════════════════
+// Reading `detail === 2` off the second click looks equivalent and is not, because the row's OTHER
+// second-click rule would collide with it: clicking an already-selected orchestrator folds its
+// worker subtree. Keying the mount on the count means the fold and the mount fight over the same
+// press and one of them has to be suppressed — a second rule, added here, to repair the first.
+// `dblclick` is a distinct event the browser raises AFTER both clicks, from the same OS double-click
+// interval the user has already tuned, so the two rules never contend: the clicks fold exactly as
+// they did before this change, and the mount arrives on its own event.
+export type RowActivation =
+  /** A `click`. `detail` is the pointer click-count — 1 for a plain press, 0 for a synthetic/AT one. */
+  | { type: "click"; detail: number }
+  /** The browser's own `dblclick`, raised once per double press. */
+  | { type: "dblclick" }
+  /** Enter or Space on the focused row. */
+  | { type: "key" };
+
+/** Does this activation of a build row patch the cable? See the block above for every branch. */
+export function mountsOnRowActivation(activation: RowActivation): boolean {
+  switch (activation.type) {
+    case "dblclick":
+      return true;
+    case "key":
+      return true;
+    case "click":
+      return activation.detail === 0;
+  }
+}
+
 /**
  * Unbind — back to floating middle. The ONE state change both gestures produce.
  *
