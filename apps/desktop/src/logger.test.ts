@@ -3,7 +3,13 @@ import { describe, expect, it, vi } from "vitest";
 const invoke = vi.fn((..._a: unknown[]) => Promise.resolve());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
-import { isBenignTauriRejection, shouldForwardConsole, log, setDebugForwarding } from "./logger";
+import {
+  isBenignTauriRejection,
+  isTransientXtermRenderError,
+  shouldForwardConsole,
+  log,
+  setDebugForwarding,
+} from "./logger";
 
 // Exactly the methods initLogger() patches (logger.ts `patch(...)` calls). Kept here so the
 // console-patch test can hand the globals back untouched.
@@ -94,6 +100,58 @@ describe("isBenignTauriRejection", () => {
     ).toBe(false);
     expect(isBenignTauriRejection("Unhandled rejection: Error: something genuinely broke")).toBe(false);
     expect(isBenignTauriRejection("")).toBe(false);
+  });
+});
+
+// The global window 'error' handler forwards every uncaught error at ERROR. xterm's renderer throws
+// a transient `undefined is not an object` from inside its OWN rAF render pass / teardown when the
+// buffer/renderer/line is momentarily undefined during a resize/reflow/dispose (bead sparkle-uhne8) —
+// one day's log had 281 of them across four vendor symbols (a.loadCell, this._renderer.value.dimensions,
+// d.getWidth, d.setCellFromCodepoint). It's thrown from a vendor rAF/event callback we can't .catch at
+// the source, and it self-heals, so isTransientXtermRenderError downgrades the family to debug while
+// every genuine app error still logs at ERROR.
+describe("isTransientXtermRenderError", () => {
+  it("matches the whole vendor-xterm render/teardown family, keyed on no single symbol", () => {
+    // WebKit phrasing, the prod bundle name, all four reported symbols.
+    for (const sym of [
+      "a.loadCell",
+      "this._renderer.value.dimensions",
+      "d.getWidth",
+      "d.setCellFromCodepoint",
+    ]) {
+      expect(
+        isTransientXtermRenderError(
+          `TypeError: undefined is not an object (evaluating '${sym}')\n    at _renderRows (https://tauri.localhost/assets/vendor-xterm-a1b2c3.js:2:34567)\n    at _innerRefresh (https://tauri.localhost/assets/vendor-xterm-a1b2c3.js:2:34000)`,
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it("matches the Chromium phrasing and the dev (@xterm/) bundle path too", () => {
+    expect(
+      isTransientXtermRenderError(
+        "TypeError: Cannot read properties of undefined (reading 'loadCell')\n    at node_modules/@xterm/addon-webgl/lib/addon-webgl.mjs:100:5",
+      ),
+    ).toBe(true);
+  });
+
+  it("does NOT downgrade a genuine app TypeError (no xterm bundle in the stack)", () => {
+    expect(
+      isTransientXtermRenderError(
+        "TypeError: undefined is not an object (evaluating 'agent.status')\n    at src/services/agentTransport.ts:42:10",
+      ),
+    ).toBe(false);
+  });
+
+  it("does NOT downgrade a real, actionable xterm error that is not an undefined access", () => {
+    // An xterm error worth seeing (e.g. an assertion / range error) must keep logging at ERROR even
+    // though its stack references the bundle — the guard requires the undefined-access shape too.
+    expect(
+      isTransientXtermRenderError(
+        "RangeError: Invalid array length\n    at vendor-xterm-a1b2c3.js:2:100",
+      ),
+    ).toBe(false);
+    expect(isTransientXtermRenderError("")).toBe(false);
   });
 });
 

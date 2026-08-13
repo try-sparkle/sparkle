@@ -1003,3 +1003,137 @@ describe("prProbeBlockedCount — the header's blocked number asks the RULE", ()
     }
   });
 });
+
+// ── AN UNVERIFIABLE ROW MAY NOT CLAIM TO BE MERGEABLE (the founder's 2026-08-12 report) ────────
+//
+// A merged pull request sat in the panel for hours reading GREEN with a live one-click Merge and a
+// place in the chiclet's "ready to merge". Every field on it was the last thing GitHub said —
+// passing, mergeable, clean — because it came from a cached list belonging to a project tab whose
+// probe had failed. Nothing in the row could reveal that it described a PR that no longer exists.
+//
+// The stamp is applied by `fleetPrs.buildPrGroups`; the RULE is here, so the dot, the word, the
+// button and every count are one decision rather than four that have to be kept in agreement.
+describe("prMergeReadiness — a row we could not re-read", () => {
+  const unverified = { ...GREEN, unverified: true } satisfies PrJudgeable;
+
+  it("is never green and never mergeable, however good the last reading was", () => {
+    // GREEN is passing + mergeable + clean: the reading that produced the founder's bug.
+    expect(prMergeReadiness(GREEN).canMerge).toBe(true);
+    const r = prMergeReadiness(unverified);
+    expect(r.canMerge).toBe(false);
+    expect(r.tone).not.toBe("ready");
+  });
+
+  it("says WHY, rather than going quietly amber", () => {
+    const r = prMergeReadiness(unverified);
+    expect(r.label).toBe("Unverified");
+    expect(r.blocker).toBe("unverified");
+    expect(r.title).toMatch(/could(n't| not) re-read/i);
+    // The remedy has to be on the row. Refresh is the panel's escape hatch and the only thing that
+    // resolves this state.
+    expect(r.title).toMatch(/Refresh/);
+  });
+
+  it("is WAITING, not BLOCKED — it is our read that failed, not the pull request", () => {
+    // Red would assert something about the PR that we have no evidence for. This resolves itself
+    // the moment a probe succeeds, exactly like `mergeable: "unknown"`.
+    expect(prMergeReadiness(unverified).tone).toBe("waiting");
+    expect(prMergeReadiness(unverified).override).toBeNull();
+  });
+
+  it("drops out of every ready count — the number the chiclet renders", () => {
+    expect(prReadyCount([GREEN, GREEN])).toBe(2);
+    expect(prReadyCount([unverified, unverified])).toBe(0);
+    // Mixed: only the row we can actually vouch for counts.
+    expect(prReadyCount([GREEN, unverified])).toBe(1);
+  });
+
+  it("keeps the dot and the button in step, like every other branch", () => {
+    const dot = prStatusDot(unverified);
+    expect(dot.tone).toBe("waiting");
+    expect(dot.label).toBe("Unverified");
+    expect(prMergeEligibility(unverified).canMerge).toBe(false);
+  });
+
+  it("still names a MORE SPECIFIC blocker when the last reading had one", () => {
+    // Placement is deliberate: this branch sits below every named blocker. A row last seen
+    // conflicting is more useful saying "Conflicts" than "Unverified" — that is the more specific
+    // fact, it is still why the PR cannot merge, and neither branch offers a Merge button. What
+    // this catches is the row that would otherwise reach the GREEN return, which is the only
+    // outcome where being wrong costs a click on a button that cannot work.
+    const r = prMergeReadiness({ ...PR_944_CONFLICTING, unverified: true });
+    expect(r.blocker).toBe("conflicts");
+    expect(r.canMerge).toBe(false);
+  });
+
+  it("leaves a row with no stamp exactly as it was", () => {
+    // The absent case is every caller predating the field, and it must be untouched.
+    expect(prMergeReadiness({ ...GREEN, unverified: false })).toEqual(prMergeReadiness(GREEN));
+    expect(prMergeReadiness({ ...GREEN, unverified: undefined })).toEqual(prMergeReadiness(GREEN));
+  });
+});
+
+// ── THE OVERRIDE PATH IS PART OF THE `unverified` GATE, NOT AN EXCEPTION TO IT ─────────────────
+//
+// roborev 63235 (Medium), against the first cut of this change — a hole in its own stated
+// invariant. The `unverified` branch sits BELOW the failing/pending/unstable branches on purpose,
+// so a row keeps naming its most specific blocker. But those branches return an `override`, and the
+// menu renders an override as the row's ONLY merge affordance — an ENABLED two-step button —
+// exactly when `canMerge` is false. So a cached row last seen `failing` + `mergeable` + `unstable`
+// still offered a live path to `runMerge`: the precise click that answers
+// `GraphQL: Merge already in progress` on a pull request that has already merged.
+//
+// It is also the one claim that cannot be checked. An override says "GitHub would accept this
+// merge" — present tense, about a row whose only evidence is a cache we just said we could not
+// re-read.
+describe("prMergeReadiness — an unverified row offers no override either", () => {
+  it("withholds 'Merge anyway' from a cached FAILING+unstable row", () => {
+    // Without the guard this row is `canMerge: false` WITH an override — which the renderer turns
+    // into the enabled button. The un-stamped row keeps its override, which is what makes this a
+    // test about the stamp rather than about the unstable rule.
+    expect(prMergeReadiness(PR_934_UNSTABLE).override).not.toBeNull();
+    expect(prMergeReadiness({ ...PR_934_UNSTABLE, unverified: true }).override).toBeNull();
+  });
+
+  it("withholds it from a cached PENDING+unstable row too", () => {
+    const pending: PrJudgeable = {
+      checks: "pending",
+      mergeable: "mergeable",
+      mergeStateStatus: "unstable",
+      pendingChecks: ["Node — shell"],
+    };
+    expect(prMergeReadiness(pending).override).not.toBeNull();
+    expect(prMergeReadiness({ ...pending, unverified: true }).override).toBeNull();
+  });
+
+  it("withholds it from the checks-not-clean row as well", () => {
+    // `passing` rollup + `unstable` state — the contradictory pair. Same override, same reasoning.
+    const notClean: PrJudgeable = {
+      checks: "passing",
+      mergeable: "mergeable",
+      mergeStateStatus: "unstable",
+    };
+    expect(prMergeReadiness(notClean).override).not.toBeNull();
+    expect(prMergeReadiness({ ...notClean, unverified: true }).override).toBeNull();
+  });
+
+  it("keeps naming the specific blocker — withholding the override is the ONLY change", () => {
+    // The placement decision stands: "2 checks failing" is more useful than "Unverified", and the
+    // reader is not merely told the row is stale, they are told what was wrong with it.
+    const r = prMergeReadiness({ ...PR_934_UNSTABLE, unverified: true });
+    expect(r.label).toBe("2 checks failing");
+    expect(r.blocker).toBe("checks");
+    expect(r.canMerge).toBe(false);
+  });
+
+  it("leaves NO merge path at all on an unverified row, by any branch", () => {
+    // The invariant the commit claimed and this restores: sweep every shape that can produce an
+    // override or a green, stamp it, and assert nothing offers a way to merge.
+    for (const pr of EVERY_COMBINATION) {
+      const r = prMergeReadiness({ ...pr, unverified: true });
+      expect(r.canMerge, JSON.stringify(pr)).toBe(false);
+      expect(r.override, JSON.stringify(pr)).toBeNull();
+      expect(r.tone, JSON.stringify(pr)).not.toBe("ready");
+    }
+  });
+});

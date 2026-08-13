@@ -229,6 +229,71 @@ however wide it is. The defect that motivated this was 14 image px across — ov
 `--json` is what turns "no seam" into a regression-testable fact rather than a screenshot someone
 looked at once.
 
+### `tab-seam-probe.mjs` — the project tab strip, at the zooms the founder reads it at
+
+```bash
+pnpm --filter @sparkle/desktop visual:tab-seam
+pnpm --filter @sparkle/desktop visual:tab-seam -- --json
+pnpm --filter @sparkle/desktop visual:tab-seam -- --scales=0.7,1 --keep
+```
+
+Mounts the real `ProjectTabs` over a content plane and answers two questions per zoom, in Chrome:
+
+- **is the strip's rule painted UNDER the active tab** — bead `sparkle-civ4i`, *"the active tab must
+  open into the content area like a folder tab."* It reads the rule's colour off an INACTIVE tab's
+  own column (so it is not comparing against a token and keeps working across a retint), then
+  asserts that colour is absent under the active one. Two vacuity guards sit either side of that:
+  the rule must EXIST under the inactive tab, and the active tab's face must not be the bar's own
+  surface — otherwise "no rule under the active tab" is satisfied by deleting the rule, or by
+  dropping the active state.
+- **does clicking a non-active tab activate it** — twice: settled, and *across an expansion*, which
+  is the gesture a hand actually makes (the pointer is already resting on a neighbour, that
+  neighbour has expanded out of flow over the tab you are aiming at, and you press inside the
+  strip's settle delay).
+
+`--scales` is the whole point of the instrument. **70% page zoom is, to the rasteriser, a
+`deviceScaleFactor` of 0.7**: a CSS pixel no longer owns a device pixel, so a 1px rule and a 1px
+overlap of it round INDEPENDENTLY and need not cancel. A seam that is "fixed" at one scale proves
+nothing about the others, so the default measures 0.7, 0.8, 0.9 **and 1** — the last so a failure can
+distinguish *breaks when zoomed out* from *broken everywhere*.
+
+Exit **0** measured and clean, **1** a real regression, **2** the probe could not run. A failing
+scale writes its PNG to the temp dir and prints the path; `--keep` writes them on the pass path too.
+
+### `quote-surface-probe.mjs` — the concierge blockquote, in both themes
+
+```bash
+pnpm --filter @sparkle/desktop visual:quote-surface
+pnpm --filter @sparkle/desktop visual:quote-surface --keep --themes=light
+```
+
+Two founder reports about one piece of chrome:
+
+- **the copy glyph painted ON the blue quote rule.** This is a float rule no unit test in this repo
+  can see: the glyph is `float: left` (`ConciergeMessageRow`), and **a float shortens the LINE BOXES
+  beside it, never a following BLOCK's box** — so a `<blockquote>`'s `border-left` is laid at the
+  container's left edge, underneath the glyph, while its inline text is pushed clear. jsdom
+  implements no floats whatsoever, so both boxes read as zero there.
+- **the "Quote in response" chiclet being a capsule.** Read as a computed `border-radius` and bounded
+  by the scale's own ceiling (`RADIUS.modal`), not by the exact step the component picked — pinning
+  that is `QuoteChiclet.radius.test.tsx`'s job, where changing it is a reviewable one-line decision.
+
+It measures with `getBoundingClientRect` rather than by scanning pixels, because the claim is about
+two BOXES rather than about a colour, and it compares them as half-open ranges so boxes that merely
+touch pass. It also refuses to pass when the rule has **vanished** — deleting the rule satisfies "no
+overlap" perfectly and is not the fix that was asked for.
+
+**Both themes every run.** The rule is `C.tealInk` and the glyph `C.conciergeMuted` at 45% opacity,
+so "can you see the collision" has a different answer in each; a fix eyeballed in dark only is a fix
+verified in half the product. The geometry assertion is theme-independent by construction, which is
+why it is worth running twice — if it ever disagrees between themes, something is theme-dependent
+that should not be.
+
+The harness **copies** `ConciergeMessageRow`'s float rather than importing the row (which needs the
+whole concierge store graph), so the probe re-reads the row's own source first and exits **2** if the
+row has stopped floating the glyph left — a fixture that no longer reproduces the product makes every
+number below it meaningless rather than merely suspect.
+
 ### `crop.mjs` — make those pixels visible to a human
 
 ```bash

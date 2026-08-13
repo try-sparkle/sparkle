@@ -736,8 +736,8 @@ describe("one repository open under two project entries", () => {
   });
 
   it("shows the list one entry could read when the other's probe failed", () => {
-    // `stale` (we have rows, one read failed) and `unreadable` (no rows at all) stay different
-    // facts. Calling a section unreadable while holding a good list would hide rows we have.
+    // `stale` (no member could re-read it) and `unreadable` (no rows at all) stay different facts.
+    // Calling a section unreadable while holding a good list would hide rows we have.
     const g = firstGroup(
       [mainCheckout, worktree],
       new Map([[keyOfScope(mainCheckout), sharedRows]]),
@@ -745,8 +745,15 @@ describe("one repository open under two project entries", () => {
     );
     expect(g.prs).toHaveLength(3);
     expect(g.known).toBe(true);
-    expect(g.stale).toBe(true);
     expect(g.unreadable).toBe(false);
+    // NOT STALE, and this line changed with the founder's 2026-08-12 fix. `stale` used to mean "some
+    // member failed", which fired here — and the notice it drives says "this is the last list we
+    // could read, so it may be out of date", which is simply false: the main checkout re-read the
+    // repository completely, and both members query the SAME repo. A warning that is usually wrong
+    // is one the reader stops seeing. `stale` now means no member could re-read it at all.
+    expect(g.verified).toBe(true);
+    expect(g.stale).toBe(false);
+    expect(g.prs.every((p) => p.unverified === undefined)).toBe(true);
   });
 
   it("leaves genuinely separate repositories alone", () => {
@@ -794,5 +801,197 @@ describe("one repository open under two project entries", () => {
     );
     expect(groups).toHaveLength(2);
     expect(fleetTotals(groups).askable).toBe(0);
+  });
+});
+
+// ── A FAILED TAB'S CACHED ROWS ARE NOT EVIDENCE (the founder's 2026-08-12 report) ──────────────
+//
+// THE BUG. The founder's panel listed #1754 for hours after it merged, under a section reading
+// `SPARKLE · also open as sparkle-desktop` — one repository, two project tabs, folded. Each tab's
+// rows are cached independently, and a failed probe deliberately KEEPS that tab's last good list
+// (it is what stops the whole chip vanishing on a rate-limited `gh`). `mergeRepoRows` then unioned
+// the two, so the failed tab's overnight cache put a merged pull request back into a section the
+// other tab had just read correctly — on every poll, forever, because nothing ever re-read the
+// failed tab and nothing expires its cache. The tab the founder was looking at never failed once.
+//
+// WHY THE UNION IS PROVABLY WRONG RATHER THAN MERELY UNLUCKY. Both tabs run the SAME
+// `gh pr list` against the SAME repository — this module says so itself, and it is the premise the
+// fold rests on. So a successful read is a COMPLETE answer for the repo, and a PR appearing only
+// in some other tab's cache is, by construction, one that answer says is no longer open. Treating
+// the cache as additive evidence can only ever ADD pull requests that have closed.
+//
+// So: rows come from members whose LATEST probe succeeded. A failed member still contributes its
+// DECORATIONS — the owning agent and the knightwatch reading, both resolved per project entry and
+// unobtainable from the other tab — but it may no longer introduce a row of its own.
+describe("a stale tab may not resurrect a pull request the fresh tab no longer lists", () => {
+  const mainCheckout: PrScope = {
+    projectId: "p-main",
+    projectName: "sparkle",
+    rootPath: "/Users/x/Projects/sparkle",
+    repoKey: "/Users/x/Projects/sparkle/.git",
+  };
+  const worktree: PrScope = {
+    projectId: "p-wt",
+    projectName: "sparkle-desktop",
+    rootPath: "/Users/x/Projects/sparkle-desktop",
+    repoKey: "/Users/x/Projects/sparkle/.git",
+  };
+  const failed = (...scopes: PrScope[]) => new Set(scopes.map(keyOfScope));
+
+  it("DROPS the merged PR the failed tab is still holding", () => {
+    // Exactly the founder's state: the main checkout re-read fine and #1754 is gone from it; the
+    // worktree tab's probe failed, so it still holds last night's list with #1754 in it.
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [green(1762)]],
+        [keyOfScope(worktree), [green(1762), green(1754)]],
+      ]),
+      failed(worktree),
+    );
+    expect(g.prs.map((p) => p.number)).toEqual([1762]);
+  });
+
+  it("counts and green-counts the fresh answer, not the union", () => {
+    const t = fleetTotals(
+      buildPrGroups(
+        [mainCheckout, worktree],
+        new Map([
+          [keyOfScope(mainCheckout), [green(1762)]],
+          [keyOfScope(worktree), [green(1762), green(1754)]],
+        ]),
+        failed(worktree),
+      ),
+    );
+    // The chiclet's number is the founder's "2 ready to merge" — it was counting a merged PR.
+    expect(t.total).toBe(1);
+    expect(t.ready).toBe(1);
+  });
+
+  it("works whichever tab failed — the fresh one need not be the primary", () => {
+    // Position must not decide this. The primary is first-in-tab-order, which has nothing to do
+    // with which probe happened to succeed.
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [green(1762), green(1754)]],
+        [keyOfScope(worktree), [green(1762)]],
+      ]),
+      failed(mainCheckout),
+    );
+    expect(g.prs.map((p) => p.number)).toEqual([1762]);
+  });
+
+  it("still takes the failed tab's OWNER answer for a PR the fresh tab does list", () => {
+    // The half that must NOT regress. `pr_owner` resolves through a store keyed by project id, so
+    // only the entry an agent lives in can name it — dropping the failed tab entirely would trade
+    // a stale-row bug for a silent attribution one, which is how this fold got written.
+    const g = firstGroup(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [{ ...green(1762), agentId: null }]],
+        [
+          keyOfScope(worktree),
+          [{ ...green(1762), agentId: "agent-9", agentIdSource: "created" }],
+        ],
+      ]),
+      failed(worktree),
+    );
+    expect(g.prs.map((p) => p.agentId)).toEqual(["agent-9"]);
+  });
+
+  it("says the section is CURRENT when one tab answered — no 'may be out of date' notice", () => {
+    // The list really is current: the fresh read is complete for the repository. Claiming staleness
+    // here would train the reader to ignore the notice on the occasions it is true.
+    const groups = buildPrGroups(
+      [mainCheckout, worktree],
+      new Map([
+        [keyOfScope(mainCheckout), [green(1762)]],
+        [keyOfScope(worktree), [green(1762), green(1754)]],
+      ]),
+      failed(worktree),
+    );
+    expect(groups[0]?.verified).toBe(true);
+    expect(groups[0]?.stale).toBe(false);
+    expect(staleProjectNames(groups)).toEqual([]);
+  });
+});
+
+// ── WHEN NOTHING COULD BE RE-READ: KEEP THE ROWS, STOP VOUCHING FOR THEM ───────────────────────
+//
+// The other half of the founder's decision. With every tab for a repository failing there is no
+// fresh answer to prefer, so the cached list is all there is — and dropping it is the vanishing-chip
+// failure this module already refuses. It stays on screen. What it stops doing is claiming to be
+// mergeable: an unverifiable row cannot back the chiclet's promise ("this many are mergeable right
+// now") and must not offer a one-click Merge that `gh` would answer with the very GraphQL error the
+// founder saw. The rule lives in `prMergeReadiness`, so the dot, the word, the button and every
+// count are one decision rather than four that have to be kept in agreement.
+describe("an all-tabs-failed section keeps its rows but stops vouching for them", () => {
+  const failed = (...scopes: PrScope[]) => new Set(scopes.map(keyOfScope));
+
+  it("keeps the cached rows on screen", () => {
+    const g = firstGroup([sparkle], new Map([[keyOfScope(sparkle), [green(1)]]]), failed(sparkle));
+    expect(g.prs.map((p) => p.number)).toEqual([1]);
+    expect(g.verified).toBe(false);
+    expect(g.stale).toBe(true);
+  });
+
+  it("stamps every row unverified, so none of them counts as ready", () => {
+    const groups = buildPrGroups(
+      [sparkle],
+      new Map([[keyOfScope(sparkle), [green(1), green(2)]]]),
+      failed(sparkle),
+    );
+    expect(groups[0]?.prs.every((p) => p.unverified === true)).toBe(true);
+    // The count the chiclet renders. Two green-looking rows, and we cannot vouch for either.
+    expect(groups[0]?.readyCount).toBe(0);
+    expect(fleetTotals(groups).ready).toBe(0);
+  });
+
+  it("does NOT stamp rows that came from a probe that succeeded", () => {
+    const g = firstGroup([sparkle], new Map([[keyOfScope(sparkle), [green(1)]]]), new Set());
+    expect(g.prs[0]?.unverified).toBeUndefined();
+    expect(g.readyCount).toBe(1);
+  });
+});
+
+// ── THE STALENESS NOTICE NAMES THE TAB THAT ACTUALLY FAILED ────────────────────────────────────
+//
+// It named `group.scope.projectName` — the PRIMARY's name — whichever member's probe failed. With
+// two tabs folded into one section that is a sentence about the wrong checkout: the notice said
+// "Couldn't reach GitHub for SPARKLE" while SPARKLE was the tab that had answered fine.
+describe("staleProjectNames names the failing member", () => {
+  const a: PrScope = {
+    projectId: "p-main",
+    projectName: "sparkle",
+    rootPath: "/r/sparkle",
+    repoKey: "/r/sparkle/.git",
+  };
+  const b: PrScope = {
+    projectId: "p-wt",
+    projectName: "sparkle-desktop",
+    rootPath: "/r/sparkle-desktop",
+    repoKey: "/r/sparkle/.git",
+  };
+
+  it("names both checkouts when both failed, not the primary twice", () => {
+    const groups = buildPrGroups(
+      [a, b],
+      new Map([
+        [keyOfScope(a), [green(1)]],
+        [keyOfScope(b), [green(1)]],
+      ]),
+      new Set([keyOfScope(a), keyOfScope(b)]),
+    );
+    expect(staleProjectNames(groups)).toEqual(["sparkle", "sparkle-desktop"]);
+  });
+
+  it("still names a single-tab project by its own name", () => {
+    const groups = buildPrGroups(
+      [sparkle],
+      new Map([[keyOfScope(sparkle), [green(1)]]]),
+      new Set([keyOfScope(sparkle)]),
+    );
+    expect(staleProjectNames(groups)).toEqual(["sparkle"]);
   });
 });

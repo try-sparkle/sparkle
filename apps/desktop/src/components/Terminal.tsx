@@ -94,6 +94,8 @@ import {
 import { safeUnlisten } from "../services/safeUnlisten";
 import { PH_NO_CAPTURE_CLASS } from "@sparkle/core";
 import { perfMark, perfSpan } from "../perfTrace";
+import { guardTerminalRenderRows, shouldLogSwallow } from "./terminalRenderGuard";
+import { log } from "../logger";
 
 // Terminal font size at 100%. The ⋯-menu "Text size" control (and Cmd +/-) multiplies
 // this by the `zoom` factor, so it scales the terminal text only — not the UI chrome.
@@ -786,6 +788,24 @@ export function Terminal({
     // opener plugin instead so links launch in the OS default browser.
     term.loadAddon(new WebLinksAddon(openLinkFromTerminal));
     term.open(container);
+
+    // Neutralize the recurring `undefined is not an object (evaluating 'a.loadCell')` render crash
+    // (bead sparkle-uhne8, 281x in one day). It is thrown inside xterm's OWN rAF render callback
+    // when the render range momentarily outruns the buffer's available lines (a resize/reflow/
+    // scrollback-trim caught between a queued refresh() and the frame that services it), so it
+    // escapes to window.onerror as an uncaught ERROR that Sparkle's synchronous refresh() try/catch
+    // cannot reach. The guard wraps RenderService._renderRows — the exact frame in the report and
+    // the renderer-agnostic chokepoint — swallowing that one dropped frame (the next write/refresh
+    // repaints correctly) and downgrading the flood to one deduped warn. See terminalRenderGuard.ts.
+    const unpatchRenderGuard = guardTerminalRenderRows(term, (err, count) => {
+      if (shouldLogSwallow(count)) {
+        log.warn(
+          "terminal",
+          `swallowed xterm render-pass throw (undefined buffer line); dropped frame #${count}`,
+          err instanceof Error ? { name: err.name, message: err.message } : err,
+        );
+      }
+    });
 
     // Reclaim plain (no-Option) drags as text selections while the composer is open, even when a
     // mouse-tracking TUI (Claude Code) owns the mouse. xterm gates all of that on ONE internal
@@ -1744,6 +1764,9 @@ export function Terminal({
       // one context per closed pane, so contexts accumulated for the whole session and eventually
       // got the visible terminal's context evicted.
       teardownWebgl();
+      // Restore the original _renderRows before disposing (idempotent, and only if ours is still
+      // installed) so nothing keeps a closure over the torn-down render service.
+      unpatchRenderGuard();
       term.dispose();
       // Null the refs so a late callback that slipped past the sentinel still hits a null guard
       // (safeFit/safeRefresh and the active/zoom/theme effects all bail on a null ref) rather than

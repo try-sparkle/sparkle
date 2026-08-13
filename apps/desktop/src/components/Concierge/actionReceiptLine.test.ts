@@ -191,11 +191,21 @@ describe("actionReceiptLine", () => {
     });
 
     it("a refused merge does not say 'Merged'", () => {
+      // The reason is a FOUNDER-ACTIONABLE one so this stays a test about the WORDING. It used to
+      // read "checks are still pending", which `refusalAudience` now withholds as an internal gate
+      // — see the block below, which covers that half.
       const l = actionReceiptLine(
-        receipt({ kind: "merged", ok: false, prNumber: 753, reason: "checks are still pending" }),
+        receipt({
+          kind: "merged",
+          ok: false,
+          prNumber: 753,
+          reason: "you do not have permission to merge in this repository",
+        }),
         resolve,
       );
-      expect(l?.spoken).toBe("Didn't merge — checks are still pending");
+      expect(l?.spoken).toBe(
+        "Didn't merge — you do not have permission to merge in this repository",
+      );
       expect(l?.spoken).not.toMatch(/^Merged/);
     });
 
@@ -205,11 +215,95 @@ describe("actionReceiptLine", () => {
     });
 
     it("covers every kind, so no refusal can fall through to silence", () => {
+      // "nope" is unclassified, and `refusalAudience` defaults those to the founder — so this still
+      // asserts what it always did: no KIND may fall through to silence.
       for (const kind of ["spawned", "sent", "closed", "goal", "filed", "merged"] as const) {
         const l = actionReceiptLine(receipt({ kind, ok: false, reason: "nope" }), resolve);
         expect(l, `${kind} must produce a refusal line`).not.toBeNull();
         expect(l?.spoken).toContain("nope");
       }
+    });
+  });
+
+  // ══ AN INTERNAL GATE IS NOT THREAD MATERIAL (the founder's 2026-08-12 question) ═══════════════
+  // "This didn't merge refuse stuff is about, and why am I seeing it? Do I need to be seeing that?"
+  // The classification lives in ./refusalAudience and is tested exhaustively there; these assert
+  // that the RECEIPT LINE actually honours it, in both directions.
+  describe("a refusal aimed at the concierge shows a gist, never the paragraph", () => {
+    it("replaces the gate paragraphs the founder was shown with one short phrase", () => {
+      // The row SURVIVES — roborev 63249. It is the only thing in the thread that can contradict a
+      // turn claiming "Merged PR #753", and deleting it reopened the silence the receipts feature
+      // was built to end. What goes is the wall of text he actually complained about.
+      const cases: [string, string][] = [
+        [
+          'Refused: roborev is the review gate on this machine and its state for sparkle/x could not be read. That is "I could not find out", not "it is clean". roborev row(s) 59204, 59203, 59177 carry no branch.',
+          "Didn't merge — the review gate has records to repair",
+        ],
+        [
+          "Refused: Checks running (2): Node — shell and Node — coverage — merging now is merging blind.",
+          "Didn't merge — waiting on checks",
+        ],
+      ];
+      for (const [reason, expected] of cases) {
+        const l = actionReceiptLine(receipt({ kind: "merged", ok: false, reason }), resolve);
+        expect(l, reason).not.toBeNull();
+        expect(l?.spoken).toBe(expected);
+        // None of the machinery reaches the thread.
+        expect(l?.spoken).not.toMatch(/59204|roborev|Node —/);
+      }
+    });
+
+    it("keeps the refusal visible for every KIND — no kind falls through to silence", () => {
+      for (const kind of ["spawned", "sent", "closed", "goal", "filed", "merged"] as const) {
+        const l = actionReceiptLine(
+          receipt({ kind, ok: false, reason: "checks are still running" }),
+          resolve,
+        );
+        expect(l, `${kind} must still produce a refusal line`).not.toBeNull();
+        expect(l?.spoken, kind).toContain("waiting on checks");
+      }
+    });
+
+    it("a refused merge STILL contradicts a turn that claims it merged", () => {
+      // The property roborev 63249 said nothing pinned. `conciergeReceipts.ts` measured 32 of 145
+      // past-tense claims with no matching tool call; this row is the counter-evidence.
+      const l = actionReceiptLine(
+        receipt({
+          kind: "merged",
+          ok: false,
+          prNumber: 753,
+          reason: "Refused: Checks running (2) — merging now is merging blind.",
+        }),
+        resolve,
+      );
+      expect(l?.spoken).toMatch(/^Didn't merge/);
+      expect(l?.spoken).not.toMatch(/^Merged/);
+    });
+
+    it("STILL posts one the founder alone can clear — this is not a mute button", () => {
+      // The regression that would make this change a silent-failure bug of its own.
+      const l = actionReceiptLine(
+        receipt({ kind: "merged", ok: false, reason: "GraphQL: unauthorized" }),
+        resolve,
+      );
+      expect(l?.spoken).toBe("Didn't merge — GraphQL: unauthorized");
+    });
+
+    it("still posts a refusal that stated no reason", () => {
+      // Absence is not evidence of an internal gate, and the existing line is already quiet.
+      expect(
+        actionReceiptLine(receipt({ kind: "closed", ok: false, reason: "  " }), resolve)?.spoken,
+      ).toBe("Couldn't close Left Pair");
+    });
+
+    it("leaves SUCCESS receipts alone, whatever their reason says", () => {
+      // `reason` on an ok receipt is the spawn shortfall, not a refusal — it must never be routed
+      // through the audience rule. This one names an internal gate and still has to be rendered.
+      const l = actionReceiptLine(
+        receipt({ kind: "spawned", ok: true, reason: "Its checks are still running." }),
+        resolve,
+      );
+      expect(l?.spoken).toContain("Its checks are still running.");
     });
   });
 

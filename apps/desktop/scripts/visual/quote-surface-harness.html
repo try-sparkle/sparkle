@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Concierge quote surface — collision + radius probe</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--c-concierge-surface, #212f4e);
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      A REAL-BROWSER PAGE for two founder reports about the concierge's quote chrome: the copy glyph
+      overlapping the blue blockquote rule, and the "Quote in response" chiclet being a full capsule.
+
+      The first is a float rule jsdom does not implement — a float shortens the LINE BOXES beside it,
+      never a following BLOCK's box, so the blockquote's border-left is laid under the floated glyph
+      while its text is pushed clear. See quote-surface-probe.mjs.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./quote-surface-harness.jsx"></script>
+  </body>
+</html>

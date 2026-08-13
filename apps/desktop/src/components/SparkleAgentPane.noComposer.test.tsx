@@ -19,19 +19,30 @@
 // question, and he had no visible way to answer it. His decided fix, same dictation: typed text goes
 // STRAIGHT INTO ITS PTY, the same path a build agent's prompt takes, NOT through the concierge relay.
 //
-// THIS FILE USED TO SAY "no compose surface of any kind", AND THAT IS WHY THE BUG LASTED. The July
-// instruction was about the BESPOKE composer — it ends "so that it works like other build agents
-// do", i.e. stop being special, not stop having input. Reading it as "no input" is what produced an
-// agent nobody could answer, and the assertion recording that reading is exactly the kind of
-// superseded-decision LOCK this repo has already paid for twice (AGENTS.md; the header of
-// Concierge/MountedAgentThread.tsx). So the absence assertions are now scoped to the AFFORDANCES he
-// pointed at rather than to "a textbox exists", and the row that replaced them is asserted here for
-// presence and, in SparkleAgentPane.inputRow.test.tsx, for actual DELIVERY to `__sparkle_self__`'s
-// PTY — because "the box is on screen" is a precondition and proves nothing about where text goes.
+// Founder, 2026-08-12, LATER THE SAME DAY, on being shown the row that answered the message above:
+//   • *"You added a secondary composed window to improve sparkle I don't need that. You can take it
+//     out. I just didn't have the actual terminal last time, and now it's back. Just make sure that
+//     that doesn't go away."*
 //
-// So this file is a set of opposed guards on ONE pane: the bespoke compose surface must be gone, the
-// plain input row must be there, and the consent surface must NOT be gone. Any one of them alone
-// would be satisfied by deleting the whole pane.
+// THAT THIRD MESSAGE IS WHAT THE FIRST TWO MEANT ALL ALONG, and this file has now been wrong in both
+// directions, which is worth recording rather than tidying away:
+//
+//   • It first said "no compose surface of any kind". That over-read the July instruction — which
+//     ends "so that it works like other build agents do", i.e. stop being BESPOKE, not stop having
+//     input — and it is what left an agent nobody could answer.
+//   • It then asserted the replacement row was PRESENT. That under-read the actual complaint: the
+//     missing "row to type into" was the TERMINAL being absent, so the row was a duplicate of a
+//     surface that had merely gone missing, not a new one the pane needed.
+//
+// So the absence assertions stay scoped to the AFFORDANCES he pointed at (the mic, the screenshot
+// button, the bespoke box) AND to a plain textbox — but the thing that keeps that honest is no
+// longer in this file. It is `SparkleAgentPane.terminal.test.tsx`, which asserts the terminal is
+// RENDERED. Read the two together: alone, every absence assertion here is satisfied by a pane that
+// renders nothing at all, which is precisely the state that started the whole detour.
+//
+// So this file is a set of opposed guards on ONE pane: the bespoke compose surface must be gone, no
+// plain textbox may replace it, and the consent surface must NOT be gone — with the terminal's own
+// presence guarded next door.
 //
 // WHY THE COMPOSER IS MOCKED AS A STAND-IN RATHER THAN OMITTED. The absence assertions have to be
 // about "the old composer, however it comes back", not about one import path — otherwise re-adding
@@ -128,11 +139,6 @@ vi.mock("../services/sparkleAgent", async (importOriginal) => {
 });
 
 import { SparkleAgentPane } from "./SparkleAgentPane";
-import {
-  SPARKLE_INPUT_LABEL,
-  SPARKLE_INPUT_PLACEHOLDER,
-  SPARKLE_INPUT_ROW_LABEL,
-} from "./SparkleAgentInputRow";
 import { useDictationStore } from "../stores/dictationStore";
 import { useSettingsStore } from "../stores/settingsStore";
 // NOT from the mock: the action map is a module-level export and it is what Terminal routes through.
@@ -174,15 +180,21 @@ describe("SparkleAgentPane — the OLD bespoke composer is gone", () => {
     expect(screen.queryByPlaceholderText(/i'm listening/i)).toBeNull();
   });
 
-  it("has EXACTLY ONE text box, and it is the new input row's", async () => {
-    // This is the discriminating half: the old composer coming back alongside the row would show up
-    // as a second textbox even if every title/placeholder above were reworded. One box, and it is
-    // the one whose text goes to the PTY (SparkleAgentPane.inputRow.test.tsx pins where it goes).
+  it("has NO text box at all — the terminal is this pane's input surface", async () => {
+    // THIS ASSERTION HAS BEEN BOTH WAYS, AND THE HISTORY IS THE POINT. It read "no textbox" until
+    // 2026-08-12, then "exactly one, the input row's" for a few hours that same day, and now reads
+    // this way again — because the founder's third message explained the second: *"I just didn't
+    // have the actual terminal last time, and now it's back."* The missing row to type into was the
+    // TERMINAL, so the extra box was a duplicate of it, not a fix for it.
+    //
+    // WHICH MEANS THIS LINE IS NOT SELF-SUFFICIENT and must never be read as one. On its own it is
+    // satisfied perfectly by a pane that renders nothing whatsoever — which is the exact state the
+    // whole detour started from. `SparkleAgentPane.terminal.test.tsx` is the opposed guard that
+    // makes it mean something: the terminal must BE there. Neither file is safe to delete without
+    // the other, and this comment is here so the next person to read one of them knows that.
     await readyPane();
 
-    const boxes = screen.getAllByRole("textbox");
-    expect(boxes).toHaveLength(1);
-    expect(boxes[0]!.getAttribute("aria-label")).toBe(SPARKLE_INPUT_LABEL);
+    expect(screen.queryAllByRole("textbox")).toHaveLength(0);
   });
 
   it("does not ask the terminal to yield its mouse mode to an overlaying composer", async () => {
@@ -239,36 +251,6 @@ describe("SparkleAgentPane — the OLD bespoke composer is gone", () => {
     expect(captured.focusCalls.n).toBe(0);
     box.remove();
   });
-});
-
-describe("SparkleAgentPane — but there IS a row to type into (the founder said so, 2026-08-12)", () => {
-  it("renders the input row, with a plain placeholder and a Send button", async () => {
-    await readyPane();
-
-    expect(screen.getByRole("region", { name: SPARKLE_INPUT_ROW_LABEL })).toBeTruthy();
-    const box = screen.getByLabelText(SPARKLE_INPUT_LABEL);
-    expect(box.tagName).toBe("TEXTAREA");
-    expect(box.getAttribute("placeholder")).toBe(SPARKLE_INPUT_PLACEHOLDER);
-    expect(screen.getByRole("button", { name: "Send" })).toBeTruthy();
-  });
-
-  it("puts the row BELOW the terminal rather than over it", async () => {
-    // Not cosmetics: a box floating over the terminal is what `composerOverlay` describes, and the
-    // case above asserts that prop stays false. A sibling row keeps that true and keeps the
-    // terminal's own drag region (SparkleAgentPane.drop.test.tsx) the pane's only drop surface.
-    await readyPane();
-
-    const row = screen.getByRole("region", { name: SPARKLE_INPUT_ROW_LABEL });
-    const terminalBox = document.querySelector("[data-dnd-target]")!;
-    expect(terminalBox.contains(row)).toBe(false);
-    expect(
-      row.compareDocumentPosition(terminalBox) & Node.DOCUMENT_POSITION_PRECEDING,
-    ).toBeTruthy();
-  });
-
-  // WHERE THE TEXT GOES is the assertion that actually matters, and it is NOT here: see
-  // SparkleAgentPane.inputRow.test.tsx, which drives this row and asserts the `pty_write` payload
-  // reaching `__sparkle_self__`. Everything in this describe is a precondition for that.
 });
 
 describe("SparkleAgentPane — the pinned header is gone (the founder said so)", () => {

@@ -14,6 +14,14 @@
 //    the silence this feature exists to end. There is precedent for the opposite failure: a settle
 //    that assumed success once reported a REFUSED merge as "Merged PR #753".
 //
+//    THE LINE IS UNCONDITIONAL; ITS TAIL IS NOT. Every refusal still posts a row — that half is
+//    absolute, and it is what keeps a receipt able to contradict a turn claiming the action
+//    succeeded. What varies is the REASON TEXT: a refusal addressed to the concierge (a review gate,
+//    running checks, no free agent slot) shows a short gist instead of the tool's paragraphs, which
+//    the founder read as a wall of red about work that was fine. Anything unrecognised, anything
+//    with no reason, and anything only he can clear keeps its words verbatim. See
+//    ./refusalAudience, which owns that split and defaults to showing.
+//
 // 2. AN INBOX SEND IS NOT A TERMINAL SEND, AND THE LINE MUST SAY WHICH. A terminal write lands in
 //    the agent's PTY now; an inbox message sits queued and is invisible everywhere until that agent
 //    reaches its next turn boundary (bead sparkle-zm0c8). The founder has already been burned by
@@ -28,6 +36,7 @@
 //    reference, because a pill carrying a wrong id opens the wrong agent and the reader cannot tell.
 
 import { bead, line, plain, ref, type Line } from "./conciergeLine";
+import { refusalGist } from "./refusalAudience";
 import type { ConciergeActionReceipt } from "../../services/conciergeReceipts";
 import type { ConciergeReceiptMark } from "./types";
 
@@ -119,7 +128,30 @@ export function actionReceiptLine(
   // target line: the receipt still names a subject, and running that name through "Spawned X" would
   // report an action that did not happen.
   if (!receipt.ok) {
-    const why = receipt.reason?.trim();
+    // ══ AN INTERNAL GATE IS NOT THREAD MATERIAL (the founder's 2026-08-12 question) ═════════════
+    //
+    // "This didn't merge refuse stuff is about, and why am I seeing it? Do I need to be seeing
+    // that?" He was reading whole paragraphs of roborev state, check rollups and agent-slot
+    // arithmetic — every one of them a gate addressed to the CONCIERGE, which read it and took
+    // another route, usually completing the merge a minute later. A healthy self-correcting system
+    // rendered as a wall of red.
+    //
+    // THIS DOES NOT WEAKEN RULE 1 ABOVE, and the distinction is the whole design. Rule 1 forbids
+    // claiming more than the tool reported — the "Merged PR #753" for a refused merge failure — and
+    // posting NOTHING claims nothing. What it does forbid is silence about a refusal the founder
+    // has to act on, so `refusalAudience` defaults every unrecognised reason to `"founder"` and
+    // checks the human-must-act signals FIRST. Only a positively-recognised internal gate is
+    // withheld; see that module for why the allowlist points this way and not the other.
+    //
+    // THE ROW SURVIVES; ONLY THE PARAGRAPH GOES (roborev 63249, Medium). Returning `null` here was
+    // the first cut and it went too far: the receipt is the ONLY surface that can contradict the
+    // concierge's own prose, and `services/conciergeReceipts.ts` records why that is load-bearing —
+    // 32 of 145 measured past-tense claims had no matching tool call, and a settle once reported a
+    // REFUSED merge as "Merged PR #753". Delete the row and such a claim renders with nothing
+    // beneath it. His complaint was the WALL OF TEXT, not the line, so the gist replaces the tool's
+    // words and the refusal itself still shows.
+    const gist = refusalGist(receipt.reason);
+    const why = gist ?? receipt.reason?.trim();
     const tail = why ? plain(` — ${why}`) : plain("");
     switch (receipt.kind) {
       case "spawned":

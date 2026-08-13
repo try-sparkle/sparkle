@@ -589,6 +589,264 @@ function changesDirectory(tokens) {
   return bin === "cd" || bin === "pushd" || bin === "popd" || bin === "chdir";
 }
 
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+// DESTRUCTIVE-COMMAND GUARD
+//
+// Sparkle writes `permissions.defaultMode: "bypassPermissions"` into every managed agent worktree,
+// because the per-command approval prompt was the fleet's biggest drag and it fired on COSMETIC
+// triggers (a space in the worktree path, a `$(...)` substitution, a `>` redirect, an `&&`) rather
+// than on danger. This guard is the other half of that trade: the brakes that make removing the
+// prompt safe.
+//
+// It is the SECOND of two layers, and it exists because of what the first one cannot see. The deny
+// rules Sparkle writes alongside the bypass (`permissions.deny`) are coarse and prefix-matched, so
+// they never see inside a compound: `cd /tmp && rm -rf ~` is not a `rm` invocation to them. This
+// guard lexes the command and checks every SEGMENT, so laundering a destructive command through a
+// compound does not get it past.
+//
+// THE CONTRACT IS A FILE, NOT THIS SOURCE. `apps/desktop/shared/destructive-commands.json` holds a
+// `mustBlock` corpus (every entry must be refused) and a `mustAllow` corpus (every entry must be
+// permitted); `apps/desktop/src/guard/destructiveCommands.test.ts` drives both against this
+// predicate, and `worktree.rs` asserts its own deny list against the same file. The two
+// hand-written halves therefore fail together instead of drifting.
+//
+// `mustAllow` is the half that matters most. Every entry in it is a VERBATIM refusal an agent hit
+// before this change — a guard that re-blocks one of them has rebuilt the wall we are tearing down,
+// except now with no approval path through it. So the checks below are command-position anchored
+// (never substring matches): `echo 'do not run: rm -rf /'` and `grep -rn 'push origin main' docs/`
+// MENTION a denied command, and mentioning is not running.
+
+/** Shells that turn piped bytes into executed code. */
+const SHELL_BINARIES = new Set(["sh", "bash", "zsh", "dash", "ksh", "ash", "fish", "csh", "tcsh"]);
+/** Fetchers whose output, piped into one of the above, is unreviewed remote code execution. */
+const DOWNLOADER_BINARIES = new Set(["curl", "wget"]);
+/** Binaries that are destructive in every invocation an agent could have a reason to write.
+ *  `diskutil` is deliberately NOT here: `diskutil list`/`info`/`apfs list` are read-only
+ *  diagnostics, and blanket-blocking them would be the same over-blocking this guard exists to
+ *  undo — worse, because a refusal has no approval path. Only its destructive verbs are denied. */
+const ALWAYS_BLOCKED_BINARIES = new Set(["sudo", "shutdown", "reboot", "halt"]);
+/** `diskutil` subcommands that destroy data. `apfs` takes a further verb, hence the second set. */
+const DISKUTIL_DESTRUCTIVE = new Set([
+  "erasedisk", "erasevolume", "partitiondisk", "reformat", "zerodisk", "secureerase", "eraseoptical",
+]);
+const DISKUTIL_APFS_DESTRUCTIVE = new Set(["delete", "deletecontainer", "deletevolume", "erasevolume"]);
+/** Package managers whose `publish` subcommand pushes to a public registry. */
+const PUBLISHERS = new Set(["npm", "pnpm", "yarn"]);
+/** The default branch, in both spellings. AGENTS.md: a PR is the gate; never write to it directly. */
+const DEFAULT_BRANCHES = new Set(["main", "master"]);
+/** System directories no agent has a reason to remove recursively, at ANY depth. */
+const SYSTEM_ROOTS = [
+  "/etc", "/system", "/usr", "/bin", "/sbin", "/var", "/library", "/applications",
+  "/opt", "/dev", "/cores", "/private/etc", "/private/var",
+];
+/** Roots under which the FIRST path component is somebody's home directory. */
+const HOME_CONTAINERS = ["/users", "/home", "/volumes"];
+
+/** The command word of one lexed segment, plus its arguments — skipping leading `VAR=value` env
+ *  assignments and any path prefix, exactly like `gitInvocation`. `bar/foo` invokes `foo`; a word
+ *  that merely CONTAINS the name (`insecurity`, `security-scan`) is a different command entirely. */
+function segmentCommand(tokens) {
+  let i = 0;
+  while (i < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[i])) i++;
+  if (i >= tokens.length) return null;
+  return { bin: tokens[i].split("/").pop(), args: tokens.slice(i + 1) };
+}
+
+/** The first argument that is not an option — a subcommand (`npm run`, `bd close`). Bare `-`/`--`
+ *  and anything starting with `-` is skipped, so `pnpm -r test` resolves to `test`. */
+function subcommandOf(args) {
+  for (const a of args) {
+    if (a === "--") continue;
+    if (a.startsWith("-") && a.length > 1) continue;
+    return a;
+  }
+  return null;
+}
+
+/** Is `p` a path whose recursive removal is catastrophic rather than ordinary cleanup?
+ *
+ *  The DEPTH RULE on home-rooted paths is the whole reason this is not a simple prefix list.
+ *  Sparkle's own agent worktrees live at `$HOME/Library/Application Support/ai.sparkle.desktop/
+ *  worktrees/<project>/<agent>`, so a blanket "under $HOME is catastrophic" would refuse
+ *  `rm -rf <that worktree>/node_modules` — ordinary work, inside the agent's own lane, and exactly
+ *  the kind of false refusal that gets a guard ripped out. So a home-rooted path is catastrophic
+ *  only at the home directory itself or ONE level below it (`~`, `$HOME`, `$HOME/Projects`);
+ *  anything deeper is the agent's own business. `$HOME` is not expanded by the lexer, so the
+ *  literal token forms are matched directly. */
+function isCatastrophicRoot(p) {
+  if (typeof p !== "string" || p.length === 0) return false;
+  // `rm -rf /*` and `rm -rf ~/` differ from their bare forms only in punctuation.
+  let t = p.replace(/\/\*+$/, "").replace(/\/+$/, "");
+  if (t === "" || t === "/") return true; // `/` survives the trailing-slash strip as ""
+  // Home, named three ways: `~`, `$HOME`, `${HOME}`.
+  const homeMatch = /^(~|\$HOME|\$\{HOME\})(\/|$)/.exec(t);
+  if (homeMatch) {
+    const rest = t.slice(homeMatch[0].length).replace(/^\/+/, "");
+    return rest === "" || !rest.includes("/");
+  }
+  const lower = t.toLowerCase();
+  for (const root of SYSTEM_ROOTS) {
+    if (lower === root || lower.startsWith(root + "/")) return true;
+  }
+  // `/Users/alice` IS a home directory, so the same depth rule applies one component further in.
+  for (const container of HOME_CONTAINERS) {
+    if (lower === container) return true;
+    if (lower.startsWith(container + "/")) {
+      const rest = t.slice(container.length + 1);
+      const parts = rest.split("/").filter(Boolean);
+      return parts.length <= 2; // <container>/<user> and <container>/<user>/<one child>
+    }
+  }
+  return false;
+}
+
+/** `rm` with a recursive flag aimed at a catastrophic root. `rm -rf node_modules` is ordinary work
+ *  and `rm -f /tmp/x` is not recursive at all — only the pairing of the two is denied. Flags may be
+ *  bundled in any order (`-rf`, `-fr`) and `--` ends option parsing. */
+function rmCatastrophicTarget(args) {
+  let recursive = false;
+  let endOfOpts = false;
+  const targets = [];
+  for (const a of args) {
+    if (!endOfOpts && a === "--") { endOfOpts = true; continue; }
+    if (!endOfOpts && a.startsWith("--")) {
+      if (a === "--recursive") recursive = true;
+      continue;
+    }
+    if (!endOfOpts && a.startsWith("-") && a.length > 1) {
+      if (/[rR]/.test(a.slice(1))) recursive = true;
+      continue;
+    }
+    targets.push(a);
+  }
+  if (!recursive) return null;
+  return targets.find(isCatastrophicRoot) ?? null;
+}
+
+/** The destination branch of a push refspec: `HEAD:main` → `main`, `+refs/heads/main` → `main`. */
+function pushDestination(refspec) {
+  const dst = refspec.includes(":") ? refspec.slice(refspec.lastIndexOf(":") + 1) : refspec;
+  return dst.replace(/^\+/, "").replace(/^refs\/heads\//, "");
+}
+
+/** `git push` that force-pushes or targets the default branch. `--force-with-lease` is the SAFE
+ *  variant and is explicitly permitted; pushing your own agent branch is the normal path. */
+function gitPushViolation(args) {
+  let force = false;
+  const positional = [];
+  for (const a of args) {
+    if (a === "--force-with-lease" || a.startsWith("--force-with-lease=") || a === "--force-if-includes") continue;
+    if (a === "--force") { force = true; continue; }
+    if (a.startsWith("--")) continue;
+    if (a.startsWith("-") && a.length > 1) {
+      if (a.slice(1).includes("f")) force = true;
+      continue;
+    }
+    positional.push(a);
+  }
+  if (force) return "force-pushing rewrites history other agents and CI are building on";
+  // positional[0] is the remote; every refspec after it names what is being written.
+  for (const ref of positional.slice(1)) {
+    if (DEFAULT_BRANCHES.has(pushDestination(ref))) {
+      return "AGENTS.md: never write to the default branch directly — open a pull request instead";
+    }
+  }
+  return null;
+}
+
+/** THE DESTRUCTIVE-COMMAND PREDICATE. Returns null to allow, or `{ rule, why }` to block.
+ *
+ *  Segment-wise and command-position anchored (see the section header). Pure: it consults no
+ *  filesystem and no repo, so it always decides from the command string alone and can never fire
+ *  because some unrelated probe failed. */
+export function blocksDestructiveCommand(command) {
+  if (typeof command !== "string" || command.length === 0) return null;
+  let sawDownloader = false;
+  for (const tokens of lexCommand(command)) {
+    const seg = segmentCommand(tokens);
+    if (!seg) continue;
+    const { bin, args } = seg;
+
+    if (ALWAYS_BLOCKED_BINARIES.has(bin)) {
+      return { rule: bin, why: `\`${bin}\` is never an agent's call` };
+    }
+    if (bin.startsWith("mkfs")) {
+      return { rule: "mkfs", why: "formatting a filesystem destroys everything on it" };
+    }
+    if (bin === "diskutil") {
+      const sub = (subcommandOf(args) ?? "").toLowerCase();
+      const apfsVerb = sub === "apfs" ? (subcommandOf(args.slice(args.indexOf(subcommandOf(args)) + 1)) ?? "").toLowerCase() : "";
+      if (DISKUTIL_DESTRUCTIVE.has(sub) || (sub === "apfs" && DISKUTIL_APFS_DESTRUCTIVE.has(apfsVerb))) {
+        return { rule: `diskutil ${sub}`, why: "erasing or repartitioning a volume destroys everything on it" };
+      }
+    }
+    if (bin === "rm") {
+      const target = rmCatastrophicTarget(args);
+      if (target) {
+        return { rule: "rm -r", why: `recursive removal of ${target}, which is outside this agent's lane` };
+      }
+    }
+    if (bin === "dd" && args.some((a) => /^of=\/dev\//.test(a))) {
+      return { rule: "dd", why: "a raw write to a device node destroys the disk" };
+    }
+    if (bin === "bd" && subcommandOf(args) === "delete") {
+      return {
+        rule: "bd delete",
+        why: "AGENTS.md: `bd delete` is unrecoverable on a shared store — use `bd close` instead",
+      };
+    }
+    if (PUBLISHERS.has(bin) && subcommandOf(args) === "publish") {
+      return { rule: `${bin} publish`, why: "an outward-facing publish is never an agent's call" };
+    }
+    if (bin === "git") {
+      const git = gitInvocation(tokens);
+      if (git) {
+        if (git.sub === "push") {
+          const why = gitPushViolation(git.args);
+          if (why) return { rule: "git push", why };
+        }
+        if (git.sub === "branch") {
+          const forceDelete = git.args.some((a) => a === "-D" || (a.startsWith("-") && !a.startsWith("--") && a.includes("D")));
+          if (forceDelete && git.args.some((a) => DEFAULT_BRANCHES.has(a))) {
+            return { rule: "git branch -D", why: "force-deleting the default branch" };
+          }
+        }
+        if (git.sub === "clean") {
+          // `-x` is the flag that removes IGNORED files — i.e. .env and credentials. `git clean -fd`
+          // leaves them alone and stays allowed.
+          const removesIgnored = git.args.some(
+            (a) => a.startsWith("-") && !a.startsWith("--") && a.includes("x"),
+          );
+          if (removesIgnored) {
+            return { rule: "git clean -x", why: "`-x` deletes IGNORED files, which is where credentials live" };
+          }
+        }
+      }
+    }
+    // Pipe-to-shell. NOTE, honestly: `lexCommand` splits on `|`, `&&`, `;` and `(` alike and does
+    // not report WHICH separator it saw, so "downloader earlier in the line, shell later" is the
+    // most this can distinguish. That is deliberately conservative — `curl -o x.sh URL && bash x.sh`
+    // is the same hazard as piping, and `curl … | jq .name` is unaffected because jq is not a shell.
+    if (DOWNLOADER_BINARIES.has(bin)) sawDownloader = true;
+    else if (sawDownloader && SHELL_BINARIES.has(bin)) {
+      return { rule: "pipe-to-shell", why: "executing unreviewed remote code; download it, read it, then run it" };
+    }
+  }
+  return null;
+}
+
+/** The stderr text for a destructive-command refusal. Names the rule and what to do instead — a
+ *  refusal that only states the rule sends an agent off to improvise something worse. */
+function destructiveCommandMessage(verdict) {
+  return (
+    `Blocked: refusing to run this command — ${verdict.why}.\n` +
+    `Rule: ${verdict.rule}. Sparkle's managed agents run with the approval prompt turned off, so ` +
+    `this small set of unambiguously destructive commands is refused outright instead. The list is ` +
+    `apps/desktop/shared/destructive-commands.json; if you believe this command belongs on the ` +
+    `allowed side, say so rather than rephrasing it to get past the check.\n`
+  );
+}
+
 /** THE SECRET-STAGING PREDICATE. Given a Bash tool's `command` string and the hook payload's `cwd`,
  *  return null to allow, or `{ kind, files }` to block — `kind` is `"named"` (CASE 1) or `"sweep"`
  *  (CASE 2) and `files` names the offending path(s) so the refusal message can quote them.
@@ -917,6 +1175,26 @@ async function main() {
         "keyring; shelling out to `security` triggers a scary OS confidential-information prompt and " +
         "is never necessary. Do not touch this keychain item.\n",
     );
+    process.exit(2); // exit code 2 → Claude Code blocks the tool call
+  }
+  // Destructive-command guard: the brakes that make `bypassPermissions` safe. Sparkle turns the
+  // per-command approval prompt OFF in every managed worktree, so this is the layer that refuses
+  // the handful of unambiguously destructive commands — and, unlike `permissions.deny`, it sees
+  // inside a compound (`cd /tmp && rm -rf ~`).
+  //
+  // The try/catch mirrors the secret-staging one below and is a blast-radius limit, NOT a policy:
+  // this predicate runs on EVERY Bash command, so a parser bug that exited 2 would block every
+  // shell command for every agent — a total outage. A crash is a BUG, not evidence about the
+  // command; degrade this one guard rather than the whole hook. The predicate is pure (no repo, no
+  // filesystem), so there is no "could not determine" case for it to fail open on.
+  let destructive = null;
+  try {
+    destructive = blocksDestructiveCommand(input.command);
+  } catch {
+    destructive = null;
+  }
+  if (destructive !== null) {
+    process.stderr.write(destructiveCommandMessage(destructive));
     process.exit(2); // exit code 2 → Claude Code blocks the tool call
   }
   // Secret-staging guard: a `git add` / `git commit` that would put credential material into git is

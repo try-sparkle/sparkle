@@ -202,7 +202,27 @@ export interface PrGroup {
   /** This scope's most recent probe FAILED. Says nothing about whether we have an older list —
    *  combine with `known` to get the two cases below, which need different things said about them. */
   failed: boolean;
-  /** Failed, but we have an older list: what is shown may be out of date. */
+  /**
+   * The names of the MEMBERS whose latest probe failed, deduplicated — what the staleness notice
+   * says out loud.
+   *
+   * The notice used to name `scope.projectName`, i.e. the PRIMARY, whichever member had actually
+   * failed. On a folded section that is a sentence about the wrong checkout: it read "Couldn't reach
+   * GitHub for SPARKLE" while SPARKLE was the tab that answered fine and `sparkle-desktop` was the
+   * one that did not. The reader needs the name they can act on.
+   */
+  failedMembers: string[];
+  /**
+   * At least one member re-read this repository successfully, so `prs` is a CURRENT answer rather
+   * than a cache.
+   *
+   * The flag the row set turns on. `false` with `known` is the honest-degradation case: rows stay on
+   * screen, stamped `unverified`, counting toward nothing green — see {@link mergeRepoRows} and
+   * `openPrs.prMergeReadiness`.
+   */
+  verified: boolean;
+  /** We have a list but could NOT re-read it — no member's latest probe succeeded, so what is shown
+   *  may be out of date. Every row in `prs` carries `unverified` in this state. */
   stale: boolean;
   /** Failed with NOTHING behind it: this project contributes no rows and no count, and the reader
    *  has to be told so. Collapsing this into "zero" is the confident-zero-from-a-machine-that-
@@ -341,17 +361,44 @@ export function probeStrength(probes: JudgedPrRow["probes"]): number {
  * Everything else describes the pull request itself and is identical by construction; the first
  * member's row supplies it, which keeps the section's rows in the primary's order.
  */
-function mergeRepoRows(perMember: readonly (JudgedPrRow[] | null)[]): JudgedPrRow[] {
+function mergeRepoRows(
+  perMember: readonly (JudgedPrRow[] | null)[],
+  /**
+   * Which members may INTRODUCE a row, positionally. Absent = all of them, which is the
+   * every-member-failed case where the cache is all we have.
+   *
+   * THE FOUNDER'S 2026-08-12 BUG (see the header note on this function). A member whose latest probe
+   * FAILED still holds its last good list, and this used to be a flat union — so that cache could
+   * put a merged pull request back into a section another member had just read correctly, on every
+   * poll, indefinitely. Both members run the same `gh pr list` against the same repository, so a
+   * successful read is a COMPLETE answer for it: a PR present only in a failed member's cache is by
+   * construction one the fresh answer says is closed. Restricting who may introduce a row is
+   * therefore not a heuristic — it drops exactly the rows the fresh read has already contradicted.
+   *
+   * Decorations are unaffected and still merge from EVERY member, which is the half that must not
+   * regress: `agentId` is resolved per project entry, so only the failed member's own read can name
+   * an agent living in it.
+   */
+  contributesRows?: readonly boolean[],
+): JudgedPrRow[] {
   const order: number[] = [];
   const seen = new Map<number, JudgedPrRow>();
+  // PASS 1 — WHICH pull requests this repository has open. Contributing members only.
+  perMember.forEach((rows, i) => {
+    if (contributesRows && !contributesRows[i]) return;
+    for (const row of rows ?? []) {
+      if (seen.has(row.number)) continue;
+      order.push(row.number);
+      seen.set(row.number, row);
+    }
+  });
+  // PASS 2 — the per-project DECORATIONS, from every member, onto the rows pass 1 admitted. A row a
+  // non-contributing member holds and pass 1 did not admit is dropped here rather than added, which
+  // is the whole point: it decorates, it does not introduce.
   for (const rows of perMember) {
     for (const row of rows ?? []) {
       const prev = seen.get(row.number);
-      if (!prev) {
-        order.push(row.number);
-        seen.set(row.number, row);
-        continue;
-      }
+      if (!prev || prev === row) continue;
       seen.set(row.number, {
         ...prev,
         ...(ownerStrength(row) > ownerStrength(prev)
@@ -371,6 +418,12 @@ function mergeRepoRows(perMember: readonly (JudgedPrRow[] | null)[]): JudgedPrRo
     }
   }
   return order.map((n) => seen.get(n)!);
+}
+
+/** Every row marked "we could not re-read this" — see {@link PrJudgeable.unverified} for what the
+ *  stamp costs a row, and {@link PrGroup.verified} for when it is applied. */
+function stampUnverified(rows: readonly JudgedPrRow[]): JudgedPrRow[] {
+  return rows.map((p) => ({ ...p, unverified: true }));
 }
 
 export function buildPrGroups(
@@ -403,7 +456,19 @@ export function buildPrGroups(
     // run as before, and their answers are merged.
     const perMember = members.map((m) => byKey.get(keyOfScope(m)) ?? null);
     const known = perMember.some((r) => r !== null);
-    const all = mergeRepoRows(perMember);
+    // WHICH MEMBERS ANSWERED ON THEIR LATEST PROBE — the distinction the row set now turns on.
+    // `failedKeys` is cleared the moment a scope's probe succeeds, so "has rows AND is not in
+    // failedKeys" is exactly "this list is what GitHub said the last time we asked, and we asked
+    // successfully". Anything else is a cache.
+    const fresh = members.map(
+      (m, i) => perMember[i] !== null && !failedKeys.has(keyOfScope(m)),
+    );
+    /** At least one member re-read this repository successfully, so `prs` is a current answer. */
+    const verified = fresh.some(Boolean);
+    // With NO fresh member there is nothing to prefer, so every cached list contributes — dropping
+    // them would make the chip vanish on a rate-limited `gh`, which is the failure this module
+    // already refuses. The rows are stamped `unverified` below instead.
+    const all = mergeRepoRows(perMember, verified ? fresh : undefined);
     // DISMISSAL IS A STATEMENT ABOUT A PULL REQUEST, so it is a UNION across the members. One repo
     // has one #1433; waving it away in one tab and having it come straight back under the other
     // would make the dismissal look broken, and the section it would come back in no longer exists.
@@ -411,15 +476,24 @@ export function buildPrGroups(
     for (const m of members) for (const n of dismissedByKey.get(keyOfScope(m)) ?? []) hidden.add(n);
     // ONE PASS, TWO BUCKETS. `prs` is what the list shows and what every count is taken from;
     // `dismissed` is what the Dismissed section offers back.
-    const prs = hidden.size > 0 ? all.filter((p) => !hidden.has(p.number)) : all;
+    const listed = hidden.size > 0 ? all.filter((p) => !hidden.has(p.number)) : all;
     const dismissed = hidden.size > 0 ? all.filter((p) => hidden.has(p.number)) : [];
+    // STAMPED ON THE ROW, NOT CHECKED AT EACH RENDER SITE. `prMergeReadiness` owns what an
+    // unverifiable row may claim — no green dot, no one-click Merge, no place in any ready count —
+    // and stamping here is what routes the row's dot, its word, its button, `readyCount`, "Merge N
+    // ready" and the header chiclet through that one decision. A caller re-testing `group.verified`
+    // beside them would be the second copy this file spends its comments refusing.
+    let prs = listed;
+    if (!verified) prs = stampUnverified(listed);
     // A scope with no `rootPath` is listed (the tab exists) but never probed, so it is neither
     // failed nor unreadable — there is nothing we tried and could not do.
     //
-    // ANY member failing marks the section stale, because a section showing merged rows is only as
-    // trustworthy as its worst read. But `unreadable` still needs `!known`: if one tab answered, the
-    // section HAS a list, and calling it unreadable would hide rows we are holding.
-    const failed = members.some((m) => failedKeys.has(keyOfScope(m)));
+    const failedMembers = [
+      ...new Set(
+        members.filter((m) => failedKeys.has(keyOfScope(m))).map((m) => m.projectName),
+      ),
+    ];
+    const failed = failedMembers.length > 0;
     return {
       scope,
       members,
@@ -429,7 +503,16 @@ export function buildPrGroups(
       dismissed,
       known,
       failed,
-      stale: failed && known,
+      failedMembers,
+      verified,
+      // STALE IS NOW "NO MEMBER ANSWERED", NOT "SOME MEMBER FAILED" — a tightening, and the second
+      // half of the founder's fix. Under the old test a two-tab section flew the "this may be out of
+      // date" notice whenever EITHER tab's probe failed, including the common case where the other
+      // tab had just re-read the repository completely. That notice was false there, and a notice
+      // that is usually false is one the reader learns to skip on the occasions it is true. With a
+      // fresh member the list IS current; what the failed member costs us is its decorations, which
+      // is not something to warn about.
+      stale: known && !verified,
       unreadable: failed && !known,
       // THROUGH THE EXPORTED HELPER, not a re-implemented filter. The two would agree by
       // construction today — the readiness invariant is `canMerge` ⟺ `tone === "ready"` — but
@@ -739,7 +822,10 @@ function readyClause(totals: FleetTotals): string {
  * not trust; "1 project could not be read" leaves them re-checking all of them.
  */
 export function staleProjectNames(groups: readonly PrGroup[]): string[] {
-  return groups.filter((g) => g.stale).map((g) => g.scope.projectName);
+  // THE MEMBERS THAT FAILED, not the section's primary — see {@link PrGroup.failedMembers}. A
+  // section only reaches `stale` when no member answered, so every probed member is named and the
+  // reader is told about both checkouts rather than about the wrong one.
+  return [...new Set(groups.filter((g) => g.stale).flatMap((g) => g.failedMembers))];
 }
 
 /**

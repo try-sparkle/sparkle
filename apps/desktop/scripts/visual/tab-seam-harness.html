@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Project tabs — folder-tab seam probe</title>
+    <style>
+      /* A page colour that is NEITHER the bar nor the content plane, so a scan that runs off the
+         end of what it meant to measure is obvious rather than plausible. */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #ff00ff;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      A REAL-BROWSER PAGE for the question a unit test cannot answer: is there a 1px rule painted
+      UNDER the active project tab (bead sparkle-civ4i — *"the active tab must open into the content
+      area like a folder tab"*)?
+
+      jsdom never lays out and never loads the stylesheet, so a green suite is compatible with a
+      visible line. And reasoning from the source cannot see it either: the rule under the active tab
+      is painted by a DIFFERENT element (the bar's own bottom edge) than the one whose style you
+      would read, and whether the tab covers it depends on the strip's overflow clip and on how the
+      device scale rounds a 1px band. See tab-seam-probe.mjs.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./tab-seam-harness.jsx"></script>
+  </body>
+</html>

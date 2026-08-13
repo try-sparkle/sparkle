@@ -436,6 +436,36 @@ export const PROBE_REASON_SHORT =
  * a reviewer's question about that diff. So a refused PR is reported and SKIPPED, and its override
  * is offered on its own row afterwards.
  */
+/**
+ * What GitHub says when a merge for this pull request is ALREADY UNDERWAY, in words.
+ *
+ * The founder saw the raw string — `GraphQL: Merge already in progress` — in the panel's error slot,
+ * rendered in the same red as "Pull request is not mergeable". It reads like a failure and it is not
+ * one: GitHub is telling us the merge it was asked for is happening. There is nothing for the reader
+ * to fix, and the row leaves the list on its own once the merge lands.
+ *
+ * It reaches a reader most often through the ONE path that makes it likeliest — clicking Merge on a
+ * row that is already gone. That is the same cached-row state {@link PrJudgeable.unverified} now
+ * covers, so this is the second line of defence rather than the first: the button is withheld when
+ * we know we cannot vouch for the row, and this is what the message says when it is offered anyway
+ * (an auto-merge, a batch, a row that merged in the window between the poll and the click).
+ */
+export const MERGE_ALREADY_IN_PROGRESS =
+  "GitHub is already merging this pull request — it will drop out of this list once it lands. Nothing to do.";
+
+/**
+ * `gh`'s error text, rewritten for a human where we recognise it — otherwise passed through
+ * VERBATIM.
+ *
+ * Pass-through is the default on purpose. A merge refusal is the one message on this surface the
+ * reader has to act on, and a translation layer that swallowed an unrecognised one would be strictly
+ * worse than a raw string: the knightwatch refusal in particular arrives as several structured lines
+ * that {@link MergeErrorText} renders into clickable links, and rewording it would destroy that.
+ */
+export function humanizeMergeError(msg: string): string {
+  return /merge already in progress/i.test(msg) ? MERGE_ALREADY_IN_PROGRESS : msg;
+}
+
 export function probeRefusedInBatch(numbers: readonly number[]): string {
   const list = numbers.map((n) => `#${n}`).join(", ");
   return `Skipped ${numbers.length} PRs with unanswered knightwatch probes (${list}). Each probe is a question about that PR, so one reason cannot cover them — override them one row at a time.`;
@@ -885,6 +915,29 @@ export function OpenPrMenu({
           }
           lastGoodRef.current.set(key, rows);
           setByKey((prev) => new Map(prev).set(key, rows));
+          // ── AND THE STALENESS FLAG CLEARS IN THE SAME BREATH ────────────────────────────────
+          //
+          // IT MUST BE HERE, BESIDE THE ROWS, NOT AFTER THE AWAITS BELOW (roborev 63235, Medium).
+          // The success is fully known on the line above and nothing further down can retract it —
+          // but `fetchDismissals` is a real IPC round trip, and while it is in flight React renders
+          // with `byKey` holding the FRESH list and `failedKeys` still holding this key. That pair
+          // is exactly what `buildPrGroups` reads as "no member could re-read this repo": every row
+          // in a single-tab project gets stamped `unverified`, every Merge button flips disabled,
+          // `readyCount` drops to 0, the chiclet goes grey and the "Couldn't reach GitHub" notice
+          // appears — for a probe that had JUST SUCCEEDED, on every recovery poll.
+          //
+          // The window predates this change, but its cost did not. It used to show one stale notice
+          // for a beat; with rows now carrying `unverified` it withdraws the merge affordance too,
+          // which turns a cosmetic flicker into a control that vanishes under the pointer.
+          //
+          // A merge error is a DIFFERENT fact and is deliberately not cleared here: a probe
+          // succeeding does not answer why the user's merge failed, and they still need to read it.
+          setFailedKeys((prev) => {
+            if (!prev.has(key)) return prev;
+            const next = new Set(prev);
+            next.delete(key);
+            return next;
+          });
           // ── PROBE READS: FIRED, NEVER AWAITED ──────────────────────────────────────────────
           //
           // Deliberately NOT awaited here, and not inside the `Promise.all` above. Each read is its
@@ -962,14 +1015,9 @@ export function OpenPrMenu({
             );
             void restorePr(scope.projectId, d.number);
           }
-          // Only this scope's staleness flag. A merge error is a different fact and is not answered
-          // by a probe succeeding — the user still needs to read why their merge failed.
-          setFailedKeys((prev) => {
-            if (!prev.has(key)) return prev;
-            const next = new Set(prev);
-            next.delete(key);
-            return next;
-          });
+          // NOTHING CLEARS THE STALENESS FLAG HERE ANY MORE — it is cleared beside `setByKey`, the
+          // moment the probe's success is known. See the block up there for why the distance
+          // between the two writes was itself the bug.
         }),
       );
     },
@@ -1371,7 +1419,11 @@ export function OpenPrMenu({
           refusedNumbers.push(n);
         }
         // NAMED BY PROJECT, because #12 alone no longer identifies a pull request in this list.
-        if (!firstError) firstError = `${scope.projectName} PR #${n}: ${msg}`;
+        // Through `humanizeMergeError`, which rewrites the one answer that is not a failure at all
+        // and passes every other one through verbatim — including the multi-line probe refusal,
+        // whose structure `MergeErrorText` depends on.
+        if (!firstError)
+          firstError = `${scope.projectName} PR #${n}: ${humanizeMergeError(msg)}`;
       }
     }
     // THE SPINNERS CLEAR UNCONDITIONALLY. They are this scope's own keys, so releasing them is

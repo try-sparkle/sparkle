@@ -394,6 +394,21 @@ pub(crate) fn ensure_account_allowlist_at(config_dir: &Path) -> Result<(), Strin
         }
     }
     let merged = crate::worktree::merge_allowed_tools_settings(existing.as_deref());
+    // …and the bypass-consent record. Claude Code gates BOTH `--dangerously-skip-permissions` (how
+    // Sparkle launches every unattended worker) and `permissions.defaultMode: "bypassPermissions"`
+    // behind a one-time interactive disclaimer, and an added account's config dir has never seen a
+    // human press "Yes, I accept". So an agent spawned into a fresh account dir does not prompt —
+    // it HANGS on a dialog nobody is watching, having produced nothing. Two workers were wedged
+    // exactly this way, alive and idle for fourteen minutes with zero tool calls, while this was
+    // being written; the human hit the same dialog by hand the same afternoon.
+    //
+    // ONLY the acceptance record is seeded here, never `defaultMode` and never the deny list: an
+    // account-level bypass would apply to every `claude` on that identity, including runs with no
+    // worktree and no guard hook. That is the distinction the paragraph above this function draws
+    // between Sparkle's own rules (which belong here) and the user's personal grants (which do not)
+    // — a consent record is neither a grant nor a personal preference, it is the acknowledgement
+    // that makes the flags Sparkle already passes on the command line usable unattended.
+    let merged = crate::worktree::merge_bypass_consent_settings(Some(&merged));
     if existing.as_deref() == Some(merged.as_str()) {
         return Ok(()); // already current — do not rewrite the file for nothing
     }
@@ -4660,6 +4675,41 @@ mod tests {
             "{ not json",
             "an unparseable settings.json must be left byte-for-byte intact"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A FRESHLY created account dir must already carry the bypass-consent record, because the very
+    /// first thing that happens to it is an unattended `claude --dangerously-skip-permissions`
+    /// spawn — and that flag is gated by the same one-time disclaimer as `bypassPermissions`. With
+    /// no human at the terminal a missing record is not an extra prompt, it is a hang: two spawned
+    /// workers sat alive and idle for fourteen minutes with zero tool calls on exactly this.
+    ///
+    /// The negative half is the point of the test, not decoration: the account layer seeds the
+    /// ACKNOWLEDGEMENT and must never seed the bypass itself, which belongs only to a managed
+    /// worktree (where the PreToolUse guard and the deny list are also installed).
+    #[test]
+    fn a_fresh_account_dir_carries_the_consent_record_but_not_the_bypass() {
+        let tmp = unique_dir("consent-seed");
+        // No settings.json at all — the state `accounts_add` leaves behind.
+        ensure_account_allowlist_at(&tmp).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.join("settings.json")).unwrap()).unwrap();
+        assert_eq!(
+            v["skipDangerousModePermissionPrompt"], true,
+            "a fresh account dir must not make the next agent stop on the bypass disclaimer"
+        );
+        assert!(
+            v["permissions"]["defaultMode"].is_null(),
+            "the bypass itself is worktree-scoped and must NOT be written at the account level"
+        );
+        assert!(
+            v["permissions"]["deny"].is_null(),
+            "the deny list rides with the bypass, in the worktree — not here"
+        );
+        // Idempotent: a second heal of the now-current file rewrites nothing.
+        let before = std::fs::read_to_string(tmp.join("settings.json")).unwrap();
+        ensure_account_allowlist_at(&tmp).unwrap();
+        assert_eq!(before, std::fs::read_to_string(tmp.join("settings.json")).unwrap());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

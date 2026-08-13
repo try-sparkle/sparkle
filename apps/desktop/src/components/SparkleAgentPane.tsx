@@ -20,7 +20,6 @@ import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneRea
 import { registerPaneRestart, unregisterPaneRestart } from "../services/paneControl";
 import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
-import { SparkleAgentInputRow } from "./SparkleAgentInputRow";
 import { Terminal } from "./Terminal";
 import { Onboarding } from "./Onboarding";
 import { TerminalDropOverlay } from "./TerminalDropOverlay";
@@ -57,8 +56,8 @@ interface SpawnCmd {
  * shared clone — so the id keys this pane's worktree, PTY, and status independently of other
  * windows'. Closing the pane keeps the worktree, so reopening in the same window resumes.
  *
- * THE OLD BESPOKE COMPOSER IS GONE AND STAYS GONE; A PLAIN INPUT ROW REPLACES IT. Two founder
- * instructions, a fortnight apart, and the second one supersedes only half of the first:
+ * THIS PANE HAS NO COMPOSE SURFACE OF ITS OWN. THE TERMINAL IS THE INPUT SURFACE. Three founder
+ * instructions, and reading any one of them alone gets this pane wrong:
  *
  *  - 2026-07-29: "the improved Sparkle agent has some old composer window functionality that should
  *    be stripped out so that it works like other build agents do" — the mic, the "I'm listening"
@@ -66,24 +65,29 @@ interface SpawnCmd {
  *    drops. Plus, on the same screenshots: "I don't want you to strip out the top functionality
  *    here… Just this bottom composer functionality" — the CONSENT ROW stays.
  *  - 2026-08-12: "There's a problem where the improved sparkle agent doesn't have a row to type
- *    into." Said while this agent sat BLOCKED ON HIM, asking a direct question it had no visible way
- *    to receive an answer to. Routing everything through the mounted concierge was the reading of
- *    the July instruction that produced that dead end — "works like other build agents do" meant
- *    stop being bespoke, not stop having input.
+ *    into." Said while this agent sat BLOCKED ON HIM with no visible way to receive an answer. A
+ *    `SparkleAgentInputRow` — a textarea and a Send button writing straight into this agent's PTY —
+ *    was added at the bottom of this pane in response.
+ *  - 2026-08-12, later the same day, on seeing it: *"You added a secondary composed window to
+ *    improve sparkle I don't need that. You can take it out. I just didn't have the actual terminal
+ *    last time, and now it's back. Just make sure that that doesn't go away."*
  *
- * So `SparkleAgentInputRow` sits at the bottom: a textarea and a Send button, nothing else, writing
- * STRAIGHT INTO THIS AGENT'S PTY via `submitPrompt` — the founder's explicit call, not through the
- * concierge relay. `__sparkle_self__` is app-owned and in no project store, so a relay that resolves
- * it the ordinary way gets null; the PTY is addressed by id and needs no lookup.
+ * THE THIRD MESSAGE IS THE ONE THAT EXPLAINS THE OTHER TWO. The missing "row to type into" was never
+ * a request for a second compose box — it was the TERMINAL being absent. A terminal is a row you
+ * type into, and once it came back the extra box was a duplicate of it. So the row is gone again,
+ * and what replaced it is not another surface but a GUARD: `SparkleAgentPane.terminal.test.tsx`
+ * fails if this pane stops rendering its `Terminal`. That guard is the founder's actual ask — *"just
+ * make sure that that doesn't go away"* — and it is the durable half of this change, because the
+ * defect that produced the whole detour was a missing terminal that nothing was watching.
  *
- * What did NOT come back with it, all deliberate:
- *  - No `composerOverlay` claim on the terminal. The row is a SIBLING below the terminal, not a box
- *    floating over it, so terminalSelectionReclaim has nothing to re-interpret (roborev 46485-M).
+ * What did NOT come back with the input row, and is still absent, all deliberate:
+ *  - No `composerOverlay` claim on the terminal. There is no box floating over it, so
+ *    terminalSelectionReclaim has nothing to re-interpret (roborev 46485-M).
  *  - No `onRequestFocus` / `onUserRequestFocus`. The ⌘J chord is still swallowed here, and this pane
  *    still does not name itself the dictation surface — revealing it must not move the mic off the
- *    concierge box. The row is typed into, not dictated into.
- *  - The terminal still takes the caret on reveal (guarded by isTypingInProgress, so it never steals
- *    a half-typed message — including one half-typed into the row below it).
+ *    concierge box.
+ *  - The terminal takes the caret on reveal (guarded by isTypingInProgress, so it never steals a
+ *    half-typed message elsewhere).
  *  - Still no pinned prompt header. It used to echo the last composer send; with the concierge
  *    owning the send it degenerated into a static label, and the founder had that label removed
  *    outright (2026-07-30) rather than reworded. The consent row is the pane's top chrome.
@@ -424,12 +428,10 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
             />
           )}
         </div>
-        {/* THE ROW THE FOUNDER ASKED FOR (2026-08-12) — see the pane doc above. A SIBLING of the
-            terminal stage, not an overlay on it: that is what keeps `composerOverlay` false and
-            keeps the terminal's own drop region (the box above) the pane's only drop surface. It is
-            gated on `ptyReady` rather than rendered conditionally, so the row is visible — and its
-            state legible — while the workspace is still coming up. */}
-        <SparkleAgentInputRow agentId={agentId} ready={ptyReady} />
+        {/* NO SECOND COMPOSE SURFACE. The input row that stood here for a few hours on 2026-08-12
+            is gone — see the pane doc above for the founder's own reason. The TERMINAL is this
+            pane's input surface, and `SparkleAgentPane.terminal.test.tsx` is the guard that it
+            stays rendered. */}
         </>
       )}
     </div>

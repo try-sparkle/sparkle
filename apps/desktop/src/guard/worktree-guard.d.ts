@@ -5,6 +5,15 @@ declare module "*/worktree-guard.mjs" {
   // Keychain guard predicate (sparkle-0ezz): true iff a Bash command shells out to the macOS
   // `security` CLI against the ai.sparkle.desktop generic-password keychain item.
   export function blocksKeychainCommand(command: unknown): boolean;
+  // Destructive-command guard predicate: non-null iff a Bash command is one of the small set of
+  // unambiguously destructive commands Sparkle refuses outright (managed agents run with the
+  // approval prompt off, so there is no prompt left to catch them). Segment-wise and
+  // command-position anchored, so it sees inside a compound (`cd /tmp && rm -rf ~`) while leaving
+  // a MENTION of a denied command (`grep -rn 'push origin main' docs/`) alone. Pure — consults no
+  // repo and no filesystem. The contract is apps/desktop/shared/destructive-commands.json.
+  export function blocksDestructiveCommand(
+    command: unknown,
+  ): { rule: string; why: string } | null;
   // Secret-staging guard predicate: non-null iff a Bash command would put credential material into
   // git. `kind: "named"` = the command line explicitly names a secret-shaped path (pure string
   // matching, fails CLOSED); `kind: "sweep"` = the command stages whatever is lying around and the

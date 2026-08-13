@@ -106,6 +106,38 @@ export function isBenignTauriRejection(message: string): boolean {
   return BENIGN_REJECTION_SIGNATURES.some((needle) => message.includes(needle));
 }
 
+// xterm's renderer throws a transient `undefined is not an object` from inside its OWN
+// requestAnimationFrame render pass (and its teardown) whenever the buffer, the renderer, or a
+// buffer line is momentarily undefined during a resize / reflow / scrollback-trim / dispose — bead
+// sparkle-uhne8. One day's log showed the SAME family under four vendor symbols, all in the
+// vendor-xterm render path:
+//   · `a.loadCell`  (281x) — the WebGL renderer's _updateModel reads `buffer.lines.get(row+ydisp)`
+//     with no null check and calls loadCell on the (undefined) line;
+//   · `d.getWidth` / `d.setCellFromCodepoint` — sibling cell/model accesses in that same glyph pass;
+//   · `this._renderer.value.dimensions` — the RenderService `dimensions` getter, read by internal
+//     mouse/selection/IntersectionObserver callbacks AFTER the renderer is disposed.
+// The render-pass subset is prevented at the source by the RenderService._renderRows wrapper in
+// components/terminalRenderGuard.ts (installed per-terminal). This is the escape-boundary NET for the
+// rest: these throws originate in vendor rAF/event callbacks we never hold and so cannot try/catch at
+// the source, they reach `window.onerror`, and they are transient and self-healing (the next frame
+// repaints, or the pane is being torn down anyway). So we log them at debug rather than flooding the
+// ERROR stream — exactly the treatment isBenignTauriRejection gives the analogous Tauri teardown race.
+//
+// Deliberately narrow: the message (which carries the error's stack) must reference the vendored
+// xterm bundle AND be an undefined/null access, so a genuine app TypeError — or a real, actionable
+// xterm error that is NOT an undefined access — still logs at ERROR. Both WebKit ("undefined is not
+// an object") and Chromium ("Cannot read properties of undefined") phrasings are covered.
+const XTERM_BUNDLE_SIGNATURE = /vendor-xterm|@xterm\//;
+const UNDEFINED_ACCESS_SIGNATURE =
+  /undefined is not an object|null is not an object|Cannot read properties of (?:undefined|null)/;
+
+/** Whether an uncaught window error is a transient xterm render/teardown undefined-access (→ debug,
+ *  not error). Covers the whole `a.loadCell` / `dimensions` / `getWidth` / `setCellFromCodepoint`
+ *  family without keying on any single symbol. */
+export function isTransientXtermRenderError(message: string): boolean {
+  return XTERM_BUNDLE_SIGNATURE.test(message) && UNDEFINED_ACCESS_SIGNATURE.test(message);
+}
+
 function forward(level: Level, scope: string, message: string) {
   if (forwarding) return;
   forwarding = true;
@@ -180,7 +212,12 @@ export function initLogger() {
 
   // Uncaught errors and unhandled promise rejections — the bugs we most want in the log.
   window.addEventListener("error", (e) => {
-    forward("error", "window", e.error ? render([e.error]) : `${e.message} (${e.filename}:${e.lineno})`);
+    // Render the error (its stack included) FIRST, then classify: a transient xterm render/teardown
+    // undefined-access is thrown from a vendor rAF/event callback we can't .catch at the source, is
+    // benign and self-healing, and used to flood the ERROR stream 281x/day (bead sparkle-uhne8).
+    // Downgrade that family to debug so the ERROR stream stays meaningful; everything else stays ERROR.
+    const message = e.error ? render([e.error]) : `${e.message} (${e.filename}:${e.lineno})`;
+    forward(isTransientXtermRenderError(message) ? "debug" : "error", "window", message);
   });
   window.addEventListener("unhandledrejection", (e) => {
     const message = `Unhandled rejection: ${render([e.reason])}`;

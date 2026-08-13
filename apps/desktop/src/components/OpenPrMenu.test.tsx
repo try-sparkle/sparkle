@@ -32,6 +32,8 @@ import {
   prBadgeTitle,
   probeFailedFor,
   probeUnreadableFor,
+  humanizeMergeError,
+  MERGE_ALREADY_IN_PROGRESS,
   PROBE_FAILED,
   PANEL_ANCHOR_GAP,
   PANEL_EDGE_MARGIN,
@@ -1534,9 +1536,15 @@ describe("OpenPrMenu — preserving a stale list must not preserve the WRONG lis
   // staleness notice DETERMINISTICALLY ate the only text saying why the merge failed.
   it("keeps a merge error readable alongside the staleness notice", async () => {
     let listed = 0;
+    // THE FIRST TWO PROBES SUCCEED, and that is load-bearing rather than incidental: opening the
+    // panel re-probes, so failing from the second call on would leave the row `unverified` and its
+    // Merge correctly disabled (see `openPrs.prMergeReadiness`) — and this test would never reach
+    // the merge it is about. The failure has to land on the refetch that FOLLOWS the merge, which
+    // is the sequence the test describes anyway: `gh` is down, so the merge fails and so does the
+    // probe behind it.
     h.invoke.mockImplementation((cmd: string) => {
       if (cmd === "project_open_prs")
-        return Promise.resolve(listed++ === 0 ? [PASS] : null);
+        return Promise.resolve(listed++ < 2 ? [PASS] : null);
       if (cmd === "merge_pr")
         return Promise.reject(new Error("Pull request is not mergeable"));
       return Promise.resolve(null);
@@ -4460,4 +4468,189 @@ describe("OpenPrMenu — folded probe detail follows the rank, not the list leng
       expect(detail.querySelectorAll('[data-testid^="probe-item-"]').length).toBe(1);
     });
   }
+});
+
+// ── "GraphQL: Merge already in progress" IS NOT A FAILURE ──────────────────────────────────────
+//
+// The founder saw that raw string in the panel's error slot, in the same red as a real refusal. It
+// says the merge is UNDERWAY — there is nothing to fix and nothing to retry.
+describe("humanizeMergeError", () => {
+  it("rewrites the already-merging answer into something a reader can act on", () => {
+    expect(humanizeMergeError("GraphQL: Merge already in progress")).toBe(
+      MERGE_ALREADY_IN_PROGRESS,
+    );
+    // Whatever `gh` wraps it in — the text arrives with varying prefixes.
+    expect(
+      humanizeMergeError("failed to run gh: GraphQL: Merge already in progress (mergePullRequest)"),
+    ).toBe(MERGE_ALREADY_IN_PROGRESS);
+  });
+
+  it("says the row leaves on its own, rather than telling the reader to do something", () => {
+    expect(MERGE_ALREADY_IN_PROGRESS).toMatch(/already merging/i);
+    expect(MERGE_ALREADY_IN_PROGRESS).not.toMatch(/failed|error/i);
+  });
+
+  it("passes every OTHER message through verbatim — this is not a translation layer", () => {
+    // The default has to be pass-through. A merge refusal is the one message here the reader must
+    // act on, so an unrecognised one may never be softened or dropped.
+    for (const msg of [
+      "Pull request is not mergeable",
+      "GraphQL: <user> does not have the correct permissions to execute MergePullRequest",
+      "Head branch was modified. Review and try the merge again.",
+    ])
+      expect(humanizeMergeError(msg)).toBe(msg);
+  });
+
+  it("leaves the MULTI-LINE knightwatch refusal alone, structure intact", () => {
+    // `MergeErrorText` renders this line by line and turns its URLs into buttons. Rewording it
+    // would destroy the one message whose structure is the point.
+    const refusal =
+      "refusing to merge: 2 unanswered [blocking] knightwatch probes\n" +
+      "  kw-1 (security): https://github.com/o/r/pull/7#issuecomment-1\n" +
+      "  kw-2 (perf): https://github.com/o/r/pull/7#issuecomment-2";
+    expect(humanizeMergeError(refusal)).toBe(refusal);
+    expect(humanizeMergeError(refusal).split("\n")).toHaveLength(3);
+  });
+});
+
+// ── THE FOUNDER'S 2026-08-12 REPORT, END TO END ───────────────────────────────────────────────
+//
+// A merged pull request stayed in the panel for hours, reading like an ordinary open one with a
+// live Merge button, and counted in the chiclet's "ready to merge". The rows come from a cache that
+// a failed probe deliberately preserves; nothing on the row said we had been unable to re-read it.
+//
+// The unit rules are asserted in `services/openPrs.test.ts` and `services/fleetPrs.test.ts`. What
+// this proves is that they reach the RENDERED row — the dot's word, the disabled button and the
+// header count — through the real component and its real probe path, rather than being facts that
+// only hold in a pure function nobody's button consults.
+describe("OpenPrMenu — a row we could not re-read does not offer a merge", () => {
+  /** Probe once with `[PASS]`, then fail every probe after — the panel is left holding a cache. */
+  const succeedThenFail = () => {
+    let listed = 0;
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs")
+        return Promise.resolve(listed++ === 0 ? [PASS] : null);
+      return Promise.resolve(null);
+    });
+  };
+
+  it("keeps the row on screen — vanishing is the worse failure", async () => {
+    succeedThenFail();
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    expect(await screen.findByTestId(`merge-${PASS.number}`)).toBeTruthy();
+    await waitFor(() => expect(screen.getByTestId("pr-stale-notice")).toBeTruthy());
+  });
+
+  it("DISABLES its Merge button and says why", async () => {
+    // PASS is passing + mergeable: without the stamp this row is green with a live one-click Merge,
+    // which is exactly what the founder was offered on a PR that had already merged.
+    succeedThenFail();
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    const merge = await screen.findByTestId(`merge-${PASS.number}`);
+    await waitFor(() => expect((merge as HTMLButtonElement).disabled).toBe(true));
+    // The WORD beside the dot, so the state never depends on the button's colour alone.
+    expect(screen.getByTestId("open-pr-menu").textContent).toMatch(/Unverified/);
+  });
+
+  it("clicking it does NOT call merge_pr", async () => {
+    // The assertion that would have spared the founder a `GraphQL: Merge already in progress`.
+    succeedThenFail();
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    const merge = await screen.findByTestId(`merge-${PASS.number}`);
+    await waitFor(() => expect((merge as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(merge);
+    expect(h.invoke.mock.calls.filter((c) => c[0] === "merge_pr")).toHaveLength(0);
+  });
+
+  it("drops out of the header's ready count", async () => {
+    succeedThenFail();
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    // `data-ready` is what the chiclet paints green off. One row, and we cannot vouch for it.
+    await waitFor(() =>
+      expect(screen.getByTestId("open-pr-badge").getAttribute("data-ready")).toBe("no"),
+    );
+  });
+
+  it("offers no OVERRIDE either — the path that bypassed the disabled Merge button", async () => {
+    // roborev 63235 (Medium). PR_934 is `failing` + `mergeable` + `unstable`, so its readiness
+    // carries an `override` — and the renderer draws an override as the row's ONLY merge
+    // affordance, ENABLED, precisely when `canMerge` is false. The disabled `merge-934` button this
+    // change added was therefore never shown for this row: the live "Merge anyway" was.
+    let listed = 0;
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs")
+        return Promise.resolve(listed++ === 0 ? [PR_934] : null);
+      return Promise.resolve(null);
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    await waitFor(() => expect(screen.getByTestId("pr-stale-notice")).toBeTruthy());
+    expect(screen.queryByTestId("merge-override-934")).toBeNull();
+    // …and what IS rendered is the disabled one, so the row still has a merge slot that says no.
+    expect((screen.getByTestId("merge-934") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  // ── THE RECOVERY WINDOW (roborev 63235, Medium) ──────────────────────────────────────────────
+  //
+  // The staleness flag used to be cleared at the END of the success path, after `fetchDismissals` —
+  // a real IPC round trip. React renders inside that window with `byKey` holding the FRESH rows and
+  // `failedKeys` still holding the key, which `buildPrGroups` reads as "no member could re-read
+  // this repo". Before this change that cost one stale notice for a beat; with rows now carrying
+  // `unverified` it also withdrew every Merge button — a control vanishing under the pointer on
+  // every recovery poll.
+  it("does not flash rows as unverified while the dismissal read is still in flight", async () => {
+    let listed = 0;
+    let releaseDismissals: (v: unknown) => void = () => {};
+    h.invoke.mockImplementation((cmd: string) => {
+      // Fail the SECOND probe (the one the panel-open fires), then recover on the third.
+      if (cmd === "project_open_prs")
+        return Promise.resolve(listed++ === 1 ? null : [PASS]);
+      // The recovering poll's dismissal read HANGS — this is the window under test.
+      if (cmd === "pr_dismissals")
+        return new Promise((res) => {
+          releaseDismissals = res;
+        });
+      return Promise.resolve(null);
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu();
+    // The failed probe landed: the row is unverified and its Merge is disabled.
+    await waitFor(() =>
+      expect((screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement).disabled).toBe(true),
+    );
+    // Now recover. `pr_dismissals` never settles, so we are parked inside the window.
+    fireEvent.click(screen.getByTestId("pr-refresh"));
+    await waitFor(() =>
+      expect((screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement).disabled).toBe(false),
+    );
+    // The notice has to go with it — the same one fact, read two ways.
+    expect(screen.queryByTestId("pr-stale-notice")).toBeNull();
+    releaseDismissals([]);
+  });
+
+  it("goes back to a normal, mergeable row once a probe succeeds again", async () => {
+    // NOT-YET, not a verdict. This state has to clear itself, or one `gh` hiccup would disable
+    // every Merge button in the app until the user restarted it.
+    let listed = 0;
+    h.invoke.mockImplementation((cmd: string) => {
+      if (cmd === "project_open_prs")
+        return Promise.resolve(listed++ === 1 ? null : [PASS]);
+      return Promise.resolve(null);
+    });
+    render(<OpenPrMenu scopes={SCOPES} resolveAgent={noAgent} onOpenAgent={noop} />);
+    await openMenu(); // probe 2 fails — the row is unverified
+    const merge = await screen.findByTestId(`merge-${PASS.number}`);
+    await waitFor(() => expect((merge as HTMLButtonElement).disabled).toBe(true));
+    fireEvent.click(screen.getByTestId("pr-refresh")); // probe 3 succeeds
+    await waitFor(() =>
+      expect(
+        (screen.getByTestId(`merge-${PASS.number}`) as HTMLButtonElement).disabled,
+      ).toBe(false),
+    );
+    expect(screen.queryByTestId("pr-stale-notice")).toBeNull();
+  });
 });

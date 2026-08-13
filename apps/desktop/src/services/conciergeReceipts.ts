@@ -64,7 +64,11 @@ export type ConciergeSendChannel = "terminal" | "inbox" | "held";
  *  EVERY FIELD IS AN OBSERVATION, NEVER A PROMISE. This record is minted from the tool reply, after
  *  the call resolved — so `ok: false` is a real and expected value, and a refused action gets a
  *  receipt too. That is not a detail: "I couldn't" is the answer to "why didn't it do the thing I
- *  asked", and suppressing it would rebuild the silence this module exists to end. */
+ *  asked", and suppressing it would rebuild the silence this module exists to end.
+ *
+ *  THAT REMAINS TRUE OF THE RECEIPT AND OF ITS LINE. What the renderer may vary is how much of
+ *  {@link ConciergeActionReceipt.reason} it prints — see `Concierge/refusalAudience`. Nothing here
+ *  is ever withheld: this record is the audit trail, and the display rule lives one layer up. */
 export interface ConciergeActionReceipt {
   /** Stable within a session; the renderer keys on it so a re-render cannot duplicate a line. */
   id: string;
@@ -98,7 +102,12 @@ export interface ConciergeActionReceipt {
   beadId?: string;
   /** For `merged`: the PR number. */
   prNumber?: number;
-  /** The refusal, when `ok` is false — the tool's own words, already human-fit at the registry. */
+  /** The refusal, when `ok` is false — the tool's own words, already human-fit at the registry.
+   *
+   *  STORED VERBATIM, ALWAYS. A refusal aimed at the concierge (a review gate, running checks, no
+   *  free agent slot) is shown to the founder as a short gist rather than these words, but that is a
+   *  RENDERING decision made in `Concierge/refusalAudience` — the record keeps the original so the
+   *  audit trail is never lossy. */
   reason?: string;
   /** Epoch ms, stamped by the recorder at the moment the call settled. */
   at: number;

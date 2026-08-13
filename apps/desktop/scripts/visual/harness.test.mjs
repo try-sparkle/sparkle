@@ -73,6 +73,23 @@ import {
   parseArgs as tabClickArgs,
   parseWidths as tabClickWidths,
 } from "./tab-click-probe.mjs";
+import {
+  DEFAULT_SCALES as SEAM_DEFAULT_SCALES,
+  RULE_MAX_CSS,
+  gradeClick as gradeSeamClick,
+  gradeSeam,
+  parseScales as seamScales,
+  ruleBandOf,
+  scanColumn,
+} from "./tab-seam-probe.mjs";
+import {
+  DEFAULT_THEMES as QUOTE_DEFAULT_THEMES,
+  MAX_RADIUS_PX,
+  gradeCollision,
+  gradeRadius,
+  parseThemes,
+  rowFloatsCopyGlyphLeft,
+} from "./quote-surface-probe.mjs";
 
 /** A tiny image with a known pixel at (x, y). */
 function img(width, height, fill = [0, 0, 0, 255]) {
@@ -2286,5 +2303,277 @@ describe("cdp waitForFunction timeout message", () => {
     };
     const err = await page.waitForFunction("window.ready", { timeout: 1, poll: 1 }).catch((e) => e);
     expect(err.message).toBe("waitForFunction timed out after 1ms: window.ready");
+  });
+});
+
+// ── THE SEAM PROBE'S OWN VERDICT LOGIC ─────────────────────────────────────────────────────────
+//
+// `tab-seam-probe.mjs` answers a question a unit test cannot (is a 1px rule painted under the ACTIVE
+// project tab, at the reduced zooms the founder reads the app at — bead sparkle-civ4i). That makes
+// its grading the thing nothing else guards: it needs Chrome and a dev server to reach, so a defect
+// there is invisible until someone reads the code. Same reasoning, and the same remedy, as the click
+// probe's rows above.
+//
+// The rows that matter most are the VACUITY ones. Two different "fixes" would make a naive
+// active-tab check pass while shipping something nobody asked for — deleting the rule everywhere,
+// and dropping the active tab's own fill — so both have to be failures, not passes.
+describe("the seam probe's verdict logic", () => {
+  const px = (hex) => ({
+    r: parseInt(hex.slice(1, 3), 16),
+    g: parseInt(hex.slice(3, 5), 16),
+    b: parseInt(hex.slice(5, 7), 16),
+    a: 255,
+  });
+  /** One image column, given top-to-bottom colours — the shape `scanColumn` reads. */
+  const column = (hexes) => {
+    const image = blank(1, hexes.length);
+    hexes.forEach((hex, y) => setPx(image, 0, y, [px(hex).r, px(hex).g, px(hex).b]));
+    return image;
+  };
+
+  const BAR = "#1c2944";
+  const RULE = "#8ba3c8";
+  const FOREST = "#070b12";
+
+  /** An INACTIVE tab's column: bar face, then the rule, then the content plane. */
+  const INACTIVE = () =>
+    scanColumn(column([BAR, BAR, BAR, RULE, FOREST, FOREST, FOREST]), 0, 0, 6);
+  /** An ACTIVE tab's column once it opens into the content: one unbroken plane. */
+  const ACTIVE_OK = () =>
+    scanColumn(column([FOREST, FOREST, FOREST, FOREST, FOREST, FOREST, FOREST]), 0, 0, 6);
+  /** …and the defect: the rule painted straight through it. */
+  const ACTIVE_BAD = () =>
+    scanColumn(column([FOREST, FOREST, FOREST, RULE, FOREST, FOREST, FOREST]), 0, 0, 6);
+
+  describe("scanColumn", () => {
+    it("collapses a column into runs carrying absolute y positions", () => {
+      expect(INACTIVE().map((r) => [r.hex, r.from, r.to])).toEqual([
+        [BAR, 0, 2],
+        [RULE, 3, 3],
+        [FOREST, 4, 6],
+      ]);
+    });
+
+    it("scans the requested band only, so a caller can aim at the bar's own bottom edge", () => {
+      expect(scanColumn(column([BAR, BAR, RULE, FOREST]), 0, 2, 3).map((r) => r.hex)).toEqual([
+        RULE,
+        FOREST,
+      ]);
+    });
+  });
+
+  describe("ruleBandOf", () => {
+    it("finds the narrow band between two planes", () => {
+      expect(ruleBandOf(INACTIVE(), 3)?.hex).toBe(RULE);
+    });
+
+    it("returns null when the two planes meet directly — there is no rule to look for", () => {
+      const runs = scanColumn(column([BAR, BAR, FOREST, FOREST]), 0, 0, 3);
+      expect(ruleBandOf(runs, 3)).toBeNull();
+    });
+
+    it("refuses a band too WIDE to be a rule — that is a third surface, not a line", () => {
+      const runs = scanColumn(column([BAR, RULE, RULE, RULE, RULE, FOREST]), 0, 0, 5);
+      expect(ruleBandOf(runs, 3)).toBeNull();
+      expect(ruleBandOf(runs, 4)?.hex).toBe(RULE);
+    });
+  });
+
+  describe("gradeSeam", () => {
+    const call = (over) =>
+      gradeSeam({ scale: 0.7, activeRuns: ACTIVE_OK(), inactiveRuns: INACTIVE(), ruleMaxPx: 3, ...over });
+
+    it("passes a strip whose rule runs under the inactive tabs and stops at the active one", () => {
+      expect(call()).toEqual([]);
+    });
+
+    it("FAILS when the rule is painted under the active tab, naming where", () => {
+      const f = call({ activeRuns: ACTIVE_BAD() });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("painted UNDER the active tab");
+      expect(f[0]).toContain("y 3..3");
+    });
+
+    // ── VACUITY, BOTH DIRECTIONS ───────────────────────────────────────────────────────────────
+    it("FAILS when there is no rule at all — deleting it is not the fix that was asked for", () => {
+      const noRule = scanColumn(column([BAR, BAR, BAR, FOREST, FOREST, FOREST, FOREST]), 0, 0, 6);
+      const f = call({ inactiveRuns: noRule });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("no rule was found under the INACTIVE tab");
+      // …and it must not ALSO claim the active tab is clean, which it cannot know.
+      expect(f[0]).not.toContain("painted UNDER");
+    });
+
+    it("FAILS when the active tab's face is the bar's own surface — it does not read as active", () => {
+      const f = call({ activeRuns: scanColumn(column([BAR, BAR, BAR, BAR]), 0, 0, 3) });
+      expect(f.some((m) => m.includes("does not read as active"))).toBe(true);
+    });
+
+    it("refuses an empty scan — a missing measurement is not a pass", () => {
+      expect(call({ activeRuns: [] })[0]).toContain("nothing was measured");
+      expect(call({ inactiveRuns: [] })[0]).toContain("nothing was measured");
+    });
+  });
+
+  describe("gradeSeamClick", () => {
+    it("passes when the clicked tab became the selected one", () => {
+      expect(gradeSeamClick({ scale: 1, gesture: "settled", clicked: "p3", selected: "p3" })).toEqual([]);
+    });
+
+    it("FAILS naming WHICH gesture dropped, because the two fail for different reasons", () => {
+      const f = gradeSeamClick({
+        scale: 0.8,
+        gesture: "across-an-expansion",
+        clicked: "p3",
+        selected: "p2",
+      });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("across-an-expansion");
+      expect(f[0]).toContain("did not activate it");
+    });
+  });
+
+  describe("the CLI contract", () => {
+    it("defaults to the three reduced zooms PLUS 1", () => {
+      // 1 is not padding: without it a failure cannot distinguish "breaks when zoomed out" from
+      // "broken everywhere", and those send the reader to different code.
+      expect(seamScales(undefined)).toEqual(SEAM_DEFAULT_SCALES);
+      expect(SEAM_DEFAULT_SCALES).toContain(1);
+      expect(SEAM_DEFAULT_SCALES).toContain(0.7);
+    });
+
+    it("parses a list and rejects anything Chrome would refuse as a device scale", () => {
+      expect(seamScales("0.7, 1")).toEqual([0.7, 1]);
+      expect(seamScales("0")).toBeNull();
+      expect(seamScales("-1")).toBeNull();
+      expect(seamScales("9")).toBeNull();
+      expect(seamScales("nope")).toBeNull();
+      expect(seamScales("")).toBeNull();
+      expect(seamScales(true)).toBeNull();
+    });
+
+    it("keeps the rule-width bound in CSS px, so it scales with the zoom rather than the raster", () => {
+      expect(RULE_MAX_CSS).toBeGreaterThan(0);
+    });
+  });
+});
+
+// ── THE QUOTE-SURFACE PROBE'S VERDICT LOGIC ────────────────────────────────────────────────────
+//
+// `quote-surface-probe.mjs` answers two founder reports about the concierge's quote chrome — the
+// copy glyph painted ON the blue blockquote rule, and the "Quote in response" chiclet being a
+// capsule. The collision half needs a browser (jsdom implements no floats at all), which is exactly
+// what leaves its grading unguarded: a defect there is invisible until a human reads it.
+describe("the quote-surface probe's verdict logic", () => {
+  /** A box, in the shape the probe reads out of the page. */
+  const box = (left, right, top = 30, bottom = 48) => ({ left, right, top, bottom });
+  /** The rule band: the blockquote's border-left, 3px wide and as tall as the quote. */
+  const rule = (left, width = 3, top = 28, bottom = 70) => ({
+    left,
+    right: left + width,
+    top,
+    bottom,
+    width,
+  });
+
+  describe("gradeCollision", () => {
+    it("passes when the glyph sits clear to the LEFT of the rule", () => {
+      expect(gradeCollision({ theme: "dark", icon: box(20, 37), rule: rule(43) })).toEqual([]);
+    });
+
+    it("FAILS on the reported overlap, naming both boxes and how much they share", () => {
+      // The measured defect, verbatim: icon x 20..37 with the rule at 24..27 — the whole rule
+      // inside the glyph's box.
+      const f = gradeCollision({ theme: "light", icon: box(20, 37), rule: rule(24) });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("painted ON the blockquote rule");
+      expect(f[0]).toContain("they share 3.0px");
+      expect(f[0]).toContain("light");
+    });
+
+    it("allows boxes that merely TOUCH — the tightest legitimate layout is not a collision", () => {
+      expect(gradeCollision({ theme: "dark", icon: box(20, 43), rule: rule(43) })).toEqual([]);
+    });
+
+    it("does not fire when the two never meet VERTICALLY, however their x ranges read", () => {
+      // A glyph on its own line above the quote overlaps in x and collides with nothing. Requiring
+      // both axes is what keeps this about the reported defect rather than about x alone.
+      const icon = box(20, 37, 0, 18);
+      expect(gradeCollision({ theme: "dark", icon, rule: rule(24, 3, 28, 70) })).toEqual([]);
+    });
+
+    it("FAILS when the rule has vanished — deleting it is not the fix that was asked for", () => {
+      const f = gradeCollision({ theme: "dark", icon: box(20, 37), rule: rule(43, 0) });
+      expect(f.some((m) => m.includes("no left rule at all"))).toBe(true);
+    });
+
+    it("refuses a missing measurement, naming WHICH box it could not read", () => {
+      expect(gradeCollision({ theme: "dark", icon: null, rule: rule(43) })[0]).toContain("copy glyph");
+      expect(gradeCollision({ theme: "dark", icon: box(20, 37), rule: null })[0]).toContain(
+        "blockquote rule",
+      );
+    });
+  });
+
+  describe("gradeRadius", () => {
+    it("passes the app's own button step and every step below it", () => {
+      expect(gradeRadius({ theme: "dark", radiusPx: 4 })).toEqual([]);
+      expect(gradeRadius({ theme: "dark", radiusPx: MAX_RADIUS_PX })).toEqual([]);
+    });
+
+    it("FAILS a capsule — the shape the founder objected to", () => {
+      const f = gradeRadius({ theme: "light", radiusPx: 999 });
+      expect(f).toHaveLength(1);
+      expect(f[0]).toContain("999px");
+      expect(f[0]).toContain("reads as a pill");
+    });
+
+    it("refuses an unreadable radius rather than passing it", () => {
+      expect(gradeRadius({ theme: "dark", radiusPx: NaN })[0]).toContain(
+        "a missing measurement is not a pass",
+      );
+    });
+  });
+
+  describe("the fixture-drift guard", () => {
+    // The harness COPIES ConciergeMessageRow's float rather than importing the row (which needs the
+    // whole concierge store graph). A copy of a layout rule drifts silently: the row could stop
+    // floating the glyph, the collision would be gone in the product, and the probe would keep
+    // measuring — and passing — a shape nothing renders.
+    it("recognises the row's float, across the attributes that sit between them", () => {
+      expect(
+        rowFloatsCopyGlyphLeft(
+          `<span style={{ float: "left", marginRight: 6, marginLeft: -2, marginTop: -1 }}>
+             <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />`,
+        ),
+      ).toBe(true);
+    });
+
+    it("does NOT match the user side, which floats RIGHT", () => {
+      expect(
+        rowFloatsCopyGlyphLeft(
+          `<span style={{ float: "right", marginLeft: 6 }}><CopyAnswerButton kind="message"`,
+        ),
+      ).toBe(false);
+    });
+
+    it("does not match a float that is nowhere near a copy button", () => {
+      expect(rowFloatsCopyGlyphLeft(`<span style={{ float: "left" }}>{something}</span>`)).toBe(false);
+    });
+  });
+
+  describe("the CLI contract", () => {
+    it("measures BOTH themes by default — half the product is not a verification", () => {
+      expect(parseThemes(undefined)).toEqual(QUOTE_DEFAULT_THEMES);
+      expect(QUOTE_DEFAULT_THEMES).toEqual(["dark", "light"]);
+    });
+
+    it("parses a named subset and rejects anything else", () => {
+      expect(parseThemes("light")).toEqual(["light"]);
+      expect(parseThemes("dark, light")).toEqual(["dark", "light"]);
+      expect(parseThemes("sepia")).toBeNull();
+      expect(parseThemes("")).toBeNull();
+      expect(parseThemes(true)).toBeNull();
+    });
   });
 });

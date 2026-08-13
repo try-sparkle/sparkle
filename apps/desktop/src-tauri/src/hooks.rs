@@ -1252,11 +1252,13 @@ pub async fn install_agent_hooks(
 }
 
 /// Compose the whole body Sparkle owns in an agent worktree's `settings.local.json`: the event
-/// emitter hooks, the default-on plugin keys, and the pre-approved permission allowlist — chained
-/// over whatever the file already had, so one atomic write carries all three.
+/// emitter hooks, the default-on plugin keys, and the permission posture — the pre-approved
+/// allowlist plus `bypassPermissions`, the deny list and the bypass consent record
+/// ([`crate::worktree::merge_agent_worktree_settings`]) — chained over whatever the file already
+/// had, so one atomic write carries all of it.
 ///
 /// Order matters only in that each merge reads the previous one's output; all three preserve keys
-/// they do not own. The allowlist step is the load-bearing addition: it is ALSO performed by
+/// they do not own. The posture step is the load-bearing addition: it is ALSO performed by
 /// [`crate::worktree::merge_guard_settings`], and that duplication is deliberate. The allowlist
 /// used to ride solely on the guard installer, so the two callers in `AgentPane.prepare` —
 /// `installWorktreeGuard` (wrapped in a `try/catch` that only warns) and `installAgentHooks` — had
@@ -1270,7 +1272,7 @@ pub fn compose_agent_settings(
 ) -> String {
     let merged = merge_event_hooks(existing, emitter_cmd);
     let merged = merge_plugin_settings(Some(&merged), plugins);
-    crate::worktree::merge_allowed_tools_settings(Some(&merged))
+    crate::worktree::merge_agent_worktree_settings(Some(&merged))
 }
 
 /// Blocking core of [`install_agent_hooks`].
@@ -2897,6 +2899,37 @@ mod tests {
             "sparkle-orchestrator not pre-approved by the hooks installer: {rules:?}"
         );
         // The emitter must survive the added merge — the allowlist step must not drop hooks.
+        assert!(out.contains("sparkle-hook.mjs"), "emitter hook lost: {out}");
+    }
+
+    /// The composed body must carry the WHOLE permission posture, not just the allowlist — and the
+    /// consent record is the half that is easy to leave out and impossible to notice.
+    ///
+    /// Writing `defaultMode: "bypassPermissions"` without it does not remove a prompt, it TRADES
+    /// the per-command approval prompt for Claude Code's one-time bypass disclaimer at startup:
+    /// the same number of dialogs for the human, and a hang for an unattended agent. So this
+    /// asserts all three keys together, and asserts the emitter and plugin merges survive the
+    /// posture step — that is the side effect, not the precondition that some file was written.
+    #[test]
+    fn composed_agent_settings_carry_bypass_deny_and_the_consent_record() {
+        let out = compose_agent_settings(None, "node '/x/sparkle-hook.mjs' '/y/ev.jsonl'", &[]);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("composed settings are JSON");
+        assert_eq!(
+            v["permissions"]["defaultMode"], "bypassPermissions",
+            "the per-command approval prompt is not turned off: {out}"
+        );
+        assert_eq!(
+            v["skipDangerousModePermissionPrompt"], true,
+            "no consent record, so the agent stops on the bypass disclaimer instead: {out}"
+        );
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny must exist on the hooks path alone")
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        assert!(deny.contains(&"Bash(sudo:*)"), "deny list missing: {deny:?}");
+        // The posture step runs LAST in the chain, so it is the one that could drop the others.
         assert!(out.contains("sparkle-hook.mjs"), "emitter hook lost: {out}");
     }
 

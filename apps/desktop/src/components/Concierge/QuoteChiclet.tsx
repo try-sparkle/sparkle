@@ -14,7 +14,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { FiCornerUpLeft } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
-import { FONT_UI, PILL, TYPE } from "../../theme/scale";
+import { FONT_UI, RADIUS, TYPE } from "../../theme/scale";
 import { popupPosition } from "../selectionPopupPosition";
 import { QUOTE_CHICLET_ATTR } from "./useQuoteOnSelection";
 
@@ -97,9 +97,16 @@ export function QuoteChiclet({
         gap: 6,
         padding: "6px 11px",
         border: `1px solid color-mix(in srgb, ${C.teal} 60%, transparent)`,
-        // The named capsule token, not a literal 999 — this really is a pill, and `labelTreatment`'s
-        // ratchet is what keeps that a deliberate choice rather than a reflex.
-        borderRadius: PILL,
+        // NOT A CAPSULE ANY MORE. Founder, 2026-08-12: *"Make this quote response button less
+        // rounded I can't stand the rounded buttons like that."*
+        //
+        // `RADIUS.input` — the scale's own workhorse, described there as "inputs, buttons, cards,
+        // the chat bubble" — rather than a number chosen by eye for this one control. It was
+        // `PILL`, and the comment that stood here argued the capsule was deliberate; it was, and it
+        // has been overruled. The smaller `RADIUS.sm` is not the right answer either: that step is
+        // for "swatches, ticks, the smallest chips", so taking it would make this button the ONLY
+        // button in the app at that radius — a different way of being bespoke.
+        borderRadius: RADIUS.input,
         cursor: "pointer",
         fontFamily: FONT_UI,
         fontSize: TYPE.small,

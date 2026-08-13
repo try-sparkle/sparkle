@@ -6340,6 +6340,91 @@ fn merge_allowed_tools(root: &mut Value) {
     }
 }
 
+/// Commands Sparkle DENIES outright in every managed agent worktree. Kept byte-identical to
+/// `denyRules` in `apps/desktop/shared/destructive-commands.json`, which the test below asserts —
+/// that fixture is the one contract both this file and `worktree-guard.mjs` are written against,
+/// so a rule added on one side and forgotten on the other fails a test instead of drifting.
+///
+/// A deny rule has NO approval path: it is a hard refusal a human cannot click through. So a rule
+/// earns its place here only if it is *unambiguously* destructive — `git reset --hard`,
+/// `git merge origin/main` and `rm -rf node_modules` are all ordinary work and are deliberately
+/// absent. Over-blocking here would rebuild the exact wall [`merge_permission_posture`] tears
+/// down, except with no way through it at all.
+const SPARKLE_DENY_RULES: &[&str] = &[
+    "Bash(sudo:*)",
+    "Bash(shutdown:*)",
+    "Bash(reboot:*)",
+    "Bash(halt:*)",
+    "Bash(mkfs:*)",
+    // `diskutil` is denied by VERB, not as a blanket `Bash(diskutil:*)`. `diskutil list`/`info`/
+    // `apfs list` are read-only diagnostics, and a deny rule has no approval path — blanket-denying
+    // them would be the same over-blocking this posture exists to undo, made permanent.
+    "Bash(diskutil eraseDisk:*)",
+    "Bash(diskutil eraseVolume:*)",
+    "Bash(diskutil partitionDisk:*)",
+    "Bash(diskutil reformat:*)",
+    "Bash(diskutil zeroDisk:*)",
+    "Bash(diskutil secureErase:*)",
+    "Bash(diskutil apfs delete:*)",
+    "Bash(diskutil apfs deleteContainer:*)",
+    "Bash(npm publish:*)",
+    "Bash(pnpm publish:*)",
+    "Bash(yarn publish:*)",
+    "Bash(bd delete:*)",
+];
+
+/// Turn the per-command approval prompt OFF in a managed agent worktree, and put real brakes in
+/// its place. Three keys, and all three are load-bearing:
+///
+///   1. `permissions.defaultMode = "bypassPermissions"` — the prompt was the fleet's biggest drag,
+///      and it fired on COSMETIC triggers rather than dangerous ones: a space in Sparkle's own
+///      worktree path (`Application Support`), a `$(...)` substitution, a `sed` substitution, a `>`
+///      redirect, an `&&`. An agent advanced one command, re-blocked, and burned a whole turn per
+///      read-only diagnostic.
+///   2. `permissions.deny = SPARKLE_DENY_RULES` — measured, not assumed: with bypass on and no deny
+///      list an `rm -f <marker>` RAN (the marker was deleted); with the deny rule added the same
+///      command was REFUSED. So deny survives bypass and is real enforcement, not documentation.
+///      See `PRD/sparkle/agent-permission-bypass-with-deny.md` for the full A/B.
+///   3. `skipDangerousModePermissionPrompt = true` — the CONSENT RECORD, and without it the other
+///      two are worse than useless. Claude Code gates bypass behind a one-time interactive
+///      disclaimer ("Yes, I accept"); pressing accept is what writes this key. Until it is set the
+///      CLI either shows that dialog or silently downgrades the mode ("Permission mode downgraded
+///      to default — bypass requires accepting the disclaimer interactively first"). So writing
+///      key 1 alone does not remove a prompt — it TRADES a per-command prompt for a startup dialog,
+///      which is a strictly worse deal for the human and, on a headless agent, a hang.
+///
+/// It goes in the WORKTREE's `settings.local.json` rather than the account's `settings.json`
+/// because that is the narrowest scope that covers every managed agent: `localSettings` is one of
+/// the four sources Claude Code consults for the consent key, and confining the bypass to
+/// Sparkle-created worktrees keeps it off every other `claude` the human runs on that identity.
+/// (`accounts::ensure_account_allowlist_at` seeds the consent key — and ONLY that key, never the
+/// bypass itself — at the account level, for the Sparkle-spawned `claude` runs that have no
+/// worktree at all.)
+///
+/// Preserves anything the user already has: existing deny rules survive, de-duplicated by rule
+/// string, and a non-object `permissions` is coerced rather than panicked on. Idempotent.
+fn merge_permission_posture(root: &mut Value) {
+    let obj = root.as_object_mut().unwrap();
+    // The consent record lives at the TOP level of a settings file, not under `permissions`.
+    obj.insert("skipDangerousModePermissionPrompt".into(), json!(true));
+    let permissions = obj.entry("permissions").or_insert_with(|| json!({}));
+    if !permissions.is_object() {
+        *permissions = json!({});
+    }
+    let perms = permissions.as_object_mut().unwrap();
+    perms.insert("defaultMode".into(), json!("bypassPermissions"));
+    let deny = perms.entry("deny").or_insert_with(|| json!([]));
+    if !deny.is_array() {
+        *deny = json!([]);
+    }
+    let arr = deny.as_array_mut().unwrap();
+    for rule in SPARKLE_DENY_RULES {
+        if !arr.iter().any(|e| e.as_str() == Some(*rule)) {
+            arr.push(json!(rule));
+        }
+    }
+}
+
 /// Merge [`SPARKLE_ALLOWED_TOOLS`] into a settings JSON *document*, preserving every other key.
 /// Returns the merged JSON; a `None`/unparseable input yields a fresh object carrying just the
 /// allowlist, so callers that must not clobber an existing file check parseability themselves.
@@ -6359,6 +6444,53 @@ pub fn merge_allowed_tools_settings(existing: Option<&str>) -> String {
         root = json!({});
     }
     merge_allowed_tools(&mut root);
+    serde_json::to_string_pretty(&root).unwrap()
+}
+
+/// The whole body Sparkle owns in a managed agent WORKTREE's `settings.local.json`: the
+/// pre-approved allowlist plus [`merge_permission_posture`].
+///
+/// Deliberately separate from [`merge_allowed_tools_settings`], which also runs against an
+/// ACCOUNT's `settings.json` (`accounts::ensure_account_allowlist_at`). The bypass belongs to
+/// Sparkle-created worktrees, not to an identity: an account-level `defaultMode` would apply to
+/// every `claude` that ever runs on that config dir, including ones with no worktree and no guard
+/// hook installed — which is precisely the combination this posture is not safe in. Folding the
+/// posture into the shared helper would have done that silently, so the two callers get two
+/// functions.
+pub fn merge_agent_worktree_settings(existing: Option<&str>) -> String {
+    let mut root: Value = existing
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    merge_allowed_tools(&mut root);
+    merge_permission_posture(&mut root);
+    serde_json::to_string_pretty(&root).unwrap()
+}
+
+/// Seed ONLY the bypass consent record into a settings document — never the bypass itself.
+///
+/// Claude Code gates `bypassPermissions` behind a one-time interactive disclaimer, and it consults
+/// four settings sources for the acceptance record. Sparkle's managed worktrees carry it via
+/// [`merge_permission_posture`]; this is for the `claude` runs that have NO worktree layer at all
+/// (concierge turns, one-shot probes, improvement passes), which Sparkle launches unattended with
+/// `--dangerously-skip-permissions` — the same disclaimer gates that flag. Without the record such
+/// a run does not merely prompt: there is no human at that terminal, so it HANGS, having produced
+/// nothing. Two spawned workers were wedged exactly this way while this change was being written.
+///
+/// It records a consent the human already gave by choosing to run Sparkle's agents unattended; it
+/// grants nothing on its own, which is why it is safe at a scope the bypass is not.
+pub fn merge_bypass_consent_settings(existing: Option<&str>) -> String {
+    let mut root: Value = existing
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    root.as_object_mut()
+        .unwrap()
+        .insert("skipDangerousModePermissionPrompt".into(), json!(true));
     serde_json::to_string_pretty(&root).unwrap()
 }
 
@@ -6404,6 +6536,10 @@ pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
     arr.push(hook_entry);
     // Pre-approve Sparkle's own MCP tools + read-only ops so interactive agents stop prompting.
     merge_allowed_tools(&mut root);
+    // …and drop the prompt entirely, with the deny list + consent record that make that safe.
+    // Written by BOTH installers on purpose: `AgentPane.prepare` only warns when the guard install
+    // fails, so a posture that rode solely on this path would go missing exactly when nobody looked.
+    merge_permission_posture(&mut root);
     serde_json::to_string_pretty(&root).unwrap()
 }
 
@@ -11002,6 +11138,139 @@ mod tests {
             1,
             "no duplicate sparkle-orchestrator rule"
         );
+    }
+
+    /// Read the ONE shared contract both language halves are written against. The JS guard's
+    /// `destructiveCommands.test.ts` reads this same file, so a rule changed on one side and
+    /// forgotten on the other fails a test here instead of drifting silently.
+    fn destructive_commands_fixture() -> serde_json::Value {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("destructive-commands.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        serde_json::from_str(&raw).expect("fixture is valid JSON")
+    }
+
+    #[test]
+    fn deny_rules_match_the_shared_fixture() {
+        let fixture = destructive_commands_fixture();
+        let expected: Vec<&str> = fixture["denyRules"]
+            .as_array()
+            .expect("denyRules array")
+            .iter()
+            .map(|e| e.as_str().expect("denyRules entries are strings"))
+            .collect();
+        assert_eq!(
+            SPARKLE_DENY_RULES.to_vec(),
+            expected,
+            "SPARKLE_DENY_RULES drifted from apps/desktop/shared/destructive-commands.json"
+        );
+    }
+
+    #[test]
+    fn fresh_worktree_gets_bypass_deny_and_the_consent_record() {
+        // The whole posture, on a worktree that had no settings at all.
+        let merged = merge_guard_settings(None, "node /abs/worktree-guard.mjs /wt/a");
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(
+            v["permissions"]["defaultMode"], "bypassPermissions",
+            "the per-command approval prompt is off"
+        );
+        // Without this, Claude Code shows the one-time bypass disclaimer (or downgrades the mode
+        // outright) — which would TRADE a per-command prompt for a startup dialog rather than
+        // remove one. It lives at the top level, not under `permissions`.
+        assert_eq!(
+            v["skipDangerousModePermissionPrompt"], true,
+            "the bypass consent record is seeded, so no disclaimer dialog is shown"
+        );
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .expect("deny array")
+            .iter()
+            .filter_map(|e| e.as_str())
+            .collect();
+        for rule in SPARKLE_DENY_RULES {
+            assert!(deny.contains(rule), "deny rule missing: {rule}");
+        }
+        // The other worktree installer writes the identical posture — either one alone is
+        // sufficient, which is what makes a failed guard install (warned about, not fatal) survivable.
+        let via_hooks: serde_json::Value =
+            serde_json::from_str(&merge_agent_worktree_settings(None)).unwrap();
+        assert_eq!(via_hooks["permissions"]["defaultMode"], "bypassPermissions");
+        assert_eq!(via_hooks["skipDangerousModePermissionPrompt"], true);
+        assert_eq!(via_hooks["permissions"]["deny"], v["permissions"]["deny"]);
+
+        // …but the ACCOUNT-level helper must NOT carry the bypass. It runs against a config dir
+        // that has no worktree and no guard hook, so a `defaultMode` there would apply the posture
+        // where its brakes are absent. Only the consent record belongs at that scope.
+        let account: serde_json::Value =
+            serde_json::from_str(&merge_bypass_consent_settings(Some(
+                &merge_allowed_tools_settings(None),
+            )))
+            .unwrap();
+        assert_eq!(account["skipDangerousModePermissionPrompt"], true);
+        assert!(
+            account["permissions"]["defaultMode"].is_null(),
+            "the account layer must not turn the approval prompt off"
+        );
+        assert!(account["permissions"]["deny"].is_null());
+    }
+
+    #[test]
+    fn posture_preserves_user_deny_rules_and_is_idempotent() {
+        // A user's own deny rule plus one of ours already present: neither may be lost or doubled.
+        let existing = r#"{
+            "model": "opus",
+            "permissions": { "deny": ["Bash(terraform destroy:*)", "Bash(sudo:*)"] }
+        }"#;
+        let once = merge_guard_settings(Some(existing), "node /abs/worktree-guard.mjs /wt/a");
+        let twice = merge_guard_settings(Some(&once), "node /abs/worktree-guard.mjs /wt/a");
+        assert_eq!(once, twice, "merging twice is a no-op");
+        let v: serde_json::Value = serde_json::from_str(&twice).unwrap();
+        assert_eq!(v["model"], "opus", "unrelated key preserved");
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|e| e.as_str())
+            .collect();
+        assert!(
+            deny.contains(&"Bash(terraform destroy:*)"),
+            "user's own deny rule preserved"
+        );
+        assert_eq!(
+            deny.iter().filter(|r| **r == "Bash(sudo:*)").count(),
+            1,
+            "no duplicate sudo deny rule"
+        );
+    }
+
+    #[test]
+    fn posture_coerces_a_non_object_permissions_block() {
+        // A hand-edited (or corrupt) settings file must not panic the installer.
+        let merged = merge_guard_settings(
+            Some(r#"{ "permissions": 3, "keep": "me" }"#),
+            "node /abs/worktree-guard.mjs /wt/a",
+        );
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(v["keep"], "me");
+        assert_eq!(v["permissions"]["defaultMode"], "bypassPermissions");
+        assert!(v["permissions"]["deny"].is_array());
+        // …and a non-array `deny` is coerced the same way.
+        let merged = merge_guard_settings(
+            Some(r#"{ "permissions": { "deny": "nope" } }"#),
+            "node /abs/worktree-guard.mjs /wt/a",
+        );
+        let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let deny: Vec<&str> = v["permissions"]["deny"]
+            .as_array()
+            .expect("deny coerced to an array")
+            .iter()
+            .filter_map(|e| e.as_str())
+            .collect();
+        assert!(deny.contains(&"Bash(sudo:*)"));
     }
 
     #[test]

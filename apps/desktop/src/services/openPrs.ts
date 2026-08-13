@@ -264,6 +264,16 @@ export type PrJudgeable = Pick<PrRow, "checks" | "mergeable"> &
     /** Absent = the probe read has not landed yet (or this caller does not do probe reads at all).
      *  Treated exactly like an unknown read: it withholds nothing and manufactures nothing. */
     probes?: PrProbeState;
+    /**
+     * This row came out of a CACHE whose latest probe failed — we are still showing it, but we could
+     * not re-read it and cannot confirm it is even still open.
+     *
+     * NOT A `PrRow` FIELD, and deliberately so: `PrRow` mirrors the Rust `PrRow` field for field, and
+     * this is a client-side stamp about the READ rather than a fact about the pull request. It is
+     * applied by `fleetPrs.buildPrGroups`, which is the only layer that knows which scope's probe
+     * failed. Absent means "read succeeded", which is what every caller predating the stamp gets.
+     */
+    unverified?: boolean;
   };
 
 /**
@@ -317,6 +327,7 @@ export type PrBlocker =
   | "checks"
   | "protection"
   | "draft"
+  | "unverified"
   | "mergeability"
   | "behind"
   | null;
@@ -381,7 +392,21 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
   // is both behind AND red — carrying the false claim into a branch that never mentions being
   // behind. UNSTABLE is checkable (GitHub reports `mergeable: MERGEABLE` beside it); BEHIND is
   // reported when the base requires an up-to-date head, i.e. when the merge is likely to be refused.
-  const githubWouldAccept = pr.mergeable === "mergeable" && state === "unstable";
+  //
+  // AND NEVER FOR AN UNVERIFIED ROW (roborev 63235, Medium — a hole in the `unverified` branch's
+  // own invariant). The `unverified` branch below sits UNDER the failing/pending/unstable branches,
+  // deliberately, so a row keeps naming its most specific blocker. But those branches hand back an
+  // `override`, and the renderer draws an override as the row's ONLY merge affordance — an ENABLED
+  // two-step button — precisely when `canMerge` is false. So a cached row last seen `failing` +
+  // `mergeable` + `unstable` still offered a live path to `runMerge`, which is the exact click that
+  // produces `GraphQL: Merge already in progress` on a PR that has already merged.
+  //
+  // It is also the one claim we cannot make. An override's whole justification on this surface is
+  // "GitHub would accept this merge" — present tense, about a pull request whose only evidence is a
+  // cache we just admitted we could not re-read. Same rule as BEHIND one branch down: the claim has
+  // to be CHECKABLE, and here it is not.
+  const githubWouldAccept =
+    pr.mergeable === "mergeable" && state === "unstable" && !pr.unverified;
 
   // ── NO MERGE RIGHTS — FIRST, BECAUSE NOTHING BELOW CAN RESCUE IT (bead sparkle-j881r) ────────
   //
@@ -572,6 +597,40 @@ export function prMergeReadiness(pr: PrJudgeable): PrReadiness {
       override: null,
     };
 
+  // ── WE COULD NOT RE-READ THIS ROW (the founder's 2026-08-12 report) ──────────────────────────
+  //
+  // THE BUG. A merged pull request sat in the panel for hours reading GREEN, with a live one-click
+  // Merge, counted in the chiclet's "ready to merge". It came from a cached list belonging to a
+  // project tab whose probe had failed — see `fleetPrs.buildPrGroups`, which stamps the flag — and
+  // every field on it was the last thing GitHub said, which was: passing, mergeable, clean. Nothing
+  // in the row itself could ever reveal that it was describing a pull request that no longer exists.
+  //
+  // WAITING, NOT BLOCKED. This is a NOT-YET about our own read, not a fault of the PR — the same
+  // shape as `mergeable: "unknown"` directly below, and it resolves the same way, by the next probe
+  // that succeeds. Amber says "come back to this"; red would say the PR is broken, which we have no
+  // evidence for.
+  //
+  // WHY IT SITS HERE, BELOW EVERY NAMED BLOCKER. A row we last read as conflicting or red is more
+  // useful saying so than saying "unverified" — that is the more specific fact, it is still the
+  // reason the PR is not mergeable, and neither branch offers a merge. What this branch has to catch
+  // is the row that would otherwise reach the GREEN return at the bottom, because that is the only
+  // outcome where being wrong costs the user a click on a button that cannot work. Placing it above
+  // the named blockers would flatten every red row in a stale section into one uninformative word.
+  //
+  // AND IT IS THE WHOLE IMPLEMENTATION of "an unverifiable row does not count as ready". The dot,
+  // the label, the Merge button, `prReadyCount`, "Merge N ready" and the header chiclet all bottom
+  // out here, so there is exactly one place that decides it rather than six that must agree.
+  if (pr.unverified)
+    return {
+      tone: "waiting",
+      label: "Unverified",
+      blocker: "unverified",
+      title:
+        "Couldn't re-read this pull request — GitHub was unreachable for this project, so this is the last thing we heard about it and it may already be merged or closed. Try Refresh.",
+      canMerge: false,
+      override: null,
+    };
+
   // NOT-YET, not a warning. GitHub computes mergeability asynchronously and invalidates it on every
   // push to the base branch, so "unknown" genuinely means "we do not know" — and the one thing a
   // merge gate must never do is offer a confident button over an answer it does not have.
@@ -693,7 +752,12 @@ export function prReadyCount(prs: readonly PrJudgeable[]): number {
  * PR list is on the panel's critical path. So the reading is a decoration applied client-side after
  * `fetchProbeGates` lands, and this type is the honest name for the result.
  */
-export type JudgedPrRow = PrRow & { probes?: PrProbeState };
+export type JudgedPrRow = PrRow & {
+  probes?: PrProbeState;
+  /** Stamped by `fleetPrs.buildPrGroups` when this row came from a cache we could not re-read. See
+   *  {@link PrJudgeable.unverified} — it is a fact about the READ, never about the pull request. */
+  unverified?: boolean;
+};
 
 /**
  * How many of `prs` report `blocker` as the ONE fact their row states.

@@ -623,13 +623,51 @@ function ensureTabStyles(): void {
  * parent/child relationship is required by ARIA, and moving the role outward to the wrapper would
  * quietly break it. `index.css` mirrors both boxes for the left-hand pair (`.concierge-tabbar`).
  */
+/**
+ * The strip's rule — the line separating the bar from the content beneath it.
+ *
+ * A NAMED CONSTANT because THREE things have to agree on it: the shadow that paints it, the inset
+ * that lets a hover-expanded tab keep it running underneath, and the test that pins the whole
+ * arrangement. It was a literal `1px` in the `borderBottom` shorthand, which is how the tab and the
+ * rule came to disagree about where the rule was.
+ */
+export const TAB_RULE_PX = 1;
+
+/**
+ * ── THE RULE IS AN INSET SHADOW, NOT A `border-bottom` (bead sparkle-civ4i) ────────────────────
+ *
+ * *"Active project tab draws a bottom border so the tab strip rule runs under it — the active tab
+ * must open into the content area like a folder tab."*
+ *
+ * It was `borderBottom: 1px solid ${C.muted}`, and the active tab was supposed to cover that line by
+ * being nudged one pixel down (`top: 1` on every slot). It never could, and the reason is two boxes
+ * away from either of them: a border is painted OUTSIDE the bar's padding box, while the tabs live
+ * inside a strip that is `overflow-x: auto` — so the one pixel of overhang the whole scheme depended
+ * on was CLIPPED AWAY by the strip's own scroll container, every time, at every zoom. Measured in
+ * Chrome at device scales 0.7, 0.8, 0.9 and 1.0: the rule painted straight through the active tab at
+ * all four (`scripts/visual/tab-seam-probe.mjs`).
+ *
+ * An INSET shadow moves the line INSIDE the bar's padding box, and CSS paints an inset shadow
+ * immediately after the element's own background and BEFORE its descendants. So the active tab's
+ * face covers it simply by being a descendant that reaches the bar's bottom edge — which it already
+ * did. There is no overlap to measure and therefore nothing for a fractional device scale to round
+ * the wrong way: the tab's face and the rule share the SAME bottom edge, so they round together.
+ * That is what makes this zoom-proof rather than merely fixed at the zoom it was tested at.
+ *
+ * TWO CONSEQUENCES, both deliberate:
+ *   • the bar is 1px shorter, because the rule now lives inside it rather than below it. Everything
+ *     under the strip moves up by that pixel; nothing else changes.
+ *   • the slots lost their `top: 1`. That offset WAS this mechanism — the nudge that was meant to
+ *     reach the old border — and with the rule inside the padding box a tab reaches it without
+ *     moving. Leaving it would push every tab a pixel into the clip for no benefit.
+ */
 const barStyle: CSSProperties = {
   flex: "none",
   display: "flex",
   alignItems: "flex-end",
   padding: "0 8px",
   background: C.barSurface,
-  borderBottom: `1px solid ${C.muted}`,
+  boxShadow: `inset 0 -${TAB_RULE_PX}px 0 ${C.muted}`,
 };
 
 const stripStyle: CSSProperties = {
@@ -1201,7 +1239,9 @@ export function ProjectTabs({
             style={{
               display: "flex",
               position: "relative",
-              top: 1,
+              // NO `top: 1`. It used to nudge every slot a pixel down to reach the bar's old
+              // `border-bottom`; the rule is an inset shadow inside the bar's padding box now, so a
+              // tab reaches it by sitting where the flex line already puts it. See `barStyle`.
               // The tab being dragged fades so the caret (or the empty gap, when the drag has left
               // the strip) is what the eye follows.
               opacity: isDragged ? (drag?.kind === "tearoff" ? 0.35 : 0.55) : tornOut ? 0.6 : 1,
@@ -1266,7 +1306,14 @@ export function ProjectTabs({
                       // slot it covers.
                       position: "absolute",
                       top: 0,
-                      bottom: 0,
+                      // AN EXPANDED TAB THAT IS NOT THE ACTIVE ONE STOPS SHORT OF THE RULE.
+                      //
+                      // The rule is an inset shadow inside the bar (see `barStyle`), so ANY tab face
+                      // reaching the bar's bottom edge covers it — which is exactly right for the
+                      // active tab and exactly wrong for a hovered one. A hover would otherwise open
+                      // the tab into the content area for as long as the pointer rested on it, which
+                      // is the ACTIVE state's own signal, on a tab that is not active.
+                      bottom: active ? 0 : TAB_RULE_PX,
                       // Grows INWARD, away from the strip's nearer edge — see `beginExpand`.
                       ...(exp.anchor === "right" ? { right: 0 } : { left: 0 }),
                       width: "max-content",
@@ -1427,8 +1474,8 @@ export function ProjectTabs({
             cursor: "pointer",
             background: "transparent",
             border: "none",
-            position: "relative",
-            top: 1,
+            // Its `top: 1` went with the slots' — it existed only to keep the "+" level with tabs
+            // that were themselves nudged a pixel down. See `barStyle`.
           }}
         >
           <FiPlus size={14} />

@@ -352,6 +352,35 @@ const components: Components = {
       style={{
         margin: "0 0 8px",
         padding: "2px 12px",
+        // ── IT MUST NOT SLIDE UNDER A FLOAT (founder screenshot, 2026-08-12) ──────────────────
+        //
+        // He sent a picture of a concierge answer whose COPY GLYPH was painted on top of this blue
+        // rule, with the quoted text starting straight after it. It reads as a rendering collision
+        // and it is one, from a CSS rule that catches everybody once: **a float shortens the LINE
+        // BOXES beside it, never a following BLOCK's box.** `ConciergeMessageRow` floats the copy
+        // glyph left; a `<blockquote>` is a block, so its border box — and therefore this rule —
+        // was laid at the container's left edge UNDERNEATH the glyph, while its inline text was
+        // pushed clear. The two never disagreed about anything except which of them the rule
+        // belonged under.
+        //
+        // `flow-root` makes this a block formatting context, and a BFC's border box may not overlap
+        // a float in the same context — so the whole quote, rule included, is placed to the RIGHT
+        // of the glyph. One declaration, no arithmetic, and nothing content-conditional: it is
+        // correct for a quote that leads an answer (the reported case) and inert for one that does
+        // not, because a block that clears the float vertically has nothing to avoid.
+        //
+        // WHAT THIS DELIBERATELY DOES NOT DO is move the GLYPH into the quote's indent, i.e. the
+        // literal left-to-right order "rule, icon, text". That would revoke the founder's own
+        // 2026-07…08-05 placement decision — *"For the content that the concierge sends I would
+        // rather have it be at the beginning of the row"* — for quote-leading answers only, so the
+        // glyph would jump position depending on what the answer happened to open with. This keeps
+        // the glyph at the row's leading edge and gives the rule, the icon and the text each their
+        // own space, which is the outcome he asked for. Easy to invert if he wants the other order.
+        //
+        // NOT `overflow: hidden`, which is the older way to get a BFC: it would clip a wide table
+        // or a fenced code block quoted inside, and those own their horizontal scroll.
+        // `quote-surface-probe.mjs` measures the two boxes in Chrome, in both themes.
+        display: "flow-root",
         // THE ACCENT, not chrome. This was `HAIRLINE` — the same gray as an `<hr>` — and the
         // founder asked for "a SOLID vertical line … the same blue as the 'Hold ⌘ to talk' line".
         // `C.tealInk` IS that line's colour (components/LogoWaveform paints the push-to-talk
