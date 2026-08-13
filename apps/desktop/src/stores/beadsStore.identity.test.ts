@@ -222,7 +222,7 @@ describe("per-field change detection", () => {
 describe("snapshotUnchanged (the comparator itself)", () => {
   const mk = (beads: Bead[]) => ({
     beads,
-    board: { backlog: beads, blocked: [], inProgress: [], done: [], delivered: [] },
+    board: { backlog: beads, blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
     loadedAt: 0,
   });
 
@@ -244,6 +244,7 @@ describe("snapshotUnchanged (the comparator itself)", () => {
       inProgress: [],
       done: [],
       delivered: [],
+      archived: [],
     };
     expect(snapshotUnchanged(prev, beads, moved)).toBe(false);
   });

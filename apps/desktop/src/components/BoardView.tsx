@@ -47,6 +47,7 @@ import { DefineStageModal } from "./DefineStageModal";
 import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip } from "./StageColumnHeader";
 import { CardCriteria } from "./CardCriteria";
 import { BeadCard } from "./BeadCard/BeadCard";
+import { BeadPriorityChip } from "./BeadCard/BeadPriorityChip";
 import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
 import { setBeadPriority } from "./BeadCard/beadPriority";
 import { beadCardMenuIsOpen } from "./BeadCard/PriorityPill";
@@ -77,13 +78,26 @@ interface StageDefs {
 // belongs in the reading order — you scan left to right asking "what's next", and a blocked item is
 // something that WOULD be next except it can't be. Putting it after "Being built" would file it as
 // a kind of progress, which is the opposite of what it is.
-const COLUMNS: { key: "backlog" | "blocked" | "inProgress" | "done" | "delivered"; label: string }[] = [
+// ARCHIVED SITS LAST, after Shipped, and is the ONE column that is collapsed by default and
+// render-capped. A background sweep closes ~1,800 low-signal beads (each stamped `archived`, see
+// ARCHIVED_LABEL), and rendering that pile eagerly would jank the board and bury the columns the
+// user actually acts on. It is a resting place, not a worklist: opened on demand, capped when open.
+const COLUMNS: {
+  key: "backlog" | "blocked" | "inProgress" | "done" | "delivered" | "archived";
+  label: string;
+}[] = [
   { key: "backlog", label: "Backlog" },
   { key: "blocked", label: "Blocked" },
   { key: "inProgress", label: "Being built" },
   { key: "done", label: "Done" },
   { key: "delivered", label: "Shipped" },
+  { key: "archived", label: "Archived" },
 ];
+
+/** How many Archived cards are rendered at once when the column is expanded — the rest are a
+ *  "+N more" count, never DOM nodes. The bucketing still processes every archived bead (cheap,
+ *  scalar work in `bucketBeads`); only the render is bounded, which is the part that janks. */
+const ARCHIVED_RENDER_CAP = 50;
 
 const DESC_PREVIEW = 120;
 
@@ -215,7 +229,14 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
     const hit = allBeads.find((b) => b.id === selectedId);
     if (hit) return hit;
     if (!board) return undefined;
-    for (const lane of [board.backlog, board.blocked, board.inProgress, board.done, board.delivered]) {
+    for (const lane of [
+      board.backlog,
+      board.blocked,
+      board.inProgress,
+      board.done,
+      board.delivered,
+      board.archived,
+    ]) {
       const inLane = lane.find((b) => b.id === selectedId);
       if (inLane) return inLane;
     }
@@ -339,6 +360,7 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
       inProgress: keep(board.inProgress),
       done: keep(board.done),
       delivered: keep(board.delivered),
+      archived: keep(board.archived),
     };
   }, [board, boardAgentFilter]);
 
@@ -354,6 +376,7 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
       inProgress: keep(agentOnlyBoard.inProgress),
       done: keep(agentOnlyBoard.done),
       delivered: keep(agentOnlyBoard.delivered),
+      archived: keep(agentOnlyBoard.archived),
     };
   }, [agentOnlyBoard, boardFilter, filterActive]);
 
@@ -377,7 +400,12 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
   const hiddenByFilter = useMemo(() => {
     if (!agentOnlyBoard || !displayBoard || !filterActive) return 0;
     const size = (b: Board) =>
-      b.backlog.length + b.blocked.length + b.inProgress.length + b.done.length + b.delivered.length;
+      b.backlog.length +
+      b.blocked.length +
+      b.inProgress.length +
+      b.done.length +
+      b.delivered.length +
+      b.archived.length;
     const baseline = size(agentOnlyBoard);
     return baseline > 0 && size(displayBoard) === 0 ? baseline : 0;
   }, [agentOnlyBoard, displayBoard, filterActive]);
@@ -578,6 +606,10 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
               inReleaseByBead={inReleaseByBead}
               onDefine={setDefineStage}
               onOpen={(b) => setSelectedId(b.id)}
+              // Archived is the one volume column: collapsed by default (a header + count, no
+              // cards), and render-capped when opened. See ARCHIVED_RENDER_CAP.
+              collapsible={key === "archived"}
+              renderCap={key === "archived" ? ARCHIVED_RENDER_CAP : undefined}
             />
           ))}
         </div>
@@ -618,6 +650,8 @@ function Column({
   inReleaseByBead,
   onDefine,
   onOpen,
+  collapsible = false,
+  renderCap,
 }: {
   columnKey: BoardColumn;
   label: string;
@@ -630,6 +664,10 @@ function Column({
   inReleaseByBead: Map<string, boolean>;
   onDefine: (key: StageKey) => void;
   onOpen: (b: Bead) => void;
+  /** Start collapsed (header + count only, no cards); the user expands on demand. Archived only. */
+  collapsible?: boolean;
+  /** When expanded, render at most this many cards; the rest are a "+N more" count. */
+  renderCap?: number;
 }) {
   // This column's own stage (for the header chip + undefined CTA), and the next stage a card here
   // is progressing toward (whose criteria the cards evaluate).
@@ -639,6 +677,17 @@ function Column({
   const nextStageKey = nextStageOf(columnKey);
   const nextDef = nextStageKey ? defs[nextStageKey] : undefined;
   const nextDefined = isDefined(nextDef);
+
+  // A collapsible column (Archived) starts closed so its ~thousands of cards are never mounted
+  // until asked for. Local, not persisted: the resting default every time the board opens is
+  // "closed", which is the whole point — it must not compete with the columns that carry live work.
+  const [expanded, setExpanded] = useState(false);
+  const isCollapsed = collapsible && !expanded;
+  // When expanded, cap the rendered cards. `bucketBeads` already visited every archived bead; only
+  // the DOM is bounded here — the count above the cap is a number, never a node.
+  const cap = renderCap ?? beads.length;
+  const rendered = isCollapsed ? [] : beads.slice(0, cap);
+  const overflow = isCollapsed ? beads.length : beads.length - rendered.length;
 
   return (
     <div
@@ -709,21 +758,74 @@ function Column({
               Nothing here yet
             </div>
           )
+        ) : isCollapsed ? (
+          // COLLAPSED (Archived, default): no cards mounted at all — just the affordance to open.
+          // The heading's count already states how many are in here; this button is the way in.
+          <button
+            type="button"
+            data-testid={`board-column-expand-${columnKey}`}
+            onClick={() => setExpanded(true)}
+            style={{
+              background: "transparent",
+              border: `1px solid ${C.hairline}`,
+              borderRadius: 6,
+              color: C.accentInk,
+              cursor: "pointer",
+              font: "inherit",
+              fontSize: 12,
+              padding: "8px 10px",
+              textAlign: "left",
+            }}
+          >
+            Show {overflow} archived {overflow === 1 ? "bead" : "beads"}
+          </button>
         ) : (
-          beads.map((b) => (
-            <Card
-              key={b.id}
-              bead={b}
-              columnKey={columnKey}
-              allBeads={allBeads}
-              agents={agents}
-              project={project}
-              nextStageKey={nextDefined ? nextStageKey : null}
-              nextDef={nextDefined ? nextDef : undefined}
-              inRelease={inReleaseByBead.get(b.id)}
-              onOpen={onOpen}
-            />
-          ))
+          <>
+            {rendered.map((b) => (
+              <Card
+                key={b.id}
+                bead={b}
+                columnKey={columnKey}
+                allBeads={allBeads}
+                agents={agents}
+                project={project}
+                nextStageKey={nextDefined ? nextStageKey : null}
+                nextDef={nextDefined ? nextDef : undefined}
+                inRelease={inReleaseByBead.get(b.id)}
+                onOpen={onOpen}
+              />
+            ))}
+            {/* Rendered fewer than there are → the remainder is a count, not DOM. This is the cap,
+                and (for a collapsible column) the way back to a closed, cheap column. */}
+            {overflow > 0 && (
+              <div
+                data-testid={`board-column-overflow-${columnKey}`}
+                style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 2px" }}
+              >
+                <span style={{ color: C.muted, fontSize: 12 }}>
+                  +{overflow} more not shown
+                </span>
+                {collapsible && (
+                  <button
+                    type="button"
+                    onClick={() => setExpanded(false)}
+                    style={{
+                      background: "transparent",
+                      border: "none",
+                      padding: 0,
+                      color: C.accentInk,
+                      cursor: "pointer",
+                      font: "inherit",
+                      fontSize: 12,
+                      textDecoration: "underline",
+                    }}
+                  >
+                    Collapse
+                  </button>
+                )}
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
@@ -826,15 +928,23 @@ function Card({
             {preview}
           </div>
         )}
-        <div
-          style={{
-            color: C.muted,
-            opacity: 0.7,
-            fontSize: 12,
-            fontFamily: FONT_MONO,
-          }}
-        >
-          {bead.id}
+        {/* The id line, now sharing its row with the priority chip. The chip reads at a glance on
+            EVERY card (the founder's ask) without stealing a line from the title above it: the id is
+            already the quietest row on the card, and priority is metadata of the same weight. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span
+            style={{
+              color: C.muted,
+              opacity: 0.7,
+              fontSize: 12,
+              fontFamily: FONT_MONO,
+              minWidth: 0,
+              overflowWrap: "anywhere",
+            }}
+          >
+            {bead.id}
+          </span>
+          <BeadPriorityChip priority={bead.priority} />
         </div>
         {workers.length > 0 && (
           <div style={{ color: C.tealInk, fontSize: 12, lineHeight: 1.4 }}>

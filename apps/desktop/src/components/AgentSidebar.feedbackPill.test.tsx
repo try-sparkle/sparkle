@@ -48,7 +48,7 @@ function bead(partial: Partial<Bead> & { id: string; title: string }): Bead {
   return { description: "", status: "open", labels: [], parent: null, ...partial };
 }
 
-const emptyBoard: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
+const emptyBoard: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] };
 
 /** Seed one build agent "a1" plus a beads snapshot for project p1. */
 function seed(beads: Bead[], over: Partial<AgentTab> = {}): Project {

@@ -259,10 +259,28 @@ export function mergeShaOf(bead: Bead): string | null {
   return sha && sha.length > 0 ? sha : null;
 }
 
-export type BoardColumn = "backlog" | "blocked" | "inProgress" | "done" | "delivered";
+export type BoardColumn = "backlog" | "blocked" | "inProgress" | "done" | "delivered" | "archived";
 
 /** A closed bead carrying this label lands in "delivered" instead of "done". */
 export const DELIVERED_LABEL = "delivered";
+
+/**
+ * A closed bead carrying this label lands in "archived" instead of "done".
+ *
+ * ══ WHY A LABEL RATHER THAN "closed == archived" ═══════════════════════════════════════════════
+ * `bd` has exactly one closed state, and the board already spends the `delivered` label to split
+ * genuinely-shipped work off it (→ "Shipped"). Everything else closed is "Done". The founder runs a
+ * background sweep that CLOSES ~1,800 low-signal beads, and those must not flood "Done" — but they
+ * are indistinguishable from real completed work by status alone (both are just `closed`), and the
+ * "Done" column carries a whole definable-stage criteria system (see `nextStageOf` / `CardCriteria`)
+ * that a status-only reinterpretation would break.
+ *
+ * So archiving is marked the same way shipping is: a label. The sweep that closes a low-signal bead
+ * also adds `archived` (mirroring how `markBeadDelivered` adds `delivered`), and the board routes it
+ * to the far-right "Archived" column — additive, leaving "Done" and its stage machinery untouched.
+ * `delivered` OUTRANKS `archived` (a shipped bead is Shipped even if also archived); see `columnFor`.
+ */
+export const ARCHIVED_LABEL = "archived";
 
 /** Stamped on every bead the APP creates for a Build agent, as opposed to one a human filed.
  *
@@ -275,16 +293,22 @@ export const AUTO_LABEL = "sparkle-auto";
 
 /** Which board column a bead belongs in:
  *  open+blocked -> blocked; open -> backlog; in_progress -> inProgress;
- *  closed+delivered-label -> delivered; closed (no label) -> done.
+ *  closed+delivered-label -> delivered; closed+archived-label -> archived; closed (neither) -> done.
  *
  *  BLOCKED OUTRANKS BACKLOG, and only for OPEN beads. A bead someone is actively working
  *  (in_progress) is not waiting on anything the user needs to see in a Blocked lane, and a closed
- *  bead cannot be blocked at all — so the check is deliberately not "is it in the set". */
+ *  bead cannot be blocked at all — so the check is deliberately not "is it in the set".
+ *
+ *  DELIVERED OUTRANKS ARCHIVED for a closed bead carrying both: "Shipped" is the more informative
+ *  home (it is out in the world), and a low-signal sweep should never hide a bead that actually
+ *  shipped. See {@link ARCHIVED_LABEL}. */
 export function columnFor(bead: Bead, blocked?: ReadonlySet<string>): BoardColumn {
   if (bead.status === "open") return blocked?.has(bead.id) ? "blocked" : "backlog";
   if (bead.status === "in_progress") return "inProgress";
   // closed
-  return bead.labels.includes(DELIVERED_LABEL) ? "delivered" : "done";
+  if (bead.labels.includes(DELIVERED_LABEL)) return "delivered";
+  if (bead.labels.includes(ARCHIVED_LABEL)) return "archived";
+  return "done";
 }
 
 export interface Board {
@@ -293,6 +317,7 @@ export interface Board {
   inProgress: Bead[];
   done: Bead[];
   delivered: Bead[];
+  archived: Bead[];
 }
 
 /** Group beads into board columns, preserving input order within each column.
@@ -302,7 +327,14 @@ export interface Board {
  *  filed. Filtered HERE rather than in the query so the underlying `listBeads` payload stays
  *  complete: the Beads list view and `childrenOf` still see them, only the BOARD hides them. */
 export function bucketBeads(beads: Bead[], blocked?: ReadonlySet<string>): Board {
-  const board: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
+  const board: Board = {
+    backlog: [],
+    blocked: [],
+    inProgress: [],
+    done: [],
+    delivered: [],
+    archived: [],
+  };
   for (const bead of beads) {
     if (bead.labels.includes(AUTO_LABEL)) continue;
     switch (columnFor(bead, blocked)) {
@@ -320,6 +352,9 @@ export function bucketBeads(beads: Bead[], blocked?: ReadonlySet<string>): Board
         break;
       case "delivered":
         board.delivered.push(bead);
+        break;
+      case "archived":
+        board.archived.push(bead);
         break;
     }
   }

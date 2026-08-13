@@ -167,6 +167,7 @@ const board: Board = {
   delivered: [
     bead({ id: "p1-d1", title: "Delivered task", status: "closed", labels: ["delivered"] }),
   ],
+  archived: [],
 };
 
 afterEach(() => {
@@ -266,16 +267,17 @@ describe("BoardView", () => {
   it("shows an empty-column hint and keeps a prior snapshot visible on error", () => {
     snapshot = {
       beads: [],
-      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     error = "bd blew up";
     render(<BoardView project={project} side="right" />);
     // Error surfaces but the (empty) board still renders.
     expect(screen.getByText("bd blew up")).toBeTruthy();
-    // The three non-definable lanes (Backlog, Blocked, Being built) show the empty hint; the two
-    // definable ones (Done, Shipped) show the Define CTA instead.
-    expect(screen.getAllByText("Nothing here yet").length).toBe(3);
+    // The four non-definable lanes (Backlog, Blocked, Being built, Archived) show the empty hint;
+    // the two definable ones (Done, Shipped) show the Define CTA instead. An empty Archived column
+    // is collapsible but has nothing to collapse, so it falls through to the same hint.
+    expect(screen.getAllByText("Nothing here yet").length).toBe(4);
     expect(screen.getByText("Define “Done”")).toBeTruthy();
     expect(screen.getByText("Define “Shipped”")).toBeTruthy();
   });
@@ -299,6 +301,7 @@ describe("BoardView", () => {
         inProgress: [],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -333,6 +336,7 @@ describe("BoardView", () => {
           inProgress: [],
           done: [],
           delivered: [],
+          archived: [],
         },
         loadedAt: Date.now(),
       };
@@ -403,7 +407,7 @@ describe("BoardView", () => {
     const e2 = bead({ id: "p1-e2", title: "Epic two", type: "epic", description: prd });
     snapshot = {
       beads: [task, e1, e2],
-      board: { backlog: [task, e1, e2], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [task, e1, e2], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} side="right" />);
@@ -423,7 +427,7 @@ describe("BoardView", () => {
     const before = bead({ id: "p1-x1", title: "Old title", priority: 3 });
     snapshot = {
       beads: [before],
-      board: { backlog: [before], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [before], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     const { rerender } = render(<BoardView project={project} side="right" />);
@@ -434,7 +438,7 @@ describe("BoardView", () => {
     const after = bead({ id: "p1-x1", title: "New title", priority: 0 });
     snapshot = {
       beads: [after],
-      board: { backlog: [after], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [after], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now() + 1,
     };
     rerender(<BoardView project={project} side="right" />);
@@ -449,7 +453,7 @@ describe("BoardView", () => {
     const b = bead({ id: "p1-x1", title: "Vanishing" });
     snapshot = {
       beads: [b],
-      board: { backlog: [b], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [b], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     const { rerender } = render(<BoardView project={project} side="right" />);
@@ -458,7 +462,7 @@ describe("BoardView", () => {
 
     snapshot = {
       beads: [],
-      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now() + 1,
     };
     rerender(<BoardView project={project} side="right" />);
@@ -500,6 +504,7 @@ describe("BoardView — Build It (epic handoff)", () => {
         inProgress: [],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -575,7 +580,7 @@ describe("BoardView — Build It (epic handoff)", () => {
     const e2 = bead({ id: "p1-e2", title: "Epic two", type: "epic", description: prd });
     snapshot = {
       beads: [e1, e2],
-      board: { backlog: [e1, e2], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [e1, e2], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     // Let the FIRST epic through, then hit the ceiling on the second.
@@ -618,6 +623,7 @@ describe("BoardView — Build It (epic handoff)", () => {
         inProgress: [],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -642,6 +648,7 @@ describe("BoardView — Build It (epic handoff)", () => {
         inProgress: [],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -741,6 +748,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
         inProgress: over.withChild === false ? [] : [child],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -824,6 +832,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
         inProgress: [bead({ id: "p1-e2", title: "Running epic", type: "epic" })],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -871,7 +880,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
     defineDone();
     snapshot = {
       beads: [],
-      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} side="right" />);
@@ -890,6 +899,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
         inProgress: [],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -914,6 +924,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
         inProgress: [],
         done: [],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -937,6 +948,7 @@ describe("BoardView — Definable Done & Delivered (Unit 5)", () => {
         inProgress: [],
         done: [bead({ id: "p1-d9", title: "Landed feature", status: "closed" })],
         delivered: [],
+        archived: [],
       },
       loadedAt: Date.now(),
     };
@@ -980,7 +992,7 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
     const other = bead({ id: "p1-other", title: "Someone elses bead", labels: ["agent:agent-y"] });
     snapshot = {
       beads: [mine, other],
-      board: { backlog: [mine, other], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [mine, other], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
   }
@@ -1026,7 +1038,7 @@ describe("BoardView — per-agent feedback filter (feedback-pill-and-filter)", (
     const mine = bead({ id: "p1-mine", title: "My feedback bead", labels: [`agent:${agentId}`] });
     snapshot = {
       beads: [mine],
-      board: { backlog: [mine], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [mine], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     useProjectStore.setState({
@@ -1103,7 +1115,7 @@ describe("BoardView — priority and date filters", () => {
     const stale = bead({ id: "p1-old", title: "Ancient one", priority: 0, updatedAt: OLD });
     snapshot = {
       beads: [p0, p2, stale],
-      board: { backlog: [p0, p2, stale], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [p0, p2, stale], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
   }
@@ -1193,7 +1205,7 @@ describe("BoardView — priority and date filters", () => {
       const all = [mine, ...others];
       snapshot = {
         beads: all,
-        board: { backlog: all, blocked: [], inProgress: [], done: [], delivered: [] },
+        board: { backlog: all, blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
         loadedAt: Date.now(),
       };
     }
@@ -1229,7 +1241,7 @@ describe("BoardView — priority and date filters", () => {
   it("shows NO empty notice when the board is genuinely empty and no filter is set", () => {
     snapshot = {
       beads: [],
-      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+      board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} side="right" />);
@@ -1347,7 +1359,9 @@ describe("the board's scroll containers", () => {
     // width, and one sideways nudge pushed the text out of view on the LEFT — the founder's clipped
     // titles ("window drop is", "causes").
     const lists = container.querySelectorAll<HTMLElement>("[data-board-column-list]");
-    expect(lists.length).toBe(5);
+    // Six columns now: Backlog / Blocked / Being built / Done / Shipped / Archived. Each owns one
+    // vertical scroller (the archived column's list is present even while collapsed).
+    expect(lists.length).toBe(6);
     for (const l of lists) {
       expect(l.style.overflowY).toBe("auto");
       expect(l.style.overflowX).toBe("hidden");
@@ -1413,5 +1427,97 @@ describe("the board's header", () => {
   it("reserves no banner when there is no error", () => {
     render(<BoardView project={project} side="right" />);
     expect(screen.queryByTestId("board-error")).toBeNull();
+  });
+});
+
+// ── Fix #1: PRIORITY ON THE CARD FACE ──────────────────────────────────────────────────────────
+// The founder asked to see a bead's priority on EVERY card in the columns, not only after opening
+// one. These assert the SIDE EFFECT — the chip on a collapsed card reflects that bead's OWN
+// priority — so a chip wired to a constant (or to the wrong bead) fails rather than passing.
+describe("the priority chip on a card face", () => {
+  function boardWith(beads: Bead[]): Board {
+    return { backlog: beads, blocked: [], inProgress: [], done: [], delivered: [], archived: [] };
+  }
+
+  it("shows each backlog card's own priority, on the card and not just in the overlay", () => {
+    const p0 = bead({ id: "p1-pri0", title: "Urgent one", priority: 0 });
+    const p3 = bead({ id: "p1-pri3", title: "Someday", priority: 3 });
+    snapshot = { beads: [p0, p3], board: boardWith([p0, p3]), loadedAt: Date.now() };
+    render(<BoardView project={project} side="right" />);
+
+    // Two chips, one per card, each carrying THAT card's priority — the wiring, not a constant.
+    const chips = screen.getAllByTestId("bead-priority-chip");
+    expect(chips).toHaveLength(2);
+    const byPriority = chips.map((c) => c.getAttribute("data-priority"));
+    expect(byPriority).toContain("0");
+    expect(byPriority).toContain("3");
+    // The label reads P0 for the urgent one — the collapsed card is where it now lives.
+    const p0Chip = chips.find((c) => c.getAttribute("data-priority") === "0");
+    expect(p0Chip?.textContent).toContain("P0");
+  });
+
+  it("renders P? for a card with no priority set (an unset priority is worth seeing, not hiding)", () => {
+    const none = bead({ id: "p1-nopri", title: "Unprioritised" });
+    snapshot = { beads: [none], board: boardWith([none]), loadedAt: Date.now() };
+    render(<BoardView project={project} side="right" />);
+    const chip = screen.getByTestId("bead-priority-chip");
+    expect(chip.getAttribute("data-priority")).toBe("");
+    expect(chip.textContent).toContain("P?");
+  });
+});
+
+// ── Fix #4: THE ARCHIVED COLUMN ────────────────────────────────────────────────────────────────
+// A far-right column for closed+archived beads, collapsed by default and render-capped so a
+// ~1,800-bead pile never mounts eagerly.
+describe("the archived column", () => {
+  function boardWithArchived(archived: Bead[]): Board {
+    return { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived };
+  }
+
+  it("renders an Archived column header after Shipped", () => {
+    snapshot = { beads: [], board, loadedAt: Date.now() };
+    render(<BoardView project={project} side="right" />);
+    const columns = screen.getByTestId("board-columns");
+    const labels = Array.from(columns.querySelectorAll("[data-board-column]")).map((el) =>
+      el.getAttribute("data-board-column"),
+    );
+    expect(labels).toEqual(["backlog", "blocked", "inProgress", "done", "delivered", "archived"]);
+  });
+
+  it("does NOT mount archived cards by default — it shows a count and an expand affordance", () => {
+    const a1 = bead({ id: "p1-arc1", title: "Old junk one", status: "closed", labels: ["archived"] });
+    const a2 = bead({ id: "p1-arc2", title: "Old junk two", status: "closed", labels: ["archived"] });
+    snapshot = { beads: [a1, a2], board: boardWithArchived([a1, a2]), loadedAt: Date.now() };
+    render(<BoardView project={project} side="right" />);
+    // The SIDE EFFECT of "collapsed/lazy": the cards are NOT in the DOM.
+    expect(screen.queryByText("Old junk one")).toBeNull();
+    expect(screen.queryByText("Old junk two")).toBeNull();
+    // ...but the way in is, and it names the count.
+    const expand = screen.getByTestId("board-column-expand-archived");
+    expect(expand.textContent).toContain("2");
+  });
+
+  it("mounts the cards once expanded", () => {
+    const a1 = bead({ id: "p1-arc1", title: "Old junk one", status: "closed", labels: ["archived"] });
+    snapshot = { beads: [a1], board: boardWithArchived([a1]), loadedAt: Date.now() };
+    render(<BoardView project={project} side="right" />);
+    expect(screen.queryByText("Old junk one")).toBeNull();
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    expect(screen.getByText("Old junk one")).toBeTruthy();
+  });
+
+  it("caps how many cards it mounts even when expanded, and counts the overflow", () => {
+    // 60 archived beads, cap 50: expanding must mount at most the cap, never all 60.
+    const many = Array.from({ length: 60 }, (_, i) =>
+      bead({ id: `p1-arc-${i}`, title: `Archived ${i}`, status: "closed", labels: ["archived"] }),
+    );
+    snapshot = { beads: many, board: boardWithArchived(many), loadedAt: Date.now() };
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    // The first card mounts; a card past the cap does not.
+    expect(screen.getByText("Archived 0")).toBeTruthy();
+    expect(screen.queryByText("Archived 59")).toBeNull();
+    // The unrendered remainder is a count (60 - 50 = 10), never DOM nodes.
+    expect(screen.getByTestId("board-column-overflow-archived").textContent).toContain("10");
   });
 });

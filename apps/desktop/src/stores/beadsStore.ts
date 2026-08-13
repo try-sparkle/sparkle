@@ -249,6 +249,7 @@ const BOARD_COLUMNS = Object.keys({
   inProgress: true,
   done: true,
   delivered: true,
+  archived: true,
 } satisfies Record<BoardColumn, true>) as BoardColumn[];
 
 function sameLabels(a: readonly string[], b: readonly string[]): boolean {

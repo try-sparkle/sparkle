@@ -18,6 +18,7 @@ import {
   recordBeadMergeSha,
   MERGED_SHA_PREFIX,
   DELIVERED_LABEL,
+  ARCHIVED_LABEL,
   AUTO_LABEL,
   type Bead,
 } from "./beads";
@@ -205,6 +206,23 @@ describe("columnFor", () => {
       "delivered",
     );
   });
+  it("closed with archived label -> archived", () => {
+    expect(columnFor(bead({ id: "a", status: "closed", labels: [ARCHIVED_LABEL] }))).toBe(
+      "archived",
+    );
+  });
+  it("closed with BOTH delivered and archived -> delivered (Shipped outranks Archived)", () => {
+    // A bead that actually shipped must never be hidden in the collapsed Archived pile just because
+    // a low-signal sweep also stamped it. Shipped is the more informative home.
+    expect(
+      columnFor(bead({ id: "a", status: "closed", labels: [DELIVERED_LABEL, ARCHIVED_LABEL] })),
+    ).toBe("delivered");
+  });
+  it("an OPEN bead carrying the archived label is still backlog, not archived", () => {
+    // Archiving is a property of a CLOSED bead — the label only routes once the bead is closed, so a
+    // stray label on open work cannot make it vanish from the backlog.
+    expect(columnFor(bead({ id: "a", status: "open", labels: [ARCHIVED_LABEL] }))).toBe("backlog");
+  });
 
   // ── BLOCKED IS DERIVED, AND IT ONLY APPLIES TO OPEN BEADS ────────────────────────────────────
   // bd computes blocked from dependency edges; it is not a stored status (BeadStatus is only
@@ -245,6 +263,20 @@ describe("bucketBeads", () => {
     expect(board.backlog.map((b) => b.id)).toEqual(["b1", "b2"]);
     expect(board.inProgress.map((b) => b.id)).toEqual(["ip1"]);
     expect(board.done.map((b) => b.id)).toEqual(["d1", "d2"]);
+    expect(board.delivered.map((b) => b.id)).toEqual(["del1"]);
+  });
+
+  it("routes archived-labelled closed beads to the archived column, away from done", () => {
+    const beads = [
+      bead({ id: "d1", status: "closed" }),
+      bead({ id: "arc1", status: "closed", labels: [ARCHIVED_LABEL] }),
+      bead({ id: "arc2", status: "closed", labels: [ARCHIVED_LABEL] }),
+      bead({ id: "del1", status: "closed", labels: [DELIVERED_LABEL] }),
+    ];
+    const board = bucketBeads(beads);
+    // The whole point: archived beads land in their own column and DON'T flood Done.
+    expect(board.archived.map((b) => b.id)).toEqual(["arc1", "arc2"]);
+    expect(board.done.map((b) => b.id)).toEqual(["d1"]);
     expect(board.delivered.map((b) => b.id)).toEqual(["del1"]);
   });
 

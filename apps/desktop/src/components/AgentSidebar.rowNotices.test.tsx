@@ -80,7 +80,7 @@ import type { Bead, Board } from "../services/beads";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 
-const EMPTY_BOARD: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
+const EMPTY_BOARD: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] };
 
 const CLEAN_BS: BranchStatus = {
   ahead: 0,

@@ -83,7 +83,7 @@ const PROJECT: Project = {
   createdAt: new Date(0).toISOString(), selectedAgentId: "a1", agents: [mkAgent()],
 };
 
-const board: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] };
+const board: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] };
 
 const rowFor = () => screen.getByText(NAME).closest('[data-hint="agent"]') as HTMLElement;
 const wired = () => useCableStore.getState().wired;

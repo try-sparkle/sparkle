@@ -156,7 +156,7 @@ beforeEach(() => {
     byProject: {
       p1: {
         beads: [],
-        board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+        board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
         loadedAt: Date.now(),
       },
     },
@@ -634,7 +634,7 @@ describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkl
             id: `b${i}`,
             labels: ["agent-feedback", "agent:a1"],
           })),
-          board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+          board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
           loadedAt: Date.now(),
         },
       },
@@ -712,7 +712,7 @@ describe("AgentSidebar — a LANDED agent needs the human's confirm (bead sparkl
       byProject: {
         p1: {
           beads: [],
-          board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [] },
+          board: { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] },
           loadedAt: Date.now(),
         },
       },
