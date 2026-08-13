@@ -63,6 +63,20 @@ describe("CopyAnswerButton", () => {
     expect(String(writeText.mock.calls[0]?.[0])).not.toContain("sparkle-agent:");
   });
 
+  it("flattens a research reference instead of pasting an internal task id", async () => {
+    // The same third-consumer tax as the agent case above, for a `sparkle-research:` link the
+    // concierge writes when it names a task it dispatched. The pill reads the question and the
+    // selection path already yields it, so the clipboard — the third rendering — must agree.
+    render(
+      <CopyAnswerButton text="I sent [how caching works](sparkle-research:rsh_1754700004000_0a1b2c3d4e5f6071) off." />,
+    );
+    fireEvent.click(btn());
+    await settle();
+
+    expect(writeText).toHaveBeenCalledWith("I sent how caching works off.");
+    expect(String(writeText.mock.calls[0]?.[0])).not.toContain("sparkle-research:");
+  });
+
   it("leaves an ORDINARY link in the paste, where it belongs", async () => {
     // The flattening is scoped to agent references, not to links. A real URL is part of the answer
     // and a paste without it is a worse paste — stripping every link would be the opposite mistake.

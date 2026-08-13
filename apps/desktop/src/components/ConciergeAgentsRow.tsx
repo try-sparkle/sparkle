@@ -51,7 +51,7 @@
 // that is always present — so a live count of zero is a fact the row reports rather than a badge it
 // suppresses. `hydrated` is what separates that from "we have not looked yet": before the first
 // `listResearch()` lands, the row shows NO badge at all rather than claiming zero.
-import { memo, useCallback, useEffect, useId, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { C } from "../theme/colors";
 import { FONT_MONO, TYPE } from "../theme/scale";
 import { DOT_SIZE, DOT_SLOT_W, GLYPH_SLOT_H, DEPTH_INDENT } from "../engine/rowGeometry";
@@ -68,7 +68,12 @@ import {
   useResearchStore,
   visibleTasks,
 } from "../services/research/store";
-import { isLive, type ResearchStatus, type ResearchTask } from "../services/research/types";
+import {
+  isLive,
+  type ResearchDepth,
+  type ResearchStatus,
+  type ResearchTask,
+} from "../services/research/types";
 
 /** The row's label. A CONSTANT because two surfaces read it — the row and its tests — and a literal
  *  in each is a place for them to disagree, the same reason `SPARKLE_AGENT_DISPLAY_NAME` exists. */
@@ -150,6 +155,18 @@ function researchStatusLabel(status: ResearchStatus): string {
   }
 }
 
+/**
+ * The research TIER, in words the founder reads — the closest stable stand-in for "which model".
+ *
+ * The task record carries no model id (the model is derived from `depth` inside the runner, which
+ * this lane deliberately does not touch), and `depth` is the contract field that decides it: `quick`
+ * is the cheaper/faster model, `deep` the bigger one on a longer wall clock (see research/types.ts).
+ * So the detail names the tier rather than inventing a model-id coupling the frontend does not own.
+ */
+function researchTierLabel(depth: ResearchDepth): string {
+  return depth === "deep" ? "Deep research" : "Quick research";
+}
+
 /** When this task's clock started, and when it stopped (`null` = still running). */
 function spanOf(task: ResearchTask): { since: number; until: number | null } {
   return { since: task.startedAt ?? task.createdAt, until: task.finishedAt };
@@ -204,6 +221,7 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   const [expanded, setExpanded] = useState(false);
   const byId = useResearchStore((s) => s.byId);
   const openTaskId = useResearchStore((s) => s.openTaskId);
+  const openTaskSeq = useResearchStore((s) => s.openTaskSeq);
   const setOpenTask = useResearchStore((s) => s.setOpenTask);
   // Newest first, through the store's OWN selector. Sorting here instead would be a second answer to
   // "which task is the latest", which is the drift `sortedTasks` exists to prevent.
@@ -247,6 +265,39 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
     }, RESEARCH_POLL_INTERVAL_MS);
     return () => clearInterval(timer);
   }, []);
+
+  // ══ A CLICKED CHAT LINK OPENS THIS GROUP ═══════════════════════════════════════════════════════
+  //
+  // The concierge names a task it dispatched as a `sparkle-research:` pill (see `ResearchPill`); the
+  // founder clicks it, and the ONLY thing that click does is set the store's `openTaskId`. This is
+  // the row's half of that gesture: when `openTaskId` points at a task this group actually renders,
+  // the group EXPANDS so the row — and, below it, the detail — is on screen. Without this the click
+  // would set a field that a collapsed group never reveals, and the link would look dead.
+  //
+  // ══ AN EDGE, NOT A CONDITION — OR THE HEADER'S COLLAPSE STOPS WORKING (roborev 63900) ══════════
+  //
+  // Two failure modes bracket this, and keying the reveal on the OPEN-GESTURE SEQ answers both:
+  //
+  //   • Re-expanding a manually-collapsed group. `openTaskId` is sticky and the effect's `tasks` dep
+  //     churns identity on every 5s poll (`replaceAll` rebuilds `byId`), so a condition on the value
+  //     re-fires within 5s of every collapse and pops the group back open forever. A poll never calls
+  //     `setOpenTask`, so it never bumps the seq — the collapse STAYS made.
+  //   • A dead re-click (roborev 63906/63907). If the edge were keyed on `openTaskId`, clicking the
+  //     SAME pill after a header collapse would write the id it already holds — no store change, no
+  //     re-render, nothing happens, violating `ResearchPill`'s "every click produces a visible
+  //     result". `setOpenTask` bumps `openTaskSeq` on every non-null call, so a repeat click is a
+  //     genuine new edge; `handledSeq` records the last one handled so only an actual gesture expands.
+  const handledSeq = useRef(0);
+  useEffect(() => {
+    if (openTaskSeq === handledSeq.current) return;
+    handledSeq.current = openTaskSeq;
+    // Guarded on membership so a stale `openTaskId` (a task since retired, or one this window has not
+    // listed) cannot force the group open around nothing. Read from the closure, which is fresh: the
+    // seq bump that ran this effect came from the same `setOpenTask` that set `openTaskId`.
+    if (openTaskId !== null && tasks.some((t) => t.id === openTaskId)) {
+      setExpanded(true);
+    }
+  }, [openTaskSeq, openTaskId, tasks]);
 
   const rowBox = rowBoxFor({ paneSide, jointOpen, isActive: false, pinned: true });
   // PER-INSTANCE, not a module constant. A module-level id is emitted once per mounted row, and
@@ -433,9 +484,20 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
     [onToggle, open, task.id],
   );
 
+  // BRING THE ROW TO THE FOUNDER when it opens — the second half of a chat-link click (the first is
+  // `ConciergeAgentsRow` expanding the group). A `sparkle-research:` pill can point at a task far
+  // down a long group, so seating it is not the same as the founder FINDING it. Optional-called
+  // because jsdom does not implement `scrollIntoView`, and a `block: "nearest"` so an already-visible
+  // row is not yanked. Only fires on the open→true edge; a manual header expansion moves nothing.
+  const rowRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (open) rowRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [open]);
+
   return (
     <>
       <div
+        ref={rowRef}
         data-hint="concierge-agent"
         data-task-id={task.id}
         role="button"
@@ -561,6 +623,9 @@ function ConciergeTaskDetail({ task }: { task: ResearchTask }) {
         }}
       >
         <span>{researchStatusLabel(task.status)}</span>
+        {/* The tier — the founder's "which model", named by the stable `depth` field rather than a
+            model id the frontend does not own. */}
+        <span data-testid="concierge-agent-tier">{researchTierLabel(task.depth)}</span>
         <span>{formatElapsed(Math.max(0, (until ?? clockNow) - since))}</span>
         {live && (
           <button

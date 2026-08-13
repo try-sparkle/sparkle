@@ -25,6 +25,8 @@ import { MD_CODE_FACE, MD_CODE_FACE_VAR } from "./mdCodeFace";
 import { parseAgentRefHref } from "./Concierge/agentRefs";
 import { AgentPill } from "./Concierge/AgentPill";
 import { parseBeadRefHref } from "./Concierge/beadRefs";
+import { parseResearchRefHref } from "./Concierge/researchRefs";
+import { ResearchPill } from "./Concierge/ResearchPill";
 import { remarkBeadRefs } from "./Concierge/remarkBeadRefs";
 import { remarkMergeQuotes } from "./Concierge/remarkMergeQuotes";
 import { BeadPill } from "./Concierge/BeadPill";
@@ -203,6 +205,11 @@ const REMARK_PLUGINS_MERGED_QUOTES = [remarkGfm, remarkBeadRefs, remarkMergeQuot
 function urlTransform(url: string): string {
   if (parseAgentRefHref(url) !== null) return url;
   if (parseBeadRefHref(url) !== null) return url;
+  // `sparkle-research:` is the THIRD exception, on identical terms: gated on `parseResearchRefHref`'s
+  // conservative id class, and `ExternalLink` returns a `<button>` (or inert text) for it so no
+  // `href` ever reaches the DOM. Without this line the sanitizer would blank the reference before
+  // `ExternalLink` ever saw it.
+  if (parseResearchRefHref(url) !== null) return url;
   return defaultUrlTransform(url);
 }
 
@@ -307,6 +314,15 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
   const beadId = parseBeadRefHref(href);
   if (beadId !== null) {
     return <BeadPill beadId={beadId} />;
+  }
+  // A research reference is not a link either. Checked BEFORE the scheme allowlist for the same
+  // reason: `sparkle-research:` is deliberately not on it, so outside the app (an agent's own reply,
+  // a support modal) it falls through to the inert-text path below and reads as the written question
+  // — which is exactly the intended degradation, since that is the label the pill would have shown.
+  // `linkText` (not the bare href) supplies the fallback so a non-plain link text still flattens.
+  const researchTaskId = parseResearchRefHref(href);
+  if (researchTaskId !== null) {
+    return <ResearchPill taskId={researchTaskId} fallbackLabel={linkText(children)} />;
   }
   const safe = isSafeLinkHref(href);
   return (

@@ -363,6 +363,126 @@ describe("Concierge Agents — click the row, then click an agent", () => {
   });
 });
 
+// ── 3b. THE CHAT LINK OPENS THE ROW ──────────────────────────────────────────────────────────────
+//
+// The concierge names a dispatched task as a `sparkle-research:` pill; clicking it sets the store's
+// `openTaskId` and nothing else (see `ResearchPill`). This is the row's half of that gesture: an
+// `openTaskId` pointing at a task this group renders must EXPAND the collapsed group, open that
+// task's detail, and scroll the row to the founder — otherwise the link sets a field a collapsed
+// group never reveals and reads as dead.
+describe("Concierge Agents — a chat-link click reveals the task's row", () => {
+  it("expands the collapsed group and opens the detail when openTaskId is set", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    // Collapsed, nothing clicked — the founder has not touched the header.
+    expect(row().getAttribute("aria-expanded")).toBe("false");
+    expect(childRows()).toHaveLength(0);
+    expect(screen.queryByTestId("concierge-agent-detail")).toBeNull();
+
+    // The pill's whole effect: name a task as open. No header click.
+    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+
+    expect(row().getAttribute("aria-expanded")).toBe("true");
+    expect(childRows()).toHaveLength(VISIBLE_IN_FIXTURE);
+    // …and it is THAT task's detail that opened, not merely the group.
+    const detail = screen.getByTestId("concierge-agent-detail");
+    expect(detail.textContent).toContain(DONE_WITH_FINDINGS.question);
+  });
+
+  it("scrolls the opened row into view", () => {
+    // jsdom implements no layout, so `scrollIntoView` is absent; the row optional-calls it, and this
+    // supplies a spy to prove the call is made on the open edge.
+    const spy = vi.fn();
+    const orig = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = spy;
+    try {
+      seedResearch(FIXTURE);
+      render(<AgentSidebar project={seed()} />);
+      act(() => useResearchStore.getState().setOpenTask(RUNNING.id));
+      const opened = childRows().find((r) => r.getAttribute("data-task-id") === RUNNING.id)!;
+      // The spy fires with the opened row as `this`; asserting the instance is what ties the scroll
+      // to the RIGHT task rather than to any row that happened to mount.
+      expect(spy.mock.instances).toContain(opened);
+    } finally {
+      Element.prototype.scrollIntoView = orig;
+    }
+  });
+
+  // THE EDGE-VS-CONDITION BUG (roborev 63900). `openTaskId` is sticky and the poll rebuilds `byId`
+  // every 5s, so a condition-based reveal re-fired within one interval of every manual collapse and
+  // popped the group back open forever. The reveal fires on the OPEN GESTURE (seq), which a poll
+  // never sends, so a collapse the founder made stays made across a poll that lands identical data.
+  it("stays collapsed after the founder collapses it, even across a poll", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+    expect(row().getAttribute("aria-expanded")).toBe("true");
+
+    // Founder collapses from the header. `openTaskId` is left sticky by design.
+    fireEvent.click(row());
+    expect(row().getAttribute("aria-expanded")).toBe("false");
+
+    // A FAITHFUL poll: `replaceAll` is exactly what `refreshResearch` calls — it rebuilds `byId`
+    // (new `tasks` identity, same data) and leaves `openTaskId`/`openTaskSeq` sticky. `seedResearch`
+    // could NOT stand in here: it also clears `openTaskId`, which sends the effect down the null
+    // branch and would pass against the very bug this guards (roborev 63906). The condition-based
+    // effect re-expands here; the seq-keyed one must not.
+    act(() => useResearchStore.getState().replaceAll([...FIXTURE]));
+    expect(row().getAttribute("aria-expanded")).toBe("false");
+  });
+
+  // THE PAIRED DIRECTION (roborev 63906/63907): the collapse must not make the pill a DEAD link.
+  // Clicking the same pill again after a header collapse is a fresh gesture — the seq bumps even
+  // though `openTaskId` is unchanged — so the group re-opens. Keyed on the value instead, this click
+  // wrote a string the store already held, nothing re-rendered, and the click did nothing forever.
+  it("re-opens the group when the SAME pill is clicked again after a manual collapse", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+    expect(row().getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(row());
+    expect(row().getAttribute("aria-expanded")).toBe("false");
+
+    // Same id again — a repeat pill click. `openTaskId` does not change, but the gesture does.
+    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+    expect(row().getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByTestId("concierge-agent-detail").textContent).toContain(
+      DONE_WITH_FINDINGS.question,
+    );
+  });
+
+  // A stale id — a task since retired, or one this window never listed — must NOT force the group
+  // open around nothing. The membership guard is what makes the reveal safe to drive from text the
+  // model wrote at a time the task was live.
+  it("does not expand for an openTaskId that names no visible task", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    act(() => useResearchStore.getState().setOpenTask("rsh_not_a_real_task"));
+    expect(row().getAttribute("aria-expanded")).toBe("false");
+    expect(childRows()).toHaveLength(0);
+  });
+});
+
+// ── 3c. THE DETAIL NAMES THE TIER ────────────────────────────────────────────────────────────────
+//
+// The founder asked each row to show "the model". The task carries no model id (the runner derives
+// it from `depth`, which this lane does not touch), so the detail names the TIER — the stable proxy.
+describe("Concierge Agents — the detail names the research tier", () => {
+  it("shows the quick/deep tier from the task's depth", () => {
+    seedResearch(FIXTURE);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+    // UNREAD_DONE is a `quick` task; RUNNING is `deep`. Assert each maps to its own label, so a
+    // hardcoded string cannot satisfy both.
+    fireEvent.click(childRows().find((r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id)!);
+    expect(screen.getByTestId("concierge-agent-tier").textContent).toBe("Quick research");
+
+    fireEvent.click(childRows().find((r) => r.getAttribute("data-task-id") === RUNNING.id)!);
+    expect(screen.getByTestId("concierge-agent-tier").textContent).toBe("Deep research");
+  });
+});
+
 // ── 4. THE KILL ────────────────────────────────────────────────────────────────────────────────
 //
 // The founder chose NO CAP on concurrent research, so "visible and killable" is the entire guardrail

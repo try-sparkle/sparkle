@@ -222,6 +222,19 @@ interface ResearchState {
   hydrated: boolean;
   /** Which task the founder has expanded in the detail view; `null` when none. */
   openTaskId: string | null;
+  /**
+   * A monotonic counter bumped on every request to OPEN a task (a non-null `setOpenTask`), so the
+   * sidebar's reveal can key on the GESTURE rather than on the sticky `openTaskId` value.
+   *
+   * WHY A SEQ AND NOT JUST `openTaskId` (roborev 63906/63907). The reveal must fire on a click and
+   * NOT on a 5s poll. Diffing `openTaskId` gets the poll right but breaks the repeat click: after the
+   * founder collapses the group from its header `openTaskId` stays sticky, so clicking the SAME pill
+   * again writes the id it already holds — zustand sees no change, nothing re-renders, and the click
+   * is a dead no-op (the exact "every click produces a visible result" rule `ResearchPill` is built
+   * on). Bumping a seq on every open request makes a repeat click a genuine new event while a poll —
+   * which never calls `setOpenTask` — leaves it untouched.
+   */
+  openTaskSeq: number;
 
   upsert: (task: ResearchTask) => void;
   replaceAll: (tasks: ResearchTask[]) => void;
@@ -232,6 +245,7 @@ export const useResearchStore = create<ResearchState>((set) => ({
   byId: {},
   hydrated: false,
   openTaskId: null,
+  openTaskSeq: 0,
 
   upsert: (task) => set((s) => ({ byId: { ...s.byId, [task.id]: task } })),
 
@@ -243,7 +257,14 @@ export const useResearchStore = create<ResearchState>((set) => ({
       hydrated: true,
     })),
 
-  setOpenTask: (taskId) => set(() => ({ openTaskId: taskId })),
+  // A non-null id is a REQUEST TO OPEN and bumps the seq (so a repeat click on the same task is a
+  // fresh reveal event); a null merely CLOSES the detail and must not trigger the reveal, so it
+  // leaves the seq alone.
+  setOpenTask: (taskId) =>
+    set((s) => ({
+      openTaskId: taskId,
+      openTaskSeq: taskId === null ? s.openTaskSeq : s.openTaskSeq + 1,
+    })),
 }));
 
 /**
@@ -317,5 +338,5 @@ export async function refreshResearch(): Promise<void> {
 /** Test seam: forget everything, including the in-flight refresh generation. */
 export function _resetResearchStoreForTests(): void {
   refreshSeq = 0;
-  useResearchStore.setState({ byId: {}, hydrated: false, openTaskId: null });
+  useResearchStore.setState({ byId: {}, hydrated: false, openTaskId: null, openTaskSeq: 0 });
 }

@@ -302,6 +302,42 @@ describe("the store is a cache, not the truth", () => {
   });
 });
 
+// THE REVEAL IS AN EVENT, NOT A STICKY VALUE (roborev 63906/63907). The sidebar keys its
+// auto-expand on `openTaskSeq` so a repeat click on the same pill after a manual collapse is a fresh
+// gesture — `openTaskId` alone could not carry that, since writing the id it already holds is a
+// no-op. And a poll must never look like a reveal, so `replaceAll` leaves the seq alone.
+describe("setOpenTask — the open GESTURE bumps a seq the reveal keys on", () => {
+  it("bumps openTaskSeq on every OPEN, even when the id is unchanged", () => {
+    const before = useResearchStore.getState().openTaskSeq;
+    useResearchStore.getState().setOpenTask("rsh_a");
+    const after1 = useResearchStore.getState().openTaskSeq;
+    expect(after1).toBe(before + 1);
+
+    // The SAME id again — the sticky-value bug's trigger. The seq must still advance, because this is
+    // a second click the founder made and the group must be able to re-open on it.
+    useResearchStore.getState().setOpenTask("rsh_a");
+    expect(useResearchStore.getState().openTaskSeq).toBe(after1 + 1);
+    expect(useResearchStore.getState().openTaskId).toBe("rsh_a");
+  });
+
+  it("does NOT bump the seq when closing (a null), so closing a detail never triggers a reveal", () => {
+    useResearchStore.getState().setOpenTask("rsh_a");
+    const seq = useResearchStore.getState().openTaskSeq;
+    useResearchStore.getState().setOpenTask(null);
+    expect(useResearchStore.getState().openTaskSeq).toBe(seq);
+    expect(useResearchStore.getState().openTaskId).toBeNull();
+  });
+
+  it("replaceAll — the poll path — leaves the seq untouched, so a poll is never a reveal", () => {
+    useResearchStore.getState().setOpenTask("rsh_a");
+    const seq = useResearchStore.getState().openTaskSeq;
+    useResearchStore.getState().replaceAll(FIXTURE);
+    expect(useResearchStore.getState().openTaskSeq).toBe(seq);
+    // …and the open id survives the poll, which is what makes it sticky across `replaceAll`.
+    expect(useResearchStore.getState().openTaskId).toBe("rsh_a");
+  });
+});
+
 // ══ recentTasks — THE SELECTOR THAT MAKES `+0` READABLE ═════════════════════════════════════════
 //
 // `liveTasks` above is a GAUGE: it falls back to zero minutes after every burst, which is true and

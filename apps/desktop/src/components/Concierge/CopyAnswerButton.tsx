@@ -44,6 +44,7 @@ import { C } from "../../theme/colors";
 import { copyToClipboard } from "../../clipboard";
 import { stripAgentRefs } from "./agentRefs";
 import { stripBeadRefs } from "./beadRefs";
+import { stripResearchRefs } from "./researchRefs";
 import { COPY_TOAST_MS } from "./useCopyOnSelection";
 
 /** Resting opacity — present, findable, and quiet enough not to compete with the answer. */
@@ -149,7 +150,12 @@ export function CopyAnswerButton({
           // parsed TREE, so `text` still holds the bare `sparkle-17hm1` the model wrote and it
           // copies through untouched. This is for the EXPLICIT `[…](sparkle-bead:…)` form, which
           // `conciergeLine.bead()` composes and which model-authored text can carry verbatim.
-          void copyToClipboard(stripBeadRefs(stripAgentRefs(text))).then((ok) => {
+          // RESEARCH REFERENCES ARE FLATTENED TOO, on identical terms — `./researchRefs`' header is
+          // the third payment of the same "third consumer" tax the two above document. A copied
+          // answer that named a dispatched task carries `[the question](sparkle-research:rsh_…)` in
+          // its source, and pasting that internal id as a dead link is not what "copy this answer"
+          // means; the pill reads the question, so the source is made to agree.
+          void copyToClipboard(stripResearchRefs(stripBeadRefs(stripAgentRefs(text)))).then((ok) => {
             // Never claim a copy that didn't happen — no check mark, no announcement.
             if (!ok || !alive.current) return;
             setCopied(true);
