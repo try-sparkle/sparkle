@@ -900,13 +900,46 @@ function globNamesSomething(pattern) {
  *  literal MEMBER of the class, not the terminator. So `[]a-z]` is one class matching `]` or a
  *  letter, while the naive regex closes at that first `]` and leaves `a-z]` behind as apparent
  *  literal text — which then counts as a name and re-opens the very bypass the strip closes,
- *  spelled with one extra character. */
+ *  spelled with one extra character.
+ *
+ *  TWO constructs hold a `]` that does not close the class, and both are supported by fnmatch and by
+ *  BRE/emacs alike. The second is the POSIX sub-expressions `[:class:]`, `[.coll.]` and `[=equiv=]`,
+ *  whose own `]` ends the sub-expression rather than the class:
+ *
+ *      find / -name '[[:alpha:]x]*' -delete       ← closing at `:alpha:]` leaves `x]*`, so `x`
+ *      find / -iregex '[[:alnum:]x]*.*' -delete     counted as a name and this was ALLOWED
+ *
+ *  Note what made that hard to see: the leak needs a member AFTER the sub-expression. `[[:alpha:]]*`
+ *  strips down to non-alnum residue either way and stays blocked, so a corpus built from the obvious
+ *  spelling reads as covering the construct while the `x` variant walks through. */
 function bracketClassEnd(pattern, open) {
   let i = open + 1;
   if (pattern[i] === "!" || pattern[i] === "^") i++;
   if (pattern[i] === "]") i++; // a leading `]` is a member, not the close
-  while (i < pattern.length && pattern[i] !== "]") i++;
-  return i < pattern.length ? i : -1;
+  while (i < pattern.length) {
+    const sub = pattern[i] === "[" ? pattern[i + 1] : undefined;
+    if (sub === ":" || sub === "." || sub === "=") {
+      const end = pattern.indexOf(sub + "]", i + 2);
+      // An UNTERMINATED sub-expression is not a sub-expression: fnmatch (glibc explicitly, BSD by
+      // the same reading) rewinds and treats the `[` as an ordinary MEMBER of the class. Returning
+      // -1 here instead looked like refusing, and was — but only on the regex path. On the glob path
+      // -1 means "this `[` never closes, so it is a literal `[`", so `stripBracketClasses` kept the
+      // `[`, resumed one character in, found a SHORTER class, stripped that, and left the real
+      // class's earlier members behind as apparent literal text:
+      //
+      //     find / -name '[a-z[:]*' -delete      ← residue `[a-z*` → `a` counted → ALLOWED,
+      //     find / -name '[a[:alpha]*' -delete     and BLOCKED before the sub-expression change
+      //
+      // Two readers of one sentinel, disagreeing about its meaning — the same shape as the two
+      // readers of a bracket class that `bracketClassEnd` was extracted to prevent.
+      if (end === -1) { i += 1; continue; }
+      i = end + 2;
+      continue;
+    }
+    if (pattern[i] === "]") return i;
+    i += 1;
+  }
+  return -1;
 }
 
 /** Remove every bracket expression from a GLOB. An unterminated `[` is a literal in glob, so it is
@@ -1116,11 +1149,18 @@ function findSplitOn(args, ops) {
  *
  *  Precedence order matters and is followed: `,` (loosest) then `-o` then the implicit `-a`. */
 function findHasNarrowingPredicate(args) {
-  // The comma's VALUE is its right operand, so only the last segment decides what find matched.
+  // EVERY comma segment must narrow. Reading only the LAST one — because the comma's VALUE is its
+  // right operand — was a bypass of its own: `,` evaluates BOTH operands and merely discards the
+  // left one's VALUE, so the left segment's ACTIONS still run on every file.
+  //
+  //     find / -delete , -name zzz              ← -delete runs over / ; last segment names something
+  //     find / -false -o -delete , -name zzz    ← and this one the flat `-o` scan used to block
+  //
+  // Each segment's own tests are the only thing bounding an action inside it, so all of them have to
+  // bound. This does over-refuse a harmless left segment (`find / -print , -name zzz -delete`) —
+  // the refusing side, and the price of not modelling which predicates are actions.
   const commaSegments = findSplitOn(args, FIND_COMMA);
-  if (commaSegments.length > 1) {
-    return findHasNarrowingPredicate(commaSegments[commaSegments.length - 1]);
-  }
+  if (commaSegments.length > 1) return commaSegments.every(findHasNarrowingPredicate);
   const branches = findSplitOn(args, FIND_OR);
   if (branches.length > 1) return branches.every(findHasNarrowingPredicate);
   for (let i = 0; i < args.length; i++) {

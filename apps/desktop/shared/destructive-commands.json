@@ -172,8 +172,17 @@
     { "command": "find / -regex 'zzz\\|.*' -delete", "why": "the emacs spelling of alternation — the right branch matches everything, so the left one naming a literal proves nothing" },
     { "command": "find / \\( -name zzz , -true \\) -delete", "why": "REGRESSION: find's COMMA is the loosest-binding operator and evaluates to its RIGHT operand, so this is always true and deletes every file while containing a perfectly good -name" },
     { "command": "find / -name zzz , -print -delete", "why": "the same comma, unbracketed" },
+    { "command": "find / -delete , -name zzz", "why": "REGRESSION, HIGH: the comma discards the LEFT operand's VALUE but still EVALUATES it, so -delete runs over / while the last segment names something. Reading only the last segment was a bypass of its own." },
+    { "command": "find / -exec rm -rf {} + , -name zzz", "why": "the same left-of-comma action, via -exec. The `+` spelling and not `\\;`: a `;` is a shell command separator, so that variant is split before the find logic ever sees the comma and would pin nothing here." },
+    { "command": "find / -false -o -delete , -name zzz", "why": "REGRESSION the flat `-o` scan used to catch: splitting on the comma FIRST drops the whole `-false -o -delete` half, and -false forces -delete over every file" },
     { "command": "find / -name '[]a-z]*' -delete", "why": "REGRESSION: POSIX fnmatch reads a `]` in the FIRST position as a MEMBER of the class, not the terminator. A `\\[[^\\]]*\\]` strip closes at that `]` and leaves `a-z]*` behind as apparent literal text — the class bypass, spelled with one extra character." },
-    { "command": "find / -name '[^]a-z]*' -delete", "why": "the negated spelling of the same leading-`]` class" }
+    { "command": "find / -name '[^]a-z]*' -delete", "why": "the negated spelling of the same leading-`]` class" },
+    { "command": "find / -name '[[:alpha:]x]*' -delete", "why": "REGRESSION: a POSIX `[:class:]` sub-expression holds a `]` that ends the SUB-EXPRESSION, not the class. Closing there left `x]*` behind, so the `x` counted as a name. The leak needs a member AFTER the sub-expression — `[[:alpha:]]*` strips to non-alnum residue either way, which is why the obvious spelling read as covering it." },
+    { "command": "find / -iregex '[[:alnum:]x]*.*' -delete", "why": "the same early close on the regex path, where the residual `x` is then read as a required atom" },
+    { "command": "find / -name '[a-z[:]*' -delete", "why": "REGRESSION, HIGH: an UNTERMINATED sub-expression is not a sub-expression — fnmatch rewinds and reads the `[` as an ordinary member. Refusing from inside the class returned the same -1 the glob path reads as `literal [`, so the strip re-scanned, took a SHORTER class, and left `[a-z` behind as literal text. This is `'[a-z]*'` re-opened by adding two characters." },
+    { "command": "find / -name '[a[:alpha]*' -delete", "why": "the same malformed sub-expression with a member before it, and a class NAME that merely lacks its `:]`" },
+    { "command": "find / -name '[a-z[.]*' -delete", "why": "the `[.coll.]` spelling of the same unterminated sub-expression" },
+    { "command": "find / -name '[a-z[=]*' -delete", "why": "and the `[=equiv=]` spelling" }
   ],
 
   "mustAllow": [
