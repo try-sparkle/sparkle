@@ -392,6 +392,37 @@ describe("explicit rules — the three values", () => {
     expect(defaultDecisionFor("read_usage")).toBe("allow");
   });
 
+  // THE RE-ARM LEVER RUNS UNATTENDED, by founder ruling on 2026-08-13. It shipped classified
+  // `irreversible`, which derives to `ask` — so the one lever built to let a machine unstick a
+  // stalled agent could not fire unless a human was awake to approve it, which is the situation it
+  // was built to end. Nine goals sat escalated simultaneously with no machine able to touch any.
+  //
+  // Asserted as a PAIR against `set_agent_goal_met`, deliberately. Both halves of the founder's ask
+  // — put an agent back to work, and close a goal that is genuinely finished — have to run without
+  // a human, or the queue drains at one end and refills at the other. A single assertion here would
+  // stay green with the other half still gated.
+  //
+  // The guard that replaces the card is the BOUND, not trust: `MAX_CONCIERGE_REARMS` caps this at
+  // two per goal, exhaustion re-notifies the human, and only a human's typing refills the
+  // allowance. See `conciergeRearmGoal` / `resetGoalRetries`.
+  it("the concierge's goal levers run unattended — the bound is the guard, not an approval card", () => {
+    expect(defaultDecisionFor("set_agent_escalation")).toBe("allow");
+    expect(evaluateToolPolicy("set_agent_escalation", NONE).requiresConfirmation).toBe(false);
+    expect(defaultDecisionFor("set_agent_goal_met")).toBe("allow");
+    expect(evaluateToolPolicy("set_agent_goal_met", NONE).requiresConfirmation).toBe(false);
+  });
+
+  // …and the human can still take it back. Autonomy by default is not autonomy by fiat: the founder
+  // setting this tool to Ask must still produce a card, or the reclassification above has quietly
+  // removed a control rather than changed its default.
+  it("a human can put the approval card back on the re-arm lever", () => {
+    const v = evaluateToolPolicy("set_agent_escalation", {
+      overrides: { set_agent_escalation: "ask" },
+    });
+    expect(v.decision).toBe("ask");
+    expect(v.requiresConfirmation).toBe(true);
+  });
+
   it("an explicit allow can loosen a dangerous default — that is the point of per-tool control", () => {
     expect(defaultDecisionFor("push_agent_branch")).toBe("ask");
     const v = evaluateToolPolicy("push_agent_branch", { overrides: { push_agent_branch: "allow" } });

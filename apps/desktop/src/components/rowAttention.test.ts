@@ -19,6 +19,8 @@ import {
   newGoal,
   escalateGoal,
   markGoalMet,
+  chargeGoalDebt,
+  goalDebtOf,
   conciergeRearmGoal,
   DEFAULT_GOAL_TTL_MS,
   MAX_CONCIERGE_REARMS,
@@ -382,6 +384,102 @@ describe("goalBadgeFor", () => {
     const badge = goalBadgeFor(goal, NOW);
     expect(badge?.escalated).toBe(true);
     expect(badge?.label).toBe("auto-continue gave up — the build never went green");
+  });
+
+  // ── THE STALE QUOTE (Bug A) ─────────────────────────────────────────────────────────────────
+  //
+  // The badge is where the contradiction is most visible: `text` is the LIVE goal and `label`
+  // embeds a sentence quoting whatever the goal was when auto-continue gave up. Those can be two
+  // different objectives in one object, and nothing said so.
+  //
+  // `staleQuote` carries the OLD text as DATA rather than folding it into `label`, deliberately.
+  // `label` is what the compact column row renders into a `title`/`aria-label`, and the founder's
+  // instruction is that the Build column stays icons — so the words go to the card, which decides
+  // its own wording from this field.
+  describe("a stale escalation quote", () => {
+    // The real carry path, not a hand-stamped goal: escalate, then move the goal on through
+    // `chargeGoalDebt` exactly as `set_agent_goal` does.
+    const movedOnAfterEscalating = (): AgentGoal => {
+      const stuck = escalateGoal(
+        newGoal("land PR #42", NOW),
+        NOW,
+        'Auto-continued 3 times with no sign of progress. The goal is still unmet: "land PR #42".',
+      );
+      return chargeGoalDebt(newGoal("drain roborev findings", NOW), goalDebtOf(stuck));
+    };
+
+    it("carries the goal the sentence quotes, so the card can show BOTH", () => {
+      const badge = goalBadgeFor(movedOnAfterEscalating(), NOW);
+      expect(badge?.staleQuote).toBe("land PR #42");
+      // …beside the live one. The pair is the whole point — either alone is what the row already had.
+      expect(badge?.text).toBe("drain roborev findings");
+    });
+
+    it("leaves the LABEL untouched, so the Build column's chip does not grow words", () => {
+      // The founder's constraint, pinned where it can actually regress. `label` is the string the
+      // compact row puts in its tooltip and aria-label; widening it here is how "just icons"
+      // quietly becomes a paragraph.
+      const badge = goalBadgeFor(movedOnAfterEscalating(), NOW);
+      expect(badge?.label).toBe(
+        'auto-continue gave up — Auto-continued 3 times with no sign of progress. ' +
+          'The goal is still unmet: "land PR #42".',
+      );
+    });
+
+    it("is ABSENT when the escalation still quotes the goal the agent holds", () => {
+      // Without this the field could be a constant, and every escalation would render the
+      // two-line "gave up on / now working on" block — including the ones where both are the same
+      // sentence, which reads as a bug to whoever is looking at it.
+      const badge = goalBadgeFor(
+        escalateGoal(newGoal("land PR #42", NOW), NOW, "the build never went green"),
+        NOW,
+      );
+      expect(badge?.escalated).toBe(true);
+      expect(badge?.staleQuote).toBeUndefined();
+    });
+
+    it("is ABSENT on a goal nobody escalated", () => {
+      expect(goalBadgeFor(newGoal("land PR #42", NOW), NOW)?.staleQuote).toBeUndefined();
+    });
+
+    // THE SECOND CONSUMER. `staleQuote` is spread onto TWO returns — the first give-up and the
+    // re-armed-and-stuck-again row — and every case above lands on the first, because a goal built
+    // by `escalateGoal` + `chargeGoalDebt` never sets `conciergeRearms`. Delete the spread from the
+    // re-armed return and all four still pass, while that card renders the live goal beside a
+    // sentence quoting a dead one.
+    //
+    // It is the row where it matters MOST and where a human is least likely to catch it: a machine
+    // has already put this agent back to work once, so "just restart it" is advice already taken
+    // and the reader is leaning on the sentence to decide what else to do.
+    //
+    // This is the repo's own two-sites-one-check failure (bead sparkle-50m03), and it was caught
+    // here by review rather than by the mutation run, which had named only the shared line.
+    it("survives onto the RE-ARMED row, which spreads it from a different return", () => {
+      // The real path, driven end to end: stuck on A, re-armed (which strips the quote), moved to
+      // B, stuck again on B, then moved to C. Only the second escalation's quote should survive.
+      let goal = escalateGoal(
+        newGoal("land PR #42", NOW),
+        NOW,
+        'Auto-continued 3 times with no sign of progress. The goal is still unmet: "land PR #42".',
+      );
+      goal = conciergeRearmGoal(goal, NOW, "unblocked the build");
+      goal = chargeGoalDebt(newGoal("drain roborev findings", NOW), goalDebtOf(goal));
+      goal = escalateGoal(
+        goal,
+        NOW,
+        'Auto-continued 3 times with no sign of progress. The goal is still unmet: "drain roborev findings".',
+      );
+      goal = chargeGoalDebt(newGoal("cut the release", NOW), goalDebtOf(goal));
+
+      const badge = goalBadgeFor(goal, NOW);
+      // Proves we are on the OTHER return — without this the case could silently drift back onto
+      // the `rearms === 0` branch and re-cover the line that was already covered.
+      expect(badge?.label.startsWith("re-armed 1× and stuck again")).toBe(true);
+      // The SECOND escalation's quote, not the first: the re-arm strips its own, so a "land PR #42"
+      // here would mean a dead quote outlived the clear that was supposed to end it.
+      expect(badge?.staleQuote).toBe("drain roborev findings");
+      expect(badge?.text).toBe("cut the release");
+    });
   });
 
   // A goal the concierge re-armed `times` times and which has escalated AGAIN — the state the

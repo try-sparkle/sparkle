@@ -32,7 +32,12 @@ import { useProjectStore } from "../stores/projectStore";
 // reply. `rearmsRemaining` is the allowance the concierge is spending; `decideContinuation` is the
 // ~9 further gates a cleared escalation still has to pass before anything actually resumes — see
 // `handleSetEscalation` for why replying without it would be an empty success.
-import { MAX_CONCIERGE_REARMS, rearmsRemaining } from "../engine/agentGoal";
+import {
+  MAX_CONCIERGE_REARMS,
+  escalationQuotesStaleText,
+  rearmsRemaining,
+} from "../engine/agentGoal";
+import type { AgentGoal } from "../engine/agentGoal";
 import {
   decideContinuation,
   progressMark,
@@ -767,11 +772,30 @@ function capForRoster(text: string): string {
   return text.length <= ROSTER_TEXT_CAP ? text : `${text.slice(0, ROSTER_TEXT_CAP - 1)}…`;
 }
 
+/**
+ * Did this agent's work reach origin/main AT OR AFTER the goal was set?
+ *
+ * `landedEvidenceFor` answers "is this agent's branch landed", which is a fact about the AGENT, not
+ * about the goal it currently holds. `workflowShipped` is a monotonic latch cleared only on close
+ * or reset, so it survives into the next goal — and the roster renders the two side by side, where
+ * the flag reads as a statement about the goal beside it.
+ *
+ * FALSE WHEN THE TIMESTAMP IS MISSING, which is the fail-closed direction and covers a real
+ * population: watermarks latched before `workflowShippedAt` existed persist without one. "I cannot
+ * tell when this merged" must not present as "it merged for this goal".
+ */
+function shippedAfterGoalSet(agent: AgentTab, goal: AgentGoal | undefined): boolean {
+  if (goal === undefined) return false;
+  const at = useRuntimeStore.getState().workflowShippedAt?.[agent.id];
+  return at !== undefined && at >= goal.setAt;
+}
+
 function goalAndStallFields(
   agent: AgentTab,
   status: AgentTabStatus,
   now: number,
 ): Record<string, unknown> {
+  const goalRecord = agent.goal;
   const goal = goalReading(agent.goal, now);
   const stall = stallReadingFor(agent.id, status, agent.goal, now);
   const thrash = thrashReadingFor(agent.id, agent.goal, now);
@@ -809,6 +833,45 @@ function goalAndStallFields(
             // alone.
             ...(goal.state === "escalated"
               ? { rearmsRemaining: rearmsRemaining(agent.goal) }
+              : {}),
+            // THE ESCALATION QUOTES A GOAL THE AGENT NO LONGER HOLDS. Carried only when TRUE and
+            // only on an escalated row, so it costs nothing on the ordinary case and reads as a
+            // warning rather than a status.
+            //
+            // ⚠️ NOTHING IN THIS COMMENT MAY CONTAIN A BARE WORD FOLLOWED BY A COLON (see the
+            // warning above; the shape test extracts this literal's keys with a regex).
+            //
+            // Without it the frozen sentence and the live text sit side by side in this payload
+            // with nothing to tell them apart, and the reader acts on the quote as a live claim.
+            // That is not hypothetical — three of nine simultaneous escalations were false this
+            // way, and the founder had to re-derive each one by hand.
+            ...(escalationQuotesStaleText(agent.goal) ? { escalationStale: true } : {}),
+            // GIT'S OWN ANSWER TO "IS THIS AGENT'S WORK ON ORIGIN MAIN", which the concierge has
+            // never been able to see. It has been allowed to close any agent's goal for a while —
+            // `handleSetGoalMet` exempts it — but the ancestry reading that would JUSTIFY doing so
+            // was computed only for a `landed`-kind goal and only inside the agent's own self-mark
+            // path. So the lever was authority without evidence, and a finished agent sat blocked
+            // for an hour while a person re-derived by hand what this field states.
+            //
+            // TRUE ONLY, never a false, matching the stall fields directly below. Absence means
+            // NOT PROVEN, and it collapses three different cases — no branch has been polled, git
+            // says no, and the merge predates this goal. For a lever that closes goals all three
+            // mean "do not rely on git here", and NO wire surface separates them today.
+            //
+            // Carried on EVERY goal state rather than only on `landed`-kind ones, deliberately.
+            // The population that gets stuck is work provable by ancestry sitting behind a `human`
+            // check, which is exactly where the self-mark path never looks.
+            //
+            // ⚠️ ANCHORED TO THE GOAL, and without the anchor this field is actively harmful
+            // (roborev 63905). `workflowShipped` is a MONOTONIC latch that survives into the
+            // agent's next goal, and `landedEvidenceFor`'s only veto is the new-work cycle. So an
+            // agent that shipped one thing and was then handed a fresh goal reads as landed from
+            // the first second — before a single commit toward that goal exists — and the caller
+            // this field was added for is the one told it may close goals other agents may not.
+            // Requiring the watermark to be at least as new as the goal is what makes the flag a
+            // statement about THIS goal rather than about the agent's history.
+            ...(landedEvidenceFor(agent.id) === true && shippedAfterGoalSet(agent, goalRecord)
+              ? { landed: true }
               : {}),
           },
         }

@@ -1825,7 +1825,13 @@ export const useProjectStore = create<ProjectState>()(
         // this branch; there is simply nothing to resume afterwards, which the caller reports.
         if (goal === undefined) {
           if (stashed?.escalatedAt === undefined) return false;
-          const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, ...restDebt } = stashed;
+          const {
+            escalatedAt: _e,
+            escalationReason: _r,
+            escalatedGoalText: _egt,
+            escalatedBy: _b,
+            ...restDebt
+          } = stashed;
           const emptied =
             restDebt.totalContinues === 0 &&
             (restDebt.conciergeRearms ?? 0) === 0 &&
@@ -1866,8 +1872,13 @@ export const useProjectStore = create<ProjectState>()(
               // cleared the moment the agent sets new goal text — the clear would look like it
               // worked and silently undo itself one call later.
               if (a.goalDebt?.escalatedAt === undefined) return rearmed;
-              const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, ...restDebt } =
-                a.goalDebt;
+              const {
+                escalatedAt: _e,
+                escalationReason: _r,
+                escalatedGoalText: _egt,
+                escalatedBy: _b,
+                ...restDebt
+              } = a.goalDebt;
               return { ...rearmed, goalDebt: restDebt };
             }),
           ),

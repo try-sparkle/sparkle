@@ -98,6 +98,25 @@ export interface AgentGoal {
   escalatedAt?: number;
   /** Why it escalated, in one sentence, for the human who now owns it. */
   escalationReason?: string;
+  /** The goal text {@link escalationReason} QUOTES — stamped by {@link escalateGoal} from the text
+   *  the goal held at that instant.
+   *
+   *  ⚠️ THIS EXISTS BECAUSE THE SENTENCE FREEZES AND THE OBJECT DOES NOT. `escalationReason` embeds
+   *  the live text at the moment auto-continue gave up; {@link chargeGoalDebt} then deliberately
+   *  carries that sentence onto whatever the agent's goal becomes next (an agent must not launder
+   *  away an escalation by rewording its goal). Nothing regenerates the sentence, so a roster row
+   *  can show the live goal beside an escalation quoting one two goals old — which reads as a live
+   *  claim and has been acted on as one.
+   *
+   *  The sentence is NOT rewritten: it is the record of what the agent was actually stuck on, and
+   *  regenerating it against current text destroys exactly the evidence the human needs. Recording
+   *  the quote instead lets any reader ask {@link escalationQuotesStaleText} and say so.
+   *
+   *  ABSENT IS "CANNOT TELL", NOT "FRESH" — every escalation persisted before this field carries no
+   *  quote, and the comparison fails closed to not-stale for them. See the strip note on
+   *  {@link conciergeRearmGoal}: this must die wherever `escalationReason` dies, or the NEXT
+   *  escalation is compared against a dead string and a TRUE escalation is dismissed as false. */
+  escalatedGoalText?: string;
   /** WHO raised the escalation. `auto` is the continuation engine giving up; `concierge` is the
    *  concierge raising one deliberately through `set_agent_escalation`.
    *
@@ -432,7 +451,39 @@ export function escalateGoal(
 ): AgentGoal {
   if (goal.escalatedAt !== undefined) return goal;
   if (goal.metAt !== undefined) return goal;
-  return { ...goal, escalatedAt: now, escalationReason: reason, escalatedBy: by };
+  return {
+    ...goal,
+    escalatedAt: now,
+    escalationReason: reason,
+    escalatedBy: by,
+    // Stamped in the SAME write as the sentence, deliberately: the two are one fact, and any path
+    // that could set one without the other reintroduces "a quote nobody can check".
+    escalatedGoalText: goal.text,
+  };
+}
+
+/**
+ * Does this escalation's sentence quote goal text the agent no longer holds?
+ *
+ * The one question a reader of {@link AgentGoal.escalationReason} cannot answer for themselves. The
+ * sentence embeds the goal text as it stood when auto-continue gave up; {@link chargeGoalDebt}
+ * carries that sentence forward onto new text on purpose, and {@link escalateGoal}'s latch means a
+ * later, correct escalation is a NO-OP that cannot replace it. So the stale quote is permanent, and
+ * nothing in the record marks it as stale.
+ *
+ * FAILS CLOSED IN BOTH DIRECTIONS, which is what makes the marker worth trusting:
+ *  • no escalation at all → `false`. There is no quote to be stale.
+ *  • escalated but no {@link AgentGoal.escalatedGoalText} → `false`. Pre-field records cannot be
+ *    compared, and reporting the whole installed base as stale would discredit the flag on the day
+ *    it shipped.
+ *
+ * Compares raw text, not a normalised form: `set_agent_goal` already trims, and treating a
+ * whitespace-only edit as "the same goal" would hide a real restatement.
+ */
+export function escalationQuotesStaleText(goal: AgentGoal | undefined): boolean {
+  if (goal?.escalatedAt === undefined) return false;
+  if (goal.escalatedGoalText === undefined) return false;
+  return goal.escalatedGoalText !== goal.text;
 }
 
 /** Re-arms remaining on this goal — what the concierge has left before the escalation locks back to
@@ -464,7 +515,19 @@ export function mayRearmGoal(goal: AgentGoal | undefined): boolean {
  * compare against a fresh observation, not a stale one recorded before the blockage was cleared.
  */
 export function conciergeRearmGoal(goal: AgentGoal, now: number, reason: string): AgentGoal {
-  const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, mark: _m, ...rest } = goal;
+  // `escalatedGoalText` goes with the sentence it belongs to, and this is the strip that matters
+  // most of the three. A re-armed agent goes back to work, restates its goal, and may stall again —
+  // and if the DEAD quote survived this clear, that fresh escalation would be compared against text
+  // from the previous one and marked stale on arrival. A true escalation dismissed as false is a
+  // worse failure than the stale quote this field exists to catch.
+  const {
+    escalatedAt: _e,
+    escalationReason: _r,
+    escalatedGoalText: _egt,
+    escalatedBy: _b,
+    mark: _m,
+    ...rest
+  } = goal;
   return {
     ...rest,
     continues: 0,
@@ -486,7 +549,13 @@ export function conciergeRearmGoal(goal: AgentGoal, now: number, reason: string)
  * a machine give-up goes through {@link rearmGoal} and is charged for.
  */
 export function unraiseGoal(goal: AgentGoal): AgentGoal {
-  const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, ...rest } = goal;
+  const {
+    escalatedAt: _e,
+    escalationReason: _r,
+    escalatedGoalText: _egt,
+    escalatedBy: _b,
+    ...rest
+  } = goal;
   return rest;
 }
 
@@ -507,6 +576,7 @@ export function resetGoalRetries(goal: AgentGoal): AgentGoal {
   const {
     escalatedAt: _e,
     escalationReason: _r,
+    escalatedGoalText: _egt,
     escalatedBy: _b,
     mark: _m,
     // The expiry latches and the re-arm budget go the same way and for the same reason: a human who
@@ -592,6 +662,11 @@ export interface GoalDebt {
    *  latched within a goal: taking it back is the human's call, not the agent's. */
   escalatedAt?: number;
   escalationReason?: string;
+  /** The goal text the owed sentence quotes. Rides the stash for the same reason the sentence does —
+   *  a clear-then-set is the LONGEST route between the escalation and the text it names, so it is
+   *  the route on which the quote most needs to stay checkable. Dropping it here would make every
+   *  escalation that survived a `set_agent_goal {goal:""}` read as pre-field, i.e. never stale. */
+  escalatedGoalText?: string;
   /** Who raised the owed escalation. Rides along so a clear-then-set cannot launder a MACHINE
    *  give-up into a concierge raise — which would be the free {@link unraiseGoal} path, i.e. an
    *  escalation the concierge could take back without spending any of its allowance. */
@@ -676,6 +751,9 @@ export function goalDebtOf(goal: AgentGoal | undefined): GoalDebt | undefined {
           ...(goal.escalationReason !== undefined
             ? { escalationReason: goal.escalationReason }
             : {}),
+          ...(goal.escalatedGoalText !== undefined
+            ? { escalatedGoalText: goal.escalatedGoalText }
+            : {}),
           // Carried as-is. Absence means `auto` (see `AgentGoal.escalatedBy`), and normalising it to
           // an explicit `"auto"` here would be harmless today but would destroy the marker that
           // identifies pre-field records, exactly as the `verifyStated` carry above refuses to.
@@ -739,6 +817,10 @@ export function chargeGoalDebt(goal: AgentGoal, debt: GoalDebt | undefined): Age
   if (debt === undefined) return goal;
   const escalatedAt = goal.escalatedAt ?? debt.escalatedAt;
   const escalationReason = goal.escalationReason ?? debt.escalationReason;
+  // Resolved from the SAME side as the sentence above, and that pairing is load-bearing: taking the
+  // quote from one source and the sentence from the other would compare a fresh goal's text against
+  // an owed goal's sentence and invent staleness that never happened.
+  const escalatedGoalText = goal.escalatedGoalText ?? debt.escalatedGoalText;
   const escalatedBy = goal.escalatedBy ?? debt.escalatedBy;
   // THE FLOOR, exactly like `totalContinues` below — a new goal cannot start with fewer re-arms
   // spent than the agent already owes. `newGoal` never sets it, so in practice the debt always
@@ -874,6 +956,7 @@ export function chargeGoalDebt(goal: AgentGoal, debt: GoalDebt | undefined): Age
       ? {
           escalatedAt,
           ...(escalationReason !== undefined ? { escalationReason } : {}),
+          ...(escalatedGoalText !== undefined ? { escalatedGoalText } : {}),
           ...(escalatedBy !== undefined ? { escalatedBy } : {}),
         }
       : {}),

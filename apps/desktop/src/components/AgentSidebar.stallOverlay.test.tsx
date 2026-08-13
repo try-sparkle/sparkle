@@ -40,7 +40,14 @@ import { useUiStore } from "../stores/uiStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
-import { DEFAULT_GOAL_TTL_MS, escalateGoal, markGoalMet, newGoal } from "../engine/agentGoal";
+import {
+  DEFAULT_GOAL_TTL_MS,
+  chargeGoalDebt,
+  escalateGoal,
+  goalDebtOf,
+  markGoalMet,
+  newGoal,
+} from "../engine/agentGoal";
 import type { AgentGoal } from "../engine/agentGoal";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
@@ -707,6 +714,68 @@ describe("EVERY goal state is visible on the row, and an ESCALATED one is still 
     // one at a glance.
     render(<AgentSidebar project={seed({ status: { busy: "working" } })} />);
     expect(within(rowFor("Busy One")).queryByTestId("row-goal")).toBeNull();
+  });
+
+  // ── THE STALE ESCALATION QUOTE, AND WHERE IT IS ALLOWED TO APPEAR ───────────────────────────
+  //
+  // An escalation sentence freezes the goal text at the instant auto-continue gave up and is never
+  // regenerated, so a row can show a live goal beside a sentence quoting one two revisions old.
+  // Three of nine simultaneous escalations read as false for exactly that reason.
+  //
+  // The founder's instruction on the fix was as much about PLACE as wording: show both texts when
+  // you click into an agent, and keep the Build column icons. So both halves are pinned here — the
+  // card says it, and the column row does not — because a block that quietly migrates into the row
+  // is the regression, and it would keep every other assertion in this file green.
+  it("the CARD spells out the stale quote and the live goal, in that order", () => {
+    const stuck = escalateGoal(
+      newGoal("land PR #42", NOW),
+      NOW,
+      'Auto-continued 3 times with no sign of progress. The goal is still unmet: "land PR #42".',
+    );
+    // Moved on through the real carry path — `chargeGoalDebt` is what `set_agent_goal` runs, and it
+    // keeps the escalation deliberately so an agent cannot launder one away by rewording its goal.
+    const movedOn = chargeGoalDebt(newGoal("drain roborev findings", NOW), goalDebtOf(stuck));
+    render(
+      <AgentSidebar
+        project={seed({ status: { stalled: "idle" }, goals: { stalled: movedOn } })}
+      />,
+    );
+
+    const row = rowFor("Stalled One");
+    // THE COLUMN FIRST, while the card is still shut — afterwards the card is in the document and a
+    // document-wide absence check could pass merely because the lookup was scoped wrong.
+    expect(within(row).queryByTestId("card-goal-stale")).toBeNull();
+    expect(row.textContent ?? "").not.toContain("Gave up on");
+
+    openAgentCard(row);
+    const stale = within(screen.getByTestId("agent-hover-card")).getByTestId("card-goal-stale");
+    // BOTH texts, and both asserted — either alone is what the row already had, and the whole value
+    // of this line is the reader seeing that they differ.
+    expect(stale.textContent).toContain("Gave up on: land PR #42");
+    expect(stale.textContent).toContain("Now working on: drain roborev findings");
+  });
+
+  it("shows no stale block when the escalation still quotes the live goal", () => {
+    // The control. Without it the block could render unconditionally and the assertions above would
+    // all still pass — while every ordinary escalation grew a line reading "gave up on X, now
+    // working on X", which reads as a bug to whoever opens the card.
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { stalled: "idle" },
+          goals: {
+            stalled: escalateGoal(newGoal("land PR #42", NOW), NOW, "the build never went green"),
+          },
+        })}
+      />,
+    );
+    const row = rowFor("Stalled One");
+    openAgentCard(row);
+    const card = screen.getByTestId("agent-hover-card");
+    // The goal line itself must still be there — otherwise this passes on a card that renders no
+    // goal at all, which would also hide the block.
+    expect(within(card).getByTestId("card-goal")).toBeTruthy();
+    expect(within(card).queryByTestId("card-goal-stale")).toBeNull();
   });
 
   it("inks the card's STALL chip and detail amber — the third surface of one fact", () => {

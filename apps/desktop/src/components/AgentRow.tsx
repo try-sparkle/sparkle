@@ -2284,6 +2284,33 @@ export const AgentRow = memo(function AgentRow({
           </span>
         </DetailLine>
       )}
+      {/* THE ESCALATION QUOTES A GOAL THIS AGENT NO LONGER HOLDS, said in words — and said HERE,
+          which is the whole point. The escalation sentence in the line above freezes the goal text
+          at the instant auto-continue gave up and is never regenerated, so `text` and that sentence
+          can describe two different objectives on one row. Read as a live claim it sends someone to
+          chase work that is already done: three of nine simultaneous escalations were false exactly
+          this way.
+
+          THIS BLOCK MUST NOT MIGRATE TO THE COLUMN ROW. The sidebar's goal chip is an ICON by
+          explicit instruction (see goalChipEl above, and the 440px note at `goalBadgeFor`'s call
+          site) — words there only ever via `title`/`aria-label`. `staleQuote` is carried as data
+          precisely so this card can spend the space and the row cannot. */}
+      {goalBadge?.staleQuote && (
+        <DetailLine label="Escalation">
+          <span
+            data-testid="card-goal-stale"
+            style={{
+              color: C.muted,
+              fontSize: 12,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+            }}
+          >
+            Gave up on: {goalBadge.staleQuote}. Now working on: {goalBadge.text}.
+          </span>
+        </DetailLine>
+      )}
       {/* The stall verdict's OWN sentence, unabbreviated. The chip on the row is a headline capped
           at ~20 characters; this is the engine's full reading, including every cause beyond the
           first that the chip could only count as "+N". Rendered only for a confident stall — an

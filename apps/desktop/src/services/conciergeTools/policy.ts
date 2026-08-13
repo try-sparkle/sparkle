@@ -311,14 +311,32 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   // repo — the claim only makes `merge_pr` pause and point at the claimant.
   set_agent_goal: "routine",
   set_agent_goal_met: "routine",
-  // IRREVERSIBLE, unlike the three `routine` intent writes around it, and the difference is what it
-  // takes OFF A HUMAN'S PLATE rather than how hard the field is to overwrite. An escalation is the
-  // app saying "this one is yours now"; clearing it withdraws that, spends one of an allowance only
-  // the human can refill, and starts a token-spending retry loop again. Raising one puts a
-  // notification in front of them. Neither is undone by setting a field back — the allowance is
-  // gone either way. `set_config` carries the same class for the same reason (it overstates
-  // recoverability, deliberately, because erring toward asking is the cheap mistake).
-  set_agent_escalation: "irreversible",
+  // ROUTINE — reclassified from `irreversible` on 2026-08-13 by founder ruling, and the reasoning
+  // is worth keeping because the original class was defensible and still lost.
+  //
+  // The old argument: clearing an escalation takes work OFF A HUMAN'S PLATE, spends one of an
+  // allowance only they can refill, and restarts a token-spending retry loop. True, and it derived
+  // to `ask`. THAT IS THE DEFECT. `irreversible` → `ask` meant the one lever built so a machine
+  // could unstick a stalled agent could not fire unless a human was awake to approve it — which is
+  // precisely the situation it exists to end. Measured: nine goals escalated simultaneously, some
+  // of them false, and nothing but the founder could touch any of them. An autonomy lever gated on
+  // the attention it was built to save is not a lever.
+  //
+  // WHAT REPLACES THE CARD IS THE BOUND, NOT TRUST, and the bound was always the real guard:
+  // `MAX_CONCIERGE_REARMS` caps this at two per goal; the third refusal re-notifies the human
+  // rather than failing quietly; `resetGoalRetries` — reachable only by a human typing — is the
+  // only thing that refills the allowance, which keeps the human strictly stronger by construction.
+  // A per-use approval card added nothing to that except a human in the loop at 3am.
+  //
+  // The one genuinely non-reversible part is the allowance decrement, and that is the DESIGNED
+  // cost of the lever rather than a hazard it exposes: spending it is how the bound is enforced.
+  // Everything else is local, touches no repo, bills nothing, and a raise puts the escalation
+  // straight back in front of the human. Unlike `set_config` — which keeps `irreversible` because
+  // it overstates recoverability on purpose — the recoverability here is not overstated.
+  //
+  // A human who disagrees sets this tool to Ask in Settings → Concierge tools; the override is
+  // tested. This changes a DEFAULT, not the availability of the control.
+  set_agent_escalation: "routine",
   claim_pr: "routine",
   release_pr: "routine",
 };

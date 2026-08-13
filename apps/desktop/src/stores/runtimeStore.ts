@@ -735,6 +735,14 @@ interface RuntimeState {
   // RESETS to a new cycle (deriveLiveStage drops back to Committed when fresh work lands on a branch
   // that already shipped). PERSISTED alongside workflowStage so the ✓ survives a relaunch.
   workflowShipped: Record<string, boolean>;
+  // WHEN that watermark first latched, so a reader can ask whether the merge happened before or
+  // after some other event. The boolean alone cannot answer that, and the gap is not cosmetic: the
+  // latch is monotonic and survives into the agent's NEXT goal, so "this agent shipped something"
+  // reads as true from the first second of a goal no work has been done on yet. Anything closing a
+  // goal on the strength of the watermark needs this to avoid acting on a merge that predates it
+  // (roborev 63905). Stamped only on the FALSE -> TRUE transition; re-stamping on every poll would
+  // make the timestamp mean "now" and the comparison vacuous. Persisted with the watermark.
+  workflowShippedAt: Record<string, number>;
   // agentId -> the LIVE WorkflowState from the last poll (reachability + PR probe + hasRemote). The
   // stage watermark above is monotonic and lossy by design; the composer CTA needs the raw signals
   // to tell "on local main" from "on origin main" (engine/agentCta.deriveCta). Live-only (never
@@ -821,6 +829,7 @@ export const useRuntimeStore = create<RuntimeState>()(
       branchStatus: {},
       workflowStage: {},
       workflowShipped: {},
+      workflowShippedAt: {},
       workflowState: {},
 
       open: (agentId) =>
@@ -861,6 +870,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
+          const { [agentId]: _shippedAt, ...workflowShippedAt } = s.workflowShippedAt;
           const { [agentId]: _wstate, ...workflowState } = s.workflowState;
           // `branchStatus` was just dropped above — `forcedOnce` must forget it too (roborev 54843,
           // High). Otherwise an agent polled once while open (marked forced), then closed, then
@@ -883,6 +893,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             branchStatus,
             workflowStage,
             workflowShipped,
+            workflowShippedAt,
             workflowState,
           };
         }),
@@ -906,6 +917,7 @@ export const useRuntimeStore = create<RuntimeState>()(
           const { [agentId]: _bs, ...branchStatus } = s.branchStatus;
           const { [agentId]: _ws, ...workflowStage } = s.workflowStage;
           const { [agentId]: _shipped, ...workflowShipped } = s.workflowShipped;
+          const { [agentId]: _shippedAt, ...workflowShippedAt } = s.workflowShippedAt;
           const { [agentId]: _wstate, ...workflowState } = s.workflowState;
           // Same reason as in `close()`: `branchStatus` was just dropped, so `forcedOnce` must
           // forget the id too, or the reused slot inherits a stale "already forced" mark with no
@@ -921,6 +933,7 @@ export const useRuntimeStore = create<RuntimeState>()(
             branchStatus,
             workflowStage,
             workflowShipped,
+            workflowShippedAt,
             workflowState,
           };
         }),
@@ -1008,7 +1021,24 @@ export const useRuntimeStore = create<RuntimeState>()(
         set((st) => ({ workflowStage: { ...st.workflowStage, [agentId]: stage } })),
 
       setWorkflowShipped: (agentId, shipped) =>
-        set((st) => ({ workflowShipped: { ...st.workflowShipped, [agentId]: shipped } })),
+        set((st) => {
+          // STAMPED ON THE TRANSITION ONLY. Call sites already guard on `!workflowShipped[id]`, but
+          // the guard is repeated here because the whole value of the timestamp is that it does not
+          // move: re-stamping while `shipped` stays true would make it read "now" on every poll, and
+          // every "did this merge predate that goal?" comparison would answer yes forever.
+          const alreadyShipped = st.workflowShipped[agentId] === true;
+          if (shipped && alreadyShipped) return {};
+          if (!shipped) {
+            // Cleared together, so the pair cannot disagree — a timestamp outliving its watermark
+            // would claim a merge that the watermark says never happened.
+            const { [agentId]: _drop, ...workflowShippedAt } = st.workflowShippedAt;
+            return { workflowShipped: { ...st.workflowShipped, [agentId]: false }, workflowShippedAt };
+          }
+          return {
+            workflowShipped: { ...st.workflowShipped, [agentId]: true },
+            workflowShippedAt: { ...st.workflowShippedAt, [agentId]: Date.now() },
+          };
+        }),
 
       setWorkflowState: (agentId, ws) =>
         set((st) => {
@@ -1174,7 +1204,14 @@ export const useRuntimeStore = create<RuntimeState>()(
           return {
             ...(openChanged ? { openAgentIds } : {}),
             ...(stagePruned ? { workflowStage: pruneMap(s.workflowStage) } : {}),
-            ...(shipPruned ? { workflowShipped: pruneMap(s.workflowShipped) } : {}),
+            ...(shipPruned
+              ? {
+                  workflowShipped: pruneMap(s.workflowShipped),
+                  // Pruned on the SAME condition, not its own: the two maps are one fact, and a
+                  // separate predicate is how they drift apart for a reused agent id.
+                  workflowShippedAt: pruneMap(s.workflowShippedAt),
+                }
+              : {}),
             ...(lastObservedPruned ? { lastObserved: pruneMap(s.lastObserved) } : {}),
           };
         }),
@@ -1190,6 +1227,10 @@ export const useRuntimeStore = create<RuntimeState>()(
         openAgentIds: s.openAgentIds,
         workflowStage: s.workflowStage,
         workflowShipped: s.workflowShipped,
+        // Persisted with it, or a relaunch leaves a latched watermark whose timestamp is gone —
+        // which reads as "we cannot tell when this merged" and silently disables the goal anchor
+        // for every agent that shipped before the restart.
+        workflowShippedAt: s.workflowShippedAt,
         // Persisted so a closed worker still reads as "ran, then stopped" after a relaunch, rather
         // than reverting to statusless and re-manufacturing a synthetic red (sparkle-w340).
         lastObserved: s.lastObserved,

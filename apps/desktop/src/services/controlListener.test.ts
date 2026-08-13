@@ -305,6 +305,9 @@ describe("controlListener", () => {
       workflowState: {},
       workflowStage: {},
       workflowShipped: {},
+      // Reset with its watermark, or a leaked timestamp lets a later test's `landed` clear the
+      // goal anchor for a merge that test never performed.
+      workflowShippedAt: {},
     } as never);
     try {
       localStorage.removeItem(RUNTIME_PERSIST_KEY);
@@ -3607,15 +3610,196 @@ describe("controlListener", () => {
       expect(row.goal).not.toHaveProperty("rearmsRemaining");
     });
 
-    it("defaults to ASK — clearing an escalation is not something it does silently", async () => {
-      // The consequence of classing it `irreversible` in conciergeTools/policy.ts, asserted here
-      // because it is the reason every other case in this block sets an explicit "allow". Taking
-      // work off a human's plate spends an allowance only the human can refill, so the derived
-      // default puts an approval card in front of them first.
+    // ── THE EVIDENCE THE CONCIERGE DECIDES ON ────────────────────────────────────────────────────
+    //
+    // The concierge has been able to close ANY agent's goal since `handleSetGoalMet` grew its
+    // `!isConcierge` exemption — including a `human`-verified one, on no evidence whatsoever. What
+    // it has never had is a way to SEE the ancestry fact that would justify doing so:
+    // `landedEvidenceFor` was computed only for `landed`-kind goals and only inside the agent's own
+    // self-mark path, on no wire shape a headless caller can read. So the founder's ask — close a
+    // finished agent's goal "by git ancestry rather than by the agent's self-report" — was blocked
+    // by missing evidence, not by missing authority.
+    const rosterGoal = async (reqId: string): Promise<Record<string, unknown> | undefined> => {
+      fire({ reqId, op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "all" } });
+      await flush();
+      return (
+        lastReply() as { agents: Array<{ id: string; goal?: Record<string, unknown> }> }
+      ).agents.find((a) => a.id === callerId)?.goal;
+    };
+
+    it("carries `landed` when git says the agent's work reached origin/main", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder likes the new column", undefined, "agent", {
+          kind: "human",
+        });
+      // The same two facts `landedEvidenceFor` consumes on the self-mark path: the sticky watermark
+      // set the first time the stage reached ORIGIN main, and a clean branch holding nothing back.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+
+      // A `human` goal ON PURPOSE. This is the population the founder was stuck on — work provable
+      // by ancestry, behind a check only a person may discharge — so evidence must reach the
+      // concierge for exactly the goals it cannot close on the agent's word.
+      expect(await rosterGoal("lv1")).toMatchObject({ state: "unmet", landed: true });
+    });
+
+    it("OMITS `landed` when no branch has been polled — absence is 'not looked up', never 'no'", async () => {
+      // Fail-closed, and the same rule the stall fields already follow: a caller must not be able to
+      // read a missing field as a confirmed negative. Nothing is seeded here, which is exactly what
+      // an agent whose pane this window has never opened looks like.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      const goal = await rosterGoal("lv2");
+      expect(goal).toMatchObject({ state: "unmet" });
+      expect(goal).not.toHaveProperty("landed");
+    });
+
+    it("OMITS `landed` when the merge PREDATES the goal — the watermark outlives its goal", async () => {
+      // roborev 63905, and the sharpest failure this field could have had. `workflowShipped` is a
+      // MONOTONIC latch cleared only on close or reset, and `landedEvidenceFor`'s only veto is the
+      // new-work cycle. So an agent that shipped PR #1 and was then handed a FRESH goal reads as
+      // landed from the first second — before a single commit toward that goal exists — while the
+      // caller told it may close goals other agents may not sits reading exactly this row.
+      //
+      // The sequence matters and is why this is not a variant of the unlanded-commits case above:
+      // the branch here is genuinely CLEAN and genuinely merged. Nothing about the branch is wrong.
+      // What is wrong is relating that merge to a goal set afterwards.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      // BACK-DATED EXPLICITLY rather than relying on call order. `setAt` and the watermark are both
+      // `Date.now()`, so within one test they land in the same millisecond and "before" is not
+      // expressible by sequencing alone — the assertion would pass or fail on clock granularity
+      // rather than on the rule. An hour is unambiguous and is the real shape anyway.
+      useRuntimeStore.setState({
+        workflowShippedAt: { [callerId]: Date.now() - 60 * 60 * 1000 },
+      } as never);
+      // …and THEN the new objective, so the goal is unambiguously newer than the merge.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "start the follow-up feature");
+
+      expect(await rosterGoal("lv4")).not.toHaveProperty("landed");
+    });
+
+    it("OMITS `landed` while the branch still holds unlanded commits", async () => {
+      // The new-work cycle: PR #1 merged (so the watermark latched) and the agent has since written
+      // commits nobody has landed. Reporting `landed` here is how a goal gets closed on a merge that
+      // predates the work — the precise failure `landedEvidenceFor`'s veto exists to stop, and it
+      // must survive being re-exposed on a new surface.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the follow-up fix");
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 3,
+        behind: 0,
+        dirty: false,
+        filesChanged: 2,
+        insertions: 40,
+        deletions: 1,
+        worktreeOnBranch: true,
+      });
+      expect(await rosterGoal("lv3")).not.toHaveProperty("landed");
+    });
+
+    it("flags an escalation whose sentence quotes goal text the agent no longer holds", async () => {
+      // BUG A, reaching the one reader that acts on it unattended. The frozen sentence and the live
+      // text sit side by side in this payload with nothing distinguishing them, and a concierge (or
+      // a founder) reads the quote as a live claim. Three of nine simultaneous escalations were
+      // false for exactly this reason.
+      // Escalated with the REAL sentence shape rather than the block's canned helper, because the
+      // whole defect is the goal text embedded in that sentence.
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "land PR #1861");
+      store.escalateAgentGoal(
+        projectId,
+        callerId,
+        'Auto-continued 3 times with no sign of progress. The goal is still unmet: "land PR #1861".',
+        Date.now(),
+      );
+      // The agent moves on through the ordinary front door. `chargeGoalDebt` carries the escalation
+      // onto the new text deliberately — an agent must not launder one away by rewording its goal —
+      // and the sentence keeps quoting the goal it no longer holds.
+      fire({
+        reqId: "st1",
+        op: "set_agent_goal",
+        callerAgentId: callerId,
+        payload: { goal: "drain roborev findings" },
+      });
+      await flush();
+
+      const goal = await rosterGoal("st2");
+      // The contradiction, in one object: live text beside a stale quote…
+      expect(goal).toMatchObject({ text: "drain roborev findings", state: "escalated" });
+      expect(String(goal?.escalationReason)).toContain("land PR #1861");
+      // …now marked as such.
+      expect(goal).toMatchObject({ escalationStale: true });
+    });
+
+    it("does NOT flag an escalation that still quotes the live goal", async () => {
+      // The other direction, and without it the flag could be a hardcoded `true`. A genuine
+      // escalation against the goal the agent is actually holding must read as trustworthy, or the
+      // marker teaches the concierge to discount every escalation it sees.
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "land PR #1861");
+      store.escalateAgentGoal(
+        projectId,
+        callerId,
+        'Auto-continued 3 times with no sign of progress. The goal is still unmet: "land PR #1861".',
+        Date.now(),
+      );
+      const goal = await rosterGoal("st3");
+      expect(goal).toMatchObject({ state: "escalated" });
+      expect(goal).not.toHaveProperty("escalationStale");
+    });
+
+    // REVERSED ON 2026-08-13 BY FOUNDER RULING. This case previously asserted the opposite —
+    // "defaults to ASK" — as the consequence of classing the op `irreversible`. That default was
+    // the defect: a lever built so a MACHINE could unstick a stalled agent could not fire unless a
+    // human was awake to approve it, which is the situation it exists to end. Nine goals sat
+    // escalated at once with nothing but the founder able to touch any of them.
+    //
+    // The bound, not a card, is what keeps this safe — see the note on `set_agent_escalation` in
+    // conciergeTools/policy.ts. Asserted with NO override in the settings store, because that is
+    // the only configuration in which the derived default is what decides; every other case in
+    // this block sets an explicit "allow" and would stay green with the default back at ask.
+    it("runs unattended with no policy set — the re-arm actually happens", async () => {
       useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
       escalateMachine(callerId);
 
       clear("e14", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, escalated: false });
+      // THE SIDE EFFECT, not the reply. A reply of `ok:true` with the goal still escalated would be
+      // the empty success this op was explicitly built not to return.
+      expect(stateOf(callerId)).not.toBe("escalated");
+      expect(goalOf(callerId)!.conciergeRearms).toBe(1);
+    });
+
+    // …and the control is still there for a human who wants it. Changing a DEFAULT must not
+    // silently delete the setting: without this pair, reclassifying the op to `routine` would be
+    // indistinguishable from dropping it out of the policy table altogether.
+    it("still refuses when a human has set this tool back to Ask", async () => {
+      useSettingsStore.setState({
+        conciergeToolPolicy: { set_agent_escalation: "ask" },
+        conciergeToolPolicyHydrated: true,
+      });
+      escalateMachine(callerId);
+
+      clear("e15", CONCIERGE_CALLER_AGENT_ID);
       await flush();
 
       expect(lastReply()).toMatchObject({ ok: false });

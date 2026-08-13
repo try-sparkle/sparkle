@@ -27,6 +27,7 @@ import {
   type AgentGoal,
   goalRemainingMs,
   goalStateOf,
+  escalationQuotesStaleText,
   mayRearmGoal,
   type GoalState,
 } from "../engine/agentGoal";
@@ -279,6 +280,16 @@ export interface GoalBadge {
   /** The goal is escalated — auto-continue gave up, or the concierge raised one deliberately.
    *  Rendered unmistakably; see `stallIsEscalated`. */
   escalated: boolean;
+  /** The goal text {@link label}'s escalation sentence QUOTES, present only when it is no longer
+   *  the goal the agent holds — i.e. `text` and the sentence describe two different objectives.
+   *
+   *  ⚠️ DATA, NOT PROSE, AND DELIBERATELY NOT FOLDED INTO {@link label}. `label` is what the
+   *  compact column row hands to a `title` and an `aria-label`; the goal there is an ICON and the
+   *  rule against putting words in it is written at AgentRow's `goalChipEl`. The card — the surface
+   *  you get by clicking into a row — reads this field and decides its own wording, so the two-line
+   *  "gave up on / now working on" reading exists exactly where there is room for it and nowhere
+   *  else. Absent whenever the quote is live, so a card can branch on presence. */
+  staleQuote?: string;
 }
 
 export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadge | null {
@@ -326,8 +337,17 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
       // must not cost the ordinary one any clarity.
       const rearms = goal.conciergeRearms ?? 0;
       const why = goal.escalationReason ? ` — ${goal.escalationReason}` : "";
+      // Spread onto every escalated shape below, so a re-armed-and-stuck-again row cannot silently
+      // lose the marker the common case gets.
+      const stale = escalationQuotesStaleText(goal) ? { staleQuote: goal.escalatedGoalText } : {};
       if (rearms === 0) {
-        return { state, text: goal.text, escalated: true, label: `auto-continue gave up${why}` };
+        return {
+          state,
+          text: goal.text,
+          escalated: true,
+          label: `auto-continue gave up${why}`,
+          ...stale,
+        };
       }
       // Amber either way. Escalated-goal was deliberately removed from the RED tier on 2026-08-06
       // because rows were painted red that needed nothing, and a spent allowance is still a row the
@@ -336,7 +356,7 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
       const label = spent
         ? `re-armed ${rearms}× and stuck again — no re-arms left, this one is yours${why}`
         : `re-armed ${rearms}× and stuck again${why}`;
-      return { state, text: goal.text, escalated: true, label };
+      return { state, text: goal.text, escalated: true, label, ...stale };
     }
   }
 }
