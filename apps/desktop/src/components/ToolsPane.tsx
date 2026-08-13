@@ -1,4 +1,4 @@
-import { useEffect, type CSSProperties, type ComponentType, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ComponentType, type ReactNode } from "react";
 import {
   FiMic,
   FiShare2,
@@ -31,7 +31,11 @@ import {
   refreshPluginInstallState,
   setBuilderIndexEnabled,
 } from "../services/configActions";
-import { BUILDER_INDEX_URL } from "../services/builderIndex";
+import {
+  BUILDER_INDEX_URL,
+  builderIndexReportFailing,
+  builderIndexStatus,
+} from "../services/builderIndex";
 import { matchesSearch } from "../engine/settingsSearch";
 import { FONT_UI, PILL } from "../theme/scale";
 import { CHIP, SECTION_LABEL } from "./labelTreatment";
@@ -193,19 +197,24 @@ const AI_HINT = "Turn on AI features to use this tool.";
  *  the toggle looks active while nothing is actually being backed up. */
 const NO_VAULT_HINT = "Open Settings → 1Password to choose a vault and start backing up your .env files.";
 
-type BadgeKind = "ai" | "core" | "builtin";
+type BadgeKind = "ai" | "core" | "builtin" | "alert";
 
 interface Badge {
   kind: BadgeKind;
   text: string;
 }
 
-/** A themed pill badge. "ai" is the accent-tinted AI marker; "core"/"builtin" mark showcase tools. */
+/** A themed pill badge. "ai" is the accent-tinted AI marker; "core"/"builtin" mark showcase tools;
+ *  "alert" says a tool that is switched ON is not actually working. */
 function BadgePill({ kind, children }: { kind: BadgeKind; children: string }) {
   const palette: Record<BadgeKind, { bg: string; fg: string; border: string }> = {
     ai: { bg: "rgba(52,224,240,0.14)", fg: C.accentInk, border: "rgba(52,224,240,0.4)" },
     core: { bg: "rgba(47,107,255,0.16)", fg: C.cream, border: "rgba(47,107,255,0.5)" },
     builtin: { bg: "transparent", fg: C.muted, border: C.muted },
+    // Outlined like "builtin" rather than tinted like the other two: `dangerInk` is a themed
+    // as-TEXT token with no matching wash, and inventing an rgba red here would be a fill whose
+    // contrast against `dangerInk` nothing in theme/ models. Same shape, alarming colour.
+    alert: { bg: "transparent", fg: C.dangerInk, border: C.dangerInk },
   };
   const p = palette[kind];
   return (
@@ -361,6 +370,9 @@ interface ToggleTool {
   /** Optional "Learn more" target. Omitted for first-party capabilities with no external page. */
   url?: string;
   ai?: boolean;
+  /** Row-specific badge beside the name. Takes precedence over the derived "AI" marker — a row
+   *  with something wrong with it should say THAT rather than which family it belongs to. */
+  badge?: Badge;
   /** Row-specific note under the description (e.g. roborev's auth self-test result). Takes
    *  precedence over the generic AI-master hint. */
   hint?: string;
@@ -406,6 +418,16 @@ const FRONTEND_DESIGN_URL = `https://github.com/${OFFICIAL_MARKETPLACE_REPO}/tre
  *  NOT retract it from worktrees that already have it — without saying so, the toggle looks broken
  *  for every agent already on screen. */
 const PLUGIN_SCOPE_HINT = "Applies to agents created from now on.";
+
+/** The Builder Index row's hint when the reporter is on but its last cycle didn't land.
+ *
+ *  It LEADS to the detail instead of restating it: the reason lives in `lastStatus`, which is a
+ *  sentence or two of the server's own words ("the server FROZE this profile — it accepted the
+ *  request and kept none of it…") and belongs in the dialog that already renders it, not wrapped
+ *  across three lines of a settings row. What the row owes the user is the fact that something is
+ *  wrong and one click to the rest. */
+const BUILDER_INDEX_FAILING_HINT =
+  "Your last report didn't reach the leaderboard — open Builder Index settings for the details";
 
 /** What a plugin row's hint line should say, given the installer's current state for it. The
  *  install is the half of a toggle-on the user can't see — it shells out to `claude plugin install`
@@ -464,12 +486,45 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const roborevAuthWarning = useSettingsStore((s) => s.roborevAuthWarning);
   const builderIndexEnabled = useSettingsStore((s) => s.builderIndexEnabled);
   const openBuilderIndexModal = useSettingsStore((s) => s.setBuilderIndexModalOpen);
+  const builderIndexModalOpen = useSettingsStore((s) => s.builderIndexModalOpen);
   const onepasswordEnabled = useSettingsStore((s) => s.onepasswordEnabled);
   const onepasswordVaultId = useSettingsStore((s) => s.onepasswordVaultId);
   // [plugins] flags — Claude Code marketplace plugins pre-enabled for every agent.
   const pluginsEnabled = useSettingsStore((s) => s.pluginsEnabled);
   // What the installer is doing right now, per row — see `pluginHint`.
   const pluginInstallState = useSettingsStore((s) => s.pluginInstallState);
+
+  // Whether the Builder Index reporter's last cycle failed to land — see `builderIndexReportFailing`
+  // for which fields decide that and why.
+  //
+  // Read HERE rather than out of the settings store because nothing in the app polls
+  // `builder_index_status`: the consent modal pulls it when it opens, which is exactly the
+  // modal-shaped dependency that let a reporter fail every two hours for weeks unseen. Cheap — a
+  // JSON file read in Rust, no scan and no socket — and only when the tool is switched on at all.
+  const [reportFailing, setReportFailing] = useState(false);
+  useEffect(() => {
+    if (!builderIndexEnabled) {
+      setReportFailing(false);
+      return;
+    }
+    let live = true;
+    void builderIndexStatus()
+      .then((s) => {
+        if (live) setReportFailing(builderIndexReportFailing(s, Date.now() / 1000));
+      })
+      .catch((e) => {
+        console.warn("tools: builder index status failed", e);
+        // An unreadable status is NOT a failed report — the reporter may be entirely healthy and
+        // this call the only broken thing. Alarming on it is the false positive that teaches the
+        // user to ignore the badge.
+        if (live) setReportFailing(false);
+      });
+    return () => {
+      live = false;
+    };
+    // Re-read when the dialog closes, so a "Report now" that fixed it clears the badge (and one
+    // that failed raises it) without waiting for the next 2h cycle or an app restart.
+  }, [builderIndexEnabled, builderIndexModalOpen]);
 
   const aiOff =
     aiFeatureMode({
@@ -515,10 +570,21 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       key: "builderIndex",
       Icon: FiTrendingUp,
       url: BUILDER_INDEX_URL,
+      // THE ONLY PLACE A BROKEN REPORTER IS VISIBLE. A discarded cycle is recorded to disk every
+      // two hours and rendered nowhere but inside the consent modal, so a profile that has been
+      // frozen for weeks looks identical to one that is publishing. The badge is the alarm; the
+      // hint below is the route to the reason.
+      badge: reportFailing ? { kind: "alert", text: "Not publishing" } : undefined,
       // Once it's on, the row is also the way back into the settings dialog (change username,
       // report now, turn off and forget) — otherwise the only route would be off-then-on, which
-      // would make withdrawing consent a prerequisite for editing it.
-      hint: builderIndexEnabled ? "Manage your Builder Index settings" : undefined,
+      // would make withdrawing consent a prerequisite for editing it. When the reporter is failing
+      // that same click is how the user gets to the server's own words, so the hint changes its
+      // text and keeps its destination.
+      hint: reportFailing
+        ? BUILDER_INDEX_FAILING_HINT
+        : builderIndexEnabled
+          ? "Manage your Builder Index settings"
+          : undefined,
       onHintClick: builderIndexEnabled ? () => openBuilderIndexModal(true) : undefined,
       checked: builderIndexEnabled,
       onToggle: () => void setBuilderIndexEnabled(!builderIndexEnabled),
@@ -671,7 +737,7 @@ export function ToolsPane({ query = "" }: { query?: string }) {
               name={t.name}
               desc={t.desc}
               url={t.url}
-              badge={t.ai ? { kind: "ai", text: "AI" } : undefined}
+              badge={t.badge ?? (t.ai ? { kind: "ai", text: "AI" } : undefined)}
               hint={t.hint ?? (t.ai && aiOff ? AI_HINT : undefined)}
               onHintClick={t.onHintClick}
               control={

@@ -6,7 +6,7 @@
 // the AI rows lock + show a hint when the AI master is Off; Learn-more opens the provider URL.
 // configActions + plugin-opener are mocked so no IPC fires; the settingsStore is the real one,
 // driven per test via setState.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // PARTIAL mock, spreading the real module. A vitest mock factory is otherwise EXHAUSTIVE: an
@@ -27,6 +27,14 @@ vi.mock("../services/configActions", async (importOriginal) => ({
 
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: vi.fn(() => Promise.resolve()) }));
 
+// Only the IPC call is stubbed. `builderIndexReportFailing` stays REAL, so the tests below drive
+// the same derivation the pane ships with instead of a test double that agrees with them by
+// construction — the row's decision is what's under test, not a boolean handed to it.
+vi.mock("../services/builderIndex", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/builderIndex")>()),
+  builderIndexStatus: vi.fn(),
+}));
+
 import {
   setAiFeature,
   setToolEnabled,
@@ -36,6 +44,7 @@ import {
   refreshPluginInstallState,
 } from "../services/configActions";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { builderIndexStatus, type BuilderIndexStatus } from "../services/builderIndex";
 import { useSettingsStore, type PluginKey } from "../stores/settingsStore";
 import { ToolsPane, TOOLS_CATEGORY_KEYWORDS, TOOL_META } from "./ToolsPane";
 
@@ -116,7 +125,47 @@ function seedAiSome() {
   });
 }
 
-beforeEach(seedAllOn);
+/** A `builder_index_status` reply for a HEALTHY, live reporter, with per-test overrides on top.
+ *
+ *  Written the way the wire actually looks: `blockedBy` is `null`, never absent. It backs a Rust
+ *  `Option<String>` with no `skip_serializing_if`, so serde always emits the key — a fixture that
+ *  omitted it would be testing a shape the command cannot produce. */
+function statusFixture(over: Partial<BuilderIndexStatus> = {}): BuilderIndexStatus {
+  return {
+    enabled: true,
+    username: "someone",
+    hasApiKey: true,
+    consented: true,
+    // Deliberately NOT a 32-hex string: no assertion here reads this value, and a realistic
+    // client id trips gitleaks' entropy rule on the `clientId` key name. Keep it word-shaped.
+    clientId: "client-id-for-tests",
+    reportDays: 7,
+    lastReportAt: Math.floor(Date.now() / 1000) - 30 * 60,
+    lastStatus: "Reported 21 row(s) across 7 day(s).",
+    blockedBy: null,
+    serverUrl: "https://tokenmaxxing.odio.dev",
+    ...over,
+  };
+}
+
+/** Render, then let the Builder Index row's status read resolve INTO the DOM.
+ *
+ *  Every assertion about that row — the ones expecting no badge above all — has to run after the
+ *  fetch has settled. An absence asserted while the promise is still pending is an absence for the
+ *  wrong reason, and would pass identically against a build that never renders a badge at all.
+ *  That this really does settle is not assumed: the failing-reporter test below uses this same
+ *  helper and then finds the badge with a SYNCHRONOUS `getByText`, which it could not do if the
+ *  effect were still in flight. */
+async function renderSettled(ui: React.ReactElement = <ToolsPane />) {
+  render(ui);
+  await act(async () => {});
+}
+
+beforeEach(() => {
+  seedAllOn();
+  // Healthy by default, so a test that isn't about the reporter never has to think about it.
+  vi.mocked(builderIndexStatus).mockResolvedValue(statusFixture());
+});
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
@@ -379,6 +428,108 @@ describe("ToolsPane", () => {
       render(<ToolsPane />);
       fireEvent.click(screen.getByRole("button", { name: "Manage your Builder Index settings" }));
       expect(useSettingsStore.getState().builderIndexModalOpen).toBe(true);
+    });
+  });
+
+  // A reporter that posts every two hours and has ZERO of it stored is the failure this row exists
+  // for: the server answers 200, `discard_reason` catches it, and the explanation is written to
+  // disk every cycle — into a modal nobody opens. The founder found out by reading his own public
+  // profile and noticing the numbers were wrong. Each test below asserts what he would SEE.
+  describe("Builder Index row — a failing reporter", () => {
+    const FAILED = "Not publishing";
+    const FAIL_HINT =
+      "Your last report didn't reach the leaderboard — open Builder Index settings for the details";
+    const MANAGE = "Manage your Builder Index settings";
+    const DAY = 24 * 60 * 60;
+
+    beforeEach(() => {
+      useSettingsStore.setState({ builderIndexEnabled: true });
+    });
+
+    it("badges the row when the last cycle didn't land", async () => {
+      // The measured message, verbatim from builder_index.rs's `discard_reason`.
+      vi.mocked(builderIndexStatus).mockResolvedValue(
+        statusFixture({
+          lastStatus:
+            "Last report failed — the server FROZE this profile — it accepted the request and kept none of it, so the Builder Index will keep showing the last snapshot.",
+          lastReportAt: Math.floor(Date.now() / 1000) - 21 * DAY,
+        }),
+      );
+      await renderSettled();
+      expect(screen.getByText(FAILED)).toBeTruthy();
+    });
+
+    it("points at the modal for the reason instead of restating it in the row", async () => {
+      vi.mocked(builderIndexStatus).mockResolvedValue(
+        statusFixture({ lastStatus: "Last report failed — server returned 500." }),
+      );
+      await renderSettled();
+      // The row says something is wrong and offers the click; the server's own words stay in the
+      // dialog that already renders them.
+      expect(screen.queryByText(/server returned 500/)).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: FAIL_HINT }));
+      expect(useSettingsStore.getState().builderIndexModalOpen).toBe(true);
+    });
+
+    it("says nothing when the last report landed", async () => {
+      await renderSettled(); // the healthy default fixture
+      expect(screen.queryByText(FAILED)).toBeNull();
+      expect(screen.getByRole("button", { name: MANAGE })).toBeTruthy();
+    });
+
+    it("does NOT badge a reporter that is merely off or unconsented", async () => {
+      // THE DISCRIMINATION THAT MATTERS. `blockedBy` means no report would go out at all — the
+      // normal state of an install that never opted in — and it must win even over a stored
+      // failure message left behind from before the user switched the tool off. Getting this
+      // wrong puts a red badge on every default install, which is worse than the silence.
+      vi.mocked(builderIndexStatus).mockResolvedValue(
+        statusFixture({
+          blockedBy: "waiting for consent",
+          consented: false,
+          lastReportAt: null,
+          lastStatus: "Last report failed — network error: dns error.",
+        }),
+      );
+      await renderSettled();
+      expect(screen.queryByText(FAILED)).toBeNull();
+    });
+
+    it("badges a live reporter whose last SUCCESS is many cycles old, whatever the message says", async () => {
+      // The signal that survives a Rust reword: `last_report_at` advances only on the success
+      // branch of `record_outcome`, so a three-day-old success under a 2h cadence is a reporter
+      // whose cycles are being discarded — even with a message that reads like a clean post.
+      vi.mocked(builderIndexStatus).mockResolvedValue(
+        statusFixture({
+          lastStatus: "Reported 21 row(s) across 7 day(s).",
+          lastReportAt: Math.floor(Date.now() / 1000) - 3 * DAY,
+        }),
+      );
+      await renderSettled();
+      expect(screen.getByText(FAILED)).toBeTruthy();
+    });
+
+    it("says nothing before the first cycle has recorded anything", async () => {
+      // Five minutes after launch a freshly-consented install has no outcome yet. Nothing has
+      // failed, so nothing should be claimed to have.
+      vi.mocked(builderIndexStatus).mockResolvedValue(
+        statusFixture({ lastStatus: null, lastReportAt: null }),
+      );
+      await renderSettled();
+      expect(screen.queryByText(FAILED)).toBeNull();
+      expect(screen.getByRole("button", { name: MANAGE })).toBeTruthy();
+    });
+
+    it("treats an unreadable status as no news, not as a failure", async () => {
+      vi.mocked(builderIndexStatus).mockRejectedValue(new Error("ipc down"));
+      await renderSettled();
+      expect(screen.queryByText(FAILED)).toBeNull();
+    });
+
+    it("never reaches for status while the tool is switched off", async () => {
+      useSettingsStore.setState({ builderIndexEnabled: false });
+      await renderSettled();
+      expect(builderIndexStatus).not.toHaveBeenCalled();
+      expect(screen.queryByText(FAILED)).toBeNull();
     });
   });
 

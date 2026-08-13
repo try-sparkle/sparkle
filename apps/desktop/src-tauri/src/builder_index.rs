@@ -152,9 +152,20 @@
 //! [`discard_reason`] is the guard, and its PRIMARY rule is deliberately not a version check: if we
 //! sent rows and the server stored none, the cycle FAILS — whatever the reason. That covers the
 //! freeze, and it covers the next gate the operator invents without anyone having to hear about it.
-//! Sending an accepted `client_version` is a SEPARATE change, held for cutover: unfreezing while
-//! tkmx-client still reports this same machine would double-count every overlapping day, and the
-//! server's primary key makes those rows permanent.
+//!
+//! THE CUTOVER IS NOW MADE (2026-08-12). [`BUILDER_INDEX_PROTOCOL_VERSION`] sends the bare tkmx
+//! protocol semver we implement, so the profile unfreezes; read that constant's comment for why an
+//! app version — prefixed OR bare — structurally cannot clear the gate, and what identification is
+//! being given up for it. The coexistence caveat above is now LIVE rather than hypothetical: both
+//! reporters are writing the same profile, so `session_stats` will flap between two denominators
+//! until the community launch agent is turned down, which is the user's launch agent to change and
+//! not something this module does silently.
+//!
+//! TEAM. The leaderboard groups by team, and this module used to hardcode [`DEFAULT_TEAM`]
+//! ("default") into every payload — so a user whose profile and tkmx-client rows all read `"Chief"`
+//! had their Sparkle-native history filed under a team that does not exist. The team now comes from
+//! [`BuilderIndexState::team`] (hand-edited in the state file; no UI), falling back to
+//! [`DEFAULT_TEAM`] for the users who genuinely have none.
 //!
 //! Profile prose (`tools`, `projects`, `communities`, `about`, `hn_username`, `demo_video_url`)
 //! is deliberately NOT sent. The reference client posts those from its `.env` on every run, so a
@@ -183,13 +194,38 @@ pub const DEFAULT_SERVER_URL: &str = "https://tokenmaxxing.odio.dev";
 /// tokens would land in a second, parallel row instead of merging.
 const SOURCE: &str = "claude";
 
-/// Sent as `client_version` so the operator can tell Sparkle-native reports apart from
-/// tkmx-client's. Not a version bump surface — it carries the app version.
+/// The tkmx WIRE PROTOCOL version this module implements — **deliberately NOT Sparkle's app
+/// version**, and it must never be wired to one.
+///
+/// tkmx-server parses `client_version` as BARE SEMVER and FREEZES any profile below its
+/// `minimum_client_version` (1.2.0 as of 2026-08-12, readable at `GET /api/user/<username>`). Two
+/// consequences that make an app version structurally unusable here:
+///   • a PREFIXED value is not understood by that parser, so `sparkle-desktop/1.3.0` reads exactly
+///     like `sparkle-desktop/0.98.0` and both stay frozen — measured, both directions;
+///   • Sparkle's own `CARGO_PKG_VERSION` is 0.101.0, which is BELOW 1.2.0 as bare semver, so
+///     stripping the prefix alone does not unfreeze either, and NO app-version bump ever can. The
+///     app would have to reach 1.2.0 on its own release track to clear a gate it has no part in.
+/// So this tracks the tkmx-client release whose protocol we implement (v1.3.0 — see the module
+/// header's wire-protocol note), and it moves only when the server's minimum does.
+///
+/// THE COST WE ARE ACCEPTING: the `sparkle-desktop/` prefix existed so the operator could tell
+/// Sparkle-native reports apart from tkmx-client's by this field alone. That identification is
+/// gone. Functioning reporting was chosen over it — a profile frozen at `tokens_28d: 0` identifies
+/// nothing. `source` and the pinned `client_id` still distinguish the rows themselves; if the
+/// operator wants the client named again, that needs a server-side field the parser does not
+/// semver-parse, not a value smuggled into this one.
+const BUILDER_INDEX_PROTOCOL_VERSION: &str = "1.3.0";
+
+/// The bare semver we send as `client_version`. See [`BUILDER_INDEX_PROTOCOL_VERSION`] for why it
+/// carries a protocol version and not the app's.
 fn client_version() -> String {
-    format!("sparkle-desktop/{}", env!("CARGO_PKG_VERSION"))
+    BUILDER_INDEX_PROTOCOL_VERSION.to_string()
 }
 
 /// tkmx groups profiles by team; the reference client defaults to "default" when unset.
+///
+/// This is the fallback for a user who has no team, NOT this machine's team — see
+/// [`BuilderIndexState::team`], which is what the payload is actually built from.
 const DEFAULT_TEAM: &str = "default";
 
 /// Keychain ACCOUNT for the tkmx API key. A distinct account under Sparkle's existing keychain
@@ -242,6 +278,18 @@ pub struct BuilderIndexState {
     pub last_status: Option<String>,
     /// Trailing window per report. 0 / absent means [`DEFAULT_REPORT_DAYS`].
     pub report_days: u32,
+    /// The tkmx team reports are filed under. Empty / absent means [`DEFAULT_TEAM`].
+    ///
+    /// The leaderboard GROUPS BY team, so reporting under the wrong one files a machine's history
+    /// beside nobody — this user's tkmx-client rows and profile are all `"Chief"`, and Sparkle was
+    /// hardcoding `"default"`, a team that does not exist for them. There is deliberately NO UI:
+    /// the value is set by editing this file, so a mis-typed team can't be produced by a stray
+    /// click, and the fallback stays correct for the users who genuinely have no team.
+    ///
+    /// The struct-level `#[serde(default)]` above is what lets a state file written before this
+    /// field existed keep deserializing (it supplies `String::default()` for every absent key), so
+    /// no per-field attribute is needed — see `state_written_before_the_team_field_still_loads`.
+    pub team: String,
 }
 
 impl BuilderIndexState {
@@ -249,6 +297,17 @@ impl BuilderIndexState {
         match self.report_days {
             0 => DEFAULT_REPORT_DAYS,
             n => n.clamp(1, MAX_REPORT_DAYS),
+        }
+    }
+
+    /// The team this machine reports under: the stored value, or [`DEFAULT_TEAM`] when unset.
+    ///
+    /// Trimmed the way `username` is at the payload boundary — a hand-edited JSON file is the only
+    /// way this gets set, and `"Chief "` and `"Chief"` are different groups to the server.
+    fn team(&self) -> &str {
+        match self.team.trim() {
+            "" => DEFAULT_TEAM,
+            t => t,
         }
     }
 }
@@ -1261,6 +1320,11 @@ fn dry_run_over(
         "note": "DRY RUN — nothing was sent to the Builder Index and no state was written.",
         "window_days": days,
         "client_version_that_would_be_sent": client_version(),
+        // RESOLVED, not raw: the leaderboard groups by team, and the whole failure this field
+        // exists to make visible is a stored value that never reaches the wire. Printing
+        // `state.team` would show the setting; this shows what a report would actually carry,
+        // including the `DEFAULT_TEAM` fallback when nothing is set.
+        "team_that_would_be_sent": state.map_or(DEFAULT_TEAM, BuilderIndexState::team),
         "client_id": state.map(|s| s.client_id.clone()),
         "username": state.map(|s| s.username.clone()),
         "app_data": app_data.map(|p| p.display().to_string()),
@@ -1474,6 +1538,33 @@ pub enum ReportOutcome {
     Skipped(SkipReason),
 }
 
+/// Build the POST body from the reporter's state and this cycle's rollup.
+///
+/// Extracted for the reason [`classify_ok_response`] was: welded inline, the identity fields —
+/// which team the rows are filed under, which `client_version` decides whether the server keeps
+/// them at all — are reachable only through a live socket, so the two fields that silently zeroed
+/// this machine's profile were the two nothing could assert on. This IS the production payload
+/// builder; `report_once_sync` serializes whatever it returns.
+fn build_report_body(
+    state: &BuilderIndexState,
+    client_id: String,
+    window: u32,
+    data: Vec<DailyUsage>,
+    session_stats: Option<SessionStats>,
+    machine_config: Option<MachineConfig>,
+) -> ReportBody {
+    ReportBody {
+        username: state.username.trim().to_string(),
+        team: state.team().to_string(),
+        client_id,
+        client_version: client_version(),
+        report_days: window,
+        data,
+        session_stats,
+        machine_config,
+    }
+}
+
 /// Run one reporting cycle: gate → scan → roll up → POST.
 ///
 /// Blocking (filesystem + network); callers wrap it in `spawn_blocking`. Returns `Err` only for a
@@ -1509,18 +1600,10 @@ fn report_once_sync(app_data: PathBuf, enabled: bool) -> Result<ReportOutcome, S
         );
     }
 
-    let body = ReportBody {
-        // `state.username` may have been refreshed by `ensure_client_id` above; using the caller's
-        // original snapshot would post the OLD name alongside a freshly-derived new-name id.
-        username: state.username.trim().to_string(),
-        team: DEFAULT_TEAM.to_string(),
-        client_id,
-        client_version: client_version(),
-        report_days: window,
-        data,
-        session_stats,
-        machine_config,
-    };
+    // `state` is passed rather than its fields: `ensure_client_id` above may have refreshed
+    // `state.username`, and using the caller's original snapshot would post the OLD name alongside
+    // a freshly-derived new-name id.
+    let body = build_report_body(&state, client_id, window, data, session_stats, machine_config);
     // An empty `data: []` is still POSTed rather than short-circuited. That matches the reference
     // client (which falls through on an inactive day on purpose) and it is the only signal the
     // server gets that this machine is alive and still reporting — a silent gap and a genuinely
@@ -2340,7 +2423,8 @@ mod tests {
         assert!(!json.contains("a-private-project-name"), "{json}");
         assert!(!json.contains("session-secret"), "{json}");
         // No path separators in the usage rows at all. (Checked on `data` rather than the whole
-        // body because `client_version` is legitimately "sparkle-desktop/<version>".)
+        // body: the body's own strings — username, team, client_id — are user-supplied and are
+        // covered by the two assertions above.)
         let rows_json = serde_json::to_string(&data).unwrap();
         assert!(!rows_json.contains('/'), "no path separators in the rows: {rows_json}");
 
@@ -2385,6 +2469,149 @@ mod tests {
         for k in ["tools", "projects", "communities", "about", "hn_username", "demo_video_url"] {
             assert!(v.get(k).is_none(), "{k} must not be sent");
         }
+    }
+
+    // ── client_version: the one field that decides whether ANY of the above is kept ───────
+
+    /// The server's `minimum_client_version`, read from `GET /api/user/<username>` on 2026-08-12.
+    /// A profile whose `client_version` parses below this is FROZEN: every post is answered
+    /// `200 {"ok":true,...}` and stored as nothing.
+    const SERVER_MINIMUM_CLIENT_VERSION: (u64, u64, u64) = (1, 2, 0);
+
+    /// Parse the way tkmx-server does: BARE `major.minor.patch` and nothing else.
+    ///
+    /// The strictness IS the test. A parser that shrugged off a `sparkle-desktop/` prefix would
+    /// re-admit the exact value that held this machine's profile at `tokens_28d: 0` for months —
+    /// the server's parser does not shrug, so neither does this one.
+    fn parse_bare_semver(s: &str) -> Option<(u64, u64, u64)> {
+        let parts: Vec<&str> = s.split('.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        // `u64::from_str` rejects any non-digit, so a prefixed component ("sparkle-desktop/1") or
+        // a suffixed one ("0-rc1") fails here rather than being silently truncated to a number.
+        Some((parts[0].parse().ok()?, parts[1].parse().ok()?, parts[2].parse().ok()?))
+    }
+
+    #[test]
+    fn the_client_version_we_send_parses_as_bare_semver_at_or_above_the_server_minimum() {
+        // The property the server actually enforces — asserted as a property, not as the literal
+        // "1.3.0", because it is the parse-and-compare that decides whether rows are kept.
+        let sent = client_version();
+        let parsed = parse_bare_semver(&sent).unwrap_or_else(|| {
+            panic!(
+                "client_version {sent:?} does not parse as BARE semver — tkmx-server would read it \
+                 as below its minimum and FREEZE the profile, keeping none of what we post"
+            )
+        });
+        assert!(
+            parsed >= SERVER_MINIMUM_CLIENT_VERSION,
+            "client_version {sent:?} parses as {parsed:?}, below the server's \
+             minimum_client_version {SERVER_MINIMUM_CLIENT_VERSION:?} — the profile stays FROZEN"
+        );
+
+        // CONTROLS — the values this repo really sent while the profile was frozen. Without them
+        // the assertions above could be read as vacuous; with them the check is shown to reject
+        // BOTH prior forms, which is the whole reason this change exists.
+        assert_eq!(
+            parse_bare_semver("sparkle-desktop/0.101.0"),
+            None,
+            "the prefixed form must NOT parse — that is why no app-version bump could ever unfreeze"
+        );
+        assert_eq!(
+            parse_bare_semver("sparkle-desktop/1.3.0"),
+            None,
+            "measured: even a prefixed 1.3.0 read as frozen, so the prefix is the defect, not the number"
+        );
+        assert!(
+            parse_bare_semver("0.101.0").unwrap() < SERVER_MINIMUM_CLIENT_VERSION,
+            "and stripping the prefix ALONE is not the fix: Sparkle's app version is below the gate, \
+             so `client_version` cannot be sourced from CARGO_PKG_VERSION at all"
+        );
+    }
+
+    // ── team: the field the leaderboard GROUPS BY ─────────────────────────────────────────
+
+    #[test]
+    fn the_posted_team_comes_from_state_and_falls_back_only_when_unset() {
+        // Driven through `build_report_body` — the same function `report_once_sync` posts the
+        // return value of — rather than a hand-built `ReportBody`, which would assert only that a
+        // struct field can hold a string.
+        let body = |team: &str| {
+            build_report_body(
+                &BuilderIndexState {
+                    username: "  someone  ".into(),
+                    team: team.into(),
+                    ..Default::default()
+                },
+                "abc123".into(),
+                7,
+                vec![],
+                None,
+                None,
+            )
+        };
+
+        // The measured bug: this user's profile and every one of their tkmx-client rows read
+        // "Chief", the leaderboard groups by team, and Sparkle hardcoded "default" — filing a
+        // consolidated history under a team that does not exist.
+        assert_eq!(body("Chief").team, "Chief");
+        // Hand-edited JSON is the only way this is set, and "Chief " is its own group server-side.
+        assert_eq!(body("  Chief  ").team, "Chief");
+        // Users who genuinely have no team keep the reference client's default.
+        assert_eq!(body("").team, DEFAULT_TEAM);
+        assert_eq!(body("   ").team, DEFAULT_TEAM);
+
+        // ...and it survives serialization, which is the only form the server ever sees.
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&body("Chief")).unwrap()).unwrap();
+        assert_eq!(v["team"], "Chief");
+        assert_eq!(v["client_version"], client_version());
+        // The rest of the payload is still assembled the same way (username still trimmed).
+        assert_eq!(v["username"], "someone");
+        assert_eq!(v["client_id"], "abc123");
+        assert_eq!(v["report_days"], 7);
+    }
+
+    #[test]
+    fn state_written_before_the_team_field_still_loads() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The exact shape the previous build wrote — no `team` key at all.
+        std::fs::write(
+            tmp.path().join("builder-index.json"),
+            r#"{
+  "username": "sam",
+  "client_id": "deadbeef",
+  "consented_at": 1700000000,
+  "last_report_at": 1700000100,
+  "last_status": "Reported 3 row(s) across 2 day(s).",
+  "report_days": 14
+}"#,
+        )
+        .unwrap();
+
+        // A field added without a default would fail the whole parse, and `load_state` degrades a
+        // failed parse to `Default` — silently un-consenting the user and unpinning the client_id
+        // that must never change. So this asserts every OTHER field survives, not just the new one.
+        let loaded = load_state(tmp.path());
+        assert_eq!(loaded.username, "sam");
+        assert_eq!(loaded.client_id, "deadbeef");
+        assert_eq!(loaded.consented_at, Some(1_700_000_000));
+        assert_eq!(loaded.last_report_at, Some(1_700_000_100));
+        assert_eq!(loaded.last_status.as_deref(), Some("Reported 3 row(s) across 2 day(s)."));
+        assert_eq!(loaded.report_days, 14);
+        assert_eq!(loaded.team, "", "an absent key stays empty — never a guess");
+        assert_eq!(loaded.team(), DEFAULT_TEAM);
+
+        // Round-trip: rewriting the file keeps every field and adds the new one as an empty string
+        // rather than dropping it, so the user has something to edit.
+        save_state(tmp.path(), &loaded).unwrap();
+        assert_eq!(load_state(tmp.path()), loaded);
+        let raw = std::fs::read_to_string(tmp.path().join("builder-index.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["team"], "");
+        assert_eq!(v["username"], "sam");
+        assert_eq!(v["client_id"], "deadbeef");
     }
 
     // ── machine_config + the SKILLS row ──────────────────────────────────────────────────
@@ -2884,6 +3111,7 @@ mod tests {
             last_report_at: Some(1_700_000_100),
             last_status: Some("Reported 3 row(s) across 2 day(s).".into()),
             report_days: 14,
+            team: "Chief".into(),
         };
         save_state(tmp.path(), &state).unwrap();
         assert_eq!(load_state(tmp.path()), state);
@@ -3386,6 +3614,24 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_run_shows_the_team_and_version_it_would_report_under() {
+        // No UI sets the team, so the dry run is the ONLY way to confirm a hand-edit took effect
+        // without posting — and both of these fields fail SILENTLY on the wire (a wrong team files
+        // the history under a group nobody reads; a wrong version is answered 200 and discarded).
+        let tmp = tempfile::tempdir().unwrap();
+        let read = |state: &BuilderIndexState| -> serde_json::Value {
+            serde_json::from_str(&dry_run_over(Some(tmp.path()), Some(state), 7, &[])).unwrap()
+        };
+
+        let v = read(&BuilderIndexState { team: "  Chief  ".into(), ..Default::default() });
+        assert_eq!(v["team_that_would_be_sent"], "Chief", "resolved, not the raw setting");
+        assert_eq!(v["client_version_that_would_be_sent"], client_version());
+
+        // Unset resolves to the fallback here too, so the two answers can never disagree.
+        assert_eq!(read(&BuilderIndexState::default())["team_that_would_be_sent"], DEFAULT_TEAM);
+    }
+
+    #[test]
     fn the_dry_run_takes_an_explicit_app_data_root() {
         let a = dry_run_args(argv("--builder-index-dry-run --app-data /tmp/store")).unwrap();
         assert_eq!(a.app_data, Some(PathBuf::from("/tmp/store")));
@@ -3536,6 +3782,7 @@ mod tests {
             last_report_at: Some(11),
             last_status: Some("Reported 21 row(s) across 7 day(s).".into()),
             report_days: 0,
+            team: "Chief".into(),
         };
         save_state(tmp.path(), &before).unwrap();
         let raw_before = std::fs::read(state_path(tmp.path())).unwrap();
