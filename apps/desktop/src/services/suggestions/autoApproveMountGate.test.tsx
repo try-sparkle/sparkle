@@ -23,8 +23,25 @@
 // bails on `if (!scrollback) return;` WITHOUT committing `lastHash` — deliberately, so the hash is
 // still fresh whenever content does show up.
 //
-// Put together: while an agent's terminal is unmounted the auto-approver is BLIND to it. The first
-// mount is what makes a pending prompt visible, and the answer is typed into the PTY on that mount.
+// Put together: while an agent's terminal is unmounted the auto-approver is BLIND to it. Making the
+// provider available is what makes a pending prompt readable, and the answer follows.
+//
+// ── TWO ROUTES REACH THE KEYSTROKE, AND AN EARLIER VERSION OF THIS FILE NAMED ONLY ONE ───────────
+// This header used to conclude "it is the MOUNT, not the registration", on the strength of a draft
+// case that registered the provider under an already-mounted hook and went red. That conclusion was
+// WRONG, and the way it was wrong is worth keeping, because it is the failure mode this whole file
+// is about: the draft went red only because these tests run on REAL timers and finish in
+// milliseconds, so `useSuggestions`' settle watcher — a `setInterval` at `SETTLE_TICK_MS` (1200ms,
+// `useSuggestions.ts:961`) that calls `getAgentScrollback` on every tick — never got to run. That is
+// a property of the harness, not of the code (roborev 63111).
+//
+// Both routes are pinned below:
+//   1. MOUNT with a provider already available — the compute effect reads it on its first pass.
+//   2. REGISTRATION under a hook that is already mounted — the settle watcher sees the provider on
+//      its next tick, settles after two identical hashes, finds `h !== lastHash.current` (still
+//      null, because the `!scrollback` bail never committed it) and bumps `retryTick`.
+// Route 2 needs no click at all once a pane is open, and a reader who believed the old conclusion
+// would go looking for a fix in mount ordering and never find it.
 //
 // ── WHY THE REST OF THIS DIRECTORY CANNOT CATCH IT ──────────────────────────────────────────────
 // Every sibling suite does `vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => … }))`
@@ -80,7 +97,7 @@ vi.mock("../../stores/runtimeStore", () => {
 
 // NOT MOCKED, on purpose (see the header): this is the module that holds the gate.
 import { registerScrollback } from "../terminalScrollback";
-import { resetSuggestionMemory, useSuggestions } from "./useSuggestions";
+import { SETTLE_TICK_MS, resetSuggestionMemory, useSuggestions } from "./useSuggestions";
 
 /** The screen a real permission prompt presents. */
 const PROMPT = "Do you want to proceed?\n1. Yes\n2. No";
@@ -134,11 +151,7 @@ describe("the auto-approve keystroke is gated on the terminal being mounted", ()
     // change across this line — the prompt is the same prompt, already on screen, unchanged; no PTY
     // output has arrived; the agent's status has not moved. The pane opening is the whole of it.
     //
-    // Registering the provider WITHOUT this fresh mount is deliberately not the trigger, and an
-    // earlier draft of this test asserted that it was and went red: the reading effect's dependency
-    // array does not list the registry (it cannot — the registry is a module-level Map, not
-    // reactive state), so a bare re-render of a hook that is already up re-runs nothing. That is
-    // worth stating because it locates the trigger precisely: it is the MOUNT, not the registration.
+    // ROUTE 1: the compute effect reads the provider on its first pass after mounting.
     unregister = registerScrollback("a1", () => PROMPT);
     renderHook(() => useSuggestions("a1", true));
     await act(async () => {});
@@ -149,18 +162,40 @@ describe("the auto-approve keystroke is gated on the terminal being mounted", ()
     expect(answers()).toBe(1);
   });
 
-  it("does not keep re-answering once mounted and settled", async () => {
-    unregister = registerScrollback("a1", () => PROMPT);
-    const view = renderHook(() => useSuggestions("a1", true));
-    await act(async () => {});
-    expect(answers()).toBe(1);
+  it("ROUTE 2: answers with NO remount at all, once the settle watcher's interval runs", async () => {
+    // The distinction this case exists for: the hook stays mounted THROUGHOUT. Nothing re-mounts,
+    // nothing re-renders with new props. The only event is a provider becoming available, which is
+    // what happens when a terminal registers beside an already-open suggestions row.
+    vi.useFakeTimers();
+    try {
+      renderHook(() => useSuggestions("a1", true));
+      await act(async () => {});
+      expect(answers()).toBe(0); // blind: no provider yet
 
-    // Repaints, re-renders and re-fits all happen constantly on a visible pane; none of them is a
-    // new decision. Only the FIRST sight of a given screen may type.
-    view.rerender();
-    await act(async () => {});
-    view.rerender();
-    await act(async () => {});
-    expect(answers()).toBe(1);
+      unregister = registerScrollback("a1", () => PROMPT);
+
+      // The watcher needs two identical hashes to call the screen settled, so one tick is not
+      // enough — this is why a real-timer test that finishes in milliseconds sees nothing and can
+      // be misread as proof that this route does not exist.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(SETTLE_TICK_MS * 3);
+      });
+
+      expect(answers()).toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
+
+// NOT TESTED HERE, DELIBERATELY: that a settled screen is never answered twice.
+//
+// A case for it lived here and could not fail (roborev 63111). It re-rendered with no new props,
+// and the reading effect's deps are all stable across that, so `maybeAutoApprove` was never
+// re-invoked whether or not the de-dupe guard worked; independently, the stand-in below de-dupes on
+// its own set, so the count would have stayed at 1 even if the effect HAD re-run. Deleting
+// `handledSigs` outright left it green — the vacuous shape AGENTS.md names.
+//
+// It cannot be repaired in this file either: `maybeAutoApprove` is mocked here, so the real
+// de-dupe lives in code this suite does not execute. `handledSigs.remount.test.tsx` drives that
+// contract against the real signature set (roborev 53074 / 53159) and is where it belongs.
