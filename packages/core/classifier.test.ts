@@ -406,3 +406,46 @@ describe("classifyLine — the DANGEROUS ordered-pair rules are LINEAR, not quad
     );
   });
 });
+
+describe("classifyLine — the DANGEROUS description centres on whichever half fired", () => {
+  // `dangerousIndex` merges TWO halves — the `DANGEROUS` regex battery and the
+  // `DANGEROUS_ORDERED` pairs — and takes the EARLIER of the two. Only the regex half was
+  // pinned (see "hard DANGEROUS is scanned on the full line" above), so dropping the ordered
+  // half, or dropping the `Math.min`, left every test green while the human-readable
+  // description silently pointed at the wrong place — or, for an ordered-only line, at
+  // nothing but the leading prose.
+  //
+  // `describe(line, i)` only re-centres when `i > MAX_SCAN`, so every fixture below puts its
+  // trigger well past char 200 and separates the two triggers by more than the 200-char
+  // window — that separation is what makes the `not.toContain` assertions load-bearing.
+  const FILLER = "narrative filler ".repeat(15); // ~255 chars, matches nothing
+
+  it("centres on an ORDERED-pair trigger past the scan window (ordered half alone)", () => {
+    // No `DANGEROUS` regex matches here at all, so the regex half returns -1. If
+    // `dangerousIndex` reported only that half, `Math.max(0, -1)` would centre the
+    // description at 0 and surface nothing but filler.
+    const line = `${FILLER}stripe charge customer $50`;
+    const ev = classifyLine(line, ctx);
+    expect(ev?.risk_class).toBe("dangerous");
+    expect(ev!.description).toContain("stripe charge");
+    expect(ev!.description.startsWith("…")).toBe(true);
+  });
+
+  it("centres on the ORDERED pair when it precedes a regex trigger", () => {
+    const line = `${FILLER}stripe charge customer $50 ${FILLER}rm -rf /`;
+    const ev = classifyLine(line, ctx);
+    expect(ev?.risk_class).toBe("dangerous");
+    expect(ev!.description).toContain("stripe charge");
+    // The later trigger must be out of frame — taking the regex half unconditionally would
+    // put `rm -rf` here instead.
+    expect(ev!.description).not.toContain("rm -rf");
+  });
+
+  it("centres on the REGEX trigger when it precedes an ordered pair", () => {
+    const line = `${FILLER}rm -rf / ${FILLER}stripe charge customer $50`;
+    const ev = classifyLine(line, ctx);
+    expect(ev?.risk_class).toBe("dangerous");
+    expect(ev!.description).toContain("rm -rf");
+    expect(ev!.description).not.toContain("stripe charge");
+  });
+});
