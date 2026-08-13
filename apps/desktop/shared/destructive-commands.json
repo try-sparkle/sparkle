@@ -48,9 +48,30 @@
     "Bash(diskutil partitionDisk:*)",
     "Bash(diskutil reformat:*)",
     "Bash(diskutil zeroDisk:*)",
+    "Bash(diskutil randomDisk:*)",
     "Bash(diskutil secureErase:*)",
+    "Bash(diskutil eraseOptical:*)",
     "Bash(diskutil apfs delete:*)",
     "Bash(diskutil apfs deleteContainer:*)",
+    "Bash(diskutil apfs deleteVolume:*)",
+    "Bash(diskutil apfs eraseVolume:*)",
+    "Bash(diskutil erasedisk:*)",
+    "Bash(diskutil erasevolume:*)",
+    "Bash(diskutil partitiondisk:*)",
+    "Bash(diskutil zerodisk:*)",
+    "Bash(diskutil randomdisk:*)",
+    "Bash(diskutil secureerase:*)",
+    "Bash(diskutil eraseoptical:*)",
+    "Bash(diskutil quiet eraseDisk:*)",
+    "Bash(diskutil quiet eraseVolume:*)",
+    "Bash(diskutil quiet partitionDisk:*)",
+    "Bash(diskutil quiet reformat:*)",
+    "Bash(diskutil quiet zeroDisk:*)",
+    "Bash(diskutil quiet randomDisk:*)",
+    "Bash(diskutil quiet secureErase:*)",
+    "Bash(diskutil quiet eraseOptical:*)",
+    "Bash(diskutil quiet apfs delete:*)",
+    "Bash(diskutil quiet apfs deleteContainer:*)",
     "Bash(npm publish:*)",
     "Bash(pnpm publish:*)",
     "Bash(yarn publish:*)",
@@ -89,6 +110,18 @@
     { "command": "pnpm publish --access public", "why": "outward-facing publish" },
     { "command": "diskutil eraseDisk JHFS+ x disk2", "why": "destroys a volume" },
     { "command": "diskutil apfs deleteContainer disk3", "why": "destroys an APFS container" },
+    {
+      "command": "diskutil quiet eraseDisk JHFS+ x disk2",
+      "why": "REGRESSION: diskutil's synopsis is `diskutil [quiet] verb …`, so a literal `quiet` before the verb is the SAME command. Narrowing the blanket rule to an enumeration made this a hole in BOTH layers until the guard learned to skip it."
+    },
+    { "command": "diskutil quiet apfs deleteContainer disk3", "why": "the `quiet` prefix in front of an apfs sub-verb too" },
+    { "command": "diskutil ERASEDISK JHFS+ x disk2", "why": "REGRESSION: diskutil verbs are case-insensitive, so an enumeration matched only on spelling is a hole a blanket rule did not have" },
+    { "command": "diskutil randomDisk 1 disk2", "why": "zeroDisk's sibling — overwrites the whole disk; missing from the first enumeration" },
+    { "command": "bash -c \"rm -rf ~\"", "why": "REGRESSION: a shell's -c argument is ONE token the top-level lexer never re-lexes" },
+    { "command": "sh -c 'git push --force origin main'", "why": "the same laundering, single-quoted" },
+    { "command": "xargs rm -rf /", "why": "REGRESSION: xargs carries its command as plain operands, so the segment's command word is xargs and the rm is invisible" },
+    { "command": "env FOO=1 rm -rf /", "why": "a wrapper binary whose trailing operands are the real command" },
+    { "command": "find / -name x -exec rm -rf {} +", "why": "the -exec target is `{}`, so what makes it catastrophic is where find was ROOTED" },
     { "command": "mkfs.ext4 /dev/disk2", "why": "formatting a filesystem destroys everything on it" },
     { "command": "shutdown -h now", "why": "takes the machine down under the whole fleet" }
   ],
@@ -139,6 +172,19 @@
       "why": "REGRESSION PIN: `diskutil` was denied as a blanket `Bash(diskutil:*)`, which is exactly the over-blocking this file rejects a blanket `security:*` for — a read-only diagnostic turned into a refusal with NO approval path. Only the destructive verbs are denied."
     },
     { "command": "diskutil info /", "why": "read-only diagnostic; only the erase/partition verbs are denied" },
-    { "command": "diskutil apfs list", "why": "read-only, and it must not be caught by the `apfs delete` rule" }
+    { "command": "diskutil apfs list", "why": "read-only, and it must not be caught by the `apfs delete` rule" },
+    { "command": "diskutil quiet list", "why": "the `quiet` skip must not turn a read-only verb into a blocked one" },
+    {
+      "command": "curl -s localhost:3000/health && bash scripts/tests/run.sh",
+      "why": "REGRESSION: pipe-to-shell was matched on mere CO-OCCURRENCE of a downloader and a shell, so this ordinary line was refused with no approval path. The discriminator is the shell's operands: a named script file is reviewable, `curl … | bash` has none."
+    },
+    { "command": "curl -sS \"$URL\" > out.json; bash scripts/verify.sh", "why": "same shape, `;` instead of `&&`" },
+    { "command": "find . -name '*.log' -exec rm -rf {} +", "why": "scoped cleanup — the hazard is a catastrophic search ROOT, not -exec rm itself" },
+    { "command": "xargs grep -l TODO", "why": "the xargs nesting must judge the nested command, not block xargs" },
+    {
+      "command": "git clean -fde'*.xz'",
+      "why": "`-e` takes a VALUE and may carry it attached, so the lexer yields one token whose 'x' belongs to the user's exclude PATTERN, not to a flag. Scanning the cluster past `e` refuses an ordinary clean with no approval path."
+    },
+    { "command": "git clean -fd -e '*.x'", "why": "the same exclude, detached — neither form removes IGNORED files" }
   ]
 }

@@ -625,9 +625,13 @@ const DOWNLOADER_BINARIES = new Set(["curl", "wget"]);
  *  diagnostics, and blanket-blocking them would be the same over-blocking this guard exists to
  *  undo — worse, because a refusal has no approval path. Only its destructive verbs are denied. */
 const ALWAYS_BLOCKED_BINARIES = new Set(["sudo", "shutdown", "reboot", "halt"]);
-/** `diskutil` subcommands that destroy data. `apfs` takes a further verb, hence the second set. */
+/** `diskutil` subcommands that destroy data. `apfs` takes a further verb, hence the second set.
+ *  Compared lowercased because diskutil's verbs are case-insensitive (`diskutil ERASEDISK` resolves
+ *  to eraseDisk), and read AFTER an optional literal `quiet` — its synopsis is
+ *  `diskutil [quiet] verb [subVerb] [options]`, so `diskutil quiet eraseDisk …` is the same command. */
 const DISKUTIL_DESTRUCTIVE = new Set([
-  "erasedisk", "erasevolume", "partitiondisk", "reformat", "zerodisk", "secureerase", "eraseoptical",
+  "erasedisk", "erasevolume", "partitiondisk", "reformat", "zerodisk", "randomdisk",
+  "secureerase", "eraseoptical",
 ]);
 const DISKUTIL_APFS_DESTRUCTIVE = new Set(["delete", "deletecontainer", "deletevolume", "erasevolume"]);
 /** Package managers whose `publish` subcommand pushes to a public registry. */
@@ -652,15 +656,15 @@ function segmentCommand(tokens) {
   return { bin: tokens[i].split("/").pop(), args: tokens.slice(i + 1) };
 }
 
-/** The first argument that is not an option — a subcommand (`npm run`, `bd close`). Bare `-`/`--`
- *  and anything starting with `-` is skipped, so `pnpm -r test` resolves to `test`. */
+/** The arguments that are not options, in order — the subcommand and its operands. Bare `-`/`--`
+ *  and anything starting with `-` is skipped, so `pnpm -r test` yields `["test"]`. */
+function operandsOf(args) {
+  return args.filter((a) => a !== "--" && !(a.startsWith("-") && a.length > 1));
+}
+
+/** The first argument that is not an option — a subcommand (`npm run`, `bd close`). */
 function subcommandOf(args) {
-  for (const a of args) {
-    if (a === "--") continue;
-    if (a.startsWith("-") && a.length > 1) continue;
-    return a;
-  }
-  return null;
+  return operandsOf(args)[0] ?? null;
 }
 
 /** Is `p` a path whose recursive removal is catastrophic rather than ordinary cleanup?
@@ -704,23 +708,33 @@ function isCatastrophicRoot(p) {
  *  and `rm -f /tmp/x` is not recursive at all — only the pairing of the two is denied. Flags may be
  *  bundled in any order (`-rf`, `-fr`) and `--` ends option parsing. */
 function rmCatastrophicTarget(args) {
-  let recursive = false;
+  if (!rmIsRecursive(args)) return null;
+  return rmTargets(args).find(isCatastrophicRoot) ?? null;
+}
+
+/** Does this `rm` argument list carry a recursive flag, in any spelling or bundle order? */
+function rmIsRecursive(args) {
   let endOfOpts = false;
+  for (const a of args) {
+    if (a === "--") { endOfOpts = true; continue; }
+    if (endOfOpts) continue;
+    if (a === "--recursive") return true;
+    if (a.startsWith("--")) continue;
+    if (a.startsWith("-") && a.length > 1 && /[rR]/.test(a.slice(1))) return true;
+  }
+  return false;
+}
+
+/** The non-option operands of an `rm` — the things it would actually delete. */
+function rmTargets(args) {
   const targets = [];
+  let endOfOpts = false;
   for (const a of args) {
     if (!endOfOpts && a === "--") { endOfOpts = true; continue; }
-    if (!endOfOpts && a.startsWith("--")) {
-      if (a === "--recursive") recursive = true;
-      continue;
-    }
-    if (!endOfOpts && a.startsWith("-") && a.length > 1) {
-      if (/[rR]/.test(a.slice(1))) recursive = true;
-      continue;
-    }
+    if (!endOfOpts && a.startsWith("-") && a.length > 1) continue;
     targets.push(a);
   }
-  if (!recursive) return null;
-  return targets.find(isCatastrophicRoot) ?? null;
+  return targets;
 }
 
 /** The destination branch of a push refspec: `HEAD:main` → `main`, `+refs/heads/main` → `main`. */
@@ -754,18 +768,134 @@ function gitPushViolation(args) {
   return null;
 }
 
+/** The arguments from the first non-option word onward — i.e. a nested command line carried as
+ *  operands (`xargs rm -rf ~`, `find . -exec rm -rf {} +`). Unlike `operandsOf` this keeps the
+ *  nested command's OWN flags, which is the whole point: `rm`'s `-rf` must survive. */
+function commandTailFrom(args) {
+  const start = args.findIndex((a) => a !== "--" && !(a.startsWith("-") && a.length > 1));
+  return start === -1 ? [] : args.slice(start);
+}
+
+/** The words a `find … -exec <cmd> … ;` / `-execdir` clause hands to a new process. */
+function findExecTail(args) {
+  const at = args.findIndex((a) => a === "-exec" || a === "-execdir");
+  if (at === -1) return [];
+  const rest = args.slice(at + 1);
+  const end = rest.findIndex((a) => a === ";" || a === "+");
+  return end === -1 ? rest : rest.slice(0, end);
+}
+
+/** `find`'s leading path operands — everything before the first predicate (`-name`, `-exec`, …). */
+function findSearchRoots(args) {
+  const out = [];
+  for (const a of args) {
+    if (a.startsWith("-")) break;
+    out.push(a);
+  }
+  return out;
+}
+
+/** How deep to follow a command nested inside another (`bash -c "xargs rm -rf ~"`). A cap, not a
+ *  policy: the shapes below are one or two levels in practice, and an unbounded walk on attacker-
+ *  shaped input is how a guard that must never hang starts hanging. */
+const MAX_NESTING = 3;
+
+/** Binaries whose trailing operands are themselves a command to run. */
+const NESTING_WRAPPERS = new Set(["xargs", "time", "nohup", "env", "nice", "stdbuf"]);
+
 /** THE DESTRUCTIVE-COMMAND PREDICATE. Returns null to allow, or `{ rule, why }` to block.
  *
  *  Segment-wise and command-position anchored (see the section header). Pure: it consults no
  *  filesystem and no repo, so it always decides from the command string alone and can never fire
- *  because some unrelated probe failed. */
-export function blocksDestructiveCommand(command) {
+ *  because some unrelated probe failed.
+ *
+ *  It also follows a command NESTED inside another, because the section header's claim — that
+ *  laundering a destructive command past this does not work — is otherwise false in three shapes
+ *  the top-level lexer cannot see: a shell's `-c` argument is ONE token and never re-lexed
+ *  (`bash -c "rm -rf ~"`), and `xargs` / `find -exec` carry their command as plain operands, so the
+ *  segment's command word is `xargs`/`find` and the `rm` is invisible. */
+export function blocksDestructiveCommand(command, depth = 0) {
   if (typeof command !== "string" || command.length === 0) return null;
+  if (depth > MAX_NESTING) return null;
   let sawDownloader = false;
   for (const tokens of lexCommand(command)) {
     const seg = segmentCommand(tokens);
     if (!seg) continue;
     const { bin, args } = seg;
+
+    const verdict = judgeSegment(tokens, depth);
+    if (verdict) return verdict;
+
+    // Pipe-to-shell is the ONE rule that cannot live in `judgeSegment`: it is the only cross-segment
+    // rule, needing to know that an earlier segment on this line fetched something.
+    //
+    // `lexCommand` splits on `|`, `&&`, `;` and `(` alike and does not report WHICH separator it
+    // saw, so co-occurrence is all this can see directly — and co-occurrence ALONE over-blocks
+    // badly: `curl -s localhost:3000/health && bash scripts/tests/run.sh` is ordinary work, and
+    // under bypassPermissions a refusal here has no approval path.
+    //
+    // The discriminator is the shell segment's OPERANDS. `curl … | bash` invokes a shell with no
+    // script to run, so its input can only be the pipe; `bash scripts/x.sh` names a local file that
+    // is on disk and reviewable. So: downloader earlier in the line AND a shell later with no file
+    // operand. `curl … | jq .name` is unaffected either way — jq is not a shell.
+    if (DOWNLOADER_BINARIES.has(bin)) sawDownloader = true;
+    else if (sawDownloader && SHELL_BINARIES.has(bin) && operandsOf(args).length === 0) {
+      return { rule: "pipe-to-shell", why: "executing unreviewed remote code; download it, read it, then run it" };
+    }
+  }
+  return null;
+}
+
+/** Every single-segment rule, judged from TOKENS rather than a string.
+ *
+ *  Taking tokens is what makes the nested cases correct: `xargs` and `find -exec` already hand us
+ *  separated words, and re-joining them into a line so the lexer could re-split it is a round trip
+ *  through quoting rules that this file's lexer does not fully implement (it treats a backslash
+ *  inside single quotes literally, as the shell does — so the classic `'\''` escape would not
+ *  survive). Tokens in, tokens judged. */
+function judgeSegment(tokens, depth) {
+  if (depth > MAX_NESTING) return null;
+  const seg = segmentCommand(tokens);
+  if (!seg) return null;
+  {
+    const { bin, args } = seg;
+
+    // ── NESTED COMMANDS ──────────────────────────────────────────────────────────────────────
+    // Without these, the section header's claim that laundering does not work is simply false:
+    // a shell's `-c` argument is ONE token the top-level lexer never re-lexes, and `xargs` /
+    // `find -exec` carry their command as plain operands, so the segment's command word is
+    // `xargs`/`find` and the `rm` behind it is invisible.
+    if (SHELL_BINARIES.has(bin)) {
+      const at = args.indexOf("-c");
+      if (at !== -1 && args[at + 1] !== undefined) {
+        // A `-c` operand IS a command string, so this one is re-lexed on purpose.
+        const nested = blocksDestructiveCommand(args[at + 1], depth + 1);
+        if (nested) return nested;
+      }
+    }
+    if (NESTING_WRAPPERS.has(bin)) {
+      const nested = judgeSegment(commandTailFrom(args), depth + 1);
+      if (nested) return nested;
+    }
+    if (bin === "find") {
+      const execTail = findExecTail(args);
+      const nested = judgeSegment(execTail, depth + 1);
+      if (nested) return nested;
+      // `find <root> -exec rm -rf {} +` names `{}` as the target, so the nested judgement above
+      // (correctly) sees nothing catastrophic — `find . -name '*.log' -exec rm -rf {} +` is
+      // ordinary cleanup. What decides it is where find was pointed: the same command rooted at
+      // `/` or `~` deletes the machine. So substitute find's own search roots for the placeholder.
+      const execSeg = segmentCommand(execTail);
+      if (execSeg?.bin === "rm" && rmIsRecursive(execSeg.args)) {
+        const root = findSearchRoots(args).find(isCatastrophicRoot);
+        if (root) {
+          return {
+            rule: "find -exec rm -r",
+            why: `recursive removal rooted at ${root}, which is outside this agent's lane`,
+          };
+        }
+      }
+    }
 
     if (ALWAYS_BLOCKED_BINARIES.has(bin)) {
       return { rule: bin, why: `\`${bin}\` is never an agent's call` };
@@ -774,10 +904,18 @@ export function blocksDestructiveCommand(command) {
       return { rule: "mkfs", why: "formatting a filesystem destroys everything on it" };
     }
     if (bin === "diskutil") {
-      const sub = (subcommandOf(args) ?? "").toLowerCase();
-      const apfsVerb = sub === "apfs" ? (subcommandOf(args.slice(args.indexOf(subcommandOf(args)) + 1)) ?? "").toLowerCase() : "";
-      if (DISKUTIL_DESTRUCTIVE.has(sub) || (sub === "apfs" && DISKUTIL_APFS_DESTRUCTIVE.has(apfsVerb))) {
-        return { rule: `diskutil ${sub}`, why: "erasing or repartitioning a volume destroys everything on it" };
+      // `diskutil [quiet] verb [subVerb] …` — so drop a leading literal `quiet` before reading the
+      // verb pair, and compare lowercased: both are real invocations of the same command, and an
+      // enumeration that misses either is a hole where a blanket rule had none. `diskutil list` /
+      // `info` / `apfs list` are read-only and must fall through.
+      const words = operandsOf(args).map((w) => w.toLowerCase());
+      if (words[0] === "quiet") words.shift();
+      const [verb = "", apfsVerb = ""] = words;
+      if (DISKUTIL_DESTRUCTIVE.has(verb) || (verb === "apfs" && DISKUTIL_APFS_DESTRUCTIVE.has(apfsVerb))) {
+        return {
+          rule: `diskutil ${verb}${verb === "apfs" ? ` ${apfsVerb}` : ""}`,
+          why: "erasing or repartitioning a volume destroys everything on it",
+        };
       }
     }
     if (bin === "rm") {
@@ -814,22 +952,23 @@ export function blocksDestructiveCommand(command) {
         if (git.sub === "clean") {
           // `-x` is the flag that removes IGNORED files — i.e. .env and credentials. `git clean -fd`
           // leaves them alone and stays allowed.
-          const removesIgnored = git.args.some(
-            (a) => a.startsWith("-") && !a.startsWith("--") && a.includes("x"),
-          );
+          //
+          // Scanning stops at `e`, because `-e` takes a VALUE and may carry it attached: in
+          // `git clean -e'*.x'` the lexer yields the single token `-e*.x`, whose "x" belongs to the
+          // user's exclude PATTERN, not to a flag. A plain `.includes("x")` refuses that — a false
+          // refusal with no approval path, which is the thing this whole posture exists to remove.
+          const removesIgnored = git.args.some((a) => {
+            if (!a.startsWith("-") || a.startsWith("--")) return false;
+            const cluster = a.slice(1);
+            const valueAt = cluster.indexOf("e");
+            const flags = valueAt === -1 ? cluster : cluster.slice(0, valueAt);
+            return flags.includes("x");
+          });
           if (removesIgnored) {
             return { rule: "git clean -x", why: "`-x` deletes IGNORED files, which is where credentials live" };
           }
         }
       }
-    }
-    // Pipe-to-shell. NOTE, honestly: `lexCommand` splits on `|`, `&&`, `;` and `(` alike and does
-    // not report WHICH separator it saw, so "downloader earlier in the line, shell later" is the
-    // most this can distinguish. That is deliberately conservative — `curl -o x.sh URL && bash x.sh`
-    // is the same hazard as piping, and `curl … | jq .name` is unaffected because jq is not a shell.
-    if (DOWNLOADER_BINARIES.has(bin)) sawDownloader = true;
-    else if (sawDownloader && SHELL_BINARIES.has(bin)) {
-      return { rule: "pipe-to-shell", why: "executing unreviewed remote code; download it, read it, then run it" };
     }
   }
   return null;

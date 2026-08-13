@@ -6359,14 +6359,42 @@ const SPARKLE_DENY_RULES: &[&str] = &[
     // `diskutil` is denied by VERB, not as a blanket `Bash(diskutil:*)`. `diskutil list`/`info`/
     // `apfs list` are read-only diagnostics, and a deny rule has no approval path — blanket-denying
     // them would be the same over-blocking this posture exists to undo, made permanent.
+    //
+    // WIDENING A BLANKET RULE INTO AN ENUMERATION MAKES EVERY OMISSION A HOLE, and a deny rule is a
+    // literal string prefix, so the enumeration has to spell out every form of the SAME command:
+    //   * `diskutil [quiet] verb …` — a literal `quiet` may sit before the verb.
+    //   * verbs are case-insensitive (`diskutil ERASEDISK` runs), prefixes are not.
+    // The JS guard normalises both instead of enumerating; this list cannot, so it enumerates. The
+    // fixture pins each form with a `mustBlock` case so a missing spelling fails a test.
     "Bash(diskutil eraseDisk:*)",
     "Bash(diskutil eraseVolume:*)",
     "Bash(diskutil partitionDisk:*)",
     "Bash(diskutil reformat:*)",
     "Bash(diskutil zeroDisk:*)",
+    "Bash(diskutil randomDisk:*)",
     "Bash(diskutil secureErase:*)",
+    "Bash(diskutil eraseOptical:*)",
     "Bash(diskutil apfs delete:*)",
     "Bash(diskutil apfs deleteContainer:*)",
+    "Bash(diskutil apfs deleteVolume:*)",
+    "Bash(diskutil apfs eraseVolume:*)",
+    "Bash(diskutil erasedisk:*)",
+    "Bash(diskutil erasevolume:*)",
+    "Bash(diskutil partitiondisk:*)",
+    "Bash(diskutil zerodisk:*)",
+    "Bash(diskutil randomdisk:*)",
+    "Bash(diskutil secureerase:*)",
+    "Bash(diskutil eraseoptical:*)",
+    "Bash(diskutil quiet eraseDisk:*)",
+    "Bash(diskutil quiet eraseVolume:*)",
+    "Bash(diskutil quiet partitionDisk:*)",
+    "Bash(diskutil quiet reformat:*)",
+    "Bash(diskutil quiet zeroDisk:*)",
+    "Bash(diskutil quiet randomDisk:*)",
+    "Bash(diskutil quiet secureErase:*)",
+    "Bash(diskutil quiet eraseOptical:*)",
+    "Bash(diskutil quiet apfs delete:*)",
+    "Bash(diskutil quiet apfs deleteContainer:*)",
     "Bash(npm publish:*)",
     "Bash(pnpm publish:*)",
     "Bash(yarn publish:*)",
@@ -6404,9 +6432,27 @@ const SPARKLE_DENY_RULES: &[&str] = &[
 /// Preserves anything the user already has: existing deny rules survive, de-duplicated by rule
 /// string, and a non-object `permissions` is coerced rather than panicked on. Idempotent.
 fn merge_permission_posture(root: &mut Value) {
+    // ── THE BYPASS REQUIRES ITS BRAKES, IN THE SAME FILE ──────────────────────────────────────
+    // `defaultMode` and `deny` are written ONLY when this document already registers the Sparkle
+    // PreToolUse guard. That is not belt-and-braces; it closes a live hole. `AgentPane.prepare`
+    // calls `installWorktreeGuard` inside a `try/catch` that merely warns — a missing write-guard
+    // is not worth refusing to start an agent over — and then calls `installAgentHooks`
+    // unconditionally. So a failed guard install used to yield a worktree with the approval prompt
+    // turned OFF and the compound-aware layer ABSENT, leaving only the coarse prefix-matched deny
+    // list: bypass where the brakes are not installed, which is exactly the combination this
+    // function's own reasoning rules out at the account level.
+    //
+    // Gating here makes the failure mode SAFE rather than silent: no guard → no bypass → the agent
+    // prompts, which is merely the status quo before this work. The consent record is written
+    // either way; it grants nothing on its own, and Sparkle passes
+    // `--dangerously-skip-permissions` to unattended workers regardless of this file.
+    let guard_installed = has_sparkle_guard_hook(root);
     let obj = root.as_object_mut().unwrap();
     // The consent record lives at the TOP level of a settings file, not under `permissions`.
     obj.insert("skipDangerousModePermissionPrompt".into(), json!(true));
+    if !guard_installed {
+        return;
+    }
     let permissions = obj.entry("permissions").or_insert_with(|| json!({}));
     if !permissions.is_object() {
         *permissions = json!({});
@@ -6423,6 +6469,28 @@ fn merge_permission_posture(root: &mut Value) {
             arr.push(json!(rule));
         }
     }
+}
+
+/// Does this settings document register Sparkle's PreToolUse write-guard? Matched by the script
+/// name baked into the hook command — the same substring [`merge_guard_settings`] uses to find and
+/// replace its own prior entry, so the two cannot disagree about what "installed" means.
+fn has_sparkle_guard_hook(root: &Value) -> bool {
+    root.get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+        .is_some_and(|entries| {
+            entries.iter().any(|e| {
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .is_some_and(|hooks| {
+                        hooks.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .is_some_and(|c| c.contains("worktree-guard.mjs"))
+                        })
+                    })
+            })
+        })
 }
 
 /// Merge [`SPARKLE_ALLOWED_TOOLS`] into a settings JSON *document*, preserving every other key.
@@ -11194,10 +11262,10 @@ mod tests {
         for rule in SPARKLE_DENY_RULES {
             assert!(deny.contains(rule), "deny rule missing: {rule}");
         }
-        // The other worktree installer writes the identical posture — either one alone is
-        // sufficient, which is what makes a failed guard install (warned about, not fatal) survivable.
+        // The hooks installer, running over a worktree the guard installer ALREADY wrote, carries
+        // the identical posture — that is the normal order in `AgentPane.prepare`.
         let via_hooks: serde_json::Value =
-            serde_json::from_str(&merge_agent_worktree_settings(None)).unwrap();
+            serde_json::from_str(&merge_agent_worktree_settings(Some(&merged))).unwrap();
         assert_eq!(via_hooks["permissions"]["defaultMode"], "bypassPermissions");
         assert_eq!(via_hooks["skipDangerousModePermissionPrompt"], true);
         assert_eq!(via_hooks["permissions"]["deny"], v["permissions"]["deny"]);
@@ -11216,6 +11284,45 @@ mod tests {
             "the account layer must not turn the approval prompt off"
         );
         assert!(account["permissions"]["deny"].is_null());
+    }
+
+    /// THE FAILURE MODE THIS GATE EXISTS FOR. `AgentPane.prepare` catches an `installWorktreeGuard`
+    /// failure and merely warns, then runs `installAgentHooks` unconditionally. If the hooks path
+    /// wrote the bypass on its own, that combination would produce a worktree with the approval
+    /// prompt OFF and the compound-aware guard ABSENT — bypass with no brakes.
+    ///
+    /// So the assertion is on the SIDE EFFECT of the guard being missing: no `defaultMode`, no
+    /// `deny`. The paired case above (composing over a document the guard installer wrote) proves
+    /// the same code path DOES produce the posture when the guard is there — one test showing
+    /// absence is ambiguous; the pair is what pins the cause.
+    #[test]
+    fn the_hooks_path_alone_writes_no_bypass_when_the_guard_is_missing() {
+        let v: serde_json::Value =
+            serde_json::from_str(&merge_agent_worktree_settings(None)).unwrap();
+        assert!(
+            v["permissions"]["defaultMode"].is_null(),
+            "bypass written into a worktree with no write-guard installed"
+        );
+        assert!(v["permissions"]["deny"].is_null(), "deny list without its guard");
+        // The allowlist and the consent record are unconditional: neither turns the prompt off.
+        assert_eq!(v["skipDangerousModePermissionPrompt"], true);
+        let allow: Vec<&str> = v["permissions"]["allow"]
+            .as_array()
+            .expect("allow array")
+            .iter()
+            .filter_map(|e| e.as_str())
+            .collect();
+        assert!(allow.contains(&"mcp__sparkle-control"));
+
+        // …and a settings file whose PreToolUse array holds only a NON-Sparkle hook is still
+        // "no guard" — presence of the key is not presence of the guard.
+        let foreign = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"node /x/other.mjs"}]}]}}"#;
+        let v: serde_json::Value =
+            serde_json::from_str(&merge_agent_worktree_settings(Some(foreign))).unwrap();
+        assert!(
+            v["permissions"]["defaultMode"].is_null(),
+            "someone else's PreToolUse hook is not Sparkle's write-guard"
+        );
     }
 
     #[test]

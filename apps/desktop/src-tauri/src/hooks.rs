@@ -3000,7 +3000,17 @@ mod tests {
     /// posture step — that is the side effect, not the precondition that some file was written.
     #[test]
     fn composed_agent_settings_carry_bypass_deny_and_the_consent_record() {
-        let out = compose_agent_settings(None, "node '/x/sparkle-hook.mjs' '/y/ev.jsonl'", &[]);
+        // Compose over a worktree the GUARD installer already wrote — the normal order in
+        // `AgentPane.prepare`. The bypass is gated on that guard being present (see
+        // `worktree::the_hooks_path_alone_writes_no_bypass_when_the_guard_is_missing`), so seeding
+        // it here is what makes this test exercise the posture rather than the refusal.
+        let guarded =
+            crate::worktree::merge_guard_settings(None, "node /abs/worktree-guard.mjs /wt/a");
+        let out = compose_agent_settings(
+            Some(&guarded),
+            "node '/x/sparkle-hook.mjs' '/y/ev.jsonl'",
+            &[],
+        );
         let v: serde_json::Value = serde_json::from_str(&out).expect("composed settings are JSON");
         assert_eq!(
             v["permissions"]["defaultMode"], "bypassPermissions",
