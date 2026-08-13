@@ -752,6 +752,191 @@ pub fn write_refusal(screen: Option<&Screen>) -> Option<Refusal> {
     None
 }
 
+// The three shapes an ordinary permission prompt is recognised by. Kept beside the gate that uses
+// them so the question and the answer stay one contract.
+
+// `* Bash(git status)` / `⏺ Shell(ls -la)`. GREEDY to the last `)`, because a command may itself
+// contain parentheses and a lazy match would truncate it -- and a TRUNCATED command is the
+// dangerous direction: `git status)` would fail the allowlist, but `find . -name (x` losing its
+// tail could turn an unsafe command into a safe-looking prefix.
+pattern!(bash_call_line, r"(?i)\b(?:bash|shell)\s*\((.+)\)");
+pattern!(proceed_question, r"(?i)do you want to (?:proceed|continue)");
+// The affirmative must be NUMBERED `1`, which is what makes sending `1` correct rather than a
+// guess about where the cursor is sitting.
+// Leading glyphs are matched as `\W*` rather than enumerated: the cursor renders as `\u{276f}`,
+// `\u{203a}`, a bare `>` or nothing at all, and the row may be boxed with `\u{2502}`. Enumerating them is
+// how this matcher silently stopped matching the real screen once already.
+pattern!(affirmative_option, r"(?im)^\W*1\.\s*(?:yes|approve|allow)\b");
+
+// == ANSWERING AN ORDINARY PERMISSION PROMPT =====================================================
+
+/// The affirmative option on Claude Code's proceed-prompt. `1` selects "Yes" and confirms.
+///
+/// NO carriage return, deliberately -- the same discipline as `ESCAPE_KEY`. A CR confirms whichever
+/// option the cursor happens to sit on, which on a screen we have mis-identified is precisely the
+/// harm `Refusal::AwaitingInput` exists to prevent. A digit selects a NAMED option or nothing.
+pub const AFFIRMATIVE_KEY: &str = "1";
+
+/// Commands the machine may answer a permission prompt for, WITHOUT a human reading it.
+///
+/// -- WHY AN ALLOWLIST AND NOT A DENY-LIST -------------------------------------------------------
+/// A deny-list ("answer unless the command looks dangerous") fails OPEN: a command nobody thought
+/// to deny is auto-approved, and the set of dangerous commands is unbounded and grows with every
+/// tool the fleet learns to use. An allowlist fails CLOSED, which is the same posture as every
+/// other arm of this module -- "every unknown is a refusal to write". The cost of a false refusal
+/// is one prompt a human clears; the cost of a false permit is a command nobody read.
+///
+/// Every entry is READ-ONLY: it inspects state and cannot mutate a repo, the filesystem, the
+/// network, or an account. That is the property that makes answering safe, so keep it when adding
+/// entries -- a build or test command belongs here only if you are certain it has no side effects,
+/// which for this repo's suites it does not.
+const ANSWERABLE_COMMANDS: &[&str] = &[
+    "git status",
+    "git log",
+    "git diff",
+    "git show",
+    "git branch",
+    "git rev-parse",
+    "git rev-list",
+    "git merge-base",
+    "git remote -v",
+    "git stash list",
+    "roborev list",
+    "roborev show",
+    "bd list",
+    "bd show",
+    "ls",
+    "find",
+    "grep",
+    "rg",
+    "cat",
+    "head",
+    "tail",
+    "wc",
+    "pwd",
+    "which",
+    "file",
+    "stat",
+    "tree",
+];
+
+/// Shell punctuation that can chain, redirect or substitute a SECOND command after the first.
+///
+/// THE HOLE THIS CLOSES, and it is the whole reason prefix-matching alone is not enough:
+/// `git status; rm -rf /` starts with an allowlisted prefix. So does `find . -exec rm {} \;`.
+/// Any of these characters means the screen is showing more than the command we matched, and the
+/// verdict is a refusal regardless of how safe the prefix looked.
+const SHELL_CHAINERS: &[char] = &[';', '&', '|', '>', '<', '`', '$', '(', ')', '\n'];
+
+/// Is this command safe for the machine to approve on its own?
+///
+/// Fails closed on everything it does not positively recognise: an empty command, a chainer, an
+/// `-exec`/`-delete` argument, or any prefix not on the list.
+pub fn command_is_answerable(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return false;
+    }
+    if cmd.contains(SHELL_CHAINERS) {
+        return false;
+    }
+    // `find` earns its place on the list only as a PLAIN find. These two arguments turn it into an
+    // arbitrary-command runner and a deleter respectively.
+    if cmd.contains("-exec") || cmd.contains("-delete") || cmd.contains("-execdir") {
+        return false;
+    }
+    ANSWERABLE_COMMANDS.iter().any(|allowed| {
+        // Prefix match on a WORD boundary, so `git showoff` never matches `git show`.
+        cmd == *allowed
+            || cmd
+                .strip_prefix(*allowed)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
+
+/// The command a permission prompt is asking about, read off the live region.
+///
+/// Claude Code renders the call above the question as `● Bash(git status)` / `⏺ Bash(...)`, so the
+/// command is on the screen in a fixed shape. Scoped to the live region for the same reason the
+/// last arm of `write_refusal` is: matched against the whole viewport this finds a call from the
+/// TRANSCRIPT and answers a question about a command that already ran.
+pub fn prompted_command(text: &str) -> Option<String> {
+    let all: Vec<&str> = lines(text).collect();
+    let (start, end) = live_region(&all);
+    // Widen upward a little: the call line sits above the question, and the question is what
+    // anchors the live region. Bounded so it cannot reach the transcript.
+    let start = start.saturating_sub(PROMPT_CALL_LOOKBACK_ROWS);
+    all[start..end]
+        .iter()
+        .rev()
+        .find_map(|line| bash_call_line().captures(line).map(|c| c[1].trim().to_string()))
+}
+
+/// How far above the live region the `Bash(...)` call line may sit.
+const PROMPT_CALL_LOOKBACK_ROWS: usize = 6;
+
+/// MAY THE MACHINE SEND `AFFIRMATIVE_KEY` INTO THIS TERMINAL? `None` means yes.
+///
+/// -- A THIRD GATE, FOR THE SAME REASON `escape_refusal` IS A SECOND ONE ------------------------
+/// `write_refusal`'s `None` licenses ARBITRARY TEXT followed by a carriage return, and a
+/// paste-then-CR at a live picker submits whichever option the cursor sits on. So this is scoped by
+/// CONSTRUCTION rather than by punching a hole in it: `write_refusal` is unchanged and still
+/// answers `AwaitingInput` here, and the only caller permitted to consult this function is the one
+/// that writes exactly `AFFIRMATIVE_KEY`.
+///
+/// Every carve-out above it still applies, in the same order and for the same reasons:
+///   * an alternate buffer we cannot attribute to Claude Code -- we do not know what we are typing
+///     into;
+///   * a RUNNING turn -- a digit into streaming output is a keystroke in the middle of a command
+///     line;
+///   * a CREDENTIAL prompt -- these echo nothing, so a misrouted write is invisible as well as
+///     wrong, and no allowlist can make typing at a password field safe;
+///   * the SESSION-LIMIT picker -- its options are account-level BILLING decisions (paid overage, a
+///     subscription change). It keeps its Esc-only path via `escape_refusal`; a DIGIT there must
+///     remain impossible, which is asserted by its own test.
+///
+/// FAILS CLOSED on every unknown, including a screen where the command cannot be read at all. "We
+/// could not tell what it was asking about" is the strongest possible reason not to answer.
+pub fn answer_refusal(screen: Option<&Screen>) -> Option<Refusal> {
+    let Some(screen) = screen else {
+        return Some(Refusal::NoViewport);
+    };
+    if screen.alternate && !looks_like_claude_prompt(screen.text) {
+        return Some(Refusal::AlternateScreen);
+    }
+    if screen_is_working(screen.text) {
+        return Some(Refusal::Working);
+    }
+    if screen_shows_credential_prompt(screen.text) {
+        return Some(Refusal::CredentialPrompt);
+    }
+    // The billing picker is NEVER answered with a digit, whatever else is true.
+    if screen_is_session_limit_picker(screen.text) {
+        return Some(Refusal::AwaitingInput);
+    }
+    // It must actually BE an ordinary proceed-prompt with an affirmative option on it.
+    if !screen_is_proceed_prompt(screen.text) {
+        return Some(Refusal::AwaitingInput);
+    }
+    match prompted_command(screen.text) {
+        Some(cmd) if command_is_answerable(&cmd) => None,
+        _ => Some(Refusal::AwaitingInput),
+    }
+}
+
+/// Is this the ordinary "Do you want to proceed? / 1. Yes / 2. No" prompt?
+///
+/// Both halves are required. The question alone can sit in the transcript above a fresh prompt; the
+/// numbered option alone matches any menu. Requiring the affirmative option to be present AND
+/// numbered `1` is also what makes `AFFIRMATIVE_KEY` correct rather than a guess about the cursor.
+pub fn screen_is_proceed_prompt(text: &str) -> bool {
+    let all: Vec<&str> = lines(text).collect();
+    let (start, end) = live_region(&all);
+    let start = start.saturating_sub(PROMPT_CALL_LOOKBACK_ROWS);
+    let live = all[start..end].join("\n");
+    proceed_question().is_match(&live) && affirmative_option().is_match(&live)
+}
+
 /// The ONE byte any machine may ever send at a session-limit picker: `Esc`, which CANCELS.
 ///
 /// Never a numbered option, under any recovery path, ever. Options 2 and 3 on that picker are
@@ -805,6 +990,152 @@ pub fn escape_refusal(screen: Option<&Screen>) -> Option<Refusal> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    // == ANSWERING AN ORDINARY PERMISSION PROMPT =================================================
+
+    /// The real shape Claude Code renders: the call, the question, the numbered options, the footer.
+    fn proceed_screen(command: &str) -> String {
+        format!(
+            "\u{25cf} Bash({command})\n\nDo you want to proceed?\n\u{276f} 1. Yes\n  2. No\n\
+             \nEsc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain"
+        )
+    }
+
+    fn may_answer(text: &str) -> bool {
+        answer_refusal(Some(&Screen { text, alternate: false })).is_none()
+    }
+
+    #[test]
+    fn an_allowlisted_read_only_command_is_answered() {
+        for cmd in [
+            "git status",
+            "roborev list --open",
+            "find . -name '*.rs'",
+            "ls -la",
+            "git log --oneline -5",
+        ] {
+            assert!(may_answer(&proceed_screen(cmd)), "should answer: {cmd}");
+        }
+    }
+
+    /// THE HOLE PREFIX-MATCHING ALONE WOULD LEAVE. Every one of these STARTS with an allowlisted
+    /// prefix, and every one runs something the allowlist never authorised.
+    #[test]
+    fn a_command_that_chains_something_else_is_refused() {
+        for cmd in [
+            "git status; rm -rf /",
+            "git status && git push --force",
+            "ls | xargs rm",
+            "find . -exec rm {} +",
+            "find . -delete",
+            "cat x > /etc/hosts",
+            "ls $(rm -rf /)",
+        ] {
+            assert!(!may_answer(&proceed_screen(cmd)), "must REFUSE: {cmd}");
+        }
+    }
+
+    #[test]
+    fn a_command_not_on_the_allowlist_is_refused() {
+        for cmd in [
+            "rm -rf build",
+            "git push",
+            "gh pr merge 12 --merge",
+            "npx some-cli",
+            "sudo reboot",
+        ] {
+            assert!(!may_answer(&proceed_screen(cmd)), "must REFUSE: {cmd}");
+        }
+    }
+
+    /// The allowlist matches on a WORD boundary, so a longer command starting with a shorter safe
+    /// one does not inherit its permission.
+    #[test]
+    fn a_longer_command_sharing_an_allowlisted_prefix_is_refused() {
+        assert!(!may_answer(&proceed_screen("git showoff --dangerous")));
+        assert!(!may_answer(&proceed_screen("findutils-wrapper --purge")));
+    }
+
+    /// "We could not tell what it was asking about" is the strongest possible reason not to answer.
+    #[test]
+    fn a_prompt_whose_command_cannot_be_read_is_refused() {
+        let no_call = "Do you want to proceed?\n\u{276f} 1. Yes\n  2. No";
+        assert!(!may_answer(no_call), "no command on screen must fail closed");
+    }
+
+    /// A numbered menu that is NOT a proceed-prompt must not be answered just because something
+    /// safe-looking is on screen.
+    #[test]
+    fn a_menu_that_is_not_a_proceed_prompt_is_refused() {
+        let menu = "\u{25cf} Bash(git status)\n\nPick a branch:\n\u{276f} 1. main\n  2. dev";
+        assert!(!may_answer(menu));
+    }
+
+    /// The carve-outs above the allowlist all still hold - an allowlisted command cannot buy a way
+    /// past a credential prompt, a running turn, or an unattributable full-screen app.
+    #[test]
+    fn the_gates_above_the_allowlist_still_refuse() {
+        let safe = proceed_screen("git status");
+
+        let cred = format!("{safe}\nPassword:");
+        assert_eq!(
+            answer_refusal(Some(&Screen { text: &cred, alternate: false })),
+            Some(Refusal::CredentialPrompt)
+        );
+
+        let working = format!("{safe}\n\u{2733} Thinking... (esc to interrupt)");
+        assert_eq!(
+            answer_refusal(Some(&Screen { text: &working, alternate: false })),
+            Some(Refusal::Working)
+        );
+
+        assert_eq!(
+            answer_refusal(Some(&Screen { text: "some vim buffer", alternate: true })),
+            Some(Refusal::AlternateScreen)
+        );
+        assert_eq!(answer_refusal(None), Some(Refusal::NoViewport));
+    }
+
+    /// `write_refusal` is UNCHANGED - it must still refuse the very screen `answer_refusal`
+    /// permits, because its `None` licenses arbitrary text plus a carriage return.
+    #[test]
+    fn the_arbitrary_text_gate_still_refuses_a_prompt_we_may_answer() {
+        let safe = proceed_screen("git status");
+        assert!(may_answer(&safe), "precondition: this one is answerable");
+        assert_eq!(
+            write_refusal(Some(&Screen { text: &safe, alternate: false })),
+            Some(Refusal::AwaitingInput),
+            "free text must never be licensed at a live prompt"
+        );
+    }
+
+    /// THE BILLING PICKER NEVER GETS A DIGIT, under any path. Its options move the user onto paid
+    /// overage or change their subscription, so pressing one spends their money. It keeps its
+    /// Esc-only route via `escape_refusal`; this asserts the new gate cannot become a second way in.
+    #[test]
+    fn the_session_limit_picker_is_never_answered_with_a_digit() {
+        let picker = format!(
+            "\u{276f} 1. {}\n  2. {}\n  3. {}\n{}",
+            reset_label(),
+            credits_label(),
+            team_label(),
+            PICKER_FOOTER
+        );
+        assert!(screen_is_session_limit_picker(&picker), "premise: this IS the billing picker");
+        assert_eq!(
+            answer_refusal(Some(&Screen { text: &picker, alternate: false })),
+            Some(Refusal::AwaitingInput),
+            "a digit at the billing picker must remain impossible"
+        );
+    }
+
+    /// The one byte, pinned. A carriage return here would confirm whatever the cursor sits on.
+    #[test]
+    fn the_affirmative_key_is_one_digit_and_carries_no_carriage_return() {
+        assert_eq!(AFFIRMATIVE_KEY, "1");
+        assert!(!AFFIRMATIVE_KEY.contains('\r'));
+        assert!(!AFFIRMATIVE_KEY.contains('\n'));
+    }
 
     // The TypeScript sources this module is a port of, as WHOLE literal paths.
     //

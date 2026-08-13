@@ -593,6 +593,16 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
             // Bracketed paste is NOT used for the bare Enter: there is nothing to paste, and the
             // whole point is to submit what the agent already typed.
             Action::Enter => Some(deliver(app, observer, agent_id, "\r", false)),
+            // EXACTLY the affirmative option byte, with NO carriage return -- `submit: false`.
+            // A CR would confirm whichever option the cursor happens to sit on, which on a screen
+            // we have mis-identified is the precise harm the gate exists to prevent.
+            Action::Answer => Some(deliver(
+                app,
+                observer,
+                agent_id,
+                nudge_gate::AFFIRMATIVE_KEY,
+                false,
+            )),
             Action::Nudge { n } => {
                 let text = nudge_ladder::nudge_text(*n, entry.state.silent_secs());
                 // Bracketed paste, so a multi-line-aware TUI takes the body as one paste rather
@@ -750,6 +760,17 @@ fn observe(observer: &PtyObserver, status: &str, goal_met: bool, now: u64) -> Ob
         } else {
             None
         },
+        // MAY WE ANSWER THIS PROMPT OURSELVES? The verdict is re-derived here, on the nudger
+        // thread, from the grid this module owns -- never taken from the WebView, for the same
+        // reason `nudger_send_escape` re-derives its own: a wedged WebView's last opinion is
+        // exactly the stale evidence that would press a button nobody read. An unreadable screen
+        // is never answerable.
+        answerable: screen_readable
+            && nudge_gate::answer_refusal(Some(&Screen {
+                text: &text,
+                alternate,
+            }))
+            .is_none(),
     }
 }
 
@@ -936,6 +957,7 @@ fn build_flag(
 fn action_name(action: &Action) -> &'static str {
     match action {
         Action::Observe => "observe",
+        Action::Answer => "answer",
         Action::Enter => "enter",
         Action::Nudge { .. } => "nudge",
     }
@@ -1722,6 +1744,7 @@ mod tests {
                 foreign_write_ms: 0,
                 goal_met: false,
                 reply: None,
+                answerable: false,
             };
             for _ in 0..7 {
                 nudge_ladder::step(&mut state, &stalled);
@@ -1846,6 +1869,35 @@ mod tests {
 
     /// An agent that has been silent for `looks` looks, driven through the REAL ladder so the
     /// escalation state under test is the one production reaches rather than a hand-set field.
+    /// THE COUPLING NOTHING ELSE PINS (roborev 63230, Medium).
+    ///
+    /// `nudge_ladder` is deliberately dependency-free -- the gate verdict arrives as a `&str` -- so
+    /// its `stalled_on_a_prompt` hand-copies two tokens out of `nudge_gate::Refusal::as_str()` with
+    /// nothing but this test holding them together. Rename a variant's string and the ladder
+    /// silently stops escalating parked agents: no compile error, no red test, and the failure mode
+    /// is the exact silent inertness the instant-escalation path exists to remove. THIS module is
+    /// where the guard belongs because it is the one that imports both.
+    #[test]
+    fn the_ladder_and_the_gate_agree_on_the_prompt_tokens() {
+        for r in [nudge_gate::Refusal::AwaitingInput, nudge_gate::Refusal::CredentialPrompt] {
+            assert!(
+                nudge_ladder::stalled_on_a_prompt(r.as_str()),
+                "{r:?} names a screen only a human can clear; the ladder must know its token"
+            );
+        }
+        // …and the self-clearing ones must NOT be in the set, or every `less` session raises a row.
+        for r in [
+            nudge_gate::Refusal::AlternateScreen,
+            nudge_gate::Refusal::NoViewport,
+            nudge_gate::Refusal::Working,
+        ] {
+            assert!(
+                !nudge_ladder::stalled_on_a_prompt(r.as_str()),
+                "{r:?} can clear without a human and must not raise a row on sight"
+            );
+        }
+    }
+
     fn wedged_state(looks: usize) -> AgentState {
         let mut state = AgentState::default();
         let stalled = nudge_ladder::Observation {
@@ -1858,6 +1910,7 @@ mod tests {
             foreign_write_ms: 0,
             goal_met: false,
             reply: None,
+            answerable: false,
         };
         for _ in 0..looks {
             nudge_ladder::step(&mut state, &stalled);
@@ -2011,6 +2064,7 @@ mod tests {
             foreign_write_ms: 0,
             goal_met: false,
             reply: None,
+            answerable: false,
         };
         for _ in 0..7 {
             nudge_ladder::step(&mut state, &stalled);

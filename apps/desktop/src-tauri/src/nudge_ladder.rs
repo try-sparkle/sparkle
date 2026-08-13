@@ -78,11 +78,11 @@ const FIRST_WRITING_RUNG: usize = 3;
 const FIRST_NUDGE_RUNG: usize = 6;
 
 /// Nudges with no output change before the concierge is flagged.
-const ESCALATE_CONCIERGE_AFTER: u32 = 3;
+const ESCALATE_CONCIERGE_AFTER: u32 = 2;
 
 /// Nudges with no output change before the founder is flagged. The nudger never addresses a human
 /// itself — it raises a flag that the pusher/concierge loop (sparkle-4cd0x) consumes.
-const ESCALATE_FOUNDER_AFTER: u32 = 6;
+const ESCALATE_FOUNDER_AFTER: u32 = 4;
 
 /// Nudges after which the ladder STOPS WRITING for the rest of the episode — the terminal rung.
 ///
@@ -97,6 +97,27 @@ const ESCALATE_FOUNDER_AFTER: u32 = 6;
 /// raising the row on every look. Sparkle's standing rule is that a row a human owes is never
 /// hidden — this stops the TYPING, not the TELLING.
 const GIVE_UP_AFTER: u32 = 8;
+
+/// Consecutive looks of UNPROVOKED output before the nudge history is wiped.
+///
+/// -- WHY ONE CHANGED LOOK IS NOT EVIDENCE OF A WORKING AGENT ----------------------------------
+/// This is the founder's `#1`-forever symptom, and the reason the first repair did not finish the
+/// job. `wrote_last_look` correctly attributes the ECHO of our own nudge -- but it covers exactly
+/// ONE look, and the climb from a nudge back to the next nudge rung is SEVEN (5+10+20+30+60+120 =
+/// 245s, the `4m 5s` in every screenshotted ping). That leaves six looks in which any single hash
+/// change wipes `attempts` back to zero, so the next ping is `#1` again, forever.
+///
+/// A live pane moves in all six of them for reasons that are not the agent working: Claude Code
+/// repaints its footer and its context-remaining counter, and the hash covers the roster STATUS as
+/// well as the PTY tail, so an agent blinking out of the roster (a WebView reload, a republish gap)
+/// changes it with no output at all. So the ladder pinged indefinitely, never escalated, and no
+/// human was ever told -- which is exactly the fleet sitting idle for hours.
+///
+/// A working agent emits on CONSECUTIVE looks; an idle repaint emits once and goes quiet again. So
+/// the reset keys on a run of activity rather than on a single sample. Three is the smallest run
+/// that a redraw split across two looks cannot fake, and the cost of erring high is one preserved
+/// episode on an agent that has to be silent another 245s before it is nudged at all.
+const LIVE_LOOKS_TO_RESET: u32 = 3;
 
 /// How long to wait between looks once an agent has told us it is out of quota.
 ///
@@ -231,6 +252,10 @@ pub enum Action {
     Observe,
     /// Press Enter. Rungs 4-6, non-empty prompt only.
     Enter,
+    /// Answer an ordinary permission prompt whose command is on the gate's allowlist, by
+    /// selecting the affirmative option. NOT free text, and never a carriage return -- see
+    /// `nudge_gate::answer_refusal`, which is the only thing that may authorise this.
+    Answer,
     /// Type the fixed nudge string. Rung 7+.
     Nudge {
         /// 1-based counter, shown in the message so scrollback carries the history.
@@ -285,6 +310,13 @@ pub struct Observation {
     /// The agent's own one-line answer to the most recent nudge, per `parse_reply`. `None` when it
     /// has not answered, or when the screen cannot be read unambiguously.
     pub reply: Option<Reply>,
+    /// The screen is an ordinary permission prompt whose command the gate's ALLOWLIST covers, so
+    /// the affirmative option may be selected without a human reading it.
+    ///
+    /// Computed by `nudger::observe` from `nudge_gate::answer_refusal`, which fails closed on every
+    /// unknown -- an unreadable command, a chained command, a credential prompt, the billing
+    /// picker. This module never decides safety itself; it only decides WHEN to act on the verdict.
+    pub answerable: bool,
 }
 
 /// The nudger's memory of one agent, between ticks.
@@ -352,6 +384,17 @@ pub struct AgentState {
     /// proxy for. Cleared at the top of every look, so it means "the look immediately before this
     /// one" and never leaks further.
     wrote_last_look: bool,
+    /// Looks spent parked on a screen only a human can clear, for that path's escalation ladder.
+    ///
+    /// Deliberately NOT `attempts`, which means "nudges we tried to send" and is both the
+    /// `GIVE_UP_AFTER` budget and the `nudges:` figure a human reads off the flag. Charging silent
+    /// observations to that counter spent the give-up budget on an agent that was never nudged.
+    parked_looks: u32,
+    /// Consecutive looks of UNPROVOKED output, for `LIVE_LOOKS_TO_RESET`.
+    ///
+    /// The counter that tells a WORKING agent from a REPAINTING one. Our own echo zeroes it (it is
+    /// not the agent living) and so does any quiet look, so it only ever reports a genuine run.
+    live_looks: u32,
 }
 
 impl AgentState {
@@ -549,6 +592,27 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         let conversation = changed && state.attempts > 0 && we_wrote_last_look;
         state.hash = Some(obs.hash);
         state.rung = 0;
+
+        // -- AND ONE CHANGED LOOK IS NOT A WORKING AGENT ---------------------------------------
+        // The `conversation` rule above attributes our own ECHO, and it is correct as far as it
+        // goes -- but it reaches exactly ONE look, while the climb back to the next nudge rung is
+        // SEVEN. Six looks were therefore left in which any single hash change wiped the episode,
+        // and a live pane supplies one for free: a footer redraw, a context-remaining counter, or
+        // the roster STATUS that is hashed alongside the PTY tail flipping as an agent blinks out
+        // of a reloading WebView. The result was the founder's screenshot -- every ping `#1`, no
+        // threshold ever reached, no human ever told, a fleet pinged for hours.
+        //
+        // So the wipe keys on a RUN of activity. A working agent emits on consecutive looks; a
+        // repaint emits once and goes quiet. Our own echo ends the run rather than extending it,
+        // because output we provoked is not evidence of anything. See `LIVE_LOOKS_TO_RESET`.
+        let live_run = if conversation || !changed {
+            state.live_looks = 0;
+            false
+        } else {
+            state.live_looks = state.live_looks.saturating_add(1);
+            state.live_looks >= LIVE_LOOKS_TO_RESET
+        };
+
         if !conversation {
             // ── AND THE REPLY LATCH GOES TOO (roborev 60338, High) ────────────────────────────
             // A previous revision kept the stand-down here, reasoning that clearing it would let an
@@ -607,8 +671,14 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
             // from one waiting six hours — the very defect roborev 57873 fixed for `conflict_watch`
             // — and clearing `escalated` also re-armed `raise`, re-emitting `nudger://escalation`
             // every repaint. An agent still standing down has not started a new episode.
-            if state.standdown.is_none() {
+            //
+            // GATED ON THE RUN, unlike the stand-down expiry above it, and the asymmetry is the
+            // safety rule rather than an oversight. Expiring a stand-down errs toward NUDGING, so
+            // a single repaint may do it. Wiping the episode errs toward SILENCE -- it discards
+            // the history that reaches a human -- so it takes real evidence the agent is alive.
+            if live_run && state.standdown.is_none() {
                 state.attempts = 0;
+                state.parked_looks = 0;
                 state.delivered = 0;
                 state.last_blocked = None;
                 state.escalated = None;
@@ -645,7 +715,9 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         };
     }
 
-    // Unchanged: climb.
+    // Unchanged: climb. A quiet look ends any run of activity -- `LIVE_LOOKS_TO_RESET` counts
+    // CONSECUTIVE emitting looks, so an intermittent flicker never accumulates into one.
+    state.live_looks = 0;
     state.silent_secs += LADDER_SECS[state.rung.min(LADDER_SECS.len() - 1)];
     state.rung = (state.rung + 1).min(LADDER_SECS.len() - 1);
     let rung = state.rung;
@@ -747,6 +819,26 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         obs.refusal
     };
 
+    // -- A PROMPT WE ARE ALLOWED TO ANSWER, WE ANSWER --------------------------------------------
+    // Ahead of the escalation below, because clearing it ourselves is strictly better than telling
+    // a human about it: on the reported night dozens of these were hand-cleared one at a time.
+    // The authority is entirely `nudge_gate::answer_refusal` (allowlisted read-only command, an
+    // ordinary proceed-prompt, no credential prompt, not the billing picker); this only decides
+    // that we have waited long enough -- a writing rung, so a human has had ~30s to answer first,
+    // and the foreign-write stand-down is already satisfied by `blocked` being `awaiting-input`.
+    if obs.answerable && blocked == Some("awaiting-input") {
+        state.wrote_last_look = true;
+        return Decision {
+            action: Action::Answer,
+            escalate: None,
+            flagged: state.escalated,
+            rung: rung_1based,
+            hash_changed: false,
+            refusal: None,
+            next_look_secs,
+        };
+    }
+
     if rung < FIRST_NUDGE_RUNG {
         // Shape A — the bare Enter, and ONLY onto a prompt that already holds text.
         if let Some(reason) = blocked {
@@ -780,6 +872,49 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     // TWO refusals are excluded, because they mean the agent is FINE rather than stuck: a running
     // turn, and somebody else having just typed. Escalating those would page a human about an agent
     // that is working.
+    // -- A SCREEN ONLY A HUMAN CAN CLEAR: STOP NUDGING AND TELL SOMEBODY --------------------------
+    // Fires at the FIRST rung the ladder would otherwise have typed at, replacing that nudge rather
+    // than adding to it -- on these screens the gate refuses by construction, so every remaining
+    // rung is a guaranteed no-op and waiting several of them out is dead time a human spends not
+    // knowing.
+    //
+    // NOT AT THE FIRST WRITING RUNG, and that is a correction (roborev 63230, Medium). The
+    // `awaiting-input` token is COARSE: `write_refusal` collapses onto it any `question_opener` /
+    // `menu_line` match in the live region, including an agent's own rhetorical "Should I ...?"
+    // that it clears itself on its next turn. Flagging that after ~35s is a false page, and a
+    // channel that reports non-problems stops being read -- this module's own header says so.
+    // Requiring the screen to SURVIVE to the nudge rung filters exactly the transient case: a
+    // question the agent answers itself moves the hash and resets the episode long before here.
+    //
+    // `!obs.answerable` is belt-and-braces: an answerable prompt has already returned above. Stated
+    // explicitly so the two rules cannot drift into flagging a screen we can clear ourselves.
+    if !obs.answerable {
+        if let Some(reason) = blocked.filter(|r| stalled_on_a_prompt(r)) {
+            // ITS OWN COUNTER, never `attempts` (roborev 63230, Medium). `attempts` means "nudges
+            // we tried to send": it drives `GIVE_UP_AFTER` and is reported to a human as
+            // `nudges:`. Charging silent observations to it made a parked agent burn the whole
+            // give-up budget in 8 looks -- so a screen that later became writable could never be
+            // nudged again -- while the founder's row read `nudges: 8, delivered: 0` for an agent
+            // that was never nudged once.
+            state.parked_looks = state.parked_looks.saturating_add(1);
+            state.last_blocked = Some(reason);
+            // The HIGHER of "a human, now" and whatever the parked count has earned. Instant
+            // escalation raises the FLOOR; it must never become a ceiling that pins a permanently
+            // parked agent at the concierge level for the rest of its life.
+            let target = ordinary_target(state.parked_looks).max(Some(Escalation::Concierge));
+            let escalate = raise(state, target);
+            return Decision {
+                action: Action::Observe,
+                escalate,
+                flagged: state.escalated,
+                rung: rung_1based,
+                hash_changed: false,
+                refusal: Some(reason),
+                next_look_secs,
+            };
+        }
+    }
+
     let counts_as_attempt = !matches!(blocked, Some("status-working") | Some("recent-other-write"));
     if !counts_as_attempt {
         return observe(blocked.unwrap_or("blocked"));
@@ -790,13 +925,7 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
     state.last_blocked = blocked;
 
     // Shape C — escalate. Not a write, and raised once per threshold crossed.
-    let target = if n >= ESCALATE_FOUNDER_AFTER {
-        Some(Escalation::Founder)
-    } else if n >= ESCALATE_CONCIERGE_AFTER {
-        Some(Escalation::Concierge)
-    } else {
-        None
-    };
+    let target = ordinary_target(n);
     // `>` not `>=`: re-raising the same flag every rung would turn one stuck agent into a stream of
     // identical notices, which is how a signal stops being read.
     let escalate = raise(state, target);
@@ -818,6 +947,53 @@ pub fn step(state: &mut AgentState, obs: &Observation) -> Decision {
         refusal: blocked,
         next_look_secs,
     }
+}
+
+/// The flag level `n` counted attempts has earned, on the ordinary thresholds.
+///
+/// Factored out because the instant-escalation path must LAYER ON TOP of it rather than replace
+/// it. Forcing a flat `Concierge` there capped a permanently parked agent at the concierge level
+/// forever -- an agent sitting on a permission prompt all night would never have reached the
+/// founder, which is the opposite of what instant escalation is for.
+fn ordinary_target(n: u32) -> Option<Escalation> {
+    if n >= ESCALATE_FOUNDER_AFTER {
+        Some(Escalation::Founder)
+    } else if n >= ESCALATE_CONCIERGE_AFTER {
+        Some(Escalation::Concierge)
+    } else {
+        None
+    }
+}
+
+/// Refusals that describe a screen only a HUMAN can clear, so more nudging cannot help.
+///
+/// -- WHY THIS IS ESCALATED INSTANTLY RATHER THAN COUNTED ---------------------------------------
+/// The ordinary ladder assumes a nudge might work: it types, waits, types again, and only tells a
+/// human once several identical pings have been ignored. That assumption is FALSE for these two
+/// screens. An agent parked on a permission prompt or a credential prompt is not slow, and it is
+/// not ignoring us -- the gate refuses to type at all (a paste-then-CR at a live picker presses a
+/// button nobody read), so the ladder is guaranteed to write nothing on every remaining rung. The
+/// state cannot resolve on its own, and waiting out four rungs before telling anyone is four rungs
+/// of a human not knowing.
+///
+/// This is the shape of the outage this fix exists for: on the reported night the fleet sat on
+/// ordinary "Do you want to proceed?" prompts and onboarding screens for HOURS. The counter bug
+/// meant no threshold was ever reached, but even a working counter would only have surfaced them
+/// after several rungs of guaranteed-useless pinging. So the trigger is the OBSERVED SCREEN, not a
+/// count of how many times we have failed to help.
+///
+/// -- THE TOKENS ARE `nudge_gate::Refusal::as_str()` --------------------------------------------
+/// Compared as strings because this module is deliberately pure -- the gate verdict arrives as a
+/// parameter and this file imports nothing from `nudge_gate`. That is a real coupling risk, so
+/// `nudger.rs` (which imports both) carries `the_ladder_and_the_gate_agree_on_the_prompt_tokens`,
+/// asserting these tokens still match the enum. That test was CLAIMED here before it existed
+/// (roborev 63230, Medium) -- a documented-but-absent guard is worse than none, because the next
+/// reader trusts it.
+/// `alternate-screen` and `no-viewport` are deliberately EXCLUDED: a full-screen app is exited and
+/// an unreadable grid recovers, so both can clear without a human and neither justifies a flag on
+/// its first look.
+pub(crate) fn stalled_on_a_prompt(reason: &str) -> bool {
+    matches!(reason, "awaiting-input" | "credential-prompt")
 }
 
 /// Advance the escalation high-water mark, returning a target only when it actually ROSE.
@@ -1002,6 +1178,7 @@ mod tests {
             foreign_write_ms: 0,
             goal_met: false,
             reply: None,
+            answerable: false,
         }
     }
 
@@ -1061,7 +1238,12 @@ mod tests {
         // ours by construction (see `our_own_echo_does_not_reset_the_counter_when_the_agent_never_
         // answers`). The second change, with no write of ours in between, is the agent.
         assert_eq!(s.attempts(), 2, "the echo of our own last nudge is not the agent moving");
-        step(&mut s, &Observation { hash: 0x5678, ..stalled() });
+        // And clearing it takes a RUN of output, not one more sample: a live pane repaints without
+        // the agent doing anything, and treating one repaint as "back to work" is what pinned the
+        // counter at `#1` forever. See `LIVE_LOOKS_TO_RESET`.
+        for h in 0x5678..(0x5678 + LIVE_LOOKS_TO_RESET as u64) {
+            step(&mut s, &Observation { hash: h, ..stalled() });
+        }
         assert_eq!(s.attempts(), 0, "a moving agent has no nudge history");
     }
 
@@ -1073,12 +1255,23 @@ mod tests {
         run(&mut s, &stalled(), 20);
         assert!(s.attempts() >= ESCALATE_FOUNDER_AFTER, "precondition: escalated");
 
-        step(&mut s, &Observation { hash: 0xfeed, ..stalled() });
+        // A RUN of unprovoked output, which is what a recovered agent actually produces.
+        let mut h = 0xfeed_u64;
+        for _ in 0..LIVE_LOOKS_TO_RESET {
+            step(&mut s, &Observation { hash: h, ..stalled() });
+            h += 1;
+        }
+        assert_eq!(s.escalated(), None, "a recovered agent's high-water mark is cleared");
+
         // Climb again and assert the concierge flag is raised afresh rather than suppressed by the
         // previous episode's high-water mark.
-        let d = run(&mut s, &Observation { hash: 0xfeed, ..stalled() }, 9);
+        let d = run(&mut s, &Observation { hash: h - 1, ..stalled() }, 9);
         let raised: Vec<Escalation> = d.iter().filter_map(|d| d.escalate).collect();
-        assert_eq!(raised, vec![Escalation::Concierge]);
+        assert_eq!(
+            raised.first(),
+            Some(&Escalation::Concierge),
+            "the ladder must be able to flag from scratch again: {raised:?}"
+        );
     }
 
     // ══ OBSERVE-ONLY RUNGS ══════════════════════════════════════════════════════════════════════
@@ -1389,7 +1582,7 @@ mod tests {
     // ══ SHAPE C — ESCALATION ════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn three_nudges_flag_the_concierge_and_six_flag_the_founder() {
+    fn two_nudges_flag_the_concierge_and_four_flag_the_founder() {
         let mut s = AgentState::default();
         let decisions = run(&mut s, &stalled(), 20);
 
@@ -1398,15 +1591,17 @@ mod tests {
         assert_eq!(
             raised,
             vec![(8, Escalation::Concierge), (8, Escalation::Founder)],
-            "one concierge flag at the 3rd nudge, one founder flag at the 6th, and nothing else"
+            "one concierge flag at the 2nd nudge, one founder flag at the 4th, and nothing else"
         );
 
         // Pin WHICH nudge each flag rode along with, so a change to the ladder that moved the
         // thresholds could not pass this test by coincidence of rung numbering.
         let concierge_at = decisions.iter().position(|d| d.escalate == Some(Escalation::Concierge));
         let founder_at = decisions.iter().position(|d| d.escalate == Some(Escalation::Founder));
-        assert_eq!(decisions[concierge_at.unwrap()].action, Action::Nudge { n: 3 });
-        assert_eq!(decisions[founder_at.unwrap()].action, Action::Nudge { n: 6 });
+        // Literals, NOT the constants the implementation reads: a test that re-derives the
+        // threshold from the same const it is guarding cannot notice the const moving.
+        assert_eq!(decisions[concierge_at.unwrap()].action, Action::Nudge { n: 2 });
+        assert_eq!(decisions[founder_at.unwrap()].action, Action::Nudge { n: 4 });
     }
 
     /// A flag is raised ONCE. Re-raising every rung would turn one stuck agent into a stream of
@@ -1464,9 +1659,16 @@ mod tests {
         run(&mut s, &stalled(), 20);
         assert_eq!(s.escalated(), Some(Escalation::Founder), "precondition: escalated");
 
-        let d = step(&mut s, &Observation { hash: 0xfeed, ..stalled() });
+        // A RUN of output, which is what recovery looks like. One repaint deliberately does NOT
+        // clear the row: an agent that merely redraws is still stuck, and a row a human owes is
+        // never hidden.
+        let mut d = None;
+        for h in 0xfeed..(0xfeed + LIVE_LOOKS_TO_RESET as u64) {
+            d = Some(step(&mut s, &Observation { hash: h, ..stalled() }));
+        }
+        let d = d.unwrap();
         assert!(d.hash_changed);
-        assert_eq!(d.flagged, None, "a moving agent's look is not a flagging look");
+        assert_eq!(d.flagged, None, "a recovered agent's look is not a flagging look");
         assert_eq!(s.escalated(), None, "and nothing is left to re-raise it from");
     }
 
@@ -1776,9 +1978,12 @@ mod tests {
         assert!(s.attempts() >= 3, "precondition: a real nudge history");
 
         // Moving, with no answer to any nudge — the agent simply got back to work. The first change
-        // is our last nudge's echo; the second is the agent itself.
+        // is our last nudge's echo; the RUN after it is the agent itself. It takes a run rather
+        // than a single sample because a live pane repaints on its own — see `LIVE_LOOKS_TO_RESET`.
         step(&mut s, &Observation { hash: 0x1077, reply: None, ..stalled() });
-        step(&mut s, &Observation { hash: 0x1078, reply: None, ..stalled() });
+        for h in 0x1078..(0x1078 + LIVE_LOOKS_TO_RESET as u64) {
+            step(&mut s, &Observation { hash: h, reply: None, ..stalled() });
+        }
         assert_eq!(s.attempts(), 0, "unprovoked output earns a clean slate");
         assert_eq!(s.escalated(), None);
         assert_eq!(s.standdown(), None, "and it never stood down in the first place");
@@ -1889,11 +2094,16 @@ mod tests {
         assert_eq!(flagged_at_end, Some(Escalation::Founder), "the row stays up afterwards");
     }
 
-    /// The boundary of that rule: output we did NOT provoke still wipes the slate, even one look
-    /// after a nudge. Without this, "our write makes the next change ours" would creep into "the
-    /// counter never resets once we have nudged once".
+    /// THE TWO ATTRIBUTION RULES, at their exact boundary. Our own echo is ours (rule one), and a
+    /// LONE unprovoked change is still not the agent working (rule two) — only a run is. Rule two
+    /// is what the first repair was missing: it covered one look, while the climb back to a nudge
+    /// rung is seven, so six looks were left in which a single repaint wiped the episode.
+    ///
+    /// The upper bound matters as much as the lower one: without the run eventually clearing, "our
+    /// write makes the next change ours" would creep into "the counter never resets once we have
+    /// nudged", and a recovered agent would inherit a dead episode's history forever.
     #[test]
-    fn the_provoked_window_is_exactly_one_look() {
+    fn the_echo_is_ours_and_a_lone_repaint_is_not_the_agent() {
         let mut s = AgentState::default();
         run(&mut s, &stalled(), 7); // …ending in nudge #1
         assert_eq!(s.attempts(), 1);
@@ -1902,9 +2112,249 @@ mod tests {
         step(&mut s, &Observation { hash: 0x2001, reply: None, ..stalled() });
         assert_eq!(s.attempts(), 1, "the echo is ours");
 
-        // Look 2: it moved again, and we wrote nothing in between. That is the agent working.
+        // Look 2: one repaint, with no write of ours in between. Still not a working agent.
         step(&mut s, &Observation { hash: 0x2002, reply: None, ..stalled() });
-        assert_eq!(s.attempts(), 0, "unprovoked output one look later is a clean slate");
+        assert_eq!(s.attempts(), 1, "a single repaint is not the agent getting back to work");
+
+        // …but a sustained run of it is, and the slate clears.
+        for h in 0x2003..(0x2003 + LIVE_LOOKS_TO_RESET as u64) {
+            step(&mut s, &Observation { hash: h, reply: None, ..stalled() });
+        }
+        assert_eq!(s.attempts(), 0, "sustained unprovoked output is a clean slate");
+    }
+
+    /// THE FOUNDER'S SYMPTOM, REPLAYED (the counter stuck at `#1` forever).
+    ///
+    /// A live Claude Code pane is never perfectly still: a footer redraw, a context-remaining
+    /// counter, a roster status flip (which is hashed alongside the PTY tail) all move the hash
+    /// without the agent doing anything. The re-climb from a nudge back to the next nudge rung is
+    /// SEVEN looks — so a provoked window one look wide leaves six looks in which one stray repaint
+    /// wipes the whole episode. Every nudge is then a first nudge, forever, and no threshold is ever
+    /// reachable: the fleet is pinged indefinitely and no human is ever told.
+    #[test]
+    fn one_stray_repaint_per_climb_must_not_restart_the_counter_at_one() {
+        let mut s = AgentState::default();
+        let mut hash = 0xdead_beef_u64;
+        let mut pings: Vec<u32> = Vec::new();
+        let mut looks_since_ping = 0u32;
+
+        for _ in 0..120 {
+            let d = step(&mut s, &Observation { hash, reply: None, ..stalled() });
+            if let Action::Nudge { n } = d.action {
+                pings.push(n);
+                // Our own ping echoes into the PTY.
+                hash = hash.wrapping_add(1);
+                looks_since_ping = 0;
+            } else {
+                looks_since_ping += 1;
+                // ONE idle repaint partway through the re-climb. Not the agent working — it emits
+                // nothing on the look before or the look after.
+                if looks_since_ping == 3 {
+                    hash = hash.wrapping_add(1);
+                }
+            }
+        }
+
+        assert_eq!(
+            pings,
+            (1..=GIVE_UP_AFTER).collect::<Vec<u32>>(),
+            "an idle repaint is not the agent getting back to work"
+        );
+        assert_eq!(
+            s.escalated(),
+            Some(Escalation::Founder),
+            "and a human must still be reachable through the repaints"
+        );
+    }
+
+    /// And the streak must be CONSECUTIVE: a quiet look in the middle is not a working agent.
+    #[test]
+    fn an_interrupted_streak_does_not_wipe_the_episode() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 12);
+        let before = s.attempts();
+        assert!(before >= 3, "precondition: a real nudge history");
+
+        // Change, change, QUIET, change, change — never `LIVE_LOOKS_TO_RESET` in a row.
+        let mut h = 0x3000;
+        for i in 0..8 {
+            if i % 3 == 2 {
+                step(&mut s, &Observation { hash: h, reply: None, ..stalled() });
+            } else {
+                h += 1;
+                step(&mut s, &Observation { hash: h, reply: None, ..stalled() });
+            }
+        }
+        assert!(s.attempts() > 0, "an intermittent flicker is not a working agent");
+    }
+
+    // ══ A SCREEN ONLY A HUMAN CAN CLEAR ═════════════════════════════════════════════════════════
+
+    /// TONIGHT'S OUTAGE, in one test. Agents sat on ordinary "Do you want to proceed?" prompts for
+    /// HOURS. The gate refuses to type at such a screen (correctly — a paste-then-CR presses a
+    /// button nobody read), so every remaining rung was guaranteed to write nothing; waiting out
+    /// four of them before telling a human is four rungs of nobody knowing.
+    #[test]
+    fn a_prompt_only_a_human_can_clear_replaces_its_first_nudge_with_a_flag() {
+        let mut s = AgentState::default();
+        let parked = Observation { refusal: Some("awaiting-input"), ..stalled() };
+        let decisions = run(&mut s, &parked, 12);
+
+        let first = decisions
+            .iter()
+            .position(|d| d.escalate.is_some())
+            .expect("a parked agent must reach a human");
+        // The first rung the ladder would otherwise have NUDGED at — the flag REPLACES that
+        // nudge instead of waiting several more out. Deliberately NOT the first writing rung:
+        // `awaiting-input` is a coarse token that also covers an agent's own transient question,
+        // and flagging that after ~35s is a false page (roborev 63230, Medium).
+        assert_eq!(decisions[first].rung, (FIRST_NUDGE_RUNG + 1) as u32);
+        assert_eq!(decisions[first].escalate, Some(Escalation::Concierge));
+        assert_eq!(decisions[first].refusal, Some("awaiting-input"));
+
+        // It never types at the prompt, on any rung.
+        assert!(
+            decisions.iter().all(|d| d.action == Action::Observe),
+            "nothing may be typed at a live prompt"
+        );
+        // And the row stays up for the rest of the episode rather than being a one-shot event.
+        assert!(
+            decisions[first..].iter().all(|d| d.flagged.is_some()),
+            "the row must persist once raised"
+        );
+        // THE COUNTERS STAY HONEST (roborev 63230, Medium). `attempts` means "nudges we tried to
+        // send" — it is both the `GIVE_UP_AFTER` budget and the `nudges:` figure a human reads off
+        // the flag. Charging silent observations to it burned the whole give-up budget in 8 looks,
+        // so a screen that later became writable could never be nudged again, and the row read
+        // `nudges: 8, delivered: 0` for an agent that was never nudged once.
+        assert_eq!(s.attempts(), 0, "no nudge was attempted, so none may be reported");
+        assert_eq!(s.delivered(), 0);
+
+        // No LEVEL is ever re-raised, however long it sits there — one event per level, strictly
+        // ascending. (Not "one event total": a permanently parked agent must still climb from the
+        // concierge to the founder, which `a_permanently_parked_agent_still_reaches_the_founder`
+        // pins. Asserting a flat 1 here is what a capped ceiling would have looked like.)
+        let raised: Vec<Escalation> = decisions.iter().filter_map(|d| d.escalate).collect();
+        assert!(
+            raised.windows(2).all(|w| w[1] > w[0]),
+            "each escalation must be a genuine RISE: {raised:?}"
+        );
+    }
+
+    /// INSTANT ESCALATION RAISES THE FLOOR, NOT A CEILING.
+    ///
+    /// The first cut forced a flat `Concierge` on every parked look, which `raise` then refused to
+    /// advance — so an agent sitting on a permission prompt all night would have stopped at the
+    /// concierge and NEVER reached the founder. That is the exact inversion of what this path is
+    /// for: it exists to tell a human sooner, not to cap how loudly they are told.
+    #[test]
+    fn a_permanently_parked_agent_still_reaches_the_founder() {
+        let mut s = AgentState::default();
+        let parked = Observation { refusal: Some("awaiting-input"), ..stalled() };
+        let raised: Vec<Escalation> =
+            run(&mut s, &parked, 20).iter().filter_map(|d| d.escalate).collect();
+        assert_eq!(
+            raised,
+            vec![Escalation::Concierge, Escalation::Founder],
+            "the concierge at once, and the founder once it has been ignored long enough"
+        );
+    }
+
+    /// A credential prompt is the same class — and the more dangerous one, since it echoes nothing.
+    #[test]
+    fn a_credential_prompt_is_escalated_and_never_typed_at() {
+        let mut s = AgentState::default();
+        let parked = Observation { refusal: Some("credential-prompt"), ..stalled() };
+        let decisions = run(&mut s, &parked, 12);
+        assert!(decisions.iter().any(|d| d.escalate == Some(Escalation::Concierge)));
+        assert!(decisions.iter().all(|d| d.action == Action::Observe));
+    }
+
+    /// THE CONTROL, and it is what stops the rule above from being "escalate on everything".
+    ///
+    /// Without this the test above passes against a ladder that flags every agent on rung 4 — which
+    /// would page a human about every ordinary stall and, per this module's own header, is how a
+    /// signal stops being read. An ordinary silent agent must still climb and still be NUDGED first.
+    #[test]
+    fn an_ordinary_stall_still_climbs_and_is_nudged_before_anyone_is_told() {
+        let mut s = AgentState::default();
+        let decisions = run(&mut s, &stalled(), 12);
+
+        let first_escalation = decisions.iter().position(|d| d.escalate.is_some()).unwrap();
+        let first_nudge = decisions.iter().position(|d| matches!(d.action, Action::Nudge { .. }));
+        assert!(
+            first_nudge.unwrap() < first_escalation,
+            "an ordinary stall is nudged before it is escalated"
+        );
+        assert!(
+            decisions[first_escalation].rung > (FIRST_WRITING_RUNG + 1) as u32,
+            "and it is NOT escalated on the first writing rung"
+        );
+    }
+
+    /// A refusal that CAN clear without a human keeps the ordinary ladder. A full-screen app gets
+    /// exited and an unreadable grid recovers, so neither earns a flag on its first look —
+    /// otherwise every agent that ran `less` for a minute would raise a row.
+    #[test]
+    fn a_self_clearing_refusal_is_not_instantly_escalated() {
+        for reason in ["alternate-screen", "no-viewport"] {
+            let mut s = AgentState::default();
+            let d = run(&mut s, &Observation { refusal: Some(reason), ..stalled() }, 12);
+            let first = d.iter().position(|x| x.escalate.is_some()).unwrap();
+            assert!(
+                d[first].rung > (FIRST_WRITING_RUNG + 1) as u32,
+                "{reason} must not escalate on the first writing rung"
+            );
+        }
+    }
+
+    /// CLEARING IT OURSELVES BEATS TELLING SOMEBODY ABOUT IT. On the reported night dozens of
+    /// ordinary permission prompts were hand-cleared one at a time; an allowlisted read-only
+    /// command is exactly what the ladder should be able to answer without waking anyone.
+    #[test]
+    fn an_answerable_prompt_is_answered_rather_than_escalated() {
+        let mut s = AgentState::default();
+        let answerable =
+            Observation { refusal: Some("awaiting-input"), answerable: true, ..stalled() };
+        let decisions = run(&mut s, &answerable, 12);
+
+        let first_answer = decisions
+            .iter()
+            .position(|d| d.action == Action::Answer)
+            .expect("an allowlisted prompt must be answered");
+        // The earliest look at which the ladder is allowed to write at all — a human has had the
+        // whole observe-only band to answer it first.
+        assert_eq!(decisions[first_answer].rung, (FIRST_WRITING_RUNG + 1) as u32);
+        // …and nobody is woken for a prompt we just cleared.
+        assert!(
+            decisions[..=first_answer].iter().all(|d| d.escalate.is_none()),
+            "answering must not also raise a flag"
+        );
+        // It NEVER types free text at the prompt — the answer is the only thing that goes out.
+        assert!(
+            decisions.iter().all(|d| !matches!(d.action, Action::Nudge { .. } | Action::Enter)),
+            "only the affirmative option may be sent at a live prompt"
+        );
+    }
+
+    /// THE CONTROL. The same screen, the same rung, `answerable: false` — the ladder must fall
+    /// through to telling a human instead. Without this the test above passes against a ladder that
+    /// answers EVERY prompt, which is the failure the allowlist exists to prevent.
+    #[test]
+    fn a_prompt_the_gate_will_not_answer_is_escalated_instead() {
+        let mut s = AgentState::default();
+        let refused =
+            Observation { refusal: Some("awaiting-input"), answerable: false, ..stalled() };
+        let decisions = run(&mut s, &refused, 12);
+
+        assert!(
+            decisions.iter().all(|d| d.action != Action::Answer),
+            "a command the gate did not allow must never be answered"
+        );
+        assert!(
+            decisions.iter().any(|d| d.escalate == Some(Escalation::Concierge)),
+            "and a human must be told instead"
+        );
     }
 
     // ══ A MET GOAL IS NOT A LIFETIME EXEMPTION ══════════════════════════════════════════════════
@@ -2145,8 +2595,12 @@ mod tests {
         run(&mut s, &stalled(), 9);
         assert!(s.attempts() >= 3);
 
+        // The echo, then a RUN of the agent's own output. It takes a run rather than one sample
+        // because a live pane repaints on its own — see `LIVE_LOOKS_TO_RESET`.
         step(&mut s, &Observation { hash: 0x9201, reply: None, ..stalled() });
-        step(&mut s, &Observation { hash: 0x9202, reply: None, ..stalled() });
+        for h in 0x9202..(0x9202 + LIVE_LOOKS_TO_RESET as u64) {
+            step(&mut s, &Observation { hash: h, reply: None, ..stalled() });
+        }
         assert_eq!(s.attempts(), 0, "no stand-down means the episode really did end");
         assert_eq!(s.escalated(), None);
         assert_eq!(s.silent_secs(), 0, "and the silence clock restarts");
