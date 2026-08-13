@@ -635,8 +635,8 @@ function targetRequired(op: string, req: ControlRequest): Record<string, unknown
 }
 
 /** The typed refusal for a per-agent WRITE aimed at an agent the caller does not own — the reply
- *  half of `mayWriteAgentFieldFor`, shared by every op behind it so the three cannot drift into
- *  three failure shapes a caller has to decode separately.
+ *  half of `mayWriteAgentFieldFor`, shared by every op behind it so the four cannot drift into
+ *  four failure shapes a caller has to decode separately.
  *
  *  `code: "not_yours"` is the stable machine-readable half (the concierge brain is an LLM reading a
  *  tool result, and the UI decodes one code, not prose). NOT a silent `{ ok: true }` no-op: a caller
@@ -2153,6 +2153,24 @@ function handleUnpinAgent(): Record<string, unknown> {
 function handleSetAgentModel(req: ControlRequest): Record<string, unknown> {
   const targetId = resolveTargetId(req);
   if (!targetId) return targetRequired("set_agent_model", req);
+  // THE FOURTH OP BEHIND THE SAME CLOSURE — it was missed when `rename_agent` and
+  // `set_agent_activity` were closed, exactly as those two were missed when `set_agent_goal` was.
+  // Its `privileged` tier is NOT the ownership check and never was: a tier answers WHO MAY CALL
+  // (it keeps unattended workers out), and says nothing about WHOSE model they may write. So every
+  // interactive caller on the shared socket could retarget any other agent's model after one
+  // free-tier `get_state` to enumerate the roster.
+  //
+  // The harm is not the roster text this time, it is the target's CAPABILITY and its spend: the
+  // model decides what that agent can do and what each of its turns costs, it persists, and the
+  // agent has no way to notice it was changed under it — its next turn simply runs weaker (or
+  // dearer) with nothing in its own context saying why. Same closure, same three admitted callers.
+  if (!mayWriteAgentFieldFor(req, targetId)) {
+    return notYours(
+      targetId,
+      "re-model",
+      "the model decides what that agent can do and what its turns cost, and it has no way to see the change",
+    );
+  }
   const model = req.payload.model;
   if (typeof model !== "string" || !model.trim()) return { ok: false, error: "model is required" };
   if (!getModelCatalog().some((m) => m.id === model)) {

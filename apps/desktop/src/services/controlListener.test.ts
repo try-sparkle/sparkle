@@ -2853,6 +2853,41 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
+  it("set_agent_model is denied for a STRANGER caller the tier lets through, and writes nothing", async () => {
+    // The `privileged` tier only keeps unattended WORKERS out — a `build` agent clears it. So this
+    // caller reaches the handler and is refused by ownership, which is the gate under test. The
+    // model assertion is the point: a refusal that still wrote would be the silent-success failure
+    // this whole surface is being cleaned of.
+    const strangerId = useProjectStore.getState().addAgent(projectId, { kind: "build" })!;
+    const before = useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!.model;
+
+    fire({
+      reqId: "sm4",
+      op: "set_agent_model",
+      callerAgentId: strangerId,
+      payload: { targetAgentId: callerId, model: "claude-opus-4-8" },
+    });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === callerId)!.model).toBe(before);
+  });
+
+  it("set_agent_model still lets an ORCHESTRATOR re-model its OWN worker", async () => {
+    // The paired half: the same setup that is refused above SUCCEEDS when the caller owns the
+    // target, so the refusal above is pinned to the ownership rule and not to some earlier gate.
+    fire({
+      reqId: "sm5",
+      op: "set_agent_model",
+      callerAgentId: callerId,
+      payload: { targetAgentId: otherId, model: "claude-opus-4-8" },
+    });
+    await flush();
+
+    expect(lastReply()).toEqual({ ok: true });
+    expect(useProjectStore.getState().projects[0]!.agents.find((a) => a.id === otherId)!.model).toBe("claude-opus-4-8");
+  });
+
   it("set_agent_ordering is REFUSED — there is only one ordering now", async () => {
     fire({ reqId: "ord1", op: "set_agent_ordering", callerAgentId: callerId, payload: { mode: "manual" } });
     await flush();
