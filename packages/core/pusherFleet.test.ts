@@ -178,6 +178,28 @@ describe("escalated goals", () => {
     const [c] = evaluateFleetConditions([esc("a", "3 continues without the mark moving")], T0);
     expect(citable(c!.text, c!.measured)).toBe(true);
   });
+
+  // sparkle-i5v42's Bug C. `escalateGoal` and `markGoalMet` are independent latches on the same
+  // `AgentGoal`, so a goal that was escalated and has SINCE been marked met (either legitimately,
+  // through the front door, or via the TOCTOU `escalateGoal`'s new `metAt` guard now closes) still
+  // carries a non-empty `escalation` field on its snapshot — `pusherSnapshots.ts` sets `escalation`
+  // and `goalMetAt` independently. `retirableAgents` and `diedHoldingWork` both gate on
+  // `goalMetAt`; this selector must too, or the founder-facing digest keeps reporting a goal the
+  // roster itself already renders as finished.
+  it("excludes an agent whose goal was escalated but has SINCE been marked met", () => {
+    const escalatedThenMet: FleetSnapshot = { ...esc("a", "no progress"), goalMetAt: T0 - HOUR };
+    expect(evaluateFleetConditions([escalatedThenMet], T0)).toEqual([]);
+  });
+
+  it("still reports the OTHERS in the batch when one has since been met", () => {
+    const [c] = evaluateFleetConditions(
+      [esc("still-stuck", "no progress"), { ...esc("done", "no progress"), goalMetAt: T0 - HOUR }],
+      T0,
+    );
+    expect(c!.id).toBe("goals-escalated");
+    expect(c!.agentIds).toEqual(["still-stuck"]);
+    expect(c!.text).not.toContain("Agent done");
+  });
 });
 
 describe("done but not retired", () => {

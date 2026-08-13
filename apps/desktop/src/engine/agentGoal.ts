@@ -413,7 +413,17 @@ export const REARM_GRANT = 5;
  *
  *  `by` records WHO raised it, and the LATCH is what makes that trustworthy: a concierge raise
  *  against an already-`auto` escalation is a no-op, so it cannot re-stamp a machine give-up as its
- *  own and then clear it for free through {@link unraiseGoal}. */
+ *  own and then clear it for free through {@link unraiseGoal}.
+ *
+ *  ALSO REFUSES A GOAL ALREADY MARKED MET (sparkle-i5v42). `decideContinuation` already declines
+ *  to DECIDE "escalate" against a goal it reads as met — but the decision and this write are two
+ *  separate reads of the goal, so a goal marked met in the gap between them (the sweep's decision
+ *  is made against a snapshot; the write lands after an await elsewhere in the same pass) would
+ *  otherwise still receive `escalatedAt` on top of `metAt`. `goalStateOf` resolves that
+ *  combination to `met` (met is checked first), so the roster row was always right — but the
+ *  Pusher's founder-facing digest read `escalatedAt`'s presence directly and kept reporting an
+ *  already-finished goal as an active, unmet escalation. Guarding the write here closes the race
+ *  at its source instead of relying on every reader to re-derive state correctly. */
 export function escalateGoal(
   goal: AgentGoal,
   now: number,
@@ -421,6 +431,7 @@ export function escalateGoal(
   by: "auto" | "concierge" = "auto",
 ): AgentGoal {
   if (goal.escalatedAt !== undefined) return goal;
+  if (goal.metAt !== undefined) return goal;
   return { ...goal, escalatedAt: now, escalationReason: reason, escalatedBy: by };
 }
 

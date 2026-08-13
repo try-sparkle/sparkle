@@ -15,6 +15,7 @@ import {
   escalateGoal,
   goalDebtOf,
   goalStateOf,
+  markGoalMet,
   mayRearmGoal,
   newGoal,
   noteContinue,
@@ -140,6 +141,22 @@ describe("escalateGoal — the latch is what makes `escalatedBy` trustworthy", (
     expect(restamped).toBe(auto);
     expect(restamped.escalatedBy).toBe("auto");
     expect(restamped.escalationReason).toBe("auto-continue gave up");
+  });
+
+  it("refuses to escalate a goal that is already MET — closes a TOCTOU between the sweep's " +
+    "decision and the write (sparkle-i5v42)", () => {
+    // The shape that produced the bug in production: `decideContinuation` decided "escalate" while
+    // the goal was still unmet, then in the async gap before the write landed the agent called
+    // `set_agent_goal_met`. `escalateGoal` used to only guard on `escalatedAt`, never `metAt`, so
+    // the write still landed and produced an object that was simultaneously met AND escalated —
+    // which the Pusher's founder-facing digest then reported as an unmet escalation.
+    const met = markGoalMet(newGoal("land the retry PR", T0), T0 + 1);
+    const after = escalateGoal(met, T0 + 2, "auto-continue gave up");
+
+    expect(after).toBe(met);
+    expect(after.escalatedAt).toBeUndefined();
+    expect(after.escalationReason).toBeUndefined();
+    expect(goalStateOf(after, T0 + 2)).toBe("met");
   });
 });
 

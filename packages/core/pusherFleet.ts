@@ -908,7 +908,12 @@ export function evaluateFleetConditions(
     out.push(conflictCondition(conflicts, snapshots));
   }
 
-  const escalated = snapshots.filter((s) => s.escalation !== undefined);
+  // `goalMetAt` is a SIBLING latch on the same `AgentGoal`, not mutually exclusive with
+  // `escalation` — a goal can be escalated and later marked met (sparkle-i5v42's Bug C). Exclude
+  // those here, the same way `retirableAgents` and `diedHoldingWork` below both gate on
+  // `goalMetAt`: a goal the roster already renders as finished must not still be reported as an
+  // active, unmet escalation.
+  const escalated = snapshots.filter((s) => s.escalation !== undefined && s.goalMetAt === undefined);
   if (escalated.length > 0) out.push(escalationCondition(escalated));
 
   const retirable = retirableAgents(snapshots);
