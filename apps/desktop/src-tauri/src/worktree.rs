@@ -688,6 +688,32 @@ pub fn resolve_default_branch(root: &str) -> String {
     git(root, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "main".to_string())
 }
 
+/// Process-lifetime dedupe for `effective_base`'s fallback `warn!`s. `effective_base` runs on EVERY
+/// status/conflict poll, once per agent, so a single stale recorded base (the dominant case: a
+/// worktree that recorded `master` while the repo default is now `main`) re-emitted the same
+/// fallback warning thousands of times a day — measured at 4,657 identical WARN lines in one day,
+/// which buries every other signal in the log. The diagnostic IS worth surfacing (a drifted base
+/// record is real), but exactly once per distinct case; the per-poll repeats are pure noise.
+///
+/// Returns `true` the FIRST time `key` is seen in this process and `false` thereafter, so the caller
+/// emits its `warn!` only on a fresh key. The `key` composes a site tag with the tuple that
+/// identifies a distinct case, so the four call sites never collide. This gates ONLY the log line —
+/// it never touches `effective_base`'s return value or control flow.
+///
+/// A poisoned lock must never wedge base resolution, so the guard is recovered rather than
+/// unwrapped; the lock scope is a single `insert` and the guard is dropped before the caller warns.
+fn warn_base_fallback_once(key: String) -> bool {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // HashSet::insert returns true when the value was NOT already present — i.e. this is the first
+    // sighting of `key` and the caller should warn.
+    seen.insert(key)
+}
+
 /// The ref creation/status/refresh compare or cut against. With a remote: `origin/<branch>`,
 /// fetched first when `fetch` is true. Any fetch failure (offline/auth/unreachable) or a
 /// missing remote-tracking ref falls back to the local `<branch>` — a command must never
@@ -712,7 +738,9 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
         // parsed as a git option (leading '-' → --upload-pack=/--exec=) or carrying control
         // chars: never hand it to git. Resolve the project's default branch instead. git forbids
         // '-'-leading branch names, so no legitimate ref is lost by this fallback.
-        if !trimmed.is_empty() {
+        if !trimmed.is_empty()
+            && warn_base_fallback_once(format!("unsafe-ref|{root}|{trimmed}"))
+        {
             tracing::warn!(rejected = %trimmed, "effective_base: unsafe base ref, using default branch");
         }
         resolved = resolve_default_branch(root);
@@ -747,19 +775,25 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
     let detected = resolve_default_branch(root);
     if detected != branch {
         if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{detected}")]).is_ok() {
-            tracing::warn!(
-                requested = %branch, using = %detected,
-                "effective_base: recorded base branch not found; falling back to detected default"
-            );
+            if warn_base_fallback_once(format!("recorded-not-found|{root}|{branch}|{detected}")) {
+                tracing::warn!(
+                    requested = %branch, using = %detected,
+                    "effective_base: recorded base branch not found; falling back to detected default"
+                );
+            }
             return detected;
         }
         if has_origin {
             let detected_remote = format!("origin/{detected}");
             if git(root, &["rev-parse", "--verify", "--quiet", &detected_remote]).is_ok() {
-                tracing::warn!(
-                    requested = %branch, using = %detected_remote,
-                    "effective_base: recorded base branch not found; falling back to detected default (remote)"
-                );
+                if warn_base_fallback_once(format!(
+                    "recorded-not-found-remote|{root}|{branch}|{detected_remote}"
+                )) {
+                    tracing::warn!(
+                        requested = %branch, using = %detected_remote,
+                        "effective_base: recorded base branch not found; falling back to detected default (remote)"
+                    );
+                }
                 return detected_remote;
             }
         }
@@ -768,10 +802,12 @@ fn effective_base(root: &str, branch: &str, fetch: bool) -> String {
     // with no local counterpart, or an unusual layout). HEAD always resolves in a repo with a born
     // commit — and the create path ensures one — so cutting the new branch from it beats erroring.
     if git(root, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok() {
-        tracing::warn!(
-            requested = %branch,
-            "effective_base: no named base branch resolves; using HEAD as the cut point"
-        );
+        if warn_base_fallback_once(format!("head-cut|{root}|{branch}")) {
+            tracing::warn!(
+                requested = %branch,
+                "effective_base: no named base branch resolves; using HEAD as the cut point"
+            );
+        }
         return "HEAD".to_string();
     }
     // Truly nothing resolves (unborn HEAD / empty repo). Return the original name and let the
@@ -8714,6 +8750,87 @@ mod tests {
         assert_eq!(effective_base(&r, "master", false), "master");
         // An empty/legacy base still auto-detects (unchanged behavior).
         assert_eq!(effective_base(&r, "", false), "master");
+    }
+
+    // Log-spam guard: `effective_base` runs on EVERY status/conflict poll, per agent, so a stale
+    // recorded base (recorded `main` while the repo default is now `master`) used to re-emit its
+    // fallback `warn!` on every single call — measured at 4,657 identical WARN lines in one day,
+    // burying real signal. The fix warns ONCE per distinct case for the process lifetime. This test
+    // drives the REAL production entry point (`effective_base`), captures the emitted `tracing`
+    // output through a subscriber, and asserts (a) the same stale case warns exactly once across two
+    // calls, and (b) a DIFFERENT stale case still emits its own warning. Return values are asserted
+    // too, so the dedupe cannot have quietly changed resolution behavior.
+    //
+    // Non-vacuous: if the check-insert gate were removed (always warn), the first assertion sees 2
+    // and fails — verified by mutation. It is not gated by an earlier short-circuit either: the
+    // paired second case proves the same setup DOES reach a warn when the key differs.
+    #[test]
+    fn effective_base_fallback_warning_is_deduped_per_distinct_case() {
+        use std::io::Write;
+        use std::sync::{Arc, Mutex};
+
+        // A `MakeWriter` over a shared buffer, so the assertions read REAL emitted output (mirrors
+        // concierge_lint_log.rs's capture helper).
+        #[derive(Clone)]
+        struct Shared(Arc<Mutex<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Shared {
+            type Writer = Shared;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        // A repo whose recorded default drifted: rename main → master so both "main" and a phantom
+        // "develop-ghost" fall back to the detected default "master" (the local-detected-default
+        // site — the one measured at 4,657x). The unique temp root makes the dedupe keys fresh for
+        // this test, independent of any other test's calls to the process-global SEEN set.
+        let r = init_repo("eb-dedupe-warn");
+        git(&r, &["branch", "-m", "main", "master"]).unwrap();
+
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(Shared(Arc::clone(&buf)))
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            // Same stale case, TWICE — resolution is byte-identical, but only the first should warn.
+            assert_eq!(effective_base(&r, "main", false), "master");
+            assert_eq!(effective_base(&r, "main", false), "master");
+            // A DIFFERENT stale case (a phantom recorded base) — a distinct key, so it must warn.
+            assert_eq!(effective_base(&r, "develop-ghost", false), "master");
+        });
+
+        let logged =
+            String::from_utf8_lossy(&buf.lock().unwrap_or_else(|e| e.into_inner())).to_string();
+        // Harness sanity: if nothing was captured every count below would be 0 and the test would
+        // pass vacuously however the dedupe is written.
+        assert!(
+            logged.contains("recorded base branch not found"),
+            "the fallback warning must have been captured at least once; got: {logged:?}"
+        );
+
+        let n_main = logged.matches("requested=main").count();
+        let n_ghost = logged.matches("requested=develop-ghost").count();
+        assert_eq!(
+            n_main, 1,
+            "the same stale case must warn EXACTLY ONCE across two calls (got {n_main}); \
+             a count of 2 means the warn-once gate is broken. Captured: {logged:?}"
+        );
+        assert_eq!(
+            n_ghost, 1,
+            "a DIFFERENT stale case must still emit its own warning (got {n_ghost}). Captured: {logged:?}"
+        );
     }
 
     // Store-healing: reconcile_default_branch_at keeps a still-valid recorded value (including a
