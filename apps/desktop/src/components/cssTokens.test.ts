@@ -63,6 +63,71 @@ describe("index.css spends the same tokens the TSX does", () => {
   });
 });
 
+// ── THE CHAT TRANSCRIPT KEEPS A SCROLLBAR YOU CAN SEE AND GRAB (bead sparkle-nheu8) ────────────
+//
+// This is a REGRESSION GUARD ON AN ABSENCE, which is why it is worth its own block. The pane was
+// never broken — it scrolled, and `ConciergeThread.autofollow.test.tsx` drives real scrollTop
+// values on it. What it had was NO `::-webkit-scrollbar` rule, so it inherited the macOS WKWebView
+// default: an OVERLAY bar that paints during a scroll gesture and fades. Nothing in a jsdom render
+// can observe that (jsdom does not lay out and never paints a scrollbar — docs/jsdom-test-caveats
+// .md), and nothing in the token ratchets sees index.css. So a delete of these three rules leaves
+// every other test in this repo green while the founder's pane silently goes back to having no
+// visible bar. This block is the only thing that reds.
+//
+// It asserts the MECHANISM, not a precondition: an explicitly declared WIDTH is precisely what
+// converts WebKit's overlay bar into a classic, always-present, space-occupying one. Drop the
+// width and the rest of the styling still parses — and the bar disappears again.
+const CHAT_SCROLLER = '[data-concierge-scroller="yes"]';
+
+describe("the chat transcript scrollbar is classic, not the macOS overlay", () => {
+  it("declares an explicit width — the one thing that opts out of the overlay bar", () => {
+    expect(
+      declaration(`${CHAT_SCROLLER}::-webkit-scrollbar`, "width"),
+      "index.css must declare a width on the chat scroller's ::-webkit-scrollbar. Without it " +
+        "macOS paints an OVERLAY scrollbar that fades the moment the gesture stops, which is the " +
+        "exact defect bead sparkle-nheu8 exists for. A styled thumb alone does NOT bring it back.",
+    ).toBe("10px");
+  });
+
+  it("hangs off the marker BOTH transcripts carry, not off a component-specific hook", () => {
+    // ConciergeThread and MountedAgentThread swap for one another in the same column, and neither
+    // has a className. `data-concierge-scroller` is the app-wide marker they share (asserted on
+    // both by threadScrollerMarker.test.tsx, which also runs THIS selector against the rendered
+    // markup). Keying the CSS to it is what gives a mounted session the same bar.
+    // Comments stripped first, or `[^{}]+` swallows the block comment above each rule into the
+    // "selector" it captures — every rule in this stylesheet carries one.
+    const selectors = [...CSS.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{[^{}]*\}/g)]
+      .map(([, sel]) => sel!.trim())
+      .filter((sel) => sel.includes("-webkit-scrollbar") && sel.includes("concierge-scroller"));
+    expect(selectors).toHaveLength(3); // scrollbar, track, thumb
+    for (const sel of selectors) expect(sel.startsWith(CHAT_SCROLLER)).toBe(true);
+  });
+
+  it("paints the thumb with a themed var, so it is not a literal that light mode never sees", () => {
+    // `pillFill`, not `chatBubble`: colors.ts floors hairline/pillFill/goldFill as "a chrome SHAPE
+    // against the surface it is drawn on", which is what a 10px thumb is. `chatBubble` is a row
+    // fill that sits deliberately near its ground and measures ~1.19 dark / ~1.15 light against
+    // these planes — invisible, in both themes, which is the whole bug.
+    expect(declaration(`${CHAT_SCROLLER}::-webkit-scrollbar-thumb`, "background")).toBe(
+      "var(--c-pill-fill)",
+    );
+  });
+
+  it("leaves the track transparent so no UA stripe paints down a repainting column", () => {
+    // ConciergeColumn repaints its plane from `data-wired`, so any fixed track colour is wrong in
+    // at least one state. Unstyled is NOT the same as transparent — unstyled is the UA's own track.
+    expect(declaration(`${CHAT_SCROLLER}::-webkit-scrollbar-track`, "background")).toBe(
+      "transparent",
+    );
+  });
+
+  it("uses RADIUS.sm on the thumb — the same no-capsule rule the xterm bar is held to", () => {
+    expect(declaration(`${CHAT_SCROLLER}::-webkit-scrollbar-thumb`, "border-radius")).toBe(
+      `${RADIUS.sm}px`,
+    );
+  });
+});
+
 // ── THE INDIRECTION RATCHET ────────────────────────────────────────────────────────────────────
 // `packages/ui`'s `FONT` export is the pre-spec webfonts — `FONT.mono` is literally
 // `'"Source Code Pro", monospace'`. It sat at 2 because its two consumers were owned by other

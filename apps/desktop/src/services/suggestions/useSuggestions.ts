@@ -14,6 +14,9 @@ import { deriveCta } from "../../engine/agentCta";
 import { isInMotion } from "../../engine/inMotion";
 import { resolveStage } from "../../engine/workflowStage";
 import { maybeAutoApprove, maybeAutoResume } from "./approvalsRuntime";
+// The de-dupe registry, shared with `./autoApproveWatch` — see that module's header for why the
+// off-pane answerer and this hook must read one set and not two.
+import { clearHandledSignatures, handledSigsFor, resetHandledSignatures } from "./handledSigs";
 import { detectPendingQuestion } from "./pendingQuestion";
 import {
   NO_OUTAGE,
@@ -263,15 +266,12 @@ export function rememberComputed<T>(memo: Map<string, T>, hash: string, value: T
  */
 /** Per-AGENT (not per-instance) state, so a remount can't resurrect an already-answered prompt or
  *  discard a paid compute. Keyed by agent id and never pruned during a session: an entry is a small
- *  Set/Map, and an agent id is not reused. See the refs in useSuggestions for why these moved. */
-const HANDLED_SIGS = new Map<string, Set<string>>();
+ *  Set/Map, and an agent id is not reused. See the refs in useSuggestions for why these moved.
+ *
+ *  The de-dupe half of that pair now lives in `./handledSigs`, because it has a SECOND reader:
+ *  `./autoApproveWatch` answers prompts for agents this hook is not mounted for, and the two must
+ *  share one registry or the click that follows would answer the prompt again. See that module. */
 const MEMOS = new Map<string, Map<string, { buttons: SuggestionButton[]; questionPending: boolean }>>();
-
-function handledSigsFor(agentId: string): Set<string> {
-  let s = HANDLED_SIGS.get(agentId);
-  if (!s) HANDLED_SIGS.set(agentId, (s = new Set()));
-  return s;
-}
 
 function memoFor(
   agentId: string,
@@ -282,21 +282,15 @@ function memoFor(
 }
 
 /**
- * Clear an agent's answered-picker signatures. Exported because the invalidation CANNOT live in a
- * mounted effect any more (roborev 53159).
- *
- * The signature is the option set alone, so every Claude Code bash permission prompt shares one —
- * the set is only meant to stop ONE settled screen re-sending a keystroke while it re-hashes during
- * a single your-turn. A later, genuinely distinct prompt with the same options must be answered
- * again. The hook used to clear on the your-turn→working flip, which worked while one instance
- * lived forever; now that the concierge mounts this only for the SELECTED agent, an agent that
- * finishes its turn while you are looking at a different one would never be cleared — and on
- * return, its next real prompt would be suppressed as "already handled", leaving the agent blocked
- * forever while the UI claimed it was auto-approved. So the flip is watched at module level.
+ * Re-exported from `./handledSigs`, which now owns the registry. Kept exported HERE because the
+ * module-level status watcher below is its only caller and reads naturally beside it — and because
+ * the reason the invalidation cannot live in a mounted effect is a fact about THIS hook: the
+ * concierge mounts it only for the SELECTED agent, so an agent that finishes its turn while you are
+ * looking at a different one would never be cleared, and on return its next real prompt would be
+ * suppressed as "already handled" — blocked forever while the UI claimed it was auto-approved
+ * (roborev 53159).
  */
-export function clearHandledSignatures(agentId: string): void {
-  HANDLED_SIGS.get(agentId)?.clear();
-}
+export { clearHandledSignatures };
 
 /**
  * Watch EVERY agent's status, not just the mounted one's, and clear the de-dupe set when an agent
@@ -332,12 +326,11 @@ if (typeof useRuntimeStore.subscribe === "function") {
 /** Drop an agent's per-agent state — call when the agent is closed for good. Exported for tests,
  *  which must not leak an answered-picker signature from one case into the next. */
 export function resetSuggestionMemory(agentId?: string): void {
+  resetHandledSignatures(agentId);
   if (agentId === undefined) {
-    HANDLED_SIGS.clear();
     MEMOS.clear();
     return;
   }
-  HANDLED_SIGS.delete(agentId);
   MEMOS.delete(agentId);
 }
 

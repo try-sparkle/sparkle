@@ -1,201 +1,253 @@
 // @vitest-environment jsdom
 //
-// THE MOUNT IS THE TRIGGER — a permission prompt raised while you were looking elsewhere is
-// auto-answered at the moment you LOOK AT IT, not at the moment it appeared.
+// THE CLICK IS NOT THE TRIGGER ANY MORE — opening an agent's pane must not be what answers a
+// permission prompt that has been sitting on its screen.
 //
 // ── WHY THIS FILE EXISTS ────────────────────────────────────────────────────────────────────────
 // The founder reported it as a P0 in these words: *"clicking an agent pane auto-runs a waiting bash
 // command — a click may be silently answering permission prompts."* The question he asked first was
-// whether that is a real PTY write or a repaint-only artefact. It is a real write, and this file is
-// the executable half of the answer.
+// whether that is a real PTY write or a repaint-only artefact. It is a real write, and this file was
+// written to be the executable half of that answer.
 //
-// Measured from one day of production logs before this test was written: of 325 pane switches, 96
-// were followed within ONE SECOND by an auto-approve keystroke (~24x the rate expected from the
-// day's base rate of such writes) and 151 within two seconds — so roughly half of every click, and
-// ~49% of all 310 auto-approve decisions that day, landed in the window right after a click. The
-// nudger's own writes showed no such enrichment (1.2x), which is what rules out "the app is just
-// busy after a switch" as the explanation.
+// Measured from one day of production logs before it was written: of 325 pane switches, 96 were
+// followed within ONE SECOND by an auto-approve keystroke (~24x the rate expected from the day's
+// base rate of such writes) and 151 within two seconds — so roughly half of every click, and ~49% of
+// all 310 auto-approve decisions that day, landed in the window right after a click. The nudger's
+// own writes showed no such enrichment (1.2x), which is what rules out "the app is just busy after a
+// switch" as the explanation.
 //
-// ── THE MECHANISM, WHICH IS A GATE AND NOT A RACE ───────────────────────────────────────────────
-// `services/terminalScrollback` says it outright: the in-memory xterm buffer is "the only history
-// that exists", and a provider is registered only "while the agent's terminal is mounted"
-// (`Terminal.tsx` registers on mount, unregisters on unmount). `useSuggestions` reads through it and
-// bails on `if (!scrollback) return;` WITHOUT committing `lastHash` — deliberately, so the hash is
-// still fresh whenever content does show up.
+// ── THE MECHANISM, WHICH WAS A GATE AND NOT A RACE ──────────────────────────────────────────────
+// Auto-approve has only ever run inside `useSuggestions`, and the concierge mounts that hook for the
+// SELECTED agent only (`Concierge/ConciergeSuggestions`, keyed by agent id). Every other agent had
+// nobody reading it — including agents whose terminal was mounted and whose scrollback was sitting
+// right there. Selecting an agent mounted the hook, the hook read a prompt that had been on screen
+// for minutes, and answered it. The click was not racing the answer; it WAS the answer's trigger.
 //
-// Put together: while an agent's terminal is unmounted the auto-approver is BLIND to it. Making the
-// provider available is what makes a pending prompt readable, and the answer follows.
+// ── THE DECISION THAT SUPERSEDED THE ORIGINAL VERSION OF THIS FILE ──────────────────────────────
+// The first version of this file pinned the gate as it stood and took no position on whether it was
+// desirable, because the founder had not yet decided whether an unread prompt should be
+// auto-answerable on sight. It said the second test should go red first if that policy changed, and
+// that its expectation should be REVISED rather than deleted.
 //
-// ── TWO ROUTES REACH THE KEYSTROKE, AND AN EARLIER VERSION OF THIS FILE NAMED ONLY ONE ───────────
-// This header used to conclude "it is the MOUNT, not the registration", on the strength of a draft
-// case that registered the provider under an already-mounted hook and went red. That conclusion was
-// WRONG, and the way it was wrong is worth keeping, because it is the failure mode this whole file
-// is about: the draft went red only because these tests run on REAL timers and finish in
-// milliseconds, so `useSuggestions`' settle watcher — a `setInterval` at `SETTLE_TICK_MS` (1200ms,
-// `useSuggestions.ts:961`) that calls `getAgentScrollback` on every tick — never got to run. That is
-// a property of the harness, not of the code (roborev 63111).
+// HE DECIDED ON 2026-08-12, explicitly over a dwell-timer and over leaving it alone, in these terms:
+// let the auto-approver see agents whose pane is NOT open, so a prompt in an `always` category is
+// answered the moment it appears, decoupled from the click entirely. He accepted the widened blast
+// radius — the app now writes to PTYs he is not watching — on the strength of four constraints:
+// staleness must fail closed, nothing may be double-answered, the chained write path is unchanged,
+// and the per-tool MCP veto keeps applying. `services/suggestions/autoApproveWatch` is the mechanism
+// and its header carries those four in full.
 //
-// Both routes are pinned below:
-//   1. MOUNT with a provider already available — the compute effect reads it on its first pass.
-//   2. REGISTRATION under a hook that is already mounted — the settle watcher sees the provider on
-//      its next tick, settles after two identical hashes, finds `h !== lastHash.current` (still
-//      null, because the `!scrollback` bail never committed it) and bumps `retryTick`.
-// Route 2 needs no click at all once a pane is open, and a reader who believed the old conclusion
-// would go looking for a fix in mount ordering and never find it.
+// So the expectations below are revised to the new contract, and the revision is the point of the
+// file rather than a footnote to it. What it pins now is the OTHER HALF of that decision — that the
+// click, having been the trigger, is no longer one. `autoApproveWatch.test.ts` pins the first half
+// (a prompt is answered when it appears). Neither is sufficient alone: a watch that answers is not a
+// fix if the subsequent click answers a second time, which is precisely the failure roborev 53074
+// was about, reached by a different road.
 //
-// ── WHY THE REST OF THIS DIRECTORY CANNOT CATCH IT ──────────────────────────────────────────────
-// Every sibling suite does `vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => … }))`
-// — a stub that returns content unconditionally, i.e. a world where the terminal is ALWAYS mounted.
-// That is a reasonable thing to stub when you are testing the de-dupe guard, but it means the gate
-// itself is invisible to all of them: they cannot distinguish "answered because a prompt appeared"
-// from "answered because a pane was mounted", because in their world the two always coincide.
-// SO THIS FILE DELIBERATELY DOES NOT MOCK THAT MODULE. It drives the real registry, which is the
-// only way the unmounted state is representable at all.
+// ── WHAT THESE ASSERT ───────────────────────────────────────────────────────────────────────────
+// The actual keystroke reaching the PTY. An assertion that a function was called, or that a
+// component rendered, would be an assertion about a precondition — and this whole subject is an
+// irreversible side effect. So `approvalsRuntime` is NOT mocked here (the original version of this
+// file mocked it, which was adequate for a claim about WHEN the decision is taken and is not
+// adequate for a claim about what reaches the pane); only the two real edges are — the PTY and the
+// AI feature flag.
 //
-// ── WHAT THIS PINS, AND WHAT IT DOES NOT ────────────────────────────────────────────────────────
-// It pins the CAUSAL CLAIM ONLY — that mounting, with no new output and no change of turn, is
-// sufficient to emit the keystroke. It takes NO position on whether that is desirable: the founder
-// has not yet decided whether an unread prompt should be auto-answerable on sight. If that policy
-// changes, the second test here is the one that should go red first, and its expectation should be
-// changed with the new decision recorded — do not delete it, and see the note in
-// `Concierge/MountedAgentThread.tsx` on why a superseded contract comment is a lock rather than
-// documentation.
+// SO THIS FILE DELIBERATELY DOES NOT MOCK `../terminalScrollback` EITHER, which every sibling suite
+// does (`getAgentScrollback: () => …`, a stub returning content unconditionally, i.e. a world where
+// the terminal is ALWAYS mounted). That stub is reasonable when you are testing the de-dupe guard,
+// but it makes the mount state unrepresentable, and the mount state is the entire subject here.
 //
 // Related prior art, both narrower halves of this same surface: roborev 53074 (a remount re-answered
 // an ALREADY-answered prompt — fixed by making `handledSigs` per-agent module state) and roborev
-// 53159 (the de-dupe set outliving a turn suppressed a genuinely new prompt). Both are about the
-// SECOND answer. This is about the FIRST one.
+// 53159 (the de-dupe set outliving a turn suppressed a genuinely new prompt).
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const h = vi.hoisted(() => ({ maybeAutoApprove: vi.fn() }));
+const writePty = vi.fn((_id: string, _data: string) => Promise.resolve());
+vi.mock("../../pty", () => ({
+  writePtyChainedStrict: (id: string, data: string) => writePty(id, data),
+}));
 
-vi.mock("./approvalsRuntime", () => ({
-  maybeAutoApprove: h.maybeAutoApprove,
-  maybeAutoResume: vi.fn(() => null),
-  useSyncProjectApprovals: () => {},
+const aiFeatureVisibleNow = vi.fn((_key: string) => true);
+vi.mock("../aiGate", () => ({
+  aiFeatureVisibleNow: (key: string) => aiFeatureVisibleNow(key),
+  // The hook's own gate for the LEARNED tier — off, so no metered path is reachable from here.
+  useAiFeature: () => false,
 }));
 vi.mock("./engine", () => ({
   computeSuggestions: vi.fn(async () => ({ agentId: "a1", buttons: [] })),
+  SuggestionOfflineError: class extends Error {},
 }));
-vi.mock("../../stores/runtimeStore", () => {
-  // Every agent reads as "approval" (i.e. it is your turn, a prompt is up) — this file is about
-  // WHEN the answer is emitted, not about how the status is resolved.
-  const state = {
-    status: new Proxy({}, { get: () => "approval" }) as Record<string, string>,
-    workflowShipped: {},
-    workflowStage: {},
-    workflowState: {},
-    branchStatus: {},
-  };
-  return {
-    useRuntimeStore: Object.assign((sel: (s: unknown) => unknown) => sel(state), {
-      getState: () => state,
-    }),
-  };
-});
 
-// NOT MOCKED, on purpose (see the header): this is the module that holds the gate.
+// NOT MOCKED, on purpose (see the header): the scrollback registry holds the mount state, and
+// `approvalsRuntime` holds the decision and the write.
 import { registerScrollback } from "../terminalScrollback";
-import { SETTLE_TICK_MS, resetSuggestionMemory, useSuggestions } from "./useSuggestions";
+import { startAutoApproveWatch, resetAutoApproveWatchForTests, SETTLE_MS } from "./autoApproveWatch";
+import { resetSuggestionMemory, useSuggestions } from "./useSuggestions";
+import { useRuntimeStore } from "../../stores/runtimeStore";
+import { useSettingsStore } from "../../stores/settingsStore";
+import { useApprovalsStore } from "../../stores/approvalsStore";
+import { useProjectStore } from "../../stores/projectStore";
+import { resetPromptGraceLedgerForTests } from "../../engine/blockedPromptGrace";
+import { resetRetractionLedgerForTests } from "../../engine/movementRetraction";
 
-/** The screen a real permission prompt presents. */
-const PROMPT = "Do you want to proceed?\n1. Yes\n2. No";
+const AGENT = "a1";
 
-/** Stand-in for the real guard: answers once per distinct screen, recording into the handed set. */
-function answerOncePerScreen(_agentId: string, scrollback: string, handled: Set<string>) {
-  const sig = `sig:${scrollback}`;
-  if (handled.has(sig)) return null;
-  handled.add(sig);
-  return "bash" as const;
+/** The screen a real permission prompt presents. `1` is plain Yes. */
+const PROMPT = [
+  "Bash command",
+  "  rm -rf build/",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again for rm commands",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  "Enter to select · ↑/↓ to navigate · Esc to cancel",
+].join("\n");
+
+/** How many keystrokes actually reached the PTY. */
+const keystrokes = () => writePty.mock.calls.length;
+
+/**
+ * Give the mounted hook every chance to type.
+ *
+ * BOTH HALVES ARE NEEDED, and a bare timer advance is the trap. The hook's settle watcher runs on
+ * TIMERS, but its auto-approve arm hangs off the `.then` of `computeSuggestions` — a MICROTASK — so
+ * advancing the clock synchronously returns before the decision has been taken. Every assertion in
+ * this file is of the form "nothing more was typed", and that assertion is worthless if the code
+ * that would have typed never got to run. Three rounds because the watcher wants two consecutive
+ * identical hashes before it calls a screen settled.
+ */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 3; i++) {
+    // Sequential by construction: each round is a tick, and a tick must complete before the next.
+    await act(async () => {
+      vi.advanceTimersByTime(SETTLE_MS);
+    });
+  }
 }
 
-/** How many times the approver actually decided to type something. */
-const answers = () => h.maybeAutoApprove.mock.results.filter((r) => r.value).length;
-
 let unregister: (() => void) | null = null;
+let stopWatch: (() => void) | null = null;
 
 beforeEach(() => {
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date("2026-08-12T12:00:00Z"));
+  writePty.mockClear();
+  aiFeatureVisibleNow.mockReturnValue(true);
   resetSuggestionMemory();
-  h.maybeAutoApprove.mockReset();
-  h.maybeAutoApprove.mockImplementation(answerOncePerScreen);
+  resetPromptGraceLedgerForTests();
+  resetRetractionLedgerForTests();
+  resetAutoApproveWatchForTests();
+  useRuntimeStore.setState({ status: {}, attentionScreen: {}, attentionScreenAt: {} });
+  useProjectStore.setState({ projects: [] });
+  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {} });
+  // The founder's actual config: bash auto-approves.
+  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask" });
 });
 afterEach(() => {
   unregister?.();
   unregister = null;
+  stopWatch?.();
+  stopWatch = null;
+  resetAutoApproveWatchForTests();
   cleanup();
+  vi.useRealTimers();
 });
 
-describe("the auto-approve keystroke is gated on the terminal being mounted", () => {
-  it("does not answer a pending prompt while the agent's terminal is unmounted", async () => {
-    // The agent is sitting at a permission prompt RIGHT NOW — it is its turn, per the runtime store
-    // above — but nobody has opened its pane, so no scrollback provider is registered for it.
-    renderHook(() => useSuggestions("a1", true));
-    await act(async () => {});
+describe("opening a pane is no longer what answers a pending permission prompt", () => {
+  it("answers while the pane is CLOSED, and the click that follows types nothing", async () => {
+    stopWatch = startAutoApproveWatch();
 
-    // Nothing is typed, because nothing can even READ the prompt. This is the state the founder's
-    // agents sit in whenever he is looking at a different pane.
-    expect(answers()).toBe(0);
+    // The agent stops to ask, with nobody looking at it. This is what `Terminal.onStatusWithCapture`
+    // does — photograph the screen, then set the red status — for an agent whose pane is mounted but
+    // not selected, which is the population the founder measured.
+    useRuntimeStore.getState().setAttentionScreen(AGENT, PROMPT);
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    // The prompt is answered here — before any click, with no hook mounted for this agent at all.
+    expect(keystrokes()).toBe(1);
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
+
+    // NOW THE CLICK, modelled as the app performs it: opening the pane mounts `Terminal` (which
+    // registers the scrollback provider) and the suggestions row together, and the same prompt is
+    // still the newest thing in the buffer.
+    unregister = registerScrollback(AGENT, () => PROMPT);
+    renderHook(() => useSuggestions(AGENT, true));
+    await settle();
+
+    // …and NOTHING more is typed. This is the founder's P0: the click used to be the trigger, and
+    // the ~49% of auto-approve decisions that landed within a second of a pane switch were this
+    // write happening here instead of above.
+    expect(keystrokes()).toBe(1);
   });
 
-  it("answers on MOUNT ALONE — no new output, no change of turn, just the pane being opened", async () => {
-    // The pane is CLOSED. Nothing is registered and nothing is mounted for this agent, so the
-    // pending prompt is unreadable and unanswerable.
-    const closed = renderHook(() => useSuggestions("a1", true));
-    await act(async () => {});
-    expect(answers()).toBe(0);
-    closed.unmount();
+  it("still SHOWS the pane that its prompt was auto-approved", async () => {
+    // The other half of not double-answering: suppressing the second keystroke must not also
+    // suppress the note. `maybeAutoApprove` returns the category from its "already handled this
+    // signature" arm precisely so the pane can say what happened to a prompt it never displayed —
+    // if that arm returned null instead, the pane would fall back to showing raw buttons for a
+    // question that has already been answered.
+    stopWatch = startAutoApproveWatch();
+    useRuntimeStore.getState().setAttentionScreen(AGENT, PROMPT);
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    vi.advanceTimersByTime(SETTLE_MS);
+    expect(keystrokes()).toBe(1);
 
-    // THE CLICK, modelled as the app actually performs it: opening a pane mounts `Terminal` (which
-    // registers the scrollback provider) AND the suggestions row together. Note what does NOT
-    // change across this line — the prompt is the same prompt, already on screen, unchanged; no PTY
-    // output has arrived; the agent's status has not moved. The pane opening is the whole of it.
+    unregister = registerScrollback(AGENT, () => PROMPT);
+    const view = renderHook(() => useSuggestions(AGENT, true));
+    await settle();
+
+    expect(view.result.current.autoApproved).toBe("bash");
+    expect(keystrokes()).toBe(1);
+  });
+
+  it("the mounted hook remains an answerer of LAST RESORT, not the trigger", async () => {
+    // The causal finding this file was originally written to record is still true and still worth
+    // holding: mounting alone — no new output, no change of turn, just the pane being opened — is
+    // sufficient to emit the keystroke. What changed on 2026-08-12 is that it is no longer how the
+    // app normally answers, because the watch gets there first. It stays as a fallback for the
+    // screens the watch declines to judge (an unstamped capture, a status it does not recognise as
+    // an ask), where a human is looking at a live terminal and the read is unambiguous.
     //
-    // ROUTE 1: the compute effect reads the provider on its first pass after mounting.
-    unregister = registerScrollback("a1", () => PROMPT);
-    renderHook(() => useSuggestions("a1", true));
-    await act(async () => {});
+    // NO WATCH IS STARTED HERE, which is what makes that fallback the thing under test.
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    unregister = registerScrollback(AGENT, () => PROMPT);
+    renderHook(() => useSuggestions(AGENT, true));
+    await settle();
 
-    // …and the keystroke goes into the PTY. This is the write the founder saw as "clicking a pane
-    // auto-ran a waiting bash command", and it is why ~half of his clicks were followed within a
-    // second by an approval he never read.
-    expect(answers()).toBe(1);
-  });
-
-  it("ROUTE 2: answers with NO remount at all, once the settle watcher's interval runs", async () => {
-    // The distinction this case exists for: the hook stays mounted THROUGHOUT. Nothing re-mounts,
-    // nothing re-renders with new props. The only event is a provider becoming available, which is
-    // what happens when a terminal registers beside an already-open suggestions row.
-    vi.useFakeTimers();
-    try {
-      renderHook(() => useSuggestions("a1", true));
-      await act(async () => {});
-      expect(answers()).toBe(0); // blind: no provider yet
-
-      unregister = registerScrollback("a1", () => PROMPT);
-
-      // The watcher needs two identical hashes to call the screen settled, so one tick is not
-      // enough — this is why a real-timer test that finishes in milliseconds sees nothing and can
-      // be misread as proof that this route does not exist.
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(SETTLE_TICK_MS * 3);
-      });
-
-      expect(answers()).toBe(1);
-    } finally {
-      vi.useRealTimers();
-    }
+    expect(keystrokes()).toBe(1);
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
+  
   });
 });
 
-// NOT TESTED HERE, DELIBERATELY: that a settled screen is never answered twice.
+// ══ NOT TESTED HERE, DELIBERATELY: that a settled screen is never answered twice ═════════════════
 //
-// A case for it lived here and could not fail (roborev 63111). It re-rendered with no new props,
-// and the reading effect's deps are all stable across that, so `maybeAutoApprove` was never
-// re-invoked whether or not the de-dupe guard worked; independently, the stand-in below de-dupes on
-// its own set, so the count would have stayed at 1 even if the effect HAD re-run. Deleting
-// `handledSigs` outright left it green — the vacuous shape AGENTS.md names.
+// A case named "does not keep re-answering once mounted and settled" stood here and could not fail
+// (roborev 63111). It re-rendered with no new props, and every dep of the reading effect is stable
+// across that, so the approver was never re-invoked whether or not the de-dupe guard worked — delete
+// `handledSigs` outright and it stayed green. That is the vacuous shape AGENTS.md names.
 //
-// It cannot be repaired in this file either: `maybeAutoApprove` is mocked here, so the real
-// de-dupe lives in code this suite does not execute. `handledSigs.remount.test.tsx` drives that
-// contract against the real signature set (roborev 53074 / 53159) and is where it belongs.
+// IT WAS REMOVED ON MAIN AND CAME BACK IN THIS MERGE, which is the part worth recording. This branch
+// was cut before that removal landed, so it carried its own copy forward and git resolved the file
+// in its favour — a deletion is invisible to a side that never saw it, and nothing about the merge
+// looked wrong. If you are about to re-add a "a re-render doesn't re-answer" case here, this
+// paragraph is why you should not: the assertion cannot tell a working guard from an effect that
+// never ran.
+//
+// The contract itself is real, and is covered where it can actually fail:
+// `handledSigs.remount.test.tsx` drives it against the real signature set (roborev 53074 / 53159).
+//
+// ══ AND ON THE SETTLE WATCHER, which outlived the behaviour change ═══════════════════════════════
+//
+// `useSuggestions` also polls `getAgentScrollback` on a `setInterval` at `SETTLE_TICK_MS` (1200ms,
+// `useSuggestions.ts:961`), settling after two identical hashes. That path is why an earlier version
+// of this file was wrong to conclude "the MOUNT, not the registration" was the trigger: registration
+// alone answered within ~2.4s. Now that `autoApproveWatch.ts` decides off captured screens instead,
+// that route is no longer the founder-visible one — but the trap that hid it is still live for
+// anyone writing tests here. THESE TESTS RUN ON REAL TIMERS and finish in milliseconds, so any
+// interval-driven path is silently unexercised, and a case that "proves" such a path does not exist
+// may only be proving that the clock never advanced. Reach for `vi.useFakeTimers()` and advance
+// deliberately whenever you mean to exercise one.

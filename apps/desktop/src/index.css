@@ -269,6 +269,46 @@ body {
   border-radius: 3px;
 }
 
+/* ── THE CHAT TRANSCRIPT SCROLLBAR — CLASSIC, NOT THE macOS OVERLAY ─────────────────────────────
+   The concierge transcript scrolled correctly and always had; what it had no way to show was a
+   bar you can SEE and GRAB. Declaring no `::-webkit-scrollbar` style at all inherits the macOS
+   WKWebView default, which is an OVERLAY scrollbar: it paints only during an active scroll
+   gesture and then fades to nothing. `.xterm-viewport` above was the ONE element in this app that
+   opted out, which is the entire reason the terminal showed a bar and the chat pane did not.
+   Declaring an explicit width is what converts it into a classic, always-present, space-occupying
+   scrollbar (bead sparkle-nheu8 — asked for repeatedly).
+
+   HUNG OFF `data-concierge-scroller`, the app-wide marker BOTH transcripts already carry
+   (ConciergeThread and MountedAgentThread — `threadScrollerMarker.test.tsx` asserts it on both,
+   and now also asserts that THIS selector matches them). Neither scroller has a className, so a
+   selector is the only reach a stylesheet has to them, and a pseudo-element has no inline form.
+
+   TRACK IS `transparent`, DELIBERATELY, AND THAT IS NOT A MISSING TOKEN. Left unstyled the UA
+   paints its own track, which on these planes reads as a pale stripe down the column. No token
+   can be right here either: ConciergeColumn repaints its plane from `data-wired`
+   (conciergeSurfaceLifted at rest, the TERMINAL's colour when wired), and MountedAgentThread sits
+   on a plane of its own — so any fixed colour is wrong in at least one state, in at least one
+   theme. `transparent` is correct in all of them and needs no mirror entry.
+
+   THUMB IS `pillFill`, NOT `chatBubble` — the token whose documented job this is. colors.ts holds
+   `hairline`/`pillFill`/`goldFill` to the floor for "a chrome SHAPE against the surface it is
+   drawn on … the bar is separation, not readability", which is exactly a 10px thumb. `chatBubble`
+   is a ROW FILL sitting deliberately near its ground (a shallow hover ramp), and measured against
+   these planes it lands at 1.19 dark / 1.15 light — a bar the founder still could not see, in
+   both themes. `pillFill` measures 1.48 / 1.44, the same band as the macOS thumb itself. */
+[data-concierge-scroller="yes"]::-webkit-scrollbar {
+  width: 10px;
+}
+[data-concierge-scroller="yes"]::-webkit-scrollbar-track {
+  background: transparent;
+}
+[data-concierge-scroller="yes"]::-webkit-scrollbar-thumb {
+  background: var(--c-pill-fill); /* token: C.pillFill */
+  /* 3px = RADIUS.sm, for the reason stated on the xterm thumb above: 5px on a 10px track is a
+     fully-round capsule, and this direction draws no capsules. */
+  border-radius: 3px;
+}
+
 /* Think composer: the textarea is transparent-text over a mention-highlight overlay. Hide its
    scrollbar so a scrollbar's width can never narrow the text and drift it out from under the
    overlay (which has no scrollbar). Scroll position is mirrored to the overlay in JS. */

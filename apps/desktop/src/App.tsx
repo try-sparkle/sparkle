@@ -45,6 +45,7 @@ import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
 import { startResurrectionRunner } from "./services/resurrectionRunner";
+import { startAutoApproveWatch } from "./services/suggestions/autoApproveWatch";
 import { startFleetWatch } from "./services/fleetWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPusher } from "./services/pusherMount";
@@ -169,6 +170,29 @@ function SettingsShortcut() {
 // an ACCOUNT, so one poller serves every open agent. Paints no UI.
 function LimitSync() {
   useLimitSync();
+  return null;
+}
+
+// Answers a permission prompt WHEN IT APPEARS rather than when its pane is clicked
+// (services/suggestions/autoApproveWatch).
+//
+// MOUNTED HERE BECAUSE THE ONLY THING THAT EVER RAN AUTO-APPROVE WAS A PER-PANE HOOK, and the
+// concierge mounts that hook for the SELECTED agent only — so the app was blind to every other
+// agent, and the founder's click was what made a waiting prompt visible and answered it. Of 325 pane
+// switches in one measured day, 96 were followed within a second by an auto-approve keystroke.
+// App-level and singular for the same reason <GoalContinuation/> is: a prompt belongs to an AGENT,
+// and one watcher serves the whole fleet.
+//
+// MAIN WINDOW ONLY, and here that is CORRECTNESS rather than cost — the distinction <FleetWatch/>
+// draws above. This types into a PTY, the de-dupe set that stops a second keystroke is per-window
+// module state, and a satellite window runs its own copy of these stores: two watchers would each
+// answer the same picker once. Paints no UI.
+function AutoApproveWatch() {
+  const isMain = useIsMainWindow();
+  useEffect(() => {
+    if (!isMain) return;
+    return startAutoApproveWatch();
+  }, [isMain]);
   return null;
 }
 
@@ -529,6 +553,7 @@ export function App() {
       <FleetWatch />
       <InboxWatch />
       <LimitSync />
+      <AutoApproveWatch />
       <GoalContinuation />
       <FleetResurrection />
       <Pusher />

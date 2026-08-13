@@ -329,6 +329,27 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           data-sent-to-agent={sent && !wired ? "yes" : "no"}
           style={{
             display: "inline-block",
+            // THE TWO LINES THAT KEEP A PASTED URL INSIDE THE COLUMN. `inline-block` is
+            // shrink-to-fit, so this bubble sizes itself to its own MIN-CONTENT — and the parent's
+            // `maxWidth: 92%` clamps the PARENT, not this. With `overflow-wrap: normal` the
+            // min-content of one unbroken token (a run URL, an absolute worktree path, a bead list)
+            // is the whole token, so the bubble grew to 569px inside a 359px scroller and pushed
+            // 252px of horizontal overflow into the thread — measured, in a rendering engine, with
+            // and without the scrollbar rules, so it is not caused by them.
+            //
+            // The founder saw it as a horizontal scrollbar the moment the vertical one appeared
+            // (bead sparkle-nheu8): `overflow-y: auto` with `overflow-x: visible` COMPUTES to
+            // `overflow-x: auto`, so the overflow had always been there and had always been
+            // scrollable — the overlay bar just never painted to say so.
+            //
+            // `anywhere`, not `break-word`: only `anywhere` participates in min-content sizing,
+            // which is the whole mechanism here. `break-word` wraps the glyphs and leaves the box
+            // just as wide, so the bar would stay. `maxWidth: 100%` is the belt to that braces —
+            // it caps the box at the parent's 92% for anything that still cannot break (a wide
+            // image, a table), turning an escaped child into a clipped one rather than a
+            // column-wide scroll.
+            maxWidth: "100%",
+            overflowWrap: "anywhere",
             textAlign: "left",
             fontSize: 13,
             // THE INK PINNING FOR THE BLACK CARD, spread FIRST so nothing below can be shadowed by
