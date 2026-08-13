@@ -227,6 +227,18 @@ vi.mock("../useConciergeDictation", () => ({
 vi.mock("../stores/sparklePrefsStore", () => ({
   useSparklePrefsStore: { getState: () => ({ setInterruptPreference: h.setInterruptPreference }) },
 }));
+// THE DISPATCH SIDE EFFECT, stubbed so the auto-dispatch effect can be OBSERVED rather than actually
+// spawning a metered research child. Every other export is preserved. Two consumers reachable from
+// THIS file's module graph call it, so the stub covers both: the host's own auto-dispatch effect,
+// and `conciergeTools/registry`'s `dispatch` route (registry.ts:242/1780, reached via the real
+// `services/concierge` import). It does NOT touch other suites — a `vi.mock` is file-scoped. The
+// file-level `afterEach` re-establishes a success default after `resetAllMocks`, because the registry
+// route reads `.ok` and would throw on `undefined`. The auto-dispatch rows at the bottom of this file
+// assert this mock was CALLED — the wiring the pure-decider test cannot see.
+vi.mock("../services/conciergeTools/research", async (orig) => ({
+  ...(await orig<typeof import("../services/conciergeTools/research")>()),
+  dispatchResearchTask: vi.fn(),
+}));
 
 // TRIAL_SPENT_TEXT is IMPORTED, not re-declared: both voices are supposed to return this exact
 // string, and asserting the literal on each side is what pins that they stay shared. A hand-synced
@@ -255,6 +267,16 @@ import {
 } from "../services/conciergeReceipts";
 import { ConciergeAiDisabledError } from "../services/concierge";
 import { MAX_QUEUED_TURNS } from "../engine/conciergeTurnQueue";
+// THE APP-WIDE SEAM the queue depth is published through — the real store, not a mock, because the
+// defect being pinned is precisely that the depth never left this component.
+import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
+// THE PUSHER'S REAL ROUTE TO THE CONCIERGE — the registration the host makes in its own effect, not
+// a mock of it. `pusherMount.sendVerified` makes this exact call, so the fold cases below drive the
+// production seam rather than a stand-in for it.
+import { notifyConcierge } from "../services/conciergeNotifier";
+import * as conciergeNotifierModule from "../services/conciergeNotifier";
+import { dispatchResearchTask } from "../services/conciergeTools/research";
+import { useResearchStore } from "../services/research/store";
 import { ANSWERED_MARKER_TESTID } from "./Concierge/ReplyAnchorViews";
 import {
   THINKING_ACTIVITY_TESTID,
@@ -366,6 +388,21 @@ afterEach(() => {
   h.dispatchConciergeAnswer.mockResolvedValue({ ok: true });
   h.startConciergeTurn.mockResolvedValue(null);
   h.agentCanAcceptInput.mockReturnValue(true);
+  // Same reason as the mocks above: `resetAllMocks` strips this stub's implementation, and it has
+  // TWO consumers reachable from this file's graph — the host's auto-dispatch effect AND
+  // `conciergeTools/registry`'s `dispatch` route (registry.ts:242/1780, reachable via the real
+  // `services/concierge` import). A row driving the tool route against a reset mock would get
+  // `undefined` back and throw on `.ok`, so re-establish a benign success here.
+  vi.mocked(dispatchResearchTask).mockResolvedValue({
+    ok: true,
+    op: "dispatch",
+    risk: "routine",
+    data: { id: "r0" },
+  } as never);
+  // The auto-dispatch effect mounts in EVERY row of this file and reads this app-global zustand
+  // store; a row that seeded a live task (the "served" case below) would otherwise leak it forward
+  // and silently satisfy the `served` short-circuit for the next describe (the sparkle-rvf6n shape).
+  useResearchStore.setState({ byId: {}, hydrated: false, openTaskId: null } as never);
   // resetAllMocks above strips this one's implementation too, and an undefined return here is not a
   // quiet no-op: `attachPaths` calls `.then` on it and the whole passive effect throws.
   h.loadAttachmentPaths.mockImplementation(async (paths: string[]) => ({
@@ -1168,6 +1205,178 @@ describe("ConciergeHost", () => {
     await settle();
     expect(h.startConciergeTurn.mock.calls.length).toBe(afterFirst + 1);
     expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("second question");
+  });
+
+  /**
+   * THE DEPTH REACHES A BACKGROUND SWEEP, WHICH IS THE WHOLE POINT OF PUBLISHING IT.
+   *
+   * The founder watched six messages queue with zero concierge agents running, and nothing said a
+   * word — because the depth existed ONLY as this component's `useRef`/`useState` pair and crossed
+   * no module boundary at all. `pusherSnapshots` is a synchronous read from a 60-second interval
+   * with no component to ask, so a fact that lives in a component is a fact the Pusher structurally
+   * cannot have.
+   *
+   * Asserted on `stores/conciergeQueueStore` — the app-wide store — rather than on anything
+   * rendered. A rendered assertion would pass against the old code, which already showed the queue
+   * position on the bubble; the store is the thing that was missing.
+   */
+  it("publishes the queue depth into the app-wide store as messages stack up", async () => {
+    _resetConciergeActivityForTests();
+    useConciergeQueueStore.getState()._resetForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    // A MOUNTED HOST WITH AN EMPTY QUEUE IS A MEASUREMENT, and it has to be distinguishable from
+    // the `undefined` the store held a moment ago — see the store's header on why `0` and "nobody
+    //
+    // `oldestAt: null` is part of that measurement, not an afterthought: nothing is waiting, so
+    // there is no age to report — and a stale timestamp here would age forever and make an empty
+    // queue look permanently abandoned to `queueUnfanned`.
+    await settle();
+    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 0, running: false, oldestAt: null });
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // One in flight, nothing behind it — the ordinary single send, which must NOT read as a backlog.
+    // `oldestAt` is null because the RUNNING turn is not waiting: it is being worked on, and its age
+    // is not what "nothing is taking my queue" is about.
+    expect(useConciergeQueueStore.getState().depth).toEqual({
+      waiting: 0,
+      running: true,
+      oldestAt: null,
+    });
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "third question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // THE STATE HE IS ACTUALLY LOOKING AT: messages stacking up behind one running turn.
+    expect(useConciergeQueueStore.getState().depth).toEqual({
+      waiting: 2,
+      running: true,
+      // A NUMBER, and specifically the FIRST waiter's — with two waiting, `oldestAt` is what
+      // separates "this queue formed a moment ago" from "the founder has been waiting", and it is
+      // the only field `queueUnfanned` uses to tell those apart.
+      oldestAt: expect.any(Number),
+    });
+
+    // ...and it comes back down as the queue drains, so a report cannot keep quoting a backlog that
+    // has cleared.
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 1, running: true, oldestAt: expect.any(Number) });
+  });
+
+  /**
+   * AN OWED PUSHER FINDING RIDES THE USER'S NEXT TURN, because the proactive channel is
+   * SELF-DEFEATING for exactly the findings that matter most.
+   *
+   * `concierge_proactive_turn` stands down for any user turn in flight — correct, the user owns the
+   * conversation — and a non-empty concierge queue means a user turn is ALWAYS in flight, by
+   * `engine/conciergeTurnQueue.enqueue`'s own invariant. So the push about a stacked-up queue is
+   * declined for precisely as long as the condition holds, while `notify()` still answers true and
+   * `pusherRunner` stamps the condition as reported for four hours.
+   *
+   * `startProactiveConciergeTurn` is stubbed in this file to resolve `null` — "the transport stood
+   * down" — which is exactly that state, so the finding reaches the founder here or nowhere.
+   */
+  it("folds an owed Pusher finding into the next user turn's prompt", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    // Through the REAL registration seam — the host hands `scheduler.notify` to
+    // `setConciergeNotifier`, and this is the call `pusherMount.sendVerified` makes.
+    act(() => {
+      expect(notifyConcierge("6 messages are queued for the concierge with nothing fanned out")).toBe(
+        true,
+      );
+    });
+
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    const prompt = String(h.startConciergeTurn.mock.calls.at(-1)?.[0]);
+    expect(prompt).toContain("6 messages are queued for the concierge");
+    // AHEAD of the founder's message, not after it — the instruction preamble is what turns a
+    // finding into something the brain acts on rather than reads past.
+    expect(prompt.indexOf("6 messages are queued")).toBeLessThan(prompt.indexOf("what needs me?"));
+  });
+
+  it("does not repeat a finding the installed turn already carried", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    act(() => void notifyConcierge("Agent A has been quota-walled for 3h"));
+
+    // A turn that INSTALLS — the id is what the claim is made against.
+    h.startConciergeTurn.mockResolvedValueOnce("1");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("quota-walled");
+
+    act(() => h.brain.done?.({ id: "1", text: "answered" }));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).not.toContain("quota-walled");
+  });
+
+  /**
+   * ...AND A TURN THAT NEVER INSTALLED KEEPS IT OWED.
+   *
+   * `startConciergeTurn` resolves `null` for a turn superseded before install, cancelled, or failed
+   * locally — it told the founder nothing. Claiming at prompt-build time would destroy the finding
+   * with no residue, which is the loss `research/drain`'s peek/claim split exists to prevent; the
+   * same rule applies here, and this is the case that discriminates the two.
+   */
+  it("keeps an owed finding when the turn never installed", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    act(() => void notifyConcierge("Agent A has been quota-walled for 3h"));
+
+    // The file's default stub resolves `null`: no turn id, so nothing may be claimed.
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("quota-walled");
+
+    // The slot is released by the local-error path, and the next send carries the finding again.
+    act(() => h.brain.error?.({ id: "1", detail: "boom" }));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(String(h.startConciergeTurn.mock.calls.at(-1)?.[0])).toContain("quota-walled");
+  });
+
+  /**
+   * A TORN-DOWN HOST MUST NOT STRAND A FALSE DEPTH.
+   *
+   * Nothing else writes this store, so an unmount that does not clear leaves its last reading
+   * standing for the life of the window: every later sweep reports "2 queued" about a concierge
+   * that no longer exists, and there is no live host left to correct it. `undefined` — nobody is
+   * looking — is the only honest answer once the mount is gone.
+   */
+  it("clears the published depth when the host unmounts", async () => {
+    _resetConciergeActivityForTests();
+    useConciergeQueueStore.getState()._resetForTests();
+    h.feed = feedWith("approval");
+    const view = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 1, running: true, oldestAt: expect.any(Number) });
+
+    view.unmount();
+    expect(useConciergeQueueStore.getState().depth).toBeUndefined();
   });
 
   /**
@@ -3725,5 +3934,134 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
     const after = (await within(thread()).findByTestId(SENT_TO_AGENT_TESTID)).textContent ?? "";
     expect(after).toBe(before);
     expect(after).not.toContain("Some Other Agent");
+  });
+});
+
+// ══ THE APP ACTUALLY DISPATCHES WHEN THE QUEUE OUTRUNS THE AGENTS (bead sparkle-6vool) ═════════════
+//
+// conciergeAutoDispatch.test.ts proves the pure DECIDER returns `action:"dispatch"`. That is a
+// trigger object, not a side effect — a decider that returns "dispatch" while nothing calls
+// `dispatchResearchTask` would pass every one of those rows and ship a feature that never runs once.
+// These rows drive the host's real interval effect and assert the REAL dispatch happens (and, in the
+// paired negative, does NOT happen when the queue is already served) — the wiring nothing else sees.
+describe("ConciergeHost — the app DISPATCHES research when the queue outruns the agents (sparkle-6vool)", () => {
+  function seedSelectedProject() {
+    // The effect resolves the root from the project store and does nothing without one, exactly as
+    // the `dispatch` tool route does. A dispatch without a root researches an arbitrary tree.
+    useProjectStore.setState({
+      projects: [
+        {
+          id: "p1", name: "sparkle", rootPath: "/tmp/sparkle", defaultBranch: "main",
+          createdAt: "2026-01-01", selectedAgentId: "ag1",
+          agents: [{ id: "ag1", name: "CI Hardening", kind: "build", runtime: "local" }],
+        },
+      ],
+      selectedProjectId: "p1",
+    } as never);
+  }
+
+  // A occupies the running slot; B waits behind it. Both clear MIN_DISPATCHABLE_CHARS (24), so the
+  // only thing keeping B from dispatch is the one-minute floor and the live-agent count.
+  const RUNNING_MSG = "why is the desktop build red right now";
+  const WAITING_MSG = "what broke the coverage shard on origin main";
+
+  async function sendRunningThenWaiting() {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: RUNNING_MSG } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: WAITING_MSG } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+  }
+
+  const OK_DISPATCH = { ok: true, op: "dispatch", risk: "routine", data: { id: "r1" } } as never;
+
+  it("calls dispatchResearchTask ONCE for the oldest waiter once it crosses the one-minute floor", async () => {
+    vi.useFakeTimers();
+    // Spy WITHOUT replacing: the real notice still stages, and we assert it was sent. Deleting the
+    // host's `notifyConcierge(autoDispatchNotice(...))` line (ConciergeHost.tsx:863) — the "and TELLS
+    // the concierge it did" half the feature's whole point rests on — must turn this row red.
+    const notifySpy = vi.spyOn(conciergeNotifierModule, "notifyConcierge");
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      vi.mocked(dispatchResearchTask).mockResolvedValue(OK_DISPATCH);
+      // The store HAS been read and NOTHING is running — the acute form of the condition, and the
+      // one the fail-closed `researchHydrated` gate would otherwise mask.
+      useResearchStore.setState({ byId: {}, hydrated: true } as never);
+      seedSelectedProject();
+      routeToAgent();
+      h.feed = feedWith("approval");
+      view = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+      await sendRunningThenWaiting();
+
+      // Not yet: B enqueued a moment ago, and the floor is a full minute.
+      expect(dispatchResearchTask).not.toHaveBeenCalled();
+
+      // Advance PAST SEVERAL eligible ticks (the 15s interval fires at 15/30/…/120s; B is eligible
+      // from 60s on, so five ticks see it eligible). One dispatch across five eligible ticks is what
+      // pins the host's OWN re-dispatch memory (`dispatched.add`, ConciergeHost.tsx:852): delete that
+      // line and this becomes five metered children a minute, which `toHaveBeenCalledTimes(1)` catches
+      // only because the window holds more than one eligible tick. A knife-edge 61_000 could not.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+
+      // THE SIDE EFFECT — the real dispatch, exactly once, for B's text, at quick depth, against the
+      // selected project's root; and the concierge is told, so it does not re-research the same thing.
+      expect(dispatchResearchTask).toHaveBeenCalledTimes(1);
+      const arg = vi.mocked(dispatchResearchTask).mock.calls[0]![0] as {
+        question: string;
+        projectId: string;
+        projectRoot: string;
+        depth: string;
+      };
+      expect(arg.question).toBe(WAITING_MSG);
+      expect(arg.projectId).toBe("p1");
+      expect(arg.projectRoot).toBe("/tmp/sparkle");
+      expect(arg.depth).toBe("quick");
+      const noticed = notifySpy.mock.calls.map((c) => String(c[0]));
+      expect(noticed.some((t) => t.includes("[sparkle-auto-dispatch]") && t.includes(WAITING_MSG))).toBe(
+        true,
+      );
+    } finally {
+      // Unmount UNDER the fake clock so the effect's `clearInterval` cancels the handle the fake clock
+      // minted; tearing down after `useRealTimers` would leave clearInterval resolving a foreign id.
+      view?.unmount();
+      vi.useRealTimers();
+      notifySpy.mockRestore();
+    }
+  });
+
+  it("does NOT dispatch (and sends no notice) when the queue is already served", async () => {
+    // The PAIRED NEGATIVE (bead sparkle-rvf6n): same queue, same crossed floor, but a live research
+    // agent already covers the single waiter. If the effect dispatched here it would be firing on the
+    // timer rather than on the condition — the "served" guard proven live, not just present.
+    vi.useFakeTimers();
+    const notifySpy = vi.spyOn(conciergeNotifierModule, "notifyConcierge");
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      vi.mocked(dispatchResearchTask).mockResolvedValue(OK_DISPATCH);
+      // liveTasks reads only `status`; one running task makes liveResearch (1) >= waiting (1).
+      useResearchStore.setState({ byId: { t1: { id: "t1", status: "running" } }, hydrated: true } as never);
+      seedSelectedProject();
+      routeToAgent();
+      h.feed = feedWith("approval");
+      view = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+      await sendRunningThenWaiting();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+
+      expect(dispatchResearchTask).not.toHaveBeenCalled();
+      // …and no auto-dispatch notice fabricated for a queue nobody needed to fan out.
+      const noticed = notifySpy.mock.calls.map((c) => String(c[0]));
+      expect(noticed.some((t) => t.includes("[sparkle-auto-dispatch]"))).toBe(false);
+    } finally {
+      view?.unmount();
+      vi.useRealTimers();
+      notifySpy.mockRestore();
+    }
   });
 });

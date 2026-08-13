@@ -19,6 +19,8 @@ import {
   dispatchResearch,
   getResearch,
   liveTasks,
+  recentTasks,
+  RECENT_RESEARCH_WINDOW_MS,
   markResearchRead,
   refreshResearch,
   sortedTasks,
@@ -297,5 +299,61 @@ describe("the store is a cache, not the truth", () => {
     expect(useResearchStore.getState().hydrated).toBe(false);
     useResearchStore.getState().replaceAll([]);
     expect(useResearchStore.getState().hydrated).toBe(true);
+  });
+});
+
+// ══ recentTasks — THE SELECTOR THAT MAKES `+0` READABLE ═════════════════════════════════════════
+//
+// `liveTasks` above is a GAUGE: it falls back to zero minutes after every burst, which is true and
+// unreadable. The founder read `Concierge Agents +0` off a store holding 28 dispatched tasks and
+// concluded the concierge never delegates. This selector answers the different question — *has it
+// been delegating at all* — and the two must not be conflated, so every test here is paired against
+// what `liveTasks` would have said.
+describe("recentTasks — has the concierge been delegating at all", () => {
+  const NOW = 1_800_000_000_000;
+  const HOUR = 60 * 60_000;
+  const at = (id: string, agoMs: number, status = "done") =>
+    ({ ...FIXTURE[0]!, id, status, createdAt: NOW - agoMs }) as (typeof FIXTURE)[number];
+
+  it("counts finished work that `liveTasks` cannot see — the whole point", () => {
+    const tasks = [at("a", HOUR), at("b", 2 * HOUR), at("c", 3 * HOUR)];
+    expect(liveTasks(tasks)).toHaveLength(0);
+    expect(recentTasks(tasks, NOW)).toHaveLength(3);
+  });
+
+  it("counts EVERY terminal status, because a failure is still a delegation", () => {
+    const tasks = [
+      at("a", HOUR, "done"),
+      at("b", HOUR, "failed"),
+      at("c", HOUR, "cancelled"),
+      at("d", HOUR, "running"),
+    ];
+    expect(recentTasks(tasks, NOW)).toHaveLength(4);
+  });
+
+  it("drops anything outside the window, and the boundary is real", () => {
+    expect(recentTasks([at("a", RECENT_RESEARCH_WINDOW_MS)], NOW)).toHaveLength(1);
+    expect(recentTasks([at("a", RECENT_RESEARCH_WINDOW_MS + 1)], NOW)).toHaveLength(0);
+  });
+
+  // FAIL CLOSED. `createdAt` comes off a JSON file, and `NOW - NaN <= window` is FALSE — so a naive
+  // comparison happens to exclude it, which is the safe direction here and is asserted rather than
+  // relied on. Inflating this number manufactures evidence of delegation that never happened, which
+  // is the one claim it must never make.
+  it("excludes a task whose dispatch time cannot be read", () => {
+    const broken = { ...FIXTURE[0]!, id: "x", createdAt: Number.NaN };
+    expect(recentTasks([broken], NOW)).toHaveLength(0);
+  });
+
+  it("is newest-first, like every other selector here", () => {
+    const out = recentTasks([at("old", 3 * HOUR), at("new", HOUR)], NOW);
+    expect(out.map((t) => t.id)).toEqual(["new", "old"]);
+  });
+
+  // THE VALUE, not just the boundary — a calendar day would reset the number at midnight while the
+  // founder is in the same working session, re-creating the false zero for a reason that has
+  // nothing to do with the concierge.
+  it("looks back twelve hours, not a calendar day", () => {
+    expect(RECENT_RESEARCH_WINDOW_MS).toBe(12 * 60 * 60_000);
   });
 });

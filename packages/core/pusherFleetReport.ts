@@ -279,18 +279,23 @@ export interface FleetReportInput {
    * The concierge's inbound queue, for the `queue-unfanned` condition — or `undefined` for WE DID
    * NOT LOOK.
    *
-   * OPTIONAL RATHER THAN REQUIRED-BUT-NULLABLE, which is a deliberate exception to the rule the two
-   * fields above state, and it is a staging decision rather than a change of mind. The producer is a
-   * persisted app-wide store that does not exist yet; making the field required would break every
-   * existing call site in a package that cannot see them. When the store lands, tighten this to
-   * `ConciergeQueue | undefined` so a caller that forgets it is a type error rather than a condition
-   * that can never fire — which is exactly the defect roborev 57323 made `duties` required to fix.
+   * ══ REQUIRED-BUT-NULLABLE SINCE 2026-08-13, AND THE OPTIONAL VERSION COST A WHOLE FEATURE ══════
+   * This was `queue?: ConciergeQueue`, with a note saying *"the producer is a persisted app-wide
+   * store that does not exist yet … when the store lands, tighten this to `ConciergeQueue |
+   * undefined` so a caller that forgets it is a type error rather than a condition that can never
+   * fire"*. The store landed. The tightening did not, because the branch that built the producer
+   * never opened a PR — and in that window the exact predicted failure occurred: `pusherRunner`
+   * spelled the key `conciergeQueue`, TypeScript accepted the object because this field was
+   * optional, and `queue-unfanned` was unreachable code for the producer's entire life. No type
+   * error, no failing test, no log line.
    *
-   * Until then, note what the optionality costs: an omission here is indistinguishable from an
-   * all-clear, so the seam is covered by a test that drives `decideFleetReport` with a real queue
-   * rather than by the evaluator's tests alone.
+   * So it is required now, and the requirement IS the guard: the sweep's decision input is annotated
+   * `FleetReportInput`, so misspelling this key is a compile error rather than a silent all-clear.
+   * A caller with nothing to report passes `undefined` — which says WE DID NOT LOOK, deliberately,
+   * exactly as `conflicts` above does — and that is a decision somebody wrote down rather than a
+   * field they forgot.
    */
-  queue?: ConciergeQueue;
+  queue: ConciergeQueue | undefined;
   memory: FleetMemory;
   /** The RECIPIENT's mailbox — the surface the report is delivered to, not any partner's. */
   inbox: InboxReading;

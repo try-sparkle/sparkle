@@ -14,7 +14,7 @@ import { SupportTicketRow } from "./SupportTicketRow";
 import { subtreeDomId } from "./subtreeDomId";
 import { SparkleAgentRow } from "./SparkleAgentRow";
 import { ConciergeAgentsRow, researchRollupStatuses } from "./ConciergeAgentsRow";
-import { liveTasks, useResearchStore } from "../services/research/store";
+import { liveTasks, recentTasks, useResearchStore } from "../services/research/store";
 import { AgentRow } from "./AgentRow";
 import { SidebarScrollContext, type SidebarScrollApi } from "./sidebarScrollContext";
 import { WorkerPeek } from "./WorkerPeek";
@@ -2434,6 +2434,15 @@ export function AgentSidebar({
   // `liveTasks` from the store, NOT a local filter — the badge and the disc read the same selector,
   // so they cannot come to disagree about what "running" means.
   const conciergeLive = useMemo(() => liveTasks(Object.values(researchById)), [researchById]);
+  // ── THE SECOND NUMBER: DISPATCHED RECENTLY, WHATEVER BECAME OF THEM ──────────────────────────
+  // Same posture as `conciergeLive` — the store's own selector, so the row cannot come to disagree
+  // with the store about what "recently" means. `Date.now()` is read at render rather than held in
+  // state on purpose: this re-renders on every `researchById` change (the row polls every 5s), so
+  // the window slides without a clock of its own, and a stale reading can only be seconds old.
+  const conciergeRecent = useMemo(
+    () => recentTasks(Object.values(researchById), Date.now()),
+    [researchById],
+  );
   const conciergeStatus: AgentTabStatus = "stopped";
   const conciergeRollup = rollupDot(conciergeStatus, researchRollupStatuses(conciergeLive));
   const conciergeRollupOverrides =
@@ -3270,6 +3279,7 @@ export function AgentSidebar({
             (conciergeRollup === "red" || conciergeRollup === "orange")
           }
           liveCount={conciergeLive.length}
+          recentCount={conciergeRecent.length}
           hydrated={researchHydrated}
           paneSide={pairSide}
           jointOpen={jointOpen}

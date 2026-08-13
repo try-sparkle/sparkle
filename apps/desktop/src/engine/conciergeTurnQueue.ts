@@ -50,6 +50,19 @@ export interface QueuedTurn {
   bubbleId: string;
   /** Exactly what the user typed. The prompt is built from this at dispatch, never at enqueue. */
   text: string;
+  /**
+   * When the user sent it, in epoch ms.
+   *
+   * STAMPED BY THE CALLER, not by `enqueue` — this module is pure and reads no clock (see the
+   * header), the same split `conciergeDelegation` and `nudge_ladder.rs` keep.
+   *
+   * REQUIRED, NOT OPTIONAL, and the whole reason this field exists is a bug caused by the opposite
+   * choice. The Pusher's `queue-unfanned` condition refuses to fire without an age
+   * (`pusherFleet.queueUnfanned`: "we cannot establish the age" is not "it is old"), so a producer
+   * that silently omits the timestamp does not degrade the report — it DELETES it, permanently and
+   * with nothing logged. Required makes forgetting a compile error instead.
+   */
+  enqueuedAt: number;
 }
 
 /**

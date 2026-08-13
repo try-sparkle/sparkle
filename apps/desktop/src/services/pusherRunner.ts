@@ -57,9 +57,11 @@ import {
   pruneRefutedFleetEvidence,
   pruneRefutedObservation,
   type ClaimVerdicts,
+  type ConciergeQueue,
   type ConflictingPr,
   type PusherClaim,
   type FleetMemory,
+  type FleetReportInput,
   type FleetSnapshot,
   type StandingDuty,
   type ObserveState,
@@ -126,6 +128,27 @@ export interface PusherRunnerDeps {
    * evidence, and an empty list would say "we checked, every PR is fine".
    */
   conflicts(): readonly ConflictingPr[] | undefined;
+  /**
+   * The concierge's own turn queue and how much of it has been fanned out — or `undefined` for
+   * NOBODY LOOKED.
+   *
+   * APP-GLOBAL, like `duties()` and `conflicts()` above, and for the sharpest reason of the three:
+   * the concierge is not an agent at all. `conciergeNotifier`'s header says so outright — a headless
+   * `claude -p` child with no row in the roster and no self — so there is no `projectId` to split
+   * this by and nothing in `FleetSnapshot` for it to hang off. It rides `dutyOwner` with the other
+   * two; see the assignment below for what threading an app-global input into every project costs.
+   *
+   * SYNCHRONOUS, exactly like its siblings: it reads `conciergeQueueStore`, which a mounted
+   * `ConciergeHost` publishes into on every queue movement.
+   *
+   * REQUIRED BUT NULLABLE, the shape `conflicts` already argues for: optional would let a caller
+   * who simply forgot compile into the same state as a window with no concierge mounted, and those
+   * are different facts. `undefined` here is the reading in a torn-off satellite, in a window with
+   * no project open, and in the seconds before the host's first effect — and it must never be
+   * coerced to an empty queue, which is the fail-OPEN answer at the door of a detector built to end
+   * a silence.
+   */
+  conciergeQueue(): ConciergeQueue | undefined;
   /**
    * RE-READ these facts NOW, at the moment we are about to speak about them.
    *
@@ -312,6 +335,12 @@ export async function sweepPushers(
   // `undefined` is passed through as `undefined`, never coerced to `[]`: the whole point of the
   // three-valued rule is that the sweep must be able to say "nothing has looked yet".
   const allConflicts = deps.conflicts();
+
+  // ...AND THE CONCIERGE'S QUEUE, read ONCE for the same reason: every project's report must
+  // describe the same moment. It is app-global in the strongest sense of the three — the concierge
+  // has no projectId and no roster row, so there is not even a nominal project to attribute it to —
+  // and it is passed through as `undefined` when nobody looked, never coerced.
+  const conciergeQueue = deps.conciergeQueue();
 
   // ...AND ASSIGNED TO EXACTLY ONE PROJECT (roborev 57400). A duty is APP-GLOBAL — the hourly pass
   // belongs to the app, not to a project — but the report loop below is per project, each with its
@@ -524,6 +553,18 @@ export async function sweepPushers(
         // fail-closed rule protects is about whether the PROBE ran, and it did; this project simply
         // is not the one that reports its result.
         projectId === dutyOwner ? allConflicts : [],
+        // THE SAME OWNER AGAIN — one election, not three. A second election is a second thing that
+        // can migrate, and every migration hands the condition to a project with a fresh
+        // two-observation counter and no cooldown, which is what makes a standing condition
+        // re-report forever (the argument `dutyOwner` above is built from).
+        //
+        // A NON-OWNER GETS `undefined`, NOT AN EMPTY QUEUE — the one place this differs from
+        // `conflicts` above, which hands a non-owner `[]` meaning "we looked, nothing for you".
+        // There is no empty-but-measured value here: `{ waiting: 0 }` is a positive claim that the
+        // concierge has nothing queued, which is precisely the false all-clear the three-valued rule
+        // exists to prevent. "Not this project's report" and "nobody looked" both correctly suppress
+        // the condition, so collapsing them onto `undefined` costs nothing and cannot mislead.
+        projectId === dutyOwner ? conciergeQueue : undefined,
       ),
     );
   }
@@ -557,6 +598,7 @@ async function reportFleet(
   partners: Map<string, PartnerMemory>,
   duties: readonly StandingDuty[],
   conflicts: readonly ConflictingPr[] | undefined,
+  conciergeQueue: ConciergeQueue | undefined,
 ): Promise<FleetMemory> {
   // NO RECIPIENT, NO REPORT — BUT THE SIGHTING STILL ADVANCES. This is rule 1 from `pusherDecide`'s
   // header applied to the report channel, and it is easy to get backwards: returning `memory`
@@ -566,8 +608,22 @@ async function reportFleet(
   //
   // The budget does not advance, because nothing was sent — but the cooldowns DO expire, which is
   // why this goes through `fleetObservationMemory` rather than spreading `lastConditions` by hand.
+  //
+  // ── AND THE CONCIERGE QUEUE *IS* THREADED INTO THIS EVALUATION, AND INTO THE WALLED ONE BELOW ──
+  // This comment said the opposite until 2026-08-13, on the grounds that `evaluateFleetConditions`
+  // "does not have a fifth positional argument yet". It has one now, so the argument that justified
+  // the omission is gone — and leaving it out would have re-created the defect this whole file was
+  // just fixed for, one level down: the two-observation counter for `queue-unfanned` would stop
+  // advancing on any sweep that took an early return, so the condition could never reach its second
+  // sighting and would be permanently silent with nothing failing.
+  //
+  // Both arms are believed unreachable for this input in production — `pusherMount.reportRecipient`
+  // returns `CONCIERGE_RECIPIENT_ID` unconditionally, and the wall check searches `everyone` (the
+  // agent roster) while the concierge has no roster row at all (`conciergeNotifier`'s header). That
+  // is a reason it costs nothing, not a reason to leave it out: "unreachable today" is exactly the
+  // assumption a later change to `reportRecipient` breaks without anything saying so.
   if (recipient === undefined) {
-    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties, conflicts));
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties, conflicts, conciergeQueue));
   }
 
   // A QUOTA-WALLED RECIPIENT CANNOT READ THE REPORT EITHER, and the argument is verbatim the one the
@@ -584,7 +640,7 @@ async function reportFleet(
       reason: "recipient-quota-blocked",
       scope: "fleet",
     });
-    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties, conflicts));
+    return fleetObservationMemory(memory, evaluateFleetConditions(owned, now, duties, conflicts, conciergeQueue));
   }
 
   const used = usage.get(recipient);
@@ -615,11 +671,28 @@ async function reportFleet(
     ],
   };
 
-  const decisionInput = {
+  // ANNOTATED, NOT INFERRED — and the annotation is the whole guard. An unannotated literal is
+  // checked only where it is USED, so `conciergeQueue` sat on it as an excess property nobody
+  // rejected and the reading was dropped in silence. Typed as `FleetReportInput`, a misspelled or
+  // missing key is a compile error at THIS line, which is where the mistake is made.
+  const decisionInput: FleetReportInput = {
     policy: deps.policy(),
     snapshots: owned as readonly FleetSnapshot[],
     duties,
     conflicts,
+    // THE APP-GLOBAL QUEUE INPUT, under the key `FleetReportInput` ACTUALLY READS.
+    //
+    // This said `conciergeQueue` until 2026-08-13, with a comment calling that safe — *"an extra key
+    // on a structurally-typed input is inert until `FleetReportInput` names it"*. It was inert, and
+    // that was the bug, not the safety property: the reading was dropped on the floor,
+    // `decideFleetReport` destructured `queue` as `undefined`, and `queue-unfanned` remained
+    // unreachable code for the entire life of the producer written to feed it. Nothing failed —
+    // no type error, no test, no log line. Renaming a key here silently disconnects the condition
+    // again, which is why `pusherRunner.conciergeQueue.test.ts` now drives the REAL
+    // `decideFleetReport` and asserts the condition comes OUT, rather than asserting what went in.
+    //
+    // Already narrowed to the duty owner by the caller — a non-owner is handed `undefined`.
+    queue: conciergeQueue,
     memory: { ...memory, budget: shared },
     inbox,
     now,

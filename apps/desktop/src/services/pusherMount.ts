@@ -59,7 +59,13 @@ import { startBabysitDispatcher } from "./babysitDispatcher";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
-import { buildFleetSnapshots, buildStandingDuties, sessionEndedOf } from "./pusherSnapshots";
+import {
+  buildConciergeQueue,
+  buildFleetSnapshots,
+  buildStandingDuties,
+  sessionEndedOf,
+} from "./pusherSnapshots";
+import { refreshResearch } from "./research/store";
 import { cachedReceipt, loadRetroReceipts } from "./retroReceipts";
 import { retroSettled } from "../engine/retroReceiptTypes";
 import { startPusherRunner, type PusherLogEntry, type PusherRunnerDeps } from "./pusherRunner";
@@ -243,6 +249,18 @@ export function buildPusherDeps(): PusherRunnerDeps {
       // `loadRetroReceipts` swallows its own errors and REPLACES one project's map, so a failed or
       // slow load cannot corrupt another project's entry.
       for (const p of projects) void loadRetroReceipts(p.id);
+      // ...AND WARM THE RESEARCH CACHE, for the same reason and with the same fire-and-forget
+      // contract. `buildConciergeQueue` counts CONCIERGE AGENTS off `useResearchStore`, and the only
+      // thing that refreshes that store today is a component effect — `ConciergeAgentsRow`'s poll,
+      // which is mounted in exactly one sidebar per window (`showConciergeRow`). So in any window
+      // where that row is not rendered, the store never hydrates: `hydrated` stays false and the
+      // count is honestly withheld, which means the condition can never fire there. That is the
+      // fail-closed direction rather than a false alarm, and it is still the feature not working.
+      //
+      // One directory read per sweep, deduplicated against a concurrent poll by `refreshResearch`'s
+      // own generation counter, and it swallows its own errors — so a failed read leaves the count
+      // withheld rather than reporting zero agents.
+      void refreshResearch();
       return buildFleetSnapshots({
         projects,
         branchStatus: useRuntimeStore.getState().branchStatus,
@@ -271,6 +289,12 @@ export function buildPusherDeps(): PusherRunnerDeps {
     // which is the honest reading on a build whose Rust side has no `conflict_flags` command at all.
     // `conflictFlags.ts` is the only writer, and it never writes an empty list it did not receive.
     conflicts: () => useConflictStore.getState().flags,
+    // THE CONCIERGE'S OWN BACKLOG, read the same way and with the same three-valued rule. The
+    // assembly lives in the adapter rather than inline here because the `hydrated` gate it applies
+    // is a JUDGEMENT about what may be reported, and a judgement made at a wiring site is one no
+    // unit test can reach — the mistake this file's own `quotaFor` binding is the standing example
+    // of. `undefined` means no concierge is mounted in this window.
+    conciergeQueue: buildConciergeQueue,
     // THE ASK RIDES THE CHALLENGE. `decidePusherAction` has already measured why this partner is
     // being spoken to; appending `BLOCKER_ASK` turns a statement into a question whose answer is
     // machine-readable, which is what closes the loop — otherwise the challenge lands, the agent

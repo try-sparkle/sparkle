@@ -23,6 +23,16 @@ import { enqueue, EMPTY_TURN_QUEUE, turnFinished } from "../engine/conciergeTurn
 import { conciergeActivityLine } from "../engine/conciergeActivityLine";
 
 /** The counter as it stands now — what the host snapshots as the turn floor. */
+/**
+ * A fixed enqueue instant for every `QueuedTurn` this file builds.
+ *
+ * The field is REQUIRED on `QueuedTurn` (see `engine/conciergeTurnQueue`), and nothing in this
+ * suite depends on the value — these tests are about which bubble reads "working" versus "3rd in
+ * line", not about how long anything has waited. A constant says that plainly; a `Date.now()` here
+ * would suggest the assertions turn on the clock, which they do not.
+ */
+const TURN_T0 = 1_700_000_000_000;
+
 const seqNow = () => useConciergeActivityStore.getState().latest?.seq ?? -1;
 
 beforeEach(() => {
@@ -181,9 +191,9 @@ describe("useConciergeMessageStatuses", () => {
     const floor = seqNow();
     noteConciergeSent();
     noteConciergeNativeToolCall("Grep", '{"pattern":"x"}');
-    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first" }).next;
-    q = enqueue(q, { bubbleId: "msg-2", text: "second" }).next;
-    q = enqueue(q, { bubbleId: "msg-3", text: "third" }).next;
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first", enqueuedAt: TURN_T0 }).next;
+    q = enqueue(q, { bubbleId: "msg-2", text: "second", enqueuedAt: TURN_T0 }).next;
+    q = enqueue(q, { bubbleId: "msg-3", text: "third", enqueuedAt: TURN_T0 }).next;
 
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor, q));
     // The one being worked on gets the observed tool line…
@@ -199,8 +209,8 @@ describe("useConciergeMessageStatuses", () => {
   it("still marks waiters when the running turn has produced no activity yet", () => {
     const floor = seqNow();
     noteConciergeSent();
-    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first" }).next;
-    q = enqueue(q, { bubbleId: "msg-2", text: "second" }).next;
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "first", enqueuedAt: TURN_T0 }).next;
+    q = enqueue(q, { bubbleId: "msg-2", text: "second", enqueuedAt: TURN_T0 }).next;
     const { result } = renderHook(() => useConciergeMessageStatuses("msg-1", true, floor, q));
     expect(result.current["msg-2"]).toEqual({ text: "Next up" });
   });
@@ -224,8 +234,8 @@ describe("useConciergeMessageStatuses", () => {
   it("tells each waiter its own place in the queue, so twenty lines are not identical", () => {
     const floor = seqNow();
     noteConciergeSent();
-    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running" }).next;
-    for (let n = 1; n <= 20; n += 1) q = enqueue(q, { bubbleId: `w${n}`, text: `q${n}` }).next;
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running", enqueuedAt: TURN_T0 }).next;
+    for (let n = 1; n <= 20; n += 1) q = enqueue(q, { bubbleId: `w${n}`, text: `q${n}`, enqueuedAt: TURN_T0 }).next;
 
     const { result } = renderHook(() => useConciergeMessageStatuses("run", true, floor, q));
     const lines = Array.from({ length: 20 }, (_, i) => result.current[`w${i + 1}`]!.text);
@@ -251,9 +261,9 @@ describe("useConciergeMessageStatuses", () => {
   it("promotes the next waiter on the SAME hook instance when the running turn finishes", () => {
     const floor = seqNow();
     noteConciergeSent();
-    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running" }).next;
-    q = enqueue(q, { bubbleId: "a", text: "a" }).next;
-    q = enqueue(q, { bubbleId: "b", text: "b" }).next;
+    let q = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running", enqueuedAt: TURN_T0 }).next;
+    q = enqueue(q, { bubbleId: "a", text: "a", enqueuedAt: TURN_T0 }).next;
+    q = enqueue(q, { bubbleId: "b", text: "b", enqueuedAt: TURN_T0 }).next;
 
     const { result, rerender } = renderHook(
       ({ queue, id }) => useConciergeMessageStatuses(id, true, floor, queue),
@@ -290,8 +300,8 @@ describe("useConciergeMessageStatuses", () => {
   it("shows a newly enqueued message while the SAME turn keeps running", () => {
     const floor = seqNow();
     noteConciergeSent();
-    const running = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running" }).next;
-    const withA = enqueue(running, { bubbleId: "a", text: "a" }).next;
+    const running = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "run", text: "running", enqueuedAt: TURN_T0 }).next;
+    const withA = enqueue(running, { bubbleId: "a", text: "a", enqueuedAt: TURN_T0 }).next;
 
     const { result, rerender } = renderHook(
       ({ queue }) => useConciergeMessageStatuses("run", true, floor, queue),
@@ -302,7 +312,7 @@ describe("useConciergeMessageStatuses", () => {
 
     // A third message arrives. Nothing else about the turn has changed — same running bubble, same
     // floor, same activity — so only the queue can carry this.
-    rerender({ queue: enqueue(withA, { bubbleId: "b", text: "b" }).next });
+    rerender({ queue: enqueue(withA, { bubbleId: "b", text: "b", enqueuedAt: TURN_T0 }).next });
     expect(result.current["a"]).toEqual({ text: "Next up" });
     expect(result.current["b"]).toEqual({ text: "2nd in line" });
   });
@@ -365,8 +375,8 @@ describe("the tool domain travels with the line", () => {
     noteConciergeSent();
     noteConciergePhase("composing");
     // Two sends: the first becomes `running`, so the second is the one that actually WAITS.
-    let queue = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "now" }).next;
-    queue = enqueue(queue, { bubbleId: "msg-2", text: "later" }).next;
+    let queue = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "msg-1", text: "now", enqueuedAt: TURN_T0 }).next;
+    queue = enqueue(queue, { bubbleId: "msg-2", text: "later", enqueuedAt: TURN_T0 }).next;
     const { result } = renderHook(() =>
       useConciergeMessageStatuses("msg-1", true, floor, queue),
     );

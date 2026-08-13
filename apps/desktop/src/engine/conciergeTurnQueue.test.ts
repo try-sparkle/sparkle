@@ -13,7 +13,17 @@ import {
   waitingCount,
 } from "./conciergeTurnQueue";
 
-const msg = (n: number) => ({ bubbleId: `u${n}`, text: `question ${n}` });
+/**
+ * `enqueuedAt` RISES WITH `n`, so send order and clock order agree. Several assertions here turn on
+ * which entry is the OLDEST — the cap evicts from the front, `turnFinished` shifts from the front,
+ * and `queueDepthOf` reads `waiting[0].enqueuedAt` as the queue's age — and a constant timestamp
+ * would make all of those pass whatever order the array was actually in.
+ */
+const msg = (n: number) => ({
+  bubbleId: `u${n}`,
+  text: `question ${n}`,
+  enqueuedAt: 1_700_000_000_000 + n * 1_000,
+});
 
 describe("enqueue", () => {
   it("dispatches immediately when nothing is running", () => {

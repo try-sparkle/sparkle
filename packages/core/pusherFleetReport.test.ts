@@ -77,6 +77,9 @@ function decide(over: Partial<FleetReportInput> = {}): FleetReportDecision {
     memory: emptyFleetMemory(),
     duties: [],
     conflicts: undefined,
+    // EXPLICIT `undefined` — WE DID NOT LOOK. Required-but-nullable since 2026-08-13: an omitted
+    // key here was what let `pusherRunner` misspell it and silently drop the reading.
+    queue: undefined,
     inbox: { used: 0, capacity: 50 },
     now: T0,
     ...over,

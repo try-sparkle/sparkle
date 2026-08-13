@@ -135,6 +135,48 @@ export function liveTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
 }
 
 /**
+ * How far back "recently" reaches for the row's second number.
+ *
+ * TWELVE HOURS, not a calendar day. A calendar boundary makes the number reset at midnight while the
+ * founder is still in the same working session — the reading would drop to zero for a reason that has
+ * nothing to do with the concierge's behaviour, which is the exact misreading the second number
+ * exists to prevent.
+ */
+export const RECENT_RESEARCH_WINDOW_MS = 12 * 60 * 60_000;
+
+/**
+ * Tasks dispatched inside {@link RECENT_RESEARCH_WINDOW_MS} — the row's `· N recently`.
+ *
+ * ══ WHY A LIVE GAUGE ALONE WAS NOT ENOUGH ══════════════════════════════════════════════════════
+ * `liveTasks` counts only `queued` + `running`, so it falls back to zero minutes after each burst
+ * finishes. That is a TRUE reading and a misleading display: the founder looked at `Concierge Agents
+ * +0` and concluded the concierge never delegates, when the store held 28 dispatched tasks and the
+ * most recent burst had simply completed. Two very different situations — "delegating, just
+ * finished" and "has never once delegated" — rendered identically, and the whole complaint was
+ * about telling them apart.
+ *
+ * COUNTS EVERY STATUS, deliberately: `done`, `failed` and `cancelled` all count, because the
+ * question this number answers is *did the concierge delegate*, not *did the research succeed*. A
+ * failed pass is still a delegation, and hiding it would restate the same false zero in a narrower
+ * window.
+ *
+ * NOT `visibleTasks`. A retired task is one the concierge has been TOLD about — the most complete
+ * kind of delegation there is — and dropping it here would make the number fall as work finished
+ * properly, which is precisely backwards.
+ */
+export function recentTasks(
+  tasks: readonly ResearchTask[],
+  now: number,
+  windowMs: number = RECENT_RESEARCH_WINDOW_MS,
+): ResearchTask[] {
+  // `createdAt` is read off a JSON file, so a corrupt or absent value arrives as a non-number and
+  // `now - NaN < window` is false — which excludes it rather than inflating the count. Stated
+  // because the fail-open direction here would manufacture evidence of delegation that never
+  // happened, which is the one claim this number must never make.
+  return sortedTasks(tasks.filter((t) => Number.isFinite(t.createdAt) && now - t.createdAt <= windowMs));
+}
+
+/**
  * What the "Concierge Agents" row actually RENDERS — everything except the retired.
  *
  * The row used to render `sortedTasks(Object.values(byId))`: every task the store had ever seen,

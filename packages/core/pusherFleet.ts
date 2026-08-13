@@ -306,13 +306,20 @@ export interface ConciergeQueue {
  * to prevent, and it would be self-defeating here: the founder's case is a queue standing for a long
  * time, and a channel that also fires on the two-second case is one he stops reading.
  *
- * ── WHY THREE MINUTES ────────────────────────────────────────────────────────────────────────────
- * Long enough that a fan-out which is merely IN PROGRESS has finished — spawning a concierge agent
- * and handing it a message is seconds, not minutes — and short enough that the founder is told while
- * he is still looking at the screen where he noticed it. It is deliberately not the four-hour
- * cooldown's order of magnitude: this class is about something that should have happened already.
+ * ── WHY ONE MINUTE ───────────────────────────────────────────────────────────────────────────────
+ * Long enough that a fan-out which is merely IN PROGRESS has finished — dispatching a research agent
+ * returns in seconds (`research.rs` returns before the child completes, and the task is `queued`
+ * from that instant) — and short enough that the founder is told while he is still looking at the
+ * screen where he noticed it. It is deliberately not the four-hour cooldown's order of magnitude:
+ * this class is about something that should have happened already.
+ *
+ * THIS WAS THREE MINUTES until 2026-08-13. The founder cut it himself: *"I don't want it to be a
+ * three-minute wait. Let's make it more than a one-minute wait."* Three minutes of watching your own
+ * message sit still is already the complaint; a channel that waits out the whole of it before
+ * speaking is reporting history rather than preventing anything. One minute still clears the
+ * healthy path — see the dispatch timing above — so the noise argument the floor exists for holds.
  */
-export const QUEUE_UNFANNED_MIN_AGE_MS = 3 * 60_000;
+export const QUEUE_UNFANNED_MIN_AGE_MS = 60_000;
 
 /**
  * The depths at which a queue counts as materially DEEPER than it was.
@@ -735,9 +742,19 @@ export function overdueDuties(
  *   • WE LOOKED. `undefined` in means `undefined` out — see {@link ConciergeQueue}'s header.
  *   • SOMETHING IS WAITING. A looked-at empty queue is an all-clear, and saying so is the point of
  *     distinguishing it from the case above.
- *   • NOTHING IS RUNNING. `liveAgents` must be zero. This is the claim the class exists to make: a
- *     queue with a concierge working it is a backlog being served, and reporting it would spend the
- *     founder's attention on the healthy path.
+ *   • THERE ARE FEWER AGENTS THAN MESSAGES. `liveAgents` must be strictly BELOW `queued`. This is
+ *     the claim the class exists to make, and the founder tightened it on 2026-08-13 from the
+ *     original "`liveAgents` must be zero": *"let's not make it if live research is zero. Let's
+ *     just make it if live research is lower than the queue depth."* One agent running against six
+ *     waiting messages is not a backlog being served — five of those messages still have nobody
+ *     coming for them, and the zero-test called that healthy. A queue with an agent per message IS
+ *     being served, and reporting it would spend the founder's attention on the healthy path.
+ *
+ *     Note this stays satisfiable even though `MAX_CONCURRENT_RESEARCH` is 2: a dispatched task is
+ *     `queued` before it is `running` and BOTH count as live (services/research/types.ts `isLive`),
+ *     so dispatching six lifts `liveAgents` to six immediately and the condition clears. It would
+ *     NOT clear if the count were of running children only — that version of this rule can never be
+ *     satisfied past a depth of two, and would report an abandoned queue forever.
  *   • IT HAS BEEN THAT WAY A WHILE. See {@link QUEUE_UNFANNED_MIN_AGE_MS}. An unrecorded `oldestAt`
  *     fails this, because "we cannot establish the age" is not "it is old" — the same fail-closed
  *     reading `overdueDuties` gives an unseeded `lastRunAt`.
@@ -750,15 +767,15 @@ export function overdueDuties(
  * ── AND NON-FINITE READINGS ARE REJECTED BEFORE THE CLAMPS, NOT BY THEM ─────────────────────────
  * A clamp defends against a number that is WRONG. `NaN` is not a number that is wrong, it is not a
  * number, and it walks through every guard here: `Math.trunc(NaN)` is `NaN`, so `=== 0` is false and
- * `> 0` is false — both admit — and `NaN < QUEUE_UNFANNED_MIN_AGE_MS` is false, so the staleness
- * floor is SKIPPED rather than enforced. `undefined` reaches the same place by a different road:
+ * `NaN >= queued` is false — both admit — and `NaN < QUEUE_UNFANNED_MIN_AGE_MS` is false, so the
+ * staleness floor is SKIPPED rather than enforced. `undefined` reaches the same place by a different road:
  * `=== null` does not catch an absent field, and `now - undefined` is `NaN`.
  *
  * That is not a theoretical hardening. This shape crosses a hydration boundary from a persisted JSON
  * store, where TypeScript enforces nothing — a payload written before `oldestAt` existed arrives as
  * `undefined`, not as the `null` the type promises. And failing open manufactures the one claim this
- * class must never make: `liveAgents: NaN` passes the "nothing is running" test, so a queue that IS
- * being served gets reported as abandoned. The delivered sentence is no defence either — `numbersIn`
+ * class must never make: `liveAgents: NaN` passes the "fewer agents than messages" test, so a queue
+ * that IS being served gets reported as abandoned. The delivered sentence is no defence either — `numbersIn`
  * finds no digits in "NaN", so "waiting NaNh NaNm" is perfectly citable and would be sent.
  */
 export function queueUnfanned(
@@ -769,7 +786,7 @@ export function queueUnfanned(
   if (!Number.isFinite(queue.queued) || !Number.isFinite(queue.liveAgents)) return undefined;
   const queued = Math.max(0, Math.trunc(queue.queued));
   const liveAgents = Math.max(0, Math.trunc(queue.liveAgents));
-  if (queued === 0 || liveAgents > 0) return undefined;
+  if (queued === 0 || liveAgents >= queued) return undefined;
   // `== null` on purpose, and it is the one place in this file that loose equality earns its keep:
   // it catches the `undefined` an older store payload sends as well as the `null` the type states.
   if (queue.oldestAt == null || !Number.isFinite(queue.oldestAt)) return undefined;
@@ -1060,13 +1077,37 @@ function queueCondition(reading: {
     // still has a fingerprint and is not failed open into repeating every sweep.
     members: ["concierge:queue", ...buckets],
     measured: [String(queued), String(liveAgents), String(h), String(m)],
+    // ══ THE REMEDY MUST NOT BE A WAY TO SILENCE THE ALARM (roborev 63598) ═══════════════════════
+    // This used to say the queue "does not drain itself while nothing is running: a queued message
+    // waits for a concierge agent to exist, so the depth only falls once one is started", and then
+    // told the reader to fan them out. Both halves were wrong in the same direction, and together
+    // they were worse than silence:
+    //
+    //   • MECHANICALLY FALSE. The concierge's turn queue advances on `turnFinished` and on nothing
+    //     else. Dispatching research does not dequeue a single message — it never has.
+    //   • SELF-DEFEATING UNDER THE NEW RULE. Fanning out raises `liveAgents` without lowering
+    //     `queued`, so following this instruction takes the reading to parity and CLEARS the
+    //     condition while every one of the queued messages is still unanswered. The one action the
+    //     text recommended was the one action that muted it without helping.
+    //
+    // That is the class AGENTS.md names: a remedy is an instruction the reader will follow, so it
+    // needs the same analysis as the code path it stands in for. The text now says what dispatching
+    // actually buys — the concierge answers from findings instead of reading serially, so turns end
+    // sooner and the queue drains at `turnFinished` — and says plainly that it is not a fix on its
+    // own, so a reader who takes the advice is not surprised when the depth does not move.
+    //
+    // NO NEW DIGITS. `citable` checks every number in this text against `measured`, and a
+    // `fabricated-citation` refusal is total — it mutes the WHOLE batched report, not this
+    // paragraph. So the prose below stays wordy rather than quantified on purpose.
     text:
       `${queued} ${plural} queued and ${liveAgents} concierge agents are running. The oldest has ` +
-      `been waiting ${h}h ${m}m. Nothing is errored and no goal is escalated — the messages are ` +
-      `simply stacking up with nothing to take them.\n` +
-      `The queue does not drain itself while nothing is running: a queued message waits for a ` +
-      `concierge agent to exist, so the depth only falls once one is started. Fan them out to ` +
-      `concierge agents rather than letting them stack up.`,
+      `been waiting ${h}h ${m}m. Nothing is errored and no goal is escalated — there are fewer ` +
+      `agents working than there are messages waiting.\n` +
+      `Dispatching research does NOT dequeue anything: the turn queue advances only as each turn ` +
+      `finishes. What it buys is that the concierge answers from findings instead of reading files ` +
+      `serially, so turns end sooner and the queue drains faster. Fan them out for that reason — ` +
+      `and note that doing so clears this alert by itself, because the agent count catches up with ` +
+      `the depth, so treat the alert going quiet as work started rather than as questions answered.`,
   };
 }
 

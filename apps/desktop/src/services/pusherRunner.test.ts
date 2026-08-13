@@ -50,6 +50,10 @@ function fakeDeps(over: Partial<PusherRunnerDeps> = {}) {
     reportRecipient: () => undefined,
     duties: () => [],
     conflicts: () => undefined,
+    // NO CONCIERGE MOUNTED — the neutral fixture for the app-global queue input, and the honest
+    // default: `undefined` is what a window with no `ConciergeHost` reads. Its own routing (one
+    // project per sweep, riding `dutyOwner`) is pinned in pusherRunner.conciergeQueue.test.ts.
+    conciergeQueue: () => undefined,
     // NOTHING IS READABLE BY DEFAULT, which is the neutral fixture: an empty map means every claim
     // reads as `unreadable`, so verification changes nothing and every existing case below still
     // measures what it was written to measure. The cases that exercise verification supply their own.

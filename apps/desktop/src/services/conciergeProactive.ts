@@ -71,6 +71,14 @@ export interface ProactiveStats {
   /** Turns actually started. */
   fired: number;
   skipped: Record<ProactiveSkipReason, number>;
+  /**
+   * Findings delivered on a turn THE USER STARTED — see {@link ProactiveScheduler.claimNotices}.
+   *
+   * Counted separately from `fired` and deliberately NOT charged to the hourly cap: that budget
+   * bounds interruptions, and a finding riding a turn the founder asked for interrupts nobody. A
+   * rising number here against a flat `fired` is the channel working as intended on a busy queue.
+   */
+  noticesRidden: number;
 }
 
 /** The edges: a clock, a timer, and the effect that actually spends money. */
@@ -152,6 +160,54 @@ export interface ProactiveScheduler {
    * `false` here is the caller's instruction to keep it owed and offer it again next sweep.
    */
   notify(text: string, kind?: NoticeKind): boolean;
+  /**
+   * What is owed right now, for a turn THE USER IS ABOUT TO START. CLAIMS NOTHING.
+   *
+   * ── WHY THIS SEAM HAD TO EXIST: THE CHANNEL IS SELF-DEFEATING WITHOUT IT ───────────────────────
+   * Two rules this module already holds, put side by side:
+   *
+   *   • {@link ProactiveDeps.startTurn} stands down for any user turn — in flight or merely
+   *     preparing. That is correct: the user owns the conversation.
+   *   • A NON-EMPTY CONCIERGE QUEUE MEANS A USER TURN IS ALWAYS IN FLIGHT. Not a coincidence —
+   *     `engine/conciergeTurnQueue.enqueue`'s own invariant: a send WAITS only when something is
+   *     already running, so `waiting > 0` implies a running turn, continuously, until it drains.
+   *
+   * So a finding about a stacked-up queue is declined for exactly as long as the finding is true.
+   * Worse than a delay: {@link notify} answers `true` (it really is owed), `conciergeNotifier` and
+   * `pusherMount.sendVerified` pass that through, and `pusherRunner` takes its `delivered` branch —
+   * spending one of four hourly slots and stamping the condition as reported for FOUR HOURS. The
+   * message arrives, if ever, about a backlog long since drained.
+   *
+   * Folding it into a turn that is GUARANTEED to run removes the contradiction without touching the
+   * stand-down, which is the rule that should not move. Same shape as `research/drain.peek`, and
+   * the same reason for the peek/claim split: a turn can be superseded, cancelled or killed after
+   * its prompt was built, and a finding claimed at build time would be gone with no residue.
+   *
+   * IDLE-SAFE: this arms nothing and spends nothing. It is called on every user turn, which on a
+   * busy queue is continuous — a version that re-armed would pump the very channel it relieves.
+   *
+   * RETURNS THE OWED OBJECTS, NOT THEIR TEXT, and the caller renders them with
+   * {@link buildNoticeSection}. Two reasons, both structural rather than stylistic: a
+   * {@link NoticeKind} is an INSTRUCTION whose preamble the reader needs (see `NOTICE_SHAPE`), so
+   * text alone would deliver a finding stripped of what to do about it; and {@link claimNotices}
+   * matches by OBJECT identity, so handing back strings would make two same-sentence notices of
+   * different kinds indistinguishable — delivering one would silently clear the other.
+   */
+  peekNotices(): readonly PendingNotice[];
+  /**
+   * The turn carrying `notices` INSTALLED. Clear them.
+   *
+   * Called once `invoke("concierge_turn")` has resolved a real turn id, beside
+   * `researchDrain.stage` — deliberately EARLIER than the drain's own claim, which waits for
+   * `concierge:done`. The two inputs differ in what a loss costs: a research finding exists once, on
+   * disk, and is unrecoverable if claimed against a turn that dies. A Pusher notice is RE-MEASURED
+   * every sweep and re-offered by an idempotent {@link notify}, so the worst case of claiming at
+   * install is that a condition which still holds is mentioned one turn later.
+   *
+   * Removes BY IDENTITY, never by truncation — the rule `settle`'s delivered branch already
+   * follows, so a finding that arrived while the turn was being built is still owed afterwards.
+   */
+  claimNotices(notices: readonly PendingNotice[]): void;
   /** Stop scheduling and drop any armed timer. */
   dispose(): void;
   stats(): ProactiveStats;
@@ -334,6 +390,28 @@ function renderNoticeKind(kind: NoticeKind, notices: readonly PendingNotice[]): 
   const body = notices.map((n) => `• ${n.text}`).join("\n");
   if (notices.length <= MAX_PENDING_NOTICES) return preamble + body;
   return preamble + overflow(notices.length) + body;
+}
+
+/**
+ * Put the owed findings in front of a prompt somebody else built — the USER-TURN seam.
+ *
+ * IDENTITY WHEN NOTHING IS OWED, which is `withResearchPreamble`'s contract restated for the same
+ * reason: `ConciergeHost.dispatchTurn` calls this unconditionally, so "nothing owed adds NOTHING to
+ * the prompt" has to be a property of this function rather than a discipline at the call site.
+ * Otherwise every ordinary turn carries an empty header, which teaches the brain the section is
+ * usually noise — and the one turn that matters gets skimmed.
+ *
+ * The section itself is {@link buildNoticeSection}'s, unchanged: every owed finding is named
+ * however many there are, and past the readability threshold the shape changes rather than the
+ * length. A second renderer here would be a second place for that rule to be forgotten.
+ *
+ * TAKES THE OWED OBJECTS, which is what makes that reuse possible — `buildNoticeSection` groups by
+ * {@link NoticeKind} and gives each group the preamble that says what to DO about it, and a list of
+ * bare strings has already thrown that away. See {@link ProactiveScheduler.peekNotices}.
+ */
+export function withNoticeSection(notices: readonly PendingNotice[], prompt: string): string {
+  const section = buildNoticeSection(notices);
+  return section === "" ? prompt : `${section}\n\n${prompt}`;
 }
 
 /** What a scheduler with no research drain wired sees: nothing unread, nothing to claim. Frozen
@@ -579,6 +657,7 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
   let disposed = false;
   const stats: ProactiveStats = {
     fired: 0,
+    noticesRidden: 0,
     skipped: {
       unchanged: 0,
       "same-surface": 0,
@@ -593,6 +672,40 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     if (timer !== null) {
       deps.clearTimer(timer);
       timer = null;
+    }
+  };
+
+  /**
+   * THE ONE WAY A NOTICE LEAVES `pendingNotices` — removal by identity, plus the flag that has to
+   * come down with it.
+   *
+   * Extracted so the two delivery paths cannot drift: a proactive turn reporting delivered
+   * (`settle`) and a USER turn that carried the finding (`claimNotices`). This file's own rule is
+   * that there is exactly one remover — see `pendingNotices`' doc, which records what happened the
+   * last time there were two: the sibling was `notify`'s `shift()`, and it destroyed the oldest
+   * owed finding with no record, no count and no retry while the caller was told it had landed.
+   * Two callers of ONE remover is not that; two removers would be.
+   *
+   * BY IDENTITY, never by truncating the list, so a finding that arrived while the turn was being
+   * built or was in flight is still owed afterwards.
+   *
+   * ...AND THE "SOMETHING IS OWED" FLAG COMES BACK DOWN WITH THEM (roborev 57705). `dropPending`
+   * deliberately keeps `pendingSince` alive while notices are owed, and nothing else lowers it —
+   * leaving the scheduler in the one state this file treats as impossible, owed-with-nothing-owed.
+   * The visible cost is not the pointless timer: it is `observe`'s `pendingSince ??=`, which keeps
+   * the STALE origin, so `dueAt` computes a coalescing deadline already in the past and the next
+   * genuine feed change fires with NO window at all. `counted` is reset with it, because those skip
+   * reasons were counted against a change that has now been delivered. The timer `dropPending` may
+   * already have armed goes too: `arm()` early-returns on a null `pendingSince` WITHOUT clearing,
+   * so lowering the flag alone would leave a live handle behind for the life of the window.
+   */
+  const clearOwed = (delivered: readonly PendingNotice[]) => {
+    const sent = new Set(delivered);
+    pendingNotices = pendingNotices.filter((n) => !sent.has(n));
+    if (pendingNotices.length === 0 && pendingFeed === null) {
+      pendingSince = null;
+      counted = new Set();
+      clearTimer();
     }
   };
 
@@ -697,37 +810,12 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
           baseline = digest;
           baselineSurfaced = surfaced;
         }
-        // THE ONLY PLACE NOTICES ARE CLEARED. Removed by identity rather than by truncating the
-        // list, so a notice that arrived while this turn was in flight is still owed afterwards.
-        // Identity is the OBJECT's now rather than the string's, which is strictly more precise:
-        // two notices of different kinds sharing one sentence are two entries, and delivering one
-        // of them can no longer clear the other.
-        const sent = new Set(notices);
-        pendingNotices = pendingNotices.filter((n) => !sent.has(n));
-        // ...AND THE "SOMETHING IS OWED" FLAG COMES BACK DOWN WITH THEM (roborev 57705).
-        //
-        // `dropPending` deliberately keeps `pendingSince` alive while notices are owed, and `fire`
-        // runs it BEFORE the transport reports back — so at that moment the notices are still owed
-        // and the flag is rightly held. Once they are delivered here, nothing else lowers it, and
-        // the scheduler is left in the one state this file treats as impossible: owed-with-nothing-
-        // owed.
-        //
-        // The visible cost is not the pointless timer. It is `observe`'s `pendingSince ??=`, which
-        // keeps the STALE origin, so `dueAt` computes a coalescing deadline already in the past and
-        // the next genuine feed change fires with NO window at all — turning a burst of roster ticks
-        // into several turns and spending the six-an-hour budget the window exists to protect.
-        //
-        // `counted` is reset with it: those skip reasons were counted against the change that has
-        // now been delivered, and carrying them forward would suppress the accounting for the next.
-        if (pendingNotices.length === 0 && pendingFeed === null) {
-          pendingSince = null;
-          counted = new Set();
-          // AND THE TIMER `dropPending` ALREADY ARMED HAS TO GO WITH IT. `arm()` below early-returns
-          // on a null `pendingSince` WITHOUT clearing, so lowering the flag alone would leave a live
-          // handle behind — it fires, `onTimer` bails, and the scheduler holds a timer per delivered
-          // notice for the life of the window. Cheap individually; unbounded over a long session.
-          clearTimer();
-        }
+        // THE NOTICES THIS TURN CARRIED ARE NOW DELIVERED. `clearOwed` is the single remover — it
+        // owns both the by-identity removal and the "something is owed" flag that has to come down
+        // with it (roborev 57705). `dropPending` keeps that flag alive while notices are owed, and
+        // `fire` runs it BEFORE the transport reports back, so at that moment the flag is rightly
+        // held; this is where it is released.
+        clearOwed(notices);
         firedAt.push(now);
         stats.fired++;
       } else {
@@ -909,10 +997,43 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
       pendingSince ??= deps.now();
       arm();
     },
+    /**
+     * See the interface for WHY this seam exists. Two properties, both cheap and both load-bearing:
+     * it claims nothing, and it arms nothing.
+     *
+     * A DISPOSED SCHEDULER OFFERS NOTHING, matching `notify`'s first answer: it will never build
+     * another prompt, so anything still owed to it reaches nobody. Handing findings to a host that
+     * is tearing down would let them be claimed against a turn nothing is left to observe.
+     */
+    peekNotices() {
+      if (disposed) return [];
+      return [...pendingNotices];
+    },
+
+    /** The turn carrying these installed — see the interface. One remover, shared with `settle`. */
+    claimNotices(notices) {
+      if (disposed || notices.length === 0) return;
+      const owed = new Set(pendingNotices);
+      // Count only what was ACTUALLY owed here. A claim naming something this scheduler never had
+      // (a stale prompt, a host that outlived a remount) must not inflate the tally — the number is
+      // read as "findings this channel got through", and an unowed claim delivered nothing.
+      const landed = notices.filter((n) => owed.has(n));
+      if (landed.length === 0) return;
+      clearOwed(landed);
+      // NOT `firedAt`, and NOT `stats.fired`. The hourly cap bounds INTERRUPTIONS; this turn is one
+      // the founder started himself, so charging it would rate-limit out a genuine push later for
+      // the sake of a message that cost him nothing.
+      stats.noticesRidden += landed.length;
+    },
+
     dispose() {
       disposed = true;
       dropPending();
     },
-    stats: () => ({ fired: stats.fired, skipped: { ...stats.skipped } }),
+    stats: () => ({
+      fired: stats.fired,
+      noticesRidden: stats.noticesRidden,
+      skipped: { ...stats.skipped },
+    }),
   };
 }

@@ -207,6 +207,14 @@ export interface Nudge {
   escalate: boolean;
   /** How many serial investigative calls provoked this. Quoted in the text and the badge. */
   serial: number;
+  /**
+   * How many delegations this episode has seen — usually 0, and NOT always.
+   *
+   * Carried on the decision rather than left for the caller to look up, so the badge and the log
+   * quote the same number the text does. The text used to hard-code a zero here; see
+   * {@link nudgeText}.
+   */
+  delegations: number;
 }
 
 export type Decision = { action: "none" } | { action: "nudge"; nudge: Nudge };
@@ -225,8 +233,20 @@ const NONE: Decision = { action: "none" };
  * The text names the RIGHT tool. The guideline this replaces named `Agent`, which the concierge
  * cannot call — see this file's header.
  */
-export function nudgeText(rung: number, serial: number): string {
-  const count = `${serial} investigative tool call${serial === 1 ? "" : "s"} and 0 delegations`;
+export function nudgeText(rung: number, serial: number, delegations = 0): string {
+  // ══ THE DELEGATION COUNT IS READ, NOT ASSUMED ZERO ══════════════════════════════════════════════
+  // This said a literal `0 delegations`, and the literal was reachable-and-wrong rather than merely
+  // redundant: a dispatch resets `serial` and `rung` but NOT `delegations`, so a concierge that
+  // delegated once and then ground through six more reads got told it was "6 investigative tool
+  // calls and 0 delegations into this turn" — a false statement, in the one channel whose whole job
+  // is to be believed about this. A model that can see its own transcript reads a message that
+  // contradicts it and has every reason to discount the next one.
+  //
+  // It also mattered for the founder's complaint: "concierge agents stuck at zero" was a claim the
+  // app was making in two places at once, and exactly one of them (the sidebar row) was true.
+  const count =
+    `${serial} investigative tool call${serial === 1 ? "" : "s"} and ` +
+    `${delegations} delegation${delegations === 1 ? "" : "s"}`;
   if (rung <= 1) {
     return (
       `[sparkle-delegation #1] You are ${count} into this turn. ` +
@@ -241,9 +261,20 @@ export function nudgeText(rung: number, serial: number): string {
       `Do not send another Read/Grep/terminal call until you have.`
     );
   }
+  // ══ RUNG 3 NO LONGER CLAIMS SOMETHING NOTHING DOES ═════════════════════════════════════════════
+  // This said "This has now been raised to the founder." Nothing raised it: `Nudge.escalate` had no
+  // production reader anywhere, so the sentence was false every time it was sent — and it is exactly
+  // the class AGENTS.md names, a remedy string that describes a path the code does not take. A model
+  // that acts on it reasonably concludes the human is already looking and stops trying to fix it.
+  //
+  // What IS true at rung 3 is stated instead, and it is stronger than the escalation would have
+  // been: past this rung the ladder stops nudging (`MAX_RUNG`), and `engine/conciergeAutoDispatch`
+  // has begun dispatching the queued messages itself. Naming that is also the honest warning — the
+  // work is being taken over, which is what the founder asked for when asking stopped working.
   return (
-    `[sparkle-delegation #3] ${count}. This has now been raised to the founder. ` +
-    `Delegate the remaining work immediately and answer with what you already have.`
+    `[sparkle-delegation #3] ${count}. This is the last nudge — Sparkle is now dispatching your ` +
+    `queued messages to research agents itself. Delegate the remaining work immediately and ` +
+    `answer with what you already have.`
   );
 }
 
@@ -304,7 +335,15 @@ export function noteToolCall(
     state: { ...carried, serial, sinceNudge: 0, rung },
     decision: {
       action: "nudge",
-      nudge: { rung, text: nudgeText(rung, serial), escalate: rung >= MAX_RUNG, serial },
+      nudge: {
+        rung,
+        // `carried.delegations` — the count this episode has actually seen. Passing it is the whole
+        // fix; the default parameter exists only so the pure function stays callable in isolation.
+        text: nudgeText(rung, serial, carried.delegations),
+        escalate: rung >= MAX_RUNG,
+        serial,
+        delegations: carried.delegations,
+      },
     },
   };
 }

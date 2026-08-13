@@ -187,6 +187,9 @@ import {
   createProactiveScheduler,
   markStaleProactive,
   surfacedDigest,
+  // The USER-TURN half of the Pusher's delivery — see the fold in `dispatchTurn`, and that
+  // function's own header for why the proactive half cannot carry these findings on its own.
+  withNoticeSection,
 } from "../services/conciergeProactive";
 import {
   setConciergeNotifier,
@@ -199,6 +202,24 @@ import {
   noteToolCall as noteDelegationToolCall,
   type DelegationState,
 } from "../engine/conciergeDelegation";
+// THE ENFORCEMENT HALF. `conciergeDelegation` above ASKS the concierge to delegate and cannot
+// interrupt the turn it is asking about; this DOES the delegation when the queue outruns the agents
+// working it. See `engine/conciergeAutoDispatch`'s header for why four rounds of asking came first.
+import {
+  AUTO_DISPATCH_TICK_MS,
+  autoDispatchNotice,
+  decideAutoDispatch,
+} from "../engine/conciergeAutoDispatch";
+import { liveTasks } from "../services/research/store";
+import { dispatchResearchTask } from "../services/conciergeTools/research";
+// THE APP-WIDE SEAM FOR THE TURN QUEUE'S DEPTH. Read by `services/pusherSnapshots` from a
+// background sweep that has no component to ask — see that store's header, and the publisher effect
+// below, for why a `useState` pair could never have satisfied the condition that reads it.
+import {
+  clearConciergeQueue,
+  publishConciergeQueue,
+  queueDepthOf,
+} from "../stores/conciergeQueueStore";
 import {
   agentCanAcceptPrompt,
   dispatchConciergeAnswer,
@@ -675,6 +696,15 @@ export function ConciergeHost({
    *  folded from the live tool stream on every `concierge:tool` event and must never re-render. */
   const delegationRef = useRef<DelegationState>(initialDelegationState());
   const [turnQueue, setTurnQueue] = useState<TurnQueueState>(EMPTY_TURN_QUEUE);
+  /**
+   * THIS host instance's identity, for the app-wide depth store below.
+   *
+   * An opaque token rather than an id, because identity is the only question being asked: two host
+   * instances briefly coexist across a remount and nothing tells them apart by value. Same shape,
+   * and same reason, as the `notify` closure `setConciergeNotifier`/`clearConciergeNotifier` are
+   * keyed on.
+   */
+  const queueOwnerRef = useRef<object>({});
   /** `dispatchTurn` through a ref: the send path calls it above its definition, and the turn-ended
    *  handlers call it from effects that must not re-subscribe when it changes identity. */
   const dispatchTurnRef = useRef<(entry: QueuedTurn) => void>(() => {});
@@ -714,6 +744,142 @@ export function ConciergeHost({
     turnQueueRef.current = outcome.next;
     setTurnQueue(outcome.next);
     if (outcome.dispatch) dispatchTurnRef.current(outcome.dispatch);
+  }, []);
+
+  // ══ PUBLISH THE DEPTH SO SOMETHING OUTSIDE THIS COMPONENT CAN SEE IT ═════════════════════════
+  //
+  // The founder, watching six messages stack up with no concierge agent running: *"I want the
+  // watcher to be watching whether there are any queued messages and when there are I want the
+  // pusher to be pushing you to send them to concierge agents instead of letting them stack up."*
+  //
+  // Nothing could watch it. The queue lived entirely in the `useRef`/`useState` pair above and
+  // crossed no module boundary, while the Pusher's sweep is a 60-second `setInterval` reading
+  // stores SYNCHRONOUSLY, with no component to ask. `stores/conciergeQueueStore`'s header states
+  // the invariant this satisfies: a fleet condition fires if and only if its evidence lives in a
+  // persisted, app-wide store — which is exactly why `goals-escalated` fires off `projectStore` and
+  // `quota-blocked` never fires off a per-window engine registry.
+  //
+  // ── ONE PUBLISHER, KEYED ON THE MIRRORED STATE ──────────────────────────────────────────────────
+  // Deliberately NOT a call at each of the four sites that move the queue (`drainQueue` above, the
+  // enqueue in `askSparkle`, and the two `clearQueue`s). Every one of them writes `setTurnQueue`,
+  // so keying on it covers all four by construction — and covers the fifth somebody adds later,
+  // which a list of call sites does not. The published value is `queueDepthOf`'s, never a count
+  // taken here: a second derivation is how the store comes to disagree with the per-message status
+  // the founder is looking at.
+  //
+  // Being one render late costs nothing at a 60-second sweep, and the alternative — publishing from
+  // the ref at each mutation — is what makes the two able to drift.
+  useEffect(() => {
+    publishConciergeQueue(queueOwnerRef.current, queueDepthOf(turnQueue));
+  }, [turnQueue]);
+
+  // ...AND RETIRE IT ON THE WAY OUT, IDENTITY-CHECKED — the same rule, and the same reason, as
+  // `clearConciergeNotifier` beside it. Nothing else writes this store, so a host that is torn down
+  // without clearing leaves its last reading standing for the life of the window: every later sweep
+  // reports a backlog belonging to a concierge that no longer exists, with nothing alive to correct
+  // it. The identity check is what stops the OUTGOING instance's cleanup — which React runs AFTER
+  // the incoming instance has already mounted and published — from wiping its replacement's reading.
+  //
+  // A SEPARATE, MOUNT-ONCE EFFECT rather than a cleanup on the publisher above: a cleanup there
+  // would clear and re-publish on every queue movement, which is a window in which the store reads
+  // "nobody looked" while a host is very much mounted.
+  useEffect(() => {
+    const owner = queueOwnerRef.current;
+    return () => clearConciergeQueue(owner);
+  }, []);
+
+  // ══ AND WHEN THE QUEUE OUTRUNS THE AGENTS, DISPATCH ONE OURSELVES (bead `sparkle-6vool`) ═══════
+  //
+  // The publisher above is what lets the Pusher SAY something about a stacked queue. This is what
+  // ACTS on it, and the founder asked for the second because four rounds of the first changed
+  // nothing: *"It keeps forgetting that it can do this and so my requests stack up."*
+  //
+  // ── WHY THE LOOP LIVES HERE AND NOT IN THE PUSHER SWEEP ────────────────────────────────────────
+  // The Pusher reads `conciergeQueueStore`, which carries COUNTS. Dispatching needs the message
+  // TEXT, and the text lives in `turnQueueRef` — in this component, deliberately (the store's header
+  // argues against widening it, and a store carrying every queued message body is a different and
+  // larger decision). The two mechanisms therefore share the constant and the rule, not the plumbing.
+  //
+  // ── FIFTEEN SECONDS, AGAINST A SIXTY-SECOND FLOOR ──────────────────────────────────────────────
+  // The tick is not the trigger — `AUTO_DISPATCH_MIN_WAIT_MS` is, and it is a minute. Ticking at a
+  // quarter of the floor means the dispatch lands within ~15s of the message becoming eligible
+  // rather than up to a minute late, and each tick is a ref read plus a store read: no IPC, no git,
+  // nothing like the per-agent cost that forced `fleetWatch` up to thirty seconds.
+  //
+  // ── EVERY GUARD THAT MATTERS IS IN THE DECIDER, NOT HERE ───────────────────────────────────────
+  // This effect owns delivery and the already-dispatched memory; it decides nothing. Same split the
+  // delegation ladder keeps, and the reason is that a judgement made in an effect is a judgement no
+  // unit test can reach.
+  useEffect(() => {
+    // WHAT WE HAVE ALREADY SENT, held across ticks. A dispatched message KEEPS WAITING — research
+    // does not dequeue anything — so without this the same question is re-dispatched every tick.
+    const dispatched = new Set<string>();
+    // ONE AT A TIME. `dispatchResearchTask` awaits a round-trip, and a tick that fired while the
+    // previous one was still in flight would decide against a live count that does not yet include
+    // the child it is about to create — the double-spend the `dispatched` set cannot catch, because
+    // the bubble id is not recorded until the dispatch returns.
+    let inFlight = false;
+
+    const tick = async (): Promise<void> => {
+      if (inFlight) return;
+      const research = useResearchStore.getState();
+      const decision = decideAutoDispatch({
+        waiting: turnQueueRef.current.waiting,
+        // THE SIDEBAR'S OWN SELECTOR, so the number this acts on is the number the founder is
+        // reading off the "Concierge Agents" row. A private count here is how the two come to
+        // disagree about whether anything is running.
+        liveResearch: liveTasks(allResearchTasks()).length,
+        researchHydrated: research.hydrated,
+        dispatched,
+        now: Date.now(),
+      });
+      if (decision.action !== "dispatch") return;
+
+      // RESOLVED FROM THE STORE, exactly as `conciergeTools/registry`'s `dispatch` route does it —
+      // and the ROOT as well as the id. The runner's fallback for a missing root is the process
+      // cwd, so a dispatch without one researches an arbitrary tree and answers confidently about
+      // it. No project selected is a reason to do nothing, never a reason to guess.
+      const projects = useProjectStore.getState();
+      const project = projects.projects.find((p) => p.id === projects.selectedProjectId);
+      if (!project) return;
+
+      inFlight = true;
+      // CLAIMED BEFORE THE AWAIT, not after. The round-trip is bounded but not instant, and a
+      // second tick that read an unclaimed id would dispatch the same question twice. A failed
+      // dispatch therefore does not retry — deliberately: `dispatchResearchTask`'s own header warns
+      // that an unacknowledged dispatch has very probably STARTED, so a retry buys a second metered
+      // child for one question. The message stays in the queue and the concierge still owes it.
+      dispatched.add(decision.entry.bubbleId);
+      try {
+        const result = await dispatchResearchTask({
+          question: decision.entry.text,
+          projectId: project.id,
+          projectRoot: project.rootPath,
+          // `quick` is the contract's default — cheap by default, escalated on demand. An
+          // auto-dispatch is the last place to spend a deep pass: nobody asked for it.
+          depth: "quick",
+        });
+        if (result.ok) {
+          notifyConcierge(autoDispatchNotice(decision.entry, decision.queued, decision.live));
+          log.warn(
+            "concierge",
+            `auto-dispatched research for a queued message: ${decision.queued} waiting, ` +
+              `${decision.live} live, oldest waited ${Math.round(decision.waitedMs / 1000)}s`,
+          );
+        } else {
+          // SAID OUT LOUD rather than swallowed. A silent failure here is indistinguishable from
+          // the mechanism not existing, which is the exact state this whole branch is fixing.
+          log.warn("concierge", `auto-dispatch refused: ${result.reason} — ${result.message}`);
+        }
+      } catch (e) {
+        log.warn("concierge", `auto-dispatch threw: ${String(e)}`);
+      } finally {
+        inFlight = false;
+      }
+    };
+
+    const timer = setInterval(() => void tick(), AUTO_DISPATCH_TICK_MS);
+    return () => clearInterval(timer);
   }, []);
   /**
    * Bumped on EVERY send — the turn-boundary signal for `useConciergeTurnFloor`.
@@ -2430,7 +2596,7 @@ export function ConciergeHost({
       });
       delegationRef.current = fold.state;
       if (fold.decision.action === "nudge") {
-        const { rung, text, serial } = fold.decision.nudge;
+        const { rung, text, serial, delegations } = fold.decision.nudge;
         // DELIVERY IS NOT INSTANT, AND THE COMMENT SAYS SO RATHER THAN IMPLYING OTHERWISE. There is
         // no channel that interrupts a `claude -p` turn already in flight, so the notifier's push
         // lands at the next turn boundary. A refusal (`false`) means it went nowhere at all — worth
@@ -2438,7 +2604,10 @@ export function ConciergeHost({
         const delivered = notifyConcierge(text);
         log.warn(
           "concierge",
-          `delegation nudge #${rung}: ${serial} investigative call(s), 0 delegations` +
+          // `delegations` READ FROM THE DECISION, not written as a literal `0` — the same defect
+          // `nudgeText` carried, in the same sentence, and it made the log unusable for the one
+          // question it exists to answer: did the ladder fire at a concierge that HAD delegated?
+          `delegation nudge #${rung}: ${serial} investigative call(s), ${delegations} delegation(s)` +
             (delivered ? "" : " — push refused, nudge not delivered"),
         );
       }
@@ -3710,7 +3879,16 @@ export function ConciergeHost({
     // already in flight the send WAITS — and that is the whole defect being fixed: dispatching
     // here is what makes `concierge.rs` kill the running child, destroying the answer the user is
     // waiting on (149 of 378 turns on 2026-07-29).
-    const queued: QueuedTurn = { bubbleId: bubbleId ?? `pending-${Date.now()}`, text };
+    // `enqueuedAt` IS THE SEND INSTANT, taken here rather than when the entry starts waiting — the
+    // founder's "6th in line" complaint is about how long HE has been waiting, which starts when he
+    // pressed send, not when some earlier turn happened to finish. It is stamped at the call site
+    // because `conciergeTurnQueue` is pure and reads no clock; the Pusher's `queue-unfanned`
+    // condition and `conciergeAutoDispatch` both measure the age from this one field.
+    const queued: QueuedTurn = {
+      bubbleId: bubbleId ?? `pending-${Date.now()}`,
+      text,
+      enqueuedAt: Date.now(),
+    };
     const outcome = enqueueTurn(turnQueueRef.current, queued);
     turnQueueRef.current = outcome.next;
     setTurnQueue(outcome.next);
@@ -3900,6 +4078,23 @@ export function ConciergeHost({
     // can no longer be a synchronous throw that costs the send; see the import block's note and
     // services/conciergeHistoryCapture.ts.
     const research = researchDrain.peek();
+    // ══ THE PUSHER'S OWED FINDINGS RIDE THIS TURN TOO ═════════════════════════════════════════════
+    //
+    // Because the channel they were built for is SELF-DEFEATING for exactly the findings that
+    // matter most. `concierge_proactive_turn` stands down for any user turn in flight — correct,
+    // the user owns the conversation — and a non-empty concierge queue means a user turn is ALWAYS
+    // in flight, by `engine/conciergeTurnQueue.enqueue`'s own invariant (a send WAITS only when
+    // something is already running). So a finding about a stacked-up queue is declined for
+    // precisely as long as the finding is true, while `notify()` answers true, `sendVerified` passes
+    // that through, and `pusherRunner` spends a budget slot and stamps a FOUR-HOUR cooldown for a
+    // message nobody reads until it is moot.
+    //
+    // This turn is guaranteed to run, so folding them in here removes the contradiction without
+    // touching the stand-down — which is the rule that should not move.
+    //
+    // PEEK CLAIMS NOTHING, exactly as `researchDrain.peek()` above it does. The claim is beside
+    // `researchDrain.stage` on the resolve below.
+    const owedNotices = schedulerRef.current?.peekNotices() ?? [];
     // THE CONVERSATION, alongside the fleet picture. Read here for the same reason the feed is:
     // this is the moment the turn actually runs. `chat` is the visible thread, so what the brain is
     // told matches what the human is looking at — which is precisely what breaks when the resumed
@@ -3925,9 +4120,17 @@ export function ConciergeHost({
       // wrongly. `openAsksNow()` is read synchronously from the queue's cache, for the same reason
       // the fleet picture is read at dispatch rather than at enqueue: the prompt should describe
       // what is outstanding when the turn actually runs.
+      // THREE SECTIONS, IN THIS ORDER: research findings (what CAME BACK), the Pusher's owed
+      // findings (what he has not been TOLD), then the fleet + thread snapshot ending in his new
+      // message. Both preambles go AHEAD of `buildSnapshot` rather than after it, because his
+      // message is the last thing inside that snapshot — anything appended would sit under the
+      // question and read as part of it.
       withResearchPreamble(
         research.preamble,
-        buildSnapshot(feedRef.current, entry.text, openAsksNow(), continuity),
+        withNoticeSection(
+          owedNotices,
+          buildSnapshot(feedRef.current, entry.text, openAsksNow(), continuity),
+        ),
       ),
     ).then(
       (id) => {
@@ -3937,6 +4140,14 @@ export function ConciergeHost({
         // error (services/concierge). There is no turn to claim against, so the findings stay
         // unread and the next send carries them.
         if (id !== null) researchDrain.stage(id, research.taskIds);
+        // THE NOTICES ARE CLAIMED AT INSTALL, one step earlier than the research drain's own claim
+        // (which waits for `concierge:done`). The two inputs differ in what a loss costs: a research
+        // finding exists once, on disk, and is unrecoverable if claimed against a turn that then
+        // dies. A Pusher notice is re-measured every sweep and re-offered by an idempotent
+        // `notify`, so the worst case here is a condition that still holds being mentioned one turn
+        // later — while waiting for `done` would mean repeating the identical paragraph on every
+        // send until the turn settles, which on a stacked-up queue is several sends.
+        if (id !== null) schedulerRef.current?.claimNotices(owedNotices);
       },
       // ══ A REJECTED DISPATCH MUST STILL RELEASE THE SLOT (probe 4 on PR #1235) ═══════════════════
       // `startConciergeTurn` throws BEFORE its own try block when AI enhancements are off

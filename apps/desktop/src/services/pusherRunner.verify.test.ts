@@ -48,6 +48,8 @@ function fakeDeps(over: Partial<PusherRunnerDeps> = {}) {
     reportRecipient: () => "concierge",
     duties: () => [],
     conflicts: () => undefined,
+    // No concierge mounted — this suite is about claim verification, not the queue input.
+    conciergeQueue: () => undefined,
     verifyClaims: async (claims) => {
       asked.push([...claims]);
       return new Map();

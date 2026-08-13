@@ -169,6 +169,7 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   dotRing,
   dotLabel,
   liveCount,
+  recentCount,
   hydrated,
   paneSide,
   jointOpen,
@@ -185,6 +186,15 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   /** Queued + running. Straight from the store's `liveTasks` selector via the caller — NOT counted
    *  again in here, so the badge and the disc can never tell different stories. */
   liveCount: number;
+  /**
+   * How many were dispatched in the last {@link RECENT_RESEARCH_WINDOW_MS} — every status.
+   *
+   * THE HALF THAT MAKES `+0` READABLE. `liveCount` is a gauge and falls back to zero minutes after
+   * each burst, so on its own it cannot distinguish "delegating, just finished" from "has never
+   * delegated" — and the founder read the second off a row that meant the first. Same rule as
+   * `liveCount`: computed by the caller through the store's own selector, never re-counted here.
+   */
+  recentCount: number;
   /** Has the first `listResearch()` landed? Separates "+0" from "we have not looked yet". */
   hydrated: boolean;
   /** The same two geometry inputs every row in this column takes — see engine/rowGeometry. */
@@ -329,11 +339,30 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
                 header for why this one does not hide itself. */}
             {hydrated && (
               <span
-                aria-label={`${liveCount} running`}
-                title={`${liveCount} research ${liveCount === 1 ? "agent" : "agents"} running`}
+                aria-label={
+                  recentCount > 0
+                    ? `${liveCount} running, ${recentCount} recently`
+                    : `${liveCount} running`
+                }
+                title={
+                  `${liveCount} research ${liveCount === 1 ? "agent" : "agents"} running` +
+                  (recentCount > 0 ? ` · ${recentCount} dispatched in the last 12 hours` : "")
+                }
                 style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, lineHeight: 1 }}
               >
+                {/* ── WHY A SECOND NUMBER, AND WHY IT IS CONDITIONAL ──────────────────────────
+                    `+{liveCount}` is a live gauge and is rendered even at zero (see the header).
+                    That is honest and, alone, unreadable: it falls to `+0` minutes after every
+                    burst, so "delegating, just finished" and "has never delegated" look identical
+                    — and the founder read the second off a row that meant the first, with 28
+                    dispatched tasks on disk.
+
+                    The recent count is SUPPRESSED at zero rather than rendered as `· 0`, which is
+                    the opposite of the rule above it and deliberately so: `+0` is a measurement of
+                    something that is always measurable, while `· 0` would add a second zero saying
+                    the same thing twice. When it is absent, `+0` means what it has always meant. */}
                 +{liveCount}
+                {recentCount > 0 && ` · ${recentCount} recently`}
               </span>
             )}
           </div>

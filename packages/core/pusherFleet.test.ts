@@ -370,6 +370,7 @@ describe("died holding work", () => {
       memory: memoryAfterReporting,
       duties: [],
       conflicts: undefined,
+      queue: undefined,
       inbox: { used: 0, capacity: 50 },
       now: later,
     });
@@ -387,6 +388,7 @@ describe("died holding work", () => {
       memory: { ...memoryAfterReporting, lastConditions: evaluateFleetConditions(two, T0) },
       duties: [],
       conflicts: undefined,
+      queue: undefined,
       inbox: { used: 0, capacity: 50 },
       now: later,
     });
@@ -799,11 +801,27 @@ describe("queue-unfanned", () => {
     expect(c!.measured.filter((n) => n === "0")).toHaveLength(1);
   });
 
-  // The remedy clause, in the register of `quotaCondition`'s notRestartable: the reader has to be
-  // told that waiting is not a strategy, or the count alone reads as something that will resolve.
-  it("says plainly that the queue does not drain itself", () => {
+  // ══ THE REMEDY MUST NOT BE A WAY TO SILENCE THE ALARM (roborev 63598) ═══════════════════════════
+  // This asserted the phrase "does not drain itself", which pinned in place a sentence that was
+  // false in the most expensive direction available. The text claimed a queued message "waits for a
+  // concierge agent to exist, so the depth only falls once one is started" and told the reader to
+  // fan them out — but the concierge's turn queue advances on `turnFinished` and nothing else, so
+  // dispatching research dequeues NOTHING while raising `liveAgents` to parity. Following the
+  // instruction cleared the condition with every message still unanswered.
+  //
+  // The assertion now guards the honest version, and — the half that matters — guards against the
+  // old claim coming back. A test that only checked for new wording would go green on a text that
+  // said both.
+  it("tells the reader what fanning out actually does, and does not promise it drains the queue", () => {
     const [c] = fire();
-    expect(c!.text).toContain("does not drain itself");
+    expect(c!.text).toContain("does NOT dequeue anything");
+    expect(c!.text).toContain("turn queue advances only as each turn finishes");
+    // The reader is told the alert clearing is not the same as being answered — without this the
+    // remedy is still, in effect, "make the alarm stop".
+    expect(c!.text).toContain("work started rather than as questions answered");
+    // THE RETIRED CLAIM, pinned as absent. Both halves of it.
+    expect(c!.text).not.toContain("does not drain itself");
+    expect(c!.text).not.toContain("depth only falls once one is started");
     expect(citable(c!.text, c!.measured)).toBe(true);
   });
 
@@ -813,11 +831,41 @@ describe("queue-unfanned", () => {
     expect(citable(c!.text, c!.measured)).toBe(true);
   });
 
-  // THE WHOLE POINT OF THE CLASS. A queue with a concierge running is a queue being served; the
-  // condition is about there being nobody to take them, not about the depth on its own.
-  it("is SILENT when a concierge agent is running", () => {
-    expect(fire({ liveAgents: 1 })).toEqual([]);
-    expect(queueUnfanned(queue({ liveAgents: 1 }), T0)).toBeUndefined();
+  // ══ THE FOUNDER'S 2026-08-13 CORRECTION, AND THE REGRESSION IT GUARDS ═════════════════════════
+  // This used to read "is SILENT when a concierge agent is running" and asserted `liveAgents: 1`
+  // was quiet. That is the exact hole he was looking at: ONE agent against SIX waiting messages
+  // called the fleet healthy, so five messages with nobody coming for them produced silence.
+  // *"Let's just make it if live research is lower than the queue depth."* The test therefore
+  // inverts — the case that used to prove correctness now proves the bug.
+  //
+  // ASSERTED AT 1 RATHER THAN ONLY AT 0. A test that fires at zero-live passes identically under
+  // BOTH rules, so it cannot tell the change happened; `liveAgents: 1` is the smallest reading that
+  // separates them.
+  it("FIRES when agents are running but fewer than the messages waiting", () => {
+    const [c] = fire({ liveAgents: 1 });
+    expect(c!.id).toBe("queue-unfanned");
+    expect(c!.text).toContain("6 messages are queued and 1 concierge agents are running");
+    expect(citable(c!.text, c!.measured)).toBe(true);
+    // One short of parity is still one message with nobody coming for it.
+    expect(fire({ liveAgents: 5 })).toHaveLength(1);
+  });
+
+  // THE OTHER HALF OF THE CLASS, and the reason it is `<` rather than `<=`. An agent per waiting
+  // message is a queue being SERVED, and reporting it spends the founder's attention on the healthy
+  // path — which is what the floor and the buckets in this file all exist to avoid.
+  it("is SILENT once there is an agent for every waiting message", () => {
+    expect(fire({ liveAgents: 6 })).toEqual([]);
+    expect(queueUnfanned(queue({ liveAgents: 6 }), T0)).toBeUndefined();
+    // And more agents than messages is the same all-clear, not an underflow.
+    expect(fire({ liveAgents: 7 })).toEqual([]);
+  });
+
+  // THE CAP INTERACTION, pinned because getting it wrong makes the condition UNSATISFIABLE rather
+  // than merely wrong. `MAX_CONCURRENT_RESEARCH` is 2, so if `liveAgents` counted only RUNNING
+  // children it could never reach a depth of 6 and this would report an abandoned queue forever.
+  // It counts queued+running (services/research `isLive`), so a full fan-out clears it.
+  it("clears when every waiting message has been dispatched, even past the concurrency cap", () => {
+    expect(fire({ queued: 6, liveAgents: 6 })).toEqual([]);
   });
 
   // A queue that formed seconds ago is the ordinary shape of a fan-out about to happen. Reporting it
@@ -830,6 +878,17 @@ describe("queue-unfanned", () => {
 
   it("fires exactly at the staleness floor, and that boundary is real", () => {
     expect(fire({ oldestAt: T0 - QUEUE_UNFANNED_MIN_AGE_MS })).toHaveLength(1);
+  });
+
+  // THE FLOOR'S VALUE, NOT JUST ITS BOUNDARY. Every assertion above is written against the symbol,
+  // so all of them hold identically if it goes back to three minutes — the founder's number would
+  // be silently reverted by a green suite. This is the one test that reads the literal.
+  // *"I don't want it to be a three-minute wait. Let's make it more than a one-minute wait."*
+  it("waits one minute, which is the founder's number and not the original three", () => {
+    expect(QUEUE_UNFANNED_MIN_AGE_MS).toBe(60_000);
+    // Stated as a live reading too, so the constant and the behaviour cannot drift apart: a
+    // 90-second-old queue is reportable, and under the old floor it was not.
+    expect(fire({ oldestAt: T0 - 90_000 })).toHaveLength(1);
   });
 
   // FAIL CLOSED. `undefined` is WE DID NOT LOOK — no store read, or a store that has not hydrated —

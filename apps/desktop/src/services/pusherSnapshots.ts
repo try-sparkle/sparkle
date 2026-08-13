@@ -27,7 +27,7 @@
 // the founder to discard an agent holding commits nobody merged. So it is only ever `false` on
 // AFFIRMATIVE evidence of a clean tree, and `undefined` whenever the branch poll has not run.
 
-import type { FleetSnapshot, StandingDuty } from "@sparkle/core";
+import type { ConciergeQueue, FleetSnapshot, StandingDuty } from "@sparkle/core";
 import type { AgentTab, LastObserved, Project } from "../types";
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { BranchStatus } from "./branchStatus";
@@ -37,6 +37,11 @@ import { agentDisplayName } from "../engine/agentDisplayName";
 // The codebase's SINGLE definition of "does this window actually know anything about this agent" —
 // reused rather than re-derived, which is the mistake its own header records being made twice.
 import { livenessOf } from "./agentLiveness";
+// THE TWO STORES `buildConciergeQueue` JOINS. Read imperatively, at sweep time — the Pusher has no
+// component to subscribe on. Both are three-valued about "we have not looked yet", which is the
+// whole of what that function has to get right.
+import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
+import { allTasksNow, liveTasks, useResearchStore } from "./research/store";
 
 /** Everything the mapping reads. Supplied by the caller so this stays testable and pure. */
 export interface FleetSnapshotInput {
@@ -320,6 +325,76 @@ export function buildStandingDuties(input: {
       ...(input.improvementHeldBy !== undefined ? { heldBy: input.improvementHeldBy } : {}),
     },
   ];
+}
+
+/**
+ * WHAT THE CONCIERGE'S OWN QUEUE LOOKS LIKE RIGHT NOW — the app-global input for the fleet
+ * condition about messages stacking up with nothing fanned out.
+ *
+ * ── A SIBLING OF `StandingDuty` AND `ConflictingPr`, NOT A FIELD ON `FleetSnapshot` ───────────────
+ * `FleetSnapshot` is keyed by `agentId`, and the concierge has no agent id: `conciergeNotifier`'s
+ * header states it outright — a headless `claude -p` child with no row in the roster and no self.
+ * There is nothing for this to hang off, which is verbatim the argument `pusherFleet` records for
+ * keeping `ConflictingPr` out of that structure. A parallel app-global input has no such
+ * requirement, and it is the shape a CAPABILITY-shaped condition already uses.
+ *
+ * ── THE MERGE NOTE THAT USED TO BE HERE HAS BEEN CARRIED OUT (2026-08-13) ────────────────────────
+ * This file declared its OWN `ConciergeQueue` — `{waiting, running, liveAgents?}` — while the
+ * condition that consumes it was landing separately in `@sparkle/core` as
+ * `{queued, liveAgents, oldestAt}`. Its note said: *"At merge: move it, and import it from
+ * `@sparkle/core` in the three places that name it."*
+ *
+ * THAT STEP WAS NEVER PERFORMED, because no PR was ever opened for the branch — and the cost is the
+ * whole reason this paragraph replaces the type. Structural typing made the mismatch INVISIBLE:
+ * `pusherRunner` put the reading on its decision input under the key `conciergeQueue` while
+ * `FleetReportInput` reads `queue`, so the value was silently dropped, `evaluateFleetConditions`
+ * received `undefined`, and `queue-unfanned` stayed exactly as dead as it had been before the
+ * producer was written. `pusherRunner.ts` even described that as a virtue — *"an extra key on a
+ * structurally-typed input is inert until `FleetReportInput` names it"* — which was true, and was
+ * the bug.
+ *
+ * So: ONE type, owned by the package that decides on it. Nothing here may re-declare it.
+ */
+
+/**
+ * Read the concierge queue and the concierge-agent count, and join them.
+ *
+ * IMPURE, unlike everything above it in this file, and that is a deliberate exception rather than
+ * drift. The two other app-global inputs are assembled the same way one level up — `duties()` reads
+ * `settingsStore` inside `pusherMount`, `conflicts()` reads `conflictStore` — and this one is
+ * assembled here instead for one reason: the `hydrated` rule below is a JUDGEMENT about what may be
+ * reported, and a judgement made at a wiring site is a judgement no unit test can reach. Its own
+ * suite drives the two stores directly (`pusherSnapshots.conciergeQueue.test.ts`).
+ *
+ * `undefined` when no host has published, which is the whole three-valued point: no concierge is
+ * mounted in this window, so there is no queue to report and nothing here may invent an empty one.
+ *
+ * ── UNHYDRATED RESEARCH ALSO RETURNS `undefined`, RATHER THAN OMITTING THE COUNT ────────────────
+ * `liveTasks(allTasksNow()).length` is 0 both before the first `listResearch()` has landed and when
+ * there genuinely are none, and getting that backwards is not a missed report — it is a FALSE ALARM
+ * about the very condition being detected: "messages queued and nobody working them", raised by a
+ * store nobody had read yet. The earlier shape spelled that as an OPTIONAL `liveAgents`, which is
+ * the weaker guard: `queueUnfanned` then reads `undefined` as a non-finite count and declines, so
+ * the two outcomes agreed by luck rather than by construction. Withholding the whole reading says
+ * the true thing — WE DID NOT LOOK — in the vocabulary the consumer already has, and it keeps
+ * `liveAgents` a required number so a producer cannot omit it silently.
+ *
+ * `hydrated` is set even by a FAILED first load (see `refreshResearch`), so this is only ever
+ * `undefined` while nothing has tried.
+ */
+export function buildConciergeQueue(): ConciergeQueue | undefined {
+  const depth = useConciergeQueueStore.getState().depth;
+  if (depth === undefined) return undefined;
+  // HYDRATION FIRST, then the count — never the count alone. See the header.
+  if (!useResearchStore.getState().hydrated) return undefined;
+  return {
+    // `queued` IS `waiting` — the messages stacked BEHIND the running turn, never the one in
+    // flight. That is the number the founder reads off his own screen as "6th in line", and it is
+    // the one the condition compares against the live agent count.
+    queued: depth.waiting,
+    liveAgents: liveTasks(allTasksNow()).length,
+    oldestAt: depth.oldestAt,
+  };
 }
 
 /**

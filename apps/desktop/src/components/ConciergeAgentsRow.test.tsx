@@ -545,6 +545,7 @@ describe("ConciergeAgentsRow — a borrowed colour draws a ring", () => {
     dotColor: BORROWED,
     dotLabel: "a task under here needs you",
     liveCount: 1,
+    recentCount: 0,
     hydrated: true,
     paneSide: "left" as const,
     jointOpen: false,
@@ -571,5 +572,68 @@ describe("ConciergeAgentsRow — a borrowed colour draws a ring", () => {
     render(<ConciergeAgentsRow {...props} />);
     expect(disc().style.background).toBe(asRgb(BORROWED));
     expect(disc().style.boxShadow).toBe("");
+  });
+});
+
+// ══ THE REGRESSION THE FOUNDER WAS LOOKING AT ═══════════════════════════════════════════════════
+//
+// He read `Concierge Agents +0` and concluded the concierge never delegates. The row was telling
+// the truth — `+[n]` counts only `queued` + `running` — and the truth was unreadable: 28 dispatched
+// tasks sat on disk and the most recent burst had simply finished. "Delegating, just finished" and
+// "has never once delegated" rendered identically, and telling them apart was the entire complaint.
+//
+// The second number is what separates them. These tests are written against the DISPLAYED TEXT
+// rather than the selector, because the selector was never the broken part.
+describe("Concierge Agents — a recent count, so +0 is readable", () => {
+  const HOUR = 60 * 60_000;
+  /** A task in a terminal state, dispatched `agoMs` ago — invisible to `+[n]` by construction. */
+  const finished = (id: string, agoMs: number): ResearchTask => ({
+    ...DONE_WITH_FINDINGS,
+    id,
+    createdAt: Date.now() - agoMs,
+  });
+
+  it("shows +0 alongside the recent count when a burst has finished", () => {
+    seedResearch([finished("rsh_r1", HOUR), finished("rsh_r2", 2 * HOUR), finished("rsh_r3", 3 * HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    // Both halves. `+0` is still the honest live reading and is NOT suppressed…
+    expect(row().textContent).toContain("+0");
+    // …and the second number is what stops it reading as "this has never happened".
+    expect(row().textContent).toContain("3 recently");
+  });
+
+  // THE COUNTER-CASE. Without it, a row that appended "N recently" unconditionally would pass the
+  // test above — and re-create the same unreadable display in the opposite direction.
+  it("shows NOTHING but +0 when nothing has been dispatched recently", () => {
+    seedResearch([finished("rsh_old", 40 * HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).toContain("+0");
+    expect(row().textContent).not.toContain("recently");
+  });
+
+  // A FAILED pass is still a delegation. Counting only successes would restate the same false zero
+  // in a narrower window — and failures are common enough on this path to matter (a real burst on
+  // 2026-08-12 was roughly half `failed`).
+  it("counts a failed dispatch, because the question is whether it DELEGATED", () => {
+    seedResearch([{ ...DONE_WITH_FINDINGS, id: "rsh_f", status: "failed", createdAt: Date.now() - HOUR }]);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).toContain("1 recently");
+  });
+
+  // The live gauge keeps working alongside it — a running task must still be in BOTH numbers, or
+  // the second one has quietly replaced the first rather than complementing it.
+  it("still counts live work in +[n], and counts it as recent too", () => {
+    seedResearch([{ ...RUNNING, id: "rsh_live", createdAt: Date.now() - 60_000 }]);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).toContain("+1");
+    expect(row().textContent).toContain("1 recently");
+  });
+
+  // Before the first listing lands the row has no basis for EITHER number. Same rule as `+0`.
+  it("shows no badge at all before the first listing lands", () => {
+    seedResearch([finished("rsh_r1", HOUR)], false);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).not.toContain("recently");
+    expect(row().textContent).not.toContain("+");
   });
 });

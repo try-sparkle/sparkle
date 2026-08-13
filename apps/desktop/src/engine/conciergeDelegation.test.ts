@@ -223,7 +223,15 @@ describe("nudge text", () => {
 
   it("gets blunter as it climbs", () => {
     expect(nudgeText(2, 6)).toContain("STOP READING");
-    expect(nudgeText(3, 9)).toContain("founder");
+    // ══ RUNG 3 USED TO ASSERT THE WORD "founder", AND THAT WAS THE BUG IT WAS GUARDING ═══════════
+    // The text said "This has now been raised to the founder." Nothing raised it — `Nudge.escalate`
+    // has no production reader — so this assertion was pinning a false statement in place, which is
+    // the worst thing a test can do to a remedy string. Rung 3 now names what actually happens, and
+    // the assertion moves with it.
+    expect(nudgeText(3, 9)).toContain("last nudge");
+    expect(nudgeText(3, 9)).toContain("dispatching your queued messages");
+    // …and the retired claim must not come back while `escalate` still has no reader.
+    expect(nudgeText(3, 9)).not.toContain("raised to the founder");
   });
 
   it("every delegation op the founder approved is honored", () => {
@@ -242,5 +250,59 @@ describe("purity", () => {
     const snapshot = { ...state };
     noteToolCall(state, { name: "Read" }, { turnId: TURN });
     expect(state).toEqual(snapshot);
+  });
+});
+
+// ══ THE NUDGE MUST NOT LIE ABOUT WHAT THE CONCIERGE HAS ALREADY DONE ═══════════════════════════
+//
+// `nudgeText` hard-coded a literal `0 delegations`, and that literal was reachable-and-wrong rather
+// than merely redundant: a dispatch resets `serial` and `rung` but NOT `delegations`, so a
+// concierge that HAD delegated and then ground on was told it had delegated zero times. In the one
+// channel whose entire job is to be believed about this, and to a reader that can see its own
+// transcript and check.
+//
+// It is also the second half of the founder's complaint. "Concierge agents stuck at zero" was a
+// claim the app made in two places at once — the sidebar row, where it was true, and here, where it
+// was a constant.
+describe("the nudge quotes the REAL delegation count", () => {
+  it("says zero only when zero is the truth", () => {
+    const { nudges } = drive(SERIAL_THRESHOLD);
+    expect(nudges).toHaveLength(1);
+    expect(nudges[0]!.text).toContain("0 delegations");
+    expect(nudges[0]!.delegations).toBe(0);
+  });
+
+  it("counts a delegation that already happened this episode", () => {
+    // Delegate once, then grind a full threshold's worth. The reset means the nudge fires again —
+    // and the sentence it fires with has to acknowledge the dispatch that reset it.
+    const first = noteToolCall(initialState(), dispatchCall(), { turnId: TURN });
+    expect(first.state.delegations).toBe(1);
+    const { nudges } = drive(SERIAL_THRESHOLD, { state: first.state });
+    expect(nudges).toHaveLength(1);
+    // THE ASSERTION THE OLD CODE COULD NOT SATISFY.
+    expect(nudges[0]!.text).toContain("1 delegation");
+    expect(nudges[0]!.text).not.toContain("0 delegations");
+    expect(nudges[0]!.delegations).toBe(1);
+  });
+
+  it("gets the plural right past one", () => {
+    let state = initialState();
+    for (let i = 0; i < 2; i++) state = noteToolCall(state, dispatchCall(), { turnId: TURN }).state;
+    const { nudges } = drive(SERIAL_THRESHOLD, { state });
+    expect(nudges[0]!.text).toContain("2 delegations");
+  });
+
+  // Every rung carries the count, not just the first — rung 3 is the one the founder reads.
+  it("carries it on every rung", () => {
+    const first = noteToolCall(initialState(), dispatchCall(), { turnId: TURN });
+    let state = first.state;
+    const seen: string[] = [];
+    for (let rung = 0; rung < MAX_RUNG; rung++) {
+      const r = drive(SERIAL_THRESHOLD, { state });
+      state = r.state;
+      seen.push(...r.nudges.map((n) => n.text));
+    }
+    expect(seen).toHaveLength(MAX_RUNG);
+    for (const text of seen) expect(text).toContain("1 delegation");
   });
 });
