@@ -112,8 +112,14 @@ impl Refusal {
 // difference is noted and is always in the refusing direction.
 
 // `SELECTION_CURSOR` — the highlighted option of an open menu, e.g. "❯ 1. Yes".
-// TS: /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m  — transcribed exactly.
-pattern!(selection_cursor, r"(?m)^\s*[│|]?\s*[❯›]\s*\d+\.\s");
+// TS: /^\s*[│|┃]?\s*[❯›]\s*\d+\.\s/m  — transcribed exactly.
+//
+// `┃` (U+2503, HEAVY VERTICAL) joined the class with bead sparkle-67xxw. The TS side admitted `│`
+// but not `┃`, so a dialog drawn with heavy borders was invisible to the cursor test while the
+// parser's own matcher — which shares a border class with it — saw the row. Widening here keeps
+// this gate at least as permissive as the classifier it ports, which is the direction this module's
+// header requires: never press a key on a screen the TS side would not have called a picker.
+pattern!(selection_cursor, r"(?m)^\s*[│|┃]?\s*[❯›]\s*\d+\.\s");
 
 // `SHELL_PROMPTS` — classic CLI prompts. TS ships five; all five are here.
 pattern!(shell_prompt_yn, r"(?i)[\(\[]y/n[\)\]]");
@@ -2313,7 +2319,10 @@ mod tests {
 
         for needle in [
             // screenClassifier.ts
-            r"const SELECTION_CURSOR = /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m;",
+            // `┃` added by bead sparkle-67xxw and ported above. Updating this needle is only legal
+            // BECAUSE the port moved with it — the rule the failure message states is "port the
+            // change, don't edit the expectation", and both halves changed in the same commit.
+            r"const SELECTION_CURSOR = /^\s*[│|┃]?\s*[❯›]\s*\d+\.\s/m;",
             // The two border predicates decide what counts as "no content" on the rule that arms
             // the keystroke, and pinning only their CALL SITES left the character classes free to
             // drift: add `>` to SEPARATOR_ROW, or drop `╰╯─`, and every call-site needle still

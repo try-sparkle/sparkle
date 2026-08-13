@@ -36,7 +36,29 @@ import {
 // only becomes an auto-answer after the looksLikePermission "No"-option gate), a bare "> 1. …" would
 // flip status RED off any markdown blockquote in scrollback. The footer check below is the
 // glyph-independent catch-all, so ">"-cursor prompts are still caught — via their footer.
-export const SELECTION_CURSOR = /^\s*[│|]?\s*[❯›]\s*\d+\.\s/m;
+// ── THE BOX BORDER IS ONE CLASS, SHARED (bead sparkle-67xxw) ──────────────────────────────────
+// Claude Code draws its dialogs inside a box, so an option row is `│ ❯ 1. Yes, and auto-accept …`.
+// This class and `heuristics.PICKER_OPTION` are two guards over the SAME row, and they drifted: the
+// parser admitted no border at all (so a boxed dialog parsed to nothing and could not be answered),
+// and this one admitted `│` but not the heavy `┃`. Exported so heuristics builds its matchers from
+// the same string — the two cannot disagree about what a border is again.
+export const OPTION_ROW_BORDER = "[\\u2502\\u2503]"; // │ ┃
+// The ASCII `|` is admitted HERE and nowhere else, and the asymmetry is deliberate: this pattern
+// additionally requires a `❯` POINTING AT the row, which prose does not draw, so it cannot mistake
+// "Options: 1. yes | 2. no" for an option row the way a border-only test would.
+//
+// A LITERAL, NOT BUILT FROM `OPTION_ROW_BORDER` — and that is not an oversight to tidy up later.
+// `src-tauri/src/nudge_gate.rs` PORTS this regex into Rust and pins it BYTE-FOR-BYTE, so that the
+// half of the app which actually presses a key can never disagree with the half that classifies the
+// screen. Composing it from a template made the port's needle unpinnable and turned that guard red
+// (`ported_typescript_patterns_have_not_drifted`). Sharing the STRING would buy a guarantee this
+// file cannot keep anyway, since the Rust copy is a separate transcription either way.
+//
+// What keeps the two in step instead is a TEST — `heuristics.test.ts`'s "the option-row guards
+// agree" — which drives one boxed cursored row through this pattern, `RENDERED_OPTION_ROW` and the
+// parser, and fails if any of them stops seeing it. So: change this class, and port the change into
+// `nudge_gate.rs` as its own comment instructs.
+export const SELECTION_CURSOR = /^\s*[│|┃]?\s*[❯›]\s*\d+\.\s/m;
 
 // Claude Code's interactive picker FOOTER — the closing hint line every menu/permission dialog
 // draws below its options. It is a glyph-independent "a menu is open, waiting on you" marker, so it

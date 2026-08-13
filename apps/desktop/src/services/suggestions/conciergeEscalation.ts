@@ -103,6 +103,125 @@ export function founderOnlyClass(region: string): FounderOnlyClass | null {
   return null;
 }
 
+// ══ THE PLAN-MODE ARM (bead sparkle-iwhzt) ═══════════════════════════════════════════════════════
+//
+// The founder's boundary, verbatim, and it is the spec for this section:
+//
+//   "spend, credentials, and product direction stay with you; everything else I approve"
+//
+// That sentence is about who approves PLANS. It is NOT a licence to narrow the five-class list
+// above, which governs a different surface with a different risk: an arbitrary picker where the
+// danger is pressing an irreversible button nobody read (roborev 63621 — a neutral "How should I
+// proceed?" over "Force push over origin/main" / "Open a PR instead"). A plan dialog cannot press
+// anything; it decides whether the agent may START work it has just described in full. So the two
+// arms are separate, and `destructive`/`legal` deliberately do NOT escalate a PLAN — the destructive
+// ACTION the plan proposes still meets the general arm when the agent gets to it.
+//
+// The failure mode the founder is escaping is agents idle overnight waiting on choices no human
+// needed to make, so a timid arm here is a real cost, not a safe default.
+const PLAN_FOUNDER_CLASSES: ReadonlySet<FounderOnlyClass> = new Set<FounderOnlyClass>([
+  "spend",
+  "credentials",
+  "product-direction",
+]);
+
+/** The founder-only class of a PLAN, or null when the concierge may approve it.
+ *
+ *  Filters `FOUNDER_ONLY_PATTERNS` rather than re-listing the patterns, so the two arms cannot drift
+ *  on what "spend" means — and it keeps the precedence ORDER of the surviving three. That ordering
+ *  is load-bearing: `founderOnlyClass` returns the FIRST match, and `destructive` sits AHEAD of
+ *  `product-direction` in the shared list, so a plan matching both would have answered `destructive`
+ *  — a class this arm does not escalate on — and the product-direction decision would have been
+ *  approved by the concierge on a technicality. */
+function planFounderClass(region: string): FounderOnlyClass | null {
+  for (const [cls, re] of FOUNDER_ONLY_PATTERNS) {
+    if (!PLAN_FOUNDER_CLASSES.has(cls)) continue;
+    if (re.test(region)) return cls;
+  }
+  return null;
+}
+
+// ── MENTION ≠ DECISION ────────────────────────────────────────────────────────────────────────
+// The shared patterns are WIDE ON PURPOSE (see their doc: over-matching costs a notification,
+// under-matching costs a force-push). That trade is right for a picker about to press a button and
+// WRONG for a plan, where the same width makes the arm timid enough to defeat its purpose: the
+// deny-list carries `\btokens?\b`, `\bcosts?\b` and `\bquotas?\b` whole, so "refactor the token
+// bucket rate limiter" and "add a test asserting the cost estimate renders" — both plainly
+// implementation work — would each be sent to the founder.
+//
+// So on the plan arm those weak terms escalate only when the plan is ASKING about them. Terms not
+// listed here (`api key`, `paid tier`, `oauth`, `purchase`…) still escalate on mention alone,
+// because there is no innocent way for a plan to be about them: "rotate the production API keys" is
+// a credentials decision however it is phrased.
+const PLAN_MENTION_ONLY_TERMS =
+  /\btokens?\b|\bquotas?\b|\bcredits?\b|\bcosts?\b|\bprices?\b|\bpricing\b|\bbudget\b|\bcharges?\b|\bspend(?:ing)?\b/gi;
+
+/** The plan is ASKING, not merely describing — "which…", "should I…", "whether to…".
+ *
+ *  THE `should` ARMS ARE NARROW ON PURPOSE, and the reason is the whole point of this rule. A bare
+ *  `\bshould\b` would be framing on almost every plan ("the retry should be capped at 3"), which
+ *  makes every weak mention a decision again and restores the timidity the arm exists to remove —
+ *  and the dialog's own "Would you like to proceed?" means a `?` is always in the region, so
+ *  punctuation cannot be the discriminator either. What distinguishes an ASK is a SUBJECT between
+ *  `should` and its verb: "should THE PICKER default to…" asks; "should be capped" describes. */
+const PLAN_DECISION_FRAMING = new RegExp(
+  [
+    "\\b(?:which|whether)\\b",
+    "\\bshould\\s+(?:i|we|you)\\b",
+    // "should <subject…> be|default|use|behave|ship|render|live|go"
+    "\\bshould\\s+\\w+(?:\\s+\\w+){0,4}\\s+(?:be|default|use|behave|ship|render|live|go)\\b",
+    "\\b(?:shall\\s+(?:i|we)|do\\s+you\\s+want|would\\s+you\\s+prefer|pick\\s+one|choose\\s+between)\\b",
+  ].join("|"),
+  "i",
+);
+
+/** Claude Code's plan-mode dialog, recognised by its OPTION SHAPE rather than its question.
+ *
+ *  The question ("Would you like to proceed?") is generic and other dialogs use it, so keying on it
+ *  would hand plan-mode authority to whatever else happens to ask the same thing. The option triple
+ *  is the actual signature: two ways to say yes that differ only in edit-approval mode, plus a "keep
+ *  planning" way to say no. Both halves are required — a menu offering only one of them is some
+ *  other dialog. */
+const PLAN_PROCEED_OPTION = /\byes\b.*\b(?:auto-accept|automatically\s+accept|manually\s+approve)\b/i;
+const PLAN_KEEP_PLANNING_OPTION = /\bno\b.*\bkeep\s+planning\b/i;
+
+export function isPlanModeDialog(options: readonly EscalationOption[]): boolean {
+  const labels = options.map((o) => o.label);
+  const proceed = labels.some((l) => PLAN_PROCEED_OPTION.test(l));
+  const keepPlanning = labels.some((l) => PLAN_KEEP_PLANNING_OPTION.test(l));
+  return proceed && keepPlanning;
+}
+
+/** User-visible BEHAVIOUR, in the words a plan actually uses.
+ *
+ *  The shared `product-direction` pattern is built for prose about the product as a business —
+ *  "roadmap", "target customer", "which feature". A plan asks the same question in engineering
+ *  words: "should the picker default to auto-accept, or manual?" That is the founder's third class
+ *  ("how it should behave to a user, as opposed to how to implement something already decided") and
+ *  the shared list carries none of it.
+ *
+ *  ONLY EVER CONSULTED TOGETHER WITH `PLAN_DECISION_FRAMING`, which is what keeps it from firing on
+ *  ordinary implementation prose — "the flag defaults to false" describes a decision already made,
+ *  while "should it default to false?" asks the founder to make one. This arm only ADDS escalation
+ *  and only on plans, so the general five-class sweep is untouched by it. */
+const PLAN_USER_FACING_BEHAVIOUR =
+  /\bdefaults?\s+to\b|\bby\s+default\b|\buser[-\s]facing\b|\bwhat\s+(?:the\s+)?users?\s+(?:see|get|expect)\b|\bopt[-\s]?(?:in|out)\b|\bturn(?:ed)?\s+on\s+by\s+default\b/i;
+
+/** The founder-only class of a plan, after the mention-vs-decision rule. */
+function planEscalationClass(region: string): FounderOnlyClass | null {
+  const framed = PLAN_DECISION_FRAMING.test(region);
+  const cls = planFounderClass(region);
+  if (cls) {
+    // Asking about it is a decision, whatever the term.
+    if (framed) return cls;
+    // Otherwise the weak terms are only mentions: remove them and see whether anything is left. A
+    // strong term (`api key`, `paid tier`) survives the strip and still escalates.
+    return planFounderClass(region.replace(PLAN_MENTION_ONLY_TERMS, " "));
+  }
+  if (framed && PLAN_USER_FACING_BEHAVIOUR.test(region)) return "product-direction";
+  return null;
+}
+
 // Mirror of approvalClassifier's private `optionText` strip: `detectClaudeCodePicker` renders a label
 // as "N · text", and the answerer wants the text. Mirrored rather than imported because that helper
 // is private to the classifier; if the render form ever drifts, both copies have to move — which is
@@ -175,7 +294,11 @@ export function routeUnclassifiedPrompt(scrollback: string): EscalationVerdict {
   // question IS readable, so the fingerprint is valid and the press goes through. This is precisely
   // the asymmetry this module's header calls out ("a false 'concierge' lets an agent press an
   // irreversible button"), so the sweep has to cover every word the human would have weighed.
-  const cls = founderOnlyClass([question, ...options.map((o) => o.label)].join("\n"));
+  const region = [question, ...options.map((o) => o.label)].join("\n");
+  // A PLAN dialog gets the founder's three classes and the mention-vs-decision rule; every other
+  // picker keeps the full five-class sweep unchanged. See the plan arm's own comment for why
+  // `destructive` must stay in the general list and out of this one.
+  const cls = isPlanModeDialog(options) ? planEscalationClass(region) : founderOnlyClass(region);
   if (cls) return { route: "founder", reason: "founder-only", founderClass: cls };
 
   return { route: "concierge", question, options };

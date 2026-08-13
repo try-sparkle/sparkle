@@ -2,7 +2,12 @@ import type { SuggestionButton } from "./types";
 // The picker-footer regex is owned by the engine's screenClassifier (the single retune point for
 // Claude Code TUI drift) and re-exported here for approvalClassifier, so the option detector, the
 // category classifier, and the red-vs-gray status check can never desync on what marks a picker.
-import { PICKER_FOOTER, pickerFooterSpan, SELECTION_CURSOR } from "../../engine/screenClassifier";
+import {
+  PICKER_FOOTER,
+  pickerFooterSpan,
+  SELECTION_CURSOR,
+  OPTION_ROW_BORDER,
+} from "../../engine/screenClassifier";
 // The ambient-chrome vocabulary, from the dependency-free module that is its documented shared
 // source of truth — the same one `screenClassifier` imports it from, so there is one definition of
 // "a row that is Claude Code's own furniture" rather than a second copy that can drift.
@@ -135,11 +140,46 @@ function asksChoice(lastLine: string): boolean {
 // option walk works identically.
 export const PICKER_WINDOW = 50; // non-empty lines to search for the footer
 export const PICKER_SPAN = 30; // non-empty lines above the footer the option block may span
+// ── ONE DEFINITION OF "AN OPTION ROW" (beads sparkle-67xxw / sparkle-xgd1k) ────────────────────
+// There used to be three, written independently, and they disagreed on the one case that matters.
+// `RENDERED_OPTION_ROW` and `screenClassifier`'s `SELECTION_CURSOR` both tolerated the box border a
+// real Claude Code dialog draws; `PICKER_OPTION` — the one the PARSE runs on — was anchored at line
+// start with only whitespace allowed before the cursor. So a BOXED, footerless dialog
+//   `│ ❯ 1. Yes, and auto-accept edits            │`
+// passed both guards and failed the parser: `cursorAnchoredRunEnd` skipped it (its `PICKER_OPTION`
+// match came back null), the parse returned `no-menu`, and a menu plainly on screen could not be
+// answered by anything. Measured: 3 options unboxed, `[]` on the identical dialog boxed.
+//
+// Two regexes that merely happen to agree today would re-open this the next time one is retuned, so
+// both are BUILT from the fragments below. That is also the "two guards disagree" of sparkle-xgd1k.
+// The cursor class is WIDER here than in `SELECTION_CURSOR`, which is deliberate and documented at
+// its declaration: a bare `>` is accepted by the parse (it is gated downstream) but must not flip
+// the status band red off a markdown blockquote.
+const OPTION_CURSOR = "[\\u276f\\u203a>]"; // ❯ › >
+// The border is BOX-DRAWING ONLY here — no ASCII `|`, or the prose line "Options: 1. yes | 2. no"
+// reads as two option rows. `OPTION_ROW_BORDER` is imported rather than restated so this and
+// `SELECTION_CURSOR` cannot drift on which glyphs a box is drawn with (that drift is this bug).
+const OPTION_BORDER = OPTION_ROW_BORDER;
+/** Cursor + number + gap: everything between the border and the label. Group 1 is the number. */
+const OPTION_ROW_CORE = `(?:${OPTION_CURSOR}[ \\t]*)?(\\d{1,2})\\.[ \\t]+`;
+
 // The option-row shape as RENDERED, for callers that must ask "is this line an option row?" without
-// running the whole footer-anchored parse. Border class is BOX-DRAWING ONLY — a literal ASCII `|`
-// would make one prose line ("Options: 1. yes | 2. no") read as two rows.
-export const RENDERED_OPTION_ROW = /(?:^|[\u2502\u2503])[ \t]*(?:[\u276f\u203a>][ \t]*)?\d{1,2}\.[ \t]+\S/;
-const PICKER_OPTION = /^\s*(?:[❯›>]\s*)?(\d{1,2})\.\s+(\S.*)/;
+// running the whole footer-anchored parse.
+export const RENDERED_OPTION_ROW = new RegExp(`(?:^|${OPTION_BORDER})[ \\t]*${OPTION_ROW_CORE}\\S`);
+// The parse's own matcher: the same shape, plus a capture for the label (group 2). That capture runs
+// to end-of-line and so swallows a boxed row's trailing padding and CLOSING border — every consumer
+// of group 2 must go through `cleanOptionLabel`.
+const PICKER_OPTION = new RegExp(`^[ \\t]*(?:${OPTION_BORDER}[ \\t]*)?${OPTION_ROW_CORE}(\\S.*)`);
+
+/** Strip a boxed row's trailing padding and closing border off a captured label.
+ *
+ *  `│ ❯ 1. Yes, and auto-accept edits          │` captures `Yes, and auto-accept edits          │`.
+ *  That label is what the human is offered as a button, so the border cannot ride along — and it has
+ *  to come off BEFORE `truncateLabel`, or a long label spends its budget on padding. */
+function cleanOptionLabel(raw: string): string {
+  return raw.replace(/[ \t]*[│┃][ \t]*$/, "").trimEnd();
+}
+
 const PICKER_LABEL_MAX = 40;
 const PICKER_MAX_BUTTONS = 6;
 
@@ -197,8 +237,14 @@ export interface PickerBounds {
  *
  *  THE RUN LENGTH IS SHORT ON PURPOSE. A narrow agent column wraps the rule, and the fragment that
  *  survives is still unmistakably a border; the discriminator is that the line holds NOTHING ELSE,
- *  which is what prose cannot produce. */
-const DIALOG_RULE = /^[ \t]*[│|┃]?[ \t]*[─━═▔▁]{8,}[ \t]*[│|┃]?[ \t]*$/;
+ *  which is what prose cannot produce.
+ *
+ *  THE SIDE CLASS CARRIES CORNERS, NOT JUST SIDES (bead sparkle-67xxw). A real boxed dialog opens
+ *  `╭────────╮` and closes `╰────────╯`; with only `│|┃` accepted at the ends, neither matched, so
+ *  `top` was -1 on every boxed dialog (the fingerprint then fell back to its own window) and the
+ *  dialog's own CLOSING border counted as one row of unrecognised output beneath itself, spending a
+ *  unit of the `UNRECOGNISED_BELOW_RUN` budget on the dialog's own furniture. */
+const DIALOG_RULE = /^[ \t]*[│|┃╭╮╰╯┌┐└┘]?[ \t]*[─━═▔▁]{8,}[ \t]*[│|┃╭╮╰╯┌┐└┘]?[ \t]*$/;
 
 /** How far above the first option a rule may sit and still be believed to be the DIALOG'S OWN
  *  border rather than the transcript divider above it. `DIALOG_RULE` cannot tell the two apart (see
@@ -367,7 +413,11 @@ function cursorAnchoredRunEnd(lines: readonly string[]): number {
     let unrecognisedBelow = 0;
     for (let j = end + 1; j < lines.length; j++) {
       const below = lines[j] ?? "";
-      if (!below.trim() || AMBIENT_CHROME_LINE.test(below)) continue;
+      // `DIALOG_RULE` is skipped alongside chrome because the row immediately under a boxed dialog's
+      // last option is that dialog's OWN closing border. Counting it charged the dialog a unit of
+      // this budget for existing, so a boxed menu tolerated one fewer row of real output beneath it
+      // than an unboxed one — the same boxed-vs-unboxed asymmetry as the parse bug above.
+      if (!below.trim() || AMBIENT_CHROME_LINE.test(below) || DIALOG_RULE.test(below)) continue;
       unrecognisedBelow++;
     }
     // The allowance exists for one real screen: the theme picker renders a live DIFF PREVIEW of the
@@ -455,7 +505,7 @@ function parsePickerOptionsWithBounds(scrollback: string): {
     if (expected !== -1 && n > expected) {
       opts = []; // bad anchor: this is the true bottom of the option run
     }
-    opts.unshift({ n, label: m[2] });
+    opts.unshift({ n, label: cleanOptionLabel(m[2]) });
     firstIdx = i;
     if (n === 1) break;
     expected = n - 1;

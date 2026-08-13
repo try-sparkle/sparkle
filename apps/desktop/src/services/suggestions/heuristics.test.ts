@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
+import { SELECTION_CURSOR } from "../../engine/screenClassifier";
 import {
+  RENDERED_OPTION_ROW,
   detectClaudeCodePicker,
   detectResumePrompt,
   detectTerminalPrompts,
@@ -376,5 +378,116 @@ describe("genericMenuRun — the single definition of which run is the menu", ()
 
     expect(run?.numbers).toEqual([1, 2]);
     expect([run?.first, run?.last]).toEqual([1, 3]);
+  });
+});
+
+// ── Claude Code's PLAN-MODE dialog, as it is actually RENDERED: inside a box (bead sparkle-67xxw) ──
+//
+// Every picker fixture above this line is UNBOXED, which is precisely why the blindness shipped.
+// Claude Code draws its dialogs inside `╭─╮ │ │ ╰─╯`, so a real option row is
+//   `│ ❯ 1. Yes, and auto-accept edits            │`
+// and the parser's `PICKER_OPTION` was anchored at line start with only whitespace allowed before
+// the cursor. Measured before the fix: the unboxed dialog parsed to 3 options and the IDENTICAL
+// dialog boxed parsed to `[]`, so `read_picker_options` answered `no-menu` on a menu that was on
+// screen — nothing could answer it, and the agent sat there.
+//
+// The plan dialog draws NO footer, so it is reachable only through `cursorAnchoredRunEnd`.
+const PLAN_OPTION_ROWS = [
+  "│ ❯ 1. Yes, and auto-accept edits                     │",
+  "│   2. Yes, and manually approve edits                │",
+  "│   3. No, keep planning                              │",
+];
+const BOXED_PLAN_DIALOG = [
+  "╭─────────────────────────────────────────────────────╮",
+  "│ Would you like to proceed?                          │",
+  "│                                                     │",
+  ...PLAN_OPTION_ROWS,
+  "╰─────────────────────────────────────────────────────╯",
+].join("\n");
+
+describe("detectClaudeCodePicker — BOXED plan-mode dialog (sparkle-67xxw)", () => {
+  it("parses a boxed, footerless plan dialog that the unboxed parser already handled", () => {
+    // The regression in one line: this returned [] while the unboxed twin returned 3 options.
+    expect(detectClaudeCodePicker(BOXED_PLAN_DIALOG).map((b) => b.value)).toEqual([
+      "1\n",
+      "2\n",
+      "3\n",
+    ]);
+  });
+
+  it("strips the dialog's closing border and padding out of the label", () => {
+    // `(\S.*)` is greedy to end-of-line, so the raw capture ends `…edits                     │`.
+    // A label carrying the border is what the human is asked to press, so it must come out clean.
+    expect(detectClaudeCodePicker(BOXED_PLAN_DIALOG).map((b) => b.label)).toEqual([
+      "1 · Yes, and auto-accept edits",
+      "2 · Yes, and manually approve edits",
+      "3 · No, keep planning",
+    ]);
+  });
+
+  it("still parses when the box is drawn with heavy borders", () => {
+    const heavy = BOXED_PLAN_DIALOG.replace(/│/g, "┃");
+    expect(detectClaudeCodePicker(heavy)).toHaveLength(3);
+  });
+
+  it("does NOT read one prose line as two option rows just because it contains an ASCII pipe", () => {
+    // The reason the border class is BOX-DRAWING ONLY (heuristics.ts's own comment). Widening it to
+    // `|` to "also catch" ASCII boxes turns this single sentence into a 2-option picker.
+    expect(detectClaudeCodePicker("Options: 1. yes | 2. no")).toEqual([]);
+  });
+});
+
+describe("the option-row guards agree (sparkle-xgd1k)", () => {
+  // The bug this pins is not "one regex was wrong", it is "three regexes over the SAME row were
+  // written separately and disagreed". A boxed cursored row satisfied SELECTION_CURSOR and
+  // RENDERED_OPTION_ROW while the parser's own matcher rejected it, so the guards reported a menu
+  // the parser could not produce options for — and `no-menu` was the honest-looking result.
+  //
+  // Asserting the CAPABILITY (all three see the same row) rather than the regex source text: a test
+  // that pinned the pattern strings would pass while they drifted apart in meaning.
+  const CURSORED_ROWS = [
+    "❯ 1. Yes, and auto-accept edits",
+    "│ ❯ 1. Yes, and auto-accept edits                  │",
+    "┃ ❯ 1. Yes, and auto-accept edits                  ┃",
+    "  ❯ 1. Yes, and auto-accept edits",
+  ];
+
+  it.each(CURSORED_ROWS)("every guard sees the same cursored row: %s", (row) => {
+    expect(SELECTION_CURSOR.test(row), "SELECTION_CURSOR").toBe(true);
+    expect(RENDERED_OPTION_ROW.test(row), "RENDERED_OPTION_ROW").toBe(true);
+    // The parser's matcher is private, so drive it through the parse that uses it: a two-option
+    // run anchored on this row must yield options.
+    const screen = [row, "  2. No, keep planning"].join("\n");
+    expect(detectClaudeCodePicker(screen), "PICKER_OPTION (via parse)").toHaveLength(2);
+  });
+
+  it("no guard accepts a prose line with an ASCII pipe as a bordered option row", () => {
+    const prose = "Options: 1. yes | 2. no";
+    expect(RENDERED_OPTION_ROW.test("| 2. no")).toBe(false);
+    expect(detectClaudeCodePicker(prose)).toEqual([]);
+  });
+});
+
+describe("boxed plan dialog with content below it (DEFECT B — sparkle-67xxw)", () => {
+  // `cursorAnchoredRunEnd` gives up when more than UNRECOGNISED_BELOW_RUN (8) rows it does not
+  // recognise sit below the run. A plan dialog draws no footer, so that walk is the ONLY way it
+  // parses — which makes this bound the one that decides whether a real plan dialog survives.
+  const withBelow = (n: number) =>
+    [BOXED_PLAN_DIALOG, ...Array.from({ length: n }, (_, i) => `output line ${i + 1}`)].join("\n");
+
+  it("survives Claude Code's own chrome below the dialog, however deep", () => {
+    // Chrome is free at any depth by design — this is the case that occurs in a live session.
+    const chrome = ["", "? for shortcuts", "⏵⏵ accept edits on (shift+tab to cycle)"];
+    expect(detectClaudeCodePicker([BOXED_PLAN_DIALOG, ...chrome].join("\n"))).toHaveLength(3);
+  });
+
+  it("survives up to the documented allowance of unrecognised rows below", () => {
+    expect(detectClaudeCodePicker(withBelow(8))).toHaveLength(3);
+  });
+
+  it("stops parsing once genuine new output has buried the dialog", () => {
+    // NOT a defect: past the allowance the menu is one the human has already moved on from, and
+    // parsing it would feed keystroke injection at a screen that is no longer waiting on it.
+    expect(detectClaudeCodePicker(withBelow(9))).toEqual([]);
   });
 });

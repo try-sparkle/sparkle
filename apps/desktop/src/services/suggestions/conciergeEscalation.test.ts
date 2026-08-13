@@ -379,3 +379,126 @@ describe("escalationNoticeText — quoted screen text is data, not instructions"
     );
   });
 });
+
+// ══ THE PLAN-MODE ARM (bead sparkle-iwhzt) ══════════════════════════════════════════════════════
+//
+// The founder's boundary: "spend, credentials, and product direction stay with you; everything else
+// I approve". These tests pin BOTH directions, and the APPROVE direction is the one that regresses —
+// the shared deny-list is deliberately wide, so the natural failure is an arm so timid it sends
+// every plan to the founder, which is the overnight-idle problem it exists to end.
+const PLAN_OPTIONS = [
+  "Yes, and auto-accept edits",
+  "Yes, and manually approve edits",
+  "No, keep planning",
+];
+const planPicker = (plan: string): string => picker(["Would you like to proceed?", plan], PLAN_OPTIONS);
+
+describe("routeUnclassifiedPrompt — plan-mode dialogs (sparkle-iwhzt)", () => {
+  describe("the concierge approves implementation decisions", () => {
+    it.each([
+      "Refactor the token bucket rate limiter",
+      "Add a test asserting the cost estimate renders",
+      "Migrate the store to the new schema and backfill in one pass",
+      "Swap the bespoke date helper for the stdlib call",
+    ])("approves: %s", (plan) => {
+      // The two `token` / `cost` cases are the ones the wide shared deny-list gets wrong: both words
+      // are in FOUNDER_ONLY_PATTERNS whole, so a plan arm reusing it unmodified escalates ordinary
+      // refactors. Mention is not decision.
+      expect(routeUnclassifiedPrompt(planPicker(plan)).route).toBe("concierge");
+    });
+  });
+
+  describe("the founder keeps spend, credentials and product direction", () => {
+    it.each<[string, FounderOnlyClass]>([
+      ["Which API key should I use for the new provider?", "credentials"],
+      ["Should I upgrade us to the paid tier to get the higher limit?", "spend"],
+      ["Rotate the production API keys as part of this change", "credentials"],
+      ["Should the picker default to auto-accept or manual for new users?", "product-direction"],
+    ])("escalates: %s", (plan, expected) => {
+      const v = routeUnclassifiedPrompt(planPicker(plan));
+      expect(v.route).toBe("founder");
+      expect(v).toMatchObject({ reason: "founder-only", founderClass: expected });
+    });
+
+    it("does not let `destructive` shadow a product-direction decision", () => {
+      // `destructive` sits AHEAD of `product-direction` in the shared precedence list and is NOT a
+      // class this arm escalates on. Filtering after the first match — rather than filtering the
+      // list before matching — would answer `destructive`, find it non-escalating, and hand a
+      // product-direction decision to the concierge on a technicality.
+      const v = routeUnclassifiedPrompt(
+        planPicker("Delete the legacy onboarding, and decide which feature replaces it"),
+      );
+      expect(v).toMatchObject({ route: "founder", founderClass: "product-direction" });
+    });
+  });
+
+  it("approves a plan that merely PROPOSES a destructive step", () => {
+    // Deliberate: a plan cannot press anything. The destructive act still meets the general arm at
+    // the moment the agent asks to perform it.
+    expect(routeUnclassifiedPrompt(planPicker("Delete the dead vendorOutage shim")).route).toBe(
+      "concierge",
+    );
+  });
+
+  it("still sends a NON-plan picker's destructive option to the founder (roborev 63621)", () => {
+    // The general five-class arm must be untouched. This is the exact shape that finding was about:
+    // a neutral question whose danger lives in the OPTIONS.
+    const v = routeUnclassifiedPrompt(
+      picker(["How should I proceed?"], ["Force push over origin/main", "Open a PR instead"]),
+    );
+    expect(v).toMatchObject({ route: "founder", founderClass: "destructive" });
+  });
+
+  it("requires BOTH halves of the option signature before granting plan authority", () => {
+    // A menu offering only "Yes, and auto-accept edits" is some other dialog, and must not inherit
+    // the plan arm's narrower deny-list. `destructive` proves which arm ran.
+    const v = routeUnclassifiedPrompt(
+      picker(["Would you like to proceed?", "Delete the staging bucket"], [
+        "Yes, and auto-accept edits",
+        "Cancel",
+      ]),
+    );
+    expect(v).toMatchObject({ route: "founder", founderClass: "destructive" });
+  });
+});
+
+describe("plan arm — user-facing behaviour is product direction, describing it is not", () => {
+  const planPicker2 = (plan: string): string =>
+    picker(["Would you like to proceed?", plan], PLAN_OPTIONS);
+
+  it("escalates a plan ASKING what the default behaviour should be", () => {
+    expect(routeUnclassifiedPrompt(planPicker2("Should dictation be opt-in or on by default?"))).
+      toMatchObject({ route: "founder", founderClass: "product-direction" });
+  });
+
+  it("approves a plan that merely STATES a default already decided", () => {
+    // The pair that makes the framing requirement load-bearing: same words, no ask. Without the
+    // pairing this test would pass for the wrong reason — the phrase simply not matching.
+    expect(
+      routeUnclassifiedPrompt(planPicker2("Wire the retry flag; it defaults to false for now")).route,
+    ).toBe("concierge");
+  });
+});
+
+describe("plan arm — `should` alone is not an ask (the framing rule's own edge)", () => {
+  const planPicker3 = (plan: string): string =>
+    picker(["Would you like to proceed?", plan], PLAN_OPTIONS);
+
+  it("approves a plan whose only `should` describes a spec, next to a weak term", () => {
+    // Both halves matter: `token` is in the credentials pattern whole, and `should be` is not an
+    // ask. Treating a bare `should` as framing sends this refactor to the founder — and the dialog's
+    // own "Would you like to proceed?" guarantees a `?` in the region, so punctuation cannot rescue
+    // the distinction either.
+    expect(
+      routeUnclassifiedPrompt(
+        planPicker3("Refactor the token bucket; the retry should be capped at 3"),
+      ).route,
+    ).toBe("concierge");
+  });
+
+  it("escalates once that same weak term is what is being ASKED about", () => {
+    expect(
+      routeUnclassifiedPrompt(planPicker3("Which token should we use for the relay handshake?")),
+    ).toMatchObject({ route: "founder", founderClass: "credentials" });
+  });
+});
