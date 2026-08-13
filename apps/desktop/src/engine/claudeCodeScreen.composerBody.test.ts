@@ -203,6 +203,61 @@ describe("a genuine full-screen app is still refused", () => {
     expect(hasClaudeCodeComposerBox(rounded(Array(13).fill(row("  continuation"))))).toBe(false);
   });
 
+  // ── "INDENTED" IS RELATIVE TO THE PROMPT, NOT TO THE BORDER (roborev 63700, Medium) ────────────
+  // The previous rule was `/^\s*[│|]\s{2,}\S/` — "at least two spaces after the left border". A
+  // bordered row also CLOSES with `│`, and that closing border is itself a `\S`, so the rule
+  // collapsed to a statement about the panel's own PADDING WIDTH rather than about the composer.
+  // The cases above only ever passed because the helper draws exactly ONE space of padding; a
+  // panel padded by two or more columns — boxen's default `padding: 1` renders three — put every
+  // output row two spaces clear of the border and sailed through unchanged.
+  //
+  // The bare-rule arm is safe because flush-left is an ABSOLUTE property of a row. Inside a box
+  // there is no absolute left edge: the impostor chooses it. So the reference point has to be the
+  // one landmark the box itself supplies — the column of its own `❯`. Claude Code indents a wrap
+  // PAST the prompt marker; a transcript's output lines up flush WITH the command, at the marker's
+  // own column. That distinction survives any padding width, which is the whole point.
+  const padded = (pad: number, bodyRows: string[]) => {
+    const p = " ".repeat(pad);
+    const r = (inner: string) => "│" + p + inner.padEnd(W) + p + "│";
+    return [
+      "╭" + "─".repeat(W + 2 * pad) + "╮",
+      r("> npm run build"),
+      ...bodyRows.map(r),
+      "╰" + "─".repeat(W + 2 * pad) + "╯",
+    ].join("\n");
+  };
+
+  it("a WIDELY PADDED panel of command output is still not a composer", () => {
+    // Identical in shape to the one-space case above, and it must stay false for the same reason:
+    // `Build succeeded` sits at the same column as the `>`, so it is output, not a continuation.
+    for (const pad of [1, 2, 3, 4]) {
+      const panel = padded(pad, ["Build succeeded in 4.2s", "3 files written"]);
+      expect(hasClaudeCodeComposerBox(panel)).toBe(false);
+      expect(isClaudeCodeScreen(panel)).toBe(false);
+    }
+  });
+
+  it("a widely padded composer whose wrap is indented PAST the prompt is recognised", () => {
+    // The other direction of the same rule: the padding is wide, but the continuation is indented
+    // relative to the `>` rather than merely clear of the border, so this one IS a composer.
+    for (const pad of [1, 2, 3, 4]) {
+      expect(hasClaudeCodeComposerBox(padded(pad, ["  a wrapped continuation"]))).toBe(true);
+    }
+  });
+
+  it("a padding-only row with its closing border trimmed away is legal body", () => {
+    // `snapshotScreen` right-trims, so the composer's reserved blank row can reach us as a bare
+    // `│`. Nothing covered that branch before — it could be deleted with the suite green, and the
+    // reserved row is exactly what the original three-row bug was about.
+    const bare = [
+      "╭" + "─".repeat(W + 2) + "╮",
+      row("> a message"),
+      "│",
+      "╰" + "─".repeat(W + 2) + "╯",
+    ].join("\n");
+    expect(hasClaudeCodeComposerBox(bare)).toBe(true);
+  });
+
   // ── THE PROMPT LINE IS LOAD-BEARING, AND ONLY THIS PINS IT ─────────────────────────────────────
   // Added because `mutation-check --line 202,212,221,222` FLAGGED the prompt-line test: the body
   // walk that follows it could still return the right answer for every other case in this file with

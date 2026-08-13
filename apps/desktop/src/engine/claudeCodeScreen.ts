@@ -258,9 +258,40 @@ function isComposerBodyRow(line: string): boolean {
  *  submitted into a pager. Re-measure against a real rounded-box build before widening it. */
 const MAX_BOX_BODY_ROWS = 12;
 
-/** Is `line` a legal row inside the ROUNDED box? Border, then padding or an indented continuation. */
-function isBoxBodyRow(line: string): boolean {
-  return BLANK_ROW.test(line) || /^\s*[│|]\s*$/.test(line) || /^\s*[│|]\s{2,}\S/.test(line);
+/** ── AND "INDENTED" IS RELATIVE TO THE PROMPT, NOT TO THE BORDER (roborev 63700, Medium) ───────
+ *  The first shaped cut of this was `/^\s*[│|]\s{2,}\S/` — "the left border, then at least two
+ *  spaces, then content". That reads like the bare-rule arm's rule and is not: a bordered row also
+ *  CLOSES with `│`, and that closing border is itself a `\S`, so the pattern collapsed into a
+ *  statement about the PANEL'S OWN PADDING WIDTH. It rejected an impostor only when the impostor
+ *  happened to use exactly one column of padding — which was true of the fixture written beside it
+ *  and of nothing else. boxen's default `padding: 1` renders three columns; Ink and `cli-table`
+ *  are similar. Every one of those panels put its output two spaces clear of the border and passed.
+ *
+ *  The bare-rule arm is safe because flush-left is an ABSOLUTE property of a row. Inside a box
+ *  there is no absolute left edge — the impostor picks it — so the reference point has to be the
+ *  one landmark the box supplies about itself: the column of its own `❯`. Claude Code indents a
+ *  soft-wrapped continuation PAST the prompt marker, while a transcript's output lines up flush
+ *  WITH the command it followed. That distinction is invariant under padding width, which is the
+ *  whole reason to measure from the prompt.
+ *
+ *  Still reasoned rather than measured, for the same reason the bound below stays at 12: no capture
+ *  in this repo shows a real rounded body. A wrong guess here costs a false NEGATIVE — one refusal,
+ *  the behaviour that shipped for months — where a false positive is text pasted AND submitted into
+ *  a pager. */
+function isBoxBodyRowFor(promptLine: string): (line: string) => boolean {
+  // `BOX_PROMPT` matched this line, so it contains a marker; `search` cannot come back -1 here.
+  const promptCol = promptLine.search(/[❯›>]/);
+  return (line: string): boolean => {
+    if (BLANK_ROW.test(line)) return true;
+    const borderCol = line.search(/[│|]/);
+    if (borderCol < 0) return false;
+    const afterBorder = line.slice(borderCol + 1);
+    const offset = afterBorder.search(/\S/);
+    // Padding only, with the closing border right-trimmed away — the composer's reserved blank row
+    // reaches us in exactly this shape, since `snapshotScreen` trims.
+    if (offset < 0) return true;
+    return borderCol + 1 + offset > promptCol;
+  };
 }
 
 /**
@@ -296,7 +327,8 @@ function hasComposerBox(lines: readonly string[]): boolean {
     }
     if (BOX_TOP.test(top) && BOX_PROMPT.test(mid)) {
       const bottom = (l: string) => BOX_BOTTOM.test(l);
-      if (closesWithinBody(lines, i + 1, bottom, isBoxBodyRow, MAX_BOX_BODY_ROWS)) return true;
+      const isBody = isBoxBodyRowFor(mid);
+      if (closesWithinBody(lines, i + 1, bottom, isBody, MAX_BOX_BODY_ROWS)) return true;
     }
   }
   return false;
