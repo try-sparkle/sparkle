@@ -268,6 +268,7 @@ export const APP_TOOL_NAMES = [
   "append_communication_guideline",
   "set_agent_goal",
   "set_agent_goal_met",
+  "set_agent_escalation",
   "claim_pr",
   "release_pr",
 ] as const;
@@ -310,6 +311,14 @@ export const APP_TOOL_RISK: Record<AppToolName, ConciergeRiskClass> = {
   // repo — the claim only makes `merge_pr` pause and point at the claimant.
   set_agent_goal: "routine",
   set_agent_goal_met: "routine",
+  // IRREVERSIBLE, unlike the three `routine` intent writes around it, and the difference is what it
+  // takes OFF A HUMAN'S PLATE rather than how hard the field is to overwrite. An escalation is the
+  // app saying "this one is yours now"; clearing it withdraws that, spends one of an allowance only
+  // the human can refill, and starts a token-spending retry loop again. Raising one puts a
+  // notification in front of them. Neither is undone by setting a field back — the allowance is
+  // gone either way. `set_config` carries the same class for the same reason (it overstates
+  // recoverability, deliberately, because erring toward asking is the cheap mistake).
+  set_agent_escalation: "irreversible",
   claim_pr: "routine",
   release_pr: "routine",
 };
@@ -327,6 +336,7 @@ const APP_TOOL_SUMMARY: Record<AppToolName, string> = {
   set_config: "Write Sparkle's machine-wide configuration.",
   set_agent_goal: "Set an agent's current objective (what it is trying to finish).",
   set_agent_goal_met: "Mark a stalled-but-finished agent's goal met — the only thing that makes an idle agent count as done.",
+  set_agent_escalation: "Hand an agent to you, or put one back to work after auto-continue gave up on it (twice at most).",
   claim_pr: "Record that you will land a pull request yourself, so nothing merges around you.",
   release_pr: "Give up your claim on a pull request.",
 };

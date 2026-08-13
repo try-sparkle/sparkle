@@ -28,11 +28,14 @@ import {
   dischargeGoal,
   escalateGoal,
   rearmGoal,
+  conciergeRearmGoal,
   goalDebtOf,
   markGoalMet,
+  mayRearmGoal,
   newGoal,
   noteContinue,
   resetGoalRetries,
+  unraiseGoal,
 } from "../engine/agentGoal";
 import { isDefaultModel } from "../services/models";
 import { clearPin } from "../services/accountStore";
@@ -259,6 +262,34 @@ export interface ProjectState {
    *  or a HUMAN's new goal clears it. An AGENT's own `setAgentGoal` does not, however it rephrases or
    *  clears first — see `GoalDebt` in engine/agentGoal for why that distinction is load-bearing. */
   escalateAgentGoal: (projectId: string, agentId: string, reason: string, now: number) => void;
+  /** Raise an escalation ON PURPOSE, as the CONCIERGE — "stop retrying this, a person is needed".
+   *  Distinct from `escalateAgentGoal` (the engine giving up) only in that it records
+   *  `escalatedBy: "concierge"`, which is what makes the raise freely undoable by its author.
+   *  Latched like every escalation, so it cannot re-stamp a machine give-up as its own.
+   *
+   *  Takes `now` for the same coupled-clock reason the expiry trio below documents. */
+  conciergeEscalateAgentGoal: (
+    projectId: string,
+    agentId: string,
+    reason: string,
+    now: number,
+  ) => void;
+  /** THE CONCIERGE'S BOUNDED LEVER on an ESCALATION: clear one and hand back a slice of retry
+   *  budget. Spends one of `MAX_CONCIERGE_REARMS`; returns false once the allowance is gone, at
+   *  which point the escalation is the human's again. Undoing the concierge's OWN raise goes through
+   *  the free path instead and costs nothing. Returns whether anything was actually cleared.
+   *
+   *  ⚠️ NOT `rearmAgentGoal` BELOW, AND THE TWO NEARLY SHARED A NAME. That one re-arms a goal's
+   *  TTL CLOCK (an expiry outcome, `engine/goalExpiry`); this one re-arms the AUTO-CONTINUE
+   *  BUDGET after an escalation. They arrived on two branches that merged here, both called
+   *  `rearmAgentGoal`, with different signatures and different meanings — so both are spelled out
+   *  in full rather than left to the reader to disambiguate by argument count. */
+  conciergeRearmAgentGoal: (
+    projectId: string,
+    agentId: string,
+    reason: string,
+    now: number,
+  ) => boolean;
   /** Extend a lapsed goal's clock. The three expiry outcomes owned by `engine/goalExpiry`; the
    *  continuation sweep is their only caller.
    *
@@ -663,16 +694,28 @@ function releaseGoalDebt(a: AgentTab): AgentTab {
   // of what typing releases (see below), so a debt consisting solely of it must not defeat the fast
   // path — otherwise every terminal line rewrites the agent, its goal and the persisted blob again,
   // which is the exact regression the paragraph above documents.
+  // ⚠️ `conciergeRearms` HAS TO BE ASKED ABOUT HERE, and this is the single easiest place in the module
+  // to miss it. `engine/agentGoal.rearmGoal` deliberately leaves a re-armed goal looking almost
+  // clean — it drops `escalatedAt` (that is what a re-arm IS) and subtracts from `totalContinues`,
+  // which floors to 0 for a goal escalated by the no-progress bound. That is exactly the shape this
+  // predicate calls "nothing owed". Without these two clauses the fast path returns the agent
+  // UNCHANGED for every re-armed goal, so the human's typed line never reaches `resetGoalRetries`,
+  // and the one lever documented as stronger than the concierge's silently stops working — while
+  // every test that only asserts `goalStateOf === "unmet"` afterwards still passes, because a
+  // re-armed goal already reads `unmet`.
   const debtOwesNothing =
     a.goalDebt === undefined ||
-    (a.goalDebt.totalContinues === 0 && a.goalDebt.escalatedAt === undefined);
+    (a.goalDebt.totalContinues === 0 &&
+      a.goalDebt.escalatedAt === undefined &&
+      (a.goalDebt.conciergeRearms ?? 0) === 0);
   const owesNothing =
     debtOwesNothing &&
     (g === undefined ||
       (g.continues === 0 &&
         g.totalContinues === 0 &&
         g.escalatedAt === undefined &&
-        g.mark === undefined));
+        g.mark === undefined &&
+        (g.conciergeRearms ?? 0) === 0));
   if (owesNothing) return a;
   const { goalDebt: _released, ...rest } = a;
   // THE STASHED CHECK SURVIVES THIS RELEASE. What fires here is ANY human-authored line — a composer
@@ -696,7 +739,14 @@ function releaseGoalDebt(a: AgentTab): AgentTab {
  */
 function stripVerify(debt: GoalDebt): GoalDebt | undefined {
   const { verify: _dropped, ...rest } = debt;
-  return rest.totalContinues === 0 && rest.escalatedAt === undefined ? undefined : rest;
+  // `conciergeRearms` counts as something left to owe, for the same reason it does in `goalDebtOf`:
+  // dropping the stash here would hand the concierge's spent allowance back through a `verify: null`
+  // take-back, which is an unrelated lever and must not double as a re-arm refill.
+  return rest.totalContinues === 0 &&
+    rest.escalatedAt === undefined &&
+    (rest.conciergeRearms ?? 0) === 0
+    ? undefined
+    : rest;
 }
 
 /** localStorage key the project store persists under. Shared so cross-window sync
@@ -1748,6 +1798,82 @@ export const useProjectStore = create<ProjectState>()(
             ),
           ),
         })),
+
+      conciergeEscalateAgentGoal: (projectId, agentId, reason, now) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.goal ? { ...a, goal: escalateGoal(a.goal, now, reason, "concierge") } : a,
+            ),
+          ),
+        })),
+
+      conciergeRearmAgentGoal: (projectId, agentId, reason, now) => {
+        // READ-THEN-WRITE, because this action's caller needs to know whether it actually happened —
+        // the control op has to answer `escalation_rearm_exhausted` rather than a bare ok, and a
+        // zustand `set` cannot report that. The read and the write are in the same synchronous tick,
+        // and this store has no other writer that could interleave.
+        const found = get()
+          .projects.find((p) => p.id === projectId)
+          ?.agents.find((a) => a.id === agentId);
+        const goal = found?.goal;
+        const stashed = found?.goalDebt;
+
+        // THE ESCALATION MAY OUTLIVE THE GOAL RECORD. An agent-actor clear stashes `escalatedAt` in
+        // `goalDebt`, which is the state that used to be unrecoverable — no goal to resume, and an
+        // escalation nobody could clear. Dropping it from the stash is the whole point of handling
+        // this branch; there is simply nothing to resume afterwards, which the caller reports.
+        if (goal === undefined) {
+          if (stashed?.escalatedAt === undefined) return false;
+          const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, ...restDebt } = stashed;
+          const emptied =
+            restDebt.totalContinues === 0 &&
+            (restDebt.conciergeRearms ?? 0) === 0 &&
+            restDebt.verify === undefined;
+          set((s) => ({
+            projects: mapProject(s.projects, projectId, (p) =>
+              mapAgent(p, agentId, (a) => {
+                const { goalDebt: _dropped, ...rest } = a;
+                return emptied ? rest : { ...rest, goalDebt: restDebt };
+              }),
+            ),
+          }));
+          return true;
+        }
+
+        if (goal.escalatedAt === undefined) return false;
+
+        // UNDOING ITS OWN RAISE IS FREE, and must not touch a single counter — see `unraiseGoal`.
+        // Charging for it would be wrong (nothing was spent), and resetting counters would make
+        // raise-then-clear an unlimited budget refill.
+        if (goal.escalatedBy === "concierge") {
+          set((s) => ({
+            projects: mapProject(s.projects, projectId, (p) =>
+              mapAgent(p, agentId, (a) => (a.goal ? { ...a, goal: unraiseGoal(a.goal) } : a)),
+            ),
+          }));
+          return true;
+        }
+
+        // A MACHINE give-up costs one of the allowance, and the allowance is finite.
+        if (!mayRearmGoal(goal)) return false;
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) => {
+              if (!a.goal) return a;
+              const rearmed = { ...a, goal: conciergeRearmGoal(a.goal, now, reason) };
+              // The stash is latched too, or `chargeGoalDebt` re-applies the escalation we just
+              // cleared the moment the agent sets new goal text — the clear would look like it
+              // worked and silently undo itself one call later.
+              if (a.goalDebt?.escalatedAt === undefined) return rearmed;
+              const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, ...restDebt } =
+                a.goalDebt;
+              return { ...rearmed, goalDebt: restDebt };
+            }),
+          ),
+        }));
+        return true;
+      },
 
       resetAgentGoalRetries: (projectId, agentId) =>
         set((s) => ({

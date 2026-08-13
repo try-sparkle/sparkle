@@ -145,9 +145,18 @@ describe("escalated goals", () => {
     expect(citable(c!.text, c!.measured)).toBe(true);
   });
 
-  it("says WHY it is a dead end — that the app reserves it for the human", () => {
+  it("says WHY it is the human's — the concierge's re-arms are bounded and only they refill them", () => {
     const [c] = evaluateFleetConditions([esc("a", "three continues, no progress")], T0);
-    expect(c!.text).toMatch(/reserves it for you/);
+    expect(c!.text).toMatch(/re-arm a goal a bounded number of times/);
+    expect(c!.text).toMatch(/only your typing to the agent refills that allowance/);
+    // The OLD claim — that the concierge can never re-arm and the app reserves it for the human —
+    // is now false (agentGoal's `rearmGoal` / MAX_CONCIERGE_REARMS). Pinned as an absence too,
+    // because a sentence that carries both readings is worse than either.
+    expect(c!.text).not.toMatch(/reserves it for you/);
+    expect(c!.text).not.toMatch(/cannot re-arm/);
+    // …and the rewrite must still survive the fabricated-citation gate: the only number it may
+    // render is the count `measured` already carries.
+    expect(citable(c!.text, c!.measured)).toBe(true);
   });
 
   it("names an agent with no recorded reason rather than dropping it from the batch", () => {

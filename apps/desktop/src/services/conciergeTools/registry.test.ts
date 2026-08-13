@@ -1159,6 +1159,13 @@ describe("dispatchConciergeTool — terminal writes carry a constructed authorit
       .agents.find((x) => x.id === agentId)!.goal!;
     expect(after.escalatedAt).toBe(before.escalatedAt);
     expect(after.text).toBe(before.text);
+    // And the COPY says WHICH protection this is. The concierge does hold a bounded re-arm lever
+    // now, so a note reading "escalated to the human" full stop would send it to a person for
+    // something it may be able to clear itself — through the explicit counted op, never by sending
+    // more text, which is the invariant the assertions above pin.
+    const note = String((r.ok && (r.data as { goalNote?: string }).goalNote) ?? "");
+    expect(note).toMatch(/set_agent_escalation/);
+    expect(note).toMatch(/never a side effect/i);
   });
 
   it("does NOT record a goal when the escalation survives only in goalDebt, and says the human must act", async () => {

@@ -32,6 +32,10 @@ export type ControlOp =
   // myself" somewhere the concierge can see it. See services/mergeGuard/types.ts for the incident.
   | "set_agent_goal"
   | "set_agent_goal_met"
+  // The concierge's BOUNDED lever on `escalated` (bead sparkle-hm4z9). Not a self-report at all —
+  // it is the one op on this surface only the concierge may call — but it is tallied like the rest
+  // so the tier table stays exhaustive (see the `chief_tool` note below for what an omission costs).
+  | "set_agent_escalation"
   | "claim_pr"
   | "release_pr"
   // The concierge's tool spine (services/conciergeTools/registry). ONE op carrying a
@@ -92,6 +96,7 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   set_agent_activity: 0,
   set_agent_goal: 0,
   set_agent_goal_met: 0,
+  set_agent_escalation: 0,
   claim_pr: 0,
   release_pr: 0,
   append_communication_guideline: 0,

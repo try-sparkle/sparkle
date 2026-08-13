@@ -1330,10 +1330,26 @@ function escalationCondition(escalated: readonly FleetSnapshot[]): FleetConditio
       String(n),
       ...quotedNumbers(...escalated.flatMap((s) => [s.label, s.escalation?.reason])),
     ],
+    // ── WHAT THE READER IS BEING TOLD IS WHY *THEY* ARE THE ONE HOLDING IT ─────────────────────────
+    // This sentence used to read "the concierge cannot re-arm an escalated goal — the app reserves
+    // it for you by design", which was true until the concierge got a BOUNDED re-arm lever
+    // (agentGoal's `rearmGoal` / MAX_CONCIERGE_REARMS). It can now clear a machine give-up, twice,
+    // and each clear spends one of an allowance ONLY a human refills by typing to the agent.
+    //
+    // So the honest claim is no longer "nothing but you can retry this" — it is that retrying has
+    // either already been spent here or was never the answer. Deliberately vague about WHICH:
+    // `FleetSnapshot.escalation` carries a reason and nothing else, so this function cannot tell the
+    // two apart, and inventing a per-row verdict it has not measured is exactly what the citation
+    // gate exists to stop.
+    //
+    // NO DIGITS. The bound is stated in words rather than as `2` because every number rendered here
+    // must appear in `measured`, and the constant lives in the desktop app (which depends on this
+    // package, not the other way round) — so a numeral would either be a hardcoded copy that can
+    // drift from the engine or a fabricated citation that mutes the whole report.
     text:
-      `${n} ${plural} escalated. Auto-continue gave up and the concierge cannot re-arm an ` +
-      `escalated goal — the app reserves it for you by design, so it stays a dead end until you ` +
-      `clear it:\n${lines.join("\n")}`,
+      `${n} ${plural} escalated. The concierge may re-arm a goal a bounded number of times, and ` +
+      `only your typing to the agent refills that allowance — so these have either run out of ` +
+      `re-arms or need a person rather than another retry:\n${lines.join("\n")}`,
   };
 }
 

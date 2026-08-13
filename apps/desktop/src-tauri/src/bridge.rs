@@ -824,6 +824,12 @@ const CONTROL_OPS: &[&str] = &[
     // claim/release let an agent say "I am landing this myself" somewhere the concierge's merge gate
     // can see it. The claimant is the bridge-stamped caller — no payload names it.
     "set_agent_goal_met",
+    // The concierge's BOUNDED lever on a goal's `escalated` state (bead sparkle-hm4z9). Listed here
+    // like every other op, but it is the one whose coarse existence gate is genuinely not enough:
+    // the frontend narrows it to the reserved concierge caller id, because clearing an escalation
+    // spends an allowance only a human can refill. This array is deliberately the COARSE gate — see
+    // the header — so read `handleSetEscalation` for who may actually call it.
+    "set_agent_escalation",
     "claim_pr",
     "release_pr",
     // Phase 4 (the concierge tool surface). ONE generic op rather than ~55 named ones: the
@@ -2095,6 +2101,10 @@ mod tests {
             // `set_agent_goal` is deliberately not repeated here — it is asserted once, in the
             // Phase-1 line above, matching where CONTROL_OPS lists it.
             "set_agent_goal_met", "claim_pr", "release_pr",
+            // The concierge's bounded lever on `escalated` — raise one, or clear one (twice at
+            // most). Frontend-gated to the reserved concierge caller; this array is only the coarse
+            // existence gate.
+            "set_agent_escalation",
             // The Chief tool surface — one op carrying every `chief_*` tool and `chief_call`.
             "chief_tool",
         ] {
@@ -2102,8 +2112,8 @@ mod tests {
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            19,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, and the Chief tool op"
+            20,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the concierge escalation lever, and the Chief tool op"
         );
     }
 

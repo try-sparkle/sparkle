@@ -15,7 +15,15 @@ import {
   thrashChipLabel,
 } from "./rowAttention";
 import { stallReport } from "../engine/agentStall";
-import { newGoal, escalateGoal, markGoalMet, DEFAULT_GOAL_TTL_MS } from "../engine/agentGoal";
+import {
+  newGoal,
+  escalateGoal,
+  markGoalMet,
+  conciergeRearmGoal,
+  DEFAULT_GOAL_TTL_MS,
+  MAX_CONCIERGE_REARMS,
+  type AgentGoal,
+} from "../engine/agentGoal";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 import type { ThrashReport } from "../engine/agentThrash";
 
@@ -374,6 +382,44 @@ describe("goalBadgeFor", () => {
     const badge = goalBadgeFor(goal, NOW);
     expect(badge?.escalated).toBe(true);
     expect(badge?.label).toBe("auto-continue gave up — the build never went green");
+  });
+
+  // A goal the concierge re-armed `times` times and which has escalated AGAIN — the state the
+  // human actually meets on the row, built by driving the real engine rather than hand-stamping
+  // `conciergeRearms` (a hand-built goal would assert against a shape production may never produce).
+  const rearmedAndStuckAgain = (times: number): AgentGoal => {
+    let goal = newGoal("land PR #42", NOW);
+    for (let i = 0; i < times; i++) {
+      goal = escalateGoal(goal, NOW, "the build never went green");
+      goal = conciergeRearmGoal(goal, NOW, "unblocked the build");
+    }
+    return escalateGoal(goal, NOW, "the build never went green");
+  };
+
+  it("says a MACHINE already re-armed it, so the human is not reading a first give-up", () => {
+    const badge = goalBadgeFor(rearmedAndStuckAgain(1), NOW);
+    expect(badge?.escalated).toBe(true);
+    // Names the count, and does NOT read as the untouched auto-continue give-up.
+    expect(badge?.label).toBe("re-armed 1× and stuck again — the build never went green");
+    expect(badge?.label).not.toContain("auto-continue gave up");
+  });
+
+  it("says the allowance is SPENT once it is, so retrying is visibly not the next move", () => {
+    const badge = goalBadgeFor(rearmedAndStuckAgain(MAX_CONCIERGE_REARMS), NOW);
+    expect(badge?.label).toContain(`re-armed ${MAX_CONCIERGE_REARMS}× and stuck again`);
+    expect(badge?.label).toContain("no re-arms left, this one is yours");
+    expect(badge?.label).toContain("the build never went green");
+    // Still AMBER: the escalated flag is what the row paints from, and a spent allowance is not a
+    // new alarm tier (escalated-goal left the red tier on 2026-08-06 and is not coming back).
+    expect(badge?.escalated).toBe(true);
+    expect(badge?.state).toBe("escalated");
+  });
+
+  it("keeps the re-armed wording when the escalation recorded no reason", () => {
+    let goal = escalateGoal(newGoal("land PR #42", NOW), NOW, "gave up");
+    goal = conciergeRearmGoal(goal, NOW, "unblocked it");
+    goal = escalateGoal(goal, NOW, "");
+    expect(goalBadgeFor(goal, NOW)?.label).toBe("re-armed 1× and stuck again");
   });
 
   it("reports a met goal as met even after its TTL passes", () => {

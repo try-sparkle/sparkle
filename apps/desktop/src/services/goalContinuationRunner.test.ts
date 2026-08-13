@@ -9,6 +9,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { progressMark } from "../engine/goalContinuation";
+import { MAX_CONCIERGE_REARMS } from "../engine/agentGoal";
 import {
   noteHooksLive,
   resetTurnEndAuthority,
@@ -730,5 +731,88 @@ describe("an auto-continue that never REACHES the terminal", () => {
     // `totalContinues` counts DELIVERED resumes. An undelivered one crediting it would make
     // `MAX_CONTINUES_WITHOUT_PROGRESS` fire on sends the agent never saw.
     expect(goalOf(projectId, agentId)!.totalContinues).toBe(0);
+  });
+});
+
+describe("the concierge's re-arm actually puts the agent back to work", () => {
+  /** Spend the consecutive-retry budget without moving the mark. */
+  function burnRetries(projectId: string, agentId: string, times: number): void {
+    for (let i = 0; i < times; i++) {
+      useProjectStore.getState().noteAgentGoalContinue(projectId, agentId, FRESH_MARK);
+    }
+  }
+
+  /** Drive the sweep to a REAL escalation, the way the runner reaches one in the field. */
+  async function escalateForReal(projectId: string, agentId: string): Promise<void> {
+    burnRetries(projectId, agentId, 3);
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+    expect(sendMock).not.toHaveBeenCalled();
+  }
+
+  it("RESUMES the agent after a non-human clear — the whole point of the feature", async () => {
+    // THE CLAIM THE FOUNDER ACTUALLY MADE, and the one his concierge got wrong: it reported
+    // "re-armed" while auto-resume stayed dead, because rewriting the goal TEXT leaves the latch
+    // alone. So this asserts the SIDE EFFECT — text that reached the terminal — and not
+    // `goalStateOf === "unmet"`, which is merely the precondition and was already true of every
+    // cosmetic re-arm that shipped nothing.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    await escalateForReal(projectId, agentId);
+
+    // The concierge clears it. No human typed anything.
+    expect(useProjectStore.getState().conciergeRearmAgentGoal(projectId, agentId, "cleared the dialog", Date.now())).toBe(
+      true,
+    );
+
+    // ONE sweep is enough: the idle clock has been armed since before the escalation, so the very
+    // next eligible window sends. (Two sweeps here would send twice, which is correct behaviour and
+    // a misleading assertion.)
+    await sweepGoalContinuations({ now: SETTLED + 46_000, ownsProject: ownsEverything });
+
+    // THE SEND HAPPENED, carrying the goal.
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    const [sentAgentId, sentText] = sendMock.mock.calls[0]!;
+    expect(sentAgentId).toBe(agentId);
+    expect(sentText).toContain("land the PR");
+
+    // And the retry was recorded against the re-armed budget, not a fresh one.
+    expect(goalOf(projectId, agentId)!.conciergeRearms).toBe(1);
+  });
+
+  it("stops resuming again once the allowance is spent — the bound is real, not advisory", async () => {
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+
+    for (let i = 0; i < MAX_CONCIERGE_REARMS; i++) {
+      useProjectStore.getState().escalateAgentGoal(projectId, agentId, "gave up", Date.now());
+      expect(useProjectStore.getState().conciergeRearmAgentGoal(projectId, agentId, `try ${i}`, Date.now())).toBe(true);
+    }
+    useProjectStore.getState().escalateAgentGoal(projectId, agentId, "gave up again", Date.now());
+
+    // The allowance is gone, so the concierge cannot clear it...
+    expect(useProjectStore.getState().conciergeRearmAgentGoal(projectId, agentId, "once more", Date.now())).toBe(false);
+
+    // ...and the agent stays stopped, which is the side effect that matters.
+    sendMock.mockClear();
+    let now = T0;
+    for (let i = 0; i < 3; i++) {
+      await sweepGoalContinuations({ now, ownsProject: ownsEverything });
+      now += 46_000;
+    }
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+  });
+
+  it("a concierge RAISE stops a healthy agent being resumed", async () => {
+    // The other direction. An agent with a live goal is eligible; raising must take it out of the
+    // pool exactly the way a machine give-up does.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    useProjectStore.getState().conciergeEscalateAgentGoal(projectId, agentId, "a person is needed", Date.now());
+
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(goalOf(projectId, agentId)!.escalatedBy).toBe("concierge");
   });
 });

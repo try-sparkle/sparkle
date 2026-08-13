@@ -88,6 +88,10 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         // Intent signals (services/mergeGuard). The op NAME only — never the goal text or the
         // claim note, both of which are free text an agent wrote.
         "set_agent_goal", "set_agent_goal_met", "claim_pr", "release_pr",
+        // The concierge's bounded lever on `escalated` (bead sparkle-hm4z9). Same rule again, and
+        // the reason it belongs to this paragraph rather than the UI ones: its payload carries a
+        // free-text `reason` naming an agent's real work, and only the op name is stored.
+        "set_agent_escalation",
       ].sort(),
     );
   });

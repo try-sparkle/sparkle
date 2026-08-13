@@ -23,7 +23,13 @@
 // which costs more than the stall did; a `finished` claim built on unread git state is the same lie
 // in the other direction. `stallReport` turns a missing input into the `unknown` verdict, and
 // `isStalled` deliberately renders no alarm for it.
-import { type AgentGoal, goalRemainingMs, goalStateOf, type GoalState } from "../engine/agentGoal";
+import {
+  type AgentGoal,
+  goalRemainingMs,
+  goalStateOf,
+  mayRearmGoal,
+  type GoalState,
+} from "../engine/agentGoal";
 import type { StallCause, StallInput, StallReport } from "../engine/agentStall";
 import type { QuotaBlock } from "../engine/quotaBlock";
 import type { ThrashReport, ThrashVerdict } from "../engine/agentThrash";
@@ -267,9 +273,11 @@ export interface GoalBadge {
   state: Exclude<GoalState, "none">;
   /** The goal's own words. */
   text: string;
-  /** The state phrase — "active · 3h 20m left", "met", "auto-continue gave up — <reason>". */
+  /** The state phrase — "active · 3h 20m left", "met", "auto-continue gave up — <reason>", or,
+   *  once the concierge has re-armed it, "re-armed 2× and stuck again — …". */
   label: string;
-  /** Auto-continue gave up. Rendered unmistakably; see `stallIsEscalated`. */
+  /** The goal is escalated — auto-continue gave up, or the concierge raised one deliberately.
+   *  Rendered unmistakably; see `stallIsEscalated`. */
   escalated: boolean;
 }
 
@@ -308,15 +316,28 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
       // MANDATE ran out — the same two facts engine/agentStall keeps apart in its `expired-goal`
       // cause, and the 153-minute-class stalls are the ones most likely to cross the TTL.
       return { state, text: goal.text, escalated: false, label: "ran out of time — never met" };
-    case "escalated":
-      return {
-        state,
-        text: goal.text,
-        escalated: true,
-        label: goal.escalationReason
-          ? `auto-continue gave up — ${goal.escalationReason}`
-          : "auto-continue gave up",
-      };
+    case "escalated": {
+      // A RE-ARMED GOAL THAT IS ESCALATED AGAIN IS NOT THE SAME ROW, and the badge has to say so.
+      // The concierge may clear a machine escalation a bounded number of times (agentGoal's
+      // MAX_CONCIERGE_REARMS); each clear puts the agent back to work and spends one. So an
+      // escalation carrying `conciergeRearms > 0` means a MACHINE already tried this — the human is not
+      // looking at a first give-up, and "just restart it" is advice that has already been taken.
+      // The common case (never re-armed) keeps its exact original wording: this is a rarer row and
+      // must not cost the ordinary one any clarity.
+      const rearms = goal.conciergeRearms ?? 0;
+      const why = goal.escalationReason ? ` — ${goal.escalationReason}` : "";
+      if (rearms === 0) {
+        return { state, text: goal.text, escalated: true, label: `auto-continue gave up${why}` };
+      }
+      // Amber either way. Escalated-goal was deliberately removed from the RED tier on 2026-08-06
+      // because rows were painted red that needed nothing, and a spent allowance is still a row the
+      // human reads at their own pace rather than an alarm.
+      const spent = !mayRearmGoal(goal);
+      const label = spent
+        ? `re-armed ${rearms}× and stuck again — no re-arms left, this one is yours${why}`
+        : `re-armed ${rearms}× and stuck again${why}`;
+      return { state, text: goal.text, escalated: true, label };
+    }
   }
 }
 

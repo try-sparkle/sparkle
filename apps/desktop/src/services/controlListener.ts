@@ -28,6 +28,30 @@ import {
 import { safeUnlisten } from "./safeUnlisten";
 import { startControlBridge, controlRespond } from "./orchestrationLaunch";
 import { useProjectStore } from "../stores/projectStore";
+// The concierge's bounded lever on `escalated` (bead sparkle-hm4z9) and the honesty half of its
+// reply. `rearmsRemaining` is the allowance the concierge is spending; `decideContinuation` is the
+// ~9 further gates a cleared escalation still has to pass before anything actually resumes — see
+// `handleSetEscalation` for why replying without it would be an empty success.
+import { MAX_CONCIERGE_REARMS, rearmsRemaining } from "../engine/agentGoal";
+import {
+  decideContinuation,
+  progressMark,
+  type NoContinueReason,
+} from "../engine/goalContinuation";
+import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
+import { quotaBlockForAgent } from "../engine/engineRegistry";
+import { withUnmergedWork } from "../engine/unmergedAttention";
+import { resolveStage } from "../engine/workflowStage";
+// The SAME evidence readers the sweep uses (services/goalContinuationRunner). Borrowed rather than
+// re-derived: a second answer to "is this agent resumable" would drift from the one that actually
+// decides, and this reply's whole value is that it predicts what the sweep will do.
+import {
+  canAcceptContinuation,
+  cloudEvidenceFor,
+  idleSinceFor,
+  processAliveFor,
+} from "./goalContinuationRunner";
+import { notifyAttention } from "./attention";
 import { sideOf } from "../engine/pairs";
 import { ZOOM_COLUMNS, isZoomColumn, type ZoomColumn } from "../engine/columnZoom";
 import {
@@ -155,6 +179,9 @@ const TALLY: Record<ControlOp, boolean> = {
   // goal text or the claim note.
   set_agent_goal: true,
   set_agent_goal_met: true,
+  // The concierge's bounded lever on `escalated`. Op name only, like everything else here — never
+  // the reason text, which names an agent's real work.
+  set_agent_escalation: true,
   claim_pr: true,
   release_pr: true,
 };
@@ -253,6 +280,14 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // by anyone else.
   claim_pr: "free",
   release_pr: "free",
+  // PRIVILEGED — AND THAT IS ONLY THE FIRST OF TWO GATES, which is the whole point of this entry.
+  // `callerMayAdminister` admits ANY interactive non-worker agent (see its doc and the
+  // `concierge_tool` entry above), so a tier alone would leave every Build/Think agent able to clear
+  // another agent's escalation — the one state that exists precisely to stop a machine deciding it
+  // should keep going. `handleSetEscalation` therefore narrows it to the ONE reserved caller and
+  // refuses everyone else with `escalation_not_yours`. Both gates matter: this op spends a bounded
+  // allowance that only a HUMAN can refill, so a near-miss caller must not get within reach of it.
+  set_agent_escalation: "privileged",
 };
 
 /**
@@ -317,6 +352,7 @@ const _conciergeGateCoverage: _ConciergeGateCoversEveryControlOp = {
   navigate: true,
   set_agent_goal: true,
   set_agent_goal_met: true,
+  set_agent_escalation: true,
   claim_pr: true,
   release_pr: true,
 };
@@ -713,6 +749,24 @@ function goalAndStallFields(
             remainingMs: goal.remainingMs,
             ...(goal.escalationReason !== undefined
               ? { escalationReason: capForRoster(goal.escalationReason) }
+              : {}),
+            // HOW MANY CLEARS THE CONCIERGE HAS LEFT on this goal (bead sparkle-hm4z9). Carried on
+            // exactly the rows that can use it — an ESCALATED goal — for the same reason
+            // `escalationReason` is, namely that this is the row someone has to pick up. A number
+            // on the other thirty rows would be a permanently-resident byte cost to say "n/a".
+            //
+            // ⚠️ NOTHING IN THIS COMMENT MAY CONTAIN A BARE WORD FOLLOWED BY A COLON.
+            // `apps/mcp-control`'s agentGoalShape test extracts this literal's KEYS with a regex
+            // that cannot tell prose from a property, so one in here invents a field the schema
+            // will never have and reds a suite in another package.
+            //
+            // It exists so the decision is made BEFORE the call rather than discovered by refusal.
+            // `set_agent_escalation` refuses an exhausted goal with `escalation_rearm_exhausted` AND
+            // re-notifies the human — which is right when the concierge genuinely believed it had
+            // fixed something, and pure noise when it could have read `0` here and left the row
+            // alone.
+            ...(goal.state === "escalated"
+              ? { rearmsRemaining: rearmsRemaining(agent.goal) }
               : {}),
           },
         }
@@ -1377,6 +1431,248 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   }
   useProjectStore.getState().setAgentGoalMet(found.projectId, targetId, met);
   return { ok: true, met };
+}
+
+/**
+ * WILL THIS AGENT ACTUALLY RESUME? — the honesty half of `set_agent_escalation`'s clear.
+ *
+ * Clearing an escalation removes ONE of the gates `decideContinuation` applies. It is not the last
+ * one: `goal-expired`, `not-idle`, `no-turn-end-authority`, `idle-not-settled`, the cloud arms and
+ * the quota wall all still stand between a cleared goal and a resumed agent. So a bare `{ ok: true }`
+ * is the empty success this surface is being cleaned of — the concierge cannot tell a fix from a
+ * no-op, reports "I've put it back to work" to the human, and the agent never moves.
+ *
+ * EVERY INPUT IS THE SWEEP'S OWN READER, imported from `goalContinuationRunner` rather than
+ * re-derived here. A second answer to "is this agent resumable" would drift from the one that
+ * actually decides, and this reply's entire value is that it predicts what the next sweep will do.
+ * `idleSinceFor` in particular is that module's private clock — nothing else can answer it.
+ *
+ * Read this as a PREDICTION, not a promise: the sweep runs every 15s in whichever window owns the
+ * project, and the row can change in between. `willResume: true` says every gate is open right now.
+ */
+function resumeReading(
+  projectId: string,
+  agent: AgentTab,
+  now: number,
+): { willResume: boolean; blockedBy?: NoContinueReason | "would-re-escalate" } {
+  const rt = useRuntimeStore.getState();
+  const raw = rt.status;
+  const openIds = new Set(mergeOpenAgentIds(rt.openAgentIds ?? [], readPersistedOpenAgentIds()));
+  const siblings = useProjectStore.getState().projects.find((p) => p.id === projectId)?.agents ?? [
+    agent,
+  ];
+  // The COMPOSITE status, exactly as the sweep builds it: `unmerged` is an overlay onto a resting
+  // row, and it is a continuable band. Reading the raw status here would report `not-idle` for the
+  // single most common band on a real fleet.
+  const overlaid = withUnmergedWork(siblings, raw, (id) =>
+    resolveStage(rt.branchStatus[id], rt.workflowStage[id]),
+  );
+  const runtime = agent.runtime === "cloud" ? "cloud" : "local";
+  const decision = decideContinuation({
+    goal: agent.goal,
+    status: overlaid[agent.id] ?? "stopped",
+    now,
+    idleSince: idleSinceFor(agent.id),
+    hasTurnEndAuthority: hasTurnEndAuthority(agent.id),
+    canAcceptInput: canAcceptContinuation(agent),
+    processAlive: processAliveFor(agent.id, raw, openIds),
+    runtime,
+    cloud: runtime === "cloud" ? cloudEvidenceFor(agent.id, now) : undefined,
+    mark: progressMark({
+      promptHistoryLength: agent.promptHistory.length,
+      activity: agent.activity,
+      aiTitle: agent.aiTitle,
+    }),
+    quotaBlock: quotaBlockForAgent(agent.id, now),
+  });
+  if (decision.action === "continue") return { willResume: true };
+  if (decision.action === "none") return { willResume: false, blockedBy: decision.reason };
+  // THE `escalate` ARM, and it is reachable after a clear rather than theoretical: `conciergeRearmGoal` hands
+  // back `REARM_GRANT` continues off a `totalContinues` that may be far past `MAX_CONTINUES_TOTAL`,
+  // so the very next sweep can decide to escalate again. Saying `willResume: true` there would be
+  // the same false assurance one arm over.
+  //
+  // NOT a `NoContinueReason` — that union covers "we did not continue", and this is "we continued
+  // ourselves right back to the human". `blockedBy` is a string on the wire precisely so this case
+  // has somewhere honest to go.
+  return { willResume: false, blockedBy: "would-re-escalate" };
+}
+
+/** How many clears this agent has left, reading the DEBT STASH when there is no goal record.
+ *
+ *  `rearmsRemaining(undefined)` answers "the full allowance", which is right for a goal that never
+ *  existed and wrong for the one case this op can produce: clearing an escalation stashed in
+ *  `goalDebt` leaves no goal behind, and the stash is exactly where the spend was carried. Reporting
+ *  2 there would tell the concierge it had an allowance the store will not honour. */
+function remainingRearmsFor(agent: AgentTab | undefined): number {
+  if (agent?.goal) return rearmsRemaining(agent.goal);
+  return Math.max(0, MAX_CONCIERGE_REARMS - (agent?.goalDebt?.conciergeRearms ?? 0));
+}
+
+/**
+ * set_agent_escalation → the CONCIERGE's bounded lever on `escalated` (bead sparkle-hm4z9).
+ *
+ * `escalated` is where auto-continue gives up and hands an agent to the human. It was absorbing and
+ * human-only, and the rationale for that is real: it terminates a TOKEN-SPENDING retry loop, and
+ * every non-human clear found in review was one the agent itself could pull. What makes this safe
+ * is that the concierge is not the subject of that loop — it is headless, has no agent row, and
+ * cannot refill its own allowance. The store is where the bound lives (`conciergeRearmAgentGoal` spends one
+ * of `MAX_CONCIERGE_REARMS`, and only a HUMAN's typed line refills it); this handler is the
+ * authorization, the typed refusals, and the two things a pure reducer must not do — notify, and
+ * tell the caller whether anything will actually happen.
+ *
+ * TWO GATES, NOT ONE. The tier table says `privileged`, which `callerMayAdminister` grants to every
+ * interactive non-worker agent — so the tier alone would hand this lever to any Build or Think
+ * agent on the shared socket. The exact-id check below is what makes it the concierge's, and it is
+ * a structural fact rather than a claim: Rust mints the reserved id from WHICH SOCKET the request
+ * arrived on and rejects it on the shared one. Same shape as `handleSetGoal`'s `verify: null` gate.
+ */
+function handleSetEscalation(req: ControlRequest): Record<string, unknown> {
+  if (req.callerAgentId !== CONCIERGE_CALLER_AGENT_ID) {
+    return {
+      ok: false,
+      code: "escalation_not_yours",
+      error:
+        "set_agent_escalation belongs to the concierge alone. An escalation is what STOPS a " +
+        "machine deciding an agent should keep going, so an agent — including an orchestrator " +
+        "above the target — may not clear one, and the retry budget it hands back is bounded by an " +
+        "allowance only a human can refill. Ask the concierge, or type to the agent yourself.",
+    };
+  }
+  // REQUIRED, never defaulted to the caller: `resolveTargetId` returns `undefined` for the
+  // concierge because it has no roster row to default to (see its doc), and this op is deliberately
+  // NOT in `PER_AGENT_OPS` for the same reason `set_agent_goal_met` is not.
+  const asked = typeof req.payload.targetAgentId === "string" ? req.payload.targetAgentId.trim() : "";
+  if (!asked) return targetRequired("set_agent_escalation", req);
+  const escalated = req.payload.escalated;
+  if (typeof escalated !== "boolean") return { ok: false, error: "escalated must be a boolean" };
+  // REQUIRED ON BOTH DIRECTIONS. A raise's reason is what the human reads in the notification and
+  // on the row; a clear's is the durable record of WHY the concierge believed it had fixed
+  // something — the only evidence available when a second clear has to be judged. An empty string
+  // would satisfy a `typeof` check and record nothing, so it is trimmed first.
+  const reason = typeof req.payload.reason === "string" ? req.payload.reason.trim() : "";
+  if (!reason) {
+    return {
+      ok: false,
+      code: "reason_required",
+      error:
+        "set_agent_escalation requires a non-empty reason: raising one is what a human will read " +
+        "on the notification, and clearing one is the record of what you believe you fixed.",
+    };
+  }
+  const found = findAgent(asked);
+  if (!found) return { ok: false, error: `unknown agent ${asked}` };
+  const { projectId } = found;
+  const store = useProjectStore.getState();
+  const name = agentDisplayName(found.agent);
+
+  if (escalated) {
+    // RAISING. Latched by `escalateGoal`, so a raise against an existing escalation changes
+    // nothing — and reporting `{ ok: true }` for it would tell the concierge it had just handed a
+    // goal to the human when the goal was already theirs (and, worse, would read as though the
+    // `concierge` stamp had been applied, which is what decides whether the clear is free).
+    if (!found.agent.goal) {
+      return {
+        ok: false,
+        code: "no_goal",
+        error: `${asked} has no goal to escalate — an escalation is a state OF a goal. Set one with set_agent_goal first.`,
+      };
+    }
+    if (found.agent.goal.escalatedAt !== undefined) {
+      return {
+        ok: false,
+        code: "already_escalated",
+        error:
+          `${asked} is already escalated and the escalation is latched, so this would change ` +
+          "nothing. The first reason is kept deliberately — it is what the human reads to learn " +
+          "why the fleet gave up.",
+      };
+    }
+    // ONE INSTANT for the write and the reading below. Two `Date.now()` reads would be the split
+    // clock `projectStore`'s expiry trio documents at length — harmless here today, and exactly the
+    // shape that becomes a bug the moment anything downstream compares the two.
+    const raisedAt = Date.now();
+    store.conciergeEscalateAgentGoal(projectId, asked, reason, raisedAt);
+    // A LATCHED FIELD NOBODY IS LOOKING AT IS THE SILENT-FOREVER STATE this whole feature exists to
+    // abolish — the same reasoning (and the same banner) as `goalContinuationRunner.escalateToHuman`.
+    notifyAttention({ projectId, agentId: asked, title: `${name} needs you`, body: reason });
+    const stored = findAgent(asked)?.agent.goal;
+    const reading = goalReading(stored, raisedAt);
+    return {
+      ok: true,
+      escalated: true,
+      rearmsRemaining: rearmsRemaining(stored),
+      ...(reading ? { goal: reading } : {}),
+    };
+  }
+
+  // CLEARING. The store owns the decision — free undo of the concierge's own raise, charged clear
+  // of a machine give-up, and an escalation stashed in `goalDebt` with no goal record are all its
+  // three internal branches — so it is CALLED FIRST and its `false` is classified afterwards from a
+  // snapshot taken before. Pre-checking each branch here would be a second copy of the store's
+  // rules, and the copy is what drifts.
+  const before = found.agent;
+  const clearedAt = Date.now();
+  if (!store.conciergeRearmAgentGoal(projectId, asked, reason, clearedAt)) {
+    const goal = before.goal;
+    if (goal === undefined) {
+      // No goal record AND no escalation stashed in `goalDebt` — there is nothing here at all.
+      return {
+        ok: false,
+        code: "no_goal",
+        error: `${asked} has no goal and no stashed escalation, so there is nothing to clear.`,
+      };
+    }
+    if (goal.escalatedAt === undefined) {
+      // NOT A BUDGET TOP-UP. This is the one refusal that protects the bound from the outside: if
+      // clearing a non-escalated goal succeeded, it would hand back `REARM_GRANT` continues for
+      // free and the allowance could be spent on goals nobody had given up on.
+      return {
+        ok: false,
+        code: "not_escalated",
+        error:
+          `${asked}'s goal is not escalated, so there is nothing to clear. This op is not a retry ` +
+          "budget top-up — it only undoes an escalation.",
+      };
+    }
+    // EXHAUSTED. The allowance is spent, the escalation is the human's again by construction, and
+    // nothing the concierge calls may take it back.
+    const spent = before.goal?.conciergeRearms ?? 0;
+    const body =
+      `Auto-continue gave up, and Sparkle has already cleared it ${spent} times without it ` +
+      `sticking. Retrying has been tried; this one needs you. Latest attempt: ${reason}`;
+    // ESCALATE HARDER — the founder's ask, and the reason the refusal is not enough on its own: a
+    // refusal reaches the CONCIERGE, which is the actor that has just been told twice that it
+    // cannot fix this. The human has heard nothing since the first notification, which may be hours
+    // old and long since dismissed. So re-fire the banner, with a body that says the retries are
+    // exhausted rather than repeating the original give-up.
+    notifyAttention({ projectId, agentId: asked, title: `${name} still needs you`, body });
+    return {
+      ok: false,
+      code: "escalation_rearm_exhausted",
+      error:
+        `${asked}'s escalation has already been cleared ${spent} times; the allowance is spent and ` +
+        "the escalation is the human's now. I've re-notified them. Nothing you can call will take " +
+        "it back — only the human typing to the agent (or rewriting its goal) resets this.",
+    };
+  }
+
+  // THE SIDE EFFECT ACTUALLY HAPPENED — now say whether it will amount to anything. Read back out
+  // of the store rather than echoed from the args, like `handleSetGoal`: the store may have taken a
+  // different branch (a free undo, or a debt-stash clear that leaves no goal behind at all).
+  const after = findAgent(asked);
+  const now = Date.now();
+  const stored = after?.agent.goal;
+  const resume = after ? resumeReading(projectId, after.agent, now) : { willResume: false };
+  const reading = goalReading(stored, now);
+  return {
+    ok: true,
+    escalated: false,
+    rearmsRemaining: remainingRearmsFor(after?.agent),
+    willResume: resume.willResume,
+    ...(resume.blockedBy !== undefined ? { blockedBy: resume.blockedBy } : {}),
+    ...(reading ? { goal: reading } : {}),
+  };
 }
 
 /** The claimant of a PR is ALWAYS `req.callerAgentId` — the id the Rust bridge stamped from the
@@ -2583,6 +2879,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "set_agent_goal_met":
         result = handleSetGoalMet(req);
+        break;
+      case "set_agent_escalation":
+        result = handleSetEscalation(req);
         break;
       case "claim_pr":
         result = await handleClaimPr(req);

@@ -126,6 +126,16 @@ vi.mock("./conciergeTools/registry", async (importOriginal) => {
 // touch their spies inside an arrow, so they get away with it; this one would be a TDZ error.
 const { classifyReceiptMock } = vi.hoisted(() => ({ classifyReceiptMock: vi.fn() }));
 vi.mock("./sparkleBusy", () => ({ sparkleActivityLine: vi.fn(() => null) }));
+// The HUMAN-FACING half of an escalation, spied rather than replaced. `notifyAttention` guards on
+// `__TAURI_INTERNALS__` and is a no-op in jsdom, so there is no side effect to observe otherwise —
+// and firing it IS the requirement for `set_agent_escalation` (a latched field nobody is looking at
+// is the silent-forever state the goal feature exists to abolish). Everything else in the module
+// passes through: `goalContinuationRunner` imports several of its neighbours.
+const notifyAttentionMock = vi.fn();
+vi.mock("./attention", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./attention")>()),
+  notifyAttention: (...a: unknown[]) => notifyAttentionMock(...a),
+}));
 /**
  * The Chief TRANSPORT seam, mocked for the whole file so app startup can be driven for real.
  *
@@ -182,7 +192,9 @@ import { useSelfReportMetrics } from "../stores/selfReportMetrics";
 // events seen for this agent" apart from a real looping verdict.
 import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
 // The vocabulary set_agent_goal exists to move: a goal is MET only when `goalStateOf` says so.
-import { goalStateOf } from "../engine/agentGoal";
+// `MAX_CONCIERGE_REARMS` is the bound `set_agent_escalation` spends against — spelled as the
+// constant so a change to the allowance moves the test with it rather than leaving a stale `2`.
+import { MAX_CONCIERGE_REARMS, goalStateOf } from "../engine/agentGoal";
 // The thinking indicator's source of truth — asserted here because this file owns the one call site
 // that records it.
 import {
@@ -235,6 +247,7 @@ describe("controlListener", () => {
     setPrClaimMock.mockClear();
     releasePrClaimMock.mockClear();
     fetchPrClaimsMock.mockClear();
+    notifyAttentionMock.mockClear();
     fetchPrClaimsMock.mockResolvedValue([]);
     releasePrClaimMock.mockResolvedValue(true);
     // The audit log is module-level state; without this, entries from an earlier case would make
@@ -3297,6 +3310,291 @@ describe("controlListener", () => {
       await flush();
       expect(lastReply()).toMatchObject({ ok: false });
       expect(String((lastReply() as { error: string }).error)).toContain("no goal");
+    });
+  });
+
+  // ── set_agent_escalation — THE CONCIERGE'S BOUNDED LEVER ON `escalated` (bead sparkle-hm4z9) ────
+  //
+  // `escalated` is where auto-continue gives up and hands an agent to the human. It was absorbing
+  // and human-only. This op lets the CONCIERGE clear one (twice at most) and raise one — and every
+  // case here reads the store back, because the failure shapes are all silent: a handler that
+  // refused the caller and cleared the escalation anyway, or that replied `{ ok: true }` having
+  // cleared nothing, both satisfy a reply-only assertion.
+  describe("set_agent_escalation", () => {
+    const agentOf = (id: string) =>
+      useProjectStore.getState().projects.flatMap((p) => p.agents).find((a) => a.id === id)!;
+    const goalOf = (id: string) => agentOf(id).goal;
+    const stateOf = (id: string) => goalStateOf(goalOf(id), Date.now());
+
+    /** Drive an agent to a real MACHINE escalation, the way the continuation runner does. */
+    const escalateMachine = (id: string, spent = 20) => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, id, "land the retry PR");
+      for (let i = 0; i < spent; i++) store.noteAgentGoalContinue(projectId, id, "stuck");
+      store.escalateAgentGoal(projectId, id, "three continues, no progress", Date.now());
+    };
+
+    const clear = (reqId: string, callerAgentId: string, reason = "unblocked the login dialog") =>
+      fire({
+        reqId,
+        op: "set_agent_escalation",
+        callerAgentId,
+        payload: { targetAgentId: callerId, escalated: false, reason },
+      });
+
+    beforeEach(() => {
+      // The op is classed `irreversible`, so its DERIVED default is `ask` — see the ask-tier case at
+      // the end of this block, which is the one that asserts that. Every other case here is about
+      // the handler, so the human has said "Allow" for this tool and the policy gate is out of the
+      // way. Without this they would all pass on the policy refusal and prove nothing.
+      useSettingsStore.setState({
+        conciergeToolPolicy: { set_agent_escalation: "allow" },
+        conciergeToolPolicyHydrated: true,
+      });
+    });
+
+    it("lets the CONCIERGE clear a real escalation, and the goal is live for the sweep again", async () => {
+      escalateMachine(callerId);
+      expect(stateOf(callerId)).toBe("escalated");
+
+      clear("e1", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, escalated: false, rearmsRemaining: 1 });
+      // THE SIDE EFFECT, not the reply: the goal is genuinely back in play.
+      expect(stateOf(callerId)).toBe("unmet");
+      expect(goalOf(callerId)!.conciergeRearmReason).toBe("unblocked the login dialog");
+      expect(goalOf(callerId)!.conciergeRearms).toBe(1);
+    });
+
+    // THE PAIR IS THE TEST. A refusal case on its own passes against a build where the op does
+    // nothing at all; the allowed half is what proves the gate is about the CALLER rather than
+    // about the outcome. Same shape as the `verify_not_yours` pair above.
+    it("REFUSES an ordinary agent with escalation_not_yours — and the escalation stays latched", async () => {
+      escalateMachine(callerId);
+
+      // `callerId` is a BUILD agent, so it clears the privileged tier gate (`callerMayAdminister`
+      // admits any interactive non-worker). It is the handler's own exact-id check that stops it —
+      // which is the whole reason this op needs two gates and not one.
+      clear("e2a", callerId);
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "escalation_not_yours" });
+      expect(stateOf(callerId)).toBe("escalated");
+      expect(goalOf(callerId)!.conciergeRearms).toBeUndefined(); // nothing was spent, either
+
+      // …and the concierge, on the identical call, may.
+      clear("e2b", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true, escalated: false });
+      expect(stateOf(callerId)).toBe("unmet");
+    });
+
+    it("RAISES one, stamps itself as the raiser, and tells the human", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+
+      fire({
+        reqId: "e3",
+        op: "set_agent_escalation",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: callerId, escalated: true, reason: "it is asking about your AWS keys" },
+      });
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, escalated: true });
+      expect(stateOf(callerId)).toBe("escalated");
+      // `escalatedBy` is what makes the UNDO free rather than charged, so it is not decoration.
+      expect(goalOf(callerId)!.escalatedBy).toBe("concierge");
+      // A latched field nobody is looking at is the silent-forever state this feature abolishes.
+      expect(notifyAttentionMock).toHaveBeenCalledWith(
+        expect.objectContaining({ agentId: callerId, projectId, body: "it is asking about your AWS keys" }),
+      );
+    });
+
+    it("undoing its OWN raise is free — it spends none of the allowance", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      useProjectStore.getState().conciergeEscalateAgentGoal(projectId, callerId, "raised by me", Date.now());
+
+      clear("e4", CONCIERGE_CALLER_AGENT_ID, "false alarm");
+      await flush();
+
+      expect(stateOf(callerId)).toBe("unmet");
+      // The full allowance is still there. If an undo were charged, a concierge that raised in error
+      // would have paid for its own mistake out of the budget meant for real machine give-ups.
+      expect(lastReply()).toMatchObject({ ok: true, rearmsRemaining: MAX_CONCIERGE_REARMS });
+      expect(goalOf(callerId)!.conciergeRearms).toBeUndefined();
+    });
+
+    it("refuses the clear after the allowance is spent, leaves it latched, and notifies AGAIN", async () => {
+      escalateMachine(callerId);
+      for (let i = 0; i < MAX_CONCIERGE_REARMS; i++) {
+        clear(`e5-${i}`, CONCIERGE_CALLER_AGENT_ID, `attempt ${i}`);
+        await flush();
+        expect(lastReply()).toMatchObject({ ok: true });
+        useProjectStore.getState().escalateAgentGoal(projectId, callerId, "gave up again", Date.now());
+      }
+      notifyAttentionMock.mockClear();
+
+      clear("e5-final", CONCIERGE_CALLER_AGENT_ID, "surely this time");
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "escalation_rearm_exhausted" });
+      // The escalation is the HUMAN's now — nothing the concierge calls takes it back.
+      expect(stateOf(callerId)).toBe("escalated");
+      expect(goalOf(callerId)!.conciergeRearms).toBe(MAX_CONCIERGE_REARMS);
+      // ESCALATE HARDER. The refusal reaches only the concierge — which is the actor that has now
+      // been told twice it cannot fix this. Without the second notification the human hears nothing
+      // beyond the original give-up banner, which may be hours old and long since dismissed.
+      expect(notifyAttentionMock).toHaveBeenCalledTimes(1);
+      const notice = notifyAttentionMock.mock.calls[0]![0] as { title: string; body: string };
+      expect(notice.title).toContain("still needs you");
+      expect(notice.body).toContain(String(MAX_CONCIERGE_REARMS)); // names the re-arm count…
+      expect(notice.body).toMatch(/retr/i); // …and says retrying has been tried
+    });
+
+    // NO EMPTY SUCCESSES. Clearing the escalation removes ONE of ~9 gates; the concierge has to be
+    // able to tell a fix from a no-op, or it reports "I've put it back to work" about an agent that
+    // will not move. Two DIFFERENT causes are asserted, on purpose: a single `willResume: false`
+    // case is satisfied by a hardcoded `false`, which is the vacuous shape this file keeps catching.
+    it("reports willResume:false with the REAL blocker — an expired goal", async () => {
+      escalateMachine(callerId);
+      // Age the goal past its TTL deterministically rather than sleeping.
+      useProjectStore.setState((st) => ({
+        projects: st.projects.map((p) => ({
+          ...p,
+          agents: p.agents.map((a) =>
+            a.id === callerId
+              ? { ...a, goal: { ...a.goal!, setAt: Date.now() - 60_000, ttlMs: 1_000 } }
+              : a,
+          ),
+        })),
+      }));
+
+      clear("e6", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      // The clear DID happen — this is a successful op reporting an unsuccessful outcome.
+      expect(lastReply()).toMatchObject({ ok: true, willResume: false, blockedBy: "goal-expired" });
+      expect(goalOf(callerId)!.escalatedAt).toBeUndefined();
+    });
+
+    it("…and a different blocker for a different state — a busy agent reads not-idle", async () => {
+      escalateMachine(callerId);
+      useRuntimeStore.getState().setStatus(callerId, "working");
+
+      clear("e7", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, willResume: false, blockedBy: "not-idle" });
+      expect(stateOf(callerId)).toBe("unmet");
+    });
+
+    it("refuses an empty or whitespace reason on BOTH directions", async () => {
+      escalateMachine(callerId);
+      for (const [reqId, reason] of [["e8a", ""], ["e8b", "   "]] as const) {
+        fire({
+          reqId,
+          op: "set_agent_escalation",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: { targetAgentId: callerId, escalated: false, reason },
+        });
+        await flush();
+        expect(lastReply(), `reason ${JSON.stringify(reason)} must be refused`).toMatchObject({
+          ok: false,
+          code: "reason_required",
+        });
+      }
+      // Nothing was cleared on the way through.
+      expect(stateOf(callerId)).toBe("escalated");
+    });
+
+    it("refuses a targetless call — the concierge has no agent row to default to", async () => {
+      escalateMachine(callerId);
+      fire({
+        reqId: "e9",
+        op: "set_agent_escalation",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { escalated: false, reason: "fixed it" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "target_required" });
+      expect(stateOf(callerId)).toBe("escalated");
+    });
+
+    it("is not a retry-budget top-up: a goal that is not escalated is refused", async () => {
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      for (let i = 0; i < 10; i++) {
+        useProjectStore.getState().noteAgentGoalContinue(projectId, callerId, "stuck");
+      }
+
+      clear("e10", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_escalated" });
+      // The budget is untouched — succeeding here would hand back REARM_GRANT continues for free.
+      expect(goalOf(callerId)!.totalContinues).toBe(10);
+      expect(goalOf(callerId)!.conciergeRearms).toBeUndefined();
+    });
+
+    it("refuses a RAISE against an already-escalated goal rather than reporting a phantom one", async () => {
+      escalateMachine(callerId);
+      fire({
+        reqId: "e11",
+        op: "set_agent_escalation",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: callerId, escalated: true, reason: "me too" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "already_escalated" });
+      // The LATCH is what makes `escalatedBy` trustworthy: a concierge raise must not be able to
+      // re-stamp a machine give-up as its own and then clear it for free.
+      expect(goalOf(callerId)!.escalatedBy).toBe("auto");
+      expect(notifyAttentionMock).not.toHaveBeenCalled();
+    });
+
+    it("carries rearmsRemaining on the ESCALATED roster row, so the concierge decides before calling", async () => {
+      escalateMachine(callerId);
+      clear("e12a", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+      useProjectStore.getState().escalateAgentGoal(projectId, callerId, "gave up again", Date.now());
+
+      fire({ reqId: "e12b", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "all" } });
+      await flush();
+      const row = (lastReply() as { agents: Array<{ id: string; goal?: Record<string, unknown> }> }).agents.find(
+        (a) => a.id === callerId,
+      )!;
+      // One spent, one left — read off the roster the concierge already pays for, instead of
+      // discovering exhaustion from a refusal that also pages the human.
+      expect(row.goal).toMatchObject({ state: "escalated", rearmsRemaining: 1 });
+    });
+
+    it("does NOT carry rearmsRemaining on a row nobody has given up on", async () => {
+      // The other half of the byte-cost argument: this payload is permanently resident in the
+      // caller's context, so a number that says "not applicable" on thirty rows is not free.
+      useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
+      fire({ reqId: "e13", op: "get_state", callerAgentId: CONCIERGE_CALLER_AGENT_ID, payload: { scope: "all" } });
+      await flush();
+      const row = (lastReply() as { agents: Array<{ id: string; goal?: Record<string, unknown> }> }).agents.find(
+        (a) => a.id === callerId,
+      )!;
+      expect(row.goal).toMatchObject({ state: "unmet" });
+      expect(row.goal).not.toHaveProperty("rearmsRemaining");
+    });
+
+    it("defaults to ASK — clearing an escalation is not something it does silently", async () => {
+      // The consequence of classing it `irreversible` in conciergeTools/policy.ts, asserted here
+      // because it is the reason every other case in this block sets an explicit "allow". Taking
+      // work off a human's plate spends an allowance only the human can refill, so the derived
+      // default puts an approval card in front of them first.
+      useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
+      escalateMachine(callerId);
+
+      clear("e14", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: false });
+      // The gate is BEFORE the mutation, not after.
+      expect(stateOf(callerId)).toBe("escalated");
+      expect(goalOf(callerId)!.conciergeRearms).toBeUndefined();
     });
   });
 

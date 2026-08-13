@@ -307,7 +307,14 @@ export async function promotePlanToBuild(
     // `humanAuthored: false` — this is the concierge's TOOL layer, not a board click (roborev
     // 55721). It matters on the reuse path `already` is read for two lines up: seeding a REUSED
     // orchestrator through `appendPrompt` releases its goal debt, so an LLM promoting an epic whose
-    // orchestrator is escalated would un-latch the escalation that exists to hand it to a human.
+    // orchestrator is escalated would un-latch the escalation.
+    //
+    // STILL TRUE NOW THAT THE CONCIERGE *CAN* CLEAR ONE, and the reason is the route rather than the
+    // actor. Its re-arm lever (agentGoal's `rearmGoal`, bounded by MAX_CONCIERGE_REARMS and refilled
+    // only by a human typing to the agent) is an explicit, counted, reasoned call —
+    // `set_agent_escalation`. An un-latch falling out of a PROMOTION is none of those: nothing is
+    // spent, nothing is attributable, and the bound that makes the lever safe is bypassed entirely.
+    // So this flag is not "the concierge may never re-arm"; it is "a re-arm is never a side effect".
     const agentId = sendToBuild({ projectId, epicId, prdPath, mode: "epic", humanAuthored: false });
     return ok("promote_plan_to_build", { agentId, epicId, reused: Boolean(already) });
   } catch (e) {

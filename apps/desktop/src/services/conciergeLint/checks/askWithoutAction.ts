@@ -138,6 +138,19 @@ export const EXEMPT_SYNONYMS: Readonly<Record<string, string>> = {
   "close the item": "delete_item",
   "change the config": "set_config",
   "edit the config": "set_config",
+  // irreversible, and the one exempt tool whose SUBJECT is the human's own attention. Clearing an
+  // escalation spends one of two re-arms that only the founder's typing refills, and raising one
+  // puts a row in front of him — so "should I re-arm this?" is a real question to ask rather than a
+  // hedge, and the check stands down on it.
+  //
+  // Every term names the ESCALATION explicitly. A bare "re-arm" would be far too broad: goal expiry
+  // re-arms a TTL clock (`rearmAgentGoal`) and that is a different, unexempt subject — the same
+  // one-word collision this op had to be renamed out of at merge time.
+  "re-arm the escalation": "set_agent_escalation",
+  "rearm the escalation": "set_agent_escalation",
+  "clear the escalation": "set_agent_escalation",
+  "raise an escalation": "set_agent_escalation",
+  "escalate it to you": "set_agent_escalation",
   // costs-money
   spend: "spawn_cloud_build_agent",
   fund: "spawn_cloud_build_agent",

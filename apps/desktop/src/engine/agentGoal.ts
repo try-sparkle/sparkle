@@ -98,6 +98,36 @@ export interface AgentGoal {
   escalatedAt?: number;
   /** Why it escalated, in one sentence, for the human who now owns it. */
   escalationReason?: string;
+  /** WHO raised the escalation. `auto` is the continuation engine giving up; `concierge` is the
+   *  concierge raising one deliberately through `set_agent_escalation`.
+   *
+   *  ⚠️ ABSENT MEANS `auto`, AND THAT DEFAULT IS THE SAFE DIRECTION. Every escalation persisted
+   *  before this field existed was a machine give-up, and the only thing this flag unlocks is the
+   *  FREE clear in {@link unraiseGoal} — undoing your own raise costs no re-arm budget because
+   *  nothing was spent on it. Reading absence as `concierge` would hand that free clear to the
+   *  entire installed base, i.e. an unbounded re-arm loop on every legacy escalation. */
+  escalatedBy?: "auto" | "concierge";
+  /** Concierge re-arms spent on this goal — {@link rearmGoal} calls that actually cleared a MACHINE
+   *  escalation. Bounded by {@link MAX_CONCIERGE_REARMS}.
+   *
+   *  THIS IS THE ONLY BOUND ON THE CONCIERGE'S LEVER, so nothing the agent or the concierge can
+   *  write may reset it — only a human release ({@link resetGoalRetries}). In particular it is
+   *  deliberately NOT progress-gated: `engine/goalContinuation`'s progress mark is built from
+   *  `promptHistoryLength ␀ activity ␀ aiTitle`, and `set_agent_activity` is a free-tier op an
+   *  agent may call on itself, so a progress-gated counter is reset by one call from the very
+   *  party it bounds. That is the same argument that produced `MAX_CONTINUES_TOTAL`; this counter
+   *  is its analogue for re-arms rather than a second thing to re-litigate. */
+  conciergeRearms?: number;
+  /** Epoch ms of the last concierge re-arm, and the reason it gave. The audit trail the human reads
+   *  to see that a machine — not they — put this agent back to work, and why.
+   *
+   *  ⚠️ DISTINCT FROM {@link AgentGoal.rearmedAt}, which is the TTL clock's ORIGIN and is read by
+   *  {@link goalDeadline}. These two were both called `rearmedAt` on the branches that merged here,
+   *  so writing this one under that name silently MOVED THE GOAL'S DEADLINE on every concierge
+   *  re-arm — a lifetime extension nobody asked for, invisible at the call site. The clock and the
+   *  escalation budget are different subjects; only the word "re-arm" was shared. */
+  conciergeRearmedAt?: number;
+  conciergeRearmReason?: string;
   /** HOW this goal is checked (see @sparkle/core goalVerify). Absent on every goal that predates the
    *  field, and absence is what keeps `set_agent_goal_met` working for those: a goal that never stated
    *  a check was never claiming to be verifiable, so it is still self-markable. A goal that DID state
@@ -347,11 +377,106 @@ export function noteContinue(goal: AgentGoal, mark: string): AgentGoal {
   };
 }
 
+/** How many times the CONCIERGE may re-arm one goal before the escalation becomes the human's
+ *  again. Two, not one: the first re-arm is often right (the concierge unblocked something real),
+ *  and a second covers the case where its first fix was incomplete. A third says the concierge has
+ *  been wrong twice about the same goal, which is precisely the evidence that the thing in the way
+ *  is not something it can clear. See {@link AgentGoal.conciergeRearms} for why this is not
+ *  progress-gated. */
+export const MAX_CONCIERGE_REARMS = 2;
+
+/**
+ * Auto-continues a concierge re-arm hands back.
+ *
+ * A TOP-UP, NOT A RESET, and the distinction is the whole safety argument. `resetGoalRetries` — the
+ * HUMAN's lever — zeroes `totalContinues` outright. If a re-arm did the same, three separate
+ * emptiness predicates (`goalDebtOf`, `projectStore.releaseGoalDebt`, `projectStore.stripVerify`)
+ * would read the re-armed goal as "nothing owed", because every one of them keys on
+ * `totalContinues === 0 && escalatedAt === undefined`. The consequences are not cosmetic: the debt
+ * stash carrying `conciergeRearms` would be dropped by one free-tier `set_agent_goal` from the agent
+ * (unbounded re-arms), and the human's own typing would stop reaching `resetGoalRetries` at all.
+ *
+ * Subtracting instead keeps the goal visibly in debt, bounds the worst case at
+ * `MAX_CONTINUES_TOTAL + MAX_CONCIERGE_REARMS * REARM_GRANT`, and keeps `continuePrompt`'s
+ * attempt counter honest — a full reset makes a fourth resume render as a first, losing the
+ * "an identical message arriving twice is NOT the human repeating themselves" banner that exists
+ * because of a measured failure.
+ *
+ * The predicates are ALSO taught about `conciergeRearms` directly, because this subtraction can still
+ * floor to 0 (a goal escalated by `MAX_CONTINUES_WITHOUT_PROGRESS` may have spent only 3). Belt
+ * and braces, deliberately: the arithmetic makes the clean shape rare, the predicates make it safe.
+ */
+export const REARM_GRANT = 5;
+
 /** Hand the goal to the human. Latched (see {@link AgentGoal.escalatedAt}); a second escalation
- *  keeps the first reason, so the human reads why it ORIGINALLY gave up. */
-export function escalateGoal(goal: AgentGoal, now: number, reason: string): AgentGoal {
+ *  keeps the first reason, so the human reads why it ORIGINALLY gave up.
+ *
+ *  `by` records WHO raised it, and the LATCH is what makes that trustworthy: a concierge raise
+ *  against an already-`auto` escalation is a no-op, so it cannot re-stamp a machine give-up as its
+ *  own and then clear it for free through {@link unraiseGoal}. */
+export function escalateGoal(
+  goal: AgentGoal,
+  now: number,
+  reason: string,
+  by: "auto" | "concierge" = "auto",
+): AgentGoal {
   if (goal.escalatedAt !== undefined) return goal;
-  return { ...goal, escalatedAt: now, escalationReason: reason };
+  return { ...goal, escalatedAt: now, escalationReason: reason, escalatedBy: by };
+}
+
+/** Re-arms remaining on this goal — what the concierge has left before the escalation locks back to
+ *  the human. Reads absence as 0 spent, so a legacy goal gets the full allowance. */
+export function rearmsRemaining(goal: AgentGoal | undefined): number {
+  if (goal === undefined) return MAX_CONCIERGE_REARMS;
+  return Math.max(0, MAX_CONCIERGE_REARMS - (goal.conciergeRearms ?? 0));
+}
+
+/** May the concierge still re-arm this goal? False once the allowance is spent — at which point the
+ *  escalation is the human's again and nothing the concierge calls may take it back. */
+export function mayRearmGoal(goal: AgentGoal | undefined): boolean {
+  return rearmsRemaining(goal) > 0;
+}
+
+/**
+ * THE CONCIERGE'S LEVER: clear a MACHINE escalation and hand back a bounded slice of retry budget.
+ *
+ * Deliberately weaker than {@link resetGoalRetries} in the two ways that matter. It hands back
+ * {@link REARM_GRANT} continues rather than the whole ceiling, and it SPENDS a re-arm — a counter
+ * only a human can reset. So the concierge can put an agent back to work, twice, and then the
+ * escalation is the human's again by construction rather than by anyone's good behaviour.
+ *
+ * Callers must check {@link mayRearmGoal} first; this function does not enforce the bound itself,
+ * because the refusal has to reach the caller as a typed code AND re-notify the human, neither of
+ * which belongs in a pure reducer.
+ *
+ * `mark` is dropped for the same reason {@link resetGoalRetries} drops it: the next continue must
+ * compare against a fresh observation, not a stale one recorded before the blockage was cleared.
+ */
+export function conciergeRearmGoal(goal: AgentGoal, now: number, reason: string): AgentGoal {
+  const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, mark: _m, ...rest } = goal;
+  return {
+    ...rest,
+    continues: 0,
+    totalContinues: Math.max(0, goal.totalContinues - REARM_GRANT),
+    conciergeRearms: (goal.conciergeRearms ?? 0) + 1,
+    conciergeRearmedAt: now,
+    conciergeRearmReason: reason,
+  };
+}
+
+/**
+ * Undo an escalation the CONCIERGE ITSELF raised — free, because nothing was spent on it.
+ *
+ * ⚠️ IT CLEARS THE LATCH AND NOTHING ELSE. Not `continues`, not `totalContinues`, not
+ * `conciergeRearms`. A raise costs no retry budget, so undoing one must return none: if this reset the
+ * counters, `set_agent_escalation {escalated:true}` followed by `{escalated:false}` would be an
+ * unlimited budget refill in two calls — and `MAX_CONTINUES_TOTAL`, the bound the whole feature
+ * rests on, could never fire again. Callers must gate this on `escalatedBy === "concierge"`;
+ * a machine give-up goes through {@link rearmGoal} and is charged for.
+ */
+export function unraiseGoal(goal: AgentGoal): AgentGoal {
+  const { escalatedAt: _e, escalationReason: _r, escalatedBy: _b, ...rest } = goal;
+  return rest;
 }
 
 /** Clear the retry budget because a HUMAN changed the picture — they typed to the agent, or
@@ -360,11 +485,18 @@ export function escalateGoal(goal: AgentGoal, now: number, reason: string): Agen
  *
  *  THIS IS THE HUMAN'S LEVER, and that is why it resets `totalContinues` too. Nothing the agent
  *  can do reaches it — see {@link clearGoalMet} for the agent-facing counterpart, which
- *  deliberately cannot refill the ceiling. */
+ *  deliberately cannot refill the ceiling.
+ *
+ *  ⚠️ IT ALSO ZEROES `conciergeRearms`, AND THAT IS WHAT KEEPS THE HUMAN STRICTLY STRONGER THAN THE
+ *  CONCIERGE. {@link rearmGoal} hands back a slice of budget and SPENDS a re-arm; this hands back
+ *  the whole ceiling and REFILLS the re-arm allowance. If both levers reset the same things the
+ *  bound on the concierge would be vacuous — it could re-arm, and its own re-arm would restore its
+ *  allowance to re-arm again. Only a human changing the picture refills the allowance. */
 export function resetGoalRetries(goal: AgentGoal): AgentGoal {
   const {
     escalatedAt: _e,
     escalationReason: _r,
+    escalatedBy: _b,
     mark: _m,
     // The expiry latches and the re-arm budget go the same way and for the same reason: a human who
     // has just engaged with this agent has overtaken every conclusion Sparkle reached about it in
@@ -377,6 +509,12 @@ export function resetGoalRetries(goal: AgentGoal): AgentGoal {
     abandonedAt: _a,
     abandonedEvidence: _ae,
     ttlRearms: _tr,
+    // The CONCIERGE's allowance and its audit trail, cleared for exactly the reason above: this
+    // lever has to stay strictly stronger than the concierge's, and it is only stronger if it is
+    // the thing that refills what the concierge spent.
+    conciergeRearms: _cr,
+    conciergeRearmedAt: _cra,
+    conciergeRearmReason: _crr,
     ...rest
   } = goal;
   // ⚠️ `rearmedAt` and `ttlMs` SURVIVE, and dropping them would be a regression rather than a
@@ -384,6 +522,12 @@ export function resetGoalRetries(goal: AgentGoal): AgentGoal {
   // lifetime recomputes the deadline from the goal's original birth — moving it EARLIER, and usually
   // into the past, so the human's own lever would hand back a goal that is instantly expired again.
   // The clock is not part of the retry budget; this lever is about the budget.
+  //
+  // ⚠️ AND `rearmedAt` IS *THEIRS*, NOT THE CONCIERGE'S — the two nearly collided. `rearmedAt` is
+  // the TTL clock's origin (`goalDeadline` reads `(rearmedAt ?? setAt) + ttlMs`); the concierge's
+  // audit stamp is `conciergeRearmedAt`. They were both called `rearmedAt` on the two branches that
+  // merged here, and keeping that name would have made every concierge re-arm silently MOVE THE
+  // GOAL'S DEADLINE — a lifetime extension nobody asked for, invisible at the call site.
   return { ...rest, continues: 0, totalContinues: 0 };
 }
 
@@ -437,6 +581,17 @@ export interface GoalDebt {
    *  latched within a goal: taking it back is the human's call, not the agent's. */
   escalatedAt?: number;
   escalationReason?: string;
+  /** Who raised the owed escalation. Rides along so a clear-then-set cannot launder a MACHINE
+   *  give-up into a concierge raise — which would be the free {@link unraiseGoal} path, i.e. an
+   *  escalation the concierge could take back without spending any of its allowance. */
+  escalatedBy?: "auto" | "concierge";
+  /** Concierge re-arms already spent. LATCHED ACROSS THE CLEAR, and it is the whole reason this
+   *  field exists on the debt at all: `conciergeRearms` is the only bound on the concierge's lever, and
+   *  `set_agent_goal {goal:""}` then `set_agent_goal {goal:"…"}` is two free-tier calls an AGENT
+   *  can make. Without the carry those two calls reset the allowance and the concierge could re-arm
+   *  the same agent forever — the exact laundering hole this whole debt mechanism was built to
+   *  close, re-opened for the newer counter. */
+  conciergeRearms?: number;
   /** The CHECK the cleared goal stated. Latched for the same reason as the escalation, and against
    *  the same escape: `verify` is what decides whether the claimant may latch `metAt`, so a goal that
    *  lost it on a rewrite would become self-markable in one extra call — the paraphrase-escape this
@@ -476,11 +631,22 @@ export function goalDebtOf(goal: AgentGoal | undefined): GoalDebt | undefined {
   if (goal === undefined) return undefined;
   // `verify` counts as debt on its own: a goal with a clean budget and no escalation still owes its
   // CHECK across a clear, or clear-then-set launders a verified goal into an unverified one.
-  if (goal.totalContinues === 0 && goal.escalatedAt === undefined && goal.verify === undefined) {
+  // `conciergeRearms` counts on its own for the SAME reason, and it is the easiest of the three to
+  // miss: a re-armed goal is deliberately left looking almost clean (`rearmGoal` subtracts from
+  // `totalContinues` and can floor it to 0, and it drops `escalatedAt` — that is the point of a
+  // re-arm), so without this clause the single field bounding the concierge's lever is dropped by
+  // the one agent-reachable call this predicate guards.
+  if (
+    goal.totalContinues === 0 &&
+    goal.escalatedAt === undefined &&
+    goal.verify === undefined &&
+    (goal.conciergeRearms ?? 0) === 0
+  ) {
     return undefined;
   }
   return {
     totalContinues: goal.totalContinues,
+    ...((goal.conciergeRearms ?? 0) > 0 ? { conciergeRearms: goal.conciergeRearms } : {}),
     // Provenance rides along with the check — a clear-then-set must not launder a MANUFACTURED
     // `human` into a stated one (which would re-freeze it), nor a stated one into a manufactured
     // one (which would shed the stickiness the debt exists to carry).
@@ -499,6 +665,10 @@ export function goalDebtOf(goal: AgentGoal | undefined): GoalDebt | undefined {
           ...(goal.escalationReason !== undefined
             ? { escalationReason: goal.escalationReason }
             : {}),
+          // Carried as-is. Absence means `auto` (see `AgentGoal.escalatedBy`), and normalising it to
+          // an explicit `"auto"` here would be harmless today but would destroy the marker that
+          // identifies pre-field records, exactly as the `verifyStated` carry above refuses to.
+          ...(goal.escalatedBy !== undefined ? { escalatedBy: goal.escalatedBy } : {}),
         }
       : {}),
   };
@@ -558,6 +728,11 @@ export function chargeGoalDebt(goal: AgentGoal, debt: GoalDebt | undefined): Age
   if (debt === undefined) return goal;
   const escalatedAt = goal.escalatedAt ?? debt.escalatedAt;
   const escalationReason = goal.escalationReason ?? debt.escalationReason;
+  const escalatedBy = goal.escalatedBy ?? debt.escalatedBy;
+  // THE FLOOR, exactly like `totalContinues` below — a new goal cannot start with fewer re-arms
+  // spent than the agent already owes. `newGoal` never sets it, so in practice the debt always
+  // wins; `Math.max` is written anyway so the direction is stated rather than relied upon.
+  const conciergeRearms = Math.max(goal.conciergeRearms ?? 0, debt.conciergeRearms ?? 0);
   // THE OBLIGATION IS INHERITED; THE PROOF IS NOT (roborev 55933).
   //
   // The incoming goal's own `verify` wins when it has one — the caller stated a NEW check. When it
@@ -683,10 +858,12 @@ export function chargeGoalDebt(goal: AgentGoal, debt: GoalDebt | undefined): Age
           ...(verifyInherited ? { verifyInherited: true } : {}),
         }
       : {}),
+    ...(conciergeRearms > 0 ? { conciergeRearms } : {}),
     ...(escalatedAt !== undefined
       ? {
           escalatedAt,
           ...(escalationReason !== undefined ? { escalationReason } : {}),
+          ...(escalatedBy !== undefined ? { escalatedBy } : {}),
         }
       : {}),
   };

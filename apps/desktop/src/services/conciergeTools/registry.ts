@@ -1136,7 +1136,16 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
       } else if (escalatedAt) {
         // DO NOT CLOBBER AN ESCALATED GOAL. It is one auto-continue already gave up on and handed to
         // the HUMAN; taking it back off their plate is not a routine send's decision to make.
-        // Clearing an escalation stays deliberate (resetAgentGoalRetries).
+        //
+        // ⚠️ THE PROTECTION IS ABOUT THE *ROUTE*, NOT ABOUT WHO MAY CLEAR IT. This used to read
+        // "clearing an escalation stays deliberate (resetAgentGoalRetries)" as though a human were
+        // the only party that could, which is no longer true: the concierge holds a BOUNDED re-arm
+        // lever (agentGoal's `rearmGoal`, capped by MAX_CONCIERGE_REARMS and refilled only by a
+        // human typing to the agent), plus the free take-back of an escalation it raised itself.
+        // What has not changed — and must not — is that none of that happens as a SIDE EFFECT of
+        // sending prose. An un-latch has to be an explicit, counted, reasoned call
+        // (`set_agent_escalation`) so the spend is attributable; a send that quietly cleared one
+        // would be an unbounded re-arm loop wearing a work message.
         //
         // TWO DIFFERENT STATES, TWO DIFFERENT SENTENCES. With a live goal record this is "your text
         // was delivered, the standing goal stayed" — a normal outcome. With the escalation known only
@@ -1146,7 +1155,8 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
         // "the goal was not replaced" there names a goal that does not exist, so it reads the state as
         // fine and never routes to the human — the one thing that clears it (roborev 55900).
         goalNote = agent?.goal
-          ? "the agent's goal is escalated to the human, so it was not replaced"
+          ? "the agent's goal is escalated, so it was not replaced — clearing an escalation is an " +
+            "explicit, counted call (set_agent_escalation), never a side effect of sending text"
           : "this agent has an escalation outstanding to the human and NO goal recorded — it will " +
             "stay goalless until a person types to it, so route this to the human rather than re-sending";
         log.warn("concierge-tools", "goal not replaced — the agent's goal is escalated to the human", {
