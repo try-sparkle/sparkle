@@ -839,6 +839,12 @@ const CONTROL_OPS: &[&str] = &[
     // on every single turn. The fine-grained allow/ask/deny decision is made frontend-side on
     // the INNER `op`, not on this outer name.
     "concierge_tool",
+    // Phase 5 (agent-to-agent peer messaging, bead `sparkle-0vl92`). Delivery rides the existing
+    // durable inbox; what is new is that a SIBLING may put something in it. Every check that makes
+    // that safe — the caller's project scope, the rate limits, the length cap — is enforced
+    // frontend-side in controlListener, because this layer is a transport and an identity stamper
+    // and deliberately validates no op's payload.
+    "send_peer_message",
     // The Chief tool surface (bead `sparkle-8rr0c`). ONE op for all twelve first-class `chief_*`
     // tools AND the `chief_call` escape hatch, for the same token-cost reason as `concierge_tool`
     // above — and for a second reason that is load-bearing here: because the hatch frames to the
@@ -2101,6 +2107,8 @@ mod tests {
             // `set_agent_goal` is deliberately not repeated here — it is asserted once, in the
             // Phase-1 line above, matching where CONTROL_OPS lists it.
             "set_agent_goal_met", "claim_pr", "release_pr",
+            // Phase 5: agent-to-agent peer messaging (bead `sparkle-0vl92`).
+            "send_peer_message",
             // The concierge's bounded lever on `escalated` — raise one, or clear one (twice at
             // most). Frontend-gated to the reserved concierge caller; this array is only the coarse
             // existence gate.
@@ -2112,8 +2120,8 @@ mod tests {
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            20,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the concierge escalation lever, and the Chief tool op"
+            21,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the concierge escalation lever, the peer send, and the Chief tool op"
         );
     }
 

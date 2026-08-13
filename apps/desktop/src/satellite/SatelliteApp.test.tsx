@@ -47,6 +47,14 @@ vi.mock("../stores/presenceStore", () => ({ startPresenceTracking: () => () => {
 // before sparkle-l7bmm it ran only in App.tsx, so a torn-out project's agents were swept by no one.
 const goalRunnerSpy = vi.hoisted(() => vi.fn(() => () => {}));
 vi.mock("../services/goalContinuationRunner", () => ({ startGoalContinuationRunner: goalRunnerSpy }));
+// The goal's DURABLE MIRROR — `<app_data>/agent-goals/<agentId>.json`, for the SessionStart hook.
+// Spied for the same reason the runner above is, and mocked as a whole module rather than left real:
+// the real one imports `ownsProjectInThisWindow` from the module mocked on the line above, and this
+// file's mock is partial, so loading it for real dies with "No 'ownsProjectInThisWindow' export is
+// defined". Its own behavior is covered end to end in services/agentGoalDisk.test.ts, including
+// against the real store and the real invoke; what belongs HERE is only that the satellite starts it.
+const goalDiskSpy = vi.hoisted(() => vi.fn(() => () => {}));
+vi.mock("../services/agentGoalDisk", () => ({ startAgentGoalDiskMirror: goalDiskSpy }));
 
 // The pane records its own mount/unmount into a shared log, so "release happened after the panes
 // came down" is a real ordering assertion rather than an inference from a rendered DOM.
@@ -140,6 +148,19 @@ describe("SatelliteApp — arrival", () => {
     goalRunnerSpy.mockClear();
     render(<SatelliteApp projectId="p1" />);
     expect(goalRunnerSpy).toHaveBeenCalled();
+  });
+
+  it("starts the goal-record disk mirror, so a torn-out project's agents wake with a brief", () => {
+    // Same gap as the runner above, one layer down: the goal lives in localStorage, which a shell
+    // SessionStart hook cannot read, so the on-disk record is the ONLY thing an agent resuming with
+    // no session context can be told what it was doing from. Mounted only in App.tsx, a torn-off
+    // project's goals would never reach disk at all. The sweep's own single-owner election is what
+    // keeps main and this satellite from both writing the same file; that is proven in
+    // services/agentGoalDisk.test.ts. What this asserts is the MOUNT — the line that would otherwise
+    // be the one call site no test drives.
+    goalDiskSpy.mockClear();
+    render(<SatelliteApp projectId="p1" />);
+    expect(goalDiskSpy).toHaveBeenCalled();
   });
 
   it("mounts only its own project's open agents", () => {

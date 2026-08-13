@@ -46,6 +46,7 @@ import type { InboxEntry } from "../../services/conciergeTools/fleet";
 import type { MountedThread } from "../../stores/mountedThreadStore";
 import { inFlight, useAgentInbox } from "../../stores/inboxStore";
 import { DELIVERY_A11Y, DELIVERY_LABEL, QUEUED_BLOCK_HEADING } from "../inboxCopy";
+import { isPeerSender, peerAttributionLine, senderOf } from "../../services/peerAttribution";
 import { useAutoFollow } from "../../hooks/useAutoFollow";
 import { useQuoteOnSelection, type PendingQuote } from "./useQuoteOnSelection";
 import { QuoteChiclet } from "./QuoteChiclet";
@@ -62,6 +63,7 @@ export const MOUNTED_HUMAN_TESTID = "mounted-human-turn";
 export const MOUNTED_AGENT_TESTID = "mounted-agent-turn";
 export const MOUNTED_EMPTY_TESTID = "mounted-thread-empty";
 export const MOUNTED_QUEUED_TESTID = "mounted-queued-message";
+export const MOUNTED_QUEUED_PEER_TESTID = "mounted-queued-peer-attribution";
 export const MOUNTED_QUEUED_BLOCK_TESTID = "mounted-queued-block";
 
 /** The provenance mark under one of your own bubbles.
@@ -311,12 +313,26 @@ export function MountedAgentThread({
  */
 function QueuedMessage({ entry, muted }: { entry: InboxEntry; muted: string }) {
   const pending = entry.state === "pending";
+  const sender = senderOf(entry.from);
+  const fromPeer = isPeerSender(entry.from);
   return (
-    <div style={{ maxWidth: "92%", alignSelf: "flex-end", textAlign: "right" }}>
+    <div
+      style={{
+        maxWidth: "92%",
+        // A PEER LEAVES THE FOUNDER'S COLUMN. The right-hand side is where the concierge speaks on
+        // the founder's behalf; a sibling agent has no such standing, so it does not get to borrow
+        // the position that carries it.
+        alignSelf: fromPeer ? "flex-start" : "flex-end",
+        textAlign: fromPeer ? "left" : "right",
+      }}
+    >
       <div
         data-testid={MOUNTED_QUEUED_TESTID}
         data-delivery-state={entry.state}
-        aria-label={DELIVERY_A11Y[entry.state]}
+        data-queued-sender={sender}
+        aria-label={
+          fromPeer ? `${DELIVERY_A11Y[entry.state]}, from peer agent ${sender}` : DELIVERY_A11Y[entry.state]
+        }
         style={{
           display: "inline-block",
           textAlign: "left",
@@ -339,6 +355,19 @@ function QueuedMessage({ entry, muted }: { entry: InboxEntry; muted: string }) {
           opacity: pending ? 0.62 : 0.82,
         }}
       >
+        {fromPeer && (
+          <div
+            data-testid={MOUNTED_QUEUED_PEER_TESTID}
+            style={{
+              fontFamily: FONT_MONO,
+              fontSize: TYPE.micro,
+              color: muted,
+              marginBottom: 4,
+            }}
+          >
+            {peerAttributionLine(entry.from)}
+          </div>
+        )}
         {entry.text}
       </div>
       <div style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: muted, marginTop: 2 }}>

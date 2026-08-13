@@ -17,6 +17,7 @@ import {
   NOTICE_PILL_TESTID,
   NOTICE_DETAIL_TESTID,
   NOTICE_MESSAGE_TESTID,
+  NOTICE_PEER_TESTID,
   NOTICE_OWN_WORDS_TESTID,
 } from "./MountedAgentNotices";
 import { NOTICE_EXPLAINER } from "../agentNotices";
@@ -124,6 +125,24 @@ function mkEntry(id: string, text: string, state: "pending" | "delivered" | "ack
 }
 
 /** Queue messages for a1 the way the concierge does. */
+/** Queue messages naming their senders — `[text, from]`, defaulting to the concierge. */
+function queueFrom(...items: [string, string][]) {
+  useInboxStore.setState({
+    byAgent: {
+      a1: items.map(([text, from], i) => ({
+        id: `m${i}`,
+        ts: Date.now(),
+        from,
+        text,
+        severity: "act",
+        state: "pending",
+        ackedAt: null,
+        ackNote: null,
+      })),
+    },
+  } as never);
+}
+
 function queue(...texts: string[]) {
   useInboxStore.setState({
     byAgent: {
@@ -331,6 +350,49 @@ describe("MountedAgentNotices", () => {
     expect(msgs).toHaveLength(2);
     expect(msgs[0]!.textContent).toContain("rebase onto main first");
     expect(msgs[1]!.textContent).toContain("then open the PR");
+  });
+
+  it("names a PEER's queued message in the mailbox, and leaves the concierge's alone", () => {
+    // The mailbox exists so that "did the concierge really send it" stops being taken on trust —
+    // which it cannot do while a peer's message is drawn identically to the concierge's. This is the
+    // fifth renderer of these entries; each earlier round of review found one more that was missed.
+    queueFrom(
+      ["rebase onto main first", "concierge"],
+      ["taking the Rust half", "Relay Builder [abc-123]"],
+    );
+    seed({ status: { a1: "working" } });
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    fireEvent.click(pills().find((p) => p.getAttribute("data-notice-id") === "inbox")!);
+
+    const peerLines = screen.getAllByTestId(NOTICE_PEER_TESTID);
+    expect(peerLines).toHaveLength(1);
+    expect(peerLines[0]!.textContent).toContain("Relay Builder [abc-123]");
+    expect(peerLines[0]!.textContent).toMatch(/no human authority/i);
+
+    // The concierge's message is untouched — the attribution marks the exception, not everything.
+    const msgs = screen.getAllByTestId(NOTICE_MESSAGE_TESTID);
+    expect(msgs[0]!.textContent).toContain("rebase onto main first");
+    expect(msgs[0]!.querySelector(`[data-testid="${NOTICE_PEER_TESTID}"]`)).toBeNull();
+
+    // AND THE LINE DIRECTLY ABOVE THEM. Attributing the message while the panel's own detail still
+    // says "Queued by the concierge" puts an affirmative claim one element above the line
+    // contradicting it — on a provenance surface, which is the worst possible place for it.
+    expect(screen.getByTestId(NOTICE_DETAIL_TESTID).textContent).not.toMatch(
+      /Queued by the concierge/,
+    );
+    expect(screen.getByTestId(NOTICE_DETAIL_TESTID).textContent).toMatch(/PEER AGENT/);
+  });
+
+  it("keeps the concierge claim for an all-concierge queue", () => {
+    // The positive control for the case above: the disclaimer marks the exception, and a panel that
+    // disclaimed every queue would tell the founder his own concierge is a peer.
+    queueFrom(["rebase onto main first", "concierge"]);
+    seed({ status: { a1: "working" } });
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    fireEvent.click(pills().find((p) => p.getAttribute("data-notice-id") === "inbox")!);
+
+    expect(screen.getByTestId(NOTICE_DETAIL_TESTID).textContent).toMatch(/Queued by the concierge/);
+    expect(screen.queryByTestId(NOTICE_PEER_TESTID)).toBeNull();
   });
 
   it("opens the pill named by a ROW-MARK click, and consumes the request", () => {

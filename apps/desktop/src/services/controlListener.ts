@@ -113,6 +113,17 @@ import { withNewAgentCalm } from "../engine/newAgentAttention";
 import { normalizeAgentName } from "../engine/decodeEntities";
 import { useInteractionStore } from "../stores/interactionStore";
 import { setPrClaim, releasePrClaim, fetchPrClaims, findClaim } from "./mergeGuard/prClaims";
+import {
+  MESSAGE_MAX_CHARS,
+  PAIR_LIMIT,
+  PAIR_WINDOW_MS,
+  SENDER_LIMIT,
+  checkPeerRateLimit,
+  peerLabel,
+  recordPeerSend,
+  releasePeerSend,
+  sendPeerInboxMessage,
+} from "./peerMessaging";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab, AgentTabStatus } from "../types";
 
@@ -184,6 +195,10 @@ const TALLY: Record<ControlOp, boolean> = {
   set_agent_escalation: true,
   claim_pr: true,
   release_pr: true,
+  // Peer messaging — the op name only. Never `to`, and never the message body: this op carries the
+  // most identifying payload on the surface, and the point of the counter is "are agents using the
+  // channel", not what they said to each other.
+  send_peer_message: true,
 };
 const TALLIED_OPS = new Set<ControlOp>(
   (Object.keys(TALLY) as ControlOp[]).filter((op) => TALLY[op]),
@@ -280,6 +295,16 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // by anyone else.
   claim_pr: "free",
   release_pr: "free",
+  // FREE, and the table demands the reasoning be explicit, so: `free` is a statement about WHO MAY
+  // CALL, and the safety here comes from the handler — project scoping, the rate limits, the length
+  // cap — not from the tier. It must be `free` for the same reason `set_agent_goal` is: an
+  // unattended worker co-designing with a sibling is the exact caller this op exists for, and
+  // `privileged` would deny it to precisely them, which is the defect being fixed (`sparkle-0vl92`).
+  //
+  // Like `set_agent_goal` and unlike `claim_pr`, this op REACHES ANOTHER AGENT. What makes that safe
+  // is `handleSendPeerMessage`'s project scoping, not this entry — and the message is delivered as
+  // `Fyi` carrying a provenance banner, so a peer can inform a sibling but never oblige it.
+  send_peer_message: "free",
   // PRIVILEGED — AND THAT IS ONLY THE FIRST OF TWO GATES, which is the whole point of this entry.
   // `callerMayAdminister` admits ANY interactive non-worker agent (see its doc and the
   // `concierge_tool` entry above), so a tier alone would leave every Build/Think agent able to clear
@@ -307,6 +332,13 @@ const CONCIERGE_EXEMPT_OPS = new Set<ControlOp>([
   // the refusing handler is UNREACHABLE from the concierge instead of being advertised as a
   // togglable Settings row for a tool that can only decline.
   "unpin_agent",
+  // Same rule, a live op rather than a retired one: `handleSendPeerMessage` refuses the concierge
+  // UNCONDITIONALLY — the reserved caller id matches no roster row, so `findAgent` can never resolve
+  // it — because this is an agent-to-agent channel and the concierge already reaches the inbox
+  // through its own tools. Classifying it would render a togglable Settings row promising a tool the
+  // handler can only decline, and a human who switched it on would get `unknown_caller` with nothing
+  // saying why the toggle did nothing.
+  "send_peer_message",
 ]);
 
 /**
@@ -329,6 +361,7 @@ type ControlOpExemptFromConciergePolicy =
   | "pin_agent"
   | "set_agent_ordering"
   | "unpin_agent"
+  | "send_peer_message"
   // EXEMPT FROM *THIS* CHECK ONLY, AND NOT FROM THE GATE — the one place these two lists differ,
   // so read the difference rather than pattern-matching the name (roborev 63142). This type asks
   // "is the op classified in `APP_TOOL_NAMES`", and `chief_tool` deliberately is not: its policy
@@ -630,15 +663,21 @@ function notYours(targetId: string, what: string, why: string): Record<string, u
  *  "agents with a live process" until roborev 53556 pointed out that that is the same overclaim
  *  `liveness` had just been corrected for, one level up — and the more dangerous one, since a caller
  *  that trusts the scope contract ("I asked for live processes, I got N rows, so N workers are
- *  running") never reaches the per-row `liveness` field at all. Count rows here, never processes. */
-export type StateScope = "self" | "active" | "all";
+ *  running") never reaches the per-row `liveness` field at all. Count rows here, never processes.
+ *
+ *  "project" is the peer-messaging scope: the rows of the caller's OWN project, and nothing else. It
+ *  exists so `send_peer_message` has a roster whose names it is guaranteed to accept — the same
+ *  builder produces both, so a name read here always resolves there. An unresolvable caller gets an
+ *  EMPTY roster rather than the full one: this scope is the project boundary made readable, so
+ *  failing open would turn a read into a cross-project enumeration oracle. */
+export type StateScope = "self" | "active" | "all" | "project";
 
 /** Coerce the caller-supplied `scope` to a known value, defaulting to the cheap one. Unknown or
  *  non-string input falls back to "active" rather than erroring: the MCP layer already rejects a
  *  bad enum, so anything odd arriving here is a misbehaving client, and quietly serving it the
  *  narrow (safe, cheap) roster beats failing a read op. */
 function resolveScope(raw: unknown): StateScope {
-  return raw === "self" || raw === "all" || raw === "active" ? raw : "active";
+  return raw === "self" || raw === "all" || raw === "active" || raw === "project" ? raw : "active";
 }
 
 /** Max ids reported in `omittedIds`. The field is a convenience for resolving a specific dropped
@@ -936,6 +975,13 @@ function handleGetState(req: ControlRequest): {
   };
   // THE USER'S BUILD AGENTS. `all` — the list every count below is derived from — is this plus the
   // app-owned Improve Sparkle row appended after it; see the block below.
+  // WHICH PROJECT EACH ROW BELONGS TO — a side map rather than a field on the row. `projects.flatMap`
+  // discards `p` and every row is permanently resident in a caller's context, so scope "project"
+  // pays for the boundary out of band instead of adding ~40 chars to every row on every scope.
+  const projectOf = new Map<string, string>();
+  for (const p of projects) {
+    for (const a of p.agents) projectOf.set(a.id, p.id);
+  }
   const rosterAgents = projects.flatMap((p) =>
     p.agents.map((a) => ({
       id: a.id,
@@ -1054,12 +1100,21 @@ function handleGetState(req: ControlRequest): {
     appOwned: true as const,
   };
   const all = [...rosterAgents, sparkleRow];
+  const callerProjectId = projectOf.get(req.callerAgentId);
   const agents = all.filter((a) => {
     if (scope === "all") return true;
     // A ROW filter, and the concierge has no row — so this is legitimately empty for it. That is
     // why the reply's `self` block is unconditional: "which of these rows is me" and "who am I" are
     // different questions, and only the first one the roster can answer. See SelfIdentity.
     if (scope === "self") return a.id === req.callerAgentId;
+    // THE PROJECT BOUNDARY, and it fails CLOSED. `callerProjectId` is undefined for an unresolvable
+    // caller and for the concierge (whose reserved id matches no row), and an undefined never equals
+    // a row's project, so both get an empty roster instead of everyone else's agents. The app-owned
+    // Improve Sparkle row is in no project, so it is absent here too — deliberately: it is not a
+    // peer, and this scope's contract is "the siblings you may address".
+    if (scope === "project") {
+      return callerProjectId !== undefined && projectOf.get(a.id) === callerProjectId;
+    }
     // "active" = has a live status, OR is open in ANY window, OR is one of the caller's own
     // children. That last clause is not a nicety: "stopped" is also what an agent with NO runtime
     // entry reads as, which is exactly a just-spawned worker (no pane mounted yet) or a permanently
@@ -1087,6 +1142,15 @@ function handleGetState(req: ControlRequest): {
   // Capped as well, so the field can never grow with the dormant-tab backlog; `omitted` stays the
   // EXACT count either way, so the truncation is always visible. roborev #53441.
   const omittedIds = scope === "active" ? omittedAll.slice(0, OMITTED_IDS_CAP) : [];
+  // SCOPE "project" MUST NOT COUNT WHAT IT REFUSED TO SHOW. `totalAgents`/`omitted` are honest
+  // book-keeping for every other scope — they exist so a truncated roster does not read as "that's
+  // everyone". Here they would be a side channel: the rows are withheld precisely because they belong
+  // to other projects, so publishing "you were shown 3 of 47" hands back the fleet-wide headcount
+  // that the scope's whole purpose is to withhold. Same reasoning as `not_in_project` being
+  // indistinguishable from "no such agent" — a boundary that leaks its own size is not a boundary.
+  // For this scope the caller's project IS the world, so the totals describe that world.
+  const scopedTotal = scope === "project" ? agents.length : all.length;
+  const scopedOmitted = scope === "project" ? 0 : omittedAll.length;
   // Additive Phase-3 fields so an agent can read before writing: the model ids it may pass to
   // set_agent_model and the current zoom. Existing fields (agents, theme) are unchanged.
   // `agentOrdering` was dropped when the sidebar stopped sorting by status; `statusFilter` replaces
@@ -1104,8 +1168,8 @@ function handleGetState(req: ControlRequest): {
     // unconditional rather than another scope the caller has to know to ask for. See SelfIdentity.
     self: selfIdentity(req),
     scope,
-    totalAgents: all.length,
-    omitted: omittedAll.length,
+    totalAgents: scopedTotal,
+    omitted: scopedOmitted,
     // The dropped IDS, not just a count: a caller that needs one omitted agent can resolve it
     // directly instead of paying for a full scope:"all" re-read, which was the whole point of
     // narrowing the roster. Ids are ~40 chars vs the ~226 chars a full row costs.
@@ -2649,6 +2713,142 @@ export function isControlOpSuccess(result: unknown): boolean {
 /** Phase-2c self-report signal (sparkle-rl84): on a SUCCESSFUL sparkle-control op, tally it (op +
  *  caller/target kinds — all non-identifying enums). rename_agent / set_agent_activity are the
  *  primary self-report signals we're measuring against the paid fallbacks. */
+/** The one refusal shape this op uses. `code` is the stable half a model branches on; `error` is the
+ *  prose, matching every other refusal on this surface (`not_yours`, `no_goal`, …). */
+function peerRefusal(code: string, error: string): Record<string, unknown> {
+  return { ok: false, code, error };
+}
+
+/** The single message for "there is no such agent you may address".
+ *
+ *  DELIBERATELY ONE STRING FOR TWO DIFFERENT FACTS — an agent in another project, and an agent that
+ *  does not exist at all. If they differed by so much as a word, this op would be an oracle for
+ *  enumerating other projects' rosters: a caller could sweep ids and read which ones came back
+ *  "wrong project" versus "no such agent". The boundary has to be opaque from the outside to be a
+ *  boundary, which is the same reason scope "project" does not report what it omitted. */
+const NO_SUCH_PEER =
+  "no agent by that id or name is working in your project — read the roster with " +
+  "get_state({ scope: 'project' }), which lists exactly the agents you may message";
+
+/**
+ * Send one message to a sibling agent in the CALLER'S OWN project (bead `sparkle-0vl92`).
+ *
+ * Every check that makes this safe lives here: the Rust bridge is a transport plus an identity
+ * stamper and validates no op's payload, so length, emptiness, self-send, the project boundary and
+ * the rate limits are all enforced at this layer and nowhere else.
+ *
+ * The caller id is stamped SERVER-SIDE from the socket the request arrived on, never taken from the
+ * payload, so `from` cannot be forged — which is what makes the project scoping meaningful.
+ */
+async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string, unknown>> {
+  // FAILS CLOSED. An unresolvable caller has no project, and "no project" must never widen to "all
+  // projects" — so this refuses rather than searching everywhere. It also covers the concierge,
+  // whose reserved id matches no roster row: the concierge already reaches the inbox through its own
+  // tools and has no business borrowing an agent-to-agent channel.
+  const caller = findAgent(req.callerAgentId);
+  if (!caller) {
+    return peerRefusal(
+      "unknown_caller",
+      "send_peer_message could not resolve who is calling, so it cannot tell which project you are " +
+        "in — refusing rather than guessing",
+    );
+  }
+
+  const rawMessage = req.payload.message;
+  const message = typeof rawMessage === "string" ? rawMessage.trim() : "";
+  if (!message) {
+    return peerRefusal("empty_message", "message must be a non-empty string");
+  }
+  // Count CHARACTERS, not UTF-16 code units: `.length` would charge a caller double for astral
+  // characters and refuse a message well inside the documented budget.
+  const messageChars = [...message].length;
+  if (messageChars > MESSAGE_MAX_CHARS) {
+    return peerRefusal(
+      "too_long",
+      `message is ${messageChars} characters; the limit is ${MESSAGE_MAX_CHARS}. A peer message is ` +
+        "coordination, not a document handoff — say what you need and point at the file or bead",
+    );
+  }
+
+  const rawTo = req.payload.to;
+  const to = typeof rawTo === "string" ? rawTo.trim() : "";
+  // An absent or non-string `to` names no agent in the caller's project, which is precisely what
+  // `not_in_project` means. Reusing it keeps the refusal vocabulary the frozen one.
+  if (!to) return peerRefusal("not_in_project", NO_SUCH_PEER);
+
+  // RESOLUTION NEVER LEAVES THE CALLER'S PROJECT — the candidate list is built from it, rather than
+  // searching globally and rejecting afterwards. A global search that filters late is one early
+  // `return` away from leaking, and this way there is nothing to leak.
+  const siblings =
+    useProjectStore.getState().projects.find((p) => p.id === caller.projectId)?.agents ?? [];
+
+  // Exact id first, then a UNIQUE display-name match — the same name the roster prints, so a name
+  // read from get_state({ scope: "project" }) always resolves here.
+  let target = siblings.find((a) => a.id === to);
+  if (!target) {
+    const byName = siblings.filter((a) => agentDisplayName(a) === to);
+    if (byName.length > 1) {
+      return peerRefusal(
+        "ambiguous_target",
+        `"${to}" matches ${byName.length} agents in your project (${byName
+          .map((a) => a.id)
+          .join(", ")}) — address one of those ids directly`,
+      );
+    }
+    target = byName[0];
+  }
+  if (!target) return peerRefusal("not_in_project", NO_SUCH_PEER);
+
+  if (target.id === req.callerAgentId) {
+    return peerRefusal(
+      "self_send",
+      "that is you — a note to yourself belongs in your own notes, not in the inbox",
+    );
+  }
+
+  // Real clock, moved by fake timers in tests, so the shipping call site is the tested one.
+  const now = Date.now();
+  const verdict = checkPeerRateLimit(req.callerAgentId, target.id, now);
+  if (verdict !== "ok") {
+    // The remedy is deliberately NOT "retry later". A rate limit here means a conversation is
+    // looping or one agent is spraying the fleet, and both want a human, not a backoff.
+    const detail =
+      verdict === "pair"
+        ? `you have sent ${PAIR_LIMIT} messages to that agent in the last ${
+            PAIR_WINDOW_MS / 60000
+          } minutes`
+        : `you have sent ${SENDER_LIMIT} messages in the last hour`;
+    return peerRefusal(
+      "rate_limited",
+      `${detail}. Stop sending and report the situation to your human — a peer that is not answering ` +
+        "will not start because you asked again",
+    );
+  }
+
+  // RESERVE ON THE NEAR SIDE OF THE HOP. Recording after the `await` below would put the check and
+  // the record on opposite sides of it, and `dispatch` is fire-and-forget
+  // (`listen(EVENT, (event) => void dispatch(event.payload))`) — so several sends from one agent in
+  // one turn, the ordinary shape when a model emits several `tool_use` blocks at once, would ALL read
+  // the pre-send counts and ALL pass. These limits are the only bound on a reply loop and on one
+  // agent spraying the fleet, and they are the stated reason this op can be `free` tier.
+  recordPeerSend(req.callerAgentId, target.id, now);
+
+  const label = peerLabel(agentDisplayName(caller.agent), req.callerAgentId);
+  let messageId: string;
+  try {
+    messageId = await sendPeerInboxMessage(target.id, message, label);
+  } catch (e) {
+    // Give the reservation back: nothing was delivered, so nothing should have been spent. Without
+    // this, an agent whose peer is at its inbox cap burns its whole budget on sends that never landed.
+    releasePeerSend(req.callerAgentId, target.id, now);
+    // The inbox refuses rather than evicting when an agent is at its cap, and that refusal names the
+    // reason — pass it through rather than flattening it, because "they are not draining their
+    // inbox" is actionable and "send failed" is not.
+    return peerRefusal("send_failed", errMsg(e));
+  }
+  return { ok: true, messageId, to: { id: target.id, name: agentDisplayName(target) } };
+}
+
 function reportControlOpSuccess(req: ControlRequest, result: unknown): void {
   if (!isControlOpSuccess(result)) return;
   if (!TALLIED_OPS.has(req.op as ControlOp)) return;
@@ -2921,6 +3121,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "concierge_tool":
         result = await handleConciergeTool(req);
+        break;
+      case "send_peer_message":
+        result = await handleSendPeerMessage(req);
         break;
       case CHIEF_TOOL_OP:
         result = await handleChiefTool(req);

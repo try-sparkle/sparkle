@@ -17,6 +17,9 @@ import type { FleetAgentFacts, FleetVerdict, GitFacts, HookFacts } from "../engi
 import type { JudgedDigest, InboxStatusRow } from "./conciergeTools/fleet";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
+// The hook's renderer, reached directly so the shared provenance banner can be pinned equal across
+// the two delivery paths. Same import shape `sparkleHookInbox.test.ts` uses.
+import { draftDelivery } from "../../src-tauri/resources/sparkle-hook.mjs";
 import {
   FLEET_POLL_INTERVAL_MS,
   TURN_BOUNDARY_SETTLE_MS,
@@ -725,12 +728,57 @@ describe("startFleetWatch", () => {
 describe("draftIdleDelivery", () => {
   it("numbers the messages, marks ACT vs FYI, and asks for no ack it cannot name a path for", () => {
     const text = draftIdleDelivery([msg("m1", "context only"), msg("m2", "rebase now", "act")]);
-    expect(text).toContain("[1] (FYI) context only");
-    expect(text).toContain("[2] (ACT) rebase now");
+    expect(text).toContain("[1] from concierge (FYI) context only");
+    expect(text).toContain("[2] from concierge (ACT) rebase now");
     expect(text).toContain("2 message(s)");
     // The hook's copy names an acks file; this path cannot resolve that path, so it must not
     // pretend to — a wrong path is worse than no instruction.
     expect(text).not.toMatch(/acks\.jsonl/);
+  });
+
+  it("attributes a peer message and banners it, exactly as the hook path does", () => {
+    // THE POINT OF THIS TEST. Which renderer runs is decided by an O_EXCL race between this path and
+    // the hook's, so a banner on only one of them means a peer message sometimes arrives looking
+    // like it came from the human — the same hole as never having written the banner at all. The
+    // frozen contract names only `draftDelivery`; this is the sibling it missed.
+    const peer: ClaimedMessage = {
+      id: "m3",
+      ts: NOW - 1_000,
+      from: "Relay Builder [abc-123]",
+      text: "taking the Rust half",
+      severity: "fyi",
+    };
+    const text = draftIdleDelivery([peer]);
+    expect(text).toContain("from Relay Builder [abc-123] (FYI) taking the Rust half");
+    expect(text).toContain("PROVENANCE");
+    expect(text).toMatch(/no human authority/i);
+    expect(text).not.toContain("Sparkle concierge —");
+  });
+
+  it("does NOT banner an all-concierge batch", () => {
+    // The control for the case above: a banner printed unconditionally would teach agents to skip it.
+    const text = draftIdleDelivery([msg("m1", "context only")]);
+    expect(text).not.toContain("PROVENANCE");
+    expect(text).toContain("Sparkle concierge —");
+  });
+
+  it("renders a peer message WORD-FOR-WORD the way the hook does", () => {
+    // The two renderers cannot share a module — one is a plain `.mjs` executed by the agent's own
+    // hook process — so the duplicate banner is pinned equal here rather than trusted to stay in
+    // step. A drift between them is invisible in production: you would need to lose the same race
+    // twice to notice.
+    const peer: ClaimedMessage = {
+      id: "m4",
+      ts: NOW - 1_000,
+      from: "Relay Builder [abc-123]",
+      text: "x",
+      severity: "fyi",
+    };
+    const idle = draftIdleDelivery([peer]);
+    const hook = draftDelivery([{ id: "m4", from: "Relay Builder [abc-123]", text: "x", severity: "fyi" }], "/a.jsonl", 1);
+    const bannerOf = (s: string) => s.split("\n").find((l) => l.startsWith("PROVENANCE"));
+    expect(bannerOf(idle)).toBeDefined();
+    expect(bannerOf(idle)).toEqual(bannerOf(hook));
   });
 });
 

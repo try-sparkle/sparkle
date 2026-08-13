@@ -88,6 +88,10 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         // Intent signals (services/mergeGuard). The op NAME only — never the goal text or the
         // claim note, both of which are free text an agent wrote.
         "set_agent_goal", "set_agent_goal_met", "claim_pr", "release_pr",
+        // Peer messaging. The op NAME only — never `to`, and never the message body, which is the
+        // most identifying payload this op carries. Same treatment, same reason, as the two above:
+        // the counter answers "are agents using the channel", not what they said to each other.
+        "send_peer_message",
         // The concierge's bounded lever on `escalated` (bead sparkle-hm4z9). Same rule again, and
         // the reason it belongs to this paragraph rather than the UI ones: its payload carries a
         // free-text `reason` naming an agent's real work, and only the op name is stored.

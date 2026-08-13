@@ -89,10 +89,12 @@ import { C, FONT_WEIGHT } from "../../theme/colors";
 import { FONT_MONO, RADIUS, TYPE } from "../../theme/scale";
 import { DELIVERY_LABEL } from "../inboxCopy";
 import type { PairSide } from "../../engine/cable";
+import { anyPeer, isPeerSender, peerAttributionLine } from "../../services/peerAttribution";
 
 export const NOTICE_PILL_TESTID = "composer-notice-pill";
 export const NOTICE_DETAIL_TESTID = "composer-notice-detail";
 export const NOTICE_MESSAGE_TESTID = "composer-notice-message";
+export const NOTICE_PEER_TESTID = "composer-notice-peer";
 /** The notice's OWN words — this agent's goal text, or the engine's sentence — as opposed to the
  *  generic explainer above it. */
 export const NOTICE_OWN_WORDS_TESTID = "composer-notice-own-words";
@@ -183,12 +185,15 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
       thrash,
       ...(isStalled(stall) ? { stall } : {}),
       pendingInbox: pending,
+      // Only PENDING entries: a delivered message is not a notice, so a peer message that has
+      // already landed must not keep the header disclaimed.
+      pendingInboxHasPeer: anyPeer(entries.filter((e) => e.state === "pending")),
       // THE GOAL, which the ROW does not pass (its own chip is that mark) and this surface must.
       // The founder's second scope addition: clicking the row's blue target or red octagon opens
       // the pill that says what it means, and the pill has to exist for that click to land on.
       goal: goalBadgeFor(goal, now),
     });
-  }, [agentId, now, goal, status, bs, ws, stageOverride, pending]);
+  }, [agentId, now, goal, status, bs, ws, stageOverride, pending, entries]);
 
   // ── WHICH PILL IS OPEN ───────────────────────────────────────────────────────────────────────
   // One at a time: two open explainers push the composer down twice as far, and the pill row sits
@@ -290,7 +295,9 @@ function NoticePill({
   open: boolean;
   onToggle: () => void;
   /** Present only on the inbox pill — the queued messages themselves. */
-  inbox?: readonly { id: string; text: string; state: string; severity: string }[];
+  // `from` is load-bearing, not decoration: it decides whether a queued message is drawn as
+  // carrying the concierge's (i.e. the founder's) authority. See `services/peerAttribution.ts`.
+  inbox?: readonly { id: string; text: string; state: string; severity: string; from?: string }[];
 }) {
   const Glyph = GLYPH_ICON[notice.glyph];
   // THE `escalated → DANGER` SPECIAL CASE IS GONE (2026-08-06, roborev 59969). `escalated-goal`
@@ -364,6 +371,17 @@ function NoticePill({
             <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
               {inbox.map((e) => (
                 <div key={e.id} data-testid={NOTICE_MESSAGE_TESTID}>
+                  {/* Same rule as the other four renderers: a peer's message says so. This mailbox
+                      exists so "did the concierge really send it" stops being taken on trust, which
+                      it cannot do while a peer's message is indistinguishable from the concierge's. */}
+                  {isPeerSender(e.from) && (
+                    <div
+                      data-testid={NOTICE_PEER_TESTID}
+                      style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: C.muted }}
+                    >
+                      {peerAttributionLine(e.from)}
+                    </div>
+                  )}
                   <div style={{ color: C.cream, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
                     {e.text}
                   </div>

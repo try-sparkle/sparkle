@@ -43,6 +43,7 @@ import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal"
 import { AccountLimitModal } from "./components/AccountLimitModal";
 import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
+import { startAgentGoalDiskMirror } from "./services/agentGoalDisk";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
 import { startResurrectionRunner } from "./services/resurrectionRunner";
 import { startAutoApproveWatch } from "./services/suggestions/autoApproveWatch";
@@ -205,6 +206,20 @@ function AutoApproveWatch() {
 // UI.
 function GoalContinuation() {
   useEffect(() => startGoalContinuationRunner(), []);
+  return null;
+}
+
+// THE GOAL'S DURABLE MIRROR — `<app_data>/agent-goals/<agentId>.json`, for the SessionStart hook
+// (services/agentGoalDisk, contract in docs/agent-goal-record.md).
+//
+// Beside GoalContinuation because they answer two halves of one question. That one restarts an agent
+// whose turn ended with work remaining; this one makes sure an agent that comes back with NO session
+// context can still be told what it was doing — the goal lives in localStorage, which a shell hook
+// cannot read, so without this a resuming agent gets nothing. Same app-level shape and the same
+// single-owner election, for the same reason: a goal belongs to an AGENT, and two windows writing
+// one file would fight over it.
+function GoalDiskMirror() {
+  useEffect(() => startAgentGoalDiskMirror(), []);
   return null;
 }
 
@@ -555,6 +570,7 @@ export function App() {
       <LimitSync />
       <AutoApproveWatch />
       <GoalContinuation />
+      <GoalDiskMirror />
       <FleetResurrection />
       <Pusher />
       <AuthRecovery />

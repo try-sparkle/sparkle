@@ -228,11 +228,21 @@ function clean(): RoborevGateVerdict {
 /**
  * The gate itself. Pure, and ordered — each step answers a question the next one would get wrong.
  *
- * `acknowledgedJobIds` is the escape hatch from the design doc, and it reaches EXACTLY ONE step
- * (`roborev-unresolved`). It cannot clear `roborev-pending`, because you cannot waive a verdict
- * that does not exist yet — a caller that "acknowledged" an in-flight round has acknowledged
- * nothing, and that is the precise state PR #806 was merged in. It cannot clear `roborev-unknown`
- * either: there is nothing to name.
+ * `acknowledgedJobIds` is the escape hatch from the design doc, and it reaches the two steps that
+ * NAME ROWS — `roborev-unresolved` and the errored arm of `roborev-unknown`. It cannot clear
+ * `roborev-pending`, because you cannot waive a verdict that does not exist yet — a caller that
+ * "acknowledged" an in-flight round has acknowledged nothing, and that is the precise state PR #806
+ * was merged in. It cannot clear the UNREADABLE arm of `roborev-unknown` either: that verdict
+ * carries no job ids, so there is nothing to name.
+ *
+ * The errored arm was unwaivable until `roborev_probe.rs` started attributing branchless rows by
+ * sha, whose comment justifies KEEPING an on-branch crashed row by saying it "lands in `errored`,
+ * which IS waivable by acknowledgement". That exit did not exist here, so the wedge merely moved:
+ * a crashed row git places on your branch blocked it permanently, with the refusal telling readers
+ * the row could not be acknowledged at all. An unwaivable gate does not get honoured — it gets
+ * routed around wholesale with `gh pr merge`, which discards the genuine FAILs too. Waiving here is
+ * strictly narrower than the FAIL hatch that already exists: it still costs an explicit id list and
+ * a published reason, and a job that ends with an actual F verdict is judged by step 5 regardless.
  */
 export function roborevMergeGate(
   state: RoborevBranchState,
@@ -268,9 +278,14 @@ export function roborevMergeGate(
     };
   }
 
-  // 4. Jobs that ended without a usable verdict — unread, not clean.
-  if (state.errored.length > 0) {
-    const ids = idsOf(state.errored);
+  const acknowledged = new Set(acknowledgedJobIds ?? []);
+
+  // 4. Jobs that ended without a usable verdict — unread, not clean. Minus the ones the caller
+  //    named: these rows are terminal, so unlike an in-flight round there IS something to read and
+  //    something to name, and leaving them unwaivable is what wedged the repo (see the header).
+  const unread = state.errored.filter((job) => !acknowledged.has(job.id));
+  if (unread.length > 0) {
+    const ids = idsOf(unread);
     return {
       canMerge: false,
       code: "roborev-unknown",
@@ -281,7 +296,6 @@ export function roborevMergeGate(
 
   // 5. Open FAILs, minus the ones the caller named. Subtraction, not a boolean: a round that
   //    appeared since the caller read the findings is not covered by what it acknowledged.
-  const acknowledged = new Set(acknowledgedJobIds ?? []);
   const unresolved = state.blocking.filter((job) => !acknowledged.has(job.id));
   if (unresolved.length > 0) {
     const ids = idsOf(unresolved);

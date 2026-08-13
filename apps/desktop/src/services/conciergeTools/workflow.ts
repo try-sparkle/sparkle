@@ -753,7 +753,7 @@ export function roborevRefusalMessage(
       // When the verdict names job ids, roborev answered fine and THOSE JOBS died; only a verdict
       // with no ids is "we could not read roborev at all".
       return v.jobIds.length
-        ? `Refused: roborev job${v.jobIds.length > 1 ? "s" : ""} ${v.jobIds.join(", ")} on ${branch} ended without a readable verdict — the review never finished, so nothing was checked. roborev answered fine; these particular jobs did not. Re-run them, or \`roborev close\` each with a reason once you have judged the commit by hand. They cannot be acknowledged with roborevOverride, which names open FAIL findings only.`
+        ? `Refused: roborev job${v.jobIds.length > 1 ? "s" : ""} ${v.jobIds.join(", ")} on ${branch} ended without a readable verdict — the review never finished, so nothing was checked. roborev answered fine; these particular jobs did not. Re-run them, or name them in \`roborevOverride\` with a reason once you have judged the commit by hand. Do not reach for \`roborev close\` first: it needs review output and returns 404 on exactly the jobs that died before producing any.`
         : `Refused: roborev is the review gate on this machine and its state for ${branch} could not be read. That is "I could not find out", not "it is clean", and merging on it is merging blind.${v.reason ? ` ${v.reason}` : ""}`;
   }
 }

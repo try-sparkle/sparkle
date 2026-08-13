@@ -194,12 +194,11 @@ describe("summarizeRoborev", () => {
     expect(roborevMergeGate(s).canMerge).toBe(true);
   });
 
-  it("`roborev close` is the ONLY exit from `errored` — and it works for every shape", () => {
+  it("`closed` is honoured FIRST, for every shape that would otherwise land in `errored`", () => {
     // The previous test could not see this: a done/`F` row was never in `errored` anyway, so it
     // stayed green against an implementation that consulted `closed` only in the `blocking` branch.
-    // These rows land in `errored` unless `closed` is honoured FIRST, and an errored job cannot be
-    // acknowledged away — so if the `closed` check ever moves below the status switch, the branch
-    // becomes permanently unmergeable through the concierge.
+    // These rows land in `errored` unless `closed` is honoured FIRST — so if the `closed` check ever
+    // moves below the status switch, a finished decision starts blocking the merge again.
     for (const row of [
       job({ id: 1, status: "failed", verdict: null, closed: true }),
       job({ id: 2, status: "done", verdict: null, closed: true }),
@@ -213,12 +212,12 @@ describe("summarizeRoborev", () => {
     }
   });
 
-  it("an OPEN errored job cannot be acknowledged away — close is the exit, not the override", () => {
+  it("an OPEN errored job REFUSES until it is named, and names itself in the refusal", () => {
     const st = summarizeRoborev(probe([job({ id: 1, status: "failed", verdict: null })]));
-    const v = roborevMergeGate(st, [1]);
+    const v = roborevMergeGate(st);
     expect(v.canMerge).toBe(false);
     expect(v.code).toBe("roborev-unknown");
-    // …and it names the job, so the refusal message can tell the reader WHICH one to close.
+    // …and it names the job, so the refusal message can tell the reader WHICH one to act on.
     expect(v.jobIds).toEqual([1]);
   });
 
@@ -313,6 +312,57 @@ describe("roborevMergeGate — the #806 gate", () => {
     const v = roborevMergeGate(summarizeRoborev(probe(null)), [1, 2, 3]);
     expect(v.canMerge).toBe(false);
     expect(v.code).toBe("roborev-unknown");
+  });
+
+  // ── The errored bucket is WAIVABLE, and that is what un-wedges the repo ────────────────────────
+  // `roborev_probe.rs` keeps a branchless row that git places on this branch precisely because a
+  // crashed row "lands in `errored`, which IS waivable by acknowledgement". That exit did not exist
+  // here, so such a row blocked the branch permanently and merges were routed around the gate
+  // entirely with `gh pr merge` — discarding the genuine FAILs along with it.
+
+  it("naming EVERY errored job clears it — the exit the probe's attribution comment promises", () => {
+    const s = summarizeRoborev(
+      probe([
+        job({ id: 59204, status: "failed", verdict: null }),
+        job({ id: 59203, status: "done", verdict: null }),
+      ]),
+    );
+    expect(roborevMergeGate(s).canMerge, "unnamed, it must refuse").toBe(false);
+    expect(roborevMergeGate(s, [59204, 59203]).canMerge).toBe(true);
+  });
+
+  it("a PARTIAL acknowledgement of errored jobs still refuses, naming only what is left", () => {
+    const s = summarizeRoborev(
+      probe([
+        job({ id: 59204, status: "failed", verdict: null }),
+        job({ id: 59203, status: "failed", verdict: null }),
+      ]),
+    );
+    const v = roborevMergeGate(s, [59204]);
+    expect(v.canMerge).toBe(false);
+    expect(v.code).toBe("roborev-unknown");
+    expect(v.jobIds).toEqual([59203]);
+  });
+
+  it("naming an errored job does NOT waive a real FAIL that is still open", () => {
+    // The waiver is per-id subtraction, not a mode: clearing the unreadable row hands the branch to
+    // step 5, which is the one that actually judges verdicts.
+    const s = summarizeRoborev(
+      probe([job({ id: 1, status: "failed", verdict: null }), job({ id: 2, verdict: "F" })]),
+    );
+    const v = roborevMergeGate(s, [1]);
+    expect(v.canMerge).toBe(false);
+    expect(v.code).toBe("roborev-unresolved");
+    expect(v.jobIds).toEqual([2]);
+  });
+
+  it("naming an errored job does NOT waive an in-flight round", () => {
+    const s = summarizeRoborev(
+      probe([job({ id: 1, status: "failed", verdict: null }), job({ id: 2, status: "running", verdict: null })]),
+    );
+    const v = roborevMergeGate(s, [1, 2]);
+    expect(v.canMerge).toBe(false);
+    expect(v.code).toBe("roborev-pending");
   });
 
   it("pending outranks unresolved, so the caller is told to WAIT rather than to go read", () => {

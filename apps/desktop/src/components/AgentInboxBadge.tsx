@@ -30,10 +30,18 @@ import { SIDEBAR_OVERLAY_Z } from "./layers";
 import { DELIVERY_A11Y, DELIVERY_LABEL, pendingBadgeLabel, pendingBadgeTitle } from "./inboxCopy";
 import { pendingCount, useAgentInbox } from "../stores/inboxStore";
 import type { InboxEntry } from "../services/conciergeTools/fleet";
+import {
+  MIXED_QUEUE_HEADER,
+  anyPeer,
+  isPeerSender,
+  peerAttributionLine,
+} from "../services/peerAttribution";
 
 export const INBOX_BADGE_TESTID = "row-inbox";
 export const INBOX_POPOVER_TESTID = "row-inbox-popover";
 export const INBOX_POPOVER_MESSAGE_TESTID = "row-inbox-message";
+export const INBOX_POPOVER_HEADER_TESTID = "row-inbox-header";
+export const INBOX_POPOVER_PEER_TESTID = "row-inbox-peer";
 
 /** How wide the popover is allowed to get. The column is narrow and the panel is anchored to a chip
  *  inside it, so it deliberately overhangs into the terminal area rather than wrapping a queued
@@ -111,7 +119,7 @@ export function AgentInboxBadge({ agentId }: { agentId: string }) {
         data-pending-count={pending}
         role="button"
         tabIndex={0}
-        title={pendingBadgeTitle(pending)}
+        title={pendingBadgeTitle(pending, anyPeer(entries))}
         aria-label={pendingBadgeLabel(pending)}
         aria-expanded={open}
         onClick={(e) => {
@@ -192,8 +200,17 @@ function Popover({ anchor, entries }: { anchor: DOMRect; entries: readonly Inbox
         boxShadow: "0 6px 20px rgba(0,0,0,0.28)",
       }}
     >
-      <div style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: C.muted }}>
-        Queued by the concierge · delivered at this agent&apos;s next turn boundary
+      <div
+        data-testid={INBOX_POPOVER_HEADER_TESTID}
+        style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: C.muted }}
+      >
+        {/* THE HEADER CANNOT CLAIM THE CONCIERGE UNCONDITIONALLY. This popover is the surface a
+            human opens precisely to check "did the concierge really send it", so stating it of a
+            queue that contains a peer's message is not a silent omission — it is an affirmative
+            untruth on the one surface built to answer that question. */}
+        {anyPeer(entries)
+          ? MIXED_QUEUE_HEADER
+          : "Queued by the concierge · delivered at this agent's next turn boundary"}
       </div>
       {entries.map((e) => (
         <div
@@ -211,6 +228,14 @@ function Popover({ anchor, entries }: { anchor: DOMRect; entries: readonly Inbox
               wordBreak: "break-word",
             }}
           >
+            {isPeerSender(e.from) && (
+              <div
+                data-testid={INBOX_POPOVER_PEER_TESTID}
+                style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: C.muted }}
+              >
+                {peerAttributionLine(e.from)}
+              </div>
+            )}
             {e.text}
           </div>
           <div style={{ fontFamily: FONT_MONO, fontSize: TYPE.micro, color: C.muted }}>

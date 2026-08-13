@@ -244,9 +244,10 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "but nobody had to take anyone's word for it. The proving commits are recorded on the goal.",
 
   inbox:
-    "The concierge has queued instructions for this agent that it has not picked up yet. Messages " +
-    "are handed over at the agent's next turn boundary rather than interrupting it mid-tool, so a " +
-    "queued message is the system working normally — not a delivery that failed.",
+    "Instructions are queued for this agent that it has not picked up yet. Messages are handed over " +
+    "at the agent's next turn boundary rather than interrupting it mid-tool, so a queued message is " +
+    "the system working normally — not a delivery that failed. Who queued each one is named on the " +
+    "message itself: a peer agent carries no human authority, the concierge speaks for you.",
 };
 
 /** Warning-class ordering: worst first, so a row's single glyph and a pill row's first pill both
@@ -397,6 +398,9 @@ export interface NoticeInputs {
   stall?: StallReport | undefined;
   /** `stores/inboxStore.pendingCount(...)`. Pending only; a delivered message is not a notice. */
   pendingInbox?: number | undefined;
+  /** Whether any PENDING entry came from a peer rather than the concierge — see
+   *  `services/peerAttribution.anyPeer`. Drives whether the notice may claim the concierge. */
+  pendingInboxHasPeer?: boolean | undefined;
   /**
    * `components/rowAttention.goalBadgeFor(...)`. `undefined`/`null` = this agent has no goal, which
    * is not a notice.
@@ -522,7 +526,12 @@ export function agentNotices(input: NoticeInputs): AgentNotice[] {
       cls: "message",
       glyph: "inbox",
       label: pending === 1 ? "1 queued message" : `${pending} queued messages`,
-      detail: "Queued by the concierge · delivered at this agent's next turn boundary",
+      // Conditional for the same reason the badge popover's header is: this line sits DIRECTLY
+      // ABOVE the per-message attribution, so leaving it unconditional put an affirmative concierge
+      // claim one element above the line contradicting it, on a provenance surface.
+      detail: input.pendingInboxHasPeer
+        ? "At least one queued message is from a PEER AGENT, not the concierge · delivered at this agent's next turn boundary"
+        : "Queued by the concierge · delivered at this agent's next turn boundary",
     });
   }
 

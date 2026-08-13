@@ -32,6 +32,17 @@ vi.mock("@tauri-apps/api/event", () => ({
 const controlResponds: Array<{ reqId: string; result: unknown }> = [];
 const setConfigCalls: Array<{ path: string; value: unknown }> = [];
 const setConfigValuesCalls: Array<{ values: Record<string, unknown> }> = [];
+/** Every `inbox_send` the listener actually made — the SIDE EFFECT peer messaging is judged on. A
+ *  reply-only assertion would pass against a handler that refused and delivered anyway. */
+interface InboxSendArgs {
+  agentId: string;
+  text: string;
+  severity: string;
+  from: string;
+}
+const inboxSends: InboxSendArgs[] = [];
+/** Set to make the next `inbox_send` reject, standing in for a full recipient inbox. */
+let inboxSendError: string | null = null;
 const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
   switch (cmd) {
     case "start_control_bridge":
@@ -49,6 +60,10 @@ const invokeMock = vi.fn(async (cmd: string, args?: unknown) => {
     case "set_config_values":
       setConfigValuesCalls.push(args as { values: Record<string, unknown> });
       return undefined;
+    case "inbox_send":
+      inboxSends.push(args as InboxSendArgs);
+      if (inboxSendError) throw new Error(inboxSendError);
+      return `msg-${inboxSends.length}`;
     default:
       return undefined;
   }
@@ -179,6 +194,15 @@ import {
   _resetControlExpiredSkipsForTests,
   type ControlRequest,
 } from "./controlListener";
+import {
+  MESSAGE_MAX_CHARS,
+  PAIR_LIMIT,
+  SENDER_LIMIT,
+  _resetPeerRateLimitsForTests,
+} from "./peerMessaging";
+// Imported from CORE, not from the desktop alias, on purpose: the point of the test below is that
+// the enforcer agrees with the value core owns, so it must not read that value through the alias.
+import { PEER_MESSAGE_MAX_CHARS } from "@sparkle/core";
 // The FROZEN Chief contract. Imported for its types only — the cases below drive the real handler
 // through the real `dispatch`, and the stub they inject is the same seam production writes.
 import type { ChiefClient, ChiefProject } from "./chiefScope";
@@ -288,6 +312,9 @@ describe("controlListener", () => {
       /* jsdom without localStorage — readPersistedOpenAgentIds already treats that as empty */
     }
     useUiStore.getState().setThemePref("auto");
+    inboxSends.length = 0;
+    inboxSendError = null;
+    _resetPeerRateLimitsForTests();
     const store = useProjectStore.getState();
     projectId = store.addProject("Demo", "/tmp/demo");
     callerId = store.addAgent(projectId, { kind: "build" })!;
@@ -5482,5 +5509,477 @@ describe("isControlOpSuccess", () => {
     expect(isControlOpSuccess(undefined)).toBe(false);
     expect(isControlOpSuccess(null)).toBe(false);
     expect(isControlOpSuccess("ok")).toBe(false);
+  });
+});
+
+
+// ---------------------------------------------------------------------------------------------
+// send_peer_message — agent-to-agent messaging (bead `sparkle-0vl92`)
+//
+// A SEPARATE top-level describe, so it carries its OWN reset. It cannot borrow the main block's
+// beforeEach, and a shared-state leak here is not a cosmetic problem: `inboxSends` is the side
+// effect every refusal case asserts is EMPTY, so one leaked delivery turns "it refused" into a
+// false pass in the other direction.
+// ---------------------------------------------------------------------------------------------
+describe("send_peer_message", () => {
+  let projectId: string;
+  let callerId: string;
+  let otherId: string;
+  let cleanup: (() => void) | undefined;
+
+  beforeEach(async () => {
+    firedHandler = undefined;
+    controlResponds.length = 0;
+    inboxSends.length = 0;
+    inboxSendError = null;
+    _resetPeerRateLimitsForTests();
+    vi.mocked(sparkleActivityLine).mockReturnValue(null);
+    useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
+    useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
+    const store = useProjectStore.getState();
+    projectId = store.addProject("Peers", "/tmp/peers");
+    callerId = store.addAgent(projectId, { kind: "build" })!;
+    otherId = store.addAgent(projectId, { kind: "worker", parentId: callerId })!;
+    cleanup = await startControlListener();
+  });
+  afterEach(() => {
+    cleanup?.();
+    cleanup = undefined;
+    vi.restoreAllMocks();
+  });
+
+  /** Freeze the clock the handler actually reads. A `Date.now` spy rather than fake timers on
+   *  purpose: `flush()` waits on a real `setTimeout`, which fake timers stop from ever firing. */
+  const freezeClock = (t: number) => vi.spyOn(Date, "now").mockReturnValue(t);
+
+  const send = (payload: Record<string, unknown>, caller = callerId, reqId = "pm") =>
+    fire({ reqId, op: "send_peer_message", callerAgentId: caller, payload });
+
+  const rename = (id: string, name: string) =>
+    useProjectStore.setState((s) => ({
+      projects: s.projects.map((p) =>
+        p.id !== projectId
+          ? p
+          : {
+              ...p,
+              agents: p.agents.map((a) =>
+                a.id === id ? { ...a, name, namePinned: true } : a,
+              ),
+            },
+      ),
+    }));
+
+  it("delivers to a sibling, naming the sender and marking it FYI", async () => {
+    send({ to: otherId, message: "taking the Rust half" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: otherId } });
+    // THE SIDE EFFECT, not just the reply: a handler that replied ok and queued nothing would pass
+    // a reply-only assertion while the whole feature was dead.
+    expect(inboxSends).toHaveLength(1);
+    expect(inboxSends[0]).toMatchObject({ agentId: otherId, text: "taking the Rust half" });
+    // ALWAYS fyi. A peer is not the human and cannot place an obligation on another agent.
+    expect(inboxSends[0]!.severity).toBe("fyi");
+    // The frozen label shape: the name to reply with AND the exact id to address.
+    expect(inboxSends[0]!.from).toMatch(new RegExp(`\\[${callerId}\\]$`));
+  });
+
+  it("resolves a target by the display NAME the project roster prints", async () => {
+    rename(otherId, "Rust Half");
+    send({ to: "Rust Half", message: "yours now" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: otherId, name: "Rust Half" } });
+    expect(inboxSends[0]).toMatchObject({ agentId: otherId });
+  });
+
+  it("refuses a name that matches two siblings, naming the ids so the caller can disambiguate", async () => {
+    const third = useProjectStore.getState().addAgent(projectId, { kind: "worker" })!;
+    rename(otherId, "Twin");
+    rename(third, "Twin");
+    send({ to: "Twin", message: "which of you" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "ambiguous_target" });
+    expect(String((lastReply() as { error?: string }).error)).toContain(otherId);
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("refuses an agent in ANOTHER project, and delivers nothing", async () => {
+    const elsewhere = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    const stranger = useProjectStore.getState().addAgent(elsewhere, { kind: "build" })!;
+    send({ to: stranger, message: "hello stranger" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "not_in_project" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("answers a cross-project target and a NONEXISTENT one identically", async () => {
+    // THE ANTI-ORACLE PROPERTY. If these replies differed by so much as a word, an agent could sweep
+    // ids and read back which exist in other projects — the op would enumerate the rosters it is
+    // specifically built to hide. Same code AND same prose.
+    const elsewhere = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    const stranger = useProjectStore.getState().addAgent(elsewhere, { kind: "build" })!;
+
+    send({ to: stranger, message: "x" }, callerId, "cross");
+    await flush();
+    const crossProject = lastReply();
+
+    send({ to: "00000000-0000-0000-0000-000000000000", message: "x" }, callerId, "ghost");
+    await flush();
+
+    expect(lastReply()).toEqual(crossProject);
+  });
+
+  it("refuses a message to yourself", async () => {
+    send({ to: callerId, message: "note to self" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "self_send" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("refuses an empty or whitespace-only message", async () => {
+    send({ to: otherId, message: "   " });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "empty_message" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("refuses a message over the character cap, and allows one exactly at it", async () => {
+    // THE CAP HAS ONE OWNER, and this is the enforcing side of that. `@sparkle/core` holds the
+    // number because this handler ENFORCES it while the MCP tool DESCRIBES it to the fleet; a
+    // literal in each is two numbers that look like one. Re-hardcode the alias in `peerMessaging.ts`
+    // and this line reds — the drives below then test whatever that literal happens to say.
+    expect(MESSAGE_MAX_CHARS).toBe(PEER_MESSAGE_MAX_CHARS);
+
+    send({ to: otherId, message: "x".repeat(MESSAGE_MAX_CHARS + 1) }, callerId, "long");
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "too_long" });
+    expect(inboxSends).toHaveLength(0);
+
+    // THE BOUNDARY CONTROL: without it, an off-by-one refusing everything would still pass above.
+    send({ to: otherId, message: "x".repeat(MESSAGE_MAX_CHARS) }, callerId, "atcap");
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true });
+    expect(inboxSends).toHaveLength(1);
+  });
+
+  it("refuses an unresolvable caller rather than searching every project", async () => {
+    send({ to: otherId, message: "who am I" }, "not-an-agent");
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "unknown_caller" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("refuses the concierge — it has its own channel and no roster row", async () => {
+    // THIS IS ALSO THE EXEMPTION PIN. `send_peer_message` is in `CONCIERGE_EXEMPT_OPS` because the
+    // handler can only ever decline it, and asserting `unknown_caller` HERE is what holds that:
+    // drop the op from the runtime Set and the policy layer answers first with a different code, so
+    // this reds. No separate case is needed, and adding one that asserts the error text lacks
+    // `concierge.tools` would be worse than redundant — with the op absent from `APP_TOOL_NAMES`
+    // that string is unreachable, so such an assertion could not fail either way.
+    send({ to: otherId, message: "from the concierge" }, CONCIERGE_CALLER_AGENT_ID);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "unknown_caller" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("ALLOWS an unattended worker to send — the free tier's whole point", async () => {
+    // The defect being fixed is workers unable to coordinate. A tier that denied them would leave it
+    // in place for exactly the agents it was reported against.
+    send({ to: callerId, message: "done with my half" }, otherId);
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true });
+    expect(inboxSends[0]).toMatchObject({ agentId: callerId });
+  });
+
+  it("passes the inbox's own refusal through rather than flattening it", async () => {
+    inboxSendError = "inbox: a1 already has 50 undelivered messages; it is not draining them";
+    send({ to: otherId, message: "hello" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "send_failed" });
+    expect(String((lastReply() as { error?: string }).error)).toContain("not draining");
+  });
+
+  it("bounds a reply loop at PAIR_LIMIT sends to one agent, and says to stop rather than retry", async () => {
+    freezeClock(1_000_000);
+    for (let i = 0; i < PAIR_LIMIT; i++) {
+      send({ to: otherId, message: `round ${i}` }, callerId, `p${i}`);
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+    }
+    send({ to: otherId, message: "one too many" }, callerId, "over");
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "rate_limited" });
+    expect(String((lastReply() as { error?: string }).error)).toMatch(/report/i);
+    expect(inboxSends).toHaveLength(PAIR_LIMIT);
+  });
+
+  it("lets the pair budget recover once its window has passed", async () => {
+    // THE PAIRED CONTROL for the limit above. Without it, a limiter that refused permanently — or
+    // one that refused everything from the first message — passes the test above unchanged.
+    const clock = freezeClock(1_000_000);
+    for (let i = 0; i < PAIR_LIMIT; i++) {
+      send({ to: otherId, message: `round ${i}` }, callerId, `p${i}`);
+      await flush();
+    }
+    clock.mockReturnValue(1_000_000 + 11 * 60 * 1000);
+    send({ to: otherId, message: "much later" }, callerId, "later");
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true });
+    expect(inboxSends).toHaveLength(PAIR_LIMIT + 1);
+  });
+
+  it("bounds one agent spraying the fleet at SENDER_LIMIT, across DIFFERENT recipients", async () => {
+    // The pair limit alone would permit this: 20 recipients at one message each never trips it.
+    freezeClock(1_000_000);
+    const store = useProjectStore.getState();
+    const targets = Array.from(
+      { length: SENDER_LIMIT + 1 },
+      () => store.addAgent(projectId, { kind: "worker" })!,
+    );
+    for (let i = 0; i < SENDER_LIMIT; i++) {
+      send({ to: targets[i]!, message: "hi" }, callerId, `s${i}`);
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: true });
+    }
+    send({ to: targets[SENDER_LIMIT]!, message: "one too many" }, callerId, "sover");
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "rate_limited" });
+    expect(inboxSends).toHaveLength(SENDER_LIMIT);
+  });
+
+  it("gives the budget BACK when the send itself fails after the limiter passed", async () => {
+    // THE ONE REFUSAL THAT STRADDLES THE RESERVATION, and the reason the earlier version of this test
+    // proved nothing: it drove `not_in_project`, which returns BEFORE `checkPeerRateLimit` is ever
+    // called, so it would have passed against exactly the regression it was written to guard. Only
+    // `send_failed` — where the reservation is already held and the inbox then throws — can observe
+    // whether a failed send spends the sender's budget.
+    freezeClock(1_000_000);
+    inboxSendError = "inbox: a1 already has 50 undelivered messages; it is not draining them";
+    for (let i = 0; i < PAIR_LIMIT + 1; i++) {
+      send({ to: otherId, message: "hello?" }, callerId, `fail${i}`);
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "send_failed" });
+    }
+
+    // The peer drains its inbox; the sender must still have its whole budget.
+    inboxSendError = null;
+    send({ to: otherId, message: "a real one" }, callerId, "good");
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true });
+  });
+
+  it("still does not spend the budget on a target that never resolved", async () => {
+    // Kept as its own case rather than as the evidence for the property above: a run of bad target
+    // names must not lock an agent out of a channel it never reached, which is true for a different
+    // reason (the refusal returns before the limiter runs at all).
+    freezeClock(1_000_000);
+    for (let i = 0; i < PAIR_LIMIT + 1; i++) {
+      send({ to: "no-such-agent", message: "hello?" }, callerId, `bad${i}`);
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "not_in_project" });
+    }
+    send({ to: otherId, message: "a real one" }, callerId, "good");
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true });
+  });
+
+  it("refunds ONE reservation per failure, not every reservation sharing that millisecond", async () => {
+    // `releasePeerSend`'s stated invariant, and the rollback test above cannot see it: that test
+    // awaits flush() between sends, so only one reservation is ever live when a rollback runs.
+    // Reimplementing the body as a filter — dropping EVERY entry matching (to, at) — leaves the
+    // whole suite green while refunding both concurrent reservations from a single failure, which
+    // is the same over-permit the reserve-before-the-hop change exists to close.
+    freezeClock(1_000_000);
+    for (let i = 0; i < PAIR_LIMIT - 2; i++) {
+      send({ to: otherId, message: `round ${i}` }, callerId, `p${i}`);
+      await flush();
+    }
+    expect(inboxSends).toHaveLength(PAIR_LIMIT - 2);
+
+    // Two sends in the SAME tick — same `at`, because the clock is frozen. One fails.
+    send({ to: otherId, message: "survivor" }, callerId, "keep");
+    inboxSendError = "inbox: a1 already has 50 undelivered messages; it is not draining them";
+    send({ to: otherId, message: "casualty" }, callerId, "drop");
+    await flush();
+    inboxSendError = null;
+
+    // `inboxSends` records ATTEMPTS — the mock appends before it throws — so both of those are in
+    // it. What matters is the BUDGET: five reservations were taken and one was refunded, so exactly
+    // one slot is left.
+    expect(inboxSends).toHaveLength(PAIR_LIMIT);
+    send({ to: otherId, message: "last slot" }, callerId, "last");
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true });
+
+    // …and it really was the last one. A filter-style rollback would have refunded both, leaving
+    // room here and letting the pair budget be exceeded.
+    send({ to: otherId, message: "over" }, callerId, "over");
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: false, code: "rate_limited" });
+  });
+
+  it("holds the limit against CONCURRENT sends, not just serialized ones", async () => {
+    // Every other test in this block awaits `flush()` between sends, so all of them are serialized —
+    // and serialization is precisely what hides this bug. `dispatch` is fire-and-forget, so several
+    // `tool_use` blocks in one model turn arrive without anything awaiting between them; if the check
+    // and the record sit on opposite sides of the `await` into the inbox, they ALL read the pre-send
+    // counts and they ALL pass.
+    freezeClock(1_000_000);
+    for (let i = 0; i < PAIR_LIMIT - 1; i++) {
+      send({ to: otherId, message: `round ${i}` }, callerId, `p${i}`);
+      await flush();
+    }
+    expect(inboxSends).toHaveLength(PAIR_LIMIT - 1);
+
+    // Two sends, NO await between them — one slot left in the pair budget.
+    const before = controlResponds.length;
+    send({ to: otherId, message: "racer A" }, callerId, "raceA");
+    send({ to: otherId, message: "racer B" }, callerId, "raceB");
+    await flush();
+
+    // Exactly one got through, and exactly one was refused. Asserted over BOTH replies rather than
+    // `lastReply()`: the refusal resolves synchronously while the winner is still awaiting the inbox,
+    // so the successful reply is the one that lands LAST — the opposite of the order they were sent.
+    expect(inboxSends).toHaveLength(PAIR_LIMIT);
+    const racerReplies = controlResponds
+      .slice(before)
+      .map((r) => r.result as Record<string, unknown>);
+    expect(racerReplies).toHaveLength(2);
+    expect(racerReplies.filter((r) => r.ok === true)).toHaveLength(1);
+    expect(racerReplies.filter((r) => r.code === "rate_limited")).toHaveLength(1);
+  });
+});
+
+describe("get_state scope: project", () => {
+  let projectId: string;
+  let callerId: string;
+  let otherId: string;
+  let cleanup: (() => void) | undefined;
+
+  beforeEach(async () => {
+    firedHandler = undefined;
+    controlResponds.length = 0;
+    inboxSends.length = 0;
+    inboxSendError = null;
+    _resetPeerRateLimitsForTests();
+    vi.mocked(sparkleActivityLine).mockReturnValue(null);
+    useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
+    useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
+    const store = useProjectStore.getState();
+    projectId = store.addProject("Mine", "/tmp/mine");
+    callerId = store.addAgent(projectId, { kind: "build" })!;
+    otherId = store.addAgent(projectId, { kind: "worker", parentId: callerId })!;
+    cleanup = await startControlListener();
+  });
+  afterEach(() => {
+    cleanup?.();
+    cleanup = undefined;
+    vi.restoreAllMocks();
+  });
+
+  const ids = (r: unknown) =>
+    ((r as { agents: Array<{ id: string }> }).agents ?? []).map((a) => a.id);
+
+  it("returns the caller's own project and nothing else", async () => {
+    const elsewhere = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    const stranger = useProjectStore.getState().addAgent(elsewhere, { kind: "build" })!;
+
+    fire({ reqId: "p1", op: "get_state", callerAgentId: callerId, payload: { scope: "project" } });
+    await flush();
+
+    expect(ids(lastReply())).toEqual(expect.arrayContaining([callerId, otherId]));
+    expect(ids(lastReply())).not.toContain(stranger);
+
+    // THE CONTROL: scope "all" DOES see the stranger, so the exclusion above is the project filter
+    // doing its job rather than the agent simply not existing.
+    fire({ reqId: "p2", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+    await flush();
+    expect(ids(lastReply())).toContain(stranger);
+  });
+
+  it("does not leak the SIZE of what it withheld", async () => {
+    // `totalAgents`/`omitted` are honest book-keeping on every other scope. Here they would be a
+    // side channel: rows are hidden precisely because they belong to other projects, so
+    // "you saw 2 of 40" hands back the fleet-wide headcount the boundary exists to withhold.
+    const elsewhere = useProjectStore.getState().addProject("Elsewhere", "/tmp/elsewhere");
+    for (let i = 0; i < 5; i++) useProjectStore.getState().addAgent(elsewhere, { kind: "build" });
+
+    fire({ reqId: "p3", op: "get_state", callerAgentId: callerId, payload: { scope: "project" } });
+    await flush();
+    const reply = lastReply() as { totalAgents: number; omitted: number; agents: unknown[] };
+
+    expect(reply.totalAgents).toBe(reply.agents.length);
+    expect(reply.omitted).toBe(0);
+  });
+
+  it("gives an unresolvable caller an EMPTY roster, never the full one", async () => {
+    fire({
+      reqId: "p4",
+      op: "get_state",
+      callerAgentId: "not-an-agent",
+      payload: { scope: "project" },
+    });
+    await flush();
+
+    expect(ids(lastReply())).toEqual([]);
+  });
+
+  it("gives the CONCIERGE an empty roster too — it has no project row to scope by", async () => {
+    fire({
+      reqId: "p5",
+      op: "get_state",
+      callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+      payload: { scope: "project" },
+    });
+    await flush();
+
+    expect(ids(lastReply())).toEqual([]);
+  });
+
+  it("prints the same names send_peer_message accepts", async () => {
+    // The two must agree, or the roster is a list of names that do not resolve. This is the seam the
+    // frozen contract cared most about, so it is pinned end to end rather than per side.
+    useProjectStore.setState((s) => ({
+      projects: s.projects.map((p) =>
+        p.id !== projectId
+          ? p
+          : {
+              ...p,
+              agents: p.agents.map((a) =>
+                a.id === otherId ? { ...a, name: "Rust Half", namePinned: true } : a,
+              ),
+            },
+      ),
+    }));
+
+    fire({ reqId: "p6", op: "get_state", callerAgentId: callerId, payload: { scope: "project" } });
+    await flush();
+    const row = (lastReply() as { agents: Array<{ id: string; name: string }> }).agents.find(
+      (a) => a.id === otherId,
+    );
+    expect(row!.name).toBe("Rust Half");
+
+    fire({
+      reqId: "p7",
+      op: "send_peer_message",
+      callerAgentId: callerId,
+      payload: { to: row!.name, message: "resolved by the printed name" },
+    });
+    await flush();
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: otherId } });
   });
 });

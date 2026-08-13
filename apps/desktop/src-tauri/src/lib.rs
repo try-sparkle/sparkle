@@ -1,6 +1,7 @@
 mod account_ledger;
 mod account_usage;
 mod accounts;
+mod agent_goal_record;
 mod agent_life;
 mod ai;
 /// The native menu bar. Carries "View → Hide/Show Helper", which is the guaranteed way back for a
@@ -816,6 +817,11 @@ pub fn run() {
             deps_bootstrap::bootstrap_worktree_deps,
             hooks::install_agent_hooks,
             hooks::heal_agent_hooks,
+            // The durable mirror of an agent's goal, for the SessionStart hook that reads it back to
+            // an agent waking with no session context (docs/agent-goal-record.md).
+            agent_goal_record::write_agent_goal_record,
+            agent_goal_record::list_agent_goal_records,
+            agent_goal_record::delete_agent_goal_record,
             hooks::ensure_default_plugins_installed,
             hooks::plugin_install_outcomes,
             hooks::read_events_since,

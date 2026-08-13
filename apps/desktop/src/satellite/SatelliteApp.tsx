@@ -47,6 +47,7 @@ import { ErrorBoundary, AgentPaneErrorCard } from "../components/ErrorBoundary";
 import { TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
 import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startPresenceTracking } from "../stores/presenceStore";
+import { startAgentGoalDiskMirror } from "../services/agentGoalDisk";
 import { startGoalContinuationRunner } from "../services/goalContinuationRunner";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { setWindowProject, clearWindowProject } from "../services/windowRegistry";
@@ -167,6 +168,13 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   // torn-off window was ever auto-continued or escalated (bead sparkle-l7bmm). Mounting it here
   // makes the owning satellite the one handler; main still defers, so there is no double-sweep.
   useEffect(() => startGoalContinuationRunner(), []);
+
+  // The goal's durable mirror, mounted here for exactly the reason the runner above is: this
+  // window OWNS the project it displays, so main defers to it. Mounted only in App.tsx, a
+  // torn-off project's goals would never reach disk and its agents would wake with no brief —
+  // the same gap bead sparkle-l7bmm records for auto-continue. The sweep's own single-owner
+  // election keeps main and the satellite from both writing the same file.
+  useEffect(() => startAgentGoalDiskMirror(), []);
 
   // Name the window after the project. Unlike the main window — which is titled "Sparkle" because
   // its tab strip already says which project you're on — a satellite has no tabs, and its title is

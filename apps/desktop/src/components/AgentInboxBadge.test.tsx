@@ -13,6 +13,8 @@ import {
   INBOX_BADGE_TESTID,
   INBOX_POPOVER_TESTID,
   INBOX_POPOVER_MESSAGE_TESTID,
+  INBOX_POPOVER_HEADER_TESTID,
+  INBOX_POPOVER_PEER_TESTID,
 } from "./AgentInboxBadge";
 import {
   __resetInboxForTests,
@@ -174,5 +176,64 @@ describe("AgentInboxBadge", () => {
 
     expect(screen.getByTestId("row-1").querySelector(`[data-testid="${INBOX_BADGE_TESTID}"]`)).toBeTruthy();
     expect(screen.getByTestId("row-2").querySelector(`[data-testid="${INBOX_BADGE_TESTID}"]`)).toBeNull();
+  });
+
+  // THE SURFACE OPENED TO CHECK PROVENANCE. This popover is where a human goes to answer "did the
+  // concierge really send it", and its header used to state "Queued by the concierge"
+  // UNCONDITIONALLY — so a peer's queued message was not merely unattributed here, it was
+  // affirmatively claimed for the concierge on the one surface built to settle the question.
+
+  it("stops claiming the concierge, and names the peer, when a peer message is queued", async () => {
+    render(<AgentInboxBadge agentId="agent-1" />);
+    await seed("agent-1", [
+      entry({ id: "m1" }),
+      entry({ id: "m2", from: "Relay Builder [abc-123]", text: "taking the Rust half" }),
+    ]);
+    fireEvent.click(screen.getByTestId(INBOX_BADGE_TESTID));
+
+    const header = screen.getByTestId(INBOX_POPOVER_HEADER_TESTID);
+    expect(header.textContent).not.toMatch(/Queued by the concierge/);
+    expect(header.textContent).toMatch(/PEER AGENT/);
+
+    // …and the peer's own message is the one that carries the line, not both of them.
+    const peerLines = screen.getAllByTestId(INBOX_POPOVER_PEER_TESTID);
+    expect(peerLines).toHaveLength(1);
+    expect(peerLines[0]!.textContent).toContain("Relay Builder [abc-123]");
+  });
+
+  it("drops the concierge claim from the TOOLTIP, which is read before the popover opens", async () => {
+    // Making the popover header conditional is not sufficient on its own: this hover is what a human
+    // reads BEFORE clicking through, so the untrue claim was made first and the corrected surface
+    // was only reached afterwards.
+    render(<AgentInboxBadge agentId="agent-1" />);
+    await seed("agent-1", [
+      entry({ id: "m1" }),
+      entry({ id: "m2", from: "Relay Builder [abc-123]" }),
+    ]);
+
+    const title = screen.getByTestId(INBOX_BADGE_TESTID).getAttribute("title") ?? "";
+    expect(title).not.toMatch(/by the concierge/);
+    expect(title).toMatch(/PEER AGENT/);
+  });
+
+  it("keeps the concierge claim in the tooltip for an all-concierge queue", async () => {
+    render(<AgentInboxBadge agentId="agent-1" />);
+    await seed("agent-1", [entry({ id: "m1" })]);
+    expect(screen.getByTestId(INBOX_BADGE_TESTID).getAttribute("title")).toMatch(
+      /by the concierge/,
+    );
+  });
+
+  it("leaves an all-concierge queue saying exactly what it said before", async () => {
+    // THE POSITIVE CONTROL. Without it, a header that banners every queue passes the case above
+    // while telling the founder his own concierge is a peer.
+    render(<AgentInboxBadge agentId="agent-1" />);
+    await seed("agent-1", [entry({ id: "m1" }), entry({ id: "m2" })]);
+    fireEvent.click(screen.getByTestId(INBOX_BADGE_TESTID));
+
+    expect(screen.getByTestId(INBOX_POPOVER_HEADER_TESTID).textContent).toMatch(
+      /Queued by the concierge/,
+    );
+    expect(screen.queryByTestId(INBOX_POPOVER_PEER_TESTID)).toBeNull();
   });
 });

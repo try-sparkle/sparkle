@@ -62,3 +62,5 @@ export * from "./babysitDispatch";
 // Pure and model-free for the same reason every module above is: a detector for "did you drop
 // something" must not share a failure domain with the thing whose reliability is in question.
 export * from "./conciergeAsks";
+// The peer-messaging cap, shared because the app ENFORCES it and the MCP tool DESCRIBES it.
+export * from "./peerMessageLimits";

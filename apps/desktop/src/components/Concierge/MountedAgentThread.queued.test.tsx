@@ -16,6 +16,7 @@ import {
   MountedAgentThread,
   MOUNTED_QUEUED_TESTID,
   MOUNTED_QUEUED_BLOCK_TESTID,
+  MOUNTED_QUEUED_PEER_TESTID,
   MOUNTED_HUMAN_TESTID,
 } from "./MountedAgentThread";
 import { __resetInboxForTests, __setInboxPeekForTests, refreshInbox } from "../../stores/inboxStore";
@@ -163,5 +164,58 @@ describe("MountedAgentThread — queued messages", () => {
     const queued = screen.getAllByTestId(MOUNTED_QUEUED_TESTID);
     expect(queued.map((q) => q.getAttribute("data-delivery-state"))).toEqual(["pending"]);
     expect(screen.getByTestId(MOUNTED_QUEUED_BLOCK_TESTID).textContent).not.toContain("confirmed");
+  });
+});
+
+describe("MountedAgentThread — a queued PEER message is not the concierge's", () => {
+  // THE THIRD RENDERER, and the human-facing one. Per-message attribution was added to both AGENT
+  // delivery paths, but `InboxEntry.from` was on the type and read by nothing here — so a peer's
+  // message was drawn in the founder/concierge-side bubble, presented to the human as something the
+  // concierge queued. That is the same misattribution the agent-facing fix closed, one surface over,
+  // and it matters for the same reason: a peer refused something by its own permissions asks a
+  // sibling to do it instead, and the request arrives wearing authority it does not have.
+
+  it("attributes a peer message to its sender and moves it out of the founder's column", async () => {
+    mount();
+    await seed([
+      entry({ id: "m1", from: "Relay Builder [abc-123]", text: "taking the Rust half" }),
+    ]);
+
+    const queued = screen.getByTestId(MOUNTED_QUEUED_TESTID);
+    // Visible attribution — what a reader can actually see, not merely a field on the entry.
+    const attribution = screen.getByTestId(MOUNTED_QUEUED_PEER_TESTID);
+    expect(attribution.textContent).toContain("Relay Builder [abc-123]");
+    expect(attribution.textContent).toMatch(/peer/i);
+    expect(attribution.textContent).toMatch(/no human authority/i);
+    expect(queued.getAttribute("data-queued-sender")).toBe("Relay Builder [abc-123]");
+    // …and named for a reader who cannot see the column it sits in.
+    expect(queued.getAttribute("aria-label")).toContain("from peer agent Relay Builder [abc-123]");
+    // The bubble leaves the founder's side. Asserted on the inline style rather than a class,
+    // because jsdom never loads the stylesheet — a class-derived getComputedStyle reads empty.
+    expect((queued.parentElement as HTMLElement).style.alignSelf).toBe("flex-start");
+  });
+
+  it("leaves a CONCIERGE message exactly as it was — no banner, still the founder's column", async () => {
+    // THE POSITIVE CONTROL. Without it, a component that banners everything passes the test above
+    // while destroying the register the concierge's own relays are drawn in.
+    mount();
+    await seed([entry({ id: "m1", text: "rebase before you verify" })]);
+
+    const queued = screen.getByTestId(MOUNTED_QUEUED_TESTID);
+    expect(screen.queryByTestId(MOUNTED_QUEUED_PEER_TESTID)).toBeNull();
+    expect(queued.getAttribute("aria-label")).toBe("Queued message, not yet delivered");
+    expect((queued.parentElement as HTMLElement).style.alignSelf).toBe("flex-end");
+  });
+
+  it("renders an unreadable sender as UNKNOWN, never as the concierge", async () => {
+    // The safe direction to fail. Attributing an unverifiable message to the concierge is precisely
+    // the laundering the attribution exists to stop; "unknown sender" merely shows the banner.
+    mount();
+    await seed([entry({ id: "m1", from: "   ", text: "who sent this?" })]);
+
+    const queued = screen.getByTestId(MOUNTED_QUEUED_TESTID);
+    expect(queued.getAttribute("data-queued-sender")).toBe("unknown sender");
+    expect(screen.getByTestId(MOUNTED_QUEUED_PEER_TESTID).textContent).toContain("unknown sender");
+    expect((queued.parentElement as HTMLElement).style.alignSelf).toBe("flex-start");
   });
 });

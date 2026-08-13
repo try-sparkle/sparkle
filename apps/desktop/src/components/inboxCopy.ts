@@ -43,10 +43,16 @@ export const DELIVERY_A11Y: Record<DeliveryState, string> = {
  * reasonably reached — is that the concierge never sent it. An inbox message is deliberately
  * non-interrupting: it waits for a turn boundary rather than ending the work the agent is inside.
  */
-export function pendingBadgeTitle(count: number): string {
+export function pendingBadgeTitle(count: number, hasPeer = false): string {
   const n = `${count} message${count === 1 ? "" : "s"}`;
+  // THE HOVER COMES FIRST. Making the popover's header conditional is not enough on its own: this
+  // tooltip is what a human reads BEFORE clicking through, so an unconditional "by the concierge"
+  // here makes the untrue claim and the corrected surface is only reached afterwards.
+  const who = hasPeer
+    ? `${n} queued for this agent — at least one from a PEER AGENT, not the concierge.`
+    : `${n} queued for this agent by the concierge.`;
   return (
-    `${n} queued for this agent by the concierge. Queued messages are delivered at the agent's ` +
+    `${who} Queued messages are delivered at the agent's ` +
     `next turn boundary rather than interrupting its current work — click to read them.`
   );
 }

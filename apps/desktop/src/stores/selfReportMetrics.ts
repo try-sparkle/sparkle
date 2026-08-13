@@ -43,6 +43,9 @@ export type ControlOp =
   // tools?" without recording WHICH tool — the op name is all that is stored, same as every other
   // key here, and the domain/op inside the payload is deliberately not tallied.
   | "concierge_tool"
+  // Agent-to-agent peer messaging (bead `sparkle-0vl92`). The op NAME only — never `to` and never
+  // the message body, which is the most identifying payload this op carries (see the privacy note).
+  | "send_peer_message"
   // The Chief tool spine (services/chiefScope + controlListener's handleChiefTool). ONE op for all
   // twelve first-class `chief_*` tools and the `chief_call` hatch, same envelope reasoning as
   // `concierge_tool` above.
@@ -111,6 +114,7 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   set_zoom: 0,
   navigate: 0,
   concierge_tool: 0,
+  send_peer_message: 0,
 });
 
 const emptyNamingOutcomes = (): Record<NamingOutcome, number> => ({
