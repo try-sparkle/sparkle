@@ -437,7 +437,25 @@ function undeliverableReason(goalText: string, path: UndeliveredPath, isCloud: b
   const pane = isCloud ? "its pane" : "the pane";
   const why =
     path === "alternate-screen"
-      ? `${screen} is sitting in a full-screen app (vim/less/htop), which would read the message as commands. Quit that app in ${pane} and the auto-resume will take over again`
+      ? // ── NAME THE EVIDENCE, NOT A GUESS DRESSED AS ONE (bead sparkle-saoe3) ────────────────
+        // This used to read "is sitting in a full-screen app (vim/less/htop)". That sentence
+        // asserts as fact something this path does not know and, in the field, is essentially
+        // never true: the refusal fires on `alternateBuffer && !isClaudeCodeScreen`, and CLAUDE
+        // CODE ITSELF holds the alternate buffer — its permission dialog replaces the composer box
+        // `isClaudeCodeScreen` requires, so an ordinary approval prompt takes this exact path.
+        //
+        // The cost was measured on one afternoon's escalations: five agents frozen with this
+        // reason, every one of them a normal Claude Code pane stopped at `Do you want to proceed?`,
+        // not one in an editor or a pager. The remedy compounded it — "quit that app in the pane"
+        // is an instruction a human CANNOT follow when there is no app to quit, so the escalation
+        // named an obstacle that did not exist and withheld the one that did. AGENTS.md's rule for
+        // remedy strings applies exactly here: a refusal's suggested action is an instruction the
+        // user will follow, and it needs the same scrutiny as the code path it replaces.
+        //
+        // So this says what is actually known — the screen is in full-screen mode and could not be
+        // recognised as Claude Code's own prompt — and leads with the likelier of the two causes,
+        // which is also the one whose remedy resolves it in seconds.
+        `${screen} is in full-screen mode and I could not recognise it as Claude Code's own prompt, so I did not type into it. That is usually a permission dialog or menu waiting on an answer: open ${pane} and answer what is on screen. If it really is an editor or pager, quit it — either way the auto-resume will take over again`
       : path === "blocked-prompt"
         ? `${screen} is waiting at a prompt that must not receive free text — a password, a host-key confirmation, a yes/no. Answer that prompt in ${pane}`
         : path === "pty-gone"

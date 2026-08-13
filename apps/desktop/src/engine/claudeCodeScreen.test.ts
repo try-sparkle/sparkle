@@ -5,6 +5,7 @@
 // which is the content-heuristic fool `dictationTerminalRoute`'s header was right to worry about.
 import { describe, expect, it } from "vitest";
 import { claudeCodeMarkerFamilies, isClaudeCodeScreen } from "./claudeCodeScreen";
+import { screenBlocksWrite } from "../voice/dictationTerminalRoute";
 import { APPROVAL_2_1_220, IDLE_AFTER_TURN_2_1_220 } from "./capturedScreens.fixture";
 
 // ══ THE FOUNDER'S SCREEN ════════════════════════════════════════════════════════════════════════
@@ -43,21 +44,32 @@ describe("isClaudeCodeScreen — the founder's busy agent is not an editor", () 
     expect(isClaudeCodeScreen(IDLE_AFTER_TURN_2_1_220)).toBe(true);
   });
 
-  // ══ A PERMISSION DIALOG IS *NOT* RECOGNISED, AND THAT IS THE SAFE ANSWER ══════════════════════
-  // Recorded rather than asserted the other way, because the honest reading of the captured screen
-  // is what it is: APPROVAL_2_1_220 carries only the tool-call glyphs. The dialog REPLACES the
-  // composer box and the chrome bars, and it prints no busy status — so exactly one family is
-  // present and this returns false.
+  // ══ A PERMISSION DIALOG *IS* RECOGNISED NOW — AND THE WRITE IS STILL REFUSED ══════════════════
   //
-  // That is the direction we want. `false` means "treat it as a full-screen app", so a write is
-  // refused; and the picker guard would have refused it too. Both roads lead to a refusal, which is
-  // correct for a screen whose highlighted button a submitted message would press. A future edit
-  // that made this return `true` would be relying entirely on `screenBlocksWrite` to catch it —
-  // safe today, but one guard deep instead of two. This row is here so that change has to be
-  // deliberate.
-  it("does not confidently recognise a permission dialog, so it stays refused", () => {
-    expect(claudeCodeMarkerFamilies(APPROVAL_2_1_220)).toBe(1);
-    expect(isClaudeCodeScreen(APPROVAL_2_1_220)).toBe(false);
+  // THE DELIBERATE CHANGE THIS ROW ASKED FOR (bead sparkle-v7k3y, second occurrence). The previous
+  // version asserted `families === 1` and `false`, reasoning that both roads lead to a refusal so
+  // the wrong road costs nothing. It cost a great deal: the two roads produce DIFFERENT REFUSAL
+  // CODES, and the code is what the human is shown. `alternate-screen` renders as "has a full-screen
+  // app open — quit it", which on a permission dialog is both false and unfollowable. One afternoon
+  // of it: nine consecutive refusals to one agent, four other agents blocked, and a fleet-wide
+  // escalation storm telling the founder to quit editors that were never running.
+  //
+  // The old comment named the exact condition for making this deliberate — "relying entirely on
+  // `screenBlocksWrite` to catch it, one guard deep instead of two" — so here is that check, made
+  // explicit rather than assumed: `terminalWriteRefusal` runs `screenBlocksWrite` on the same text
+  // immediately after this predicate, and it returns `awaiting-input` for this screen. Free text is
+  // therefore STILL refused. What changes is only which refusal fires, and so what the human is
+  // told: "answer the prompt on screen", which is true and actionable, instead of "quit vim", which
+  // is neither.
+  it("recognises a permission dialog as Claude Code", () => {
+    expect(claudeCodeMarkerFamilies(APPROVAL_2_1_220)).toBeGreaterThanOrEqual(2);
+    expect(isClaudeCodeScreen(APPROVAL_2_1_220)).toBe(true);
+  });
+
+  // THE GUARD THAT NOW CARRIES THE REFUSAL. If this ever goes false, the change above becomes a
+  // hole rather than a correction — a submitted message would press the highlighted button.
+  it("...and the write is still refused, by the guard that names the real obstacle", () => {
+    expect(screenBlocksWrite(APPROVAL_2_1_220)).toBe(true);
   });
 });
 

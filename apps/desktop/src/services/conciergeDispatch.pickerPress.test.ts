@@ -40,6 +40,7 @@ import { dispatchConciergeAnswer, liveOptionsFor } from "./conciergeDispatch";
 import { pickerFingerprint } from "./pickerFingerprint";
 import { APPROVAL_2_1_220 } from "../engine/capturedScreens.fixture";
 import { isClaudeCodeScreen } from "../engine/claudeCodeScreen";
+import { screenBlocksWrite } from "../voice/dictationTerminalRoute";
 
 const AGENT = "agent-1";
 const OPTS = { authority: { kind: "mention", agentId: AGENT } as const, userPrompt: false };
@@ -71,9 +72,27 @@ afterEach(() => {
 // If either of these drifts, the tests below would still pass while testing nothing of interest —
 // a picker press on a screen that was never alt-screen, or one the old code would have allowed. So
 // the trap is pinned explicitly rather than assumed.
-describe("the trap: an approval dialog is on the alternate screen AND is not recognised", () => {
-  it("does not read as Claude Code, which is why the write path refused it", () => {
-    expect(isClaudeCodeScreen(APPROVAL_2_1_220)).toBe(false);
+describe("the trap: an approval dialog is on the alternate screen", () => {
+  // ══ THIS PRECONDITION WAS INVERTED, DELIBERATELY ═══════════════════════════════════════════════
+  // It used to assert `isClaudeCodeScreen(APPROVAL_2_1_220) === false` and call that the reason the
+  // write path refused the press. That WAS true, and it was the defect: the predicate required a
+  // composer box, and a permission dialog is exactly what replaces one. Eight agents escalated in a
+  // single night being told their terminal was "sitting in a full-screen app (vim/less/htop)" while
+  // they sat on ordinary Claude Code screens.
+  //
+  // So the dialog is recognised now, and the carve-out this file tests is no longer what makes the
+  // press possible. That does NOT make the file vacuous — it relocates what it guards. The refusal
+  // a press must survive is now the `blocked-prompt` arm (the screen IS awaiting input; it is a
+  // dialog), and the tests below assert exactly that, plus the invariant that never moves: a press
+  // that does not verify writes NOTHING.
+  it("reads as Claude Code — a blocked agent is still Claude Code", () => {
+    expect(isClaudeCodeScreen(APPROVAL_2_1_220)).toBe(true);
+  });
+
+  // AND IT IS STILL A SCREEN FREE TEXT MUST NOT REACH. This is the guard that now carries the
+  // refusal, so if it ever goes false the exception below becomes a hole rather than a carve-out.
+  it("...and is still a screen that blocks a free-text write", () => {
+    expect(screenBlocksWrite(APPROVAL_2_1_220)).toBe(true);
   });
 
   it("nonetheless offers real, readable options — the contradiction that started this", () => {
@@ -115,7 +134,11 @@ describe("a fingerprinted picker press is answered, not refused", () => {
     });
 
     expect(r.ok).toBe(false);
-    expect(r.path).toBe("alternate-screen");
+    // `blocked-prompt`, not `alternate-screen`, and the change is the point rather than a detail:
+    // the dialog is recognised as Claude Code now, so the guard that refuses an unverified press is
+    // the one that names the REAL obstacle — "answer the prompt on screen" instead of "quit vim".
+    // What has not changed, and is what this test is actually for, is the line below it.
+    expect(r.path).toBe("blocked-prompt");
     expectNothingWritten();
   });
 
@@ -128,7 +151,7 @@ describe("a fingerprinted picker press is answered, not refused", () => {
     });
 
     expect(r.ok).toBe(false);
-    expect(r.path).toBe("alternate-screen");
+    expect(r.path).toBe("blocked-prompt");
     expectNothingWritten();
   });
 });
@@ -143,7 +166,11 @@ describe("free text is still refused in the same state", () => {
     const r = await dispatchConciergeAnswer(AGENT, "rebase onto main please", OPTS);
 
     expect(r.ok).toBe(false);
-    expect(r.path).toBe("alternate-screen");
+    // `blocked-prompt` now — the dialog is recognised as Claude Code, so the honest refusal is the
+    // one about the prompt rather than about a full-screen app. The property this file exists to
+    // defend does not move: prose gets NOTHING on this screen. Note the pager case below still
+    // answers `alternate-screen`, which is what shows the recogniser was not simply widened.
+    expect(r.path).toBe("blocked-prompt");
     expectNothingWritten();
   });
 

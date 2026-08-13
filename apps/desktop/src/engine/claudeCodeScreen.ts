@@ -53,6 +53,11 @@
 // background" (ordinary English in shell docs), no `_` in a rule line (20 underscores is a common
 // ASCII separator), and no bare `>` as a prompt-with-text glyph (that is every markdown blockquote).
 
+// The footer matcher and the below-footer walk are OWNED BY `screenClassifier` and imported, never
+// re-derived here. That file is this codebase's single retune point for Claude Code TUI drift, and
+// a second copy of "what marks a picker" is the desync its own header forbids.
+import { pickerFooterSpan, nothingUnrecognizedBelowFooter } from "./screenClassifier";
+
 /** ══ FAMILY A — THE BUSY STATUS BAR ═════════════════════════════════════════════════════════════
  *  What Claude Code draws WHILE WORKING, which is the state this whole module is about.
  *
@@ -125,6 +130,46 @@ const BOX_TOP = /^\s*[╭┌][─━═]{10,}[╮┐]\s*$/;
 const BOX_BOTTOM = /^\s*[╰└][─━═]{10,}[╯┘]\s*$/;
 const BOX_PROMPT = /^\s*[│|]\s*[❯›>]\s*[│|]?\s*$|^\s*[│|]\s*[❯›>]\s+\S.*[│|]\s*$/;
 
+/** ══ FAMILY E — A LIVE DIALOG, WHICH IS WHAT REPLACES THE COMPOSER BOX ══════════════════════════
+ *  THE DEFECT THIS CLOSES (bead sparkle-v7k3y, second occurrence). Family D was made MANDATORY as
+ *  the one proof of a LIVE TUI — and it is exactly the element Claude Code REMOVES while it has a
+ *  question up. `services/conciergeDispatch` already stated the consequence in its own comments:
+ *  "Claude Code's permission dialog REPLACES the composer box … so on a permission prompt exactly
+ *  one family survives (the tool-call glyphs) and the predicate returns false."
+ *
+ *  So the guard was strictest precisely when the agent was blocked, which is when a human most
+ *  needs to reach it. Measured on one afternoon: nine consecutive `alternate-screen` refusals to a
+ *  single agent across several hours, none of it in an editor or a pager; the same refusal blocked
+ *  four other agents and produced a fleet-wide escalation storm blaming vim/less/htop.
+ *
+ *  ── WHY THIS IS STILL EVIDENCE OF A LIVE TUI, NOT OF TEXT ABOUT ONE ───────────────────────────
+ *  Family D's whole argument is that a pasted transcript in a pager reproduces Claude's glyphs and
+ *  status bar easily, and a well-formed composer box at the bottom of the grid is another matter.
+ *  A live dialog earns the same standing through POSITION rather than shape: a picker footer that
+ *  TERMINATES the grid — nothing below it but blanks, one closing border, and Claude's own ambient
+ *  chrome — is a dialog waiting on an answer, because a dialog that has been answered scrolls and
+ *  acquires output beneath it.
+ *
+ *  That is not a new rule invented here: `nothingUnrecognizedBelowFooter` is the same below-footer
+ *  walk `screenAnswerable` already uses to decide whether a picker is live, and it is what keeps a
+ *  pager out. A pager showing a transcript that happens to end at a footer still draws its OWN
+ *  status row (`less`'s `:` prompt, a filename, a percentage), which is not ambient Claude chrome,
+ *  so the walk rejects it. `vim` and `htop` never satisfy the footer grammar at all — htop's
+ *  "F1Help F2Setup" carries no `<key> to <verb>` hint. */
+function hasLiveDialog(lines: readonly string[]): boolean {
+  // The LAST footer on the grid, matching the option parser's own rule: an earlier, already
+  // answered dialog higher up is stale, and it is the bottom-most one that has to terminate the
+  // screen for this to mean anything.
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const span = pickerFooterSpan(lines, i);
+    // `i + span - 1` is the footer's LAST line, not its first: a footer Ink wrapped onto two rows
+    // would otherwise have its own continuation read as unrecognised output below it, which is the
+    // precise mis-read roborev 61827 recorded against this same walk.
+    if (span > 0) return nothingUnrecognizedBelowFooter(lines, i + span - 1);
+  }
+  return false;
+}
+
 function hasComposerBox(lines: readonly string[]): boolean {
   for (let i = 0; i + 2 < lines.length; i += 1) {
     const top = lines[i] ?? "";
@@ -154,6 +199,11 @@ export function claudeCodeMarkerFamilies(snapshot: string): number {
   if (matchesAny(TOOL_GLYPH, snapshot)) n += 1;
   if (matchesAny(CHROME_BAR, snapshot)) n += 1;
   if (hasComposerBox(lines)) n += 1;
+  // Family E counts as its own family, not merely as a substitute precondition. Without that, a
+  // dialog that terminates the grid with no ambient chrome below it — the bare approval screen —
+  // clears the live-TUI bar and then fails `>= 2` on the tool-call glyphs alone, which is the same
+  // refusal arriving one line later.
+  if (hasLiveDialog(lines)) n += 1;
   return n;
 }
 
@@ -182,8 +232,35 @@ export function hasClaudeCodeComposerBox(snapshot: string): boolean {
  * `terminalWriteRefusal` it does. Do not let a true from this function stand in for that check.
  */
 export function isClaudeCodeScreen(snapshot: string): boolean {
-  // The composer box is REQUIRED, not merely one of the two. A pasted transcript in a pager carries
-  // Claude's glyphs and its status bar — two families — without being Claude Code at all.
-  if (!hasClaudeCodeComposerBox(snapshot)) return false;
+  const lines = snapshot.split("\n");
+
+  // ── A LIVE DIALOG STANDS ALONE; IT DOES NOT NEED A SECOND FAMILY ─────────────────────────────
+  // Counting Family E as one vote among five (the first cut at this fix) does not clear the bar it
+  // was meant to clear, and the captured screens say so outright: `APPROVAL_OPTION_2_2_1_220` and
+  // `MODEL_PICKER_2_1_220` are a dialog and NOTHING ELSE — no tool glyph, no busy line, no chrome
+  // bar, and by construction no composer box, because the dialog is what replaced it. They score
+  // exactly 1, fail `>= 2`, and are refused as `alternate-screen`. That is the original defect
+  // surviving its own fix, one line further down, on the two screens where a human is most likely
+  // to be waiting: an approval with "No" highlighted, and the /model picker.
+  //
+  // The corroboration rule exists to keep out a document that QUOTES Claude Code, and `hasLiveDialog`
+  // already answers that objection by POSITION rather than by a second lexical marker: the footer has
+  // to TERMINATE the grid. A pager renders its own status row beneath the text, a transcript keeps
+  // going, and both are rejected there — see `hasLiveDialog` and the impostor cases in
+  // `claudeCodeScreen.liveDialog.test.ts`. Demanding another Claude marker on top of that does not
+  // add safety; it only fails the screens whose dialog is the entire viewport.
+  if (hasLiveDialog(lines)) return true;
+
+  // ── OTHERWISE THE COMPOSER BOX IS MANDATORY, PLUS ONE CORROBORATING FAMILY ───────────────────
+  // Unchanged, and still the rule for every screen without a live dialog: a pasted transcript in a
+  // pager carries Claude's glyphs and its status bar — two families — without being Claude Code.
+  if (!hasComposerBox(lines)) return false;
   return claudeCodeMarkerFamilies(snapshot) >= 2;
+}
+
+/** Is there evidence of a LIVE Claude Code TUI — either form? The precondition `isClaudeCodeScreen`
+ *  applies, split out so callers and tests can ask for it directly. */
+export function hasClaudeCodeLiveTui(snapshot: string): boolean {
+  const lines = snapshot.split("\n");
+  return hasComposerBox(lines) || hasLiveDialog(lines);
 }

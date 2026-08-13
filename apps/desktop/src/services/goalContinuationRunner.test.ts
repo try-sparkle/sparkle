@@ -547,8 +547,17 @@ describe("an auto-continue that never REACHES the terminal", () => {
     await sweepUntilEligible(MAX_UNDELIVERED_CONTINUES);
 
     const reason = goalOf(projectId, agentId)!.escalationReason!;
-    expect(reason).toContain("full-screen app");
+    expect(reason).toContain("full-screen mode");
     expect(reason).toContain("land the PR");
+    // ── AND IT MUST NOT NAME AN APP IT HAS NO EVIDENCE OF (bead sparkle-saoe3) ────────────────
+    // This path fires on `alternateBuffer && !isClaudeCodeScreen`, and Claude Code's own permission
+    // dialog satisfies both — so the overwhelmingly common cause is an approval prompt, not an
+    // editor. Naming vim/less/htop as fact sent the founder hunting for an app to quit on five
+    // separate agents in one afternoon, every one of them a normal pane stopped at "Do you want to
+    // proceed?". The remedy has to be one the human can actually carry out.
+    expect(reason).not.toContain("vim");
+    expect(reason).not.toContain("htop");
+    expect(reason).toMatch(/answer what is on screen/i);
     // The diagnosis the progress bound gives is WRONG here — nothing was ever typed, so there is no
     // "restarting" that failed. This is the assertion the whole change exists for.
     expect(reason).not.toContain("restarting cannot fix");

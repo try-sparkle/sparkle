@@ -47,8 +47,26 @@ import type { SuggestionButton } from "./suggestions/types";
 // no such test existing — so what a prompt's identity IS now has exactly one definition, and the two
 // callers share it rather than resembling each other.
 
-/** How far above the option block the question may sit. Claude Code's Bash-approval dialog puts the
- *  command and its description 3–4 lines up; generous without reaching into unrelated output. */
+/** How far above the option block the question may sit, WHEN THE DIALOG DECLARES NO TOP BORDER.
+ *
+ *  ═ THIS IS THE FALLBACK NOW, NOT THE RULE (bead sparkle-saoe3) ═════════════════════════════════
+ *  It used to be the only bound, and "generous without reaching into unrelated output" — the claim
+ *  that stood here — was false for every dialog carrying fewer than ten lines of its own above its
+ *  options. AskUserQuestion carries four. The overshoot is invisible on a short screen, which is
+ *  where it was tested: the walk clamps at index 0 and stops. On a REAL screen the 50-line picker
+ *  window is saturated, so the same walk lands six lines deep in the live transcript — on Claude
+ *  Code's spinner glyph, its elapsed readout and its token counter, none of which hold still.
+ *
+ *  Hashing those made the question's identity a moving target: consecutive reads of one unchanged
+ *  `sed` approval returned different fingerprints, and because `selectPickerOption` re-derives the
+ *  hash from the live screen at press time, a caller echoing back the fingerprint it had just been
+ *  handed was refused as `changed` anyway — twice, on a prompt nothing was touching. The menu was
+ *  readable and permanently unanswerable at the same time.
+ *
+ *  So the bound is now the dialog's own top border (`bounds.top`) whenever it has one, and this
+ *  number applies only when it does not. It is deliberately unchanged: a dialog with no border is
+ *  exactly the case nothing better is known about, and narrowing the fallback there would trade a
+ *  churning fingerprint for a colliding one. */
 const QUESTION_CONTEXT_LINES = 10;
 
 /** Hard ceiling on the block, whatever the anchors say. A fingerprint over hundreds of lines of live
@@ -90,9 +108,18 @@ function questionBlock(scrollback: string, yesNo: boolean): string {
     const lines = pickerWindow(clean);
     const bounds = pickerBlockBounds(clean);
     if (bounds) {
-      // The footer sits just below the last option row, so the block is [first, footer).
+      // The footer sits just below the last option row, so the block is [start, footer).
+      //
+      // START AT THE DIALOG'S OWN TOP BORDER, and fall back to the fixed window only when the
+      // parser reports it has none. Everything above that border belongs to the transcript, not to
+      // the question — see QUESTION_CONTEXT_LINES. The border line itself is excluded: it is the
+      // same run of box characters on every dialog, so it distinguishes nothing.
+      const start =
+        bounds.top >= 0
+          ? bounds.top + 1
+          : Math.max(0, bounds.first - QUESTION_CONTEXT_LINES);
       const block = lines
-        .slice(Math.max(0, bounds.first - QUESTION_CONTEXT_LINES), bounds.footer)
+        .slice(start, bounds.footer)
         // The pointer MOVES as the user arrows around without the question changing, so it is
         // normalised away — otherwise merely navigating a menu would invalidate a fingerprint.
         .map((l) => steady(l.replace(/^\s*[❯›>]\s*/, "")).trim())

@@ -724,7 +724,23 @@ async function routeConciergeAnswer(
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
   }
-  if (claudeCodeHoldsTheBuffer && screenBlocksWrite(screen.text)) {
+  // ── A VERIFIED PICKER PRESS IS WAIVED HERE TOO, FOR THE REASON IT IS WAIVED ABOVE ────────────
+  // This arm and the alternate-screen arm are two refusals of the SAME write, and until now only
+  // the first had the carve-out — which was survivable ONLY because `isClaudeCodeScreen` returned
+  // false on a permission dialog, so `claudeCodeHoldsTheBuffer` was false and this arm never ran
+  // during a picker. Fixing that predicate (a live dialog IS Claude Code) makes this arm the one
+  // that fires, and a press that used to be answered comes back `blocked-prompt` instead: the same
+  // "the concierge cannot answer ANY approval prompt" bug that `sparkle-jk8zt` fixed, re-entering
+  // through the second door. `conciergeDispatch.pickerPress.test.ts` catches it.
+  //
+  // The premise is unchanged and is not weakened. `screenBlocksWrite` is true here because the
+  // screen is AWAITING INPUT — it is a dialog — and answering that dialog by its own option is
+  // exactly the act this guard exists to permit rather than prevent. `verifiedPickerPress` is not
+  // the caller's word for it: the fingerprint was re-derived from the CURRENT screen a few lines
+  // up, so a match means this function has just read the same live menu. FREE TEXT still takes the
+  // refusal — `pickerPress` is reachable only from `selectPickerOption`, never from the
+  // model-facing `send_to_agent_terminal`, which is what keeps prose off this screen.
+  if (claudeCodeHoldsTheBuffer && !verifiedPickerPress && screenBlocksWrite(screen.text)) {
     log.warn("concierge", "refused a write into a blocked prompt on a Claude Code screen", {
       agentId,
     });
