@@ -1473,7 +1473,8 @@ describe("restart_agent / stop_agent", () => {
     mountPane(SPARKLE_AGENT_ID);
     const r = await stopAgent(SPARKLE_AGENT_ID);
     expect(r.ok).toBe(true);
-    expect(killPty).toHaveBeenCalledWith(SPARKLE_AGENT_ID);
+    // A concierge stop is not a human stop; the ledger has to be able to tell them apart.
+    expect(killPty).toHaveBeenCalledWith(SPARKLE_AGENT_ID, "concierge-stop-agent");
     // The narrow reading, asserted as the ABSENCE of the destructive calls: a stop must not reach
     // the teardown paths that remove worktrees or branches.
     expect(spinDownGitMock).not.toHaveBeenCalled();

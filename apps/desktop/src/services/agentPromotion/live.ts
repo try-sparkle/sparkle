@@ -197,7 +197,7 @@ export function makePromoteDeps(
     deleteSession: (id) => deleteCloudSession(id),
     // The LOCAL transport, explicitly: at this instant the tab still reads `runtime: "local"`, but
     // relying on that would make the cut depend on a field the very next step changes.
-    killLocalPty: (agentId) => getTransport({ id: agentId, runtime: "local" }).kill(),
+    killLocalPty: (agentId) => getTransport({ id: agentId, runtime: "local" }).kill("runtime-cutover"),
     setRuntimeCloud: ({ projectId, agentId }) =>
       useProjectStore.getState().setAgentRuntime(projectId, agentId, "cloud"),
     sendHandoff: ({ sessionId, text }) => {

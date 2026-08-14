@@ -14,6 +14,7 @@ vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/worktree", () => ({ removeAgentWorkspace: vi.fn(() => Promise.resolve()) }));
 vi.mock("../pty", () => ({ killPty: vi.fn(() => Promise.resolve()) }));
+import { killPty } from "../pty";
 
 const { terminateIfCloud } = vi.hoisted(() => ({
   terminateIfCloud: vi.fn(() => Promise.resolve()),
@@ -86,6 +87,46 @@ beforeEach(() => {
   discardAgentGit.mockClear().mockResolvedValue(undefined);
 });
 afterEach(cleanup);
+
+// ── A × ON A WORKER ROW IS A HUMAN ────────────────────────────────────────────────────────────
+//
+// The worker row takes `teardownAgent`'s early return into `spinDownWorker`, whose `stoppedBy`
+// DEFAULTS to `worker-spin-down` — the orchestrator's reap label. The sidebar has to override it,
+// and the default is what makes an omission silent rather than a type error: delete the argument
+// and every other test still passes while a human's click is recorded as automation (roborev
+// 64274). This is the only test that drives that call site.
+describe("AgentSidebar — a × on a worker row is attributed to the human, not to the reaper", () => {
+  it("passes sidebar-close-agent through spinDownWorker rather than taking its automation default", async () => {
+    const worker: AgentTab = {
+      id: "w1", name: "Worker 1", kind: "worker", parentId: "a1", runtime: "local",
+      worktreePath: "/wt/w1", branch: "sparkle/agent-w1", baseBranch: "main", lastPrompt: "",
+      promptHistory: [], namePinned: false, autoNameBasis: null, autoNameVariants: null,
+      shellCommand: null,
+    };
+    const parent: AgentTab = { ...worker, id: "a1", name: "Agent 1", kind: "build", parentId: null };
+    useProjectStore.setState({
+      projects: [
+        {
+          id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+          createdAt: new Date(0).toISOString(),
+          // The WORKER is selected, so its row owns the ×.
+          selectedAgentId: "w1", agents: [parent, worker],
+        },
+      ],
+    } as never);
+    useRuntimeStore.setState({
+      branchStatus: { w1: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 } },
+      status: {}, workflowStage: {}, pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    vi.mocked(killPty).mockClear();
+
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+    fireEvent.click(screen.getByLabelText("Close agent"));
+
+    await waitFor(() => expect(killPty).toHaveBeenCalledWith("w1", "sidebar-close-agent"));
+  });
+});
 
 describe("AgentSidebar — closing a cloud agent stops the sandbox", () => {
   it("× on a cloud agent terminates the server session", async () => {

@@ -58,9 +58,12 @@ export interface WatchdogReport {
  * The kill seam. Defaults to the real `killPty`; tests override it to assert the side effect
  * without a live PTY. Pass nothing to restore the real one.
  */
-let killer: (agentId: string) => Promise<void> = killPty;
+// A runaway reaped on memory pressure is the least human-initiated stop there is, so it names
+// itself in the ledger like every other automated caller.
+const watchdogKill = (agentId: string) => killPty(agentId, "memory-watchdog");
+let killer: (agentId: string) => Promise<void> = watchdogKill;
 export function setAgentWatchdogKiller(fn?: (agentId: string) => Promise<void>): void {
-  killer = fn ?? killPty;
+  killer = fn ?? watchdogKill;
 }
 
 /**

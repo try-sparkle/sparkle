@@ -1748,7 +1748,9 @@ export function Terminal({
       // DETACH, never kill: unmount happens on tab close, StrictMode double-mount, and "Start
       // again" — for a cloud agent, kill() would DELETE the server session that is supposed to
       // outlive this pane (roborev 46244). Local detach == kill (pre-seam behavior).
-      void transport.detach().catch((e) => console.debug("terminal detach failed", agentId, e));
+      void transport
+        .detach("pane-unmount")
+        .catch((e) => console.debug("terminal detach failed", agentId, e));
       transportRef.current = null;
       unregisterStatusEngine(agentId, engine);
       engine.dispose();

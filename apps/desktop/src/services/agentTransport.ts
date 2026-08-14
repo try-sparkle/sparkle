@@ -34,6 +34,7 @@ import {
   onPtyOutput,
   onPtyExit,
   ignorePtyGone,
+  type KillReason,
 } from "../pty";
 import { safeUnlisten } from "./safeUnlisten";
 import { getRelaySocket } from "./relayClient";
@@ -75,7 +76,7 @@ export interface AgentTransport {
   /** Tell the agent its terminal is now cols×rows. Cloud is a client-side-only reflow (no-op wire). */
   resize(cols: number, rows: number): void;
   /** End the agent. Local: kill the PTY. Cloud: DELETE the server session (terminates it). */
-  kill(): Promise<void>;
+  kill(stoppedBy: KillReason): Promise<void>;
   /**
    * Release THIS CLIENT's hold without terminating the agent. Local: same as kill (a local PTY has
    * no life beyond its pane). Cloud: unwatch only — the server session keeps running, which is the
@@ -83,7 +84,7 @@ export interface AgentTransport {
    * unmount happens on tab close, StrictMode double-mount, and "Start again", none of which mean
    * "destroy the sandbox" (roborev 46244).
    */
-  detach(): Promise<void>;
+  detach(stoppedBy: KillReason): Promise<void>;
   /** Subscribe to output. Returns an unlisten. */
   onOutput(cb: (e: TransportOutput) => void): () => void;
   /** Subscribe to exit. Returns an unlisten. */
@@ -334,13 +335,14 @@ export class LocalTransport implements AgentTransport {
     void resizePty(this.id, cols, rows).catch(ignorePtyGone);
   }
 
-  kill(): Promise<void> {
-    return killPty(this.id).catch(ignorePtyGone);
+  kill(stoppedBy: KillReason): Promise<void> {
+    return killPty(this.id, stoppedBy).catch(ignorePtyGone);
   }
 
-  detach(): Promise<void> {
-    // A local PTY has no life beyond its pane — detaching IS killing it (pre-seam behavior).
-    return this.kill();
+  detach(stoppedBy: KillReason): Promise<void> {
+    // A local PTY has no life beyond its pane — detaching IS killing it (pre-seam behavior). The
+    // reason is passed straight through: the ledger must record the CALLER's intent, not "detach".
+    return this.kill(stoppedBy);
   }
 
   ack(bytes: number): void {
@@ -434,13 +436,13 @@ export class CloudTransport implements AgentTransport {
     // v1: the cloud PTY runs at a fixed server-side size and xterm reflows locally — no wire message.
   }
 
-  async kill(): Promise<void> {
+  async kill(_stoppedBy: KillReason): Promise<void> {
     // Stop streaming first, then end the session server-side.
     this.opts.getSocket()?.emit("unwatch", { agent_id: this.id });
     await (this.opts.killSession ?? deleteCloudSession)(this.id);
   }
 
-  async detach(): Promise<void> {
+  async detach(_stoppedBy: KillReason): Promise<void> {
     // Unwatch ONLY — the server session survives the pane (laptop close, tab close, remount).
     this.opts.getSocket()?.emit("unwatch", { agent_id: this.id });
   }

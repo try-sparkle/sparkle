@@ -2299,7 +2299,7 @@ export async function stopAgent(agentId: string): Promise<LifecycleResult<Proces
   const refusal = resolveForProcessOp("stop_agent", agentId);
   if (refusal) return refusal;
   try {
-    await killPty(agentId);
+    await killPty(agentId, "concierge-stop-agent");
   } catch (e) {
     // `killPty` does NOT swallow the "no such pty" teardown race the way the other PTY ops do, so a
     // stop aimed at an agent whose terminal has already gone lands here. Reported honestly rather

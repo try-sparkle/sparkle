@@ -379,8 +379,16 @@ describe("LocalTransport delegation to pty.ts", () => {
     expect(writePty).toHaveBeenCalledWith("agent-1", "y\n");
     t.resize(120, 40);
     expect(resizePty).toHaveBeenCalledWith("agent-1", 120, 40);
-    await t.kill();
-    expect(killPty).toHaveBeenCalledWith("agent-1");
+    await t.kill("pane-unmount");
+    // The reason is passed THROUGH, not swallowed: the ledger has to record the caller's intent.
+    expect(killPty).toHaveBeenCalledWith("agent-1", "pane-unmount");
+    // DETACH is the path Terminal's unmount actually takes, and for a local agent detach IS kill —
+    // so it must carry the caller's reason too, not a generic one. Without this, every pane unmount
+    // would land in the ledger as an unattributed stop, which is the shape that had 27 agents
+    // reading as "a human stopped this" on 2026-08-13.
+    vi.mocked(killPty).mockClear();
+    await t.detach("sidebar-close-agent");
+    expect(killPty).toHaveBeenCalledWith("agent-1", "sidebar-close-agent");
     t.ack(2048);
     expect(ptyAck).toHaveBeenCalledWith("agent-1", 2048);
     t.setPaused(true);
@@ -560,7 +568,7 @@ describe("CloudTransport over the relay", () => {
     const s = fakeSocket();
     const killSession = vi.fn(() => Promise.resolve());
     const t = new CloudTransport("sess-9", { getSocket: () => s.socket, killSession });
-    await t.kill();
+    await t.kill("pane-unmount");
     expect(s.emitted).toContainEqual({ event: "unwatch", payload: { agent_id: "sess-9" } });
     expect(killSession).toHaveBeenCalledWith("sess-9");
   });
@@ -577,7 +585,7 @@ describe("CloudTransport over the relay", () => {
     expect(() => t.write("x")).not.toThrow();
     expect(() => t.onOutput(() => {})()).not.toThrow();
     await expect(t.spawn({ command: "", args: [] })).resolves.toBeUndefined();
-    await expect(t.kill()).resolves.toBeUndefined();
+    await expect(t.kill("pane-unmount")).resolves.toBeUndefined();
   });
 
   it("the onOutput unlisten stops further frames", () => {
@@ -601,7 +609,7 @@ describe("CloudTransport default kill (deleteSession REST path)", () => {
     const s = fakeSocket();
     // No killSession injected → the default deleteSession REST path runs.
     const t = new CloudTransport("sess/9 x", { getSocket: () => s.socket });
-    await t.kill();
+    await t.kill("pane-unmount");
     expect(s.emitted).toContainEqual({ event: "unwatch", payload: { agent_id: "sess/9 x" } });
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost:3001/sessions/sess%2F9%20x",
@@ -655,6 +663,6 @@ describe("CloudTransport default kill (deleteSession REST path)", () => {
     vi.stubGlobal("fetch", vi.fn(() => Promise.resolve({ ok: false, status: 500 } as Response)));
     const s = fakeSocket();
     const t = new CloudTransport("sess-9", { getSocket: () => s.socket });
-    await expect(t.kill()).rejects.toThrow(/500/);
+    await expect(t.kill("pane-unmount")).rejects.toThrow(/500/);
   });
 });

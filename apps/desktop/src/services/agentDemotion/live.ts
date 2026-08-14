@@ -156,7 +156,7 @@ export function makeDemoteDeps(
     // deriving the transport from the tab would kill the SANDBOX — the exact opposite of standing
     // the local agent down, and it would do it on a failure path that promises the cloud agent
     // survives.
-    killLocalAgent: (agentId) => getTransport({ id: agentId, runtime: "local" }).kill(),
+    killLocalAgent: (agentId) => getTransport({ id: agentId, runtime: "local" }).kill("runtime-cutover"),
     deleteSession: (id) => deleteCloudSession(id),
     setRuntimeLocal: ({ projectId, agentId }) =>
       useProjectStore.getState().setAgentRuntime(projectId, agentId, "local"),

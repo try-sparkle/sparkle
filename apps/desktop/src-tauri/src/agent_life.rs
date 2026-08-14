@@ -305,6 +305,21 @@ pub struct Death {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_met_at: Option<i64>,
+    /// WHICH CALL SITE issued a deliberate stop — `"pane-unmount"`, `"window-close"`,
+    /// `"concierge-stop-agent"`, and so on.
+    ///
+    /// `human-stopped / user-stop` is written by EVERY `pty_kill`, and most of them are not a human
+    /// clicking anything: a React unmount, a concierge tool call, a worker spin-down, a
+    /// promotion/demotion cutover, the resurrection runner's own restart. On 2026-08-13 the ledger
+    /// therefore reported that a human had individually stopped 27 agents in one second, and the
+    /// founder could not tell from the record whether he had done it — the cause/evidence pair
+    /// simply does not carry that fact. This does.
+    ///
+    /// Optional and skipped when absent, so records written before this existed stay readable and a
+    /// caller that does not know its own reason is not forced to invent one. Absent means UNKNOWN,
+    /// never "a human did it".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped_by: Option<String>,
 }
 
 /// A wall the agent hit, carried INDEPENDENTLY of `Death`.
@@ -679,7 +694,12 @@ fn validate(death: &Death, wall: Option<&Wall>) -> Result<(), LifeError> {
 /// ONLY a `Live` record is touched, so this can never downgrade a richer verdict a window already
 /// observed (a met goal, a wall, a transport banner). `Ok(false)` means "there was nothing to mark",
 /// which is a normal outcome and not a failure.
-pub fn mark_stopped_at(dir: &Path, agent_id: &str, now_ms: i64) -> Result<bool, LifeError> {
+pub fn mark_stopped_at(
+    dir: &Path,
+    agent_id: &str,
+    now_ms: i64,
+    stopped_by: Option<&str>,
+) -> Result<bool, LifeError> {
     match read_record_at(dir, agent_id)? {
         Some(rec) if rec.state == LifeState::Live => {}
         _ => return Ok(false),
@@ -690,6 +710,9 @@ pub fn mark_stopped_at(dir: &Path, agent_id: &str, now_ms: i64) -> Result<bool, 
         at: now_ms,
         message: None,
         goal_met_at: None,
+        // See `Death::stopped_by`. The cause/evidence pair says a deliberate stop happened; this
+        // says WHO asked for it, which is the part a reader actually needs and the pair cannot carry.
+        stopped_by: stopped_by.map(str::to_owned),
     };
     close_at(dir, agent_id, death, None)?;
     Ok(true)
@@ -917,6 +940,8 @@ pub fn seal_stale_at(
             at: now_ms,
             message: None,
             goal_met_at: None,
+            // Inferred, never requested — nobody stopped this, the app simply went away.
+            stopped_by: None,
         });
         // `rec.wall` is left EXACTLY as it was. An agent walled at 18:19 and killed by the quit at
         // 18:20 has both facts, and recovery needs both — the sealer observed only one of them.
@@ -1029,6 +1054,8 @@ pub fn reap_dead_sessions_at(
             at: now_ms,
             message: None,
             goal_met_at: None,
+            // Inferred from the session's absence — nobody asked for this either.
+            stopped_by: None,
         };
         // THROUGH `validate`, not around it (roborev 61705). Writing straight to
         // `write_record_at` is what let the first version persist a `{ProcessGone, PtyExit}` pair
@@ -1420,7 +1447,7 @@ mod tests {
     }
 
     fn death(cause: DeathCause, evidence: DeathEvidence) -> Death {
-        Death { cause, evidence, at: NOW, message: None, goal_met_at: None }
+        Death { cause, evidence, at: NOW, message: None, goal_met_at: None, stopped_by: None }
     }
 
     /// The TS union's own members, read out of `deathTypes.ts` at compile time.
@@ -1676,7 +1703,7 @@ mod tests {
         // `Death` and call `close_at` — so deleting the call from `pty_kill`, or changing its cause
         // to something resurrectable, left this green while every stop path became resurrectable.
         assert!(
-            mark_stopped_at(&dir, "a1", NOW).unwrap(),
+            mark_stopped_at(&dir, "a1", NOW, Some("sidebar-close-agent")).unwrap(),
             "a Live record must actually be marked — an Ok(false) here would make everything below \
              assert about a record nothing touched"
         );
@@ -1715,6 +1742,53 @@ mod tests {
         );
     }
 
+    // ── WHO ASKED FOR THE STOP ──────────────────────────────────────────────────────────────────
+    //
+    // `human-stopped / user-stop` is written by EVERY `pty_kill`, and most callers are not a human:
+    // a React unmount, a concierge tool call, a worker spin-down, a runtime cutover, the memory
+    // watchdog. On 2026-08-13 the ledger reported that a human had individually stopped 27 agents in
+    // one second, and nothing in the record could say otherwise afterwards.
+
+    #[test]
+    fn a_stop_records_which_call_site_asked_for_it() {
+        let (_td, dir, _app_data) = dirs();
+        open_at(&dir, "a1", "p1", "/wt/a1", "epoch-1", NOW).unwrap();
+        assert!(mark_stopped_at(&dir, "a1", NOW + 1, Some("concierge-stop-agent")).unwrap());
+
+        let rec = read_record_at(&dir, "a1").unwrap().unwrap();
+        let death = rec.death.expect("a stopped agent has a death record");
+        assert_eq!(death.stopped_by.as_deref(), Some("concierge-stop-agent"));
+        // The pair is unchanged — this ADDS the missing fact rather than reclassifying the stop.
+        assert_eq!(death.cause, DeathCause::HumanStopped);
+        assert_eq!(death.evidence, DeathEvidence::UserStop);
+    }
+
+    #[test]
+    fn a_stop_with_no_stated_caller_records_UNKNOWN_not_a_human() {
+        // Absent must read as "nobody said", never as evidence a person acted. A record written
+        // before this field existed deserializes exactly here, which is why the default matters.
+        let (_td, dir, _app_data) = dirs();
+        open_at(&dir, "a1", "p1", "/wt/a1", "epoch-1", NOW).unwrap();
+        assert!(mark_stopped_at(&dir, "a1", NOW + 1, None).unwrap());
+
+        let death = read_record_at(&dir, "a1").unwrap().unwrap().death.unwrap();
+        assert_eq!(death.stopped_by, None);
+    }
+
+    #[test]
+    fn an_INFERRED_death_never_claims_a_stopper() {
+        // A sealed app-restart is not a stop at all — nobody asked for it, and saying somebody did
+        // would be the same lie in a different field.
+        let (_td, dir, app_data) = dirs();
+        open_at(&dir, "a1", "p1", "/wt/a1", "dead-epoch", NOW).unwrap();
+        seal_stale_at(&dir, &app_data, "live-epoch", NOW + 1);
+
+        let death = read_record_at(&dir, "a1").unwrap().unwrap().death.unwrap();
+        assert_eq!(death.cause, DeathCause::AppRestart);
+        assert_eq!(death.stopped_by, None);
+    }
+
+
     /// THE OTHER HALF: A STOP MUST NOT OVERWRITE A RICHER VERDICT SOMEONE ALREADY OBSERVED.
     ///
     /// This is the one behaviour that distinguishes `mark_stopped_at` from a bare `close_at`, and it
@@ -1747,7 +1821,7 @@ mod tests {
             .unwrap();
 
         assert!(
-            !mark_stopped_at(&dir, "a1", NOW + 1).unwrap(),
+            !mark_stopped_at(&dir, "a1", NOW + 1, Some("sidebar-close-agent")).unwrap(),
             "the record is no longer Live, so there is nothing to mark — reporting true would mean \
              the stop had claimed a record it must not touch"
         );
@@ -2887,12 +2961,81 @@ mod tests {
             "the slice swallowed `take_and_signal_session`'s DEFINITION, so the ordering assertion \
              below would match the definition rather than pty_kill's call — re-scope it"
         );
-        let call = body.find("mark_stopped_before_kill(").unwrap_or_else(|| {
+        // THE ATTRIBUTION MUST BE FORWARDED, NOT DROPPED — AND ASSERTED ON THE ARGUMENT, NOT THE
+        // BODY. A body-wide `contains("stopped_by")` is satisfied by `pty_kill`'s own
+        // `tracing::info!` line, so it stays green while the value handed to the helper is a
+        // literal `None` and every production stop loses its attribution (roborev 64259, which
+        // caught exactly that in the first version of this guard). So: slice the CALL's own
+        // arguments and require the reason to reach it, and require the binding it passes to be
+        // derived from the command's parameter rather than re-declared as nothing.
+        let call_at = body.find("mark_stopped_before_kill(").unwrap_or_else(|| {
             panic!(
                 "`pty_kill` no longer records the deliberate stop, so the session reaper will seal \
                  these agents `process-gone` and resurrect what the user just stopped (roborev 61700)"
             )
         });
+        let args_start = call_at + "mark_stopped_before_kill(".len();
+        let args_len = body[args_start..]
+            .find(')')
+            .expect("the call to `mark_stopped_before_kill` has no closing paren");
+        let args = &body[args_start..args_start + args_len];
+        // Self-check: a slice that no longer contains the id argument is mis-scoped, and every
+        // assertion below would be measuring the wrong text.
+        assert!(
+            args.contains("mark_id"),
+            "the argument slice `{args}` does not look like `mark_stopped_before_kill`'s call — \
+             re-scope it before trusting the assertions below"
+        );
+        assert!(
+            !args.contains("None"),
+            "`pty_kill` hands `mark_stopped_before_kill` a literal `None` for the stopper, which is \
+             indistinguishable from 'nobody said' — forward the command's own `stopped_by` \
+             (sparkle-qki57)"
+        );
+        assert!(
+            args.contains("mark_reason"),
+            "`pty_kill` no longer passes `mark_reason` to `mark_stopped_before_kill`; every \
+             deliberate stop is recorded with no attribution and automated teardowns read as human \
+             ones again (sparkle-qki57)"
+        );
+        // ...and that binding must come FROM the command's parameter. Without this, re-declaring
+        // `let mark_reason: Option<String> = None;` satisfies everything above.
+        assert!(
+            body.contains("let mark_reason = stopped_by"),
+            "`mark_reason` is no longer derived from `pty_kill`'s own `stopped_by` parameter, so \
+             the attribution the caller sent is dropped before it reaches the ledger (sparkle-qki57)"
+        );
+
+        // ...AND THE NEXT HOP. Everything above proves the reason REACHES
+        // `mark_stopped_before_kill`; nothing proves it LEAVES. That helper is a private fn taking
+        // `&AppHandle`, so no test drives it, and the slice above deliberately EXCLUDES its body —
+        // so changing its own `mark_stopped_at(...)` call to pass `None` keeps every assertion here
+        // green and silently drops the attribution for every production stop. The mutation just
+        // moves one frame down (roborev 64274). Same scan, applied to the helper.
+        let helper = fn_body(src, "fn mark_stopped_before_kill");
+        let hop_at = helper
+            .find("mark_stopped_at(")
+            .expect("`mark_stopped_before_kill` no longer writes the ledger at all");
+        let hop_start = hop_at + "mark_stopped_at(".len();
+        let hop_len = helper[hop_start..]
+            .find(')')
+            .expect("the call to `mark_stopped_at` has no closing paren");
+        let hop = &helper[hop_start..hop_start + hop_len];
+        assert!(
+            hop.contains("dir") && hop.contains("id"),
+            "the argument slice `{hop}` does not look like `mark_stopped_at`'s call — re-scope it"
+        );
+        assert!(
+            !hop.contains("None"),
+            "`mark_stopped_before_kill` hands `mark_stopped_at` a literal `None` for the stopper, \
+             so the reason `pty_kill` forwarded is dropped one frame later (sparkle-qki57)"
+        );
+        assert!(
+            hop.contains("stopped_by"),
+            "`mark_stopped_before_kill` no longer forwards its `stopped_by` argument to the ledger \
+             (sparkle-qki57)"
+        );
+        let call = call_at;
         // PRESENCE IS NOT THE PROPERTY — POSITION IS (roborev 61789). Dropping the `.await`, or
         // moving the mark below the session removal, leaves every test green while the record is
         // still read `Live` after the session has vanished: exactly the state

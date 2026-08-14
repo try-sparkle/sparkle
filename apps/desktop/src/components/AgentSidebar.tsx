@@ -1445,7 +1445,8 @@ export function AgentSidebar({
     // that; sparkle-close-resurrect). Do NOT await it: the row is already gone before its first await,
     // so reselecting immediately keeps the × instant instead of waiting on the ~1-2s worktree removal.
     if (agent?.kind === "worker") {
-      void spinDownWorker({ projectId: project.id, workerId: id });
+      // A × on a worker row is a HUMAN closing it, not the orchestrator reaping it.
+      void spinDownWorker({ projectId: project.id, workerId: id, stoppedBy: "sidebar-close-agent" });
       reselectAfterClose(id);
       return;
     }
@@ -1457,15 +1458,25 @@ export function AgentSidebar({
     // resurrect a row while the worktrees are still being torn down below (sparkle-close-resurrect).
     const childIds = project.agents.filter((a) => a.parentId === id).map((a) => a.id);
     const allIds = [id, ...childIds];
+    // KILL BEFORE THE ROWS GO, AND FOR EVERY ID AT ONCE — this is an attribution race, not a
+    // performance choice. Dropping a row unmounts its pane, and that unmount fires
+    // `transport.detach("pane-unmount")`, which is itself a `killPty`. `mark_stopped_at` writes only
+    // while the record is still `Live`, so FIRST WRITER WINS. With the kills below the row removal
+    // and awaited one-worktree-at-a-time (~1-2s each), the parent won the race but every WORKER's
+    // kill arrived seconds late — so closing a build agent from the × recorded its workers as
+    // `pane-unmount`, i.e. as automation. That is exactly the misreading `stopped_by` exists to
+    // prevent. `killPty` dispatches its invoke synchronously, so firing all of them here costs the
+    // interaction path nothing and the rows still disappear immediately.
+    const kills = allIds.map((cid) => killPty(cid, "sidebar-close-agent").catch(() => {}));
     for (const cid of allIds) close(cid);
     removeAgent(project.id, id);
     reselectAfterClose(id);
-    // Background: kill each PTY and remove each worktree. NOT awaited on the interaction path — the
-    // rows are already gone; this only reclaims disk + processes. Sequential to avoid a git worktree
-    // lock storm. Best-effort (the BRANCHES are intentionally kept — this is the "Save" outcome).
+    // Background: remove each worktree. NOT awaited on the interaction path — the rows are already
+    // gone; this only reclaims disk. Sequential to avoid a git worktree lock storm. Best-effort (the
+    // BRANCHES are intentionally kept — this is the "Save" outcome).
     void (async () => {
+      await Promise.all(kills);
       for (const cid of allIds) {
-        await killPty(cid).catch(() => {});
         await removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
       }
     })();

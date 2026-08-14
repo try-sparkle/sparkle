@@ -13,6 +13,7 @@ vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/worktree", () => ({ removeAgentWorkspace: vi.fn(() => Promise.resolve()) }));
 import { removeAgentWorkspace } from "../services/worktree";
+import { killPty } from "../pty";
 // killPty shells out to a Tauri command that doesn't exist under jsdom; stub it so the teardown's
 // background reap is deterministic and never rejects into the test.
 vi.mock("../pty", () => ({ killPty: vi.fn(() => Promise.resolve()) }));
@@ -206,6 +207,47 @@ describe("AgentSidebar — silent close removes the row without waiting on git",
     // No await, no waitFor: the store must already have dropped the row synchronously with the click,
     // NOT after the hanging removeAgentWorkspace settles.
     expect(agentsNow()).not.toContain("a1");
+  });
+});
+
+// ── WHO THE LEDGER SAYS STOPPED THEM ──────────────────────────────────────────────────────────
+//
+// A deliberate stop is recorded with the CALL SITE that asked (`stopped_by`), and `mark_stopped_at`
+// writes only while the record is still `Live` — so FIRST WRITER WINS. Dropping a row unmounts its
+// pane, and that unmount is itself a `killPty(id, "pane-unmount")`. Kill the PTYs after the rows go
+// and the workers' own kills arrive seconds late behind a ~1-2s worktree removal each, so closing a
+// build agent from the × records its WORKERS as automation — the exact misreading `stopped_by`
+// exists to prevent (roborev 64245).
+describe("AgentSidebar — a × close is attributed to the human, workers included", () => {
+  it("names itself for the parent AND every worker, before the rows unmount", () => {
+    // The worktree removal hangs, standing in for the real ~1-2s-per-agent cost. If the kills were
+    // still sequenced behind it, the workers' would not have been dispatched by now at all.
+    vi.mocked(removeAgentWorkspace).mockReset().mockReturnValue(new Promise<void>(() => {}));
+    silentCloseProject();
+    const p = useProjectStore.getState().projects[0]!;
+    useProjectStore.setState({
+      projects: [
+        {
+          ...p,
+          selectedAgentId: "a1",
+          agents: [...p.agents, { ...p.agents[0]!, id: "w1", parentId: "a1", kind: "worker" }],
+        },
+      ],
+    } as never);
+    useUiStore.setState({ collapsedOrchestrators: {}, activeSpecial: null } as never);
+    render(<AgentSidebar project={useProjectStore.getState().projects[0]!} />);
+
+    // CLEARED IMMEDIATELY BEFORE THE CLICK. Nothing resets this mock between tests (no `clearMocks`
+    // in vite.config, and `beforeEach` does not touch it), and an earlier test in this file already
+    // tears down `a1` with the same reason — so without this the parent assertion below is satisfied
+    // by a leaked call and would pass even if this click killed nothing (roborev 64259).
+    vi.mocked(killPty).mockClear();
+    fireEvent.click(screen.getByLabelText("Close agent"));
+
+    // No await: both must already be dispatched, synchronously with the click.
+    const reasons = vi.mocked(killPty).mock.calls.map(([id, why]) => `${id}:${why}`);
+    expect(reasons).toContain("a1:sidebar-close-agent");
+    expect(reasons).toContain("w1:sidebar-close-agent");
   });
 });
 

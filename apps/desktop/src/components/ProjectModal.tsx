@@ -85,7 +85,7 @@ export function ProjectModal({ project, onClose }: { project: Project; onClose: 
         // Stop the project's agents (best effort) so no orphaned Claude keeps writing to the
         // old location. On macOS std::fs::rename moves the directory even while file handles
         // are open, so the move itself doesn't depend on this — no fixed delay needed.
-        await Promise.all(project.agents.map((a) => killPty(a.id).catch(() => {})));
+        await Promise.all(project.agents.map((a) => killPty(a.id, "project-save").catch(() => {})));
         for (const a of project.agents) closeAgent(a.id);
         await moveProjectFolder(project.rootPath, newRootPath);
         relocateProject(project.id, name, newRootPath);

@@ -34,19 +34,38 @@ describe("killPty dispatch", () => {
     });
   });
 
+  // WHO ASKED IS PART OF THE COMMAND, not a nicety. Every one of these writes
+  // `human-stopped / user-stop` into the death ledger, and most callers are not a human — a pane
+  // unmount, a concierge tool call, a worker spin-down, the memory watchdog. Without this reaching
+  // the wire the ledger reports a person stopped agents nobody touched, which is exactly what it
+  // did on 2026-08-13 for 27 of them at once.
+  it("carries WHO asked for the stop through to the command", async () => {
+    await killPty("agent-2", "memory-watchdog");
+    expect(calls[0]?.args).toEqual({ id: "agent-2", stoppedBy: "memory-watchdog" });
+  });
+
+  it("does not collapse distinct callers onto one reason", async () => {
+    await killPty("agent-3", "concierge-stop-agent");
+    await killPty("agent-4", "window-close");
+    expect(calls.map((c) => (c.args as { stoppedBy: string }).stoppedBy)).toEqual([
+      "concierge-stop-agent",
+      "window-close",
+    ]);
+  });
+
   it("issues pty_kill SYNCHRONOUSLY — before any microtask can run", () => {
     // Deliberately NOT awaited: this is the state the webview is in at `destroy()` time. An
     // implementation that awaits anything first has issued only that first command by now, so this
     // assertion fails — which is precisely the regression.
-    const pending = killPty("agent-1");
+    const pending = killPty("agent-1", "pane-unmount");
 
     expect(calls.map((c) => c.cmd)).toEqual(["pty_kill"]);
-    expect(calls[0]?.args).toEqual({ id: "agent-1" });
+    expect(calls[0]?.args).toEqual({ id: "agent-1", stoppedBy: "pane-unmount" });
     return pending;
   });
 
   it("issues exactly one command, ever — the retire moved to Rust", async () => {
-    await killPty("agent-2");
+    await killPty("agent-2", "pane-unmount");
 
     expect(calls.map((c) => c.cmd)).toEqual(["pty_kill"]);
     // A second round-trip is what the 250ms budget cannot afford. If a future change needs more
@@ -63,6 +82,6 @@ describe("killPty dispatch", () => {
       return undefined;
     });
 
-    await expect(killPty("agent-3")).rejects.toThrow("boom");
+    await expect(killPty("agent-3", "pane-unmount")).rejects.toThrow("boom");
   });
 });

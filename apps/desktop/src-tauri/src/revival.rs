@@ -585,6 +585,7 @@ mod tests {
             at,
             message: None,
             goal_met_at: None,
+            stopped_by: None,
         });
         rec
     }
@@ -897,6 +898,7 @@ mod tests {
                     at: NOW,
                     message: None,
                     goal_met_at: None,
+            stopped_by: None,
                 },
                 None,
             )
@@ -978,6 +980,7 @@ mod tests {
                 at: NOW,
                 message: Some("API Error: Unable to connect to API (ENOTFOUND)".into()),
                 goal_met_at: None,
+            stopped_by: None,
             },
             None,
         )
@@ -1023,6 +1026,7 @@ mod tests {
                 at: NOW,
                 message: Some("API Error: 529 Overloaded".into()),
                 goal_met_at: None,
+            stopped_by: None,
             },
             None,
         )
@@ -1120,6 +1124,7 @@ mod tests {
                 at: NOW,
                 message: Some("API Error: Unable to connect to API (ENOTFOUND)".into()),
                 goal_met_at: None,
+            stopped_by: None,
             },
             None,
         )

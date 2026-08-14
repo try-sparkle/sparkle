@@ -13,7 +13,7 @@ interface KillDeps {
 
 function realDeps(): KillDeps {
   return {
-    kill: (id) => killPty(id),
+    kill: (id) => killPty(id, "window-close"),
     close: (id) => useRuntimeStore.getState().close(id),
   };
 }

@@ -316,10 +316,36 @@ export function setPtyPaused(id: string, paused: boolean): Promise<void> {
  * The agent-life bookkeeping a deliberate stop needs — recording it so the session reaper cannot
  * resurrect what the user just stopped — happens INSIDE `pty_kill`, on the Rust side, where the
  * ordering is guaranteed without a second round-trip. See `pty.rs::mark_stopped_before_kill`.
+ *
+ * `stoppedBy` is REQUIRED, and that is the point. Every call here writes `human-stopped / user-stop`
+ * into the death ledger, but most callers are not a human clicking anything — a React unmount, a
+ * concierge tool call, a worker spin-down, a promotion cutover, the resurrection runner's own
+ * restart. On 2026-08-13 the ledger reported that a human had individually stopped 27 agents in one
+ * second and there was no way to learn otherwise afterwards. Making the parameter mandatory is what
+ * stops the next call site being added without one.
  */
-export function killPty(id: string): Promise<void> {
-  return invoke("pty_kill", { id });
+export function killPty(id: string, stoppedBy: KillReason): Promise<void> {
+  return invoke("pty_kill", { id, stoppedBy });
 }
+
+/**
+ * Who asked for a PTY to be killed. A CLOSED SET, not free text: these end up in the death ledger
+ * and get grouped across agents, so a typo'd variant silently becomes its own cohort.
+ *
+ * Only `sidebar-close-agent`, `window-close` and `project-save` originate at a human's click. The
+ * rest are automation — a pane unmounting, a concierge tool call, a worker spin-down, a
+ * local/cloud cutover, the memory watchdog reaping a runaway — and reading any of them as a
+ * human's decision is the misreading this exists to prevent.
+ */
+export type KillReason =
+  | "pane-unmount"
+  | "sidebar-close-agent"
+  | "window-close"
+  | "project-save"
+  | "concierge-stop-agent"
+  | "worker-spin-down"
+  | "runtime-cutover"
+  | "memory-watchdog";
 
 /** Return `bytes` of IPC emit credit for a PTY, once xterm has PARSED that chunk. The Rust flusher
  *  parks past a per-PTY ceiling of un-acked bytes, which is what actually bounds the (otherwise

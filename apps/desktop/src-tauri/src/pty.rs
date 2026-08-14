@@ -1329,14 +1329,14 @@ pub fn pty_resize(
 /// Serialized in front of the AppKit event loop that is a read + an fsync each, inside the very
 /// 250ms `CLOSE_SETTLE_MS` budget this design exists to protect, on the same thread the concierge
 /// bridge needs — the round-trip regression coming back through another channel.
-fn mark_stopped_before_kill(app: &AppHandle, id: &str) {
+fn mark_stopped_before_kill(app: &AppHandle, id: &str, stopped_by: Option<&str>) {
     let Ok(base) = crate::dev_identity::app_data_dir(app) else { return };
     let dir = crate::agent_life::life_dir(&base);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    if let Err(e) = crate::agent_life::mark_stopped_at(&dir, id, now) {
+    if let Err(e) = crate::agent_life::mark_stopped_at(&dir, id, now, stopped_by) {
         // WARN, not debug: a stop that failed to record is a stop the resurrector may undo.
         tracing::warn!(target: "pty", %id, error = %e, "could not mark a deliberate stop");
     }
@@ -1520,8 +1520,15 @@ fn drain_then_release(
 /// the blocking hop, which is what makes "release the PTY after the flush" a fact about ownership
 /// rather than a comment about ordering.
 #[tauri::command]
-pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String) -> Result<(), String> {
-    tracing::info!(%id, "pty_kill");
+pub async fn pty_kill(
+    app: AppHandle,
+    manager: State<'_, PtyManager>,
+    id: String,
+    // WHICH CALL SITE asked for this. Optional on the wire so an older front-end still works, and
+    // absent means UNKNOWN rather than "a human did it" — see `agent_life::Death::stopped_by`.
+    stopped_by: Option<String>,
+) -> Result<(), String> {
+    tracing::info!(%id, stopped_by = stopped_by.as_deref().unwrap_or("<unknown>"), "pty_kill");
     // Resolved BEFORE anything else touches the log, so the offset is a floor under our own signal.
     let target = session_end_drain_target(&app, &id);
     // BEFORE the kill, so there is no window in which the session is gone and the record still
@@ -1533,8 +1540,9 @@ pub async fn pty_kill(app: AppHandle, manager: State<'_, PtyManager>, id: String
     // hop before the kill is what keeps the order.
     let mark_app = app.clone();
     let mark_id = id.clone();
+    let mark_reason = stopped_by.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        mark_stopped_before_kill(&mark_app, &mark_id);
+        mark_stopped_before_kill(&mark_app, &mark_id, mark_reason.as_deref());
     })
     .await;
     // Signal on the async side (a mutex plus a signal, as before); the WAIT and the release go to a

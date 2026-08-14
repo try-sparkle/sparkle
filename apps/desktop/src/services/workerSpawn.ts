@@ -2,7 +2,7 @@
 // from the parent's local branch, and persist the worktree. The PTY launch happens when the
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
 import { useProjectStore } from "../stores/projectStore";
-import { type WorktreeInfo, killPty } from "../pty";
+import { type WorktreeInfo, type KillReason, killPty } from "../pty";
 import { prepareWorkerWorkspace, removeAgentWorkspace, writeWorkerManifest } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { maybeAutoName } from "./agentNaming";
@@ -204,7 +204,14 @@ export async function spawnWorker(args: {
  *  Returns after the reap so callers that need the worktree actually gone (handleSpinDown's slot
  *  accounting relies only on the synchronous removeAgent, but the MCP reply should reflect a real
  *  teardown) still await completion. */
-export async function spinDownWorker(args: { projectId: string; workerId: string }): Promise<void> {
+export async function spinDownWorker(args: {
+  projectId: string;
+  workerId: string;
+  /** WHO asked. Defaults to `worker-spin-down` — the orchestrator and concierge callers, which are
+   *  automation. A human clicking × on a worker row must pass `sidebar-close-agent`, or the ledger
+   *  records their click as a reap. */
+  stoppedBy?: KillReason;
+}): Promise<void> {
   const project = useProjectStore.getState().projects.find((p) => p.id === args.projectId);
   if (!project) return;
   const worker = project.agents.find((a) => a.id === args.workerId);
@@ -220,12 +227,20 @@ export async function spinDownWorker(args: { projectId: string; workerId: string
   // for that same torn-out project (SatelliteApp mounts on `openAgentIds` alone). Guessing wrong in
   // the other direction cancels a LIVE trace and silently stops measuring closes, which is worse
   // than the dangle. Left alone until the ownership question is settled where it belongs.
+  // KILL BEFORE THE ROW GOES. Dropping the row unmounts the pane, and that unmount is itself a
+  // `killPty(id, "pane-unmount")`; `mark_stopped_at` writes only while the record is still `Live`,
+  // so FIRST WRITER WINS. Killing after the removal let the unmount win and recorded a human's ×
+  // as automation — the same race already fixed on the build-agent path (roborev 64259). Dispatched
+  // here, awaited below, so the row still disappears without waiting on the PTY.
+  const kill = killPty(args.workerId, args.stoppedBy ?? "worker-spin-down").catch((e) =>
+    console.warn("spinDownWorker: killPty failed", e),
+  );
   useRuntimeStore.getState().close(args.workerId);
   useProjectStore.getState().removeAgent(args.projectId, args.workerId);
   // Then the slow disk teardown — still AWAITED so the orchestrator's spin_down reply only resolves
   // once the PTY is dead and the worktree is gone. Errors are swallowed so a partially-gone worker
   // still finishes; warn so a failed kill / removal (a transient git error leaving an orphan) shows.
-  await killPty(args.workerId).catch((e) => console.warn("spinDownWorker: killPty failed", e));
+  await kill;
   await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
     console.warn("spinDownWorker: removeAgentWorkspace failed", e),
   );

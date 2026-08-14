@@ -573,11 +573,53 @@ describe("spinDownWorker", () => {
     const runtimeCloseMock = vi.spyOn(useRuntimeStore.getState(), "close");
     await spinDownWorker({ projectId, workerId });
 
-    expect(killPtyMock).toHaveBeenCalledWith(workerId);
+    // Named, so the ledger records automation rather than reporting a human stop.
+    expect(killPtyMock).toHaveBeenCalledWith(workerId, "worker-spin-down");
     expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
     expect(runtimeCloseMock).toHaveBeenCalledWith(workerId); // runtime entry closed
     const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
     expect(agents.some((a) => a.id === workerId)).toBe(false); // tab gone
+  });
+
+  // A × ON A WORKER ROW IS A HUMAN, NOT A REAP. This path is the sidebar's early return, and it had
+  // both defects the build-agent path was fixed for: the kill landed after the row dropped (so the
+  // pane unmount's `pane-unmount` won the first-writer race), and even winning it would have said
+  // `worker-spin-down` — indistinguishable from `reapOrphanedWorkers` (roborev 64259).
+  it("records the CALLER's reason when one is given, rather than always saying automation", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    await spinDownWorker({ projectId, workerId, stoppedBy: "sidebar-close-agent" });
+
+    expect(killPtyMock).toHaveBeenCalledWith(workerId, "sidebar-close-agent");
+  });
+
+  it("dispatches the kill BEFORE the row is dropped, so the pane unmount cannot win the race", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    // The row is gone the moment `removeAgent` runs; record whether the kill had already been
+    // dispatched by then. `mark_stopped_at` is first-writer-wins, so "before" is the whole property.
+    let killedBeforeRowDropped = false;
+    const removeSpy = vi
+      .spyOn(useProjectStore.getState(), "removeAgent")
+      .mockImplementation((...a: Parameters<typeof store.removeAgent>) => {
+        killedBeforeRowDropped = killPtyMock.mock.calls.length > 0;
+        return useProjectStore.getInitialState().removeAgent(...a);
+      });
+    try {
+      await spinDownWorker({ projectId, workerId, stoppedBy: "sidebar-close-agent" });
+    } finally {
+      removeSpy.mockRestore();
+    }
+
+    expect(killedBeforeRowDropped).toBe(true);
   });
 
   it("is a no-op for an unknown project or worker id (idempotent)", async () => {
@@ -637,7 +679,8 @@ describe("spinDownWorker", () => {
     await p;
     // The slow disk cleanup still ran — just off the interaction path.
     expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
-    expect(killPtyMock).toHaveBeenCalledWith(workerId);
+    // Named, so the ledger records automation rather than reporting a human stop.
+    expect(killPtyMock).toHaveBeenCalledWith(workerId, "worker-spin-down");
   });
 
   it("still removes the tab when killPty / removeAgentWorkspace reject", async () => {
