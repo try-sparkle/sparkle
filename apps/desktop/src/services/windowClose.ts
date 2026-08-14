@@ -159,3 +159,34 @@ export function planWindowClose(mode: CloseMode, isLast: boolean, isMain: boolea
   const hide = (mode === "keep" && isLast) || (isMain && !isLast);
   return { killAgents: mode === "kill", hide, clearRegistry: !hide };
 }
+
+/**
+ * THE ONE GATE THAT KEEPS A CLOSE FROM NUKING THE WHOLE FLEET (sparkle-9ch9i).
+ *
+ * `killAllOpenAgents` stops EVERY project's running agents — one window hosts every project as a
+ * tab, so on a genuine app QUIT that is correct: the process is exiting, its PTYs die with it, and
+ * stopping them first is what keeps the next launch from resurrecting all of them (see
+ * `projectsWithOpenAgents`). But that justification holds ONLY when the app is actually going away.
+ *
+ * When the plan HIDES the window instead of destroying it — the main window while other windows
+ * remain, or headless-survival on "keep" — the process keeps running, every project's agents keep
+ * running normally, and there is no imminent relaunch to pre-empt. Firing the fleet-wide kill there
+ * stops 80+ agents across every project in one second while the app is still up and the window the
+ * user closed merely slid out of view: the reported catastrophe (uncommitted work lost, the whole
+ * fleet gone, unbidden). A hidden window is not a quit, so it must not stop agents it does not own.
+ *
+ * So: stop the fleet ONLY when `killAgents` is set AND we are NOT hiding. Callers pass the plan they
+ * are about to enact, so the decision and the teardown cannot drift apart.
+ */
+export async function stopAgentsForClose(
+  plan: ClosePlan,
+  projects: readonly Project[],
+  openAgentIds: readonly string[],
+  deps: KillDeps = realDeps(),
+  isLive: (agentId: string) => boolean = defaultIsLive,
+): Promise<void> {
+  // `plan.hide` is the guard: a window that only hides leaves the app — and thus every project's
+  // agents — alive, so there is nothing this close is entitled to tear down.
+  if (!plan.killAgents || plan.hide) return;
+  await killAllOpenAgents(projects, openAgentIds, deps, isLive);
+}

@@ -42,6 +42,7 @@ vi.mock("../services/crossWindowSync", () => ({
 vi.mock("../services/windowClose", () => ({
   stopOpenProjectAgents: vi.fn(() => Promise.resolve()),
   killAllOpenAgents: vi.fn(() => Promise.resolve()),
+  stopAgentsForClose: vi.fn(() => Promise.resolve()),
   projectsWithOpenAgents: vi.fn(() => []),
   closeScopeProjectNames: vi.fn(() => []),
   planWindowClose: vi.fn(() => ({ killAgents: false, clearRegistry: false, hide: true })),

@@ -4,6 +4,7 @@ import {
   killAllOpenAgents,
   planWindowClose,
   projectsWithOpenAgents,
+  stopAgentsForClose,
   stopOpenProjectAgents,
 } from "./windowClose";
 import { resetPaneReadiness, setPaneFailed, setPaneReady } from "./paneReadiness";
@@ -202,6 +203,72 @@ describe("killAllOpenAgents", () => {
     const kill = vi.fn(async () => {});
     await killAllOpenAgents([alpha, beta], [], { kill, close: vi.fn() }, live);
     expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+// THE CATASTROPHE GUARD (sparkle-9ch9i): the close prompt used to fire the fleet-wide kill whenever
+// the plan carried `killAgents`, INCLUDING the plans that only HIDE the window. Closing the main
+// window while another window kept the app alive therefore stopped every project's agents across the
+// whole fleet — 80+ agents in one second — while the app itself never went away. `stopAgentsForClose`
+// is the gate that makes a hidden window incapable of stopping agents it does not own.
+describe("stopAgentsForClose — the fleet-wide kill only fires when the app actually goes down", () => {
+  const destroyAndKill = { killAgents: true, hide: false, clearRegistry: true };
+  const hideAndKill = { killAgents: true, hide: true, clearRegistry: false };
+  const hideAndKeep = { killAgents: false, hide: true, clearRegistry: false };
+
+  it("stops EVERY open project's agents on a real quit (destroy, not hide)", async () => {
+    const kill = vi.fn(async () => {});
+    const close = vi.fn();
+    await stopAgentsForClose(destroyAndKill, [alpha, beta, dormant], ["a1", "b1"], { kill, close }, live);
+    // The app is exiting, so the deliberate single-window behaviour still holds: reach both running
+    // projects (so neither resurrects next launch), and leave the untouched project alone.
+    expect(kill.mock.calls.flat()).toEqual(["a1", "b1"]);
+    expect(close.mock.calls.flat()).toEqual(["a1", "b1"]);
+    expect(kill).not.toHaveBeenCalledWith("c1");
+  });
+
+  it("stops NOTHING when the window merely HIDES — the app stays alive, so the fleet keeps running", async () => {
+    // This is the exact regression: `killAgents` is set AND agents are live, but the window is only
+    // hiding. Under the pre-fix `if (plan.killAgents)` this killed a1 and b1 across two projects with
+    // the app still up. The gate must leave the whole fleet untouched.
+    const kill = vi.fn(async () => {});
+    const close = vi.fn();
+    await stopAgentsForClose(hideAndKill, [alpha, beta, dormant], ["a1", "b1"], { kill, close }, live);
+    expect(kill).not.toHaveBeenCalled();
+    expect(close).not.toHaveBeenCalled();
+  });
+
+  it("stops nothing on a plain keep-alive hide (no kill requested)", async () => {
+    const kill = vi.fn(async () => {});
+    await stopAgentsForClose(hideAndKeep, [alpha, beta], ["a1", "b1"], { kill, close: vi.fn() }, live);
+    expect(kill).not.toHaveBeenCalled();
+  });
+});
+
+// CLOSING ONE PROJECT MUST NEVER REACH ANOTHER (sparkle-9ch9i). The per-project teardown is what a
+// project-scoped close (ProjectModal move/remove, a satellite handing its project back) runs, and it
+// must be structurally incapable of touching a sibling project's agents or the app-owned agents
+// (the concierge and the Improve-Sparkle agent), even when their ids sit in the same global open set.
+describe("stopOpenProjectAgents is scoped to ONE project — siblings and the concierge survive", () => {
+  it("closing Alpha stops only Alpha's agents; Beta's agent and the concierge are untouched", async () => {
+    const kill = vi.fn(async () => {});
+    const close = vi.fn();
+    // The open set is GLOBAL: it holds Beta's live agent and the app-owned Sparkle/concierge agent
+    // alongside Alpha's. A project-scoped close must ignore everything that is not Alpha's.
+    await stopOpenProjectAgents(
+      alpha,
+      new Set(["a1", "a2", "b1", "__sparkle_self__"]),
+      { kill, close },
+      live,
+    );
+    expect(kill.mock.calls.flat().sort()).toEqual(["a1", "a2"]);
+    // Beta belongs to a DIFFERENT project the user did not close…
+    expect(kill).not.toHaveBeenCalledWith("b1");
+    expect(close).not.toHaveBeenCalledWith("b1");
+    // …and the concierge / Improve-Sparkle agent is not a project agent at all, so a project close
+    // must never be able to stop it.
+    expect(kill).not.toHaveBeenCalledWith("__sparkle_self__");
+    expect(close).not.toHaveBeenCalledWith("__sparkle_self__");
   });
 });
 

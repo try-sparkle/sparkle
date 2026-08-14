@@ -120,7 +120,7 @@ import { startControlListener } from "../services/controlListener";
 import { startAiServiceHealthListener } from "../services/aiServiceHealthListener";
 import { listPreviews, startPreviewListener } from "../services/preview";
 import { startPreviewIdleGraceWatcher } from "../services/previewIdleGrace";
-import { closeScopeProjectNames, killAllOpenAgents, planWindowClose } from "../services/windowClose";
+import { closeScopeProjectNames, planWindowClose, stopAgentsForClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
@@ -1789,9 +1789,13 @@ export function Workspace() {
     const all = await getAllWindows();
     const plan = planWindowClose(mode, all.length <= 1, isMainWindow);
     // "Stop the agents" means every project's RUNNING agents, not just the selected tab's: one
-    // window hosts every project now, and leaving the others open in the runtime means the next
-    // launch resumes them all. It stops them — it does not delete agents (see windowClose.ts).
-    if (plan.killAgents) await killAllOpenAgents(projects, openAgentIds);
+    // window hosts every project now, and on a genuine QUIT leaving the others open in the runtime
+    // means the next launch resumes them all. It stops them — it does not delete agents.
+    // BUT ONLY WHEN THE APP IS ACTUALLY GOING AWAY: `stopAgentsForClose` declines the fleet-wide
+    // kill whenever the plan merely HIDES this window (main window with others open,
+    // headless-survival), because the process — and every project's agents — stays alive, so
+    // stopping them would be an unbidden fleet-wide teardown of live work (sparkle-9ch9i).
+    await stopAgentsForClose(plan, projects, openAgentIds);
     // Keep the registry mapping when only hiding, so a later open can find and reveal the hidden
     // window (the Rust RunEvent::Reopen handler re-shows it on Dock click).
     if (plan.clearRegistry) {
