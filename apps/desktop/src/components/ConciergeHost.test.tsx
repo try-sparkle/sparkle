@@ -2000,6 +2000,8 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
         // FALSE for every send in this file: none of them is @-addressed, so each keeps the
         // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
         neverPickerAnswer: false,
+        // FALSE too — the router path, never a mounted send.
+        holdForScreenClear: false,
       }),
     );
   });
@@ -2055,6 +2057,9 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
         // FALSE for every send in this file: none of them is @-addressed, so each keeps the
         // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
         neverPickerAnswer: false,
+        // FALSE too: none of these is a MOUNTED send (see holdForScreenClear's own doc) — this
+        // describe block is entirely the router/countdown path.
+        holdForScreenClear: false,
       },
     );
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
@@ -2321,6 +2326,8 @@ describe("ConciergeHost — routed prompt → the selected agent", () => {
         // FALSE for every send in this file: none of them is @-addressed, so each keeps the
         // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
         neverPickerAnswer: false,
+        // FALSE too — see the row above.
+        holdForScreenClear: false,
       }),
     );
   });
@@ -2716,6 +2723,8 @@ describe("ConciergeHost — recommended actions", () => {
       // FALSE for every send in this file: none of them is @-addressed, so each keeps the
       // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
       neverPickerAnswer: false,
+      // A pill click is never a mounted send.
+      holdForScreenClear: false,
     });
     // A suggestion click posts no receipt, so this is the one delivery that DOES say so itself.
     expect(await findInThread(/^Sent to @CI Hardening\.$/)).toBeTruthy();

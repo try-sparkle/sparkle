@@ -327,6 +327,8 @@ describe("ConciergeHost — the box re-aimed from one agent to another", () => {
         // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
         neverPickerAnswer: false,
         authority: { kind: "suggestion", agentId: "ag2" },
+        // A pill click is never a mounted send.
+        holdForScreenClear: false,
       }),
     );
   });

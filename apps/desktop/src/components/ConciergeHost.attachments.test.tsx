@@ -282,6 +282,8 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
       // FALSE for every send in this file: none of them is @-addressed, so each keeps the
       // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
       neverPickerAnswer: false,
+      // FALSE too — the routed path, never a mounted send.
+      holdForScreenClear: false,
     });
   });
 
@@ -374,6 +376,8 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
       // FALSE for every send in this file: none of them is @-addressed, so each keeps the
       // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
       neverPickerAnswer: false,
+      // FALSE too — the routed path, never a mounted send.
+      holdForScreenClear: false,
     });
   });
 });

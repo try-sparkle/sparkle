@@ -276,6 +276,7 @@ import {
 } from "./Concierge/mentions";
 import { classifyComposerRoute } from "./Concierge/composerRoute";
 import { useMountedNotice } from "../hooks/useMountedNotice";
+import { useScreenHoldDrain } from "../hooks/useScreenHoldDrain";
 import { buildDigest, type DigestReadiness } from "../services/conciergeDigest";
 import { usePrReadinessStore } from "../stores/prReadinessStore";
 import { isSparkleAgentId, SPARKLE_AGENT_NAME } from "../services/sparkleAgent";
@@ -1384,6 +1385,10 @@ export function ConciergeHost({
   // exact position among this component's effects. Nothing between the old two positions reads
   // `mountedNotice` or calls `noteMounted`, so nothing moves relative to its producer.
   const { mountedNotice, noteMounted } = useMountedNotice(mountedAgentId);
+  // Delivers a mounted send held by `holdForScreenClear` (services/conciergeDispatch) the moment
+  // that agent's screen clears — see hooks/useScreenHoldDrain for why this has to poll and why it
+  // is NOT scoped to the current mount (a hold can outlive the mount that created it).
+  useScreenHoldDrain();
 
   // Gated on the NAME rather than on the row, because a name is what this needs and the roster is
   // only one of the two places one can come from (see `mountedName`). Keeping `mountedRow` as the
@@ -3665,12 +3670,19 @@ export function ConciergeHost({
        *  (roborev 54569). REQUIRED, so a future call site has to decide rather than inherit a
        *  default that is wrong for it. */
       neverPickerAnswer: boolean,
+      /** Ask the dispatcher to HOLD rather than refuse when the only problem is the screen — see
+       *  conciergeDispatch's `holdForScreenClear` for who may set this. TRUE for exactly one
+       *  caller: a MOUNTED send (bead sparkle-tbsvf, reopened). Every other caller of this
+       *  function — a redirect, a recommended-action pill — leaves it false and keeps the
+       *  outright refusal, because none of them is the founder looking straight at the pane. */
+      holdForScreenClear: boolean,
     ): Promise<boolean> => {
       try {
         const r = await dispatchConciergeAnswer(target.agentId, text, {
           authority,
           userPrompt: true,
           neverPickerAnswer,
+          holdForScreenClear,
           ...renderings,
         });
         // As in `approve`, `ok` gates the held branch: an ok:false queued result must not be
@@ -3680,7 +3692,24 @@ export function ConciergeHost({
           // Held, not delivered: keep the files with the promise, so a hold that never lands can
           // give them back instead of quietly costing the user the picking (roborev 51594).
           holdAttachments(target.agentId, staged);
-          postSparkle(line`${ref(asAgent(target))} is still starting up — I'll send that the moment it's ready.`);
+          // TWO REASONS SHARE ONE PATH (`"queued"`) — see conciergeDispatch's `heldReason` doc.
+          // "still starting up" is a factual claim that is FALSE for a screen hold: the agent is
+          // running, its screen just isn't safe to write to right now. Telling the founder his
+          // own pane "is still starting up" while he's looking straight at it reads as the app
+          // not knowing what it's showing him.
+          if (r.heldReason === "screen") {
+            // ONE STRING, both surfaces — a mounted send only ever shows one of the two, so there
+            // is no reader who could catch them disagreeing, which is exactly how they drifted
+            // apart the first time this was written (fixed before it shipped).
+            const holdText = `${target.name}'s screen is busy right now — I'll send that the moment it clears.`;
+            postSparkle(line`${ref(asAgent(target))}'s screen is busy right now — I'll send that the moment it clears.`);
+            // Mounted, the thread this just posted to is off screen (roborev 57360) — see
+            // MountedNotice's header. Without this the founder sees NOTHING happen: no refusal
+            // (the whole point of the hold), and no confirmation either.
+            if (displayMountedRef.current) noteMounted(holdText, "info");
+          } else {
+            postSparkle(line`${ref(asAgent(target))} is still starting up — I'll send that the moment it's ready.`);
+          }
           return true;
         }
         // `matchedLabel` is OPTIONAL on the result, so interpolating it unguarded would render the
@@ -3712,7 +3741,7 @@ export function ConciergeHost({
         return false;
       }
     },
-    [postSparkle, holdAttachments],
+    [postSparkle, holdAttachments, noteMounted],
   );
 
   // Reconcile the promise made when a prompt was QUEUED: the pane flushes it later (or the hold
@@ -4654,7 +4683,20 @@ export function ConciergeHost({
       // stops a mount and not an address.
       if (addressable && aim) {
         const blocked = terminalWriteBlocked(aim.agentId, mentionAim.via);
-        if (blocked) {
+        // ══ A MOUNTED SEND HOLDS, RATHER THAN BOUNCES, WHEN THE SCREEN MAY CLEAR ═══════════════
+        // (bead sparkle-tbsvf, reopened.) The refusal below is right for a MODEL or an
+        // auto-resume guessing at a screen it cannot see — it cannot take a bad write back, so
+        // refusing outright is the only safe direction. It is wrong for the founder himself,
+        // mounted and looking straight at this pane: refusing him left "file a bead" as his only
+        // channel to an agent whose pane was open in front of him. `no-viewport` is excluded on
+        // purpose and stays fatal for a mount (see terminalWriteBlocked) — there is no screen to
+        // wait on clearing. The actual hold happens a few lines down, inside
+        // dispatchConciergeAnswer via `holdForScreenClear`; skipping the refusal here just lets
+        // the send fall through to it instead of bouncing before it gets the chance.
+        const holdable =
+          mentionAim.via === "mount" &&
+          (blocked === "alternate-screen" || blocked === "awaiting-input");
+        if (blocked && !holdable) {
           postSparkle(terminalRefusalLine(asAgent(aim), blocked));
           // AND on the surface a mounted column can actually show (roborev 57360) — the line above
           // goes to a thread the mount replaces. ONLY while the thread is actually replaced
@@ -4802,13 +4844,19 @@ export function ConciergeHost({
             // ITS TEST IS THE ADDRESSED ONE, and that is now sufficient rather than a gap: both
             // paths run THIS function, so these are the only post-write screen-check lines in the
             // code and the addressed row exercises them literally. Mutating this to `null` kills
-            // that row. A mounted equivalent is unwritable — the send-while-busy queue re-runs the
-            // submit-time check when it drains a held message, so the earlier guard always refuses
-            // first. See the note on the mounted screen row for the full reasoning.
+            // that row.
             const blocked = mentionAim
               ? terminalWriteBlocked(aim.agentId, mentionAim.via)
               : null;
-            if (blocked) {
+            // Same carve-out as the pre-arm check above — see its comment. `holdForScreenClear`
+            // (passed to `promptAgent` below) is what actually decides to hold rather than refuse,
+            // re-reading the screen fresh at that instant rather than trusting this possibly-stale
+            // `blocked` read.
+            const holdable =
+              !!mentionAim &&
+              mentionAim.via === "mount" &&
+              (blocked === "alternate-screen" || blocked === "awaiting-input");
+            if (blocked && !holdable) {
               postSparkle(terminalRefusalLine(asAgent(aim), blocked));
               if (displayMountedRef.current)
                 noteMounted(terminalRefusalText(aim.name, blocked), "warn");
@@ -4846,6 +4894,10 @@ export function ConciergeHost({
               // An ADDRESSED message is a message. Without this the dispatcher would still match
               // it against a live picker and press a button (roborev 54569).
               !!mentionAim && addressable,
+              // HOLD rather than refuse when the screen is the only problem — see promptAgent's
+              // own doc. True for exactly the same predicate that let this send fall through the
+              // two guards above instead of bouncing (bead sparkle-tbsvf, reopened).
+              mentionAim?.via === "mount",
             );
             // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in
             // the thread, and "→ Sent to X" over a message that never arrived would be a plain lie.
@@ -5772,6 +5824,10 @@ export function ConciergeHost({
               // and carries the agent's actual on-screen options), not to a replay of a message the
               // user aimed somewhere else.
               true,
+              // NOT a mount — this is the receipt's "Also ask X" redirect, an ADDRESS in every
+              // sense (see terminalWriteBlocked above, which this path also calls with "address").
+              // A screen refusal here stays a refusal.
+              false,
             ),
           false,
         );
@@ -6509,6 +6565,9 @@ export function ConciergeHost({
               { kind: "suggestion", agentId: target.agentId },
               // A recommended-action pill IS often a picker answer — that is much of what it is
               // for — so it keeps the keystroke path.
+              false,
+              // NOT a mount send — a pill click, whichever agent it targets. Screen refusals stay
+              // refusals here.
               false,
             )
           }

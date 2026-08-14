@@ -31,7 +31,8 @@ import { submitPrompt, writePtyChainedStrict } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { getAgentViewport } from "./terminalViewport";
-import { dispatchConciergeAnswer } from "./conciergeDispatch";
+import { dispatchConciergeAnswer, flushScreenHeldSends } from "./conciergeDispatch";
+import { resetScreenHeldSends } from "./screenHoldQueue";
 
 const AGENT = "agent-1";
 /** A real gesture, so the authority gate (which runs first) is never what refuses here. */
@@ -55,6 +56,9 @@ function expectNothingWritten(): void {
 beforeEach(() => {
   vi.mocked(getAgentViewport).mockReturnValue(null);
   vi.mocked(detectTerminalPrompts).mockReturnValue([]);
+  // The hold queue is module-level state shared across every test in the process — see the
+  // describe block below, which is the only one in this file that populates it.
+  resetScreenHeldSends();
 });
 afterEach(() => {
   vi.clearAllMocks();
@@ -496,5 +500,84 @@ describe("the guard is narrow — it blocks the alternate buffer and nothing els
     const r = await dispatchConciergeAnswer(AGENT, "run the tests", OPTS);
     expect(r.path).toBe("free-text");
     expect(submitPrompt).toHaveBeenCalled();
+  });
+});
+
+// ══ A MOUNTED SEND HOLDS RATHER THAN REFUSES, WHEN ASKED (bead sparkle-tbsvf, reopened) ═══════════
+// The founder: he mounts an agent's pane, types a message while it's mid-tool-call, and the send is
+// refused with "Sparkle has a full-screen app open" — correct for a MODEL guessing at a screen it
+// can't take a write back from, but not for him, looking straight at the pane he just typed into.
+// His only channel to that agent then becomes filing a bead.
+//
+// `holdForScreenClear` is the opt-in only ConciergeHost's mounted composer sets. THE REGRESSION TEST
+// below is the one that matters: it proves a message held here is later WRITTEN — not merely
+// accepted with `ok: true` and forgotten, which would be the exact same bug wearing a friendlier
+// status code.
+describe("a mounted send holds instead of refusing, when asked to", () => {
+  const MOUNT_OPTS = {
+    authority: { kind: "mention", agentId: AGENT } as const,
+    userPrompt: true,
+    holdForScreenClear: true,
+  };
+
+  it("queues rather than refusing a full-screen app, and writes nothing yet", async () => {
+    onFullScreenApp();
+    const r = await dispatchConciergeAnswer(AGENT, "did you get my ask about more?", MOUNT_OPTS);
+    expect(r.ok).toBe(true);
+    expect(r.path).toBe("queued");
+    expect(r.heldReason).toBe("screen");
+    expectNothingWritten();
+  });
+
+  // THE REGRESSION TEST. Queuing with nothing to drain it would silently reproduce "file a bead is
+  // the only channel" — the message would sit forever and the founder would never know why. This is
+  // what hooks/useScreenHoldDrain calls once its poll sees the screen has cleared.
+  it("reaches the agent once the screen clears and the queue is flushed", async () => {
+    onFullScreenApp();
+    const held = await dispatchConciergeAnswer(AGENT, "did you get my ask about more?", MOUNT_OPTS);
+    expect(held.path).toBe("queued");
+    expectNothingWritten();
+
+    atAPrompt();
+    const [flushed] = await flushScreenHeldSends(AGENT);
+    expect(flushed?.ok).toBe(true);
+    expect(flushed?.path).toBe("free-text");
+    expect(submitPrompt).toHaveBeenCalledWith(
+      AGENT,
+      "did you get my ask about more?",
+      expect.anything(),
+    );
+  });
+
+  // The credential/`(yes/no)` refusal (`blocked-prompt`) is the OTHER screen-only reason a mounted
+  // send is refused — see `terminalWriteBlocked`'s `awaiting-input`, which the composer maps to the
+  // same hold. Same mechanism, same proof.
+  it("also holds behind a credential prompt, and delivers once it clears", async () => {
+    vi.mocked(getAgentViewport).mockReturnValue({
+      text: "$ sudo -v\n[sudo] password for drodio:",
+      alternateBuffer: false,
+    });
+    const held = await dispatchConciergeAnswer(AGENT, "carry on when you're able", MOUNT_OPTS);
+    expect(held.ok).toBe(true);
+    expect(held.path).toBe("queued");
+    expectNothingWritten();
+
+    atAPrompt();
+    const [flushed] = await flushScreenHeldSends(AGENT);
+    expect(flushed?.ok).toBe(true);
+    expect(submitPrompt).toHaveBeenCalledWith(AGENT, "carry on when you're able", expect.anything());
+  });
+
+  // THE CARVE-OUT'S OTHER HALF: without `holdForScreenClear`, the exact same screen still refuses
+  // outright — a model or an auto-resume calling this function gets no hold, because neither can
+  // set the flag (see its own doc on `ConciergeDispatchOptions`).
+  it("still refuses outright when the caller did not ask to hold", async () => {
+    onFullScreenApp();
+    const r = await dispatchConciergeAnswer(AGENT, "did you get my ask about more?", {
+      authority: { kind: "goal-continue", agentId: AGENT },
+    });
+    expect(r.ok).toBe(false);
+    expect(r.path).toBe("alternate-screen");
+    expectNothingWritten();
   });
 });

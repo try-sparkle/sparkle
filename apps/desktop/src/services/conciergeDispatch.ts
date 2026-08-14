@@ -100,6 +100,7 @@ import { maybeAutoName } from "./agentNaming";
 import { recordTrialSend, trialSendAllowed } from "./trialMeter";
 import { aiFeatureNow } from "./aiGate";
 import { queuePendingSend, takePendingSends } from "./pendingSends";
+import { queueScreenHeldSend, takeScreenHeldSends } from "./screenHoldQueue";
 import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
@@ -166,6 +167,11 @@ export interface ConciergeDispatchResult {
    *  refusals — "ambiguous-picker" and "addressed-at-picker" — since the second was split out of
    *  the first and carries the same options (roborev 54665/54673). */
   options?: SuggestionButton[];
+  /** Present, and always `"screen"`, on a `"queued"` result produced by `holdForScreenClear`
+   *  rather than by the PTY-not-ready hold a few lines above. The two share one queue and one
+   *  `"queued"` path (see its own doc), but the founder-facing wording differs — "the screen is
+   *  busy" is not "it's still starting up" — so a caller that wants the right one reads this. */
+  heldReason?: "screen";
 }
 
 /** How a dispatch should be treated. `userPrompt` marks the text as something the USER authored
@@ -265,6 +271,28 @@ export interface ConciergeDispatchOptions {
    * schema, so free text cannot acquire the exemption by asking for it.
    */
   pickerPress?: { fingerprint: string };
+  /**
+   * HOLD RATHER THAN REFUSE, when the only reason this write would be refused is the SCREEN
+   * (`alternate-screen` or the `blocked-prompt` arms) — never for `unauthorized`, `trial-spent`,
+   * `pty-gone`, or any refusal that has nothing to do with what's on screen right now.
+   *
+   * SET BY EXACTLY ONE CALLER (bead sparkle-tbsvf, reopened): ConciergeHost's MOUNTED composer
+   * send. That scoping is the whole safety argument, not an implementation detail. The three
+   * screen refusals above exist because a write that lands wrong on `vim`/a credential field
+   * can't be taken back — which is exactly as true for a MODEL guessing at a screen it can't see
+   * (`send_to_agent_terminal`) or an auto-resume firing every 15s as it ever was, so neither may
+   * set this. It is true in a DIFFERENT way for the founder himself, mounted and looking straight
+   * at the pane he just typed into: he is not guessing that the screen will clear, he is watching
+   * it. Refusing him outright left "file a bead" as his only channel to an agent whose pane was
+   * open in front of him.
+   *
+   * Reuses the SAME hold-queue/flush pair as the "PTY isn't up yet" case a few lines down
+   * (services/pendingSends + flushPendingSends) — a `"queued"` result either way, so every
+   * existing reader of that path (receipts, onDeferredSendOutcome) already knows what to do with
+   * it. `heldReason: "screen"` on the result is the one thing that's new, and it exists only so
+   * the founder-facing copy can tell the two apart.
+   */
+  holdForScreenClear?: boolean;
 }
 
 // WHOLE-PHRASE anchored (roborev 46311): the entire trimmed answer must be a member of the
@@ -579,6 +607,52 @@ function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatch
  * individual arms. A thrown (unexpected) error reports nothing on purpose: nothing was decided about
  * the prompt, so the grace window's ceiling is the honest backstop.
  */
+/**
+ * `opts.holdForScreenClear`'s implementation — see that field for who may set it and why. A
+ * SEPARATE queue from the PTY-not-ready hold below (services/screenHoldQueue, not pendingSends) —
+ * see that module's header for why the two must not share one TTL. Reports anything the queue's
+ * own prune drops the same way the PTY-not-ready hold does: promised sends don't vanish silently
+ * just because a later one crowded them out (roborev 53015's reasoning, reused rather than
+ * re-derived).
+ *
+ * Returns null — "fall through to your own refusal" — when holding wasn't requested or this
+ * agent's hold queue is already full of live entries.
+ */
+function holdForScreenClear(
+  agentId: string,
+  text: string,
+  opts: ConciergeDispatchOptions,
+): ConciergeDispatchResult | null {
+  if (!opts.holdForScreenClear) return null;
+  const display = opts.display ?? text;
+  const queued = queueScreenHeldSend(
+    {
+      agentId,
+      text,
+      userPrompt: opts.userPrompt === true,
+      // Same argument as the PTY-not-ready hold: the entry carries the answer rather than letting
+      // the flush re-derive one, because the unsafe default (`appendPrompt`'s `humanAuthored: true`)
+      // would release an agent's goal debt for a hold a machine-authored caller queued.
+      humanAuthored: isHumanAuthored(opts.authority),
+      display: opts.display,
+      namingBasis: opts.namingBasis,
+    },
+    (dropped) => {
+      for (const e of dropped) {
+        emitOutcome({
+          ok: false,
+          path: "expired",
+          agentId,
+          sent: e.text,
+          display: e.display ?? e.text,
+        });
+      }
+    },
+  );
+  if (!queued) return { ok: false, path: "queue-full", agentId };
+  return { ok: true, path: "queued", agentId, sent: text, display, heldReason: "screen" };
+}
+
 export async function dispatchConciergeAnswer(
   agentId: string,
   text: string,
@@ -691,6 +765,8 @@ async function routeConciergeAnswer(
     pickerOptions.length > 0 &&
     pickerFingerprint(agentId, pickerOptions) === opts.pickerPress.fingerprint;
   if (screen?.alternateBuffer && !claudeCodeHoldsTheBuffer && !verifiedPickerPress) {
+    const held = holdForScreenClear(agentId, text, opts);
+    if (held) return held;
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
     return { ok: false, path: "alternate-screen", agentId };
   }
@@ -798,6 +874,8 @@ async function routeConciergeAnswer(
     (screenIsCredentialField(screen.text) ||
       (!viewportOffersYesNo && screenIsYesNoPrompt(screen.text)))
   ) {
+    const held = holdForScreenClear(agentId, text, opts);
+    if (held) return held;
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
   }
@@ -818,6 +896,8 @@ async function routeConciergeAnswer(
   // refusal — `pickerPress` is reachable only from `selectPickerOption`, never from the
   // model-facing `send_to_agent_terminal`, which is what keeps prose off this screen.
   if (claudeCodeHoldsTheBuffer && !verifiedPickerPress && screenBlocksWrite(screen.text)) {
+    const held = holdForScreenClear(agentId, text, opts);
+    if (held) return held;
     log.warn("concierge", "refused a write into a blocked prompt on a Claude Code screen", {
       agentId,
     });
@@ -1146,6 +1226,49 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
       // machine-composed prose from clearing a human's escalation latch went onto the direct path
       // and missed this one, which re-opened the hole for any concierge send that had to wait for a
       // starting PTY. The entry carries the answer precisely so this line does not have to guess.
+      if (entry.userPrompt)
+        recordPromptSideEffects(agentId, entry.text, entry, entry.humanAuthored);
+      r = { ok: true, path: "free-text", agentId, sent: entry.text, display };
+    } catch (err) {
+      if (!(err instanceof PtyGoneError)) throw err;
+      r = { ok: false, path: "pty-gone", agentId, sent: entry.text, display };
+    }
+    out.push(r);
+    emitOutcome(r);
+  }
+  return out;
+}
+
+/**
+ * Deliver everything `holdForScreenClear` queued for `agentId` (see services/screenHoldQueue).
+ * The mirror of `flushPendingSends` above, and it shares that function's shape deliberately — same
+ * outcome broadcast, same expired-vs-due split — but reads the SEPARATE screen-hold queue with its
+ * own, longer TTL.
+ *
+ * NO SCREEN RE-CHECK HERE, and that is the caller's job, not an omission: this function only ever
+ * exists to be called once the screen is already known to be safe (see hooks/useScreenHoldDrain,
+ * the only caller), exactly as `flushPendingSends` is only ever called once the PTY is already
+ * known to be ready. Re-checking here would duplicate that decision rather than trust it.
+ */
+export async function flushScreenHeldSends(agentId: string): Promise<ConciergeDispatchResult[]> {
+  const { due, expired } = takeScreenHeldSends(agentId);
+  const out: ConciergeDispatchResult[] = [];
+  for (const entry of expired) {
+    const r: ConciergeDispatchResult = {
+      ok: false,
+      path: "expired",
+      agentId,
+      sent: entry.text,
+      display: entry.display ?? entry.text,
+    };
+    out.push(r);
+    emitOutcome(r);
+  }
+  for (const entry of due) {
+    const display = entry.display ?? entry.text;
+    let r: ConciergeDispatchResult;
+    try {
+      await submitPrompt(agentId, entry.text, { machine: !entry.humanAuthored });
       if (entry.userPrompt)
         recordPromptSideEffects(agentId, entry.text, entry, entry.humanAuthored);
       r = { ok: true, path: "free-text", agentId, sent: entry.text, display };
