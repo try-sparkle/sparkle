@@ -510,13 +510,24 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     std::thread::spawn(move || {
         let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        // SAMPLED ONCE PER ITERATION AND CARRIED, so the window this measures is the WHOLE loop —
+        // sleep plus the `tick` body — rather than the sleep alone.
+        //
+        // Re-sampling at the top measured only the sleep, which left `tick`'s own runtime as a BLIND
+        // SPOT: a freeze beginning while `tick` was executing produced an overshoot of ~0, no
+        // rebaseline, and the next look then measured the entire frozen span as elapsed wall clock
+        // (roborev 64284). `tick` is not instantaneous — it clones the roster and renders a VT grid
+        // per agent — so that window is a real fraction of every second. Charging the tick body to
+        // the overshoot is safe with a 5s threshold against a 1s tick; a `tick` slow enough to trip
+        // it on its own is itself worth a rebaseline.
+        let mut last_wake = now_ms();
         loop {
-            let before = now_ms();
             std::thread::sleep(TICK);
             let now = now_ms();
             let overshoot = now
-                .saturating_sub(before)
+                .saturating_sub(last_wake)
                 .saturating_sub(TICK.as_millis() as u64);
+            last_wake = now;
             if overshoot > SUSPEND_OVERSHOOT_MS {
                 // We were frozen alongside everything else, so the silence means nothing. Push
                 // every deadline out rather than reading a suspend as eight rungs of stall.
@@ -612,7 +623,25 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         // THE WALL CLOCK THIS LOOK REPRESENTS, measured rather than re-derived from the schedule.
         // The ladder's two clocks both count seconds, and the interval that was SCHEDULED is not
         // the interval that PASSED whenever a stand-down overrode it or a suspend rebaselined it.
-        let elapsed_secs = now.saturating_sub(entry.last_look_ms) / 1000;
+        //
+        // CAPPED, because a measurement is only as good as the clock behind it and this one has two
+        // known ways to be wrong (roborev 64284). The suspend detector above can miss a freeze —
+        // it now covers the tick body too, but nothing covers the instant between the two — and
+        // `now_ms` is `SystemTime`, so a forward wall-clock step is indistinguishable from time
+        // passing. Uncapped, either one dumps the whole gap into both clocks in a single look:
+        // `UNLANDED_STALL_SECS` is 1800, so ONE such look takes a healthy agent from zero to a
+        // concierge flag, and `silent_secs` is the figure on the founder's row.
+        //
+        // The bound is what was actually SCHEDULED for this agent, plus the same slack the suspend
+        // detector uses. `due_at_ms - last_look_ms` IS that schedule — set from the previous
+        // decision's own `next_look_secs` — so this needs nothing out of the ladder's internals, and
+        // ordinary jitter (well under the slack) still passes through unrounded. A look can now
+        // never credit more than one scheduled interval however badly the clock behaves.
+        let scheduled_ms = entry.due_at_ms.saturating_sub(entry.last_look_ms);
+        let elapsed_secs = now
+            .saturating_sub(entry.last_look_ms)
+            .min(scheduled_ms.saturating_add(SUSPEND_OVERSHOOT_MS))
+            / 1000;
         entry.last_look_ms = now;
         let obs = observe(
             observer,
@@ -1757,6 +1786,94 @@ mod tests {
             flags[0].blocked_by.as_deref(),
             Some("write-failed"),
             "and the pusher must be told WHY, not handed a null that reads as 'never writable'"
+        );
+    }
+
+    /// Set up a mock app with one silent, writable agent and walk it through `n` ordinary looks,
+    /// each arriving EXACTLY on its deadline. Returns the tracked map and the time of the last look.
+    fn ticked_agent<R: tauri::Runtime>(
+        handle: &AppHandle<R>,
+        n: usize,
+    ) -> (HashMap<String, Tracked>, u64) {
+        let observer = handle.state::<Observers>().attach("agent-1", 120, 40);
+        observer.ingest(
+            "\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}\r\n────────────────────────",
+        );
+        let mut tracked: HashMap<String, Tracked> = HashMap::new();
+        let mut now = now_ms();
+        for _ in 0..n {
+            tick(handle, &mut tracked, now);
+            now = tracked["agent-1"].due_at_ms;
+        }
+        (tracked, now)
+    }
+
+    /// THE WIRING LINE, DRIVEN THROUGH `tick` ITSELF — without this the fix is deletable with the
+    /// whole suite green (roborev 64284).
+    ///
+    /// `Observation::elapsed_secs` is an `Option` whose `None` arm restores the pre-fix,
+    /// schedule-derived behaviour, and every ladder test injects the value directly. The two
+    /// existing `tick`-driving tests advance `now` to EXACTLY `due_at_ms`, so measured elapsed and
+    /// the schedule fallback produce identical numbers and no assertion can tell them apart. This
+    /// one makes the look arrive LATE, which is the only shape that separates the two arms.
+    #[test]
+    fn tick_hands_the_ladder_the_gap_that_passed_not_the_one_it_scheduled() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        handle.manage(Observers::default());
+        handle.manage(NudgeFlags::default());
+
+        let (mut tracked, _) = ticked_agent(&handle, 3);
+        let before = tracked["agent-1"].state.silent_secs();
+        let due = tracked["agent-1"].due_at_ms;
+        let scheduled_secs = (due - tracked["agent-1"].last_look_ms) / 1000;
+
+        // Four seconds late — inside the detector's slack, so nothing is capped away.
+        tick(&handle, &mut tracked, due + 4_000);
+        let credited = tracked["agent-1"].state.silent_secs() - before;
+
+        assert_eq!(
+            credited,
+            scheduled_secs + 4,
+            "the clock must credit the wall time that PASSED"
+        );
+        assert_ne!(
+            credited, scheduled_secs,
+            "…and that is NOT what the schedule would have said — which is the whole point"
+        );
+    }
+
+    /// …AND IT IS CAPPED, because a measurement is only as good as the clock behind it.
+    ///
+    /// The suspend detector can still miss a freeze in the instant between its own sampling and the
+    /// look, and `now_ms` is `SystemTime`, so a forward wall-clock step is indistinguishable from
+    /// time passing. Uncapped, either one dumps the whole gap into both clocks in ONE look — and
+    /// the unlanded budget is only 1800s, so a single such look would take a healthy agent from
+    /// zero to a concierge flag while also inflating the `silent_secs` on the founder's row.
+    #[test]
+    fn an_undetected_freeze_cannot_dump_hours_into_the_clocks() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle().clone();
+        handle.manage(Observers::default());
+        handle.manage(NudgeFlags::default());
+
+        let (mut tracked, _) = ticked_agent(&handle, 3);
+        let before = tracked["agent-1"].state.silent_secs();
+        let last_look = tracked["agent-1"].last_look_ms;
+        let scheduled_secs = (tracked["agent-1"].due_at_ms - last_look) / 1000;
+
+        // Six hours, with the detector none the wiser.
+        tick(&handle, &mut tracked, last_look + 6 * 60 * 60 * 1000);
+        let credited = tracked["agent-1"].state.silent_secs() - before;
+
+        assert!(
+            credited <= scheduled_secs + SUSPEND_OVERSHOOT_MS / 1000,
+            "a look may never credit more than one scheduled interval plus the detector's slack \
+             (scheduled {scheduled_secs}s, credited {credited}s)"
+        );
+        assert!(
+            credited < 1800,
+            "…so one look can never cross UNLANDED_STALL_SECS on its own (credited {credited}s)"
         );
     }
 
