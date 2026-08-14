@@ -71,6 +71,7 @@ const agentBranchStatusMock = vi.fn(async () => {
 });
 vi.mock("../branchStatus", async (orig) => ({
   ...(await orig<typeof import("../branchStatus")>()),
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   agentBranchStatus: (...a: unknown[]) => agentBranchStatusMock(...(a as [])),
 }));
 // The real spawn body runs by default (these tests assert the human path's exact sequence); a test

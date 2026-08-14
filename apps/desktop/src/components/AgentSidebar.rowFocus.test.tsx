@@ -33,6 +33,7 @@ vi.mock("./HistorySearch", () => ({
   renderSnippet: () => null,
 }));
 vi.mock("../services/branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
   landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
 }));

@@ -9,6 +9,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 // test run for real, so the linkage between them is genuinely covered (not hand-wired by the test).
 
 vi.mock("./branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   landAgentBranch: vi.fn(),
   pushAgentBranch: vi.fn(),
   openAgentPr: vi.fn(),

@@ -30,6 +30,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 vi.mock("../services/branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
   landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
 }));

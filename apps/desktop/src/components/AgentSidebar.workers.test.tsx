@@ -21,7 +21,11 @@ const { refreshAgentBranch, landAgentBranch } = vi.hoisted(() => ({
   refreshAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
   landAgentBranch: vi.fn(() => Promise.resolve({ ok: true })),
 }));
-vi.mock("../services/branchStatus", () => ({ refreshAgentBranch, landAgentBranch }));
+vi.mock("../services/branchStatus", () => ({
+  refreshAgentBranch,
+  landAgentBranch,
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
+}));
 
 import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";

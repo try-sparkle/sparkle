@@ -30,6 +30,7 @@ vi.mock("../services/closeAgentActions", async (orig) => ({
 }));
 vi.mock("../services/branchStatus", async (orig) => ({
   ...(await orig<typeof import("../services/branchStatus")>()),
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   refreshAgentBranch,
 }));
 

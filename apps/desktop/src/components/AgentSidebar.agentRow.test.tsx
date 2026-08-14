@@ -15,6 +15,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({
 // pills are wired to the right action: red → rebase (refreshAgentBranch), green → land.
 vi.mock("../services/branchStatus", async (orig) => ({
   ...(await orig<typeof import("../services/branchStatus")>()),
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   landAgentBranch: vi.fn(async () => ({ ok: false as const, reason: "busy" as const })),
   refreshAgentBranch: vi.fn(async () => ({ ok: false as const, reason: "busy" as const })),
 }));

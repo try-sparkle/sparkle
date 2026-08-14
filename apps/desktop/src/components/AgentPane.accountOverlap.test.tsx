@@ -71,6 +71,7 @@ vi.mock("../preflight", () => ({
   claudeSessionInfo: vi.fn(() => new Promise(() => {})),
 }));
 vi.mock("../services/branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   reconcileDefaultBranch: vi.fn(() => Promise.resolve("main")),
 }));
 vi.mock("../services/accountSelection", () => ({

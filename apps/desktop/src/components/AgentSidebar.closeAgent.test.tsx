@@ -52,6 +52,7 @@ const { refreshAgentBranch, landAgentBranch, pushAgentBranch, openAgentPr, delet
     deleteAgentBranch: vi.fn(() => Promise.resolve()),
   }));
 vi.mock("../services/branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   refreshAgentBranch,
   landAgentBranch,
   pushAgentBranch,

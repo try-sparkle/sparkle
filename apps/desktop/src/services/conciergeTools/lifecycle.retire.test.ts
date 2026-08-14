@@ -44,6 +44,7 @@ const agentWorkflowStateMock = vi.fn(async () => {
 });
 vi.mock("../branchStatus", async (orig) => ({
   ...(await orig<typeof import("../branchStatus")>()),
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   agentBranchStatus: (...a: unknown[]) => agentBranchStatusMock(...(a as [])),
   agentWorkflowState: (...a: unknown[]) => agentWorkflowStateMock(...(a as [])),
 }));

@@ -25,6 +25,7 @@ const STORE_KEY = "sparkle-runtime";
 const agentBranchStatus = vi.fn();
 const agentWorkflowState = vi.fn();
 vi.mock("../services/branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   agentBranchStatus: (...a: unknown[]) => agentBranchStatus(...a),
   agentWorkflowState: (...a: unknown[]) => agentWorkflowState(...a),
 }));

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 vi.mock("./branchStatus", () => ({
+  projectAgentsStatus: vi.fn(() => Promise.resolve([])),
   landAgentBranch: vi.fn(),
   pushAgentBranch: vi.fn(),
   openAgentPr: vi.fn(),
