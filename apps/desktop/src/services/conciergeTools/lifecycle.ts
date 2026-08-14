@@ -132,7 +132,7 @@ import type { AgentKind, AgentTab, Project, Runtime } from "../../types";
 // deliberately not a member of that array (services/knownAgents). `findKnownAgent` is the resolver
 // built for "can I address this id?", and it has the Sparkle arm. Bead sparkle-x0pvw.
 import { findKnownAgent } from "../knownAgents";
-import { restartPane } from "../paneControl";
+import { restartPaneAwaited } from "../paneControl";
 import { killPty } from "../../pty";
 import { isSparkleAgentId } from "../sparkleAgent";
 // The ONE "is Improve Sparkle mid-work" rule, shared with the write gate and the get_state row.
@@ -2207,20 +2207,81 @@ function resolveForProcessOp(
  * a pane stuck on a screen its CLI will not leave — the login prompt that ignores Escape being the
  * case that prompted it.
  *
- * `restartPane` returns false when no pane is mounted, and that is reported as `no-pane` rather than
- * `action-failed`: a closed agent picks up a fresh spawn the next time it opens, so there is nothing
- * wrong, nothing to retry, and nothing that happened.
+ * `no-pane` is reported when no pane is mounted, rather than `action-failed`: a closed agent picks
+ * up a fresh spawn the next time it opens, so there is nothing wrong, nothing to retry, and nothing
+ * that happened.
+ *
+ * THE ACK WAITS FOR THE RESTART, and that is the whole point of `restartPaneAwaited`. This used to
+ * call `restartPane`, whose boolean is a DISPATCH receipt — the pane's lever is async and swallows
+ * its own failures, so `ok` was written before anything had run and regardless of whether it then
+ * worked. Measured on v0.107.0: three errored agents restarted, three `{ok:true, outcome:"restart"}`
+ * replies, and an immediate `get_agent_status` on each still reading `errored` with needsYou true.
+ * That is the false-success shape that has the concierge report agents as recovered while they are
+ * still down, so every non-`restarted` outcome is now a refusal the caller can read and relay.
  */
 export async function restartAgent(agentId: string): Promise<LifecycleResult<ProcessActed>> {
   const refusal = resolveForProcessOp("restart_agent", agentId);
   if (refusal) return refusal;
-  if (!restartPane(agentId)) {
+  const result = await restartPaneAwaited(agentId);
+  if (result === "no-pane") {
     return refuse(
       "restart_agent",
       "no-pane",
       `${agentId} has no terminal open right now, so there was nothing to restart. It will start fresh the next time it is opened.`,
     );
   }
+  if (result === "no-claude") {
+    return refuse(
+      "restart_agent",
+      "action-failed",
+      `${agentId}'s terminal could not be restarted: the \`claude\` CLI was not found. The agent is still down — this needs a human to fix the install.`,
+    );
+  }
+  if (result === "nothing-to-restart") {
+    // SAYS ONLY WHAT IS KNOWN, AND QUALIFIES THE REMEDY BY RUNTIME. Two earlier versions of this
+    // copy each asserted one false universal: first that the runtime "rebuilds its config and keeps
+    // the same process" (a cloud agent has no local process to keep), then that "closing and
+    // reopening starts a fresh terminal" (reopening a cloud pane RE-ATTACHES to the same
+    // server-side session — `AgentPane.prepare()`: "the session already exists there. The desktop's
+    // job is to ATTACH, not to spawn"). A human follows this verbatim, so a remedy that is wrong for
+    // half the population sends them to the same stuck screen. Remedy copy is code (AGENTS.md,
+    // bead sparkle-8bvh) — and where the runtime is unknown, the honest move is to say so rather
+    // than pick one.
+    const runtime = findKnownAgent(agentId)?.runtime;
+    const remedy =
+      runtime === "cloud"
+        ? "This agent runs server-side and the desktop only attaches to it, so reopening the tab re-attaches to the same session rather than starting a new one — nothing on this machine will restart it."
+        : runtime === "local"
+          ? "Restarting does not reach this kind of agent; closing and reopening it is what starts a fresh terminal."
+          : "What would actually restart it depends on where it runs, and that could not be determined here.";
+    return refuse(
+      "restart_agent",
+      "action-failed",
+      `${agentId}'s terminal was not re-spawned — nothing was replaced, so it is in exactly the state it was in before. ${remedy} Do not report it as recovered.`,
+    );
+  }
+  if (result === "timed-out") {
+    return refuse(
+      "restart_agent",
+      "action-failed",
+      `${agentId}'s terminal was told to restart but had not come up yet. It may still be starting — re-read its status before reporting it either way, and do not report it as recovered.`,
+    );
+  }
+  if (result !== "restarted") {
+    return refuse(
+      "restart_agent",
+      "action-failed",
+      `${agentId}'s terminal did not come back up (${result}). It is still down — do not report it as recovered.`,
+    );
+  }
+  // NOTHING IS WRITTEN TO `runtimeStore.status` HERE, deliberately. An earlier cut of this cleared a
+  // red status to `working` on success, which relocated the very bug this function exists to close:
+  // the success verdict was the pane's PHASE, which only means the spawn command was assembled, so a
+  // launch that then died at PTY spawn would have had its truthful `errored` overwritten with a
+  // calm `working` — and `get_agent_status` derives `needsYou` from exactly that. The verdict is now
+  // `paneReadiness` reaching `ready`, i.e. the PTY genuinely came up, and statusEngine's own
+  // `spawn -> working` transition repaints the status off the real spawn. Letting the engine own it
+  // means a restart that comes up and immediately re-errors still reads red.
   log.info("concierge", "restarted an agent's terminal", { agentId });
   return ok("restart_agent", { agentId, outcome: "restart" });
 }

@@ -92,8 +92,13 @@ vi.mock("../services/sparkleAgent", async (importOriginal) => {
 });
 
 import { SparkleAgentPane } from "./SparkleAgentPane";
-import { paneState, resetPaneReadiness } from "../services/paneReadiness";
-import { clearPaneRestarts, restartPane } from "../services/paneControl";
+import { paneRelaunchCount, paneState, resetPaneReadiness } from "../services/paneReadiness";
+import {
+  clearPaneRestarts,
+  restartPane,
+  restartPaneAwaited,
+  type PaneRestartResult,
+} from "../services/paneControl";
 import {
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
@@ -234,6 +239,69 @@ describe("SparkleAgentPane — the respawn lever the concierge's remedy copy nam
     const { unmount } = await mountPane();
     unmount();
     expect(restartPane(SPARKLE_ID)).toBe(false);
+  });
+
+  // ── THE REAL REGISTRANT, DRIVEN THROUGH restartPaneAwaited ───────────────────────────────────
+  //
+  // Every other test of this lever hand-registers a fake one, so all of them would stay green if
+  // this component reverted to `() => void prepareRef.current()` and the false-success ack came
+  // back verbatim — the "defaulted seam every test injects" shape AGENTS.md warns about. These
+  // three drive the production registration.
+  //
+  // `reportSpawnFailed` is the case that matters most: it is the Terminal's own spawn rejection,
+  // which by construction NEVER TOUCHES `phase`. A verdict read off the phase calls that
+  // "restarted"; only paneReadiness sees it.
+  describe("reports an honest verdict to restartPaneAwaited", () => {
+    const fast = { readyTimeoutMs: 3000, pollMs: 5 };
+
+    /** Kick the awaited restart without blocking, so the test can then drive the Terminal. */
+    async function startRestart() {
+      const box: { settled?: PaneRestartResult } = {};
+      await act(async () => {
+        void restartPaneAwaited(SPARKLE_ID, fast).then((r) => (box.settled = r));
+        await Promise.resolve();
+      });
+      return box;
+    }
+
+    it("restarted — only once the PTY actually comes up", async () => {
+      await mountPane();
+      const box = await startRestart();
+      // Still starting: the spawn was assembled but nothing has execed. Must not answer yet.
+      expect(box.settled).toBeUndefined();
+      await reportReady();
+      await waitFor(() => expect(box.settled).toBe("restarted"));
+    });
+
+    it("spawn-failed when the PTY spawn rejects — the failure `phase` cannot see", async () => {
+      await mountPane();
+      await reportReady(); // healthy first, so this is a real regression not an initial state
+      const box = await startRestart();
+      await reportSpawnFailed();
+      await waitFor(() => expect(box.settled).toBe("spawn-failed"));
+    });
+
+    // The counterpart to the shell case in AgentPane.runtimeFlip.test.tsx. This pane is always a
+    // local claude agent, so every prepare genuinely replaces the PTY and must say so — otherwise
+    // restartPaneAwaited reads a real restart as "nothing to restart" (roborev 64104).
+    it("announces a relaunch on the production prepare path", async () => {
+      await mountPane();
+      await reportReady();
+      const before = paneRelaunchCount(SPARKLE_ID);
+      await act(async () => {
+        restartPane(SPARKLE_ID);
+        await Promise.resolve();
+      });
+      expect(paneRelaunchCount(SPARKLE_ID)).toBeGreaterThan(before);
+    });
+
+    it("no-claude when the preflight finds no CLI", async () => {
+      await mountPane();
+      const { checkClaude } = await import("../preflight");
+      vi.mocked(checkClaude).mockResolvedValueOnce({ installed: false, path: null } as never);
+      const box = await startRestart();
+      await waitFor(() => expect(box.settled).toBe("no-claude"));
+    });
   });
 });
 

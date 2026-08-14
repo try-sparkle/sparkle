@@ -72,6 +72,8 @@ vi.mock("../services/paneReadiness", () => ({
   setPaneReady: (_id: string, ready: boolean) => captured.published.push(ready ? "ready" : "starting"),
   setPaneFailed: () => captured.published.push("failed"),
   unregisterPane: () => {},
+  notePaneRelaunch: () => {},
+  paneRelaunchCount: () => 0,
 }));
 // Prompt-delivery plumbing fired by the ptyReady flush effect — no-op so it adds no Tauri side effects.
 vi.mock("../services/conciergeDispatch", () => ({

@@ -65,6 +65,8 @@ vi.mock("../services/paneReadiness", () => ({
   setPaneReady: () => {},
   setPaneFailed: () => {},
   unregisterPane: () => {},
+  notePaneRelaunch: () => {},
+  paneRelaunchCount: () => 0,
 }));
 vi.mock("../services/conciergeDispatch", () => ({
   flushPendingSends: () => Promise.resolve(),

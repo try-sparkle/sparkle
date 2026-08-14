@@ -76,7 +76,12 @@ import {
   noteBriefLaunchAbandoned,
   noteBriefLaunched,
 } from "../services/agentBrief";
-import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
+import {
+  notePaneRelaunch,
+  setPaneFailed,
+  setPaneReady,
+  unregisterPane,
+} from "../services/paneReadiness";
 import { isTypingInProgress } from "../engine/focusGuard";
 import { markTerminalAutoFocus } from "../services/terminalFocusIntent";
 import { TerminalDropOverlay } from "./TerminalDropOverlay";
@@ -239,7 +244,17 @@ function AgentPaneInner({
   // because a Terminal unmount kills its PTY. AgentPane.blueprint.test.tsx pins that.
   const resolvedTheme = useResolvedTheme();
 
-  const [phase, setPhase] = useState<Phase>("preparing");
+  const [phase, setPhaseState] = useState<Phase>("preparing");
+  // The phase, readable SYNCHRONOUSLY. `prepare()` catches its own failures and resolves normally,
+  // so awaiting it says nothing about whether the spawn worked — only the phase it settled on does,
+  // and React state is not readable from inside the closure that just set it. The restart lever
+  // (registerPaneRestart, below) reports this ref so `restartPaneAwaited` can tell a restart that
+  // came up from one that did not.
+  const phaseRef = useRef<Phase>("preparing");
+  const setPhase = (p: Phase) => {
+    phaseRef.current = p;
+    setPhaseState(p);
+  };
   // THE PANE GAVE UP ON A LAUNCH THAT NEVER TOUCHED `phase` — i.e. the terminal's own spawn rejection.
   //
   // Pane STATE, not a direct `setPaneFailed` write, because paneReadiness's contract says the value
@@ -576,9 +591,20 @@ function AgentPaneInner({
     // Fire-and-forget + self-throttling (a no-op once the pool is full or the feature is disabled).
     // Rust resolves the base itself, so an as-yet-unresolved defaultBranch is fine here.
     void warmWorktreePool(project.rootPath, project.id, project.defaultBranch ?? "").catch(() => {});
+    // FROM HERE ON THE PTY IS GENUINELY REPLACED, so say so — synchronously, before the first
+    // await, so anyone waiting on this restart can tell it began. It cannot be inferred from the
+    // readiness publications below: re-entering prepare() on an agent that is already mid-launch
+    // makes all three of these writes no-ops, so nothing publishes even though a real re-spawn is
+    // in flight (roborev 64104). Deliberately BELOW the cloud/shell early returns, which return
+    // without re-spawning anything.
+    notePaneRelaunch(agent.id);
     setPhase("preparing");
     setGaveUp(false);
     setErrorMsg("");
+    // DELIBERATELY NOT HOISTED above the cloud/shell early returns. Those paths never remount
+    // Terminal (same id/runtime/key), so nothing would ever re-fire `onReady` to undo the reset and
+    // the pane would latch at "starting" forever, silently queuing prompts the flush effect can
+    // never drain — pinned by AgentPane.runtimeFlip.test.tsx.
     setPtyReady(false);
     // A re-prepare (Try again) restarts the agent from scratch — drop any prior hook watcher so
     // hooks for the new run start clean.
@@ -1122,7 +1148,10 @@ function AgentPaneInner({
     prepareRef.current = prepare;
   });
   useEffect(() => {
-    registerPaneRestart(agent.id, () => void prepareRef.current());
+    registerPaneRestart(agent.id, async () => {
+      await prepareRef.current();
+      return phaseRef.current;
+    });
     return () => unregisterPaneRestart(agent.id);
   }, [agent.id]);
 

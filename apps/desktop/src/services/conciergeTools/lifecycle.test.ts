@@ -116,6 +116,12 @@ import {
   type LifecycleRisk,
 } from "./lifecycle";
 import { registerPaneRestart, clearPaneRestarts } from "../paneControl";
+import {
+  setPaneReady,
+  setPaneFailed,
+  resetPaneReadiness,
+  notePaneRelaunch,
+} from "../paneReadiness";
 // THE REAL LATCH, not a mock of it: `improvementPassLatch` is a leaf with `claimPass`/`releasePass`,
 // so the restart/stop guard is driven through services/sparkleBusy end to end.
 import { claimPass, releasePass } from "../improvementPassLatch";
@@ -1427,19 +1433,27 @@ describe("typed results", () => {
 describe("restart_agent / stop_agent", () => {
   beforeEach(() => {
     clearPaneRestarts();
+    resetPaneReadiness();
     releasePass();
     vi.mocked(killPty).mockClear();
     vi.mocked(killPty).mockResolvedValue(undefined);
   });
   afterEach(() => {
     clearPaneRestarts();
+    resetPaneReadiness();
     releasePass();
   });
 
   /** Make `agentId` look like it has a mounted pane and a live status, which is what
    *  `findKnownAgent`'s Sparkle/observed arms resolve on. Returns the restart spy. */
   function mountPane(agentId: string) {
-    const restart = vi.fn();
+    // A HEALTHY pane: prepare reaches phase "ready" AND the PTY comes up. Both are required — the
+    // success verdict is paneReadiness, not the phase (see the PTY-spawn-dies test below).
+    const restart = vi.fn(() => {
+      notePaneRelaunch(agentId);
+      setPaneReady(agentId, true);
+      return "ready";
+    });
     registerPaneRestart(agentId, restart);
     useRuntimeStore.setState({ status: { [agentId]: "working" } } as never);
     return restart;
@@ -1486,6 +1500,182 @@ describe("restart_agent / stop_agent", () => {
     const restart = mountPane(agentId);
     expect((await restartAgent(agentId)).ok).toBe(true);
     expect(restart).toHaveBeenCalledTimes(1);
+  });
+
+  // ── THE FALSE-SUCCESS ACK ────────────────────────────────────────────────────────────────────
+  //
+  // Measured on v0.107.0: three errored agents were restarted, all three returned
+  // `{ok:true, outcome:"restart"}`, and an immediate get_agent_status on each still read `errored`
+  // with needsYou true. The ack was written the instant the lever was CALLED — `restartPane` returns
+  // at dispatch, and the pane's `prepare()` is async AND swallows its own failures. So "ok" meant
+  // "I called a function", not "the agent restarted", which is exactly the class of bug that has the
+  // concierge report agents as recovered while they are still down.
+  //
+  // These assert the SIDE EFFECT the reply is supposed to stand for, not the reply.
+
+  it("refuses — readably — when the pane's prepare RESOLVES having failed", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    // prepare() catches its own error and resolves normally; only the phase reveals it.
+    registerPaneRestart(agentId, async () => "error");
+    useRuntimeStore.setState({ status: { [agentId]: "errored" } } as never);
+    const r = await restartAgent(agentId);
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("action-failed");
+    // The status is left ALONE on a failure: nothing restarted, so nothing may look calmer.
+    expect(useRuntimeStore.getState().status[agentId]).toBe("errored");
+  });
+
+  it("refuses when claude is missing, naming that cause rather than a generic failure", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    registerPaneRestart(agentId, async () => "no-claude");
+    const r = await restartAgent(agentId);
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("action-failed");
+    expect(r.ok === false && r.message).toMatch(/claude/i);
+  });
+
+  it("refuses when the restart REJECTS asynchronously — the rejection restartPane discards", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    registerPaneRestart(agentId, () => Promise.reject(new Error("boom")));
+    const r = await restartAgent(agentId);
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("action-failed");
+  });
+
+  it("does not answer until the restart has actually finished", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    let finished = false;
+    registerPaneRestart(agentId, async () => {
+      notePaneRelaunch(agentId);
+      await Promise.resolve();
+      finished = true;
+      setPaneReady(agentId, true);
+      return "ready";
+    });
+    useRuntimeStore.setState({ status: { [agentId]: "working" } } as never);
+    const r = await restartAgent(agentId);
+    // Would be false if the ack were still written at dispatch.
+    expect(finished).toBe(true);
+    expect(r.ok).toBe(true);
+  });
+
+  // THE REGRESSION THE FIRST CUT OF THIS FIX INTRODUCED, kept as its own test. Reading the pane's
+  // PHASE as the success verdict calls a launch that died at PTY spawn "restarted" — phase "ready"
+  // only means the spawn command was assembled, and the Terminal's own spawn rejection publishes
+  // paneReadiness `failed` without ever touching phase. An earlier version also cleared the red
+  // status on that verdict, which turned a truthful `errored` into a calm `working` and made
+  // get_agent_status report a down agent as needing nobody.
+  it("refuses when the PTY spawn dies, even though prepare reported phase ready", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    registerPaneRestart(agentId, async () => {
+      notePaneRelaunch(agentId);
+      setPaneFailed(agentId);
+      return "ready";
+    });
+    useRuntimeStore.setState({ status: { [agentId]: "errored" } } as never);
+    const r = await restartAgent(agentId);
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("action-failed");
+    // The truthful red must survive: this agent is down and someone has to know.
+    expect(useRuntimeStore.getState().status[agentId]).toBe("errored");
+  });
+
+  // THE nothing-to-restart BRANCH, tested on its own rather than only via the other cases. A shell
+  // or cloud re-prepare returns early: Terminal is never remounted and the PTY is never replaced,
+  // so no relaunch is announced and nothing was restarted. Saying "restarted" there reports an
+  // action that did not happen.
+  it("refuses when the re-prepare announced no relaunch — nothing was actually re-spawned", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    // Healthy and up throughout — it never stopped — but no notePaneRelaunch: nothing re-spawned.
+    setPaneReady(agentId, true);
+    registerPaneRestart(agentId, async () => "ready");
+    useRuntimeStore.setState({ status: { [agentId]: "idle" } } as never);
+
+    const r = await restartAgent(agentId);
+
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.reason).toBe("action-failed");
+    // The copy must say nothing was replaced, and must not claim a process was kept or config
+    // rebuilt — neither is knowable here and both are false for a cloud agent.
+    expect(r.ok === false && r.message).toMatch(/not re-spawned|nothing was replaced/i);
+    expect(r.ok === false && r.message).not.toMatch(/keeps the same process|rebuilds its config/i);
+    // It must name a NEXT STEP. Asserted on the REMEDY PORTION — one of the three branches must be
+    // present — rather than on the message length: the invariant prefix and suffix are ~130 chars
+    // on their own, so a length check stays green with the remedy deleted entirely.
+    expect(r.ok === false && r.message).toMatch(
+      /clos(e|ing) and reopen|re-attach|could not be determined/i,
+    );
+    // This agent is LOCAL, so the local remedy is the correct one here.
+    expect(r.ok === false && r.message).toMatch(/clos(e|ing) and reopen/i);
+  });
+
+  // THE THIRD BRANCH. `findKnownAgent`'s `observed` arm resolves an id this window has a live
+  // status for but no roster row, and returns `runtime: "unknown"` BY DESIGN — a live status proves
+  // the window is watching something, not what runtime it is. Guessing a remedy there is exactly
+  // what the previous two rounds got wrong, so the copy says it could not be determined, and that
+  // has to be pinned like the other two.
+  it("says the remedy could not be determined when the runtime is unknown, rather than guessing", async () => {
+    const agentId = "observed-only-agent";
+    // No roster row — only a live status entry, which is the observed arm.
+    useRuntimeStore.setState({ status: { [agentId]: "idle" } } as never);
+    setPaneReady(agentId, true);
+    registerPaneRestart(agentId, async () => "ready");
+
+    const r = await restartAgent(agentId);
+
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.message).toMatch(/could not be determined/i);
+    expect(r.ok === false && r.message).not.toMatch(/clos(e|ing) and reopen/i);
+    expect(r.ok === false && r.message).not.toMatch(/re-attach/i);
+  });
+
+  // THE OTHER HALF OF THE POPULATION, and the reason the remedy is branched at all. Reopening a
+  // cloud pane RE-ATTACHES to the same server-side session — AgentPane.prepare(): "the session
+  // already exists there. The desktop's job is to ATTACH, not to spawn" — so telling a human to
+  // close and reopen sends them back to the identical stuck screen.
+  it("does NOT tell a CLOUD agent's owner to close and reopen — that re-attaches, it does not restart", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    // Flip it to the cloud runtime — `seedBuild` only makes local ones.
+    useProjectStore.setState((st) => ({
+      projects: st.projects.map((pr) =>
+        pr.id === projectId
+          ? {
+              ...pr,
+              agents: pr.agents.map((a) => (a.id === agentId ? { ...a, runtime: "cloud" } : a)),
+            }
+          : pr,
+      ),
+    }));
+    setPaneReady(agentId, true);
+    registerPaneRestart(agentId, async () => "ready");
+
+    const r = await restartAgent(agentId);
+
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.message).not.toMatch(/clos(e|ing) and reopen/i);
+    expect(r.ok === false && r.message).toMatch(/re-attach|server-side/i);
+  });
+
+  it("never writes the status itself — statusEngine's real spawn transition owns that", async () => {
+    const projectId = seedProject();
+    const agentId = seedBuild(projectId);
+    registerPaneRestart(agentId, async () => {
+      notePaneRelaunch(agentId);
+      setPaneReady(agentId, true);
+      return "ready";
+    });
+    useRuntimeStore.setState({ status: { [agentId]: "errored" } } as never);
+    expect((await restartAgent(agentId)).ok).toBe(true);
+    // Untouched on purpose. A restart that comes up and immediately re-errors must still read red,
+    // and only the engine watching real output can know which it is.
+    expect(useRuntimeStore.getState().status[agentId]).toBe("errored");
   });
 
   it("refuses an id nothing has ever seen, without acting", async () => {

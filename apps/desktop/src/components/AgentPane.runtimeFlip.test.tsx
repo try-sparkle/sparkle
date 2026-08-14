@@ -36,6 +36,10 @@ const captured = vi.hoisted(() => ({
   // republishes "starting" (false) across a flip instead of leaving a stale "ready" (true) up while no
   // PTY exists.
   paneReady: [] as boolean[],
+  // Every relaunch AgentPane ANNOUNCES, per agent — so a test can prove that a re-prepare which
+  // re-spawns nothing (shell/cloud early return) says so, which is what stops restartPaneAwaited
+  // reporting it to a human as a restart that happened.
+  relaunches: {} as Record<string, number>,
 }));
 
 vi.mock("./Terminal", async () => {
@@ -70,6 +74,10 @@ vi.mock("../services/paneReadiness", () => ({
   setPaneReady: (_id: string, ready: boolean) => captured.paneReady.push(ready),
   setPaneFailed: () => {},
   unregisterPane: () => {},
+  notePaneRelaunch: (id: string) => {
+    captured.relaunches[id] = (captured.relaunches[id] ?? 0) + 1;
+  },
+  paneRelaunchCount: (id: string) => captured.relaunches[id] ?? 0,
 }));
 // Prompt-delivery plumbing fired by the ptyReady flush effect — no-op so it adds no Tauri side effects.
 vi.mock("../services/conciergeDispatch", () => ({
@@ -119,6 +127,24 @@ function shellAgent(runtime: "cloud" | "local", extra: Partial<AgentTab> = {}): 
   } as AgentTab;
 }
 
+/** A LOCAL claude agent — the population `restart_agent` actually serves, and the one whose
+ *  `notePaneRelaunch` call site the whole nothing-to-restart mechanism hinges on. */
+function claudeAgent(extra: Partial<AgentTab> = {}): AgentTab {
+  return {
+    id: "a1",
+    name: "Builder",
+    kind: "claude",
+    parentId: null,
+    runtime: "local",
+    worktreePath: null,
+    branch: null,
+    baseBranch: null,
+    lastPrompt: "",
+    promptHistory: [],
+    ...extra,
+  } as AgentTab;
+}
+
 const project: Project = {
   id: "p1",
   name: "Proj",
@@ -144,6 +170,7 @@ beforeEach(() => {
   captured.mountCount = 0;
   captured.unmountCount = 0;
   captured.paneReady.length = 0;
+  for (const k of Object.keys(captured.relaunches)) delete captured.relaunches[k];
 });
 afterEach(() => cleanup());
 
@@ -267,5 +294,46 @@ describe("AgentPane — a runtime flip rebuilds the spawn command and never bind
     // (and never a true after it, since nothing remounts to restore readiness) → this fails RED.
     expect(captured.paneReady.slice(beforeRestart).includes(false)).toBe(false);
     expect(captured.paneReady.at(-1)).toBe(true);
+  });
+
+  // THE OTHER HALF OF THAT SAME FACT, and the one restartPaneAwaited depends on. A shell re-prepare
+  // takes the early return: Terminal is never remounted and the PTY is never replaced, so NOTHING
+  // was restarted. `notePaneRelaunch` sits below those early returns precisely so this reads as
+  // "nothing to restart" rather than being reported to a human as a restart that happened
+  // (roborev 64104). Asserted on the production component, because the counter's whole job is to
+  // describe what the real prepare() paths do — a unit test with a hand-written lever cannot see it.
+  it("does NOT announce a relaunch for a same-runtime shell re-prepare — nothing re-spawns", async () => {
+    render(<AgentPane project={project} agent={shellAgent("local")} visible />);
+    await waitFor(() => expect(captured.paneReady.at(-1)).toBe(true));
+    const before = captured.relaunches["a1"] ?? 0;
+
+    await act(async () => {
+      expect(restartPane("a1")).toBe(true);
+      await Promise.resolve();
+    });
+
+    expect(captured.relaunches["a1"] ?? 0).toBe(before);
+  });
+
+  // THE POSITIVE HALF, and the one that matters most: build agents are the population
+  // `restart_agent` serves. Without it, deleting `notePaneRelaunch(agent.id)` from AgentPane leaves
+  // the suite green while EVERY build-agent restart answers `nothing-to-restart` — which
+  // `restartAgent` relays as "was not re-spawned … do not report it as recovered" for a restart
+  // that in fact succeeded. That is the false-negative inversion this mechanism exists to remove.
+  it("DOES announce a relaunch for a local claude re-prepare — the build-agent path", async () => {
+    // Asserted on the ANNOUNCEMENT rather than on readiness: this pane's spawn needs account
+    // selection and the orchestration bridge to reach `ready`, neither of which is mocked here, and
+    // neither is what this pins. The call site is what the mechanism hinges on.
+    render(<AgentPane project={project} agent={claudeAgent()} visible />);
+    await waitFor(() => expect(captured.relaunches["a1"] ?? 0).toBeGreaterThan(0));
+    const before = captured.relaunches["a1"] ?? 0;
+
+    await act(async () => {
+      expect(restartPane("a1")).toBe(true);
+      await Promise.resolve();
+    });
+
+    // A SECOND announcement: the re-prepare re-spawns, exactly as restartPaneAwaited assumes.
+    await waitFor(() => expect(captured.relaunches["a1"] ?? 0).toBeGreaterThan(before));
   });
 });

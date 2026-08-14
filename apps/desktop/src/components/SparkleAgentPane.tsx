@@ -16,7 +16,12 @@ import {
 } from "../services/sparkleAgent";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useSettingsStore } from "../stores/settingsStore";
-import { setPaneFailed, setPaneReady, unregisterPane } from "../services/paneReadiness";
+import {
+  notePaneRelaunch,
+  setPaneFailed,
+  setPaneReady,
+  unregisterPane,
+} from "../services/paneReadiness";
 import { registerPaneRestart, unregisterPaneRestart } from "../services/paneControl";
 import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
@@ -96,7 +101,14 @@ interface SpawnCmd {
  *    replacement.
  */
 export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agentId: string }) {
-  const [phase, setPhase] = useState<Phase>("preparing");
+  const [phase, setPhaseState] = useState<Phase>("preparing");
+  // Synchronously-readable phase — see AgentPane for why the restart lever needs this rather than
+  // the React state: `prepare()` swallows its own failures, so the phase is the only evidence.
+  const phaseRef = useRef<Phase>("preparing");
+  const setPhase = (p: Phase) => {
+    phaseRef.current = p;
+    setPhaseState(p);
+  };
   const [errorMsg, setErrorMsg] = useState("");
   const [spawn, setSpawn] = useState<SpawnCmd | null>(null);
   const [ptyReady, setPtyReady] = useState(false);
@@ -141,6 +153,10 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   );
 
   const prepare = async () => {
+    // Always a local claude agent, so every prepare genuinely replaces the PTY. Announced
+    // synchronously, before any await, so a waiter can tell the restart began — see
+    // paneReadiness.notePaneRelaunch.
+    notePaneRelaunch(agentId);
     setPhase("preparing");
     setGaveUp(false);
     setErrorMsg("");
@@ -257,7 +273,10 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     prepareRef.current = prepare;
   });
   useEffect(() => {
-    registerPaneRestart(agentId, () => void prepareRef.current());
+    registerPaneRestart(agentId, async () => {
+      await prepareRef.current();
+      return phaseRef.current;
+    });
     return () => unregisterPaneRestart(agentId);
   }, [agentId]);
   useEffect(
