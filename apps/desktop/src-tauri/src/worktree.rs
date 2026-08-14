@@ -7115,6 +7115,14 @@ mod tests {
     /// happened, so a mutating caller (`gh pr merge`, `claude plugin install`) must not be told
     /// anything went wrong — and once the group kill releases the pipe there is nothing wrong to
     /// tell: the capture is COMPLETE and carries no truncation note.
+    ///
+    /// The elapsed bound is derived from the code's own contract, exactly as the `output_with_timeout`
+    /// sibling above: the child exits at once, so the only wait left is the post-exit settle plus the
+    /// group kill, whose guaranteed ceiling is `POST_EXIT_SETTLE + DRAIN_GRACE` (each `await_threads`
+    /// may consume its full grace). The assertion is that plus slack, still far under the 30s deadline
+    /// — bounding by the deadline would blow past it, which is the distinction being pinned. (An
+    /// earlier version asserted a flat `< 2s`, which is BELOW the 2.25s ceiling the path can
+    /// legitimately take, so it flaked under CI load while the production code was correctly bounded.)
     #[cfg(unix)]
     #[test]
     fn a_grandchild_holding_the_pipes_open_is_released_not_reported_as_truncation() {
@@ -7124,7 +7132,13 @@ mod tests {
         let captured =
             output_with_timeout_lenient(cmd, Duration::from_secs(30)).expect("lenient returns Ok");
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            started.elapsed() < POST_EXIT_SETTLE + DRAIN_GRACE + Duration::from_secs(3),
+            "the post-exit drain must be bounded by the settle + kill ({:?}), not by the remaining \
+             deadline; took {:?}",
+            POST_EXIT_SETTLE + DRAIN_GRACE,
+            started.elapsed()
+        );
         assert!(captured.output.status.success(), "the child itself exited 0");
         assert_eq!(String::from_utf8_lossy(&captured.output.stdout).trim(), "started");
         assert!(captured.drain_complete, "the kill released the pipe, so the capture is whole");
