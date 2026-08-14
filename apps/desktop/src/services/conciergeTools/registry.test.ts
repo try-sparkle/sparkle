@@ -158,6 +158,8 @@ import {
   type ToolPolicyQuery,
 } from "./registry";
 import { DISCARD_CONFIRM_TOKEN } from "./lifecycle";
+// The turn state the relay gate reads — set here the way ConciergeHost sets it at dispatch.
+import { setConciergeTurnOrigin } from "../conciergeReceipts";
 import { configuredToolPolicy } from "./policyBinding";
 import {
   approveApproval,
@@ -2067,5 +2069,70 @@ describe("spawn_build_agent — atomic brief, name, model and mode", () => {
       paths: { nodePath: "/n", serverPath: "/o.js" },
     });
     expect(ordinary.args.join(" ")).not.toContain("--permission-mode");
+  });
+});
+
+// ══ GATE 0 — THE RELAY GATE'S POSITION IS THE WHOLE FIX (bead `sparkle-p9s5q`) ═══════════════════
+//
+// The founder's second instruction: "nor should it send it to a build agent unless I have mentioned
+// that build agent." A relay of his words to an agent he never named must not happen at all.
+//
+// THIS BLOCK IS ABOUT WHERE THE GATE SITS, not what it decides — ./relayGate.test.ts owns the
+// decision. Position is what a reviewer cannot see and what a refactor silently breaks:
+// `send_to_agent_terminal` is `disruptive`, so its default decision is `ask`, and the ask-tier
+// return fires BEFORE the route handler. A gate inside the handler is therefore never reached on
+// the first call — and the approved re-run arrives from a click handler after the turn has ended,
+// with the founder's text already dropped, so it fails open. The gate was written in that position
+// first and was inert for exactly the population that matters.
+describe("the relay gate refuses BEFORE the approval tier", () => {
+  const FOUNDER = "You should have better memory now. can you tell me if that's true?";
+  const ask: ConciergeToolPolicy = () => ({ tier: "ask", approvedByUser: false });
+
+  afterEach(() => setConciergeTurnOrigin(null));
+
+  const send = (text: string, policy?: ConciergeToolPolicy) =>
+    dispatchConciergeTool(
+      call({
+        domain: "terminal",
+        op: "send_to_agent_terminal",
+        args: { agentId: "ag-unnamed", text, goal: "", notWork: { reason: "fixture" } },
+      }),
+      policy ? { policy } : {},
+    );
+
+  it("refuses an unaddressed relay instead of raising an approval for it", async () => {
+    setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] });
+    const r = await send(FOUNDER, ask);
+    // THE ASSERTION THAT PINS THE ORDER. Under the old placement this read `needs-approval`: the
+    // policy answered first and the gate never ran. The human must not be asked to approve a send
+    // that is not allowed to happen.
+    expect(refusal(r).code).toBe(REGISTRY_CODES.unaddressedRelay);
+    expect(refusal(r).code).not.toBe(REGISTRY_CODES.needsApproval);
+  });
+
+  it("still refuses on the APPROVED re-run — the path conciergeApprovalResume takes", async () => {
+    setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] });
+    // A FULLY APPROVED decision — bound to this call's own id, so nothing downstream could refuse
+    // it for a reason other than the gate. That is what makes this row about the gate.
+    const approved: ConciergeToolPolicy = () => ({
+      tier: "ask",
+      approvedByUser: true,
+      approvedForToolCallId: TOOL_CALL_ID,
+    });
+    expect(refusal(await send(FOUNDER, approved)).code).toBe(REGISTRY_CODES.unaddressedRelay);
+  });
+
+  it("lets an ordinary ask-tier send reach the approval gate untouched", async () => {
+    // THE POSITIVE CONTROL. Without it the rows above would pass against a build that had simply
+    // stopped dispatching this op at all. A brief the concierge composed still asks for approval,
+    // exactly as before — the gate narrows one shape, it does not seize the tool.
+    setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] });
+    const r = await send("STOP — you are 42 commits ahead of origin/main", ask);
+    expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
+  });
+
+  it("lets a relay through to the approval gate when he NAMED the agent", async () => {
+    setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: ["ag-unnamed"] });
+    expect(refusal(await send(FOUNDER, ask)).code).toBe(REGISTRY_CODES.needsApproval);
   });
 });

@@ -203,7 +203,9 @@ export function foldKeyOf(
   if (mark.hasDetail === true) return null;
 
   switch (mark.kind) {
-    case "sent":
+    // BRACED, because the arm declares a binding. `no-case-declarations` is active for this package
+    // and `pnpm -r lint` treats it as an error — a gate `pnpm verify` deliberately does not run.
+    case "sent": {
       // A PICKER PRESS IS NOT A MESSAGE, and it does not share a bucket with one — the individual
       // lines are already careful to say which happened ("Answered X's prompt." vs "Sent to X's
       // terminal."), and a fold that merged them would undo that distinction wholesale.
@@ -212,7 +214,24 @@ export function foldKeyOf(
       // write lands now, an inbox message waits for the agent's next turn, a held one waits for a
       // PTY that may never come up. "Sent to 16 agents" over a mixture would be true of none of
       // them.
-      return `sent:${mark.channel ?? "terminal"}`;
+      //
+      // ══ AND SO IS WHOSE WORDS WENT (bead `sparkle-p9s5q`) ═══════════════════════════════════
+      // Same rule one level in: a relay of the founder's words and a brief the concierge composed
+      // say DIFFERENT SENTENCES ("Sent to X's terminal" vs "Concierge wrote to X"), so one count
+      // over a mixture is true of neither — and the sentence it would land on is the stronger claim,
+      // that his private words reached the fleet. Exactly the false claim this change removes, back
+      // through the fold.
+      //
+      // TERMINAL ONLY, because that is the only channel whose wording carries the distinction. The
+      // inbox and held sentences ("Left X a message", "Holding a message for X") already read as the
+      // concierge's own act, so splitting their buckets would double the arms below to say the same
+      // thing twice.
+      const channel = mark.channel ?? "terminal";
+      if (channel === "terminal" && mark.relayedFounderWords !== true) {
+        return "sent:terminal:concierge";
+      }
+      return `sent:${channel}`;
+    }
     case "spawned":
       return "spawned";
     case "closed":
@@ -654,6 +673,23 @@ export function receiptRunLine(run: ReceiptRun): Line {
         repeats
           ? line`Sent ${n} messages to ${whose} ${theirs("terminal")}.`
           : line`Sent to ${whose} ${theirs("terminal")}.`,
+        run.members,
+      );
+    // THE CONCIERGE'S OWN BRIEFS, folded — and still ATTRIBUTED (bead `sparkle-p9s5q`). The founder
+    // was offered "show nothing at all" for these and rejected it: "He needs to keep seeing what I
+    // send to his fleet. 'Nothing at all' would fix the misattribution by removing his visibility,
+    // which is a worse trade." So the fold keeps the count and the pills exactly as the relay arm
+    // above does; only the author changes, and it is now stated instead of left to be inferred.
+    //
+    // NO POSSESSIVE `terminal` NOUN HERE, unlike the arm above. That phrasing exists to say WHERE a
+    // message landed, which is the interesting fact when it was the founder's message; for the
+    // concierge's own traffic the interesting fact is WHO wrote it, and stacking both makes a
+    // sentence nobody scans.
+    case "sent:terminal:concierge":
+      return withSubjects(
+        repeats
+          ? line`Concierge wrote ${n} messages to ${who}.`
+          : line`Concierge wrote to ${who}.`,
         run.members,
       );
     case "sent:inbox":

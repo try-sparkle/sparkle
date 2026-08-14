@@ -15,6 +15,12 @@ function receipt(over: Partial<ConciergeActionReceipt> = {}): ConciergeActionRec
     agentId: AGENT.id,
     agentName: AGENT.name,
     channel: "terminal",
+    // A RELAY OF THE FOUNDER'S WORDS — stated, because the sentence now depends on it. Every test
+    // below that pins "Sent to X's terminal." is testing the RELAY wording (pill degradation, the
+    // singular terminal noun, the "that agent" fallback), so the fixture has to be the shape those
+    // sentences belong to. A composed send is a different sentence with its own tests, at the bottom
+    // of this file (bead `sparkle-p9s5q`).
+    relayedFounderWords: true,
     at: 1_769_649_600_123,
     op: "terminal.send_to_agent_terminal",
     ...over,
@@ -447,5 +453,66 @@ describe("a retirement is reported as its own act, with its reason", () => {
     expect(foldKeyOf(receiptMark(receipt({ kind: "closed", channel: undefined }), resolve))).toBe(
       "closed",
     );
+  });
+});
+
+// ══ WHOSE WORDS WENT — bead `sparkle-p9s5q` ══════════════════════════════════════════════════════
+//
+// The founder asked the concierge a question, the concierge wrote its OWN brief to two agents in
+// that same turn, and the column rendered his message as though he had forwarded it to them. The
+// badge on his bubble is gated elsewhere (ConciergeHost); this file owns the SENTENCE, which used to
+// be silent about authorship and so could be read either way.
+describe("a concierge-composed send says so", () => {
+  /** A terminal send the concierge wrote itself: everything the relay fixture has, minus the one
+   *  field that licenses a claim about the founder's words. */
+  const composed = (over: Partial<ConciergeActionReceipt> = {}) =>
+    receipt({ relayedFounderWords: undefined, ...over });
+
+  it("attributes the concierge's own brief to the concierge", () => {
+    expect(actionReceiptLine(composed(), resolve)?.spoken).toBe("Concierge wrote to Left Pair.");
+  });
+
+  it("does NOT claim the founder's message was sent anywhere", () => {
+    // The exact wording the founder read as a forward. It must not appear over text he never wrote.
+    const spoken = actionReceiptLine(composed(), resolve)!.spoken;
+    expect(spoken).not.toContain("Sent to");
+  });
+
+  it("still RENDERS — his visibility into the fleet is not what was wrong", () => {
+    // His explicit correction when offered "show nothing at all": "He needs to keep seeing what I
+    // send to his fleet." So the row exists, names the agent, and keeps its clickable pill.
+    const l = actionReceiptLine(composed(), resolve)!;
+    expect(l.md).toContain(`sparkle-agent:${AGENT.id}`);
+    expect(l.spoken).toContain("Left Pair");
+  });
+
+  it("keeps the RELAY wording when the send really did carry his words", () => {
+    // The positive control, and the reason this pair is not vacuous: the same fixture with the flag
+    // set takes the other arm, so these tests pin the FLAG rather than the fixture.
+    expect(actionReceiptLine(receipt(), resolve)?.spoken).toBe("Sent to Left Pair's terminal.");
+  });
+
+  it("folds in its OWN bucket, so a count can never span both claims", () => {
+    const relayKey = foldKeyOf(receiptMark(receipt(), resolve));
+    const composedKey = foldKeyOf(receiptMark(composed(), resolve));
+    // Both still fold — this is a split, not a refusal to fold.
+    expect(relayKey).toBeTruthy();
+    expect(composedKey).toBeTruthy();
+    // …but never onto each other. One count over a mixture would land on the stronger claim.
+    expect(composedKey).not.toBe(relayKey);
+  });
+
+  it("leaves the inbox and held channels alone — their wording never claimed authorship", () => {
+    expect(actionReceiptLine(composed({ channel: "inbox" }), resolve)?.spoken).toBe(
+      "Left Left Pair a message — it delivers at their next turn.",
+    );
+    expect(actionReceiptLine(composed({ channel: "held" }), resolve)?.spoken).toBe(
+      "Holding a message for Left Pair — it goes in when its terminal is ready.",
+    );
+  });
+
+  it("leaves a REFUSED send alone — nothing was written, by anyone", () => {
+    const l = actionReceiptLine(composed({ ok: false, reason: "that agent is mid-turn" }), resolve);
+    expect(l?.spoken).not.toContain("Concierge wrote to");
   });
 });

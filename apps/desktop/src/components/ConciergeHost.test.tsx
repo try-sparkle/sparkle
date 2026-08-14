@@ -268,6 +268,7 @@ import { SENT_TO_AGENT_TESTID } from "./Concierge/SentToAgentRow";
 // The REAL seam the relay-stamp suite drives, rather than a mock of it: the production effect
 // subscribes to this module, so recording here is the same event the settler emits.
 import {
+  currentConciergeTurnContent,
   currentConciergeTurnOrigin,
   recordConciergeActionReceipt,
   type ConciergeActionReceipt,
@@ -3873,7 +3874,13 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
     return row?.dataset.messageId ?? "";
   }
 
-  /** Record a receipt the way the settler does, with whatever overrides the case is about. */
+  /** Record a receipt the way the settler does for a GENUINE RELAY of the founder's words, with
+   *  whatever overrides the case is about.
+   *
+   *  `relayedFounderWords` is in the base because every case below is about a message that really
+   *  did carry his words — the join, the exclusions, his own aim outranking an inferred one. A send
+   *  the CONCIERGE composed is a different population with its own block at the end of this
+   *  describe, and it is the one the founder reported (bead `sparkle-p9s5q`). */
   function relay(over: Partial<ConciergeActionReceipt> = {}) {
     act(() =>
       recordConciergeActionReceipt({
@@ -3883,6 +3890,7 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
         channel: "terminal",
         agentId: AGENT.id,
         agentName: AGENT.name,
+        relayedFounderWords: true,
         at: Date.now(),
         op: "terminal.send_to_agent_terminal",
         ...over,
@@ -3946,6 +3954,36 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
     expect(currentConciergeTurnOrigin()).toBeNull();
   });
 
+  // ══ THE WIRING NOTHING ELSE SEES (bead `sparkle-p9s5q`) ═══════════════════════════════════════
+  //
+  // Both new guards read the turn's CONTENT — the founder's words and the agents he named. Every
+  // other test of those guards SETS that state by hand, which is the right way to test a decision
+  // and is structurally blind to the one line that supplies the real value. Delete the publish in
+  // this host and the relay gate would allow every send, the badge would never appear, and each of
+  // those suites would stay green: the defaulted-seam trap in AGENTS.md, exactly.
+  //
+  // So this drives the REAL send and reads what the module actually holds.
+  it("publishes the founder's own words with the turn, not just the bubble id", async () => {
+    await sendPlain("please rebase this branch onto origin/main");
+    expect(currentConciergeTurnContent().text).toBe("please rebase this branch onto origin/main");
+  });
+
+  it("drops his words when the turn ends, so they cannot be read against the NEXT send", async () => {
+    // Stale founder text is the turn-proximity error one level down: a send in the next turn judged
+    // a relay of the last turn's words.
+    await sendPlain("please rebase this branch onto origin/main");
+    cleanup();
+    expect(currentConciergeTurnContent().text).toBeUndefined();
+    expect(currentConciergeTurnContent().mentionedAgentIds).toEqual([]);
+  });
+
+  it("names nobody for a message that names nobody — the common case, and the strict one", async () => {
+    // The founder's own reported message. An empty list is what makes the gate refuse a relay of it,
+    // so this is the value the whole send-side fix turns on.
+    await sendPlain("You should have better memory now. can you tell me if that's true?");
+    expect(currentConciergeTurnContent().mentionedAgentIds).toEqual([]);
+  });
+
   it("never overwrites an agent the USER addressed himself", async () => {
     // His own aim outranks anything inferred. Renaming his destination under him is the one error
     // this whole feature exists to prevent, so it must not be reachable from the relay path.
@@ -3972,6 +4010,59 @@ describe("ConciergeHost — the concierge relays a message, and says so ON the b
     const after = (await within(thread()).findByTestId(SENT_TO_AGENT_TESTID)).textContent ?? "";
     expect(after).toBe(before);
     expect(after).not.toContain("Some Other Agent");
+  });
+
+  // ══ THE REPORTED BUG — bead `sparkle-p9s5q` ═══════════════════════════════════════════════════
+  //
+  // "why are you sending what i ask you to agents, like this?"
+  //
+  // The founder asked the concierge whether its memory had improved. In that same turn the concierge
+  // wrote two briefs OF ITS OWN to two agents — "STOP — you are 42 commits ahead of origin/main" and
+  // "commit your untracked files" — and his question came back stamped `Sent to: @Drodio.com
+  // Publishing MCP`. It had gone nowhere. Every guard above passed, because every one of them asks
+  // whether a send HAPPENED and none asked whether it was HIS.
+  //
+  // These rows are the ones that would have caught it. They drive the same real subscription the
+  // rows above do; the only thing that changes is whether the receipt claims to carry his words.
+  describe("a send the CONCIERGE composed is not a forward of his message", () => {
+    it("puts NO card on his bubble", async () => {
+      const origin = await sendPlain("You should have better memory now. can you tell me if that's true?");
+      // The receipt the settler mints for a brief the concierge wrote itself: a real, successful,
+      // delivered terminal send to a real agent, during his turn — and not his words.
+      relay({ originBubbleId: origin, relayedFounderWords: undefined });
+      await settle();
+      expect(card()).toBe("no");
+      expect(within(thread()).queryByTestId(SENT_TO_AGENT_TESTID)).toBeNull();
+    });
+
+    it("still marks the bubble when the send DID carry his words", async () => {
+      // THE POSITIVE CONTROL, and without it the row above is vacuous — it would pass against a
+      // build that had simply stopped drawing the card at all. Same helper, same turn, one field.
+      const origin = await sendPlain("You should have better memory now. can you tell me if that's true?");
+      relay({ originBubbleId: origin });
+      await waitFor(() => expect(card()).toBe("yes"));
+    });
+
+    it("leaves his bubble bare even when TWO composed sends land in one turn", async () => {
+      // The reported turn exactly: two agents, two briefs, one question of his. Neither may claim
+      // his message, and the second must not sneak past a guard the first tripped.
+      const origin = await sendPlain("You should have better memory now. can you tell me if that's true?");
+      relay({ originBubbleId: origin, relayedFounderWords: undefined, agentId: "ag-pub", agentName: "Drodio.com Publishing MCP" });
+      relay({ originBubbleId: origin, relayedFounderWords: undefined, agentId: "ag-eyes", agentName: "Sparkle Preview Agent Eyes" });
+      await settle();
+      expect(card()).toBe("no");
+    });
+
+    it("does not let a composed send be UPGRADED by a later relay to another agent", async () => {
+      // Order independence. A composed send followed by a genuine relay must mark the relay's agent
+      // and nobody else — the composed one never earned a claim it could pass along.
+      const origin = await sendPlain();
+      relay({ originBubbleId: origin, relayedFounderWords: undefined, agentId: "ag-pub", agentName: "Drodio.com Publishing MCP" });
+      relay({ originBubbleId: origin });
+      const row = await within(thread()).findByTestId(SENT_TO_AGENT_TESTID);
+      expect(row.textContent).toContain(AGENT.name);
+      expect(row.textContent).not.toContain("Drodio.com Publishing MCP");
+    });
   });
 });
 

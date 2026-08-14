@@ -253,6 +253,9 @@ import {
 } from "./Concierge/conciergeLine";
 import type { Line } from "./Concierge/conciergeLine";
 import { actionReceiptLine, receiptMark } from "./Concierge/actionReceiptLine";
+// WHO THE FOUNDER NAMED in a message — published with the turn so the send gate can tell a relay he
+// aimed from one he never asked for (bead `sparkle-p9s5q`).
+import { namedAgentIds } from "./Concierge/namedAgents";
 import {
   noteConciergeTurnForPromises,
   promiseVerbPhrase,
@@ -3878,8 +3881,41 @@ export function ConciergeHost({
   // be stamped with it. That is not merely stale: message ids survive rehydration, so a remounted
   // thread can contain the very id left behind, and the receipt would mark a message whose turn
   // ended long ago. Clearing is the same fail-closed rule the reader end follows.
+  //
+  // ══ AND THE TURN'S CONTENT TRAVELS WITH ITS ID (bead `sparkle-p9s5q`) ═════════════════════════
+  // The id alone answers WHICH message was in flight. It was being read as the answer to a question
+  // it cannot answer — "did this send carry what he wrote?" — and the two coincide only while the
+  // concierge is relaying. When it composes its own brief they are unrelated, and his bubble was
+  // stamped `Sent to: @<agent>` for a forward that never happened.
+  //
+  // So what he WROTE and who he NAMED go out with the id, and the two guards that need to tell a
+  // relay from a composition read them at call entry: the send gate
+  // (services/conciergeTools/relayGate) and the badge gate (`stampRelayReceipt` below).
+  //
+  // READ THROUGH THE REFS, not from render scope. Both are assigned in effects declared far above
+  // this one, so on the commit that adds the bubble and sets `awaitingId` they are already current —
+  // and keeping this effect's dep list at `[awaitingId]` is what makes it fire exactly once per
+  // turn rather than on every keystroke that reshapes the thread.
   useEffect(() => {
-    setConciergeTurnOrigin(awaitingId);
+    const bubble = awaitingId
+      ? chatRef.current.find((m) => m.id === awaitingId && m.kind === "you")
+      : undefined;
+    setConciergeTurnOrigin(
+      awaitingId,
+      bubble?.kind === "you"
+        ? {
+            text: bubble.text,
+            // `mentions` is only the `@`-picker's resolved list; `namedAgentIds` widens it to agents
+            // he named in prose. Deliberately generous — see Concierge/namedAgents: every id here can
+            // only ALLOW a relay, never cause a badge.
+            mentionedAgentIds: namedAgentIds(
+              bubble.text,
+              bubble.mentions,
+              mentionAgentsRef.current,
+            ),
+          }
+        : undefined,
+    );
     return () => setConciergeTurnOrigin(null);
   }, [awaitingId]);
 
@@ -4461,6 +4497,26 @@ export function ConciergeHost({
         // single destination to name.
         if (receipt.kind !== "sent" || !receipt.ok || receipt.viaPicker || receipt.fanout) return;
         if (!receipt.agentId) return;
+        // ══ AND IT MUST ACTUALLY CARRY HIS WORDS (bead `sparkle-p9s5q`) ══════════════════════════
+        // THE GUARD THIS WHOLE FEATURE WAS MISSING. Every test above asks whether a send HAPPENED;
+        // none of them asked whether it was HIS. So a brief the concierge composed itself — "STOP —
+        // you are 42 commits ahead of origin/main" — cleared all of them on the strength of having
+        // started during his turn, and painted `Sent to: @Drodio.com Publishing MCP` onto a question
+        // about his memory that had gone nowhere. Twice, on two different messages, both screenshot.
+        //
+        // The badge is a DELIVERY CLAIM ABOUT HIS PRIVATE WORDS, and a claim that can be wrong is
+        // worth less than no claim: he then has to assume everything he types is reaching the fleet.
+        // So it is licensed by CONTENT — judged at call entry in services/controlListener against
+        // the turn's own text — and never by turn proximity again.
+        //
+        // FAIL-CLOSED, matching the origin check above: absent means make no claim. A genuine relay
+        // that goes unbadged loses nothing he cannot see, because the receipt line below the bubble
+        // still reports the send; a false badge is the entire bug.
+        //
+        // THE CONCIERGE'S OWN SENDS ARE NOT HIDDEN by this — they keep their receipt line, worded so
+        // it reads as the concierge's action (Concierge/actionReceiptLine). His ruling: "He needs to
+        // keep seeing what I send to his fleet."
+        if (!receipt.relayedFounderWords) return;
         // "held" is NOT a delivery — it means the message goes in when the terminal is ready — so it
         // must not turn the bubble into a card claiming it went. Terminal and inbox both did arrive.
         if (receipt.channel !== "terminal" && receipt.channel !== "inbox") return;

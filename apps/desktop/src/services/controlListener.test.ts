@@ -4668,6 +4668,93 @@ describe("controlListener", () => {
         expect(received[0]!.originBubbleId).toBeUndefined();
       });
 
+      // ══ AND WHOSE WORDS THE CALL CARRIED — same seam, same discipline (bead `sparkle-p9s5q`) ══
+      //
+      // THE OTHER PRODUCTION SEAM NOTHING ELSE SEES (roborev 64196). This positional argument is the
+      // only producer of `relayedFounderWords` on a receipt: every badge test hand-sets the flag on a
+      // fixture and every gate test calls `setConciergeTurnOrigin` directly, so deleting the argument
+      // leaves the badge permanently absent with all of those suites green.
+      const relaySend = (reqId: string, text: string) => {
+        dispatchConciergeToolMock.mockImplementationOnce(async () => ({
+          ok: true,
+          domain: "terminal",
+          op: "send_to_agent_terminal",
+          data: { ok: true, agentId: "agent-x", agentName: "CI Hardening", channel: "terminal" },
+        }));
+        fire({
+          reqId,
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            args: { agentId: "agent-x", text },
+            toolCallId: reqId,
+          },
+        });
+      };
+
+      it("marks a receipt whose text CARRIES the founder's words", async () => {
+        setConciergeTurnOrigin("bubble-1", {
+          text: "please rebase this branch onto origin/main",
+          mentionedAgentIds: ["agent-x"],
+        });
+        relaySend("r-relay", "Passing along: please rebase this branch onto origin/main");
+        await flush();
+        expect(received).toHaveLength(1);
+        expect(received[0]!.relayedFounderWords).toBe(true);
+      });
+
+      it("leaves a brief the CONCIERGE composed unmarked — the reported bug", async () => {
+        // The paired negative, and the one that matters: this is the shape that was stamping
+        // `Sent to: @X` on a message that never left the room.
+        setConciergeTurnOrigin("bubble-1", {
+          text: "You should have better memory now. can you tell me if that's true?",
+          mentionedAgentIds: [],
+        });
+        relaySend("r-composed", "STOP — you are 42 commits ahead of origin/main");
+        await flush();
+        expect(received).toHaveLength(1);
+        expect(received[0]!.relayedFounderWords).toBeUndefined();
+      });
+
+      it("judges it at ENTRY, not at settle — the same displaced-turn hazard as the origin", async () => {
+        // The turn's TEXT moves mid-call, exactly as the bubble id does above. An entry read judges
+        // against what he actually wrote when the call started; a settle read judges against the next
+        // message and would mark a send as carrying words it never saw.
+        setConciergeTurnOrigin("bubble-1", {
+          text: "please rebase this branch onto origin/main",
+          mentionedAgentIds: ["agent-x"],
+        });
+        dispatchConciergeToolMock.mockImplementationOnce(async () => {
+          setConciergeTurnOrigin("bubble-2", {
+            text: "something else entirely, about the booking flow",
+            mentionedAgentIds: [],
+          });
+          return {
+            ok: true,
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            data: { ok: true, agentId: "agent-x", agentName: "CI Hardening", channel: "terminal" },
+          };
+        });
+        fire({
+          reqId: "r-displaced",
+          op: "concierge_tool",
+          callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+          payload: {
+            domain: "terminal",
+            op: "send_to_agent_terminal",
+            args: { agentId: "agent-x", text: "please rebase this branch onto origin/main" },
+            toolCallId: "tc-displaced",
+          },
+        });
+        await flush();
+        expect(received).toHaveLength(1);
+        // A settle-time read would have compared against bubble-2's unrelated text and answered false.
+        expect(received[0]!.relayedFounderWords).toBe(true);
+      });
+
       it("publishes exactly one receipt for a spawn, carrying the id from the REPLY", async () => {
         dispatchConciergeToolMock.mockImplementationOnce(async () => ({
           ok: true,

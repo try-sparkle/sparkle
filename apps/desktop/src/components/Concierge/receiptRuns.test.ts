@@ -22,7 +22,12 @@ import {
 import type { ConciergeActionReceipt } from "../../services/conciergeReceipts";
 import type { ConciergeMessage, ConciergeReceiptMark } from "./types";
 
-/** A successful terminal send to `name`, as the thread would hold it. */
+/** A successful terminal RELAY of the founder's words to `name`, as the thread would hold it.
+ *
+ *  `relayedFounderWords` is set because this fixture's own `text` reads "Sent to X's terminal" — the
+ *  relay sentence. A mark that omitted it would be a row whose sentence and whose fold bucket
+ *  disagreed about who wrote the message (bead `sparkle-p9s5q`). Concierge-composed runs have their
+ *  own fixture and their own tests below. */
 function sent(
   id: string,
   name: string,
@@ -36,11 +41,22 @@ function sent(
       kind: "sent",
       ok: true,
       channel: "terminal",
+      relayedFounderWords: true,
       subjectId: `${id}-agent`,
       subjectName: name,
       ...over,
     },
   };
+}
+
+/** The same send, but the text was the CONCIERGE'S OWN — the population that used to be rendered as
+ *  a forward of the founder's message. */
+function composed(
+  id: string,
+  name: string,
+  over: Partial<ConciergeReceiptMark> = {},
+): ConciergeMessage {
+  return sent(id, name, { relayedFounderWords: undefined, ...over });
 }
 
 /** A REFUSED send — the population that must never be swallowed. */
@@ -130,10 +146,22 @@ describe("foldKeyOf — which receipts may fold at all", () => {
   });
 
   it("folds the ordinary successes", () => {
-    expect(foldKeyOf({ kind: "sent", ok: true, channel: "terminal" })).toBe(
-      "sent:terminal",
-    );
+    expect(
+      foldKeyOf({ kind: "sent", ok: true, channel: "terminal", relayedFounderWords: true }),
+    ).toBe("sent:terminal");
     expect(foldKeyOf({ kind: "spawned", ok: true })).toBe("spawned");
+  });
+
+  it("buckets a mark that does NOT claim the founder's words as the concierge's own", () => {
+    // FAIL-CLOSED, and the direction matters (bead `sparkle-p9s5q`). A mark with no
+    // `relayedFounderWords` has not shown that his words went anywhere, so it may not join the
+    // bucket whose sentence says they did. That also covers a mark rehydrated from a thread
+    // persisted before this field existed: such a row is re-bucketed as the concierge's, which
+    // understates nothing and asserts nothing — the opposite default would keep asserting a forward
+    // no one can now verify.
+    expect(foldKeyOf({ kind: "sent", ok: true, channel: "terminal" })).toBe(
+      "sent:terminal:concierge",
+    );
   });
 
   it("returns null for a message carrying no mark at all", () => {
@@ -1125,5 +1153,77 @@ describe("what the verbatim door newly reaches", () => {
     expect(one.kind === "sparkle" ? one.actionReceipt?.reason : undefined).toBe(
       "that agent is mid-turn",
     );
+  });
+});
+
+// ══ A RELAY AND A COMPOSITION ARE TWO CLAIMS — bead `sparkle-p9s5q` ══════════════════════════════
+//
+// The fold's whole contract is that the folded sentence is TRUE of every row it stands for. Before
+// this split there was one `sent:terminal` bucket, so a turn mixing a relay of the founder's words
+// with the concierge's own briefs collapsed onto "Sent to N agents' terminals." — a sentence that is
+// true of one of them and, for the rest, is exactly the false forward he reported.
+describe("whose words went is a fold boundary", () => {
+  /** Every folded run in `messages`, in order. Uses the module's own row type rather than a guess. */
+  const runsOf = (messages: ConciergeMessage[]): ReceiptRun[] =>
+    foldReceiptRuns(messages).flatMap((r) => (r.type === "receipt-run" ? [r] : []));
+
+  const markOf = (m: ConciergeMessage) =>
+    m.kind === "sparkle" ? m.actionReceipt : undefined;
+
+  it("never folds a relay together with a concierge-composed send", () => {
+    expect(markOf(sent("s1", "Alpha"))).toBeTruthy();
+    expect(foldKeyOf(markOf(sent("s1", "Alpha")))).toBe("sent:terminal");
+    expect(foldKeyOf(markOf(composed("s2", "Beta")))).toBe("sent:terminal:concierge");
+    expect(foldKeyOf(markOf(composed("s2", "Beta")))).not.toBe(
+      foldKeyOf(markOf(sent("s1", "Alpha"))),
+    );
+  });
+
+  it("renders a mixed turn as TWO rows, each true of its own members", () => {
+    // The reported turn's shape: one message he aimed, plus briefs the concierge wrote itself.
+    const runs = runsOf([
+      sent("s1", "Alpha"),
+      sent("s2", "Beta"),
+      composed("s3", "Gamma"),
+      composed("s4", "Delta"),
+    ]);
+    expect(runs).toHaveLength(2);
+    // `spoken` carries the subject residue after the sentence, so match on the sentence itself.
+    const said = runs.map((r) => receiptRunLine(r).spoken);
+    expect(said.some((s) => s.startsWith("Sent to 2 agents' terminals."))).toBe(true);
+    expect(said.some((s) => s.startsWith("Concierge wrote to 2 agents."))).toBe(true);
+  });
+
+  it("attributes a folded run of the concierge's own briefs, and still names every agent", () => {
+    // His correction: the row must not disappear. It keeps the count and the pills; only the author
+    // changes. Sixteen composed briefs are the wall the fold exists for — attribution does not
+    // reintroduce it.
+    const runs = runsOf(Array.from({ length: 16 }, (_, i) => composed(`c${i}`, `Agent ${i}`)));
+    expect(runs).toHaveLength(1);
+    const l = receiptRunLine(runs[0]!);
+    expect(l.spoken).toContain("Concierge wrote to 16 agents.");
+    // Never the forward wording, so no reading of this row claims his message went out.
+    expect(l.spoken).not.toContain("Sent to");
+    // The navigation the unfolded rows had survives — one pill per agent.
+    expect(l.md.match(/sparkle-agent:/g) ?? []).toHaveLength(16);
+  });
+
+  it("says MESSAGES and AGENTS separately for composed briefs too", () => {
+    // Two briefs to ONE agent — the SAME subject id, which is what makes this the repeats case
+    // rather than two agents that happen to share a name.
+    const runs = runsOf([
+      composed("c1", "Alpha", { subjectId: "same-agent" }),
+      composed("c2", "Alpha", { subjectId: "same-agent" }),
+    ]);
+    // "Concierge wrote to 1 agent." would understate the traffic, exactly as "Sent to 1 agents'
+    // terminals." would have — the agreement bug this module already fixed once, on the new arm.
+    expect(receiptRunLine(runs[0]!).spoken).toContain("Concierge wrote 2 messages to 1 agent.");
+  });
+
+  it("leaves the inbox and held buckets un-split — their wording never claimed authorship", () => {
+    const inbox = foldKeyOf({ kind: "sent", ok: true, channel: "inbox" });
+    const held = foldKeyOf({ kind: "sent", ok: true, channel: "held" });
+    expect(inbox).toBe("sent:inbox");
+    expect(held).toBe("sent:held");
   });
 });

@@ -121,6 +121,11 @@ export function receiptMark(
     channel: receipt.channel,
     fanout: receipt.fanout,
     viaPicker: receipt.viaPicker,
+    // WHOSE WORDS WENT — carried so the fold buckets on the same distinction the sentence above just
+    // drew. Read off the SAME field that arm reads, for the same reason `hasDetail` and `gist` are:
+    // a mark that decided this differently could fold a relay together with a composition, and the
+    // single count they collapsed onto would assert the founder's words reached the fleet.
+    relayedFounderWords: receipt.relayedFounderWords,
     failed: receipt.failed,
     // A SUCCESS CAN STILL CARRY SOMETHING THE READER HAS TO ACT ON. `reason` on an `ok` receipt is
     // the spawn shortfall — the agent is up but unbriefed — and the success arm below renders it as
@@ -318,6 +323,22 @@ export function actionReceiptLine(
           ? line`Left a message for several agents — it delivers at each one's next turn.`
           : line`Left ${subject} a message — it delivers at their next turn.`;
       }
+      // ══ WHOSE WORDS WENT? — the founder's, or the concierge's own (bead `sparkle-p9s5q`) ══════
+      // "Sent to X's terminal" is silent about authorship, and that silence is what let the column
+      // read as though his message had been forwarded. The badge on his bubble is now gated on the
+      // answer (ConciergeHost's `stampRelayReceipt`), and this row states it, so the two surfaces
+      // cannot be read against each other and reach different conclusions.
+      //
+      // IT IS A RELABEL, NOT A SUPPRESSION, and that was the founder's explicit correction when
+      // offered the choice: "He needs to keep seeing what I send to his fleet. 'Nothing at all'
+      // would fix the misattribution by removing his visibility, which is a worse trade." So a
+      // concierge-composed send keeps its row and gains an author.
+      //
+      // NAMED "Concierge", first-person-avoidant on purpose: this line sits in a thread where the
+      // concierge is also the narrator, and "I wrote to X" is one voice for two different claims —
+      // the sentence has to be readable as a statement about WHO acted, at a glance, in a column he
+      // is scanning rather than reading.
+      if (!receipt.relayedFounderWords) return line`Concierge wrote to ${subject}.`;
       return line`Sent to ${subject}'s terminal.`;
     }
 

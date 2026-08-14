@@ -95,7 +95,10 @@ import { noteConciergeAuditCall } from "./conciergeAudit";
 // imagined sending it" look identical. A receipt outlives the turn; the classifier decides which
 // calls earn one.
 import { settleConciergeReceipt } from "./conciergeReceiptSettle";
-import { currentConciergeTurnOrigin } from "./conciergeReceipts";
+import { currentConciergeTurnContent, currentConciergeTurnOrigin } from "./conciergeReceipts";
+// Tells a RELAY of the founder's words from a brief the concierge composed — see the module header
+// for the two measured incidents this exists to stop (bead `sparkle-p9s5q`).
+import { carriesFounderWords } from "./relayDerivation";
 import { CONCIERGE_RECEIPT_APP_OPS } from "./conciergeReceiptClassifier";
 import { conciergeToolConfigPath } from "./conciergeTools/policy";
 import { appOpPolicy, chiefOpPolicy, configuredToolPolicy } from "./conciergeTools/policyBinding";
@@ -2542,6 +2545,22 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
   // cause it — and the concierge paints that attribution as a black "sent to an agent" card, which
   // is a delivery claim. See `setConciergeTurnOrigin` in ./conciergeReceipts (roborev 62737).
   const originBubbleId = currentConciergeTurnOrigin() ?? undefined;
+  // AND WHETHER THIS CALL CARRIES HIS OWN WORDS — judged HERE, at entry, against the turn's text,
+  // for exactly the reason the id above is captured here (bead `sparkle-p9s5q`). The id says which
+  // message was in flight; it cannot say whether this send is a RELAY of that message, and reading
+  // it as though it could is what stamped `Sent to: @<agent>` on a bubble that never left the room.
+  //
+  // `args.text` is the only field either send op carries the message in (`send_to_agent_terminal`
+  // and `inbox_send` both), read defensively because this payload came off a wire a model assembled.
+  // Computed for EVERY op rather than only the send ones: the flag is attached only to a `sent`
+  // receipt (see the settler), so a match on some other op's unrelated `text` field cannot escape,
+  // and an op list kept here would be one more thing to forget to update.
+  const relayedFounderWords = carriesFounderWords(
+    currentConciergeTurnContent().text,
+    typeof (req.payload.args as Record<string, unknown> | undefined)?.text === "string"
+      ? ((req.payload.args as Record<string, unknown>).text as string)
+      : undefined,
+  );
   // Read defensively: this payload was assembled by a model's MCP client, and the reply has to name
   // the domain/op it was asked about even when they arrive as the wrong type.
   const domain = typeof req.payload.domain === "string" ? req.payload.domain : "";
@@ -2647,6 +2666,10 @@ async function handleConciergeTool(req: ControlRequest): Promise<ConciergeToolRe
       auditReply.code,
       // Captured at ENTRY, above — not read here. See the note at the top of this function.
       originBubbleId,
+      // Likewise judged at ENTRY. By the time this `finally` runs the turn may have moved on, and a
+      // comparison against the NEXT message's words is the same class of error as reading the
+      // awaiting bubble at settle time.
+      relayedFounderWords,
     );
   }
 }

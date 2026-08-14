@@ -144,6 +144,24 @@ export interface ConciergeApprovalRequest {
    * replay can only ever be the call the human read and agreed to.
    */
   rawArgs: unknown;
+  /**
+   * Did this call carry the FOUNDER'S OWN WORDS — judged when the approval was RAISED, which is the
+   * only moment anyone can still tell (bead `sparkle-p9s5q`, roborev 64197).
+   *
+   * WHY IT HAS TO BE CAPTURED HERE. Approving RUNS the call from a click handler, arbitrarily long
+   * after the requesting turn ended — and `services/relayDerivation`'s question is asked against the
+   * turn's own text, which by then has been dropped. So the resumed call cannot re-derive this; it
+   * can only carry what the first call worked out.
+   *
+   * It matters because the receipt line now states AUTHORSHIP. Without this field an approved,
+   * genuine relay of his words settles with the flag absent and renders "Concierge wrote to @X" —
+   * an affirmative claim that the concierge composed something it merely forwarded, on the path MOST
+   * terminal sends take (`send_to_agent_terminal` is `disruptive`, so its default decision is `ask`).
+   * The old wording was neutral, so this is not a withheld claim but a wrong one.
+   *
+   * Absent means "no relay claim", matching every other fail-closed reader of this verdict.
+   */
+  relayedFounderWords?: true;
   /** `concierge.tools.<op>` — named in the card so "stop asking me" is one click from discoverable. */
   configPath: string;
   /** Canonical identity of this exact call. Build with {@link approvalFingerprint}. */

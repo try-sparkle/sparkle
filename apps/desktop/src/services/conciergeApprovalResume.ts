@@ -92,6 +92,11 @@ export interface ApprovalResumeDeps {
     data: unknown,
     reason: string | undefined,
     code?: string,
+    /** The bubble this call belongs to. Always `undefined` here — see the call site. */
+    originBubbleId?: string,
+    /** Whether the call carried the founder's OWN words, judged when the approval was RAISED and
+     *  carried on the entry. The turn state it would be derived from is gone by click time. */
+    relayedFounderWords?: boolean,
   ) => void;
   /** Open an AUDIT entry for the call, returning its settler. The audit pane is the surface whose
    *  own header says it exists to answer "why didn't it do the thing I asked for" — so repairing
@@ -209,6 +214,16 @@ export async function resumeApprovedCall(
       ran.ok ? ran.data : undefined,
       ran.ok ? undefined : ran.message,
       ran.ok ? undefined : ran.code,
+      // NO ORIGIN BUBBLE, deliberately and unchanged: this runs from a click handler long after the
+      // requesting turn ended, so which message caused it is genuinely unknown and the card is
+      // withheld (services/conciergeReceipts). Passed explicitly rather than omitted so the
+      // provenance argument beside it is not sitting in a positional slot the reader has to count.
+      undefined,
+      // …but WHOSE WORDS these are IS known — the first call worked it out while the turn was live
+      // and the approval carried it here (bead `sparkle-p9s5q`, roborev 64197). Without this an
+      // approved genuine relay renders "Concierge wrote to @X", which is not a withheld claim but a
+      // WRONG one, on the path most terminal sends take.
+      entry.relayedFounderWords,
     );
     settleAudit(
       ran.ok ? { ok: true } : { ok: false, code: ran.code, message: ran.message },

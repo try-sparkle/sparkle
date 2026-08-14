@@ -138,6 +138,17 @@ export interface ConciergeActionReceipt {
   /** The `domain.op` behind this receipt. Carried for diagnostics and for a future audit join;
    *  the renderer must not key display off it — that is what {@link kind} is for. */
   op: string;
+  /** This `sent` receipt CARRIED THE FOUNDER'S OWN WORDS — it is a RELAY, not a brief the concierge
+   *  composed itself. Judged at call ENTRY against the turn's text (./relayDerivation), for the same
+   *  reason {@link originBubbleId} is captured there: a comparison made at settle time is made
+   *  against whatever turn happens to be in flight then.
+   *
+   *  IT IS THE ONLY LICENCE FOR THE `Sent to:` BADGE on his bubble (Concierge/SentToAgentRow). Absent
+   *  means the concierge wrote its own text, which still gets a receipt line — attributed to the
+   *  concierge — but never a claim that his message was forwarded (bead `sparkle-p9s5q`).
+   *
+   *  FAIL-CLOSED, like the origin beside it: absent means "make no claim", never "probably yes". */
+  relayedFounderWords?: true;
   /** WHICH USER BUBBLE CAUSED THIS, captured when the call STARTED — see `setConciergeTurnOrigin`.
    *  Absent when the call did not originate in a user turn (a proactive nudge) or when the origin
    *  was lost (an approval resumed from a click handler long after its turn ended). Absent means
@@ -171,16 +182,62 @@ export interface ConciergeActionReceipt {
 // FAIL-CLOSED: `undefined` means "no bubble may be marked", never "guess". A send whose origin was
 // lost simply gets no card — the receipt line below the bubble still reports it, so nothing is
 // hidden; only the stronger visual claim is withheld.
-let turnOrigin: string | null = null;
+//
+// ══ AND THE ORIGIN'S ID IS NOT ENOUGH ═══════════════════════════════════════════════════════════
+// The id answers WHICH message was in flight. It cannot answer WHETHER THIS SEND CARRIED THAT
+// MESSAGE, and reading it as though it could is bead `sparkle-p9s5q`: a concierge-composed brief,
+// sent during his turn, stamped his bubble as a forward of his words (see ./relayDerivation for the
+// two measured incidents). So the turn carries its CONTENT too — what he wrote, and which agents he
+// named — and the two guards that need to tell a relay from a composition read it from here.
+//
+// ONE RECORD, NOT TWO. The id and the content are facts about the same turn and are set in the same
+// place, so a second module holding half of them would be one forgotten edit away from attributing
+// a send using a bubble id from this turn and text from the last one.
+interface TurnState {
+  bubbleId: string | null;
+  /** Exactly what the founder typed this turn, when the host supplied it. */
+  text?: string;
+  /** Agents the founder NAMED — `@`-mentioned, or called by name in his prose. Resolved by the host,
+   *  which is the only layer holding the roster. Empty means he named nobody, which is the common
+   *  case and the one the send gate refuses a relay on. */
+  mentionedAgentIds: readonly string[];
+}
 
-/** Set by the concierge host as a user turn is dispatched, and cleared when it ends. */
-export function setConciergeTurnOrigin(bubbleId: string | null): void {
-  turnOrigin = bubbleId;
+let turn: TurnState = { bubbleId: null, mentionedAgentIds: [] };
+
+/** Set by the concierge host as a user turn is dispatched, and cleared when it ends.
+ *
+ *  `detail` is OPTIONAL so the existing single-argument call shape keeps working, and its absence is
+ *  fail-closed rather than merely lossy: a turn with no text can never satisfy `carriesFounderWords`,
+ *  and a turn with no named agents can never satisfy the send gate. A caller that does not know
+ *  says so by omission and gets the strict answer. */
+export function setConciergeTurnOrigin(
+  bubbleId: string | null,
+  detail?: { text?: string; mentionedAgentIds?: readonly string[] },
+): void {
+  turn = {
+    bubbleId,
+    // Dropped WITH the bubble id, never carried across turns. Stale founder text is worse than none:
+    // it would let a send in THIS turn be judged a relay of the LAST one's words.
+    text: bubbleId === null ? undefined : detail?.text,
+    mentionedAgentIds: bubbleId === null ? [] : (detail?.mentionedAgentIds ?? []),
+  };
 }
 
 /** The bubble a call starting RIGHT NOW belongs to. Read at call entry, never at settle. */
 export function currentConciergeTurnOrigin(): string | null {
-  return turnOrigin;
+  return turn.bubbleId;
+}
+
+/** What the founder wrote in the turn a call starting RIGHT NOW belongs to, and who he named.
+ *
+ *  Read at call ENTRY for exactly the reason the id is (see this section's header): a send judged
+ *  against whatever turn happens to be in flight when it SETTLES is judged against the wrong words. */
+export function currentConciergeTurnContent(): {
+  text?: string;
+  mentionedAgentIds: readonly string[];
+} {
+  return { text: turn.text, mentionedAgentIds: turn.mentionedAgentIds };
 }
 
 type ReceiptListener = (r: ConciergeActionReceipt) => void;
@@ -307,8 +364,11 @@ export function _resetConciergeReceiptsForTests(): void {
   // The replay buffer too, or one test's receipts are replayed into the next test's subscriber.
   recent.length = 0;
   // And the turn origin, or a test that dispatched a turn leaks its bubble id into the next one —
-  // where it would attribute a send to a message from a previous test.
-  turnOrigin = null;
+  // where it would attribute a send to a message from a previous test. Cleared through the SETTER
+  // rather than by assigning the field, so the turn's CONTENT — his words and the agents he named —
+  // is dropped with it. Assigning `bubbleId` alone would leave a previous test's founder text live,
+  // and the send gate reads that (services/conciergeTools/relayGate).
+  setConciergeTurnOrigin(null);
   // …and the posted-id set, which is the THIRD piece of module state here (roborev 57926). Every
   // receipts suite calls this reset and none of them knew to clear that separately, so a test
   // recording a receipt whose id a previous test had already "posted" would silently see it

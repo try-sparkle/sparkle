@@ -265,6 +265,22 @@ import {
   type MemoryResult,
 } from "./memory";
 import { conciergeToolConfigPath } from "./policy";
+// The founder's words go where HE aimed them — see ./relayGate for his ruling and for why this is a
+// refused SEND rather than a relabelled one.
+import { refuseUnaddressedRelay } from "./relayGate";
+
+/** Every op that carries a MESSAGE to an agent, and so can relay the founder's own words.
+ *
+ *  A SET RATHER THAN A CONDITION AT THE GATE, so the population is one named list a reader can check
+ *  against the receipt classifier's `kind: "sent"` arms. It was a single `op === …` test first, which
+ *  left the ruling walkable by picking `inbox_send` instead (roborev 64191). A new message-carrying
+ *  op must be added here; `relayGate.test.ts` pins the list against the classifier so a missing entry
+ *  is a red test rather than a silent hole. */
+export const RELAY_GATED_OPS = new Set<string>([
+  "send_to_agent_terminal",
+  "inbox_send",
+  "inbox_broadcast",
+]);
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
 // The SAME predicate spawn_worker gates on — one copy, shared, so the two dispatch surfaces cannot
@@ -358,6 +374,10 @@ export const REGISTRY_CODES = {
   unknownProject: "unknown-project",
   /** No authority could be built for a write (blank toolCallId, or an unresolved policy). */
   unauthorized: "unauthorized",
+  /** The send would relay the FOUNDER'S OWN WORDS to an agent he never named. See
+   *  {@link refuseUnaddressedRelay} — his aim is the authority for where his words go, and this is
+   *  the one refusal that protects it. */
+  unaddressedRelay: "unaddressed-relay",
   /** An unexpected exception. The bug bucket — it should stay empty. */
   internalError: "internal-error",
 } as const;
@@ -1092,6 +1112,14 @@ const TERMINAL_ROUTES: Record<TerminalOp, Handler> = {
     if (!goalVerdict.ok) {
       return err(ctx, REGISTRY_CODES.badArgs, `Not sent: ${goalVerdict.message}`);
     }
+    // THE RELAY GATE IS NOT HERE — it is GATE 0 in `dispatchConciergeTool`, above the policy tier,
+    // and this note exists so nobody "tidies" it back down into this body. It lived here first and
+    // was almost entirely inert: this op is `disruptive`, so its default decision is `ask`, and the
+    // ask-tier return fires BEFORE the handler runs. The first call therefore never reached this
+    // line, and the approved re-run arrives from a click handler after the founder's turn has
+    // ended — when the turn text the gate compares against is already gone. See the comment at
+    // gate 0 for the full reasoning.
+    //
     // THE ONLY constructor, from the toolCallId ON THE WIRE. Null for a denied tool, an ask-tier
     // tool nobody approved, and a blank id — all three are refusals, and none of them reach a PTY.
     // (The policy tiers are already refused above, so a null here means the id was unusable.)
@@ -2228,6 +2256,53 @@ export async function dispatchConciergeTool(
     const policy = opts.policy ?? permissiveToolPolicy;
     const decision = policy({ domain, op, write: entry.write(op), toolCallId, args: call.args });
     const ctx: OpContext = { domain, op, toolCallId, decision };
+    // ══ THE RELAY GATE, AND IT MUST SIT ABOVE THE APPROVAL TIER ══════════════════════════════════
+    //
+    // GATE 0, ahead of policy — because the two returns below END THE CALL, and one of them comes
+    // BACK. `send_to_agent_terminal` is `disruptive`, whose default decision is `ask`, so the common
+    // path is: this dispatch returns `needs-approval`, the human clicks approve, and
+    // `conciergeApprovalResume` runs the call AGAIN from a click handler. The route body — where
+    // this check first lived — is therefore never reached on the first call, and by the time the
+    // resumed call reaches it the founder's turn has ended, so `currentConciergeTurnContent()` is
+    // empty and the gate fails open. Net effect of placing it lower: a relay of his words to an
+    // agent he never named is refused only for the tools that DON'T ask, which is the opposite of
+    // the population that matters.
+    //
+    // Here it is judged on the FIRST call, while the turn state is live — and a send that must not
+    // happen never even raises an approval prompt for the human to answer.
+    //
+    // ARGS READ DEFENSIVELY: this is above zod (see the gate order in this function's header), so
+    // the fields are whatever the model sent. That is fine — both are compared, never dispatched,
+    // and a non-string simply fails the comparison and allows the call, which is this gate's own
+    // fail-open direction (see ./relayGate).
+    //
+    // EVERY OP THAT CARRIES A MESSAGE TO AN AGENT, not just the terminal one. `fleet.inbox_send`
+    // takes the same `text`, classifies to the same `kind: "sent"`, and the badge gate admits
+    // `channel: "inbox"` — so gating only the terminal write leaves the founder's ruling walkable by
+    // choosing the other tool. `inbox_broadcast` passes every recipient, and is refused if his words
+    // would reach ANY agent he did not name.
+    if (RELAY_GATED_OPS.has(op)) {
+      const a = (call.args ?? {}) as Record<string, unknown>;
+      // The recipients, however this op spells them. Read defensively: this is above zod, so the
+      // fields are whatever the model sent — a shape that yields no ids simply cannot be shown to
+      // be an unaddressed relay, which is this gate's fail-open direction (see ./relayGate).
+      const ids = [
+        ...(typeof a.agentId === "string" ? [a.agentId] : []),
+        ...(Array.isArray(a.agentIds) ? a.agentIds.filter((x): x is string => typeof x === "string") : []),
+      ];
+      const unaddressed =
+        ids.length > 0 && typeof a.text === "string"
+          ? refuseUnaddressedRelay(ids, a.text)
+          : null;
+      if (unaddressed) {
+        log.warn("concierge-tools", "send refused — unaddressed relay of the founder's words", {
+          domain,
+          op,
+          recipients: ids.length,
+        });
+        return err(ctx, REGISTRY_CODES.unaddressedRelay, unaddressed);
+      }
+    }
     if (decision.tier === "deny") {
       return err(
         ctx,

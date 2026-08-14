@@ -50,6 +50,10 @@ function sent(
       kind: "sent",
       ok: true,
       channel: "terminal",
+      // A RELAY, matching this fixture's own "Sent to …" text. The folded sentence is keyed on it,
+      // so a mark without it would make the row's wording and its bucket disagree about authorship
+      // (bead `sparkle-p9s5q`).
+      relayedFounderWords: true,
       subjectId: `${id}-agent`,
       subjectName: name,
       ...over,

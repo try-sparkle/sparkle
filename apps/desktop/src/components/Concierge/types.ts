@@ -266,6 +266,14 @@ export interface ConciergeReceiptMark {
   fanout?: true;
   /** This `sent` was a picker press, not a message. Folds in its own bucket. */
   viaPicker?: true;
+  /** This `sent` carried the FOUNDER'S OWN WORDS rather than a brief the concierge composed —
+   *  verbatim from the receipt (services/conciergeReceipts.relayedFounderWords).
+   *
+   *  IT IS A FOLD BUCKET, because the two say different sentences: a relay reads "Sent to X's
+   *  terminal", a composition reads "Concierge wrote to X". Folding them together would produce one
+   *  count over two different claims — and the one it would land on is the claim that his private
+   *  words went to the fleet, which is the bug this whole change removes (bead `sparkle-p9s5q`). */
+  relayedFounderWords?: true;
   /** How many recipients REFUSED, on a fan-out that reported `ok` anyway. Any value above zero
    *  keeps this row standing alone. */
   failed?: number;

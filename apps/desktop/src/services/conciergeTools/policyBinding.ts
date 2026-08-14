@@ -52,6 +52,10 @@ import { useSettingsStore } from "../../stores/settingsStore";
 import { aiEnhancementsEnabled, aiFeatureNow } from "../aiGate";
 import { useAuthStore } from "../../stores/authStore";
 import type { ToolPolicyDecision } from "../dispatchAuthority";
+// Whether an approved call carries the founder's OWN words has to be decided while his turn is
+// still live — see the `relayedFounderWords` field on the approval entry.
+import { currentConciergeTurnContent } from "../conciergeReceipts";
+import { carriesFounderWords } from "../relayDerivation";
 import {
   CONCIERGE_RISK_NOTE,
   CONCIERGE_TOOL_CATALOG,
@@ -225,6 +229,18 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
     // The same value the fingerprint above was computed from, kept verbatim so approving can replay
     // this exact call instead of waiting for the model to reproduce it. See the ledger's `rawArgs`.
     rawArgs: c.args,
+    // JUDGED NOW, BECAUSE NOW IS THE ONLY TIME IT CAN BE. This runs during the founder's turn, so
+    // the turn's text is still live; the approval's click handler runs after it has been dropped and
+    // could only guess. See the field's own doc for what goes wrong without it — an approved genuine
+    // relay rendering as "Concierge wrote to @X", on the path most terminal sends take.
+    ...(carriesFounderWords(
+      currentConciergeTurnContent().text,
+      typeof (c.args as Record<string, unknown> | undefined)?.text === "string"
+        ? ((c.args as Record<string, unknown>).text as string)
+        : undefined,
+    )
+      ? { relayedFounderWords: true as const }
+      : {}),
     configPath: entry?.configPath ?? conciergeToolConfigPath(c.op),
     fingerprint,
     ranRecently,

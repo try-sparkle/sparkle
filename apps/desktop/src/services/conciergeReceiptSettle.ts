@@ -47,6 +47,15 @@ export function settleConciergeReceipt(
    *  see `setConciergeTurnOrigin` in ./conciergeReceipts for why inferring it at settle time is
    *  wrong rather than merely imprecise. */
   originBubbleId?: string,
+  /** Did this call carry the FOUNDER'S OWN WORDS into an agent — i.e. is it a relay rather than a
+   *  brief the concierge composed? Judged by the caller at call ENTRY, for the same reason
+   *  `originBubbleId` is captured there: at settle time the turn it would be compared against may
+   *  already be the next one.
+   *
+   *  Like the origin, it is attached AFTER classification rather than threaded into the classifier —
+   *  it is provenance, and the classifier reads reply shapes. Omitted means "no relay claim", which
+   *  is the fail-closed answer per ConciergeActionReceipt.relayedFounderWords. */
+  relayedFounderWords?: boolean,
 ): void {
   // ══ A DEFERRAL IS NOT A REFUSAL — DO NOT RECORD ONE ═══════════════════════════════════════════
   // roborev 57852 (High). `needs-approval` means the call is WAITING on the human, not that it was
@@ -74,7 +83,17 @@ export function settleConciergeReceipt(
     });
     // Attached AFTER classification, deliberately: provenance is not something the classifier reads
     // out of a reply shape, and threading it through that signature would invite exactly that.
-    if (receipt) recordConciergeActionReceipt(originBubbleId ? { ...receipt, originBubbleId } : receipt);
+    if (receipt) {
+      recordConciergeActionReceipt({
+        ...receipt,
+        ...(originBubbleId ? { originBubbleId } : {}),
+        // ONLY ON A `sent` RECEIPT. "This carried his words" is a statement about a message; on a
+        // spawn or a merge it would be a field with no meaning that a later reader could still test.
+        ...(relayedFounderWords && receipt.kind === "sent"
+          ? { relayedFounderWords: true as const }
+          : {}),
+      });
+    }
   } catch (err) {
     console.warn("[control] concierge receipt classification failed", domain, op, err);
   }

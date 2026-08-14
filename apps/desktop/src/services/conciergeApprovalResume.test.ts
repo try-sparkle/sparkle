@@ -250,6 +250,10 @@ describe("the receipt for a call the human approved", () => {
       { prNumber: 753 },
       undefined,
       undefined,
+      // originBubbleId — never known here, see the call site.
+      undefined,
+      // relayedFounderWords — absent on an entry that carried no such verdict.
+      undefined,
     );
   });
 
@@ -274,7 +278,46 @@ describe("the receipt for a call the human approved", () => {
       undefined,
       "the branch has conflicts",
       "conflict",
+      undefined,
+      undefined,
     );
+  });
+
+  // ══ WHOSE WORDS THE APPROVED CALL CARRIED — bead `sparkle-p9s5q`, roborev 64197 ═══════════════
+  //
+  // `send_to_agent_terminal` is `disruptive`, so its default decision is `ask`: the FIRST dispatch
+  // returns `needs-approval` and mints nothing, the human clicks approve, and this path mints the
+  // only receipt there will ever be. That makes it the COMMON path, not an edge one.
+  //
+  // The receipt line now states AUTHORSHIP, so an absent verdict here is not a withheld claim but a
+  // wrong one: a genuine relay of the founder's words would render "Concierge wrote to @X". The
+  // verdict cannot be re-derived at click time — the turn text is gone — so it rides on the entry.
+  it("carries the entry's relay verdict into the receipt", async () => {
+    const { deps, settleReceipt } = fakeDeps({ ok: true, domain: "terminal", op: "send_to_agent_terminal" });
+
+    await resumeApprovedCall(ledgerEntry({ relayedFounderWords: true }), deps);
+
+    expect(settleReceipt).toHaveBeenCalledWith(
+      "terminal",
+      "send_to_agent_terminal",
+      expect.anything(),
+      true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
+  });
+
+  it("claims nothing when the entry recorded no relay — the concierge's own brief", async () => {
+    // The paired negative. Without it the row above would pass against a build that stamped every
+    // approved send as a relay, which is the original bug wearing the fix's clothes.
+    const { deps, settleReceipt } = fakeDeps({ ok: true, domain: "terminal", op: "send_to_agent_terminal" });
+
+    await resumeApprovedCall(ledgerEntry(), deps);
+
+    expect(settleReceipt.mock.calls[0]?.[8]).toBeUndefined();
   });
 
   it("settles NOTHING when the grant lapsed — that call did not run", async () => {
