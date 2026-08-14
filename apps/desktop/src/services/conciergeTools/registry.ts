@@ -237,6 +237,14 @@ import {
   type ScreenshotResult,
 } from "./screenshot";
 import {
+  PREVIEW_INSPECT_OPS,
+  PREVIEW_INSPECT_RISK,
+  previewScreenshot,
+  previewQueryDom,
+  type PreviewInspectOp,
+  type PreviewInspectResult,
+} from "./previewInspect";
+import {
   RESEARCH_OPS,
   cancelResearchTask,
   dispatchResearchTask,
@@ -292,6 +300,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   "events",
   "workspace",
   "screenshot",
+  "preview_inspect",
   "board",
   "approvals",
   "plans",
@@ -553,6 +562,13 @@ function fromScreenshot<T>(ctx: OpContext, r: ScreenshotResult<T>): ConciergeToo
   return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
 }
 
+/** preview_inspect: same convention as screenshot, but see previewInspect.ts's header for why its
+ *  ops are `read-only` rather than `privacy-sensitive` — this reads the agent's own dev-server
+ *  output, not the human's screen. */
+function fromPreviewInspect<T>(ctx: OpContext, r: PreviewInspectResult<T>): ConciergeToolReply {
+  return r.ok ? ok(ctx, r.data) : err(ctx, r.reason, r.message);
+}
+
 /** board: `{ ok, op, risk, data }` | `{ ok: false, …, reason, message }` — the lifecycle convention.
  *  `beads-unavailable` passes through as the code, so a project with no `bd` database is reported as
  *  the supported state it is rather than as a failure. */
@@ -669,6 +685,9 @@ const agentIdArg = z.string().min(1, "an agent id is required");
 const projectIdArg = z.string().min(1, "a project id is required");
 const noArgs = z.object({}).strict();
 const agentOnly = z.object({ agentId: agentIdArg }).strict();
+const agentAndSelector = z
+  .object({ agentId: agentIdArg, selector: z.string().min(1, "a CSS selector is required") })
+  .strict();
 /** close_agent, plus the agent's own stated reason for having no retro (bead sparkle-0l9xk). */
 const closeAgentArgs = z
   .object({
@@ -1609,6 +1628,18 @@ const SCREENSHOT_WRITE: Record<ScreenshotOp, boolean> = {
   capture_agent: true,
 };
 
+/**
+ * preview_inspect: reads an already-open preview's own render — see previewInspect.ts's header for
+ * why `agentId` here names the AGENT WHOSE PREVIEW to look at, not the pane on screen (there is no
+ * "on screen" requirement at all: this drives its own throwaway headless browser).
+ */
+const PREVIEW_INSPECT_ROUTES: Record<PreviewInspectOp, Handler> = {
+  screenshot: route(agentOnly, async (a, ctx) => fromPreviewInspect(ctx, await previewScreenshot(a.agentId))),
+  query_dom: route(agentAndSelector, async (a, ctx) =>
+    fromPreviewInspect(ctx, await previewQueryDom(a.agentId, a.selector)),
+  ),
+};
+
 // ---------------------------------------------------------------------------------------------
 // The domain table
 // ---------------------------------------------------------------------------------------------
@@ -2052,6 +2083,11 @@ const DOMAINS: Record<ConciergeToolDomain, DomainEntry> = {
     write: (op) => SCREENSHOT_WRITE[op as ScreenshotOp] ?? true,
     ops: SCREENSHOT_OPS,
   },
+  preview_inspect: {
+    routes: PREVIEW_INSPECT_ROUTES,
+    write: (op) => PREVIEW_INSPECT_RISK[op as PreviewInspectOp] !== "read-only",
+    ops: PREVIEW_INSPECT_OPS,
+  },
   diff: {
     routes: DIFF_ROUTES,
     write: (op) => DIFF_RISK[op as DiffOp] !== "read-only",
@@ -2128,6 +2164,7 @@ export const CONCIERGE_TOOL_OPS: Record<ConciergeToolDomain, readonly string[]> 
   events: DOMAINS.events.ops,
   workspace: DOMAINS.workspace.ops,
   screenshot: DOMAINS.screenshot.ops,
+  preview_inspect: DOMAINS.preview_inspect.ops,
   board: DOMAINS.board.ops,
   approvals: DOMAINS.approvals.ops,
   plans: DOMAINS.plans.ops,

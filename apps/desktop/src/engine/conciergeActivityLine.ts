@@ -25,6 +25,7 @@ import type { WorkflowOperation } from "../services/conciergeTools/workflow";
 import type { EventsOp } from "../services/conciergeTools/events";
 import type { WorkspaceOp } from "../services/conciergeTools/workspace";
 import type { ScreenshotOp } from "../services/conciergeTools/screenshot";
+import type { PreviewInspectOp } from "../services/conciergeTools/previewInspect";
 import type { BoardOp } from "../services/conciergeTools/board";
 import type { ApprovalsOp } from "../services/conciergeTools/approvals";
 import type { DiffOp } from "../services/conciergeTools/diff";
@@ -368,6 +369,14 @@ const SCREENSHOT_PHRASES: Record<ScreenshotOp, OpPhrase> = {
   capture_agent: phrase("Taking a screenshot of %s", "Took a screenshot of %s", AGENT),
 };
 
+/** The preview-eyes ops (docs/live-browser-preview.md, Phase 3) — an agent looking at its OWN
+ *  running preview, not at Sparkle or the human's screen. Worded to say "preview" rather than
+ *  reusing the screenshot domain's "%s" pattern, so the two are never visually confused. */
+const PREVIEW_INSPECT_PHRASES: Record<PreviewInspectOp, OpPhrase> = {
+  screenshot: phrase("Looking at %s's preview", "Looked at %s's preview", AGENT),
+  query_dom: phrase("Inspecting %s's preview", "Inspected %s's preview", AGENT),
+};
+
 /** The work-graph ops. `%s` is never used here: a bead id is not a name the human recognises, and
  *  resolving it would need a `bd` round-trip on the render path.
  *
@@ -485,6 +494,7 @@ const DOMAINS: Record<
   // like — which is the same subject the workspace ops act on. No new glyph is minted for it,
   // consistent with `board` and `plans` above.
   screenshot: { icon: "workspace", phrases: SCREENSHOT_PHRASES },
+  preview_inspect: { icon: "workspace", phrases: PREVIEW_INSPECT_PHRASES },
   board: { icon: "workspace", phrases: BOARD_PHRASES },
   approvals: { icon: "agents", phrases: APPROVALS_PHRASES },
   plans: { icon: "workspace", phrases: PLANS_PHRASES },

@@ -45,6 +45,7 @@ import type { WorkflowOperation } from "./conciergeTools/workflow";
 import type { EventsOp } from "./conciergeTools/events";
 import type { WorkspaceOp } from "./conciergeTools/workspace";
 import type { ScreenshotOp } from "./conciergeTools/screenshot";
+import type { PreviewInspectOp } from "./conciergeTools/previewInspect";
 import type { BoardOp } from "./conciergeTools/board";
 import type { ApprovalsOp } from "./conciergeTools/approvals";
 import type { DiffOp } from "./conciergeTools/diff";
@@ -215,6 +216,13 @@ const SCREENSHOT_RULES: Record<ScreenshotOp, OpRule> = {
   capture_agent: null,
 };
 
+/** Preview inspection ("agent eyes"). No receipt fields either — the reply's own `path`/matches are
+ *  the record, exactly as a screenshot's is. */
+const PREVIEW_INSPECT_RULES: Record<PreviewInspectOp, OpRule> = {
+  screenshot: null,
+  query_dom: null,
+};
+
 /** The work graph. `create_item` is the one that mints something with an id the human can open, and
  *  `beadId` is what lets the rendered line carry a real pill rather than a claim. */
 const BOARD_RULES: Record<BoardOp, OpRule> = {
@@ -310,6 +318,7 @@ const RULES_BY_DOMAIN: Record<string, Record<string, OpRule | undefined> | undef
   events: EVENTS_RULES,
   workspace: WORKSPACE_RULES,
   screenshot: SCREENSHOT_RULES,
+  preview_inspect: PREVIEW_INSPECT_RULES,
   board: BOARD_RULES,
   approvals: APPROVALS_RULES,
   plans: PLANS_RULES,

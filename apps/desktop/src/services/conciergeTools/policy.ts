@@ -79,6 +79,7 @@ import { PLANS_OPS, PLANS_RISK, type PlansOp } from "./plans";
 import { DIFF_OPS, DIFF_RISK, type DiffOp } from "./diff";
 import { FLEET_OPS, FLEET_RISK, type FleetOp } from "./fleet";
 import { SCREENSHOT_OPS, SCREENSHOT_RISK, type ScreenshotOp, type ScreenshotRisk } from "./screenshot";
+import { PREVIEW_INSPECT_OPS, PREVIEW_INSPECT_RISK, type PreviewInspectOp } from "./previewInspect";
 import { RESEARCH_OPS, RESEARCH_RISK, type ResearchOp } from "./research";
 import { MEMORY_OPS, MEMORY_RISK, type MemoryOp } from "./memory";
 import {
@@ -191,6 +192,7 @@ export type ConciergeToolDomain =
   | "events"
   | "workspace"
   | "screenshot"
+  | "preview_inspect"
   | "board"
   | "approvals"
   | "plans"
@@ -212,6 +214,7 @@ export const CONCIERGE_TOOL_DOMAINS = [
   { id: "events", label: "Change notifications" },
   { id: "workspace", label: "Projects & window" },
   { id: "screenshot", label: "Screenshots" },
+  { id: "preview_inspect", label: "Preview inspection" },
   { id: "board", label: "Tasks & work graph" },
   { id: "approvals", label: "Approvals" },
   { id: "plans", label: "Plans" },
@@ -597,6 +600,7 @@ export type ConciergeToolName =
   | EventsOp
   | WorkspaceOp
   | ScreenshotOp
+  | PreviewInspectOp
   | BoardOp
   | ApprovalsOp
   | DiffOp
@@ -674,6 +678,11 @@ const RISK_BY_TOOL: Record<ConciergeToolName, ConciergeRiskClass> = {
   ...translateRisk(REVIEW_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(WORKSPACE_OP_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(SCREENSHOT_RISK, SCREENSHOT_RISK_TO_CLASS),
+  // preview_inspect publishes ONLY `read-only` — a member of workspace's vocabulary — so it reuses
+  // that translation rather than declaring a second one-entry table. See previewInspect.ts's header
+  // for why this reads an agent's own dev-server output rather than the human's screen, and so is
+  // NOT `privacy-sensitive` the way the screenshot domain's rows are.
+  ...translateRisk(PREVIEW_INSPECT_RISK, WORKSPACE_RISK_TO_CLASS),
   ...translateRisk(WORKFLOW_OP_RISK, WORKFLOW_RISK_TO_CLASS),
   // The events domain publishes only `read-only` and `routine` — both members of workspace's
   // vocabulary — so it reuses that translation rather than declaring a third identical one. Both map
@@ -870,6 +879,7 @@ const DOMAIN_BY_TOOL: Record<ConciergeToolName, ConciergeToolDomain> = {
   ...constantOver(REVIEW_RISK, "review" as const),
   ...constantOver(WORKSPACE_OP_RISK, "workspace" as const),
   ...constantOver(SCREENSHOT_RISK, "screenshot" as const),
+  ...constantOver(PREVIEW_INSPECT_RISK, "preview_inspect" as const),
   ...constantOver(WORKFLOW_OP_RISK, "workflow" as const),
   ...constantOver(EVENTS_RISK, "events" as const),
   ...constantOver(TERMINAL_TOOL_RISK, "terminal" as const),
@@ -923,6 +933,7 @@ const NAMES_BY_DOMAIN: Record<ConciergeToolDomain, readonly ConciergeToolName[]>
   events: EVENTS_OPS,
   workspace: WORKSPACE_OPS,
   screenshot: SCREENSHOT_OPS,
+  preview_inspect: PREVIEW_INSPECT_OPS,
   board: BOARD_OPS,
   approvals: APPROVALS_OPS,
   plans: PLANS_OPS,

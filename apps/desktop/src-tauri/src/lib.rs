@@ -84,6 +84,9 @@ mod retro_receipt;
 mod preflight;
 /// The live in-app browser preview's dev-server supervisor.
 mod preview;
+/// Preview "agent eyes" — headless-browser screenshot + DOM query over an already-open preview.
+/// Phase 3 of `docs/live-browser-preview.md`; additive to `preview`, never touches its registry.
+mod preview_capture;
 /// Guard pinning the loopback `frame-src` the live browser preview depends on, plus the reserved
 /// port set that keeps a preview frame from being same-origin with the app document.
 mod preview_csp;
@@ -763,6 +766,8 @@ pub fn run() {
             preview::preview_stop_for_agent,
             preview::preview_status,
             preview::preview_list,
+            preview_capture::preview_screenshot,
+            preview_capture::preview_query_dom,
             preflight::claude_preflight,
             preflight::claude_version,
             preflight::claude_session_info,

@@ -50,6 +50,7 @@ import { EVENTS_OPS } from "./events";
 import { WORKSPACE_OPS } from "./workspace";
 import { ATTACHMENTS_OPS } from "./attachments";
 import { SCREENSHOT_OPS } from "./screenshot";
+import { PREVIEW_INSPECT_OPS } from "./previewInspect";
 import { BOARD_OPS } from "./board";
 import { APPROVALS_OPS } from "./approvals";
 import { PLANS_OPS } from "./plans";
@@ -478,6 +479,7 @@ describe("the tool set is derived from the domains", () => {
       "events",
       "workspace",
       "screenshot",
+      "preview_inspect",
       "board",
       "approvals",
       "plans",
@@ -536,6 +538,7 @@ describe("the tool set is derived from the domains", () => {
         EVENTS_OPS.length +
         WORKSPACE_OPS.length +
         SCREENSHOT_OPS.length +
+        PREVIEW_INSPECT_OPS.length +
         BOARD_OPS.length +
         APPROVALS_OPS.length +
         PLANS_OPS.length +
