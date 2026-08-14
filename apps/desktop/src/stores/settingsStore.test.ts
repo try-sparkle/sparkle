@@ -295,6 +295,73 @@ describe("hydrateFromConfig — [improvement].consent mirror", () => {
   });
 });
 
+// `[preview] auto_open` — the setting that decides whether a pane may open UNASKED, so the two
+// facts worth pinning are that a written value is adopted and that nothing else can reach
+// `"always"` by accident. See `previewOpenOutcomeFor` for what each value means.
+describe("hydrateFromConfig — [preview].auto_open mirror", () => {
+  const baseConfig = {
+    workflow: {
+      require_pr: true,
+      worktree_isolation: true,
+      default_branch: "",
+      born_fresh_from_base: true,
+      delete_merged_branch: true,
+      drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+    },
+    workers: { max_concurrent: 5 },
+    ai: {
+      auto_rename: true,
+      voice_dictation: true,
+      composer: true,
+      suggested_actions: true,
+      auto_approve: true,
+    },
+    freshness: {
+      staleness_warn_commits: 25,
+      stale_build_block_commits: 25,
+      require_fresh_branch: true,
+    },
+    capture: { popover_shortcut: "ctrl+shift+r" },
+    done: { description: null, criteria: [] },
+    delivered: {
+      description: null,
+      detected_method: null,
+      confidence: null,
+      confidence_note: null,
+      learned: false,
+      criteria: [],
+    },
+  };
+  const eff = (preview?: { enabled: boolean; idle_grace_min: number; auto_open: string }) =>
+    ({
+      config: { ...baseConfig, ...(preview ? { preview } : {}) },
+      warnings: [],
+    }) as EffectiveConfig;
+  const section = (auto_open: string) => ({ enabled: true, idle_grace_min: 10, auto_open });
+
+  it.each(["never", "always", "returning"] as const)("adopts %s from the file", (value) => {
+    useSettingsStore.setState({ previewAutoOpen: "returning" });
+    useSettingsStore.getState().hydrateFromConfig(eff(section(value)));
+    expect(useSettingsStore.getState().previewAutoOpen).toBe(value);
+  });
+
+  it("falls back to the shipped default when the [preview] section is absent", () => {
+    // A backend predating [preview]. `config.ts` states the rule for the whole section: an absent
+    // one means "use the shipped defaults", NOT "the feature is off".
+    useSettingsStore.setState({ previewAutoOpen: "always" });
+    useSettingsStore.getState().hydrateFromConfig(eff());
+    expect(useSettingsStore.getState().previewAutoOpen).toBe("returning");
+  });
+
+  it("degrades an unrecognized value to the default, NEVER to always", () => {
+    // Rust validates, so this should be unreachable — which is exactly why it is worth pinning.
+    // The direction is the point: a fail-open coercion here pops panes on a typo nobody can see.
+    useSettingsStore.setState({ previewAutoOpen: "never" });
+    useSettingsStore.getState().hydrateFromConfig(eff(section("ALWAYS")));
+    expect(useSettingsStore.getState().previewAutoOpen).toBe("returning");
+  });
+});
+
 describe("settingsStore — Chief doc state", () => {
   beforeEach(() => {
     useSettingsStore.setState({ chiefDocStateByProject: {} });

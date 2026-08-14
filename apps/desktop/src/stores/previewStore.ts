@@ -106,6 +106,39 @@ export interface PreviewEntry {
    *  changed, which is what makes "Reload" actually re-fetch rather than being a no-op that looks
    *  fine: the same element with the same `src` is left alone. */
   reloadNonce: number;
+  /**
+   * When this preview last became WORTH SURFACING — the moment it entered `ready`/`serving`. Null
+   * until it ever has.
+   *
+   * This is condition 5's clock (design §10: "the request is fresher than a TTL (5s, matching
+   * `REVEAL_REQUEST_TTL_MS`)"), and it is a TRANSITION stamp rather than a last-seen-at. The
+   * difference is the whole point: a dev server re-emits `serving` on every hot reload, so a
+   * last-seen stamp would hold the TTL open indefinitely and the freshness clause — the one thing
+   * standing between "a build finished" and "a pane opened three minutes later" — would never bind.
+   *
+   * `setPreview`'s unchanged-value bail already gives this for free on an identical repeat; the
+   * explicit `prev.status !== next.status` test below covers the repeat that carries a new url or
+   * port, which is not identical but is not a fresh surfacing either.
+   *
+   * OPTIONAL, unlike its two neighbours, and NOT for the `T | null` wire reason stated at the top
+   * of this file — this field never crosses the Rust boundary; `setPreview` is its only writer and
+   * always populates it. It is optional so a hand-built fixture that predates it keeps compiling,
+   * and because omitting it fails CLOSED: an absent stamp reads as "never surfaced", which makes
+   * `previewOpenOutcomeFor` decline. The direction matters more than the strictness here — the
+   * value's whole job is to withhold permission to open a pane unasked.
+   */
+  surfacedAt?: number | null;
+}
+
+/** The states in which a preview is worth putting in front of the user: it has compiled and is
+ *  answering. `listening` is deliberately NOT one — a port is bound before the first build
+ *  finishes, so surfacing there shows the framework's own "compiling" page, which is the "several
+ *  of them showing a broken build" outcome §10 exists to prevent. */
+const SURFACING_STATES: ReadonlySet<PreviewState> = new Set<PreviewState>(["ready", "serving"]);
+
+/** Is this a state whose ARRIVAL should arm the auto-open predictor? See `surfacedAt`. */
+export function isSurfacingState(state: PreviewState): boolean {
+  return SURFACING_STATES.has(state);
 }
 
 /** The fields an update carries. `startedAt` / `reloadNonce` are ours and are never overwritten by
@@ -121,10 +154,30 @@ interface PreviewStoreState {
    *  distinct from `{ previewable: false }`, so a UI that hides an affordance on a false can tell
    *  "we know this project cannot be previewed" from "the probe has not answered". */
   capability: Record<string, PreviewCapability | undefined>;
+  /**
+   * projectId -> "the USER has opened a preview here at least once THIS SESSION" — condition 2 of
+   * the auto-open conjunction (design §10).
+   *
+   * IN-MEMORY AND PER-SESSION BY DESIGN, not by omission, and for a stronger reason than the rest
+   * of this store. The other fields describe child processes that cannot outlive the app; this one
+   * describes a *permission to interrupt*, and persisting it would mean a preview the founder
+   * opened once, weeks ago, silently licenses a pane to pop on its own every launch afterwards.
+   * "Returning" means returning within this sitting. It is deliberately NOT in the persisted
+   * `uiStore` blob.
+   *
+   * A RECORD RATHER THAN A `Set` because zustand's state is compared and serialized in places a
+   * `Set` degrades to `{}` — the same reason `byAgent` is a record.
+   */
+  openedProjects: Record<string, true>;
   setPreview: (agentId: string, next: PreviewUpdate) => void;
   clearPreview: (agentId: string) => void;
   bumpReload: (agentId: string) => void;
   setCapability: (projectId: string, cap: PreviewCapability) => void;
+  /** Record that the user asked for a preview in this project. Called from
+   *  `services/preview.openPreviewServer` on a `user`-initiated open ONLY — an agent opening its
+   *  own preview through the control bridge must not forge the returning-user signal that gates an
+   *  unasked pane. */
+  markPreviewOpenedForProject: (projectId: string) => void;
 }
 
 /** True when a wire update says nothing new. Compared field-by-field rather than by object
@@ -142,6 +195,7 @@ function sameUpdate(a: PreviewEntry, b: PreviewUpdate): boolean {
 export const usePreviewStore = create<PreviewStoreState>((set) => ({
   byAgent: {},
   capability: {},
+  openedProjects: {},
   // THE UNCHANGED-VALUE BAIL IS LOAD-BEARING, not a micro-optimisation. `preview:state` is emitted
   // on every transition and a dev server's readiness probe can repeat a state several times over;
   // returning `s` unchanged means a repeat costs zero subscriber wake-ups, and — the part that
@@ -158,6 +212,14 @@ export const usePreviewStore = create<PreviewStoreState>((set) => ({
         // reset it (that would silently re-create the frame under them).
         startedAt: prev?.startedAt ?? Date.now(),
         reloadNonce: prev?.reloadNonce ?? 0,
+        // STAMPED ON THE TRANSITION INTO a surfacing state, and carried forward otherwise. A
+        // status that arrives already equal to the previous one is not a fresh surfacing however
+        // else the payload differs — see the `surfacedAt` note on PreviewEntry for why a
+        // last-seen-at here would make condition 5 permanently true.
+        surfacedAt:
+          isSurfacingState(next.status) && prev?.status !== next.status
+            ? Date.now()
+            : (prev?.surfacedAt ?? null),
       };
       return { byAgent: { ...s.byAgent, [agentId]: entry } };
     }),
@@ -194,4 +256,12 @@ export const usePreviewStore = create<PreviewStoreState>((set) => ({
       }
       return { capability: { ...s.capability, [projectId]: cap } };
     }),
+  // The unchanged-value bail, same as every setter above: this is written on each manual open, and
+  // after the first one every later call is a no-op that must not wake a subscriber.
+  markPreviewOpenedForProject: (projectId) =>
+    set((s) =>
+      s.openedProjects[projectId]
+        ? s
+        : { openedProjects: { ...s.openedProjects, [projectId]: true } },
+    ),
 }));

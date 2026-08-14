@@ -289,6 +289,13 @@ export const AgentRow = memo(function AgentRow({
   const previewOfferable = usePreviewStore((s) => s.capability[project.id]?.previewable === true);
   const openPreviewPane = useUiStore((s) => s.openPreview);
   const setPreviewEntry = usePreviewStore((s) => s.setPreview);
+  // The AMBIENT pill's two inputs. THIS agent's entry only — `byAgent[a.id]` is a stable reference
+  // between writes (`setPreview` bails on an unchanged update), so subscribing to the entry rather
+  // than to the map keeps a preview tick on one agent from re-rendering every other row.
+  const previewEntry = usePreviewStore((s) => s.byAgent[a.id]);
+  const paneShowsThisPreview = useUiStore(
+    (s) => s.workModeBySide[paneSide] === "preview" && project.selectedAgentId === a.id,
+  );
   const openPromoteToCloud = useUiStore((s) => s.openPromoteToCloud);
   // The OTHER direction. Deliberately NOT gated on `cloudOfferable` (see the button below).
   const openDemoteToLocal = useUiStore((s) => s.openDemoteToLocal);
@@ -1410,6 +1417,72 @@ export const AgentRow = memo(function AgentRow({
     </span>
   ) : null;
 
+  // ══ THE ROW PREVIEW PILL — "what appears unasked is a pill, not a pane" ═══════════════════════
+  //
+  // Design doc §10's condition zero, and the reason the auto-open feature is safe to ship at all:
+  // the passive half of it. Twenty agents finishing a build within a minute of each other produce
+  // twenty PILLS, which is a column that tells you where to look; the same twenty as panes is the
+  // outcome §10 calls "strictly worse than no feature".
+  //
+  // IT IS NOT ROUTED THROUGH `previewOpenOutcomeFor`, deliberately, and that is the thing most
+  // likely to be "simplified" later. The conjunction gates the PANE — the thing that can take the
+  // screen — while this steals nothing, so it shows under `auto_open = "never"`, on a pair sitting
+  // on Plan, and for a project the user has never previewed by hand. That last case is the point:
+  // the pill is how a first preview becomes discoverable, and gating it on having previewed before
+  // would make the feature visible only to people already using it.
+  // `AgentSidebar.previewPill.test.tsx` pins all three from the failing side.
+  //
+  // TWO CONDITIONS, and they are both "is there something you are not looking at":
+  //   • a LIVE server with a url — `listening`/`ready`/`serving`. Not `starting` (nothing to point
+  //     at yet) and not `failed`/`crashed`/`stopped` (the pane's job to explain, not the row's; a
+  //     wordless mark on a dead server is an alarm with no action attached).
+  //
+  //     WIDER THAN `previewStore.isSurfacingState`, which stops at `ready`/`serving`, and the gap
+  //     is not drift. That set decides whether to OPEN A PANE, where `listening` is wrong because
+  //     the port is bound before the first build finishes and the pane would fill with the
+  //     framework's own compiling page. A pill saying ":5173" at `listening` is simply true, and
+  //     costs the reader nothing if the page behind it is still building.
+  //   • the pane is NOT already showing it. Ambient means off-screen; beside a live preview pane
+  //     the pill would be a second, smaller rendering of the thing filling the column.
+  //
+  // A READOUT, NOT AN ACTION — no `onClick`. Every other pill in this strip is a jump (`epicPill`,
+  // `feedbackPill`), and the temptation is to make this one open the pane. That is precisely the
+  // interruption the design refuses: the row says "there is something here", and the user decides.
+  // Sized like `row-stall`: `fontSize: 10`, an icon plus the shortest true label (the port), with
+  // the full url and state on the tooltip for whoever needs it.
+  const previewPillEl =
+    previewEntry &&
+    previewEntry.url &&
+    (previewEntry.status === "listening" ||
+      previewEntry.status === "ready" ||
+      previewEntry.status === "serving") &&
+    !paneShowsThisPreview ? (
+      <span
+        data-testid="row-preview"
+        title={`Preview ${previewEntry.status} — ${previewEntry.url}`}
+        aria-label={`Preview ${previewEntry.status} at ${previewEntry.url}`}
+        style={{
+          // `flex: 0 0 auto` and OUTSIDE the clipping name box (see where it renders): the name box
+          // is `minWidth: 0; overflow: hidden`, so a trailing child of it is simply cut off on a
+          // narrow column — which is how the retirement mark nearly vanished on exactly the rows
+          // that had one.
+          flex: "0 0 auto",
+          display: "inline-flex",
+          alignItems: "center",
+          gap: 2,
+          lineHeight: 1.4,
+          fontSize: 10,
+          fontFamily: FONT_MONO,
+          // MUTED, not an accent. A live dev server is good news, and good news that draws the eye
+          // as hard as a stall does makes the column's ink stop meaning anything.
+          color: C.muted,
+        }}
+      >
+        <FiMonitor size={10} style={{ flex: "0 0 auto" }} />
+        {previewEntry.port ?? ""}
+      </span>
+    ) : null;
+
   // The FEEDBACK pill (feedback-pill-and-filter): a build-agent row's affordance to jump to the Plan
   // board filtered to JUST that agent's feedback — the beads labeled `agent:<id>` it created or
   // commented on. Mirrors epicPill's handoff (stopPropagation so it doesn't select the row; flip to
@@ -1830,6 +1903,11 @@ export const AgentRow = memo(function AgentRow({
                     the statement rather than the request. */}
                 {askPill}
                 {retirePill}
+                {/* Same ambient mark on the EXPANDED strip, under the rule the comment above
+                    `AgentInboxBadge` states for this whole cluster: the card stands in for the
+                    in-flow row while it is open, so omitting it here makes the signal vanish from
+                    the one row the user has actually stopped on. */}
+                {previewPillEl}
                 {cloudChip}
               </div>
               {/* The model pill anchors the card's top-right corner, above the progress bar's
@@ -1985,6 +2063,14 @@ export const AgentRow = memo(function AgentRow({
                   READY TO RETIRE) stays on the expanded card where `main` sent `epicPill`, which is
                   the part of sparkle-tyter's width budget that actually bound. */}
               {retireMark}
+              {/* THE PREVIEW PILL, in the same band as `retireMark` above and for the identical
+                  reason: a `flex: 0 0 auto` SIBLING of the name box rather than a child of it.
+                  Inside that box it would be clipped away on a narrow column (`minWidth: 0` +
+                  `overflow: hidden` make it the first thing flexbox shrinks), and `clusterMarkCount`
+                  counts only notice marks and the goal, so the collapse can never buy space for it.
+                  It is also cheap by construction — an 11px glyph plus a 4-digit port, only on the
+                  rows that actually have a live server, which is a small subset at any moment. */}
+              {previewPillEl}
               {/* `.stg` — LAST before the close slot, exactly as the mock orders the row
                   (dot · el · nm · stg · close). Outside the name container so the title ellipsizes
                   against it rather than pushing it off the row. Collapsed only: the card already
@@ -2221,6 +2307,14 @@ export const AgentRow = memo(function AgentRow({
                 agentId: a.id,
                 projectId: project.id,
                 worktree: a.worktreePath!,
+                // THIS BUTTON IS THE ONE PLACE A PERSON OPENS A PREVIEW BY HAND, which is what
+                // condition 2 of the auto-open conjunction is asking about ("the user has opened a
+                // preview for this project at least once this session"). The flag is fail-closed —
+                // `openPreviewServer` treats an absent `initiator` as an agent — because the other
+                // caller is `controlListener.handlePreview`, i.e. an AGENT opening its own preview
+                // through the control bridge, and letting that count would let an agent manufacture
+                // the returning-user signal that licenses a pane to open unasked.
+                initiator: "user",
               }).catch((err: unknown) => {
                 // ONE REJECTION IS NOT A FAILURE: a click landing while this agent's own start is
                 // still in flight is REFUSED by the Rust reservation (which is what stops a second

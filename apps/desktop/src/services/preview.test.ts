@@ -160,6 +160,62 @@ describe("openPreviewServer — the wire shape preview_open ACTUALLY returns", (
   });
 });
 
+// ══ WHO ASKED — the one input to the auto-open conjunction that this module owns ═══════════════
+//
+// `openPreviewServer` is the ONLY place condition 2 ("the user has opened a preview for this
+// project at least once this session") is written, and it has two callers with opposite meanings:
+// the hover-card button, which is a person, and `controlListener.handlePreview`, which is an AGENT
+// opening its own preview through the control bridge. Getting this backwards is not cosmetic — it
+// would let an agent manufacture the signal that licenses a pane to open unasked, in a project the
+// founder has never previewed, which is the exact interruption design §10 exists to prevent.
+describe("openPreviewServer — only a USER-initiated open marks the session flag", () => {
+  beforeEach(() =>
+    usePreviewStore.setState({ byAgent: {}, capability: {}, openedProjects: {} } as never),
+  );
+
+  it('marks the project when the caller says initiator: "user"', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      id: "p1", url: "http://127.0.0.1:5199/", port: 5199, state: "ready",
+    });
+    await openPreviewServer({
+      agentId: "a1", projectId: "proj", worktree: "/w", initiator: "user",
+    });
+    expect(usePreviewStore.getState().openedProjects.proj).toBe(true);
+  });
+
+  it('does NOT mark it for initiator: "agent"', async () => {
+    vi.mocked(invoke).mockResolvedValueOnce({
+      id: "p1", url: "http://127.0.0.1:5199/", port: 5199, state: "ready",
+    });
+    await openPreviewServer({
+      agentId: "a1", projectId: "proj", worktree: "/w", initiator: "agent",
+    });
+    expect(usePreviewStore.getState().openedProjects.proj).toBeUndefined();
+  });
+
+  it("FAILS CLOSED for a caller that names no initiator at all", async () => {
+    // `controlListener.handlePreview` is exactly this call. An absent initiator must read as "not
+    // attributable to a person", never as the permissive default.
+    vi.mocked(invoke).mockResolvedValueOnce({
+      id: "p1", url: "http://127.0.0.1:5199/", port: 5199, state: "ready",
+    });
+    await openPreviewServer({ agentId: "a1", projectId: "proj", worktree: "/w" });
+    expect(usePreviewStore.getState().openedProjects.proj).toBeUndefined();
+  });
+
+  it("marks it even when the server fails to start — it records INTENT, not success", async () => {
+    // A dev server that dies on boot does not retract the fact that the user asked for a preview
+    // here. Written BEFORE the round trip for that reason.
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("spawn failed"));
+    await expect(
+      openPreviewServer({
+        agentId: "a1", projectId: "proj", worktree: "/w", initiator: "user",
+      }),
+    ).rejects.toThrow();
+    expect(usePreviewStore.getState().openedProjects.proj).toBe(true);
+  });
+});
+
 // "WE COULD NOT LOOK" IS NOT "WE LOOKED AND THE ANSWER IS NO", and conflating them cost the whole
 // feature for a session. The only caller gates on `capability[id] !== undefined`, so a recorded
 // failure satisfies the gate and the probe is never asked again — one transient miss (bridge not up

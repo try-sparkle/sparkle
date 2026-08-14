@@ -13,6 +13,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./safeUnlisten";
+import { autoOpenPreviewIfWarranted } from "./previewOpenOutcomeFor";
 import {
   usePreviewStore,
   type PreviewCapability,
@@ -159,7 +160,26 @@ export async function openPreviewServer(args: {
   projectId: string;
   worktree: string;
   path?: string | null;
+  /**
+   * WHO asked. Absent means "not attributable to a person", and that is the FAIL-CLOSED default on
+   * purpose (bead sparkle-3475b.6).
+   *
+   * The only thing this decides is condition 2 of the auto-open conjunction — "the user has opened
+   * a preview for this project at least once this session" — which is the clause that licenses a
+   * pane to open unasked later. `controlListener.handlePreview` calls this function on behalf of an
+   * AGENT opening its own preview through the control bridge; if that counted, an agent could
+   * manufacture the returning-user signal for a project the founder has never previewed, and the
+   * conjunction would be answering a question nobody asked. So only an explicit `"user"` marks it,
+   * and a caller that forgets is treated as an agent rather than as a person.
+   */
+  initiator?: "user" | "agent";
 }): Promise<PreviewOpened | null> {
+  // MARKED BEFORE THE ROUND TRIP, and deliberately not conditioned on it succeeding. The clause
+  // this feeds is about the USER'S INTENT ("does he want previews in this project"), which a dev
+  // server that failed to boot does not retract.
+  if (args.initiator === "user") {
+    usePreviewStore.getState().markPreviewOpenedForProject(args.projectId);
+  }
   const reply = await invoke<PreviewOpened>("preview_open", {
     agentId: args.agentId,
     projectId: args.projectId,
@@ -211,6 +231,8 @@ export async function listPreviews(): Promise<PreviewStatus[]> {
  *  the store the way Rust does, rather than hand-building an entry that already has the shape the
  *  parser is supposed to produce (which would test nothing). */
 export function applyPreviewStatus(status: PreviewStatus): void {
+  // Read BEFORE the fold, so the comparison below is against the state this event is changing.
+  const before = usePreviewStore.getState().byAgent[status.agentId]?.surfacedAt ?? null;
   usePreviewStore.getState().setPreview(status.agentId, {
     id: status.id,
     status: status.state,
@@ -221,6 +243,20 @@ export function applyPreviewStatus(status: PreviewStatus): void {
     port: status.port ?? null,
     error: status.error ?? null,
   });
+  // THE AUTO-OPEN TRIGGER (design §10, bead sparkle-3475b.6).
+  //
+  // Armed by the TRANSITION into `ready`/`serving` — a fresh `surfacedAt` stamp — and never by the
+  // state merely being one of those. The distinction is what keeps the whole thing bounded: a dev
+  // server re-emits `serving` on every hot reload, and an arm-on-state trigger would ask to open a
+  // pane on each of them, forever. `previewStore.setPreview` owns the stamping rule; this only
+  // notices that it moved.
+  //
+  // Everything about WHETHER to open lives in `previewOpenOutcomeFor`, which writes nothing —
+  // this line is the "when", not the "whether".
+  const after = usePreviewStore.getState().byAgent[status.agentId]?.surfacedAt ?? null;
+  if (after !== null && after !== before) {
+    autoOpenPreviewIfWarranted(status.projectId, status.agentId);
+  }
 }
 
 /** Singleton guard, mirroring `aiServiceHealthListener`: StrictMode and HMR both double-mount, and

@@ -446,6 +446,29 @@ export type SparkleImprovementConsent = "always" | "case_by_case" | "never";
 /** The default consent mode for a fresh install: review-and-approve each PR. */
 export const DEFAULT_SPARKLE_CONSENT: SparkleImprovementConsent = "case_by_case";
 
+/** `[preview] auto_open` — when a preview PANE may open unasked. See `previewAutoOpen` below and
+ *  design doc §10; the row PILL is unconditional and is not governed by this. */
+export type PreviewAutoOpen = "returning" | "never" | "always";
+
+/** The founder's ratified default (design §10, "Decisions — settled by the founder, 2026-08-05"):
+ *  the five-condition conjunction, not "never" and not "always". */
+export const DEFAULT_PREVIEW_AUTO_OPEN: PreviewAutoOpen = "returning";
+
+/**
+ * Coerce the wire's bare `string` into the union, FAILING CLOSED to the default.
+ *
+ * The wire can only carry the three (Rust validates and falls back), so in practice this only has
+ * to absorb an absent `[preview]` section from a backend predating it. It is written as a
+ * whitelist anyway because of what the alternative costs: the one value that must never be
+ * *reached by accident* is `"always"`, which pops panes on its own, and a permissive cast would
+ * hand it to any typo that happened to survive a future config path.
+ */
+export function asPreviewAutoOpen(value: unknown): PreviewAutoOpen {
+  return value === "never" || value === "always" || value === "returning"
+    ? value
+    : DEFAULT_PREVIEW_AUTO_OPEN;
+}
+
 interface SettingsState {
   /** Legacy user-entered Chief PAT (begins with `pat_`), persisted in localStorage. Kept as a
    *  READ-ONLY fallback; the OS keychain value (keychainChiefPat) is preferred. */
@@ -624,6 +647,20 @@ interface SettingsState {
   /** Usage analytics + masked session replay (PostHog). Off → analytics.ts sends nothing. Mirrors
    *  [tools].analytics. Config-backed, NOT persisted — re-read from the file each launch. */
   analyticsEnabled: boolean;
+  /**
+   * When a preview pane may open UNASKED. Mirrors `[preview] auto_open`; config-backed, NOT
+   * persisted.
+   *
+   *   • `"returning"` (default) — the five-condition conjunction in design §10.
+   *   • `"never"` — no pane ever opens on its own. The row PILL still appears; it is passive.
+   *   • `"always"` — skip the "is this a returning previewer" clauses. Exists for the founder to try.
+   *
+   * A UNION rather than the wire's bare `string`, because this is what the predictor branches on
+   * and an unrecognized value must degrade to the default rather than to `"always"`. Rust already
+   * validates and falls back, so hydration only has to defend against a backend that predates the
+   * key — but a fail-open default here would auto-pop panes on a typo nobody can see.
+   */
+  previewAutoOpen: PreviewAutoOpen;
   /** The in-repo work graph behind the Plan board (Beads / `bd`). Off → the board is hidden and no
    *  `bd` shell-out runs. Mirrors [tools].beads. */
   beadsEnabled: boolean;
@@ -860,6 +897,7 @@ export const useSettingsStore = create<SettingsState>()(
       driftAheadNudge: 15,
       driftChangedLines: 1000,
       analyticsEnabled: true,
+      previewAutoOpen: DEFAULT_PREVIEW_AUTO_OPEN,
       beadsEnabled: true,
       githubEnabled: true,
       guardrailsEnabled: true,
@@ -1172,6 +1210,11 @@ export const useSettingsStore = create<SettingsState>()(
           // Tools flags. `?? true` treats an absent [tools] block (older backend) as the on-by-default
           // state, matching SparkleConfig::default() — a new install ships every tool on.
           analyticsEnabled: config.tools?.analytics ?? true,
+          // `[preview] auto_open`. An absent [preview] section — a backend predating it — reads as
+          // the shipped default, NOT as disabled: `config.ts` states that rule for the whole
+          // section ("callers that need a default fall back to the shipped ones"), and it is what
+          // `asPreviewAutoOpen(undefined)` returns.
+          previewAutoOpen: asPreviewAutoOpen(config.preview?.auto_open),
           beadsEnabled: config.tools?.beads ?? true,
           githubEnabled: config.tools?.github ?? true,
           guardrailsEnabled: config.tools?.guardrails ?? true,
