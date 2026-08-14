@@ -601,16 +601,25 @@ fn parse_records(text: &str, first_index: usize) -> Vec<RawRecord> {
     out
 }
 
-/// The structural filter. An ALLOWLIST on `type`, then per-role structural drops.
+/// The `type` values that carry actual conversation. EVERYTHING ELSE IS METADATA.
 ///
-/// Allowlisting `user`/`assistant` (rather than blocking the types we happen to have seen) is
-/// deliberate: `attachment`, `last-prompt`, `permission-mode`, `mode`, `queue-operation`,
-/// `pr-link`, `system`, `file-history-delta` and `file-history-snapshot` were 618 of 1741 records
-/// in one 4.2 MB session, and the list grows with every Claude Code release. A blocklist would
-/// leak each new type into the pane.
+/// Allowlisting (rather than blocking the types we happen to have seen) is deliberate:
+/// `attachment`, `last-prompt`, `permission-mode`, `mode`, `queue-operation`, `pr-link`, `system`,
+/// `file-history-delta` and `file-history-snapshot` were 618 of 1741 records in one 4.2 MB session,
+/// and **the list grows with every Claude Code release** — the vocabulary is Claude Code's, not
+/// Sparkle's, so a blocklist is stale the moment it is written.
+///
+/// `pub(crate)` because `claude.rs` asks the same question for a different purpose — "does this
+/// transcript hold a conversation at all, or is it a metadata-only file we must not resume into?"
+/// Two copies of this rule would drift, and the drift would be silent in exactly the direction that
+/// hurts: a type missing from one copy reads as conversation there and metadata here.
+pub(crate) const CONVERSATION_TYPES: &[&str] = &["user", "assistant"];
+
+/// The structural filter. An ALLOWLIST on `type` (see [`CONVERSATION_TYPES`]), then per-role
+/// structural drops.
 fn classify(v: &Value) -> RecordKind {
     let ty = v.get("type").and_then(Value::as_str).unwrap_or_default();
-    if ty != "user" && ty != "assistant" {
+    if !CONVERSATION_TYPES.contains(&ty) {
         return RecordKind::Drop;
     }
     // A subagent's inner transcript — somebody else's conversation, not this agent's.

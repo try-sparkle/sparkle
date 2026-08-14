@@ -102,6 +102,11 @@ pub(crate) fn claude_session_dir_for(projects_root: &Path, worktree_path: &str) 
 /// (`<uuid>.jsonl`). We require an actual `.jsonl` file rather than "any entry"
 /// so OS cruft (`.DS_Store`) or an empty subdir doesn't make us run
 /// `claude --continue` against a directory with no conversation to resume.
+///
+/// And a `.jsonl` is not enough on its own: it must hold a CONVERSATION. See `has_conversation` —
+/// a directory whose only transcript is a Sparkle-written stub has nothing to continue, and
+/// answering `true` here sends `claude --continue` into an empty session while suppressing the
+/// opening brief. Same defect as the one `latest_session_file` guards, reached by the other door.
 fn has_session_file(dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -112,6 +117,7 @@ fn has_session_file(dir: &Path) -> bool {
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
             && entry.file_type().map(|t| t.is_file()).unwrap_or(false)
+            && has_conversation(&entry.path())
         {
             return true;
         }
@@ -214,9 +220,88 @@ pub async fn claude_has_session(worktree_path: String, config_dir: Option<String
     .unwrap_or(false)
 }
 
+/// Does this `.jsonl` hold an actual CONVERSATION, or only metadata records?
+///
+/// THIS IS NOT A HYPOTHETICAL FILE. When an agent's account assignment rotates, the transcript path
+/// for the newly-chosen config dir does not exist yet, and a session opened there writes its opening
+/// metadata records — `last-prompt`, `ai-title`, `mode`, `permission-mode`, `pr-link` — before any
+/// turn happens. The result is a 600-1000 byte file holding zero conversation. Measured 2026-08-13:
+/// six agents each had exactly one such file, all stamped at the same instant, while their real
+/// transcripts (262 KB-3.4 MB) sat intact under other accounts. Seventeen exist across the tree
+/// against 18,301 real ones.
+///
+/// It is then load-bearing in the worst way, because the resume target is picked by MTIME: it is the
+/// newest (usually the only) `.jsonl` in that directory, so the probe reports `has_session: true`,
+/// the app runs `claude --resume <that-uuid>`, and the session resumes into an empty conversation.
+/// Worse, `buildClaudeExec` emits the opening prompt only when NOT resuming (`claudeSpawn.ts`), so
+/// the agent gets neither its history nor its task — and the app believes the resume worked. That is
+/// the "agents come back with empty sessions and no task" report.
+///
+/// ALLOW-LIST, NOT BLOCKLIST, and that is the whole design. The record vocabulary is CLAUDE CODE's
+/// and grows with every release (see [`crate::transcript::CONVERSATION_TYPES`], which this shares so
+/// the two cannot drift). Enumerating the metadata types instead would mean a transcript holding
+/// only types added after this was written — `system`, `file-history-snapshot`, `queue-operation`, a
+/// future one — classifies as a conversation, wins on mtime, and reproduces the exact defect this
+/// guards. Asking "is there a real turn in here" is stable against a vocabulary Sparkle does not own.
+///
+/// Skipping these fails in the SAFE direction: falling through to `has_session: false` yields a
+/// fresh spawn that DOES carry the opening brief, which is strictly better than resuming into
+/// nothing. It also protects against the files already on disk, which no change to the writing side
+/// can retract.
+///
+/// `SNIFF_LINES` is set from measurement, not taste: across 400 sampled real transcripts (>20 KB)
+/// the first `user`/`assistant` record was at line 12 at the WORST, median 8, with zero exceptions.
+/// 64 is >5x that worst case, and bounds the read so this never walks a multi-MB file.
+fn has_conversation(path: &Path) -> bool {
+    use std::io::BufRead;
+    const SNIFF_LINES: usize = 64;
+
+    let Ok(file) = std::fs::File::open(path) else {
+        // Unreadable is an I/O condition, not evidence about content: say it has a conversation so a
+        // transient failure cannot discard a live session. The resume then fails loudly downstream
+        // rather than silently starting fresh.
+        return true;
+    };
+    for line in std::io::BufReader::new(file).lines().take(SNIFF_LINES) {
+        let Ok(line) = line else { return true };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let is_conversation = serde_json::from_str::<serde_json::Value>(trimmed)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_owned))
+            .is_some_and(|t| crate::transcript::CONVERSATION_TYPES.contains(&t.as_str()));
+        if is_conversation {
+            return true;
+        }
+    }
+    false
+}
+
 /// The most-recently-modified `<uuid>.jsonl` transcript in `dir`, or None. A worktree accrues one
 /// transcript per session (fresh start + each `--continue`); the newest mtime is the live one.
+///
+/// UNFILTERED, and that is correct for READERS. Sparkle's own sidecar records — `ai-title` in
+/// particular — live in these files, and a transcript that holds nothing else is still the right
+/// place to read a title from. Callers deciding what to RESUME want
+/// [`latest_resumable_session_file`] instead.
 fn latest_session_file(dir: &Path) -> Option<PathBuf> {
+    latest_session_file_where(dir, |_| true)
+}
+
+/// The newest transcript in `dir` that actually holds a CONVERSATION, or None.
+///
+/// This is the selector for anything that decides what to resume or which account holds the live
+/// conversation. A Sparkle-written stub is skipped rather than being allowed to win on mtime — see
+/// [`has_conversation`] for what it is and why skipping fails safe.
+fn latest_resumable_session_file(dir: &Path) -> Option<PathBuf> {
+    latest_session_file_where(dir, |p| has_conversation(p))
+}
+
+/// Shared body. `keep` is consulted only for a candidate that would otherwise WIN, so a directory of
+/// large real transcripts costs at most one sniff.
+fn latest_session_file_where(dir: &Path, keep: impl Fn(&Path) -> bool) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let is_jsonl = entry
@@ -228,7 +313,7 @@ fn latest_session_file(dir: &Path) -> Option<PathBuf> {
             continue;
         }
         if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
-            if best.as_ref().is_none_or(|(t, _)| mtime > *t) {
+            if best.as_ref().is_none_or(|(t, _)| mtime > *t) && keep(&entry.path()) {
                 best = Some((mtime, entry.path()));
             }
         }
@@ -356,7 +441,7 @@ fn claude_latest_session_id_in(
     worktree_path: &str,
 ) -> Option<String> {
     let root = claude_projects_root(config_dir, home)?;
-    let file = latest_session_file(&claude_session_dir_for(&root, worktree_path))?;
+    let file = latest_resumable_session_file(&claude_session_dir_for(&root, worktree_path))?;
     file.file_stem().map(|s| s.to_string_lossy().into_owned())
 }
 
@@ -435,7 +520,7 @@ pub(crate) fn claude_session_accounts_in(
         let Some(root) = claude_projects_root(resolved.as_deref(), home) else {
             continue;
         };
-        let Some(file) = latest_session_file(&claude_session_dir_for(&root, worktree_path)) else {
+        let Some(file) = latest_resumable_session_file(&claude_session_dir_for(&root, worktree_path)) else {
             continue;
         };
         let Ok(mtime) = file.metadata().and_then(|m| m.modified()) else {
@@ -545,11 +630,17 @@ mod tests {
         dir
     }
 
+    /// A transcript body that looks like a real conversation. Every fixture standing in for "a real
+    /// session" uses it: session detection now requires an actual `user`/`assistant` turn (see
+    /// `has_conversation`), so a `{}` placeholder would read as a metadata-only file and these
+    /// path-resolution tests would be asserting the wrong thing for the wrong reason.
+    const REAL_BODY: &[u8] = b"{\"type\":\"user\",\"message\":{}}\n{\"type\":\"assistant\",\"message\":{}}\n";
+
     /// Create a `<uuid>.jsonl` transcript inside `dir` so it looks like a real
     /// Claude session directory.
     fn seed_session(dir: &Path) {
         std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join("b3d4494a-3b98.jsonl"), b"{}\n").unwrap();
+        std::fs::write(dir.join("b3d4494a-3b98.jsonl"), REAL_BODY).unwrap();
     }
 
     fn home_root(home: &Path) -> PathBuf {
@@ -576,8 +667,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let older = dir.join("pass-1.jsonl");
         let newer = dir.join("pass-2.jsonl");
-        std::fs::write(&older, b"{}\n").unwrap();
-        std::fs::write(&newer, b"{}\n").unwrap();
+        std::fs::write(&older, REAL_BODY).unwrap();
+        std::fs::write(&newer, REAL_BODY).unwrap();
         // Deliberately NOT in filename order: an implementation that sorted by name would pass a
         // fixture where the newer file also sorts last.
         set_mtime(&older, 2_000);
@@ -928,9 +1019,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let old = dir.join("11111111-aaaa.jsonl");
-        std::fs::write(&old, b"{}\n").unwrap();
+        std::fs::write(&old, REAL_BODY).unwrap();
         let new = dir.join("22222222-bbbb.jsonl");
-        std::fs::write(&new, b"{}\n").unwrap();
+        std::fs::write(&new, REAL_BODY).unwrap();
         // Force `old` strictly older so mtime ordering is unambiguous on fast filesystems.
         let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
         std::fs::File::options()
@@ -1102,7 +1193,7 @@ mod tests {
             worktree,
         );
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("deadbeef-1234.jsonl"), b"{}\n").unwrap();
+        std::fs::write(dir.join("deadbeef-1234.jsonl"), REAL_BODY).unwrap();
 
         assert_eq!(
             claude_latest_session_id_in(Some(&config_dir), Some(&home), worktree),
@@ -1154,4 +1245,190 @@ mod tests {
         assert!(!claude_has_session_in(Some(&empty), None, worktree));
         let _ = std::fs::remove_dir_all(&home);
     }
+
+    // ── THE CONVERSATION-LESS STUB ──────────────────────────────────────────────────────────────
+    //
+    // Sparkle appends its own sidecar records into the transcript path for whichever account an
+    // agent is currently assigned to. After an account rotation that path does not exist under the
+    // new config dir, so the append CREATES a file holding zero conversation — and because the
+    // resume target is chosen by MTIME, that brand-new file wins. The app then runs
+    // `claude --resume <stub>` into an empty session AND suppresses the opening brief (which is only
+    // emitted when not resuming), which is the "agents come back with empty sessions and no task"
+    // report. Six agents hit this at one instant on 2026-08-13.
+
+    /// A real Claude transcript: conversation records.
+    fn seed_real(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(
+            &p,
+            b"{\"type\":\"user\",\"message\":{}}\n{\"type\":\"assistant\",\"message\":{}}\n",
+        )
+        .unwrap();
+        p
+    }
+
+    /// A Sparkle-written stub: sidecar records only, no conversation. Byte-for-byte the shape
+    /// observed on disk.
+    fn seed_stub(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(
+            &p,
+            b"{\"type\":\"last-prompt\",\"lastPrompt\":\"x\"}\n\
+              {\"type\":\"ai-title\",\"aiTitle\":\"t\"}\n\
+              {\"type\":\"mode\",\"mode\":\"normal\"}\n\
+              {\"type\":\"permission-mode\",\"permissionMode\":\"auto\"}\n\
+              {\"type\":\"pr-link\",\"prNumber\":1}\n",
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn has_conversation_rejects_a_sidecar_only_stub() {
+        let d = unique_home("conv-stub");
+        assert!(!has_conversation(&seed_stub(&d, "a.jsonl")));
+    }
+
+    #[test]
+    fn has_conversation_accepts_a_real_transcript() {
+        let d = unique_home("conv-real");
+        assert!(has_conversation(&seed_real(&d, "a.jsonl")));
+    }
+
+    #[test]
+    fn has_conversation_requires_an_actual_turn_not_merely_an_unknown_type() {
+        // ALLOW-LIST, not blocklist. The record vocabulary is Claude Code's and grows with every
+        // release, so "types I do not recognise" must NOT read as conversation — a transcript of
+        // only `system` / `file-history-snapshot` / `queue-operation` records is exactly the
+        // metadata-only file this guards, and enumerating the metadata types would have let it pass.
+        let d = unique_home("conv-unknown");
+        let p = d.join("a.jsonl");
+        std::fs::write(
+            &p,
+            b"{\"type\":\"system\"}\n{\"type\":\"file-history-snapshot\"}\n{\"type\":\"queue-operation\"}\n",
+        )
+        .unwrap();
+        assert!(!has_conversation(&p));
+
+        // A single real turn anywhere in the window is enough, whatever surrounds it.
+        std::fs::write(&p, b"{\"type\":\"system\"}\n{\"type\":\"assistant\",\"message\":{}}\n").unwrap();
+        assert!(has_conversation(&p));
+    }
+
+    #[test]
+    fn has_conversation_is_not_fooled_by_a_line_it_cannot_parse() {
+        // Garbage is not a turn. Falling through to "no conversation" yields a fresh spawn that
+        // carries the brief, which is the safe direction; treating it as a conversation would resume
+        // into a file with nothing in it.
+        let d = unique_home("conv-garbage");
+        let p = d.join("a.jsonl");
+        std::fs::write(&p, b"not json\n{}\n").unwrap();
+        assert!(!has_conversation(&p));
+    }
+
+    #[test]
+    fn has_conversation_rejects_an_empty_file() {
+        let d = unique_home("conv-empty");
+        let p = d.join("a.jsonl");
+        std::fs::write(&p, b"").unwrap();
+        assert!(!has_conversation(&p));
+    }
+
+    #[test]
+    fn latest_resumable_session_file_skips_a_newer_stub_for_an_older_real_transcript() {
+        // THE PRODUCTION CASE, with the stub deliberately NEWER — which is how it presents, since it
+        // is written at teardown. Picking by mtime alone returns the stub.
+        let d = unique_home("latest-skips-stub");
+        let real = seed_real(&d, "real.jsonl");
+        let stub = seed_stub(&d, "stub.jsonl");
+        set_mtime(&real, 1_000);
+        set_mtime(&stub, 2_000);
+        assert_eq!(latest_resumable_session_file(&d), Some(real));
+    }
+
+    #[test]
+    fn latest_resumable_session_file_is_none_when_the_only_transcript_is_a_stub() {
+        // Falling through to "no session" is the SAFE direction: the spawn is then fresh, and a
+        // fresh spawn carries the opening brief. Resuming into nothing carries neither.
+        let d = unique_home("latest-only-stub");
+        seed_stub(&d, "stub.jsonl");
+        assert_eq!(latest_resumable_session_file(&d), None);
+    }
+
+    // ── THE PRODUCTION ENTRY POINTS ─────────────────────────────────────────────────────────────
+    //
+    // The helpers above are covered, but the two call sites that actually TURN THIS ON are what a
+    // regression would revert. Both of these fail if either site goes back to the unfiltered
+    // `latest_session_file` — the grip-vs-intent gap AGENTS.md warns about, since a mutation-check
+    // PASS on those lines only proves the call is load-bearing, not that it skips a stub.
+
+    #[test]
+    fn the_resume_target_skips_a_newer_stub_and_names_the_real_session() {
+        // The `--resume <id>` target, resolved exactly as the spawn path resolves it.
+        let home = unique_home("resume-target-skips-stub");
+        let wt = "/wt/agent-x";
+        let dir = claude_session_dir_for(&home_root(&home), wt);
+        let real = seed_real(&dir, "11111111-aaaa.jsonl");
+        let stub = seed_stub(&dir, "22222222-bbbb.jsonl");
+        set_mtime(&real, 1_000);
+        set_mtime(&stub, 2_000); // the stub is NEWER, which is how it presents
+
+        assert_eq!(
+            claude_latest_session_id_in(None, Some(&home), wt).as_deref(),
+            Some("11111111-aaaa"),
+        );
+    }
+
+    #[test]
+    fn the_resume_target_is_none_when_only_a_stub_exists() {
+        // No session beats a session with nothing in it: a fresh spawn carries the opening brief.
+        let home = unique_home("resume-target-only-stub");
+        let wt = "/wt/agent-y";
+        seed_stub(&claude_session_dir_for(&home_root(&home), wt), "33333333-cccc.jsonl");
+
+        assert_eq!(claude_latest_session_id_in(None, Some(&home), wt), None);
+    }
+
+    #[test]
+    fn transcript_affinity_omits_an_account_whose_only_transcript_is_a_stub() {
+        // Affinity ranks accounts by which holds the live conversation. A stub makes the WRONG
+        // account look like it does — which is precisely how the stub defeats the mitigation that
+        // was supposed to stop an account rotation from losing a conversation.
+        let home = unique_home("affinity-skips-stub");
+        let wt = "/wt/agent-z";
+        let with_stub = home.join("acct-stub");
+        let with_real = home.join("acct-real");
+        let stub_dir = claude_session_dir_for(&claude_projects_root(Some(&with_stub), None).unwrap(), wt);
+        let real_dir = claude_session_dir_for(&claude_projects_root(Some(&with_real), None).unwrap(), wt);
+        let stub = seed_stub(&stub_dir, "44444444-dddd.jsonl");
+        let real = seed_real(&real_dir, "55555555-eeee.jsonl");
+        set_mtime(&real, 1_000);
+        set_mtime(&stub, 2_000); // newer, so an unfiltered ranking would put it FIRST
+
+        let ranked = claude_session_accounts_in(
+            &[
+                with_stub.to_string_lossy().into_owned(),
+                with_real.to_string_lossy().into_owned(),
+            ],
+            None,
+            Some(&home),
+            wt,
+        );
+
+        assert_eq!(ranked, vec![with_real.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn has_session_file_rejects_a_directory_holding_only_a_stub() {
+        // The same defect reached by the other door: `claude --continue` against a stub resumes an
+        // empty session just as `--resume <uuid>` does.
+        let d = unique_home("hasfile-only-stub");
+        seed_stub(&d, "stub.jsonl");
+        assert!(!has_session_file(&d));
+        seed_real(&d, "real.jsonl");
+        assert!(has_session_file(&d));
+    }
+
 }
