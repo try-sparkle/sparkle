@@ -24,7 +24,7 @@
 //
 // ── WHAT THIS DOES AND DOES NOT REACH ───────────────────────────────────────────────────────────
 // It reaches every agent this WINDOW is running: mounted-but-unselected (the population the founder
-// measured, read from live scrollback) and unmounted-with-a-fresh-capture (read from
+// measured, read from the live viewport) and unmounted-with-a-fresh-capture (read from
 // `runtimeStore.attentionScreen`). It does NOT reach an agent in a project never visited this
 // session, and that is not a gap left open: unmounting a Terminal kills its PTY and panes mount
 // lazily per project (`Workspace`), so such an agent has no process in this window and therefore no
@@ -32,12 +32,14 @@
 //
 // ── THE FOUR CONSTRAINTS, AND WHERE EACH ONE LIVES ──────────────────────────────────────────────
 //  1. STALENESS IS THE MAIN HAZARD. Answering off a stale snapshot types a digit into whatever
-//     replaced the prompt. `approvalScreen.approvalScreenFor` is the single gate — stamp required,
-//     age ceiling, movement ledger — and it fails closed on every uncertain path. This module adds
-//     the two checks a reader cannot make for itself: the agent must STILL be in an ask status at
-//     the moment of decision (scrollback is 300 lines of HISTORY, so an answered picker stays in the
-//     tail long after it is gone), and the screen must be UNCHANGED across a settle window, so a
-//     half-painted picker is never decided on.
+//     replaced the prompt. `approvalScreen.approvalScreenFor` is the single gate: its tier (a) reads
+//     the LIVE VIEWPORT — never scrollback history (bead sparkle-af831) — refusing a null or
+//     alternate-buffer screen, and its tier (b) snapshot path requires a stamp, an age ceiling and a
+//     clean movement ledger, failing closed on every uncertain path. This module adds the two checks
+//     a reader cannot make for itself: the agent must STILL be in an ask status at the moment of
+//     decision (a viewport captured a beat before the human answered can still show the picker), and
+//     the screen must be UNCHANGED across a settle window, so a half-painted picker is never decided
+//     on.
 //  2. NEVER DOUBLE-ANSWER. The de-dupe set is `handledSigs`, shared with the mounted hook — see that
 //     module's header for why sharing it is the whole point rather than an optimisation. The click
 //     that used to answer the prompt now mounts onto a screen this module already handled, and
@@ -130,12 +132,14 @@ function schedule(agentId: string): void {
  * The settle window elapsed. Re-read, and answer only if nothing has changed underneath us.
  *
  * THE STATUS RE-CHECK IS NOT REDUNDANT WITH THE SCREEN READ, and this is the subtlest thing in the
- * module. Tier (a) of the read is `terminalScrollback`, which is HISTORY — up to 300 lines of it. A
- * picker the user answered by hand two seconds ago is still sitting in that tail, and it is still a
- * perfectly classifiable permission prompt. The capture path cannot go wrong this way (it expires
- * with the ask, twice over), but the scrollback path can, and it is the common one. The status is
- * what says the agent is still STOPPED. `handledSigs` would not save us either: a hand-answered
- * prompt was never added to it.
+ * module. Tier (a) of the read is now the live VIEWPORT (bead sparkle-af831), which redraws — so the
+ * old scrollback-history hazard, where a picker answered by hand seconds ago sat in the tail forever
+ * and read as live, is gone from that tier. But the re-check still earns its place across the whole
+ * arm→settle window: the tier (b) capture is a SNAPSHOT that can outlive the ask, and even a live
+ * viewport read the instant before the human answered can still show the picker until the terminal
+ * repaints. The status is the fact that says the agent is still STOPPED, so it is re-checked at the
+ * moment of decision and not merely at the moment of arming. `handledSigs` would not save us either:
+ * a hand-answered prompt was never added to it.
  */
 function decide(agentId: string, textAtSchedule: string): void {
   if (!ASK.has(useRuntimeStore.getState().status[agentId] as AgentTabStatus)) return;
