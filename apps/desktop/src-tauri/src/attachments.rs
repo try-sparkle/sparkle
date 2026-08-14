@@ -7,7 +7,7 @@
 //! Clipboard + save flows are macOS-only (the app is macOS-only) and shell out to the
 //! built-in `sips` / `osascript` rather than pull in a clipboard crate.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -379,6 +379,26 @@ pub fn note_drag_event(window: &str, event: &tauri::DragDropEvent) {
             "drag-drop: Drop reached Rust"
         );
     }
+    // The recent-drop marker is set on Enter/Over TOO, not just Drop, and this is load-bearing —
+    // Tauri emits this window's JS drag-drop event to the frontend BEFORE running this listener
+    // (see the tier note above and `lib.rs`'s `on_window_event`), so a Drop-only marker can lose
+    // that race: the frontend's drop handler can invoke `recover_drag_paths` before this function's
+    // own Drop branch has run, finding no marker for a drop that is genuinely happening right now.
+    // Enter always precedes Drop in a real drag and cannot be forged by webview JS, so marking on
+    // it too guarantees the marker already exists by the time Drop's JS event reaches the frontend.
+    //
+    // DROP IS DURABLE, Enter/Over are PROVISIONAL — mirroring `dispatch_drag`'s own split below,
+    // and for the same reason: `Leave` must forget a mere HOVER but must NEVER revoke a completed
+    // DROP's consent. wry emits `Leave` from `draggingExited:`, whose ordering relative to
+    // `performDragOperation:` (Drop) this code does not control — a `Leave` arriving just after a
+    // real Drop is not hypothetical. `forget_recent_drop` only clears a still-provisional marker, so
+    // a Drop's marker survives until `take_recent_drop` consumes it or its TTL lapses, exactly like
+    // `Chosen::note_chosen` already protects the path-grant tier from the same ordering.
+    match event {
+        tauri::DragDropEvent::Leave => forget_recent_drop(window),
+        tauri::DragDropEvent::Drop { .. } => mark_recent_drop(window, true),
+        _ => mark_recent_drop(window, false),
+    }
     match dispatch_drag(event) {
         DragGrant::Provisional(paths) => note_dragged_paths(paths, window),
         DragGrant::Renew => refresh_dragged_paths(window),
@@ -403,6 +423,143 @@ pub fn note_drag_event(window: &str, event: &tauri::DragDropEvent) {
 /// reopening the ordering race", which understated it: that race is the bug.
 pub fn note_window_gone(window: &str) {
     forget_dragged_paths(window);
+    clear_recent_drop(window);
+}
+
+/// How long a recent-drop marker stays valid before `take_recent_drop` must treat it as stale.
+/// Generous for the JS round-trip (the frontend's drop handler sees empty paths and invokes
+/// `recover_drag_paths` in reply), but short enough that it cannot be pre-staged: the only way to
+/// benefit from the window is for a REAL drag to touch this exact window within it, which is the
+/// fact the marker exists to prove.
+const RECENT_DROP_TTL: Duration = Duration::from_secs(5);
+
+/// `true` = set by a real `Drop` (durable consent, `Leave` cannot revoke it); `false` = set by
+/// `Enter`/`Over` (a mere hover, `Leave` forgets it). Mirrors the Provisional/Durable split
+/// `dispatch_drag` already applies to path grants, and for the identical reason.
+fn recent_drops() -> &'static Mutex<HashMap<String, (Instant, bool)>> {
+    static DROPS: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    DROPS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record that a real OS drag phase just touched `window`. `durable` is `true` only for `Drop`.
+///
+/// Called ONLY from `note_drag_event`, which is wired to Tauri's window-event delivery — nothing a
+/// webview's own JS can reach or forge. This is the provenance `drag_paths::recover_drag_paths`
+/// checks before reading image BYTES off the drag pasteboard: without it, any permitted webview
+/// could invoke that command ambiently, with no drag over Sparkle at all, and read whatever a
+/// PREVIOUS drag — to this app or to some entirely unrelated app — left resident on the OS-wide
+/// drag pasteboard, then exfiltrate it via `load_attachment`.
+///
+/// NOT Drop-only. Tauri emits this window's JS drag-drop event to the frontend BEFORE running
+/// `note_drag_event` (see the tier note above), so a marker set only on Drop can lose that race —
+/// the frontend's drop handler can invoke `recover_drag_paths` before this function's own Drop
+/// branch has run. Enter always precedes Drop in a real drag, so marking on every phase but Leave
+/// guarantees the marker already exists by the time Drop's JS event reaches the frontend.
+///
+/// STICKY DURABLE, AND NEVER REVIVED BY A HOVER: once a window's marker is durable it cannot be
+/// downgraded back to provisional by a later Enter/Over (see `next_recent_drop`) — `recover_drag_paths`
+/// runs via `spawn_blocking`, on a worker thread concurrent with the main thread's drag delivery, so
+/// "a second gesture on this window within `RECENT_DROP_TTL`" is not a rare double-drag; it is an
+/// ordinary race between that worker thread's `take_recent_drop` and whatever the main thread
+/// delivers next. An unconditional overwrite would let that race downgrade a real Drop's consent to
+/// a hover the very next `Leave` then clears — reopening the silent refusal this marker exists to
+/// prevent.
+///
+/// Equally important and easy to get backwards: a LIVE existing durable marker's timestamp is NOT
+/// refreshed by a later hover either. A window that keeps seeing ordinary drag traffic (a compose
+/// box users drag files into often) would otherwise never let a stale Drop's consent expire — each
+/// Enter/Over silently extending `RECENT_DROP_TTL` past what a real caller could exploit through the
+/// marker alone. Only a fresh Drop resets a durable stamp; a fresh Drop over an existing durable
+/// entry is its own new, legitimate consent, so that reset is correct, not a bug.
+///
+/// "LIVE" is load-bearing (roborev caught this the first time it shipped without it): an EXPIRED
+/// durable entry must be treated as though nothing is stored at all, not as a veto that blocks a
+/// later hover from establishing a fresh marker. Without that, an ordinary drop with real paths —
+/// which never gets consumed, because a drop that carries paths never calls `recover_drag_paths` at
+/// all — leaves `(T1, true)` sitting in the map forever. Minutes later a genuinely new pathless-image
+/// drag arrives: its Enter hits the stale-veto arm and is silently dropped on the floor, so by the
+/// time that drag's own Drop reaches the frontend (before `note_drag_event` has run — the exact race
+/// Enter/Over marking exists to win) there is no fresh marker for `take_recent_drop` to find. The
+/// very race this whole mechanism exists to close reopens, for every window that has ever seen one
+/// prior drop.
+fn mark_recent_drop(window: &str, durable: bool) {
+    if let Ok(mut d) = recent_drops().lock() {
+        let now = Instant::now();
+        let existing = d.get(window).copied();
+        d.insert(window.to_owned(), next_recent_drop(existing, now, durable, RECENT_DROP_TTL));
+    }
+}
+
+/// The pure decision `mark_recent_drop` applies: given what is currently stored for a window (if
+/// anything) and a new drag-phase touch, what should be stored next. Split out so it is testable
+/// with SYNTHETIC `Instant`s — no real clock, no sleeping, no touching the global registry — the
+/// same pattern `Chosen`'s tier rules use above.
+fn next_recent_drop(
+    existing: Option<(Instant, bool)>,
+    now: Instant,
+    durable: bool,
+    ttl: Duration,
+) -> (Instant, bool) {
+    // An EXPIRED entry is not "existing" for this decision — `take_recent_drop` would prune it on
+    // the very next read anyway, so treating it as live here would only let a dead marker block a
+    // fresh one from ever being established. See the "LIVE is load-bearing" doc above.
+    let existing = existing.filter(|(seen, _)| now.saturating_duration_since(*seen) <= ttl);
+    match existing {
+        // A durable (Drop) consent is already recorded AND STILL LIVE, and this touch is a mere
+        // hover: leave the stamp untouched. Refreshing it here IS the stale-marker-revival bug —
+        // see the doc above.
+        Some((seen, true)) if !durable => (seen, true),
+        // Everything else is a legitimate reason to (re)set the stamp: a fresh Drop (even over an
+        // existing durable entry — a second real Drop is its own new consent), a hover renewing an
+        // existing hover (mirrors `Over` renewing a path grant), or the window's first (or first
+        // LIVE) touch.
+        Some((_, existing_durable)) => (now, existing_durable || durable),
+        None => (now, durable),
+    }
+}
+
+/// The drag left `window`. Clears a mere HOVER (Enter/Over with no Drop) — but must NEVER revoke a
+/// completed Drop's DURABLE consent: wry emits `Leave` from `draggingExited:`, and its ordering
+/// relative to `performDragOperation:` (Drop) is not something this code controls, so a `Leave`
+/// arriving just after a real Drop is not hypothetical. Mirrors `Chosen::note_chosen` protecting the
+/// path-grant tier from the identical ordering.
+fn forget_recent_drop(window: &str) {
+    if let Ok(mut d) = recent_drops().lock() {
+        if let Some(&(_, durable)) = d.get(window) {
+            if !durable {
+                d.remove(window);
+            }
+        }
+    }
+}
+
+/// `window` was destroyed — its consent cannot apply to anything, unconditionally, regardless of
+/// tier. Window LABELS are reused in this app (`main`, `helper`, `capture`), so without this a
+/// window recreated under the same label within `RECENT_DROP_TTL` of the old one's destruction
+/// would inherit a Drop's consent it never earned — the same ambient-read this whole gate exists to
+/// refuse, reached through label reuse instead of a missing marker. Called from `note_window_gone`,
+/// which already applies the identical rule to the path-grant tier (`forget_dragged_paths`) for the
+/// same reason: a torn-down view never delivers `draggingExited:`, so nothing else would clear it.
+fn clear_recent_drop(window: &str) {
+    if let Ok(mut d) = recent_drops().lock() {
+        d.remove(window);
+    }
+}
+
+/// Consume `window`'s recent-drop marker if it is still fresh. SINGLE USE: a second call for the
+/// same drop gets nothing, which is fine — the pasteboard read this gates is itself a last-resort
+/// fallback for a drop that already came back with no paths once, not something a caller needs to
+/// repeat.
+///
+/// Also opportunistically prunes every window's stale entry, not just this one's, so the map never
+/// grows unboundedly even across several windows — it is touched on every drag phase.
+pub fn take_recent_drop(window: &str) -> bool {
+    let Ok(mut d) = recent_drops().lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    d.retain(|_, (seen, _)| now.saturating_duration_since(*seen) <= RECENT_DROP_TTL);
+    d.remove(window).is_some()
 }
 
 /// What a window event means for the drag registry. A value so the arm SET is testable — including
@@ -1205,6 +1362,224 @@ mod tests {
             validate_read_path(&f, &roots).is_err(),
             "a window that went away mid-drag must not strand the hover grant"
         );
+    }
+
+    // ── Recent-drop provenance, for `recover_drag_paths`'s image-bytes fallback ────────────────────
+    //
+    // The stamp/tier DECISION is `next_recent_drop`, tested here PURELY with synthetic `Instant`s —
+    // no sleeping, no real clock, no touching the global registry — the same split `Chosen`'s tier
+    // rules use above. The `note_drag_event`/`take_recent_drop` tests below drive the process-global
+    // registry directly for what only exists at that level: whether a real `Drop` reached the
+    // dispatcher at all. Each of THOSE tests uses its own window label — the registry is TTL-based
+    // rather than cleared eagerly, so a shared label could leak a marker from one test into the next.
+
+    #[test]
+    fn a_stale_durable_marker_is_not_revived_by_a_later_hover() {
+        // THE BUG THIS PINS: a naive "always refresh the timestamp" rule lets ordinary drag traffic
+        // over a window (a compose box users drag files into often) keep a stale Drop's consent
+        // alive indefinitely — each Enter/Over silently extending `RECENT_DROP_TTL` past anything a
+        // real caller could exploit through the marker alone.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let after_drop = next_recent_drop(None, t0, true, RECENT_DROP_TTL);
+        assert_eq!(after_drop, (t0, true));
+        let after_hover = next_recent_drop(Some(after_drop), t1, false, RECENT_DROP_TTL);
+        assert_eq!(
+            after_hover,
+            (t0, true),
+            "a later hover, still within the TTL, must NOT refresh a LIVE durable marker's timestamp"
+        );
+    }
+
+    #[test]
+    fn an_expired_durable_marker_does_not_block_a_fresh_hover_from_registering() {
+        // THE BUG ROBOREV CAUGHT IN THE FIX ABOVE: treating ANY durable entry as a veto — expired
+        // or not — reopens the exact silent refusal this whole mechanism exists to close. An
+        // ordinary drop with real paths is never consumed (a drop that carries paths never calls
+        // `recover_drag_paths`), so its durable marker sits unconsumed until it expires. Minutes
+        // later a genuinely NEW pathless-image drag's Enter must be free to establish its own
+        // fresh marker — an expired entry is not "existing" for this decision.
+        let t0 = Instant::now();
+        let long_after = t0 + RECENT_DROP_TTL + Duration::from_secs(1);
+        let after_drop = next_recent_drop(None, t0, true, RECENT_DROP_TTL);
+        let after_stale_hover = next_recent_drop(Some(after_drop), long_after, false, RECENT_DROP_TTL);
+        assert_eq!(
+            after_stale_hover,
+            (long_after, false),
+            "an EXPIRED durable marker must not block a later hover from registering a fresh one"
+        );
+    }
+
+    #[test]
+    fn a_fresh_drop_always_resets_the_stamp_even_over_an_existing_durable_entry() {
+        // A SECOND real Drop is its own new, legitimate consent — unlike a mere hover, it must
+        // reset the timestamp even when a durable entry already exists.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let first = next_recent_drop(None, t0, true, RECENT_DROP_TTL);
+        let second = next_recent_drop(Some(first), t1, true, RECENT_DROP_TTL);
+        assert_eq!(second, (t1, true));
+    }
+
+    #[test]
+    fn a_hover_still_renews_its_own_provisional_stamp() {
+        // The stale-marker-revival fix must not also break the ordinary case: renewing a mere
+        // hover (mirrors `Over` renewing a path grant) is still allowed to refresh its timestamp —
+        // only a LIVE DURABLE entry's stamp is protected from a later hover.
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_secs(1);
+        let first = next_recent_drop(None, t0, false, RECENT_DROP_TTL);
+        let second = next_recent_drop(Some(first), t1, false, RECENT_DROP_TTL);
+        assert_eq!(second, (t1, false));
+    }
+
+    #[test]
+    fn a_drop_upgrades_an_existing_hover_to_durable() {
+        let t0 = Instant::now();
+        let hover = (t0, false);
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(next_recent_drop(Some(hover), t1, true, RECENT_DROP_TTL), (t1, true));
+    }
+
+    #[test]
+    fn a_real_drop_marks_the_window_and_the_marker_is_single_use() {
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-single-use", &tauri::DragDropEvent::Drop {
+            paths: vec![],
+            position: drag_position(),
+        });
+        assert!(
+            take_recent_drop("prov-single-use"),
+            "a real Drop just delivered to this window must leave a provenance marker"
+        );
+        assert!(
+            !take_recent_drop("prov-single-use"),
+            "the marker is single-use — a second consume must find nothing"
+        );
+    }
+
+    #[test]
+    fn a_drop_on_one_window_does_not_mark_another() {
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-cross-a", &tauri::DragDropEvent::Drop {
+            paths: vec![],
+            position: drag_position(),
+        });
+        assert!(
+            !take_recent_drop("prov-cross-b"),
+            "an ambient call from a DIFFERENT window must not ride another window's real drop"
+        );
+        // Clean up the marker this test itself set, so it cannot outlive the test.
+        assert!(take_recent_drop("prov-cross-a"));
+    }
+
+    #[test]
+    fn entering_marks_the_window_even_before_any_drop() {
+        // THE RACE THIS CLOSES: Tauri emits this window's JS drag-drop event to the frontend BEFORE
+        // running `note_drag_event`, so a marker set only on Drop can lose to the frontend's own
+        // `recover_drag_paths` call racing ahead of this function's Drop branch. Marking on Enter
+        // too means the marker is already set by the time Drop's JS event reaches the frontend,
+        // since Enter always precedes Drop in every real drag and — unlike a JS-side flag — cannot
+        // be forged by webview-controlled code.
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-enter-only", &tauri::DragDropEvent::Enter {
+            paths: vec![],
+            position: drag_position(),
+        });
+        assert!(
+            take_recent_drop("prov-enter-only"),
+            "Enter alone, before any Drop, must already leave a fresh provenance marker"
+        );
+    }
+
+    #[test]
+    fn a_hover_that_leaves_without_dropping_clears_its_marker() {
+        // A drag merely crossing this window (Enter, then Leave, no Drop) must not leave a residual
+        // grant a later ambient call could ride — same rule `forget_dragged_paths` already applies
+        // to path grants.
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-enter-leave", &tauri::DragDropEvent::Enter {
+            paths: vec![],
+            position: drag_position(),
+        });
+        note_drag_event("prov-enter-leave", &tauri::DragDropEvent::Leave);
+        assert!(
+            !take_recent_drop("prov-enter-leave"),
+            "Enter followed by Leave, with no Drop, must leave NO provenance marker behind"
+        );
+    }
+
+    #[test]
+    fn a_drop_followed_by_leave_keeps_its_marker() {
+        // THE TIER-COLLAPSE THIS GUARDS: wry emits `Leave` from `draggingExited:`, and this code
+        // does not control its ordering relative to `performDragOperation:` (Drop) — a `Leave`
+        // arriving just after a real Drop is not hypothetical. A marker collapsed to one
+        // undifferentiated tier would let that `Leave` wipe the Drop's DURABLE consent before the
+        // frontend's `recover_drag_paths` call ever consumes it — recreating the exact silent
+        // refusal this whole feature exists to fix.
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-drop-then-leave", &tauri::DragDropEvent::Drop {
+            paths: vec![],
+            position: drag_position(),
+        });
+        note_drag_event("prov-drop-then-leave", &tauri::DragDropEvent::Leave);
+        assert!(
+            take_recent_drop("prov-drop-then-leave"),
+            "a Leave arriving after a real Drop must NOT revoke the Drop's consent marker"
+        );
+    }
+
+    #[test]
+    fn a_stray_enter_after_a_drop_cannot_downgrade_its_marker() {
+        // THE DOWNGRADE THIS GUARDS: `recover_drag_paths` runs via `spawn_blocking`, on a worker
+        // thread concurrent with the main thread's drag delivery. If a later Enter/Over (a second
+        // gesture inside the TTL, or a stray Enter from another view moving under the cursor) were
+        // allowed to overwrite a durable marker with a provisional one, a subsequent Leave — which
+        // is allowed to clear a provisional marker — would revoke the ORIGINAL Drop's consent
+        // before the worker thread ever consumes it. Sticky-durable in `mark_recent_drop` is what
+        // prevents that: this pins Drop -> Enter -> Leave still leaving a usable marker.
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-drop-then-enter-then-leave", &tauri::DragDropEvent::Drop {
+            paths: vec![],
+            position: drag_position(),
+        });
+        note_drag_event("prov-drop-then-enter-then-leave", &tauri::DragDropEvent::Enter {
+            paths: vec![],
+            position: drag_position(),
+        });
+        note_drag_event("prov-drop-then-enter-then-leave", &tauri::DragDropEvent::Leave);
+        assert!(
+            take_recent_drop("prov-drop-then-enter-then-leave"),
+            "a stray Enter after a real Drop must not downgrade the marker to something a \
+             following Leave can then revoke"
+        );
+    }
+
+    #[test]
+    fn a_destroyed_window_cannot_hand_its_drop_consent_to_its_replacement() {
+        // Window LABELS are reused ("main", "helper", "capture"). Without `note_window_gone`
+        // clearing `recent_drops`, a window recreated under the same label within the TTL would
+        // inherit a Drop's consent it never earned — the exact ambient-read this gate exists to
+        // refuse, reached through label reuse instead of a missing marker.
+        let _serialized = global_drag_lock();
+        note_drag_event("prov-gone", &tauri::DragDropEvent::Drop {
+            paths: vec![],
+            position: drag_position(),
+        });
+        note_window_gone("prov-gone");
+        assert!(
+            !take_recent_drop("prov-gone"),
+            "a destroyed window's Drop consent must not survive for whatever window is recreated \
+             under the same label"
+        );
+    }
+
+    #[test]
+    fn an_ambient_call_with_no_drop_at_all_finds_no_marker() {
+        // THE ATTACK ITSELF: a permitted webview invokes `recover_drag_paths` with no drag in
+        // progress whatsoever — no Enter, no Drop, nothing. `take_recent_drop` must refuse it.
+        let _serialized = global_drag_lock();
+        assert!(!take_recent_drop("prov-never-dropped-on"));
     }
 
     // ── Window scoping, at the RULE level ───────────────────────────────────────────────────────

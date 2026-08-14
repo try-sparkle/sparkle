@@ -218,6 +218,10 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std",
     "NSArray",
+    # `drag_paths.rs` reads image BYTES off the drag pasteboard for a drag that carries no file URL
+    # at all (an image dragged out of Preview, Photos, or a browser) and writes them to a temp file,
+    # so the agent has a path to read. `dataForType:` hands back an NSData.
+    "NSData",
     "NSString",
     "NSURL",
 ] }

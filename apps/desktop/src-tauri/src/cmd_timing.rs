@@ -488,7 +488,6 @@ mod main_thread_guard {
         "read_concierge_guidelines",
         "read_config_text",
         "read_prd",
-        "recover_drag_paths",
         "refresh_preflight",
         "reset_config",
         "reset_window_size",
@@ -548,6 +547,7 @@ mod main_thread_guard {
             &["list_audio_inputs"],
         ),
         (include_str!("stale_build.rs"), "stale_build.rs", &["stale_build_probe"]),
+        (include_str!("drag_paths.rs"), "drag_paths.rs", &["recover_drag_paths"]),
     ];
 
     #[test]
