@@ -41,3 +41,26 @@ describe("writePty / resizePty exited-session race", () => {
     expect(invoke).toHaveBeenCalledWith("pty_write", { id: "a1", data: "hi" });
   });
 });
+
+// The PTY-resize hard floor (bead sparkle-mtpot). resizePty is the single choke point every resize
+// path funnels through, so the SIDE EFFECT we pin is the IPC PAYLOAD it actually hands the child —
+// not the args it was called with. A pathological ~2-col collapse (a transient/zero layout
+// measurement) that reached the child would hard-wrap the CLI, destroy scrollback, and paint the
+// pane false-RED; the clamp must lift it BEFORE `pty_resize` is invoked.
+describe("resizePty clamps a collapsed size before it reaches the PTY", () => {
+  it("lifts a ~2-column resize up to the floor in the pty_resize payload", async () => {
+    invoke.mockResolvedValue(undefined);
+    await resizePty("a1", 2, 3);
+    // The child is told the CLAMPED size, never the collapsed one it was called with.
+    expect(invoke).toHaveBeenCalledWith("pty_resize", { id: "a1", cols: 20, rows: 5 });
+    const payload = invoke.mock.calls[0]![1] as { cols: number; rows: number };
+    expect(payload.cols).not.toBe(2);
+    expect(payload.cols).toBeGreaterThanOrEqual(20);
+  });
+
+  it("forwards a normal resize UNCHANGED — only the pathological value is clamped", async () => {
+    invoke.mockResolvedValue(undefined);
+    await resizePty("a1", 120, 40);
+    expect(invoke).toHaveBeenCalledWith("pty_resize", { id: "a1", cols: 120, rows: 40 });
+  });
+});

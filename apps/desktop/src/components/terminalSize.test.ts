@@ -4,8 +4,11 @@ import {
   spawnSize,
   isPlausibleFit,
   implausibleFitWarning,
+  clampPtyResize,
   SPAWN_FALLBACK_COLS,
   SPAWN_FALLBACK_ROWS,
+  MIN_PLAUSIBLE_COLS,
+  MIN_PLAUSIBLE_ROWS,
 } from "./terminalSize";
 
 describe("isMeasuredSize", () => {
@@ -107,5 +110,41 @@ describe("implausibleFitWarning — the loud half", () => {
   it("stays silent on a healthy fit", () => {
     expect(implausibleFitWarning({ cols: 43, rows: 42 }, GOOD)).toBeNull();
     expect(implausibleFitWarning({ cols: 23, rows: 42 }, undefined)).toBeNull();
+  });
+});
+
+describe("clampPtyResize — the PTY-resize hard floor (bead sparkle-mtpot)", () => {
+  it("lifts a pathological ~2-column collapse up to the minimum", () => {
+    // The reported symptom: a transient layout measurement resizes the PTY to ~2 cols, stranding
+    // the agent and painting the pane false-RED. The floor must fire BEFORE the size is handed out.
+    const { cols, rows } = clampPtyResize(2, 3);
+    expect(cols).toBe(MIN_PLAUSIBLE_COLS);
+    expect(rows).toBe(MIN_PLAUSIBLE_ROWS);
+    // And it never leaves the child below a usable width.
+    expect(cols).toBeGreaterThanOrEqual(20);
+  });
+
+  it("passes a normal resize through UNCHANGED", () => {
+    expect(clampPtyResize(132, 44)).toEqual({ cols: 132, rows: 44 });
+    expect(clampPtyResize(80, 24)).toEqual({ cols: 80, rows: 24 });
+  });
+
+  it("clamps cols and rows independently", () => {
+    // A narrow-but-not-collapsed column can be tall: only the offending axis is lifted.
+    expect(clampPtyResize(3, 44)).toEqual({ cols: MIN_PLAUSIBLE_COLS, rows: 44 });
+    expect(clampPtyResize(132, 1)).toEqual({ cols: 132, rows: MIN_PLAUSIBLE_ROWS });
+  });
+
+  it("holds the value exactly at the floor (boundary, not lifted)", () => {
+    expect(clampPtyResize(MIN_PLAUSIBLE_COLS, MIN_PLAUSIBLE_ROWS)).toEqual({
+      cols: MIN_PLAUSIBLE_COLS,
+      rows: MIN_PLAUSIBLE_ROWS,
+    });
+  });
+
+  it("treats a zero or non-finite measurement as the floor, never passes NaN to the child", () => {
+    expect(clampPtyResize(0, 0)).toEqual({ cols: MIN_PLAUSIBLE_COLS, rows: MIN_PLAUSIBLE_ROWS });
+    expect(clampPtyResize(NaN, NaN)).toEqual({ cols: MIN_PLAUSIBLE_COLS, rows: MIN_PLAUSIBLE_ROWS });
+    expect(Number.isNaN(clampPtyResize(NaN, NaN).cols)).toBe(false);
   });
 });

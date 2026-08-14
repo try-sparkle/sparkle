@@ -15,6 +15,7 @@ import {
   noteProgrammaticInsert,
   noteProgrammaticSubmit,
 } from "./components/terminalSubmit";
+import { clampPtyResize } from "./components/terminalSize";
 
 export interface PtyOutput {
   id: string;
@@ -286,7 +287,13 @@ export function submitPrompt(
 }
 
 export function resizePty(id: string, cols: number, rows: number): Promise<void> {
-  return invoke<void>("pty_resize", { id, cols, rows }).catch(ignoreExitedPty);
+  // Clamp up to a sane floor BEFORE the size reaches the child. Every resize path funnels through
+  // here (both transports call it), so this is the one choke point that can guarantee a transient
+  // zero/tiny layout measurement never collapses the PTY to a ~2-column strip — which hard-wraps the
+  // CLI's output, destroys scrollback, and makes the pane misparse as errored/false-RED. See
+  // clampPtyResize in components/terminalSize.ts (bead sparkle-mtpot).
+  const { cols: safeCols, rows: safeRows } = clampPtyResize(cols, rows);
+  return invoke<void>("pty_resize", { id, cols: safeCols, rows: safeRows }).catch(ignoreExitedPty);
 }
 
 /** Pause or resume the PTY's reader for flow control (). Fire-and-forget: the frontend

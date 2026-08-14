@@ -36,6 +36,26 @@ export interface TermSize {
 }
 
 /**
+ * The HARD FLOOR the PTY-resize IPC enforces, independent of the fit-plausibility guard above.
+ * `syncPtySize` already refuses an implausible fit before it pushes a size — but it is NOT the only
+ * path that can reach `resizePty`, and this is defense-in-depth for the one that matters most: a
+ * transient or zero layout measurement (a pane laid out mid-boot, a divider dragged to ~0, a future
+ * caller that never ran the fit guard) collapsing the child to a ~2-column strip. When that reaches
+ * the CLI it hard-wraps every line into a thin column that no later resize un-wraps, the pane
+ * misparses as errored and paints the fleet false-RED, and the scrollback is destroyed
+ * (bead sparkle-mtpot). So the resize IPC itself clamps cols/rows up to these minimums.
+ *
+ * This is DISTINCT from the pixel floor in engine/columnResize.ts (which bounds a column's WIDTH in
+ * px): this clamps the actual `cols`/`rows` cell count handed to the child PTY. A normal size (at or
+ * above the floor) passes through unchanged — only a pathological tiny or non-finite value is lifted.
+ */
+export function clampPtyResize(cols: number, rows: number): TermSize {
+  const clamp = (v: number, min: number): number =>
+    Number.isFinite(v) && v > min ? Math.floor(v) : min;
+  return { cols: clamp(cols, MIN_PLAUSIBLE_COLS), rows: clamp(rows, MIN_PLAUSIBLE_ROWS) };
+}
+
+/**
  * The container the fit was measured against. Optional everywhere it is accepted: when it is
  * absent (or unmeasurable) the relative check FAILS OPEN and the absolute floors above remain the
  * only gate — losing the new guard must never cost the old one.
