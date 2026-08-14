@@ -547,3 +547,40 @@ export function pairIsLive(state: CableState, pair: PairSide): boolean {
 export function effectiveWired(wired: WiredSide, farEndHasAgent: boolean): WiredSide {
   return farEndHasAgent ? wired : "off";
 }
+
+// ── THE CABLE MUST NOT OUTLIVE THE AGENT IT NAMES — BUT "I CANNOT SEE IT" IS NOT "IT IS GONE" ──
+//
+// PR #1817 pinned the far end at mount time and added a Workspace effect that drops the cable when
+// the pinned agent is no longer a member of the WIRED SIDE'S project — the self-heal that pinning
+// removed (roborev 63302: close the mounted agent, or switch the wired pair's project tab, and the
+// pin points at a roster it is not in). This is the decision, extracted so it is testable as a
+// SIDE EFFECT (drop vs keep) rather than only through the shell.
+//
+// THE BUG THIS EXTRACTION FIXES (bead sparkle-4uw52). The inline form was
+// `wiredProject?.agents.some(...)` — an optional chain, so a wired side whose project is momentarily
+// UNRESOLVED (`wiredProject == null`: a tab switch mid-flight, a cold load, the project closing)
+// evaluated to `undefined`, read as falsy, and FIRED THE UNBIND. Dropping the cable there blanks a
+// live mounted pane with no gesture behind it — exactly the "mounted pane stopped showing its
+// terminal, recovering on a pair change" symptom the bead reports — and it is redundant besides:
+// `effectiveWired` above ALREADY projects a far end with no agent as unwired for DRAWING, without
+// destroying the pin. So an unresolved project is NOT evidence the agent is gone; only a RESOLVED
+// roster that positively lacks the pin is. Membership takes the store, visual treatment takes the
+// projection — the same split `effectiveWired`'s own note draws.
+//
+// `wiredAgentIds === null` means "the wired side has no resolved project right now" — keep the
+// cable. The two click-reachable heal cases both leave a real (different) project resolved on the
+// wired side, so they still return `true` and still drop, unchanged.
+export function pinnedFarEndIsGone(
+  wired: WiredSide,
+  pinnedAgentId: string | null,
+  sparkleAgentId: string,
+  wiredAgentIds: readonly string[] | null,
+): boolean {
+  if (wired === "off" || pinnedAgentId === null) return false;
+  // The Sparkle pane's agent is deliberately never a roster member, so a membership test would
+  // unbind the one mount whose far end is app-owned. Exempt it.
+  if (pinnedAgentId === sparkleAgentId) return false;
+  // Cannot confirm absence — do not take the destructive action. See the header.
+  if (wiredAgentIds === null) return false;
+  return !wiredAgentIds.includes(pinnedAgentId);
+}

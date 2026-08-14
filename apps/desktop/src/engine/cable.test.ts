@@ -14,6 +14,7 @@ import {
   RELEASE_ARM_WINDOW_MS,
   pairIsLive,
   patchCable,
+  pinnedFarEndIsGone,
   setOverlay,
   unbindCable,
   unbindsOnKey,
@@ -575,5 +576,53 @@ describe("portalled surfaces are still the circuit — roborev 54821", () => {
     const btn = host.querySelector('[data-testid="stray"]')!;
     expect(unbindsOnPointerDown(wired, btn)).toBe(true);
     host.remove();
+  });
+});
+
+// ── pinnedFarEndIsGone — the forced-unbind's decision, and the transient-null bug it fixes ──────
+//
+// bead sparkle-4uw52. The SIDE EFFECT under test is "does the shell drop a LIVE cable" — true means
+// the mounted pane blanks. Every case asserts that outcome, never the inputs that produce it.
+describe("pinnedFarEndIsGone — a cable whose agent left the wired roster is dropped", () => {
+  const SPARKLE = "sparkle-agent";
+
+  it("keeps the cable when the pinned agent IS a member of the wired side's project", () => {
+    // The mount that just happened. Dropping here is the regression — the pane would blank the
+    // instant it mounted.
+    expect(pinnedFarEndIsGone("right", "a1", SPARKLE, ["a1", "a2"])).toBe(false);
+  });
+
+  it("drops the cable when the pinned agent is ABSENT from a resolved roster", () => {
+    // The two click-reachable heal cases (close the mounted agent / switch the wired pair's tab)
+    // leave a real, different project resolved on the wired side that no longer holds the pin.
+    expect(pinnedFarEndIsGone("right", "gone", SPARKLE, ["a1", "a2"])).toBe(true);
+  });
+
+  it("KEEPS the cable when the wired side's project is UNRESOLVED (null roster)", () => {
+    // THE FIX. A tab switch mid-flight / cold load / closing project makes `wiredProject` null for a
+    // render. The old `wiredProject?.agents.some(...)` read that as "not a member" and unbound,
+    // blanking a live pane with no gesture — the reported symptom. "Cannot see it" is not "gone".
+    expect(pinnedFarEndIsGone("right", "a1", SPARKLE, null)).toBe(false);
+    // …and it must not drop even when the pin would be absent from a hypothetical roster: with no
+    // resolved project there is nothing to be absent from.
+    expect(pinnedFarEndIsGone("left", "whatever", SPARKLE, null)).toBe(false);
+  });
+
+  it("never drops the cable for the Sparkle agent — its far end is app-owned, off every roster", () => {
+    // Sparkle is deliberately never a project member, so a membership test would unbind the one
+    // mount that is always 'absent'. This is what keeps Improve-Sparkle mounted.
+    expect(pinnedFarEndIsGone("right", SPARKLE, SPARKLE, ["a1", "a2"])).toBe(false);
+    expect(pinnedFarEndIsGone("right", SPARKLE, SPARKLE, [])).toBe(false);
+  });
+
+  it("does nothing while unwired or with no pin — there is no cable to drop", () => {
+    expect(pinnedFarEndIsGone("off", "a1", SPARKLE, ["a2"])).toBe(false);
+    expect(pinnedFarEndIsGone("right", null, SPARKLE, ["a2"])).toBe(false);
+  });
+
+  it("drops the cable when the resolved roster is EMPTY and the pin is not Sparkle", () => {
+    // An empty array is a resolved roster (the wired project has zero agents), distinct from null.
+    // The pin cannot be a member, so the cable is genuinely stale.
+    expect(pinnedFarEndIsGone("right", "a1", SPARKLE, [])).toBe(true);
   });
 });

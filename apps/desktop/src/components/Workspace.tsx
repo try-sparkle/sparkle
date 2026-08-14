@@ -75,6 +75,7 @@ import {
 } from "../engine/columnResize";
 import {
   clearsSelectionOnKey,
+  pinnedFarEndIsGone,
   releaseStillArmed,
   unbindsOnKey,
   unbindsOnPointerDown,
@@ -1383,12 +1384,22 @@ export function Workspace() {
   //
   // The Sparkle pane is exempt: its agent is deliberately never a roster member, so a roster lookup
   // would unbind the one mount whose far end is app-owned.
+  //
+  // THE DECISION IS `engine/cable`'s `pinnedFarEndIsGone`, not an inline chain, and that move is the
+  // fix (bead sparkle-4uw52). The old inline `wiredProject?.agents.some(...)` unbound whenever
+  // `wiredProject` was momentarily UNRESOLVED (a tab switch mid-flight, a cold load, a project
+  // closing) — the optional chain read `undefined` as "not a member" and dropped a LIVE cable,
+  // blanking the mounted pane with no gesture. A `null` roster now means "cannot see it", which is
+  // not "it is gone"; `effectiveWired` already draws that transient as unwired without destroying
+  // the pin. The two click-reachable heal cases leave a real project resolved on the wired side, so
+  // they still drop the cable exactly as before.
+  const wiredAgentIds = useMemo(
+    () => (wiredProject ? wiredProject.agents.map((a) => a.id) : null),
+    [wiredProject],
+  );
   useEffect(() => {
-    if (wired === "off" || pinnedAgentId === null) return;
-    if (pinnedAgentId === sparkleAgentId) return;
-    if (wiredProject?.agents.some((a) => a.id === pinnedAgentId)) return;
-    unbind();
-  }, [wired, pinnedAgentId, sparkleAgentId, wiredProject, unbind]);
+    if (pinnedFarEndIsGone(wired, pinnedAgentId, sparkleAgentId, wiredAgentIds)) unbind();
+  }, [wired, pinnedAgentId, sparkleAgentId, wiredAgentIds, unbind]);
   // WHAT THE SHELL DRAWS, from the ONE shared derivation (hooks/useEffectiveWired). It was a local
   // expression here for one commit, and `wired` has three readers — this root, the concierge column
   // via ConciergeHost, and the sidebar's row joint — so projecting it at one of them left the state
