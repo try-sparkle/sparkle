@@ -802,7 +802,10 @@ function gitPushViolation(args) {
  *  the nested command word — `xargs -n 1 rm -rf ~` reads as the binary `1`, which matches no rule
  *  and is allowed. Same option-takes-a-value class as the `git clean -e` fix. */
 const WRAPPER_VALUE_FLAGS = {
-  xargs: new Set(["-I", "-i", "-n", "-L", "-l", "-P", "-s", "-a", "-d", "-E", "-e"]),
+  // `-S` is BSD/macOS xargs's replsize and takes a value, exactly like GNU's lowercase `-s`. Its
+  // absence let `xargs -S 5000 -I{} rm -rf {}` read the VALUE `5000` as the nested command word, so
+  // a real `rm -rf` behind it resolved to a binary that matches no rule.
+  xargs: new Set(["-I", "-i", "-n", "-L", "-l", "-P", "-s", "-S", "-a", "-d", "-E", "-e"]),
   nice: new Set(["-n"]),
   env: new Set(["-u", "-S", "-C"]),
   stdbuf: new Set(["-i", "-o", "-e"]),
@@ -829,13 +832,140 @@ function commandTailFrom(args, valueFlags = new Set()) {
   return [];
 }
 
-/** The words a `find … -exec <cmd> … ;` / `-execdir` clause hands to a new process. */
-function findExecTail(args) {
-  const at = args.findIndex((a) => a === "-exec" || a === "-execdir");
-  if (at === -1) return [];
-  const rest = args.slice(at + 1);
-  const end = rest.findIndex((a) => a === ";" || a === "+");
-  return end === -1 ? rest : rest.slice(0, end);
+/** The words EVERY `find … -exec/-execdir/-ok/-okdir <cmd> …` clause hands to a new process.
+ *
+ *  Two holes closed by returning all of them, and by reusing `FIND_COMMAND_PREDICATES` rather than
+ *  re-listing the predicates here:
+ *
+ *  - `find` lets the predicate REPEAT, and reading only the first clause judged the harmless half of
+ *    `find / -type f -exec echo {} \; -exec rm {} +` — one no-op clause in front hid the delete.
+ *  - `-ok`/`-okdir` are `-exec`/`-execdir` with a per-file prompt, and the prompt is not a guard:
+ *    `yes | find / -type f -ok rm {} \;` answers every one of them. The narrowing walk below already
+ *    counted all four as command-carrying predicates; only this extractor disagreed, and a set that
+ *    disagrees with its twin is exactly the drift the shared constant prevents. */
+function findExecTails(args) {
+  const out = [];
+  for (let i = 0; i < args.length; i++) {
+    if (!FIND_COMMAND_PREDICATES.has(args[i])) continue;
+    const rest = args.slice(i + 1);
+    const end = rest.findIndex((a) => a === ";" || a === "\\;" || a === "+");
+    const tail = end === -1 ? rest : rest.slice(0, end);
+    if (tail.length) out.push(tail);
+    i = findSkipCommandRun(args, i) - 1; // step past this run so its words are never re-read
+  }
+  return out;
+}
+
+/** Every binary that DESTROYS the files `find` hands it.
+ *
+ *  This rule has been fixed one spelling at a time — `rm -r`, then plain `rm`, then `unlink` — because
+ *  the predicate asked "is this the binary I happened to think of" instead of "does this destroy what
+ *  it is given". `shred`/`srm` overwrite then unlink; `truncate` zeroes in place, which for the set
+ *  find hands it is the same loss. Adding a spelling is now one edit here rather than a new clause at
+ *  the call site.
+ *
+ *  `rmdir` is deliberately NOT here. It refuses non-empty directories and can never remove a file, so
+ *  it destroys nothing that was not already empty — and including it hard-refused the canonical prune
+ *  (`find ~ -type d -empty -exec rmdir {} +`), which neither `-empty` nor `-depth` narrows in this
+ *  file's sense. Re-blocking safe work with no approval path is the failure mode this rule's own
+ *  header warns about first, so the bar for joining this set is "destroys data", not "removes". */
+const DELETING_BINARIES = new Set(["rm", "unlink", "shred", "srm", "truncate"]);
+
+/** `env`'s command-carrying flag. `env -S 'rm {}'` RUNS `rm` — the string is a command line, not an
+ *  opaque value — so treating `-S` as a value flag (which `WRAPPER_VALUE_FLAGS.env` does, correctly,
+ *  for `-u`/`-C`) skips both words and hands back an empty tail. That reads as "nothing exec'd" and
+ *  allows the very laundering the normalizer exists to catch.
+ *
+ *  Returns `{ str, rest }` — the command STRING and the operands that follow the flag, because
+ *  `env -S 'sh -c' 'rm "$@"' _ {}` really runs `sh -c 'rm "$@"' _ {}`; re-lexing the string alone
+ *  loses the `-c` argument and the deleter with it.
+ *
+ *  THE SCAN MUST BE BOUNDED to env's OWN option prefix. Scanning the whole vector let a `-S`-looking
+ *  word belonging to the NESTED command hijack the parse — `env rm -rf -- -Sx {}` matched the `-Sx`
+ *  operand of `rm`, so a real `rm -rf` at an unbounded root was reported as a non-deleter. That was
+ *  a REGRESSION against the plain-wrapper path, which resolved the same tail to `rm` and blocked it.
+ *  So: stop at `--`, and stop at the first word that is neither an option nor a `NAME=value`
+ *  assignment (that word is the command). */
+function envSplitString(args) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") return null; // end of env's own options; everything after is the command
+    if (!a.startsWith("-") || a === "-") {
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) continue; // NAME=value is still env's own
+      return null; // the command word — env carried no -S
+    }
+    if (a.startsWith("--")) {
+      // getopt_long takes `--opt=value`, `--opt value`, and unambiguous abbreviations.
+      const eq = a.indexOf("=");
+      const name = eq === -1 ? a : a.slice(0, eq);
+      if (name.length > 2 && "--split-string".startsWith(name)) {
+        return eq === -1
+          ? { str: args[i + 1] ?? "", rest: args.slice(i + 2) }
+          : { str: a.slice(eq + 1), rest: args.slice(i + 1) };
+      }
+      continue; // some other long option
+    }
+    // A short cluster: `-S`, `-S<str>`, and bundled forms like `-iS` / `-vS<str>`. Everything left
+    // of the `S` is an ordinary boolean option letter.
+    const sAt = a.indexOf("S", 1);
+    if (sAt !== -1) {
+      const after = a.slice(sAt + 1);
+      return after.length
+        ? { str: after, rest: args.slice(i + 1) }
+        : { str: args[i + 1] ?? "", rest: args.slice(i + 2) };
+    }
+    // `-u NAME` / `-C DIR` take a separate value; skip it so it cannot be read as the command word.
+    if (a === "-u" || a === "-C") i++;
+  }
+  return null;
+}
+
+/** The deleting binary an exec tail ultimately runs, or null.
+ *
+ *  Reading the tail's FIRST word is not enough, and that is the same "one word over" reasoning that
+ *  added `unlink`: the identical deletion is spelled through a wrapper (`env rm`, `nice rm`,
+ *  `stdbuf -o0 rm`) or through a shell (`sh -c 'rm "$@"'`), and both leave the command word as
+ *  something no binary list will ever contain. Enumerating names is only sound once the tail is
+ *  NORMALIZED, so resolve the wrapper chain and the shell's `-c` string first — reusing the
+ *  machinery this file already applies to `xargs` and to top-level shell segments. */
+function execTailDeleter(tail, depth = 0) {
+  if (depth > MAX_NESTING) return null;
+  let seg = segmentCommand(tail);
+  // `env nice rm` is two wrappers deep, so unwrap in a loop rather than once.
+  for (let i = 0; seg && NESTING_WRAPPERS.has(seg.bin) && i < MAX_NESTING; i++) {
+    // `env -S '…'` carries a COMMAND LINE, so it is re-lexed like a shell's `-c` rather than
+    // unwrapped like an operand tail — the generic unwrap treats `-S` as taking an opaque value
+    // and returns an empty tail, which reads as "nothing was exec'd" and allows the laundering.
+    if (seg.bin === "env") {
+      const split = envSplitString(seg.args);
+      if (split !== null) {
+        const segs = lexCommand(stripHeredocBodies(split.str));
+        if (segs.length === 0) return execTailDeleter(split.rest, depth + 1);
+        for (let k = 0; k < segs.length; k++) {
+          // The operands after the flag continue the LAST segment of the split string, so that
+          // `env -S 'sh -c' 'rm "$@"' _ {}` is judged as the `sh -c 'rm "$@"' _ {}` it really runs.
+          const toks = k === segs.length - 1 ? [...segs[k], ...split.rest] : segs[k];
+          const inner = execTailDeleter(toks, depth + 1);
+          if (inner) return inner;
+        }
+        return null;
+      }
+    }
+    seg = segmentCommand(commandTailFrom(seg.args, WRAPPER_VALUE_FLAGS[seg.bin]));
+  }
+  if (!seg) return null;
+  if (DELETING_BINARIES.has(seg.bin)) return seg.bin;
+  if (SHELL_BINARIES.has(seg.bin)) {
+    // Same bundled-flag search as the top-level shell rule (`-lc`, `-ec`, …), not an exact `-c`.
+    const at = seg.args.findIndex((a) => a.startsWith("-") && !a.startsWith("--") && a.includes("c"));
+    if (at !== -1 && seg.args[at + 1] !== undefined) {
+      for (const toks of lexCommand(stripHeredocBodies(seg.args[at + 1]))) {
+        const inner = execTailDeleter(toks, depth + 1);
+        if (inner) return inner;
+      }
+    }
+  }
+  return null;
 }
 
 /** find's own options that precede the paths (`find -L $HOME …`), and the one that takes a value. */
@@ -1356,9 +1486,11 @@ function judgeSegment(tokens, depth) {
       if (nested) return nested;
     }
     if (bin === "find") {
-      const execTail = findExecTail(args);
-      const nested = judgeSegment(execTail, depth + 1);
-      if (nested) return nested;
+      const execTails = findExecTails(args);
+      for (const tail of execTails) {
+        const nested = judgeSegment(tail, depth + 1);
+        if (nested) return nested;
+      }
       // `find <root> -exec rm -rf {} +` names `{}` as the target, so the nested judgement above
       // (correctly) sees nothing catastrophic — `find . -name '*.log' -exec rm -rf {} +` is
       // ordinary cleanup. What decides it is where find was pointed AND how wide it casts.
@@ -1369,23 +1501,27 @@ function judgeSegment(tokens, depth) {
       // it — a false refusal with no approval path. So this fires only when the deletion set is
       // genuinely unbounded: a top-level root (`/`, `~`, `$HOME`, a home directory itself — depth
       // 0, not one level below) AND no narrowing predicate to bound what matches.
-      const execSeg = segmentCommand(execTail);
       // `-r` is NOT what makes the `-exec` destructive here, and requiring it left the widest
       // shape of all open: `find / -type f -exec rm {} +` returned ALLOW while its `-rf` sibling
       // was refused. A plain `rm` removes every FILE it is handed — recursion only buys the
       // ability to descend into DIRECTORIES, and find has already done the descending, so the
       // deletion set is identical. `-type f` even makes the plain form the *natural* spelling.
-      // `unlink` is the same primitive under another name and was unguarded for the same reason.
-      // Widening this cannot over-refuse, because the two conditions below are untouched: it
-      // still fires only on a depth-0 root AND when nothing narrows the match, so an ordinary
-      // scoped cleanup (`find build -type f -exec rm {} +`, or any real `-name`) is unaffected.
-      const execDeletes = execSeg?.bin === "rm" || execSeg?.bin === "unlink";
-      const deletes = args.includes("-delete") || execDeletes;
+      //
+      // Which binary counts, and how a tail is normalized before that question is asked, both live
+      // in `execTailDeleter` — so a laundered spelling (`env rm`, `sh -c 'rm "$@"'`) and a sibling
+      // primitive (`shred -u`, `truncate -s0`) are judged the same as the plain one, and ANY of the
+      // clauses may be the deleting one.
+      //
+      // None of this can over-refuse, because the two conditions below are untouched: it still
+      // fires only on a depth-0 root AND when nothing narrows the match, so an ordinary scoped
+      // cleanup (`find build -type f -exec rm {} +`, or any real `-name`) is unaffected.
+      const deleter = execTails.map((t) => execTailDeleter(t)).find(Boolean) ?? null;
+      const deletes = args.includes("-delete") || deleter !== null;
       if (deletes && !findHasNarrowingPredicate(args)) {
         const root = findSearchRoots(args).find(isTopLevelRoot);
         if (root) {
           return {
-            rule: args.includes("-delete") ? "find -delete" : `find -exec ${execSeg?.bin ?? "rm"}`,
+            rule: args.includes("-delete") ? "find -delete" : `find -exec ${deleter ?? "rm"}`,
             why: `an unbounded delete rooted at ${root} — nothing narrows what it matches`,
           };
         }
