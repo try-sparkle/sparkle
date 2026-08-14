@@ -238,13 +238,22 @@ pub enum Reply {
     Ci,
     AnotherAgent,
     Quota,
+    /// The agent has NO task assigned — finished, or spawned without one. It cannot be blocked on a
+    /// human, because there is nothing for a person to unblock. Routes to the concierge, never the
+    /// founder (bead `sparkle-dfy3d`).
+    NoTask,
+    /// The agent has exhausted its context window. The remedy is to succeed it or hand its goal to a
+    /// successor — a concierge action, not a founder page (bead `sparkle-umtx1`).
+    OutOfContext,
 }
 
 /// The wire tokens, longest-first so a prefix can never shadow a longer match.
-const REPLY_TOKENS: [(&str, Reply); 5] = [
+const REPLY_TOKENS: [(&str, Reply); 7] = [
     ("blocked-on-another-agent", Reply::AnotherAgent),
+    ("no-task-assigned", Reply::NoTask),
     ("blocked-on-human", Reply::Human),
     ("blocked-on-quota", Reply::Quota),
+    ("out-of-context", Reply::OutOfContext),
     ("blocked-on-ci", Reply::Ci),
     ("not-blocked", Reply::NotBlocked),
 ];
@@ -257,6 +266,8 @@ impl Reply {
             Reply::Ci => "blocked-on-ci",
             Reply::AnotherAgent => "blocked-on-another-agent",
             Reply::Quota => "blocked-on-quota",
+            Reply::NoTask => "no-task-assigned",
+            Reply::OutOfContext => "out-of-context",
         }
     }
 }
@@ -280,6 +291,17 @@ pub enum Standdown {
     /// external, so keep the ladder running — but at the top rung only, and let the counter climb
     /// to the terminal rung so this ends.
     External,
+    /// `no-task-assigned`. A finished or freshly-spawned agent that has NO task cannot be blocked on
+    /// a human — there is nothing for a person to unblock, so a `blocked-on-human` row that paints
+    /// red and pages the FOUNDER is a false alarm (bead `sparkle-dfy3d`). Writes stop and the
+    /// CONCIERGE — the layer that can stand the agent down or hand it work — is flagged, never the
+    /// founder.
+    NoTask,
+    /// `out-of-context`. The agent has run out of context window. That is not a human blocker
+    /// either: the remedy is to succeed it or hand its goal to a successor, which is the CONCIERGE's
+    /// job (bead `sparkle-umtx1`). Writes stop and the concierge is flagged with a machine-readable
+    /// `out-of-context` reason the layer above can act on — never the founder.
+    OutOfContext,
 }
 
 impl Standdown {
@@ -289,6 +311,8 @@ impl Standdown {
             Reply::Human => Standdown::AwaitHuman,
             Reply::Quota => Standdown::Quota,
             Reply::Ci | Reply::AnotherAgent => Standdown::External,
+            Reply::NoTask => Standdown::NoTask,
+            Reply::OutOfContext => Standdown::OutOfContext,
         }
     }
 
@@ -301,6 +325,11 @@ impl Standdown {
             // External keeps whatever the ordinary escalation counter has reached; it does not
             // assert a level of its own.
             Standdown::External => None,
+            // A task-less or out-of-context agent is a concierge matter, never a founder page — the
+            // founder is the red alarm, and neither of these needs a person. `Some(Concierge)` also
+            // marks both VISIBLE, so `effective_standdown`'s invisible-expiry (keyed on
+            // `flag().is_none()`) leaves their rows standing until the concierge acts.
+            Standdown::NoTask | Standdown::OutOfContext => Some(Escalation::Concierge),
         }
     }
 
@@ -315,6 +344,8 @@ impl Standdown {
             Standdown::AwaitHuman => "blocked-on-human",
             Standdown::Quota => "blocked-on-quota",
             Standdown::External => "blocked-externally",
+            Standdown::NoTask => "no-task-assigned",
+            Standdown::OutOfContext => "out-of-context",
         }
     }
 }
@@ -1349,6 +1380,10 @@ fn standdown_level(stand: Option<Standdown>, escalated: Option<Escalation>) -> O
 ///   * "Resume your goal" — the instruction, and it is idempotent: safe to receive twenty times.
 ///   * The typed reply vocabulary — the SAME small set the pusher loop (sparkle-4cd0x) parses, so a
 ///     blocked agent's answer is machine-readable by the layer above instead of dying in a terminal.
+///     Two of the tokens are NOT blockers and route to the concierge rather than the founder:
+///     `no-task-assigned` (a finished/task-less agent — nothing for a person to unblock,
+///     bead `sparkle-dfy3d`) and `out-of-context` (context exhausted — succeed it or hand off to a
+///     successor, bead `sparkle-umtx1`). Neither paints the founder's red row.
 ///   * "the exact command or permission you need" — the token says WHO is owed; this says WHAT.
 ///     Asking for "what you need" got prose that named no action, so the row reached a human with
 ///     nothing on it to act on: one agent sat blocked on a privileged command for two days without
@@ -1359,9 +1394,9 @@ fn standdown_level(stand: Option<Standdown>, escalated: Option<Escalation>) -> O
 pub fn nudge_text(n: u32, silent_secs: u64) -> String {
     format!(
         "[sparkle-nudge #{n} · no output for {}] Automated ping, not a new task. Resume your \
-         goal. If you are blocked, reply with ONE line: blocked-on-human | blocked-on-ci | \
-         blocked-on-another-agent | blocked-on-quota | not-blocked — plus the exact command or \
-         permission you need.",
+         goal. Reply with ONE line: blocked-on-human | blocked-on-ci | blocked-on-another-agent | \
+         blocked-on-quota | not-blocked | no-task-assigned | out-of-context — plus the exact \
+         command or permission you need.",
         human_duration(silent_secs)
     )
 }
@@ -1810,9 +1845,9 @@ mod tests {
         assert_eq!(
             text,
             "[sparkle-nudge #3 · no output for 15m] Automated ping, not a new task. Resume your \
-             goal. If you are blocked, reply with ONE line: blocked-on-human | blocked-on-ci | \
-             blocked-on-another-agent | blocked-on-quota | not-blocked — plus the exact command \
-             or permission you need."
+             goal. Reply with ONE line: blocked-on-human | blocked-on-ci | blocked-on-another-agent | \
+             blocked-on-quota | not-blocked | no-task-assigned | out-of-context — plus the exact \
+             command or permission you need."
         );
     }
 
@@ -1843,6 +1878,8 @@ mod tests {
             "blocked-on-another-agent",
             "blocked-on-quota",
             "not-blocked",
+            "no-task-assigned",
+            "out-of-context",
         ] {
             assert!(text.contains(token), "nudge must offer {token}");
         }
@@ -2234,6 +2271,105 @@ mod tests {
             "the backoff must exceed the ladder's own top rung, not merely reach it: {waits:?}"
         );
         assert!(QUOTA_BACKOFF_SECS > LADDER_SECS[LADDER_SECS.len() - 1]);
+    }
+
+    /// A TASK-LESS AGENT IS A CONCIERGE MATTER, NOT A FOUNDER PAGE (bead `sparkle-dfy3d`).
+    ///
+    /// A finished / task-less agent answering the pusher nudge could previously only reach for
+    /// `blocked-on-human`, which routed to `AwaitHuman` → the FOUNDER and painted the red row: an
+    /// alarm for a person to unblock a task that does not exist. `no-task-assigned` routes to the
+    /// CONCIERGE instead — still flagged, so the agent is never hidden, but never the founder and
+    /// never red. The paired positive proves the founder page was NARROWED, not removed: a genuinely
+    /// blocked agent WITH a task still reaches the founder.
+    #[test]
+    fn a_task_less_agent_routes_to_the_concierge_never_the_founder() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let no_task = Observation { hash: 0x1a01, reply: Some(Reply::NoTask), ..stalled() };
+
+        let d = run(&mut s, &no_task, 12);
+        assert_eq!(
+            d[0].escalate,
+            Some(Escalation::Concierge),
+            "a task-less agent is raised to the concierge on the look that reads the answer",
+        );
+        assert!(
+            d.iter().all(|x| x.flagged == Some(Escalation::Concierge)),
+            "the row must sit at concierge for as long as the stand-down holds: {:?}",
+            d.iter().map(|x| x.flagged).collect::<Vec<_>>(),
+        );
+        // THE ANTI-RED ASSERTION: the founder is the red alarm, and a task-less agent must never
+        // raise it. This is the exact defect `sparkle-dfy3d` names.
+        assert!(
+            d.iter().all(|x| x.flagged != Some(Escalation::Founder)),
+            "a task-less agent must NEVER page the founder — nothing needs a human",
+        );
+        assert!(
+            d.iter().all(|x| x.action == Action::Observe),
+            "and it is not typed at — another ping cannot conjure a task to resume",
+        );
+        assert_eq!(d.last().unwrap().refusal, Some("no-task-assigned"));
+
+        // PAIRED POSITIVE — a real human blocker WITH a task still reaches the founder.
+        let mut blocked = AgentState::default();
+        run(&mut blocked, &stalled(), 7);
+        let asking = Observation { hash: 0x1a02, reply: Some(Reply::Human), ..stalled() };
+        let b = run(&mut blocked, &asking, 12);
+        assert_eq!(
+            b[0].escalate,
+            Some(Escalation::Founder),
+            "the change must not touch a genuinely blocked agent: it still pages the founder",
+        );
+        assert!(b.iter().all(|x| x.flagged == Some(Escalation::Founder)));
+    }
+
+    /// AN OUT-OF-CONTEXT AGENT IS SUCCEEDED / HANDED OFF, NOT ESCALATED TO A HUMAN (bead
+    /// `sparkle-umtx1`).
+    ///
+    /// Running out of context is not a human blocker: the remedy is to succeed the agent or hand its
+    /// goal to a successor, which is the concierge's job — not a founder page. `out-of-context`
+    /// routes to the concierge with a machine-readable `out-of-context` reason the layer above reads
+    /// to auto-succeed or spawn a successor, and it never reaches the founder. (The successor
+    /// hand-off itself lives above this module; here we pin the ROUTING away from the founder.)
+    #[test]
+    fn an_out_of_context_agent_is_handed_off_never_escalated_to_the_founder() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let ooc = Observation { hash: 0x1b01, reply: Some(Reply::OutOfContext), ..stalled() };
+
+        let d = run(&mut s, &ooc, 12);
+        assert_eq!(
+            d[0].escalate,
+            Some(Escalation::Concierge),
+            "out-of-context routes to the concierge — the layer that can succeed it or spawn a successor",
+        );
+        assert!(
+            d.iter().all(|x| x.flagged == Some(Escalation::Concierge)),
+            "the hand-off row sits at concierge: {:?}",
+            d.iter().map(|x| x.flagged).collect::<Vec<_>>(),
+        );
+        assert!(
+            d.iter().all(|x| x.flagged != Some(Escalation::Founder)),
+            "an out-of-context agent must NEVER be escalated to the founder",
+        );
+        assert!(
+            d.iter().all(|x| x.action == Action::Observe),
+            "and it is not pinged — a ping cannot manufacture more context",
+        );
+        // The machine-readable hand-off signal the successor layer keys on.
+        assert_eq!(d.last().unwrap().refusal, Some("out-of-context"));
+
+        // PAIRED POSITIVE — a real human blocker WITH a task still reaches the founder.
+        let mut blocked = AgentState::default();
+        run(&mut blocked, &stalled(), 7);
+        let asking = Observation { hash: 0x1b02, reply: Some(Reply::Human), ..stalled() };
+        let b = run(&mut blocked, &asking, 12);
+        assert_eq!(
+            b[0].escalate,
+            Some(Escalation::Founder),
+            "a genuinely blocked agent is untouched: it still pages the founder",
+        );
+        assert!(b.iter().all(|x| x.flagged == Some(Escalation::Founder)));
     }
 
     // ══ THE LADDER ACTUALLY ADVANCES ════════════════════════════════════════════════════════════
