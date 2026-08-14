@@ -466,8 +466,17 @@ fn open_page(session: &mut CdpSession, url: &str) -> Result<String, String> {
     // died between `preview_status` and this call answers with `net::ERR_CONNECTION_REFUSED` here,
     // not as a CDP protocol error, and the caller must not be handed a screenshot of Chrome's own
     // error page (or an empty DOM query) with no signal that this happened. (roborev 64071)
+    //
+    // `net::ERR_ABORTED` is EXCLUDED and is not a bug in that exclusion: Chromium reports it for
+    // benign, non-failure outcomes through this SAME field — a client-side redirect racing the
+    // navigation, or a `Content-Disposition: attachment` response — and both Puppeteer and
+    // Playwright special-case exactly this value for that reason. Treating it as fatal would turn
+    // a preview whose entry page redirects during load into a hard refusal instead of a capture.
+    // (roborev 64105)
     if let Some(err_text) = nav_result.get("errorText").and_then(Value::as_str) {
-        return Err(format!("preview eyes: navigating to {url} failed: {err_text}"));
+        if err_text != "net::ERR_ABORTED" {
+            return Err(format!("preview eyes: navigating to {url} failed: {err_text}"));
+        }
     }
     // Best-effort from here: a dev server that never fires `load` (an infinite XHR poll, a WS-only
     // app) must not fail the whole op — proceed with whatever painted. Mirrors `cdp.mjs`'s
@@ -758,6 +767,14 @@ mod tests {
         // No `--headless` flag: chrome-headless-shell is headless by construction, and passing an
         // unrecognised flag to it is a silent no-op that would mask the day this stops being true.
         assert!(!flags.iter().any(|f| f.starts_with("--headless")));
+        // A RATCHET, not just prose: the renderer sandbox must stay on, since this loads arbitrary
+        // web content at auto-allow risk tier — see the header comment above `launch_flags`. The
+        // sibling harness (`cdp.mjs:138`) still passes `--no-sandbox`, which is exactly the place a
+        // future reader copies from without this assertion. (roborev 64105)
+        assert!(
+            !flags.iter().any(|f| f == "--no-sandbox"),
+            "the renderer sandbox must stay on — see the launch_flags header"
+        );
     }
 
     // ----- free_port -----
@@ -837,6 +854,30 @@ mod tests {
 
     impl FixtureServer {
         fn start(body: &'static str) -> Self {
+            Self::start_response(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ))
+        }
+
+        /// A response Chromium treats as a DOWNLOAD, not a page — `Content-Disposition: attachment`
+        /// makes ITS OWN navigation abort with `net::ERR_ABORTED`, which is the exact benign case
+        /// `open_page`'s `errorText` check must not treat as fatal (both Puppeteer and Playwright
+        /// special-case the same value for the same reason). (roborev 64105)
+        fn start_download() -> Self {
+            let body = "just a file, not a page";
+            Self::start_response(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\
+                 Content-Disposition: attachment; filename=\"x.txt\"\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                body.len(),
+                body
+            ))
+        }
+
+        fn start_response(response: String) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
             let port = listener.local_addr().unwrap().port();
             listener.set_nonblocking(true).expect("set nonblocking");
@@ -849,13 +890,7 @@ mod tests {
                         Ok((mut stream, _)) => {
                             let mut buf = [0u8; 1024];
                             let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                            let _ = stream.read(&mut buf); // discard the request; one fixed page
-                            let response = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
-                                 Connection: close\r\n\r\n{}",
-                                body.len(),
-                                body
-                            );
+                            let _ = stream.read(&mut buf); // discard the request; one fixed response
                             let _ = stream.write_all(response.as_bytes());
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -926,6 +961,23 @@ mod tests {
         let dead_url = format!("http://127.0.0.1:{port}");
         let err = capture_screenshot_blocking(&dead_url).unwrap_err();
         assert!(err.contains("navigating") && err.contains("failed"), "got: {err}");
+    }
+
+    #[test]
+    fn an_aborted_download_navigation_is_not_treated_as_a_fatal_error() {
+        if !headless_shell_available() {
+            eprintln!(
+                "SKIPPED an_aborted_download_navigation_is_not_treated_as_a_fatal_error: no \
+                 chrome-headless-shell installed"
+            );
+            return;
+        }
+        // A `Content-Disposition: attachment` response makes Chromium abort its OWN navigation
+        // with `net::ERR_ABORTED` — the benign case the errorText check must exclude. This must
+        // still yield a capture, not the hard "navigating to … failed" error.
+        let server = FixtureServer::start_download();
+        let capture = capture_screenshot_blocking(&server.url());
+        assert!(capture.is_ok(), "an aborted (download) navigation must not be a hard failure: {:?}", capture.err());
     }
 
     // ----- resolve_url_from_status -----
