@@ -17,6 +17,7 @@ import { getConfig, onConfigChanged } from "./services/config";
 import { refreshRoborevAuth, backfillImprovementConsentMirror } from "./services/configActions";
 import { pollMemoryAdmission } from "./services/agentCapacity";
 import { MEMORY_ADMISSION_POLL_MS } from "./services/memoryAdmission";
+import { refreshAgentWatchdog } from "./services/agentMemoryWatchdog";
 import { safeUnlisten } from "./services/safeUnlisten";
 import {
   AppBoot,
@@ -556,6 +557,13 @@ export function App() {
   useEffect(() => {
     const tick = () => {
       void pollMemoryAdmission();
+      // The PER-AGENT half: admission gates NEW spawns on total pressure, but nothing watched an
+      // agent that was already admitted and then ran its RSS away — the 2026-07-20 jetsam mode
+      // (`sparkle-0bye`). This surfaces warn/critical agents and, only when the user opted into
+      // `agent_rss_auto_kill`, stops a runaway. Fire-and-forget like the admission poll; it never
+      // throws (older backends reject the command every tick). Shares this one interval — no new
+      // thread — because the two are the same cadence and the same "watch the machine" job.
+      void refreshAgentWatchdog();
     };
     tick(); // don't make the first reading wait a whole interval
     const id = window.setInterval(tick, MEMORY_ADMISSION_POLL_MS);
