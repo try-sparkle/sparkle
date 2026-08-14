@@ -525,17 +525,20 @@ mod tests {
     use super::*;
     use std::str::FromStr;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::sync::{mpsc, Arc};
     use std::time::Duration;
     use tauri::http::header::{HeaderName, ORIGIN};
     use tauri::test::{mock_builder, mock_context, noop_assets, MockRuntime, INVOKE_KEY};
     use tauri::WebviewWindowBuilder;
 
-    /// One process-global ring, so tests that read it must not interleave. Same guard `ipc_ring`
-    /// uses, duplicated rather than shared because it is test-only state on both sides.
+    /// One process-global ring, so tests that read it must not interleave. Locks the SAME crate-level
+    /// mutex `ipc_ring`'s own tests hold (`ipc_ring::test_ring_guard`), not a per-module duplicate:
+    /// both modules' tests compile into one binary and libtest runs them on parallel threads, so a
+    /// separate `Mutex<()>` here would let this module's `ipc_ring::reset()`/`begin()` race
+    /// `ipc_ring`'s exact-count assertions on the shared `CURSOR` and red them at random (the flake
+    /// this shared lock removes).
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static G: OnceLock<Mutex<()>> = OnceLock::new();
-        G.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        ipc_ring::test_ring_guard()
     }
 
     /// THE COMMAND THE HEADLINE TEST RESTS ON, and it must stay `async`.

@@ -393,14 +393,31 @@ pub fn reset() {
     UNJOINED.store(0, Ordering::Relaxed);
 }
 
+/// The ONE lock every test that touches the process-global ring must hold — in ANY module, not a
+/// per-module copy.
+///
+/// `CURSOR`, the slot array, `ENABLED` and `IN_FLIGHT` are a single global instrument, shared by the
+/// tests in `ipc_ring`, `ipc_trace` and `watchdog`. All of those tests compile into ONE test binary
+/// and libtest runs them on parallel threads, so a per-module `Mutex<()>` looks like a guard while
+/// serializing nothing across modules: `ipc_trace`'s `reset()`/`begin()` would then interleave with
+/// this module's exact-count assertions on `CURSOR` and red them at random under load — which is the
+/// flake this function exists to remove. Locking THIS single mutex from every such test makes the
+/// modules mutually exclusive on the shared ring.
+#[cfg(test)]
+pub(crate) fn test_ring_guard() -> std::sync::MutexGuard<'static, ()> {
+    static G: OnceLock<Mutex<()>> = OnceLock::new();
+    G.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// One process-global ring, so tests that touch it must not interleave.
+    /// One process-global ring, so tests that touch it must not interleave. Delegates to the ONE
+    /// crate-level lock (`super::test_ring_guard`) so this module and `ipc_trace`'s tests serialize
+    /// against EACH OTHER, not just internally — see that function's note.
     fn guard() -> std::sync::MutexGuard<'static, ()> {
-        static G: OnceLock<Mutex<()>> = OnceLock::new();
-        G.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        super::test_ring_guard()
     }
 
     /// The headline claim: HANDLER time is measured, not dispatch time.
@@ -545,6 +562,14 @@ mod tests {
         reset();
         set_enabled(true);
         let cmd = intern("joined_command");
+        // Warm the epoch so `entry` is reliably non-zero. `now_ns()` returns 0 when it is the FIRST
+        // caller in the process — `epoch()` initialises to `Instant::now()` and `elapsed()` on the
+        // same instant is 0. A zero `entry` then takes `begin_traced`'s "no caller stamp" branch and
+        // is recorded as dispatch, so the assertion below reads dispatch != 0 and fails. In a full
+        // test run something calls `now_ns()` first, but running only this module can make this test
+        // the first caller; the warm-up plus a real elapsed gap removes the dependency on run order.
+        let _ = now_ns();
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let entry = now_ns();
         std::thread::sleep(std::time::Duration::from_millis(5));
         let t = begin_traced(cmd, 4, false, 0xDEAD_BEEF, entry).expect("armed");

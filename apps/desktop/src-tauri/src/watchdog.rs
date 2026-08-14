@@ -1590,6 +1590,13 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_ipc_timeline_lands_before_and_independently_of_the_sampler() {
+        // Hold the ONE process-global ring test lock: `capture_stack_into` reads the shared ring
+        // (`ipc_trace::dump_to_file` → `ipc_ring::snapshot`) and emits the `dump_to_file` tracing
+        // callsite. Without this lock it runs concurrently with `ipc_ring`/`ipc_trace`'s tests —
+        // libtest parallelises the one binary — and its emit of that callsite races
+        // `the_dump_emits_exactly_one_tracing_event`'s `with_default` counter into a spurious 0.
+        let _g = crate::ipc_ring::test_ring_guard();
+
         let root = std::env::temp_dir().join(format!("-hook-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
 
