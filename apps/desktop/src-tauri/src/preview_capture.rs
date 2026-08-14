@@ -58,6 +58,10 @@ const DOM_QUERY_TEXT_MAX_CHARS: usize = 300;
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(10);
 const NAV_TIMEOUT: Duration = Duration::from_secs(10);
 const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long to wait for `Page.frameNavigated` after a `net::ERR_ABORTED` result, before deciding
+/// nothing is going to commit. Short, not the full `NAV_TIMEOUT`: a racing redirect that IS going
+/// to commit does so on response headers, not on `load` — see `open_page`. (roborev 64133)
+const ABORT_RECOMMIT_WAIT: Duration = Duration::from_secs(1);
 
 // ---------------------------------------------------------------------------------------------
 // Wire shapes
@@ -418,6 +422,38 @@ fn evaluate(session: &mut CdpSession, session_id: &str, expression: &str) -> Res
     Ok(result.get("result").and_then(|r| r.get("value")).cloned().unwrap_or(Value::Null))
 }
 
+/// The final verdict for one navigation attempt, given what `Page.navigate` reported (`err_text`)
+/// and where the frame ended up (`href`). Pure and browser-free ON PURPOSE: this is the exact
+/// decision three prior rounds got wrong in the two different ways roborev 64071/64105/64123 each
+/// found, and it used to be inlined in `open_page` where only the FAILING half of the
+/// `ERR_ABORTED` case could ever be exercised without a live browser plus a fixture that reliably
+/// reproduces a commit-then-abort race. Both halves are unit-tested below. (roborev 64133)
+///
+/// `Page.navigate` ACKs successfully even when the navigation itself fails — a dev server that
+/// died between `preview_status` and this call answers with `net::ERR_CONNECTION_REFUSED` here,
+/// not as a CDP protocol error — so a caller must not be handed a screenshot of Chrome's own error
+/// page (or an empty DOM query) with no signal that happened. `net::ERR_ABORTED` is the one
+/// exception: Chromium reports it for TWO different outcomes through the same field — a
+/// client-side redirect racing this navigation (commits a new document, benign) and a
+/// `Content-Disposition: attachment` response (commits NOTHING, stays on `about:blank`) — so it is
+/// the one case whose verdict depends on `href` rather than on `err_text` alone.
+fn nav_verdict(url: &str, err_text: Option<&str>, href: Option<&str>) -> Result<(), String> {
+    match err_text {
+        None => Ok(()),
+        Some("net::ERR_ABORTED") => {
+            let committed = href.is_some_and(|h| h != "about:blank");
+            if committed {
+                Ok(())
+            } else {
+                Err(format!(
+                    "preview eyes: navigating to {url} failed: net::ERR_ABORTED (no document committed)"
+                ))
+            }
+        }
+        Some(other) => Err(format!("preview eyes: navigating to {url} failed: {other}")),
+    }
+}
+
 /// Open a fresh page target, point it at `url`, and wait (best-effort) for it to finish loading.
 /// Returns the CDP session id the caller uses for every subsequent per-page command.
 fn open_page(session: &mut CdpSession, url: &str) -> Result<String, String> {
@@ -462,37 +498,36 @@ fn open_page(session: &mut CdpSession, url: &str) -> Result<String, String> {
     let nav_deadline = Instant::now() + NAV_TIMEOUT;
     let nav_result =
         session.call("Page.navigate", json!({ "url": url }), Some(&session_id), NAV_TIMEOUT)?;
-    // `Page.navigate` ACKs successfully even when the navigation itself fails — a dev server that
-    // died between `preview_status` and this call answers with `net::ERR_CONNECTION_REFUSED` here,
-    // not as a CDP protocol error, and the caller must not be handed a screenshot of Chrome's own
-    // error page (or an empty DOM query) with no signal that this happened. (roborev 64071)
-    //
-    // `net::ERR_ABORTED` is a SEPARATE case, checked below rather than folded into the hard-fail
-    // above, because it means two DIFFERENT things through the same field: a client-side redirect
-    // racing this navigation (which commits a new document — benign) and a `Content-Disposition:
-    // attachment` response (which commits NOTHING — the frame stays on `about:blank`, and treating
-    // that as success is exactly the "blank capture with no signal" failure the check above exists
-    // to prevent). A blanket exclusion re-opened that hole; only whether a document actually
-    // committed decides it now. (roborev 64105, 64123)
-    let aborted = match nav_result.get("errorText").and_then(Value::as_str) {
-        Some("net::ERR_ABORTED") => true,
-        Some(err_text) => return Err(format!("preview eyes: navigating to {url} failed: {err_text}")),
-        None => false,
-    };
-    // Best-effort from here: a dev server that never fires `load` (an infinite XHR poll, a WS-only
-    // app) must not fail the whole op — proceed with whatever painted. Mirrors `cdp.mjs`'s
-    // `navigate()`, which resolves on the same timeout rather than rejecting.
-    let remaining = nav_deadline.saturating_duration_since(Instant::now());
-    let _ = session.wait_for_event("Page.loadEventFired", &session_id, remaining);
-    if aborted {
-        let href = evaluate(session, &session_id, "location.href")?;
-        let committed = href.as_str().is_some_and(|h| h != "about:blank");
-        if !committed {
-            return Err(format!(
-                "preview eyes: navigating to {url} failed: net::ERR_ABORTED (no document committed)"
-            ));
+    let err_text = nav_result.get("errorText").and_then(Value::as_str).map(str::to_string);
+
+    match err_text.as_deref() {
+        None => {
+            // Best-effort: a dev server that never fires `load` (an infinite XHR poll, a WS-only
+            // app) must not fail the whole op — proceed with whatever painted. Mirrors `cdp.mjs`'s
+            // `navigate()`, which resolves on the same timeout rather than rejecting.
+            let remaining = nav_deadline.saturating_duration_since(Instant::now());
+            let _ = session.wait_for_event("Page.loadEventFired", &session_id, remaining);
         }
+        Some("net::ERR_ABORTED") => {
+            // A racing client-side redirect commits FAST — on response headers, well before
+            // `load` fires — so this waits only a SHORT window, not the full nav budget. A true
+            // abort (a download, a 204) can never fire ANY frame event, and waiting the full
+            // `NAV_TIMEOUT` for it would hang every failing preview URL for ~10s before refusing
+            // — the exact regression this replaces. (roborev 64133)
+            let _ = session.wait_for_event("Page.frameNavigated", &session_id, ABORT_RECOMMIT_WAIT);
+        }
+        Some(_) => {} // a real failure — nav_verdict below reports it immediately, no wait needed
     }
+
+    // Only read `location.href` for the ERR_ABORTED case: it is the one case whose verdict depends
+    // on it, and skipping the extra CDP round-trip otherwise keeps the common (successful) path at
+    // its previous cost.
+    let href = if err_text.as_deref() == Some("net::ERR_ABORTED") {
+        evaluate(session, &session_id, "location.href").ok().and_then(|v| v.as_str().map(str::to_string))
+    } else {
+        None
+    };
+    nav_verdict(url, err_text.as_deref(), href.as_deref())?;
     Ok(session_id)
 }
 
@@ -980,8 +1015,54 @@ mod tests {
         // assertion pins BOTH halves: this reaches the `ERR_ABORTED` branch at all (not some other
         // error), AND the committed-document check catches it as a real failure.
         let server = FixtureServer::start_download();
+        let started = Instant::now();
         let err = capture_screenshot_blocking(&server.url()).unwrap_err();
         assert!(err.contains("net::ERR_ABORTED"), "got: {err}");
+        assert!(err.contains("no document committed"), "got: {err}");
+        // Must fail FAST — a true abort can never fire `Page.loadEventFired`, so waiting the full
+        // `NAV_TIMEOUT` (10s) for it would hang every failing preview URL that long before
+        // refusing. Bounded by `ABORT_RECOMMIT_WAIT` (1s) plus generous slack for browser launch.
+        // (roborev 64133)
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?} — the aborted-no-commit path must not wait the full NAV_TIMEOUT",
+            started.elapsed()
+        );
+    }
+
+    // ----- nav_verdict -----
+
+    #[test]
+    fn no_error_is_always_ok() {
+        assert!(nav_verdict("http://x", None, None).is_ok());
+        assert!(nav_verdict("http://x", None, Some("about:blank")).is_ok());
+    }
+
+    #[test]
+    fn a_connection_level_failure_is_always_an_error() {
+        let err = nav_verdict("http://x", Some("net::ERR_CONNECTION_REFUSED"), Some("about:blank"))
+            .unwrap_err();
+        assert!(err.contains("net::ERR_CONNECTION_REFUSED"), "got: {err}");
+    }
+
+    #[test]
+    fn aborted_with_a_committed_document_is_ok() {
+        // The benign case: a racing redirect that DID commit somewhere other than about:blank.
+        assert!(nav_verdict("http://x", Some("net::ERR_ABORTED"), Some("http://x/after-redirect")).is_ok());
+    }
+
+    #[test]
+    fn aborted_with_nothing_committed_is_an_error() {
+        let err = nav_verdict("http://x", Some("net::ERR_ABORTED"), Some("about:blank")).unwrap_err();
+        assert!(err.contains("net::ERR_ABORTED"), "got: {err}");
+        assert!(err.contains("no document committed"), "got: {err}");
+    }
+
+    #[test]
+    fn aborted_with_no_href_reading_at_all_is_an_error() {
+        // `evaluate()` failing (or the CDP call erroring) must fail CLOSED, not treat an unreadable
+        // href as a committed document.
+        let err = nav_verdict("http://x", Some("net::ERR_ABORTED"), None).unwrap_err();
         assert!(err.contains("no document committed"), "got: {err}");
     }
 
