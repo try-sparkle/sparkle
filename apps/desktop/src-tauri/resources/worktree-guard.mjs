@@ -1370,12 +1370,22 @@ function judgeSegment(tokens, depth) {
       // genuinely unbounded: a top-level root (`/`, `~`, `$HOME`, a home directory itself — depth
       // 0, not one level below) AND no narrowing predicate to bound what matches.
       const execSeg = segmentCommand(execTail);
-      const deletes = args.includes("-delete") || (execSeg?.bin === "rm" && rmIsRecursive(execSeg.args));
+      // `-r` is NOT what makes the `-exec` destructive here, and requiring it left the widest
+      // shape of all open: `find / -type f -exec rm {} +` returned ALLOW while its `-rf` sibling
+      // was refused. A plain `rm` removes every FILE it is handed — recursion only buys the
+      // ability to descend into DIRECTORIES, and find has already done the descending, so the
+      // deletion set is identical. `-type f` even makes the plain form the *natural* spelling.
+      // `unlink` is the same primitive under another name and was unguarded for the same reason.
+      // Widening this cannot over-refuse, because the two conditions below are untouched: it
+      // still fires only on a depth-0 root AND when nothing narrows the match, so an ordinary
+      // scoped cleanup (`find build -type f -exec rm {} +`, or any real `-name`) is unaffected.
+      const execDeletes = execSeg?.bin === "rm" || execSeg?.bin === "unlink";
+      const deletes = args.includes("-delete") || execDeletes;
       if (deletes && !findHasNarrowingPredicate(args)) {
         const root = findSearchRoots(args).find(isTopLevelRoot);
         if (root) {
           return {
-            rule: args.includes("-delete") ? "find -delete" : "find -exec rm -r",
+            rule: args.includes("-delete") ? "find -delete" : `find -exec ${execSeg?.bin ?? "rm"}`,
             why: `an unbounded delete rooted at ${root} — nothing narrows what it matches`,
           };
         }
