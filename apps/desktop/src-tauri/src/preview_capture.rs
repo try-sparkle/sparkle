@@ -467,22 +467,32 @@ fn open_page(session: &mut CdpSession, url: &str) -> Result<String, String> {
     // not as a CDP protocol error, and the caller must not be handed a screenshot of Chrome's own
     // error page (or an empty DOM query) with no signal that this happened. (roborev 64071)
     //
-    // `net::ERR_ABORTED` is EXCLUDED and is not a bug in that exclusion: Chromium reports it for
-    // benign, non-failure outcomes through this SAME field — a client-side redirect racing the
-    // navigation, or a `Content-Disposition: attachment` response — and both Puppeteer and
-    // Playwright special-case exactly this value for that reason. Treating it as fatal would turn
-    // a preview whose entry page redirects during load into a hard refusal instead of a capture.
-    // (roborev 64105)
-    if let Some(err_text) = nav_result.get("errorText").and_then(Value::as_str) {
-        if err_text != "net::ERR_ABORTED" {
-            return Err(format!("preview eyes: navigating to {url} failed: {err_text}"));
-        }
-    }
+    // `net::ERR_ABORTED` is a SEPARATE case, checked below rather than folded into the hard-fail
+    // above, because it means two DIFFERENT things through the same field: a client-side redirect
+    // racing this navigation (which commits a new document — benign) and a `Content-Disposition:
+    // attachment` response (which commits NOTHING — the frame stays on `about:blank`, and treating
+    // that as success is exactly the "blank capture with no signal" failure the check above exists
+    // to prevent). A blanket exclusion re-opened that hole; only whether a document actually
+    // committed decides it now. (roborev 64105, 64123)
+    let aborted = match nav_result.get("errorText").and_then(Value::as_str) {
+        Some("net::ERR_ABORTED") => true,
+        Some(err_text) => return Err(format!("preview eyes: navigating to {url} failed: {err_text}")),
+        None => false,
+    };
     // Best-effort from here: a dev server that never fires `load` (an infinite XHR poll, a WS-only
     // app) must not fail the whole op — proceed with whatever painted. Mirrors `cdp.mjs`'s
     // `navigate()`, which resolves on the same timeout rather than rejecting.
     let remaining = nav_deadline.saturating_duration_since(Instant::now());
     let _ = session.wait_for_event("Page.loadEventFired", &session_id, remaining);
+    if aborted {
+        let href = evaluate(session, &session_id, "location.href")?;
+        let committed = href.as_str().is_some_and(|h| h != "about:blank");
+        if !committed {
+            return Err(format!(
+                "preview eyes: navigating to {url} failed: net::ERR_ABORTED (no document committed)"
+            ));
+        }
+    }
     Ok(session_id)
 }
 
@@ -789,23 +799,44 @@ mod tests {
     // ----- live-binary integration tests -----
     //
     // These exercise the REAL headless browser end to end rather than only the pure helpers above.
-    // SKIPPED (not failed) when Playwright's browsers aren't installed on the machine running the
-    // suite — libtest has no runtime-skip primitive, so this is the same "announce a skip, don't
-    // fail" idiom used elsewhere in this crate for tests that need a real external binary.
+    // SKIPPED (not failed) when Playwright's browsers aren't installed — libtest has no runtime-
+    // skip primitive, so this is the same "announce a skip, don't fail" idiom used elsewhere in
+    // this crate for tests that need a real external binary.
+    //
+    // STRICT UNDER CI: a missing browser there PANICS instead of skipping. A silent skip left the
+    // whole HTTP-navigation/errorText/load-event line of coverage running on nothing in CI once
+    // already (roborev 64105) — the `desktop-rust` job installs the browser precisely so these
+    // tests are load-bearing there, and a future regression in `find_headless_shell`, a
+    // `PLAYWRIGHT_BROWSERS_PATH` override, or a `HOME` difference on the runner must fail loudly
+    // rather than quietly return CI to a green job testing nothing. (roborev 64123)
 
     fn headless_shell_available() -> bool {
         playwright_browsers_dir().ok().and_then(|d| find_headless_shell(&d).ok()).is_some()
     }
 
+    macro_rules! require_headless_shell_or_skip {
+        ($test_name:expr) => {
+            if !headless_shell_available() {
+                if std::env::var("CI").is_ok() {
+                    panic!(
+                        "{}: CI must have Playwright's chrome-headless-shell installed (see the \
+                         desktop-rust job's install step) — a live test cannot silently skip here",
+                        $test_name
+                    );
+                }
+                eprintln!(
+                    "SKIPPED {}: no chrome-headless-shell installed — run \
+                     `npx playwright install chromium` to exercise this test",
+                    $test_name
+                );
+                return;
+            }
+        };
+    }
+
     #[test]
     fn a_live_headless_browser_can_answer_a_dom_query() {
-        if !headless_shell_available() {
-            eprintln!(
-                "SKIPPED a_live_headless_browser_can_answer_a_dom_query: no chrome-headless-shell \
-                 installed — run `npx playwright install chromium` to exercise this test"
-            );
-            return;
-        }
+        require_headless_shell_or_skip!("a_live_headless_browser_can_answer_a_dom_query");
         let matches = query_dom_blocking("about:blank", "body").expect("query should succeed");
         assert_eq!(matches.len(), 1, "about:blank has exactly one <body>");
         assert_eq!(matches[0].tag, "body");
@@ -813,13 +844,7 @@ mod tests {
 
     #[test]
     fn a_live_headless_browser_can_screenshot_a_page() {
-        if !headless_shell_available() {
-            eprintln!(
-                "SKIPPED a_live_headless_browser_can_screenshot_a_page: no chrome-headless-shell \
-                 installed — run `npx playwright install chromium` to exercise this test"
-            );
-            return;
-        }
+        require_headless_shell_or_skip!("a_live_headless_browser_can_screenshot_a_page");
         let capture = capture_screenshot_blocking("about:blank").expect("screenshot should succeed");
         assert!(Path::new(&capture.path).is_file(), "capture file should exist at {}", capture.path);
         let on_disk = std::fs::metadata(&capture.path).unwrap().len();
@@ -831,13 +856,7 @@ mod tests {
 
     #[test]
     fn a_bad_selector_surfaces_as_a_readable_error_not_a_null_result() {
-        if !headless_shell_available() {
-            eprintln!(
-                "SKIPPED a_bad_selector_surfaces_as_a_readable_error_not_a_null_result: no \
-                 chrome-headless-shell installed"
-            );
-            return;
-        }
+        require_headless_shell_or_skip!("a_bad_selector_surfaces_as_a_readable_error_not_a_null_result");
         let err = query_dom_blocking("about:blank", ":::not-a-selector").unwrap_err();
         assert!(err.contains("preview eyes:"), "got: {err}");
     }
@@ -919,10 +938,7 @@ mod tests {
 
     #[test]
     fn a_live_headless_browser_can_query_a_real_http_page() {
-        if !headless_shell_available() {
-            eprintln!("SKIPPED a_live_headless_browser_can_query_a_real_http_page: no chrome-headless-shell installed");
-            return;
-        }
+        require_headless_shell_or_skip!("a_live_headless_browser_can_query_a_real_http_page");
         let server = FixtureServer::start(
             r#"<!doctype html><html><body><button id="submit" class="btn primary">Save</button></body></html>"#,
         );
@@ -935,10 +951,7 @@ mod tests {
 
     #[test]
     fn a_live_headless_browser_can_screenshot_a_real_http_page() {
-        if !headless_shell_available() {
-            eprintln!("SKIPPED a_live_headless_browser_can_screenshot_a_real_http_page: no chrome-headless-shell installed");
-            return;
-        }
+        require_headless_shell_or_skip!("a_live_headless_browser_can_screenshot_a_real_http_page");
         let server =
             FixtureServer::start(r#"<!doctype html><html><body><h1>hello preview</h1></body></html>"#);
         let capture = capture_screenshot_blocking(&server.url()).expect("screenshot should succeed");
@@ -948,13 +961,7 @@ mod tests {
 
     #[test]
     fn a_connection_refused_navigation_surfaces_as_an_error_not_a_blank_capture() {
-        if !headless_shell_available() {
-            eprintln!(
-                "SKIPPED a_connection_refused_navigation_surfaces_as_an_error_not_a_blank_capture: \
-                 no chrome-headless-shell installed"
-            );
-            return;
-        }
+        require_headless_shell_or_skip!("a_connection_refused_navigation_surfaces_as_an_error_not_a_blank_capture");
         // Reserve then release a port, so nothing is listening on it — the dev server "died
         // between preview_status and the capture" case the errorText check exists for.
         let port = free_port().expect("reserve a port");
@@ -964,20 +971,18 @@ mod tests {
     }
 
     #[test]
-    fn an_aborted_download_navigation_is_not_treated_as_a_fatal_error() {
-        if !headless_shell_available() {
-            eprintln!(
-                "SKIPPED an_aborted_download_navigation_is_not_treated_as_a_fatal_error: no \
-                 chrome-headless-shell installed"
-            );
-            return;
-        }
-        // A `Content-Disposition: attachment` response makes Chromium abort its OWN navigation
-        // with `net::ERR_ABORTED` — the benign case the errorText check must exclude. This must
-        // still yield a capture, not the hard "navigating to … failed" error.
+    fn a_download_response_aborts_and_commits_nothing_so_it_still_fails_loudly() {
+        require_headless_shell_or_skip!("a_download_response_aborts_and_commits_nothing_so_it_still_fails_loudly");
+        // A `Content-Disposition: attachment` response makes Chromium abort ITS OWN navigation
+        // with `net::ERR_ABORTED` — but unlike a redirect racing the navigation, NOTHING commits:
+        // the frame stays on `about:blank`. A round-2 fix wrongly treated every `ERR_ABORTED` as
+        // benign, which would have silently returned a blank capture here (roborev 64123). The
+        // assertion pins BOTH halves: this reaches the `ERR_ABORTED` branch at all (not some other
+        // error), AND the committed-document check catches it as a real failure.
         let server = FixtureServer::start_download();
-        let capture = capture_screenshot_blocking(&server.url());
-        assert!(capture.is_ok(), "an aborted (download) navigation must not be a hard failure: {:?}", capture.err());
+        let err = capture_screenshot_blocking(&server.url()).unwrap_err();
+        assert!(err.contains("net::ERR_ABORTED"), "got: {err}");
+        assert!(err.contains("no document committed"), "got: {err}");
     }
 
     // ----- resolve_url_from_status -----
