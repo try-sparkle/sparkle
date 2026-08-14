@@ -18,6 +18,7 @@
     "visual:compare": "node scripts/visual/compare.mjs",
     "visual:verify-stable": "node scripts/visual/verify-stable.mjs",
     "visual:recap-narrow": "node scripts/visual/recap-narrow-probe.mjs",
+    "visual:blocked-row-narrow": "node scripts/visual/blocked-row-narrow-probe.mjs",
     "visual:row-narrow": "node scripts/visual/row-narrow-probe.mjs",
     "visual:tab-crowded": "node scripts/visual/tab-crowded-probe.mjs",
     "visual:tab-click": "node scripts/visual/tab-click-probe.mjs",

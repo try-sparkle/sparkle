@@ -52,6 +52,12 @@ import {
   parseWidths as recapWidths,
   verdictFor as recapVerdict,
 } from "./recap-narrow-probe.mjs";
+import {
+  DEFAULT_WIDTHS as BLOCKED_ROW_DEFAULT_WIDTHS,
+  parseArgs as blockedRowArgs,
+  parseWidths as blockedRowWidths,
+  verdictFor as blockedRowVerdict,
+} from "./blocked-row-narrow-probe.mjs";
 // The two project-tab probes. Importing them is itself the coverage for their
 // `import.meta.url === argv[1]` main-guard: were that guard wrong, this import would try to launch
 // Chrome and the suite would hang rather than fail.
@@ -1571,6 +1577,197 @@ describe("recap-narrow probe — the CLI contract", () => {
     // A bare `--widths` yields `true`, which `main()` must not treat as a width list — the guard
     // there is `args.widths ? … : DEFAULT_WIDTHS`, so this documents the shape it receives.
     expect(recapArgs(["--widths"])).toEqual({ widths: true });
+  });
+});
+
+// ── THE BLOCKED-ROW-NARROW PROBE'S VERDICT RULES (bead sparkle-jaq7n, roborev 63961) ────────────
+//
+// Same reasoning as the recap probe's block above: an instrument whose judgements have never been
+// shown to fail is one that can report a clean row while the row overlaps. Fed synthetic
+// measurements so every rule is proven able to go red without booting Chrome.
+describe("blocked-row-narrow probe — the verdict rules, fed synthetic measurements", () => {
+  /** One row as `MEASURE` returns it. Defaults describe a healthy, fully-visible row. */
+  const row = (over = {}) => ({
+    agentId: "a",
+    text: "BLOCKED:@AgentAin sparkleApprove",
+    overlaps: [],
+    rowOverhang: 0,
+    labelVisible: true,
+    approveVisible: true,
+    approveText: "Approve",
+    nameTruncated: false,
+    nameTitle: null,
+    ...over,
+  });
+
+  /** A whole measurement. Defaults are a column that passes everything. */
+  const measurement = (over = {}) => ({
+    ok: true,
+    columnWidth: 280,
+    scrollsSideways: false,
+    rows: [row()],
+    ...over,
+  });
+
+  /** A click record for the default single row ("a"), correctly attributed. */
+  const CLICKED_A = { a: { clickedApproveButton: true, actions: [["a", "approve"]] } };
+
+  const check = (v, fragment) => v.checks.find((c) => c.name.includes(fragment))?.ok;
+  const failed = (v) => v.checks.filter((c) => !c.ok).map((c) => c.name);
+
+  it("passes a healthy, fully-visible row that was clicked and fired its own approval", () => {
+    expect(failed(blockedRowVerdict(280, measurement(), CLICKED_A))).toEqual([]);
+  });
+
+  it("reports the probe not reaching the row as a FAILED CHECK, not by throwing", () => {
+    let v;
+    expect(() => {
+      v = blockedRowVerdict(280, { ok: false, reason: "no rows" }, {});
+    }).not.toThrow();
+    expect(check(v, "could reach the row")).toBe(false);
+  });
+
+  it("reports an empty row set as a failed check rather than crashing the fold", () => {
+    let v;
+    expect(() => {
+      v = blockedRowVerdict(280, measurement({ rows: [] }), {});
+    }).not.toThrow();
+    expect(check(v, "produced rows to measure")).toBe(false);
+  });
+
+  // ── THE FOUNDER'S OWN REPORT: THE OVERLAP CHECK MUST BE ABLE TO FAIL ───────────────────────────
+  it("fails a row where the Approve button paints over the agent name", () => {
+    const overlapping = measurement({
+      rows: [row({ overlaps: [{ a: "@Agent A", b: "Approve", px: 480 }] })],
+    });
+    expect(check(blockedRowVerdict(280, overlapping, {}), "never paints over")).toBe(false);
+  });
+
+  // ── CONTAINMENT MUST BE ABLE TO FAIL TOO — a clean overlap check is not the whole contract ─────
+  it("fails a row that overhangs the column, or a column that scrolls sideways", () => {
+    expect(
+      check(
+        blockedRowVerdict(280, measurement({ rows: [row({ rowOverhang: 12 })] }), {}),
+        "passes the column's right edge",
+      ),
+    ).toBe(false);
+    expect(
+      check(blockedRowVerdict(280, measurement({ scrollsSideways: true }), {}), "does not scroll"),
+    ).toBe(false);
+  });
+
+  // ── THE SACRIFICE ORDER ITSELF (roborev 63961 asked: can this check actually catch a swap?) ────
+  it("fails when the button is hidden while the label is still shown — the order reversed", () => {
+    const reversed = measurement({
+      rows: [row({ approveVisible: false, labelVisible: true })],
+    });
+    expect(check(blockedRowVerdict(280, reversed, {}), "label goes first")).toBe(false);
+  });
+
+  // ── PER-ROW CLICK VERIFICATION (roborev 63961: clicking only row A cannot verify row B) ────────
+  // `labelVisible: false` on both rows: a hidden button with the label STILL shown is a different
+  // (and already-covered) failure — see "the order reversed" above — so these fixtures put the
+  // label in the state a real narrow width would, to isolate what THIS check is about.
+  it("checks EACH row with a hidden button independently, keyed by agent id", () => {
+    const twoHidden = measurement({
+      rows: [
+        row({ agentId: "a", approveVisible: false, labelVisible: false, text: "row a" }),
+        row({ agentId: "b", approveVisible: false, labelVisible: false, text: "row b" }),
+      ],
+    });
+    // Row "b" was never clicked (its entry is absent from `clicked`) — that row's own check must
+    // fail rather than silently passing because SOME row in the click record looked fine.
+    const clicked = { a: { clickedApproveButton: false, actions: [["a", "approve"]] } };
+    const v = blockedRowVerdict(280, twoHidden, clicked);
+    expect(failed(v).filter((n) => n.includes("row \"row a\""))).toEqual([]);
+    expect(failed(v).some((n) => n.includes("row \"row b\""))).toBe(true);
+  });
+
+  it("passes per-row once every hidden-button row was clicked and fired its own action", () => {
+    const twoHidden = measurement({
+      rows: [
+        row({ agentId: "a", approveVisible: false, labelVisible: false, text: "row a" }),
+        row({ agentId: "b", approveVisible: false, labelVisible: false, text: "row b" }),
+      ],
+    });
+    const clicked = {
+      a: { clickedApproveButton: false, actions: [["a", "approve"]] },
+      b: { clickedApproveButton: false, actions: [["b", "approve"]] },
+    };
+    expect(failed(blockedRowVerdict(280, twoHidden, clicked))).toEqual([]);
+  });
+
+  // ── VISIBLE-BUTTON ROWS ARE GRADED TOO (roborev 64018) ─────────────────────────────────────────
+  // `CLICK_APPROVE` presses the real Approve button on every row, including roomy-width ones whose
+  // button never hides — that evidence must not be collected and then discarded. A stale handler
+  // (the button renders but no longer dispatches) has to fail the sweep, not sail through it.
+  it("fails a visible-button row that was clicked but fired NOTHING", () => {
+    expect(check(blockedRowVerdict(280, measurement(), {}), "fires exactly that row's OWN")).toBe(
+      false,
+    );
+  });
+
+  it("no longer has a special case for 'nothing to grade' — every row is graded, always", () => {
+    // The old contract ("skip rows with a visible button") is gone on purpose; this pins that no
+    // check name reverts to describing an unconditional skip.
+    const v = blockedRowVerdict(280, measurement(), CLICKED_A);
+    expect(v.checks.some((c) => c.name.includes("fires exactly that row's OWN"))).toBe(true);
+  });
+
+  // ── THE CHECK MUST VERIFY *WHICH* ROW FIRED, NOT JUST THAT *AN* APPROVAL FIRED (roborev 64018) ──
+  // If every row's activation closed over the WRONG blocker (e.g. always the first one), each row
+  // would still record `[someId, "approve"]` under its own `clicked[agentId]` key — length 1,
+  // action id "approve" — and a check that reads only `actions[0][1]` would call every row
+  // verified. Comparing `actions[0][0]` (the id the ACTION was attributed to) against the row's
+  // OWN agent id is what actually catches that class of bug.
+  it("fails a row whose recorded action belongs to a DIFFERENT agent", () => {
+    const twoRows = measurement({
+      rows: [
+        row({ agentId: "a", approveVisible: false, labelVisible: false, text: "row a" }),
+        row({ agentId: "b", approveVisible: false, labelVisible: false, text: "row b" }),
+      ],
+    });
+    // Both rows' activation mistakenly fired agent "a"'s approval — a plausible bug shape if a
+    // click handler closed over the wrong blocker in a loop.
+    const misattributed = {
+      a: { clickedApproveButton: false, actions: [["a", "approve"]] },
+      b: { clickedApproveButton: false, actions: [["a", "approve"]] },
+    };
+    const v = blockedRowVerdict(280, twoRows, misattributed);
+    expect(failed(v).filter((n) => n.includes("row \"row a\""))).toEqual([]);
+    expect(failed(v).some((n) => n.includes("row \"row b\""))).toBe(true);
+  });
+
+  it("fails when a truncated name carries no recoverable title", () => {
+    const untitled = measurement({ rows: [row({ nameTruncated: true, nameTitle: null })] });
+    expect(check(blockedRowVerdict(280, untitled, {}), "title/tooltip")).toBe(false);
+  });
+});
+
+describe("blocked-row-narrow probe — the CLI contract", () => {
+  it("reads --widths and --json the way the probe's own docs promise", () => {
+    expect(blockedRowArgs(["--widths=360,280,200", "--json"])).toEqual({
+      widths: "360,280,200",
+      json: true,
+    });
+    expect(blockedRowArgs([])).toEqual({});
+    expect(blockedRowArgs(["--widths"])).toEqual({ widths: true });
+  });
+
+  // Same trap `recap-narrow-probe.mjs` was built to avoid (roborev 58761): a bare `--widths`
+  // arrives as boolean `true`, and `String(true).split(",").map(Number)` silently produces
+  // `[NaN]` rather than an error — which would have swept a column nobody can reach and graded
+  // every rule against it, reporting green.
+  it("refuses a --widths value that is not a list of positive numbers", () => {
+    expect(blockedRowWidths(undefined)).toEqual(BLOCKED_ROW_DEFAULT_WIDTHS);
+    expect(blockedRowWidths("360,280,200")).toEqual([360, 280, 200]);
+    expect(blockedRowWidths(" 280 , 200 ")).toEqual([280, 200]);
+    expect(blockedRowWidths(true)).toBeNull();
+    expect(blockedRowWidths("360,,200")).toBeNull();
+    expect(blockedRowWidths("narrow")).toBeNull();
+    expect(blockedRowWidths("-140")).toBeNull();
+    expect(blockedRowWidths("0")).toBeNull();
+    expect(blockedRowWidths("")).toBeNull();
   });
 });
 

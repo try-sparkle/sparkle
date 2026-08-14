@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pinned blocked row — narrow-column layout probe</title>
+  </head>
+  <body>
+    <!--
+      A LAYOUT-ONLY PAGE, served by the app's own vite dev server so it renders the REAL
+      PinnedBlockers row with the REAL stylesheet and the REAL fonts. It exists because jsdom cannot
+      answer the only question that matters here — does the Approve button ever paint over the agent
+      name — and the full visual harness cannot reach this row without seeding pinned blockers into
+      src/dev/visualFixtures.ts. See blocked-row-narrow-probe.mjs for what is measured.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./blocked-row-narrow-harness.jsx"></script>
+  </body>
+</html>

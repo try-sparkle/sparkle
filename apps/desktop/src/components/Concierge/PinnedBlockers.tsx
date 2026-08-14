@@ -34,7 +34,7 @@
 //     the live set and the row would simply VANISH from the one surface built so it cannot. The
 //     chip is what closes that: the host keeps a snapshot of what was acknowledged and renders it
 //     quietly here until the agent leaves the fleet or goes red again.
-import type { CSSProperties } from "react";
+import { useCallback, useRef, useState, type CSSProperties } from "react";
 import { FiBellOff, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../../theme/colors";
 import { RADIUS, TYPE } from "../../theme/scale";
@@ -48,12 +48,108 @@ export const PINNED_BLOCKERS_TESTID = "concierge-pinned-blockers";
 export const PINNED_BLOCKER_TESTID = "concierge-pinned-blocker";
 /** One entry, ACKNOWLEDGED — the quiet chip a [x] leaves behind. Still names its agent. */
 export const PINNED_BLOCKER_CHIP_TESTID = "concierge-pinned-blocker-chip";
+/** The "BLOCKED:" word itself — how a test/probe finds it to check whether it is showing. */
+export const PINNED_BLOCKER_LABEL_TESTID = "concierge-pinned-blocker-label";
+/** The action button (Approve/Open) — how a test/probe finds it to check whether it is showing. */
+export const PINNED_BLOCKER_ACTION_TESTID = "concierge-pinned-blocker-action";
 /** Clear an acknowledged chip off the strip. The LAST removal gesture, and the only one that takes
  *  a blocker off this surface on purpose — see the header for why [x] is not it. */
 export const PINNED_CLEAR_ACTION = "pinned-clear";
 
 /** The lead word, identical to the inline card's so the two read as one vocabulary. */
 const LEAD = "BLOCKED:";
+
+// ══ THE ORDER OF SACRIFICE (founder, 2026-08-13, bead sparkle-jaq7n) ══════════════════════════════
+//
+// His own screenshot: at a narrow pane, the Approve button painted directly over the agent name.
+// His framing: *"Maybe we don't show that button at all when it's too narrow... why don't you
+// figure it out?"* — an invitation to design the degradation, not a literal spec. The rule applied
+// here: elements must never overlap, and as the column narrows the row gives up the LEAST useful
+// thing first.
+//
+//   1. widest    — dot, "BLOCKED:", the full agent name, the full Approve/Open button.
+//   2. narrower  — "BLOCKED:" drops to just the dot. The word is the most redundant pixel in the
+//                  row: the dot already carries the state, and `aria-label` on the row still says
+//                  the word for anyone not reading it visually.
+//   3. narrower  — the agent name ellipsizes (AgentPill's own truncation — see PILL_FENCE below).
+//                  The button stays FULL SIZE: it is the point of the row, the one thing that
+//                  actually unblocks the agent, so it is the last thing to give.
+//   4. narrowest — only here does the button itself disappear, and ONLY because the ROW's own
+//                  area is wired to fire the exact same action in that state (see the row's own
+//                  `onClick`/`onKeyDown` below) — a block you can see but cannot act on would be
+//                  worse than a cramped row. THE PILL IS A PURE CARVE-OUT, not a second approval
+//                  path: every form it can render — the live button, a closed pill's disclosure
+//                  toggle, the notice prose that toggle can reveal, its own "See what it did"
+//                  button, or a fully inert unwired span — keeps ONLY its own honest behavior
+//                  (open the agent, toggle an explanation, navigate to history, or nothing at
+//                  all) and NEVER also triggers the approval; the fence around it exists solely to
+//                  `stopPropagation()` so none of that bubbles up and double-fires the row's own
+//                  handler. "The entire row remains clickable" is satisfied by the ROW's own area
+//                  — its padding, the dot, the "in {project}" text — and by Enter/Space on the row
+//                  itself, never by the pill sub-region. The name keeps its tooltip regardless
+//                  (AgentPill already carries one — see `AgentPill`'s `title`), so a truncated
+//                  name is always recoverable on hover.
+//
+// WHY MEASURED WIDTH RATHER THAN A CSS BREAKPOINT: this row lives in a COLUMN the user drags, not
+// the window — a `@media` query cannot see it. Mirrors `ComposeBox.tsx`'s own `columnWidth`
+// (ResizeObserver on the PARENT, not this element, for the same non-settling-loop reason spelled
+// out there): observing THIS row's own box would have the row's collapse change the very width
+// being measured.
+
+/** Below this column width, "BLOCKED:" drops to just the dot — tier 2.
+ *
+ *  MEASURED, not guessed: `visual:blocked-row-narrow` was run with the label always shown, and the
+ *  row stays overlap-free (the name simply ellipsizes further) all the way down to
+ *  `PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX`. So this threshold is not load-bearing for
+ *  containment — nothing breaks if it were 0 — it exists purely so the row does not spend its
+ *  narrowing budget on the word before the name has had a chance to shrink at all. 260px leaves a
+ *  comfortably legible name (`Sparkle Preview Agent Eyes` still reads past a dozen characters) at
+ *  `CONCIERGE_DEFAULT_WIDTH` (360) and above, and starts shedding the label well before the name
+ *  is squeezed to nothing.
+ */
+export const PINNED_BLOCKER_HIDE_LABEL_MAX_COLUMN_PX = 260;
+
+/** Below this column width, the Approve/Open button itself disappears — tier 4, the last resort.
+ *
+ *  MEASURED: `visual:blocked-row-narrow --widths=170,160,150,140` shows the row painting clean and
+ *  contained with the button still full-size down to 150px; below that the dot + icon buttons +
+ *  button's own min-content width no longer leave the name any room to ellipsize into, and the row
+ *  starts to overhang. 140 is the highest multiple of ten under that floor, so this fires only
+ *  where it has to.
+ */
+export const PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX = 140;
+
+/** Does the row show the "BLOCKED:" word at this measured column width? `0` (not yet measured)
+ *  reads as roomy, matching `ComposeBox.toolbarShowsLabels`'s convention — so the row does not
+ *  flash collapsed before the first real measurement lands. */
+export function pinnedBlockerShowsLabel(columnWidth: number): boolean {
+  return columnWidth === 0 || columnWidth >= PINNED_BLOCKER_HIDE_LABEL_MAX_COLUMN_PX;
+}
+
+/** Does the row show its Approve/Open button at this measured column width? Same "unmeasured
+ *  reads as roomy" convention as {@link pinnedBlockerShowsLabel}. */
+export function pinnedBlockerShowsButton(columnWidth: number): boolean {
+  return columnWidth === 0 || columnWidth >= PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX;
+}
+
+/** What the ROW ITSELF does when activated (clicked, or Enter/Space on it) — tier 4's wiring.
+ *  A PURE FUNCTION rather than inline in the click handler, so this is testable without a real
+ *  ResizeObserver: jsdom never lays out, so it never fires one, which means a rendered PinnedBlockers
+ *  in a jsdom test is permanently stuck reading `columnWidth` as its unmeasured (roomy) default —
+ *  the very state this decision only diverges from below `PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX`.
+ *
+ *  With the button hidden, the row is the ONLY remaining affordance, so it must land the exact same
+ *  approval the button would have — never fall back to merely opening the agent, which is what the
+ *  founder's "only if the entire row remains clickable and lands on the same approval" bars. Falls
+ *  back to "open" only when there is no action to fire at all (an empty `actions` array), which is
+ *  already true of the button's own presence today — a row with no actions never showed one. */
+export function pinnedBlockerRowActivation(
+  showButton: boolean,
+  primaryActionId: string | undefined,
+): { kind: "action"; actionId: string } | { kind: "open" } {
+  if (!showButton && primaryActionId !== undefined) return { kind: "action", actionId: primaryActionId };
+  return { kind: "open" };
+}
 
 /** Roughly three expanded rows. Past that the zone scrolls rather than grows — see the header: the
  *  composer's position is not negotiable, and a busy fleet can produce a dozen of these at once. */
@@ -72,6 +168,16 @@ const row = (): CSSProperties => ({
   // strip reads as alarm fatigue rather than as urgency.
   background: "transparent",
   cursor: "pointer",
+  // CLIP, NEVER ESCAPE — the containment floor below the last sacrifice tier. The zone's own
+  // horizontal padding plus this row's padding can, at `CONCIERGE_MIN_WIDTH` (50px), leave less
+  // room than the dot + mute + dismiss icons need even with the label, button, name and project
+  // text all fully collapsed — measured via `visual:blocked-row-narrow`: without this, the mute
+  // and dismiss buttons (pushed by `marginLeft: "auto"`) laid out tens of px past the row's own
+  // box and past the column's right edge, invisible to a check that only compares the row's own
+  // rect against the column's. Same principle `RecapCard`'s narrow cells use ("clip instead of
+  // escaping"): below the floor where everything fits, the least-recently-sacrificed control is
+  // clipped rather than painting into the composer or the next row.
+  overflow: "hidden",
 });
 
 const chip = (): CSSProperties => ({
@@ -132,11 +238,65 @@ export function PinnedBlockers({
   const live = new Set(blockers.map((b) => b.id));
   const shut = acknowledged.filter((a) => !live.has(a.id));
   const open = blockers;
+
+  // ── HOW WIDE THE COLUMN IS — MEASURED OUTSIDE THIS ZONE, NOT INSIDE IT ─────────────────────────
+  // Same technique and same reason as `ComposeBox.tsx`'s own `columnWidth`: this zone lives in the
+  // concierge COLUMN, which the user resizes independently of the window, so window width cannot
+  // answer "how much room does this row have". Observing the PARENT rather than this zone's own
+  // root avoids a non-settling loop — this zone's box would itself change size the moment a tier
+  // fires, which would move the very thing being measured.
+  //
+  // 0 means "not measured yet" and the tiers below read that as the roomy form (see
+  // `pinnedBlockerShowsLabel`/`pinnedBlockerShowsButton`), so the row does not flash collapsed
+  // before the first real measurement lands.
+  const [columnWidth, setColumnWidth] = useState(0);
+  const observerRef = useRef<ResizeObserver | null>(null);
+  // A CALLBACK REF, NOT `useRef` + a `useEffect([])` — this component RETURNS NULL when there is
+  // nothing live (the ordinary starting state: no blocker yet), so the div this ref names is not
+  // in the DOM on first mount at all. A `useEffect([])` runs exactly once, on that first mount,
+  // finds `rootRef.current` still `null`, and gives up for the lifetime of the component — so the
+  // observer NEVER attaches on the transition that actually matters (idle → a blocker appears),
+  // and every tier in this file is permanently inert in the ordinary case (roborev 64001). A
+  // callback ref is invoked by React every time the underlying DOM node changes — including from
+  // absent to present, on every open→null→open cycle a busy fleet produces — so re-attaching here
+  // happens exactly when there is something to attach to, with no dependency array to get stale.
+  //
+  // `useCallback([])`, NOT AN INLINE ARROW (roborev 64032). React detaches and re-attaches a
+  // callback ref whenever ITS OWN IDENTITY changes, not only when the DOM node changes — so an
+  // inline arrow, which is a fresh function on every render, tore the observer down and rebuilt it
+  // on every render of `PinnedBlockers`: every column-drag frame, and every unrelated re-render
+  // from its parent (`ConciergeColumn.tsx`), not merely the mount transition this fix targets.
+  // That did not visibly break anything only because `setColumnWidth`'s `prev === w ? prev : w`
+  // guard swallowed the redundant callback each fresh observer immediately re-delivered on
+  // `observe()` — but it is real, avoidable churn the empty dependency array below removes.
+  const rootRef = useCallback((node: HTMLDivElement | null) => {
+    observerRef.current?.disconnect();
+    observerRef.current = null;
+    const el = node?.parentElement;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width;
+      if (typeof w === "number" && w > 0) setColumnWidth((prev) => (prev === w ? prev : w));
+    });
+    ro.observe(el);
+    observerRef.current = ro;
+  }, []);
+  const showLabel = pinnedBlockerShowsLabel(columnWidth);
+  const showButton = pinnedBlockerShowsButton(columnWidth);
+
   if (open.length === 0 && shut.length === 0) return null;
 
   return (
     <div
+      ref={rootRef}
       data-testid={PINNED_BLOCKERS_TESTID}
+      // THE MEASURED WIDTH, EXPOSED — purely so a probe/test can wait for the ResizeObserver to
+      // have actually fired before reading the tier it produced. Without this, `visual:blocked-row-
+      // narrow` raced the observer: `waitForFunction` on the harness's ready flag resolves after
+      // two animation frames, which does not guarantee the observer's first callback has already
+      // run, so the probe sometimes measured the row at its "unmeasured" (0 → roomy) default
+      // regardless of the width under test.
+      data-column-width={columnWidth}
       // A LANDMARK, not a log. `role="region"` with a name is what lets a screen-reader user jump to
       // it deliberately; `aria-live` would be wrong — this content persists rather than arriving,
       // and the column already has exactly one live region (see ConciergeColumn's announcer).
@@ -154,22 +314,39 @@ export function PinnedBlockers({
         flex: "0 0 auto",
       }}
     >
-      {open.map((b) => (
+      {open.map((b) => {
+        // TIER 4's WIRING — see {@link pinnedBlockerRowActivation}. `actions[0]` rather than a
+        // "primary" kind lookup: today's producer (`services/nudgeActions`) emits at most one
+        // action, and a future second one is still better served by the first (Approve/Open) than
+        // by silently picking none.
+        const activation = pinnedBlockerRowActivation(showButton, b.actions[0]?.id);
+        const rowActivate = () =>
+          activation.kind === "action" ? onNudgeAction(b, activation.actionId) : onNudgeClick(b);
+        return (
         <div
           key={b.id}
           data-testid={PINNED_BLOCKER_TESTID}
           data-agent-id={b.id}
           role="button"
           tabIndex={0}
-          aria-label={`${LEAD} ${b.agentName} in ${b.projectName}`}
-          onClick={() => onNudgeClick(b)}
+          // TIER 4 CHANGES WHAT ACTIVATING THIS ROW DOES (roborev 64058: "the behavior moved, the
+          // string that narrates it did not"). At every other width, Enter/click opens the agent;
+          // below the button threshold it fires an irreversible Approve relay instead — a
+          // screen-reader user gets no visual cue for that (the missing button is sighted-only),
+          // so the accessible name has to say so.
+          aria-label={
+            activation.kind === "action"
+              ? `${LEAD} ${b.agentName} in ${b.projectName} — activate to ${b.actions[0]?.label ?? "approve"}`
+              : `${LEAD} ${b.agentName} in ${b.projectName}`
+          }
+          onClick={rowActivate}
           onKeyDown={(e) => {
             // ONLY THE ROW ITSELF, matching NudgeCard: a keydown on the nested fold button bubbles
             // here, and preventDefault would cancel the button's own Enter/Space activation.
             if (e.target !== e.currentTarget) return;
             if (e.key !== "Enter" && e.key !== " ") return;
             e.preventDefault();
-            onNudgeClick(b);
+            rowActivate();
           }}
           style={row()}
         >
@@ -177,17 +354,53 @@ export function PinnedBlockers({
             style={{ flex: "0 0 auto", width: 7, height: 7, borderRadius: "50%", background: C.sienna }}
             aria-hidden
           />
-          {/* THE THEMED ink, not raw sienna: the accent is under the AA floor as TEXT on this
-              column. Same split, and same reason, as the inline card's. */}
-          <strong
-            style={{ color: C.dangerInk, fontWeight: FONT_WEIGHT.bold, letterSpacing: "0.02em" }}
-          >
-            {LEAD}
-          </strong>
+          {/* TIER 2: the word is the most redundant pixel in the row — the dot beside it already
+              carries the state, and the row's own `aria-label` above still says "BLOCKED:" for a
+              screen-reader user regardless of whether this renders. THE THEMED ink, not raw
+              sienna: the accent is under the AA floor as TEXT on this column. Same split, and
+              same reason, as the inline card's. */}
+          {showLabel && (
+            <strong
+              data-testid={PINNED_BLOCKER_LABEL_TESTID}
+              style={{ color: C.dangerInk, fontWeight: FONT_WEIGHT.bold, letterSpacing: "0.02em" }}
+            >
+              {LEAD}
+            </strong>
+          )}
           {/* A FENCE around the pill's own click, exactly as the inline card does it — without it
               one click runs the reveal twice. */}
           <span
-            style={{ display: "inline-flex", minWidth: 0 }}
+            // NO explicit `flex` — deliberately left at its CSS default (`0 1 auto`: grow 0,
+            // shrink 1, basis auto), which is what actually lets this box shrink and clip. An
+            // earlier draft wrote `flex: "1 1 0%"` (roborev 63961): flex-grow:1 makes the fence
+            // consume ALL positive free space at a roomy width, opening a gap between the name and
+            // "in {project}" that does not exist today, and flex-basis:0% meant it got no shrink
+            // allocation under negative free space, collapsing toward 0 before its sibling gave up
+            // any width at all. Grow must stay 0. A LATER DRAFT then wrote `flex: "0 1 auto"`
+            // explicitly (roborev 64018) — which is a no-op, since that IS the default every flex
+            // item already has, and src/index.css sets no different default. Writing it out was
+            // false documentation: it read as "grow-vs-shrink is guarded here" when nothing does.
+            // `minWidth: 0` and `overflow: "hidden"` below are the two declarations that actually
+            // do the work — the fix is that this box was left ALONE, not that it was configured.
+            style={{ display: "inline-flex", minWidth: 0, overflow: "hidden" }}
+            // A PURE CLICK SINK, NOT A SECOND APPROVAL PATH (roborev 64112, retiring two drafts —
+            // 64079, 64095 — that tried to give this fence its own tier-4 fallback). This span has
+            // no padding and no gap, and it holds exactly ONE flex child that always fills its
+            // content box (the live pill's button, or the shipping disclosure form's inline
+            // wrapper) — so there is no "fence's own bare space" a real pointer event can ever
+            // land on; `e.target` is always some descendant of the pill, never the fence itself.
+            // A fallback keyed on that condition was dead code that only a synthetic jsdom event
+            // (which can set `target` to whatever it likes, unconstrained by real hit-testing —
+            // docs/jsdom-test-caveats.md) could ever exercise.
+            //
+            // That is not a gap in the founder's "the entire row remains clickable" bar: this
+            // fence covers only the narrow pill sub-region, and the REST of the row — its own
+            // padding, the dot, the "in {project}" text, the gaps between every element — already
+            // reaches the row's own `onClick` (nothing here stops THAT propagation from firing for
+            // clicks outside this fence). What `stopPropagation` has to do is exactly what its
+            // original comment above says: keep the pill's own click from ALSO bubbling into the
+            // row's, which would double-fire whatever the pill did (open the agent, toggle a
+            // disclosure, navigate to history) alongside an unrelated approval.
             onClick={(e) => e.stopPropagation()}
             role="presentation"
           >
@@ -208,30 +421,35 @@ export function PinnedBlockers({
               quietly drop what could be done from it: Approve is a one-tap relay into a live
               terminal with no other home in the app, and Open is the cloud agent's substitute for
               it (`services/nudgeActions` picks which). A blocker you can see but no longer act on
-              is a worse surface than the scrolling one it replaced. */}
-          {b.actions.map((a) => (
-            <button
-              key={a.id}
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onNudgeAction(b, a.id);
-              }}
-              style={{
-                flex: "0 0 auto",
-                padding: "2px 8px",
-                borderRadius: RADIUS.sm,
-                border: `1px solid ${C.sienna}`,
-                background: "transparent",
-                color: C.dangerInk,
-                fontSize: TYPE.small,
-                fontWeight: FONT_WEIGHT.bold,
-                cursor: "pointer",
-              }}
-            >
-              {a.label}
-            </button>
-          ))}
+              is a worse surface than the scrolling one it replaced.
+              TIER 4: hidden ONLY below `PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX`, and only
+              because `rowActivate` above wires the row's own click to the same action in that
+              state — never hidden without that wiring, or the block would be un-actable. */}
+          {showButton &&
+            b.actions.map((a) => (
+              <button
+                key={a.id}
+                type="button"
+                data-testid={PINNED_BLOCKER_ACTION_TESTID}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onNudgeAction(b, a.id);
+                }}
+                style={{
+                  flex: "0 0 auto",
+                  padding: "2px 8px",
+                  borderRadius: RADIUS.sm,
+                  border: `1px solid ${C.sienna}`,
+                  background: "transparent",
+                  color: C.dangerInk,
+                  fontSize: TYPE.small,
+                  fontWeight: FONT_WEIGHT.bold,
+                  cursor: "pointer",
+                }}
+              >
+                {a.label}
+              </button>
+            ))}
           {/* MUTE, on the same handle as before. A durable preference about the AGENT rather than
               about this episode, and this strip is now its only call site — dropping it here would
               delete do-not-interrupt from the app. */}
@@ -266,7 +484,8 @@ export function PinnedBlockers({
             <FiX size={12} />
           </button>
         </div>
-      ))}
+        );
+      })}
       {shut.length > 0 && (
         // The acknowledged ones share ONE wrapping row: a dozen of them should cost a line or two,
         // not a dozen. They stay in DOM order beneath the loud ones, so what the reader has NOT
