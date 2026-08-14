@@ -19,10 +19,19 @@ function acct(id: string, over: Partial<Account> = {}): Account {
 /** A deps harness that models the real login sequence: the new slot's identity does not exist until
  *  `onLogin` settles, at which point `onLoginEffect` pushes whatever the browser signed in as. Starts
  *  with one PRE-EXISTING signed-in account so the duplicate case has something to collide with. */
-function harness(onLoginEffect: (ids: Identity[], newId: string) => void) {
+function harness(
+  onLoginEffect: (ids: Identity[], newId: string) => void,
+  existingOver: Partial<Identity> = {},
+) {
   const accounts: Account[] = [acct("existing", { nickname: "Personal" })];
   const identities: Identity[] = [
-    { id: "existing", email: "personal@example.com", organization: null, accountUuid: "u-personal" },
+    {
+      id: "existing",
+      email: "personal@example.com",
+      organization: null,
+      accountUuid: "u-personal",
+      ...existingOver,
+    },
   ];
   const removeAccount = vi.fn(async (id: string) => {
     const i = accounts.findIndex((a) => a.id === id);
@@ -96,5 +105,48 @@ describe("AccountsScreen — identity-keyed add reconciliation", () => {
     await waitFor(() => expect(deps.addAccount).toHaveBeenCalledWith("Gmail"));
     // A distinct identity is not a duplicate — the slot stays, nothing is removed.
     expect(removeAccount).not.toHaveBeenCalled();
+  });
+
+  it("KEEPS a second account under ONE email that is a DIFFERENT organization (the amforge case)", async () => {
+    // THE FOUNDER'S CASE: a Team org already registered, adding a Personal Max under the SAME email.
+    // They share an accountUuid but sit in different organizations, so they are DIFFERENT Anthropic
+    // accounts with separate quotas — the second must be allowed, not refused as a duplicate.
+    const { deps, onLogin, removeAccount } = harness(
+      (ids, newId) =>
+        ids.push({
+          id: newId,
+          email: "amforge@example.com",
+          organization: "amforge (Personal)",
+          accountUuid: "u-amforge",
+        }),
+      { email: "amforge@example.com", organization: "Amforge Team", accountUuid: "u-amforge" },
+    );
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await addAccountNamed("Amforge Personal");
+
+    await waitFor(() => expect(deps.addAccount).toHaveBeenCalledWith("Amforge Personal"));
+    // The SIDE EFFECT that would break without org-awareness: the slot is NOT torn down, and no
+    // "already signed in to this account" message is shown.
+    expect(removeAccount).not.toHaveBeenCalled();
+    expect(screen.queryByText(/already signed in to this account/)).toBeNull();
+  });
+
+  it("STILL discards a true duplicate that shares email, uuid AND organization", async () => {
+    // The real dedup the founder relies on must survive org-awareness: same login AND same org is one
+    // account in two config dirs, and the redundant slot is still removed.
+    const { deps, onLogin, removeAccount } = harness(
+      (ids, newId) =>
+        ids.push({
+          id: newId,
+          email: "amforge@example.com",
+          organization: "Amforge Team",
+          accountUuid: "u-amforge",
+        }),
+      { email: "amforge@example.com", organization: "Amforge Team", accountUuid: "u-amforge" },
+    );
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await addAccountNamed("Duplicate");
+
+    await waitFor(() => expect(removeAccount).toHaveBeenCalledWith("new"));
   });
 });

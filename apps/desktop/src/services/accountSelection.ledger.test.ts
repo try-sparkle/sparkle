@@ -1,18 +1,18 @@
-// Does an account approaching its ceiling actually stop receiving new spawns — and can anyone SEE
-// that it did?
+// Which account did a spawn use, and can anyone SEE it?
 //
 // These tests drive the real production resolver (`chooseAccountForAgent`) against a mocked accounts
 // backend and then assert on THE LEDGER LINE IT WROTE, not on the function's return value. That is
-// deliberate: the founder's complaint is not that the selection rule is wrong, it is that nothing
+// deliberate: the founder's complaint was not that the selection rule is wrong, it is that nothing
 // anywhere records which account a spawn used, so "it works" has never been checkable. A test that
 // asserted `chosen.id` would pass just as happily with the ledger deleted.
 //
-// The near-cap pair below is the load-bearing one. This repo's most common defect is the VACUOUS
-// test — an assertion already true before the change — and the specific trap here is that an account
-// can be absent from the pick for reasons that have nothing to do with its ceiling (not signed in,
-// already exhausted, a stale pin). So the exclusion is asserted TWICE against the same fixture:
-// once with usage above the act line (excluded) and once with usage below it (chosen). Only the pair
-// pins the ceiling as the cause.
+// THE LEARNED-CEILING ESTIMATE NO LONGER GATES SELECTION. It used to exclude an account at >= 0.9 of
+// its estimated ceiling BEFORE the wall; the founder retired that estimate as a driver (it read
+// "90% of its usual limit" while the real Anthropic numbers were clear). The ledger still RECORDS
+// the ceiling/fraction of the chosen account — recording was never the problem — but the pick is now
+// ranked by raw/real usage, with the OBSERVED wall (`exhaustedUntil`) and real live utilization as
+// the only exclusions. The tests below pin that: an account over its estimated ceiling is kept, and
+// the empty-pool/fallback cases are driven by a real wall rather than the estimate.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 const invoke = vi.fn();
@@ -44,6 +44,9 @@ const CEILING = 1_000_000;
 const OVER_ACT_LINE = Math.ceil(CEILING * (CEILING_AVOID_FRACTION + 0.05));
 /** Comfortably below it, so the ONLY difference between the paired tests is the ceiling verdict. */
 const UNDER_ACT_LINE = Math.floor(CEILING * (CEILING_AVOID_FRACTION - 0.3));
+/** A future observed-wall instant, in epoch SECONDS (the wire unit `getUsage` converts ×1000 to ms).
+ *  Relative to real `Date.now()` because `chooseAccountForAgent` here runs on the real clock. */
+const FUTURE_WALL_SECS = Math.floor(Date.now() / 1000) + 3600;
 
 function mockBackend(opts: {
   usage?: Array<{ id: string; tokens5h: number; tokens7d: number; exhaustedUntil: number | null }>;
@@ -105,15 +108,16 @@ describe("the spawn ledger records which account a spawn used", () => {
     expect(e.candidateIds).toEqual(expect.arrayContaining(["personal", "second"]));
   });
 
-  // ── THE PAIR ─────────────────────────────────────────────────────────────────────────────────
-  // Same fixture, same two signed-in accounts, same learned ceiling. The ONLY thing that differs
-  // between these two tests is whether `personal` is above or below the act line.
+  // ── THE ESTIMATE DOES NOT MOVE THE PICK ──────────────────────────────────────────────────────
+  // An account over its learned ceiling is kept in the pool (the gate was removed), and the ledger
+  // still records how close it is — so a reader can see the standing without it changing the choice.
 
-  it("stops sending spawns to an account at its learned ceiling, and the ledger says so", async () => {
+  it("does NOT exclude an account over its learned ceiling — lowest usage still wins", async () => {
     mockBackend({
       usage: [
-        // Over the act line, but NOT exhausted and with the LOWER 7d tally — so under the plain
-        // lowest-usage rule this account would still win. Only the ceiling can move it.
+        // Over the estimated ceiling line, NOT exhausted, and with the LOWER 7d tally. It USED to be
+        // excluded by the proactive ceiling gate; the estimate no longer gates, so it stays in and
+        // lowest-usage keeps the pick on it. Re-add `isNearLearnedCeiling` and this flips to "second".
         { id: "personal", tokens5h: OVER_ACT_LINE, tokens7d: 1, exhaustedUntil: null },
         { id: "second", tokens5h: 10, tokens7d: 999_999, exhaustedUntil: null },
       ],
@@ -126,15 +130,17 @@ describe("the spawn ledger records which account a spawn used", () => {
     await chooseAccountForAgent("agent-nearcap");
 
     const e = lastEntry();
-    expect(e.accountId).toBe("second"); // moved OFF the near-cap account
+    expect(e.accountId).toBe("personal"); // kept — the estimate does not exclude it
     expect(e.reason).toBe("auto");
-    // The near-cap account was removed from the pool — this is the proactive gate firing.
-    expect(e.candidateIds).toEqual(["second"]);
-    expect(e.candidateIds).not.toContain("personal");
-    expect(e.eligibleCount).toBe(1);
+    expect(e.candidateIds).toEqual(expect.arrayContaining(["personal", "second"]));
+    expect(e.eligibleCount).toBe(2);
+    // The ledger still QUANTIFIES the ceiling standing (recording was never the problem — only the
+    // GATE was removed).
+    expect(e.ceiling).toBe(CEILING);
+    expect(e.fraction).toBeCloseTo(OVER_ACT_LINE / CEILING, 5);
   });
 
-  it("…and sends them right back to that same account once it is below the line", async () => {
+  it("records the ceiling/fraction of the chosen account when it is below the line too", async () => {
     mockBackend({
       usage: [
         { id: "personal", tokens5h: UNDER_ACT_LINE, tokens7d: 1, exhaustedUntil: null },
@@ -149,12 +155,10 @@ describe("the spawn ledger records which account a spawn used", () => {
     await chooseAccountForAgent("agent-undercap");
 
     const e = lastEntry();
-    // Identical setup to the test above except the tally — so the exclusion there was caused by the
-    // ceiling and by nothing upstream of it.
     expect(e.accountId).toBe("personal");
     expect(e.candidateIds).toEqual(expect.arrayContaining(["personal", "second"]));
     expect(e.eligibleCount).toBe(2);
-    // And the ledger quantifies how close it is, so a reader can see the gate coming.
+    // The ledger quantifies how close it is — a diagnostic, not a gate.
     expect(e.ceiling).toBe(CEILING);
     expect(e.fraction).toBeCloseTo(UNDER_ACT_LINE / CEILING, 5);
   });
@@ -187,20 +191,17 @@ describe("the spawn ledger records which account a spawn used", () => {
   it("marks the least-bad fallback as 'fallback', not as an ordinary auto-pick", async () => {
     mockBackend({
       usage: [
-        { id: "personal", tokens5h: OVER_ACT_LINE, tokens7d: 1, exhaustedUntil: null },
-        { id: "second", tokens5h: OVER_ACT_LINE, tokens7d: 1, exhaustedUntil: null },
-      ],
-      ceilings: [
-        { id: "personal", samples: [CEILING, CEILING, CEILING], ceiling: CEILING },
-        { id: "second", samples: [CEILING, CEILING, CEILING], ceiling: CEILING },
+        // Both accounts have hit a REAL wall (the observed exclusion, not the retired estimate), so
+        // nothing is a healthy candidate — but a spawn still happens (refusing outright would strand
+        // the fleet behind a wall it cannot yet see the far side of).
+        { id: "personal", tokens5h: 1, tokens7d: 1, exhaustedUntil: FUTURE_WALL_SECS },
+        { id: "second", tokens5h: 1, tokens7d: 1, exhaustedUntil: FUTURE_WALL_SECS },
       ],
     });
 
     await chooseAccountForAgent("agent-allspent");
 
     const e = lastEntry();
-    // Every account is over its act line, so nothing is a healthy candidate — but a spawn still
-    // happens (refusing to spawn on an ESTIMATE would let a mis-learned ceiling halt the fleet).
     expect(e.candidateIds).toEqual([]);
     expect(e.eligibleCount).toBe(0);
     expect(e.reason).toBe("fallback");
@@ -276,12 +277,10 @@ describe("the ledger never invents a measurement it did not take", () => {
     // lose the ability to say "everything was spent".
     mockBackend({
       usage: [
-        { id: "personal", tokens5h: OVER_ACT_LINE, tokens7d: 1, exhaustedUntil: null },
-        { id: "second", tokens5h: OVER_ACT_LINE, tokens7d: 1, exhaustedUntil: null },
-      ],
-      ceilings: [
-        { id: "personal", samples: [CEILING, CEILING, CEILING], ceiling: CEILING },
-        { id: "second", samples: [CEILING, CEILING, CEILING], ceiling: CEILING },
+        // Genuinely empty pool: both accounts have hit a REAL wall, so `[]` and `0` are real
+        // findings that must survive (not the "we could not look" null of the paired test above).
+        { id: "personal", tokens5h: 1, tokens7d: 1, exhaustedUntil: FUTURE_WALL_SECS },
+        { id: "second", tokens5h: 1, tokens7d: 1, exhaustedUntil: FUTURE_WALL_SECS },
       ],
     });
     await chooseAccountForAgent("agent-really-empty");

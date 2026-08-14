@@ -16,6 +16,7 @@ import {
   removeAccount,
   accountDisplay,
   duplicateAccountGroups,
+  loginSiblingIds,
   identityKey,
   getPreferredAccountId,
   clearPreferredAccount,
@@ -23,10 +24,10 @@ import {
   getPin,
   setPin,
   clearPin,
-  CEILING_AVOID_FRACTION,
   type Account,
   type Usage,
   type Identity,
+  type LiveUsage,
 } from "../services/accountStore";
 import {
   stickyAccountSnapshot,
@@ -43,8 +44,8 @@ import {
   exhaustionOutlook,
   switchRecommendation,
   describeRecommendation,
+  leadName,
   type Ceiling,
-  type Headroom,
 } from "../services/headroom";
 import { getAccountUsageLive, type AccountUsageLive } from "../services/accountUsage";
 import { joinList } from "../engine/joinList";
@@ -185,22 +186,30 @@ const primaryTagStyle: CSSProperties = {
  *
  *  Two details are load-bearing, and each is a way this has already failed:
  *
- *  • FULL BLEED. The scrollport is `ModalShell`'s body, which carries the dialog's inset. A sticky
- *    header that respects that inset leaves a `MODAL_PADDING`-wide gutter down each side with live
- *    content sliding up through it. Cancelling the inset with negative margins and re-adding it as
- *    padding makes the header span the card edge-to-edge while looking identical at rest.
+ *  • FULL BLEED, SIDES ONLY. The scrollport is `ModalShell`'s body, which carries the dialog's
+ *    inset. A sticky header that respects the SIDE inset leaves a `MODAL_PADDING`-wide gutter down
+ *    each side with live content sliding up through it, so the horizontal inset is cancelled with
+ *    negative left/right margins and re-added as padding — the header spans the card edge-to-edge
+ *    while its content stays aligned with the rows below.
  *  • OPAQUE. `sticky` does not imply a background. Without one the ledger rows scroll straight
  *    THROUGH the title and the button, which is worse than the overflow it replaced.
  *
- *  The negative top margin means it is already at its sticky offset before any scrolling happens,
- *  so it is pinned from the first paint rather than snapping into place partway down. */
+ *  NO NEGATIVE TOP MARGIN. It used to cancel the top inset too, to sit flush against the card's top
+ *  edge — but paired with `position: sticky` that laid the following content out `MODAL_PADDING`px
+ *  HIGHER than the header pins to when stuck, so the stuck header painted over the first rows: the
+ *  intro line and the account cards' action buttons scrolled UNDER it (the founder's screenshot).
+ *  With `margin-top: 0` the header reserves its own space cleanly and its stuck position matches
+ *  that reserved space, so content passes below it rather than behind it. It sits at the
+ *  scrollport's own top inset, which reads as ordinary breathing room above the title. The `top: 0`
+ *  pin, the opaque plane and the z-index are unchanged — see AccountsScreen.reachability.test.tsx,
+ *  which pins that contract. */
 const stickyHeader: CSSProperties = {
   position: "sticky",
   top: 0,
   zIndex: 2,
   background: C.dialogSurface,
-  margin: `-${MODAL_PADDING}px -${MODAL_PADDING}px 10px`,
-  padding: `${MODAL_PADDING}px ${MODAL_PADDING}px 8px`,
+  margin: `0 -${MODAL_PADDING}px 10px`,
+  padding: `0 ${MODAL_PADDING}px 8px`,
   borderBottom: `1px solid ${C.muted}`,
   display: "flex",
   alignItems: "center",
@@ -217,14 +226,6 @@ const inputStyle: CSSProperties = {
   fontFamily: fontStack,
   padding: "4px 8px",
 };
-
-/** Human-readable token count (e.g. 9.3B, 1.2M, 34k). */
-function fmtTokens(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
-  return `${n}`;
-}
 
 /** The human-readable cause of a rejected IO call, or `fallback` when there is genuinely nothing.
  *
@@ -361,74 +362,16 @@ function noticeCard(ink: string): CSSProperties {
   return { ...card, borderColor: ink, color: ink, fontSize: 12, lineHeight: 1.5 };
 }
 
-/** How each headroom verdict reads and colours.
- *
- *  `unknown` is muted and says so IN WORDS. It must never borrow `ok`'s green or render as a
- *  percentage: an account with too few observed limit episodes has no ceiling, and presenting that
- *  as "0% used" would make the least-measured account look like the emptiest one. */
-const HEADROOM_TONE: Record<Headroom["state"], { ink: string; label: string }> = {
-  ok: { ink: C.successInk, label: "Room to spare" },
-  warn: { ink: C.amberInk, label: "Close to its limit" },
-  exhausted: { ink: C.dangerInk, label: "At its limit" },
-  unknown: { ink: C.muted, label: "Limit unknown" },
-};
-
-/** Where ONE account stands against its OWN learned ceiling — the per-account half of rotation
- *  visibility. Unlike the removed relative cross-account bar, this one
- *  answers "how much room does this account have left", which is what decides when rotation bites.
- *
- *  With no ceiling learned yet it renders words and NO bar. A bar implies a denominator we do not
- *  have, and either extreme of it would be a lie in one direction or the other. */
-function HeadroomLine({ headroom, accountId }: { headroom: Headroom; accountId: string }) {
-  const tone = HEADROOM_TONE[headroom.state];
-  const pct = headroom.fraction != null ? Math.round(headroom.fraction * 100) : null;
-  const actPct = Math.round(CEILING_AVOID_FRACTION * 100);
-  return (
-    <div data-testid={`account-headroom-${accountId}`} style={{ marginTop: 8, fontSize: 12 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, color: tone.ink }}>
-        <span style={{ fontWeight: 600 }}>{tone.label}</span>
-        {headroom.ceiling != null && pct != null && (
-          <span style={{ color: C.muted }}>
-            {fmtTokens(headroom.used)} of about {fmtTokens(headroom.ceiling)} · {pct}% of its usual
-            limit
-          </span>
-        )}
-      </div>
-      {headroom.ceiling == null ? (
-        <div style={{ color: C.muted, marginTop: 2 }}>
-          Not enough history to estimate a limit yet
-        </div>
-      ) : (
-        <>
-          <div
-            role="progressbar"
-            aria-label="Headroom against learned limit"
-            aria-valuenow={Math.min(100, pct ?? 0)}
-            aria-valuemin={0}
-            aria-valuemax={100}
-            style={{
-              height: 6,
-              borderRadius: 3,
-              background: C.deepForest,
-              border: `1px solid ${C.muted}`,
-              marginTop: 4,
-              overflow: "hidden",
-            }}
-          >
-            <div style={{ width: `${Math.min(100, pct ?? 0)}%`, height: "100%", background: tone.ink }} />
-          </div>
-          {/* The ACT line, not the WARN line. `CEILING_AVOID_FRACTION` is the fraction at which
-              auto-pick stops sending this account new work; `headroom.WARN_FRACTION` (0.8) is the
-              lower point at which the human is merely told. Two stages, one number each — imported
-              rather than typed out so the sentence cannot drift from the behaviour. */}
-          <div style={{ color: C.muted, marginTop: 2 }}>
-            Stops taking new agents at {actPct}% of that.
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
+// ── The estimated "usual limit" HEADROOM BAR was REMOVED here (founder's instruction) ───────────
+// `HeadroomLine` + its `HEADROOM_TONE` rendered a yellow "Close to its limit — 6.8M of about 7.5M ·
+// 90% of its usual limit / Stops taking new agents at 90% of that" bar on every account card. It was
+// the LEARNED-CEILING estimate, and it misfired: it screamed "90%, close to the wall" while the REAL
+// USAGE (ANTHROPIC) section right below it — the `LiveUsageSection` that STAYS — showed the account
+// comfortably clear (session 39% / weekly 71% on the founder's card). A confident estimate that
+// contradicts the real number beside it is a liability, not a fallback, so the real Anthropic
+// figures are the source of truth for this card now. The estimate no longer drives BEHAVIOUR either
+// — see `accountStore.partitionAccounts` (the spawn gate) and `headroom.switchRecommendation` (the
+// proactive nudge), both of which stopped acting on it in the same change.
 
 /** THE HEADLINE OF THIS SCREEN: how many accounts can actually receive a spawn.
  *
@@ -856,12 +799,29 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     return agents;
   };
   const readiness = rotationReadiness(accounts, identities);
-  const headroomById = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
+  // The REAL Anthropic rows we have fetched, in the shape selection uses. Feeding these into the
+  // AC8 verdict keeps "all accounts are at their limit" tracking the SAME signal the spawn gate now
+  // excludes on (`partitionAccounts` → `isLiveSpent`), rather than only the observed wall — so the
+  // banner and the gate cannot disagree. Rows still loading ("undefined") or failed ("error") are
+  // simply absent, which reads as "no live evidence" for that account, never as spent.
+  const liveRows: LiveUsage[] = Object.entries(liveUsage)
+    .filter((e): e is [string, AccountUsageLive] => e[1] !== "error")
+    .map(([id, l]) => ({
+      id,
+      fiveHourPercent: l.fiveHourPercent,
+      sevenDayPercent: l.sevenDayPercent,
+    }));
+  // id → login-group siblings, so AC8 judges the live signal PER LOGIN exactly as
+  // `switchRecommendation` and the spawn gate do (a duplicate's missing live row is covered by its
+  // twin's), keeping the deduped banner from disagreeing with them.
+  const siblingIds = loginSiblingIds(accounts, identities);
   const outlook = exhaustionOutlook(
     readiness.usable.map((a) => a.id),
     usage,
     ceilings,
     now,
+    liveRows,
+    siblingIds,
   );
   // AC9 — the runway warning, raised BEFORE the wall.
   //
@@ -872,25 +832,43 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // HEALTHIEST account, so it is never the one approaching its ceiling, and a warning keyed on it
   // could only ever fire in the all-bad fallback that AC8's banner already covers. The pool is what
   // agents actually run on over time, so the pool is what has runway.
+  // Observed-exhaustion state per account, for the no-target fallback below. `switchRecommendation`
+  // owns the SAME live rows the spawn gate uses, so a runway target it returns is never one AC8 just
+  // called walled.
+  const headroomById = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
   const runwayIds = currentAccountId ? [currentAccountId] : readiness.usable.map((a) => a.id);
   const runways = runwayIds
     .map((id) => ({
       account: accounts.find((a) => a.id === id),
       headroom: headroomById.get(id),
       // `switchRecommendation` + `describeRecommendation` ARE the policy and the sentence. This
-      // screen does not get a second opinion about either.
-      recommendation: switchRecommendation(id, accounts, usage, ceilings, identities, now),
+      // screen does not get a second opinion about either. It gets the SAME `liveRows`, so its target
+      // choice cannot contradict AC8's live-aware verdict.
+      recommendation: switchRecommendation(id, accounts, usage, ceilings, identities, now, liveRows),
+      // For the no-target fallback: does this account share a login with another slot (a shared quota
+      // is why there is nowhere to move), and — preferring a member that actually HAS a readable email
+      // — what is that email? `duplicates` is the canonical grouping already computed above. The email
+      // is chosen by SIGNED-IN member, not array order: a uuid-only sibling registered first must not
+      // blank the email and revert the copy to the false "no other signed-in account".
+      ...(() => {
+        const group = duplicates.find((g) => g.accounts.some((a) => a.id === id));
+        const others = (group?.accounts ?? []).filter((a) => a.id !== id);
+        const email = others.map((a) => identityFor(a.id)?.email).find((e) => e != null) ?? null;
+        return { hasSameLoginSibling: others.length > 0, sameLoginSiblingEmail: email };
+      })(),
     }))
     .filter(
       (r) =>
         r.account != null &&
         (r.recommendation != null ||
-          // The no-target case: running out with nowhere to move. NOT a switch recommendation —
-          // there is nothing to recommend — so it cannot come from the formatter, but staying silent
-          // about it is exactly the founder's blind spot. Suppressed when AC8's banner is already
-          // saying the same thing about the whole pool.
-          (!outlook.allAtLimit &&
-            (r.headroom?.state === "warn" || r.headroom?.state === "exhausted"))),
+          // NO-TARGET FALLBACK. An account hit a REAL wall but there is nothing to move to. This is
+          // NOT redundant with AC8: `switchRecommendation` also drops a candidate that is the SAME
+          // LOGIN as `from` (a shared quota is no escape), and `exhaustionOutlook` — judging the
+          // login-deduped `usable` set — knows nothing about that. So a walled account whose only
+          // alternative is its own duplicate has no recommendation AND is not `allAtLimit`: without
+          // this row the screen goes silent while the fleet sits behind a five-hour wall (the
+          // founder's blind spot). Suppressed when AC8 is already saying it about the whole pool.
+          (!outlook.allAtLimit && r.headroom?.state === "exhausted")),
     );
 
   async function handleAdd() {
@@ -993,7 +971,23 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
 
       // Case 1 — SAME identity as before. The legit "my token expired, re-auth" case: nothing to
       // warn about. (A slot that had NO prior identity falls through to the change handling below,
-      // where the "account lost" branch is correctly suppressed because there was no X to lose.)
+      // where the "account lost" branch is suppressed because there was no X to lose.)
+      //
+      // DELIBERATELY ORG-BLIND (raw `identityKey` equality). ALL organization-awareness on the
+      // RE-LOGIN path is deferred to `organizationUuid` (bead sparkle-hli8pu), because the mutable
+      // `organizationName` cannot drive it safely:
+      //   • gating this on `accountsAreSame` false-alarms on an ordinary org RENAME (a single-dir
+      //     token refresh comparing a cached name against a freshly-written one), and its fall-through
+      //     lands in Case 3 whose copy names both sides by the same email;
+      //   • detecting the "Team→Personal re-login onto ANOTHER slot's account" duplicate from a change
+      //     in `duplicateAccountGroups` membership false-alarms just as badly — that membership flips
+      //     when an org merely becomes `null` (a documented state for a completed login; see
+      //     `splitGroupByOrganization`: "null is unknown, never a difference"), so an unchanged account
+      //     whose org went unreadable would raise a false "wrong account" warning on a routine refresh.
+      // A false alarm on the most routine action is worse than missing a rare deliberate re-login, so
+      // this stays key-based until a stable `organizationUuid` is plumbed. The ADD path still
+      // refuses/permits the two-org case via `accountsAreSame` (`adoptionOutcome` /
+      // `duplicateAccountGroups`), which is the founder's actual blocker.
       if (priorKey != null && newKey === priorKey) {
         setLiveNonce((n) => n + 1);
         return;
@@ -1143,12 +1137,20 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
             {r.recommendation ? (
               describeRecommendation(r.recommendation, displayFor)
             ) : (
+              // The no-target fallback (see the runway filter): a real wall with nowhere safe to go.
+              // The subject is named by `leadName` — the SAME rule the recommendation sentence uses —
+              // so a uuid-only login never reads the false "Not signed in has hit its limit". And the
+              // reason is stated honestly: this row fires only when the sole other usable account is
+              // the SAME Claude login (a shared quota is no escape — `switchRecommendation` excludes
+              // it, `exhaustionOutlook` can't see it), so saying "no other signed-in account" would
+              // contradict the duplicate banner above. Where that sibling is known, name it.
               <span>
-                {displayFor(r.account!).primary}
-                {r.headroom?.fraction != null
-                  ? ` is at ${Math.round(r.headroom.fraction * 100)}% of its usual limit`
-                  : " has hit its limit"}
-                , and there is no other signed-in account to move to.
+                {leadName(displayFor(r.account!))} has hit its limit
+                {r.hasSameLoginSibling
+                  ? `, and another registration of the same Claude login${
+                      r.sameLoginSiblingEmail ? ` (${r.sameLoginSiblingEmail})` : ""
+                    } shares this limit. Sign in a different account to keep working.`
+                  : ", and there is no other signed-in account to move to."}
               </span>
             )}
           </div>
@@ -1549,20 +1551,9 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               );
             })()}
 
-            {/* Where this account stands against its OWN learned ceiling. An account with no usage
-                row yet has nothing measured — rendered as "unknown", never as 0%. */}
-            <HeadroomLine
-              accountId={a.id}
-              headroom={
-                headroomById.get(a.id) ?? {
-                  accountId: a.id,
-                  used: 0,
-                  ceiling: null,
-                  fraction: null,
-                  state: "unknown",
-                }
-              }
-            />
+            {/* The estimated "usual limit" headroom bar was removed here — see the block comment
+                where `HeadroomLine` used to be defined. The REAL USAGE (ANTHROPIC) section below is
+                the only standing on this card now. */}
 
             {/* REAL server-side usage from Anthropic — the account's actual 5h/7d percent + reset.
                 THE ONLY usage figures on this card now.

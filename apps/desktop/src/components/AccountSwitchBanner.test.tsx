@@ -24,11 +24,13 @@ const ident = (id: string, email: string | null): Identity => ({
 });
 const display = displayFor([ident("a", "drodio@storytell.ai"), ident("b", "drodio@gmail.com")]);
 
+// A recommendation is now ALWAYS an observed wall (`reason: "exhausted"`) — the estimate-driven
+// "approaching" nudge was retired (see `headroom.switchRecommendation`).
 const rec: SwitchRecommendation = {
   from: acct("a", "Storytell"),
   to: acct("b", "Gmail"),
-  fraction: 0.87,
-  reason: "approaching",
+  fraction: null,
+  reason: "exhausted",
 };
 
 describe("AccountSwitchBanner", () => {
@@ -39,11 +41,13 @@ describe("AccountSwitchBanner", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("warns BEFORE the limit, quantified, and names where it would go", () => {
+  it("names the observed wall and where it would go — never a '% of usual limit' estimate", () => {
     render(
       <AccountSwitchBanner recommendation={rec} plan={null} display={display} onAccept={vi.fn()} onDismiss={vi.fn()} />,
     );
-    expect(screen.getByRole("alert").textContent).toContain("drodio@storytell.ai is 87% of its usual limit");
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toContain("drodio@storytell.ai has hit its limit");
+    expect(alert.textContent).not.toContain("usual limit");
     expect(screen.getByRole("button", { name: "Switch to drodio@gmail.com" })).toBeTruthy();
   });
 
@@ -146,6 +150,6 @@ describe("AccountSwitchBanner", () => {
     const alert = screen.getByRole("alert");
     expect(alert.textContent).not.toContain("Storytell");
     expect(alert.textContent).not.toContain("Gmail");
-    expect(alert.textContent).toContain("An account that isn't signed in is 87% of its usual limit");
+    expect(alert.textContent).toContain("An account that isn't signed in has hit its limit");
   });
 });

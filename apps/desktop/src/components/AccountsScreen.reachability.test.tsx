@@ -127,6 +127,12 @@ describe("the accounts dialog cannot grow off the screen", () => {
     // Pinned to the TOP of the scrollport specifically. A sticky header with no `top` sticks
     // nowhere and behaves exactly like the static header this replaced.
     expect(pinned!.style.top).toBe("0px");
+    // It must RESERVE its own vertical space: a negative top margin (which it used to carry to sit
+    // flush against the card edge) laid the content out `MODAL_PADDING`px higher than the header
+    // pins to when stuck, so the stuck header painted over the intro line and the account cards'
+    // action buttons — the founder's overlap screenshot. `margin-top: 0` is what keeps the content
+    // scrolling BELOW the header rather than behind it.
+    expect(pinned!.style.marginTop).toBe("0px");
     // It must sit above the content sliding under it, and paint an opaque plane — a transparent
     // sticky header lets the ledger render straight through the button.
     expect(Number(pinned!.style.zIndex)).toBeGreaterThan(0);

@@ -18,6 +18,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import {
   loadAccountState,
   invalidateAccountState,
+  liveUsageRows,
 } from "../services/accountSelection";
 import {
   listCeilings,
@@ -110,12 +111,17 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           observedWalls.current = new Map(state.usage.map((u) => [u.id, u.exhaustedUntil ?? null]));
         }
         const current = busiestPaneAccount();
+        // The SAME live rows the spawn gate uses (`loadAccountState` kicks the background refresh;
+        // `liveUsageRows` returns whatever is cached). Passing them here is what stops an auto-switch
+        // migrating the fleet onto an account `pickAccount` would refuse for being live-spent.
         const rec = switchRecommendation(
           current,
           state.accounts,
           state.usage,
           ceilings,
           state.identities,
+          Date.now(),
+          liveUsageRows(),
         );
         // Suppress while a switch is already running — the answer is "we're on it", not a new ask.
         if (planRef.current) return;

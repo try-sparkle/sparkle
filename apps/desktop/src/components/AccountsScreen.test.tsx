@@ -7,7 +7,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountsScreen, SIGNED_IN_NO_EMAIL, type AccountsDeps } from "./AccountsScreen";
 import {
   NOT_SIGNED_IN,
-  CEILING_AVOID_FRACTION,
   type Account,
   type Usage,
   type Identity,
@@ -884,24 +883,42 @@ describe("rotation-readiness banner", () => {
   });
 });
 
-describe("per-account headroom", () => {
-  it("shows used vs the LEARNED ceiling and the percentage", async () => {
+describe("the estimated 'usual limit' headroom bar is GONE (real Anthropic usage is the truth)", () => {
+  // The account card used to render a `HeadroomLine` from the LEARNED-CEILING estimate — a yellow
+  // "Close to its limit — X of about Y · N% of its usual limit / Stops taking new agents at 90% of
+  // that" bar. It was removed at the founder's instruction: it screamed "90%, close to the wall"
+  // while the REAL USAGE (ANTHROPIC) section right below showed the account clear. These tests pin
+  // the removal (the copy is gone even for the exact inputs that used to draw it) and that the real
+  // section stays.
+  const ESTIMATE_COPY = [
+    "Close to its limit",
+    "Room to spare",
+    "Limit unknown",
+    "usual limit",
+    "of about",
+    "Stops taking new agents",
+    "Not enough history to estimate a limit yet",
+  ];
+
+  it("renders NO estimate bar or copy even when a learned ceiling IS present", async () => {
+    // A learned ceiling at 90% usage is the exact input that used to draw the "Close to its limit …
+    // 90% of its usual limit" bar. None of that copy renders now, and there is no headroom testid.
     const deps = makeDeps(
       [acct("a", { nickname: "One" })],
-      [used("a", 45_000_000)],
+      [used("a", 0.9 * CEIL)],
       [signedInAs("a", "one@example.com")],
       [ceiling("a", CEIL)],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("account-headroom-a");
-    expect(line.textContent).toContain("45%");
-    expect(line.textContent).toContain("Room to spare");
-    expect(line.textContent).toContain("45.0M");
+    const card = await screen.findByTestId("account-row-a");
+    expect(screen.queryByTestId("account-headroom-a")).toBeNull();
+    for (const gone of ESTIMATE_COPY) expect(card.textContent).not.toContain(gone);
+    // getUsageLive rejects in this fixture, so the ONLY usage state is the "unavailable" note and
+    // there is no progressbar of any origin — the estimate bar is not hiding under a role.
+    expect(within(card).queryAllByRole("progressbar")).toHaveLength(0);
   });
 
-  it("a NULL ceiling reads as unknown — NEVER as 0% and never as a bar", async () => {
-    // An unmeasured account must not look like the emptiest one in the pool. A bar implies a
-    // denominator that does not exist, and either extreme of it is a lie in one direction.
+  it("renders no estimate copy for a NULL (unlearned) ceiling either", async () => {
     const deps = makeDeps(
       [acct("a", { nickname: "One" })],
       [used("a", 45_000_000)],
@@ -909,33 +926,34 @@ describe("per-account headroom", () => {
       [ceiling("a", null)],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("account-headroom-a");
-    expect(line.textContent).toContain("Not enough history to estimate a limit yet");
-    expect(line.textContent).toContain("Limit unknown");
-    expect(line.textContent).not.toMatch(/\d+%/);
-    expect(line.querySelector("[role='progressbar']")).toBeNull();
-    // And no bar anywhere on the card: `getUsageLive` rejects in this fixture, and the two
-    // "(local estimate)" bars that used to make this 2 are gone. The point of the assertion is
-    // unchanged — an unknown ceiling must not be drawn as a bar — but it is now stronger, since a
-    // stray bar of ANY origin would fail it rather than being absorbed into an expected count.
-    expect(screen.queryAllByRole("progressbar")).toHaveLength(0);
+    const card = await screen.findByTestId("account-row-a");
+    for (const gone of ESTIMATE_COPY) expect(card.textContent).not.toContain(gone);
   });
 
-  it("states the ACT line — the fraction at which spawns stop — not the warn line", async () => {
+  it("STILL shows the REAL USAGE (ANTHROPIC) section when live figures are available", async () => {
+    // The section the founder keeps — session 39% / weekly 71% on his card, comfortably clear while
+    // the removed estimate had been screaming 90%.
     const deps = makeDeps(
-      [acct("a")],
-      [used("a", 10_000_000)],
+      [acct("a", { nickname: "One" })],
+      [used("a", 0.9 * CEIL)],
       [signedInAs("a", "one@example.com")],
       [ceiling("a", CEIL)],
     );
+    deps.getUsageLive = vi.fn(async () => liveUsage(39, 71));
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("account-headroom-a");
-    expect(line.textContent).toContain(
-      `Stops taking new agents at ${Math.round(CEILING_AVOID_FRACTION * 100)}%`,
-    );
+    const card = await screen.findByTestId("account-row-a");
+    expect(await within(card).findByText("Session (5h)")).toBeTruthy();
+    expect(within(card).getByText("Weekly (7d)")).toBeTruthy();
+    expect(within(card).getByText("39%")).toBeTruthy();
+    expect(within(card).getByText("71%")).toBeTruthy();
+    // Two real bars, and NOTHING from the removed estimate.
+    expect(within(card).getAllByRole("progressbar").length).toBe(2);
+    for (const gone of ESTIMATE_COPY) expect(card.textContent).not.toContain(gone);
   });
 
-  it("an exhausted account reads as at its limit and shows when it resets", async () => {
+  it("still shows the observed 'Exhausted until' line for a real rate limit", async () => {
+    // The observed wall is fact, not estimate, so its line stays. It is a SEPARATE element from the
+    // removed HeadroomLine.
     const reset = Date.now() + 47 * 60_000;
     const deps = makeDeps(
       [acct("a")],
@@ -944,15 +962,13 @@ describe("per-account headroom", () => {
       [ceiling("a", CEIL)],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const line = await screen.findByTestId("account-headroom-a");
-    expect(line.textContent).toContain("At its limit");
-    // The observed limit outranks the estimate: 1k of 100M is 0%, and it still reads exhausted.
-    expect(screen.getByText(`Exhausted until ${clock(reset)}`)).toBeTruthy();
+    expect(await screen.findByText(`Exhausted until ${clock(reset)}`)).toBeTruthy();
+    expect(screen.queryByTestId("account-headroom-a")).toBeNull();
   });
 
   it("keeps rendering accounts when the ceilings read FAILS", async () => {
     // Ceilings are an enrichment. Sharing a rejection path with `listAccounts` would trade a missing
-    // percentage for a screen showing no accounts at all.
+    // number for a screen showing no accounts at all.
     const deps = makeDeps([acct("a", { nickname: "One" })], [used("a", 5)], [
       signedInAs("a", "one@example.com"),
     ]);
@@ -961,9 +977,6 @@ describe("per-account headroom", () => {
     });
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     expect(await screen.findByText("one@example.com")).toBeTruthy();
-    expect(screen.getByTestId("account-headroom-a").textContent).toContain(
-      "Not enough history to estimate a limit yet",
-    );
     // ...and no error banner: a missing enrichment is not a failure to report to the user.
     expect(screen.queryByText(/accounts_ceilings unavailable/)).toBeNull();
   });
@@ -1019,27 +1032,55 @@ describe("AC8 — every account at its limit", () => {
     expect(screen.queryByTestId("all-at-limit-banner")).toBeNull();
   });
 
-  it("does not claim a reset time nobody reported", async () => {
-    // Over the ACT line on an ESTIMATE, with no observed rate limit — so there is no instant to
-    // quote and none may be invented.
-    const overAct = CEILING_AVOID_FRACTION * CEIL;
+  it("fires from REAL Anthropic usage with no observed wall — and quotes NO reset time", async () => {
+    // AC8 tracks the SAME signal the spawn gate excludes on: an account at 97% of its REAL Anthropic
+    // limit with NO rate-limit event is out of room to auto-pick, so the banner must say so. And
+    // because there is no observed wall, there is no reset instant to quote — the "No reset time"
+    // branch (unreachable under observed-only) is reachable again exactly here. Remove the live
+    // clause from `exhaustionOutlook` and this banner never renders (the gate and banner disagree).
     const deps = makeDeps(
       [acct("a")],
-      [used("a", overAct)],
+      [used("a", 5)], // low local tally, NOT exhausted
       [signedInAs("a", "one@example.com")],
       [ceiling("a", CEIL)],
     );
+    deps.getUsageLive = vi.fn(async () => liveUsage(97, 50)); // 97% real → spent
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     const banner = await screen.findByTestId("all-at-limit-banner");
+    expect(banner.textContent).toContain("Your only signed-in account is at its limit");
     expect(banner.textContent).toContain("No reset time has been reported yet");
     expect(banner.textContent).not.toMatch(/frees up at/);
   });
 });
 
-describe("AC9 — runway warning before the wall", () => {
-  it("warns with the switch target while the account still has room left", async () => {
-    // 85% is past the WARN line (0.8) and short of the ACT line (0.9): still receiving spawns, and
-    // exactly the window in which telling the human is useful.
+describe("AC9 — runway warning on an observed wall", () => {
+  // The runway warning now fires ONLY on a real, OBSERVED rate limit — the learned-ceiling estimate
+  // (the old 85% "approaching" trigger) was retired as a driver. It read "close to its limit" while
+  // the real Anthropic figures were clear.
+  it("warns with the switch target when an account hits a real wall", async () => {
+    // `a` has actually hit its limit; `b` is healthy — so move to `b`.
+    const deps = makeDeps(
+      [acct("a"), acct("b")],
+      [used("a", 1_000, Date.now() + 60_000), used("b", 5_000_000)],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+      [ceiling("a", CEIL), ceiling("b", CEIL)],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    const warn = await screen.findByTestId("runway-warning-a");
+    // `describeRecommendation`'s sentence verbatim — the observed-wall message, no "usual limit".
+    expect(warn.textContent).toBe(
+      "one@example.com has hit its limit. Switch to two@example.com to keep working.",
+    );
+    expect(warn.textContent).not.toContain("usual limit");
+    // The healthy account gets no warning of its own; and it is not yet the whole-pool wall.
+    expect(screen.queryByTestId("runway-warning-b")).toBeNull();
+    expect(screen.queryByTestId("all-at-limit-banner")).toBeNull();
+  });
+
+  it("does NOT warn off the learned-ceiling estimate alone (the retired proactive nudge)", async () => {
+    // `a` is at 85% of its learned ceiling — the OLD trigger — but has not hit a real wall. No
+    // warning now. Reinstate the `warn` clause in the runway filter / `switchRecommendation` and this
+    // goes from absent to present.
     const deps = makeDeps(
       [acct("a"), acct("b")],
       [used("a", 0.85 * CEIL), used("b", 5_000_000)],
@@ -1047,31 +1088,160 @@ describe("AC9 — runway warning before the wall", () => {
       [ceiling("a", CEIL), ceiling("b", CEIL)],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
-    const warn = await screen.findByTestId("runway-warning-a");
-    // `describeRecommendation`'s sentence verbatim — this screen must not own a second copy of it.
-    expect(warn.textContent).toBe(
-      "one@example.com is 85% of its usual limit. Switch to two@example.com before it runs out.",
-    );
-    // The healthy account gets no warning of its own.
+    await screen.findByText("two@example.com");
+    expect(screen.queryByTestId("runway-warning-a")).toBeNull();
     expect(screen.queryByTestId("runway-warning-b")).toBeNull();
-    // Not yet the wall.
-    expect(screen.queryByTestId("all-at-limit-banner")).toBeNull();
   });
 
-  it("THE FOUNDER'S CASE: warns that there is nowhere to move to", async () => {
+  it("recommends a near-ceiling account as the target rather than reporting no target", async () => {
+    // The estimate no longer VETOES a switch target: `a` hit a real wall, `b` is near its learned
+    // ceiling (the old excluded case) but has NOT hit a wall — so `b` is a valid target and the
+    // runway warning offers the switch instead of "there is nowhere to move to". This pins the High
+    // finding: a walled fleet is never stranded because a guess said the only alternative was busy.
     const deps = makeDeps(
-      [acct("a"), acct("dead", { nickname: "DROdio Gmail" })],
-      [used("a", 0.85 * CEIL)],
-      [signedInAs("a", "drodio@gmail.com"), neverLoggedIn("dead")],
-      [ceiling("a", CEIL)],
+      [acct("a"), acct("b")],
+      [used("a", 1_000, Date.now() + 60_000), used("b", 0.85 * CEIL)],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+      [ceiling("a", CEIL), ceiling("b", CEIL)],
     );
     render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
     const warn = await screen.findByTestId("runway-warning-a");
-    expect(warn.textContent).toContain("drodio@gmail.com is at 85% of its usual limit");
-    expect(warn.textContent).toContain("no other signed-in account to move to");
-    // It must NOT propose a switch to the account that cannot receive agents.
+    expect(warn.textContent).toBe(
+      "one@example.com has hit its limit. Switch to two@example.com to keep working.",
+    );
+    expect(warn.textContent).not.toContain("no other signed-in account to move to");
+    expect(warn.textContent).not.toContain("usual limit");
+  });
+
+  it("does NOT offer a LIVE-SPENT account as the escape route (AC8 and AC9 agree on the live signal)", async () => {
+    // `a` hit a real wall; `b` reads 99% on Anthropic's own number (no wall). The spawn gate refuses
+    // `b`, so AC9 must not point the fleet at it — and AC8 already calls the whole pool at-limit. This
+    // is the contradiction the live-blind `switchRecommendation` produced: the banner said "all at
+    // their limit" while the runway sentence offered `b`. Drop the live clause from the candidate
+    // filter and this offers `b` again.
+    const deps = makeDeps(
+      [acct("a"), acct("b")],
+      [used("a", 5, Date.now() + 60_000), used("b", 5)],
+      [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
+      [ceiling("a", CEIL), ceiling("b", CEIL)],
+    );
+    deps.getUsageLive = vi.fn(async (configDir: string) =>
+      configDir === "/cfg/b" ? liveUsage(99, 10) : liveUsage(10, 10),
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} />);
+    // AC8 fires once the live rows land (a walled + b live-spent = whole pool at limit).
+    await screen.findByTestId("all-at-limit-banner");
+    // And `b` is never offered as a switch target.
+    expect(screen.queryByText(/Switch to two@example.com/)).toBeNull();
+  });
+
+  it("AC8 and AC9 agree across the DUPLICATE-login ordering (per-login live everywhere)", async () => {
+    // The ordering the live signal made contradict itself: `b` and `a2` are two dirs of ONE login;
+    // `b` is FIRST so `rotationReadiness` makes it the usable rep, and only `a2` (the redundant dir)
+    // reports 99% live — `b`'s own fetch reads clear. `x` is walled and current. Per-DIR, AC8 (judging
+    // the deduped usable set `[x, b]`) reads `b` healthy → no banner, while a per-login
+    // switchRecommendation returns null → the runway fallback fires with `b`/`a2` on screen: the two
+    // verdicts disagree. Per-login EVERYWHERE, `b`'s login is spent (via its twin `a2`), so AC8 fires
+    // and no switch is offered — banner and runway agree. Drop `siblingIds` from `exhaustionOutlook`
+    // and the banner disappears while the fallback contradicts it.
+    const deps = makeDeps(
+      [acct("x"), acct("b"), acct("a2")],
+      [used("x", 5, Date.now() + 60_000), used("b", 5), used("a2", 5)],
+      [
+        signedInAs("x", "x@example.com", "u-x"),
+        signedInAs("b", "dup@example.com", "u-dup"),
+        signedInAs("a2", "dup@example.com", "u-dup"),
+      ],
+      [ceiling("x", CEIL), ceiling("b", CEIL), ceiling("a2", CEIL)],
+    );
+    // Only the redundant dir `a2` reports spent; `b`'s own fetch reads clear.
+    deps.getUsageLive = vi.fn(async (configDir: string) =>
+      configDir === "/cfg/a2" ? liveUsage(99, 10) : liveUsage(10, 10),
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} currentAccountId="x" />);
+    // The banner fires (x walled + the dup login spent per-login = whole usable pool at limit)...
+    await screen.findByTestId("all-at-limit-banner");
+    // ...and, agreeing with it, no runway row contradicts it by offering the spent login.
+    expect(screen.queryByTestId("runway-warning-x")).toBeNull();
+  });
+
+  it("still warns when a walled account's only alternative is its OWN duplicate (no silent gap)", async () => {
+    // `a` and `b` are the SAME login (shared uuid); `b` is first so it is the usable rep and `a` is
+    // redundant. `currentAccountId` names the walled `a`. `switchRecommendation` drops `b` as
+    // same-login → null, and `exhaustionOutlook` (over the login-deduped usable set = [b], not walled)
+    // says allAtLimit=false → no AC8. Without the no-target fallback the screen is SILENT while the
+    // fleet sits behind a five-hour wall — the founder's blind spot. The fallback row fires instead.
+    const deps = makeDeps(
+      [acct("b"), acct("a")],
+      [used("b", 5), used("a", 5, Date.now() + 60_000)],
+      [
+        signedInAs("b", "shared@example.com", "u-shared"),
+        signedInAs("a", "shared@example.com", "u-shared"),
+      ],
+      [ceiling("b", CEIL), ceiling("a", CEIL)],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} currentAccountId="a" />);
+    const warn = await screen.findByTestId("runway-warning-a");
+    expect(warn.textContent).toContain("has hit its limit");
+    // The copy states the REAL reason — the other account is the SAME login (shared quota) — rather
+    // than the false "no other signed-in account" (both ARE signed in and both are on screen).
+    expect(warn.textContent).toContain("the same Claude login");
+    expect(warn.textContent).toContain("shares this limit");
+    expect(warn.textContent).toContain("shared@example.com");
+    expect(warn.textContent).not.toContain("no other signed-in account to move to");
     expect(warn.textContent).not.toContain("Switch to");
-    expect(warn.textContent).not.toContain("DROdio Gmail");
+    expect(screen.queryByTestId("all-at-limit-banner")).toBeNull();
+  });
+
+  it("names an EMAIL-bearing same-login sibling even when a uuid-only one is registered first", async () => {
+    // The N2 shape: a login with THREE registrations — `z` (uuid-only, no readable email, registered
+    // FIRST), `b` (the email-bearing sibling and the usable rep, so `allAtLimit` is false and the
+    // runway fires), `a` (walled, current). The fallback must name the SIBLING's email, not blank it
+    // because `z` comes first in group order and would revert the copy to the false "no other
+    // signed-in account". The sibling's email is DISTINCT from the walled account's own so the
+    // assertion is not satisfied by `leadName`'s subject — it pins the email-PREFERRING selection.
+    const deps = makeDeps(
+      [acct("z"), acct("b"), acct("a")],
+      [
+        used("z", 5),
+        used("b", 5),
+        used("a", 5, Date.now() + 60_000),
+      ],
+      [
+        { id: "z", email: null, organization: null, accountUuid: "u-shared" },
+        signedInAs("b", "sibling@example.com", "u-shared"),
+        signedInAs("a", "walled@example.com", "u-shared"),
+      ],
+      [ceiling("z", CEIL), ceiling("b", CEIL), ceiling("a", CEIL)],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} currentAccountId="a" />);
+    const warn = await screen.findByTestId("runway-warning-a");
+    expect(warn.textContent).toContain("the same Claude login");
+    // The sibling's email (picked past the uuid-only `z`), NOT blanked. Distinct from the subject
+    // `walled@example.com`, so `[0]`-order selection (which would pick `z`'s null) fails this.
+    expect(warn.textContent).toContain("sibling@example.com");
+    expect(warn.textContent).not.toContain("no other signed-in account to move to");
+  });
+
+  it("names the walled account by leadName in the fallback — never the false 'Not signed in'", async () => {
+    // A uuid-only login (real, but no readable email) is `readiness.noEmail` — never in `usable`, so
+    // `allAtLimit` is false — and its own runway fallback must read "The account Sparkle is signed
+    // into", not the `AccountDisplay.primary` fallback "Not signed in". `currentAccountId` names it so
+    // it is the judged account, and a signed-in sibling `keep` gives it a wall with a target that is
+    // nonetheless excluded (same login), so the fallback fires.
+    const deps = makeDeps(
+      [acct("uuidonly"), acct("keep")],
+      [used("uuidonly", 5, Date.now() + 60_000), used("keep", 5)],
+      [
+        { id: "uuidonly", email: null, organization: null, accountUuid: "u-shared" },
+        { id: "keep", email: "keep@example.com", organization: null, accountUuid: "u-shared" },
+      ],
+      [ceiling("uuidonly", CEIL), ceiling("keep", CEIL)],
+    );
+    render(<AccountsScreen onLogin={vi.fn()} deps={deps} currentAccountId="uuidonly" />);
+    const warn = await screen.findByTestId("runway-warning-uuidonly");
+    expect(warn.textContent).toContain("The account Sparkle is signed into has hit its limit");
+    expect(warn.textContent).not.toContain("Not signed in");
   });
 
   it("says nothing while every account has room", async () => {
@@ -1089,10 +1259,11 @@ describe("AC9 — runway warning before the wall", () => {
 
   it("judges ONLY the named account when the integrator supplies one", async () => {
     // `currentAccountId` is the precise answer when the integrator knows the fleet's real account;
-    // it must narrow the warning rather than adding to it.
+    // it must narrow the warning rather than adding to it. `b` hit a real wall; `a` is healthy but
+    // NOT the named account, so it is not judged even though it could be a target.
     const deps = makeDeps(
       [acct("a"), acct("b")],
-      [used("a", 0.85 * CEIL), used("b", 0.85 * CEIL)],
+      [used("a", 5_000_000), used("b", 1_000, Date.now() + 60_000)],
       [signedInAs("a", "one@example.com", "u1"), signedInAs("b", "two@example.com", "u2")],
       [ceiling("a", CEIL), ceiling("b", CEIL)],
     );

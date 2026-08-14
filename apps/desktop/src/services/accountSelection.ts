@@ -18,6 +18,7 @@ import {
   getPreferredAccountId,
   isAccountExhausted,
   signedInAccountIds,
+  loginSiblingIds,
   type Account,
   type Usage,
   type Identity,
@@ -39,10 +40,12 @@ export interface AccountState {
   usage: Usage[];
   /** Real authenticated identity (email + org) per account id — the trustworthy badge label. */
   identities: Identity[];
-  /** Per-account LEARNED rate-limit ceilings. Feeds the PROACTIVE half of selection: an account at
-   *  or above `CEILING_AVOID_FRACTION` of its own ceiling stops receiving new spawns, so rotation
-   *  happens before the wall instead of after it. Empty means "nothing learned yet", which degrades
-   *  selection to the previous lowest-usage rule rather than to a guess. */
+  /** Per-account LEARNED rate-limit ceilings. NO LONGER GATES SELECTION — the founder retired the
+   *  estimate as a driver (it read "90% of its usual limit" while the real Anthropic numbers were
+   *  clear). Proactive avoidance is now `PickOptions.live` (real Anthropic utilization); the observed
+   *  wall (`exhaustedUntil`) is the reactive backstop. Ceilings are still passed through for the
+   *  all-excluded FALLBACK ranking (`accountStore.leastBad`) and for `assessHeadroom`'s reporting
+   *  states; empty means "nothing learned yet". */
   ceilings: Ceiling[];
   /** The load did not succeed, so the empty arrays above mean "unknown", NOT "no accounts".
    *
@@ -327,6 +330,11 @@ export async function chooseAccountForAgent(
     // `signedInIds` got silently lost from one of them once. Whatever the background refresh has —
     // possibly nothing, which degrades to the local-tally rule rather than to a guess.
     live: liveUsageRows(),
+    // Login grouping, so the live exclusion is judged PER LOGIN: a duplicate of a spent login whose
+    // OWN live fetch failed (no row) is still excluded from the spawn pool via its twin's 99%. This
+    // is the SAME per-login judgement `exhaustionOutlook` (AC8) and `switchRecommendation` use, so the
+    // spawn gate cannot land agents on a quota those two already call spent.
+    siblingIds: loginSiblingIds(state.accounts, state.identities),
   };
   // A pin only counts if it still names a REAL account. Branching on the pin's mere presence let a
   // STALE pin — one left behind by a deleted account — bypass everything below it: `pickAccount`
@@ -601,29 +609,24 @@ function autoPick(agentId: string, state: AccountState, base: PickOptions): Acco
   if (!isStickyAccountKey(agentId)) return pickAccount(state.accounts, state.usage, base);
   const previousId = stickySelections.get(agentId);
   if (previousId) {
-    // THE LEARNED CEILING DOES NOT GET A VOTE ON KEEPING AN ACCOUNT — only on choosing one.
+    // A STICKY KEY IS KEPT ON ITS ACCOUNT WHILE THAT ACCOUNT IS STILL ELIGIBLE — it is not re-picked
+    // to the lowest-usage account every turn. Moving it runs `rebindSessionToAccount` (both session
+    // pointers nulled, conversation re-probed), and a PROACTIVE move has no stale-resume retry by
+    // design, so it would die silently with nobody having asked for it. So the key moves only when
+    // its account becomes genuinely INELIGIBLE — an OBSERVED rate limit (`exhaustedUntil`) or real
+    // Anthropic utilization at/above `LIVE_AVOID_PERCENT`, both FACTS.
     //
-    // This asymmetry is the whole point, and getting it wrong is a live conversation. The safety
-    // argument for acting on an estimate is that a FRESH spawn has nothing to lose. That does not
-    // hold here: the concierge resolves this key once per TURN, and a changed answer runs
-    // `rebindSessionToAccount`, which nulls both session pointers and re-probes. An ordinary turn
-    // self-heals into a fresh session (visible, survivable). A PROACTIVE push does not — it has no
-    // stale-resume retry by design, so a resume aimed at the old account's tree just dies silently,
-    // and nobody asked for that push, so nobody notices it is missing.
-    //
-    // So a sticky key moves only on `exhaustedUntil` — an OBSERVED rate limit, which is fact rather
-    // than estimate, and which is exactly what moved it before this gate existed. That is strictly
-    // no worse than the previous behaviour for these two consumers, while fresh spawns still rotate
-    // proactively, which is where the fleet-wide win actually is.
-    const keepOpts: PickOptions = { ...base, ceilings: undefined };
-    const stillHealthy = eligibleAccounts(state.accounts, state.usage, keepOpts).find(
+    // There used to be an extra asymmetry here: the learned-ceiling ESTIMATE was withheld
+    // (`ceilings: undefined`) so it could not evict a live conversation. That is now redundant — the
+    // estimate was retired as a selection driver and gates NEITHER keep nor first-pick — so keep and
+    // first-pick share one eligibility rule and no `ceilings` override is needed.
+    const stillHealthy = eligibleAccounts(state.accounts, state.usage, base).find(
       (a) => a.id === previousId,
     );
     if (stillHealthy) return stillHealthy;
   }
-  // FIRST pick for this key (or its previous account just hit a real limit): the ceilings DO apply.
-  // There is no conversation to strand yet, so this is the fresh-spawn case and gets the fresh-spawn
-  // rule — a sticky key should not settle onto an account that is already nearly spent.
+  // FIRST pick for this key (or its previous account just became ineligible): ordinary auto-pick —
+  // lowest real/observed usage, exactly as a fresh spawn. There is no conversation to strand yet.
   const chosen = pickAccount(state.accounts, state.usage, base);
   if (chosen) stickySelections.set(agentId, chosen.id);
   return chosen;

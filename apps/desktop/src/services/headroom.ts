@@ -15,12 +15,14 @@
 // excluded from the unit. That's tight enough to warn on, and much too loose to promise precision —
 // hence a threshold well below 1.0 and a banner that RECOMMENDS rather than acts unilaterally.
 
-import type { Account, Usage, Identity, AccountDisplay } from "./accountStore";
+import type { Account, Usage, Identity, AccountDisplay, LiveUsage } from "./accountStore";
 import {
   accountSentenceName,
   signedInAccountIds,
   duplicateAccountGroups,
-  CEILING_AVOID_FRACTION,
+  loginSiblingIds,
+  loginLiveWorstPercent,
+  LIVE_AVOID_PERCENT,
 } from "./accountStore";
 
 /** Fraction of the learned ceiling at which we start recommending a switch. Chosen against the
@@ -92,21 +94,35 @@ export interface SwitchRecommendation {
   /** `from`'s position against its learned ceiling (null when it's already exhausted with no
    *  ceiling learned — the recommendation still stands, we just can't quantify it). */
   fraction: number | null;
-  /** Why we're recommending: it hit a real limit, or it's approaching its learned ceiling. */
-  reason: "exhausted" | "approaching";
-  /** True when `from`'s config dir is known to have hosted a DIFFERENT Anthropic login inside the
-   *  ceiling learn window — so the percentage above was partly measured against someone else and
-   *  has to be presented with a caveat. Optional so a hand-built recommendation (tests, an older
-   *  caller) simply carries no caveat rather than failing to typecheck. */
+  /** Why we're recommending. ONLY `"exhausted"` now: a recommendation is made solely for an account
+   *  that has hit a real, OBSERVED rate limit. The learned-ceiling `"approaching"` estimate was
+   *  retired as a driver (founder's call), so the union is narrowed to the single reachable value —
+   *  the compiler then flags any stale `"approaching"` branch rather than letting a producer emit a
+   *  reason the formatter would silently mislabel as "has hit its limit". */
+  reason: "exhausted";
 }
 
-/** Rank candidate targets: least-loaded first. Accounts with a known fraction sort by it; those
- *  without a ceiling fall back to raw 5h tokens, which is still a valid relative comparison. */
+/** Rank candidate targets: least-loaded first, in three tiers so a near-ceiling target is a LAST
+ *  resort rather than a preferred one. `exhausted` and live-spent targets are excluded before this
+ *  runs, so `state` here is only `ok` / `unknown` / `warn`:
+ *
+ *   - `[0, 1)`  OK, quantified-healthy — sort by its own fraction (< {@link WARN_FRACTION}).
+ *   - `[1, 2)`  UNKNOWN ceiling — behind every quantified-healthy account, ordered by raw usage so
+ *               the least-used unknown still wins over a busier one. A freshly-added account with no
+ *               learned ceiling lands here.
+ *   - `[2, 3)`  WARN (near its learned ceiling) — behind BOTH of the above. Admitted as a target
+ *               only because the estimate may no longer VETO one (a real wall must not strand the
+ *               fleet), but it is the least preferred: an unknown-ceiling zero-usage account is a
+ *               better bet than one the estimate says is at 99% of its ceiling.
+ *
+ *  The old single-line rank (`fraction`, else `1 + used/(used+1)`) mis-ordered exactly this: a `warn`
+ *  target scored 0.8–1.0 and an unknown-ceiling account scored ≥ 1.0, so the near-ceiling account
+ *  sorted AHEAD of the unknown one. That never mattered while `warn` was filtered out; admitting it
+ *  as a target exposed it. */
 function headroomRank(h: Headroom): number {
-  if (h.fraction != null) return h.fraction;
-  // Unknown ceiling — push behind any account we can actually quantify, but keep relative order by
-  // raw usage so the least-used unknown still wins over a busier one.
-  return 1 + h.used / (h.used + 1);
+  if (h.state === "warn") return 2 + (h.fraction ?? 1);
+  if (h.fraction != null) return h.fraction; // ok / quantified-healthy
+  return 1 + h.used / (h.used + 1); // unknown ceiling
 }
 
 /** Recommend a switch, or null if none is warranted.
@@ -147,27 +163,32 @@ export function switchRecommendation(
   ceilings: Ceiling[],
   identities: Identity[],
   now: number = Date.now(),
+  live: readonly LiveUsage[] = [],
 ): SwitchRecommendation | null {
   if (!currentAccountId) return null;
   const from = accounts.find((a) => a.id === currentAccountId);
   if (!from) return null;
 
+  const liveById = new Map(live.map((l) => [l.id, l]));
   const byId = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
   const current = byId.get(currentAccountId);
-  if (!current || (current.state !== "warn" && current.state !== "exhausted")) return null;
+  // OBSERVED WALL ONLY. A recommendation is now made solely when `from` has hit a REAL rate limit
+  // (`exhaustedUntil` in the future — the authoritative `exhausted` state), never off the LEARNED
+  // CEILING estimate (the `warn` state, `tokens5h/ceiling >= WARN_FRACTION`). The founder's call:
+  // the estimate screamed "90% of its usual limit, close to the wall" on the account card while the
+  // real Anthropic session/weekly numbers beside it read comfortably clear, so a proactive
+  // "approaching" nudge off that guess pointed the user away from a healthy account. The estimate is
+  // not available on this poll path (the real Anthropic figures need a per-account keychain read +
+  // network round-trip, deliberately kept out of the 120s headroom loop), so rather than nudge off a
+  // number that has misfired we act only on the fact — the observed wall — which
+  // `useAccountSwitch` already migrates the fleet on automatically. See `describeRecommendation`.
+  if (!current || current.state !== "exhausted") return null;
 
   const signedIn = new Set(signedInAccountIds(identities));
-  // Same-login exclusion, from the CANONICAL grouping — see the docblock for why this is derived
-  // rather than re-decided here. A group only exists on positive evidence of a shared login, so an
-  // account the grouping declines to pair stays a candidate.
+  // ONE login grouping, shared by the same-login exclusion and the PER-LOGIN live check below.
+  const siblingIds = loginSiblingIds(accounts, identities);
   const sameLoginAsFrom = new Set(
-    (
-      duplicateAccountGroups(accounts, identities).find((g) =>
-        g.accounts.some((a) => a.id === currentAccountId),
-      )?.accounts ?? []
-    )
-      .map((a) => a.id)
-      .filter((id) => id !== currentAccountId),
+    (siblingIds.get(currentAccountId) ?? []).filter((id) => id !== currentAccountId),
   );
   const candidates = accounts
     .filter(
@@ -183,7 +204,20 @@ export function switchRecommendation(
         state: "unknown" as const,
       },
     }))
-    .filter((c) => c.h.state !== "exhausted" && c.h.state !== "warn");
+    // Exclude a target on the OBSERVED wall OR real Anthropic utilization at/above LIVE_AVOID_PERCENT,
+    // judged PER LOGIN ({@link loginLiveWorstPercent}) — the SAME exclusions and the SAME per-login
+    // judgement `partitionAccounts` (the spawn gate) and `exhaustionOutlook` (AC8) now apply, so all
+    // three consumers of the live signal stay consistent. This is what closes both the harm (a
+    // duplicate of a spent login whose OWN live fetch failed is no longer offered/auto-migrated onto)
+    // and the contradiction (AC8 judges the login-DEDUPED `usable` set, so a per-DIR live rule made
+    // "which dir carries the row" decide the banner while this filter saw another dir — banner and
+    // runway could then render opposite verdicts). The learned-ceiling estimate (`warn`) is
+    // deliberately NOT an exclusion here — it must not veto a real escape — it only RANKS last.
+    .filter(
+      (c) =>
+        c.h.state !== "exhausted" &&
+        !((loginLiveWorstPercent(c.account.id, liveById, siblingIds) ?? 0) >= LIVE_AVOID_PERCENT),
+    );
 
   if (candidates.length === 0) return null;
   candidates.sort((x, y) => headroomRank(x.h) - headroomRank(y.h));
@@ -193,14 +227,18 @@ export function switchRecommendation(
     from,
     to: best.account,
     fraction: current.fraction,
-    reason: current.state === "exhausted" ? "exhausted" : "approaching",
+    reason: "exhausted",
   };
 }
 
 
 /** How to name an account at the START of a sentence. Only the not-signed-in case is capitalized:
- *  the signed-in name is an EMAIL, and "Drodio@storytell.ai" would be a different address. */
-function leadName(display: AccountDisplay): string {
+ *  the signed-in name is an EMAIL, and "Drodio@storytell.ai" would be a different address.
+ *
+ *  Exported so the runway no-target fallback (`AccountsScreen`) names its subject by the SAME rule
+ *  the recommendation sentence does — a uuid-only login (no readable email) must read "The account
+ *  Sparkle is signed into", never the false "Not signed in" that `AccountDisplay.primary` falls to. */
+export function leadName(display: AccountDisplay): string {
   if (display.signedIn) return display.primary;
   // `hasLogin`, not `signedIn`. `signedIn` is EMAIL-only, so a login carrying a uuid but no readable
   // email — which is a real sign-in — was announced as "An account that isn't signed in has hit its
@@ -223,18 +261,12 @@ export function describeRecommendation(
 ): string {
   const from = leadName(display(rec.from));
   const to = accountSentenceName(display(rec.to));
-  const pct = rec.fraction != null ? `${Math.round(rec.fraction * 100)}% of` : "at";
-  const base =
-    rec.reason === "exhausted"
-      ? `${from} has hit its limit. Switch to ${to} to keep working.`
-      : `${from} is ${pct} its usual limit. Switch to ${to} before it runs out.`;
-  // NO identity caveat here (knightwatch probe 4). It would only ever fire when `fraction != null`,
-  // i.e. when a ceiling EXISTS — and `ceiling_for_account` cuts every pre-takeover and
-  // boundary-crossing episode before it returns a non-null one. A surviving number therefore
-  // contains only the current login's samples, so telling the user "part of the history behind it
-  // isn't its own" was false exactly where it appeared. The reset already expresses the doubt, by
-  // yielding `null` while the evidence is insufficient.
-  return base;
+  // ONE sentence now: the observed-wall message. The "approaching … is N% of its usual limit …"
+  // wording is gone with the estimate-driven `"approaching"` recommendation — `switchRecommendation`
+  // only ever returns `reason: "exhausted"`, so a recommendation exists only for an account that has
+  // actually hit its limit. Naming a percentage "of its usual limit" was the exact estimate the
+  // founder retired; there is no learned-ceiling figure to quote here any more.
+  return `${from} has hit its limit. Switch to ${to} to keep working.`;
 }
 
 // ── Rotation readiness ────────────────────────────────────────────────────────────────────────
@@ -334,50 +366,62 @@ export function rotationReadiness(
 
 /** Whether every usable account is out of room, and when the first one frees up. */
 export interface ExhaustionOutlook {
-  /** True when EVERY usable account is exhausted or at/above the ACT line
-   *  ({@link CEILING_AVOID_FRACTION}) — i.e. auto-pick has no healthy candidate left and is down to
-   *  its least-bad fallback.
+  /** True when EVERY usable account is out of room by a signal AUTO-PICK ACTS ON — either a REAL,
+   *  OBSERVED rate limit (`exhaustedUntil` in the future) OR real Anthropic utilization at/above
+   *  {@link LIVE_AVOID_PERCENT}. These are exactly the two exclusions `accountStore.partitionAccounts`
+   *  applies, so the banner tracks the same fact the spawn gate does: when it says "all at their
+   *  limit", auto-pick genuinely has no healthy candidate left.
+   *
+   *  The LEARNED-CEILING estimate does NOT count — the founder retired it as a driver (it read "90%
+   *  of its usual limit" while the real Anthropic figures were clear). "All at their limit" now means
+   *  every account either hit a real wall or reads spent on Anthropic's own number.
    *
    *  False when there are no usable accounts at all: "all of nothing is at its limit" is a vacuous
    *  truth that would render a limit warning for a user whose actual problem is having no login. */
   allAtLimit: boolean;
   /** Earliest epoch-MS instant a usable account's rate limit resets, or null when none of them is
-   *  actually rate-limited (they can all be over the ACT line on an ESTIMATE, with no observed
-   *  reset time to quote). Never invented: a null here means "we don't know when", and the caller
-   *  must not print a time. */
+   *  actually rate-limited. Never invented: a null here means "we don't know when", and the caller
+   *  must not print a time. A pool that is `allAtLimit` purely on live-usage (no observed wall) has
+   *  NO reset instant to quote, so this is null there — the caller says so rather than inventing one. */
   earliestReset: number | null;
 }
 
 /** Judge the usable pool as a whole (PRD acceptance criterion 8).
  *
- *  The ACT line is {@link CEILING_AVOID_FRACTION} (0.9), NOT {@link WARN_FRACTION} (0.8). They are
- *  deliberately different numbers: 0.8 is where the human is told an account is getting close, 0.9
- *  is where Sparkle itself stops sending that account new work. This function answers "has auto-pick
- *  run out of healthy accounts", which is the 0.9 question, so it imports the constant rather than
- *  restating it.
+ *  `allAtLimit` counts an account out of room on the SAME two signals auto-pick excludes on
+ *  (`partitionAccounts`): the OBSERVED wall (`state === "exhausted"`) OR real Anthropic utilization
+ *  ≥ {@link LIVE_AVOID_PERCENT}. The learned-ceiling estimate is not one of them. Feeding the same
+ *  `live` rows the spawn path uses keeps the banner from disagreeing with the gate — the case where
+ *  every account reads 99% real but has no rate-limit event yet, which the OBSERVED-only version
+ *  silently missed while `pickAccount` dropped to its least-bad fallback.
  *
- *  An account with NO usage row is treated as having no usage (the most headroom) — matching
- *  `usageLookup` on the selection side — so it holds `allAtLimit` false rather than defaulting a
- *  silent account into the wall. An `unknown` account (no learned ceiling) is likewise NOT at the
- *  limit: an unmeasured account is not evidence of exhaustion, and treating it as such would print
- *  "all accounts are at their limit" about a pool we have never measured. */
+ *  An account with NO usage row and no live row is treated as having room (matching `usageLookup`),
+ *  so it holds `allAtLimit` false rather than defaulting a silent account into the wall. `ceilings`
+ *  is retained for signature stability and `assessHeadroom`'s other states; it does not gate this. */
 export function exhaustionOutlook(
   usableAccountIds: readonly string[],
   usage: Usage[],
   ceilings: Ceiling[],
   now: number = Date.now(),
+  live: readonly LiveUsage[] = [],
+  siblingIds?: ReadonlyMap<string, readonly string[]>,
 ): ExhaustionOutlook {
   if (usableAccountIds.length === 0) return { allAtLimit: false, earliestReset: null };
 
   const headroomById = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
   const usageById = new Map(usage.map((u) => [u.id, u]));
+  const liveById = new Map(live.map((l) => [l.id, l]));
 
-  const allAtLimit = usableAccountIds.every((id) => {
-    const h = headroomById.get(id);
-    if (!h) return false; // no usage row at all → no evidence of a limit
-    if (h.state === "exhausted") return true;
-    return h.fraction != null && h.fraction >= CEILING_AVOID_FRACTION;
-  });
+  // Out of room on either signal auto-pick acts on: the observed wall, or Anthropic's own number at
+  // or above LIVE_AVOID_PERCENT — judged PER LOGIN (`siblingIds`), the SAME way the spawn gate and
+  // `switchRecommendation` judge it, so this deduped-set banner cannot disagree with them. A missing
+  // row on BOTH is "no evidence of a limit", so `every` is false as before.
+  const atLimit = (id: string): boolean => {
+    if (headroomById.get(id)?.state === "exhausted") return true;
+    const p = loginLiveWorstPercent(id, liveById, siblingIds);
+    return p != null && p >= LIVE_AVOID_PERCENT;
+  };
+  const allAtLimit = usableAccountIds.every(atLimit);
 
   const earliestReset = earliestResetAcross(usableAccountIds, usageById, now);
   return { allAtLimit, earliestReset };

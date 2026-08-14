@@ -26,6 +26,7 @@ import {
   signedInAccountIds,
   duplicateAccountGroups,
   identityKey,
+  accountsAreSame,
   duplicateAccountIds,
   PINS_STORAGE_KEY,
   type Account,
@@ -231,20 +232,62 @@ describe("pickAccount", () => {
     expect(pickAccount(accounts, u, { now: NOW, pinnedAccountId: "ghost" })?.id).toBe("b");
   });
 
-  it("skips an account at/above CEILING_AVOID_FRACTION of its OWN learned ceiling", () => {
+  it("does NOT skip an account near its learned ceiling — the estimate spawn-gate was removed", () => {
     const accounts = [acct("hot"), acct("cool")];
-    // hot has FEWER tokens than cool and would win the lowest-usage rule outright. It is excluded
-    // only because 90 against a learned ceiling of 100 is 0.90 — the act line. This is the whole
-    // proactive mechanism, and the fixture is built so raw usage points the other way.
+    // hot has FEWER tokens than cool, so lowest-usage picks it. It USED to be EXCLUDED for sitting
+    // at 0.90 of its learned ceiling — the retired "stops taking new agents at 90%" gate. The
+    // founder retired that estimate as a driver, so it no longer gates: the account near its
+    // ESTIMATED ceiling but low on raw/real usage is eligible again.
     const u = [usage("hot", { tokens5h: 90, tokens7d: 90 }), usage("cool", { tokens5h: 200, tokens7d: 200 })];
     const ceilings = [
-      { id: "hot", samples: [100], ceiling: 100 },
-      { id: "cool", samples: [1000], ceiling: 1000 }, // 0.2 — plenty of room
+      { id: "hot", samples: [100], ceiling: 100 }, // 0.90 of its learned ceiling
+      { id: "cool", samples: [1000], ceiling: 1000 },
     ];
-    expect(pickAccount(accounts, u, { now: NOW, ceilings })?.id).toBe("cool");
-    // Withhold the ceilings and the old rule reasserts itself, which is what proves the assertion
-    // above is caused by the ceiling and not by something incidental to the fixture.
+    // Whether ceilings are supplied or not, the answer is the same now — the learned-ceiling
+    // estimate has NO effect on auto-pick. Re-add `isNearLearnedCeiling` to `partitionAccounts` and
+    // the first line flips to "cool", which is exactly the behaviour that was removed.
+    expect(pickAccount(accounts, u, { now: NOW, ceilings })?.id).toBe("hot");
     expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("hot");
+  });
+
+  it("has NO proactive exclusion for an account with no live row — only real usage / the observed wall", () => {
+    // When live data is present it gates (real Anthropic ≥ LIVE_AVOID_PERCENT), and when it is
+    // MISSING there is no proactive exclusion — the retired learned ceiling is NOT reinstated as a
+    // fallback, because it is the same local tally that read zero for a fully-spent account on the
+    // founder's machine. So a no-live-row account is judged by lowest local usage, with the observed
+    // wall as the only backstop.
+    const accounts = [acct("nolive"), acct("spent")];
+    // `spent` has the LOWEST local tally (0) — it would win lowest-usage outright — but reads 99% on
+    // Anthropic's own number. `nolive` has a higher local tally and NO live row.
+    const u = [usage("nolive", { tokens5h: 10, tokens7d: 10 }), usage("spent", { tokens5h: 0, tokens7d: 0 })];
+    const live = [{ id: "spent", fiveHourPercent: 99, sevenDayPercent: 10 }];
+    // With live data: `spent` is excluded on its REAL number, so `nolive` wins despite the higher tally.
+    expect(pickAccount(accounts, u, { now: NOW, live })?.id).toBe("nolive");
+    // With NO live rows at all: lowest LOCAL tally wins outright (`spent`) — no estimate gate steps in
+    // to exclude it. This is the window the docblock documents; the observed wall is the only backstop.
+    expect(pickAccount(accounts, u, { now: NOW })?.id).toBe("spent");
+  });
+
+  it("excludes a DUPLICATE of a spent login even when its own live fetch failed (per-login siblingIds)", () => {
+    // `a` and `b` are two dirs of ONE login. Only `a` reports 99% live; `b`'s fetch failed (no row).
+    // `cool` is a healthy different login. Per config-dir, `b` reads eligible and — being the lowest
+    // tally — would win, landing agents on the shared, spent quota. With the login grouping, `b` is
+    // excluded via its twin `a`, so `cool` wins. This is the SAME per-login judgement AC8 and the
+    // switch path use, so the spawn gate cannot disagree with them.
+    const accounts = [acct("a"), acct("b"), acct("cool")];
+    const u = [
+      usage("a", { tokens5h: 500, tokens7d: 500 }),
+      usage("b", { tokens5h: 0, tokens7d: 0 }), // lowest tally → would win per-dir
+      usage("cool", { tokens5h: 100, tokens7d: 100 }),
+    ];
+    const live = [{ id: "a", fiveHourPercent: 99, sevenDayPercent: 10 }]; // only `a` reported
+    const siblingIds = new Map<string, readonly string[]>([
+      ["a", ["a", "b"]],
+      ["b", ["a", "b"]],
+    ]);
+    expect(pickAccount(accounts, u, { now: NOW, live, siblingIds })?.id).toBe("cool");
+    // Without the grouping (per-dir), `b` is not excluded and its zero tally wins — the hole.
+    expect(pickAccount(accounts, u, { now: NOW, live })?.id).toBe("b");
   });
 
   it("treats an unlearned ceiling as unknown, never as zero", () => {
@@ -502,18 +545,45 @@ describe("accountDisplay — the shell fork (default account only)", () => {
     expect(groups[0]!.email).toBe("same@example.com");
   });
 
-  it("identityKey mirrors the Rust ladder: uuid, else email:<addr>, else null", () => {
-    // Direct coverage, because this is a CROSS-LANGUAGE mirror of `accounts::identity_key` and the
-    // ledger + ceiling gate key on the Rust side of it. With nothing exercising it here the two
-    // halves could drift silently and disagree about who an account is — which is the whole failure
-    // this branch exists to remove (roborev 58175).
+  it("identityKey mirrors the Rust ladder: uuid, else email:<addr>, else null — ORG-BLIND", () => {
+    // The base login key, a cross-language mirror of `accounts::identity_key`. It is deliberately
+    // org-BLIND: it drives identity-CHANGE detection, and `organizationName` is sometimes null even
+    // for a completed login, so folding org in here would masquerade a null->named transition on ONE
+    // login as a different account. The org distinction lives in `accountsAreSame` (pairwise).
     expect(identityKey(ident("a", { accountUuid: "u1", email: "e@x.com" }))).toBe("u1");
     expect(identityKey(ident("a", { email: "e@x.com" }))).toBe("email:e@x.com");
     expect(identityKey(ident("a", {}))).toBeNull();
     expect(identityKey(undefined)).toBeNull();
-    // The uuid WINS when both are present — it is the stronger discriminator, and two config dirs
-    // can hold logins to one account under one email, which is why accountUuid exists at all.
+    // The uuid WINS over the email as the base when both are present.
     expect(identityKey(ident("a", { accountUuid: "u2", email: "same@x.com" }))).toBe("u2");
+    // ORG-BLIND: two orgs of ONE uuid still key the same here — they are told apart by accountsAreSame.
+    expect(identityKey(ident("t", { accountUuid: "u1", email: "e@x.com", organization: "Amforge" }))).toBe(
+      identityKey(ident("p", { accountUuid: "u1", email: "e@x.com", organization: "Personal" })),
+    );
+  });
+
+  it("accountsAreSame separates a Team org from a Personal Max under ONE email (same uuid, two orgs)", () => {
+    // The founder's `amforge` case: two DISTINCT Anthropic accounts under one email share an
+    // accountUuid but sit in different organizations. Same login key, but NOT the same account.
+    const team = ident("t", { accountUuid: "u1", email: "e@x.com", organization: "Amforge" });
+    const personal = ident("p", { accountUuid: "u1", email: "e@x.com", organization: "Personal" });
+    expect(accountsAreSame(team, personal)).toBe(false);
+
+    // A GENUINE duplicate — same uuid AND same org (two config dirs, one login) — IS the same.
+    const dupA = ident("a", { accountUuid: "u1", email: "e@x.com", organization: "Amforge" });
+    const dupB = ident("b", { accountUuid: "u1", email: "e@x.com", organization: "Amforge" });
+    expect(accountsAreSame(dupA, dupB)).toBe(true);
+
+    // A NULL org is "unknown", never a difference: org can only SPLIT a shared login, so a null-org
+    // sibling of the same uuid is still the same account (the 3-config-dir tolerance case).
+    const noOrg = ident("n", { accountUuid: "u1", email: "e@x.com" });
+    expect(accountsAreSame(team, noOrg)).toBe(true);
+    expect(accountsAreSame(personal, noOrg)).toBe(true);
+
+    // Two DIFFERENT logins are never the same, org or no org.
+    expect(accountsAreSame(ident("x", { accountUuid: "u1" }), ident("y", { accountUuid: "u2" }))).toBe(false);
+    // An unresolvable identity is the same as nothing.
+    expect(accountsAreSame(ident("z", {}), team)).toBe(false);
   });
 
   it("groups a uuid-bearing row with its email-only TWIN (knightwatch probe 1)", () => {
@@ -575,6 +645,57 @@ describe("accountDisplay — the shell fork (default account only)", () => {
       [ident("a", { email: "one@example.com" }), ident("b", { email: "two@example.com" })],
     );
     expect(groups).toHaveLength(0);
+  });
+
+  it("does NOT group a Team org and a Personal Max under ONE email (same uuid, different org)", () => {
+    // THE FOUNDER'S CASE (`amforge`): two genuinely distinct Anthropic accounts under one email that
+    // share an accountUuid but sit in different organizations. Grouped, the second could never be
+    // registered (handleAdd's guard) and one would be benched when the other ran out. They are NOT a
+    // duplicate. Keyed on `accountUuid` alone (the old rule) this returned a group of two.
+    const groups = duplicateAccountGroups(
+      [acct("team", {}), acct("personal", {})],
+      [
+        ident("team", { email: "amforge@example.com", accountUuid: "u1", organization: "Amforge" }),
+        ident("personal", { email: "amforge@example.com", accountUuid: "u1", organization: "Personal" }),
+      ],
+    );
+    expect(groups).toEqual([]);
+  });
+
+  it("does NOT pair UNKNOWN-org rows once the login is proven to front two distinct orgs", () => {
+    // The mixed known/unknown-org group. `a`(Team) and `b`(Personal) prove this uuid fronts TWO
+    // distinct accounts, so `c` and `d` — both `organization: null` under that uuid — are
+    // UNATTRIBUTABLE: `c` may be the Team's and `d` the Personal's. Pairing them into a duplicate
+    // group would be the roborev-58175 wrong-pairing (the banner would call two independent accounts
+    // one, `siblingMap` would bench the healthy one, `switchRecommendation` would drop a real escape
+    // target). So no group is returned — every row is a singleton after the split.
+    const groups = duplicateAccountGroups(
+      [acct("a", {}), acct("b", {}), acct("c", {}), acct("d", {})],
+      [
+        ident("a", { email: "e@example.com", accountUuid: "u1", organization: "Team" }),
+        ident("b", { email: "e@example.com", accountUuid: "u1", organization: "Personal" }),
+        ident("c", { email: "e@example.com", accountUuid: "u1" }), // org null → unattributable
+        ident("d", { email: "e@example.com", accountUuid: "u1" }), // org null → unattributable
+      ],
+    );
+    expect(groups).toEqual([]);
+    // (Known limitation, org-uuid follow-up: a null-org row that IS a genuine duplicate of one sub-
+    // group goes un-benched here — the safe direction, since we cannot attribute it without guessing.)
+  });
+
+  it("STILL groups a genuine duplicate — same uuid AND same org (two dirs, one login)", () => {
+    // The real dedup the founder relies on must survive: two config dirs holding the SAME login
+    // record the SAME organizationName, so org-awareness never splits them.
+    const groups = duplicateAccountGroups(
+      [acct("storytell", {}), acct("gmail", {})],
+      [
+        ident("storytell", { email: "e@example.com", accountUuid: "u1", organization: "Acme" }),
+        ident("gmail", { email: "e@example.com", accountUuid: "u1", organization: "Acme" }),
+      ],
+    );
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.accounts.map((x) => x.id).sort()).toEqual(["gmail", "storytell"]);
+    expect(groups[0]!.accountUuid).toBe("u1");
   });
 
   it("keeps calling a genuinely login-less account not signed in", () => {

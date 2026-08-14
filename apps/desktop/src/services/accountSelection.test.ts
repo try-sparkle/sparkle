@@ -453,22 +453,19 @@ describe("accountSelection cache", () => {
   });
 });
 
-// ── PROACTIVE rotation: the spawn path avoids an account approaching its LEARNED ceiling ────────
+// ── The LEARNED-CEILING ESTIMATE NO LONGER DIVERTS SPAWNS ────────────────────────────────────────
 //
-// The founder's ask, verbatim: "switch login accounts BEFORE the session limit hits."
+// This used to be "proactive rotation": an account at >= CEILING_AVOID_FRACTION of its LEARNED
+// ceiling was removed from auto-pick, so the next spawn skipped it BEFORE it hit the wall. The
+// founder retired that estimate as a driver — it read "90% of its usual limit" on accounts whose
+// REAL Anthropic numbers were clear, steering spawns off healthy accounts. So the estimate is now
+// inert on the spawn path: selection ranks by raw/real usage, with the OBSERVED wall
+// (`exhaustedUntil`) and the REAL live utilization (`PickOptions.live`) as the only exclusions.
 //
-// Before this, the ONLY thing that removed an account from auto-pick was `exhaustedUntil` — set
-// after a real rate-limit message is observed, i.e. AFTER the wall. `PickOptions.nearCap` existed
-// but `DEFAULT_NEAR_CAP` is MAX_SAFE_INTEGER on both windows and no production caller ever passed
-// one, so the near-cap branch was dead code in production.
-//
-// WHY THE FIXTURE LOOKS BACKWARDS, and why it must: `hot` has the LOWEST raw usage of the two, so
-// today's lowest-usage rule picks it — while it sits at 90% of its own learned ceiling and `cool`
-// sits at 20% of a ceiling ten times larger. That is the real shape (accounts learn different
-// ceilings), and it is what makes this test non-vacuous: a fixture where the near-limit account
-// also had the most tokens would pass against unchanged code, proving nothing.
-describe("proactive rotation on the spawn path", () => {
-  // hot: 90/100 of its learned ceiling = 0.90 — at the ACT line, and the lowest raw tally.
+// The fixture keeps its shape (`hot` is near its learned ceiling but has the LOWEST raw tally) so it
+// can prove the estimate is ignored: `hot` now WINS despite sitting at 0.90 of its ceiling.
+describe("the learned-ceiling estimate no longer diverts spawns", () => {
+  // hot: 90/100 of its learned ceiling = 0.90, and the lowest raw tally.
   // cool: 200/1000 = 0.20 — more tokens, far more room.
   const ROT_ACCOUNTS = [
     { id: "hot", nickname: "Hot", configDir: "/data/accounts/hot", isDefault: true, createdAt: 1 },
@@ -501,81 +498,35 @@ describe("proactive rotation on the spawn path", () => {
     });
   });
 
-  it("resolves the NEXT spawn to a different account's config dir, with no human acting", async () => {
-    // The goal, stated as an assertion: an account approaching its limit does not get the next
-    // agent. Nothing here clicks a banner, accepts a recommendation, or sets a pin.
+  it("sends the NEXT spawn to the lowest-usage account even at 0.90 of its learned ceiling", async () => {
+    // `hot` is at 0.90 of its estimated ceiling — the OLD trigger to divert away from it. The
+    // estimate no longer gates, so lowest raw usage wins and `hot` gets the agent. Re-add
+    // `isNearLearnedCeiling` to `partitionAccounts` and this flips to `cool`.
     const dir = await accountConfigDirFor("agent-next", { now: 7_000_000 });
-    expect(dir).toBe("/data/accounts/cool");
+    expect(dir).toBe("/data/accounts/hot");
   });
 
-  it("does NOT move a STICKY key off its account on the ESTIMATE alone", async () => {
-    // The inverse of the test above, and the more important of the two. An earlier revision of this
-    // change let the ceiling gate reach the sticky "is my previous account still healthy?" check,
-    // which reads as a free win and is not one: the concierge resolves this key once per TURN, and a
-    // changed answer runs `rebindSessionToAccount` — both session pointers nulled, conversation
-    // re-probed. An ordinary turn self-heals into a fresh session; a PROACTIVE push has no
-    // stale-resume retry by design, so it dies silently and nobody notices, because nobody asked for
-    // it. A 0.9 estimate is not enough evidence to spend a live conversation on.
-    invoke.mockImplementation((cmd: string) => {
-      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
-      if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);
-      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
-      if (cmd === "accounts_ceilings") return Promise.resolve([]);
-      return Promise.reject(new Error(`unexpected command ${cmd}`));
-    });
-    // Settles on `hot` while nothing is known.
-    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_200_000 })).toBe(
-      "/data/accounts/hot",
-    );
+  // REMOVED "does NOT move a STICKY key off its account on the ESTIMATE alone". With the learned-
+  // ceiling gate gone from EVERY path, no code can move a sticky key on the estimate, so that test
+  // was vacuous — deleting the whole `if (previousId) { keep }` block left all three legs green
+  // (`hot` is the plain lowest-usage winner, and `pickAccount` evicts an OBSERVED-exhausted account
+  // on its own, so even the "observed wall moves it" leg did not exercise the keep block). The keep
+  // path — a sticky key retained on an account that is no longer the lowest-usage pick — is covered
+  // non-vacuously by the usage-drift test earlier in this suite. (roborev review 64135, F3.)
 
-    // `hot` is now measured at 0.90 of its ceiling. The sticky key STAYS — an estimate may not
-    // abandon a conversation.
-    invalidateAccountState();
-    invoke.mockImplementation((cmd: string) => {
-      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
-      if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);
-      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
-      if (cmd === "accounts_ceilings") return Promise.resolve(ROT_CEILINGS);
-      return Promise.reject(new Error(`unexpected command ${cmd}`));
-    });
-    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_300_000 })).toBe(
-      "/data/accounts/hot",
-    );
-
-    // But an OBSERVED rate limit is fact, not estimate, and still moves it — the pre-existing
-    // behaviour this change must not weaken. Without this half the test above would be satisfied by
-    // a sticky key that never moves at all.
-    invalidateAccountState();
-    invoke.mockImplementation((cmd: string) => {
-      if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
-      if (cmd === "accounts_usage")
-        return Promise.resolve([
-          { id: "hot", tokens5h: 90, tokens7d: 90, exhaustedUntil: 7_400_000 / 1000 + 600 },
-          { id: "cool", tokens5h: 200, tokens7d: 200, exhaustedUntil: null },
-        ]);
-      if (cmd === "accounts_identities") return Promise.resolve(ROT_IDENTITIES);
-      if (cmd === "accounts_ceilings") return Promise.resolve(ROT_CEILINGS);
-      return Promise.reject(new Error(`unexpected command ${cmd}`));
-    });
-    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_400_000 })).toBe(
-      "/data/accounts/cool",
-    );
-  });
-
-  it("applies the ceiling to a sticky key's FIRST pick, where no conversation exists yet", async () => {
-    // The other half of the asymmetry: ceilings may not END a sticky selection, but they must inform
-    // one that hasn't been made. Settling a fresh concierge onto an account that is already nearly
-    // spent would just move the problem to its first turn.
+  it("does NOT apply the ceiling estimate to a sticky key's FIRST pick either — lowest usage wins", async () => {
+    // The estimate used to inform a fresh sticky selection (settle the concierge onto the account
+    // with the most estimated room). It no longer does: `hot` is at 0.90 of its ceiling but is the
+    // lowest raw tally, so a first-time sticky pick lands on it just like an ordinary spawn.
     expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: 7_500_000 })).toBe(
-      "/data/accounts/cool",
+      "/data/accounts/hot",
     );
   });
 
-  it("would have picked the near-limit account under the lowest-usage rule alone", async () => {
-    // Pins the fixture's own premise, so this suite can never quietly become vacuous: with the
-    // ceilings withheld, `hot` (the lower raw tally) still wins. If a future refactor makes `cool`
-    // win for some unrelated reason, THIS test fails and tells you the one above stopped proving
-    // anything.
+  it("picks the same account whether or not learned ceilings are supplied — the estimate is inert", async () => {
+    // With the ceilings withheld, `hot` (the lower raw tally) wins. The test above shows it wins WITH
+    // the ceilings too, which is the whole point: the learned ceiling changes nothing on the spawn
+    // path any more.
     invoke.mockImplementation((cmd: string) => {
       if (cmd === "accounts_list") return Promise.resolve(ROT_ACCOUNTS);
       if (cmd === "accounts_usage") return Promise.resolve(ROT_USAGE);

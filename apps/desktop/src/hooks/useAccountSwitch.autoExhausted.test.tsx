@@ -43,6 +43,11 @@ const h = vi.hoisted(() => ({
   setPin: vi.fn((_agentId: string, _accountId: string) => {}),
   statuses: {} as Record<string, AgentTabStatus | undefined>,
   paneAccounts: {} as Record<string, string | undefined>,
+  // What `liveUsageRows()` returns on this tick, and what `switchRecommendation` was actually handed
+  // as its `live` argument — the pair that pins the hook FORWARDING the cached rows (a defaulted seam
+  // otherwise: `live` defaults to [], so dropping `liveUsageRows()` from the call site stays green).
+  liveRows: [] as { id: string; fiveHourPercent: number | null; sevenDayPercent: number | null }[],
+  seenLive: undefined as unknown,
 }));
 
 vi.mock("../services/paneControl", () => ({
@@ -66,6 +71,7 @@ vi.mock("../services/accountSelection", async (importOriginal) => ({
     failed: h.failed,
   }),
   invalidateAccountState: () => {},
+  liveUsageRows: () => h.liveRows,
 }));
 
 const acct = (id: string): Account => ({
@@ -79,15 +85,17 @@ const acct = (id: string): Account => ({
 // The ONE thing this suite varies. Everything else is held constant so the reason is the only
 // possible cause of a difference between the two tests.
 vi.mock("../services/headroom", () => ({
-  switchRecommendation: () =>
-    h.reason === null
+  switchRecommendation: (...args: unknown[]) => {
+    h.seenLive = args[6]; // the `live` argument — see `h.liveRows` / the forwarding test
+    return h.reason === null
       ? null
       : {
           from: acct(h.from),
           to: acct("acct-b"),
           fraction: 0.95,
           reason: h.reason,
-        },
+        };
+  },
 }));
 
 vi.mock("../stores/runtimeStore", () => ({
@@ -162,6 +170,21 @@ beforeEach(() => {
   h.from = "acct-a";
   h.usage = [wall("acct-a")];
   h.failed = false;
+  h.liveRows = [];
+  h.seenLive = undefined;
+});
+
+describe("the poll forwards the cached live-usage rows to switchRecommendation", () => {
+  it("hands `liveUsageRows()` to switchRecommendation so it can exclude a live-spent target", async () => {
+    // The auto-migration path is the harmful half of the live-aware switch: without the cached rows,
+    // switchRecommendation is live-blind and can migrate the fleet onto an account at 99% of its real
+    // Anthropic limit. `live` defaults to [], so this defaulted seam is invisible unless a test pins
+    // the forwarding. Delete `liveUsageRows()` from the phase-1 call and `seenLive` is `[]`, not the
+    // primed rows → red.
+    h.liveRows = [{ id: "acct-b", fiveHourPercent: 99, sevenDayPercent: 10 }];
+    await mounted();
+    expect(h.seenLive).toEqual([{ id: "acct-b", fiveHourPercent: 99, sevenDayPercent: 10 }]);
+  });
 });
 
 describe("an OBSERVED wall migrates running agents without being asked", () => {

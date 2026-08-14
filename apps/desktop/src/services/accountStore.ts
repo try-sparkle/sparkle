@@ -224,12 +224,57 @@ export type AccountDisplay = {
  *  all). The uuid ALONE is not enough: it is absent on logins predating the field, and those are
  *  fully signed in and fully attributable by email. Rust keys the identity ledger and the ceiling
  *  gate this way; TypeScript must match, or the two halves of one product disagree about who an
- *  account is. */
+ *  account is.
+ *
+ *  DELIBERATELY ORG-BLIND. Organization is NOT folded in here, for two reasons: (1) this key drives
+ *  identity-CHANGE detection (`AccountsScreen.handleLogin`), and `organizationName` is sometimes
+ *  `null` even for a completed login, so a null→named transition on ONE login would masquerade as a
+ *  different account; (2) sameness-with-org is NOT transitive (a null-org row matches both a named-org
+ *  row and another null one, which two different named orgs do not), and a single canonical key cannot
+ *  express that. The org distinction lives in {@link duplicateAccountGroups} / {@link accountsAreSame},
+ *  which compare PAIRWISE on positive evidence. */
 export function identityKey(identity: Identity | undefined): string | null {
   const uuid = identity?.accountUuid ?? null;
   if (uuid) return uuid;
   const email = identity?.email ?? null;
   return email ? `email:${email}` : null;
+}
+
+/** Do two identities share an ORGANIZATION we can positively tell apart? True ONLY when both record a
+ *  non-null `organization` and the two differ. A null on either side is "unknown", never a difference —
+ *  the same "positive evidence only" rule {@link identitiesDiffer} uses for uuid/email.
+ *
+ *  This is what separates a Team org from a Personal Max under ONE email: Anthropic gives each its own
+ *  `organizationName` (a team name vs the personal "<email>'s Organization"), so both are known and
+ *  differ. It never splits a genuine duplicate, whose two config dirs record the same org — or, when
+ *  one dir happens to report `null`, are simply not told apart here and stay merged.
+ *
+ *  KNOWN LIMITATION (follow-up): this compares `organization`, which is `oauthAccount.organizationName`
+ *  — a mutable DISPLAY string, not a stable id. `organizationUuid` sits in the same blob but is not yet
+ *  plumbed through `OauthIdentity`/`AccountIdentity`/`Identity` (Rust `accounts.rs`), so a genuine
+ *  duplicate whose two config-dir caches disagree on the name after an org RENAME would read as
+ *  positively-different and split. The window is narrow (both dirs must cache one login, and a rename
+ *  must land between their refreshes), and the immediate case this ships for — a Team org vs a
+ *  Personal Max — is separated correctly. Surfacing `organizationUuid` and preferring it here (name as
+ *  fallback) is the durable fix; tracked as a follow-up bead. */
+function organizationsDiffer(a: Identity | undefined, b: Identity | undefined): boolean {
+  const oa = a?.organization ?? null;
+  const ob = b?.organization ?? null;
+  return oa != null && ob != null && oa !== ob;
+}
+
+/** Do two registered accounts denote the SAME Anthropic account — same login AND not a
+ *  positively-different organization? The shared sameness test behind duplicate detection and the
+ *  add/relogin guards.
+ *
+ *  Same login is {@link identityKey} equality (uuid, else verified email). On top of that, two
+ *  accounts that share a login but sit in DIFFERENT known organizations (a Team org vs a Personal Max
+ *  under one email) are NOT the same account — they hold separate quotas. Org can only SPLIT a shared
+ *  login, never join two different ones, so an unknown (null) org leaves the login verdict untouched. */
+export function accountsAreSame(a: Identity | undefined, b: Identity | undefined): boolean {
+  const ka = identityKey(a);
+  if (ka == null) return false; // no resolvable login → never "the same" as anything
+  return ka === identityKey(b) && !organizationsDiffer(a, b);
 }
 
 /** Do two identities denote DIFFERENT Anthropic accounts? TS mirror of Rust
@@ -238,7 +283,17 @@ export function identityKey(identity: Identity | undefined): string | null {
  *  The uuid decides when BOTH sides have one; otherwise fall back to the email. A bare `!==` on the
  *  uuids reads `null !== "x"` as a difference and INVENTS one — which, on the fork notice, means
  *  telling the user their terminal is on a different account when it may well be the same. Never
- *  claims a difference it cannot show. */
+ *  claims a difference it cannot show.
+ *
+ *  ORGANIZATION-BLIND (known limitation, follow-up). This compares only uuid/email, so it does NOT see
+ *  the Team-org-vs-Personal-Max-under-one-email split that `organizationsDiffer` / `accountsAreSame`
+ *  now draw. Its one consumer is `accountDisplay.shellForked` (the default account's fork notice), so
+ *  a default account on the Team org whose login SHELL is signed into the Personal Max reads as "same
+ *  account" (no fork surfaced) even though the quotas differ. Routing `shellForked` through
+ *  `accountsAreSame` would fix it, but the shell side carries no organization: `AccountIdentity` has
+ *  `shell_email`/`shell_account_uuid` but no `shell_organization` (Rust `accounts.rs`), so there is no
+ *  org to compare until that is plumbed. Deferred to the same `organizationUuid` follow-up; the fork
+ *  notice is advisory (it never gates spawning), so the miss is a missing hint, not a wrong action. */
 export function identitiesDiffer(
   a: { accountUuid: string | null; email: string | null },
   b: { accountUuid: string | null; email: string | null },
@@ -364,7 +419,7 @@ export function duplicateAccountGroups(
   const byId = new Map(identities.map((i) => [i.id, i]));
 
   // TWO PASSES, uuid first. A single pass keyed on `identityKey` still splits ONE login across two
-  // groups whenever one registration reports an `accountUuid` and its twin does not — the modern
+  // groups whenever one registration reports an `accountUuid` and its twin does not - the modern
   // client records the field, an older login in another config dir does not. `siblingMap` is
   // derived from these groups, so a split means only one of the pair gets benched when their SHARED
   // quota runs out, and auto-pick immediately routes work back into the exhausted account. That is
@@ -372,7 +427,7 @@ export function duplicateAccountGroups(
   const groups = new Map<string, DuplicateGroup>();
   const emailToUuidKeys = new Map<string, Set<string>>();
 
-  // Pass 1 — every row that HAS a uuid. The uuid is the authoritative discriminator.
+  // Pass 1 - every row that HAS a uuid. The uuid is the authoritative discriminator.
   for (const a of accounts) {
     const identity = byId.get(a.id);
     const uuid = identity?.accountUuid ?? null;
@@ -388,7 +443,7 @@ export function duplicateAccountGroups(
     }
   }
 
-  // Pass 2 — rows with an email but no uuid. Merge into a uuid group ONLY when that email
+  // Pass 2 - rows with an email but no uuid. Merge into a uuid group ONLY when that email
   // identifies exactly one such group: with two, the email is ambiguous (it genuinely maps to more
   // than one Anthropic account) and guessing would bench an account that is not actually a sibling,
   // which is worse than missing the pairing. Otherwise they group among themselves by email.
@@ -396,14 +451,14 @@ export function duplicateAccountGroups(
     const identity = byId.get(a.id);
     if (identity?.accountUuid) continue;
     const email = identity?.email;
-    if (!email) continue; // no login at all → not comparable
+    if (!email) continue; // no login at all -> not comparable
     const candidates = emailToUuidKeys.get(email);
     if (candidates && candidates.size > 1) {
-      // AMBIGUOUS, so this row is not grouped AT ALL — not with a uuid group, and not with the
+      // AMBIGUOUS, so this row is not grouped AT ALL - not with a uuid group, and not with the
       // other refused rows either. Falling through to email bucketing here was a real bug: given
       // a(u1,X) b(u2,X) c(no-uuid,X) d(no-uuid,X), c and d landed in one `email:X` group of two,
       // which survives the length filter. That is the SAME unfounded guess the line above just
-      // declined — c may be u1 and d may be u2 — except this branch actually produces a group, so
+      // declined - c may be u1 and d may be u2 - except this branch actually produces a group, so
       // `siblingMap` benched d when c exhausted, and the banner told the user "2 accounts are the
       // same Claude login" about accounts we had just proven we cannot pair (roborev 58175).
       continue;
@@ -421,7 +476,82 @@ export function duplicateAccountGroups(
     else groups.set(key, { key, accountUuid: null, email, accounts: [a] });
   }
 
-  return [...groups.values()].filter((g) => g.accounts.length > 1);
+  // ORGANIZATION SPLIT. The passes above grouped by LOGIN (uuid/email). One login can nonetheless
+  // front TWO distinct Anthropic accounts - a Team org and a Personal Max under ONE email - which
+  // share an `accountUuid` but hold SEPARATE quotas, so they must not read as one "duplicate".
+  // `splitGroupByOrganization` splits a group only when it holds two or more POSITIVELY-DIFFERENT
+  // organizations (both known and differing); a `null` org is "unknown", never a difference, so a
+  // genuine duplicate - same login, matching orgs, or where one dir reports null - is never split.
+  // Only a real Team-vs-Personal divergence is (the founder's `amforge` case).
+  return [...groups.values()].flatMap((g) => splitGroupByOrganization(g, byId));
+}
+
+/** Split one login-group into per-organization groups when — and only when — it holds two or more
+ *  POSITIVELY-DIFFERENT organizations. Returns the group unchanged (still filtered to >= 2 members)
+ *  when there is at most one known org, so a genuine duplicate is never broken apart.
+ *
+ *  Rows whose org is `null` are "unknown": with a single known org they stay with the group; with two
+ *  or more they are UNATTRIBUTABLE and are not grouped at all (each becomes a singleton and drops on
+ *  the length filter). This is deliberate, and it is the SAME refusal-to-guess the ambiguous-email
+ *  guard makes (roborev 58175): the ≥2-known-orgs premise is precisely "one `accountUuid` fronts two
+ *  DIFFERENT accounts", so a null-org row is NOT a proven sibling of any particular sub-group — it may
+ *  be the Team's or the Personal's, and we cannot tell. Pairing two such rows into a duplicate group
+ *  would be a positively wrong claim: the banner would tell the user to remove one of two independent
+ *  accounts, `siblingMap` would bench the healthy one when the other walls, and
+ *  `switchRecommendation`'s same-login exclusion would drop a real escape target.
+ *
+ *  KNOWN LIMITATION (follow-up, bead sparkle-hli8pu). The refusal to pair is the SAFE direction for
+ *  the duplicate BANNER (never claim two independent accounts are one), but this strict result feeds
+ *  THREE consumers and the other two have the opposite safe direction:
+ *   - `siblingMap` (benching): a null-org row that really IS a duplicate of one sub-group goes
+ *     un-benched, so it is not fanned an `exhaustedUntil` when its true twin walls.
+ *   - `switchRecommendation`'s `sameLoginAsFrom` (switch-target exclusion): the same row is not
+ *     excluded, so it can be OFFERED as the escape route from its walled twin and auto-migrated onto —
+ *     the shared quota. The live-usage exclusion ({@link loginLiveWorstPercent}) is judged per LOGIN,
+ *     but this ungrouped row is in NO login group, so it is judged on its OWN dir's live row alone —
+ *     masked only when that row's own fetch succeeded at ≥ {@link LIVE_AVOID_PERCENT}. Offline / 401 /
+ *     before the first poll it is unmasked, and the observed wall is the only backstop left (it fans
+ *     across `siblingMap`, which does not contain the row either).
+ *  The correct fix is a SEPARATE inclusive "possible-sibling" relation for those two consumers
+ *  (a null-org row counts as a possible sibling of every sub-group of its login), kept distinct from
+ *  this strict banner result — but it must NOT exclude a KNOWN-different-org account (that would break
+ *  the Team→Personal switch the whole feature exists for), so it needs `organizationUuid` to draw the
+ *  line safely. Deferred to sparkle-hli8pu. This is the {@link organizationsDiffer} "positive evidence
+ *  only" rule applied to a whole group: a Team org and a Personal Max under one email split apart;
+ *  two config dirs holding the SAME login (orgs match, or ≤1 known org) stay one group. */
+function splitGroupByOrganization(
+  group: DuplicateGroup,
+  byId: Map<string, Identity>,
+): DuplicateGroup[] {
+  const orgOf = (a: Account): string | null => byId.get(a.id)?.organization ?? null;
+
+  const knownOrgs = new Set<string>();
+  for (const a of group.accounts) {
+    const org = orgOf(a);
+    if (org != null) knownOrgs.add(org);
+  }
+  // At most one distinct known org -> nothing to tell apart; keep the group whole.
+  if (knownOrgs.size <= 1) return group.accounts.length > 1 ? [group] : [];
+
+  // Two or more known orgs -> the login fronts distinct accounts. Bucket each NAMED-org row by its
+  // org; UNKNOWN-org rows are unattributable (see the docblock) and are left ungrouped — each falls
+  // out of the group as its own singleton on the length filter below. We do NOT pair unknown-org rows
+  // with each other: that is the roborev-58175 wrong-pairing, one axis over.
+  const byOrg = new Map<string, DuplicateGroup>();
+  for (const a of group.accounts) {
+    const org = orgOf(a);
+    if (org == null) continue;
+    const sub = byOrg.get(org);
+    if (sub) sub.accounts.push(a);
+    else
+      byOrg.set(org, {
+        key: `${group.key}::org:${org}`,
+        accountUuid: group.accountUuid,
+        email: group.email,
+        accounts: [a],
+      });
+  }
+  return [...byOrg.values()].filter((g) => g.accounts.length > 1);
 }
 
 /** Ids of accounts that duplicate another account's login (flattened {@link duplicateAccountGroups}). */
@@ -429,6 +559,44 @@ export function duplicateAccountIds(accounts: Account[], identities: Identity[])
   return new Set(
     duplicateAccountGroups(accounts, identities).flatMap((g) => g.accounts.map((a) => a.id)),
   );
+}
+
+/** id → all account-ids that share its LOGIN (the flattened {@link duplicateAccountGroups}). An
+ *  ungrouped account is absent (callers default it to `[id]`). Built ONCE by a caller and threaded
+ *  into the three consumers of the live-usage signal ({@link pickAccount}/`partitionAccounts`,
+ *  `headroom.exhaustionOutlook`, `headroom.switchRecommendation`) so they judge live-spent PER LOGIN
+ *  and cannot contradict each other — see {@link loginLiveWorstPercent}. */
+export function loginSiblingIds(
+  accounts: Account[],
+  identities: Identity[],
+): Map<string, string[]> {
+  const m = new Map<string, string[]>();
+  for (const g of duplicateAccountGroups(accounts, identities)) {
+    const ids = g.accounts.map((a) => a.id);
+    for (const id of ids) m.set(id, ids);
+  }
+  return m;
+}
+
+/** The worst real-Anthropic utilization across an account's whole LOGIN group, or null when no row in
+ *  the group was reported. A QUOTA belongs to a login, not a config dir: `refreshLiveUsage` fetches
+ *  per registration and a failed fetch (401 / keychain declined / offline) simply has no row, so one
+ *  registration of a spent login can read 99% while its twin reads nothing. Taking the MAX over the
+ *  login group makes the twin count as spent too — exactly as `limitSync.pendingExhaustions` fans an
+ *  OBSERVED wall across `siblingMap`, but WITHOUT waiting for the wall. `siblingIds` absent, or an
+ *  account not in it, falls back to the single dir (`[id]`), i.e. plain per-dir behaviour. */
+export function loginLiveWorstPercent(
+  id: string,
+  liveById: ReadonlyMap<string, LiveUsage>,
+  siblingIds?: ReadonlyMap<string, readonly string[]>,
+): number | null {
+  const ids = siblingIds?.get(id) ?? [id];
+  let worst: number | null = null;
+  for (const sid of ids) {
+    const p = liveWorstPercent(liveById.get(sid));
+    if (p != null && (worst == null || p > worst)) worst = p;
+  }
+  return worst;
 }
 
 /** Raw {@link LimitEvent} shape from Rust — `atEpoch` is epoch SECONDS (Rust's unit). */
@@ -487,18 +655,17 @@ export const DEFAULT_NEAR_CAP: NearCap = {
   tokens7d: Number.MAX_SAFE_INTEGER,
 };
 
-/** Fraction of an account's LEARNED ceiling at which new spawns stop landing on it.
+/** RETIRED as a gate. This was the fraction of an account's LEARNED ceiling at or above which new
+ *  spawns stopped landing on it ("stops taking new agents at 90%") — but the founder retired the
+ *  learned-ceiling ESTIMATE as a driver of UI and behaviour: it fired "90% of its usual limit" on
+ *  accounts whose REAL Anthropic session/weekly numbers were clear. Proactive spawn avoidance is now
+ *  driven by Anthropic's own utilization ({@link LIVE_AVOID_PERCENT}), with the observed wall
+ *  (`exhaustedUntil`) as the reactive backstop.
  *
- *  This is the ACT line, and it is deliberately a different number from `headroom.WARN_FRACTION`
- *  (0.8), which is the WARN line. Two stages, one meaning each: at 0.8 the banner tells the human an
- *  account is getting close; at 0.9 Sparkle stops sending it new work of its own accord. Chosen by
- *  the founder ("switch later") against the alternative of collapsing both onto 0.8.
- *
- *  Why acting on an imperfect estimate is safe HERE specifically: the learned ceiling has a measured
- *  CoV of 0.24, which `headroom.ts` correctly judged too loose to re-spawn a RUNNING fleet unasked.
- *  A NEW spawn carries no such risk — it has no conversation to lose, so a wrong guess costs nothing
- *  beyond starting on a slightly-less-loaded account. That asymmetry is the whole reason the spawn
- *  path can be automatic while the fleet migration stays gated. */
+ *  The constant is kept for reference (several docblocks below cite it, and `headroom.ts` still
+ *  describes the old two-stage WARN/ACT design in prose) but nothing reads it any more. Do NOT wire
+ *  it back into `partitionAccounts` or `switchRecommendation` without the founder — that is exactly
+ *  the estimate-driven behaviour that was removed. */
 export const CEILING_AVOID_FRACTION = 0.9;
 
 /** `tokens5h` as a fraction of this account's learned ceiling, or null when we can't say.
@@ -544,7 +711,7 @@ export const LIVE_AVOID_PERCENT = 95;
  *  The MAX, not the 7-day figure alone: an account at 0% weekly but 100% of its 5-hour session is
  *  just as unable to take a spawn right now. The founder's measured card showed exactly this split
  *  (session 0%, weekly 100%), so reading either window on its own would have missed one of them. */
-function liveWorstPercent(l: LiveUsage | undefined): number | null {
+export function liveWorstPercent(l: LiveUsage | undefined): number | null {
   if (!l) return null;
   const vals = [l.fiveHourPercent, l.sevenDayPercent].filter((v): v is number => v != null);
   return vals.length === 0 ? null : Math.max(...vals);
@@ -556,28 +723,45 @@ export interface PickOptions {
   pinnedAccountId?: string;
   /** Soft window ceilings; defaults to {@link DEFAULT_NEAR_CAP}. */
   nearCap?: NearCap;
-  /** Per-account LEARNED ceilings (Rust `accounts_ceilings`). When supplied, an account at or above
-   *  {@link CEILING_AVOID_FRACTION} of its OWN ceiling is excluded from auto-pick — the proactive
-   *  half of rotation, and the thing that makes a switch happen BEFORE the wall rather than after.
+  /** Per-account LEARNED ceilings (Rust `accounts_ceilings`).
    *
-   *  Per-account rather than a single global threshold because that is the shape of the truth: two
-   *  accounts learn different ceilings, so a raw token count is not comparable across them. Omitting
-   *  this (or passing ceilings that are all null) leaves selection exactly as it was — lowest raw
-   *  usage, with `exhaustedUntil` as the reactive backstop. */
+   *  NO LONGER GATES AUTO-PICK. An account at or above {@link CEILING_AVOID_FRACTION} of its ceiling
+   *  used to be excluded here — the proactive "switch before the wall" half of rotation — but the
+   *  founder retired the learned-ceiling estimate as a driver (it fired "close to its limit" while
+   *  the real Anthropic figures were clear). Proactive avoidance is now {@link PickOptions.live}
+   *  (Anthropic's own number); the observed `exhaustedUntil` is the reactive backstop.
+   *
+   *  Still consumed for ONE thing: ranking the all-excluded FALLBACK (see `leastBad`), where a
+   *  genuinely rate-limited account should sort behind a merely near-ceiling one. Omitting it leaves
+   *  that fallback ranked by raw usage instead. */
   ceilings?: readonly Ceiling[];
   /** Ids of accounts that are actually `claude login`ed (see {@link signedInAccountIds}). When
    *  supplied and at least one listed account matches, auto-pick considers ONLY these. Omit (or pass
    *  a set matching no account) to skip the filter entirely — see the rationale on `pickAccount`. */
   signedInIds?: readonly string[];
   /** REAL per-account utilization from Anthropic. When supplied, this OUTRANKS the local token
-   *  tally for every account it covers — see {@link pickAccount}.
+   *  tally for every account it covers — see {@link pickAccount} — and, at/above
+   *  {@link LIVE_AVOID_PERCENT}, is the ONLY proactive exclusion (the learned-ceiling gate is gone).
    *
    *  It exists because the local tally and the truth can disagree completely, and did: an account
    *  reading 100% of its weekly limit server-side had a LOCAL tally of zero, because the tally is
    *  computed by scanning that account's own transcripts and this machine had run none of its work.
    *  Zero tokens is the most headroom there is, so the single most exhausted account on the machine
-   *  won auto-pick for every spawn. Omitting this leaves selection exactly as it was. */
+   *  won auto-pick for every spawn. Omitting this leaves selection exactly as it was.
+   *
+   *  WHEN A LIVE ROW IS MISSING (background cache not warmed yet, offline, 401, keychain declined),
+   *  there is NO proactive exclusion for that account — it is judged by lowest local tally with the
+   *  OBSERVED wall (`exhaustedUntil`) as the only backstop. The retired learned ceiling is NOT used
+   *  to fill that window on purpose: it is computed from the SAME local transcripts that read zero
+   *  for a fully-spent account on the founder's machine, so leaning on it here would reinstate the
+   *  exact unreliable estimate the founder removed. The observed wall is the reliable local signal. */
   live?: readonly LiveUsage[];
+  /** id → all account-ids sharing its LOGIN (see {@link loginSiblingIds}). When supplied, the live
+   *  exclusion is judged PER LOGIN (max real utilization across the group) rather than per config
+   *  dir, so a duplicate of an already-spent login whose OWN live fetch failed is still excluded —
+   *  and this matches the same per-login judgement `exhaustionOutlook` / `switchRecommendation` use,
+   *  so the spawn gate cannot disagree with them. Omit for plain per-dir behaviour. */
+  siblingIds?: ReadonlyMap<string, readonly string[]>;
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
 }
@@ -686,7 +870,7 @@ function partitionAccounts(
   usage: Usage[],
   opts: PickOptions = {},
 ): { eligible: Account[]; candidates: Account[] } {
-  const { nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now(), ceilings } = opts;
+  const { nearCap = DEFAULT_NEAR_CAP, signedInIds, now = Date.now() } = opts;
 
   // Signed-in accounts only — unless that would eliminate everything, in which case we keep the
   // full list so a spawn still happens (better a login prompt than a dead agent).
@@ -695,37 +879,38 @@ function partitionAccounts(
   const eligible = authed.length > 0 ? authed : accounts;
 
   const usageFor = usageLookup(usage);
-  const ceilingFor = ceilingLookup(ceilings);
   const isExhausted = (u: Usage) => usageExhausted(u, now);
-  // Two independent tests, and an account trips on EITHER.
+  // The static token cap, still defaulting to no cap at all (see DEFAULT_NEAR_CAP).
   //
-  // The static one is the historical behaviour, still defaulting to no cap at all. The learned one
-  // is the proactive gate: when Rust has enough limit episodes to know this account's ceiling, an
-  // account at >= 90% of it stops receiving new work. An account with no learned ceiling yet reads
-  // null and is simply not judged by it — never treated as 0% and never as 100%.
+  // THE LEARNED-CEILING GATE IS GONE. An account at >= CEILING_AVOID_FRACTION of its ESTIMATED
+  // ceiling used to be excluded here — the "stops taking new agents at 90%" behaviour the account
+  // card described. The founder retired that estimate as a driver: it fired "90% of its usual
+  // limit" on accounts whose REAL Anthropic session/weekly numbers were clear, steering new spawns
+  // off healthy accounts. Proactive avoidance is now driven by Anthropic's OWN number (`isLiveSpent`
+  // below), with the observed wall (`isExhausted`) as the reactive backstop — fact, not estimate.
   const isNearStaticCap = (u: Usage) =>
     u.tokens5h >= nearCap.tokens5h || u.tokens7d >= nearCap.tokens7d;
-  const isNearLearnedCeiling = (a: Account, u: Usage) => {
-    const f = ceilingFraction(u, ceilingFor(a));
-    return f != null && f >= CEILING_AVOID_FRACTION;
-  };
 
-  // ANTHROPIC'S OWN NUMBER, and it outranks every estimate above. The two token-based tests are
-  // computed from local transcripts, which is why they cannot see this case at all: an account whose
+  // ANTHROPIC'S OWN NUMBER — the real per-account utilization, and the source of truth for proactive
+  // avoidance now that the learned-ceiling estimate no longer gates. The token-based static cap is
+  // computed from local transcripts, which is why it cannot see this case at all: an account whose
   // work ran on another machine has a local tally of zero however spent it really is.
   //
   // `null` (window not reported, or no live row for this account) is NOT an exclusion — an
   // unreadable figure must never look like a full one, exactly as it must never look like an empty
   // one. It simply leaves the account to be judged by the tests above.
-  const liveFor = liveLookup(opts.live);
+  // Judged PER LOGIN when `siblingIds` is supplied (max real utilization across the login group), so
+  // a duplicate of a spent login whose own fetch failed is still excluded and this gate agrees with
+  // `exhaustionOutlook` / `switchRecommendation`. Absent it, this is plain per-dir.
+  const liveById = new Map((opts.live ?? []).map((l) => [l.id, l]));
   const isLiveSpent = (a: Account) => {
-    const p = liveWorstPercent(liveFor(a));
+    const p = loginLiveWorstPercent(a.id, liveById, opts.siblingIds);
     return p != null && p >= LIVE_AVOID_PERCENT;
   };
 
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
-    return !isExhausted(u) && !isNearStaticCap(u) && !isNearLearnedCeiling(a, u) && !isLiveSpent(a);
+    return !isExhausted(u) && !isNearStaticCap(u) && !isLiveSpent(a);
   });
   return { eligible, candidates };
 }
@@ -1144,7 +1329,11 @@ export function adoptionOutcome(
 
   for (const other of identities) {
     if (other.id === accountId) continue;
-    if (identityKey(other) !== key) continue;
+    // Same LOGIN and same ORGANIZATION — {@link accountsAreSame}, not a raw `identityKey` equality.
+    // A Team org and a Personal Max under one email share an `accountUuid` (so their keys match) but
+    // are DIFFERENT Anthropic accounts; refusing the second as a "duplicate" is the exact bug the
+    // founder hit. Org can only split a shared login, so a genuine two-dir duplicate is still caught.
+    if (!accountsAreSame(mine, other)) continue;
     const row = accounts.find((a) => a.id === other.id);
     return { kind: "duplicate", existingNickname: row?.nickname ?? other.email ?? "another account" };
   }

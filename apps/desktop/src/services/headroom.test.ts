@@ -73,21 +73,35 @@ describe("switchRecommendation", () => {
   const accounts = [acct("a"), acct("b"), acct("c")];
   const idents = [ident("a"), ident("b"), ident("c")];
 
+  // TRIGGER IS THE OBSERVED WALL, NOT THE ESTIMATE. A recommendation is made only when `from` has
+  // actually hit a rate limit (`exhaustedUntil` in the future). The learned-ceiling `warn` estimate
+  // no longer produces one (founder's call — see `switchRecommendation`). These cases still pin
+  // WHERE it recommends switching TO; `from` is exhausted so the recommendation exists to test that.
   it("recommends the account with the most headroom", () => {
-    const u = [usage("a", 90), usage("b", 50), usage("c", 10)];
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 50), usage("c", 10)];
     const c = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];
     const rec = switchRecommendation("a", accounts, u, c, idents, NOW);
     expect(rec?.from.id).toBe("a");
     expect(rec?.to.id).toBe("c");
-    expect(rec?.reason).toBe("approaching");
+    expect(rec?.reason).toBe("exhausted");
     expect(rec?.fraction).toBeCloseTo(0.9);
+  });
+
+  it("does NOT recommend off the learned-ceiling ESTIMATE alone (the retired proactive nudge)", () => {
+    // `a` is at 90% of its learned ceiling — the old "approaching" trigger — but has NOT hit a real
+    // wall. The estimate no longer drives a recommendation, so this is silence now. Pins the removal:
+    // restore the `warn` clause in `switchRecommendation` and this goes from null to a recommendation.
+    const u = [usage("a", 90), usage("b", 10)];
+    const c = [ceil("a", 100), ceil("b", 100)];
+    expect(switchRecommendation("a", accounts, u, c, idents, NOW)).toBeNull();
   });
 
   it("carries the CURRENT account's identity-change flag onto the recommendation", () => {
     // The ceiling itself is the guard: `ceiling_for_account` returns null while an identity change
     // leaves too few attributable samples, so a recommendation that HAS a fraction is already one
     // measured only against the current login. Nothing about the change needs to ride the wire.
-    const u = [usage("a", 90), usage("b", 10)];
+    // `a` is exhausted (the only trigger now); its ceiling still quantifies the recommendation.
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 10)];
     const c = [ceil("a", 100), ceil("b", 100)];
     const changed = [{ ...ident("a"), identityChanged: true }, ident("b"), ident("c")];
     const rec = switchRecommendation("a", accounts, u, c, changed, NOW);
@@ -102,8 +116,9 @@ describe("switchRecommendation", () => {
   });
 
   it("never recommends an account that isn't signed in", () => {
-    // Moving to a login prompt is not a fix. `c` has the most headroom but no identity.
-    const u = [usage("a", 90), usage("b", 50), usage("c", 0)];
+    // Moving to a login prompt is not a fix. `c` has the most headroom but no identity. `a` is
+    // exhausted so a recommendation is warranted.
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 50), usage("c", 0)];
     const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];
     const rec = switchRecommendation("a", accounts, u, c2, [ident("a"), ident("b"), ident("c", null)], NOW);
     expect(rec?.to.id).toBe("b");
@@ -125,9 +140,9 @@ describe("switchRecommendation", () => {
       ident("b"),
       { id: "c", email: eb, organization: null, accountUuid: ub },
     ];
-    const u = [usage("a", 90), usage("b", 50), usage("c", 1)];
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 50), usage("c", 1)];
     const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];
-    // `c` looks like the emptiest account in the world; it is the same quota as `a`.
+    // `a` hit a real wall; `c` looks like the emptiest account in the world but is the same quota.
     expect(switchRecommendation("a", accounts, u, c2, dup, NOW)?.to.id).toBe("b");
     // …and when the duplicate is the ONLY candidate, stay silent rather than offer a no-op.
     expect(switchRecommendation("a", [acct("a"), acct("c")], u, c2, dup, NOW)).toBeNull();
@@ -221,11 +236,21 @@ describe("switchRecommendation", () => {
     ).toBe("b");
   });
 
-  it("never recommends an account that is itself exhausted or warning", () => {
-    const u = [usage("a", 90), usage("b", 95), usage("c", 10, NOW + 60_000)];
+  it("never recommends an EXHAUSTED target, but a merely-warn one is now ELIGIBLE (ranked last)", () => {
+    // The learned-ceiling `warn` estimate no longer EXCLUDES a switch target — it only ranks it last
+    // (dropping the estimate-veto on the escape route). So with `a` walled: `b` is near its ceiling
+    // (warn) but not walled, `c` is exhausted. `c` is excluded on the observed wall; `b` is the only
+    // eligible target and IS recommended — the fleet is not stranded behind a real wall by a guess.
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 95), usage("c", 10, NOW + 60_000)];
     const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", 100)];
-    // b is warning, c is exhausted → nothing safe to move to.
-    expect(switchRecommendation("a", accounts, u, c2, idents, NOW)).toBeNull();
+    expect(switchRecommendation("a", accounts, u, c2, idents, NOW)?.to.id).toBe("b");
+    // When every alternative is itself EXHAUSTED (observed), there is nothing to move to → null.
+    const allWalled = [
+      usage("a", 90, NOW + 60_000),
+      usage("b", 95, NOW + 60_000),
+      usage("c", 10, NOW + 60_000),
+    ];
+    expect(switchRecommendation("a", accounts, allWalled, c2, idents, NOW)).toBeNull();
   });
 
   it("recommends a move when the current account has actually hit its limit", () => {
@@ -238,14 +263,63 @@ describe("switchRecommendation", () => {
   });
 
   it("prefers a quantified account over one with an unknown ceiling", () => {
-    const u = [usage("a", 90), usage("b", 20), usage("c", 1)];
-    // c is least-used but unmeasurable; b is known-comfortable. Prefer the one we can vouch for.
+    // `a` hit a real wall. c is least-used but unmeasurable; b is known-comfortable. Prefer the one
+    // we can vouch for.
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 20), usage("c", 1)];
     const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", null)];
     expect(switchRecommendation("a", accounts, u, c2, idents, NOW)?.to.id).toBe("b");
   });
 
+  it("EXCLUDES a target that is live-spent on Anthropic's own number (parity with the spawn gate)", () => {
+    // `a` hit a real wall; `b` has no wall but reads 99% on Anthropic's own number. `partitionAccounts`
+    // refuses `b` for a new spawn (`isLiveSpent`), so recommending/auto-switching onto it would wall
+    // the fleet immediately — and AC8 would already be calling `b` at-limit. With `b` the only
+    // alternative, the recommendation is null. Drop the live clause from the candidate filter and this
+    // returns `b`, contradicting the spawn gate.
+    const u = [usage("a", 5, NOW + 60_000), usage("b", 1)];
+    const c2 = [ceil("a", 100), ceil("b", 100)];
+    const live = [{ id: "b", fiveHourPercent: 99, sevenDayPercent: 10 }];
+    expect(switchRecommendation("a", [acct("a"), acct("b")], u, c2, [ident("a"), ident("b")], NOW, live)).toBeNull();
+    // Without the live signal `b` is a fine target — proving the exclusion above is the live clause,
+    // not something incidental to the fixture.
+    expect(
+      switchRecommendation("a", [acct("a"), acct("b")], u, c2, [ident("a"), ident("b")], NOW)?.to.id,
+    ).toBe("b");
+  });
+
+  it("judges a live-spent target PER LOGIN — a duplicate of a spent login is not an escape route", () => {
+    // `x` hit a real wall. `a` and `b` are two registrations of ONE login (shared uuid). Only `a` has
+    // a live row (99%); `b`'s fetch failed → no row. A quota belongs to the LOGIN, so `b` is just as
+    // spent as `a`, and `switchRecommendation` (which builds the login grouping and judges live per
+    // login) excludes BOTH → null. The per-DIR filter would read `b` as unknown and offer it, then
+    // auto-switch would wall the fleet on the shared quota. `null` vs `b` is the discriminator, and it
+    // is the same per-login judgement the spawn gate and AC8 use, so the three cannot disagree.
+    const accounts3 = [acct("x"), acct("a"), acct("b")];
+    const idents3: Identity[] = [
+      ident("x"),
+      { id: "a", email: "dup@x.com", organization: null, accountUuid: "u-dup" },
+      { id: "b", email: "dup@x.com", organization: null, accountUuid: "u-dup" },
+    ];
+    const u = [usage("x", 5, NOW + 60_000), usage("a", 1), usage("b", 1)];
+    const c2 = [ceil("x", 100), ceil("a", 100), ceil("b", 100)];
+    const live = [{ id: "a", fiveHourPercent: 99, sevenDayPercent: 10 }]; // only `a` reported
+    expect(switchRecommendation("x", accounts3, u, c2, idents3, NOW, live)).toBeNull();
+  });
+
+  it("prefers an UNKNOWN-ceiling target over a near-ceiling (warn) one — tiered ranking", () => {
+    // `a` hit a real wall. `b` is at 0.9 of its LEARNED ceiling (warn, admitted as a last-resort
+    // target now), `c` has NO learned ceiling and zero usage (a freshly-added account). The unknown,
+    // untouched account is the better bet than one the estimate says is near its wall, so `c` wins.
+    // The old flat rank (fraction, else 1+used/(used+1)) scored `b` at 0.9 and `c` at ~1.0, preferring
+    // the near-ceiling `b`; the tiered rank puts warn behind unknown.
+    const u = [usage("a", 90, NOW + 60_000), usage("b", 90), usage("c", 0)];
+    const c2 = [ceil("a", 100), ceil("b", 100), ceil("c", null)];
+    expect(switchRecommendation("a", accounts, u, c2, idents, NOW)?.to.id).toBe("c");
+  });
+
   it("returns null when there is nowhere to go", () => {
-    const u = [usage("a", 90)];
+    // `a` hit a real wall but is the only account → no candidate → null.
+    const u = [usage("a", 90, NOW + 60_000)];
     const c2 = [ceil("a", 100)];
     expect(switchRecommendation("a", [acct("a")], u, c2, [ident("a")], NOW)).toBeNull();
   });
@@ -270,76 +344,66 @@ describe("describeRecommendation", () => {
   const TO = acct("b", { nickname: "Gmail" });
   const signedIn = displayFor([ident("a", "drodio@storytell.ai"), ident("b", "drodio@gmail.com")]);
 
-  it("quantifies an approaching limit, naming both accounts by their verified email", () => {
-    const rec = { from: FROM, to: TO, fraction: 0.87, reason: "approaching" as const };
-    expect(describeRecommendation(rec, signedIn)).toBe(
-      "drodio@storytell.ai is 87% of its usual limit. Switch to drodio@gmail.com before it runs out.",
-    );
-  });
-
-  it("states a reached limit plainly", () => {
+  it("states a reached limit plainly, naming both accounts by their verified email", () => {
     const rec = { from: FROM, to: TO, fraction: null, reason: "exhausted" as const };
     expect(describeRecommendation(rec, signedIn)).toBe(
       "drodio@storytell.ai has hit its limit. Switch to drodio@gmail.com to keep working.",
     );
   });
 
-  it("NEVER names an account by a nickname it cannot verify", () => {
-    // The banner asks the user to move work between real Anthropic logins. Naming an unverified
-    // account "Storytell" asserts a login nobody read. Assert the nicknames are ABSENT — asserting
-    // only that the not-signed-in phrasing appears would pass even if the nickname came along too.
-    const rec = { from: FROM, to: TO, fraction: 0.9, reason: "approaching" as const };
-    const out = describeRecommendation(rec, displayFor([]));
-    expect(out).not.toContain("Storytell");
-    expect(out).not.toContain("Gmail");
-    expect(out).toBe(
-      "An account that isn't signed in is 90% of its usual limit. " +
-        "Switch to an account that isn't signed in before it runs out.",
-    );
-  });
-
-  it("never claims a surviving estimate is partly someone else's (knightwatch probe 4)", () => {
-    // There USED to be an identity caveat here. It was false wherever it could appear: it required
-    // `fraction != null`, i.e. a ceiling to divide by — and `ceiling_for_account` cuts every
-    // pre-takeover and boundary-crossing episode BEFORE returning a non-null ceiling. A number that
-    // survives to reach this banner therefore contains only the current login's samples. The reset
-    // already carries the doubt by yielding `null` while the evidence is insufficient; saying it
-    // again in prose said something untrue about the user's own data.
-    // The flag is CARRIED but IGNORED — and carrying it is what makes this test able to fail.
-    // My first version omitted `identityChanged` entirely, so the pre-fix formatter (which appended
-    // the caveat only when `rec.identityChanged && rec.fraction != null`) returned the same plain
-    // string: the assertion held against the very code it was written to pin. Vacuous, and
-    // knightwatch caught it. Setting it true is the discriminator — the old formatter appends here,
-    // the new one does not. The cast is deliberate: the field is gone from the type, and this
-    // asserts the FORMATTER ignores it even if a stale producer still sends it over the wire.
+  it("NEVER quotes a '% of its usual limit' estimate, even when a fraction is present", () => {
+    // The estimate wording is GONE with the learned-ceiling nudge. `describeRecommendation` now
+    // returns the observed-wall sentence regardless of `reason`/`fraction`, so a stale producer that
+    // still sends a fraction (or the legacy "approaching" reason) can no longer make it quote a
+    // percentage. Reintroduce the estimate branch and this goes red.
     const rec = {
       from: FROM,
       to: TO,
       fraction: 0.87,
       reason: "approaching" as const,
-      identityChanged: true,
     } as unknown as SwitchRecommendation;
-    const text = describeRecommendation(rec, signedIn);
-    expect(text).toBe(
-      "drodio@storytell.ai is 87% of its usual limit. Switch to drodio@gmail.com before it runs out.",
+    const out = describeRecommendation(rec, signedIn);
+    expect(out).toBe(
+      "drodio@storytell.ai has hit its limit. Switch to drodio@gmail.com to keep working.",
     );
-    expect(text).not.toMatch(/isn't its own|rough|different Claude sign-in/i);
+    expect(out).not.toContain("usual limit");
+    expect(out).not.toContain("87%");
   });
 
   it("NEVER names an account by a nickname it cannot verify", () => {
     // The banner asks the user to move work between real Anthropic logins. Naming an unverified
     // account "Storytell" asserts a login nobody read. Assert the nicknames are ABSENT — asserting
     // only that the not-signed-in phrasing appears would pass even if the nickname came along too.
-    const rec = { from: FROM, to: TO, fraction: 0.9, reason: "approaching" as const };
+    const rec = { from: FROM, to: TO, fraction: null, reason: "exhausted" as const };
     const out = describeRecommendation(rec, displayFor([]));
     expect(out).not.toContain("Storytell");
     expect(out).not.toContain("Gmail");
     expect(out).toBe(
-      "An account that isn't signed in is 90% of its usual limit. " +
-        "Switch to an account that isn't signed in before it runs out.",
+      "An account that isn't signed in has hit its limit. " +
+        "Switch to an account that isn't signed in to keep working.",
     );
   });
 
+  it("never claims a surviving estimate is partly someone else's (knightwatch probe 4)", () => {
+    // There USED to be an identity caveat here, appended when `rec.identityChanged && fraction`.
+    // The whole estimate branch is gone, so the formatter can never append it — but the flag is
+    // still CARRIED and IGNORED, and setting it true is the discriminator that makes this able to
+    // fail: a formatter that reads it (old or reintroduced) would append the caveat, the current one
+    // returns the plain observed-wall sentence. The cast is deliberate — the field is gone from the
+    // type, so this asserts the formatter ignores it even if a stale producer sends it.
+    const rec = {
+      from: FROM,
+      to: TO,
+      fraction: 0.87,
+      reason: "exhausted" as const,
+      identityChanged: true,
+    } as unknown as SwitchRecommendation;
+    const text = describeRecommendation(rec, signedIn);
+    expect(text).toBe(
+      "drodio@storytell.ai has hit its limit. Switch to drodio@gmail.com to keep working.",
+    );
+    expect(text).not.toMatch(/isn't its own|rough|different Claude sign-in/i);
+  });
 });
 
 describe("rotationReadiness", () => {
@@ -503,27 +567,60 @@ describe("exhaustionOutlook (AC8)", () => {
     expect(got.earliestReset).toBe(NOW + 60_000);
   });
 
-  it("counts an account over the ACT line as at its limit even with no observed rate limit", () => {
-    // This is the proactive half: auto-pick has already stopped sending it work, so the pool is
-    // empty of healthy candidates whether or not the wall was actually hit.
+  it("does NOT count an account over its estimated ceiling as at-limit without an observed wall", () => {
+    // OBSERVED-ONLY now. An account over the learned-ceiling estimate but with no real rate-limit
+    // event is NOT "at its limit" — the estimate was retired as a driver (it read "90% of its usual
+    // limit" while the real Anthropic numbers were clear). Reintroduce the `fraction >= ACT` clause
+    // and this flips to true, which is exactly the behaviour that was removed.
     const got = exhaustionOutlook(["a"], [usage("a", OVER_ACT)], [ceil("a", CEIL)], NOW);
-    expect(got.allAtLimit).toBe(true);
-    // ...and NO time is invented for an account that never reported one.
+    expect(got.allAtLimit).toBe(false);
     expect(got.earliestReset).toBeNull();
   });
 
-  it("uses the ACT line (0.9), NOT the WARN line (0.8)", () => {
-    // The two thresholds are deliberately different numbers and must not collapse: at 0.8 the human
-    // is told an account is getting close; at 0.9 Sparkle stops sending it new work. An account
-    // sitting between them is warn-worthy but is still receiving spawns, so "all accounts are at
-    // their limit" would be false about it.
-    expect(WARN_FRACTION).toBeLessThan(CEILING_AVOID_FRACTION);
-    const between = ((WARN_FRACTION + CEILING_AVOID_FRACTION) / 2) * CEIL;
-    expect(exhaustionOutlook(["a"], [usage("a", between)], [ceil("a", CEIL)], NOW).allAtLimit).toBe(
+  it("counts REAL Anthropic utilization at/above LIVE_AVOID_PERCENT as at-limit (matches the spawn gate)", () => {
+    // The banner must track the SAME signal `partitionAccounts` excludes on. An account at 99% of its
+    // real Anthropic limit with NO rate-limit event yet is out of room to auto-pick, so it counts.
+    const live = [{ id: "a", fiveHourPercent: 99, sevenDayPercent: 10 }];
+    const got = exhaustionOutlook(["a"], [usage("a", 1)], [ceil("a", CEIL)], NOW, live);
+    expect(got.allAtLimit).toBe(true);
+    // ...but it has no observed rate-limit event, so there is NO reset instant to quote.
+    expect(got.earliestReset).toBeNull();
+    // Just under the line → still has room → not all-at-limit. Remove the live clause from
+    // exhaustionOutlook and the first assertion flips to false (out of step with the gate again).
+    const under = [{ id: "a", fiveHourPercent: 94, sevenDayPercent: 10 }];
+    expect(exhaustionOutlook(["a"], [usage("a", 1)], [ceil("a", CEIL)], NOW, under).allAtLimit).toBe(
       false,
     );
+  });
+
+  it("judges the live signal PER LOGIN, matching switchRecommendation and the spawn gate", () => {
+    // usable = [x, a] (the reps). `x` walled; `a` has NO live row but its login twin `b` reads 99%.
+    // Per-login `a`'s quota is spent, so the pool IS all-at-limit — the SAME verdict the switch and
+    // spawn paths reach for `a`/`b`. The per-DIR reading (no siblingIds) would call `a` healthy and
+    // the banner would disagree with them; the sibling map is the discriminator.
+    const siblingIds = new Map([
+      ["a", ["a", "b"]],
+      ["b", ["a", "b"]],
+    ]);
+    const usableIds = ["x", "a"];
+    const u = [usage("x", 5, NOW + 60_000), usage("a", 1)];
+    const c2 = [ceil("x", CEIL), ceil("a", CEIL)];
+    const live = [{ id: "b", fiveHourPercent: 99, sevenDayPercent: 10 }]; // only the TWIN reported
+    expect(exhaustionOutlook(usableIds, u, c2, NOW, live, siblingIds).allAtLimit).toBe(true);
+    expect(exhaustionOutlook(usableIds, u, c2, NOW, live).allAtLimit).toBe(false); // per-dir
+  });
+
+  it("all-at-limit is decided by the OBSERVED wall or REAL usage, not the learned-ceiling estimate", () => {
+    // An account well over its ESTIMATED ceiling still does not make the pool "all at their limit";
+    // only an account that actually hit a wall (or reads spent on Anthropic's own number) does. The
+    // paired case (same account, now walled) pins that the observed signal DOES flip it — so the
+    // false above is about the estimate, not an unconditional false.
     expect(
       exhaustionOutlook(["a"], [usage("a", OVER_ACT)], [ceil("a", CEIL)], NOW).allAtLimit,
+    ).toBe(false);
+    expect(
+      exhaustionOutlook(["a"], [usage("a", OVER_ACT, NOW + 60_000)], [ceil("a", CEIL)], NOW)
+        .allAtLimit,
     ).toBe(true);
   });
 

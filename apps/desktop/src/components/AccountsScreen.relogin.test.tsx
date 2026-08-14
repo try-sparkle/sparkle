@@ -36,11 +36,13 @@ function setIdentity(ids: Identity[], id: string, over: Partial<Identity>) {
 function harness(opts: {
   others?: { account: Account; identity: Identity }[];
   onLoginEffect: (ids: Identity[]) => void;
+  /** Override slot A's STARTING identity (e.g. to give it a known organization). */
+  slotAOver?: Partial<Identity>;
 }) {
   const slotA = acct("slotA", { nickname: "Work" });
   const accounts: Account[] = [slotA, ...(opts.others ?? []).map((o) => o.account)];
   const identities: Identity[] = [
-    { id: "slotA", email: "work@example.com", organization: null, accountUuid: "u-work" },
+    { id: "slotA", email: "work@example.com", organization: null, accountUuid: "u-work", ...opts.slotAOver },
     ...(opts.others ?? []).map((o) => o.identity),
   ];
   const removeAccount = vi.fn(async (id: string) => {
@@ -98,6 +100,73 @@ describe("AccountsScreen — identity-keyed re-login reconciliation", () => {
     expect(removeAccount).not.toHaveBeenCalled();
     expect(screen.queryByText(/no longer in your accounts/)).toBeNull();
     expect(screen.queryByText(/Switch your browser to the account you meant/)).toBeNull();
+  });
+
+  it("a token refresh that reads a NULL org does NOT false-alarm (the O1 group-collapse scenario)", async () => {
+    // THE scenario the org-blind revert exists to protect, and the one a membership-delta heuristic
+    // gets wrong: slot A holds "Amforge Team" and slot B holds "Amforge (Personal)" under ONE uuid, so
+    // `duplicateAccountGroups` SPLITS them (two known orgs → two singletons → not a duplicate). An
+    // ordinary token refresh on A that reads `organization: null` collapses `knownOrgs` to 1, which
+    // makes the group WHOLE again → a `becameNewDuplicate` membership-delta clause (the reverted
+    // round-6 heuristic) reads that as a new duplicate and fires the false "Switch your browser to the
+    // account you meant" alarm on an account that did not change. Org-blind Case 1 (key equality)
+    // stays silent, as it must. Re-add the `becameNewDuplicate` clause and this goes RED — the guard
+    // the prose comment claims, now enforced.
+    const { deps, onLogin, removeAccount } = harness({
+      slotAOver: { organization: "Amforge Team" },
+      others: [
+        {
+          account: acct("slotB", { nickname: "Personal" }),
+          identity: {
+            id: "slotB",
+            email: "work@example.com",
+            organization: "Amforge (Personal)",
+            accountUuid: "u-work",
+          },
+        },
+      ],
+      onLoginEffect: (ids) =>
+        setIdentity(ids, "slotA", {
+          email: "work@example.com",
+          accountUuid: "u-work",
+          organization: null, // the collapse: A's org read goes unknown on a routine refresh
+        }),
+    });
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await reloginSlotA();
+
+    await waitFor(() => expect(onLogin).toHaveBeenCalled());
+    await waitFor(() => expect(deps.getIdentities).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText(/Switch your browser to the account you meant/)).toBeNull();
+    expect(screen.queryByText(/no longer in your accounts/)).toBeNull();
+    expect(removeAccount).not.toHaveBeenCalled();
+  });
+
+  it("an org RENAME on a token refresh never false-alarms — Case 1 is org-blind on the key", async () => {
+    // The ordinary case org-blindness protects: slot A is the SAME account across the re-login (same
+    // email + uuid), and only its `organizationName` changed — an org rename in the Anthropic console
+    // that this dir's cache had not yet picked up. `organizationName` is a mutable display string, so
+    // gating Case 1 on `accountsAreSame` would read the rename as a different account and fire the
+    // "your account is no longer in your accounts, re-add it" alarm (whose remedy creates a duplicate).
+    // Org-blind Case 1 swallows it silently, as it must. Swap line 970 back to `accountsAreSame` and
+    // this goes red — the guarantee the code comment claims, now enforced.
+    const { deps, onLogin, removeAccount } = harness({
+      slotAOver: { organization: "Amforge Team" },
+      onLoginEffect: (ids) =>
+        setIdentity(ids, "slotA", {
+          email: "work@example.com",
+          accountUuid: "u-work",
+          organization: "Amforge Corp", // a rename of the SAME account, not a different one
+        }),
+    });
+    render(<AccountsScreen onLogin={onLogin} deps={deps} />);
+    await reloginSlotA();
+
+    await waitFor(() => expect(onLogin).toHaveBeenCalled());
+    await waitFor(() => expect(deps.getIdentities).toHaveBeenCalledTimes(3));
+    expect(screen.queryByText(/no longer in your accounts/)).toBeNull();
+    expect(screen.queryByText(/Switch your browser to the account you meant/)).toBeNull();
+    expect(removeAccount).not.toHaveBeenCalled();
   });
 
   it("re-login to an identity ANOTHER slot holds → loud duplicate warning, slot NOT deleted", async () => {
