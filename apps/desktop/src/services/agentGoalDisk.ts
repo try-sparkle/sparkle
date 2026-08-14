@@ -28,13 +28,35 @@
 // defensively. Nothing here needs to UNDERSTAND the vocabulary — it only has to write it down.
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 
-import { type AgentGoal, goalStateOf } from "../engine/agentGoal";
+import { type AgentGoal, escalationQuotesStaleText, goalStateOf } from "../engine/agentGoal";
 import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
 import type { Project } from "../types";
 import { ownsProjectInThisWindow } from "./goalContinuationRunner";
 
-/** Bump ONLY on a breaking change — the reader refuses to guess at a version it does not know. */
+/** Bump ONLY on a BREAKING change — a renamed field, a retyped one, a changed meaning.
+ *
+ *  ⚠️ AN ADDITIVE FIELD SET IS NOT A BUMP, and the asymmetry that makes that true is worth stating
+ *  because the instinct is the other way. The writer is ONE app; the reader is a per-worktree
+ *  checkout of `scripts/session-goal-brief.sh` (`.claude/settings.json` runs it from
+ *  `${CLAUDE_PROJECT_DIR}`), so at any moment ~20 agent worktrees are running whatever copy their
+ *  branch was cut with — days behind this file. Bumping for `escalationQuotedGoal` +
+ *  `escalationStale` therefore did not buy an honest refusal; it turned OFF the whole wake-up brief
+ *  — goal text, PR state, PRD pointer — on every one of those worktrees, to withhold two fields
+ *  they never read. The bump was reverted for exactly that reason.
+ *
+ *  Absence already degrades correctly in BOTH directions, which is what makes additive safe: an old
+ *  reader meeting a new key ignores it, and a new reader meeting an old record reads the missing key
+ *  as "cannot tell" (the shell hook's `flat` → `""` → not `"true"`; this file's `?? null`).
+ *
+ *  ⚠️ AND A BUMP CANNOT RESCUE A BREAKING CHANGE EITHER — do not read the paragraph above as "bump
+ *  when it really is breaking". The gate is now DECLARATIVE in new readers (they read the record and
+ *  say the reading may be partial), while every reader ALREADY IN THE FIELD still hard-refuses on a
+ *  version it does not know. So bumping for a breaking change buys nothing where you want it and
+ *  reproduces the fleet-wide blackout where you do not — the softened gate only takes effect once
+ *  every worktree's checkout has caught up, which is the very propagation lag that caused the
+ *  incident. A breaking change must therefore be made NON-BREAKING AT THE FIELD LEVEL: add a new
+ *  key and leave the old one meaning exactly what it meant, until no reader in the field reads it. */
 export const GOAL_RECORD_SCHEMA_VERSION = 1;
 
 /** Trailing-debounce window for the record write.
@@ -73,6 +95,22 @@ export interface AgentGoalRecordGoal {
   continues: number;
   totalContinues: number;
   escalationReason: string | null;
+  /** The goal text {@link AgentGoalRecordGoal.escalationReason} QUOTES, when that is no longer the
+   *  goal above it — otherwise `null`.
+   *
+   *  ⚠️ THIS RECORD IS READ BACK TO A WAKING AGENT AS ITS BRIEF, which is what makes the pair worth
+   *  carrying. The escalation sentence embeds the goal text at the instant auto-continue gave up and
+   *  is never regenerated, so `text` and `escalationReason` here can describe two different
+   *  objectives — and the agent reads its own stale sentence as a live statement of what it is stuck
+   *  on. That is the same frozen-snapshot failure the roster and the card now mark; this is the
+   *  third surface, and the only one whose reader is the agent itself. */
+  escalationQuotedGoal: string | null;
+  /** Is {@link AgentGoalRecordGoal.escalationReason} quoting a goal the agent no longer holds? The
+   *  VERDICT, carried beside the text so the shell hook that renders this brief does not have to
+   *  re-derive it with a string comparison. `false` when there is no escalation at all, and `false`
+   *  — never `true` — when the record predates the quote being recorded, because "cannot tell" must
+   *  not present as "stale". */
+  escalationStale: boolean;
   /** The verification KIND alone (`"landed" | "command" | "human"`), not the `GoalVerify` object.
    *  The frozen contract writes a bare string, and a `command` check's `cmd` is deliberately NOT
    *  mirrored: this file is read back to a waking agent as a brief, and a stale command replayed as
@@ -138,6 +176,10 @@ export function buildAgentGoalRecord(args: {
       continues: goal.continues,
       totalContinues: goal.totalContinues,
       escalationReason: goal.escalationReason ?? null,
+      // Both derived from the ENGINE's own predicate rather than compared here, so this file cannot
+      // drift from what the roster and the card say about the same goal.
+      escalationQuotedGoal: escalationQuotesStaleText(goal) ? (goal.escalatedGoalText ?? null) : null,
+      escalationStale: escalationQuotesStaleText(goal),
       verify: goal.verify?.kind ?? null,
     },
   };

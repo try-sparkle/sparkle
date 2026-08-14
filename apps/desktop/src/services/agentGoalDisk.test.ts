@@ -231,6 +231,70 @@ describe("buildAgentGoalRecord — the frozen contract", () => {
     expect(record.goal.state).toBe("escalated");
     expect(record.goal.escalationReason).toBe("auto-continue gave up");
   });
+
+  // ── THE STALE-QUOTE VERDICT ───────────────────────────────────────────────────────────────────
+  // These three drive the two `escalationQuotesStaleText` expressions in the writer. Without them
+  // both could be replaced by hardcoded `null`/`false` with the suite still green — the canonical
+  // fixture pins exactly that pair of values, so it is a control and never a positive case. The
+  // shell suite cannot stand in for this: it feeds the READER a hand-built record, so it never
+  // executes these lines.
+  //
+  // `escalatedGoalText` is the goal text frozen into `escalationReason` at the instant
+  // auto-continue gave up. When the goal has moved on since, the sentence in the brief is about a
+  // problem the agent may have finished two goals ago.
+  it("reports a stale verdict and NAMES the earlier goal when the escalation has been outlived", () => {
+    const record = buildAgentGoalRecord({
+      agentId: "a1",
+      agentName: "A",
+      worktree: null,
+      branch: null,
+      goal: goalOf({
+        escalatedAt: NOW - 1,
+        escalationReason: 'still unmet: "ship the v2 record"',
+        escalatedGoalText: "ship the v2 record",
+      }),
+      now: NOW,
+    });
+    expect(record.goal.escalationStale).toBe(true);
+    expect(record.goal.escalationQuotedGoal).toBe("ship the v2 record");
+    // The CURRENT goal rides along unchanged — the brief shows both, and a writer that overwrote
+    // one with the other would satisfy the two assertions above on their own.
+    expect(record.goal.text).toBe(FIXTURE.goal.text);
+  });
+
+  it("reports NOT stale when the escalation quotes the goal the agent still holds", () => {
+    const record = buildAgentGoalRecord({
+      agentId: "a1",
+      agentName: "A",
+      worktree: null,
+      branch: null,
+      goal: goalOf({
+        escalatedAt: NOW - 1,
+        escalationReason: "the build never went green",
+        escalatedGoalText: FIXTURE.goal.text,
+      }),
+      now: NOW,
+    });
+    expect(record.goal.escalationStale).toBe(false);
+    // NULL, not the goal text. A quoted goal that equals the current one would render as a warning
+    // naming the goal the agent is looking at, which is worse than no warning at all.
+    expect(record.goal.escalationQuotedGoal).toBeNull();
+  });
+
+  it("reports NOT stale for a legacy escalation that recorded no quoted goal", () => {
+    // Every escalation persisted before `escalatedGoalText` existed. Absence is CANNOT TELL, and
+    // presenting cannot-tell as stale would discredit the marker across the whole installed base.
+    const record = buildAgentGoalRecord({
+      agentId: "a1",
+      agentName: "A",
+      worktree: null,
+      branch: null,
+      goal: goalOf({ escalatedAt: NOW - 1, escalationReason: "auto-continue gave up" }),
+      now: NOW,
+    });
+    expect(record.goal.escalationStale).toBe(false);
+    expect(record.goal.escalationQuotedGoal).toBeNull();
+  });
 });
 
 describe("syncAgentGoalRecords — the mirror", () => {
