@@ -60,8 +60,12 @@ const NAV_TIMEOUT: Duration = Duration::from_secs(10);
 const CDP_CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long to wait for `Page.frameNavigated` after a `net::ERR_ABORTED` result, before deciding
 /// nothing is going to commit. Short, not the full `NAV_TIMEOUT`: a racing redirect that IS going
-/// to commit does so on response headers, not on `load` — see `open_page`. (roborev 64133)
-const ABORT_RECOMMIT_WAIT: Duration = Duration::from_secs(1);
+/// to commit does so on response headers, not on `load` — see `open_page`. 2s rather than 1s:
+/// this covers the response headers for a REDIRECT TARGET, which can be a slower origin or a
+/// cold-start route, not just the loopback dev server itself — a bound too tight here reads as a
+/// false refusal on a perfectly good preview URL. Still ~5x faster than the `NAV_TIMEOUT` a true
+/// abort used to cost. (roborev 64133, 64142)
+const ABORT_RECOMMIT_WAIT: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------------------------
 // Wire shapes
@@ -510,11 +514,24 @@ fn open_page(session: &mut CdpSession, url: &str) -> Result<String, String> {
         }
         Some("net::ERR_ABORTED") => {
             // A racing client-side redirect commits FAST — on response headers, well before
-            // `load` fires — so this waits only a SHORT window, not the full nav budget. A true
-            // abort (a download, a 204) can never fire ANY frame event, and waiting the full
-            // `NAV_TIMEOUT` for it would hang every failing preview URL for ~10s before refusing
-            // — the exact regression this replaces. (roborev 64133)
-            let _ = session.wait_for_event("Page.frameNavigated", &session_id, ABORT_RECOMMIT_WAIT);
+            // `load` fires — so COMMIT is detected with only a SHORT window, not the full nav
+            // budget. A true abort (a download, a 204) can never fire ANY frame event, and
+            // waiting the full `NAV_TIMEOUT` for it would hang every failing preview URL for ~10s
+            // before refusing — the regression roborev 64133 fixed. (roborev 64133, 64142)
+            if session.wait_for_event("Page.frameNavigated", &session_id, ABORT_RECOMMIT_WAIT).is_ok() {
+                // A document committed — give it the SAME best-effort load wait every successful
+                // navigation gets below. Without this, a redirect-racing capture ran immediately
+                // after commit, on a document that had parsed nothing: an empty screenshot or a
+                // zero-match DOM query, reported `Ok` with no signal — exactly the "blank capture"
+                // failure this whole `errorText` guard exists to prevent (roborev 64142, the
+                // regression the 1s latency fix introduced on the path it was trying to preserve).
+                let remaining = nav_deadline.saturating_duration_since(Instant::now());
+                let _ = session.wait_for_event("Page.loadEventFired", &session_id, remaining);
+            }
+            // Else: nothing committed within the short window — `href` below will still read
+            // `about:blank` (or fail to read at all) and `nav_verdict` reports the refusal. No
+            // further waiting: a true abort can never fire `frameNavigated`, so there is nothing
+            // left to wait FOR.
         }
         Some(_) => {} // a real failure — nav_verdict below reports it immediately, no wait needed
     }
@@ -1019,12 +1036,17 @@ mod tests {
         let err = capture_screenshot_blocking(&server.url()).unwrap_err();
         assert!(err.contains("net::ERR_ABORTED"), "got: {err}");
         assert!(err.contains("no document committed"), "got: {err}");
-        // Must fail FAST — a true abort can never fire `Page.loadEventFired`, so waiting the full
+        // Must fail FAST — a true abort can never fire `Page.frameNavigated`, so waiting the full
         // `NAV_TIMEOUT` (10s) for it would hang every failing preview URL that long before
-        // refusing. Bounded by `ABORT_RECOMMIT_WAIT` (1s) plus generous slack for browser launch.
-        // (roborev 64133)
+        // refusing. The bound is deliberately loose: `started` includes `launch_browser()` +
+        // `wait_for_debugger` (a Chromium cold start `LAUNCH_TIMEOUT` allows up to 10s for, though
+        // the module header estimates ~1s in practice), not just the navigation itself — a tight
+        // bound here would read ordinary CI machine load as a latency regression. 8s still
+        // excludes the ~10s+ regression this guards against with real margin, since the fixed
+        // navigation cost is now `ABORT_RECOMMIT_WAIT` (2s) rather than `NAV_TIMEOUT` (10s).
+        // (roborev 64133, 64142)
         assert!(
-            started.elapsed() < Duration::from_secs(5),
+            started.elapsed() < Duration::from_secs(8),
             "took {:?} — the aborted-no-commit path must not wait the full NAV_TIMEOUT",
             started.elapsed()
         );
