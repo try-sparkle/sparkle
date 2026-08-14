@@ -21,7 +21,12 @@ vi.mock("../pty", () => ({
 vi.mock("./terminalScrollback", () => ({ getAgentScrollback: () => screen.text }));
 vi.mock("./trialMeter", () => ({ trialSendAllowed: () => true, recordTrialSend: vi.fn() }));
 
-import { answersLivePicker, isTerseAnswer, liveOptionsFor } from "./conciergeDispatch";
+import {
+  answersLivePicker,
+  isTerseAnswer,
+  liveOptionsFor,
+  matchAnswerToOption,
+} from "./conciergeDispatch";
 import { attachedPayload } from "./conciergeAttach";
 import type { Attachment } from "../components/composer/attachments";
 
@@ -31,8 +36,10 @@ import type { Attachment } from "../components/composer/attachments";
 /** A y/n prompt. Detected as Approve/Deny with `y\n` / `n\n` values, so the yes/no FAMILY arm
  *  matches: "Yes" answers it. */
 const YN = "Do you want to continue? (y/n) ";
-/** A Claude Code numbered picker. Its labels are "1 · Yes" etc., so a bare "Yes" matches nothing
- *  (deliberately — see `isAffirmative`) and only the option NUMBER answers it. */
+/** A Claude Code numbered picker. Its labels carry the detector's own ordinal — "1 · Yes" — which
+ *  `isAffirmative` strips before testing, so both the option NUMBER and a whole-phrase yes answer
+ *  it (bead sparkle-voudj7; before that fix only the number did, which is what left the BLOCKED
+ *  row's Approve button unable to answer a permission prompt). */
 const NUMBERED = [
   "Bash command",
   "  rm -rf build/",
@@ -68,13 +75,40 @@ describe("answersLivePicker", () => {
     expect(answersLivePicker("ag1", "2")).toBe(true);
   });
 
-  // Mirrors `matchAnswerToOption`'s deliberate refusal: a numbered picker's labels are "1 · Yes",
-  // and `isAffirmative` does not match them, so a bare "Yes" is genuinely ambiguous there. The
-  // predicate must agree — claiming otherwise would strip the attachments off a message the
-  // dispatcher is about to refuse anyway.
-  it("is FALSE for a bare yes against a NUMBERED picker, matching the dispatcher", () => {
+  // ══ REVERSED, BECAUSE IT WAS PINNING A DEFECT (bead sparkle-voudj7) ═════════════════════════
+  // This row used to assert FALSE and called that "deliberate": a numbered picker's labels are
+  // "1 · Yes", `isAffirmative` tested `^yes\b` against the WHOLE label including the detector's own
+  // ordinal, so nothing matched. But `detectClaudeCodePicker` is the only thing that ever produces
+  // these labels, and it ALWAYS prefixes them — so the `^yes\b` arm could not fire on the single
+  // most common picker in the app, and the fixtures that "proved" it worked were hand-built as
+  // `{ label: "Yes" }`, a shape production cannot emit.
+  //
+  // What made it expensive rather than merely untidy: the BLOCKED row's Approve button sends the
+  // literal word "approve", a `YES_WORDS` member, so it fell through to `ambiguous-picker` on
+  // exactly the dialogs it exists to answer. `isAffirmative` now strips the detector's ordinal, so
+  // a whole-phrase yes answers a numbered picker the way a human reading it would expect.
+  it("is TRUE for a bare yes against a NUMBERED picker, matching the dispatcher", () => {
     screen.text = NUMBERED;
-    expect(answersLivePicker("ag1", "Yes")).toBe(false);
+    expect(answersLivePicker("ag1", "Yes")).toBe(true);
+  });
+
+  // …AND IT PRESSES THE NARROW ONE. This fixture offers two affirmatives — "1 · Yes" and
+  // "2 · Yes, and don't ask again" — and they are not interchangeable: the second grants standing
+  // permission for every later invocation. A yes-family answer must never be able to spend that.
+  it("presses the bare Yes, never 'Yes, and don't ask again'", () => {
+    screen.text = NUMBERED;
+    const opts = liveOptionsFor("ag1");
+    expect(opts.map((o) => o.label)).toEqual([
+      "1 · Yes",
+      "2 · Yes, and don't ask again",
+      "3 · No, and tell Claude what to do",
+    ]);
+    expect(matchAnswerToOption("yes", opts)?.value).toBe("1\n");
+    expect(matchAnswerToOption("approve", opts)?.value).toBe("1\n");
+    // Order is not what protects this: reversing the two affirmatives must still pick the bare one.
+    expect(matchAnswerToOption("yes", [opts[1]!, opts[0]!, opts[2]!])?.value).toBe("1\n");
+    // And the deny family still reaches the negative option through the same ordinal strip.
+    expect(matchAnswerToOption("no", opts)?.value).toBe("3\n");
   });
 
   // The dispatcher refuses an INSTRUCTION that merely opens with a yes word, because collapsing

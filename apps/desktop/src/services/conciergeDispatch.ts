@@ -257,8 +257,11 @@ export interface ConciergeDispatchOptions {
    * account. Every other guard on this path still runs on a picker press, the credential checks
    * included.
    *
-   * SET BY EXACTLY ONE CALLER: `conciergeTools/terminal`'s `selectPickerOption`, after its own
-   * fingerprint check. It is deliberately NOT reachable from `send_to_agent_terminal`'s tool
+   * SET BY EXACTLY TWO CALLERS, both of which derive the fingerprint from the live screen rather
+   * than accepting one from anybody else: `conciergeTools/terminal`'s `selectPickerOption` (after
+   * its own fingerprint check) and `ConciergeHost`'s Approve relay via {@link pickerPressFor}
+   * (bead sparkle-voudj7 — the founder's Approve button was refused eight times running because it
+   * set nothing here). It remains deliberately NOT reachable from `send_to_agent_terminal`'s tool
    * schema, so free text cannot acquire the exemption by asking for it.
    */
   pickerPress?: { fingerprint: string };
@@ -274,15 +277,34 @@ const YES_WORDS =
 const NO_WORDS =
   /^\s*(n|no|nope|deny|denied|reject|cancel|stop|don'?t|do not|no thanks|no thank you|not now)[.!?\s]*$/i;
 
+/**
+ * The label with the DETECTOR'S OWN ordinal prefix removed (bead sparkle-voudj7).
+ *
+ * `detectClaudeCodePicker` renders every option as ``${n} · ${label}`` (suggestions/heuristics), so
+ * the real permission dialog reaches the matcher as `"1 · Yes"` / `"2 · Yes, and don't ask again"` /
+ * `"3 · No, and tell Claude what to do"` — never as `"Yes"`. The `^yes\b` tests below therefore
+ * matched NOTHING on the single most common picker in the app, and every unit fixture that "proved"
+ * they worked was hand-built as `{ label: "Yes" }`: a shape production cannot produce.
+ *
+ * THE COST WAS THE APPROVE BUTTON. `ConciergeHost`'s nudge relay sends the literal word "approve",
+ * which is a `YES_WORDS` member — so it reached this matcher and fell straight through to
+ * `ambiguous-picker` on the exact dialogs the button exists to answer.
+ *
+ * ONLY the detector's own prefix is stripped — `\d+ · ` — not arbitrary leading punctuation, so a
+ * label that genuinely begins with something else still reads as itself.
+ */
+function withoutOrdinal(label: string): string {
+  return label.replace(/^\s*\d{1,2}\s*·\s*/, "");
+}
 /** True when the button is the plain-affirmative option: label "Yes…" or the y/N "y\n" value.
  *  Deliberately does NOT match any label merely starting with a standalone "y" (e.g. "Y - use YAML"),
  *  which would let a "yes"-family answer select a non-affirmative option on a non-yes/no picker. */
 function isAffirmative(b: SuggestionButton): boolean {
-  return /^\s*yes\b/i.test(b.label) || /^y[\r\n]*$/i.test(b.value);
+  return /^\s*yes\b/i.test(withoutOrdinal(b.label)) || /^y[\r\n]*$/i.test(b.value);
 }
 /** True when the button is the negative option ("No", or the y/N "n" answer). */
 function isNegative(b: SuggestionButton): boolean {
-  return /^\s*no\b/i.test(b.label) || /^n[\r\n]*$/i.test(b.value);
+  return /^\s*no\b/i.test(withoutOrdinal(b.label)) || /^n[\r\n]*$/i.test(b.value);
 }
 
 /**
@@ -315,7 +337,19 @@ export function matchAnswerToOption(
   if (exact) return exact;
 
   // 3. Yes/approve family → the affirmative option; No/deny family → the negative option.
+  //
+  // ══ THE NARROWEST AFFIRMATIVE WINS, NOT THE FIRST ONE (bead sparkle-voudj7) ═══════════════════
+  // Claude Code's permission dialog offers TWO affirmatives — "Yes" and "Yes, and don't ask again" —
+  // and they are not interchangeable: the second grants STANDING permission for every later
+  // invocation, which is not what anyone typing "yes" (or pressing an Approve button) asked for.
+  // Position is not a defence. `find` happens to return the plain "Yes" on today's dialog only
+  // because Claude Code lists it first; nothing in this codebase pins that order, and one release
+  // reordering the menu would silently upgrade every "yes" into a permanent grant with no diff to
+  // review. So the bare affirmative is preferred EXPLICITLY, and the loose one is reached only when
+  // there is no bare one to prefer.
   if (YES_WORDS.test(t)) {
+    const bare = options.find((o) => /^\s*yes[.!\s]*$/i.test(withoutOrdinal(o.label)));
+    if (bare) return bare;
     const yes = options.find(isAffirmative);
     if (yes) return yes;
   }
@@ -412,6 +446,49 @@ function isApprovalGesture(opts: ConciergeDispatchOptions): boolean {
 export function agentCanAcceptInput(agentId: string): boolean {
   const agent = findAgent(agentId);
   return !!agent && agent.runtime !== "cloud";
+}
+
+/**
+ * The `pickerPress` evidence for answering the menu this agent has on screen RIGHT NOW with `text`,
+ * or `undefined` when there is no such menu, no fingerprint for it, or `text` answers nothing on it.
+ *
+ * ══ WHY A UI BUTTON NEEDS THIS AT ALL (bead sparkle-voudj7) ═══════════════════════════════════
+ * THE FIELD SYMPTOM: the founder pressed the BLOCKED row's Approve EIGHT times in a row and got
+ * "…is in a full-screen app right now, so I didn't send the approval… Quit it and approve again."
+ * every time. The full-screen app was the agent's OWN Claude Code picker — there was nothing of his
+ * to quit, and quitting it would have discarded the very question he was approving. The advice was
+ * unfollowable, so the button was not merely broken but inescapably so.
+ *
+ * THE MECHANISM is the one `sparkle-jk8zt` already documented for the model-facing tool, arriving
+ * through a second door. `isClaudeCodeScreen` REQUIRES the composer box, and a permission dialog
+ * REPLACES it — so a live picker reads as a full-screen app to the write path, and the
+ * alternate-screen arm refuses. `selectPickerOption` escapes that by carrying a fingerprint;
+ * `ConciergeHost`'s Approve relay carried nothing, so it took the refusal every single time.
+ * `select_picker_option` SUCCEEDING on the same agent in the same instant is what proved it.
+ *
+ * IT IS EVIDENCE, NOT A FLAG, and that is why this returns a fingerprint rather than a boolean.
+ * The dispatcher does not trust it: it re-derives the fingerprint from the CURRENT screen and
+ * compares (see `verifiedPickerPress`), so a menu that MOVED between this call and the dispatch
+ * refuses itself. `vim`, `less` and `htop` have no menu for `liveOptionsFor` to find, so they yield
+ * no options, no fingerprint, and take the alternate-screen refusal exactly as before.
+ *
+ * THE `matchAnswerToOption` CONJUNCT IS LOAD-BEARING, not a convenience. Without it a caller could
+ * acquire the alternate-screen exemption for text that maps to NO option, and that text would fall
+ * past the picker block to `submitPrompt` — i.e. pasted AND SUBMITTED as free text onto the very
+ * screen the guard exists to keep prose off. Requiring a match means the exemption can only ever be
+ * spent on a keystroke this module has already decided the menu accepts.
+ */
+export function pickerPressFor(agentId: string, text: string): { fingerprint: string } | undefined {
+  const options = liveOptionsFor(agentId);
+  if (options.length === 0) return undefined;
+  if (!matchAnswerToOption(text, options)) return undefined;
+  const fingerprint = pickerFingerprint(agentId, options);
+  // "" is `pickerFingerprint`'s sentinel for "found options but could not locate the question they
+  // belong to" — the state where two different dialogs with the same option shape are
+  // indistinguishable. `selectPickerOption` refuses outright on it (`unreadable-picker`) and the
+  // dispatcher rejects it in `verifiedPickerPress`; returning it here would only manufacture a
+  // waiver the dispatcher is about to throw away.
+  return fingerprint === "" ? undefined : { fingerprint };
 }
 
 /**

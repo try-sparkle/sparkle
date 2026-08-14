@@ -16,6 +16,14 @@
 //
 // Only the CHAT (the paid `claude -p` brain) and the tools hang off this. The column's status
 // readout is derived from local app state, costs nothing, and stays live — see ConciergeColumn.
+//
+// ══ AND NOT THE COMPOSER, ONCE A CABLE IS PATCHED (bead sparkle-voudj7) ═══════════════════════
+// That sentence was the declared scope and the column did not honour it: the lock also removed the
+// COMPOSER, in every state. Mounted, that box is not the brain — it relays keystrokes to the human's
+// OWN agent's PTY, which calls no model and costs nothing — so the lock was confiscating a
+// capability it does not sell. The founder mounted a pane and reported having no typing area at all.
+// `ConciergeColumn`'s `lockBlanksColumn` is where that carve-out lives; the `@Sparkle` escape hatch
+// is still refused at the service level, which is the line that was always doing the real work.
 import { useAuthStore } from "../../stores/authStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { aiEnhancementsEnabled, useHasAiCredits } from "../../services/aiGate";

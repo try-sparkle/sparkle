@@ -211,6 +211,34 @@ export function ConciergeColumn({
   // theme/blueprintSpec for why they are not in THEME_HEX, and ./wordmarkRamp for the ramp.
   const mode = useResolvedTheme();
   const isWired = wired !== "off";
+  // ══ THE LOCK SELLS THE BRAIN; IT MUST NOT CONFISCATE THE CABLE (bead sparkle-voudj7) ══════════
+  // THE FOUNDER'S REPORT: *"I don't have any terminal typing area."* Mounted, this column offered
+  // him NO input surface of any kind — not a refusal he could read, not a disabled box, nothing.
+  //
+  // `aiLock && isWired` was a KNOWN state, described in four separate comments in this file, each
+  // ending "and THERE IS NO COMPOSER AT ALL". Every one of them treated that as a fact to route
+  // around — gate the neighbour off too, so nothing points at a composer that isn't there — and
+  // none asked whether the composer should have been gone in the first place. It should not have
+  // been, and `conciergeAiLock`'s own header says so: *"Only the CHAT (the paid `claude -p` brain)
+  // and the tools hang off this."* The implementation took the composer as well.
+  //
+  // WHY THAT IS A BUG AND NOT A STRICTER READING OF THE PAYWALL: mounted, this box is not the paid
+  // brain. The cable is patched by a sidebar row click, and what the human types then goes to their
+  // OWN agent's PTY through `dispatchConciergeAnswer` — a keystroke relay that costs nothing, calls
+  // no model, and is not a feature anyone is being sold. Locking it takes away the ability to talk
+  // to a process they are already running, which no lock reason ("flag off", "not bought", "out of
+  // credits") is a justification for.
+  //
+  // THE PAID HALF IS STILL LOCKED, and the guarantee it rests on is unchanged: the `@Sparkle`
+  // escape hatch is the only path from this box to the brain, and the SERVICE-LEVEL refusal — which
+  // the composer's own comment below already names as the real line, this being merely "the
+  // structural half" — still refuses it. What is restored is the terminal relay, which that refusal
+  // was never about.
+  //
+  // UNMOUNTED, NOTHING CHANGES. With no cable there is no PTY to relay to, so the column is the
+  // paid brain and only the paid brain — it still floods to `ConciergeAiLocked` with no composer,
+  // exactly as before.
+  const lockBlanksColumn = aiLock !== null && !mountedAgent;
   // THE SECOND WAY OUT, named on screen (bead sparkle-thm9o). Subscribed to the LIVE binding rather
   // than formatted from `SHORTCUT_DEFAULTS`: `unmountCable` is rebindable in ⋯ Settings → Shortcuts,
   // and a hint naming a chord the user has since changed sends them to a key that does nothing —
@@ -670,7 +698,7 @@ export function ConciergeColumn({
           counts and the per-project segments are all derived from local app state, cost nothing to
           run, and stay live. That adjacency is the design: the lock sells what the human is missing
           while sitting next to live proof it would be useful (Concierge/ConciergeAiLocked). */}
-      {aiLock ? (
+      {lockBlanksColumn && aiLock ? (
         <ConciergeAiLocked reason={aiLock} />
       ) : mountedAgent ? (
         /* MOUNTED: this agent's own conversation, not Sparkle's.
@@ -811,13 +839,14 @@ export function ConciergeColumn({
           to Cancel — it is the more perishable of the two, so it keeps the position nearest the eye
           after a send. A blocker persists until it is resolved and can afford to sit under it.
 
-          GATED ON `!aiLock` like every other member of this strip, and for the reason spelled out
-          on its neighbours: `aiLock && isWired` is REACHABLE and there is NO COMPOSER in that
-          state, so a surface whose whole promise is "above the composer" would be pointing at
-          something that is not on screen. NOT gated on `isWired` — unlike the mounted pills, a
-          blocker is about the FLEET rather than about the mounted agent, and the founder must see
-          it whether or not a cable happens to be patched. */}
-      {!aiLock && (
+          GATED ON `!lockBlanksColumn` like every other member of this strip, and for the reason
+          spelled out on its neighbours: a surface whose whole promise is "above the composer" must
+          not render where no composer does. That condition used to be `!aiLock`, because a lock
+          took the composer away in every state; it now takes it away only while UNMOUNTED, so the
+          gate follows the composer rather than the lock (bead sparkle-voudj7). NOT gated on
+          `isWired` — unlike the mounted pills, a blocker is about the FLEET rather than about the
+          mounted agent, and the founder must see it whether or not a cable happens to be patched. */}
+      {!lockBlanksColumn && (
         // ITS OWN `AgentPillProvider`, and this is NOT optional. The provider above wraps the
         // THREAD, and a blocker is no longer in the thread — so without this the strip's pills
         // resolve to nothing and render the "…is closed" dead-end variant, naming an agent the
@@ -846,7 +875,7 @@ export function ConciergeColumn({
           NOT gated on `mountedAgent`: the host only ever fills it on the mounted path, and gating it
           here as well would be a second place for "are we mounted" to be decided — the divergence
           that put the composer in the terminal's face while the send path refused to route. */}
-      {!aiLock && <MountedNotice notice={mountedNotice} />}
+      {!lockBlanksColumn && <MountedNotice notice={mountedNotice} />}
       {/* THE MOUNTED AGENT'S NOTICES, AS PILLS — bead sparkle-tyter, and the founder's second ask
           for it: *"when I click on the agent to mount the concierge, I get pills on top of the
           composed window that tell me any notices or warnings."*
@@ -857,10 +886,10 @@ export function ConciergeColumn({
           land somewhere with room, and this is that place.
 
           SAME THREE GATES AS ITS NEIGHBOURS, for the reasons spelled out at 650-680 rather than
-          re-derived here. `!aiLock` because `aiLock && isWired` is REACHABLE and there is NO COMPOSER
-          AT ALL in that state, so pills claiming to sit "above the composer" would be pointing at
-          something that is not on screen. `isWired` because a pill row about the mounted agent must
-          not outlive the cable. `mountedAgent` because that is where the id comes from.
+          re-derived here. `!lockBlanksColumn` because pills claiming to sit "above the composer"
+          must not render where no composer does — which, since sparkle-voudj7, is the unmounted
+          lock rather than every lock. `isWired` because a pill row about the mounted agent must not
+          outlive the cable. `mountedAgent` because that is where the id comes from.
 
           OUTSIDE THE MOUNT SWAP, like `countdownSlot` and `MountedNotice` above and the unmount hint
           below — which is what makes it visible in the one state the feature exists for.
@@ -870,7 +899,7 @@ export function ConciergeColumn({
           patched the cable to that same side — so reading it here is reading the one value, rather
           than adding a second place for "which side am I" to be decided. The `isWired` gate above
           has already excluded "off", which is what makes the narrowing sound. */}
-      {!aiLock && isWired && mountedAgent && (
+      {!lockBlanksColumn && isWired && mountedAgent && (
         <MountedAgentNotices agentId={mountedAgent.agentId} side={wired} />
       )}
       {/* THE WAY OUT OF THE MOUNT. Mounted, the human's typing goes to a build agent's terminal
@@ -885,16 +914,18 @@ export function ConciergeColumn({
           state of its own: it is a projection of `wired`, like every other consequence of the cable
           (MAPPING.md — one value, every visual consequence follows from it).
 
-          AND GATED ON `!aiLock`, matching both its neighbours (ConciergeUnavailable above,
-          ComposeBox below). `aiLock && isWired` is REACHABLE, because the cable is patched by a
-          sidebar row click and that gesture knows nothing about the concierge AI entitlement: the
-          column floods to terminal material, the thread is replaced by ConciergeAiLocked, and THERE
-          IS NO COMPOSER AT ALL. Un-gated, the hint would sit at the bottom of that column offering
-          "the way out" of a typing-routes-elsewhere state whose input surface does not exist — an
-          affordance with nothing behind it, which is the one thing this file's own rules forbid, and
-          it would break the founder's placement ("directly above the composer") by construction
-          (roborev 55535). */}
-      {!aiLock && isWired && (
+          AND GATED ON `!lockBlanksColumn`, matching the ComposeBox below. This used to read
+          `!aiLock`, and the reasoning recorded here was sound but rested on a premise that was
+          itself the bug: `aiLock && isWired` is REACHABLE (the cable is patched by a sidebar row
+          click, and that gesture knows nothing about the concierge AI entitlement), and in that
+          state the thread was replaced by ConciergeAiLocked and THERE WAS NO COMPOSER AT ALL — so
+          an un-gated hint would offer "the way out" of a typing-routes-elsewhere state whose input
+          surface did not exist, an affordance with nothing behind it (roborev 55535).
+          The premise is gone: mounted, the composer renders whatever the lock says (bead
+          sparkle-voudj7 — the founder had no typing area at all in exactly this state). So the hint
+          follows the composer, which is what it was always really tracking, and the founder's
+          placement ("directly above the composer") holds by construction in both states. */}
+      {!lockBlanksColumn && isWired && (
         // ══ THE CHIP SHARES THIS ROW, LEFT-ALIGNED (bead sparkle-wj3ya) ═══════════════════════════
         // The founder's placement, which supersedes the "next to the paperclip" one in that bead's
         // description: *"When the pane is mounted, it should be saying 'Chatting with [circle (red,
@@ -1029,10 +1060,16 @@ export function ConciergeColumn({
           {announcement.text}
         </span>
       </div>
-      {/* No composer while locked — the structural half of the guarantee. A column in this state
-          has nothing to type into and no Send to press, so a gated send can never be ATTEMPTED
-          from here at all (the service-level refusal stays the backstop, not the only line). */}
-      {!aiLock && (
+      {/* No composer while locked AND UNMOUNTED — the structural half of the guarantee. A column in
+          that state has nothing to type into and no Send to press, so a gated send can never be
+          ATTEMPTED from here at all (the service-level refusal stays the backstop, not the only
+          line).
+          MOUNTED, THE BOX COMES BACK, and the guarantee above is why that is safe rather than a
+          hole: the only route from here to the paid brain is the `@Sparkle` escape hatch, and the
+          service-level refusal this comment already calls "not the only line" is still that line.
+          What returns is the PTY relay to the human's own agent, which was never the paid half.
+          See `lockBlanksColumn` for the founder report that made this a bug rather than a policy. */}
+      {!lockBlanksColumn && (
         <ComposeBox
           /* One draft per conversation. Mounted, the box is addressed to that agent; unmounted it is
              addressed to Sparkle — and a half-typed message must not follow you from one to the

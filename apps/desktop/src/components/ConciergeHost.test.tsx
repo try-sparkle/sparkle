@@ -25,6 +25,9 @@ type Concierge = typeof import("../services/concierge");
 // brain, nudge actions → dispatch/select/mute, brain deltas → thread. ConciergeColumn renders for real.
 const h = vi.hoisted(() => ({
   feed: null as unknown,
+  pickerPressFor: vi.fn((_agentId: string, _text: string): { fingerprint: string } | undefined =>
+    undefined,
+  ),
   openProjectTab: vi.fn(),
   startConciergeTurn: vi.fn(async (_prompt: string): Promise<string | null> => null),
   // `path` is the real union, not bare `string`: typed loosely, a `path: "pty-gonw"` typo compiles
@@ -164,6 +167,10 @@ vi.mock("../services/conciergeDispatch", () => ({
   liveOptionsFor: vi.fn(() => []),
   isTerseAnswer: vi.fn(() => false),
   matchAnswerToOption: vi.fn(() => null),
+  // The PRESS EVIDENCE the Approve relay must carry when a menu is live (bead sparkle-voudj7).
+  // Defaults to `undefined` — "no picker on screen" — which is the state every pre-existing row in
+  // this file is in, so they keep asserting the shape they always did.
+  pickerPressFor: h.pickerPressFor,
   // Not exercised in these rows (no picker on screen), but the host imports it — and Vitest
   // throws on ACCESS to an export a factory omits, so a partial mock breaks the whole file.
   answersLivePicker: () => false,
@@ -579,8 +586,39 @@ describe("ConciergeHost", () => {
       // The user clicked Approve on the nudge card — that click IS the authorization.
       authority: { kind: "nudge-approve", agentId: "ag1" },
       userPrompt: false,
+      // No menu on screen in this fixture, so there is no press to evidence and the relay carries
+      // nothing — the pre-sparkle-voudj7 behaviour, unchanged for the non-picker case.
+      pickerPress: undefined,
     });
     expect(h.openProjectTab).not.toHaveBeenCalled();
+  });
+
+  // ══ APPROVE PRESSES THE PICKER; IT DOES NOT TYPE AT IT (bead sparkle-voudj7) ══════════════════
+  // THE FOUNDER'S BUG, at the layer that caused it. He pressed Approve eight times on an agent
+  // showing a Claude Code picker and got the same refusal each time: "…is in a full-screen app right
+  // now, so I didn't send the approval… Quit it and approve again." The "full-screen app" was that
+  // agent's own picker — nothing of his to quit, and quitting it would have discarded the question.
+  //
+  // The cause was here, in the relay's ARGUMENTS: it sent "approve" as ordinary text with no
+  // `pickerPress`, so the dispatcher's alternate-screen guard refused it. The waiver that makes a
+  // press legal already existed (`sparkle-jk8zt`) and this call site never used it — which is
+  // exactly why this row lives at the HOST rather than only in the dispatcher's own suite. Every
+  // dispatcher-level test passes with this argument deleted; only this one goes red.
+  it("carries the live picker's fingerprint, so the press is not refused as a full-screen app", async () => {
+    h.pickerPressFor.mockReturnValue({ fingerprint: "fp-of-the-menu-on-screen" });
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.click(inThread("Approve"));
+    await settle();
+
+    expect(h.dispatchConciergeAnswer).toHaveBeenCalledWith(
+      "ag1",
+      "approve",
+      expect.objectContaining({ pickerPress: { fingerprint: "fp-of-the-menu-on-screen" } }),
+    );
+    // Read against the SAME agent and the SAME word the relay sends — a fingerprint derived for a
+    // different agent, or for different text, would be evidence about the wrong screen.
+    expect(h.pickerPressFor).toHaveBeenCalledWith("ag1", "approve");
   });
 
   // Approve sits behind the queue now, so a click during a still-routing send produces no

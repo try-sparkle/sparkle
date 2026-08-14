@@ -56,6 +56,11 @@ vi.mock("../services/conciergeDispatch", () => ({
   // Not exercised in these rows (no picker on screen), but the host imports it — and Vitest
   // throws on ACCESS to an export a factory omits, so a partial mock breaks the whole file.
   answersLivePicker: () => false,
+  // Same reason, and this one IS reached here: the Approve relay reads it on every press to decide
+  // whether it is pressing a menu option or typing (bead sparkle-voudj7). Omitting it made the
+  // queued-approve row fail as a stale attachment chip — the throw was swallowed by `approve`'s own
+  // catch, so no dispatch happened and no hold slot was taken.
+  pickerPressFor: vi.fn(() => undefined),
   onDeferredSendOutcome: (
     cb: (r: {
       ok: boolean;

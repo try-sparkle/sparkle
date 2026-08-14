@@ -229,6 +229,7 @@ import {
   agentCanAcceptPrompt,
   dispatchConciergeAnswer,
   onDeferredSendOutcome,
+  pickerPressFor,
   type ConciergeDispatchResult,
 } from "../services/conciergeDispatch";
 import type { DispatchAuthority } from "../services/dispatchAuthority";
@@ -1630,8 +1631,11 @@ export function ConciergeHost({
     // Returns whether a send actually went out (see UseAutoSendArgs.onFire), and BOTH ways of not
     // sending are reported rather than just the first:
     //
-    //  • no submit registered — the compose box renders only when `!aiLock`, so a lock engaging
-    //    mid-countdown unmounts it and `registerSubmit(null)` leaves nothing to call;
+    //  • no submit registered — the compose box renders only when the column is not blanked by the
+    //    AI lock (`ConciergeColumn`'s `lockBlanksColumn`: locked AND unmounted), so a lock engaging
+    //    mid-countdown on an UNMOUNTED column unmounts it and `registerSubmit(null)` leaves nothing
+    //    to call. Mounted, the box survives the lock (bead sparkle-voudj7) and this arm is unreachable
+    //    — which narrows the case rather than removing it, so the guard stays;
     //  • the box was empty when the clock expired — `submit()` early-returns `false`.
     //
     // Both used to return `true` here, which the rail announced as "Sent to …" and recorded as a
@@ -3565,6 +3569,24 @@ export function ConciergeHost({
             dispatchConciergeAnswer(a.id, "approve", {
               authority: { kind: "nudge-approve", agentId: a.id },
               userPrompt: false,
+              // ══ PRESS THE OPTION; DO NOT TYPE AT IT (bead sparkle-voudj7) ═══════════════════
+              // Without this the word "approve" is an ordinary text write, and a live Claude Code
+              // picker owns the ALTERNATE screen — so the dispatcher refused every press with
+              // "…is in a full-screen app right now… Quit it and approve again." The founder hit
+              // that eight times running on a picker that was the agent's own interview prompt:
+              // nothing of his to quit, and quitting it would have thrown away the question. See
+              // `pickerPressFor` for why a fingerprint rather than a flag.
+              //
+              // DERIVED HERE, INSIDE THE QUEUED FUNCTION, NOT AT CLICK TIME. Approve goes through
+              // the same FIFO as every other user-initiated PTY write, so it can sit behind a
+              // routing send for seconds — long enough for the menu to move. Reading the screen at
+              // click time would hand the dispatcher a fingerprint that was already stale by the
+              // time it re-derived its own, turning a working press into a fresh refusal. Read it
+              // as late as possible and the two reads are effectively the same instant.
+              //
+              // `undefined` when no menu is up, which is exactly the old behaviour: an agent
+              // blocked on something that is NOT a picker still takes whatever refusal it earned.
+              pickerPress: pickerPressFor(a.id, "approve"),
             }).catch(
               () => "threw" as const,
             ),

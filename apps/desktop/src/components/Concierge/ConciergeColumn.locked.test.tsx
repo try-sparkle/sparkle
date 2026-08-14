@@ -158,6 +158,86 @@ describe("ConciergeColumn with AI enhancements locked — the PAID half is gone"
   });
 });
 
+// ══ …BUT A MOUNTED COLUMN STILL HAS A TYPING AREA (bead sparkle-voudj7) ═══════════════════════
+//
+// THE FOUNDER'S REPORT, verbatim: *"I don't have any terminal typing area."* He mounted an agent
+// pane and the column gave him NO input surface of any kind — not a disabled box, not a refusal he
+// could read, nothing to type into at all.
+//
+// The state was KNOWN and un-tested. Four comments in ConciergeColumn described `aiLock && isWired`
+// and each ended "and THERE IS NO COMPOSER AT ALL"; every one treated that as a fact to route
+// around — gate the neighbouring affordance off too, so nothing points at a box that isn't there —
+// and none asked whether the box should have been gone. Meanwhile every suite that finds the
+// textarea calls `enableAiEnhancementsForTests()` first, and the locked suite above never mounts,
+// so no test in the repo ever visited the one state the founder was in.
+//
+// WHY IT IS A BUG RATHER THAN A STRICT PAYWALL: mounted, this box is not the paid brain. What the
+// human types goes to their OWN agent's PTY — a keystroke relay that calls no model and costs
+// nothing. `conciergeAiLock`'s own header says only the chat and the tools hang off the lock; the
+// composer was taken by mistake.
+describe("ConciergeColumn locked but MOUNTED — the cable is not the paid half", () => {
+  const mounted = {
+    agentId: "agent-1",
+    name: "Kraken Auth",
+    thread: { entries: [], hasMore: false, loading: false },
+    onReachTop: vi.fn(),
+  } as unknown as NonNullable<Parameters<typeof ConciergeColumn>[0]["mountedAgent"]>;
+
+  const renderMountedAndLocked = () =>
+    render(
+      <ConciergeColumn
+        model={model}
+        controller={controller()}
+        wired="right"
+        mountedAgent={mounted}
+        routableMountedAgentId={mounted.agentId}
+      />,
+    );
+
+  it("renders a typing area", () => {
+    renderMountedAndLocked();
+    // `getBy*` throws with the DOM attached, so this is the row that would have named the founder's
+    // symptom directly instead of leaving him to describe it.
+    expect(screen.getByRole("textbox", { name: "Message" })).toBeTruthy();
+    expect(screen.getByTestId("concierge-compose")).toBeTruthy();
+  });
+
+  // THE SIDE EFFECT, not just the pixels. A box that renders but cannot deliver is the same outage
+  // wearing a nicer face — and this is the assertion that would fail if a later change re-gated the
+  // SEND while leaving the textarea on screen.
+  it("and that typing area actually sends", () => {
+    const c = controller();
+    render(
+      <ConciergeColumn
+        model={model}
+        controller={c}
+        wired="right"
+        mountedAgent={mounted}
+        routableMountedAgentId={mounted.agentId}
+      />,
+    );
+    const box = screen.getByRole("textbox", { name: "Message" });
+    fireEvent.change(box, { target: { value: "run the tests" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(c.onSend).toHaveBeenCalledWith("run the tests");
+  });
+
+  it("shows the agent's own thread, not the upsell", () => {
+    renderMountedAndLocked();
+    expect(screen.queryByTestId("concierge-ai-locked")).toBeNull();
+    expect(screen.queryByText(CONCIERGE_AI_PITCH)).toBeNull();
+  });
+
+  // THE PAIRED CASE, and the reason the two are in one file: unmount and the paywall must come
+  // straight back. Without this row the fix above could be "delete the lock" and still go green,
+  // which is the failure mode the locked suite exists to prevent.
+  it("…and unmounting restores the upsell with no composer", () => {
+    render(<ConciergeColumn model={model} controller={controller()} wired="off" />);
+    expect(screen.getByTestId("concierge-ai-locked")).toBeTruthy();
+    expect(screen.queryByTestId("concierge-compose")).toBeNull();
+  });
+});
+
 describe("ConciergeColumn with AI enhancements ON — nothing changed", () => {
   beforeEach(() => {
     useAuthStore.setState({
