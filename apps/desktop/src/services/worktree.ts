@@ -7,6 +7,7 @@ import { loadAccountState } from "./accountSelection";
 import { createWorkerWorktree } from "../pty";
 import { abandonWorktreeSeed, seedWorktreeEnv } from "./envSeed";
 import { abandonWorktreeBootstrap, bootstrapWorktreeDeps } from "./depsBootstrap";
+import { stopPreviewForAgent } from "./preview";
 import { useProjectStore } from "../stores/projectStore";
 
 export interface WorktreeInfo {
@@ -382,10 +383,11 @@ export function prepareWorkerWorkspace(args: {
  * `.git/index.lock`. Always route agent-close cleanup through this, never the raw
  * removeAgentWorktree bridge, so removal queues behind any in-flight prepare/remove.
  *
- * Also settles the two fire-and-forget writers aimed at this worktree FIRST — the env seed and the
- * dependency bootstrap. Both escape this lock by design; without that step a `git worktree remove`
- * can run while `op` or a package manager is still writing into the directory, which re-creates the
- * tree git just deleted (see envSeed.ts / depsBootstrap.ts).
+ * Also settles the three writers aimed at this worktree FIRST — the env seed, the dependency
+ * bootstrap, and the preview dev server. All three escape this lock by design; without that step a
+ * `git worktree remove` can run while `op`, a package manager, or a dev server is still writing into
+ * the directory, which re-creates the tree git just deleted (see envSeed.ts / depsBootstrap.ts /
+ * stopPreviewBeforeTeardown below).
  */
 export function removeAgentWorkspace(
   root: string,
@@ -396,17 +398,50 @@ export function removeAgentWorkspace(
   const preparedPath = preparedPaths.get(key);
   preparedPaths.delete(key);
   return withRepoLock(root, async () => {
+    // CONCURRENTLY, not one after the other. Each wait is separately bounded and all of them run
+    // inside the per-root git lock that every other prepare/remove on this project queues behind.
+    // Serialized, the worst case is the sum — and since an install measures ~27s, hitting the bound
+    // is the common case when an agent is closed shortly after opening, multiplied by N because
+    // a project's agents are closed one at a time. There is no ordering requirement among them;
+    // the only ordering that matters is that ALL of them land before the removal below.
+    const settles: Promise<unknown>[] = [stopPreviewBeforeTeardown(agentId)];
     if (preparedPath) {
-      // CONCURRENTLY, not one after the other. Each wait is separately bounded at 5s and both run
-      // inside the per-root git lock that every other prepare/remove on this project queues behind.
-      // Serialized, the worst case is 10s — and since an install measures ~27s, hitting the bound
-      // is the common case when an agent is closed shortly after opening, multiplied by N because
-      // a project's agents are closed one at a time. There is no ordering requirement between them.
-      await Promise.all([
-        abandonWorktreeSeed(preparedPath),
-        abandonWorktreeBootstrap(preparedPath),
-      ]);
+      settles.push(abandonWorktreeSeed(preparedPath), abandonWorktreeBootstrap(preparedPath));
     }
+    await Promise.all(settles);
     return removeAgentWorktree(root, projectId, agentId);
   });
+}
+
+/** Stop this agent's preview dev server before its checkout is evacuated (bead sparkle-3475b.6;
+ *  docs/live-browser-preview.md §5, "Interlock with worktree teardown").
+ *
+ *  A preview is the one writer that outlives the agent's own processes: a `next dev`/`vite` whose
+ *  cwd is INSIDE the worktree, still compiling into `.next/` or `node_modules/.vite` while
+ *  `remove_agent_worktree` renames that directory into worktree-trash and deletes it on a background
+ *  thread. The failure is the same stray-non-empty-slot hazard the seed and bootstrap handshakes
+ *  above exist to prevent, with a longer-lived writer behind it.
+ *
+ *  UNCONDITIONAL — deliberately no local "did this agent have a preview" guard. The Rust command is
+ *  a map lookup over live servers that answers `not-found` when there is none
+ *  (`preview.rs::preview_stop_for_agent`), so the common case is already cheaper than any state read
+ *  we could do here. A frontend-store guard would also fail exactly where it matters: after a window
+ *  reload the store is empty while the server is still running.
+ *
+ *  NEVER REJECTS. A stray preview must not be able to wedge cleanup — an un-removed worktree is a
+ *  permanent problem (its slot path fails a later `git worktree add`), while a preview that outlived
+ *  its stop is a leaked process the supervisor's own reaping still covers. The try/catch is for a
+ *  synchronous throw before the promise exists; the `.then` rejection arm is for the IPC failing. */
+function stopPreviewBeforeTeardown(agentId: string): Promise<void> {
+  try {
+    return Promise.resolve(stopPreviewForAgent(agentId)).then(
+      () => undefined,
+      (e: unknown) => {
+        console.warn("preview: could not stop before worktree teardown; removing anyway", e);
+      },
+    );
+  } catch (e) {
+    console.warn("preview: could not start the stop before worktree teardown", e);
+    return Promise.resolve();
+  }
 }

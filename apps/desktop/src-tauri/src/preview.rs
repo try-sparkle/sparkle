@@ -1265,6 +1265,11 @@ fn kill_pgid(pgid: u32) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PreviewState {
+    /// Waiting on `node_modules` to materialize before the dev server can even be spawned — see
+    /// `open_reserved`'s deps-wait step. Reachable only when a lockfile names a manager this module
+    /// drives and `node_modules` is not yet on disk; a worktree whose `deps_bootstrap` fire-and-forget
+    /// install already finished (the common case) never passes through here at all.
+    Installing,
     Starting,
     Listening,
     Ready,
@@ -1343,7 +1348,8 @@ struct Server {
 /// dead server is not in the map to be found; they exist so the intent survives that changing.
 fn live_for_reattach(state: PreviewState) -> bool {
     match state {
-        PreviewState::Starting
+        PreviewState::Installing
+        | PreviewState::Starting
         | PreviewState::Listening
         | PreviewState::Ready
         | PreviewState::Serving => true,
@@ -1495,6 +1501,16 @@ impl PreviewManager {
         let _ = app.emit("preview:state", status);
     }
 
+    /// Attach the REAL pgid once the dev server actually spawns. The entry is created with `pgid: 0`
+    /// at `Installing`/`Starting` time (see `open_reserved`), before there is a child to name — a
+    /// stop requested during that window has nothing to signal (`stop_one`'s `pgid > 1` guard makes
+    /// `0` inert on purpose) and only starts meaning something once this runs.
+    fn set_pgid(&self, id: &str, pgid: u32) {
+        if let Some(server) = self.lock().get_mut(id) {
+            server.pgid = pgid;
+        }
+    }
+
     /// Stop one preview. Idempotent by construction: a second call finds nothing to take.
     fn stop_one(&self, app: Option<&AppHandle>, id: &str) -> &'static str {
         let (child, pgid, present) = {
@@ -1569,6 +1585,13 @@ const READY_TIMEOUT: Duration = Duration::from_secs(120);
 const DISCOVERY_INTERVAL: Duration = Duration::from_millis(500);
 /// After it is up, how often to notice the process died.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(2);
+/// How long `open_reserved` waits in the `Installing` state for `node_modules` to appear before
+/// giving up. Generous on purpose: this is a full dependency install, not a compile — measured at
+/// ~27s on a warm pnpm store (`services/depsBootstrap.ts`'s own module comment), and a cold store or
+/// an npm/yarn project can run well past that. Longer than any `deps_bootstrap` timeout on the TS
+/// side, deliberately: this is a fallback for the case that install was slow or never started, not a
+/// race with it.
+const INSTALL_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 /// How much of stderr to put in a failure message.
 const STDERR_TAIL: usize = 1200;
 
@@ -1687,6 +1710,94 @@ where
     }
 }
 
+/// Does this directory need `PreviewState::Installing` before a dev server can be spawned in it?
+///
+/// PURE AND FILESYSTEM-ONLY, deliberately — extracted from `open_reserved` (which needs a live
+/// `AppHandle` and so cannot be unit tested directly) precisely so this one decision can be. Mirrors
+/// `deps_bootstrap::plan_for`'s own "already installed" short-circuit: a lockfile a manager THIS
+/// MODULE ACTUALLY DRIVES (`PackageManager::is_supported`), with no `node_modules` yet, means either
+/// an install has never run or one is still in flight — either way, spawning `<manager> run dev`
+/// right now would fail with a missing-module error that reads as a broken preview rather than as
+/// "give it a moment".
+///
+/// GATED ON `is_supported()`, NOT JUST `manager_for().is_some()` — `manager_for` also recognizes
+/// yarn and bun by their lockfile, but `bootstrap_worktree_deps` never drives either (`is_supported`
+/// is pnpm/npm only), so a yarn/bun worktree's `node_modules` will NEVER appear on its own. Waiting
+/// on it anyway would burn the full `INSTALL_WAIT_TIMEOUT` for an install nothing ever attempts, and
+/// then fail with a message that reads as "the install broke" when nothing was ever running.
+fn needs_deps_wait(cwd: &Path) -> bool {
+    matches!(crate::deps_bootstrap::manager_for(cwd), Some(pm) if pm.is_supported())
+        && !cwd.join("node_modules").is_dir()
+}
+
+/// Has the install the deps-wait loop is polling for actually FINISHED, as opposed to merely
+/// started?
+///
+/// `node_modules` existing is NOT that signal, and using it as one was the bug: both pnpm and npm
+/// create the directory near the START of an install (pnpm creates the virtual store directory
+/// before linking a single package; npm creates it before its first extraction), so a poll loop
+/// keyed on the bare directory can break within one `DISCOVERY_INTERVAL` of the install beginning —
+/// exactly the "one is still in flight" case `Installing` exists to cover, defeated by its own
+/// readiness check. `<manager> run dev` then spawns against a partially populated tree and produces
+/// the missing-module failure this state was built to prevent.
+///
+/// So this waits on each manager's own completion marker instead — a file each one writes ONCE, at
+/// the end of a successful install, as its own source of truth for "is this tree consistent with
+/// the lockfile": pnpm's `node_modules/.modules.yaml` (pnpm itself reads this to decide whether a
+/// reinstall can be skipped) and npm's `node_modules/.package-lock.json` (npm's cached snapshot of
+/// the resolved tree, rewritten once the tree matches it). Gated on `manager_for`, not
+/// `is_supported()` — the caller (`needs_deps_wait`) already restricted entry to the wait to pnpm/npm,
+/// so any other arm here is unreachable in production; it stays honest rather than assuming that by
+/// reading as "not ready" instead of guessing.
+fn deps_install_ready(cwd: &Path) -> bool {
+    match crate::deps_bootstrap::manager_for(cwd) {
+        Some(crate::deps_bootstrap::PackageManager::Pnpm) => cwd.join("node_modules/.modules.yaml").is_file(),
+        Some(crate::deps_bootstrap::PackageManager::Npm) => cwd.join("node_modules/.package-lock.json").is_file(),
+        _ => false,
+    }
+}
+
+/// What the deps-wait loop found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DepsWaitOutcome {
+    /// The completion marker appeared — safe to spawn the dev server now.
+    Ready,
+    /// A stop was requested while nothing had spawned yet.
+    Stopped,
+    /// The deadline passed with no marker in sight.
+    TimedOut,
+}
+
+/// The deps-wait poll loop, extracted from `open_reserved` so its three outcomes are unit-testable
+/// without a real filesystem, a real clock, or a real thread sleep — `open_reserved` itself needs a
+/// live `AppHandle` and cannot be. `is_ready`/`now`/`sleep` are injected for exactly that: production
+/// calls this with `deps_install_ready`/`Instant::now`/`std::thread::sleep(DISCOVERY_INTERVAL)`;
+/// tests substitute a scripted readiness sequence and a fake clock that never actually sleeps.
+fn wait_for_deps(
+    stop: &AtomicBool,
+    deadline: Instant,
+    mut is_ready: impl FnMut() -> bool,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(),
+) -> DepsWaitOutcome {
+    loop {
+        // A stop requested while nothing has spawned yet. `stop_one` already handles this entry
+        // fine (its child is `None`, so it reports "already-stopped" and drops the map entry) —
+        // this loop's job is only to notice and get out of the way rather than keep polling an
+        // entry `stop_one` may be mid-removal on.
+        if stop.load(Ordering::Acquire) {
+            return DepsWaitOutcome::Stopped;
+        }
+        if is_ready() {
+            return DepsWaitOutcome::Ready;
+        }
+        if now() >= deadline {
+            return DepsWaitOutcome::TimedOut;
+        }
+        sleep();
+    }
+}
+
 /// RE-ATTACH, OR RESERVE AND SPAWN. Blocking — callers wrap it in `spawn_blocking`.
 fn open_blocking(
     app: AppHandle,
@@ -1720,13 +1831,11 @@ fn open_reserved(
     let real = validate_worktree(&app_data.join("worktrees"), &worktree)?;
 
     let cfg = crate::config::for_project(&real.to_string_lossy()).config.preview;
-    // Read and LOGGED, acted on by nothing: the idle-grace timer is Phase 2 and explicitly out of
-    // scope here. Logging it is what makes "the value is plumbed but inert" a visible fact rather
-    // than something the next agent has to infer from the absence of a timer.
-    tracing::info!(
-        idle_grace_min = cfg.idle_grace_min,
-        "preview: idle grace is configured but NOT enforced yet (Phase 2)"
-    );
+    // `idle_grace_min` is enforced FRONTEND-side (`services/previewIdleGrace.ts`), not here — "is a
+    // human looking at this pane" is React layout state Rust has no channel to observe, and the stop
+    // path it needs (`stopPreviewForAgent`) already exists. Logged so the value being read is a
+    // visible fact rather than something the next agent has to infer.
+    tracing::info!(idle_grace_min = cfg.idle_grace_min, "preview: idle grace configured (enforced in TS)");
     let target = detect_preview_target(&real, cfg.enabled).map_err(|d| d.message())?;
 
     let cwd = match path_override.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
@@ -1737,17 +1846,102 @@ fn open_reserved(
     // The override arrives from the frontend too, so it gets the same containment check.
     let cwd = validate_worktree(&app_data.join("worktrees"), &cwd.to_string_lossy())?;
 
+    // THE ENTRY IS CREATED HERE, BEFORE THE PORT IS EVEN ALLOCATED — earlier than every previous
+    // Phase-1 comment claimed ("written immediately after spawn, before readiness"), and that is the
+    // whole point of the Installing state: the deps-wait below needs somewhere to publish an event
+    // BEFORE there is a process to describe. `id`/`stop`/`child` are created once and reused for the
+    // life of the server; the deps-wait, if it runs, updates this SAME entry rather than creating a
+    // second one, so a `preview_open` retry during either phase re-attaches via `live_for_reattach`
+    // instead of starting a competing install or a competing spawn.
+    let id = new_id();
+    let stop = Arc::new(AtomicBool::new(false));
+    let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+    // Decided BEFORE the entry is inserted, not checked-then-transitioned, so the very first event a
+    // deps-waiting agent sees is `Installing` — never a `Starting` flash immediately superseded by
+    // it. `deps_bootstrap::manager_for` recognizes the SAME lockfiles `bootstrapWorktreeDeps`
+    // (`services/depsBootstrap.ts`) fires off at worktree-creation time — that install is
+    // fire-and-forget and this module has no channel into its TS-side tracking, so this checks the
+    // one thing both sides agree means "not ready yet": `node_modules` is not on disk. The common
+    // case (bootstrap already finished, which is most of the time by the point anyone clicks
+    // Preview) starts straight at `Starting` and never touches the deps-wait loop below at all.
+    let awaiting_deps = needs_deps_wait(&cwd);
+    {
+        let manager = app.state::<PreviewManager>();
+        manager.set_app_data(app_data.clone());
+        let status = PreviewStatus {
+            id: id.clone(),
+            agent_id: agent_id.clone(),
+            project_id: project_id.clone(),
+            url: None,
+            port: None,
+            state: if awaiting_deps { PreviewState::Installing } else { PreviewState::Starting },
+            error: None,
+        };
+        manager
+            .lock()
+            .insert(id.clone(), Server { status: status.clone(), child: Arc::clone(&child), pgid: 0, stop: Arc::clone(&stop) });
+        let _ = app.emit("preview:state", status);
+    }
+
+    if awaiting_deps {
+        let manager = app.state::<PreviewManager>();
+        let deadline = Instant::now() + INSTALL_WAIT_TIMEOUT;
+        let outcome = wait_for_deps(
+            &stop,
+            deadline,
+            || deps_install_ready(&cwd),
+            Instant::now,
+            || std::thread::sleep(DISCOVERY_INTERVAL),
+        );
+        match outcome {
+            DepsWaitOutcome::Ready => manager.transition(&app, &id, PreviewState::Starting, None, None),
+            DepsWaitOutcome::Stopped => {
+                return Err(format!("preview: a server for this agent is {ALREADY_STARTING}"));
+            }
+            DepsWaitOutcome::TimedOut => {
+                // NOT "a missing node_modules usually means it failed" — that was true when this
+                // waited on the bare directory, but `deps_install_ready` now waits on each manager's
+                // completion marker, so `node_modules` can be fully present and this can still time
+                // out (an interrupted install that created the directory and some packages but never
+                // wrote pnpm's `.modules.yaml` / npm's `.package-lock.json`). Point at the install
+                // rather than at a specific missing path that may not be missing.
+                let msg = format!(
+                    "dependencies did not finish installing within {}s — check the worktree's own \
+                     install (this usually means it stalled or failed partway through, not that it \
+                     is merely slow)",
+                    INSTALL_WAIT_TIMEOUT.as_secs()
+                );
+                finish(&app, &id, PreviewState::Failed, None, Some(msg.clone()), &app_data);
+                return Err(format!("preview: {msg}"));
+            }
+        }
+    }
+
+    // From here on, EVERY early return must clean up the entry created above — unlike Phase 1, where
+    // nothing existed in the map yet at this point, so a bare `?`/`return Err` was enough.
+    macro_rules! fail {
+        ($msg:expr) => {{
+            let msg = $msg;
+            finish(&app, &id, PreviewState::Failed, None, Some(msg.clone()), &app_data);
+            return Err(format!("preview: {msg}"));
+        }};
+    }
+
     let port = match target.port {
         Some(p) if !is_reserved_port(p) => p,
-        Some(p) => {
-            return Err(format!(
-                "preview: this project pins port {p}, which is Sparkle's own dev port and would \
-                 frame Sparkle inside Sparkle"
-            ))
-        }
-        None => allocate_port()?,
+        Some(p) => fail!(format!(
+            "this project pins port {p}, which is Sparkle's own dev port and would frame Sparkle \
+             inside Sparkle"
+        )),
+        None => match allocate_port() {
+            Ok(p) => p,
+            Err(e) => fail!(e),
+        },
     };
-    let program = resolve_program(&target.program)?;
+    let program = match resolve_program(&target.program) {
+        Ok(p) => p,
+        Err(e) => fail!(e),
+    };
     let args = build_argv(&target, port);
 
     let mut cmd = Command::new(&program);
@@ -1779,14 +1973,16 @@ fn open_reserved(
         }
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("preview: failed to start {program}: {e}"))?;
-    let pid = child.id();
-    let (_out_drain, _out_thread) = crate::worktree::spawn_drain(child.stdout.take());
-    let (err_drain, _err_thread) = crate::worktree::spawn_drain(child.stderr.take());
+    let mut spawned = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => fail!(format!("failed to start {program}: {e}")),
+    };
+    let pid = spawned.id();
+    let (_out_drain, _out_thread) = crate::worktree::spawn_drain(spawned.stdout.take());
+    let (err_drain, _err_thread) = crate::worktree::spawn_drain(spawned.stderr.take());
 
     let identity = PsIdentity.identity(pid);
     let pgid = identity.as_ref().map(|i| i.pgid).unwrap_or(pid);
-    let id = new_id();
     let cmdline = format!("{program} {}", args.join(" "));
 
     // WRITTEN IMMEDIATELY, before readiness: a hard kill in the settling window must still leave the
@@ -1810,33 +2006,27 @@ fn open_reserved(
         },
     );
 
-    let status = PreviewStatus {
-        id: id.clone(),
-        agent_id,
-        project_id,
-        // The URL is knowable before the server is ready precisely because the port was FORCED;
-        // discovery may still replace it if the framework ignored us.
-        url: Some(preview_url_for(port)),
-        port: Some(port),
-        state: PreviewState::Starting,
-        error: None,
-    };
-    let child = Arc::new(Mutex::new(Some(child)));
-    let stop = Arc::new(AtomicBool::new(false));
+    // ATTACH the real process to the entry created (and possibly already shown as `Installing`)
+    // above, rather than inserting a second one — `id`/`child`/`stop` are the SAME instances a
+    // `preview_open` re-attach during either phase would have observed.
     {
-        let manager = app.state::<PreviewManager>();
-        manager.set_app_data(app_data.clone());
-        manager.lock().insert(
-            id.clone(),
-            Server {
-                status: status.clone(),
-                child: Arc::clone(&child),
-                pgid,
-                stop: Arc::clone(&stop),
-            },
-        );
+        let mut slot = child.lock().unwrap_or_else(|e| e.into_inner());
+        *slot = Some(spawned);
     }
-    let _ = app.emit("preview:state", status);
+    let manager = app.state::<PreviewManager>();
+
+    // RE-CHECK, now that the child is attached and visible to a concurrent `stop_one`. See
+    // `cancel_if_stopped_during_spawn`'s own doc for why this is needed at all.
+    if cancel_if_stopped_during_spawn(&child, &stop, &app_data, &id) {
+        return Err(format!("preview: a server for this agent is {ALREADY_STARTING}"));
+    }
+
+    manager.set_pgid(&id, pgid);
+    // The URL is knowable before the server is ready precisely because the port was FORCED;
+    // discovery may still replace it if the framework ignored us. State stays `Starting` — this is
+    // an attribute update (port/url), not a phase change, so it reuses `transition` rather than a
+    // second `insert`.
+    manager.transition(&app, &id, PreviewState::Starting, Some(port), None);
 
     let supervisor_app = app.clone();
     let supervisor_id = id.clone();
@@ -1952,6 +2142,38 @@ fn kill_now(child: &Arc<Mutex<Option<Child>>>) {
         }
     }
     *slot = None;
+}
+
+/// Extracted from `open_reserved` so this specific race-closing check has a return value a test
+/// can assert on, rather than being buried in `AppHandle`-bound control flow: `true` means a
+/// concurrent `stop_one` beat the spawn to it and the caller must fail the open; `false` means the
+/// spawn is clear to proceed.
+///
+/// `stop_one` sets `stop = true` BEFORE it does anything else, on the SAME `Arc` cloned into the
+/// `Server` at insert time. So between the reservation `open_reserved` takes and the point it calls
+/// this — port allocation, `resolve_program`'s login-shell PATH lookup, and `cmd.spawn()` itself,
+/// none of which re-check `stop` — a stop requested in that window found `child == None`, read that
+/// (correctly, at the time) as "already-stopped", and — per `stop_one`'s own contract — already
+/// removed the id from `servers` AND its on-disk registry row. Without this re-check the dev server
+/// that finished spawning during that window would be attached to an `Arc` no
+/// `preview_stop`/`preview_stop_for_agent`/`stop_all` can reach: a live 400 MB–1 GB Node process
+/// holding a port, invisible to every stop path, reapable only by the next app-launch registry
+/// sweep (roborev 63963, High).
+fn cancel_if_stopped_during_spawn(
+    child: &Arc<Mutex<Option<Child>>>,
+    stop: &AtomicBool,
+    app_data: &Path,
+    id: &str,
+) -> bool {
+    if !stop.load(Ordering::Acquire) {
+        return false;
+    }
+    kill_now(child);
+    // `stop_one` already removed the registry row it saw (before the caller ever wrote one); the
+    // caller's own `registry_upsert` ran AFTER that removal and re-added a row for a process about
+    // to be killed here — undo it, or the next app launch's sweep finds a row for a pid already gone.
+    registry_remove(app_data, id);
+    true
 }
 
 /// A terminal transition: emit it, and drop the registry entry so no sweep ever considers a process
@@ -2567,6 +2789,331 @@ mod tests {
         }
     }
 
+    // ------------------------------------------------------- §5b Installing / deps-wait
+
+    /// A lockfile with no `node_modules` yet is exactly the case `PreviewState::Installing` exists
+    /// for — this is the condition, pinned in isolation from the `AppHandle`-requiring flow around
+    /// it, so it can be unit tested at all.
+    #[test]
+    fn a_lockfile_with_no_node_modules_needs_the_deps_wait() {
+        let dir = tempdir("needs-wait");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+        assert!(needs_deps_wait(&dir), "a lockfile with no node_modules must wait for the install");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The common case — `deps_bootstrap` already finished by the time anyone clicks Preview — must
+    /// skip the wait entirely rather than re-checking an install that is already done.
+    #[test]
+    fn node_modules_already_present_skips_the_deps_wait() {
+        let dir = tempdir("no-wait-installed");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        assert!(!needs_deps_wait(&dir), "node_modules already exists — nothing to wait for");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No lockfile this module drives (or none at all) is not this module's install to wait on —
+    /// mirrors `deps_bootstrap::plan_for`'s own refusal to resolve a fresh graph for a project with
+    /// no lockfile, or to drive a manager it does not recognize.
+    #[test]
+    fn no_recognized_lockfile_never_waits() {
+        let dir = tempdir("no-lockfile");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        assert!(!needs_deps_wait(&dir), "no lockfile at all — nothing this module would have installed");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir2 = tempdir("unsupported-manager");
+        write(&dir2.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir2.join("yarn.lock"), "# yarn lockfile v1\n");
+        assert!(
+            !needs_deps_wait(&dir2),
+            "yarn is recognized by manager_for but is_supported() is pnpm/npm only — \
+             bootstrap_worktree_deps never drives it, so waiting on its node_modules would hang \
+             for the full timeout over an install that was never going to run"
+        );
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
+    /// The bug this predicate exists to fix: `node_modules` appearing is NOT "the install
+    /// finished" — both managers create the directory near the start of an install, so a bare
+    /// directory with neither manager's completion marker must read as still-installing.
+    #[test]
+    fn a_bare_node_modules_directory_with_no_marker_is_not_ready() {
+        let dir = tempdir("bare-node-modules");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+        std::fs::create_dir_all(dir.join("node_modules")).unwrap();
+        assert!(
+            !deps_install_ready(&dir),
+            "node_modules exists but pnpm's own completion marker does not — install is still in flight"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pnpms_own_completion_marker_is_ready() {
+        let dir = tempdir("pnpm-marker");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+        write(&dir.join("node_modules/.modules.yaml"), "hoistedDependencies: {}\n");
+        assert!(deps_install_ready(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn npms_own_completion_marker_is_ready() {
+        let dir = tempdir("npm-marker");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("package-lock.json"), "{}\n");
+        write(&dir.join("node_modules/.package-lock.json"), "{}\n");
+        assert!(deps_install_ready(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn npms_marker_does_not_satisfy_a_pnpm_project_or_vice_versa() {
+        // pnpm project, but only npm's marker is on disk (e.g. a stale directory from a manager
+        // switch) — must not read as ready off the wrong manager's file.
+        let dir = tempdir("pnpm-project-npm-marker");
+        write(&dir.join("package.json"), r#"{"scripts":{"dev":"vite"}}"#);
+        write(&dir.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+        write(&dir.join("node_modules/.package-lock.json"), "{}\n");
+        assert!(!deps_install_ready(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `wait_for_deps`'s three outcomes, extracted from `open_reserved` precisely so they are
+    /// testable without a real filesystem, clock, or thread sleep — the gap roborev 63963 named:
+    /// "the timeout constant, the finish cleanup, and the stop check could each be deleted and the
+    /// suite would stay green."
+    #[test]
+    fn wait_for_deps_returns_ready_once_is_ready_answers_true() {
+        let stop = AtomicBool::new(false);
+        let mut ticks = 0;
+        let outcome = wait_for_deps(
+            &stop,
+            Instant::now() + Duration::from_secs(999), // never reached — is_ready wins first
+            || {
+                ticks += 1;
+                ticks >= 3
+            },
+            Instant::now,
+            || {},
+        );
+        assert_eq!(outcome, DepsWaitOutcome::Ready);
+        assert_eq!(ticks, 3, "must have actually polled, not guessed ready on the first check");
+    }
+
+    #[test]
+    fn wait_for_deps_returns_stopped_the_moment_stop_is_set_even_if_ready_would_answer_true() {
+        let stop = AtomicBool::new(true);
+        let outcome = wait_for_deps(
+            &stop,
+            Instant::now() + Duration::from_secs(999),
+            || true, // would be ready immediately — stop must still win
+            Instant::now,
+            || {},
+        );
+        assert_eq!(outcome, DepsWaitOutcome::Stopped);
+    }
+
+    #[test]
+    fn wait_for_deps_returns_timed_out_once_the_deadline_passes_with_no_marker() {
+        let stop = AtomicBool::new(false);
+        // A fake clock that starts before the deadline and crosses it after a few polls, so the
+        // loop actually iterates rather than timing out on its very first check.
+        let base = Instant::now();
+        let deadline = base + Duration::from_secs(10);
+        let mut elapsed_secs = 0u64;
+        let outcome = wait_for_deps(
+            &stop,
+            deadline,
+            || false, // never ready
+            || {
+                let now = base + Duration::from_secs(elapsed_secs);
+                elapsed_secs += 5;
+                now
+            },
+            || {},
+        );
+        assert_eq!(outcome, DepsWaitOutcome::TimedOut);
+    }
+
+    /// The High fix (roborev 63963): a `stop` that won the race against a spawn must actually kill
+    /// the process and undo the registry write, not merely report `true`. A REAL spawned process,
+    /// because the whole bug was the DIFFERENCE between "the map entry says stopped" and "the OS
+    /// process is still running" — an assertion against a fake `Child` could not see that gap.
+    #[cfg(unix)]
+    #[test]
+    fn cancel_if_stopped_during_spawn_kills_the_process_and_clears_the_registry_row() {
+        let dir = tempdir("cancel-race-stopped");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30").stdout(Stdio::null()).stderr(Stdio::null());
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let spawned = cmd.spawn().expect("spawn sleep");
+        let pid = spawned.id();
+        let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(spawned)));
+        let stop = AtomicBool::new(true); // `stop_one` already won the race before we got here
+
+        registry_upsert(
+            &dir,
+            PreviewEntry {
+                id: "race-id".into(),
+                agent_id: "ag".into(),
+                project_id: "proj".into(),
+                worktree: "/tmp/does-not-matter".into(),
+                requested_port: Some(5555),
+                bound_port: None,
+                pid,
+                pgid: pid,
+                pid_start_time: String::new(),
+                owner_pid: std::process::id(),
+                owner_epoch: "epoch".into(),
+                started_at: 0,
+                cmd: "sleep 30".into(),
+            },
+        );
+
+        let cancelled = cancel_if_stopped_during_spawn(&child, &stop, &dir, "race-id");
+        assert!(cancelled, "a stop that already fired must be reported, not silently swallowed");
+
+        // THE LOAD-BEARING ASSERTION: the process must actually be dead, not just the map entry.
+        // `kill(pid, 0)` asks the kernel rather than trusting `Child`'s own cached state (same
+        // reasoning as `exited_without_reaping_reports_exit_but_leaves_the_child_waitable` in
+        // worktree.rs). Polled and bounded, because a SIGKILL is not synchronous.
+        let started = Instant::now();
+        loop {
+            let alive = unsafe { libc::kill(pid as libc::pid_t, 0) };
+            if alive != 0 {
+                break;
+            }
+            assert!(started.elapsed() < Duration::from_secs(5), "the process was never actually killed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let entries = load_registry(&dir);
+        assert!(
+            !entries.iter().any(|e| e.id == "race-id"),
+            "the registry row written for the about-to-be-killed process must be undone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancel_if_stopped_during_spawn_leaves_a_live_process_alone_when_stop_was_never_set() {
+        let dir = tempdir("cancel-race-not-stopped");
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("sleep 30").stdout(Stdio::null()).stderr(Stdio::null());
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let spawned = cmd.spawn().expect("spawn sleep");
+        let pid = spawned.id();
+        let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(spawned)));
+        let stop = AtomicBool::new(false);
+
+        let cancelled = cancel_if_stopped_during_spawn(&child, &stop, &dir, "not-a-race");
+        assert!(!cancelled, "no stop was requested — the normal spawn path must proceed");
+
+        let alive = unsafe { libc::kill(pid as libc::pid_t, 0) };
+        assert_eq!(alive, 0, "the process must be left running when there was no race to lose");
+
+        // Clean up the process this test itself spawned.
+        {
+            let mut slot = child.lock().unwrap();
+            if let Some(c) = slot.as_mut() {
+                crate::proc::kill_process_group(c);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// roborev 64017: the two tests above prove `cancel_if_stopped_during_spawn` WORKS — they call
+    /// it directly — but neither proves `open_reserved` actually CALLS it. Deleting the `if
+    /// cancel_if_stopped_during_spawn(…) { … }` line at its post-spawn tail would leave every other
+    /// `preview::` test green while fully restoring the High-severity orphaned-server bug (the exact
+    /// "defaulted/unexercised production call site" shape named in `AGENTS.md`, bead
+    /// `sparkle-lgbwf`). `open_reserved` needs a live `AppHandle` and a real spawned `Child` and
+    /// cannot be driven end-to-end from a unit test (documented elsewhere in this file), so this
+    /// pins the call SOURCE-TEXTUALLY instead — the same technique `previewSeam.test.ts` uses across
+    /// the Rust/TS boundary, applied here within one file.
+    ///
+    /// `include_str!` on this file's own path (relative to itself, so it resolves regardless of
+    /// where the crate root is) — NOT a hand-copied excerpt, which would just be a second place for
+    /// the two to drift apart.
+    ///
+    /// SCOPED TO `open_reserved`'S OWN BODY — not just the production half. Two earlier drafts each
+    /// fixed one leak and left another (roborev 64029, then 64039, both High/Medium):
+    ///
+    /// 1. Scanning the WHOLE FILE matched the test module's own source (this test's body contains
+    ///    the same three anchor strings — its two direct calls to the helper, and prose mentioning
+    ///    `set_pgid`). Fixed by cutting at `mod tests`.
+    /// 2. Scanning the whole PRODUCTION HALF (~2,300 lines) pinned nothing to `open_reserved`
+    ///    itself: the three needles happening to live inside it was incidental, so a refactor that
+    ///    extracted `open_reserved`'s post-spawn tail into a helper defined ANYWHERE ELSE in the
+    ///    file and then forgot to call it would still find all three needles, in the same order,
+    ///    and pass — while fully restoring the orphaned-server race. Fixed by narrowing to the
+    ///    function's own body before searching at all.
+    ///
+    /// Each anchor is still found INDEPENDENTLY against that one narrowed slice, not nested inside
+    /// the previous match's remainder — nesting is what made an even earlier draft's ordering assert
+    /// tautological (`upsert <= cancel <= set_pgid` held by construction no matter the real order).
+    #[test]
+    fn open_reserved_calls_cancel_if_stopped_during_spawn_between_the_registry_write_and_set_pgid() {
+        let whole = include_str!("preview.rs");
+        let test_mod = whole.find("#[cfg(test)]\nmod tests {").expect(
+            "preview.rs no longer carries its `#[cfg(test)] mod tests` marker — this guard cannot \
+             scope itself to the production half, and an unscoped scan can be satisfied by this \
+             very test's own source",
+        );
+        let prod = &whole[..test_mod];
+        // Same discipline as `previewSeam.test.ts`'s own scoping check: both bounds are properties
+        // the slice does not guarantee, so assert them rather than trust `find` succeeded silently.
+        assert!(prod.len() > 1000, "the production half must not have been truncated to nothing");
+        assert!(whole.len() - prod.len() > 1000, "the test module cut away must be substantial too");
+
+        // Narrow further to `open_reserved`'s OWN body: from its signature to the next top-level
+        // (zero-indent) closing brace. Every brace INSIDE the function — including the local
+        // `macro_rules! fail { … }` it defines — is indented at least one level, so the first
+        // `"\n}\n"` after the signature is the function's own close, not an inner block's.
+        let fn_start = prod.find("fn open_reserved(").expect("open_reserved must still exist");
+        let after_sig = &prod[fn_start..];
+        let fn_end = after_sig
+            .find("\n}\n")
+            .expect("open_reserved must still have a top-level closing brace to bound the search");
+        let body = &after_sig[..fn_end];
+        assert!(body.len() > 500, "open_reserved's body must not have been truncated to nothing");
+
+        // Each anchor found INDEPENDENTLY against `body`, not nested inside the previous match's
+        // remainder — nesting is what made an earlier draft's ordering assert vacuous.
+        let upsert = body
+            .find("registry_upsert(\n        &app_data,\n        PreviewEntry {")
+            .expect("open_reserved's registry_upsert call must still exist in this exact shape");
+        let cancel = body
+            .find("cancel_if_stopped_during_spawn(&child, &stop, &app_data, &id)")
+            .expect(
+                "open_reserved must still call cancel_if_stopped_during_spawn after writing the \
+                 registry row it needs to be able to undo",
+            );
+        let set_pgid = body
+            .find("manager.set_pgid(&id, pgid);")
+            .expect("set_pgid must still be called after the cancel check, not before it");
+
+        assert!(
+            upsert < cancel && cancel < set_pgid,
+            "call order must be registry_upsert -> cancel_if_stopped_during_spawn -> set_pgid, \
+             all inside open_reserved's own body"
+        );
+    }
+
     // ---------------------------------------------------------------- §4 ports + argv
 
     /// 1420 is Sparkle's own devUrl and Tauri REWRITES External URLs matching it, so a preview there
@@ -2916,9 +3463,13 @@ mod tests {
                 "{state:?} must fall through to a fresh spawn"
             );
         }
-        for state in
-            [PreviewState::Starting, PreviewState::Listening, PreviewState::Ready, PreviewState::Serving]
-        {
+        for state in [
+            PreviewState::Installing,
+            PreviewState::Starting,
+            PreviewState::Listening,
+            PreviewState::Ready,
+            PreviewState::Serving,
+        ] {
             let mgr = PreviewManager::default();
             mgr.lock().insert("srv-1".into(), seeded("agent-1", "srv-1", 5173, state));
             assert!(
@@ -2933,6 +3484,7 @@ mod tests {
     #[test]
     fn live_for_reattach_names_every_state_exactly_once() {
         let live = [
+            PreviewState::Installing,
             PreviewState::Starting,
             PreviewState::Listening,
             PreviewState::Ready,
@@ -2945,7 +3497,7 @@ mod tests {
         for s in dead {
             assert!(!live_for_reattach(s), "{s:?} is a corpse");
         }
-        assert_eq!(live.len() + dead.len(), 7, "every PreviewState variant is classified above");
+        assert_eq!(live.len() + dead.len(), 8, "every PreviewState variant is classified above");
     }
 
     /// The wire name of a state, as an EXHAUSTIVE match. Rust cannot enumerate variants, so a
@@ -2955,6 +3507,7 @@ mod tests {
     /// here, which is the prompt to add it to `previewStore.ts`'s union too.
     fn wire_name(state: PreviewState) -> &'static str {
         match state {
+            PreviewState::Installing => "installing",
             PreviewState::Starting => "starting",
             PreviewState::Listening => "listening",
             PreviewState::Ready => "ready",
@@ -2968,6 +3521,7 @@ mod tests {
     #[test]
     fn every_state_serializes_to_the_string_the_frontend_is_typed_against() {
         let pairs = [
+            (PreviewState::Installing, "installing"),
             (PreviewState::Starting, "starting"),
             (PreviewState::Listening, "listening"),
             (PreviewState::Ready, "ready"),

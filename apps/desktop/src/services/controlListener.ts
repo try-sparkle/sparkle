@@ -132,6 +132,9 @@ import {
   releasePeerSend,
   sendPeerInboxMessage,
 } from "./peerMessaging";
+// The preview supervisor's wrappers — the ONE module that invokes the Rust preview commands, so
+// this handler never touches `invoke` directly (services/preview's own header explains why).
+import { openPreviewServer, stopPreviewForAgent, fetchPreviewStatus } from "./preview";
 import type { ControlOp } from "../stores/selfReportMetrics";
 import type { AgentTab, AgentTabStatus } from "../types";
 
@@ -207,6 +210,9 @@ const TALLY: Record<ControlOp, boolean> = {
   // most identifying payload on the surface, and the point of the counter is "are agents using the
   // channel", not what they said to each other.
   send_peer_message: true,
+  // Are agents actually showing their work? The op name only — never the route, which names what
+  // the caller is building.
+  preview: true,
 };
 const TALLIED_OPS = new Set<ControlOp>(
   (Object.keys(TALLY) as ControlOp[]).filter((op) => TALLY[op]),
@@ -321,6 +327,27 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // refuses everyone else with `escalation_not_yours`. Both gates matter: this op spends a bounded
   // allowance that only a HUMAN can refill, so a near-miss caller must not get within reach of it.
   set_agent_escalation: "privileged",
+  // PRIVILEGED — and this entry is where the founder's preview rule is ENFORCED rather than merely
+  // described (docs/live-browser-preview.md, "Decisions — amended 2026-08-08": *only interactive
+  // agents may open a preview; workers may not*).
+  //
+  // `callerMayAdminister` IS that rule's predicate — `kind != null && kind !== "worker"` — so this
+  // tier makes ONE gate carry it, in the single place `dispatch` enforces the free/privileged
+  // decision. A second copy of the check inside `handlePreview` would be unreachable from here and
+  // would rot into exactly the decorative per-handler guard this table exists to replace.
+  //
+  // IT COVERS close AND list TOO, which is a decision rather than a side effect of the tier. A
+  // preview is A PANE THE HUMAN LOOKS AT, so it sits in the same class as zoom/ordering/navigation
+  // above: an unattended worker must not change the human's UI on its own initiative. Under the
+  // open rule a worker can never have started one, so the only preview its `close` could ever reach
+  // is one a HUMAN opened on that worker's row — blanking the human's pane, which is the very thing
+  // this tier denies. Refusing all three is both safer and simpler to explain than a rule that
+  // turns on which door was used.
+  //
+  // The concierge clears this gate outright (it is the human's own front-of-house), so the one
+  // caller that must still be refused is refused by the handler — see `handlePreview`: a headless
+  // `claude -p` child has no roster row and no checkout, so there is no worktree to serve.
+  preview: "privileged",
 };
 
 /**
@@ -347,6 +374,12 @@ const CONCIERGE_EXEMPT_OPS = new Set<ControlOp>([
   // handler can only decline, and a human who switched it on would get `unknown_caller` with nothing
   // saying why the toggle did nothing.
   "send_peer_message",
+  // Same rule again, for the same structural reason: a preview serves an AGENT'S OWN WORKTREE, and
+  // the concierge is a headless `claude -p` child with no roster row — `findAgent` can never resolve
+  // its reserved id, so `handlePreview` can only ever decline it. Classifying it would advertise a
+  // Settings toggle for a tool that cannot work, and turning that toggle on would produce a refusal
+  // with nothing explaining why.
+  "preview",
 ]);
 
 /**
@@ -370,6 +403,9 @@ type ControlOpExemptFromConciergePolicy =
   | "set_agent_ordering"
   | "unpin_agent"
   | "send_peer_message"
+  // Exempt on BOTH sides, like `send_peer_message` directly above and for the same reason: the
+  // concierge has no worktree, so `handlePreview` can only decline it. See `CONCIERGE_EXEMPT_OPS`.
+  | "preview"
   // EXEMPT FROM *THIS* CHECK ONLY, AND NOT FROM THE GATE — the one place these two lists differ,
   // so read the difference rather than pattern-matching the name (roborev 63142). This type asks
   // "is the op classified in `APP_TOOL_NAMES`", and `chief_tool` deliberately is not: its policy
@@ -2263,6 +2299,150 @@ function handleNavigate(req: ControlRequest): Record<string, unknown> {
   return { ok: false, error: 'view must be "sparkle" | "board" | "agent"' };
 }
 
+/** The three sub-ops `preview` carries. Frozen contract, mirrored by the Zod enum in
+ *  apps/mcp-control's `previewArgs`. */
+const PREVIEW_OPS = ["open", "close", "list"] as const;
+type PreviewSubOp = (typeof PREVIEW_OPS)[number];
+
+/**
+ * Is this a ROUTE ON THE DEV SERVER, rather than a URL?
+ *
+ * A DELIBERATE SECOND COPY of the guard in apps/mcp-control's `previewArgs`, for the same reason
+ * `isLoopbackPreviewUrl` is a second copy of the Rust one: the client's check lives in a different
+ * process's build, so "the MCP server already validated it" is a claim about someone else's binary,
+ * and this side is what hands the path to the thing that resolves it.
+ *
+ * A POSITIVE check, not `startsWith("/")`. A protocol-relative reference like `//evil.example/x`
+ * starts with `/` and resolves against the loopback base to a different origin entirely; `/\host`
+ * is the same trick, since the URL parser normalises `\` to `/` in special schemes. The
+ * control-character clause is the other half of that defence, not hygiene: the WHATWG parser strips
+ * ASCII tab/newline BEFORE parsing, so `"/\t/evil.example"` becomes `"//evil.example"` at resolve
+ * time — an escape the `(?![/\\])` lookahead alone does not catch. Do not relax it.
+ *
+ * `no-control-regex` fires on the `\x00-\x1f` range and is wrong here for exactly that reason: the
+ * range is the input class being REJECTED, not a typo.
+ */
+// eslint-disable-next-line no-control-regex
+const PREVIEW_ROUTE = /^\/(?![/\\])[^\s\x00-\x1f\x7f]*$/;
+
+/**
+ * preview → open / close / list THE CALLER'S OWN live browser preview (bead `sparkle-3475b.6`).
+ *
+ * WIRE CONTRACT, mirrored in `bridge.rs` CONTROL_OPS and apps/mcp-control's `previewTool`:
+ *   payload → { previewOp: "open" | "close" | "list", path?: string }   (`path` only on open)
+ *   reply   → { ok: true, preview } | { ok: true, outcome } | { ok: true, previews } | { ok: false, code, error }
+ *
+ * `previewOp`, NOT `op`: the client flattens this payload into the wire envelope, whose own reserved
+ * `op` field is written after the spread and then stripped by the Rust bridge — so an inner field
+ * named `op` never arrives. That is not a hypothetical; it is how `concierge_tool` shipped inert in
+ * v0.55.0 (see `handleConciergeTool`). There is deliberately no `op` fallback here, because unlike
+ * that op there was never a build in which the old spelling reached this handler — it could not.
+ *
+ * THERE IS NO `agentId` PARAMETER, AND THAT IS THE SECURITY PROPERTY, not an omission. Every op here
+ * targets `req.callerAgentId`, which Rust stamps from the socket the request arrived on. `open`
+ * spawns a real dev server in a real checkout and `close` kills one, so a payload-named target would
+ * be a confused-deputy hole by construction: one agent starting servers in another agent's worktree,
+ * or stopping the preview a colleague is being watched through. Anything the payload calls
+ * `agentId`, `projectId`, `worktree` or `id` is ignored — read, deliberately, nowhere below.
+ *
+ * WHO MAY CALL IT is the tier gate's job (`CONTROL_OP_TIERS.preview` is `privileged`), so a worker
+ * never reaches this function. The one caller that clears that gate and still cannot be served is
+ * the concierge: it has no roster row, so `findAgent` cannot resolve it and there is no worktree.
+ */
+async function handlePreview(req: ControlRequest): Promise<Record<string, unknown>> {
+  const requested = req.payload.previewOp;
+  const sub = PREVIEW_OPS.find((o) => o === requested) as PreviewSubOp | undefined;
+  if (!sub) {
+    return {
+      ok: false,
+      code: "preview_bad_op",
+      error: `preview needs previewOp: "open", "close" or "list" (got ${JSON.stringify(requested) ?? "nothing"})`,
+    };
+  }
+  // The caller's OWN row. Not `resolveTargetId` — that honours a payload-supplied `targetAgentId`,
+  // which is exactly what this op must never do (see the header).
+  const found = findAgent(req.callerAgentId);
+  if (!found) {
+    return {
+      ok: false,
+      code: "preview_unknown_caller",
+      error: `preview serves the calling agent's own worktree, and ${req.callerAgentId || "an unidentified caller"} does not resolve to an agent`,
+    };
+  }
+  try {
+    if (sub === "close") {
+      // BY AGENT, NEVER BY SERVER ID. `stopPreview(id)` would take an id off the payload, and a
+      // server id is not proof of ownership — routing through the agent makes "stop someone else's
+      // preview" unrepresentable rather than merely refused.
+      const outcome = await stopPreviewForAgent(req.callerAgentId);
+      return { ok: true, outcome };
+    }
+    if (sub === "list") {
+      // SCOPED TO THE CALLER, and `listPreviews()` is deliberately NOT used. `preview_list` returns
+      // every live preview across every agent, and there is no version of that answer this op should
+      // give: the tool's own contract is "open / close / list THIS AGENT's live browser preview",
+      // every other per-agent op on this bridge scopes strictly to the stamped caller, and each row
+      // carries a loopback URL + port for another agent's worktree — which is the cross-agent reach
+      // the absent `agentId` parameter exists to prevent. An array (of at most one) rather than a
+      // bare object because "list" is the caller's word for it and an empty array is an unambiguous
+      // "nothing running".
+      const status = await fetchPreviewStatus(req.callerAgentId);
+      return { ok: true, previews: status ? [status] : [] };
+    }
+    const worktree = found.agent.worktreePath;
+    if (!worktree) {
+      return {
+        ok: false,
+        code: "preview_no_worktree",
+        error: "preview open needs your own worktree, and this agent has none cut yet",
+      };
+    }
+    const raw = req.payload.path;
+    if (raw !== undefined && raw !== null && typeof raw !== "string") {
+      return { ok: false, code: "preview_bad_path", error: "path must be a string route, e.g. '/dashboard'" };
+    }
+    const path = typeof raw === "string" ? raw : null;
+    if (path !== null && !PREVIEW_ROUTE.test(path)) {
+      return {
+        ok: false,
+        code: "preview_bad_path",
+        error:
+          "path must start with '/' and be a route on the dev server, not a URL — '//host' and '/\\host' are protocol-relative and resolve to another origin",
+      };
+    }
+    const opened = await openPreviewServer({
+      agentId: req.callerAgentId,
+      projectId: found.projectId,
+      worktree,
+      path,
+    });
+    if (!opened) {
+      return { ok: false, code: "preview_not_started", error: "the preview supervisor started nothing" };
+    }
+    // `opened.url`/`opened.port` are only meaningful once a port has been allocated. Keyed on the
+    // ADDRESS ITSELF (`!url || !port`), NOT on `state === "installing"` — that was the bug in an
+    // earlier draft of this guard (roborev 63997): `open_reserved` inserts the map entry with
+    // `port: None` and `state: Starting` for the COMMON case too (no deps wait needed), and does not
+    // set the real port until several steps later (login-shell PATH lookup, `cmd.spawn()`). A
+    // RE-ATTACH landing in that window has `state: "starting"`, not `"installing"`, and the same
+    // empty `url: ""` / `port: 0` `PreviewManager::reserve_or_reattach` sends whenever it has nothing
+    // to report yet. Passing that straight through reads as a started preview carrying an unusable
+    // address — forwarding only `id`/`state` here means a caller has to look at `state` before it has
+    // an address to act on at all, rather than trusting a payload that merely happens to be shaped
+    // like success.
+    if (!opened.url || !opened.port) {
+      return { ok: true, preview: { id: opened.id, state: opened.state } };
+    }
+    return { ok: true, preview: opened };
+  } catch (e) {
+    // A REFUSAL, NOT A THROW. An uncaught error still replies (dispatch catches it), but as a bare
+    // `{ error }` with no `code` — and the message a caller most needs to branch on comes through
+    // here: `already-starting` is a healthy in-flight start, not a failed one (see preview.ts's
+    // PREVIEW_ALREADY_STARTING), and a caller that reads it as failure retries into the rejection.
+    return { ok: false, code: "preview_failed", error: errMsg(e) };
+  }
+}
+
 /**
  * concierge_tool → the concierge's four tool domains (services/conciergeTools/registry).
  *
@@ -3244,6 +3424,9 @@ async function dispatch(req: ControlRequest): Promise<void> {
         break;
       case "send_peer_message":
         result = await handleSendPeerMessage(req);
+        break;
+      case "preview":
+        result = await handlePreview(req);
         break;
       case CHIEF_TOOL_OP:
         result = await handleChiefTool(req);

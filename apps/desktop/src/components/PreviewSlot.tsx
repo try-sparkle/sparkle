@@ -81,9 +81,10 @@ export const PREVIEW_SANDBOX_TOKENS = [
  * listening server whose url is refused renders the refusal instead. That is why this maps to a pane
  * KIND rather than to a testid.
  */
-type PreviewPane = "framable" | "starting" | "stopped" | "failed";
+type PreviewPane = "framable" | "installing" | "starting" | "stopped" | "failed";
 
 const PANE_FOR: Record<PreviewState, PreviewPane> = {
+  installing: "installing",
   starting: "starting",
   listening: "framable",
   ready: "framable",
@@ -228,6 +229,19 @@ export function PreviewSlot({ project, side }: { project: Project; side: PairSid
             title="The dev server was stopped"
             detail="Open the preview again from that agent's card in the Build column to start a fresh one."
           />
+        ) : pane === "installing" ? (
+          // ITS OWN STATE, NOT FOLDED INTO "starting". Before this existed, a worktree whose
+          // `node_modules` had not materialized yet looked identical to a cold compile — the design
+          // doc calls this out by name: "Phase 2 should surface 'installing dependencies' as a
+          // distinct pane state rather than letting it look like a hang." Reachable only while
+          // Rust's deps-wait is still polling for `node_modules` (see `preview.rs::open_reserved`);
+          // most opens skip straight past it because `deps_bootstrap` already finished by then.
+          <PreviewMessage
+            testId="preview-installing"
+            icon={null}
+            title="Installing dependencies…"
+            detail="This worktree's node_modules isn't ready yet. The dev server starts automatically once the install finishes — this can take a while on a cold package-manager store."
+          />
         ) : pane === "starting" ? (
           <PreviewMessage
             testId="preview-starting"
@@ -237,7 +251,7 @@ export function PreviewSlot({ project, side }: { project: Project; side: PairSid
             // `listening`/`ready` for "It is up and compiling the first page" — copy that became
             // unreachable when those states started framing — and the fall-through it left behind
             // then swallowed `stopped` (above). Naming the state is what keeps the title honest.
-            detail="This takes a few seconds on a cold start, and longer if dependencies are still installing."
+            detail="This takes a few seconds on a cold start."
           />
         ) : entry ? (
           // AN ENTRY WE DO NOT RECOGNISE IS NOT "no preview running", and telling the user there is

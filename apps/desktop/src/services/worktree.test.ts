@@ -2,6 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...a) }));
 
+// `services/preview` is imported for real here — the preview-interlock tests below assert on the
+// COMMAND NAME that crosses the bridge (`preview_stop_for_agent`), which a mocked module would hide.
+// Only its event subscription is stubbed: preview.ts imports `listen` at module scope, and nothing
+// in these tests arms the listener.
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(() => Promise.resolve(() => {})) }));
+
 // The env seeder shells out to the 1Password `op` CLI over IPC. Mocked here so the wiring — which
 // call sites seed, with what, and that none of them WAIT on it — is testable without a vault.
 vi.mock("./envSeed", () => ({
@@ -417,5 +423,95 @@ describe("worktree service — dependency bootstrap", () => {
 
     await removeAgentWorkspace(root, "p", "a");
     expect(startedWhileSeedPending).toBe(true);
+  });
+});
+
+// A preview is a LIVE dev server whose cwd is inside the agent's checkout — the one writer that
+// outlives the agent's own processes. `remove_agent_worktree` renames that checkout into
+// worktree-trash and then deletes it on a background thread, so a preview left running is writing
+// into a directory that is being moved out from under it (docs/live-browser-preview.md §5,
+// "Interlock with worktree teardown"; bead sparkle-3475b.6).
+describe("worktree service — preview teardown interlock", () => {
+  beforeEach(() => {
+    invoke.mockReset();
+    vi.mocked(abandonWorktreeSeed).mockReset().mockResolvedValue(undefined);
+    vi.mocked(abandonWorktreeBootstrap).mockReset().mockResolvedValue(undefined);
+  });
+
+  it("stops the preview BEFORE the checkout is evacuated", async () => {
+    // ORDER, not presence. A presence-only assertion stays green when the stop is issued AFTER the
+    // rename has started — which is the exact race this interlock exists to close, so it would prove
+    // nothing. Both commands push into one array and the array is compared as a sequence.
+    const order: string[] = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "preview_stop_for_agent") {
+        order.push("preview-stop");
+        return Promise.resolve({ outcome: "stopped" });
+      }
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace("/root-preview-order", "p", "a");
+
+    expect(invoke).toHaveBeenCalledWith("preview_stop_for_agent", { agentId: "a" });
+    expect(order).toEqual(["preview-stop", "remove"]);
+  });
+
+  it("still stops the preview first on a worktree that WAS prepared (the real close path)", async () => {
+    // The prepared path also settles the env seed and the dependency bootstrap. Whatever those two
+    // do, the preview stop must still land ahead of the removal — this is the ordering that holds
+    // in production, where every closed agent went through prepareAgentWorkspace first.
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const root = "/root-preview-prepared";
+    await prepareAgentWorkspace(root, "p", "a", "main");
+
+    const order: string[] = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "preview_stop_for_agent") {
+        order.push("preview-stop");
+        return Promise.resolve({ outcome: "not-found" });
+      }
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace(root, "p", "a");
+
+    expect(order).toEqual(["preview-stop", "remove"]);
+    expect(abandonWorktreeSeed).toHaveBeenCalledWith("/wt/p/a");
+    expect(abandonWorktreeBootstrap).toHaveBeenCalledWith("/wt/p/a");
+  });
+
+  it("removes the worktree anyway when the preview stop rejects", async () => {
+    // A stray preview must never be able to WEDGE cleanup: an un-removed worktree is a permanent
+    // problem (its slot path fails a later `worktree add`), while a preview that outlived its stop
+    // is a leaked process the supervisor's own reaping still covers.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    invoke.mockImplementation((cmd: string) =>
+      cmd === "preview_stop_for_agent"
+        ? Promise.reject(new Error("preview supervisor is wedged"))
+        : Promise.resolve(undefined),
+    );
+
+    await expect(
+      removeAgentWorkspace("/root-preview-throws", "p", "a"),
+    ).resolves.toBeUndefined();
+
+    expect(invoke).toHaveBeenCalledWith("remove_agent_worktree", {
+      root: "/root-preview-throws", projectId: "p", agentId: "a",
+    });
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("asks unconditionally — no local 'did this agent have a preview' guard", async () => {
+    // The Rust command is a map lookup that answers "not-found" when the agent has none
+    // (preview.rs::preview_stop_for_agent), so the common case is already a cheap no-op. A guard
+    // here would have to read state this module does not own, and would fail exactly where it
+    // matters: after a window reload, the frontend store is empty while the server is still up.
+    invoke.mockResolvedValue(undefined);
+    await removeAgentWorkspace("/root-preview-never", "p", "never-previewed");
+    expect(invoke).toHaveBeenCalledWith("preview_stop_for_agent", { agentId: "never-previewed" });
   });
 });

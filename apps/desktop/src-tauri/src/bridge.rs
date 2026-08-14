@@ -857,6 +857,18 @@ const CONTROL_OPS: &[&str] = &[
     // this bridge stamps from the socket. This entry is only the coarse existence gate — but
     // without it every Chief call dies at "unknown op" before the frontend is ever reached.
     "chief_tool",
+    // The live browser preview (bead `sparkle-3475b.6`): an agent showing its OWN work in a pane.
+    // ONE op for open/close/list — the sub-op rides in the payload as `previewOp`, NOT as `op`,
+    // because `op` is one of CONTROL_RESERVED_FIELDS below and an inner field by that name is
+    // overwritten by the envelope client-side and then stripped here. (That is not theoretical:
+    // it is how `concierge_tool` shipped inert in v0.55.0, which is why ITS sub-op is `toolOp`.)
+    //
+    // Scoping is NOT enforced at this layer. Every preview op targets the `callerAgentId` this
+    // bridge stamps from the socket — a payload-named agent must never start a dev server in
+    // someone else's worktree — and the founder's "interactive agents only, not workers" rule is
+    // the frontend tier gate (`CONTROL_OP_TIERS.preview`). This entry is only the coarse existence
+    // gate, without which every preview call dies at "unknown op".
+    "preview",
 ];
 
 /// Fields the bridge owns on the wire; everything else in the request becomes the op `payload`.
@@ -2115,13 +2127,16 @@ mod tests {
             "set_agent_escalation",
             // The Chief tool surface — one op carrying every `chief_*` tool and `chief_call`.
             "chief_tool",
+            // Preview Phase 2 (bead `sparkle-3475b.6`): an agent showing its own work in a pane.
+            // One op for open/close/list; the sub-op rides in the payload as `previewOp`.
+            "preview",
         ] {
             assert!(CONTROL_OPS.contains(&op), "{op} must be in the control allowlist");
         }
         assert_eq!(
             CONTROL_OPS.len(),
-            21,
-            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the concierge escalation lever, the peer send, and the Chief tool op"
+            22,
+            "exactly the frozen Phase-1 + Phase-3 + Phase-4 control ops, the guidelines append, the three intent ops, the concierge escalation lever, the peer send, the Chief tool op, and the preview op"
         );
     }
 
@@ -2140,6 +2155,49 @@ mod tests {
         // Op data passes through.
         assert_eq!(payload["name"], "Neo");
         assert_eq!(payload["targetAgentId"], "t9");
+    }
+
+    /// `preview` — the op an agent uses to show its own work in a pane (bead `sparkle-3475b.6`).
+    ///
+    /// THREE ASSERTIONS, because any one of them alone stays green while the wire is dead:
+    ///
+    ///  1. it clears the `CONTROL_OPS` gate at all. Until it was allowlisted, every call died as
+    ///     `unknown op` in `decode_control_request` — before the frontend was ever reached, and with
+    ///     both the mcp-control suite (which mocks `Bridge`) and the desktop suite (which hands a
+    ///     payload straight to `dispatch`) green, since neither crosses this socket.
+    ///  2. the SUB-op survives as `previewOp`. `op` is a reserved envelope field, so an inner field
+    ///     spelled `op` is overwritten by the envelope's own op ("preview") client-side and then
+    ///     stripped here as reserved — the exact defect that shipped `concierge_tool` inert in
+    ///     v0.55.0. The name is the fix; this pins it from the receiving end.
+    ///  3. the caller is OURS. A `preview open` spawns a dev server in a worktree, so an `agentId`
+    ///     a client nests in the payload must never be what names the target — it rides through as
+    ///     inert data while `caller_agent_id` stays the id this bridge stamped.
+    #[test]
+    fn control_preview_op_is_allowlisted_and_keeps_its_sub_op_and_stamped_caller() {
+        let r = decode_control_request(
+            r#"{"id":"1","token":"T","op":"preview","callerAgentId":"a1","previewOp":"open","path":"/dashboard","agentId":"victim"}"#,
+            "T",
+            ControlCaller::Shared,
+        )
+        .expect("preview must clear the CONTROL_OPS gate — an unlisted op decodes as `unknown op`");
+        assert_eq!(r.op, "preview");
+        assert_eq!(r.caller_agent_id, "a1", "identity is stamped by the bridge, never by the payload");
+        assert_eq!(r.payload["previewOp"], "open", "the sub-op must survive the envelope");
+        assert_eq!(r.payload["path"], "/dashboard");
+        assert!(r.payload.get("op").is_none(), "`op` is reserved — it can never carry the sub-op");
+        assert_eq!(
+            r.payload["agentId"], "victim",
+            "a spoofed agentId rides through as inert payload; the frontend handler must ignore it",
+        );
+
+        // And it reaches the round-trip rather than being refused: with no app handle the only
+        // remaining failure is the missing handle, NOT `unknown op`.
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let v: serde_json::Value = serde_json::from_str(&handle_control_request_line(
+            r#"{"id":"2","token":"T","op":"preview","callerAgentId":"a1","previewOp":"list"}"#,
+            "T", ControlCaller::Shared, &None, &pending,
+        )).unwrap();
+        assert_eq!(v["error"], "no app handle", "preview must reach dispatch, not the unknown-op gate");
     }
 
     #[test]

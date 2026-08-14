@@ -96,6 +96,10 @@ describe("useSelfReportMetrics — session-scoped increments", () => {
         // the reason it belongs to this paragraph rather than the UI ones: its payload carries a
         // free-text `reason` naming an agent's real work, and only the op name is stored.
         "set_agent_escalation",
+        // The live browser preview (bead sparkle-3475b.6). Same rule once more: the op NAME only,
+        // never the `path` its payload carries — a route names the page an agent is building, which
+        // is a description of the user's own work.
+        "preview",
       ].sort(),
     );
   });

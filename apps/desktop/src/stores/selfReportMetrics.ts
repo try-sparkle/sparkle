@@ -57,7 +57,11 @@ export type ControlOp =
   // and `callerMayAdminister` is skipped by OMISSION rather than by decision. `chief_tool` was in
   // exactly that state: free by accident. Adding it here is what makes the exhaustiveness claim
   // true again, and what forces the next op to state its tier.
-  | "chief_tool";
+  | "chief_tool"
+  // The live browser preview (bead `sparkle-3475b.6`) — ONE op carrying open/close/list, so this
+  // counter answers "are agents showing their work at all". The op NAME only, like every other key
+  // here: never the route, which names the caller's real work (see the privacy note above).
+  | "preview";
 
 /** The mutually-exclusive result of one auto-naming trigger (see agentNaming.namingOutcome). */
 export type NamingOutcome =
@@ -115,6 +119,7 @@ const emptyControlOps = (): Record<ControlOp, number> => ({
   navigate: 0,
   concierge_tool: 0,
   send_peer_message: 0,
+  preview: 0,
 });
 
 const emptyNamingOutcomes = (): Record<NamingOutcome, number> => ({

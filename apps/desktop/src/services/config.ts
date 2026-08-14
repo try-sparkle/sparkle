@@ -286,6 +286,12 @@ export interface SparkleConfig {
    *  backend predating `[builder_index]` omits it. An absent section reads as "nothing excluded",
    *  which is also the shipped default. */
   builder_index?: BuilderIndexConfig;
+  /** Live in-app browser preview (bead `sparkle-3475b`). Optional for the same back-compat reason
+   *  as `builder_index?`/`pushers?` above: a payload from a Rust backend predating [preview] omits
+   *  it. An absent section reads as "no preview support in this build" — callers that need a
+   *  default fall back to the shipped ones (`enabled: true`, `idle_grace_min: 10`,
+   *  `auto_open: "returning"`) rather than treating an absent section as disabled. */
+  preview?: PreviewConfig;
 }
 /** The `[builder_index]` table as Rust serializes it. Machine-wide; ignored in a per-project file —
  *  and here that is a boundary, not tidiness: a repo must not be able to change what its owner's
@@ -295,6 +301,19 @@ export interface BuilderIndexConfig {
    *  (trimmed, lowercased, empties dropped), matching tkmx-client's `applyExclusions` so the two
    *  reporters agree on what a name means. */
   skills_exclude: string[];
+}
+/** The `[preview]` table as Rust's `PreviewConfig` serializes it (`config.rs`), field for field —
+ *  do not add a field that struct cannot emit. Repo-scoped, per-project overridable. */
+export interface PreviewConfig {
+  /** Master switch. `false` = never detect, never spawn a preview server. */
+  enabled: boolean;
+  /** How long a preview keeps serving after its pane is covered, before it is stopped. */
+  idle_grace_min: number;
+  /** `"returning" | "never" | "always"`. Kept as `string` rather than a union: Rust validates and
+   *  falls back to `"returning"` on anything else, so the wire can only ever carry one of the
+   *  three, but typing it as `string` here matches how this file treats every other enum-ish
+   *  config string (see `auto_open`'s neighbours) and avoids a second copy of the literal list. */
+  auto_open: string;
 }
 /** The merged effective config plus any non-fatal load warnings (malformed layer, ignored keys). */
 export interface EffectiveConfig {

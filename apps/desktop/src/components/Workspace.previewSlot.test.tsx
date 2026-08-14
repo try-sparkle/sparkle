@@ -447,6 +447,30 @@ describe("the preview slot covers its pair", () => {
     expect(screen.getByTestId("preview-failed-detail").textContent).toContain("Cannot find module");
   });
 
+  // ITS OWN STATE, DISTINCT FROM `starting`. Before this existed, a worktree whose deps were still
+  // installing rendered as "Starting the dev server…" — indistinguishable from a cold compile — and
+  // the design doc calls that out by name: surfacing this as its own pane state is what tells the
+  // founder "give it a moment" instead of letting an install look like a hang. `url`/`port` are both
+  // null here, unlike `starting` below — Rust has not allocated a port yet at this point (see
+  // `preview.rs::open_reserved`'s deps-wait, which runs before port allocation).
+  it("shows INSTALLING, not the starting copy, while dependencies are not yet on disk", () => {
+    usePreviewStore.setState({
+      byAgent: {
+        a2: {
+          id: "srv-1", status: "installing", url: null, port: null,
+          error: null, startedAt: 0, reloadNonce: 0,
+        },
+      },
+    });
+    render(<Workspace />);
+    previewOn("left");
+
+    const col = previewColumn("left");
+    expect(col.querySelector("[data-testid='preview-frame']")).toBe(null);
+    expect(screen.getByTestId("preview-installing")).toBeTruthy();
+    expect(col.querySelector("[data-testid='preview-starting']")).toBe(null);
+  });
+
   // THE COLD START, and the bug it replaces was invisible in every other test because they all
   // seed `serving`. Rust knows the url BEFORE the server is up — it forced the port — so a
   // `starting` entry carries a perfectly good loopback url. Framing on the url's presence therefore
@@ -525,12 +549,16 @@ describe("the preview slot covers its pair", () => {
   // wire's `state` into the store unvalidated, so a desktop build older than the agent that started
   // the server sees exactly this — and the previous fall-through told the user there was no preview
   // for a server that was live, with no Reload button (gated on framable) and no way to tell.
-  // Cast because the whole point is a value outside the union.
+  // Cast because the whole point is a value outside the union. NOT "installing" — that USED to be
+  // this test's placeholder for "a state no build recognises yet" until Phase 2 gave it a real
+  // meaning (`PreviewState::Installing`), which is exactly the scenario this test guards against:
+  // a placeholder for "unrecognised" must itself stay unrecognised, or the test silently stops
+  // covering the branch it names.
   it("names an unrecognised state instead of claiming there is no preview", () => {
     usePreviewStore.setState({
       byAgent: {
         a2: {
-          id: "srv-1", status: "installing" as never, url: "http://127.0.0.1:5199/", port: 5199,
+          id: "srv-1", status: "provisioning" as never, url: "http://127.0.0.1:5199/", port: 5199,
           error: null, startedAt: 0, reloadNonce: 0,
         },
       },
@@ -540,7 +568,7 @@ describe("the preview slot covers its pair", () => {
 
     const col = previewColumn("left");
     expect(screen.getByTestId("preview-unknown")).toBeTruthy();
-    expect(screen.getByTestId("preview-unknown-detail").textContent).toContain("installing");
+    expect(screen.getByTestId("preview-unknown-detail").textContent).toContain("provisioning");
     expect(col.querySelector("[data-testid='preview-empty']")).toBe(null);
     expect(col.querySelector("[data-testid='preview-starting']")).toBe(null);
   });

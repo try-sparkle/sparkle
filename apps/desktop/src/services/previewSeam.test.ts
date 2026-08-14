@@ -404,6 +404,65 @@ describe("withoutRustComments keeps code and blanks only comments", () => {
   });
 });
 
+// THE THIRD SEAM: `previewIdleGrace.ts`'s `LIVE_STATES` claims to mirror `live_for_reattach`, and
+// until this test existed nothing checked that claim. `installing` was added to `live_for_reattach`
+// (Phase 2's Installing state) without a matching update to `LIVE_STATES` — a pane covered while its
+// preview was still waiting on `node_modules` armed no idle-grace timer at all (roborev 63963). Both
+// sides are exhaustive `match`/`Record`s against their OWN type, so neither notices drift in the
+// other; this is what makes them fail together instead.
+const IDLE_GRACE = fileURLToPath(new URL("./previewIdleGrace.ts", import.meta.url));
+
+/** Every `PreviewState` variant `live_for_reattach` maps to `true`, lowercased. Reuses
+ *  `withoutRustComments` so a brace inside a doc comment cannot move the match's boundary, the same
+ *  hazard `readEnum` above is written against. */
+function readLiveForReattachTrueStates(source: string): string[] {
+  const clean = withoutRustComments(source);
+  const fnStart = clean.indexOf("fn live_for_reattach(");
+  if (fnStart < 0) throw new Error("preview.rs no longer declares `fn live_for_reattach`");
+  const open = clean.indexOf("{", fnStart);
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < clean.length; i++) {
+    if (clean[i] === "{") depth++;
+    else if (clean[i] === "}" && --depth === 0) {
+      close = i;
+      break;
+    }
+  }
+  if (close < 0) throw new Error("live_for_reattach's braces never balanced");
+  const body = clean.slice(open + 1, close);
+
+  // Every match arm, in order: the pattern text up to its own `=>`, then `true` or `false`. Works
+  // regardless of how many states share one arm or how the match is wrapped across lines.
+  const armRe = /([\s\S]*?)=>\s*(true|false)\s*,/g;
+  const trueStates: string[] = [];
+  let m: RegExpExecArray | null;
+  let sawArm = false;
+  while ((m = armRe.exec(body))) {
+    sawArm = true;
+    const [, pattern, result] = m;
+    const names = [...pattern!.matchAll(/PreviewState::([A-Za-z]+)/g)].map((x) => x[1]!.toLowerCase());
+    if (result === "true") trueStates.push(...names);
+  }
+  if (!sawArm) throw new Error("live_for_reattach has no `=> true`/`=> false` arms to read");
+  return trueStates;
+}
+
+describe("previewIdleGrace's LIVE_STATES mirrors live_for_reattach", () => {
+  it("names exactly the states live_for_reattach maps to true", () => {
+    const rust = readFileSync(RUST_SOURCE, "utf8");
+    const trueStates = readLiveForReattachTrueStates(rust);
+    expect(trueStates.length).toBeGreaterThan(1);
+
+    const ts = readFileSync(IDLE_GRACE, "utf8");
+    const decl = /const LIVE_STATES: ReadonlySet<PreviewState> = new Set\(\[([\s\S]*?)\]\)/.exec(ts)?.[1];
+    expect(decl, "previewIdleGrace.ts must still declare `LIVE_STATES` as a `new Set([...])`").toBeDefined();
+    const members = [...decl!.matchAll(/"([^"]+)"/g)].map((x) => x[1]!);
+
+    expect(new Set(members)).toEqual(new Set(trueStates));
+  });
+});
+
 describe("Rust's PreviewState and the TypeScript union name the same states", () => {
   it("has one member per variant, lowercased", () => {
     const rust = readFileSync(RUST_SOURCE, "utf8");

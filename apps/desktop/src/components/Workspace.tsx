@@ -118,6 +118,7 @@ import { startOrchestrationListener } from "../services/orchestrationListener";
 import { startControlListener } from "../services/controlListener";
 import { startAiServiceHealthListener } from "../services/aiServiceHealthListener";
 import { listPreviews, startPreviewListener } from "../services/preview";
+import { startPreviewIdleGraceWatcher } from "../services/previewIdleGrace";
 import { closeScopeProjectNames, killAllOpenAgents, planWindowClose } from "../services/windowClose";
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
@@ -894,6 +895,16 @@ export function Workspace() {
       unmounted = true;
       cleanup?.();
     };
+  }, [isMainWindow]);
+
+  // ARM THE IDLE-GRACE TIMER, MAIN WINDOW ONLY — same scoping as the preview listener above,
+  // because `usePreviewStore`/`useUiStore`/`useProjectStore` are process-global and a satellite
+  // window running this too would race the main window's timers over the same agents. Synchronous
+  // start/stop (unlike the listener above): `startPreviewIdleGraceWatcher` subscribes directly,
+  // it does not await a Tauri event-channel handshake.
+  useEffect(() => {
+    if (!isMainWindow) return;
+    return startPreviewIdleGraceWatcher();
   }, [isMainWindow]);
 
   // Reap orphaned per-window Sparkle worktrees left behind by the old multi-window shell: each

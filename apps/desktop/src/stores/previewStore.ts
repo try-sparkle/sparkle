@@ -15,10 +15,14 @@
 // Keying by side would have made "the left pane's preview" a fact about the layout.
 import { create } from "zustand";
 
-/** The server-side state machine (design §5), verbatim from the Rust contract. `starting` →
- *  `listening` → `ready` → `serving` on the happy path; `failed` is reachable from `starting` /
- *  `listening` (the process exited, or no port inside the timeout) and `crashed` from `serving`. */
+/** The server-side state machine (design §5), verbatim from the Rust contract. `installing` →
+ *  `starting` → `listening` → `ready` → `serving` on the happy path; `installing` is reachable only
+ *  when `node_modules` was not yet on disk at open time (Phase 2 — most opens skip straight to
+ *  `starting`, since `deps_bootstrap` usually finished long before anyone clicks Preview). `failed`
+ *  is reachable from `installing` (the deps wait timed out) / `starting` / `listening` (the process
+ *  exited, or no port inside the timeout) and `crashed` from `serving`. */
 export type PreviewState =
+  | "installing"
   | "starting"
   | "listening"
   | "ready"
