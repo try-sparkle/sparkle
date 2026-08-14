@@ -40,7 +40,7 @@ use tungstenite::client::IntoClientRequest;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-use crate::preview::PreviewState;
+use crate::preview::{PreviewState, PreviewStatus};
 use crate::window_screenshot::{capture_dir, capture_path, within_byte_cap, CAPTURE_MAX_BYTES};
 
 /// The viewport every capture/query runs at. Fixed rather than caller-supplied — same reasoning as
@@ -169,6 +169,13 @@ fn free_port() -> Result<u16, String> {
 /// Flags chosen for a throwaway, non-interactive capture: no GPU, no first-run UI, no network
 /// side-chatter. `chrome-headless-shell` is headless BY CONSTRUCTION (unlike full Chrome, it takes
 /// no `--headless` flag — there is no other mode to opt out of).
+///
+/// DELIBERATELY NO `--no-sandbox`. This process runs as an ordinary logged-in macOS user, not
+/// root-in-a-container, so the renderer sandbox works and is worth keeping: the page loaded is
+/// arbitrary web content (the agent's dev server, its npm dependencies, anything those pull in
+/// over the network), and dropping the sandbox for an `allow`-tier, no-approval-required op would
+/// mean a renderer compromise runs unsandboxed as the user at the agent's discretion. (roborev
+/// 64071)
 fn launch_flags(debug_port: u16, user_data_dir: &Path, width: u32, height: u32) -> Vec<String> {
     vec![
         format!("--remote-debugging-port={debug_port}"),
@@ -183,7 +190,6 @@ fn launch_flags(debug_port: u16, user_data_dir: &Path, width: u32, height: u32) 
         "--disable-background-networking".to_string(),
         "--disable-sync".to_string(),
         "--mute-audio".to_string(),
-        "--no-sandbox".to_string(),
     ]
 }
 
@@ -283,12 +289,25 @@ fn connect_cdp(ws_url: &str) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, Str
         .ok_or_else(|| "preview eyes: no address for the CDP url".to_string())?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| format!("preview eyes: couldn't connect to headless Chromium's debugger: {e}"))?;
-    // Short so `read_until` below actually gets to re-check ITS OWN deadline between polls, rather
-    // than blocking for one long socket-level timeout regardless of what the caller asked for.
-    let _ = tcp.set_read_timeout(Some(Duration::from_millis(250)));
-    let _ = tcp.set_write_timeout(Some(Duration::from_secs(5)));
+    // The WS upgrade handshake below reads over THIS SAME blocking stream, so it needs a timeout
+    // generous enough for the handshake itself — 5s, matching the connect timeout above — not the
+    // short poll tick `read_until` needs afterward. Installing the short timeout first (as this
+    // used to) made any handshake response slower than 250ms — a cold browser, a loaded machine, a
+    // busy CI runner — surface as `HandshakeError::Interrupted`, which this function maps to a
+    // hard, misleading "CDP handshake failed", non-deterministically. (roborev 64071)
+    tcp.set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("preview eyes: couldn't set the CDP handshake read timeout: {e}"))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("preview eyes: couldn't set the CDP handshake write timeout: {e}"))?;
     let (socket, _resp) = tungstenite::client(req, MaybeTlsStream::Plain(tcp))
         .map_err(|e| format!("preview eyes: CDP handshake failed: {e}"))?;
+    // NOW shorten it, on the ESTABLISHED connection: `read_until` polls in a loop and needs to
+    // re-check its own deadline frequently, rather than block for one long socket-level timeout
+    // regardless of what the caller asked for.
+    if let MaybeTlsStream::Plain(tcp) = socket.get_ref() {
+        tcp.set_read_timeout(Some(Duration::from_millis(250)))
+            .map_err(|e| format!("preview eyes: couldn't lower the post-handshake read timeout: {e}"))?;
+    }
     Ok(socket)
 }
 
@@ -441,10 +460,18 @@ fn open_page(session: &mut CdpSession, url: &str) -> Result<String, String> {
     )?;
 
     let nav_deadline = Instant::now() + NAV_TIMEOUT;
-    session.call("Page.navigate", json!({ "url": url }), Some(&session_id), NAV_TIMEOUT)?;
-    // Best-effort: a dev server that never fires `load` (an infinite XHR poll, a WS-only app) must
-    // not fail the whole op — proceed with whatever painted. Mirrors `cdp.mjs`'s `navigate()`,
-    // which resolves on the same timeout rather than rejecting.
+    let nav_result =
+        session.call("Page.navigate", json!({ "url": url }), Some(&session_id), NAV_TIMEOUT)?;
+    // `Page.navigate` ACKs successfully even when the navigation itself fails — a dev server that
+    // died between `preview_status` and this call answers with `net::ERR_CONNECTION_REFUSED` here,
+    // not as a CDP protocol error, and the caller must not be handed a screenshot of Chrome's own
+    // error page (or an empty DOM query) with no signal that this happened. (roborev 64071)
+    if let Some(err_text) = nav_result.get("errorText").and_then(Value::as_str) {
+        return Err(format!("preview eyes: navigating to {url} failed: {err_text}"));
+    }
+    // Best-effort from here: a dev server that never fires `load` (an infinite XHR poll, a WS-only
+    // app) must not fail the whole op — proceed with whatever painted. Mirrors `cdp.mjs`'s
+    // `navigate()`, which resolves on the same timeout rather than rejecting.
     let remaining = nav_deadline.saturating_duration_since(Instant::now());
     let _ = session.wait_for_event("Page.loadEventFired", &session_id, remaining);
     Ok(session_id)
@@ -551,9 +578,13 @@ fn is_framable(state: PreviewState) -> bool {
     matches!(state, PreviewState::Listening | PreviewState::Ready | PreviewState::Serving)
 }
 
-async fn resolve_preview_url(app: AppHandle, agent_id: String) -> Result<String, String> {
-    let status = crate::preview::preview_status(app, agent_id.clone())
-        .await?
+/// The whole `Option<PreviewStatus>` → URL decision, pulled out of `resolve_preview_url` so it is
+/// callable — and testable — without an `AppHandle`. This is the gate `previewInspect.ts`'s
+/// `no-preview`/`preview-not-ready` refusals are keyed on (by string-matching these exact
+/// messages), so a test on the async `AppHandle`-bound version alone could never cover it without
+/// standing up a Tauri app. (roborev 64071)
+fn resolve_url_from_status(status: Option<PreviewStatus>, agent_id: &str) -> Result<String, String> {
+    let status = status
         .ok_or_else(|| format!("preview eyes: no preview is open for agent {agent_id} — open one first"))?;
     if !is_framable(status.state) {
         return Err(format!(
@@ -565,6 +596,11 @@ async fn resolve_preview_url(app: AppHandle, agent_id: String) -> Result<String,
         .port
         .ok_or_else(|| "preview eyes: this preview has no port yet — it may still be starting".to_string())?;
     Ok(format!("http://127.0.0.1:{port}"))
+}
+
+async fn resolve_preview_url(app: AppHandle, agent_id: String) -> Result<String, String> {
+    let status = crate::preview::preview_status(app, agent_id.clone()).await?;
+    resolve_url_from_status(status, &agent_id)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -787,5 +823,151 @@ mod tests {
         }
         let err = query_dom_blocking("about:blank", ":::not-a-selector").unwrap_err();
         assert!(err.contains("preview eyes:"), "got: {err}");
+    }
+
+    /// A minimal single-page HTTP fixture server — real markup over a real socket, so the live
+    /// tests below exercise `Page.navigate` against an actual `http://127.0.0.1:<port>` URL, not
+    /// only `about:blank`. `about:blank` alone left the HTTP navigation path, and the
+    /// `errorText`/load-event handling in `open_page`, exercised by nothing. (roborev 64071)
+    struct FixtureServer {
+        port: u16,
+        handle: Option<std::thread::JoinHandle<()>>,
+        shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FixtureServer {
+        fn start(body: &'static str) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture server");
+            let port = listener.local_addr().unwrap().port();
+            listener.set_nonblocking(true).expect("set nonblocking");
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let shutdown_bg = shutdown.clone();
+            let handle = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                while !shutdown_bg.load(std::sync::atomic::Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            let mut buf = [0u8; 1024];
+                            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                            let _ = stream.read(&mut buf); // discard the request; one fixed page
+                            let response = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\
+                                 Connection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes());
+                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(20));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self { port, handle: Some(handle), shutdown }
+        }
+
+        fn url(&self) -> String {
+            format!("http://127.0.0.1:{}", self.port)
+        }
+    }
+
+    impl Drop for FixtureServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(h) = self.handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+
+    #[test]
+    fn a_live_headless_browser_can_query_a_real_http_page() {
+        if !headless_shell_available() {
+            eprintln!("SKIPPED a_live_headless_browser_can_query_a_real_http_page: no chrome-headless-shell installed");
+            return;
+        }
+        let server = FixtureServer::start(
+            r#"<!doctype html><html><body><button id="submit" class="btn primary">Save</button></body></html>"#,
+        );
+        let matches = query_dom_blocking(&server.url(), "#submit").expect("query should succeed");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tag, "button");
+        assert_eq!(matches[0].id.as_deref(), Some("submit"));
+        assert_eq!(matches[0].text, "Save");
+    }
+
+    #[test]
+    fn a_live_headless_browser_can_screenshot_a_real_http_page() {
+        if !headless_shell_available() {
+            eprintln!("SKIPPED a_live_headless_browser_can_screenshot_a_real_http_page: no chrome-headless-shell installed");
+            return;
+        }
+        let server =
+            FixtureServer::start(r#"<!doctype html><html><body><h1>hello preview</h1></body></html>"#);
+        let capture = capture_screenshot_blocking(&server.url()).expect("screenshot should succeed");
+        assert!(Path::new(&capture.path).is_file());
+        std::fs::remove_file(&capture.path).ok();
+    }
+
+    #[test]
+    fn a_connection_refused_navigation_surfaces_as_an_error_not_a_blank_capture() {
+        if !headless_shell_available() {
+            eprintln!(
+                "SKIPPED a_connection_refused_navigation_surfaces_as_an_error_not_a_blank_capture: \
+                 no chrome-headless-shell installed"
+            );
+            return;
+        }
+        // Reserve then release a port, so nothing is listening on it — the dev server "died
+        // between preview_status and the capture" case the errorText check exists for.
+        let port = free_port().expect("reserve a port");
+        let dead_url = format!("http://127.0.0.1:{port}");
+        let err = capture_screenshot_blocking(&dead_url).unwrap_err();
+        assert!(err.contains("navigating") && err.contains("failed"), "got: {err}");
+    }
+
+    // ----- resolve_url_from_status -----
+
+    fn preview_status(state: PreviewState, port: Option<u16>) -> PreviewStatus {
+        PreviewStatus {
+            id: "preview-1".to_string(),
+            agent_id: "agent-1".to_string(),
+            project_id: "project-1".to_string(),
+            url: None,
+            port,
+            state,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn no_status_refuses_with_no_preview() {
+        let err = resolve_url_from_status(None, "agent-1").unwrap_err();
+        assert!(err.contains("no preview is open"), "got: {err}");
+    }
+
+    #[test]
+    fn a_non_framable_state_refuses_as_not_ready() {
+        let err =
+            resolve_url_from_status(Some(preview_status(PreviewState::Starting, Some(3000))), "agent-1")
+                .unwrap_err();
+        assert!(err.contains("not yet serving"), "got: {err}");
+    }
+
+    #[test]
+    fn a_framable_state_with_no_port_refuses() {
+        let err = resolve_url_from_status(Some(preview_status(PreviewState::Ready, None)), "agent-1")
+            .unwrap_err();
+        assert!(err.contains("no port yet"), "got: {err}");
+    }
+
+    #[test]
+    fn a_framable_state_with_a_port_resolves_the_loopback_url() {
+        let url =
+            resolve_url_from_status(Some(preview_status(PreviewState::Ready, Some(4321))), "agent-1")
+                .unwrap();
+        assert_eq!(url, "http://127.0.0.1:4321");
     }
 }
