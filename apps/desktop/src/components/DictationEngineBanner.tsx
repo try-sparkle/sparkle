@@ -33,17 +33,17 @@
 // DISMISSIBLE, like AiServiceBanner: the user cannot fix an outage, and dictation keeps working
 // underneath, so a ✕ that hides the nag for the episode is reasonable. The re-arm rule — a NEW
 // reason speaks even over a dismissal, the same one does not — lives in the store, not here.
-import { useEffect, type CSSProperties } from "react";
+import { type CSSProperties } from "react";
 import { FiAlertTriangle, FiX } from "react-icons/fi";
 import { C, ON_BRAND_FILL_DARK } from "../theme/colors";
 import { FONT_WEIGHT } from "@sparkle/ui";
 import { FONT_UI } from "../theme/scale";
 import {
-  FALLBACK_NOTICE_TTL_MS,
-  shouldWarnLocalEngine,
+  localEngineNoticeSurface,
   useDictationEngineStore,
   type DictationFallbackReason,
 } from "../stores/dictationEngineStore";
+import { useRetireStaleNotice } from "./useRetireStaleNotice";
 
 /** One sentence per coarse reason — FOUR of them now that the relay's answer is carried through
  *  (`unavailable`, `exhausted`, `signed_out`, `not_entitled`). The two paragraphs below were written
@@ -70,6 +70,19 @@ import {
  *
  *  Neither carries a raw error, a status code, or any PII. */
 export const WARNING: Record<DictationFallbackReason, string> = {
+  // ── THIS BAR NO LONGER PAINTS THIS ONE EITHER (sparkle-cbyhg) ─────────────────────────────────
+  // `localEngineNoticeSurface` routes `unavailable` to the mic caption (DictationMicNotice), so the
+  // sentence below is unreachable from this component — the same standing `too-slow` has had since
+  // sparkle-v3990, reached by a different argument. There the reason was per-utterance noise; here
+  // it is that a self-healing degradation which loses no words does not warrant a window-wide amber
+  // warning above the whole app. The founder reported this bar firing on a condition whose own copy
+  // says "It usually reconnects on its own".
+  //
+  // KEPT, and for the same two reasons `too-slow` is: the key is what keeps this map exhaustive over
+  // the union, and this is still the reason's canonical long-form copy — the store records it, the
+  // console diagnostic reads it, and the copy tests sweep it. The mic caption deliberately does NOT
+  // reuse it (see MIC_NOTICE): a caption under the mic has the context this sentence has to spell
+  // out, so it says the two things that matter and stops.
   unavailable:
     // THE CREDITS HEDGE IS GONE, AND ITS REMOVAL IS THE POINT (it was added under roborev 59930).
     // That tail — "if it keeps happening, check your Sparkle credits" — existed only because this
@@ -203,41 +216,21 @@ export function DictationEngineBanner() {
   // second copy of it to drift.
   const engine = useDictationEngineStore((s) => s);
   const reason = engine.fallbackReason;
-  const observedAt = engine.observedAt;
 
-  // THE BAR HAS TO BE ABLE TO COME DOWN BY ITSELF. `shouldWarnLocalEngine` going false at the TTL is
-  // not enough on its own: nothing re-renders when a deadline merely passes, so without this the
-  // notice would sit there, painted, until some unrelated state change happened to wake the
-  // component — which for a user who has stopped dictating is "never, until you restart". Arming a
-  // timer for the exact remaining lifetime is what turns the rule into an observable side effect.
+  // THE BAR HAS TO BE ABLE TO COME DOWN BY ITSELF — see `useRetireStaleNotice`, which now owns this
+  // and is shared with the mic-side notice so the rule cannot drift between the two surfaces.
+  useRetireStaleNotice(reason, engine.observedAt);
+
+  // ONE ROUTER, TWO SURFACES (sparkle-cbyhg). This used to ask `shouldWarnLocalEngine` — "should a
+  // notice be up at all" — which was the same question as "should THIS bar be up" only while the bar
+  // was the sole surface. It is not any more: `unavailable` renders as a quiet caption under the mic
+  // instead, so asking the old predicate here would paint BOTH. `localEngineNoticeSurface` answers
+  // the narrower question, and it lives in the store for the reason this component has always
+  // insisted on — re-deriving the rule per surface is a second copy to drift.
   //
-  // Re-armed whenever the stamp changes, so a re-report during a live outage pushes the deadline out
-  // rather than leaving a timer aimed at the old one.
-  useEffect(() => {
-    if (reason === null || observedAt === null) return;
-    // The deadline this timer is aimed at, computed ONCE and then handed to the action — the timer
-    // must not re-derive staleness from a clock it did not schedule against.
-    //
-    // THE TIMER GETS EXACTLY ONE SHOT, SO IT MUST NOT BE ABLE TO MISS (roborev 59930). `setTimeout`
-    // counts on the MONOTONIC clock while `Date.now()` is WALL time, and the two disagree across a
-    // backward NTP step, a suspend/resume correction, or ordinary drift over 300 s. Letting
-    // `retireStaleNotice()` re-read `Date.now()` meant a callback that fired a millisecond "early"
-    // by wall time found the notice not-yet-stale and retired nothing — and because that no-op
-    // leaves `reason` and `observedAt` untouched, the effect's deps never change and NO replacement
-    // timer is armed. Every mounted banner arms from the same stamp, so they would all miss in
-    // lockstep and the bar would be stuck permanently: precisely the failure this whole change
-    // exists to remove. Passing the deadline makes the fire self-consistent by construction.
-    const deadline = observedAt + FALLBACK_NOTICE_TTL_MS + 1;
-    const timer = setTimeout(
-      () => useDictationEngineStore.getState().retireStaleNotice(deadline),
-      Math.max(0, deadline - Date.now()),
-    );
-    return () => clearTimeout(timer);
-  }, [reason, observedAt]);
-
-  // `reason` is always set when the predicate is true; the null check narrows it for the lookup
+  // `reason` is always set when the surface is non-null; the null check narrows it for the lookup
   // below so a partial state can never index `WARNING` with null.
-  if (!shouldWarnLocalEngine(engine) || reason === null) return null;
+  if (localEngineNoticeSurface(engine) !== "banner" || reason === null) return null;
 
   return (
     <div style={bar}>

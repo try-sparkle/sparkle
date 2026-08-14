@@ -355,6 +355,15 @@ export interface DictationEngineState {
    *  `noteCloudOpenRefused`'s warning branch — an earlier version of each listed only two, in
    *  different pairs, so no single place in the file was correct. */
   openRefusals: number;
+  /** When the CURRENT unbroken run of ambiguous failures began (epoch ms), or `null` when no such
+   *  run is open. The duration half of the debounce — see `UNAVAILABLE_SUSTAINED_MS`.
+   *
+   *  It is the run's START and is not renewed by later failures in the same run: the question the
+   *  gate asks is "has this been failing for twenty seconds", which a stamp that moved with every
+   *  attempt could never answer. Cleared by exactly the things that end an episode — a live cloud,
+   *  a definitive relay answer, and expiry — so a recovery re-arms the full debounce rather than
+   *  leaving the next lone blip able to read as "sustained since ages ago" and speak alone. */
+  unavailableSince: number | null;
   dismiss: () => void;
 }
 
@@ -393,6 +402,36 @@ export interface DictationEngineState {
  *  produce. A healthy session therefore never accumulates two. */
 export const OPEN_REFUSALS_BEFORE_WARNING = 2;
 
+/** How many failures, and over how long, before an `unavailable` outage is allowed to SAY anything.
+ *
+ * ── WHY A COUNT WAS NOT ENOUGH, AND WHY THE OTHER SEAM HAD NO COUNT AT ALL (sparkle-cbyhg) ───────
+ * `OPEN_REFUSALS_BEFORE_WARNING` above guards the OPEN seam. It never guarded the other one: the
+ * mid-stream `cloud-ended` teardown calls `noteCloudUnavailable("unavailable")` directly, and that
+ * sink zeroed `openRefusals` for every reason it received — so a single dropped socket both painted
+ * the notice instantly AND destroyed the corroboration the open seam had accumulated. The store
+ * header called that path "unambiguous", which is true of a relay that ANSWERS and false of a socket
+ * that simply died: a dropped connection is the same ambiguous evidence as a refused open.
+ *
+ * That is the founder's report, and the banner's own copy convicts it — "It usually reconnects on
+ * its own, so try dictating again in a moment" is a sentence about a condition that heals itself,
+ * shouted from a full-width amber warning above his entire agent fleet.
+ *
+ * ── THE THRESHOLD IS MEASURED, NOT GUESSED ──────────────────────────────────────────────────────
+ * `scripts/relay-probe.sh` against the live relay on the machine this was reported from: 8/8
+ * successful WebSocket handshakes, 68 / 70 / 84 / 86 / 87 / 100 / 122 / 183 ms — median ~90 ms. A
+ * healthy reconnect is therefore sub-second, and `UNAVAILABLE_SUSTAINED_MS` is ~200x that. Anything
+ * that clears inside twenty seconds is a blip the user does not need to be told about; anything
+ * still failing after twenty seconds AND across separate attempts is a real outage.
+ *
+ * BOTH GATES, because each alone is defeated by an ordinary usage pattern:
+ *   • COUNT alone still fires on two failures a second apart — the identical blip, merely doubled.
+ *   • DURATION alone fires on a single failure for anyone who dictates less often than every twenty
+ *     seconds, which is most push-to-talk use. One failure must never raise it, per the brief.
+ * A user whose relay drops once and reconnects — the overwhelmingly common case — now sees nothing
+ * at all, which is the correct amount of noise for a degradation that loses none of their words. */
+export const UNAVAILABLE_FAILURES_BEFORE_NOTICE = 2;
+export const UNAVAILABLE_SUSTAINED_MS = 20_000;
+
 export const useDictationEngineStore = create<DictationEngineState>()(
   (set, get) => ({
     fallbackReason: null,
@@ -401,6 +440,7 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     observedSession: null,
     dismissed: false,
     openRefusals: 0,
+    unavailableSince: null,
     // ── A NOTICE BELONGS TO THE SESSION THAT PRODUCED IT (the founder's mic-on banner) ───────────
     // Reported as: "As soon as I turn the mic on, I get this error banner… then as soon as I start
     // speaking, it goes away." Both halves are the same defect, and the second half is the tell.
@@ -433,6 +473,12 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     noteSessionStart: () => set((s) => ({ captureSession: s.captureSession + 1 })),
     // Any evidence of a live cloud also clears the corroboration counter — consecutive means
     // consecutive, so a refusal an hour and a hundred good streams ago must not be half of a verdict.
+    // ── THIS IS THE AUTO-DISMISS (sparkle-cbyhg) ─────────────────────────────────────────────────
+    // Reached by a successful open AND by the relay's first streamed word, so the moment the service
+    // comes back the notice goes with it — no ✕, no timer, no user action. The component subscribes
+    // to the store, so the clear IS the disappearance. `unavailableSince` is cleared alongside the
+    // counter for the reason its own doc gives: a recovery must re-arm the whole debounce, or the
+    // next single blip inherits a twenty-second-old start stamp and speaks on its own.
     noteCloudLive: () =>
       set({
         fallbackReason: null,
@@ -440,6 +486,7 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         observedSession: null,
         dismissed: false,
         openRefusals: 0,
+        unavailableSince: null,
       }),
     // A NEW reason re-arms a dismissal, the SAME one does not. Going from a plain outage to
     // out-of-credits is a different thing to tell the user (the second is actionable), so it must be
@@ -458,17 +505,40 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     // signal as the unambiguous one. So a lone `unreachable` blip left the count at 1, a stream
     // death reported `exhausted`, and ONE later blip crossed the threshold — the exact failure the
     // reset was added to prevent, one channel over. One rule, one place.
+    // ── THE SINK CARRIES TWO KINDS OF NEWS, AND ONLY ONE OF THEM IS AN ANSWER (sparkle-cbyhg) ────
+    // Everything above describes this as the DEFINITIVE channel, and for four of its five callers
+    // that is right: `exhausted`/`signed_out`/`not_entitled`/`too_many_streams` are the relay
+    // SAYING something, so they end the ambiguous episode and speak at once. The fifth is not an
+    // answer at all — the mid-stream `cloud-ended` teardown reports `unavailable`, which means only
+    // that a socket died. That is the SAME ambiguous evidence `noteCloudOpenRefused` counts, and
+    // routing it through the definitive reset did two wrong things at once: it painted on a single
+    // failure, and it zeroed the corroboration the open seam had already gathered. So the split is
+    // on the REASON, not on the caller — one blip cannot be told from another by where it entered.
+    //
+    // `openRefusals` therefore CLIMBS here for `unavailable` instead of resetting, which makes the
+    // two seams share one counter and one run-start stamp. A real outage refusing at both seams
+    // still crosses the threshold on schedule; a lone dropped socket no longer says anything.
+    //
+    // The roborev-60366 invariant this sink was given — "a definitive answer ends the ambiguous
+    // episode" — is UNCHANGED and is now literally what the code says: the reset moved into the
+    // branch for the reasons that are actually definitive.
     noteCloudUnavailable: (reason) =>
-      set((s) => ({
-        fallbackReason: reason,
-        observedAt: Date.now(),
-        // Observing stamps BOTH perishability axes together — see `noteSessionStart`. Wherever the
-        // clock is renewed the session marker is too, and wherever a reason is merely PRESERVED
-        // (below) neither moves.
-        observedSession: s.captureSession,
-        dismissed: s.fallbackReason === reason ? s.dismissed : false,
-        openRefusals: 0,
-      })),
+      set((s) => {
+        const ambiguous = reason === "unavailable";
+        return {
+          fallbackReason: reason,
+          observedAt: Date.now(),
+          // Observing stamps BOTH perishability axes together — see `noteSessionStart`. Wherever the
+          // clock is renewed the session marker is too, and wherever a reason is merely PRESERVED
+          // (below) neither moves.
+          observedSession: s.captureSession,
+          dismissed: s.fallbackReason === reason ? s.dismissed : false,
+          openRefusals: ambiguous ? s.openRefusals + 1 : 0,
+          // The run's START, so it survives later failures in the same run and is only re-taken once
+          // an episode has ended and a new one begins.
+          unavailableSince: ambiguous ? (s.unavailableSince ?? Date.now()) : null,
+        };
+      }),
     // ── A MIC FAILURE IS NOT A RELAY VERDICT, SO IT DOES NOT USE THE RELAY SEAM ──────────────────
     // This went through `noteCloudUnavailable` first, which was the same conflation this whole
     // change exists to delete — just pointing the other way (roborev 61695). That seam does two
@@ -541,6 +611,9 @@ export const useDictationEngineStore = create<DictationEngineState>()(
               // The episode is over, so its corroboration goes with it (roborev 59941) — otherwise
               // a retired notice leaves the counter armed and the next lone refusal speaks alone.
               openRefusals: 0,
+              // Both halves of the debounce retire together, for the identical reason: a stale
+              // run-start would let one later blip satisfy the duration gate on its own.
+              unavailableSince: null,
             }
           : {},
       ),
@@ -550,8 +623,11 @@ export const useDictationEngineStore = create<DictationEngineState>()(
     noteCloudOpenRefused: () =>
       set((s) => {
         const openRefusals = s.openRefusals + 1;
+        // The run-start stamp is taken on the FIRST ambiguous refusal of a run and then left alone,
+        // so this seam and the teardown sink accumulate into one shared duration (sparkle-cbyhg).
+        const unavailableSince = s.unavailableSince ?? Date.now();
         if (openRefusals < OPEN_REFUSALS_BEFORE_WARNING)
-          return { openRefusals };
+          return { openRefusals, unavailableSince };
         // AN AMBIGUOUS REFUSAL MUST NOT DOWNGRADE A SPECIFIC ONE (roborev 59930). This seam always
         // reports "unavailable" because it cannot know better — but `exhausted` came from the relay
         // SAYING SO on a mid-stream teardown, and it is strictly more informative. Overwriting it
@@ -677,6 +753,7 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           // written against the threshold silently dead — and one such guard (the orphan
           // withdrawal) was written against it before it was noticed.
           openRefusals,
+          unavailableSince,
           fallbackReason: reason,
           // PRESERVING A REASON IS NOT OBSERVING IT (roborev 59968). This seam saw an ambiguous
           // `false` and nothing more — it has no evidence of out-of-credits — so renewing the stamp
@@ -789,16 +866,22 @@ export const useDictationEngineStore = create<DictationEngineState>()(
         // account was under the cap at that moment — the condition is not merely unproven, it is
         // disproven. Leaving it standing keeps telling the user to close another Sparkle window to
         // fix something that has already cleared, which is the remedy-that-cannot-help shape.
+        // `unavailableSince` retires wherever `openRefusals` does, and here the ground is the same
+        // one this seam already states for the counter: a completed handshake is EVIDENCE OF A LIVE
+        // CLOUD, so it ends the ambiguous run outright. Zeroing the count while leaving the run-start
+        // standing would keep half the debounce armed across a proven-live connection, which is the
+        // straddling flap the corroboration exists to remove (sparkle-cbyhg).
         if (!speaks)
           return s.fallbackReason === "unavailable" || s.fallbackReason === "too_many_streams"
             ? {
                 openRefusals: 0,
+                unavailableSince: null,
                 fallbackReason: null,
                 observedAt: null,
                 observedSession: null,
                 dismissed: false,
               }
-            : { openRefusals: 0 };
+            : { openRefusals: 0, unavailableSince: null };
         // Bound to a local first so the narrowing survives, for the same TypeScript reason
         // `noteCloudOpenRefused` states: an aliased condition written against a property of the
         // callback's argument does not narrow.
@@ -834,6 +917,7 @@ export const useDictationEngineStore = create<DictationEngineState>()(
           observedSession: s.captureSession,
           dismissed: s.fallbackReason === reason ? s.dismissed : false,
           openRefusals: 0,
+          unavailableSince: null,
         };
       }),
     dismiss: () => set({ dismissed: true }),
@@ -943,6 +1027,25 @@ export function fallbackReasonWarrantsBanner(
  *
  *  `now` is a parameter rather than a `Date.now()` read so the rule stays pure and the expiry is
  *  testable without leaning on fake timers at every call site. */
+/** Has an ambiguous outage produced enough evidence to be worth mentioning at all?
+ *
+ *  BOTH gates, and the constant's own doc block argues each at length: at least
+ *  `UNAVAILABLE_FAILURES_BEFORE_NOTICE` failures, spanning at least `UNAVAILABLE_SUSTAINED_MS` since
+ *  the run began. Asked ONLY of `unavailable` — every other reason is the relay stating something,
+ *  and withholding an answer we already have would be its own defect (sparkle-cbyhg).
+ *
+ *  An unstamped run reads as NOT corroborated, which is the opposite default to `isStale`'s and is
+ *  deliberate: these two carry opposite burdens of proof. `isStale` may only take a notice DOWN when
+ *  it can prove expiry, so a missing stamp keeps it up; this may only put one UP when it can prove
+ *  the outage sustained, so a missing stamp keeps it quiet. Both fail toward silence. */
+function unavailableCorroborated(state: DictationEngineState, now: number): boolean {
+  return (
+    state.openRefusals >= UNAVAILABLE_FAILURES_BEFORE_NOTICE &&
+    state.unavailableSince !== null &&
+    now - state.unavailableSince >= UNAVAILABLE_SUSTAINED_MS
+  );
+}
+
 export function shouldWarnLocalEngine(
   state: DictationEngineState,
   now: number = Date.now(),
@@ -950,10 +1053,41 @@ export function shouldWarnLocalEngine(
   return (
     state.fallbackReason !== null &&
     fallbackReasonWarrantsBanner(state.fallbackReason) &&
+    // THE DEBOUNCE, asked here so it applies to every surface at once and cannot be half-adopted by
+    // one of them. A relay that ANSWERS is unaffected; only the "we could not reach it" claim waits.
+    (state.fallbackReason !== "unavailable" || unavailableCorroborated(state, now)) &&
     !state.dismissed &&
     !isStale(state, now) &&
     !isFromEarlierSession(state)
   );
+}
+
+/** WHERE a live fallback notice belongs — `null` when nothing should be shown at all.
+ *
+ * ── THE FOUNDER OVERRULED THIS COMPONENT'S ORIGINAL PREMISE, PARTLY (sparkle-cbyhg) ──────────────
+ * `DictationEngineBanner`'s header says the window-wide bar exists BECAUSE the founder twice went
+ * looking in the mic UI and found nothing, and concluded the notice belonged "across the TOP of the
+ * window — nothing inside the composer or the mic UI". That reasoning is still correct for the
+ * reasons it was written about, and it is NOT correct for all of them, which is why this is a split
+ * rather than a move:
+ *
+ *   • "banner" — the user must DO something (`exhausted` → refill, `signed_out` → sign in,
+ *     `not_entitled` → unlock, `too_many_streams` → close a window) or their WORDS WERE LOST
+ *     (`mic_missed_hold`, `model_still_loading`). Missing one of these is expensive, so they keep
+ *     the loud surface and the immediacy. Nothing about these changes.
+ *   • "mic" — `unavailable` alone. It is a graceful degradation: every word is still captured, the
+ *     relay heals itself, and there is no action to take. Warning colour across the whole window is
+ *     the wrong weight for it, and it cost a full row above the founder's entire agent fleet.
+ *
+ * Deciding it HERE rather than in either component keeps the "should this speak, and where" rule in
+ * the one place this store already insists it lives — the banner says in as many words that
+ * re-deriving it at a component would be a second copy to drift, and there are now two components. */
+export function localEngineNoticeSurface(
+  state: DictationEngineState,
+  now: number = Date.now(),
+): "banner" | "mic" | null {
+  if (!shouldWarnLocalEngine(state, now)) return null;
+  return state.fallbackReason === "unavailable" ? "mic" : "banner";
 }
 
 // `CloudEndedFacts` / `fallbackReasonForEnded` lived here and are GONE (roborev 60355). The

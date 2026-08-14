@@ -39,17 +39,45 @@ afterEach(() => {
  *  file was edited to fix, moved one file over and silent by construction. */
 const NON_RELAY: DictationFallbackReason[] = ["mic_missed_hold", "model_still_loading"];
 
+/** Reasons this BAR never paints, whatever the store holds — so a sweep over `WARNING` has to read
+ *  their copy from the map rather than from the DOM.
+ *
+ *  TWO OF THEM NOW (sparkle-cbyhg). `too-slow` was the first: per-utterance, self-correcting, no
+ *  remedy. `unavailable` joined it for the same reason one axis over — it is self-healing and needs
+ *  no action, so it renders as a quiet caption under the mic (DictationMicNotice) instead of a
+ *  window-wide amber warning. Both are still RECORDED, and `WARNING` is still their canonical copy,
+ *  which is why the string invariants below apply to them exactly as to the painted reasons.
+ *
+ *  Deliberately a LITERAL, not derived from `localEngineNoticeSurface`: a test that computed this
+ *  from the production predicate would agree with any future suppression automatically and the sweep
+ *  would go quiet without anyone deciding to. Suppress a third reason and `getByRole` throws here,
+ *  which is the point. */
+const NOT_PAINTED_IN_BAR: DictationFallbackReason[] = ["too-slow", "unavailable"];
+
+/** Seed a banner-surface reason for the tests whose subject is the BAR'S MECHANICS — dismissal,
+ *  re-arm, TTL expiry — rather than any particular reason's copy.
+ *
+ *  These were all written against `unavailable` when it was the ordinary relay outage AND the bar
+ *  was the only surface. It is neither now, so they need a reason the bar still paints; `exhausted`
+ *  is the natural stand-in (a standing, actionable, relay-stated condition). Routing them through
+ *  one helper keeps the next surface change to one line instead of a dozen. */
+function seedBannerReason(reason: DictationFallbackReason = "exhausted"): void {
+  useDictationEngineStore.setState({ fallbackReason: reason, dismissed: false });
+}
+
 describe("DictationEngineBanner", () => {
   it("renders nothing at rest — no fallback has been reported", () => {
     const { container } = render(<DictationEngineBanner />);
     expect(container.innerHTML).toBe("");
   });
 
-  it("names what was lost, and the local engine, once the relay is unavailable", () => {
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
-    render(<DictationEngineBanner />);
-    const text = screen.getByRole("status").textContent ?? "";
-    // WHAT IS LOST is the whole point — a banner that only said "degraded" would send the user
+  // READS THE MAP, NOT THE DOM, because this bar no longer paints `unavailable` (sparkle-cbyhg) —
+  // that reason moved to the mic caption. The string is still its canonical copy and these are still
+  // its copy invariants, so they are asserted where the string lives. What the USER now sees for
+  // this condition is pinned in DictationMicNotice.test.tsx.
+  it("names what was lost, and the local engine, in the unavailable copy", () => {
+    const text = WARNING.unavailable;
+    // WHAT IS LOST is the whole point — copy that only said "degraded" would send the user
     // hunting for the missing italics all over again.
     expect(text).toContain("Live dictation preview is off");
     expect(text).toContain("local engine");
@@ -58,12 +86,9 @@ describe("DictationEngineBanner", () => {
   });
 
   it("gives the exhausted case DIFFERENT copy, naming the refill remedy", () => {
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
-    render(<DictationEngineBanner />);
-    const unavailable = screen.getByRole("status").textContent ?? "";
+    const unavailable = WARNING.unavailable;
 
-    cleanup();
-    useDictationEngineStore.setState({ fallbackReason: "exhausted", dismissed: false });
+    seedBannerReason("exhausted");
     render(<DictationEngineBanner />);
     const exhausted = screen.getByRole("status").textContent ?? "";
 
@@ -100,10 +125,9 @@ describe("DictationEngineBanner", () => {
       // asserted against the map rather than skipped. Written as a literal, not derived from the
       // production predicate: if a SECOND reason is ever suppressed, `getByRole` throws here and
       // whoever did it has to come and say so, instead of the sweep quietly going soft.
-      const text =
-        reason === "too-slow"
-          ? WARNING[reason]
-          : (screen.getByRole("status").textContent ?? "");
+      const text = NOT_PAINTED_IN_BAR.includes(reason)
+        ? WARNING[reason]
+        : (screen.getByRole("status").textContent ?? "");
       expect(text).not.toMatch(/HTTP \d|\b4\d\d\b|\b5\d\d\b|websocket|deepgram|sherpa|@/i);
       expect(text).not.toMatch(/your network|you're offline|you are offline|Claude|rate.?limit/i);
       // ── NARROWED FROM "EVERY REASON" TO "EVERY RELAY REASON" (roborev 61695) ──────────────────
@@ -179,10 +203,9 @@ describe("DictationEngineBanner", () => {
       // The unpainted reason is compared on its canonical string, for the reason given in the sweep
       // above — distinctness is a property of the COPY, so dropping it here would let a new reason
       // be pasted from `too-slow` unnoticed.
-      const text =
-        reason === "too-slow"
-          ? WARNING[reason]
-          : (screen.getByRole("status").textContent ?? "");
+      const text = NOT_PAINTED_IN_BAR.includes(reason)
+        ? WARNING[reason]
+        : (screen.getByRole("status").textContent ?? "");
       expect(seen.has(text)).toBe(false);
       seen.set(text, reason);
     }
@@ -215,23 +238,22 @@ describe("DictationEngineBanner", () => {
   // refused. It can now — an empty balance arrives as `exhausted` — so the hedge would send a user
   // whose network blipped to inspect a balance that is fine.
   it("no longer sends an unreachable-relay user to check their credits", () => {
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
-    render(<DictationEngineBanner />);
-    const text = screen.getByRole("status").textContent ?? "";
+    // Asserted on the map: this bar no longer paints `unavailable` (sparkle-cbyhg).
+    const text = WARNING.unavailable;
     expect(text).not.toMatch(/credits/i);
     expect(text).toMatch(/try dictating again in a moment/i);
   });
 
   it("uses a react-icons glyph, never an emoji, for the caution mark", () => {
     // Standing founder rule: no emoji as icons anywhere in the product.
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
+    seedBannerReason();
     const { container } = render(<DictationEngineBanner />);
     expect(container.querySelector("svg")).not.toBeNull();
     expect(container.textContent ?? "").not.toMatch(/\p{Extended_Pictographic}/u);
   });
 
   it("disappears when the ✕ is clicked", () => {
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
+    seedBannerReason();
     const { container } = render(<DictationEngineBanner />);
     expect(container.innerHTML).not.toBe("");
 
@@ -243,9 +265,12 @@ describe("DictationEngineBanner", () => {
   });
 
   it("comes back for a DIFFERENT reason after a dismissal", () => {
-    // A plain outage waved away must not silence the actionable out-of-credits case: that one has a
-    // remedy, so it has something new to say.
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
+    // One actionable reason waved away must not silence a DIFFERENT actionable one: each names a
+    // remedy the other does not, so the second has something new to say.
+    //
+    // Both legs are banner reasons now (sparkle-cbyhg). This used to run `unavailable` → `exhausted`,
+    // which no longer exercises a dismissal at all — the first leg never paints.
+    seedBannerReason("signed_out");
     const { container } = render(<DictationEngineBanner />);
     fireEvent.click(screen.getByLabelText("Dismiss"));
     expect(container.innerHTML).toBe("");
@@ -257,17 +282,17 @@ describe("DictationEngineBanner", () => {
   });
 
   it("stays hidden when the SAME reason is re-reported after a dismissal", () => {
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
+    seedBannerReason();
     const { container } = render(<DictationEngineBanner />);
     fireEvent.click(screen.getByLabelText("Dismiss"));
 
-    act(() => useDictationEngineStore.getState().noteCloudUnavailable("unavailable"));
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("exhausted"));
 
     expect(container.innerHTML).toBe("");
   });
 
   it("retires itself when a cloud stream comes back", () => {
-    useDictationEngineStore.setState({ fallbackReason: "unavailable", dismissed: false });
+    seedBannerReason();
     const { container } = render(<DictationEngineBanner />);
     expect(container.innerHTML).not.toBe("");
 
@@ -308,11 +333,16 @@ describe("DictationEngineBanner", () => {
     expect(screen.getByRole("status").textContent ?? "").toMatch(/refill/i);
   });
 
-  it("comes DOWN when a standing outage turns out to have been a late handshake", () => {
-    // The relay was unreachable, the bar is up and correct — then a handshake completes late, which
-    // disproves the connectivity claim outright. The honest state is "nothing to tell the user", so
-    // the bar must go away rather than swap one amber sentence for another.
-    act(() => useDictationEngineStore.getState().noteCloudUnavailable("unavailable"));
+  it("comes DOWN when a standing cap refusal turns out to have been a late handshake", () => {
+    // The relay reported the stream cap, the bar is up and correct — then a handshake completes
+    // late, which disproves that claim outright (the cap is enforced DURING the upgrade, so a
+    // completed handshake proves the account was under it). The honest state is "nothing to tell the
+    // user", so the bar must go away rather than swap one amber sentence for another.
+    //
+    // `too_many_streams` rather than `unavailable` (sparkle-cbyhg): the store retracts BOTH on this
+    // path, but only this one still paints in the bar, so only this one can exercise a DOM
+    // disappearance. The `unavailable` half of the same rule is pinned in DictationMicNotice.test.tsx.
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("too_many_streams"));
     const { container } = render(<DictationEngineBanner />);
     expect(container.innerHTML).not.toBe("");
 
@@ -333,20 +363,12 @@ describe("DictationEngineBanner", () => {
   // indistinguishable from noise.
 
   it("leads with the CAUSE, so the two reasons are told apart at a glance", () => {
-    useDictationEngineStore.setState({
-      fallbackReason: "unavailable",
-      dismissed: false,
-    });
-    render(<DictationEngineBanner />);
-    const unavailable = screen.getByRole("status").textContent ?? "";
-
-    cleanup();
-    useDictationEngineStore.setState({
-      fallbackReason: "exhausted",
-      dismissed: false,
-    });
-    render(<DictationEngineBanner />);
-    const exhausted = screen.getByRole("status").textContent ?? "";
+    // Compared as STRINGS, since the two no longer share a surface to be compared in
+    // (sparkle-cbyhg). The invariant is about the copy, and it still matters: these two sentences
+    // are the ones a user sees across a session, and a shared opening clause is what let them be
+    // conflated in the first place.
+    const unavailable = WARNING.unavailable;
+    const exhausted = WARNING.exhausted;
 
     // A shared prefix is exactly what let the two be conflated: the opening clause is what a reader
     // takes in at a glance, so the opening clause has to be the part that differs.
@@ -354,12 +376,7 @@ describe("DictationEngineBanner", () => {
   });
 
   it("gives the UNAVAILABLE case a remedy too — not just the billable one", () => {
-    useDictationEngineStore.setState({
-      fallbackReason: "unavailable",
-      dismissed: false,
-    });
-    render(<DictationEngineBanner />);
-    const text = screen.getByRole("status").textContent ?? "";
+    const text = WARNING.unavailable;
 
     // The relay recovers by itself and the next dictation re-tries it, so there IS something to
     // tell the user. Saying nothing is what left the founder with "I have no idea why".
@@ -374,9 +391,7 @@ describe("DictationEngineBanner", () => {
 
   it("takes itself down once the outage stops being observed — no restart, no re-dictation", () => {
     vi.useFakeTimers();
-    act(() =>
-      useDictationEngineStore.getState().noteCloudUnavailable("unavailable"),
-    );
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("exhausted"));
     const { container } = render(<DictationEngineBanner />);
     expect(container.innerHTML).not.toBe("");
 
@@ -399,7 +414,7 @@ describe("DictationEngineBanner", () => {
     // short of the deadline, retires nothing, and — since `reason`/`observedAt` never change — no
     // replacement timer is armed and the bar is stuck forever.
     vi.useFakeTimers();
-    act(() => useDictationEngineStore.getState().noteCloudUnavailable("unavailable"));
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("exhausted"));
     const observedAt = useDictationEngineStore.getState().observedAt as number;
     const { container } = render(<DictationEngineBanner />);
     expect(container.innerHTML).not.toBe("");
@@ -423,16 +438,12 @@ describe("DictationEngineBanner", () => {
 
   it("stays up while the outage is still live — expiry must not swallow a real one", () => {
     vi.useFakeTimers();
-    act(() =>
-      useDictationEngineStore.getState().noteCloudUnavailable("unavailable"),
-    );
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("exhausted"));
     const { container } = render(<DictationEngineBanner />);
 
     // Nearly stale, then the user dictates again and the relay refuses again.
     act(() => void vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS - 1000));
-    act(() =>
-      useDictationEngineStore.getState().noteCloudUnavailable("unavailable"),
-    );
+    act(() => useDictationEngineStore.getState().noteCloudUnavailable("exhausted"));
     act(() => void vi.advanceTimersByTime(2000));
 
     expect(container.innerHTML).not.toBe("");

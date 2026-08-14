@@ -50,6 +50,8 @@ import { useDictationStore } from "./stores/dictationStore";
 import {
   noteCloudLate,
   shouldWarnLocalEngine,
+  UNAVAILABLE_FAILURES_BEFORE_NOTICE,
+  UNAVAILABLE_SUSTAINED_MS,
   useDictationEngineStore,
   type CloudStreamOutcome,
 } from "./stores/dictationEngineStore";
@@ -597,6 +599,12 @@ describe("the relay's own answer to start_cloud_stream drives the engine signal"
       captureSession: 0,
       observedSession: 0,
       dismissed: false,
+      // A CORROBORATED outage, or it would not have been speaking in the previous session either
+      // and this test would pass for the wrong reason (sparkle-cbyhg). The debounce means an
+      // `unavailable` that never cleared both gates is silent regardless of which session it is in,
+      // so seeding it un-corroborated makes the "before" assertion below vacuous.
+      openRefusals: UNAVAILABLE_FAILURES_BEFORE_NOTICE,
+      unavailableSince: Date.now() - UNAVAILABLE_SUSTAINED_MS - 1,
     });
     expect(shouldWarnLocalEngine(useDictationEngineStore.getState())).toBe(true);
     // `enabled` is already true in the fixture, so mounting RUNS the arm effect — the same path the

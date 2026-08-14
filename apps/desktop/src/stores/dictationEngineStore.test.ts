@@ -8,6 +8,7 @@ import {
   outcomeInstalledStream,
   sawCloudLateThisAttempt,
   shouldWarnLocalEngine,
+  UNAVAILABLE_SUSTAINED_MS,
   useDictationEngineStore,
   type CloudStreamOutcome,
   type DictationEngineState,
@@ -15,12 +16,57 @@ import {
 
 const read = (): DictationEngineState => useDictationEngineStore.getState();
 
+/** Raise an `unavailable` outage that has already cleared the DEBOUNCE (sparkle-cbyhg).
+ *
+ *  A transient outage now says nothing until it has failed repeatedly AND persisted for
+ *  `UNAVAILABLE_SUSTAINED_MS`, so a test whose subject is some OTHER rule — session scoping,
+ *  dismissal re-arm, TTL expiry, reason precedence — needs a standing outage as its PRECONDITION
+ *  rather than as the thing under test. Every one of those tests used to get there with a single
+ *  `noteCloudUnavailable("unavailable")`, which is exactly the one-failure alarm this change
+ *  deletes; without this helper they would each have to re-encode the debounce, and each would then
+ *  silently stop testing its own rule the day the threshold moved.
+ *
+ *  The backdate is applied to `unavailableSince` DIRECTLY rather than by advancing a clock, so this
+ *  works identically under real and fake timers and never disturbs a test's own timer bookkeeping.
+ *  The resulting state is one the store genuinely reaches: a run that began 20s ago and was
+ *  re-observed just now.
+ *
+ *  THE DEBOUNCE ITSELF IS NOT TESTED HERE — it is pinned in `dictationEngineStore.transient.test.ts`,
+ *  which drives the real seams at real timestamps. Keep it that way: a helper that both sets up and
+ *  verifies the gate would let a broken gate pass its own test. */
+function raiseCorroboratedOutage(): void {
+  read().noteCloudUnavailable("unavailable");
+  read().noteCloudUnavailable("unavailable");
+  sustainTheOutage();
+}
+
+/** The same precondition reached through the OPEN seam — `OPEN_REFUSALS_BEFORE_WARNING` ambiguous
+ *  refusals, then the duration gate satisfied. The count and the duration are separate gates, and
+ *  before the debounce existed the loop alone was the whole corroboration, which is why so many
+ *  tests spell it out. */
+function corroborateOpenRefusals(): void {
+  for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+  sustainTheOutage();
+}
+
+/** Backdate the current ambiguous run's start so it has lasted longer than `UNAVAILABLE_SUSTAINED_MS`.
+ *  A no-op on the assertions of any test whose reason is not `unavailable`, since the gate is only
+ *  ever asked about that one. */
+function sustainTheOutage(): void {
+  useDictationEngineStore.setState({
+    unavailableSince: Date.now() - UNAVAILABLE_SUSTAINED_MS - 1,
+  });
+}
+
 beforeEach(() => {
   useDictationEngineStore.setState({
     fallbackReason: null,
     dismissed: false,
     observedAt: null,
     openRefusals: 0,
+    // The debounce's duration half resets with its count half — a leaked run-start from a previous
+    // test would let that test's clock satisfy this one's gate (sparkle-cbyhg).
+    unavailableSince: null,
     // THE SESSION AXIS BELONGS IN THE RESET, exactly as `openRefusals` does and for the same reason
     // (roborev 63346). A case that calls `noteSessionStart()` leaves `captureSession` at 1 for every
     // test after it, with `observedSession` still 0 — and nothing fails today only because the rest
@@ -44,8 +90,16 @@ describe("dictationEngineStore", () => {
     expect(shouldWarnLocalEngine(read())).toBe(false);
   });
 
-  it("warns once a cloud attempt has been refused", () => {
+  // A SINGLE refusal is now RECORDED but SILENT — the debounce (sparkle-cbyhg). The evidence half of
+  // this assertion is what proves the change is presentation-only, exactly as `too-slow` is.
+  it("records a refused cloud attempt without warning about it yet", () => {
     read().noteCloudUnavailable("unavailable");
+    expect(read().fallbackReason).toBe("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  it("warns once refusals are corroborated and sustained", () => {
+    raiseCorroboratedOutage();
     expect(read().fallbackReason).toBe("unavailable");
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
@@ -63,7 +117,7 @@ describe("dictationEngineStore", () => {
   // suppressed outright by `fallbackReasonWarrantsBanner`, so a session-scoping test written with it
   // would pass against the unfixed store and prove nothing.
   it("does not inherit the PREVIOUS session's fallback notice when the mic is armed again", () => {
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
     expect(shouldWarnLocalEngine(read())).toBe(true);
     read().noteSessionStart();
     // The evidence is still RECORDED — suppression here is presentation-only, the same split
@@ -76,7 +130,7 @@ describe("dictationEngineStore", () => {
   // against a `shouldWarnLocalEngine` hard-wired to `false`, which would mute every real outage.
   it("still speaks for evidence observed IN the current session", () => {
     read().noteSessionStart();
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 
@@ -93,7 +147,7 @@ describe("dictationEngineStore", () => {
     read().noteCloudUnavailable("exhausted"); // session 0: the relay stated out-of-credits
     read().noteSessionStart(); // the user mutes and re-arms → session 1
     // Two consecutive `unreachable`s in session 1 — the corroboration this seam exists for.
-    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     // The more informative reason is still the one displayed…
     expect(read().fallbackReason).toBe("exhausted");
     // …but the EVIDENCE is this session's, so it must speak.
@@ -121,7 +175,7 @@ describe("dictationEngineStore", () => {
       const stampedAt = read().observedAt;
       vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS - 1_000);
       read().noteSessionStart();
-      for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+      corroborateOpenRefusals();
       expect(read().observedAt).toBe(stampedAt);
       expect(shouldWarnLocalEngine(read())).toBe(true);
       // …and one second past the deadline it retires on its own, exactly as before.
@@ -148,7 +202,7 @@ describe("dictationEngineStore", () => {
   it("drops a previous session's mic failure and reports THIS session's outage instead", () => {
     read().noteMicMissedHold("capture"); // session 0: the mic never started for THAT hold
     read().noteSessionStart(); // the user mutes and re-arms → session 1, audio is fine
-    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     // The false claim is gone — not merely muted…
     expect(read().fallbackReason).toBe("unavailable");
     // …and what IS happening in this session gets said, on this session's stamp.
@@ -173,7 +227,7 @@ describe("dictationEngineStore", () => {
   // and the two above read `mic_missed_hold` / `model_still_loading`.
   it("keeps a mic failure observed in the SAME session as the refusals", () => {
     read().noteMicMissedHold("capture");
-    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     expect(read().fallbackReason).toBe("mic_missed_hold");
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
@@ -201,7 +255,7 @@ describe("dictationEngineStore", () => {
   it("reports a corroborated outage that follows a late connect in the SAME session", () => {
     read().noteCloudConnectedLate(true); // this utterance's handshake landed too late
     expect(shouldWarnLocalEngine(read())).toBe(false); // …which correctly says nothing
-    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     // The per-utterance claim yields to the seam's corroborated verdict…
     expect(read().fallbackReason).toBe("unavailable");
     // …and nothing is downgraded by that, because `too-slow` never painted in the first place.
@@ -227,7 +281,7 @@ describe("dictationEngineStore", () => {
       expect(read().fallbackReason).toBe("too_many_streams");
       const capStamp = read().observedAt;
       vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS - 1_000);
-      for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+      corroborateOpenRefusals();
       // The cleared-cap claim yields to what this seam can actually see now…
       expect(read().fallbackReason).toBe("unavailable");
       // …and the seam OBSERVED that, so it stamps rather than dragging the cap's dead stamp along.
@@ -263,7 +317,7 @@ describe("dictationEngineStore", () => {
   it("keeps an account fact across a session boundary, where a per-hold claim yields", () => {
     read().noteCloudUnavailable("exhausted");
     read().noteSessionStart();
-    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i++) read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     expect(read().fallbackReason).toBe("exhausted");
   });
 
@@ -296,10 +350,10 @@ describe("dictationEngineStore", () => {
   });
 
   it("re-arms after a recovery, so a later distinct outage is not silenced by one dismissal", () => {
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
     read().dismiss();
     read().noteCloudLive();
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 
@@ -313,7 +367,7 @@ describe("dictationEngineStore", () => {
 
   it("retires an observation nobody has renewed — the outage is no longer being seen", () => {
     vi.useFakeTimers();
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
     expect(shouldWarnLocalEngine(read())).toBe(true);
 
     vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS + 1);
@@ -369,9 +423,18 @@ describe("dictationEngineStore", () => {
     expect(read().fallbackReason).toBeNull();
   });
 
-  it("speaks once a second consecutive refusal corroborates the first", () => {
+  // THE COUNT ALONE NO LONGER SPEAKS — the debounce added a duration gate beside it (sparkle-cbyhg),
+  // so two refusals a moment apart are still a blip. Both halves are asserted here rather than only
+  // the end state, because a version that dropped the duration gate would pass the second `it` alone.
+  it("records the reason on a second consecutive refusal but still waits out the duration", () => {
     read().noteCloudOpenRefused();
     read().noteCloudOpenRefused();
+    expect(read().fallbackReason).toBe("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+  });
+
+  it("speaks once a second consecutive refusal is ALSO sustained", () => {
+    corroborateOpenRefusals();
     expect(read().fallbackReason).toBe("unavailable");
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
@@ -419,7 +482,12 @@ describe("dictationEngineStore", () => {
     // when only the ambiguous seam could raise a reason; it contradicted the newer rule the moment
     // `noteCloudOutcome` started ending the episode on a named answer, and the two were pinned in
     // opposite directions in the same file (roborev 60366). One rule now, asserted here and there.
-    read().noteCloudUnavailable("unavailable");
+    //
+    // `exhausted`, NOT `unavailable`, and the swap is the point (sparkle-cbyhg): "definitive" means
+    // the relay ANSWERED, which `unavailable` never did — it is the ambiguous seam's own report, and
+    // it now accumulates rather than resetting. Written with `unavailable` this asserted that a
+    // dropped socket ends the corroboration episode, which is the defect itself.
+    read().noteCloudUnavailable("exhausted");
     expect(read().openRefusals).toBe(0);
     // Re-arm so the rest of this case still exercises what it was written for: a counter that is
     // live when the notice goes stale.
@@ -433,8 +501,7 @@ describe("dictationEngineStore", () => {
 
   it("end to end: an episode that ends leaves the next lone refusal silent", () => {
     vi.useFakeTimers();
-    read().noteCloudOpenRefused();
-    read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     expect(shouldWarnLocalEngine(read())).toBe(true);
 
     // The relay recovers, but the user does not dictate again, so only the expiry ends it.
@@ -509,21 +576,50 @@ describe("dictationEngineStore", () => {
     expect(read().fallbackReason).toBeNull();
   });
 
-  it("the mid-stream teardown still speaks IMMEDIATELY — that signal is not ambiguous", () => {
-    // `cloud-ended` is the relay telling us the stream died. Nothing to corroborate, and delaying it
-    // would leave the user watching the preview vanish with no explanation.
+  // ══ THE TEST THAT PINNED THE DEFECT, INVERTED (sparkle-cbyhg) ═════════════════════════════════
+  // This read "the mid-stream teardown still speaks IMMEDIATELY — that signal is not ambiguous",
+  // and it is the reason the founder kept getting a full-width amber warning on a healthy relay.
+  // The premise was wrong on its own terms: `cloud-ended` is NOT the relay telling us anything, it
+  // is a SOCKET DYING. A relay that answers says `exhausted`/`signed_out`/`not_entitled` and those
+  // still speak at once — but a dropped connection is precisely as ambiguous as a refused open,
+  // which this store has debounced since `OPEN_REFUSALS_BEFORE_WARNING` was introduced.
+  //
+  // Its stated harm ("the user watches the preview vanish with no explanation") does not survive
+  // contact with the measurement either: the relay reconnects in ~90 ms, so what actually vanished
+  // was one utterance's live preview, with every word still captured and delivered.
+  //
+  // A worked example of AGENTS.md's warning that a mutation PASS proves grip, not intent — this
+  // test had a perfect grip on the behaviour nobody wanted.
+  it("the mid-stream teardown does NOT speak on one dropped socket — it is ambiguous too", () => {
     read().noteCloudUnavailable("unavailable");
+    expect(read().fallbackReason).toBe("unavailable"); // recorded…
+    expect(shouldWarnLocalEngine(read())).toBe(false); // …but not shouted
+  });
+
+  // The paired case, so the assertion above cannot pass against a permanently-muted store.
+  it("…and DOES speak once the teardowns are repeated and sustained", () => {
+    raiseCorroboratedOutage();
     expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // The teardown seam must ACCUMULATE rather than reset, which is what lets two failures arriving
+  // at different seams add up to one verdict. Resetting here is the specific line that made a lone
+  // dropped socket both paint instantly and destroy the open seam's evidence.
+  it("counts a teardown toward corroboration instead of zeroing it", () => {
+    read().noteCloudOpenRefused();
+    expect(read().openRefusals).toBe(1);
+    read().noteCloudUnavailable("unavailable");
+    expect(read().openRefusals).toBe(2);
   });
 
   it("a retired notice re-arms cleanly — the next outage is not swallowed by the old dismissal", () => {
     vi.useFakeTimers();
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
     read().dismiss();
     vi.advanceTimersByTime(FALLBACK_NOTICE_TTL_MS + 1);
     read().retireStaleNotice();
 
-    read().noteCloudUnavailable("unavailable");
+    raiseCorroboratedOutage();
 
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
@@ -613,8 +709,7 @@ describe("a relay that CONNECTED is never reported as unreachable", () => {
     // shown the relay IS reachable must not go on claiming it is unreachable — and it is the one
     // window that can never take that back itself, since `noteCloudLive` and the interim-driven
     // clear both require it to be the capturable one. It would stand for the full TTL.
-    read().noteCloudOpenRefused();
-    read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     expect(read().fallbackReason).toBe("unavailable");
     expect(shouldWarnLocalEngine(read())).toBe(true);
 
@@ -622,6 +717,9 @@ describe("a relay that CONNECTED is never reported as unreachable", () => {
     expect(read().fallbackReason).toBeNull();
     expect(read().observedAt).toBeNull();
     expect(read().openRefusals).toBe(0);
+    // The duration half of the debounce retires with the count half, or the next lone blip would
+    // inherit this run's start stamp and speak alone (sparkle-cbyhg).
+    expect(read().unavailableSince).toBeNull();
     expect(shouldWarnLocalEngine(read())).toBe(false);
   });
 
@@ -875,6 +973,11 @@ describe("noteCloudOutcome — what the seam actually does with an outcome", () 
 
     read().noteCloudOutcome("unreachable");
     expect(read().fallbackReason).toBe("unavailable");
+    // Two is not enough either any more — they must also have SPANNED the sustained window
+    // (sparkle-cbyhg). Both assertions kept, so the count gate cannot be dropped unnoticed.
+    expect(shouldWarnLocalEngine(read())).toBe(false);
+
+    sustainTheOutage();
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 
@@ -1053,13 +1156,22 @@ describe("a per-utterance late connect never raises the app-shell alarm", () => 
 
   // THE PAIR THAT STOPS THE ABOVE PASSING AGAINST A BLANKET "NEVER WARN". Every reason that names a
   // STANDING condition with a remedy the user can act on still speaks, through the same predicate.
-  it.each(["unavailable", "exhausted", "signed_out", "not_entitled", "too_many_streams"] as const)(
+  it.each(["exhausted", "signed_out", "not_entitled", "too_many_streams"] as const)(
     "still warns for '%s' — a standing condition the user can act on",
     (reason) => {
       read().noteCloudUnavailable(reason);
       expect(shouldWarnLocalEngine(read())).toBe(true);
     },
   );
+
+  // `unavailable` LEFT THAT LIST (sparkle-cbyhg) — not because it stopped warning, but because it is
+  // the one reason with nothing for the user to act on, so it now waits out the debounce first. It
+  // stays in the pair for the reason the pair exists: it must still be able to speak, or the
+  // suppression above would be a blanket mute.
+  it("still warns for 'unavailable' — once corroborated, since there is no action to take", () => {
+    raiseCorroboratedOutage();
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
 
   it("does not swallow a LATER standing reason — the suppression is per-reason, not a latch", () => {
     read().noteCloudConnectedLate(true);
@@ -1086,7 +1198,7 @@ describe("a per-utterance late connect never raises the app-shell alarm", () => 
   it("takes a standing 'unavailable' DOWN when a handshake lands late", () => {
     // The reverse direction, and the one that would hide a regression to "warn on too-slow": the
     // late connect replaces the connectivity claim it disproves, so the bar must go from up to down.
-    for (let i = 0; i < OPEN_REFUSALS_BEFORE_WARNING; i += 1) read().noteCloudOpenRefused();
+    corroborateOpenRefusals();
     expect(shouldWarnLocalEngine(read())).toBe(true);
 
     read().noteCloudConnectedLate(true);

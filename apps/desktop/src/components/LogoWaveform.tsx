@@ -26,6 +26,7 @@ import { useDictationPauseReason } from "../voice/useDictationPauseReason";
 import type { PauseReason } from "../voice/dictationFocus";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { micVisual, MicGlyph } from "./MicButton";
+import { DictationMicNotice } from "./DictationMicNotice";
 import { useHasAiCredits } from "../services/aiGate";
 import { SidebarOutOfCreditsNotice } from "./OutOfCreditsNotice";
 import { useAudioInputSync } from "../services/audioInputs";
@@ -570,6 +571,14 @@ export function LogoWaveform({ pttHeld = false }: LogoWaveformProps = {}) {
           <MicGlyph variant={micVis.variant} size={20} surfaceColor={C.forest} />
         </span>
       </div>
+
+      {/* The cloud-transcription fallback, as a quiet caption rather than a window-wide warning
+          (sparkle-cbyhg). OUTSIDE the presentation chain below, deliberately: that chain is a
+          mutually-exclusive ladder, so putting this in an arm of it would make a transient relay
+          outage HIDE the live status line — replacing the words the user is steering by with a
+          notice about something that needs no action. It renders null unless
+          `localEngineNoticeSurface` routes here, so in the common case it costs a row of nothing. */}
+      <DictationMicNotice />
 
       {presentation === "outOfCredits" ? (
         // Out of credits: an arm attempt was refused. Show the two-line notice in place of the
