@@ -49,12 +49,23 @@ function corroborateOpenRefusals(): void {
   sustainTheOutage();
 }
 
-/** Backdate the current ambiguous run's start so it has lasted longer than `UNAVAILABLE_SUSTAINED_MS`.
- *  A no-op on the assertions of any test whose reason is not `unavailable`, since the gate is only
- *  ever asked about that one. */
+/** Backdate the current ambiguous run's start so the failures it recorded SPAN longer than
+ *  `UNAVAILABLE_SUSTAINED_MS`. A no-op on the assertions of any test whose reason is not
+ *  `unavailable`, since the gate is only ever asked about that one.
+ *
+ *  ── ANCHOR ON `observedAt`, NEVER ON `Date.now()` (roborev 64374) ────────────────────────────────
+ *  The gate reads `observedAt - unavailableSince`, and `observedAt` was stamped by the store action
+ *  that ran just BEFORE this helper — so backdating from `Date.now()` leaves a margin of
+ *  `1 - (Date.now() - observedAt)` ms. That is 1 ms on a fast machine and NEGATIVE the moment
+ *  anything stalls 2 ms between the action and this call, which reds ~25 tests whose subject is some
+ *  unrelated rule, intermittently and only under load. Anchoring on the stamp the predicate actually
+ *  reads makes the span exactly `UNAVAILABLE_SUSTAINED_MS + 1` regardless of how slowly the suite
+ *  runs. The `?? Date.now()` is unreachable in practice — every seam that sets `unavailable` renews
+ *  `observedAt` — and exists only so a future caller that skips the seam still gets a live number. */
 function sustainTheOutage(): void {
+  const anchor = read().observedAt ?? Date.now();
   useDictationEngineStore.setState({
-    unavailableSince: Date.now() - UNAVAILABLE_SUSTAINED_MS - 1,
+    unavailableSince: anchor - UNAVAILABLE_SUSTAINED_MS - 1,
   });
 }
 
@@ -101,6 +112,22 @@ describe("dictationEngineStore", () => {
   it("warns once refusals are corroborated and sustained", () => {
     raiseCorroboratedOutage();
     expect(read().fallbackReason).toBe("unavailable");
+    expect(shouldWarnLocalEngine(read())).toBe(true);
+  });
+
+  // THE PRECONDITION HELPER MUST NOT DEPEND ON HOW FAST THE SUITE RUNS (roborev 64374). The gate now
+  // reads `observedAt - unavailableSince`, so a helper that backdates from the WALL CLOCK leaves a
+  // margin of `1 - (now - observedAt)` ms — 1 ms on an idle machine, negative on a loaded one — and
+  // the ~25 tests that use it as a mere precondition would then red on their own unrelated subject.
+  // The advance below is what a real stall looks like; it fails against a `Date.now()`-anchored
+  // helper and passes against an `observedAt`-anchored one.
+  it("reaches the sustained precondition regardless of delay between the seam and the backdate", () => {
+    vi.useFakeTimers();
+    read().noteCloudUnavailable("unavailable");
+    read().noteCloudUnavailable("unavailable");
+    vi.advanceTimersByTime(5_000);
+    sustainTheOutage();
+    expect(read().observedAt! - read().unavailableSince!).toBe(UNAVAILABLE_SUSTAINED_MS + 1);
     expect(shouldWarnLocalEngine(read())).toBe(true);
   });
 

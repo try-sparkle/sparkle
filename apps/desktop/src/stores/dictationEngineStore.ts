@@ -1030,19 +1030,38 @@ export function fallbackReasonWarrantsBanner(
 /** Has an ambiguous outage produced enough evidence to be worth mentioning at all?
  *
  *  BOTH gates, and the constant's own doc block argues each at length: at least
- *  `UNAVAILABLE_FAILURES_BEFORE_NOTICE` failures, spanning at least `UNAVAILABLE_SUSTAINED_MS` since
- *  the run began. Asked ONLY of `unavailable` — every other reason is the relay stating something,
- *  and withholding an answer we already have would be its own defect (sparkle-cbyhg).
+ *  `UNAVAILABLE_FAILURES_BEFORE_NOTICE` failures, SPANNING at least `UNAVAILABLE_SUSTAINED_MS`.
+ *  Asked ONLY of `unavailable` — every other reason is the relay stating something, and withholding
+ *  an answer we already have would be its own defect (sparkle-cbyhg).
+ *
+ *  ── THE SPAN IS BETWEEN THE FAILURES, NOT BETWEEN THE RUN AND NOW (roborev 64232) ────────────────
+ *  This measured `now - unavailableSince` and is the one place in the predicate where that is
+ *  wrong. Elapsed wall time since the run began is not evidence about the relay — it advances on
+ *  its own while nothing whatsoever is failing. So two failures a second apart (the `cloud-ended`
+ *  teardown plus the immediate re-hold's failed open — ONE gesture reaches both) were correctly
+ *  silent at the instant of the second, and then satisfied this gate ~20s later having observed
+ *  nothing further. Nothing dispatches at that moment, so the notice appeared on whatever
+ *  incidental re-render came next: the founder-visible alarm-on-a-blip that this debounce exists to
+ *  delete, merely deferred by 20 seconds, with a RENDER for its trigger instead of an outage.
+ *
+ *  `observedAt` is the last failure this run recorded, so `observedAt - unavailableSince` is the
+ *  span the failures actually COVER, which is the thing the count is corroborating. Reading it that
+ *  way also makes the predicate a pure function of state — it can no longer change value as the
+ *  clock advances, in either direction — so the notice appears at the moment evidence arrives and
+ *  never at the mercy of when React happens to ask. Both stamps are guaranteed present here: this
+ *  is asked only of `unavailable`, and every seam that writes that reason renews `observedAt`
+ *  (a preserved stamp always comes with a preserved reason, which is never `unavailable`).
  *
  *  An unstamped run reads as NOT corroborated, which is the opposite default to `isStale`'s and is
  *  deliberate: these two carry opposite burdens of proof. `isStale` may only take a notice DOWN when
  *  it can prove expiry, so a missing stamp keeps it up; this may only put one UP when it can prove
  *  the outage sustained, so a missing stamp keeps it quiet. Both fail toward silence. */
-function unavailableCorroborated(state: DictationEngineState, now: number): boolean {
+function unavailableCorroborated(state: DictationEngineState): boolean {
   return (
     state.openRefusals >= UNAVAILABLE_FAILURES_BEFORE_NOTICE &&
     state.unavailableSince !== null &&
-    now - state.unavailableSince >= UNAVAILABLE_SUSTAINED_MS
+    state.observedAt !== null &&
+    state.observedAt - state.unavailableSince >= UNAVAILABLE_SUSTAINED_MS
   );
 }
 
@@ -1055,7 +1074,7 @@ export function shouldWarnLocalEngine(
     fallbackReasonWarrantsBanner(state.fallbackReason) &&
     // THE DEBOUNCE, asked here so it applies to every surface at once and cannot be half-adopted by
     // one of them. A relay that ANSWERS is unaffected; only the "we could not reach it" claim waits.
-    (state.fallbackReason !== "unavailable" || unavailableCorroborated(state, now)) &&
+    (state.fallbackReason !== "unavailable" || unavailableCorroborated(state)) &&
     !state.dismissed &&
     !isStale(state, now) &&
     !isFromEarlierSession(state)

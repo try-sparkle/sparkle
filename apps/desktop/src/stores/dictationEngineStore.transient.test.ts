@@ -72,6 +72,41 @@ describe("transient cloud-transcription outages stay quiet", () => {
     expect(localEngineNoticeSurface(read())).toBe(null);
   });
 
+  // ── …AND IT MUST STILL SAY NOTHING LATER, WHICH THE TEST ABOVE CANNOT SEE (roborev 64232) ──────
+  // That test asks the question at the instant of the second failure, and the gate USED to measure
+  // `now - unavailableSince` — elapsed wall time since the run began, not the span the failures
+  // actually covered. So two failures a second apart were silent when they happened and then
+  // satisfied the duration gate ~20s later ON THEIR OWN, with no further evidence at all. Nothing
+  // dispatches at that moment, so the notice surfaced on whatever incidental re-render came next:
+  // an alarm whose trigger was a render rather than an outage, and the exact founder-visible
+  // symptom this suite exists to delete, merely postponed by 20 seconds.
+  //
+  // Both failures are reachable from ONE gesture — the `cloud-ended` teardown plus the immediate
+  // re-hold's failed open — so this is the common shape, not a contrived one.
+  //
+  // PAIRED DELIBERATELY. A test that only proves silence cannot say WHY it was silent: expiry
+  // (`isStale`) and any upstream gate produce the same `false`. The second half drives one further
+  // failure at that same instant, which extends the covered span past the window and speaks — so
+  // the silence above is attributable to the span gate and to nothing else.
+  it("stays quiet as the clock runs past the window on two rapid failures", () => {
+    vi.useFakeTimers();
+    const t0 = 1_000_000;
+    relayDroppedAt(t0);
+    relayDroppedAt(t0 + 1_000);
+
+    // Well inside FALLBACK_NOTICE_TTL_MS (5 min), so expiry is NOT what is keeping this quiet.
+    vi.setSystemTime(t0 + UNAVAILABLE_SUSTAINED_MS * 2);
+
+    expect(read().openRefusals).toBeGreaterThanOrEqual(UNAVAILABLE_FAILURES_BEFORE_NOTICE);
+    expect(shouldWarnLocalEngine(read(), Date.now())).toBe(false);
+    expect(localEngineNoticeSurface(read(), Date.now())).toBe(null);
+
+    relayDroppedAt(t0 + UNAVAILABLE_SUSTAINED_MS * 2);
+
+    expect(shouldWarnLocalEngine(read(), Date.now())).toBe(true);
+    expect(localEngineNoticeSurface(read(), Date.now())).toBe("mic");
+  });
+
   // The DURATION half. A long gap alone is not evidence either: the first failure could have been
   // the only one, with the user simply away from the keyboard since.
   it("says nothing on a single failure however long ago it was", () => {
