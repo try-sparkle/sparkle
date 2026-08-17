@@ -5714,13 +5714,55 @@ pub struct WipCommitOutcome {
 /// teardown that proceeds — the same outcome as any other best-effort failure here.
 const WIP_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// The reserve the post-commit bookkeeping gets, INDEPENDENT of the snapshot's shared budget.
+/// The MOST the post-commit bookkeeping may add to the lock hold, in total across all of its calls.
 ///
 /// Once `git commit` has succeeded the work is safe only if the ref bookkeeping after it also runs;
 /// funding that from whatever the sequence had left over is what let an exhausted budget skip the
-/// rescue-ref write and lose a commit that had really been made (roborev 64474). These are three
-/// cheap local calls, so a small fixed reserve is enough and cannot meaningfully extend the lock.
-const POST_COMMIT_TAIL: Duration = Duration::from_secs(5);
+/// rescue-ref write and lose a commit that had really been made (roborev 64474). So the bookkeeping
+/// gets a reserve of its own — but a reserve is a lock-hold extension, and this is the number that
+/// bounds it.
+const POST_COMMIT_TAIL_TOTAL_MS: u64 = 5_000;
+
+/// THE SPLIT IS WEIGHTED, NOT EQUAL, because the three calls are not equally important.
+///
+/// Per call rather than one reserve shared by three, because a shared one lets the report-only pair
+/// consume it under the very contention this exists for, after which `update-ref` sees a zero budget
+/// and is skipped (roborev 64480). But per call is not the same as unbounded: each reserve used to be
+/// the full total, so three calls could hold the per-root repo lock for 15s past the snapshot's own
+/// budget while the doc still claimed a reserve that "cannot meaningfully extend the lock" (roborev
+/// 64484) — and that tail is not hypothetical, since the `index.lock` contention from the ~27s
+/// bootstrap install that [`WIP_SNAPSHOT_TIMEOUT`] cites is exactly the state in which all three burn
+/// their reserve, on a lock that queues every other prepare/remove for the project.
+///
+/// Dividing the total EQUALLY was the obvious repair and the wrong one (roborev 64511): it cut the
+/// budget of `update-ref` — the only call whose failure loses a real commit, and whose failure is
+/// swallowed by `.ok()` so the loss is silent — by 3×, to buy headroom for two calls that only affect
+/// a log line and a ref's name. `rev-parse` and `symbolic-ref` are REPORT-ONLY; they get a small
+/// reserve each. `update-ref` keeps the rest, so the aggregate is still bounded by
+/// [`POST_COMMIT_TAIL_TOTAL_MS`] while the protective call keeps nearly all of its former budget.
+const POST_COMMIT_TAIL_REPORT_MS: u64 = 500;
+
+/// How many report-only calls take [`POST_COMMIT_TAIL_REPORT`] (`rev-parse`, `symbolic-ref`), and how
+/// many take [`POST_COMMIT_TAIL_RESCUE`] (`update-ref`). These are the divisors of the total, so a
+/// call site added without updating them silently raises the worst-case lock hold above what this
+/// file documents — which is why a test counts the call sites in this source rather than trusting the
+/// constants to be kept in step by hand.
+const POST_COMMIT_TAIL_REPORT_CALLS: u64 = 2;
+const POST_COMMIT_TAIL_RESCUE_CALLS: u64 = 1;
+
+/// What each rescue write gets: everything the report-only calls do not, shared among however many
+/// of them there are — so the aggregate stays bounded by the total no matter which count changes.
+const POST_COMMIT_TAIL_RESCUE_MS: u64 =
+    (POST_COMMIT_TAIL_TOTAL_MS - POST_COMMIT_TAIL_REPORT_MS * POST_COMMIT_TAIL_REPORT_CALLS)
+        / POST_COMMIT_TAIL_RESCUE_CALLS;
+
+/// The reserve for a REPORT-ONLY bookkeeping call, INDEPENDENT of the shared budget and of its
+/// siblings' spend. Its failure costs a log line and the rescue ref's NAME, never the commit.
+const POST_COMMIT_TAIL_REPORT: Duration = Duration::from_millis(POST_COMMIT_TAIL_REPORT_MS);
+
+/// The reserve for the `update-ref` that anchors a detached commit — the call whose failure is actual
+/// work loss, and which is therefore the one the split favours.
+const POST_COMMIT_TAIL_RESCUE: Duration = Duration::from_millis(POST_COMMIT_TAIL_RESCUE_MS);
 
 /// `git` for the WIP snapshot, bounded by a deadline SHARED BY THE WHOLE SNAPSHOT.
 ///
@@ -5764,12 +5806,14 @@ fn git_wip(cwd: &str, args: &[&str], deadline: Instant) -> Result<String, String
     Err(format!("git {} failed: {msg}", args.join(" ")))
 }
 
-/// The deadline for the post-commit bookkeeping, deliberately INDEPENDENT of the snapshot's shared
-/// budget. Taking `_shared` it does not use is the point: the whole defect was funding these calls
-/// from whatever the sequence had left, so the parameter is here to make "and it ignores that"
+/// The deadline for one post-commit bookkeeping call, deliberately INDEPENDENT of the snapshot's
+/// shared budget. Taking `_shared` it does not use is the point: the whole defect was funding these
+/// calls from whatever the sequence had left, so the parameter is here to make "and it ignores that"
 /// explicit and testable (roborev 64474 — a mutation that returns `_shared` must fail a test).
-fn post_commit_tail(_shared: Instant) -> Instant {
-    Instant::now() + POST_COMMIT_TAIL
+///
+/// `reserve` is the caller's declaration of what THIS call is worth — see the weighted split above.
+fn post_commit_tail(_shared: Instant, reserve: Duration) -> Instant {
+    Instant::now() + reserve
 }
 
 /// Given `git diff --cached --name-only` restricted to the env pathspecs, decide whether to refuse.
@@ -5935,13 +5979,26 @@ pub fn commit_worktree_wip_within(
     // it under the very contention this exists for, after which `update-ref` sees a zero budget and is
     // skipped: the same work loss as roborev 64474, one level down. Note that the `sha: None` fallback
     // below is written for a failed `rev-parse`, so under a shared reserve it could never fire on the
-    // deadline path it was written for — its `update-ref` was guaranteed to be skipped too.
-    let sha = git_wip(worktree, &["rev-parse", "HEAD"], post_commit_tail(deadline)).ok();
+    // deadline path it was written for — its `update-ref` was guaranteed to be skipped too. Each
+    // reserve is a SLICE of the tail total rather than the whole of it, so the three together still
+    // add no more to the lock hold than `POST_COMMIT_TAIL_TOTAL_MS` says they can (roborev 64484) —
+    // and the slices are WEIGHTED, so the one call that can lose work keeps nearly all of the budget
+    // (roborev 64511). This one is report-only: its sha feeds a log line and the rescue ref's name.
+    let sha =
+        git_wip(worktree, &["rev-parse", "HEAD"], post_commit_tail(deadline, POST_COMMIT_TAIL_REPORT))
+            .ok();
     // ON A BRANCH? `symbolic-ref -q HEAD` is the test — it fails exactly when HEAD is detached.
     // A failure we cannot attribute (a timeout) falls through to the detached arm on purpose: an
     // extra rescue ref pointing at a commit that was already on a branch is harmless, whereas
     // skipping the ref for a commit that really is detached loses it.
-    if git_wip(worktree, &["symbolic-ref", "-q", "HEAD"], post_commit_tail(deadline)).is_ok() {
+    // Report-only too: it decides which arm reports the outcome, not whether the commit survives.
+    if git_wip(
+        worktree,
+        &["symbolic-ref", "-q", "HEAD"],
+        post_commit_tail(deadline, POST_COMMIT_TAIL_REPORT),
+    )
+    .is_ok()
+    {
         return Ok(WipCommitOutcome { kind: WipCommitKind::Committed, sha, files, rescue_ref: None });
     }
     // Detached: the commit is held by nothing but this worktree's HEAD, which the teardown deletes.
@@ -5964,9 +6021,16 @@ pub fn commit_worktree_wip_within(
                 .unwrap_or(0)
         ),
     };
-    let rescue_ref = git_wip(worktree, &["update-ref", &rescue, "HEAD"], post_commit_tail(deadline))
-        .ok()
-        .map(|_| rescue);
+    // THE CALL THE WEIGHTING EXISTS FOR. Its failure is swallowed by `.ok()` and reported only as
+    // `rescue_ref: None`, so a budget too small to take `.git/refs/rescue/...lock` under contention
+    // loses the commit SILENTLY — which is why it keeps the bulk of the tail (roborev 64511).
+    let rescue_ref = git_wip(
+        worktree,
+        &["update-ref", &rescue, "HEAD"],
+        post_commit_tail(deadline, POST_COMMIT_TAIL_RESCUE),
+    )
+    .ok()
+    .map(|_| rescue);
     Ok(WipCommitOutcome {
         kind: WipCommitKind::CommittedDetached,
         sha,
@@ -8654,10 +8718,159 @@ mod tests {
 
         let err = commit_worktree_wip_within(&wt, "wip", Instant::now())
             .expect_err("a spent budget cannot produce a commit");
-        assert!(err.contains("deadline"), "unexpected: {err}");
+        // THE MESSAGE ONLY THE PRE-START GUARD CAN PRODUCE. A loose `contains("deadline")` passed
+        // with that guard DELETED (roborev 64484): the call then falls through to the `--git-dir`
+        // probe, which short-circuits on the same spent deadline and — because `.git` exists —
+        // returns "...git rev-parse --git-dir skipped: WIP snapshot deadline reached". That contains
+        // "deadline", and the tip has not moved either, so both assertions held for a reason with
+        // nothing to do with the guard under test. This one names a phrase the fallthrough error
+        // cannot contain, because that error names a git call instead.
+        assert!(err.contains("deadline reached before it started"), "unexpected: {err}");
         // NOT `is_ok()` on some unrelated git call — that would hold identically if a commit HAD been
         // made (roborev 64480). The tip is the thing that must not have moved.
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip_before, "no commit may exist");
+    }
+
+    #[test]
+    fn wip_snapshot_spends_ONE_budget_across_the_WHOLE_sequence() {
+        // THE INVARIANT THAT GIVES `WIP_SNAPSHOT_TIMEOUT` ITS DOCUMENTED MEANING: one budget shared
+        // by every git call in the sequence, not a ceiling per call. Nothing else covers it —
+        // `a_spent_budget_short_circuits_git_wip_WITHOUT_spawning_a_child` calls the helper directly
+        // and says nothing about how the sequence threads its deadline, and the pre-start test above
+        // returns before any call runs (roborev 64484). Mutate every `deadline` argument inside
+        // `commit_worktree_wip_within` to a fresh `Instant::now() + WIP_SNAPSHOT_TIMEOUT` — the ~10×
+        // per-call ceiling roborev 64463 was filed against — and this is the test that goes red.
+        let (_root, wt, _app_data) = repo_with_worktree("wip-shared-budget");
+        std::fs::write(format!("{wt}/new.txt"), "work").unwrap();
+        let tip_before = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        // Unspent (so the pre-start guard passes and the sequence really begins) but nowhere near
+        // enough to fund ~10 subprocesses. No timing assertion, so nothing here races: under a shared
+        // budget the sequence CANNOT reach the commit, under a per-call ceiling it always does.
+        //
+        // 20ms, not 1ms (roborev 64511). At 1ms a >1ms deschedule between constructing the deadline
+        // and reaching the pre-start guard — routine under a parallel 3352-test run — returns at that
+        // guard with ZERO spawns, and every assertion below still held while the sequence never ran:
+        // the test silently degenerated into the pre-start test it says does not cover this. 20ms is
+        // comfortably past a scheduling hiccup and still far below one git round-trip, and the
+        // `spawns >= 1` assertion turns that degeneration from a silent pass into a failure.
+        let before = git_spawns_on_this_thread();
+        commit_worktree_wip_within(&wt, "wip", Instant::now() + Duration::from_millis(20))
+            .expect_err("a budget that cannot cover the sequence must not produce a commit");
+        let spawns = git_spawns_on_this_thread() - before;
+
+        assert!(
+            spawns >= 1,
+            "PRECONDITION: the sequence must actually have started — zero spawns means this returned \
+             on the pre-start guard and pinned nothing about how the budget is threaded"
+        );
+        assert!(
+            spawns <= 3,
+            "the sequence must stop when the SHARED budget is gone, not restart it per call \
+             (spawned {spawns} of the ~10 calls a per-call ceiling would allow)"
+        );
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip_before, "no commit may exist");
+
+        // PAIRED, on the same tree and the same entry point: with a budget that CAN cover the
+        // sequence the commit IS made. Without this, "no commit" above is ambiguous — it would read
+        // the same if an unrelated earlier guard had refused the tree outright.
+        let out =
+            commit_worktree_wip_within(&wt, "wip", Instant::now() + WIP_SNAPSHOT_TIMEOUT).unwrap();
+        assert_eq!(out.kind, WipCommitKind::Committed, "the budget is the only thing that differed");
+        assert_ne!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip_before, "the tip moved this time");
+    }
+
+    #[test]
+    fn the_post_commit_tail_cannot_extend_the_LOCK_HOLD_past_its_documented_total() {
+        // The per-call reserve fixed starvation (roborev 64480) but tripled the worst-case lock hold,
+        // while the constant's own doc still described the single shared reserve it replaced — 15s of
+        // tail against a documented 5s, on the per-root lock that queues every other prepare/remove
+        // for the project (roborev 64484).
+        //
+        // THE BOUND IS COMPUTED FROM THE CALL SITES, NOT FROM THE CONSTANTS. Asserting
+        // `REPORT * REPORT_CALLS + RESCUE * RESCUE_CALLS <= TOTAL` looked like the check and was a
+        // TAUTOLOGY (roborev 64522): `RESCUE_MS` is *defined* as `(TOTAL - REPORT_MS * REPORT_CALLS)
+        // / RESCUE_CALLS`, so it reduces to `X + floor((TOTAL - X)/n)*n <= TOTAL`, true for every set
+        // of constants that compiles — mutate any of the four and it stays green. What the lock
+        // actually holds is what the SITES request, so that is what gets summed here.
+        let src = include_str!("worktree.rs");
+        // The marker is brace-free because it does not need one to be unique — NOT because braces are
+        // banned here. The `format!` needles a few lines below put braces in literals quite happily;
+        // what matters is that they are PAIRED. `scripts/lib/tauri-handler-guard.sh` finds the end of
+        // this `#[cfg(test)]` module by net brace depth, and an UNPAIRED brace in a string or a
+        // comment used to move that depth in whichever direction it pointed: an extra `{` swallowed
+        // the rest of the file, an extra `}` ended the module early. This marker's literal carried
+        // exactly one such `{` and cost two red CI rounds — the second because the comment written to
+        // explain the first carried one too. The guard now skips strings, char literals and comments
+        // (`netbraces`), with fixtures in `scripts/tests/tauri-handler-guard.test.sh` pinning both
+        // directions, so this is history rather than a rule you have to remember.
+        let prod = &src[..src.find("\nmod tests").expect("the test module marks the split")];
+
+        // Counted per RESERVE, not just in aggregate. A count of sites alone does not say which
+        // reserve each takes — and under a weighted split that is the whole question: flipping the
+        // existing `symbolic-ref` site from REPORT to RESCUE needs no constant edit, keeps the total
+        // count at 3, and takes the real worst case to 8.5s against a documented 5s (roborev 64522).
+        // The needles are assembled at runtime so this test's own source cannot count as a site, and
+        // the trailing `)` keeps `POST_COMMIT_TAIL_REPORT_MS`/`_CALLS` from matching.
+        let report_needle = format!("POST_COMMIT_TAIL_{})", "REPORT");
+        let rescue_needle = format!("POST_COMMIT_TAIL_{})", "RESCUE");
+        let report_sites = prod.matches(&report_needle).count();
+        let rescue_sites = prod.matches(&rescue_needle).count();
+        assert_eq!(
+            u64::try_from(report_sites).unwrap(),
+            POST_COMMIT_TAIL_REPORT_CALLS,
+            "{report_sites} site(s) take the report-only reserve but the total is divided as if \
+             there were {POST_COMMIT_TAIL_REPORT_CALLS}"
+        );
+        assert_eq!(
+            u64::try_from(rescue_sites).unwrap(),
+            POST_COMMIT_TAIL_RESCUE_CALLS,
+            "{rescue_sites} site(s) take the rescue reserve but the total is divided as if there \
+             were {POST_COMMIT_TAIL_RESCUE_CALLS}"
+        );
+
+        // THE ASSERTION THIS TEST IS NAMED FOR: what the call sites actually ask for, against what
+        // this file tells the reader the bookkeeping can add to the lock hold.
+        let requested = POST_COMMIT_TAIL_REPORT * u32::try_from(report_sites).unwrap()
+            + POST_COMMIT_TAIL_RESCUE * u32::try_from(rescue_sites).unwrap();
+        assert!(
+            requested <= Duration::from_millis(POST_COMMIT_TAIL_TOTAL_MS),
+            "the call sites request {requested:?} of tail, more than the \
+             {POST_COMMIT_TAIL_TOTAL_MS}ms documented — on the per-root lock that queues every \
+             other prepare/remove for the project"
+        );
+
+        // AND EVERY SITE MUST TAKE ONE OF THE TWO. The bare call name is the catch-all: a site
+        // passing some third reserve satisfies both per-reserve counts above while escaping the
+        // aggregate. Requiring the argument to be spelled `deadline` failed BOTH ways — a site
+        // written `post_commit_tail(dl, …)` went uncounted, and a rustfmt wrap failed a correct tree
+        // (roborev 64511) — so this matches the bare name instead.
+        let needle = format!("{}_tail(", "post_commit");
+        assert!(prod.contains(&format!("fn {needle}")), "the definition itself is one occurrence");
+        let sites = prod.matches(&needle).count() - 1; // minus the `fn` definition
+        assert_eq!(
+            sites,
+            report_sites + rescue_sites,
+            "{sites} bookkeeping call site(s) exist but only {} take a reserve this test knows \
+             about — a site taking some third reserve is outside the bound above",
+            report_sites + rescue_sites
+        );
+
+        assert!(
+            !POST_COMMIT_TAIL_REPORT.is_zero() && !POST_COMMIT_TAIL_RESCUE.is_zero(),
+            "every bookkeeping call must still get an unstarvable reserve of its own"
+        );
+        // AND THE SPLIT MUST FAVOUR THE CALL THAT CAN LOSE WORK. An equal division satisfies the
+        // bound above while cutting `update-ref` — whose failure is swallowed and IS the work loss —
+        // to a third of its budget, to buy headroom for two calls that only affect a log line
+        // (roborev 64511). Not merely `RESCUE > REPORT`: an even three-way split satisfies THAT by a
+        // rounding remainder (1668ms vs 1666ms) while being exactly the defect, so the rescue write
+        // must hold the MAJORITY of the tail.
+        assert!(
+            POST_COMMIT_TAIL_RESCUE * 2 >= Duration::from_millis(POST_COMMIT_TAIL_TOTAL_MS),
+            "the rescue write must keep most of the tail, not be squeezed to fund the report-only \
+             calls: {POST_COMMIT_TAIL_RESCUE:?} of {POST_COMMIT_TAIL_TOTAL_MS}ms"
+        );
     }
 
     #[test]
@@ -8668,8 +8881,12 @@ mod tests {
         // made (roborev 64474). A spent shared deadline must therefore still yield a usable tail.
         let spent = Instant::now() - Duration::from_secs(60);
         assert!(
-            post_commit_tail(spent) > Instant::now(),
-            "the bookkeeping must get its own reserve, not the sequence's remainder"
+            post_commit_tail(spent, POST_COMMIT_TAIL_RESCUE) > Instant::now(),
+            "the rescue write must get its own reserve, not the sequence's remainder"
+        );
+        assert!(
+            post_commit_tail(spent, POST_COMMIT_TAIL_REPORT) > Instant::now(),
+            "and so must a report-only call, on the same spent shared budget"
         );
         // NO "the reserve is small" assertion here: `post_commit_tail(x) <= Instant::now() +
         // POST_COMMIT_TAIL` samples the right-hand clock AFTER the call, so it holds for a reserve of
