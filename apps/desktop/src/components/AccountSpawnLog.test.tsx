@@ -64,6 +64,36 @@ describe("AccountSpawnLog", () => {
     expect(screen.queryByText(/no account is signed in/i)).toBeNull();
   });
 
+  it("keeps the one-account banner when the NEWEST row measured nothing but older rows did", async () => {
+    // THE MIXED LIST, which only became reachable once the ledger's Rust side stopped rejecting
+    // unmeasured entries outright. Before that, the newest row and the newest MEASURED row were
+    // necessarily the same row, so reading the pool off `entries[0]` was safe by construction.
+    //
+    // Now one transient `remembered` line — written precisely when the accounts backend hiccuped —
+    // sits on top of rows that all measured the same answer. Suppressing the banner there hands the
+    // reader back the exact misreading this panel exists to prevent ("rotation is broken"), on the
+    // strength of a row that measured nothing. The test above pins the all-null list; neither it
+    // nor any other could see this case.
+    const read = vi.fn().mockResolvedValue([
+      entry({
+        at: Date.parse("2026-08-07T19:00:00Z"),
+        signedInCount: null,
+        reason: "remembered",
+        candidateIds: null,
+        tokens5h: null,
+        eligibleCount: null,
+      }),
+      entry({ at: Date.parse("2026-08-07T18:00:00Z"), signedInCount: 1, candidateIds: ["personal"] }),
+      entry({ at: Date.parse("2026-08-07T17:00:00Z"), signedInCount: 1, candidateIds: ["personal"] }),
+    ]);
+    render(<AccountSpawnLog read={read} />);
+
+    // Shown — and DATED, because a newer unmeasured row above it means "right now" would be a claim
+    // about an instant nobody looked at.
+    expect(await screen.findByText(/only one account was signed in/i)).toBeTruthy();
+    expect(screen.queryByText(/right now only one account is signed in/i)).toBeNull();
+  });
+
   it("gives ZERO signed-in accounts its own sentence, not the one-account one", async () => {
     // 0 is a real reading but a different situation: "it is the only one signed in" names an
     // account that does not exist, and "sign in another" presumes there is already one.
@@ -78,6 +108,124 @@ describe("AccountSpawnLog", () => {
     // at least one account — so it must never claim none is registered.
     expect(screen.queryByText(/none is registered/i)).toBeNull();
     expect(screen.queryByText(/only one account is signed in/i)).toBeNull();
+  });
+
+  // TWO ROWS ANSWER TWO DIFFERENT QUESTIONS in the `"none"` branch, and conflating them renders a
+  // sentence that contradicts the group list directly beneath it. The COUNT (`signedInCount`) can
+  // only come from the newest MEASURED row and is dated when that row is not the newest. But
+  // `accountId` is a recorded FACT, not a measurement — it was `Option` on the wire long before the
+  // null-wire fix — so "did this spawn get an account, and which" is answered by the NEWEST row.
+  //
+  // One test per branch, because each covers a site the other cannot see.
+  it("says no account was chosen when the NEWEST spawn got none, whatever an older row measured", async () => {
+    // The realistic co-occurring shape: a backend read failure yields BOTH a null count and no
+    // chosen account. Answering "did it get an account" off the older measured row would print
+    // "spawns are still being routed to DROdio Personal" above a group row reading "no account
+    // (used your terminal's login)" for that very spawn — and point the remedy at an account it
+    // never used.
+    const read = vi.fn().mockResolvedValue([
+      entry({
+        at: Date.parse("2026-08-07T19:00:00Z"),
+        signedInCount: null,
+        reason: "remembered",
+        accountId: null,
+        nickname: null,
+        email: null,
+        candidateIds: null,
+        tokens5h: null,
+        eligibleCount: null,
+      }),
+      entry({
+        at: Date.parse("2026-08-07T18:00:00Z"),
+        signedInCount: 0,
+        reason: "auto",
+        accountId: "personal",
+        nickname: "DROdio Personal",
+        email: null,
+        candidateIds: [],
+      }),
+    ]);
+    render(<AccountSpawnLog read={read} />);
+
+    const sentence = await screen.findByText(/did not get an account from/i);
+    expect(screen.queryByText(/still being routed to/i)).toBeNull();
+    // Dated, because the COUNT behind this sentence came from a row with a newer one above it.
+    expect(screen.getByText(/no account was signed in/i)).toBeTruthy();
+    expect(screen.queryByText(/^no account is signed in\.$/i)).toBeNull();
+
+    // AND IT MUST NOT CONTRADICT THE GROUP LIST UNDER IT. `choseNothing` is a fact about ONE row,
+    // so a plural "these spawns" would claim something about the list the gate never checked —
+    // while a group row right below is labelled with the account the older spawn really used. The
+    // subject is scoped to the newest spawn, and the older ones are reconciled rather than denied.
+    expect(sentence.textContent).toMatch(/The most recent spawn did not get an account/i);
+    expect(sentence.textContent).not.toMatch(/These spawns did not get an account/i);
+    expect(sentence.textContent).toMatch(/Earlier entries below did run on an account/i);
+    expect(screen.getByText("DROdio Personal")).toBeTruthy(); // the group row it must agree with
+  });
+
+  it("keeps the PLURAL sentence when every entry really did run without an account", async () => {
+    // The paired half: with nothing in the list holding an account, "these spawns" is true and
+    // there is no group row to contradict — so scoping to the newest one would understate it.
+    const read = vi.fn().mockResolvedValue([
+      entry({ at: Date.parse("2026-08-07T19:00:00Z"), signedInCount: 0, reason: "none", accountId: null, nickname: null, email: null, candidateIds: [] }),
+      entry({ at: Date.parse("2026-08-07T18:00:00Z"), signedInCount: 0, reason: "none", accountId: null, nickname: null, email: null, candidateIds: [] }),
+    ]);
+    render(<AccountSpawnLog read={read} />);
+
+    const sentence = await screen.findByText(/did not get an account from/i);
+    expect(sentence.textContent).toMatch(/These spawns did not get an account/i);
+    expect(sentence.textContent).not.toMatch(/Earlier entries below did run on/i);
+  });
+
+  it("names the NEWEST spawn's account in the routing sentence, not an older row's", async () => {
+    // The other branch, and the one that covers the nickname site. The newest row measured nothing
+    // but DID get an account; the older row supplies the zero count. The sentence must name the
+    // account spawns are actually going to — reading the nickname off the measured row instead
+    // would send the user to sign in at a different account than the one being used.
+    const read = vi.fn().mockResolvedValue([
+      entry({
+        at: Date.parse("2026-08-07T19:00:00Z"),
+        signedInCount: null,
+        reason: "remembered",
+        accountId: "second",
+        nickname: "Work Account",
+        email: null,
+        candidateIds: null,
+        tokens5h: null,
+        eligibleCount: null,
+      }),
+      entry({
+        at: Date.parse("2026-08-07T18:00:00Z"),
+        signedInCount: 0,
+        reason: "auto",
+        accountId: "personal",
+        nickname: "DROdio Personal",
+        email: null,
+        candidateIds: [],
+      }),
+    ]);
+    render(<AccountSpawnLog read={read} />);
+
+    // Read the SENTENCE's own text: a bare getByText("Work Account") is ambiguous, because a group
+    // row falls back to the nickname when `email` is null — so it would pass off the row above
+    // while the sentence still said "a registered account".
+    const sentence = await screen.findByText(/still being routed to/i);
+    expect(sentence.textContent).toMatch(/Work Account/);
+    expect(sentence.textContent).not.toMatch(/DROdio Personal/);
+    expect(screen.getByText(/no account was signed in/i)).toBeTruthy();
+    // THE DATED ARM: past tense, premise KEPT. The subject is the newest row while the count sits
+    // on an older one, so the clause must not claim the present — but it must still say something
+    // about the account it names, because the causal "so …" and the remedy "sign in there" need an
+    // antecedent and a restatement of the headline is not one. It refers back to the headline's
+    // instant rather than reprinting it, so the timestamp appears exactly once.
+    //
+    // NOT "something Work Account never measured" — that framing is what produced the
+    // over-correction this clause already round-tripped through. `signedInCount === 0` is a count
+    // across every registered account, so it DOES entail this account's config dir had no login at
+    // that instant; the defect was only ever the tense.
+    expect(sentence.textContent).toMatch(/whose config dir had no login at that point/i);
+    expect(sentence.textContent).not.toMatch(/whose config dir has no login/i);
+    expect(sentence.textContent).not.toMatch(/nothing was signed in/i);
   });
 
   it("does NOT cry wolf once a second account is signed in", async () => {
@@ -192,8 +340,13 @@ describe("AccountSpawnLog", () => {
     render(<AccountSpawnLog read={read} />);
 
     expect(await screen.findByText(/no account is signed in/i)).toBeTruthy();
-    expect(screen.getByText(/still being routed to/i)).toBeTruthy();
+    const sentence = screen.getByText(/still being routed to/i);
     expect(screen.queryByText(/did not get an account from/i)).toBeNull();
+    // THE PRESENT-TENSE ARM of the dating ternary — the common case, and the direction the mixed-list
+    // test cannot reach. Without this the mutation "always take the dated arm" stays green while the
+    // current reading silently loses its one account-specific fact.
+    expect(sentence.textContent).toMatch(/whose config dir has no login/i);
+    expect(sentence.textContent).not.toMatch(/as of /i);
   });
 
   it("does not present an empty ledger as proof that rotation never happened", async () => {

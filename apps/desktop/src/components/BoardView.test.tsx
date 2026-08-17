@@ -109,6 +109,28 @@ vi.mock("../services/beads", async (importOriginal) => {
   };
 });
 
+// Stub ONLY the two comment IPC wrappers the DetailOverlay now drives on open (read) and on submit
+// (write), so opening a card triggers no real Tauri invoke. Everything else in the module (the error
+// helpers `setBeadPriority` depends on) stays real via `importOriginal`.
+const beadsDetailMock = vi.fn(async (..._a: unknown[]) => ({
+  bead: {} as unknown,
+  fullDescription: "",
+  children: { beads: [], total: 0, omitted: 0, omittedIds: [], limit: 100 },
+  dependencies: [],
+  dependents: [],
+  comments: [] as unknown[],
+  linksTruncated: false,
+}));
+const beadsCommentMock = vi.fn(async (..._a: unknown[]) => undefined);
+vi.mock("../services/beadsCommands", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/beadsCommands")>();
+  return {
+    ...actual,
+    beadsDetail: (...a: unknown[]) => beadsDetailMock(...a),
+    beadsComment: (...a: unknown[]) => beadsCommentMock(...a),
+  };
+});
+
 import { BoardView, boardScrollDelta } from "./BoardView";
 import { sendToBuild } from "../services/sendToBuild";
 import { claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
@@ -193,6 +215,8 @@ afterEach(() => {
   blockedReasonMock.mockReturnValue(null);
   useCriteriaStore.setState({ ticks: {} });
   useProjectStore.setState({ projects: [], selectedProjectId: null });
+  beadsDetailMock.mockClear();
+  beadsCommentMock.mockClear();
 });
 
 beforeEach(() => {
@@ -396,6 +420,74 @@ describe("BoardView", () => {
     });
   });
 
+  // ══ THE COMMENT READ PATH IS LAZY — ON OPEN, NEVER ON THE 5s POLL ════════════════════════════
+  // `beads_detail` carries `--include-comments`; pulling it on every poll for every bead would
+  // hammer the contended bd store. These pin that it fires ONLY when a card opens, and that the
+  // compose box drives the real `beadsComment` write path.
+  describe("BoardView — the bead comment thread", () => {
+    function overlaySnapshot() {
+      snapshot = {
+        beads: [],
+        board: {
+          backlog: [bead({ id: "p1-x1", title: "Detailed task", priority: 2 })],
+          blocked: [],
+          inProgress: [],
+          done: [],
+          delivered: [],
+          archived: [],
+        },
+        loadedAt: Date.now(),
+      };
+    }
+
+    it("does NOT read comments on the board poll — only when a card is opened", async () => {
+      overlaySnapshot();
+      render(<BoardView project={project} side="right" />);
+      // The board is rendered from the poll snapshot. The comment read must not have run yet: if it
+      // were wired into the list path this would already be non-zero.
+      expect(beadsDetailMock).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByText("Detailed task"));
+      // Opening the card is the ONLY thing that fetches comments — and with this bead's id.
+      await waitFor(() => expect(beadsDetailMock).toHaveBeenCalledTimes(1));
+      expect(beadsDetailMock).toHaveBeenCalledWith("/tmp/demo", "p1-x1");
+    });
+
+    it("posts a typed comment through beadsComment with the bead id and text", async () => {
+      overlaySnapshot();
+      render(<BoardView project={project} side="right" />);
+      fireEvent.click(screen.getByText("Detailed task"));
+      await waitFor(() => expect(beadsDetailMock).toHaveBeenCalled());
+
+      const box = screen.getByTestId("board-bead-card-comments-input") as HTMLTextAreaElement;
+      fireEvent.change(box, { target: { value: "a human note" } });
+      fireEvent.click(screen.getByTestId("board-bead-card-comments-submit"));
+
+      // THE SIDE EFFECT: the shipped write path was called with THIS project, THIS bead, THIS text —
+      // not merely that a button rendered.
+      await waitFor(() => expect(beadsCommentMock).toHaveBeenCalledWith("/tmp/demo", "p1-x1", "a human note"));
+    });
+
+    it("renders comments returned by the detail read", async () => {
+      overlaySnapshot();
+      beadsDetailMock.mockResolvedValueOnce({
+        bead: {} as unknown,
+        fullDescription: "",
+        children: { beads: [], total: 0, omitted: 0, omittedIds: [], limit: 100 },
+        dependencies: [],
+        dependents: [],
+        comments: [
+          { id: "c-1", author: "DROdio", text: "the first comment", createdAt: "2026-08-12T00:00:00Z" },
+        ],
+        linksTruncated: false,
+      });
+      render(<BoardView project={project} side="right" />);
+      fireEvent.click(screen.getByText("Detailed task"));
+      // The thread shows the fetched comment body once the lazy read resolves.
+      expect(await screen.findByText("the first comment")).toBeTruthy();
+    });
+  });
+
   // The batch button is gated on the bead being an EPIC, not merely on its body naming a PRD.
   // `parsePrdRef` matches a "PRD file:" line in ANY body, so a task carrying a back-link resolved a
   // non-empty prdEpics — and a length-only gate offered "Build all N epics in this PRD" on a card
@@ -470,19 +562,24 @@ describe("BoardView", () => {
     expect(screen.queryByTestId("board-bead-card")).toBeNull();
   });
 
-  it("has no free-form edit controls — no inputs, selects, or textareas", () => {
+  it("has no free-form edit controls on the COLLAPSED board — inputs/selects/textareas appear only on open", () => {
     const { container } = render(<BoardView project={project} side="right" />);
-    // No edit controls anywhere on the board (buttons exist: cards open detail, epics get Start).
+    // No edit controls anywhere on the collapsed board (buttons exist: cards open detail, epics get
+    // Start). The board is a read/navigate surface — the one deliberate exception is the comment
+    // compose box, which lives on the OPENED card, not here.
     expect(container.querySelector("input")).toBeNull();
     expect(container.querySelector("select")).toBeNull();
     expect(container.querySelector("textarea")).toBeNull();
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
-    // Opening detail still introduces no inputs/selects.
+    // Opening detail introduces exactly ONE edit control — the comment compose box (the founder's
+    // ask). Still no `input`/`select`: this is a comment thread, not an edit grid.
     fireEvent.click(screen.getByText("Backlog one"));
     expect(container.querySelector("input")).toBeNull();
     expect(container.querySelector("select")).toBeNull();
-    expect(screen.queryByRole("textbox")).toBeNull();
+    // The compose textarea IS present now, and it is the only textbox on the surface.
+    expect(screen.getByTestId("board-bead-card-comments-input")).toBeTruthy();
+    expect(screen.getAllByRole("textbox")).toHaveLength(1);
   });
 
   it("counts each column", () => {

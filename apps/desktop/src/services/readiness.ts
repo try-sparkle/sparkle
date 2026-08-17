@@ -75,3 +75,64 @@ export function readinessStage(
 export function readinessComplete(r: PrereqsReport, auth: ClaudeAuthStatus): boolean {
   return readinessStage(r, auth) === "ready";
 }
+
+// ── ROTATION-AWARE auth gate ──────────────────────────────────────────────────────────────────
+//
+// WHY THIS EXISTS. `readinessStage` above answers "can the DEFAULT account authenticate?" — the only
+// account the gate ever probes (`checkClaudeAuthStatus()` with no config dir). When it cannot, the
+// stage is "auth". But a full-screen BLOCK on that one fact is wrong the moment the machine runs more
+// than one Claude account: the founder had six accounts, five healthy, and a lapsed session on the
+// DEFAULT one locked him out of the whole app even though every spawn auto-picks a healthy account
+// (`accountSelection.pickAccount`). The default is not privileged in selection — it is just the one
+// this gate happened to probe.
+//
+// So a default-account auth failure is no longer automatically a dead end. It is a dead end ONLY when
+// the ROTATION cannot carry the app either. This decision is kept here, pure and IPC-free, so it is
+// unit-testable; the gate computes the rotation summary from the account store and feeds it in.
+
+/**
+ * A minimal, IPC-free summary of whether the account ROTATION can carry the app while the account the
+ * gate probed (the default) cannot authenticate. Computed by `ReadinessGate` from the account store
+ * (`eligibleAccounts`) and passed to {@link authGateDecision}.
+ *
+ * `null` is a DISTINCT third state from `{ hasUsableAlternative: false }`, and the distinction is the
+ * whole point: `null` means "we could not read the rotation at all" (the store read failed or threw),
+ * which must FAIL OPEN — a broken store read must never lock the user out. `false` is a read that
+ * SUCCEEDED and genuinely found nothing usable — the real single-account dead end this gate was built
+ * for. Conflating the two would turn a transient IPC hiccup into a full-screen lockout.
+ */
+export interface RotationHealth {
+  /** At least one account OTHER than the probed (expired) default is usable RIGHT NOW — signed in and
+   *  not exhausted, per `accountStore.eligibleAccounts`. This is NOT a new notion of "usable": it is
+   *  exactly the predicate auto-pick uses to choose the account a spawn runs under. */
+  hasUsableAlternative: boolean;
+}
+
+/** How a default-account auth failure should be surfaced. */
+export type AuthGateDecision = "none" | "banner" | "block";
+
+/**
+ * Decide how to surface a default-account auth failure, given the readiness stage and what we know
+ * about the rotation. The asymmetry is deliberate: we BLOCK only on a positive "nothing usable", and
+ * every other path — a usable alternative, or an unreadable store — declines to block.
+ *
+ *   • "block"  — a FULL-SCREEN dead end, and the ONLY case that still blocks the whole app. Chosen
+ *                solely when we POSITIVELY know rotation cannot help: the store read succeeded AND no
+ *                other account is usable (`rotation.hasUsableAlternative === false`). This is the
+ *                single-account expiry the gate was originally built for; its "Continue anyway" escape
+ *                hatch still applies.
+ *   • "banner" — a NON-BLOCKING, dismissible notice. Chosen when another account is usable (the app
+ *                keeps working via that account) OR when rotation health is UNKNOWN (`rotation ===
+ *                null`). Unknown FAILS OPEN and lands here, never on "block".
+ *   • "none"   — not the auth stage; the gate shows nothing (or the install stage owns it).
+ */
+export function authGateDecision(
+  stage: ReadinessStage,
+  rotation: RotationHealth | null,
+): AuthGateDecision {
+  if (stage !== "auth") return "none";
+  // Block ONLY on a positive, successfully-read "nothing else is usable". A null rotation (unreadable
+  // store) is not that — it fails open to a banner below.
+  if (rotation !== null && !rotation.hasUsableAlternative) return "block";
+  return "banner";
+}

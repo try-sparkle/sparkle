@@ -42,6 +42,13 @@ declare module "*/sparkle-hook.mjs" {
   /** Sanitizes on the way out if it was not sanitized on the way in. */
   export function ensureDeliverySafe(m: InboxMessage): InboxMessage;
 
+  /** May THIS `claude` process drain `agentId`'s inbox? True only when the spawn-time
+   *  `SPARKLE_INBOX_AGENT` env var is present and strictly equals `agentId`. */
+  export function mayDrain(
+    env: Record<string, string | undefined> | undefined,
+    agentId: string,
+  ): boolean;
+
   /** The text injected back into the agent at its turn boundary. */
   export function draftDelivery(
     messages: InboxMessage[],

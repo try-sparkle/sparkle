@@ -366,3 +366,100 @@ describe("BeadCard — the priority write and the build button have separate bus
     });
   });
 });
+
+// ── SEVERITY BADGE — the relevance score, a SEPARATE axis from priority ──────────────────────────
+
+describe("BeadCard — the severity badge", () => {
+  it("renders the severity level from the `sev-<N>` label", () => {
+    mount({ bead: bead({ id: "", labels: ["sev-3"] }) });
+    const badge = screen.getByTestId(`${t}-severity`);
+    // THE ASSERTION: the badge shows the score the label carries (S3), not merely that a node exists.
+    expect(badge.textContent).toBe("S3");
+    expect(badge.getAttribute("data-severity")).toBe("3");
+  });
+
+  it("takes the MAX when duplicate sev labels are present", () => {
+    mount({ bead: bead({ id: "sparkle-sev2", labels: ["sev-1", "sev-4"] }) });
+    expect(screen.getByTestId(`${t}-severity`).textContent).toBe("S4");
+  });
+
+  it("renders NO badge when the bead carries no sev label", () => {
+    // The overwhelming common case — absent score is absent badge, not `S0`.
+    mount({ bead: bead({ id: "sparkle-nosev", labels: ["ui", "kanban"] }) });
+    expect(screen.queryByTestId(`${t}-severity`)).toBeNull();
+  });
+});
+
+// ── COMMENT THREAD + COMPOSE — the human-facing half ─────────────────────────────────────────────
+
+describe("BeadCard — the comment thread and compose box", () => {
+  const ct = `${t}-comments`;
+
+  it("renders existing comments' text", () => {
+    mount({
+      comments: [
+        { id: "c-1", author: "DROdio", text: "the first note", createdAt: "2026-08-12T00:00:00Z" },
+      ],
+    });
+    expect(screen.getByText("the first note")).toBeTruthy();
+    expect(screen.getByText("DROdio")).toBeTruthy();
+  });
+
+  it("shows the empty state when comments loaded but the thread is empty", () => {
+    mount({ comments: [] });
+    expect(screen.getByTestId(`${ct}-empty`)).toBeTruthy();
+  });
+
+  it("calls onComment with the typed text when Comment is pressed", async () => {
+    const onComment = vi.fn().mockResolvedValue(undefined);
+    mount({ comments: [], onComment });
+
+    const box = screen.getByTestId(`${ct}-input`) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "  a new comment  " } });
+    fireEvent.click(screen.getByTestId(`${ct}-submit`));
+
+    // THE SIDE EFFECT: the shipped write path is invoked with the TRIMMED text the reader typed —
+    // asserting the button rendered would pass against a compose box wired to nothing.
+    await waitFor(() => expect(onComment).toHaveBeenCalledWith("a new comment"));
+  });
+
+  it("clears the draft after a successful post", async () => {
+    const onComment = vi.fn().mockResolvedValue(undefined);
+    mount({ comments: [], onComment });
+    const box = screen.getByTestId(`${ct}-input`) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "posted" } });
+    fireEvent.click(screen.getByTestId(`${ct}-submit`));
+    await waitFor(() => expect(box.value).toBe(""));
+  });
+
+  it("does NOT dispatch an all-whitespace comment", () => {
+    const onComment = vi.fn().mockResolvedValue(undefined);
+    mount({ comments: [], onComment });
+    const box = screen.getByTestId(`${ct}-input`) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "   " } });
+    fireEvent.click(screen.getByTestId(`${ct}-submit`));
+    expect(onComment).not.toHaveBeenCalled();
+  });
+
+  it("keeps the draft and shows the error when the post fails", async () => {
+    const onComment = vi.fn().mockRejectedValue(new Error("bd is busy"));
+    mount({ comments: [], onComment });
+    const box = screen.getByTestId(`${ct}-input`) as HTMLTextAreaElement;
+    fireEvent.change(box, { target: { value: "keep me" } });
+    fireEvent.click(screen.getByTestId(`${ct}-submit`));
+    expect(await screen.findByTestId(`${ct}-error`)).toBeTruthy();
+    expect(box.value).toBe("keep me");
+  });
+
+  it("renders NO compose box when onComment is absent (read-only surface)", () => {
+    mount({ comments: [{ id: "c-1", author: null, text: "read only", createdAt: null }] });
+    expect(screen.queryByTestId(`${ct}-input`)).toBeNull();
+    // …but the existing thread is still shown.
+    expect(screen.getByText("read only")).toBeTruthy();
+  });
+
+  it("renders NO thread section at all when neither comments nor onComment is given", () => {
+    mount({});
+    expect(screen.queryByTestId(ct)).toBeNull();
+  });
+});

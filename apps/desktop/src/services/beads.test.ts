@@ -15,6 +15,8 @@ import {
   childrenOf,
   parseCreatedBeadId,
   mergeShaOf,
+  severityOf,
+  SEVERITY_LABEL_PREFIX,
   recordBeadMergeSha,
   MERGED_SHA_PREFIX,
   DELIVERED_LABEL,
@@ -349,6 +351,22 @@ describe("mergeShaOf", () => {
   });
   it("returns null for a blank/empty merged-sha label rather than an empty string", () => {
     expect(mergeShaOf(bead({ id: "b", labels: [`${MERGED_SHA_PREFIX}   `] }))).toBeNull();
+  });
+});
+
+describe("severityOf", () => {
+  it("reads the score from the `sev-<N>` label", () => {
+    expect(severityOf(bead({ id: "b", labels: [`${SEVERITY_LABEL_PREFIX}3`] }))).toBe(3);
+  });
+  it("returns null when no sev label is present (renders no badge)", () => {
+    expect(severityOf(bead({ id: "b", labels: ["ui", DELIVERED_LABEL] }))).toBeNull();
+  });
+  it("takes the MAX when duplicate sev labels linger (a decaying score writes both ways)", () => {
+    expect(severityOf(bead({ id: "b", labels: [`${SEVERITY_LABEL_PREFIX}1`, `${SEVERITY_LABEL_PREFIX}5`] }))).toBe(5);
+  });
+  it("ignores a non-numeric or negative suffix rather than reading it as 0", () => {
+    expect(severityOf(bead({ id: "b", labels: [`${SEVERITY_LABEL_PREFIX}x`] }))).toBeNull();
+    expect(severityOf(bead({ id: "b", labels: [`${SEVERITY_LABEL_PREFIX}-2`] }))).toBeNull();
   });
 });
 

@@ -67,17 +67,37 @@ pub struct SpawnLogEntry {
     /// (`"preferred"` = the fleet-wide account the user activated in the accounts modal, as
     /// distinct from `"pinned"`, which is one human choice about one agent.)
     pub reason: String,
-    pub tokens5h: u64,
-    /// Learned ceiling; `None` = not enough evidence to have learned one.
+    // ── THE MEASURED FIELDS ──────────────────────────────────────────────────────────────────────
+    //
+    // EVERY ONE IS `Option`, AND `None` MEANS NOT EVALUATED — never an evaluated zero. These are
+    // nullable because the TypeScript producer sends them null, not as a convenience: the
+    // `remembered` branch of `chooseAccountForAgent` fires exactly when the accounts backend could
+    // not be read, so there is no pool, no usage and no identity to report, and the client
+    // deliberately writes null rather than the obvious zeros.
+    //
+    // They were plain `u64`/`usize`/`Vec<String>`, which made serde reject that whole payload — and
+    // `recordSelection` swallows a rejected invoke by design (losing a log line must never cost a
+    // spawn), so every entry recording a backend failure was dropped in silence from the one file
+    // written to be trusted later. Neither suite could see it: the Rust tests only ever built
+    // measured entries, and the TS interface has always declared these `| null`.
+    //
+    // `#[serde(skip_serializing_if)]` is deliberately absent, here as everywhere on this struct: a
+    // `None` must reach disk as an explicit `null`, because a reader cannot tell an omitted key
+    // from a field this build does not have. `MIN_LINE_BYTES` depends on that too.
+    /// Trailing-5h consumption of the chosen account; `None` = not evaluated.
+    pub tokens5h: Option<u64>,
+    /// Learned ceiling; `None` = not enough evidence to have learned one (or not evaluated).
     pub ceiling: Option<u64>,
-    /// `tokens5h / ceiling`; `None` whenever `ceiling` is `None`.
+    /// `tokens5h / ceiling`; `None` whenever either is `None`.
     pub fraction: Option<f64>,
-    /// How many accounts auto-pick was allowed to choose from.
-    pub eligible_count: usize,
-    /// How many registered accounts are actually signed in.
-    pub signed_in_count: usize,
-    /// The ids that were healthy candidates at this instant.
-    pub candidate_ids: Vec<String>,
+    /// How many accounts auto-pick was allowed to choose from; `None` = not evaluated.
+    pub eligible_count: Option<usize>,
+    /// How many registered accounts are actually signed in; `None` = not evaluated, which must NOT
+    /// be read as "nobody is signed in".
+    pub signed_in_count: Option<usize>,
+    /// The ids that were healthy candidates at this instant. `Some([])` = evaluated and every
+    /// account was over its line; `None` = the pool was never evaluated.
+    pub candidate_ids: Option<Vec<String>>,
 }
 
 /// Retained line count. Past this the oldest are dropped — see [`MAX_LINES_SLACK`] for why the file
@@ -314,12 +334,12 @@ mod tests {
             config_dir: account.map(|a| format!("/tmp/{a}")),
             email: account.map(|a| format!("{a}@example.invalid")),
             reason: if account.is_some() { "auto".into() } else { "none".into() },
-            tokens5h: 1_234,
+            tokens5h: Some(1_234),
             ceiling: Some(88_000),
             fraction: Some(0.25),
-            eligible_count: 2,
-            signed_in_count: 3,
-            candidate_ids: vec!["acc-1".into(), "acc-2".into()],
+            eligible_count: Some(2),
+            signed_in_count: Some(3),
+            candidate_ids: Some(vec!["acc-1".into(), "acc-2".into()]),
         }
     }
 
@@ -597,12 +617,15 @@ mod tests {
             config_dir: None,
             email: None,
             reason: String::new(),
-            tokens5h: 0,
-            ceiling: None,
-            fraction: None,
-            eligible_count: 0,
-            signed_in_count: 0,
-            candidate_ids: vec![],
+            // The SHORTEST serialization of each measured field, which is what makes this a true
+            // lower bound: now they are nullable, `0`/`[]` are one and two bytes against `null`'s
+            // four, so the all-`None` entry is not the smallest one and would overstate the floor.
+            tokens5h: Some(0),
+            ceiling: Some(0),
+            fraction: Some(0.0),
+            eligible_count: Some(0),
+            signed_in_count: Some(0),
+            candidate_ids: Some(vec![]),
         };
         let len = serde_json::to_string(&minimal).unwrap().len() + 1; // + the newline
         assert!(
@@ -614,6 +637,25 @@ mod tests {
 
     // ── The frozen wire contract ────────────────────────────────────────────────────────────────
 
+    /// THE contract, as literal strings, in ONE place. Both the serialization test and the shared
+    /// fixture's key-set assertion read it, so a field added or dropped cannot satisfy one of them
+    /// while the other keeps passing against its own stale copy of the list.
+    const WIRE_KEYS: [&str; 13] = [
+        "at",
+        "key",
+        "accountId",
+        "nickname",
+        "configDir",
+        "email",
+        "reason",
+        "tokens5h",
+        "ceiling",
+        "fraction",
+        "eligibleCount",
+        "signedInCount",
+        "candidateIds",
+    ];
+
     #[test]
     fn the_wire_keys_are_camel_case() {
         // Pinned as literal strings because the TypeScript client is written against exactly these
@@ -623,24 +665,10 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         let obj = v.as_object().expect("an object");
 
-        for key in [
-            "at",
-            "key",
-            "accountId",
-            "nickname",
-            "configDir",
-            "email",
-            "reason",
-            "tokens5h",
-            "ceiling",
-            "fraction",
-            "eligibleCount",
-            "signedInCount",
-            "candidateIds",
-        ] {
+        for key in WIRE_KEYS {
             assert!(obj.contains_key(key), "the wire contract is missing `{key}`: {json}");
         }
-        assert_eq!(obj.len(), 13, "no extra fields leaked onto the wire: {json}");
+        assert_eq!(obj.len(), WIRE_KEYS.len(), "no extra fields leaked onto the wire: {json}");
 
         // The negative half — without it, a struct that emitted BOTH forms would pass.
         for snake in ["account_id", "config_dir", "eligible_count", "signed_in_count", "candidate_ids"]
@@ -674,10 +702,94 @@ mod tests {
         assert_eq!(e.at, 1_785_886_200_123);
         assert_eq!(e.account_id.as_deref(), Some("acc-9"));
         assert_eq!(e.reason, "sticky");
-        assert_eq!(e.tokens5h, 42);
+        assert_eq!(e.tokens5h, Some(42));
         assert_eq!(e.ceiling, None);
-        assert_eq!(e.signed_in_count, 2);
-        assert_eq!(e.candidate_ids, vec!["acc-9".to_string()]);
+        assert_eq!(e.signed_in_count, Some(2));
+        assert_eq!(e.candidate_ids.as_deref(), Some(&["acc-9".to_string()][..]));
+    }
+
+    /// The ONE payload both halves parse. Shared with the TypeScript suite
+    /// (`accountLedger.wire.test.ts`) so a drift on either side reds BOTH — the Rust struct and the
+    /// hand-written TS interface cannot otherwise see each other, which is how the null-vs-absent
+    /// mismatch below shipped with two green suites.
+    const SHARED_WIRE_FIXTURE: &str =
+        include_str!("../../src/fixtures/accountSpawnLogEntries.json");
+
+    #[test]
+    fn the_not_evaluated_shape_the_frontend_actually_sends_deserializes() {
+        // THE MEASURED FIELDS ARE NULLABLE ON THE WIRE, and this is the half that was missing.
+        //
+        // `chooseAccountForAgent`'s `remembered` branch — the one that fires precisely when the
+        // accounts backend could NOT be read — logs `candidates: null`, which the TS producer turns
+        // into `tokens5h/eligibleCount/signedInCount/candidateIds: null`. That is deliberate: the
+        // interface documents null as "not evaluated", explicitly distinct from an evaluated zero.
+        //
+        // These were `u64`/`usize`/`Vec<String>` here, so serde REJECTED the whole payload, and
+        // `recordSelection` swallows the rejection by design (losing a log line must never cost a
+        // spawn). Net effect: every entry recording a backend failure was dropped, silently, from
+        // the one file written to be trusted later — the exact event the ledger exists to capture.
+        // THE KEY SET, CHECKED ON THE RAW JSON FIRST — without this the fixture does not deliver
+        // the cross-suite guarantee it is here for, in EITHER direction:
+        //
+        //   * A field ADDED on the TS side is dropped at this boundary (there is deliberately no
+        //     `deny_unknown_fields`, which would make an older build reject a newer payload
+        //     wholesale — precisely the swallow-the-whole-entry failure this commit fixes). The TS
+        //     key-parity assertion reds and the fixture gains the key; `SpawnLogEntry` then parses
+        //     it happily and the field is silently lost.
+        //   * A field REMOVED on the TS side now parses as `None`, because making these `Option`
+        //     also made them optional on DESERIALIZE. A producer that stopped emitting
+        //     `signedInCount` would record "not evaluated" as fact — the exact inference the
+        //     struct's own comment says must never be drawn from an absent key.
+        //
+        // Asserting the exact key set catches both while leaving the read path forward-compatible.
+        let raw: Vec<serde_json::Map<String, serde_json::Value>> =
+            serde_json::from_str(SHARED_WIRE_FIXTURE).expect("the fixture is an array of objects");
+        assert_eq!(raw.len(), 2, "the fixture carries a measured AND an unmeasured entry");
+        for (i, obj) in raw.iter().enumerate() {
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let mut want = WIRE_KEYS;
+            want.sort_unstable();
+            assert_eq!(keys, want, "fixture entry {i} does not carry exactly the wire contract");
+        }
+
+        let entries: Vec<SpawnLogEntry> = serde_json::from_str(SHARED_WIRE_FIXTURE)
+            .expect("both shapes the frontend emits deserialize");
+        assert_eq!(entries.len(), 2, "the fixture carries a measured AND an unmeasured entry");
+
+        let measured = &entries[0];
+        assert_eq!(measured.tokens5h, Some(1_234));
+        assert_eq!(measured.eligible_count, Some(2));
+        assert_eq!(measured.signed_in_count, Some(3));
+        assert_eq!(measured.candidate_ids.as_deref().map(<[String]>::len), Some(2));
+
+        let unmeasured = &entries[1];
+        assert_eq!(unmeasured.reason, "remembered");
+        // None, not a defaulted zero: a zero here would state that nobody is signed in and that
+        // every account was exhausted, on the strength of a read that never happened.
+        assert_eq!(unmeasured.tokens5h, None);
+        assert_eq!(unmeasured.eligible_count, None);
+        assert_eq!(unmeasured.signed_in_count, None);
+        assert_eq!(unmeasured.candidate_ids, None);
+    }
+
+    #[test]
+    fn an_unmeasured_entry_round_trips_as_null_rather_than_zero() {
+        // The write direction of the same contract. Serializing `None` as `0`/`[]` would be worse
+        // than dropping the line: the reader cannot re-run the moment, so a coerced zero is an
+        // unmeasured claim recorded as fact.
+        let entries: Vec<SpawnLogEntry> = serde_json::from_str(SHARED_WIRE_FIXTURE).unwrap();
+        let dir = unique_dir("unmeasured");
+        let path = spawn_log_path(&dir);
+        append_entry(&path, &entries[1]).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(raw.trim_end()).unwrap();
+        for key in ["tokens5h", "eligibleCount", "signedInCount", "candidateIds"] {
+            assert!(v.as_object().unwrap().contains_key(key), "`{key}` is still emitted");
+            assert_eq!(v[key], serde_json::Value::Null, "`{key}` stays null, never coerced");
+        }
+        assert_eq!(read_entries(&path, 10), vec![entries[1].clone()], "and it reads back intact");
     }
 
     // ── Wiring ──────────────────────────────────────────────────────────────────────────────────

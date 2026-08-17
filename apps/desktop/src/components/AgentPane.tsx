@@ -67,6 +67,7 @@ import { Terminal, type TerminalApi } from "./Terminal";
 import { registerPromptMarker } from "../services/terminalMarkers";
 import {
   abandonPendingSends,
+  abandonScreenHeldSends,
   flushPendingSends,
   recordPromptSideEffects,
 } from "../services/conciergeDispatch";
@@ -862,6 +863,9 @@ function AgentPaneInner({
           configDir,
           resumeSessionId,
           model: agent.model,
+          // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg). SAME id as
+          // SPARKLE_AGENT_ID above — the hook-events log and the inbox are both keyed by it.
+          inboxAgentId: agent.id,
           // Add the app-level sparkle-control MCP (undefined when the bridge was unavailable → no
           // flag). No strictMcpConfig, so the worker keeps the user's own global MCP servers too.
           mcpConfig: controlMcpConfig,
@@ -942,6 +946,10 @@ function AgentPaneInner({
               configDir,
               resumeSessionId,
               model: agent.model,
+              // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg). Passed
+              // separately from `control` below because the control bridge is best-effort: a build
+              // agent must not lose turn-boundary message delivery when its MCP wiring failed.
+              agentId: agent.id,
               // Spawn-time plan-mode request. THIS is the branch build agents take, and build agents
               // are the only ones that can carry the field — threading it only into the generic
               // branch below meant the flag was never emitted at all (roborev 55057).
@@ -982,6 +990,9 @@ function AgentPaneInner({
           configDir,
           resumeSessionId,
           model: agent.model,
+          // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg). SAME id as
+          // SPARKLE_AGENT_ID above — the hook-events log and the inbox are both keyed by it.
+          inboxAgentId: agent.id,
           // Spawn-time plan-mode request. buildClaudeExec applies it only when NOT resuming, so an
           // agent the human took out of plan mode with shift+tab is not dragged back into it on
           // every relaunch.
@@ -1125,8 +1136,10 @@ function AgentPaneInner({
       unregisterPaneRestart(agent.id);
       unregisterPaneAccount(agent.id);
       // Report (not just drop) anything still held — the concierge promised the user a delivery
-      // and must say what actually happened (roborev 46311).
+      // and must say what actually happened (roborev 46311). Both queues: a screen hold made no
+      // fewer a promise than a PTY-not-ready one (roborev 64238's Medium).
       abandonPendingSends(agent.id);
+      abandonScreenHeldSends(agent.id);
     },
     [agent.id],
   );
@@ -1187,6 +1200,7 @@ function AgentPaneInner({
     (reason: string) => {
       setGaveUp(true);
       abandonPendingSends(agent.id);
+      abandonScreenHeldSends(agent.id);
       noteBriefFailed(agent.id, reason);
     },
     [agent.id],

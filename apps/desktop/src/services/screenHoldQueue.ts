@@ -46,6 +46,31 @@ export const MAX_AGE_MS = 15 * 60 * 1000;
 
 const queues = new Map<string, ScreenHeldSend[]>();
 
+/**
+ * Per-agent generation, bumped whenever a queue is cleared out from UNDER an in-flight flush
+ * (abandonment, an explicit clear) rather than by the flush's own ordinary take-and-deliver.
+ *
+ * WHY THIS EXISTS (roborev 64289's Medium). `flushScreenHeldSends` takes the queue, awaits
+ * `submitPrompt`, then re-queues whatever it could not deliver this round. If the pane tears down
+ * DURING that await, `abandonScreenHeldSends` finds an already-empty queue (the flush took it) and
+ * reports nothing — and the flush then re-queues into what is now a dead agent's queue, resurrecting
+ * sends the founder never typed into the session that (maybe) relaunches under that id. A flush
+ * that captures the generation before its own take, and checks it again before re-queuing, can tell
+ * "nothing changed" apart from "this agent was abandoned while I was waiting" and must not resurrect
+ * the latter.
+ */
+const generations = new Map<string, number>();
+
+function bumpGeneration(agentId: string): void {
+  generations.set(agentId, (generations.get(agentId) ?? 0) + 1);
+}
+
+/** This agent's current generation. Compare a value captured before an await against one read
+ *  after it to detect an intervening abandon/clear — see the constant's own doc above. */
+export function screenHoldGeneration(agentId: string): number {
+  return generations.get(agentId) ?? 0;
+}
+
 /** Entries still young enough to deliver. Applied everywhere a queue is read, so an aged-out entry
  *  never counts toward the cap or the reported count — it is already dead, just not swept. */
 function live(q: ScreenHeldSend[], nowMs: number): ScreenHeldSend[] {
@@ -59,6 +84,15 @@ function live(q: ScreenHeldSend[], nowMs: number): ScreenHeldSend[] {
  *
  * `onPruned` receives anything the prune dropped, oldest first — see pendingSends' identical
  * parameter for why this exists: a promised send must not vanish with no outcome at all.
+ *
+ * INSERTS BY `at`, NOT APPENDS (roborev 64268's Medium). `flushScreenHeldSends` re-queues
+ * still-due entries through this same function AFTER an `await submitPrompt` — and a genuinely
+ * NEW message can land in that same window, queued by an entirely separate `holdForScreenClear`
+ * call. A plain append would put that new arrival ahead of the older re-queued ones (they are
+ * re-added after the await returns, the new one during it), delivering a follow-up before the
+ * message it follows. Every existing caller already passes an ascending `at`, so this changes
+ * nothing about their behaviour — it only fixes the interleaved-caller case none of them can see
+ * from inside their own call.
  */
 export function queueScreenHeldSend(
   entry: Omit<ScreenHeldSend, "at"> & { at?: number },
@@ -75,7 +109,10 @@ export function queueScreenHeldSend(
     queues.set(entry.agentId, q); // keep the pruned list even when refusing
     return false;
   }
-  q.push({ ...entry, at: now });
+  const toInsert: ScreenHeldSend = { ...entry, at: now };
+  const insertAt = q.findIndex((e) => e.at > toInsert.at);
+  if (insertAt === -1) q.push(toInsert);
+  else q.splice(insertAt, 0, toInsert);
   queues.set(entry.agentId, q);
   return true;
 }
@@ -105,23 +142,117 @@ export function screenHeldSendCount(agentId: string, nowMs: number = Date.now())
   return live(queues.get(agentId) ?? [], nowMs).length;
 }
 
-/** Every agent id with at least one LIVE held send. Small by construction (MAX_PER_AGENT bounds
- *  each entry, and only a mounted send ever queues here at all), so a caller can safely poll every
- *  one of them each tick without needing to track "which agents" separately. */
-export function agentIdsWithScreenHolds(nowMs: number = Date.now()): string[] {
+/**
+ * Every agent id with at least one held send. Small by construction (MAX_PER_AGENT bounds each
+ * entry, and only a mounted send ever queues here at all), so a caller can safely poll every one
+ * of them each tick without needing to track "which agents" separately.
+ *
+ * `includeExpired` DEFAULTS FALSE for the general case (most callers only care about live entries),
+ * but the drain poll must pass `true` — see roborev 64238's High. An agent whose entries are all
+ * expired but never yet SWEPT (see `sweepExpiredScreenHolds`) has a live-only filter here return
+ * `false` for it, which would mean nothing ever visits that agent again to report the expiry or
+ * free the map entry: an agent that unmounts (or is switched away from) while its screen stays
+ * blocked drops out of the live-only view forever, well before its 15-minute TTL lapses, and the
+ * entries then sit in `queues` unswept for the rest of the session.
+ */
+export function agentIdsWithScreenHolds(
+  nowMs: number = Date.now(),
+  opts?: { includeExpired?: boolean },
+): string[] {
   const ids: string[] = [];
   for (const [agentId, q] of queues) {
-    if (live(q, nowMs).length > 0) ids.push(agentId);
+    const has = opts?.includeExpired ? q.length > 0 : live(q, nowMs).length > 0;
+    if (has) ids.push(agentId);
   }
   return ids;
 }
 
-/** Drop this agent's held sends without delivering them — e.g. its pane closed for good. */
-export function clearScreenHeldSends(agentId: string): void {
-  queues.delete(agentId);
+/**
+ * Remove ONLY the entries that have aged out past MAX_AGE_MS, leaving any still-live ones queued.
+ * The counterpart to `takeScreenHeldSends` for a screen that is STILL blocked: a full take would
+ * hand back live entries that must stay queued (the screen isn't safe to write to), but leaving
+ * expired ones untouched is exactly the silent-drop `flushScreenHeldSends`'s `expired` branch
+ * exists to prevent (roborev 64238's High) — this is what lets the drain report and clear them
+ * without touching entries that are still waiting.
+ */
+export function sweepExpiredScreenHolds(
+  agentId: string,
+  nowMs: number = Date.now(),
+): ScreenHeldSend[] {
+  const q = queues.get(agentId);
+  if (!q || q.length === 0) return [];
+  const stillLive = live(q, nowMs);
+  const expired = q.filter((e) => !stillLive.includes(e));
+  if (expired.length === 0) return [];
+  if (stillLive.length > 0) queues.set(agentId, stillLive);
+  else queues.delete(agentId);
+  return expired;
 }
 
-/** Test seam: drop every queue. */
+/** Drop this agent's held sends without delivering them — e.g. its pane closed for good. Bumps
+ *  the generation (see `screenHoldGeneration`) so a flush already in flight for this agent knows
+ *  not to resurrect what it re-queues. */
+export function clearScreenHeldSends(agentId: string): void {
+  queues.delete(agentId);
+  bumpGeneration(agentId);
+}
+
+/**
+ * Take EVERYTHING held for `agentId` — due, expired, all of it — and mark the agent abandoned by
+ * bumping its generation. The caller reports each returned entry as abandoned; this function only
+ * owns the queue mutation and the generation bump, atomically, so nothing observing the generation
+ * can see the bump without also seeing the empty queue (or vice versa).
+ */
+export function abandonAllScreenHeldSends(agentId: string): ScreenHeldSend[] {
+  const q = queues.get(agentId) ?? [];
+  queues.delete(agentId);
+  bumpGeneration(agentId);
+  return q;
+}
+
+/**
+ * Re-queue entries a flush took off the queue but could not deliver this round — as opposed to a
+ * FRESH message arriving via `queueScreenHeldSend`. Unlike that function, this PREFERS the entries
+ * being reinstated over whatever queued in during the flush's `await` window: merges both sets,
+ * sorts oldest-first by `at`, and keeps only the oldest `MAX_PER_AGENT` — so a promised send cannot
+ * be crowded out by a message that arrived after it (roborev 64289's Medium: a plain per-entry
+ * `queueScreenHeldSend` call let mid-flush arrivals occupy the cap first and refuse the OLDER
+ * promised sends instead, the exact ordering inversion the `at`-insert change above was made to
+ * prevent).
+ *
+ * Evaluates staleness and the cap against the REAL clock (`Date.now()`), never against a reinstated
+ * entry's own past `at` — using a past `at` as "now" made every already-queued entry read as
+ * younger than "now" and therefore permanently un-prunable, which is also why the same finding's
+ * `onPruned` never fired in the first cut and the cap could refuse an entry that was actually
+ * already expired.
+ *
+ * `onCrowdedOut` receives whatever had to be evicted to make room, oldest of the evicted first, so
+ * the caller can report a truthful `queue-full` rather than let it vanish silently.
+ */
+export function reinstateScreenHeldSends(
+  agentId: string,
+  entries: readonly ScreenHeldSend[],
+  onCrowdedOut?: (evicted: ScreenHeldSend[]) => void,
+  onPruned?: (dropped: ScreenHeldSend[]) => void,
+): void {
+  if (entries.length === 0) return;
+  const now = Date.now();
+  const all = queues.get(agentId) ?? [];
+  const current = live(all, now);
+  if (onPruned && current.length !== all.length) {
+    const kept = new Set(current);
+    onPruned(all.filter((e) => !kept.has(e)));
+  }
+  const merged = [...current, ...entries].sort((a, b) => a.at - b.at);
+  const keep = merged.slice(0, MAX_PER_AGENT);
+  const evicted = merged.slice(MAX_PER_AGENT);
+  if (keep.length > 0) queues.set(agentId, keep);
+  else queues.delete(agentId);
+  if (onCrowdedOut && evicted.length > 0) onCrowdedOut(evicted);
+}
+
+/** Test seam: drop every queue and every generation counter. */
 export function resetScreenHeldSends(): void {
   queues.clear();
+  generations.clear();
 }

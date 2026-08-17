@@ -100,7 +100,14 @@ import { maybeAutoName } from "./agentNaming";
 import { recordTrialSend, trialSendAllowed } from "./trialMeter";
 import { aiFeatureNow } from "./aiGate";
 import { queuePendingSend, takePendingSends } from "./pendingSends";
-import { queueScreenHeldSend, takeScreenHeldSends } from "./screenHoldQueue";
+import {
+  abandonAllScreenHeldSends,
+  queueScreenHeldSend,
+  reinstateScreenHeldSends,
+  screenHoldGeneration,
+  sweepExpiredScreenHolds,
+  takeScreenHeldSends,
+} from "./screenHoldQueue";
 import { paneState } from "./paneReadiness";
 import { findKnownAgent } from "./knownAgents";
 import { getAgentViewport } from "./terminalViewport";
@@ -645,6 +652,7 @@ function holdForScreenClear(
           agentId,
           sent: e.text,
           display: e.display ?? e.text,
+          heldReason: "screen",
         });
       }
     },
@@ -1243,14 +1251,35 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
  * Deliver everything `holdForScreenClear` queued for `agentId` (see services/screenHoldQueue).
  * The mirror of `flushPendingSends` above, and it shares that function's shape deliberately — same
  * outcome broadcast, same expired-vs-due split — but reads the SEPARATE screen-hold queue with its
- * own, longer TTL.
+ * own, longer TTL, and every outcome it emits carries `heldReason: "screen"` (see that field's doc)
+ * so a deferred reader can tell this hold apart from the PTY-not-ready one and say something true
+ * about it — the agent DID come up; it is its screen that was busy.
  *
- * NO SCREEN RE-CHECK HERE, and that is the caller's job, not an omission: this function only ever
- * exists to be called once the screen is already known to be safe (see hooks/useScreenHoldDrain,
- * the only caller), exactly as `flushPendingSends` is only ever called once the PTY is already
- * known to be ready. Re-checking here would duplicate that decision rather than trust it.
+ * DELIVERS AT MOST ONE DUE ENTRY PER CALL (roborev 64268's Medium — a prior version tried to
+ * re-check the screen between writes within one call and loop through the rest, but that cannot
+ * see the hazard it was meant to prevent: `submitPrompt`'s `await` resolves once the PTY has
+ * ACCEPTED the write, not once the agent has processed it and xterm has redrawn — a dialog the
+ * first write raises appears seconds later, well after a synchronous re-read of the viewport would
+ * have already passed). Any further due entries are re-queued and hooks/useScreenHoldDrain's own
+ * 1500ms poll interval is what gives the screen a REAL chance to change before the next one is
+ * tried, re-reading the viewport from scratch rather than trusting a stale read.
+ *
+ * THE RE-QUEUE IS GENERATION-GUARDED (roborev 64289's Medium). `takeScreenHeldSends` above empties
+ * the queue before the `await`, so if the pane is abandoned WHILE that write is in flight,
+ * `abandonScreenHeldSends` finds an already-empty queue and reports nothing — and re-queuing `rest`
+ * afterward would resurrect it into a dead agent's queue (or a relaunch's, under the same id, that
+ * the founder never typed into). Capturing the generation before the take and checking it again
+ * after the await is what tells "nothing changed" apart from "this agent was abandoned while I was
+ * waiting"; see `screenHoldGeneration`'s own doc for why the bump is atomic with the clear.
+ *
+ * THE RE-QUEUE PREFERS THE OLDER ENTRIES (also roborev 64289's Medium). `reinstateScreenHeldSends`
+ * merges `rest` with whatever queued in during the await and keeps the oldest — a plain per-entry
+ * `queueScreenHeldSend` loop let mid-flush arrivals occupy the cap first and refuse the OLDER
+ * promised sends instead, the exact ordering inversion the `at`-insert change in screenHoldQueue.ts
+ * was made to prevent.
  */
 export async function flushScreenHeldSends(agentId: string): Promise<ConciergeDispatchResult[]> {
+  const generationBefore = screenHoldGeneration(agentId);
   const { due, expired } = takeScreenHeldSends(agentId);
   const out: ConciergeDispatchResult[] = [];
   for (const entry of expired) {
@@ -1260,26 +1289,105 @@ export async function flushScreenHeldSends(agentId: string): Promise<ConciergeDi
       agentId,
       sent: entry.text,
       display: entry.display ?? entry.text,
+      heldReason: "screen",
     };
     out.push(r);
     emitOutcome(r);
   }
-  for (const entry of due) {
-    const display = entry.display ?? entry.text;
-    let r: ConciergeDispatchResult;
-    try {
-      await submitPrompt(agentId, entry.text, { machine: !entry.humanAuthored });
-      if (entry.userPrompt)
-        recordPromptSideEffects(agentId, entry.text, entry, entry.humanAuthored);
-      r = { ok: true, path: "free-text", agentId, sent: entry.text, display };
-    } catch (err) {
-      if (!(err instanceof PtyGoneError)) throw err;
-      r = { ok: false, path: "pty-gone", agentId, sent: entry.text, display };
+  const [first, ...rest] = due;
+  // `rest`'s handling lives in `finally` (roborev 64312's Medium): `takeScreenHeldSends` above
+  // already emptied the queue, so if `submitPrompt` or `recordPromptSideEffects` throws anything
+  // OTHER than `PtyGoneError`, that error re-throws past the `try` below — and without `finally`,
+  // control never reached this block at all. Up to MAX_PER_AGENT still-due, explicitly-promised
+  // sends would vanish with no re-queue and no outcome, an unobserved rejection on the only real
+  // caller (`useScreenHoldDrain`'s `void flushScreenHeldSends(...)`). `finally` runs regardless of
+  // how the try block exits, so `rest` is always reinstated or reported before this function's own
+  // promise settles (rejected or not).
+  try {
+    if (first) {
+      const display = first.display ?? first.text;
+      let r: ConciergeDispatchResult;
+      try {
+        await submitPrompt(agentId, first.text, { machine: !first.humanAuthored });
+        if (first.userPrompt)
+          recordPromptSideEffects(agentId, first.text, first, first.humanAuthored);
+        r = { ok: true, path: "free-text", agentId, sent: first.text, display, heldReason: "screen" };
+      } catch (err) {
+        if (!(err instanceof PtyGoneError)) throw err;
+        r = { ok: false, path: "pty-gone", agentId, sent: first.text, display, heldReason: "screen" };
+      }
+      out.push(r);
+      emitOutcome(r);
     }
-    out.push(r);
-    emitOutcome(r);
+  } finally {
+    if (rest.length > 0) {
+      if (screenHoldGeneration(agentId) !== generationBefore) {
+        // Abandoned while the first write was in flight — do not resurrect anything into its (now
+        // dead, or relaunched-under-the-same-id) queue. Report the truth instead.
+        for (const entry of rest) {
+          emitOutcome({
+            ok: false,
+            path: "abandoned",
+            agentId,
+            sent: entry.text,
+            display: entry.display ?? entry.text,
+            heldReason: "screen",
+          });
+        }
+      } else {
+        reinstateScreenHeldSends(
+          agentId,
+          rest,
+          (evicted) => {
+            for (const e of evicted) {
+              emitOutcome({
+                ok: false,
+                path: "queue-full",
+                agentId,
+                sent: e.text,
+                display: e.display ?? e.text,
+                heldReason: "screen",
+              });
+            }
+          },
+          (dropped) => {
+            for (const d of dropped) {
+              emitOutcome({
+                ok: false,
+                path: "expired",
+                agentId,
+                sent: d.text,
+                display: d.display ?? d.text,
+                heldReason: "screen",
+              });
+            }
+          },
+        );
+      }
+    }
   }
   return out;
+}
+
+/**
+ * Report and clear ONLY the entries in `agentId`'s screen-hold queue that have aged out — for a
+ * screen that is STILL blocked, where `flushScreenHeldSends` (which would deliver the still-live
+ * ones) must not run. Without this, an agent whose screen never clears drops out of
+ * `agentIdsWithScreenHolds`'s default (live-only) view once every entry has expired, and nothing
+ * ever visits it again to report the expiry or free the queue — roborev 64238's High. Called from
+ * hooks/useScreenHoldDrain on the "still blocked" branch; a no-op when nothing has expired.
+ */
+export function sweepExpiredScreenHeldSends(agentId: string): void {
+  for (const entry of sweepExpiredScreenHolds(agentId)) {
+    emitOutcome({
+      ok: false,
+      path: "expired",
+      agentId,
+      sent: entry.text,
+      display: entry.display ?? entry.text,
+      heldReason: "screen",
+    });
+  }
 }
 
 /**
@@ -1297,6 +1405,32 @@ export function abandonPendingSends(agentId: string): void {
       agentId,
       sent: entry.text,
       display: entry.display ?? entry.text,
+    });
+  }
+}
+
+/**
+ * The screen-hold twin of `abandonPendingSends` — voids a dead pane's held sends with a reported
+ * outcome, rather than leaving them to rot until useScreenHoldDrain's poll notices the pane's
+ * viewport is gone and (eventually) their TTL lapses. Same promise, same reasoning; a SEPARATE
+ * function because the two queues are separate (roborev 64238's Medium — the first cut of this
+ * feature left this one queue with no abandon path at all, and `clearScreenHeldSends` no
+ * production caller). Called from the same sites `abandonPendingSends` is.
+ *
+ * `abandonAllScreenHeldSends`, NOT `takeScreenHeldSends` (roborev 64289's Medium): the take alone
+ * cannot be told apart from an ordinary flush's take, and `flushScreenHeldSends` needs the
+ * generation bump to know this agent was torn down while its own write was in flight — see that
+ * function's header and `screenHoldGeneration`'s doc.
+ */
+export function abandonScreenHeldSends(agentId: string): void {
+  for (const entry of abandonAllScreenHeldSends(agentId)) {
+    emitOutcome({
+      ok: false,
+      path: "abandoned",
+      agentId,
+      sent: entry.text,
+      display: entry.display ?? entry.text,
+      heldReason: "screen",
     });
   }
 }

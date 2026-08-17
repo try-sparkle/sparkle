@@ -160,6 +160,41 @@ export function removeAgentWorktree(
   return invoke("remove_agent_worktree", { root, projectId, agentId });
 }
 
+/**
+ * What a WIP snapshot did. `sha` is a Rust `Option<String>`, so it arrives as `null` and NEVER as an
+ * absent key — hence `string | null` rather than the `sha?: string` the shape invites (AGENTS.md,
+ * "A Rust `Option` crosses the wire as `null`").
+ *
+ * `sha` MAY BE NULL ON EVERY KIND, `"committed"` included. It was documented as non-null for that
+ * one, and that is now false in both directions: the bookkeeping after the commit is best-effort on
+ * purpose, so a `rev-parse` that could not be read degrades the REPORT rather than discarding a
+ * commit that was really made. Read it as "the snapshot happened; here is its sha if we could name
+ * it" — never as a guarantee, and never with `!` (roborev 64480).
+ */
+export interface WipCommitOutcome {
+  kind: "committed" | "committed-detached" | "nothing-to-commit" | "no-worktree";
+  sha: string | null;
+  files: number;
+  /** Set only for `"committed-detached"`: the ref holding a commit that is on no branch. */
+  rescueRef: string | null;
+}
+
+/**
+ * Commit whatever is uncommitted in an agent's (or worker's) worktree onto its own branch, so the
+ * teardown that follows cannot take that work with it. See `commit_worktree_wip_at` in
+ * `worktree.rs` for the three choices behind it (`--no-verify`, `add -A`, fallback identity).
+ *
+ * The branch SURVIVES a spin-down by design and the worktree does not, which is the whole asymmetry
+ * this closes: before it, a killed worker's edits lived only in the directory teardown deletes.
+ */
+export function commitWorktreeWip(
+  projectId: string,
+  agentId: string,
+  message?: string,
+): Promise<WipCommitOutcome> {
+  return invoke<WipCommitOutcome>("commit_worktree_wip", { projectId, agentId, message });
+}
+
 /** Tripwire: throws if the worktree's git toplevel isn't the worktree itself. */
 export function assertWorkspaceIntegrity(worktree: string): Promise<void> {
   return invoke("assert_workspace_integrity", { worktree });
@@ -393,6 +428,7 @@ export function removeAgentWorkspace(
   root: string,
   projectId: string,
   agentId: string,
+  opts?: RemoveWorkspaceOptions,
 ): Promise<void> {
   const key = seedKey(projectId, agentId);
   const preparedPath = preparedPaths.get(key);
@@ -409,8 +445,63 @@ export function removeAgentWorkspace(
       settles.push(abandonWorktreeSeed(preparedPath), abandonWorktreeBootstrap(preparedPath));
     }
     await Promise.all(settles);
+    // SNAPSHOT BEFORE THE DELETE, for every caller that keeps the branch (see RemoveWorkspaceOptions).
+    // Placed HERE — after the two writer handshakes, inside the per-root lock — rather than at the
+    // call sites, which would run it while the env seed and the dependency bootstrap are certainly
+    // still writing.
+    //
+    // BUT `abandonWorktreeBootstrap` IS A BOUNDED RACE, NOT A SETTLE (roborev 64457): it waits 5s and
+    // deliberately never kills an install the surrounding comments measure at ~27s. So a package
+    // manager can still be writing here, and the honest guarantee is not "the tree is quiet" — it is
+    // that the whole snapshot shares ONE deadline (`WIP_SNAPSHOT_TIMEOUT`, ~20s for the entire
+    // sequence, not per git call), so a busy tree costs a skipped snapshot rather than a wedged
+    // teardown holding the per-root lock.
+    if (opts?.snapshotWip) await snapshotBeforeTeardown(projectId, agentId);
     return removeAgentWorktree(root, projectId, agentId);
   });
+}
+
+/** Options for {@link removeAgentWorkspace}. */
+export interface RemoveWorkspaceOptions {
+  /**
+   * Commit uncommitted worktree edits onto the agent's own branch before the worktree is deleted.
+   *
+   * Pass this from every SAVE-semantics teardown — the ones that keep the branch precisely so work
+   * is not lost (worker spin-down, build-agent close, the sidebar's ×). Do NOT pass it from
+   * `discardAgentGit`, where destroying unmerged work is the whole point of the operation, nor from
+   * a spawn rollback, where the worktree was cut seconds ago and holds nothing.
+   */
+  snapshotWip?: boolean;
+}
+
+/**
+ * Best-effort WIP snapshot: never throws, because a teardown must not be blockable. A refusal here
+ * would strand the agent's concurrency slot permanently, which is a worse failure than the loss this
+ * prevents.
+ *
+ * A DETACHED head is reported differently on purpose — the commit is on no branch and is held only
+ * by a rescue ref, so saying "salvaged to the branch" would be a false claim about where the work is.
+ */
+async function snapshotBeforeTeardown(projectId: string, agentId: string): Promise<void> {
+  try {
+    const r = await commitWorktreeWip(projectId, agentId, `wip: ${agentId} before teardown`);
+    if (r.kind === "committed") {
+      console.warn(
+        // `sha ?? …` — a bare null renders as "... as null", which reads as a bug rather than as
+        // "the commit is safe, we just could not name it" (roborev 64480).
+        `removeAgentWorkspace: salvaged ${r.files} uncommitted path(s) to ${agentId}'s branch as ` +
+          `${r.sha ?? "(sha unreadable — the commit was made)"}`,
+      );
+    } else if (r.kind === "committed-detached") {
+      console.warn(
+        `removeAgentWorkspace: ${agentId} had a DETACHED head — ${r.files} path(s) committed as ` +
+          `${r.sha ?? "(sha unreadable)"}, reachable only via ` +
+          `${r.rescueRef ?? "(no rescue ref could be written)"}`,
+      );
+    }
+  } catch (e) {
+    console.warn("removeAgentWorkspace: WIP snapshot failed; tearing down anyway", e);
+  }
 }
 
 /** Stop this agent's preview dev server before its checkout is evacuated (bead sparkle-3475b.6;

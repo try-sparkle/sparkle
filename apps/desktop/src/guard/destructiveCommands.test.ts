@@ -148,3 +148,47 @@ describe("blocksDestructiveCommand — input handling", () => {
     expect(blocksDestructiveCommand({ command: "rm -rf /" })).toBeNull();
   });
 });
+
+// The corpus can only assert THAT a command was refused — it has no expected-rule field. For the
+// `env` reading budget that is not enough: the whole point of the budget is fail-CLOSED refusal, and
+// a corpus entry goes green if ANY rule refuses it, so a future rule (or an `envParse` change that
+// resolves one reading to a denied binary) would keep the fixture passing while the budget itself
+// became deletable. These assert the budget specifically.
+describe("blocksDestructiveCommand — the env reading budget refuses, and resets", () => {
+  // Each alt's command word is literally `env`, so readings multiply per nesting level and pass the
+  // budget, while EVERY individual reading resolves to the harmless `echo hi` and fires no rule.
+  // Without the budget this is ALLOW; with it, refused BY THE BUDGET.
+  const exhausting = "env " + "-u env ".repeat(16) + "echo hi";
+
+  it("refuses by the budget, naming the budget — not merely 'something refused'", () => {
+    const verdict = blocksDestructiveCommand(exhausting);
+    expect(verdict).not.toBeNull();
+    expect(verdict?.rule).toBe("env");
+    expect(verdict?.why).toMatch(/too many option-arity readings/);
+  });
+
+  it("resets the budget between top-level commands, independent of test ordering", () => {
+    // Exhaust, then immediately judge ordinary commands IN THE SAME TEST. Relying on a later
+    // `describe` to catch a leaked counter makes the coverage an artifact of file order — move the
+    // blocks, split the file, or isolate modules per test and it silently disappears.
+    expect(blocksDestructiveCommand(exhausting)).not.toBeNull();
+    expect(blocksDestructiveCommand("env -u NODE_OPTIONS pnpm test")).toBeNull();
+    expect(blocksDestructiveCommand("env -S 'echo hi'")).toBeNull();
+    expect(blocksDestructiveCommand("env --unset FOO ls -la")).toBeNull();
+  });
+
+  it("refuses the next deleter ON ITS OWN MERITS, not on a leaked budget", () => {
+    // `not.toBeNull()` is NOT enough here, and asserting it was this test's own bug: with the reset
+    // removed the counter is already exhausted on entry, so this command is refused by the BUDGET
+    // rather than by the rm rule — non-null either way, green with and without the thing it claims
+    // to guard. Naming the expected rule is what makes the two outcomes distinguishable.
+    blocksDestructiveCommand(exhausting);
+    const rm = blocksDestructiveCommand("env -uSHELL rm -rf /");
+    expect(rm?.rule).toBe("rm -r");
+    expect(rm?.why).not.toMatch(/too many option-arity readings/);
+
+    const find = blocksDestructiveCommand("find / -type f -exec rm {} +");
+    expect(find?.rule).toBe("find -exec rm");
+    expect(find?.why).not.toMatch(/too many option-arity readings/);
+  });
+});

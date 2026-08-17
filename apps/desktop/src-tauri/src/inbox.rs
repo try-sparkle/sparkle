@@ -1486,6 +1486,109 @@ mod tests {
         std::fs::remove_dir_all(&base).ok();
     }
 
+    /// A UI POLL MUST NOT BECOME A DELIVERY PATH — asserted against the FILESYSTEM, not against a
+    /// derived count.
+    ///
+    /// `peek_reports_the_text_and_the_lifecycle_stage_of_every_live_message` already checks that
+    /// `status_of(...).pending` is unchanged after a peek, which is a real assertion but a narrow
+    /// one: it would still pass if a peek appended an ack line, touched a file it had no business
+    /// touching, or created a claim for a message that was already delivered. None of those change
+    /// `pending`, and every one of them would mean looking at the queue had modified it.
+    ///
+    /// This is now the load-bearing property rather than an internal tidiness one, and it covers
+    /// BOTH readers because they are different functions: the `inbox_status` command maps over
+    /// `status_of`, while `inbox_peek` maps over `entries_of`. The concierge's `fleet.inbox_status`
+    /// tool invokes both; `fleetWatch` drives only the former, on a ~10s beat. If either wrote,
+    /// then a concierge double-checking its own send would consume the very message it was checking
+    /// on, and the messages would vanish EXACTLY when someone was trying to confirm they had not.
+    /// That is sparkle-ei7keg reintroduced by its own fix.
+    ///
+    /// So: snapshot every path under the inbox tree with its bytes, peek in all three states, and
+    /// require the tree back byte-for-byte identical — no file created, none removed, none appended
+    /// to. The states matter: a claim write would be most tempting on a `pending` record, and an ack
+    /// write on a `delivered` one, so a fixture holding only one stage could miss the other.
+    #[test]
+    fn peek_writes_nothing_to_the_inbox_tree() {
+        let base = tmp("peek-readonly-fs");
+        send(&base, "a1", "still queued", 1_000, "m1").unwrap();
+        send(&base, "a1", "handed over", 1_000, "m2").unwrap();
+        send(&base, "a1", "confirmed", 1_000, "m3").unwrap();
+        claim(&claims_dir(&base, "a1"), "m2");
+        claim(&claims_dir(&base, "a1"), "m3");
+        append_jsonl(&acks_path(&base, "a1"), &InboxAck { id: "m3".into(), ts: 1_100, note: None })
+            .unwrap();
+
+        /// Every path under `root`, with its bytes — sorted, so the comparison is order-independent.
+        fn snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+            let mut out = Vec::new();
+            let mut stack = vec![root.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        // The directory itself is recorded too, so a claim dir created by the read
+                        // is caught even while it is still empty.
+                        out.push((p.clone(), Vec::new()));
+                        stack.push(p);
+                    } else {
+                        out.push((p.clone(), std::fs::read(&p).unwrap_or_default()));
+                    }
+                }
+            }
+            out.sort();
+            out
+        }
+
+        let before = snapshot(&base);
+        assert!(
+            before.iter().any(|(p, _)| p.ends_with("m2")),
+            "the fixture must contain a claim file, or 'no new claim file' proves nothing: {before:?}"
+        );
+
+        let got = entries_of(&base, "a1", 1_000);
+        assert_eq!(
+            got.iter().map(|e| e.state).collect::<Vec<_>>(),
+            vec![DeliveryState::Pending, DeliveryState::Delivered, DeliveryState::Acknowledged],
+            "the read must actually have seen all three stages, or it proves nothing about them"
+        );
+        // Twice: a first read that lazily created something would leave a second one looking clean.
+        let _ = entries_of(&base, "a1", 1_000);
+
+        // `status_of` MUST BE INSIDE THE SNAPSHOT WINDOW TOO, and it used to sit after it.
+        //
+        // `entries_of` is only half the read surface. The `inbox_status` COMMAND maps over
+        // `status_of`, not `entries_of`, and `services/fleetWatch.ts` drives that command on the
+        // ~10s poll — so `status_of` is the reader most exposed to "a poll became a delivery path".
+        // It reaches `messages_path`, `acks_path` and `claims_dir` and calls `is_claimed` per
+        // record, any of which could grow a lazily-created directory or a compacting rewrite. With
+        // the call left below the comparison, that regression would ship through the polled path
+        // with this test still green. Twice, for the same lazy-creation reason as above.
+        let st = status_of(&base, "a1", 1_000);
+        let _ = status_of(&base, "a1", 1_000);
+
+        let after = snapshot(&base);
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "peeking created or removed a file — a read became a write.\nbefore: {:?}\nafter:  {:?}",
+            before.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+            after.iter().map(|(p, _)| p).collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            after, before,
+            "peeking changed the inbox tree — a claim file, an ack line, or a rewritten queue"
+        );
+
+        // And the delivery set is untouched in the way that matters to the agent: the pending
+        // message is STILL pending, so a later claim will still hand it over. Read from the
+        // in-window call above, so this assertion cannot re-introduce a read after the snapshot.
+        assert_eq!(st.pending, 1);
+        assert!(claim(&claims_dir(&base, "a1"), "m1"), "peeking consumed m1's claim");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
     #[test]
     fn peek_omits_an_expired_message_so_no_surface_shows_a_dead_instruction() {
         // MAX_AGE_MS is how long a message is worth DELIVERING. A badge counting a day-old "rebase

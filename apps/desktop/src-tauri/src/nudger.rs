@@ -39,7 +39,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
@@ -510,24 +510,12 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     let app = app.clone();
     std::thread::spawn(move || {
         let mut tracked: HashMap<String, Tracked> = HashMap::new();
-        // SAMPLED ONCE PER ITERATION AND CARRIED, so the window this measures is the WHOLE loop —
-        // sleep plus the `tick` body — rather than the sleep alone.
-        //
-        // Re-sampling at the top measured only the sleep, which left `tick`'s own runtime as a BLIND
-        // SPOT: a freeze beginning while `tick` was executing produced an overshoot of ~0, no
-        // rebaseline, and the next look then measured the entire frozen span as elapsed wall clock
-        // (roborev 64284). `tick` is not instantaneous — it clones the roster and renders a VT grid
-        // per agent — so that window is a real fraction of every second. Charging the tick body to
-        // the overshoot is safe with a 5s threshold against a 1s tick; a `tick` slow enough to trip
-        // it on its own is itself worth a rebaseline.
-        let mut last_wake = now_ms();
+        let started = Instant::now();
+        let mut clock = LoopClock::new(now_ms(), started.elapsed().as_millis() as u64);
         loop {
             std::thread::sleep(TICK);
             let now = now_ms();
-            let overshoot = now
-                .saturating_sub(last_wake)
-                .saturating_sub(TICK.as_millis() as u64);
-            last_wake = now;
+            let overshoot = clock.suspended_ms(now, started.elapsed().as_millis() as u64);
             if overshoot > SUSPEND_OVERSHOOT_MS {
                 // We were frozen alongside everything else, so the silence means nothing. Push
                 // every deadline out rather than reading a suspend as eight rungs of stall.
@@ -546,6 +534,52 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
             tick(&app, &mut tracked, now);
         }
     });
+}
+
+/// The loop's own clock, and the ONE thing that can tell a FROZEN MACHINE from a SLOW ITERATION.
+///
+/// Both look identical on a wall clock: the loop went round and more time had passed than it slept
+/// for. Reading that difference alone as a suspend was WRONG IN THE EXPENSIVE DIRECTION (roborev
+/// 64304), because `tick` is not bounded — it renders a VT grid per due agent and sleeps
+/// `SUBMIT_CR_DELAY` inside `deliver_with` for EVERY nudge it submits — and deadlines are aligned by
+/// construction, since agents that start together climb identical rungs and come due in the same
+/// tick. A fleet-sized burst therefore pushes one iteration past the threshold on a perfectly awake
+/// machine, and the response is not a no-op: the loop `continue`s past every due look and
+/// `rebaseline_after_suspend` rewrites the WHOLE roster — discarding elapsed credit for agents that
+/// were never frozen and collapsing a 600s or 1800s stand-down schedule to 5s. Worse, it is
+/// self-sustaining: a consistently slow tick alternates rebaseline and tick forever, so the clocks
+/// under-count real silence while every test stays green.
+///
+/// A MONOTONIC clock separates them, because it is the one that STOPS during a suspend while the
+/// wall clock keeps running. So the suspended time is exactly the wall-clock delta MINUS the
+/// monotonic delta: a slow tick advances both equally and yields zero, and a freeze — wherever in
+/// the iteration it begins, including inside the `tick` body — yields the whole frozen span. It
+/// also catches a forward `SystemTime` step for free, which is the other way `now_ms` can lie.
+///
+/// Both readings are passed IN rather than taken here, so this is testable with plain integers; the
+/// loop is the only caller and it is the part that cannot be reached from a test.
+struct LoopClock {
+    last_wall_ms: u64,
+    last_mono_ms: u64,
+}
+
+impl LoopClock {
+    fn new(wall_ms: u64, mono_ms: u64) -> Self {
+        Self {
+            last_wall_ms: wall_ms,
+            last_mono_ms: mono_ms,
+        }
+    }
+
+    /// Milliseconds of this iteration attributable to a SUSPEND: wall clock that passed while the
+    /// monotonic clock did not. Zero for any iteration that merely took a long time.
+    fn suspended_ms(&mut self, wall_ms: u64, mono_ms: u64) -> u64 {
+        let wall = wall_ms.saturating_sub(self.last_wall_ms);
+        let mono = mono_ms.saturating_sub(self.last_mono_ms);
+        self.last_wall_ms = wall_ms;
+        self.last_mono_ms = mono_ms;
+        wall.saturating_sub(mono)
+    }
 }
 
 /// Forget everything the freeze made us believe about time.
@@ -1075,6 +1109,63 @@ mod tests {
 
     fn observer() -> PtyObserver {
         PtyObserver::new(DEFAULT_COLS, DEFAULT_ROWS)
+    }
+
+    /// A SLOW ITERATION IS NOT A SUSPEND, and this is the pair that pins the difference.
+    ///
+    /// The wall clock alone cannot tell them apart, and reading it alone was wrong in the expensive
+    /// direction: `tick` sleeps `SUBMIT_CR_DELAY` per submitted nudge and renders a grid per due
+    /// agent, while deadlines are aligned by construction — so a fleet-sized burst pushes one
+    /// iteration past the threshold on an awake machine. That is not a harmless false positive.
+    /// The loop skips every due look and `rebaseline_after_suspend` rewrites the WHOLE roster,
+    /// discarding elapsed credit for agents that were never frozen and collapsing a 1800s
+    /// stand-down schedule to 5s — and a consistently slow tick does it forever.
+    #[test]
+    fn a_slow_tick_is_not_charged_as_a_suspend_but_a_freeze_is() {
+        let mut clock = LoopClock::new(1_000, 1_000);
+
+        // An ordinary iteration: one second of sleep, both clocks agree.
+        assert_eq!(clock.suspended_ms(2_000, 2_000), 0, "an ordinary iteration is not a suspend");
+
+        // THE REGRESSION CASE. Eight seconds of real work — well past SUSPEND_OVERSHOOT_MS — with
+        // the machine awake throughout, so the monotonic clock advanced just as far.
+        let slow = clock.suspended_ms(10_000, 10_000);
+        assert_eq!(slow, 0, "a slow tick advances BOTH clocks, so none of it is frozen time");
+        assert!(
+            slow <= SUSPEND_OVERSHOOT_MS,
+            "…and so it must never trip the detector (got {slow}ms)"
+        );
+
+        // A real six-hour sleep: the wall clock ran, the monotonic clock did not.
+        let frozen = clock.suspended_ms(10_000 + 6 * 60 * 60 * 1_000, 11_000);
+        assert_eq!(frozen, 6 * 60 * 60 * 1_000 - 1_000, "the frozen span is wall minus monotonic");
+        assert!(frozen > SUSPEND_OVERSHOOT_MS, "and it must trip the detector");
+    }
+
+    /// The freeze this whole line of work started from: one that begins INSIDE the `tick` body.
+    ///
+    /// It is invisible to anything that measures only the sleep, and it is the shape that let a
+    /// post-resume look credit the entire frozen span as elapsed. Charging the whole iteration
+    /// catches it wherever it began — and, unlike the wall-clock-only form, without also charging
+    /// an iteration that was merely slow.
+    #[test]
+    fn a_freeze_that_begins_inside_the_tick_body_is_still_charged() {
+        let mut clock = LoopClock::new(0, 0);
+        // The sleep was ordinary (1s); the freeze happened afterwards, while `tick` was running.
+        // Both facts arrive together at the NEXT sample, which is the point of carrying the clock.
+        let frozen = clock.suspended_ms(3_600_000, 1_000);
+        assert_eq!(frozen, 3_599_000);
+        assert!(frozen > SUSPEND_OVERSHOOT_MS, "a freeze inside the tick body must still be seen");
+    }
+
+    /// A forward `SystemTime` step is caught for free — `now_ms` is not monotonic, and a clock that
+    /// jumps forward is not time the agent spent silent.
+    #[test]
+    fn a_forward_wall_clock_step_is_not_credited_as_elapsed() {
+        let mut clock = LoopClock::new(1_000, 1_000);
+        let stepped = clock.suspended_ms(61_000, 2_000);
+        assert_eq!(stepped, 59_000, "the step is wall clock the monotonic clock never saw");
+        assert!(stepped > SUSPEND_OVERSHOOT_MS, "so it rebaselines rather than being credited");
     }
 
     /// A SUSPEND IS NOT ELAPSED TIME — and the deadline is only half of saying so.

@@ -25,6 +25,26 @@ describe("assembleBuildSpawn", () => {
     expect(s.cwd).toBe("/wt/build");
   });
 
+  it("exports SPARKLE_INBOX_AGENT for the build agent's own claude (bead sparkle-ei7keg)", () => {
+    // The Stop hook drains this agent's inbox only for a process carrying this proof. A build agent
+    // spawned without it keeps its queue but loses turn-boundary delivery, silently.
+    expect(assembleBuildSpawn({ ...base, agentId: "build-7" }).args[2]).toContain(
+      "export SPARKLE_INBOX_AGENT='build-7'; ",
+    );
+  });
+
+  it("takes the inbox id from agentId, NOT from the best-effort control wiring", () => {
+    // `control` is optional — it is omitted whenever the control bridge failed to start. Deriving
+    // the ownership proof from it would mean an MCP hiccup silently costs the agent its messages.
+    const exec = assembleBuildSpawn({ ...base, agentId: "build-7" }).args[2];
+    expect(exec).toContain("export SPARKLE_INBOX_AGENT='build-7'; ");
+    expect(exec).not.toContain("SPARKLE_AGENT_ID"); // no control server in `base`
+  });
+
+  it("omits the export when no agentId is passed", () => {
+    expect(assembleBuildSpawn(base).args[2]).not.toContain("SPARKLE_INBOX_AGENT");
+  });
+
   it("includes --mcp-config (with bridge socket+token+server), --strict-mcp-config, and the persona", () => {
     const exec = assembleBuildSpawn(base).args[2];
     expect(exec).toContain("--mcp-config");

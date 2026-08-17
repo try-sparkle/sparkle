@@ -6,7 +6,7 @@
  * its next `Stop` — its natural turn boundary — and never twice.
  */
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ import {
   ensureDeliverySafe,
   inboxPaths,
   isDeliverySafe,
+  mayDrain,
   pendingMessages,
   sanitizeText,
 } from "../../src-tauri/resources/sparkle-hook.mjs";
@@ -55,12 +56,64 @@ function queue(id: string, text: string, severity = "fyi", ts = Date.now()) {
   writeFileSync(path, existing + line);
 }
 
-/** Run the hook exactly as Claude Code does: payload on stdin, log path as argv[2]. */
-function fireHook(event: string): string {
+/**
+ * Run the hook exactly as Claude Code does: payload on stdin, log path as argv[2], and the env the
+ * spawning process handed it.
+ *
+ * `owner` is `SPARKLE_INBOX_AGENT` — the ownership proof Sparkle exports into an agent's OWN
+ * `claude` child (`services/claudeSpawn.buildClaudeExec`). It defaults to "agent-1", the agent this
+ * suite's log path names, so an ordinary call models the real agent's own process. Pass `null` to
+ * model a FOREIGN session (a roborev reviewer, a `claude -p` one-shot) which inherits no such var,
+ * or another id to model a different agent's process.
+ */
+function fireHook(event: string, owner: string | null = "agent-1"): string {
+  const env = { ...process.env };
+  delete env.SPARKLE_INBOX_AGENT;
+  if (owner !== null) env.SPARKLE_INBOX_AGENT = owner;
   return execFileSync("node", [SCRIPT, logPath], {
     input: JSON.stringify({ hook_event_name: event, session_id: "s1" }),
     encoding: "utf8",
+    env,
   });
+}
+
+/** What the drain would have written, read straight off disk. `null` for "the path does not exist",
+ *  which is the state a refusing drain must leave behind. */
+function claimFiles(): string[] | null {
+  try {
+    return readdirSync(join(root, "inbox", "claims", "agent-1")).sort();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every path under `inbox/` with its bytes — the whole side-effect surface of a drain, in one
+ * comparable value.
+ *
+ * Snapshotted rather than asserting "no ack line" directly, because the hook never writes the ack
+ * file itself: it asks the AGENT to append to it (that is what the roborev reviewer went on to do
+ * in the real incident). So `acks.jsonl is absent` would be true whether or not the gate ran, which
+ * is exactly the vacuous shape AGENTS.md forbids. What IS the hook's own side effect is the O_EXCL
+ * claim — and comparing the whole tree catches that plus anything else a future drain might write.
+ */
+function inboxTree(): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (dir: string, prefix: string) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+      const rel = prefix ? `${prefix}/${e.name}` : e.name;
+      if (e.isDirectory()) walk(join(dir, e.name), rel);
+      else out[rel] = readFileSync(join(dir, e.name), "utf8");
+    }
+  };
+  walk(join(root, "inbox"), "");
+  return out;
 }
 
 describe("inboxPaths", () => {
@@ -267,6 +320,109 @@ describe("the hook at a turn boundary", () => {
     expect(reason).toContain("beta");
     expect(reason).toContain("2 message(s)");
     expect(fireHook("Stop")).toBe("");
+  });
+});
+
+describe("mayDrain — only the agent's OWN claude process may drain its inbox", () => {
+  it("admits the process Sparkle spawned for exactly this agent", () => {
+    expect(mayDrain({ SPARKLE_INBOX_AGENT: "agent-1" }, "agent-1")).toBe(true);
+  });
+
+  it("refuses a session that carries no ownership proof at all", () => {
+    // A roborev post-commit reviewer: `claude -p`, a child of the roborev daemon (PPID 1), so it
+    // can never inherit an env var exported into an agent's PTY.
+    expect(mayDrain({}, "agent-1")).toBe(false);
+    expect(mayDrain(undefined, "agent-1")).toBe(false);
+  });
+
+  it("refuses another agent's process, and refuses an empty proof", () => {
+    expect(mayDrain({ SPARKLE_INBOX_AGENT: "agent-2" }, "agent-1")).toBe(false);
+    // "" must not be read as "matches anything" — an unset shell var expands to it.
+    expect(mayDrain({ SPARKLE_INBOX_AGENT: "" }, "")).toBe(false);
+  });
+
+  it("matches strictly — a prefix or a differently-cased id is a different agent", () => {
+    expect(mayDrain({ SPARKLE_INBOX_AGENT: "agent-1" }, "agent-10")).toBe(false);
+    expect(mayDrain({ SPARKLE_INBOX_AGENT: "AGENT-1" }, "agent-1")).toBe(false);
+  });
+});
+
+describe("the drain is gated on ownership (bead sparkle-ei7keg — the message-loss root cause)", () => {
+  // THE REGRESSION SUITE. The hook is registered once per WORKTREE, so every `claude` process in
+  // that worktree used to drain the same per-agent queue — and the drain is destructive and
+  // exactly-once (an O_EXCL claim, then an ack), so whoever hit `Stop` first CONSUMED the founder's
+  // messages and the real agent was guaranteed never to see them. Measured: a roborev reviewer
+  // drained and acked four queued instructions and exited 19s later; the agent's own Stop 54s after
+  // that found an empty queue.
+
+  it("a FOREIGN session claims nothing, acks nothing — and the agent still gets the message", () => {
+    // The pair is the point. One test proving absence is ambiguous: a delivery could be missing
+    // because the gate worked, or because nothing was ever queued.
+    queue("m1", "the founder's actual instruction");
+    const before = inboxTree();
+
+    // (1) The foreign session — no SPARKLE_INBOX_AGENT, exactly as roborev's reviewer runs.
+    expect(fireHook("Stop", null)).toBe("");
+    // Asserted on the FILESYSTEM, not on the return value: "" is also what an empty inbox returns.
+    // What must be true is that NOTHING under inbox/ changed — no claim, no ack, no rewrite.
+    expect(inboxTree()).toEqual(before);
+    expect(claimFiles()).toBeNull();
+
+    // (2) …and the real agent's own drain, immediately afterwards, still delivers it.
+    const parsed = JSON.parse(fireHook("Stop"));
+    expect(parsed.decision).toBe("block");
+    expect(parsed.reason).toContain("the founder's actual instruction");
+    // Now — and only now — the message is consumed.
+    expect(claimFiles()).toEqual(["m1"]);
+  });
+
+  it("a DIFFERENT agent's session does not drain this agent's inbox either", () => {
+    queue("m1", "addressed to agent-1 alone");
+    const before = inboxTree();
+    expect(fireHook("Stop", "agent-2")).toBe("");
+    expect(inboxTree()).toEqual(before);
+    expect(claimFiles()).toBeNull();
+    // Still pending, so agent-1's own turn boundary delivers it.
+    expect(JSON.parse(fireHook("Stop")).reason).toContain("addressed to agent-1 alone");
+  });
+
+  it("a foreign session still APPENDS its event to the log — only the drain is gated", () => {
+    // The hook's original job is unchanged for everyone. Gating the log too would blind
+    // HookStatusEngine to the very sessions `isMainSessionId` exists to recognise and discount.
+    queue("m1", "untouched");
+    fireHook("Stop", null);
+    const events = readFileSync(logPath, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    expect(events.at(-1)?.event).toBe("Stop");
+  });
+
+  it("SURVIVES A RESTART: a fresh process re-reads the same inbox and still delivers", () => {
+    // The app or the agent restarting is a NEW `claude` process against the same app-data dir, with
+    // the env re-exported by the new spawn. Nothing about the queue is per-process, so the message
+    // must survive — every fireHook here is already its own `node` process.
+    queue("m1", "queued before the restart");
+
+    // Between the queueing and the restart the message is still PENDING: nothing has claimed it.
+    expect(claimFiles()).toBeNull();
+    expect(inboxTree()["agent-1.jsonl"]).toContain("queued before the restart");
+
+    const parsed = JSON.parse(fireHook("Stop"));
+    expect(parsed.reason).toContain("queued before the restart");
+    expect(claimFiles()).toEqual(["m1"]);
+  });
+
+  it("SURVIVES AN ACCOUNT SWITCH: CLAUDE_CONFIG_DIR does not re-key or lose the queue", () => {
+    // Switching Claude Max accounts changes CLAUDE_CONFIG_DIR only. The inbox is keyed by agent id
+    // under Sparkle's own app-data dir, so it must be indifferent to which account is signed in —
+    // otherwise a switch would silently strand every queued message.
+    queue("m1", "queued under account A");
+    const env = { ...process.env, SPARKLE_INBOX_AGENT: "agent-1", CLAUDE_CONFIG_DIR: "/accounts/B" };
+    const out = execFileSync("node", [SCRIPT, logPath], {
+      input: JSON.stringify({ hook_event_name: "Stop", session_id: "s1" }),
+      encoding: "utf8",
+      env,
+    });
+    expect(JSON.parse(out).reason).toContain("queued under account A");
+    expect(claimFiles()).toEqual(["m1"]);
   });
 });
 

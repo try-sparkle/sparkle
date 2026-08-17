@@ -88,6 +88,28 @@ export interface ClaudeExecOpts {
    *  the design spec already mandates: spawn a worker, assert `BD_READONLY=1` is in its env,
    *  mutation-checked to red when the flag is removed. */
   beadsReadonly?: boolean;
+  /**
+   * This agent's AgentTab.id, exported as `SPARKLE_INBOX_AGENT` so the Stop hook can tell THIS
+   * `claude` process apart from every other one running in the same worktree.
+   *
+   * WITHOUT IT THE FOUNDER'S MESSAGES ARE LOST (bead sparkle-ei7keg, a P0 trust bug). The hook
+   * (`src-tauri/resources/sparkle-hook.mjs`) is registered once per WORKTREE, and it derives the
+   * agent id from the event-log path — so every background one-shot `claude` in that worktree
+   * drains the SAME per-agent inbox. Measured: a roborev post-commit reviewer (`claude -p`) hit
+   * `Stop`, drained and acked four of the founder's queued instructions, and exited; the real
+   * agent's own `Stop` 54s later found an empty queue. The drain is destructive and exactly-once
+   * (an `O_EXCL` claim, then an ack), so the loser never sees the message at all.
+   *
+   * Must be the SAME id used for {@link ControlMcpOpts.agentId} / `SPARKLE_AGENT_ID` — that is the
+   * id the hook-events log and the inbox are both keyed by (`hooks.rs::event_log_path` takes the
+   * worktree basename, which is the AgentTab.id).
+   *
+   * Exported alongside PATH/CLAUDE_CONFIG_DIR, confined to the child `claude` and never Sparkle's
+   * own env. Absent → the hook refuses to drain, which is SAFE rather than a regression: an
+   * unclaimed message stays `pending`, and the app-side idle path (`services/fleetWatch` →
+   * `inbox_claim_for_idle`) still delivers it over the agent's own PTY.
+   */
+  inboxAgentId?: string;
 }
 
 /** Build the `exec …` string passed to `zsh -l -c`. Appends `--continue` only
@@ -181,7 +203,21 @@ export function buildClaudeExec(
   // alongside PATH/config so it applies to the child `claude` and everything it shells out to,
   // never to Sparkle's own env.
   const beadsReadonlyExport = opts.beadsReadonly ? `export BD_READONLY=1; ` : "";
-  return `${configExport}${beadsReadonlyExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
+  // SPARKLE_INBOX_AGENT is the Stop hook's ownership proof — see the option's JSDoc (bead
+  // sparkle-ei7keg). Exported into the child `claude` alongside the two above, so it reaches this
+  // agent's own process tree and NOTHING PARENTED ELSEWHERE: the roborev reviewers that consumed the
+  // founder's messages are forked by `roborev daemon run`, itself parented by launchd (PPID 1), so
+  // they inherit the daemon's environment and never this PTY's, and the hook refuses to drain for
+  // them. Note the limit of that claim — an env var is INHERITED, so this proves "descendant of this
+  // PTY", not "is this agent's own claude"; a nested `claude -p` the agent runs itself does inherit
+  // it. `mayDrain` in sparkle-hook.mjs documents that residual and how to close it.
+  // Written as an explicit `!== ""` rather than a truthiness ternary so the gate is one mutable
+  // comparison a mutation check can invert — a spawn that silently stops exporting this is the
+  // exact regression that costs the founder messages, and it must be provable that a test sees it.
+  const inboxAgentId = opts.inboxAgentId ?? "";
+  const inboxAgentExport =
+    inboxAgentId !== "" ? `export SPARKLE_INBOX_AGENT=${shellQuote(inboxAgentId)}; ` : "";
+  return `${configExport}${beadsReadonlyExport}${inboxAgentExport}export PATH="$HOME/.local/bin:$PATH"; ${cmd}`;
 }
 
 /**

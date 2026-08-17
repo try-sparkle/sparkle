@@ -209,7 +209,11 @@ describe("spinDownAgentGit (close a shipped build agent)", () => {
 
   it("removes worktrees but keeps branches when deleteBranch=false", async () => {
     await spinDownAgentGit({ root: "/r", projectId: "p1", ids: ["parent"], deleteBranch: false });
-    expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent");
+    expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent", {
+      // The branch is KEPT here, so an uncommitted edit in the worktree would otherwise be the
+      // one copy of that work and this call would destroy it (bead sparkle-ovzoj).
+      snapshotWip: true,
+    });
     expect(branch.deleteAgentBranchIfMerged).not.toHaveBeenCalled();
   });
 
@@ -257,7 +261,11 @@ describe("spinDownAgentGit (close a shipped build agent)", () => {
         deleteBranch: false,
       }),
     ).resolves.toBeUndefined();
-    expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent");
+    expect(worktree.removeAgentWorkspace).toHaveBeenCalledWith("/r", "p1", "parent", {
+      // The branch is KEPT here, so an uncommitted edit in the worktree would otherwise be the
+      // one copy of that work and this call would destroy it (bead sparkle-ovzoj).
+      snapshotWip: true,
+    });
   });
 
   it("tolerates a caller that passes no beadIds (agent never got a bead)", async () => {

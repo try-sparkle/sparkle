@@ -438,6 +438,76 @@ describe("worktree service — preview teardown interlock", () => {
     vi.mocked(abandonWorktreeBootstrap).mockReset().mockResolvedValue(undefined);
   });
 
+  // ── WIP SNAPSHOT (bead sparkle-ovzoj) ─────────────────────────────────────────────────────────
+  // The worktree is deleted and the branch is kept, so anything uncommitted dies with the directory.
+
+  it("commits the WIP snapshot BEFORE the worktree is removed, and only when asked", async () => {
+    // ORDER, not presence — same reasoning as the preview interlock below. A snapshot taken after
+    // the removal has nothing left to read, so a presence-only assertion would pass against the
+    // exact bug this prevents.
+    const order: string[] = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "commit_worktree_wip") {
+        order.push("snapshot");
+        return Promise.resolve({ kind: "committed", sha: "abc123", files: 2, rescueRef: null });
+      }
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace("/root-wip-order", "p", "a", { snapshotWip: true });
+    expect(order).toEqual(["snapshot", "remove"]);
+    expect(invoke).toHaveBeenCalledWith("commit_worktree_wip", {
+      projectId: "p",
+      agentId: "a",
+      message: expect.stringContaining("a"),
+    });
+
+    // OPT-IN, because discard must keep destroying: a caller that did not ask gets no snapshot.
+    order.length = 0;
+    await removeAgentWorkspace("/root-wip-order", "p", "a");
+    expect(order).toEqual(["remove"]);
+  });
+
+  it("removes the worktree anyway when the snapshot fails", async () => {
+    // A teardown that can be blocked strands the agent's concurrency slot permanently — worse than
+    // the loss the snapshot prevents. So the failure path must still reach the removal.
+    const order: string[] = [];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "commit_worktree_wip") return Promise.reject(new Error("git exploded"));
+      if (cmd === "remove_agent_worktree") order.push("remove");
+      return Promise.resolve(undefined);
+    });
+
+    await expect(
+      removeAgentWorkspace("/root-wip-fail", "p", "a", { snapshotWip: true }),
+    ).resolves.toBeUndefined();
+    expect(order).toEqual(["remove"]);
+  });
+
+  it("snapshots AFTER the dependency bootstrap has been settled", async () => {
+    // The bootstrap writes into this worktree for ~27s. A snapshot racing it stages an in-flight
+    // node_modules — minutes of teardown stall, and exactly the hang `--no-verify` exists to avoid.
+    invoke.mockResolvedValue({ path: "/wt/p/a", branch: "b" });
+    const root = "/root-wip-after-bootstrap";
+    await prepareAgentWorkspace(root, "p", "a", "main");
+
+    const order: string[] = [];
+    vi.mocked(abandonWorktreeBootstrap).mockImplementation(async () => {
+      order.push("bootstrap-settled");
+    });
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "commit_worktree_wip") {
+        order.push("snapshot");
+        return Promise.resolve({ kind: "committed", sha: "s", files: 1, rescueRef: null });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    await removeAgentWorkspace(root, "p", "a", { snapshotWip: true });
+    expect(order).toEqual(["bootstrap-settled", "snapshot"]);
+  });
+
   it("stops the preview BEFORE the checkout is evacuated", async () => {
     // ORDER, not presence. A presence-only assertion stays green when the stop is issued AFTER the
     // rename has started — which is the exact race this interlock exists to close, so it would prove

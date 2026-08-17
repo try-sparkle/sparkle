@@ -141,6 +141,15 @@ pub(crate) fn apply_test_hook_isolation(cmd: &mut Command) {
     // execute whatever it put there. Elsewhere this is simply a path that does not exist, which is
     // the same outcome.
     cmd.env("GIT_CONFIG_VALUE_0", "/dev/null/sparkle-hooks-disabled");
+    // AND THE DEVELOPER'S OWN CONFIG, for the same reason and by the same mechanism (roborev 64446).
+    // Every fixture repo sets its identity LOCALLY (`init_repo`), so nothing here needs the global
+    // file — but any code path that BRANCHES on "does this repo have an identity / a hooksPath / a
+    // default branch" reads a different answer on a configured machine than on a bare one. That makes
+    // the test non-hermetic in the worst way: it exercises different code for different developers,
+    // and the branch that only runs on a bare machine is the one no one ever tests. Neutralising the
+    // global and system files makes the fixture's own config the whole truth.
+    cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    cmd.env("GIT_CONFIG_NOSYSTEM", "1");
 }
 
 thread_local! {
@@ -5652,6 +5661,339 @@ pub async fn push_agent_branch(root: String, agent_id: String) -> Result<String,
         .map_err(|e| format!("push_agent_branch task failed: {e}"))?
 }
 
+/// WHAT A WIP SNAPSHOT ACTUALLY DID — the three outcomes are distinguishable because only ONE of
+/// them means work was preserved, and the caller reports it (bead `sparkle-ovzoj`: an app restart
+/// killed two workers whose ~870 lines existed only as uncommitted worktree edits, and the roster
+/// went on reporting them as running).
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum WipCommitKind {
+    /// There were changes and they are now a commit on the worktree's own branch.
+    Committed,
+    /// The worktree was clean. Nothing was created — this is the common case, not a failure.
+    NothingToCommit,
+    /// There is no worktree at that slot (already torn down, or never cut). Nothing to preserve.
+    NoWorktree,
+    /// Committed, but HEAD was DETACHED, so the commit is on no branch. A rescue ref was written to
+    /// hold it (`rescue_ref`), because a commit reachable only from a worktree's own HEAD is made
+    /// UNREACHABLE by the `git worktree remove` that follows — the precise loss AGENTS.md documents
+    /// for detached checkouts. Reported as its own kind so the caller cannot claim a plain
+    /// "saved to the branch" for work that is not on one (roborev 64446).
+    CommittedDetached,
+}
+
+/// The observed result of [`commit_worktree_wip_at`].
+///
+/// `sha` is a Rust `Option`, so it crosses the wire as `null` and NEVER as an absent key — the TS
+/// side must read `string | null`, not `string | undefined` (AGENTS.md, "A Rust `Option` crosses the
+/// wire as `null`"). It is `Some` only for `Committed`.
+#[derive(Serialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WipCommitOutcome {
+    pub kind: WipCommitKind,
+    pub sha: Option<String>,
+    /// How many paths the snapshot swept up, straight from `git status --porcelain`. Zero whenever
+    /// nothing was committed.
+    pub files: usize,
+    /// The ref written to hold a DETACHED commit. `Some` only for `CommittedDetached` — and the
+    /// caller must say so rather than reporting a branch save, because nothing else will find that
+    /// commit once the worktree is gone. Another `Option`, so it too crosses as `null`.
+    pub rescue_ref: Option<String>,
+}
+
+/// How long the WHOLE WIP snapshot may take before it gives up — one budget shared by all of its
+/// git calls, not a ceiling per call (roborev 64463: ten calls × a per-call ceiling is ~10× this
+/// number with the per-root lock held, which is the stall this exists to prevent, in miniature).
+///
+/// The snapshot runs inside the per-root repo lock, so a call that blocks does not merely delay one
+/// teardown — it queues every other prepare/remove on that project. And it cannot assume a quiet
+/// tree: `abandonWorktreeBootstrap` waits a bounded 5s for the dependency install and deliberately
+/// never kills it, against an install measured at ~27s, so a package manager IS often still writing
+/// when this runs (roborev 64457). Unbounded, a sweep over that tree is the teardown stall this
+/// whole feature was supposed to avoid. Bounded, the worst case is a snapshot that gives up and a
+/// teardown that proceeds — the same outcome as any other best-effort failure here.
+const WIP_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The reserve the post-commit bookkeeping gets, INDEPENDENT of the snapshot's shared budget.
+///
+/// Once `git commit` has succeeded the work is safe only if the ref bookkeeping after it also runs;
+/// funding that from whatever the sequence had left over is what let an exhausted budget skip the
+/// rescue-ref write and lose a commit that had really been made (roborev 64474). These are three
+/// cheap local calls, so a small fixed reserve is enough and cannot meaningfully extend the lock.
+const POST_COMMIT_TAIL: Duration = Duration::from_secs(5);
+
+/// `git` for the WIP snapshot, bounded by a deadline SHARED BY THE WHOLE SNAPSHOT.
+///
+/// Two departures from [`git`], both of which a per-call copy of this got wrong (roborev 64463):
+///
+/// 1. **One deadline for the sequence, not one per call.** The snapshot makes up to ten git calls;
+///    a per-call ceiling multiplies out to ~10× the constant with the per-root repo lock held, which
+///    is a smaller version of the stall this exists to prevent. Each call gets whatever remains, and
+///    a used-up deadline short-circuits instead of starting an eleventh subprocess.
+/// 2. **`output_with_timeout_lenient`, NOT the strict form.** The strict wrapper fails a call whose
+///    child left the pipes held — correct for a caller parsing output as a whole value, WRONG for a
+///    mutating one, as this file's own note at `output_with_timeout` says. `--no-verify` does not
+///    skip `post-commit`, and hook isolation is `#[cfg(test)]`, so in production a user's global
+///    `core.hooksPath` post-commit hook runs and can hand its pipes to a helper. The strict form then
+///    returns `Err` AFTER the commit succeeded, the `?` unwinds before the detached-HEAD branch runs,
+///    the rescue ref is never written, and the teardown deletes a commit that really was made. That
+///    is work loss in exactly the case the rescue ref exists for. `status.success()` is the honest
+///    question here: the operation either happened or it did not, and a short capture only degrades
+///    the error text.
+fn git_wip(cwd: &str, args: &[&str], deadline: Instant) -> Result<String, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(format!("git {} skipped: WIP snapshot deadline reached", args.join(" ")));
+    }
+    note_git_spawn();
+    let mut cmd = Command::new(crate::preflight::git_program());
+    cmd.arg("-C").arg(cwd).args(args);
+    apply_noninteractive(&mut cmd);
+    let captured = output_with_timeout_lenient(cmd, remaining)
+        .map_err(|e| format!("git {} failed: {e}", args.join(" ")))?;
+    let output = captured.output;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let msg = if stderr.is_empty() {
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    } else {
+        stderr
+    };
+    Err(format!("git {} failed: {msg}", args.join(" ")))
+}
+
+/// The deadline for the post-commit bookkeeping, deliberately INDEPENDENT of the snapshot's shared
+/// budget. Taking `_shared` it does not use is the point: the whole defect was funding these calls
+/// from whatever the sequence had left, so the parameter is here to make "and it ignores that"
+/// explicit and testable (roborev 64474 — a mutation that returns `_shared` must fail a test).
+fn post_commit_tail(_shared: Instant) -> Instant {
+    Instant::now() + POST_COMMIT_TAIL
+}
+
+/// Given `git diff --cached --name-only` restricted to the env pathspecs, decide whether to refuse.
+///
+/// A free function because the states that reach it in production — an `index.lock` race with the
+/// dependency install, a deadline expiry between the `add` and the `reset` — are not reproducible
+/// from a test, and a fail-closed branch that nothing can exercise is a branch nobody can trust
+/// (roborev 64474). Refusing costs an uncommitted-work snapshot; proceeding costs a secret on a
+/// branch Sparkle can push, and only one of those is recoverable.
+fn env_still_staged_refusal(diff_cached_names: &str) -> Option<String> {
+    let names = diff_cached_names.trim();
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "refusing to snapshot: env file(s) still staged after unstage: {}",
+        names.replace('\n', ", ")
+    ))
+}
+
+/// Core (testable): SNAPSHOT whatever is uncommitted in `worktree` onto the branch it has checked
+/// out, so a teardown cannot take that work with it.
+///
+/// This exists because `spin_down_worker` deletes the worktree. A worker's branch is KEPT by design,
+/// so anything committed survives the teardown and anything merely edited does not — which made a
+/// routine cleanup a silent destroyer of finished work. Committing first turns the branch into the
+/// evidence it was always supposed to be.
+///
+/// Three deliberate choices, each of which has a way to go wrong:
+///
+/// 1. **`--no-verify`.** This runs at teardown, on a path the caller cannot abandon halfway. A
+///    pre-commit hook that fails (or blocks on an editor, or takes a minute) would wedge the
+///    teardown and strand the concurrency slot, and the hook's own opinion about the code is beside
+///    the point here — a salvage snapshot is not a contribution, it is a receipt for work that would
+///    otherwise be deleted. Verification happens when a human or an agent picks the branch back up.
+///    NOT unit-tested, and it CANNOT be from here: `apply_noninteractive` disables hooks for every
+///    `git()` the suite makes (`apply_test_hook_isolation`, `#[cfg(test)]`), so a hook-based test
+///    would stay green with this flag deleted. Keep it — production repos do run their hooks.
+/// 2. **`git add -A`, MINUS the env files Sparkle itself wrote.** Untracked files are the ones with
+///    no other copy anywhere — a tracked edit is recoverable from a diff, a brand-new file exists in
+///    exactly one directory, the one about to be removed — so they must be swept up. But
+///    `seedWorktreeEnv` COPIES the project's `.env*` into every worktree, and this branch can later
+///    be pushed (`push_agent_branch`) or landed. Sweeping blindly would let secrets leave the machine
+///    inside a commit no human authored, on the strength of the user's project happening to gitignore
+///    them. They are excluded by pathspec instead of trusted to `.gitignore` (roborev 64446).
+/// 3. **Identity is probed with `git var GIT_AUTHOR_IDENT`, not `git config user.email`.** A machine
+///    with no identity makes `git commit` fail outright, turning a best-effort salvage into an error
+///    at the worst moment, so `-c` supplies a fallback for this one invocation when there is none.
+///    `git config` is the wrong probe: it exits 0 for a key set to the EMPTY string, so it reports an
+///    identity that `git commit` then rejects with "empty ident name". `git var` answers the question
+///    git itself will ask.
+///
+/// DETACHED HEAD is handled rather than assumed away. A worker killed mid-rebase/merge, or one that
+/// checked out a sha, has no branch — and a commit reachable only from that worktree's HEAD is
+/// deleted along with the worktree moments later. Such a commit gets a `refs/rescue/...` ref and a
+/// distinct outcome kind, so nothing reports work as saved to a branch that never received it.
+pub fn commit_worktree_wip_at(worktree: &str, message: &str) -> Result<WipCommitOutcome, String> {
+    commit_worktree_wip_within(worktree, message, Instant::now() + WIP_SNAPSHOT_TIMEOUT)
+}
+
+/// [`commit_worktree_wip_at`] with the deadline supplied, so the exhausted-budget behaviour is
+/// drivable by a test. The production entry point above is the only caller that picks the
+/// deadline, so this is not a seam every test injects past — both go through the same body.
+pub fn commit_worktree_wip_within(
+    worktree: &str,
+    message: &str,
+    deadline: Instant,
+) -> Result<WipCommitOutcome, String> {
+    let nothing = |kind| WipCommitOutcome { kind, sha: None, files: 0, rescue_ref: None };
+    // A SPENT BUDGET IS AN ERROR, NOT AN ANSWER. Checked before the probe below, because that probe
+    // reports every failure as `NoWorktree` — so an expired deadline would otherwise be reported as
+    // "there was no worktree to save", which is a false and very reassuring thing to say about a
+    // directory that is about to be deleted with work in it.
+    if Instant::now() >= deadline {
+        return Err("WIP snapshot deadline reached before it started".to_string());
+    }
+    // Not a worktree (already removed, or never cut) — nothing to preserve, and not an error: this
+    // runs on a teardown path that must stay idempotent.
+    if !Path::new(worktree).is_dir() {
+        return Ok(nothing(WipCommitKind::NoWorktree));
+    }
+    // BUT A FAILED PROBE IS NOT THE SAME ANSWER AS "NOT A REPO" (roborev 64474). Collapsing both into
+    // `NoWorktree` reports "there was nothing to save" about a directory that is about to be deleted
+    // with work in it — and that outcome is SILENT on the TS side, which logs only for the committed
+    // kinds, so unlike an `Err` it does not even leave a warning. A probe that times out on
+    // `index.lock` (the bootstrap-install contention this whole timeout exists for) must say so.
+    if let Err(e) = git_wip(worktree, &["rev-parse", "--git-dir"], deadline) {
+        return if Path::new(worktree).join(".git").exists() {
+            Err(format!("WIP snapshot could not read the worktree: {e}"))
+        } else {
+            Ok(nothing(WipCommitKind::NoWorktree))
+        };
+    }
+    // `--porcelain` lists untracked paths too, which is the set the `add` below stages.
+    let status = git_wip(worktree, &["status", "--porcelain"], deadline)?;
+    let files = status.lines().filter(|l| !l.trim().is_empty()).count();
+    if files == 0 {
+        return Ok(nothing(WipCommitKind::NothingToCommit));
+    }
+    // Everything EXCEPT the seeded env files. `:(exclude)` is a pathspec magic word, so these are
+    // git's own semantics rather than a hand-rolled filter.
+    git_wip(
+        worktree,
+        &[
+            "add",
+            "-A",
+            "--",
+            ".",
+            ":(exclude).env",
+            ":(exclude).env.*",
+            ":(exclude)*/.env",
+            ":(exclude)*/.env.*",
+        ],
+        deadline,
+    )?;
+    // AND UNSTAGE ANY THAT WERE ALREADY IN THE INDEX. `:(exclude)` governs only what THIS `add`
+    // stages; it cannot remove an entry that is already there. The case is not hypothetical and is
+    // precisely the one the exclusion exists for: in a project that does not gitignore its env
+    // files, an agent that ran `git add -A` and was then killed leaves `.env` staged, and the commit
+    // would carry it onto a branch Sparkle can push (roborev 64457). Best-effort — an unborn HEAD
+    // makes `reset` fail, and that is a repo with nothing to leak anyway.
+    let _ = git_wip(worktree, &["reset", "-q", "--", ".env", ".env.*", "*/.env", "*/.env.*"], deadline);
+    // AND VERIFY IT, rather than inferring success from a call whose failure we discarded. The
+    // discard above is deliberate (an unborn HEAD makes `reset` fail, and that repo has nothing to
+    // leak) — but it also absorbs a deadline expiry and `index.lock` contention from a git process
+    // that appeared between the `add` and the `reset`, which is plausible precisely when a bootstrap
+    // install is still running. In those cases the staged `.env` is still there, `diff --cached` sees
+    // content, and the commit would carry the secret onto a pushable branch: the exact leak the reset
+    // was added to close. Note the asymmetry this fixes — the `add` fails CLOSED via `?` while the
+    // step that removes the secret used to fail OPEN (roborev 64463).
+    let still_staged = git_wip(
+        worktree,
+        &["diff", "--cached", "--name-only", "--", ".env", ".env.*", "*/.env", "*/.env.*"],
+        deadline,
+    )?;
+    if let Some(refusal) = env_still_staged_refusal(&still_staged) {
+        return Err(refusal);
+    }
+    // Nothing staged after the exclusions (the only dirt WAS an env file) — no empty commit.
+    if git_wip(worktree, &["diff", "--cached", "--quiet"], deadline).is_ok() {
+        return Ok(nothing(WipCommitKind::NothingToCommit));
+    }
+    let has_identity = git_wip(worktree, &["var", "GIT_AUTHOR_IDENT"], deadline)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let mut args: Vec<&str> = Vec::new();
+    if !has_identity {
+        args.extend_from_slice(&["-c", "user.email=agent@sparkle.local", "-c", "user.name=Sparkle"]);
+    }
+    args.extend_from_slice(&["commit", "--no-verify", "-m", message]);
+    git_wip(worktree, &args, deadline)?;
+    // PAST THIS LINE THE COMMIT EXISTS, so nothing below may return `Err` and nothing below may be
+    // skipped for want of budget (roborev 64474). The shared deadline was reintroducing the exact
+    // work loss this feature exists to prevent: `commit` is the most expensive call in the sequence
+    // (in production it runs the user's global post-commit hook — `--no-verify` does not skip it),
+    // so an exhausted budget short-circuited the `rev-parse` below, the `?` unwound before the
+    // detached-HEAD branch, the rescue ref was never written, and the teardown deleted a commit that
+    // really had been made. The bookkeeping therefore gets its OWN small reserve rather than the
+    // shared remainder, and every failure in it degrades the REPORT instead of discarding the work.
+    // A RESERVE PER CALL, not one shared by three (roborev 64480). `rev-parse` and `symbolic-ref` are
+    // REPORT-ONLY — their sha feeds a log line and the rescue ref's name — while `update-ref` is the
+    // call that actually saves a detached commit. One shared reserve lets the report-only pair consume
+    // it under the very contention this exists for, after which `update-ref` sees a zero budget and is
+    // skipped: the same work loss as roborev 64474, one level down. Note that the `sha: None` fallback
+    // below is written for a failed `rev-parse`, so under a shared reserve it could never fire on the
+    // deadline path it was written for — its `update-ref` was guaranteed to be skipped too.
+    let sha = git_wip(worktree, &["rev-parse", "HEAD"], post_commit_tail(deadline)).ok();
+    // ON A BRANCH? `symbolic-ref -q HEAD` is the test — it fails exactly when HEAD is detached.
+    // A failure we cannot attribute (a timeout) falls through to the detached arm on purpose: an
+    // extra rescue ref pointing at a commit that was already on a branch is harmless, whereas
+    // skipping the ref for a commit that really is detached loses it.
+    if git_wip(worktree, &["symbolic-ref", "-q", "HEAD"], post_commit_tail(deadline)).is_ok() {
+        return Ok(WipCommitOutcome { kind: WipCommitKind::Committed, sha, files, rescue_ref: None });
+    }
+    // Detached: the commit is held by nothing but this worktree's HEAD, which the teardown deletes.
+    // Anchor it to a real ref first, and report the weaker outcome either way — a rescue ref that
+    // failed to write must not be reported as a save. Named from HEAD when the sha could not be
+    // read, so an unreadable sha still gets an anchor rather than none.
+    // The name must be UNIQUE. A sha-derived one is content-addressed and so is safe by construction;
+    // the unread-sha fallback used a FIXED name, and `update-ref` overwrites unconditionally — so two
+    // teardowns that both failed to read a sha wrote the same ref and the second silently discarded
+    // the first, orphaning the very commit the anchor existed to hold (roborev 64480). The unread case
+    // falls back to wall-clock nanos, which is not a correctness claim about uniqueness so much as a
+    // guarantee that two anchors do not collapse onto one name.
+    let rescue = match sha.as_deref() {
+        Some(s) => format!("refs/rescue/wip-{}", &s[..s.len().min(12)]),
+        None => format!(
+            "refs/rescue/wip-unread-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ),
+    };
+    let rescue_ref = git_wip(worktree, &["update-ref", &rescue, "HEAD"], post_commit_tail(deadline))
+        .ok()
+        .map(|_| rescue);
+    Ok(WipCommitOutcome {
+        kind: WipCommitKind::CommittedDetached,
+        sha,
+        files,
+        rescue_ref,
+    })
+}
+
+/// Snapshot an agent's (or worker's) uncommitted worktree edits onto its own branch before teardown.
+/// See [`commit_worktree_wip_at`]. Best-effort by contract: the caller treats a failure as "nothing
+/// was saved" and proceeds, because refusing to tear down would strand the slot for good.
+#[tauri::command]
+pub async fn commit_worktree_wip(
+    app: AppHandle,
+    project_id: String,
+    agent_id: String,
+    message: Option<String>,
+) -> Result<WipCommitOutcome, String> {
+    let app_data = app_data_dir(&app)?;
+    let path = worktree_path(&app_data, &project_id, &agent_id)?;
+    let worktree = path.to_string_lossy().to_string();
+    let message = message.unwrap_or_else(|| "wip: snapshot before teardown".to_string());
+    tauri::async_runtime::spawn_blocking(move || commit_worktree_wip_at(&worktree, &message))
+        .await
+        .map_err(|e| format!("commit_worktree_wip task failed: {e}"))?
+}
+
 /// WHAT A DELETE ACTUALLY DID. Both delete commands below succeed (`Ok`) in cases where the branch
 /// is still there — `delete_agent_branch_if_merged_at` keeps an unlanded branch by design, and both
 /// are idempotent for a branch that was already gone. A caller that reads "the call resolved" as
@@ -8061,6 +8403,305 @@ mod tests {
         clear_dangling_gitfile(&r);
         assert!(Path::new(&r).join(".git").is_file(), "live gitfile must remain in place");
         assert!(!Path::new(&r).join(".git.orphaned").exists(), "nothing should be moved aside");
+    }
+
+    // ── commit_worktree_wip_at ──────────────────────────────────────────────────────────────────
+    //
+    // The property under test is never "a commit was made" — it is that the work SURVIVES the
+    // teardown that follows. So each test that snapshots also REMOVES the worktree and then reads
+    // the file back out of the branch from the main checkout, which is the only place a killed
+    // worker's evidence can still be found (bead `sparkle-ovzoj`).
+
+    /// A repo with an agent worktree cut from main. Returns (root, worktree path, app_data).
+    fn repo_with_worktree(tag: &str) -> (String, String, PathBuf) {
+        let r = init_repo(tag);
+        let app_data = unique_root(&format!("{tag}-appdata"));
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        (r, info.path, app_data)
+    }
+
+    #[test]
+    fn wip_snapshot_survives_the_teardown_that_deletes_the_worktree() {
+        let (root, wt, app_data) = repo_with_worktree("wip-survives");
+        // One brand-new file (the case with no other copy anywhere) and one edit to a tracked file.
+        std::fs::write(format!("{wt}/new.txt"), "870 lines of work").unwrap();
+        std::fs::write(format!("{wt}/tracked.txt"), "v1").unwrap();
+        git(&wt, &["add", "tracked.txt"]).unwrap();
+        git(&wt, &["commit", "-m", "add tracked"]).unwrap();
+        std::fs::write(format!("{wt}/tracked.txt"), "v2").unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(out.kind, WipCommitKind::Committed);
+        assert_eq!(out.files, 2, "both the untracked file and the tracked edit are swept up");
+        assert!(out.sha.is_some(), "a Committed outcome names the commit it made");
+
+        // THE SIDE EFFECT THAT MATTERS: tear the worktree down, then read the work back from the
+        // branch. Before this change the same teardown took both files with it.
+        remove_worktree_at(&root, "p1", "a1", &app_data).unwrap();
+        assert!(!Path::new(&wt).exists(), "the worktree really is gone");
+        let branch = "sparkle/agent-a1";
+        assert_eq!(
+            git(&root, &["show", &format!("{branch}:new.txt")]).unwrap(),
+            "870 lines of work"
+        );
+        assert_eq!(git(&root, &["show", &format!("{branch}:tracked.txt")]).unwrap(), "v2");
+    }
+
+    #[test]
+    fn wip_snapshot_on_a_clean_worktree_makes_no_commit() {
+        let (root, wt, _app_data) = repo_with_worktree("wip-clean");
+        let before = git(&root, &["rev-parse", "sparkle/agent-a1"]).unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(out.kind, WipCommitKind::NothingToCommit);
+        assert_eq!(out.sha, None, "nothing was created, so there is no sha to report");
+        assert_eq!(out.files, 0);
+        assert_eq!(
+            git(&root, &["rev-parse", "sparkle/agent-a1"]).unwrap(),
+            before,
+            "a clean teardown must not manufacture an empty commit on the branch"
+        );
+    }
+
+    #[test]
+    fn wip_snapshot_answers_no_worktree_instead_of_failing_a_teardown() {
+        // Already removed (or never cut). This runs on a path that cannot abandon halfway, so the
+        // absence of a worktree is an outcome, not an error.
+        let missing = unique_root("wip-missing").to_string_lossy().to_string();
+        let out = commit_worktree_wip_at(&missing, "wip").unwrap();
+        assert_eq!(out.kind, WipCommitKind::NoWorktree);
+        assert_eq!(out.files, 0);
+        // A real directory that is not a git worktree answers the same way rather than erroring.
+        std::fs::create_dir_all(&missing).unwrap();
+        assert_eq!(commit_worktree_wip_at(&missing, "wip").unwrap().kind, WipCommitKind::NoWorktree);
+    }
+
+    // NOT COVERED HERE, DELIBERATELY: the `--no-verify` behaviour. A pre-commit hook is the one
+    // thing that can wedge this call in production, but `apply_noninteractive` installs
+    // `apply_test_hook_isolation` under `#[cfg(test)]`, which disables hooks for EVERY `git()` the
+    // suite makes. So a hook-based test here would pass with `--no-verify` removed — a vacuous test
+    // pinning a precondition rather than the flag. Left to the flag's own comment instead.
+
+    #[test]
+    fn wip_snapshot_commits_even_when_the_repo_has_no_git_identity() {
+        let (root, wt, app_data) = repo_with_worktree("wip-identity");
+        // `init_repo` configures an identity LOCALLY; strip it so `git commit` would fail outright.
+        // This is only decisive because `apply_test_hook_isolation` also neutralises the global and
+        // system config — without that, a developer's own ~/.gitconfig supplies an identity, the
+        // fallback below is never taken, and this test passes with those two `-c` lines deleted.
+        git(&root, &["config", "--unset", "user.email"]).unwrap();
+        git(&root, &["config", "--unset", "user.name"]).unwrap();
+        std::fs::write(format!("{wt}/new.txt"), "unattributed but saved").unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(out.kind, WipCommitKind::Committed);
+        remove_worktree_at(&root, "p1", "a1", &app_data).unwrap();
+        assert_eq!(
+            git(&root, &["show", "sparkle/agent-a1:new.txt"]).unwrap(),
+            "unattributed but saved"
+        );
+    }
+
+    #[test]
+    fn wip_snapshot_treats_an_empty_configured_identity_as_no_identity() {
+        let (root, wt, _app_data) = repo_with_worktree("wip-empty-ident");
+        // `git config user.email` EXITS 0 for a key set to the empty string, so the obvious probe
+        // reports an identity present and `git commit` then dies with "empty ident name". `git var
+        // GIT_AUTHOR_IDENT` asks the question git itself will ask.
+        git(&root, &["config", "user.email", ""]).unwrap();
+        git(&root, &["config", "user.name", ""]).unwrap();
+        std::fs::write(format!("{wt}/new.txt"), "saved despite a blank ident").unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(out.kind, WipCommitKind::Committed);
+    }
+
+    #[test]
+    fn wip_snapshot_anchors_a_detached_head_to_a_rescue_ref_and_says_it_is_not_on_a_branch() {
+        let (root, wt, app_data) = repo_with_worktree("wip-detached");
+        // A worker killed mid-rebase, or one that checked out a sha. The commit below is then held
+        // by nothing but this worktree's HEAD, which the teardown deletes moments later.
+        let head = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+        git(&wt, &["checkout", "-q", "--detach", &head]).unwrap();
+        std::fs::write(format!("{wt}/new.txt"), "work with no branch to land on").unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(
+            out.kind,
+            WipCommitKind::CommittedDetached,
+            "a detached commit must NOT be reported as saved to the branch"
+        );
+        let rescue = out.rescue_ref.clone().expect("a detached commit gets a rescue ref");
+        assert!(rescue.starts_with("refs/rescue/"));
+
+        // THE SIDE EFFECT: the work is still reachable AFTER the worktree is gone — which is exactly
+        // what a bare commit on a detached HEAD would not have been.
+        remove_worktree_at(&root, "p1", "a1", &app_data).unwrap();
+        assert_eq!(git(&root, &["show", &format!("{rescue}:new.txt")]).unwrap(), "work with no branch to land on");
+    }
+
+    #[test]
+    fn wip_snapshot_leaves_seeded_env_files_out_of_the_commit() {
+        let (root, wt, app_data) = repo_with_worktree("wip-env");
+        // `seedWorktreeEnv` copies the project's env files into every worktree, and this branch can
+        // later be PUSHED. Sweeping them up would let secrets leave the machine inside a commit no
+        // human authored — on the strength of the user's project happening to gitignore them.
+        std::fs::write(format!("{wt}/.env"), "OPENAI_API_KEY=not-a-real-key").unwrap();
+        std::fs::write(format!("{wt}/.env.local"), "DB_PASSWORD=also-not-real").unwrap();
+        std::fs::create_dir_all(format!("{wt}/apps/web")).unwrap();
+        std::fs::write(format!("{wt}/apps/web/.env"), "NESTED_SECRET=nope").unwrap();
+        std::fs::write(format!("{wt}/new.txt"), "ordinary work").unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(out.kind, WipCommitKind::Committed);
+
+        remove_worktree_at(&root, "p1", "a1", &app_data).unwrap();
+        let branch = "sparkle/agent-a1";
+        assert_eq!(git(&root, &["show", &format!("{branch}:new.txt")]).unwrap(), "ordinary work");
+        for secret in [".env", ".env.local", "apps/web/.env"] {
+            assert!(
+                git(&root, &["show", &format!("{branch}:{secret}")]).is_err(),
+                "{secret} must not be in the commit — this branch can be pushed"
+            );
+        }
+    }
+
+    #[test]
+    fn wip_snapshot_drops_an_env_file_that_was_ALREADY_STAGED_when_the_agent_died() {
+        let (root, wt, app_data) = repo_with_worktree("wip-env-staged");
+        // The case the pathspec exclusion alone does NOT cover, and the one it exists for: a project
+        // that does not gitignore its env files, where an agent ran `git add -A` and was then killed.
+        // `:(exclude)` governs what an `add` STAGES; it cannot remove an index entry already there.
+        std::fs::write(format!("{wt}/.env"), "OPENAI_API_KEY=not-a-real-key").unwrap();
+        std::fs::write(format!("{wt}/new.txt"), "ordinary work").unwrap();
+        git(&wt, &["add", "-A"]).unwrap(); // the dead agent's own staging
+        assert!(
+            git(&wt, &["diff", "--cached", "--name-only"]).unwrap().contains(".env"),
+            "precondition: the env file really is staged before the snapshot runs"
+        );
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(out.kind, WipCommitKind::Committed);
+
+        remove_worktree_at(&root, "p1", "a1", &app_data).unwrap();
+        assert_eq!(git(&root, &["show", "sparkle/agent-a1:new.txt"]).unwrap(), "ordinary work");
+        assert!(
+            git(&root, &["show", "sparkle/agent-a1:.env"]).is_err(),
+            "a staged env file must be unstaged, not carried onto a branch that can be pushed"
+        );
+    }
+
+    #[test]
+    fn wip_snapshot_keeps_a_pre_staged_env_file_out_even_with_an_unborn_head() {
+        // UNBORN HEAD is the reachable case where `git reset -- <paths>` genuinely fails: there is
+        // no HEAD to reset the index to. The earlier comment claimed such a repo "has nothing to
+        // leak" — false when the dead agent had already staged its .env, because the snapshot's
+        // commit would be the INITIAL commit and would contain it. The unstage failing must
+        // therefore refuse, not fall through (roborev 64463: the `add` fails closed via `?` while
+        // the step that removes the secret used to fail open).
+        let repo = unique_root("wip-unborn").to_str().unwrap().to_string();
+        git(&repo, &["init", "-q"]).unwrap();
+        git(&repo, &["config", "user.email", "t@t"]).unwrap();
+        git(&repo, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(format!("{repo}/.env"), "OPENAI_API_KEY=not-a-real-key").unwrap();
+        std::fs::write(format!("{repo}/new.txt"), "ordinary work").unwrap();
+        git(&repo, &["add", "-A"]).unwrap(); // the dead agent's own staging, before any commit
+        assert!(git(&repo, &["rev-parse", "--verify", "HEAD"]).is_err(), "precondition: unborn HEAD");
+
+        let out =
+            commit_worktree_wip_within(&repo, "wip", Instant::now() + WIP_SNAPSHOT_TIMEOUT).unwrap();
+
+        // THE PROPERTY IS ABOUT THE COMMIT, NOT ABOUT WHICH BRANCH PRODUCED IT. `git reset -- <paths>`
+        // turns out to succeed against an unborn HEAD (it resets those entries to the empty tree), so
+        // the snapshot proceeds and the refusal below it never fires here — which is the RIGHT
+        // outcome, and exactly why this asserts the tree of the resulting commit rather than the
+        // refusal. The `still staged` guard remains as the fail-closed backstop for the cases that
+        // are not reproducible from a test (an index.lock race, a deadline expiry mid-sequence).
+        assert_eq!(out.kind, WipCommitKind::Committed);
+        let tree = git(&repo, &["ls-tree", "-r", "--name-only", "HEAD"]).unwrap();
+        assert!(tree.contains("new.txt"), "ordinary work is preserved: {tree}");
+        assert!(
+            !tree.contains(".env"),
+            "a pre-staged env file must never reach the commit, unborn HEAD included: {tree}"
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_short_circuits_git_wip_WITHOUT_spawning_a_child() {
+        // DETERMINISTIC, where a "future-but-tiny budget" was a race that flipped on a quiet machine
+        // (roborev 64480): above zero, `git_wip` spawns git and the error becomes the wrapper's
+        // "timed out" rather than its own "skipped", so the substring assertion failed whenever the
+        // thread was NOT descheduled — i.e. exactly when a developer narrows the run. The spawn
+        // counter answers the real question — did the sequence stop making subprocesses — with no
+        // timing in it at all.
+        let (_root, wt, _app_data) = repo_with_worktree("wip-shortcircuit");
+        let before = git_spawns_on_this_thread();
+        let err = git_wip(&wt, &["status", "--porcelain"], Instant::now())
+            .expect_err("a spent budget must not run the call");
+        assert!(err.contains("skipped: WIP snapshot deadline reached"), "unexpected: {err}");
+        assert_eq!(
+            git_spawns_on_this_thread(),
+            before,
+            "a spent budget must short-circuit BEFORE forking git, not wait out another timeout"
+        );
+    }
+
+    #[test]
+    fn wip_snapshot_refuses_outright_when_its_budget_is_already_gone() {
+        let (_root, wt, _app_data) = repo_with_worktree("wip-deadline");
+        std::fs::write(format!("{wt}/new.txt"), "work").unwrap();
+        let tip_before = git(&wt, &["rev-parse", "HEAD"]).unwrap();
+
+        let err = commit_worktree_wip_within(&wt, "wip", Instant::now())
+            .expect_err("a spent budget cannot produce a commit");
+        assert!(err.contains("deadline"), "unexpected: {err}");
+        // NOT `is_ok()` on some unrelated git call — that would hold identically if a commit HAD been
+        // made (roborev 64480). The tip is the thing that must not have moved.
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip_before, "no commit may exist");
+    }
+
+    #[test]
+    fn the_post_commit_bookkeeping_never_inherits_a_spent_budget() {
+        // ONCE THE COMMIT EXISTS the ref bookkeeping after it must still run: an exhausted shared
+        // budget used to short-circuit the `rev-parse`, unwind past the detached-HEAD branch, and
+        // leave the rescue ref unwritten — so the teardown deleted a commit that had really been
+        // made (roborev 64474). A spent shared deadline must therefore still yield a usable tail.
+        let spent = Instant::now() - Duration::from_secs(60);
+        assert!(
+            post_commit_tail(spent) > Instant::now(),
+            "the bookkeeping must get its own reserve, not the sequence's remainder"
+        );
+        // NO "the reserve is small" assertion here: `post_commit_tail(x) <= Instant::now() +
+        // POST_COMMIT_TAIL` samples the right-hand clock AFTER the call, so it holds for a reserve of
+        // any size and pins nothing (roborev 64480). The size is a constant; what needs a test is that
+        // it is not inherited, which is what the assertion above checks.
+    }
+
+    #[test]
+    fn a_still_staged_env_path_is_refused_rather_than_committed() {
+        // The fail-closed decision as arithmetic, so the branch is covered even though the states
+        // that trigger it in production (an index.lock race, a mid-sequence deadline expiry) are not
+        // reproducible from a test (roborev 64474).
+        assert!(env_still_staged_refusal("").is_none(), "a clean index proceeds");
+        assert!(env_still_staged_refusal("   \n  ").is_none(), "whitespace is not a staged path");
+        let refusal = env_still_staged_refusal(".env\napps/web/.env").expect("must refuse");
+        assert!(refusal.contains(".env"), "the refusal names what is still staged: {refusal}");
+        assert!(refusal.contains("refusing to snapshot"));
+    }
+
+    #[test]
+    fn wip_snapshot_makes_no_commit_when_the_only_dirt_is_an_env_file() {
+        let (root, wt, _app_data) = repo_with_worktree("wip-env-only");
+        let before = git(&root, &["rev-parse", "sparkle/agent-a1"]).unwrap();
+        std::fs::write(format!("{wt}/.env"), "SECRET=nope").unwrap();
+
+        let out = commit_worktree_wip_at(&wt, "wip: snapshot before teardown").unwrap();
+        assert_eq!(
+            out.kind,
+            WipCommitKind::NothingToCommit,
+            "excluding the only dirty path must not leave an empty commit behind"
+        );
+        assert_eq!(git(&root, &["rev-parse", "sparkle/agent-a1"]).unwrap(), before);
     }
 
     // ── park_worktree_on_base_at ────────────────────────────────────────────────────────────────

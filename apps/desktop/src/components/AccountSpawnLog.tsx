@@ -213,6 +213,19 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
   // Only the MOST RECENT entry can speak for the pool as it stands now; an older line's counts
   // describe a machine state that may since have changed.
   const latest = entries?.[0];
+  // ...BUT THE NEWEST LINE MAY HAVE MEASURED NOTHING, and until the ledger's wire contract was
+  // fixed that case could not reach disk at all: serde rejected every unmeasured entry, so
+  // `entries[0]` and "the newest MEASURED entry" were necessarily the same row. They are not any
+  // more. An `accounts_record_spawn` written during an IPC hiccup carries `signedInCount: null`,
+  // and reading the pool off it unconditionally would flip this panel to "unknown" — silencing the
+  // one-account banner that is its whole reason for existing — on the strength of a single
+  // transient row sitting above two dozen that all measured the same answer.
+  //
+  // So: the newest row that ACTUALLY LOOKED. Null still wins when nothing in the list looked.
+  const latestMeasured = (entries ?? []).find((e) => e.signedInCount != null);
+  // Whether that reading is the current moment or an older one, which changes what the copy may
+  // claim — "right now" is not sayable off a row with newer, unmeasured rows above it.
+  const measuredIsNewest = latestMeasured != null && latestMeasured === latest;
   // THREE STATES, NOT TWO — and lumping them cost this panel a false statement twice over.
   //
   // `<= 1` was wrong in both directions. Null means the accounts backend could not be read, and JS
@@ -220,7 +233,7 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
   // real reading but a DIFFERENT situation: nobody is signed in at all, so "it is the only one
   // signed in" names an account that does not exist, and "sign in another" points at a remedy
   // premised on there already being one. Each state gets its own sentence, or none.
-  const signedIn = latest?.signedInCount ?? null;
+  const signedIn = latestMeasured?.signedInCount ?? null;
   // THE WHOLE SET, and the sentence says "the entries below" to match it. Scoping this to
   // `slice(1)` removed an overstatement but created a worse silence: a log whose NEWEST row names a
   // different account from the rows under it is a rotation that just happened, and that is exactly
@@ -238,7 +251,30 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
   // login prompt than a dead agent — so `pickAccount` still returns a real registered account and
   // the spawn still exports its config dir. Only a genuinely empty registry yields `accountId:
   // null`. That is the sole state in which "Sparkle is not choosing an account at all" is true.
+  //
+  // OFF `latest`, NOT `latestMeasured` — and that asymmetry with `signedIn` above is the point.
+  // `accountId` is not a MEASUREMENT, it is a recorded FACT about what that spawn got: it has always
+  // been `Option<String>` on the wire (`account_ledger.rs`), where `None` means "no account chosen,
+  // the spawn inherited the shell's login", and the null-wire fix did not touch it. Only the four
+  // measured fields can be absent for want of a reading.
+  //
+  // So routing this through `latestMeasured` would discard the newest still-valid fact in favour of
+  // an older row — and produce the contradiction the comment above warns about, inverted: with a
+  // backend read failure (the realistic co-occurring shape: null count AND no chosen account), the
+  // group list renders "no account (used your terminal's login)" for the newest spawn directly under
+  // a sentence naming an account that spawn never used.
   const choseNothing = latest?.accountId == null;
+  // ...and whether that is true of the WHOLE list, which is what licenses the plural copy below.
+  // `choseNothing` is one row's fact; a sentence saying "these spawns" needs every row to agree, or
+  // it contradicts the group list rendered directly under it.
+  const allChoseNothing = (entries ?? []).every((e) => e.accountId == null);
+  // DATED FOR THE SAME REASON THE ONE-ACCOUNT BANNER IS. Both `"none"` sentences below asserted
+  // this in the present tense, and the reading behind them can now come from a row with newer,
+  // unmeasured rows above it — so leaving them undated would reintroduce, in the sibling branch,
+  // exactly the unverified claim about this instant that the `"single"` copy was corrected for.
+  const noneHeadline = measuredIsNewest
+    ? "No account is signed in."
+    : `As of ${fmtTime(latestMeasured?.at ?? 0)} no account was signed in.`;
   const groups = groupByAccount(entries ?? []);
 
   return (
@@ -259,9 +295,17 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
               accounts (rotation demonstrably having happened before one was signed out) would be
               captioned as if it showed one. A panel written to stop a correct log being misread
               must not itself make an unverified claim about the rows underneath it. */}
-          <strong>Right now only one account is signed in</strong>, so new spawns have nowhere to
-          rotate to — that is not rotation failing. Sign in another Claude account to give it
-          somewhere to go.
+          {/* DATED WHEN IT IS NOT CURRENT. The reading can now come from a row with newer,
+              unmeasured rows above it, and "right now" would then be an unverified claim about
+              this instant — the same overstatement the note above records this panel already
+              having made once. Naming the instant it was measured keeps the sentence true. */}
+          <strong>
+            {measuredIsNewest
+              ? "Right now only one account is signed in"
+              : `As of ${fmtTime(latestMeasured?.at ?? 0)} only one account was signed in`}
+          </strong>
+          , so new spawns have nowhere to rotate to — that is not rotation failing. Sign in another
+          Claude account to give it somewhere to go.
           {distinctAccounts > 1 && (
             <> The entries below used {distinctAccounts} different accounts.</>
           )}
@@ -274,9 +318,23 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
               renders is gated on `accounts.length > 0`, so "none is registered" was false exactly
               where it appeared. All this row can honestly report is that no account was chosen for
               these spawns. */}
-          <strong>No account is signed in.</strong> These spawns did not get an account from
-          Sparkle at all — they inherited whatever your terminal is logged into. Sign in at least
-          two accounts to enable rotation.
+          {/* SUBJECT MATCHES THE GATE. `choseNothing` is a fact about ONE row (the newest), so a
+              plural "these spawns" claims something about the list that the gate never checked —
+              and with a newest row carrying no account above older rows that DID run on one, it
+              contradicts the group list directly beneath it. Same defect the `"single"` branch
+              already mitigates with its `distinctAccounts` clause; this branch had none. */}
+          <strong>{noneHeadline}</strong>{" "}
+          {allChoseNothing ? "These spawns" : "The most recent spawn"} did not get an account from
+          Sparkle at all — {allChoseNothing ? "they" : "it"} inherited whatever your terminal is
+          logged into.
+          {!allChoseNothing && distinctAccounts > 0 && (
+            <>
+              {" "}
+              Earlier entries below did run on{" "}
+              {distinctAccounts === 1 ? "an account" : `${distinctAccounts} accounts`}.
+            </>
+          )}{" "}
+          Sign in at least two accounts to enable rotation.
         </div>
       )}
 
@@ -286,9 +344,29 @@ export function AccountSpawnLog({ read = readSpawnLog }: AccountSpawnLogProps) {
               returning nothing, so a real account was chosen and its config dir was exported. Saying
               "Sparkle is not choosing an account" here would contradict the row directly below,
               which names the account it picked. */}
-          <strong>No account is signed in.</strong> Spawns are still being routed to{" "}
-          {latest?.nickname ?? "a registered account"}, whose config dir has no login — so the agent
-          will be asked to sign in when it starts. Complete a sign-in there to fix it.
+          <strong>{noneHeadline}</strong> Spawns are still being routed to{" "}
+          {/* The newest row's account, matching `choseNothing` above: this clause is about WHERE
+              spawns are going, which is a fact on the newest entry, not something the older
+              measured row can speak for. Naming the measured row's account here would print a
+              remedy pointing at an account the newest spawn did not use. */}
+          {latest?.nickname ?? "a registered account"}
+          {/* THE PREMISE IS DATED TOO, not just the headline. The subject above is the newest row;
+              this clause's "no login" comes from the `signedInCount === 0` reading, which may sit on
+              an older row naming a different account. Left in the present tense it is the same
+              unverified claim about this instant that the headline was corrected for — and it is
+              the clause carrying the remedy the user will actually act on. */}
+          {/* DATE THE PREMISE, DON'T DISCARD IT. `signedInCount === 0` is a count across every
+              registered account, so it does entail that THIS account's config dir had no login at
+              that instant — the defect was the tense, not the account identity. An earlier pass
+              replaced the clause with a restatement of the headline, which left the causal "so …"
+              and the remedy "sign in THERE" bridging off a repetition rather than off any stated
+              fact about the account they name. */}
+          {measuredIsNewest ? (
+            <>, whose config dir has no login</>
+          ) : (
+            <>, whose config dir had no login at that point</>
+          )}{" "}
+          — so the agent will be asked to sign in when it starts. Complete a sign-in there to fix it.
         </div>
       )}
 

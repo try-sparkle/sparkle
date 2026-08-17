@@ -7,6 +7,7 @@ import {
   claimBead,
   labelBead,
   mergeShaOf,
+  severityOf,
   DELIVERED_LABEL,
   type Bead,
   type Board,
@@ -48,9 +49,11 @@ import { StageColumnHeader, DefineStageCta, definableStageKey, type DeliveryChip
 import { CardCriteria } from "./CardCriteria";
 import { BeadCard } from "./BeadCard/BeadCard";
 import { BeadPriorityChip } from "./BeadCard/BeadPriorityChip";
+import { BeadSeverityBadge } from "./BeadCard/BeadSeverityBadge";
 import { useBeadBuildActions } from "./BeadCard/useBeadBuildActions";
 import { setBeadPriority } from "./BeadCard/beadPriority";
 import { beadCardMenuIsOpen } from "./BeadCard/PriorityPill";
+import { beadsComment, beadsDetail, type BeadComment } from "../services/beadsCommands";
 import { FONT_MONO, FONT_UI } from "../theme/scale";
 
 /** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
@@ -945,6 +948,9 @@ function Card({
             {bead.id}
           </span>
           <BeadPriorityChip priority={bead.priority} />
+          {/* SEVERITY — a SEPARATE axis beside priority (the founder asked for both visible). Reads
+              the `sev-<N>` label; renders nothing when the bead has no score, which is most of them. */}
+          <BeadSeverityBadge severity={severityOf(bead)} />
         </div>
         {workers.length > 0 && (
           <div style={{ color: C.tealInk, fontSize: 12, lineHeight: 1.4 }}>
@@ -1238,6 +1244,41 @@ function DetailOverlay({
   );
   const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
 
+  // ── COMMENT THREAD — READ LAZILY, ONLY ON OPEN ───────────────────────────────────────────────
+  // This overlay mounts only when a card is OPENED (`selectedBead && <DetailOverlay>`), so the one
+  // `beads_detail` call below — which carries `--include-comments` — runs per-open, NOT on the board's
+  // 5s list poll. Pulling every bead's whole thread on every tick would hammer the already-contended
+  // bd store; the poll stays on `listBeads`, which never asks for comments.
+  const [comments, setComments] = useState<BeadComment[] | undefined>(undefined);
+  // Bumped after a successful post so the thread re-reads and shows the new comment.
+  const [commentReload, setCommentReload] = useState(0);
+  useEffect(() => {
+    if (rootPath === null) return;
+    let alive = true;
+    beadsDetail(rootPath, bead.id)
+      .then((d) => {
+        if (alive) setComments(d.comments);
+      })
+      // A failed detail read degrades to an empty thread — the card must still be usable — and the
+      // compose box below (which has its own error surface) remains available.
+      .catch(() => {
+        if (alive) setComments([]);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [rootPath, bead.id, commentReload]);
+
+  // The write half. Absent when the project has no path (every bd write is addressed by path), which
+  // makes `BeadCard` render a read-only thread with no compose box.
+  const handleComment =
+    rootPath === null
+      ? undefined
+      : async (text: string) => {
+          await beadsComment(rootPath, bead.id, text);
+          setCommentReload((n) => n + 1);
+        };
+
   // ── ESCAPE CLOSES IT ─────────────────────────────────────────────────────────────────────────
   // The scrim already dismissed on an outside click; Escape was simply absent from this file. The
   // founder hit the same dead end on the concierge card ("right now I have to click back on the
@@ -1338,6 +1379,10 @@ function DetailOverlay({
           // so this surface and the concierge cannot drift apart on it again.
           onBuildAllPrd={buildActions.buildAllPrd ?? undefined}
           prdEpicCount={buildActions.prdEpics.length}
+          // Lazily-read thread + the shipped `beadsComment` write path. Both undefined when the
+          // project has no path, degrading the card to a read-only thread.
+          comments={comments}
+          onComment={handleComment}
         />
 
         {/* BOARD-ONLY, and the reason this overlay still exists as more than a frame: the per-child

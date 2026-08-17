@@ -1,0 +1,32 @@
+[
+  {
+    "at": 1786680000000,
+    "key": "agent-1111",
+    "accountId": "acc-1",
+    "nickname": "nick-acc-1",
+    "configDir": "/config/acc-1",
+    "email": "acc-1@example.invalid",
+    "reason": "auto",
+    "tokens5h": 1234,
+    "ceiling": 88000,
+    "fraction": 0.014022727272727272,
+    "eligibleCount": 2,
+    "signedInCount": 3,
+    "candidateIds": ["acc-1", "acc-2"]
+  },
+  {
+    "at": 1786680001000,
+    "key": "sparkle:concierge",
+    "accountId": "acc-2",
+    "nickname": "nick-acc-2",
+    "configDir": "/config/acc-2",
+    "email": null,
+    "reason": "remembered",
+    "tokens5h": null,
+    "ceiling": null,
+    "fraction": null,
+    "eligibleCount": null,
+    "signedInCount": null,
+    "candidateIds": null
+  }
+]

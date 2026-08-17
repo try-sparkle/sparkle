@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { prereqsAllInstalled, readinessComplete, readinessStage } from "./readiness";
+import { authGateDecision, prereqsAllInstalled, readinessComplete, readinessStage } from "./readiness";
 import type { PrereqsReport, ClaudeAuthStatus, AuthStatusSource } from "../preflight";
 
 /** Build a report with per-prereq installed flags (paths don't affect the predicate). */
@@ -73,5 +73,31 @@ describe("readiness predicate", () => {
   // nothing to lock the user out of, since they could not run an agent either.
   it("`absent` gates, because nobody has ever signed in on this machine", () => {
     expect(readinessStage(report(), auth(false, "absent"))).toBe("auth");
+  });
+});
+
+describe("authGateDecision — block vs banner vs nothing", () => {
+  // Only the AUTH stage is ever surfaced by this decision; every other stage shows nothing here.
+  it("returns 'none' for any stage that is not 'auth', regardless of rotation", () => {
+    expect(authGateDecision("ready", null)).toBe("none");
+    expect(authGateDecision("ready", { hasUsableAlternative: false })).toBe("none");
+    expect(authGateDecision("install", { hasUsableAlternative: false })).toBe("none");
+    expect(authGateDecision("probing", null)).toBe("none");
+  });
+
+  // THE ONLY CASE THAT STILL BLOCKS THE WHOLE APP: a successfully-read rotation with nothing usable.
+  it("BLOCKS only when the store was read AND no other account is usable", () => {
+    expect(authGateDecision("auth", { hasUsableAlternative: false })).toBe("block");
+  });
+
+  // A usable alternative means the app keeps working via rotation → non-blocking banner, never block.
+  it("shows a BANNER (not a block) when another account is usable", () => {
+    expect(authGateDecision("auth", { hasUsableAlternative: true })).toBe("banner");
+  });
+
+  // FAIL OPEN: an unreadable rotation (null) must never manufacture a block. It lands on the banner,
+  // the non-blocking side — the same fail-open invariant the whole gate is built around.
+  it("FAILS OPEN to a banner (never a block) when rotation health is unknown (null)", () => {
+    expect(authGateDecision("auth", null)).toBe("banner");
   });
 });

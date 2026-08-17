@@ -319,6 +319,84 @@ describe("buildClaudeExec ()", () => {
   });
 });
 
+describe("SPARKLE_INBOX_AGENT — the Stop hook's ownership proof (bead sparkle-ei7keg)", () => {
+  // The hook is registered once per WORKTREE, so every `claude` in that worktree used to drain the
+  // same per-agent inbox — destructively and exactly-once. This export is what lets the hook tell
+  // the agent's OWN process from a roborev reviewer or any other background one-shot sharing the
+  // worktree. A spawn that omits it silently loses turn-boundary delivery for that agent, so these
+  // pin the string the hook's `mayDrain` compares against.
+
+  it("exports SPARKLE_INBOX_AGENT when inboxAgentId is set", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, { inboxAgentId: "3ab86d6b-9ff7" });
+    expect(cmd).toBe(`export SPARKLE_INBOX_AGENT='3ab86d6b-9ff7'; ${PATH_PREFIX}exec '/bin/claude'`);
+  });
+
+  it("omits the export entirely when no inboxAgentId is given", () => {
+    expect(buildClaudeExec("/bin/claude", false)).not.toContain("SPARKLE_INBOX_AGENT");
+    // "" is not an identity — an unset shell var expands to it, and `mayDrain` refuses it too.
+    expect(buildClaudeExec("/bin/claude", false, { inboxAgentId: "" })).not.toContain(
+      "SPARKLE_INBOX_AGENT",
+    );
+  });
+
+  it("shell-quotes an id containing a single quote, so the exec string cannot be broken out of", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, { inboxAgentId: "a'b; rm -rf /" });
+    expect(cmd).toContain(`export SPARKLE_INBOX_AGENT='a'\\''b; rm -rf /'; `);
+  });
+
+  it("is exported on BOTH the fresh and the --resume paths", () => {
+    // A resumed agent is the SAME agent and has the same inbox. Emitting this only on a fresh spawn
+    // would mean every reopened pane silently stopped receiving messages at its turn boundaries —
+    // and reopening is the common case, so the bug would be near-permanent rather than rare.
+    const fresh = buildClaudeExec("/bin/claude", false, { inboxAgentId: "agent-1" });
+    const resumed = buildClaudeExec("/bin/claude", true, {
+      inboxAgentId: "agent-1",
+      resumeSessionId: "sess-9",
+    });
+    const cont = buildClaudeExec("/bin/claude", true, { inboxAgentId: "agent-1" });
+    for (const cmd of [fresh, resumed, cont]) {
+      expect(cmd).toContain("export SPARKLE_INBOX_AGENT='agent-1'; ");
+    }
+    expect(resumed).toContain("--resume 'sess-9'");
+    expect(cont).toContain("--continue");
+  });
+
+  it("SURVIVES AN ACCOUNT SWITCH: still exported alongside a per-account CLAUDE_CONFIG_DIR", () => {
+    // Switching Claude Max accounts only changes CLAUDE_CONFIG_DIR. The inbox is keyed by agent id
+    // under Sparkle's own app-data dir, so the ownership proof must ride along unchanged — if the
+    // account export displaced it, every message queued for that agent would sit undelivered at its
+    // turn boundaries from the switch onwards.
+    const a = buildClaudeExec("/bin/claude", false, {
+      inboxAgentId: "agent-1",
+      configDir: "/accounts/A",
+    });
+    const b = buildClaudeExec("/bin/claude", false, {
+      inboxAgentId: "agent-1",
+      configDir: "/accounts/B",
+    });
+    expect(a).toBe(
+      `export CLAUDE_CONFIG_DIR='/accounts/A'; export SPARKLE_INBOX_AGENT='agent-1'; ${PATH_PREFIX}exec '/bin/claude'`,
+    );
+    // The SAME agent id under a different account — the id is not re-keyed by the account.
+    expect(b).toContain("export SPARKLE_INBOX_AGENT='agent-1'; ");
+    expect(a.replace("/accounts/A", "/accounts/B")).toBe(b);
+  });
+
+  it("orders after CLAUDE_CONFIG_DIR and BD_READONLY, and combines with a full worker spawn", () => {
+    const cmd = buildClaudeExec("/bin/claude", false, {
+      configDir: "/acc/dir",
+      beadsReadonly: true,
+      inboxAgentId: "agent-1",
+      dangerouslySkipPermissions: true,
+      initialPrompt: "do the task",
+    });
+    expect(cmd).toBe(
+      `export CLAUDE_CONFIG_DIR='/acc/dir'; export BD_READONLY=1; export SPARKLE_INBOX_AGENT='agent-1'; ` +
+        `${PATH_PREFIX}exec '/bin/claude' --dangerously-skip-permissions -- 'do the task'`,
+    );
+  });
+});
+
 describe("buildClaudeExec --mcp-config (orchestrator launch)", () => {
   it("emits --mcp-config then --strict-mcp-config before --append-system-prompt", () => {
     const cmd = buildClaudeExec("/bin/claude", false, {

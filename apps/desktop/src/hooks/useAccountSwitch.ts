@@ -34,6 +34,7 @@ import {
   type SwitchPlan,
 } from "../services/accountSwitch";
 import { busiestPaneAccount, paneAccountMap, restartPane } from "../services/paneControl";
+import { useAccountLimitStore } from "../stores/accountLimitStore";
 
 /** How often to re-evaluate headroom. Slower than the limit poll: the ceiling is cached in Rust for
  *  15 minutes and 5h consumption moves gradually, so a tighter loop would just burn IPC. */
@@ -160,6 +161,21 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
           // Nothing mounted to move: fall through to the banner rather than spin an empty plan
           // (phase 2 never retires one), same rule as `accept`.
           if (fresh.pending.length > 0) {
+            // ACTIVATE the target — the founder's own manual step, now automatic. The healthy account
+            // may be signed in but INACTIVE (not the fleet's preferred account), which is exactly the
+            // case that stranded him: a target existed at Weekly 56% but he had to click "Activate
+            // this account" by hand because nothing moved the fleet there. `planSwitch` re-pins only
+            // the RUNNING agents; without this the target never becomes preferred, so the next spawn
+            // and the UI's "active account" would not follow. `setPreferredAccountId` is the same
+            // durable write `switchTo`/"Activate this account" makes — see `recordActivation`.
+            setPreferredAccountId(rec.to.id);
+            // Auto-switch is now rescuing this account's fleet, so a manual limit modal for it is
+            // moot. This closes the loop for the case the modal is DESIGNED for — raised earlier when
+            // there was nowhere to go — and a target has since freed up (an account's window reset,
+            // or the user signed one in): the founder should not have to act on an interruption the
+            // automation just superseded. Only a modal about THIS account is cleared; a limit on
+            // another still stands. See `raiseFirstLimitUnlessAutoSwitchHandles` for the other half.
+            useAccountLimitStore.getState().resolveByAutoSwitch(rec.from.id);
             setRecommendation(null);
             planRef.current = fresh;
             setPlan(fresh);

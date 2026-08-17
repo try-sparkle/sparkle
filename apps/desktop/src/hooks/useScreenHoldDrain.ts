@@ -16,7 +16,7 @@
 // looked away. `agentIdsWithScreenHolds` keeps this cheap: it is only ever the handful of agents
 // that actually have something held, bounded by MAX_PER_AGENT on each — never a scan of the fleet.
 import { useEffect } from "react";
-import { flushScreenHeldSends } from "../services/conciergeDispatch";
+import { flushScreenHeldSends, sweepExpiredScreenHeldSends } from "../services/conciergeDispatch";
 import { agentIdsWithScreenHolds } from "../services/screenHoldQueue";
 import { getAgentViewport } from "../services/terminalViewport";
 import { terminalWriteRefusal } from "../voice/dictationTerminalRoute";
@@ -30,12 +30,21 @@ export const SCREEN_HOLD_POLL_MS = 1500;
 export function useScreenHoldDrain(): void {
   useEffect(() => {
     const id = setInterval(() => {
-      for (const agentId of agentIdsWithScreenHolds()) {
+      // `includeExpired: true` — see agentIdsWithScreenHolds' own doc (roborev 64238's High). A
+      // live-only view drops an agent whose screen never clears (or whose viewport unregisters,
+      // e.g. on unmount) once its entries have all aged out but before anything has SWEPT them —
+      // and a live-only poll never visits that agent again to do the sweeping.
+      for (const agentId of agentIdsWithScreenHolds(undefined, { includeExpired: true })) {
         // The SAME predicate `holdForScreenClear`'s callers used to decide this needed holding in
         // the first place — reusing it here, rather than re-deriving "is it safe now" a second
         // way, is what keeps the hold and the drain from ever disagreeing about what the screen
         // shows.
-        if (terminalWriteRefusal(getAgentViewport(agentId)) !== null) continue;
+        if (terminalWriteRefusal(getAgentViewport(agentId)) !== null) {
+          // Still blocked: nothing may be DELIVERED, but anything that aged out while waiting
+          // still has to be reported and cleared rather than left to rot in the queue.
+          sweepExpiredScreenHeldSends(agentId);
+          continue;
+        }
         void flushScreenHeldSends(agentId);
       }
     }, SCREEN_HOLD_POLL_MS);

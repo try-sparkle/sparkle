@@ -72,6 +72,20 @@ describe("parseResetInstant — real messages Claude Code emits", () => {
     const got = parseResetInstant("Claude usage limit reached — will reset at 3pm (America/Bogota)", at);
     expect(got).toBe(instantAt("America/Bogota", 2026, 7, 26, 15, 0));
   });
+
+  it("parses a WEEKLY-limit message the same as a session one (bead sparkle-hbyae)", () => {
+    // The founder's real wall: "You've hit your weekly limit · resets 4pm". Detection is agnostic to
+    // session-vs-weekly — it parses the reset clock, not the noun — so a weekly cap benches just like
+    // a session one. This locks that: the parser must NOT fall back to the 5h SESSION window for a
+    // weekly message, which would return the account to rotation while it is still weekly-walled.
+    const at = Date.parse("2026-08-13T22:00:00.000Z"); // 3pm LA
+    const got = parseResetInstant(
+      "You've hit your weekly limit · resets 4pm (America/Los_Angeles)",
+      at,
+    );
+    expect(got).toBe(instantAt("America/Los_Angeles", 2026, 8, 13, 16, 0));
+    expect(got).not.toBe(at + SESSION_WINDOW_MS);
+  });
 });
 
 describe("parseResetInstant — falls back rather than guessing wrong", () => {

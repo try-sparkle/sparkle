@@ -24,6 +24,7 @@ import {
   clearPin,
   clearAllPins,
   signedInAccountIds,
+  signedInFilterApplies,
   duplicateAccountGroups,
   identityKey,
   accountsAreSame,
@@ -1095,5 +1096,34 @@ describe("adoptionOutcome — naming a fresh login, and refusing one that is alr
   it("does not call its own row a duplicate of itself", () => {
     const outcome = adoptionOutcome("solo", [acct("solo")], [ident("solo", { email: "a@b.c", accountUuid: "u" })]);
     expect(outcome).toEqual({ kind: "named", nickname: "a@b.c" });
+  });
+});
+
+// A signed-in reading whose only entries name accounts that NO LONGER EXIST is not a usable signal.
+// This is the predicate `partitionAccounts`, `usablePreferredAccount` and `firstUsableHolder` now
+// share; before they did, the first read this case as "no signal" (opening the pool to everything)
+// while the other two read it as "signal present, nothing matches" (rejecting every account).
+describe("signedInFilterApplies — the shared 'is this reading usable' predicate", () => {
+  const NOW = 1_000_000;
+  const accounts = [
+    { id: "a", nickname: "A", configDir: "/a", isDefault: true, createdAt: 1 },
+    { id: "b", nickname: "B", configDir: "/b", isDefault: false, createdAt: 2 },
+  ];
+
+  it("is false for a reading that names only a STALE id — the divergence this ends", () => {
+    expect(signedInFilterApplies(accounts, ["ghost"])).toBe(false);
+    // …and the spawn pool therefore stays open rather than emptying.
+    expect(pickAccount(accounts, [], { now: NOW, signedInIds: ["ghost"] })?.id).toBe("a");
+  });
+
+  it("is true as soon as ONE listed id names a real account, stale siblings notwithstanding", () => {
+    expect(signedInFilterApplies(accounts, ["ghost", "b"])).toBe(true);
+    // The filter now bites: `a` is excluded even though it would otherwise win on zero usage.
+    expect(pickAccount(accounts, [], { now: NOW, signedInIds: ["ghost", "b"] })?.id).toBe("b");
+  });
+
+  it("is false for an absent or empty reading — 'could not tell' never empties the pool", () => {
+    expect(signedInFilterApplies(accounts, undefined)).toBe(false);
+    expect(signedInFilterApplies(accounts, [])).toBe(false);
   });
 });

@@ -575,7 +575,9 @@ describe("spinDownWorker", () => {
 
     // Named, so the ledger records automation rather than reporting a human stop.
     expect(killPtyMock).toHaveBeenCalledWith(workerId, "worker-spin-down");
-    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
+    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId, {
+      snapshotWip: true,
+    });
     expect(runtimeCloseMock).toHaveBeenCalledWith(workerId); // runtime entry closed
     const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
     expect(agents.some((a) => a.id === workerId)).toBe(false); // tab gone
@@ -620,6 +622,31 @@ describe("spinDownWorker", () => {
     }
 
     expect(killedBeforeRowDropped).toBe(true);
+  });
+
+  // THE WORKTREE IS DELETED HERE AND THE BRANCH IS NOT, so anything uncommitted dies with the
+  // directory. An app restart killed two workers holding ~870 lines that existed nowhere else, and a
+  // routine spin-down at that moment would have destroyed both halves silently (bead sparkle-ovzoj).
+  //
+  // The snapshot itself lives INSIDE removeAgentWorkspace (it has to run after that function settles
+  // the env seed and the dependency bootstrap, which are still writing into the worktree). What this
+  // path owns is ASKING for it — so that is what is asserted here, and worktree.test.ts owns the
+  // ordering against the removal.
+  it("asks for a WIP snapshot when it tears the worktree down", async () => {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    const workerId = store.addAgent(projectId, { kind: "worker", parentId: buildId })!;
+    store.setAgentWorktree(projectId, workerId, "/wt/w", "sparkle/agent-w");
+
+    await spinDownWorker({ projectId, workerId });
+
+    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId, {
+      snapshotWip: true,
+    });
+    // And the request is made only after the pty is killed: a live worker is still writing, so a
+    // snapshot taken mid-keystroke captures a torn file and is superseded anyway.
+    expect(killPtyMock).toHaveBeenCalled();
   });
 
   it("is a no-op for an unknown project or worker id (idempotent)", async () => {
@@ -678,7 +705,9 @@ describe("spinDownWorker", () => {
     resolveRemove();
     await p;
     // The slow disk cleanup still ran — just off the interaction path.
-    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId);
+    expect(removeWsMock).toHaveBeenCalledWith("/tmp/demo", projectId, workerId, {
+      snapshotWip: true,
+    });
     // Named, so the ledger records automation rather than reporting a human stop.
     expect(killPtyMock).toHaveBeenCalledWith(workerId, "worker-spin-down");
   });

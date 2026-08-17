@@ -177,6 +177,22 @@ pub struct BeadLink {
     pub link_type: String,
 }
 
+/// One comment on a bead, as reported by `bd show --json --include-comments`.
+///
+/// The read HALF of the comment feature — the write half (`beads_comment`) already shipped with no
+/// reader. bd emits each comment as `{id, issue_id, author, text, created_at}`; only `text` is
+/// load-bearing, so `author`/`created_at` are `Option` (a bd build that renames or drops one must
+/// degrade the comment to "no author" rather than drop the whole thread). These are `Option`, so
+/// serde emits them as an explicit `null` — the TS side reads them as `T | null`, never `T?`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BeadComment {
+    pub id: String,
+    pub author: Option<String>,
+    pub text: String,
+    pub created_at: Option<String>,
+}
+
 /// A single bead with its full description plus its immediate graph neighbourhood.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +207,10 @@ pub struct BeadDetail {
     pub dependencies: Vec<BeadLink>,
     /// What depends on this bead.
     pub dependents: Vec<BeadLink>,
+    /// The bead's comment thread, oldest-first as bd returns it. Read LAZILY — `--include-comments`
+    /// rides only on this per-open detail call, never on the board's 5s list poll (which would pull
+    /// every bead's whole thread against an already-contended store on every tick).
+    pub comments: Vec<BeadComment>,
     /// True when the link lists were cut at LINKS_CAP.
     pub links_truncated: bool,
 }
@@ -852,17 +872,23 @@ fn query_beads(project_path: &str, q: &BeadQuery, env: ChildEnv<'_>) -> Result<B
 
 fn detail_bead(project_path: &str, id: &str, env: ChildEnv<'_>) -> Result<BeadDetail, BeadsError> {
     require_id(id)?;
-    // ONE `bd show`, read twice out of the same stdout. The excerpt lives on BeadSummary and detail
-    // also carries the uncut text, but a second invocation is the wrong way to get it: each `bd
-    // show` is a cold-Dolt-open candidate with the full BD_TIMEOUT budget, so it doubled worst-case
-    // latency, and two reads can straddle a concurrent edit and hand back a `fullDescription` that
-    // does not belong to the `bead` beside it.
-    let shown = bd_stdout(project_path, &["show".into(), id.to_string(), "--json".into()], env)?;
+    // ONE `bd show`, read three ways out of the same stdout — the summary, the uncut description,
+    // AND the comment thread. `--include-comments` rides here and ONLY here: a second invocation is
+    // the wrong way to get any of it, because each `bd show` is a cold-Dolt-open candidate with the
+    // full BD_TIMEOUT budget (doubling worst-case latency) and two reads can straddle a concurrent
+    // edit and hand back parts that do not belong together. The flag stays off the board's 5s list
+    // poll, which must not pull every bead's whole thread against a contended store on every tick.
+    let shown = bd_stdout(
+        project_path,
+        &["show".into(), id.to_string(), "--json".into(), "--include-comments".into()],
+        env,
+    )?;
     let bead = parse_bead_rows(&shown)?.into_iter().next().ok_or_else(|| {
         BeadsError::new(BeadsErrorKind::InvalidInput, format!("no bead found with id {id}"))
     })?;
     let full_description =
         full_description_from(&shown).unwrap_or_else(|| bead.description.clone());
+    let comments = comments_from(&shown);
 
     // Children and links are ENRICHMENT: a bead whose neighbourhood fails to load is still
     // worth returning, so these degrade to empty rather than failing the whole detail read.
@@ -876,7 +902,48 @@ fn detail_bead(project_path: &str, id: &str, env: ChildEnv<'_>) -> Result<BeadDe
         Err(_) => (Vec::new(), Vec::new(), false),
     };
 
-    Ok(BeadDetail { bead, full_description, children, dependencies, dependents, links_truncated })
+    Ok(BeadDetail {
+        bead,
+        full_description,
+        children,
+        dependencies,
+        dependents,
+        comments,
+        links_truncated,
+    })
+}
+
+/// The comment thread out of a raw `bd show --json --include-comments` body. Pure, and TOLERANT: a
+/// bd build that drops the `comments` key (or one comment missing a `text`) degrades to fewer
+/// comments rather than failing the whole detail read — comments are enrichment, exactly like the
+/// child/link neighbourhood above. bd reports each as `{id, issue_id, author, text, created_at}`.
+fn comments_from(stdout: &str) -> Vec<BeadComment> {
+    let Ok(parsed) = serde_json::from_str::<Value>(stdout.trim()) else {
+        return Vec::new();
+    };
+    let row = match &parsed {
+        Value::Array(a) => match a.first() {
+            Some(r) => r,
+            None => return Vec::new(),
+        },
+        other => other,
+    };
+    let Some(arr) = row.get("comments").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|c| {
+            // `text` is the one load-bearing field: a comment with none is not renderable, so it is
+            // dropped rather than shown blank. `id` falls back to empty (bd always supplies it).
+            let text = as_str(c.get("text"))?;
+            Some(BeadComment {
+                id: as_str(c.get("id")).unwrap_or_default(),
+                author: as_str(c.get("author")),
+                text,
+                created_at: as_str(c.get("created_at")),
+            })
+        })
+        .collect()
 }
 
 /// The UNCUT `description` out of a raw `bd show --json` body. Pure — the counterpart to
@@ -1136,6 +1203,41 @@ mod tests {
     fn empty_stdout_is_an_empty_result_not_an_error() {
         assert_eq!(parse_bead_rows("").unwrap().len(), 0);
         assert_eq!(parse_bead_rows("   \n ").unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parses_comments_from_a_show_with_include_comments() {
+        // The exact shape `bd show --json --include-comments` emits (captured, trimmed).
+        let shown = r#"[
+          {
+            "id": "sparkle-mzgqt",
+            "title": "beads need comments",
+            "status": "open",
+            "comments": [
+              {"id":"c-1","issue_id":"sparkle-mzgqt","author":"DROdio","text":"first note","created_at":"2026-08-12T00:21:39Z"},
+              {"id":"c-2","issue_id":"sparkle-mzgqt","text":"authorless still shows"}
+            ],
+            "comment_count": 2
+          }
+        ]"#;
+        let comments = comments_from(shown);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].text, "first note");
+        assert_eq!(comments[0].author.as_deref(), Some("DROdio"));
+        assert_eq!(comments[0].created_at.as_deref(), Some("2026-08-12T00:21:39Z"));
+        // A comment missing author/created_at is kept — text is the only load-bearing field.
+        assert_eq!(comments[1].text, "authorless still shows");
+        assert_eq!(comments[1].author, None);
+        assert_eq!(comments[1].created_at, None);
+    }
+
+    #[test]
+    fn a_show_without_comments_is_an_empty_thread_not_an_error() {
+        // `bd show --json` (no --include-comments) has no `comments` key; a textless comment is
+        // dropped rather than shown blank. Neither is a parse failure.
+        assert!(comments_from(r#"[{"id":"x","status":"open"}]"#).is_empty());
+        assert!(comments_from(r#"[{"id":"x","comments":[{"id":"c","author":"a"}]}]"#).is_empty());
+        assert!(comments_from("").is_empty());
     }
 
     #[test]
@@ -2071,6 +2173,17 @@ mod tests {
             .expect("bd update ran");
         // A dash-leading body is the case the argument terminator exists for.
         comment_bead(&path, &id, "- a round-trip comment", TEST_GIT_ENV).expect("bd comment ran");
+
+        // The comment must be READABLE, not merely counted. `detail_bead` carries `--include-comments`
+        // (the read half this feature adds), so the written body round-trips back through the thread —
+        // asserting only `comment_count` would pass even if the parse dropped every body.
+        let with_comment = detail_bead(&path, &id, TEST_GIT_ENV).expect("bd show ran");
+        assert!(
+            with_comment.comments.iter().any(|c| c.text == "- a round-trip comment"),
+            "the written comment reads back through the detail thread, got {:?}",
+            with_comment.comments,
+        );
+
         close_bead(&path, &id, "done in test", TEST_GIT_ENV).expect("bd close ran");
 
         // The bead is now closed — visible only with closed rows included.

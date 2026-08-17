@@ -175,7 +175,13 @@ export interface SpinDownGitParams {
  *  so a project without a beads DB (bd is optional) never breaks the git teardown. */
 export async function spinDownAgentGit(p: SpinDownGitParams): Promise<void> {
   for (const cid of p.ids) {
-    await removeAgentWorkspace(p.root, p.projectId, cid).catch(() => {});
+    // `snapshotWip` — this path KEEPS every branch (that is what distinguishes it from discard), so
+    // an uncommitted edit in any of these worktrees is about to be destroyed with nothing left to
+    // recover it. `p.ids` is the build agent AND its workers, and a worker is the likeliest holder
+    // of uncommitted work here: closing a build agent with the × tears down workers that were never
+    // spun down individually, which reproduced bead sparkle-ovzoj through this path unchanged
+    // (roborev 64446).
+    await removeAgentWorkspace(p.root, p.projectId, cid, { snapshotWip: true }).catch(() => {});
     if (p.deleteBranch) await deleteAgentBranchIfMerged(p.root, cid).catch(() => {});
   }
   for (const bid of p.beadIds ?? []) await closeBead(p.root, bid).catch(() => {});

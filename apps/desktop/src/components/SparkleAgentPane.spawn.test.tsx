@@ -85,6 +85,22 @@ describe("SparkleAgentPane — spawn arg assembly per consent mode", () => {
     expect(resumed.exec).not.toContain("Start your first improvement pass");
   });
 
+  it("exports SPARKLE_INBOX_AGENT on BOTH fresh and resumed spawns (bead sparkle-ei7keg)", async () => {
+    // Drives the REAL call site, not buildClaudeExec directly: the defect this guards is a call
+    // site that forgets to pass the id, which a unit test of the builder cannot see. Both paths are
+    // asserted because a resumed pane is the same agent with the same inbox — and reopening is the
+    // common case, so an export emitted only on a fresh spawn would fail almost every time.
+    const fresh = await spawned();
+    expect(fresh.exec).toContain("export SPARKLE_INBOX_AGENT='__sparkle_self__'; ");
+
+    cleanup();
+    captured.props.length = 0;
+    (claudeHasSession as Mock).mockResolvedValue(true);
+    const resumed = await spawned();
+    expect(resumed.resuming).toBe(true);
+    expect(resumed.exec).toContain("export SPARKLE_INBOX_AGENT='__sparkle_self__'; ");
+  });
+
   it('consent "never" spawns with NO --add-dir for the log dir and the chat-only prompt', async () => {
     useSettingsStore.getState().setSparkleImprovementConsent("never");
     const { exec } = await spawned();

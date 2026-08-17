@@ -9,9 +9,12 @@
 // a pane, and every pane polling independently would multiply the transcript walk by the number of
 // open agents to reach the same conclusion.
 import { useEffect } from "react";
-import { loadAccountState, invalidateAccountState } from "../services/accountSelection";
+import { loadAccountState, invalidateAccountState, liveUsageRows } from "../services/accountSelection";
 import { syncLimitsOnce, LIMIT_POLL_MS } from "../services/limitSync";
-import { raiseFirstLimit } from "../stores/accountLimitStore";
+import { raiseFirstLimitUnlessAutoSwitchHandles } from "../stores/accountLimitStore";
+import { listCeilings } from "../services/accountStore";
+import { switchRecommendation, type Ceiling } from "../services/headroom";
+import { busiestPaneAccount } from "../services/paneControl";
 
 /** Poll for real rate-limit events and bench the affected accounts until their true reset time.
  *  Best-effort throughout — a failure is logged by `syncLimitsOnce` and retried on the next tick,
@@ -44,10 +47,42 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
       // one transcript walk and nothing else.
       if (cancelled || applied.length === 0) return;
       invalidateAccountState();
+
       // A landed exhaustion is the deterministic "you are blocked" signal the founder asked for —
       // `syncLimitsOnce` returns only writes that PERSISTED, and re-seeing the same event is a
       // no-op, so this fires on a genuinely new (or extended) limit rather than on every tick.
-      raiseFirstLimit(applied);
+      //
+      // But it is the FALLBACK, not the first response: with auto-switch ON the founder expects the
+      // fleet moved for him, not a "log in to another account" modal. So before raising it, ask the
+      // SAME question `useAccountSwitch` asks — is there a healthy, signed-in, different-identity
+      // account to migrate the walled fleet onto? `switchRecommendation` is that exact oracle, and a
+      // non-null result means auto-switch will carry the migration out at a safe boundary. In that
+      // case the modal is redundant and stealing focus, so we suppress it; only when there is
+      // genuinely nowhere to go does the modal remain the last signal and show.
+      //
+      // Fresh state is re-loaded so the just-landed bench is reflected — an exhausted `from` is what
+      // makes `switchRecommendation` evaluate a target at all — and the SAME cached live rows the
+      // spawn gate uses are passed so a live-spent account is not counted as an escape.
+      const fresh = await loadAccountState();
+      if (cancelled) return;
+      let ceilings: Ceiling[] = [];
+      try {
+        ceilings = await listCeilings();
+      } catch {
+        // No ceilings → accounts read "unknown", never healthy-by-estimate. The observed-wall
+        // recommendation does not need them; a failure here just leaves us raising the modal.
+      }
+      if (cancelled) return;
+      const rec = switchRecommendation(
+        busiestPaneAccount(),
+        fresh.accounts,
+        fresh.usage,
+        ceilings,
+        fresh.identities,
+        Date.now(),
+        liveUsageRows(),
+      );
+      raiseFirstLimitUnlessAutoSwitchHandles(applied, rec !== null);
     };
 
     void tick(); // check immediately on mount — a limit hit while the app was closed still applies

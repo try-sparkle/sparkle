@@ -97,6 +97,12 @@ export function assembleBuildSpawn(opts: {
    *  both fan out workers AND drive its own UI. `agentId` (this build agent's AgentTab.id) is the
    *  caller identity injected as SPARKLE_AGENT_ID. Absent → orchestrator-only (prior behavior). */
   control?: { bridge: BridgeInfo; paths: McpPaths; agentId: string };
+  /** This build agent's AgentTab.id, exported into the child as `SPARKLE_INBOX_AGENT` so the Stop
+   *  hook drains this agent's inbox only for THIS `claude` and not for the background one-shots
+   *  sharing its worktree (bead sparkle-ei7keg). Its own field rather than reused from `control`:
+   *  the control bridge is best-effort and may be absent this spawn, and an agent must not lose
+   *  turn-boundary message delivery because its MCP wiring happened to fail. */
+  agentId?: string;
   /** Spawn-time plan-mode request (AgentTab.permissionMode). MUST be forwarded: this is the branch
    *  BUILD agents take, and `spawnBuildAgentInProject` — the only writer of that field — always
    *  creates `kind: "build"`. Omitting it here meant `--permission-mode plan` was never emitted for
@@ -147,6 +153,7 @@ export function assembleBuildSpawn(opts: {
     model: opts.model,
     permissionMode: opts.permissionMode,
     initialPrompt: opts.initialPrompt,
+    inboxAgentId: opts.agentId,
   });
   return { command: SHELL, args: ["-l", "-c", exec], cwd: opts.cwd };
 }

@@ -2814,6 +2814,73 @@ describe("ConciergeHost — reconciling a queued prompt", () => {
     expect(queryInThread(/terminal closed before I could send|never came up/)).toBeNull();
   });
 
+  // ══ A SCREEN HOLD GETS ITS OWN WORDING (roborev 64236/64268) ══════════════════════════════════
+  // `heldReason: "screen"` is what tells this ladder the hold was never about the PTY — the agent
+  // WAS up, its screen was just busy — so "never came up" / "Send it again once it's running"
+  // would tell the founder something false about the agent he was just looking at. These two rows
+  // are anchored so they cannot pass against EITHER the PTY wording or each other's.
+  it("says the SCREEN never cleared, not that the agent never came up", async () => {
+    renderHost();
+    act(() =>
+      h.deferred?.({
+        ok: false,
+        path: "expired",
+        agentId: "ag1",
+        sent: "never sent",
+        heldReason: "screen",
+      }),
+    );
+    expect(
+      await findInThread(
+        /^@CI Hardening's screen never cleared, so I dropped the message I was holding \("never sent"\)\. Send it again\.$/,
+      ),
+    ).toBeTruthy();
+    expect(queryInThread(/never came up/)).toBeNull();
+  });
+
+  it("says the agent CLOSED while waiting for its screen — not that it couldn't take the message", async () => {
+    renderHost();
+    act(() =>
+      h.deferred?.({
+        ok: false,
+        path: "abandoned",
+        agentId: "ag1",
+        sent: "held",
+        heldReason: "screen",
+      }),
+    );
+    expect(
+      await findInThread(
+        /^@CI Hardening closed while I was waiting for its screen to clear, so I dropped the message I was holding \("held"\)\.$/,
+      ),
+    ).toBeTruthy();
+    expect(queryInThread(/couldn't take the message|Send it again once it's running/)).toBeNull();
+  });
+
+  // ══ A SCREEN HOLD CROWDED OUT OF ITS OWN CAP GETS A TRUTHFUL, DISTINCT REMEDY (roborev 64289) ══
+  // Before this arm existed, `queue-full` fell through to the bare catch-all ("didn't take the
+  // message… ") with no remedy clause — an unactionable mystery for an agent the founder can see
+  // is up and mounted. Anchored against both the PTY-not-ready wording and the generic catch-all
+  // so neither can silently reabsorb this path.
+  it("says the screen hold's OWN queue is full — not the generic catch-all", async () => {
+    renderHost();
+    act(() =>
+      h.deferred?.({
+        ok: false,
+        path: "queue-full",
+        agentId: "ag1",
+        sent: "crowded out",
+        heldReason: "screen",
+      }),
+    );
+    expect(
+      await findInThread(
+        /^@CI Hardening's screen is still busy and I'm already holding as much as I can for it, so I dropped the message \("crowded out"\)\. Send it again\.$/,
+      ),
+    ).toBeTruthy();
+    expect(queryInThread(/didn't take the message/)).toBeNull();
+  });
+
   // The anonymous fallback is a LIVE path: the outcome can arrive after the agent has left the
   // feed. Nothing covered it, so a change to a non-guarding form would render
   // "undefined is up — I sent your message" — the same literal-undefined report the matchedLabel

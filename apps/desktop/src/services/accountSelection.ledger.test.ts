@@ -26,6 +26,10 @@ import {
 } from "./accountSelection";
 import { clearAllPins, setPin, CEILING_AVOID_FRACTION } from "./accountStore";
 import { resetSelectionLog, type SpawnLogEntry } from "./accountLedger";
+// The SAME bytes `account_ledger.rs` deserializes (`include_str!` of this path). Shared on purpose:
+// the Rust struct and this hand-written TS interface cannot see each other, and a mismatch between
+// them is silent in both directions — see the seam test below.
+import WIRE_FIXTURE from "../fixtures/accountSpawnLogEntries.json";
 
 const ACCOUNTS = [
   { id: "personal", nickname: "Personal", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
@@ -269,6 +273,60 @@ describe("the ledger never invents a measurement it did not take", () => {
     expect(e.eligibleCount).toBeNull();
     expect(e.tokens5h).toBeNull();
     expect(e.fraction).toBeNull();
+  });
+
+  it("emits exactly the shape the Rust ledger parses, for BOTH the measured and unmeasured case", async () => {
+    // THE SEAM TEST. Everything above proves the TypeScript half writes null correctly; none of it
+    // could see that the Rust `SpawnLogEntry` typed these same four fields as `u64`/`usize`/`Vec`,
+    // so serde REJECTED the whole unmeasured payload and `recordSelection` swallowed the rejection
+    // by design. Two green suites, and every entry recording a backend failure silently dropped.
+    //
+    // So both halves now parse ONE fixture: `account_ledger.rs`'s
+    // `the_not_evaluated_shape_the_frontend_actually_sends_deserializes` deserializes these exact
+    // bytes, and this asserts the live resolver still emits that shape. Neither can drift alone.
+    // Thrown, not asserted with `!`: a fixture that lost an entry must fail by NAME here rather
+    // than as an inscrutable undefined deref three assertions later.
+    const fixtureEntry = (i: number): Record<string, unknown> => {
+      const e = WIRE_FIXTURE[i];
+      if (!e) throw new Error(`the shared wire fixture lost entry ${i}`);
+      return e as unknown as Record<string, unknown>;
+    };
+    const measuredFixture = fixtureEntry(0);
+    const unmeasuredFixture = fixtureEntry(1);
+    const nullKeys = (o: Record<string, unknown>) =>
+      Object.keys(o)
+        .filter((k) => o[k] === null)
+        .sort();
+
+    mockBackend({
+      usage: [
+        { id: "personal", tokens5h: 7, tokens7d: 7, exhaustedUntil: null },
+        { id: "second", tokens5h: 999, tokens7d: 999, exhaustedUntil: null },
+      ],
+      ceilings: [{ id: "personal", samples: [CEILING], ceiling: CEILING }],
+    });
+    await chooseAccountForAgent("agent-wire");
+    const measured = lastEntry() as unknown as Record<string, unknown>;
+    expect(Object.keys(measured).sort()).toEqual(Object.keys(measuredFixture).sort());
+    // The measured entry's defining property: nothing in it is null. A fixture that let one of
+    // these be null would make the Rust test pass while proving nothing about this case.
+    expect(nullKeys(measured)).toEqual([]);
+    expect(nullKeys(measuredFixture)).toEqual([]);
+
+    invoke.mockReset();
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_record_spawn") return Promise.resolve(null);
+      return Promise.reject(new Error("backend down"));
+    });
+    invalidateAccountState();
+    await chooseAccountForAgent("agent-wire");
+    const unmeasured = lastEntry() as unknown as Record<string, unknown>;
+    expect(unmeasured.reason).toBe("remembered");
+    expect(Object.keys(unmeasured).sort()).toEqual(Object.keys(unmeasuredFixture).sort());
+    // WHICH fields are null, not merely that some are: the fixture is only evidence about the Rust
+    // parser insofar as it nulls the same ones the resolver does.
+    expect(nullKeys(unmeasured)).toEqual(nullKeys(unmeasuredFixture));
+    expect(nullKeys(unmeasured)).toContain("candidateIds");
   });
 
   it("distinguishes an empty pool (measured) from an unevaluated one (not measured)", async () => {

@@ -280,6 +280,10 @@ describe("beadsDetail", () => {
       children: page({ beads: [summary({ id: "sparkle-4562.2" })], total: 1 }),
       dependencies: [{ id: "b-9", linkType: "blocks" }],
       dependents: [{ id: "b-2", linkType: "parent-child" }],
+      comments: [
+        { id: "c-1", author: "DROdio", text: "a human note", createdAt: "2026-08-12T00:21:39Z" },
+        { id: "c-2", author: null, text: "authorless", createdAt: null },
+      ],
       linksTruncated: false,
     });
 
@@ -295,6 +299,12 @@ describe("beadsDetail", () => {
     expect(d.children.beads[0]?.id).toBe("sparkle-4562.2");
     expect(d.dependencies[0]?.id).toBe("b-9");
     expect(d.dependents[0]?.linkType).toBe("parent-child");
+    // The comment thread rides the SAME per-open detail read (never the poll). `author`/`createdAt`
+    // are `T | null` — a null author is a real authorless comment, not an absent field.
+    expect(d.comments).toHaveLength(2);
+    expect(d.comments[0]?.text).toBe("a human note");
+    expect(d.comments[1]?.author).toBeNull();
+    expect(d.comments[1]?.createdAt).toBeNull();
   });
 });
 

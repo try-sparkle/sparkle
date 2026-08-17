@@ -29,9 +29,12 @@ import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
 import { FiExternalLink, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
-import type { Bead } from "../../services/beads";
+import { severityOf, type Bead } from "../../services/beads";
+import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 import { PriorityPill } from "./PriorityPill";
+import { BeadSeverityBadge } from "./BeadSeverityBadge";
+import { CommentThread } from "./CommentThread";
 import { StageLine } from "./StageLine";
 import { statusDot, statusLabel } from "./beadStatus";
 
@@ -86,6 +89,14 @@ export interface BeadCardProps {
   onBuildAllPrd?: () => Promise<void>;
   /** How many epics share this bead's PRD. The batch button appears only above 1. */
   prdEpicCount?: number;
+  /** The bead's comment thread, read LAZILY by the caller when the card opens (never on the board's
+   *  5s poll). `undefined` renders no thread — the concierge and any read-only surface that has not
+   *  fetched comments simply omit the section, exactly like every other absent affordance here. An
+   *  empty array renders the thread frame with its "no comments yet" state. */
+  comments?: BeadComment[];
+  /** Post a comment. Like every other callback here, its PRESENCE is the switch for the compose box:
+   *  a surface that cannot write (no project path) passes nothing and shows a read-only thread. */
+  onComment?: (text: string) => Promise<void>;
   /** A sentence the caller wants under the controls — today, "that board could not be opened". */
   notice?: string;
   /** Bumped by the caller so a REPEAT of the same notice re-registers as a live-region update
@@ -122,6 +133,8 @@ export function BeadCard({
   onBuildIt,
   onBuildAllPrd,
   prdEpicCount,
+  comments,
+  onComment,
   notice,
   noticeKey,
 }: BeadCardProps) {
@@ -206,6 +219,13 @@ export function BeadCard({
     meta.push(
       <span key="priority" data-testid={`${t}-priority-readonly`}>{`P${shownPriority}`}</span>,
     );
+  }
+  // SEVERITY — a distinct axis beside priority (the founder asked for both visible), read from the
+  // `sev-<N>` label. Renders nothing when the bead carries no score, so it adds a meta item only when
+  // there is one to show; `severityOf` returns null otherwise.
+  const severity = severityOf(bead);
+  if (severity !== null) {
+    meta.push(<BeadSeverityBadge key="severity" severity={severity} testId={`${t}-severity`} />);
   }
   if (bead.type) meta.push(<span key="type">{bead.type}</span>);
   // LAST, and only when the bead is somewhere else. "View on board" calls `selectProject`, so this
@@ -441,6 +461,19 @@ export function BeadCard({
             </button>
           )}
         </span>
+      )}
+
+      {/* ── COMMENT THREAD + COMPOSE ─────────────────────────────────────────────────────────────
+          The point of the whole feature: humans (and agents) comment on a bead instead of filing a
+          near-duplicate. Rendered only when the caller wired EITHER a thread to show or a way to
+          write — a bare read-only surface (a test fixture, a board with no project path) omits it.
+          Comments are read lazily by the caller on open; nothing here fetches on the 5s poll. */}
+      {(comments !== undefined || onComment !== undefined) && (
+        <CommentThread
+          testId={`${t}-comments`}
+          comments={comments}
+          onComment={onComment}
+        />
       )}
 
       {/* THE ERROR SITS BESIDE THE CONTROLS, not in a toast — this app has no toast system, and the

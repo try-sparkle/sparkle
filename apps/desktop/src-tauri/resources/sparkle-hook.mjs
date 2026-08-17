@@ -237,14 +237,74 @@ function claim(claimsDir, id) {
 }
 
 /**
+ * The env var Sparkle exports into an agent's OWN `claude` child at spawn time, carrying the agent
+ * id that child is. Set by `services/claudeSpawn.buildClaudeExec` ({@link ClaudeExecOpts.inboxAgentId}).
+ */
+const OWNER_ENV = "SPARKLE_INBOX_AGENT";
+
+/**
+ * Pure: may THIS `claude` process drain the inbox of `agentId`?
+ *
+ * THE BUG THIS EXISTS FOR (bead sparkle-ei7keg — a P0 trust bug: the founder's messages vanished).
+ * The hook is registered once per WORKTREE in `.claude/settings.local.json`, and {@link inboxPaths}
+ * derives the agent id from the event-log path — so EVERY `claude` process that runs in that
+ * worktree drains the SAME per-agent queue. That includes background one-shots that are nobody's
+ * agent: measured, a roborev post-commit code-review `claude -p` hit `Stop` in an agent's worktree,
+ * drained and ACKED all four of the founder's queued instructions, and exited 19s later. The real
+ * agent's own `Stop` 54s afterwards found an empty queue. Because the drain is destructive and
+ * exactly-once (an `O_EXCL` claim, then an ack), the loser is GUARANTEED never to see the message.
+ *
+ * The app already knows this hazard and gates on it everywhere else — see `isMainSessionId` in
+ * `src/engine/hookEvents.ts`, which `HookStatusEngine`, `createHookEventHandler` and
+ * `engine/movementRetraction` all consult. The drain was the one consumer that gated on nothing.
+ *
+ * So the gate is POSITIVE OWNERSHIP, supplied by Sparkle at spawn time rather than inferred here:
+ * the env var must be present AND strictly equal to the id the log path names. Nothing about the
+ * payload can substitute for it — in the measured incident all three sessions reported
+ * `source: "startup"` and `CLAUDE_CODE_ENTRYPOINT=cli`, so neither field can tell the agent's own
+ * session from a background one-shot.
+ *
+ * WHAT THIS PROVES, STATED HONESTLY: an env var is INHERITED, so a pass means "descendant of the
+ * agent's PTY", NOT "is the agent's own `claude`". Those coincide for the measured case — the
+ * roborev reviewers are forked by `roborev daemon run`, itself parented by launchd (PPID 1),
+ * so they inherit the daemon's environment and never the agent's — and that is the case that cost
+ * the founder his messages. They do NOT coincide in general. A `claude` the agent starts ITSELF
+ * from its own shell inside the worktree — a nested `claude -p`, a script that shells out, or any
+ * daemon lazily auto-started from that shell and then forking children — inherits the variable and
+ * passes this gate, and would perform the same destructive claim + ack. That residual is REAL and
+ * is not closed here.
+ *
+ * Closing it needs the proof narrowed from the env TREE to the SESSION: have the app record the
+ * owning session id — the same fact `engine/hookEvents.isMainSessionId` already establishes — and
+ * require `payload.session_id` to match it too. Filed as a follow-up. Documented rather than
+ * asserted away, because a comment claiming this is airtight is what stops the next reader from
+ * finding the hole.
+ *
+ * REFUSING IS SAFE, AND THAT IS WHY THIS FAILS CLOSED. A message we do not claim stays `pending`,
+ * and the app-side idle delivery path (`services/fleetWatch.ts` → the `inbox_claim_for_idle` Tauri
+ * command) still delivers it over the agent's own PTY when the agent goes idle — a channel that
+ * knows which PTY belongs to which agent, which this hook cannot know. So refusing can never LOSE a
+ * message; it only defers it to the channel that can address it correctly. That is also why an
+ * agent spawned by an OLDER build (env var absent) is acceptable to refuse rather than a
+ * regression: it loses the turn-boundary injection and keeps the idle delivery.
+ */
+export function mayDrain(env, agentId) {
+  const owner = env?.[OWNER_ENV];
+  return typeof owner === "string" && owner !== "" && owner === agentId;
+}
+
+/**
  * Drain the inbox at a turn boundary. Returns the text to inject, or "" when there is nothing to
  * deliver.
  *
  * Every failure path returns "" — a broken inbox must never stop an agent from finishing its turn.
  */
-function drainInbox(logPath, now) {
+function drainInbox(logPath, now, env = process.env) {
   try {
     const paths = inboxPaths(logPath);
+    // Ownership first, BEFORE any read: a foreign session must claim nothing, ack nothing, and
+    // write nothing. See mayDrain for why refusing cannot lose the message.
+    if (!mayDrain(env, paths.agentId)) return "";
     let raw;
     try {
       raw = readFileSync(paths.messages, "utf8");

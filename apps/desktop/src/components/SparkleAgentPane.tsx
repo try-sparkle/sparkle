@@ -23,7 +23,11 @@ import {
   unregisterPane,
 } from "../services/paneReadiness";
 import { registerPaneRestart, unregisterPaneRestart } from "../services/paneControl";
-import { abandonPendingSends, flushPendingSends } from "../services/conciergeDispatch";
+import {
+  abandonPendingSends,
+  abandonScreenHeldSends,
+  flushPendingSends,
+} from "../services/conciergeDispatch";
 import { SparkleConsentBanner } from "./SparkleConsentBanner";
 import { Terminal } from "./Terminal";
 import { Onboarding } from "./Onboarding";
@@ -215,6 +219,15 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
               // The pane IS the user sitting in the chat, so an auth failure is theirs to clear.
               { attended: true },
             ),
+            // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg): the same
+            // window id the hook-events log and the inbox would be keyed by.
+            //
+            // INERT TODAY, DELIBERATELY. This pane never calls `installAgentHooks`, so no Stop hook
+            // is registered in its worktree and nothing reads this yet. It is set anyway because
+            // the alternative is a silent hole the day hooks ARE installed here: the drain fails
+            // CLOSED, so a missing export presents as "the Improve-Sparkle agent stopped receiving
+            // messages" with nothing in the diff that installed hooks to explain it.
+            inboxAgentId: agentId,
             // "Never" = chat-only: don't even grant the agent read access to the log dir, and open
             // with an introduction instead of a log-review mission.
             ...(consent === "never" ? {} : { addDirs: [ws.logDir] }),
@@ -283,6 +296,7 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     () => () => {
       unregisterPane(agentId);
       abandonPendingSends(agentId);
+      abandonScreenHeldSends(agentId);
     },
     [agentId],
   );
@@ -294,7 +308,10 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   // A spawn that ERRORS or finds no Claude never flips ptyReady, so a held prompt would dangle with
   // no outcome. Report it the moment the pane gives up (roborev 46311) — the pane may never unmount.
   useEffect(() => {
-    if (gaveUp || phase === "error" || phase === "no-claude") abandonPendingSends(agentId);
+    if (gaveUp || phase === "error" || phase === "no-claude") {
+      abandonPendingSends(agentId);
+      abandonScreenHeldSends(agentId);
+    }
   }, [phase, agentId, gaveUp]);
 
   // The visible, ready pane takes the caret: with no composer over it, the terminal IS this pane's

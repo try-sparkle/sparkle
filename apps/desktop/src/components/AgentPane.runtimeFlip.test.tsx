@@ -83,6 +83,7 @@ vi.mock("../services/paneReadiness", () => ({
 vi.mock("../services/conciergeDispatch", () => ({
   flushPendingSends: () => Promise.resolve(),
   abandonPendingSends: () => {},
+  abandonScreenHeldSends: () => {},
   recordPromptSideEffects: () => {},
 }));
 vi.mock("./PinnedPrompt", () => ({ PinnedPrompt: () => null }));

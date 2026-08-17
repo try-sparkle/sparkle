@@ -241,7 +241,16 @@ export async function spinDownWorker(args: {
   // once the PTY is dead and the worktree is gone. Errors are swallowed so a partially-gone worker
   // still finishes; warn so a failed kill / removal (a transient git error leaving an orphan) shows.
   await kill;
-  await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId).catch((e) =>
-    console.warn("spinDownWorker: removeAgentWorkspace failed", e),
-  );
+  // SNAPSHOT BEFORE THE DELETE (`snapshotWip`). The worker's BRANCH survives a spin-down; its
+  // WORKTREE does not — so anything the worker edited but never committed is destroyed here,
+  // silently and with nothing left to salvage from. That is not hypothetical: an app restart killed
+  // two workers whose ~870 lines existed only as uncommitted worktree edits, and only a by-hand
+  // rescue before teardown saved them (bead sparkle-ovzoj).
+  //
+  // The snapshot happens INSIDE removeAgentWorkspace, after it settles the env seed and the
+  // dependency bootstrap — both of which are still writing into this worktree until then. It is
+  // reached only after the PTY kill above, so a live worker is no longer typing into what it reads.
+  await removeAgentWorkspace(project.rootPath, args.projectId, args.workerId, {
+    snapshotWip: true,
+  }).catch((e) => console.warn("spinDownWorker: removeAgentWorkspace failed", e));
 }

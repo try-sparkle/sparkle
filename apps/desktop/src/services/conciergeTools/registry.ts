@@ -2010,7 +2010,18 @@ const inboxBroadcastArgs = z
   })
   .strict();
 
-const inboxStatusArgs = z.object({ agentIds: z.array(agentIdArg).min(1) }).strict();
+/**
+ * `messageIds` IS THE POINT OF THIS OP, not an optimisation (sparkle-ei7keg). `inbox_send` returns an
+ * ENQUEUE receipt carrying `verifyArgs` — the agentIds/messageIds to pass straight back here. Without
+ * this parameter the only follow-up available was per-agent counts, and counts cannot distinguish "the
+ * five instructions I queued are still pending" from "the five instructions I queued reached nobody".
+ */
+const inboxStatusArgs = z
+  .object({
+    agentIds: z.array(agentIdArg).min(1),
+    messageIds: z.array(z.string().min(1)).optional(),
+  })
+  .strict();
 
 const FLEET_ROUTES: Record<FleetOp, Handler> = {
   fleet_digest: route(fleetDigestArgs, async (a, ctx) =>
@@ -2029,7 +2040,9 @@ const FLEET_ROUTES: Record<FleetOp, Handler> = {
     fromFleet(ctx, await inboxBroadcast(a.agentIds, a.text, a.severity ?? "fyi")),
   ),
   inbox_status: route(inboxStatusArgs, async (a, ctx) =>
-    fromFleet(ctx, await inboxStatus(a.agentIds)),
+    // `withEntries: true` — the concierge asks this op to confirm a send, which counts cannot
+    // answer, so it always pays for the peek. `fleetWatch`'s ~10s poll deliberately does not.
+    fromFleet(ctx, await inboxStatus(a.agentIds, a.messageIds, true)),
   ),
 };
 

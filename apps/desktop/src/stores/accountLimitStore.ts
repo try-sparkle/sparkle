@@ -48,6 +48,12 @@ interface AccountLimitState {
   raise: (limit: AccountLimit) => void;
   /** Dismiss the current limit so it cannot re-raise. */
   dismiss: () => void;
+  /** Auto-switch has started migrating this account's agents onto a healthy one, so the manual
+   *  interruption is now moot — clear it (and record it dismissed so it cannot re-raise for this same
+   *  episode). Distinct from {@link dismiss} in INTENT — the machine resolved it, not the user — but
+   *  it shares the effect. Only a modal that is actually ABOUT `accountId` is cleared; a limit on a
+   *  different account is a different problem auto-switch did not touch, so it stands. */
+  resolveByAutoSwitch: (accountId: string) => void;
 }
 
 export const useAccountLimitStore = create<AccountLimitState>((set, get) => ({
@@ -65,7 +71,36 @@ export const useAccountLimitStore = create<AccountLimitState>((set, get) => ({
     next.add(limitKey(current));
     set({ current: null, dismissed: next });
   },
+  resolveByAutoSwitch: (accountId) => {
+    const { current, dismissed } = get();
+    if (current == null || current.accountId !== accountId) return;
+    const next = new Set(dismissed);
+    next.add(limitKey(current));
+    set({ current: null, dismissed: next });
+  },
 }));
+
+/** Raise the modal for a fresh batch of exhaustions ONLY when auto-switch cannot rescue the fleet.
+ *
+ *  The manual modal and `useAccountSwitch` are two answers to ONE event, and this store's own header
+ *  says the modal is the FALLBACK — "the case neither covers … there may be nowhere to switch TO".
+ *  Nothing enforced that: `useLimitSync` raised it unconditionally the instant `syncLimitsOnce`
+ *  benched an account, so with auto-switch ON and a healthy target available, the founder still got
+ *  the "log in to another account" interruption while the automation was already migrating the fleet
+ *  onto that target — the exact complaint this addresses.
+ *
+ *  `autoSwitchWillHandle` is the caller's answer to "does a healthy, signed-in, different-identity
+ *  account exist to move to" (in `useLimitSync`, `switchRecommendation(...) != null` — the SAME
+ *  oracle auto-switch acts on). When true, surfacing the modal asks the founder to do by hand what
+ *  the automation is doing for him, so stay silent. When false — genuinely nowhere to go — the modal
+ *  is the only signal left and must show, so this falls through to {@link raiseFirstLimit}. */
+export function raiseFirstLimitUnlessAutoSwitchHandles(
+  applied: readonly AccountLimit[],
+  autoSwitchWillHandle: boolean,
+): void {
+  if (autoSwitchWillHandle) return;
+  raiseFirstLimit(applied);
+}
 
 /** Raise the FIRST of a batch of freshly-applied exhaustions.
  *

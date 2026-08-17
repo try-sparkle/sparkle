@@ -1477,7 +1477,13 @@ export function AgentSidebar({
     void (async () => {
       await Promise.all(kills);
       for (const cid of allIds) {
-        await removeAgentWorkspace(project.rootPath, project.id, cid).catch(() => {});
+        // `snapshotWip` — the comment above says these branches are intentionally kept because this
+        // is the "Save" outcome, and that promise is only half-kept while the worktrees' UNCOMMITTED
+        // edits are deleted with them. Committing first makes the kept branch hold what the user was
+        // told was saved (bead sparkle-ovzoj, roborev 64446).
+        await removeAgentWorkspace(project.rootPath, project.id, cid, {
+          snapshotWip: true,
+        }).catch(() => {});
       }
     })();
   };

@@ -147,6 +147,18 @@ export interface BeadLink {
   linkType: string;
 }
 
+/** One comment on a bead — the READ half of the comment feature (the write is {@link beadsComment}).
+ *
+ *  `author` and `createdAt` are `T | null`, NOT `T?`: they are backed by a Rust `Option`, which serde
+ *  emits as an explicit `null` value (never an absent key), and bd itself always includes the keys.
+ *  A comment whose `author` is null is a real comment with no recorded author, not a missing field. */
+export interface BeadComment {
+  id: string;
+  author: string | null;
+  text: string;
+  createdAt: string | null;
+}
+
 /** A bead plus its immediate neighbourhood. */
 export interface BeadDetail {
   bead: BeadSummary;
@@ -158,6 +170,10 @@ export interface BeadDetail {
   dependencies: BeadLink[];
   /** What depends on this bead. */
   dependents: BeadLink[];
+  /** The bead's comment thread, oldest-first. Populated only on this per-open detail read — the
+   *  board's 5s list poll never carries comments (it would pull every bead's whole thread against a
+   *  contended store on every tick). */
+  comments: BeadComment[];
   /** True when the link lists were cut at 100. */
   linksTruncated: boolean;
 }

@@ -886,13 +886,118 @@ const DELETING_BINARIES = new Set(["rm", "unlink", "shred", "srm", "truncate"]);
  *  a REGRESSION against the plain-wrapper path, which resolved the same tail to `rm` and blocked it.
  *  So: stop at `--`, and stop at the first word that is neither an option nor a `NAME=value`
  *  assignment (that word is the command). */
-function envSplitString(args) {
+/** env's short options that take a VALUE (attached `-uNAME` or separate `-u NAME`). GNU contributes
+ *  `u`/`C`/`a`(=--argv0)/`S`; BSD/macOS — the platform this guard actually runs on — adds `P altpath`
+ *  and `L`/`U user`. A letter missing from here is walked as a boolean, so the `S` inside its
+ *  attached value is read as `-S`: that is precisely the `-uSHELL` HIGH, and `-a`/`-P` reproduced it
+ *  byte for byte. Booleans (`i`, `0`, `v`) must NOT be listed — see the arity warning below. */
+const ENV_VALUE_SHORT = new Set(["u", "C", "a", "P", "L", "U"]);
+
+/** Long options taking a REQUIRED argument: `--opt=V` or `--opt V`. */
+const ENV_VALUE_LONG = ["--unset", "--chdir", "--argv0"];
+
+/** Long options taking an OPTIONAL argument, which getopt_long only ever accepts ATTACHED
+ *  (`--block-signal=SIG`). It never consumes a separate word, so treating these like the required
+ *  set ate the nested command word — `env --block-signal rm -rf {}` resolved to the binary `{}` and
+ *  allowed a real `rm -rf` over `/`. */
+const ENV_OPTIONAL_LONG = ["--block-signal", "--ignore-signal", "--default-signal"];
+
+/** ARITY MISTAKES CUT BOTH WAYS, and both ways end in ALLOW: fail to skip a real value and the value
+ *  is read as the command word; skip a word that was not a value and the COMMAND is eaten. Five
+ *  successive regressions on this rule were one or the other, each fixed by teaching the parser one
+ *  more option spelling — and each time another spelling was already waiting.
+ *
+ *  So the parser no longer has to be RIGHT, only COMPLETE: every separate-word value is consumed AND
+ *  its non-consuming reading is recorded as an alt, and every reading is judged. No word list is
+ *  privileged and no reading is dropped. Safety comes from ADDITIVITY rather than from guessing the
+ *  grammar — which matters because GNU and BSD env genuinely disagree about what the grammar is.
+ */
+
+/** Total `env` readings judged per top-level command, and the refusal for when it runs out.
+ *
+ *  A bound is needed: `alts` are SUFFIXES of one vector, and an alt's own command word can be `env`
+ *  again, so nesting multiplies width while `MAX_NESTING` bounds only depth.
+ *
+ *  But the bound must FAIL CLOSED, and the first attempt did the exact opposite. It silently
+ *  TRUNCATED the reading list, and because alts are recorded left to right the entries it dropped
+ *  were the SHORTEST suffixes — the most plausible real commands. Seven no-op `-u` pads were then
+ *  enough to push the one destructive reading off the end, so
+ *  `env -u A ... -u G --unset sh -c 'rm -rf /'` was ALLOWED while the same command unpadded blocked.
+ *  A cap an attacker can pad past is not a cap; exhausting this budget REFUSES instead. */
+const ENV_READING_BUDGET = 512;
+let envReadingsLeft = ENV_READING_BUDGET;
+const ENV_BUDGET_VERDICT = {
+  rule: "env",
+  why: "too many option-arity readings to judge — refusing rather than guessing which one runs",
+};
+
+/** Distinct token lists, MOST SPECIFIC FIRST. Nothing is dropped: the shortest suffix is the
+ *  likeliest real command so it is judged first, and the budget refuses rather than truncating. */
+function envDedupeReadings(lists) {
+  const seen = new Set();
+  const out = [];
+  for (const t of lists) {
+    const k = t.join("\u0000"); // NUL cannot occur in argv, so it cannot collide
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  return out;
+}
+
+/** The token lists `env` ultimately runs — the ONE implementation both callers use.
+ *
+ *  This exists because a second, weaker reader is what caused the whole `env` saga: `commandTailFrom`
+ *  matches value flags as exact tokens, and while `execTailDeleter` was taught the real option
+ *  grammar, `judgeSegment` kept using the weak reader. So every spelling fixed for `find -exec`
+ *  stayed ALLOW when `env` was the command word itself — `env -S 'rm -rf /'` among them, which is a
+ *  plainer and more reachable spelling than any of the `find` ones. Two readers of one question, two
+ *  answers, and the fixture suite could not see it because every `env` case was wrapped in `find`. */
+function envRunTokenLists(args) {
+  const parsed = envParse(args);
+  const alts = parsed.alts ?? [];
+  const ordered = [...alts].reverse(); // shortest suffix = likeliest real command
+  if (parsed.kind === "tail") return envDedupeReadings([parsed.tail, ...ordered]);
+  const segs = lexCommand(stripHeredocBodies(parsed.str));
+  if (segs.length === 0) return envDedupeReadings([parsed.rest, ...ordered]);
+  // Operands after the flag continue the LAST segment of the split string.
+  return envDedupeReadings([
+    ...segs.map((s, k) => (k === segs.length - 1 ? [...s, ...parsed.rest] : s)),
+    ...ordered,
+  ]);
+}
+
+/** Parse `env`'s OWN option prefix and say what it ultimately runs. Either:
+ *    `{ kind: "split", str, rest }` — `env -S '<command line>' [operands]`
+ *    `{ kind: "tail", tail }`       — the nested command's own words
+ *
+ *  Returning the tail here (rather than falling back to the generic `commandTailFrom`) is what makes
+ *  the two shapes agree. `commandTailFrom` matches value-taking flags as EXACT TOKENS, so it cannot
+ *  skip a bundled or attached value — and every value it fails to skip is then read as the nested
+ *  command word, which reports a real `rm` as some harmless binary.
+ *
+ *  The cluster is walked LETTER BY LETTER for the same reason. Searching for an `S` anywhere in the
+ *  word matched the `S` inside an ATTACHED value: `env -uSHELL rm -rf {}` parsed as the command
+ *  `HELL rm -rf {}`, so a real `rm -rf` at an unbounded root came back a non-deleter. That shipped —
+ *  it is the third regression of this exact class on this rule, each one an option-parsing shortcut
+ *  that happened to match something belonging to the nested command. Hence: consume `-u`/`-C`'s value
+ *  (rest of the word, else the next word) and stop reading that word as options. */
+function envParse(args) {
+  // Every separate word we SKIP as an option value is also a candidate command word, and `alts`
+  // records that reading so both can be judged. GNU and BSD env do not agree on the option set —
+  // BSD has no `--unset` at all (`usage: env [-0iv] [-C workdir] [-P utilpath] [-S string]`), and
+  // measured on macOS, `env --unset sh -c '…'` really does execute `sh -c '…'`. One grammar cannot
+  // be right for both platforms, so ambiguity is made ADDITIVE rather than guessed: judge each
+  // reading and refuse if any is destructive. That cannot over-refuse in practice, because the
+  // alternative reading of a genuine value (`env -u NODE_OPTIONS pnpm test` → `NODE_OPTIONS …`)
+  // has a command word that matches no rule.
+  const alts = [];
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
-    if (a === "--") return null; // end of env's own options; everything after is the command
+    if (a === "--") return { kind: "tail", tail: args.slice(i + 1), alts };
     if (!a.startsWith("-") || a === "-") {
       if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(a)) continue; // NAME=value is still env's own
-      return null; // the command word — env carried no -S
+      return { kind: "tail", tail: args.slice(i), alts }; // the command word
     }
     if (a.startsWith("--")) {
       // getopt_long takes `--opt=value`, `--opt value`, and unambiguous abbreviations.
@@ -900,24 +1005,42 @@ function envSplitString(args) {
       const name = eq === -1 ? a : a.slice(0, eq);
       if (name.length > 2 && "--split-string".startsWith(name)) {
         return eq === -1
-          ? { str: args[i + 1] ?? "", rest: args.slice(i + 2) }
-          : { str: a.slice(eq + 1), rest: args.slice(i + 1) };
+          ? { kind: "split", str: args[i + 1] ?? "", rest: args.slice(i + 2), alts }
+          : { kind: "split", str: a.slice(eq + 1), rest: args.slice(i + 1), alts };
       }
-      continue; // some other long option
+      // Optional-argument options are matched FIRST and consume nothing: `--block-signal` never
+      // takes a separate word, so falling through to the required set would eat the command.
+      if (eq === -1 && name.length > 2 && ENV_OPTIONAL_LONG.some((o) => o.startsWith(name))) continue;
+      if (eq === -1 && name.length > 2 && ENV_VALUE_LONG.some((o) => o.startsWith(name))) {
+        alts.push(args.slice(i + 1)); // the reading where this option takes NO separate value
+        i++;
+      }
+      continue;
     }
-    // A short cluster: `-S`, `-S<str>`, and bundled forms like `-iS` / `-vS<str>`. Everything left
-    // of the `S` is an ordinary boolean option letter.
-    const sAt = a.indexOf("S", 1);
-    if (sAt !== -1) {
-      const after = a.slice(sAt + 1);
-      return after.length
-        ? { str: after, rest: args.slice(i + 1) }
-        : { str: args[i + 1] ?? "", rest: args.slice(i + 2) };
+    let valueIsNextWord = false;
+    for (let k = 1; k < a.length; k++) {
+      const c = a[k];
+      if (c === "S") {
+        const after = a.slice(k + 1);
+        return after.length
+          ? { kind: "split", str: after, rest: args.slice(i + 1), alts }
+          : { kind: "split", str: args[i + 1] ?? "", rest: args.slice(i + 2), alts };
+      }
+      if (ENV_VALUE_SHORT.has(c)) {
+        // Whatever follows in this word is this option's VALUE, not more option letters. If the
+        // word ends here the value is the next word — consumed unconditionally, with the
+        // non-consuming reading recorded as an alt just below, so neither reading is privileged.
+        valueIsNextWord = k + 1 >= a.length;
+        break;
+      }
+      // otherwise an ordinary boolean option letter (`-i`, `-v`, `-0`) — keep walking the cluster
     }
-    // `-u NAME` / `-C DIR` take a separate value; skip it so it cannot be read as the command word.
-    if (a === "-u" || a === "-C") i++;
+    if (valueIsNextWord) {
+      alts.push(args.slice(i + 1)); // the reading where this option takes NO separate value
+      i++;
+    }
   }
-  return null;
+  return { kind: "tail", tail: [], alts };
 }
 
 /** The deleting binary an exec tail ultimately runs, or null.
@@ -937,19 +1060,12 @@ function execTailDeleter(tail, depth = 0) {
     // unwrapped like an operand tail — the generic unwrap treats `-S` as taking an opaque value
     // and returns an empty tail, which reads as "nothing was exec'd" and allows the laundering.
     if (seg.bin === "env") {
-      const split = envSplitString(seg.args);
-      if (split !== null) {
-        const segs = lexCommand(stripHeredocBodies(split.str));
-        if (segs.length === 0) return execTailDeleter(split.rest, depth + 1);
-        for (let k = 0; k < segs.length; k++) {
-          // The operands after the flag continue the LAST segment of the split string, so that
-          // `env -S 'sh -c' 'rm "$@"' _ {}` is judged as the `sh -c 'rm "$@"' _ {}` it really runs.
-          const toks = k === segs.length - 1 ? [...segs[k], ...split.rest] : segs[k];
-          const inner = execTailDeleter(toks, depth + 1);
-          if (inner) return inner;
-        }
-        return null;
+      for (const toks of envRunTokenLists(seg.args)) {
+        if (envReadingsLeft-- <= 0) return "rm"; // budget exhausted: refuse, never fall through
+        const inner = execTailDeleter(toks, depth + 1);
+        if (inner) return inner;
       }
+      return null;
     }
     seg = segmentCommand(commandTailFrom(seg.args, WRAPPER_VALUE_FLAGS[seg.bin]));
   }
@@ -1415,6 +1531,7 @@ const NESTING_WRAPPERS = new Set(["xargs", "time", "nohup", "env", "nice", "stdb
 export function blocksDestructiveCommand(command, depth = 0) {
   if (typeof command !== "string" || command.length === 0) return null;
   if (depth > MAX_NESTING) return null;
+  if (depth === 0) envReadingsLeft = ENV_READING_BUDGET; // per top-level command, so nesting cannot multiply past it
   let sawDownloader = false;
   for (const tokens of lexCommand(stripHeredocBodies(command))) {
     const seg = segmentCommand(tokens);
@@ -1481,7 +1598,37 @@ function judgeSegment(tokens, depth) {
         if (nested) return nested;
       }
     }
-    if (NESTING_WRAPPERS.has(bin)) {
+    if (bin === "env") {
+      // `env` gets the REAL option grammar, not `commandTailFrom`'s exact-token flag set — the same
+      // reader `find -exec` uses. Using the weak one here left `env -S 'rm -rf /'` allowed at top
+      // level long after the `find -exec` spelling of it was closed.
+      const parsed = envParse(args);
+      if (parsed.kind === "split") {
+        // `-S` carries a whole COMMAND LINE, so it goes through the FULL judge: pipe-to-shell is a
+        // CROSS-SEGMENT rule living only in `blocksDestructiveCommand`. This used to run only when
+        // no operands followed, so appending one harmless word skipped it —
+        // `env -S 'curl … | bash' x` was allowed while the same string without the `x` blocked.
+        if (envReadingsLeft-- <= 0) return ENV_BUDGET_VERDICT;
+        const whole = blocksDestructiveCommand(parsed.str, depth + 1);
+        if (whole) return whole;
+        // Only the readings that judge did NOT already cover: the last segment with the trailing
+        // operands attached, plus the alternative option-arity readings. Re-walking every segment
+        // here would duplicate the full judge's work and burn the budget at ~2x on `-S` shapes.
+        const segs = lexCommand(stripHeredocBodies(parsed.str));
+        const last = segs.length ? [...segs[segs.length - 1], ...parsed.rest] : parsed.rest;
+        for (const toks of envDedupeReadings([last, ...[...(parsed.alts ?? [])].reverse()])) {
+          if (envReadingsLeft-- <= 0) return ENV_BUDGET_VERDICT;
+          const nested = judgeSegment(toks, depth + 1);
+          if (nested) return nested;
+        }
+      } else {
+        for (const toks of envRunTokenLists(args)) {
+          if (envReadingsLeft-- <= 0) return ENV_BUDGET_VERDICT;
+          const nested = judgeSegment(toks, depth + 1);
+          if (nested) return nested;
+        }
+      }
+    } else if (NESTING_WRAPPERS.has(bin)) {
       const nested = judgeSegment(commandTailFrom(args, WRAPPER_VALUE_FLAGS[bin]), depth + 1);
       if (nested) return nested;
     }

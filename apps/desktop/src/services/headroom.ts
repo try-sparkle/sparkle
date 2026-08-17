@@ -94,11 +94,14 @@ export interface SwitchRecommendation {
   /** `from`'s position against its learned ceiling (null when it's already exhausted with no
    *  ceiling learned — the recommendation still stands, we just can't quantify it). */
   fraction: number | null;
-  /** Why we're recommending. ONLY `"exhausted"` now: a recommendation is made solely for an account
-   *  that has hit a real, OBSERVED rate limit. The learned-ceiling `"approaching"` estimate was
-   *  retired as a driver (founder's call), so the union is narrowed to the single reachable value —
-   *  the compiler then flags any stale `"approaching"` branch rather than letting a producer emit a
-   *  reason the formatter would silently mislabel as "has hit its limit". */
+  /** Why we're recommending. ONLY `"exhausted"` — read as "out of room by an AUTHORITATIVE signal",
+   *  which is now either the observed rate-limit wall OR real Anthropic utilization (weekly/session)
+   *  at/above {@link LIVE_AVOID_PERCENT}; see the trigger in {@link switchRecommendation}. What stays
+   *  excluded is the learned-ceiling `"approaching"` ESTIMATE, retired as a driver (founder's call) —
+   *  narrowing the union to this single reachable value makes the compiler flag any stale
+   *  `"approaching"` branch rather than letting a producer emit a reason the formatter would silently
+   *  mislabel as "has hit its limit". Both authoritative signals mean the fleet cannot keep working on
+   *  `from`, which is exactly what "has hit its limit. Switch to X to keep working." states. */
   reason: "exhausted";
 }
 
@@ -172,21 +175,36 @@ export function switchRecommendation(
   const liveById = new Map(live.map((l) => [l.id, l]));
   const byId = new Map(assessHeadroom(usage, ceilings, now).map((h) => [h.accountId, h]));
   const current = byId.get(currentAccountId);
-  // OBSERVED WALL ONLY. A recommendation is now made solely when `from` has hit a REAL rate limit
-  // (`exhaustedUntil` in the future — the authoritative `exhausted` state), never off the LEARNED
-  // CEILING estimate (the `warn` state, `tokens5h/ceiling >= WARN_FRACTION`). The founder's call:
-  // the estimate screamed "90% of its usual limit, close to the wall" on the account card while the
-  // real Anthropic session/weekly numbers beside it read comfortably clear, so a proactive
-  // "approaching" nudge off that guess pointed the user away from a healthy account. The estimate is
-  // not available on this poll path (the real Anthropic figures need a per-account keychain read +
-  // network round-trip, deliberately kept out of the 120s headroom loop), so rather than nudge off a
-  // number that has misfired we act only on the fact — the observed wall — which
-  // `useAccountSwitch` already migrates the fleet on automatically. See `describeRecommendation`.
-  if (!current || current.state !== "exhausted") return null;
+  if (!current) return null;
 
   const signedIn = new Set(signedInAccountIds(identities));
-  // ONE login grouping, shared by the same-login exclusion and the PER-LOGIN live check below.
+  // ONE login grouping, shared by the same-login exclusion, the current-account spend test below, and
+  // the PER-LOGIN live check on candidates.
   const siblingIds = loginSiblingIds(accounts, identities);
+
+  // TRIGGER on EITHER authoritative signal auto-pick already acts on for the CURRENT account — never
+  // the learned-ceiling ESTIMATE:
+  //
+  //   * the OBSERVED WALL — a REAL rate-limit event, `exhaustedUntil` in the future (`state ===
+  //     "exhausted"`); OR
+  //   * real Anthropic utilization at/above LIVE_AVOID_PERCENT — its OWN number, WEEKLY or session,
+  //     judged per login ({@link loginLiveWorstPercent}), the SAME test used to EXCLUDE a target just
+  //     below and the SAME one `partitionAccounts`/`exhaustionOutlook` gate spawns on.
+  //
+  // The WEEKLY cap is the case this second arm closes (bead sparkle-hbyae): an account at 100% of its
+  // 7-day limit with its 5-HOUR SESSION at 0% never records a session rate-limit event, so its
+  // `exhaustedUntil` stays null and `state` never becomes "exhausted" — yet the fleet running on it is
+  // just as walled, refused by Anthropic until the weekly window resets (up to a day). Before this,
+  // the live weekly signal excluded that account as a spawn TARGET but never moved the fleet OFF it,
+  // so the migration the founder had auto-switch ON for silently did not fire and he activated a
+  // healthy account by hand. Reading Anthropic's own number here is consistent with the design's
+  // treatment of it as authoritative (`exhaustionOutlook`: "all at their limit" already counts a
+  // live-spent account); the retired driver was the learned-ceiling GUESS (`warn`), which still never
+  // triggers — it only ranks a target last.
+  const currentLiveWorst = loginLiveWorstPercent(currentAccountId, liveById, siblingIds) ?? 0;
+  const currentIsSpent = current.state === "exhausted" || currentLiveWorst >= LIVE_AVOID_PERCENT;
+  if (!currentIsSpent) return null;
+
   const sameLoginAsFrom = new Set(
     (siblingIds.get(currentAccountId) ?? []).filter((id) => id !== currentAccountId),
   );

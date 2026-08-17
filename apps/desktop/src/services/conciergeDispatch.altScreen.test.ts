@@ -31,8 +31,19 @@ import { submitPrompt, writePtyChainedStrict } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { getAgentViewport } from "./terminalViewport";
-import { dispatchConciergeAnswer, flushScreenHeldSends } from "./conciergeDispatch";
-import { resetScreenHeldSends } from "./screenHoldQueue";
+import {
+  abandonScreenHeldSends,
+  dispatchConciergeAnswer,
+  flushScreenHeldSends,
+  onDeferredSendOutcome,
+  sweepExpiredScreenHeldSends,
+} from "./conciergeDispatch";
+import {
+  MAX_AGE_MS,
+  MAX_PER_AGENT,
+  queueScreenHeldSend,
+  resetScreenHeldSends,
+} from "./screenHoldQueue";
 
 const AGENT = "agent-1";
 /** A real gesture, so the authority gate (which runs first) is never what refuses here. */
@@ -579,5 +590,355 @@ describe("a mounted send holds instead of refusing, when asked to", () => {
     expect(r.ok).toBe(false);
     expect(r.path).toBe("alternate-screen");
     expectNothingWritten();
+  });
+
+  // roborev 64236's Medium: every outcome a screen hold produces carries `heldReason: "screen"`,
+  // which is what lets a deferred-outcome reader (ConciergeHost) tell it apart from a PTY-not-ready
+  // hold and say something true — the agent DID come up; it was its screen that was busy.
+  it("tags every emitted outcome with heldReason: \"screen\"", async () => {
+    onFullScreenApp();
+    const held = await dispatchConciergeAnswer(AGENT, "carry on", MOUNT_OPTS);
+    expect(held.heldReason).toBe("screen");
+
+    atAPrompt();
+    const [flushed] = await flushScreenHeldSends(AGENT);
+    expect(flushed?.heldReason).toBe("screen");
+  });
+
+  // roborev 64268's Medium: the ONE emit site that got missed — a hold pruned from the queue for
+  // being stale (not the live-count `queue-full` refusal, but genuinely aged past MAX_AGE_MS) still
+  // has to say `heldReason: "screen"`, or ConciergeHost's deferred-outcome reader falls back to the
+  // PTY-not-ready wording ("never came up… Send it again when it's running") for a hold whose agent
+  // is up and whose screen the founder is looking at.
+  it("tags a prune-dropped hold's outcome with heldReason too", async () => {
+    onFullScreenApp();
+    // Seeded directly (rather than aged by real time) — a stale entry already sitting in this
+    // agent's queue when the next hold is queued.
+    queueScreenHeldSend({
+      agentId: AGENT,
+      text: "stale",
+      userPrompt: true,
+      humanAuthored: true,
+      at: 0,
+    });
+    const outcomes: Array<{ path: string; heldReason?: string }> = [];
+    const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+    await dispatchConciergeAnswer(AGENT, "fresh", MOUNT_OPTS);
+    unsubscribe();
+    expect(outcomes).toEqual([
+      expect.objectContaining({ path: "expired", heldReason: "screen" }),
+    ]);
+  });
+
+  // ══ ONE DELIVERY PER FLUSH, NEVER A BATCH (roborev 64268's Medium) ═══════════════════════════
+  // A prior version tried to re-check the viewport SYNCHRONOUSLY between writes within one flush
+  // call, to stop a second held message pasting into a dialog the first write opened. That cannot
+  // work: `submitPrompt`'s `await` resolves once the PTY has ACCEPTED the write, not once the
+  // agent has processed it and xterm has redrawn — a dialog the first write raises appears well
+  // after any synchronous re-read would have already passed, so the "re-check" would see the same
+  // clear screen the caller already confirmed and paste into the dialog anyway. The actual fix is
+  // simpler: deliver AT MOST ONE due entry per call, full stop, and let
+  // hooks/useScreenHoldDrain's real 1500ms poll — which re-reads the viewport from scratch on its
+  // own tick, giving the terminal genuine time to redraw — decide whether the next one is safe.
+  it("delivers only the first due entry per flush, re-queuing the rest for the next poll tick", async () => {
+    onFullScreenApp();
+    await dispatchConciergeAnswer(AGENT, "first message", MOUNT_OPTS);
+    await dispatchConciergeAnswer(AGENT, "second message", MOUNT_OPTS);
+    expectNothingWritten();
+
+    atAPrompt();
+    const results = await flushScreenHeldSends(AGENT);
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+    expect(submitPrompt).toHaveBeenCalledWith(AGENT, "first message", expect.anything());
+    expect(results.map((r) => r.sent)).toEqual(["first message"]);
+
+    // The second message is still queued, not lost or reordered — a later flush (the next poll
+    // tick, in production) delivers it.
+    const [redelivered] = await flushScreenHeldSends(AGENT);
+    expect(redelivered?.ok).toBe(true);
+    expect(submitPrompt).toHaveBeenLastCalledWith(AGENT, "second message", expect.anything());
+  });
+
+  // ══ A THIRD MESSAGE ARRIVING MID-AWAIT MUST NOT JUMP THE RE-QUEUED ONE (roborev 64268's Medium)
+  // `takeScreenHeldSends` empties this agent's queue at the top of the flush, so anything queued
+  // by a SEPARATE `dispatchConciergeAnswer` call while the first write is in flight lands in a
+  // fresh queue — and the re-queue of the older, still-due entry happens only AFTER that await
+  // returns. A plain append would therefore put the newer arrival ahead of the older one,
+  // delivering a follow-up before the message it follows. Driven through the real entry points
+  // (`dispatchConciergeAnswer` queuing, `flushScreenHeldSends` draining) rather than the pure
+  // queue function directly, per this file's own header: a held message must be WRITTEN in the
+  // right order, not merely accepted.
+  it("does not let a message queued mid-flush jump ahead of one re-queued from the same flush", async () => {
+    vi.useFakeTimers();
+    try {
+      onFullScreenApp();
+      vi.setSystemTime(1000);
+      await dispatchConciergeAnswer(AGENT, "first message", MOUNT_OPTS);
+      vi.setSystemTime(2000);
+      await dispatchConciergeAnswer(AGENT, "second message", MOUNT_OPTS);
+      expectNothingWritten();
+
+      // Gate the first write so it stays "in flight" (PTY-accepted, not yet resolved) exactly as
+      // long as this test needs — real `submitPrompt` behaves the same way: its promise resolves
+      // once the write is handed to the PTY, independent of whatever else queues in the meantime.
+      let resolveFirstWrite: () => void = () => {};
+      const firstWriteGate = new Promise<void>((resolve) => {
+        resolveFirstWrite = resolve;
+      });
+      vi.mocked(submitPrompt).mockImplementationOnce(async () => {
+        await firstWriteGate;
+      });
+
+      // `flushScreenHeldSends` runs synchronously up to its `await submitPrompt(...)`, which is
+      // where it suspends on the gate above — so by the time this line returns control, the queue
+      // has already been taken (emptied) and the first write is in flight.
+      const flushPromise = flushScreenHeldSends(AGENT);
+
+      // A third message arrives from a SEPARATE dispatch call while the first write is still
+      // pending — it queues into the now-empty queue, at a LATER system time than "second".
+      vi.setSystemTime(3000);
+      await dispatchConciergeAnswer(AGENT, "third message", MOUNT_OPTS);
+
+      // Now let the first write resolve. `flushScreenHeldSends` re-queues "second" (at 2000) —
+      // the older, still-due entry from THIS flush — after "third" (at 3000) already occupies the
+      // queue. The fix must put "second" back ahead of it.
+      resolveFirstWrite();
+      await flushPromise;
+
+      atAPrompt();
+      const [redelivered1] = await flushScreenHeldSends(AGENT);
+      expect(submitPrompt).toHaveBeenLastCalledWith(AGENT, "second message", expect.anything());
+      expect(redelivered1?.sent).toBe("second message");
+
+      const [redelivered2] = await flushScreenHeldSends(AGENT);
+      expect(submitPrompt).toHaveBeenLastCalledWith(AGENT, "third message", expect.anything());
+      expect(redelivered2?.sent).toBe("third message");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ══ ABANDONMENT DURING AN IN-FLIGHT FLUSH MUST NOT RESURRECT ANYTHING (roborev 64289's Medium)
+  // `takeScreenHeldSends` empties the queue before the `await submitPrompt`. If the pane is
+  // abandoned (torn down, spawn gave up) WHILE that write is in flight, `abandonScreenHeldSends`
+  // finds an already-empty queue and reports nothing — and re-queuing the rest afterward would
+  // resurrect it into a dead agent's queue, or a relaunch's under the same id that the founder
+  // never typed into. Driven through the real entry points, per this file's own header.
+  it("does not resurrect the rest of a flush's due entries if the agent is abandoned mid-flush", async () => {
+    onFullScreenApp();
+    await dispatchConciergeAnswer(AGENT, "first message", MOUNT_OPTS);
+    await dispatchConciergeAnswer(AGENT, "second message", MOUNT_OPTS);
+    expectNothingWritten();
+
+    let resolveFirstWrite: () => void = () => {};
+    const firstWriteGate = new Promise<void>((resolve) => {
+      resolveFirstWrite = resolve;
+    });
+    vi.mocked(submitPrompt).mockImplementationOnce(async () => {
+      await firstWriteGate;
+    });
+
+    const flushPromise = flushScreenHeldSends(AGENT);
+    const outcomes: Array<{ path: string; heldReason?: string }> = [];
+    const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+
+    // The pane tears down while the first write is still in flight — its screen hold queue is
+    // already empty (this flush took it), so the abandon call itself reports nothing.
+    abandonScreenHeldSends(AGENT);
+    expect(outcomes).toEqual([]);
+
+    resolveFirstWrite();
+    const results = await flushPromise;
+    unsubscribe();
+
+    // The already-in-flight first write still lands (it cannot be recalled) and reports normally;
+    // "second message" must be reported abandoned, NOT silently re-queued for a dead agent.
+    expect(outcomes).toEqual([
+      expect.objectContaining({ path: "free-text", ok: true, sent: "first message" }),
+      expect.objectContaining({ path: "abandoned", heldReason: "screen", sent: "second message" }),
+    ]);
+    expect(results.map((r) => r.sent)).toEqual(["first message"]);
+
+    // And critically: nothing was resurrected into the queue. A later flush finds nothing due.
+    atAPrompt();
+    expect(await flushScreenHeldSends(AGENT)).toEqual([]);
+    expect(submitPrompt).toHaveBeenCalledTimes(1);
+  });
+
+  // ══ A NON-PtyGoneError THROW MUST NOT STRAND THE REST OF THE FLUSH (roborev 64312's Medium) ══
+  // `takeScreenHeldSends` empties the queue before the write; if `submitPrompt` throws anything
+  // other than `PtyGoneError`, the `try` around the first entry re-throws — and without a
+  // `finally` around the re-queue, the still-due `rest` would vanish with no re-queue and no
+  // outcome, an unobserved rejection on `useScreenHoldDrain`'s fire-and-forget caller.
+  it("still reinstates the rest of the flush when the first write throws an unrelated error", async () => {
+    onFullScreenApp();
+    await dispatchConciergeAnswer(AGENT, "first message", MOUNT_OPTS);
+    await dispatchConciergeAnswer(AGENT, "second message", MOUNT_OPTS);
+    expectNothingWritten();
+
+    vi.mocked(submitPrompt).mockImplementationOnce(async () => {
+      throw new Error("ipc hiccup");
+    });
+    await expect(flushScreenHeldSends(AGENT)).rejects.toThrow("ipc hiccup");
+
+    // "second message" survived the throw — reinstated, not stranded.
+    atAPrompt();
+    const [redelivered] = await flushScreenHeldSends(AGENT);
+    expect(redelivered?.sent).toBe("second message");
+    expect(redelivered?.ok).toBe(true);
+  });
+
+  // ══ THE queue-full / expired CALLBACKS ARE WIRED THROUGH THE REAL FLUSH (roborev 64312's
+  // Medium) — driven through dispatchConciergeAnswer/flushScreenHeldSends, not by calling
+  // reinstateScreenHeldSends directly, so a dropped or `undefined`-callback regression at the
+  // conciergeDispatch.ts call site would fail this test even though screenHoldQueue.test.ts and
+  // the ConciergeHost copy test both stay green (the exact "wired nowhere" gap the finding named).
+  it("reports queue-full for the entry crowded out when a flush's re-queue overflows the cap", async () => {
+    vi.useFakeTimers();
+    try {
+      onFullScreenApp();
+      vi.setSystemTime(1000);
+      await dispatchConciergeAnswer(AGENT, "first message", MOUNT_OPTS);
+      vi.setSystemTime(2000);
+      await dispatchConciergeAnswer(AGENT, "second message", MOUNT_OPTS);
+      expectNothingWritten();
+
+      let resolveFirstWrite: () => void = () => {};
+      const firstWriteGate = new Promise<void>((resolve) => {
+        resolveFirstWrite = resolve;
+      });
+      vi.mocked(submitPrompt).mockImplementationOnce(async () => {
+        await firstWriteGate;
+      });
+      const flushPromise = flushScreenHeldSends(AGENT);
+
+      // Fill the (now-empty, taken) queue to the cap with mid-flush arrivals — all newer than
+      // "second message", which the flush is holding to re-queue once the gate releases.
+      for (let i = 0; i < MAX_PER_AGENT; i++) {
+        vi.setSystemTime(3000 + i);
+        await dispatchConciergeAnswer(AGENT, `mid-flush-${i}`, MOUNT_OPTS);
+      }
+
+      const outcomes: Array<{ path: string; heldReason?: string; sent?: string }> = [];
+      const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+      resolveFirstWrite();
+      await flushPromise;
+      unsubscribe();
+
+      // "second message" (the oldest) survives; the NEWEST mid-flush arrival is crowded out and
+      // reported — not silently dropped. The in-flight first write also reports normally.
+      expect(outcomes).toEqual([
+        expect.objectContaining({ path: "free-text", ok: true, sent: "first message" }),
+        expect.objectContaining({
+          path: "queue-full",
+          heldReason: "screen",
+          sent: `mid-flush-${MAX_PER_AGENT - 1}`,
+        }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reports expired for a stale mid-flush arrival pruned when a flush's re-queue runs", async () => {
+    vi.useFakeTimers();
+    try {
+      onFullScreenApp();
+      vi.setSystemTime(1000);
+      await dispatchConciergeAnswer(AGENT, "first message", MOUNT_OPTS);
+      vi.setSystemTime(2000);
+      await dispatchConciergeAnswer(AGENT, "second message", MOUNT_OPTS);
+      expectNothingWritten();
+
+      let resolveFirstWrite: () => void = () => {};
+      const firstWriteGate = new Promise<void>((resolve) => {
+        resolveFirstWrite = resolve;
+      });
+      vi.mocked(submitPrompt).mockImplementationOnce(async () => {
+        await firstWriteGate;
+      });
+      const flushPromise = flushScreenHeldSends(AGENT);
+
+      // A mid-flush arrival that is already, at the moment it queues, older than MAX_AGE_MS —
+      // seeded directly with a past `at` the way the existing sweep tests do.
+      queueScreenHeldSend({
+        agentId: AGENT,
+        text: "stale-mid-flush",
+        userPrompt: true,
+        humanAuthored: true,
+        at: 0,
+      });
+      // Advance real time past MAX_AGE_MS relative to that entry before the re-queue runs.
+      vi.setSystemTime(MAX_AGE_MS + 5000);
+
+      const outcomes: Array<{ path: string; heldReason?: string; sent?: string }> = [];
+      const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+      resolveFirstWrite();
+      await flushPromise;
+      unsubscribe();
+
+      expect(outcomes).toEqual([
+        expect.objectContaining({ path: "free-text", ok: true, sent: "first message" }),
+        expect.objectContaining({ path: "expired", heldReason: "screen", sent: "stale-mid-flush" }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  describe("sweepExpiredScreenHeldSends", () => {
+    it("reports and clears an expired hold without delivering it, while the screen is still blocked", async () => {
+      // `at: 0` (epoch) is already far more than MAX_AGE_MS behind the real Date.now() this runs
+      // against, so no clock mocking is needed to make it read as expired.
+      queueScreenHeldSend({
+        agentId: AGENT,
+        text: "stale",
+        userPrompt: true,
+        humanAuthored: true,
+        at: 0,
+      });
+      const outcomes: Array<{ ok: boolean; path: string }> = [];
+      const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+      sweepExpiredScreenHeldSends(AGENT);
+      unsubscribe();
+      expect(outcomes).toEqual([
+        expect.objectContaining({ ok: false, path: "expired", heldReason: "screen" }),
+      ]);
+      expectNothingWritten();
+    });
+
+    it("is a no-op when nothing has expired", () => {
+      const outcomes: unknown[] = [];
+      const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+      sweepExpiredScreenHeldSends(AGENT);
+      unsubscribe();
+      expect(outcomes).toEqual([]);
+    });
+  });
+
+  describe("abandonScreenHeldSends", () => {
+    it("reports every held send as abandoned and clears the queue", async () => {
+      queueScreenHeldSend({
+        agentId: AGENT,
+        text: "orphaned",
+        userPrompt: true,
+        humanAuthored: true,
+        at: 0,
+      });
+      const outcomes: Array<{ ok: boolean; path: string }> = [];
+      const unsubscribe = onDeferredSendOutcome((r) => outcomes.push(r));
+      abandonScreenHeldSends(AGENT);
+      unsubscribe();
+      expect(outcomes).toEqual([
+        expect.objectContaining({ ok: false, path: "abandoned", heldReason: "screen" }),
+      ]);
+      expectNothingWritten();
+      // Nothing left to flush — the queue was cleared, not merely reported.
+      expect(await flushScreenHeldSends(AGENT)).toEqual([]);
+    });
+
+    it("is a no-op when nothing is held", () => {
+      expect(() => abandonScreenHeldSends(AGENT)).not.toThrow();
+    });
   });
 });

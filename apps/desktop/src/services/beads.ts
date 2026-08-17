@@ -259,6 +259,35 @@ export function mergeShaOf(bead: Bead): string | null {
   return sha && sha.length > 0 ? sha : null;
 }
 
+/** Label prefix carrying a bead's SEVERITY — the weighted relevance score (human comments = 3,
+ *  machine = 1, decayed over a window), materialized as `sev-<N>` by the scoring pipeline. Stored as
+ *  a label for the same reason `merged-sha:` is: bd has no custom sortable field, and labels
+ *  round-trip through `list_beads`, so the board reads the score with no extra per-bead query.
+ *
+ *  SEVERITY IS NOT PRIORITY. Priority is the manual, dominant ordering (P0-P4); severity ranks WITHIN
+ *  a priority band and is written by automation. The two are deliberately separate axes — see the
+ *  design in `docs/superpowers/specs/2026-08-09-bead-comments-severity-design.md`. */
+export const SEVERITY_LABEL_PREFIX = "sev-";
+
+/** The severity score a bead carries (see {@link SEVERITY_LABEL_PREFIX}), or null when it has none —
+ *  which is the common case today (the score is materialized lazily and most beads have no comments),
+ *  and renders as NO badge rather than a zero. Pure.
+ *
+ *  Standardizes on the MAX of any `sev-<N>` labels present: a decaying score writes in both
+ *  directions, so a stale duplicate label is likelier than for a monotone counter, and max is the
+ *  one rule both score readers must share (per the design's "two readers, one rule"). A non-numeric
+ *  or negative suffix is ignored rather than read as 0. */
+export function severityOf(bead: Bead): number | null {
+  let max: number | null = null;
+  for (const label of bead.labels) {
+    if (!label.startsWith(SEVERITY_LABEL_PREFIX)) continue;
+    const n = Number(label.slice(SEVERITY_LABEL_PREFIX.length));
+    if (!Number.isFinite(n) || n < 0) continue;
+    if (max === null || n > max) max = n;
+  }
+  return max;
+}
+
 export type BoardColumn = "backlog" | "blocked" | "inProgress" | "done" | "delivered" | "archived";
 
 /** A closed bead carrying this label lands in "delivered" instead of "done". */

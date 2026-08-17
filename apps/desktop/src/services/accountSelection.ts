@@ -18,6 +18,7 @@ import {
   getPreferredAccountId,
   isAccountExhausted,
   signedInAccountIds,
+  signedInFilterApplies,
   loginSiblingIds,
   type Account,
   type Usage,
@@ -535,9 +536,13 @@ function firstUsableHolder(
   base: PickOptions,
   now: number = Date.now(),
 ): Account | undefined {
+  // `signedInFilterApplies`, not `signedInIds.length > 0` — see its doc comment. A reading whose
+  // only entries name accounts that no longer exist is NOT a usable signal, and counting it as one
+  // rejected every holder here while `partitionAccounts` was simultaneously opening the pool.
+  const applies = signedInFilterApplies(state.accounts, base.signedInIds);
   return holders.find(
     (a) =>
-      !(base.signedInIds && base.signedInIds.length > 0 && !base.signedInIds.includes(a.id)) &&
+      (!applies || base.signedInIds!.includes(a.id)) &&
       !isAccountExhausted(state.usage, a.id, now),
   );
 }
@@ -685,9 +690,14 @@ function usablePreferredAccount(
   // `oauthAccount` or could not be parsed. On such an install EVERY account reads "not signed in",
   // and a bare `includes` would silently drop the founder's choice on every spawn, permanently,
   // with the ledger recording a bland "auto". `partitionAccounts` already refuses to let an absent
-  // signal mean "nothing is usable" (`eligible = authed.length > 0 ? authed : accounts`); the gate
-  // degrades the same way, so the two cannot disagree about what an empty list means.
-  if (signedInIds.length > 0 && !signedInIds.includes(preferred)) return undefined;
+  // signal mean "nothing is usable"; the gate degrades the same way, so the two cannot disagree
+  // about what an empty list means. That agreement is now ENFORCED rather than asserted: both call
+  // `signedInFilterApplies`. They used to disagree — this gate keyed on raw length while
+  // `partitionAccounts` keyed on membership, so a reading holding only a STALE id (an identity that
+  // outlived its account row) read as "signal present" here and "no signal" there, and the
+  // preferred account was dropped on every spawn.
+  if (signedInFilterApplies(state.accounts, signedInIds) && !signedInIds.includes(preferred))
+    return undefined;
   if (isAccountExhausted(state.usage, preferred, now ?? Date.now())) return undefined; // (4)
   return preferred;
 }

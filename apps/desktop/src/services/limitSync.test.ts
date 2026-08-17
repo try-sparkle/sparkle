@@ -28,6 +28,21 @@ describe("pendingExhaustions", () => {
     expect(p?.until).not.toBe(AT + 4 * 3600_000);
   });
 
+  it("benches on a WEEKLY-limit event, not only a session one (bead sparkle-hbyae)", () => {
+    // The founder's account hit its WEEKLY limit while its session was fine. Benching keys on the
+    // parsed reset instant, not on the noun, so a weekly event marks the account exhausted exactly
+    // like a session one — the SIDE EFFECT `pickAccount` needs to route new work away from it.
+    const weekly: LimitEvent = {
+      accountId: "walled",
+      at: AT,
+      text: "You've hit your weekly limit · resets 4pm (America/Bogota)",
+    };
+    const [p] = pendingExhaustions([weekly], [], NOW);
+    expect(p?.accountId).toBe("walled");
+    expect(p!.until).toBeGreaterThan(NOW); // a real future bench, not the "already reset" no-op
+    expect(p!.until).not.toBe(AT + SESSION_WINDOW_MS); // parsed the reset, not the 5h fallback
+  });
+
   it("is idempotent — re-seeing the same event does not rewrite the flag", () => {
     const [first] = pendingExhaustions([REAL], [], NOW);
     expect(first).toBeDefined();

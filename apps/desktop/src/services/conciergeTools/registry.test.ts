@@ -210,6 +210,18 @@ function seedBuild(projectId: string): string {
   return id;
 }
 
+// `vi.clearAllMocks()` in the `beforeEach` below clears CALLS, not IMPLEMENTATIONS — a distinction
+// this file already documents at the history suite's own `afterEach`, and one that had to be
+// rediscovered once per leak. A test that installs an `invoke` implementation and returns without
+// restoring it therefore answers every test declared after it, which is inert until the day someone
+// adds a test below that happens to invoke the same command and silently gets the wrong fixture.
+// Resetting here makes that class of leak impossible rather than each instance remembered: it runs
+// even when a test fails early, and it costs nothing, because every test that needs an
+// implementation installs its own before it looks.
+afterEach(() => {
+  invoke.mockImplementation(async () => undefined);
+});
+
 beforeEach(() => {
   vi.clearAllMocks();
   // The pending-send queue is module-level state, so a spawn that queued a brief would otherwise
@@ -369,6 +381,133 @@ describe("dispatchConciergeTool — argument validation", () => {
       call({ domain: "workspace", op: "list_projects", args: undefined }),
     );
     expect(r.ok).toBe(true);
+  });
+
+  /**
+   * THE SCHEMA IS THE ONLY GATE BETWEEN AN LLM AND THE VERIFICATION PATH (sparkle-ei7keg).
+   *
+   * `fleet.inbox_send` now returns `verifyArgs: { agentIds, messageIds }` and tells the caller to
+   * hand them straight to `inbox_status` — but `inboxStatusArgs` is `.strict()`, so before
+   * `messageIds` was added to it the registry answered `bad-args` and the confirming call was
+   * UNREACHABLE through the only door a model has. The unit tests in `fleet.test.ts` call
+   * `inboxStatus` directly, BELOW the schema, so they would have stayed green with the feature
+   * completely inaccessible — the same shape as the `expectFingerprint` finding above.
+   *
+   * Asserts the SIDE EFFECT: the filter survives the strict schema and is applied over the
+   * `inbox_peek` view before the reply leaves the registry — and, because that is a claim about
+   * WHERE the filtering happens, the absence of `messageIds` on the wire is asserted too. Rust is
+   * handed `{ agentIds }` alone; narrowing is entirely client-side (`fleet.ts`), so a reader must
+   * not be left believing the backend honours the filter.
+   *
+   * The receipt is NOT hardcoded here. `verifyArgs` (fleet.ts) and `inboxStatusArgs` (registry.ts)
+   * are two independent declarations with no type coupling, so spelling the field names out in the
+   * test would let a rename break the paste-the-receipt path while this stayed green — the exact
+   * vacuous shape this suite exists to catch. Instead the test dispatches a real `inbox_send` and
+   * feeds its `verifyArgs` back through the registry VERBATIM.
+   */
+  it("carries inbox_status's messageIds filter through the schema to the per-message answer", async () => {
+    invoke.mockImplementation((async (cmd: string) => {
+      if (cmd === "inbox_send") return "m2";
+      if (cmd === "inbox_status")
+        // Consistent with `status_of` (inbox.rs): a CLAIMED message counts under `delivered` and is
+        // excluded from both `pending` and `pendingIds`, and `awaitingAck` is `delivered -
+        // acknowledged`. The peek below reports m1 pending and m2 delivered, so these counts must
+        // agree with it — a fixture modelling a state the backend cannot emit is the same
+        // "shape the wire cannot produce" defect the `ackedAt` note below guards against, and this
+        // is the fixture later filtered-status tests will copy.
+        return [
+          { agentId: "a1", pending: 1, delivered: 1, acknowledged: 0, awaitingAck: 1, pendingIds: ["m1"] },
+        ];
+      if (cmd === "inbox_peek")
+        return [
+          {
+            agentId: "a1",
+            entries: [
+              // `ackedAt`/`ackNote` are `null`, not absent: they back a Rust `Option<T>`, which serde
+              // emits as a null VALUE. A fixture that omitted them would test a shape the wire cannot
+              // produce (AGENTS.md's Rust->TS seam rule).
+              { id: "m1", ts: 1, from: "concierge", text: "rebase first", severity: "act", state: "pending", ackedAt: null, ackNote: null },
+              { id: "m2", ts: 2, from: "concierge", text: "and then verify", severity: "act", state: "delivered", ackedAt: null, ackNote: null },
+            ],
+          },
+        ];
+      return undefined;
+    }) as unknown as () => Promise<undefined>);
+
+    // The receipt the concierge is told to paste, taken from a REAL send rather than retyped.
+    const sent = await dispatchConciergeTool(
+      call({ domain: "fleet", op: "inbox_send", args: { agentId: "a1", text: "and then verify" } }),
+    );
+    expect(sent.ok).toBe(true);
+    const receipt = (sent as { data: { verifyWith: string; verifyArgs: Record<string, unknown> } }).data;
+    // The op it names has to be the one we then call; a renamed op would strand the caller.
+    expect(receipt.verifyWith).toBe("fleet.inbox_status");
+
+    const r = await dispatchConciergeTool(
+      // VERBATIM — whatever `verifyArgs` is called, this is the paste the receipt promises works.
+      call({ domain: "fleet", op: "inbox_status", args: receipt.verifyArgs }),
+    );
+
+    expect(r.ok).toBe(true);
+    const data = (
+      r as {
+        data: {
+          rows: Array<{ entries: Array<{ id: string; state: string }> | null }>;
+          queriedIds: string[] | null;
+          notFound: string[];
+        };
+      }
+    ).data;
+    expect(data.rows[0]!.entries).toEqual([expect.objectContaining({ id: "m2", state: "delivered" })]);
+    // The two fields a model actually reads to answer "did it land?".
+    expect(data.queriedIds).toEqual(["m2"]);
+    expect(data.notFound).toEqual([]);
+    // …and the read really went through `inbox_peek`, not a second reader invented here — with the
+    // filter NOT on the wire, which is what makes the doc comment above checkable rather than a claim.
+    expect(invoke).toHaveBeenCalledWith("inbox_peek", { agentIds: ["a1"] });
+    // The implementation installed above is restored by the file-level `afterEach`, so these
+    // fixtures cannot answer a later test's `invoke`.
+  });
+
+  /**
+   * THE ONE LINE THAT MAKES THE CONCIERGE ABLE TO CONFIRM A SEND (`withEntries: true` at the
+   * `inbox_status` route) IS OTHERWISE COVERED BY NOTHING.
+   *
+   * The peek is opt-in — off by default so `fleetWatch`'s ~10s poll does not pay for entries it
+   * discards. The concierge route turns it on explicitly. Delete that `true` and every existing
+   * test stays green: `fleet.test.ts` calls `inboxStatus` directly and passes its own flag, and the
+   * filtered case below implies the peek via `messageIds`. Meanwhile the concierge silently loses
+   * the ability to answer "did it land?" — the exact defect this whole change exists to prevent,
+   * reintroduced through the seam nothing drives (AGENTS.md's defaulted-seam trap).
+   *
+   * So this drives the registry with NO `messageIds`, where only the route's own flag can produce a
+   * peek, and asserts the SIDE EFFECT: `inbox_peek` was actually invoked.
+   */
+  it("the concierge route asks for entries even unfiltered, so it can confirm a send", async () => {
+    invoke.mockImplementation((async (cmd: string) => {
+      if (cmd === "inbox_status")
+        return [{ agentId: "a1", pending: 1, delivered: 0, acknowledged: 0, awaitingAck: 0, pendingIds: ["m1"] }];
+      if (cmd === "inbox_peek")
+        return [
+          {
+            agentId: "a1",
+            entries: [
+              { id: "m1", ts: 1, from: "concierge", text: "rebase first", severity: "act", state: "pending", ackedAt: null, ackNote: null },
+            ],
+          },
+        ];
+      return undefined;
+    }) as unknown as () => Promise<undefined>);
+
+    const r = await dispatchConciergeTool(
+      call({ domain: "fleet", op: "inbox_status", args: { agentIds: ["a1"] } }), // no messageIds
+    );
+
+    expect(r.ok).toBe(true);
+    expect(invoke).toHaveBeenCalledWith("inbox_peek", { agentIds: ["a1"] });
+    const data = (r as { data: { rows: Array<{ entries: unknown }>; entriesUnavailable: string | null } }).data;
+    expect(data.rows[0]!.entries).toEqual([expect.objectContaining({ id: "m1" })]);
+    expect(data.entriesUnavailable).toBeNull();
   });
 
   it("refuses a non-integer PR number instead of forwarding it to gh", async () => {

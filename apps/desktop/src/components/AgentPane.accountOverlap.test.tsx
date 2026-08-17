@@ -47,6 +47,7 @@ vi.mock("../services/paneReadiness", () => ({
 vi.mock("../services/conciergeDispatch", () => ({
   flushPendingSends: () => Promise.resolve(),
   abandonPendingSends: () => {},
+  abandonScreenHeldSends: () => {},
   recordPromptSideEffects: () => {},
 }));
 // The worktree seam. `installWorktreeGuard` hands back a promise this file controls, which is what

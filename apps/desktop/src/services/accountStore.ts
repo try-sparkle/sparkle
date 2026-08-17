@@ -779,6 +779,31 @@ export function signedInAccountIds(identities: Identity[]): string[] {
   return identities.filter((i) => i.email != null).map((i) => i.id);
 }
 
+/** Does the signed-in reading carry a USABLE signal — i.e. does it name at least one account that
+ *  actually exists? THE one definition of "the signed-in filter applies", shared by every gate that
+ *  degrades on an absent signal, so they cannot disagree about what an empty reading means.
+ *
+ *  The distinction that makes this a function rather than `signedInIds.length > 0`: an id can be
+ *  present in the reading and name NO existing account. `signedInAccountIds` is derived from
+ *  identities, which are read per config dir and can outlive the account row they describe — a
+ *  deleted or renamed account leaves a stale identity behind. Length alone counts that ghost as a
+ *  usable signal; membership does not.
+ *
+ *  That gap was a live divergence. `partitionAccounts` has always keyed on membership (its
+ *  `authed.length > 0`), while the preferred-account gate and the fleet-holder scan keyed on raw
+ *  length — so on an install whose only signed-in identity was stale, the spawn pool opened to every
+ *  account (membership: no signal) while those two gates simultaneously rejected every account
+ *  (length: signal present, nothing matches it). The founder's explicitly preferred account was
+ *  dropped on every spawn, silently, with the ledger recording a bland "auto". */
+export function signedInFilterApplies(
+  accounts: readonly { id: string }[],
+  signedInIds: readonly string[] | undefined,
+): boolean {
+  if (!signedInIds || signedInIds.length === 0) return false;
+  const ids = new Set(signedInIds);
+  return accounts.some((a) => ids.has(a.id));
+}
+
 /** Choose the account a new job should run under. PURE — no IO.
  *
  *  Order (design spec §"Per-job account selection"):
@@ -874,9 +899,10 @@ function partitionAccounts(
 
   // Signed-in accounts only — unless that would eliminate everything, in which case we keep the
   // full list so a spawn still happens (better a login prompt than a dead agent).
-  const signedIn = signedInIds ? new Set(signedInIds) : null;
-  const authed = signedIn ? accounts.filter((a) => signedIn.has(a.id)) : [];
-  const eligible = authed.length > 0 ? authed : accounts;
+  const signedIn = new Set(signedInIds ?? []);
+  const eligible = signedInFilterApplies(accounts, signedInIds)
+    ? accounts.filter((a) => signedIn.has(a.id))
+    : accounts;
 
   const usageFor = usageLookup(usage);
   const isExhausted = (u: Usage) => usageExhausted(u, now);

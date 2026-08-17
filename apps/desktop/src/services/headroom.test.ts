@@ -96,6 +96,63 @@ describe("switchRecommendation", () => {
     expect(switchRecommendation("a", accounts, u, c, idents, NOW)).toBeNull();
   });
 
+  // THE WEEKLY-WALL TRIGGER (bead sparkle-hbyae). The founder's account hit its 7-DAY limit (Anthropic
+  // "Current week: 100% used") while its 5-HOUR SESSION was at 0%. A weekly cap records no session
+  // rate-limit event, so `exhaustedUntil` stays null and `state` never becomes "exhausted" — yet the
+  // fleet is walled until the weekly window resets. Before the fix, `switchRecommendation` triggered
+  // ONLY on the observed session wall, so it returned null and auto-switch never moved the fleet; the
+  // founder activated a healthy account by hand. These pin that Anthropic's OWN weekly number now
+  // triggers the migration, the SAME signal the target-exclusion filter already used.
+  const twoIdents = [ident("a"), ident("b")];
+  const twoAccts = [acct("a"), acct("b")];
+  const bigCeil = [ceil("a", 1000), ceil("b", 1000)];
+  const healthy = usage("a", 10); // session fine, no wall
+  it("TRIGGERS on a live WEEKLY wall even with the session at 0% and no rate-limit event", () => {
+    const u = [healthy, usage("b", 10)];
+    const live = [
+      { id: "a", fiveHourPercent: 0, sevenDayPercent: 100 }, // weekly 100%, session 0%
+      { id: "b", fiveHourPercent: 20, sevenDayPercent: 56 }, // the healthy target
+    ];
+    const rec = switchRecommendation("a", twoAccts, u, bigCeil, twoIdents, NOW, live);
+    // THE SIDE EFFECT: a recommendation to move the fleet OFF the weekly-walled account, which
+    // `useAccountSwitch` then auto-migrates on because `reason === "exhausted"`.
+    expect(rec?.from.id).toBe("a");
+    expect(rec?.to.id).toBe("b");
+    expect(rec?.reason).toBe("exhausted");
+  });
+
+  it("does NOT trigger when the current account's live usage is BELOW the avoid threshold", () => {
+    // The paired negative. `a` at 94% weekly is under LIVE_AVOID_PERCENT (95) and has no wall, so it
+    // is not spent — the boundary that proves the THRESHOLD drives the trigger, not the mere presence
+    // of a live row. Bump 94→95 and the recommendation appears.
+    const u = [healthy, usage("b", 10)];
+    const live = [
+      { id: "a", fiveHourPercent: 10, sevenDayPercent: 94 },
+      { id: "b", fiveHourPercent: 20, sevenDayPercent: 56 },
+    ];
+    expect(switchRecommendation("a", twoAccts, u, bigCeil, twoIdents, NOW, live)).toBeNull();
+  });
+
+  it("TRIGGERS on a live SESSION wall too — the trigger is symmetric across both windows", () => {
+    const u = [healthy, usage("b", 10)];
+    const live = [
+      { id: "a", fiveHourPercent: 100, sevenDayPercent: 5 }, // session 100%, weekly clear
+      { id: "b", fiveHourPercent: 10, sevenDayPercent: 5 },
+    ];
+    expect(switchRecommendation("a", twoAccts, u, bigCeil, twoIdents, NOW, live)?.to.id).toBe("b");
+  });
+
+  it("a live-walled current account with NOWHERE healthy to go still returns null", () => {
+    // The whole pool is weekly-spent — the modal's genuine no-target case. Auto-switch cannot help, so
+    // no recommendation, and `useLimitSync` correctly falls through to the manual modal.
+    const u = [healthy, usage("b", 10)];
+    const live = [
+      { id: "a", fiveHourPercent: 0, sevenDayPercent: 100 },
+      { id: "b", fiveHourPercent: 0, sevenDayPercent: 99 }, // also weekly-spent
+    ];
+    expect(switchRecommendation("a", twoAccts, u, bigCeil, twoIdents, NOW, live)).toBeNull();
+  });
+
   it("carries the CURRENT account's identity-change flag onto the recommendation", () => {
     // The ceiling itself is the guard: `ceiling_for_account` returns null while an identity change
     // leaves too few attributable samples, so a recommendation that HAS a fraction is already one

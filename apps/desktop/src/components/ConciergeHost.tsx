@@ -3816,7 +3816,25 @@ export function ConciergeHost({
         // specific claim, and letting any future path fall into it (say abandonPendingSends grows
         // an `agent-failed` emit) is how 46485-M happened the first time. An unknown path gets a
         // reason it can always stand behind (roborev 53162).
-        if (r.ok) postSparkle(line`${who} is up — I sent your message${plain(quoted)}.`, collapsed);
+        // A SCREEN hold gets its own wording for `expired`/`abandoned`: the agent DID come up —
+        // the wait was on its screen, not its PTY — so "never came up" / "Send it again once it's
+        // running" would tell the founder something false about the agent he was just looking at
+        // (roborev 64236's Medium; AGENTS.md's "user-facing copy is code"). `heldReason` is what
+        // lets this branch tell the two holds apart; every other path is worded identically either
+        // way, since a delivered message or a dead PTY reads the same regardless of why it waited.
+        if (r.heldReason === "screen" && r.path === "expired")
+          postSparkle(line`${who}'s screen never cleared, so I dropped the message I was holding${plain(quoted)}. Send it again.`, collapsed);
+        else if (r.heldReason === "screen" && r.path === "abandoned")
+          postSparkle(line`${who} closed while I was waiting for its screen to clear, so I dropped the message I was holding${plain(quoted)}.`, collapsed);
+        // `queue-full` DOES reach this listener now (roborev 64289's Medium — the catch-all's own
+        // comment below says any path that starts to must get its own arm rather than the bare
+        // line, and this is exactly that): a screen hold's own cap can be exceeded while its flush
+        // is still deciding what to re-queue. A truthful, distinct remedy — "still busy, already
+        // holding as much as I can" — rather than the generic "didn't take the message", which
+        // would read as a mystery refusal for an agent the founder can see is up and mounted.
+        else if (r.heldReason === "screen" && r.path === "queue-full")
+          postSparkle(line`${who}'s screen is still busy and I'm already holding as much as I can for it, so I dropped the message${plain(quoted)}. Send it again.`, collapsed);
+        else if (r.ok) postSparkle(line`${who} is up — I sent your message${plain(quoted)}.`, collapsed);
         else if (r.path === "expired") postSparkle(line`${who} never came up, so I dropped the message I was holding${plain(quoted)}. Send it again when it's running.`, collapsed);
         else if (r.path === "abandoned") postSparkle(line`${who} couldn't take the message I was holding${plain(quoted)}. Send it again once it's running.`, collapsed);
         else if (r.path === "pty-gone") postSparkle(line`${who}'s terminal closed before I could send the message I was holding${plain(quoted)}.`, collapsed);

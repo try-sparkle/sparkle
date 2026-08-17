@@ -41,6 +41,9 @@ const h = vi.hoisted(() => ({
   failed: false,
   restart: vi.fn((_agentId: string) => true),
   setPin: vi.fn((_agentId: string, _accountId: string) => {}),
+  // The "Activate this account" durable write. The auto-exhausted migration should make the healthy
+  // target the fleet's preferred account, exactly as clicking Activate does.
+  setPref: vi.fn((_accountId: string) => {}),
   statuses: {} as Record<string, AgentTabStatus | undefined>,
   paneAccounts: {} as Record<string, string | undefined>,
   // What `liveUsageRows()` returns on this tick, and what `switchRecommendation` was actually handed
@@ -59,6 +62,7 @@ vi.mock("../services/paneControl", () => ({
 vi.mock("../services/accountStore", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/accountStore")>()),
   setPinFromSwitch: (agentId: string, accountId: string) => h.setPin(agentId, accountId),
+  setPreferredAccountId: (accountId: string) => h.setPref(accountId),
   listCeilings: async () => [],
 }));
 
@@ -103,6 +107,7 @@ vi.mock("../stores/runtimeStore", () => ({
 }));
 
 const { useAccountSwitch, SWITCH_ADVANCE_MS } = await import("./useAccountSwitch");
+const { useAccountLimitStore } = await import("../stores/accountLimitStore");
 
 /** How often phase 1 re-evaluates in this suite. Short so a test can drive a SECOND evaluation. */
 const POLL_MS = 1_000;
@@ -164,6 +169,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   h.restart.mockClear();
   h.setPin.mockClear();
+  h.setPref.mockClear();
   h.paneAccounts = { a1: "acct-a", a2: "acct-a" };
   h.statuses = { a1: "idle", a2: "idle" };
   h.reason = "approaching";
@@ -172,6 +178,76 @@ beforeEach(() => {
   h.failed = false;
   h.liveRows = [];
   h.seenLive = undefined;
+  useAccountLimitStore.setState({ current: null, dismissed: new Set() });
+});
+
+describe("auto-migration ACTIVATES the healthy target the founder used to activate by hand", () => {
+  it("makes the target the preferred account when it auto-starts an exhausted switch", async () => {
+    // The founder's stranded case: a signed-in but INACTIVE healthy account existed, and nothing made
+    // it active — he clicked "Activate this account" himself. `planSwitch` re-pins only running
+    // agents; the target becomes the fleet's preferred account only via this write.
+    h.reason = "exhausted";
+
+    const view = await mounted();
+
+    expect(view.result.current.plan?.pending.length).toBe(2);
+    // THE SIDE EFFECT: the healthy target (`acct-b`) is activated as the preferred account.
+    expect(h.setPref).toHaveBeenCalledWith("acct-b");
+  });
+
+  it("does NOT activate anything when it only ASKS (an estimate)", async () => {
+    // The paired negative. On an ESTIMATE the hook raises a banner and migrates nothing, so it must
+    // not silently switch the founder's preferred account out from under him.
+    h.reason = "approaching";
+
+    const view = await mounted();
+
+    expect(view.result.current.plan).toBeNull();
+    expect(h.setPref).not.toHaveBeenCalled();
+  });
+
+  it("does NOT activate a target when the wall is real but nothing can be moved", async () => {
+    // Empty plan (every agent pinned / no panes): the migration does not start, so no activation and
+    // no preferred-account write — the banner is the only signal. Guards against activating a target
+    // the fleet never actually moved onto.
+    h.reason = "exhausted";
+    h.paneAccounts = {};
+
+    const view = await mounted();
+
+    expect(view.result.current.plan).toBeNull();
+    expect(h.setPref).not.toHaveBeenCalled();
+  });
+});
+
+describe("auto-migration clears the manual limit modal it supersedes", () => {
+  it("dismisses a modal about the account whose fleet auto-switch is now migrating", async () => {
+    // The modal is the FALLBACK, raised earlier when there was nowhere to go. Once a target frees up
+    // and the observed wall auto-starts the switch, that manual "log in to another account" prompt is
+    // moot — the founder should not have to act on an interruption the automation just superseded.
+    h.reason = "exhausted";
+    useAccountLimitStore.getState().raise({ accountId: "acct-a", until: Date.now() + 5 * 60 * 60 * 1_000 });
+    expect(useAccountLimitStore.getState().current).not.toBeNull();
+
+    const view = await mounted();
+
+    // The migration started (side effect one) AND the modal for that account cleared (side effect two).
+    expect(view.result.current.plan?.pending.length).toBe(2);
+    expect(useAccountLimitStore.getState().current).toBeNull();
+  });
+
+  it("leaves the modal up when auto-switch does NOT migrate (only ASKS)", async () => {
+    // The paired negative. On an ESTIMATE the hook only raises a banner — nothing is migrated — so it
+    // must NOT clear a real limit modal. Identical fixture but the reason, so the modal surviving here
+    // while it clears above is the only outcome consistent with "the auto-migration drives the clear".
+    h.reason = "approaching";
+    useAccountLimitStore.getState().raise({ accountId: "acct-a", until: Date.now() + 5 * 60 * 60 * 1_000 });
+
+    const view = await mounted();
+
+    expect(view.result.current.plan).toBeNull();
+    expect(useAccountLimitStore.getState().current).not.toBeNull();
+  });
 });
 
 describe("the poll forwards the cached live-usage rows to switchRecommendation", () => {
