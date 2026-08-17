@@ -72,6 +72,59 @@ const HEADLINES: Record<ConciergeFailureKind, string> = {
   unknown: UNKNOWN_FAILURE_HEADLINE,
 };
 
+/**
+ * The same three facts, worded for the MOUNTED notice row (bead sparkle-voudj7, roborev 64296).
+ *
+ * ══ WHY THE BUBBLE'S HEADLINE CANNOT BE REUSED THERE ══════════════════════════════════════════
+ * Those strings are written for the `failure` bubble in `ConciergeThread`, and two of them depend on
+ * things only that bubble has:
+ *
+ *   • `auth` says "sign in again", and its own doc block above states the contract — the app renders
+ *     a Sign in button NEXT TO this sentence, and "if the button is ever removed, this string has to
+ *     change with it". That button is the bubble's `canReauth`, and a mounted column does not render
+ *     the thread at all. Shown verbatim on the notice row it tells the reader to sign in with no
+ *     control anywhere on screen: the unfollowable remedy this bead exists to remove.
+ *   • `auth` and `quota` both END IN A COLON introducing the evidence block underneath them. The
+ *     notice row carries no evidence, so the mirrored line dangles mid-sentence.
+ *
+ * So the mounted variants are whole sentences that name an action reachable FROM A MOUNTED COLUMN —
+ * unmounting, which is what puts the bubble and its button back on screen.
+ */
+const MOUNTED_HEADLINES: Record<ConciergeFailureKind, string> = {
+  quota:
+    "Your Claude plan is out of room — retrying won't clear it. Unmount to read when it resets.",
+  auth: "Your Claude sign-in has expired — unmount to sign in again and I'll pick up where we left off.",
+  // ══ `unknown` NEEDS THE ROUTE MOST, NOT LEAST (roborev 64319) ═══════════════════════════════
+  // A first cut copied the bubble's retry line verbatim here, which broke both rules this block
+  // declares — it named no mounted-reachable action, and it was a duplicate literal free to drift
+  // from `UNKNOWN_FAILURE_HEADLINE`.
+  //
+  // And `unknown` is the WORST kind to leave without a route. This module's header records that the
+  // machine's verbatim words ride along for every kind *including* this one, precisely because the
+  // classifier is lossy — and that evidence lives only in the `failure` bubble a mounted column does
+  // not render. `unknown` is the bucket that already swallowed "OAuth session expired and could not
+  // be refreshed", i.e. a case where retrying is exactly what cannot work. Pure retry advice with no
+  // mention that the real error text is one Esc away reproduces that failure on this surface.
+  unknown: "I couldn't reach my brain just now — unmount to read what it said.",
+};
+
+/** The mounted-surface sentence for a failure of this kind. See {@link MOUNTED_HEADLINES}. */
+export function mountedFailureHeadline(kind: ConciergeFailureKind): string {
+  return MOUNTED_HEADLINES[kind];
+}
+
+/** The BUBBLE sentence for a failure of this kind — the `HEADLINES` map above, read by kind.
+ *
+ *  EXPORTED FOR THE TEST THAT ASSERTS THE TWO MAPS DIFFER (roborev 64334). That suite had grown a
+ *  hand-maintained second copy of `HEADLINES`, which the total-`Record` type forces to have an ENTRY
+ *  but not a CORRECT one — so a fourth kind mapped to `""` or to a copy of another kind's string
+ *  would make `mounted !== bubble` pass vacuously for exactly the kind the guard exists to cover.
+ *  That is the same entry-versus-contract distinction `MOUNTED_HEADLINES` is commented for. One map,
+ *  read through here, so the comparison is against the string the bubble actually renders. */
+export function bubbleFailureHeadline(kind: ConciergeFailureKind): string {
+  return HEADLINES[kind];
+}
+
 /** Every quota phrasing observed in the logs, plus the neighbouring ones the same API emits.
  *  Checked BEFORE {@link AUTH}: a 429 can mention authorization, and a rate limit is a quota fact,
  *  not a credential one. */

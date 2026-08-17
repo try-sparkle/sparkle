@@ -43,6 +43,13 @@ import {
   type ConciergeViewModel,
 } from "./Concierge";
 import type { ConciergeMountedAgent, ConciergeReceiptMark } from "./Concierge/types";
+// Refusal COPY for a mounted reader, plus the lock reason that picks it. Copy only — never a gate;
+// see `askSparkle` for the guard that was keyed on this and reverted (bead sparkle-voudj7).
+import {
+  conciergeAiOffNotice,
+  useConciergeAiLock,
+  type ConciergeAiLockReason,
+} from "./Concierge/conciergeAiLock";
 // The reply-anchoring RULE — which of the user's messages a reply is answering — lives in its own
 // pure module (no React, no stores) so the inference is unit-testable without mounting this file, and
 // so the stub that draws an anchor reads the same declaration the host writes.
@@ -186,7 +193,7 @@ import { DISABLED_POLICY, toLintPolicy } from "../services/conciergeLintPolicy";
 import type { LintPolicy, LintResult, Violation } from "../services/conciergeLint";
 import type { LintAction } from "../stores/conciergeLintMetrics";
 import { getConfig, onConfigChanged, type EffectiveConfig } from "../services/config";
-import { conciergeFailureNotice } from "../engine/conciergeFailureNotice";
+import { conciergeFailureNotice, mountedFailureHeadline } from "../engine/conciergeFailureNotice";
 import { reportClaudeAuthFailed } from "../services/claudeAuthSignal";
 import {
   createProactiveScheduler,
@@ -1005,6 +1012,9 @@ export function ConciergeHost({
   // conversation). These refs let the callbacks defined ABOVE that point reach it without hoisting
   // `draftKey` — the same ref-indirection `insertRef` uses one function up.
   const quoteRef = useRef<ConciergeQuoteApi | null>(null);
+  /** Why the paid half is locked, or null — for CHOOSING WORDS after the authoritative gate has
+   *  already refused, never for deciding anything. See `conciergeAiOffNotice`. */
+  const aiLockRef = useRef<ConciergeAiLockReason | null>(null);
 
   // `sentQuote` is REQUIRED, not optional, and that is the guard rather than a style choice: this
   // defect has now been fixed at three different call sites (roborev 59801/59803/59804), each time
@@ -1275,6 +1285,18 @@ export function ConciergeHost({
   // during render on purpose and idempotently — the value is a stable object from a memo, and the
   // consumers are event callbacks that cannot run before this line has.
   quoteRef.current = quoteApi;
+
+  // ══ PUBLISHED FOR REFUSAL COPY ONLY (roborev 64277) ═══════════════════════════════════════════
+  // Read through the HOOK — `useConciergeAiLock` composes `useHasAiCredits`, which every suite that
+  // stubs `services/aiGate` already provides; an imperative twin would need `hasAiCredits`, which
+  // those same factories omit, so it would THROW rather than answer.
+  //
+  // AND IT MUST STAY COPY-ONLY. A guard keyed on this value was added here once and reverted (see
+  // `askSparkle`): this rule is stricter than the one that decides whether a turn may run, so using
+  // it to decide anything locks out entitled users. Choosing which sentence to show, after the
+  // authoritative gate has already refused, is the one thing it is right for.
+  const aiLock = useConciergeAiLock();
+  aiLockRef.current = aiLock;
 
   // ══ THE MOUNT THAT ROUTES *IS* THE MOUNT THE COLUMN NAMES — ONE VALUE, UNGATED ═════════════════
   // The founder's rule, which supersedes the `promptTargetShown` gate that used to stand here:
@@ -3019,6 +3041,23 @@ export function ConciergeHost({
           canReauth: notice.kind === "auth",
         },
       ]);
+      // ══ AND MIRROR IT WHERE A MOUNTED READER CAN SEE IT (roborev 64277) ═══════════════════════
+      // This is the path the founder's own documented case takes — an expired Claude session or a
+      // quota rejection — because `startConciergeTurn` RESOLVES NULL for every non-typed failure
+      // and reports it through `onConciergeError`. The `failure` bubble above lands in
+      // `ConciergeThread`, which a mounted column does not render, so the only thing left on screen
+      // was `send`'s "Asked Sparkle — press … to unmount and read the reply": a promise of an
+      // answer that is not coming, which is the exact shape this branch's sibling was just fixed
+      // for.
+      //
+      // NOT `notice.headline` VERBATIM (roborev 64296). That string is written for the bubble and
+      // depends on what the bubble has: `auth` says "sign in again" next to a Sign in button that
+      // is the bubble's own `canReauth`, and both `auth` and `quota` end in a colon introducing the
+      // evidence block underneath. On this row the button does not exist and there is no evidence,
+      // so the verbatim line tells a mounted reader to press something absent, mid-dangling
+      // sentence. `mountedFailureHeadline` carries the same classified fact worded for a surface
+      // whose one reachable action is unmounting.
+      if (displayMountedRef.current) noteMounted(mountedFailureHeadline(notice.kind), "warn");
       // TELL THE GATE. The founder's case was a FOCUSED app: he typed a question and the concierge
       // child was the thing that discovered the session was dead. ReadinessGate's focus re-probe
       // cannot see that — the window never lost focus — so without this the app would keep serving
@@ -3972,6 +4011,27 @@ export function ConciergeHost({
    *  see the orphan stamp below. Optional because the proactive-relay and redirect paths call this
    *  with text that has no bubble of its own. */
   const askSparkle = useCallback((text: string, bubbleId?: string) => {
+    // ══ NO PAYWALL CHECK HERE, AND THAT IS DELIBERATE (bead sparkle-voudj7, roborev 64231) ═══════
+    // A guard keyed on `conciergeAiLockReason` briefly stood at this line. It was WRONG, and the
+    // way it was wrong is worth recording because the reasoning that produced it is seductive:
+    // restoring the mounted composer removes "there is no box to type into", which had been doing
+    // real enforcement by accident, so it looked like the enforcement had to be rebuilt here.
+    //
+    // It does not, because the authoritative gate already exists and is CORRECT: `startConciergeTurn`
+    // refuses on `conciergeAiEnabled()` before spawning anything, throwing `ConciergeAiDisabledError`
+    // — handled a few hundred lines below, sticky, with copy. What the rebuilt guard added was a
+    // SECOND, STRICTER copy of that rule: the column's lock requires `flag && entitled && credits`,
+    // and `services/conciergeTools/policyBinding` says in as many words why credits must not appear
+    // in this decision — "the concierge turn runs on the user's own Claude Code subscription and
+    // costs Sparkle nothing, so a Sparkle balance cannot answer it". The credit gate was removed
+    // from here on purpose; re-adding it locked an ENTITLED user out of the escape hatch over a
+    // balance that is irrelevant to what the turn costs.
+    //
+    // Same shape as the picker-matcher duplication this branch fixed one commit earlier: a rule
+    // copied next to its owner rather than imported, drifting immediately. The lock answers "what
+    // does the column RENDER"; `conciergeAiEnabled` answers "may a turn RUN". They are different
+    // questions and only the second belongs on this path.
+    //
     // THE DROPPED-MESSAGE BUG, made visible (Concierge/types ConciergeReceipt.unanswered).
     //
     // Sending KILLS whatever turn is in flight: concierge.rs kills the old child and its reader goes
@@ -4368,6 +4428,10 @@ export function ConciergeHost({
               evidence: [String(err), "", entry.text].join("\n"),
             },
           ]);
+          // Same mounted blind spot as its sticky twin below and `onConciergeError` above
+          // (roborev 64277): the bubble goes to a thread a mounted column does not render, leaving
+          // the "Asked Sparkle" promise as the only thing on screen.
+          if (displayMountedRef.current) noteMounted("That message didn't get sent.", "warn");
           drainQueueRef.current();
           return;
         }
@@ -4411,6 +4475,28 @@ export function ConciergeHost({
             evidence: [String(err), "", ...stranded.map((q) => q.text)].join("\n"),
           },
         ]);
+        // ══ AND SAY IT WHERE A MOUNTED READER CAN SEE IT (roborev 64264) ═════════════════════════
+        // The `failure` bubble above goes into `ConciergeThread`, which a MOUNTED column does not
+        // render at all — the same blind spot `useMountedNotice` exists for. So on this path the
+        // reader was shown `send`'s "Asked Sparkle — press … to unmount and read the reply" and
+        // nothing else: a claim that a turn was asked and an answer is coming, for a turn that was
+        // refused at the door. Both write the single notice slot, so this overwrites that line with
+        // the truth rather than adding a second one.
+        //
+        // NEWLY REACHABLE ON THIS BRANCH, which is why it belongs to this change rather than being
+        // pre-existing: until the composer came back under `lockBlanksColumn`, every
+        // `conciergeAiEnabled()`-false state was ALSO a `conciergeAiLockReason` lock (that rule is
+        // strictly stricter), so the column was blanked and the send could not be attempted at all.
+        //
+        // KEYED ON THE REJECTION, not on the render lock — the distinction this commit is about.
+        // This fires exactly when the authoritative gate refused, so it cannot re-import the credit
+        // rule that `policyBinding` removed on purpose.
+        // THE WORDS COME FROM THE REASON, not from a hard-coded guess at it — `flag_off` is the
+        // least likely way to reach this line, and telling an unentitled or empty account to flip a
+        // switch that is already on is the unfollowable remedy this bead exists to remove.
+        if (displayMountedRef.current) {
+          noteMounted(conciergeAiOffNotice(aiLockRef.current), "warn");
+        }
       },
     );
     // NAMED, NOT SUPPRESSED — and naming it costs nothing. The disclosure notices above are the
@@ -4420,7 +4506,9 @@ export function ConciergeHost({
     // `dispatchTurn` a new identity on any render, which is the same reasoning the brain-subscription
     // array records for `noteMounted`. Leaving it out is not a style note — it is desktop lint
     // warning number THIRTEEN against an `eslint src --max-warnings 12` ratchet, i.e. a red CI.
-  }, [postSparkle]);
+    // `noteMounted` joins it on the same reasoning — a `useCallback(…, [])`, so naming it cannot
+    // give `dispatchTurn` a new identity either.
+  }, [postSparkle, noteMounted]);
   dispatchTurnRef.current = dispatchTurn;
   drainQueueRef.current = drainQueue;
 

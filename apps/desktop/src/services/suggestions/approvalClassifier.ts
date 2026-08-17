@@ -30,13 +30,14 @@ const PICKER_SPAN = 30;
 // The plain affirmative ("Yes", "Yes.") — the option we auto-select. Deliberately NOT the
 // "Yes, and don't ask again / allow all edits this session" variants (those hand control to Claude
 // Code's own allowlist, which the spec explicitly avoids so Sparkle's toggle stays authoritative).
-const PLAIN_YES = /^\s*yes\b/i;
+export const PLAIN_YES = /^\s*yes\b/i;
 // A "Yes, and …" continuation or a native remember-my-answer option — marks an option as NOT the
 // plain Yes (so findApproveOption skips it). The bare `\band\b` is fine here because it's only ever
 // tested against options that ALREADY start with "Yes"; it must NOT be used to detect a permission
 // dialog (an ordinary picker option like "Merge and rebase" would false-positive — see
 // looksLikePermission, which keys on an explicit No option instead).
-const YES_CONTINUATION = /\band\b|don'?t ask|allow all|allow any|for the rest|this session|automatically/i;
+export const YES_CONTINUATION =
+  /\band\b|don'?t ask|allow all|allow any|for the rest|this session|automatically/i;
 const NO_OPTION = /^\s*no\b/i;
 
 // Category signals, checked in the spec's stated order (skill → bash → edit → mcp → fetch → other).
@@ -85,8 +86,17 @@ export function headerRegion(scrollback: string): string {
   return region.filter((l) => !OPTION_LINE.test(l)).join("\n");
 }
 
-/** Strip the "N · " prefix detectClaudeCodePicker adds to a button label, leaving the raw option text. */
-function optionText(b: SuggestionButton): string {
+/** Strip the "N · " prefix detectClaudeCodePicker adds to a button label, leaving the raw option text.
+ *
+ *  EXPORTED, with {@link PLAIN_YES} and {@link YES_CONTINUATION}, because `conciergeDispatch`'s
+ *  yes-family matcher has to answer the SAME question about the SAME screens — "which of these is
+ *  the plain Yes?" — and a second copy of the rule is exactly how the two drift. It was briefly two
+ *  copies (bead sparkle-voudj7): the dispatcher stripped the ordinal but only preferred a bare Yes
+ *  when one existed, so on a plan-mode dialog whose affirmatives are ALL continuations
+ *  ("Yes, and auto-accept edits" / "Yes, and manually approve edits") it fell back to the first and
+ *  a single Approve click would have turned on auto-accept for the session. This file already
+ *  refused that, and had done all along. */
+export function optionText(b: SuggestionButton): string {
   return b.label.replace(/^\s*\d{1,2}\s*·\s*/, "");
 }
 

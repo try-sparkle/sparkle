@@ -25,6 +25,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const h = vi.hoisted(() => ({
+  /** The credit half of the concierge AI lock. Open by default; one row shuts it. */
+  useHasAiCredits: vi.fn(() => true),
+  /** The entitlement half. Open by default; the paywall row shuts it. */
+  aiEnhancementsEnabled: vi.fn(() => true),
+  /** The real class the host branches on, hoisted so the module mock and the rows share ONE
+   *  identity — two separate declarations would make `instanceof` false. */
+  ConciergeAiDisabledError: class ConciergeAiDisabledError extends Error {},
+  /** The live `onConciergeError` listener, captured at mount so a row can fire a real failure. */
+  conciergeError: undefined as undefined | ((e: { id: string; detail: string }) => void),
   openProjectTab: vi.fn(),
   startConciergeTurn: vi.fn(async (_p: string): Promise<string | null> => null),
   dispatchConciergeAnswer: vi.fn(
@@ -54,6 +63,10 @@ vi.mock("../services/openProjectTab", () => ({
 }));
 vi.mock("../services/concierge", () => ({
   startConciergeTurn: h.startConciergeTurn,
+  // The host does `err instanceof ConciergeAiDisabledError` to decide the STICKY branch, so the
+  // mock has to supply the real constructor identity or that check silently reads false and the
+  // row below would assert against the generic failure path instead (roborev 64264).
+  ConciergeAiDisabledError: h.ConciergeAiDisabledError,
   startProactiveConciergeTurn: vi.fn(async () => null),
   isProactiveTurn: () => false,
   // The LIVE tool channel. A no-op unsubscribe, exactly like its siblings: these suites are about
@@ -62,7 +75,12 @@ vi.mock("../services/concierge", () => ({
   onConciergeTool: () => () => {},
   onConciergeDelta: () => () => {},
   onConciergeDone: () => () => {},
-  onConciergeError: () => () => {},
+  // CAPTURED, not inert: the ordinary-failure row below needs to fire a real error at the host,
+  // because `startConciergeTurn` RESOLVES NULL for every non-typed failure and reports it here.
+  onConciergeError: (cb: (e: { id: string; detail: string }) => void) => {
+    h.conciergeError = cb;
+    return () => {};
+  },
   onConciergeTurnsAbandoned: () => () => {},
   isSupersededDetail: () => false,
   SUPERSEDED_DETAILS: [],
@@ -105,8 +123,15 @@ vi.mock("./Concierge/ConciergeSuggestions", () => ({ ConciergeSuggestions: () =>
 vi.mock("../services/aiGate", () => ({
   useAiFeature: () => true,
   aiFeatureNow: () => false,
-  useHasAiCredits: () => true,
-  aiEnhancementsEnabled: () => true,
+  // A `vi.fn`, not an arrow literal, so ONE row can shut the credit gate and put the column in the
+  // locked-AND-mounted state (bead sparkle-voudj7). Everything else here wants it open, so it is
+  // reset to `true` in `beforeEach`.
+  useHasAiCredits: h.useHasAiCredits,
+  // Also a `vi.fn`, and for the same reason as its neighbour: the paywall row needs an UNENTITLED
+  // account, and a hard-coded `true` here made `not_entitled` unreachable in this suite — so the
+  // lock reported `no_credits` instead, which is the one reason production cannot produce at that
+  // call site. Stubbing both is what lets the row pin the copy a real out-of-money user sees.
+  aiEnhancementsEnabled: h.aiEnhancementsEnabled,
 }));
 
 const RUNTIME = {
@@ -173,6 +198,10 @@ import {
 import { IDLE_AWAY_MS, usePresenceStore } from "../stores/presenceStore";
 import { setConciergeChat } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
+import { useSettingsStore } from "../stores/settingsStore";
+// Seeded directly by the unentitled row: the paywall state must be REAL (lock and gate agreeing)
+// rather than a forced rejection, so it writes `me` instead of using the fully-funded helper.
+import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
 import { CONCIERGE_CHATTING_WITH_TESTID } from "./Concierge/ConciergeColumn";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
@@ -258,6 +287,10 @@ function seedMountedRow() {
 }
 
 beforeEach(() => {
+  h.useHasAiCredits.mockReturnValue(true);
+  h.aiEnhancementsEnabled.mockReturnValue(true);
+  // One row shuts the concierge AI flag; restore it so the others inherit an unlocked column.
+  useSettingsStore.setState({ aiConcierge: true } as never);
   enableAiEnhancementsForTests();
   setConciergeChat(() => []);
   h.dispatchConciergeAnswer.mockReset();
@@ -686,6 +719,131 @@ describe("ConciergeHost — @Sparkle is the way out of a mount", () => {
     await send("@Sparkle what is the status of the build?");
     await elapse();
     expect(h.routeMessage).not.toHaveBeenCalled();
+  });
+
+  // ══ A ZERO BALANCE MUST NOT CLOSE THE ESCAPE HATCH (bead sparkle-voudj7, roborev 64231) ════════
+  // Mounted, the column now keeps its composer even while `conciergeAiLockReason` reads LOCKED,
+  // because typing to your own agent's PTY costs nothing and was never the paid feature. A guard was
+  // then briefly added to `askSparkle` to "restore the paywall that the missing composer had been
+  // enforcing by accident" — and it was wrong, which is what this row pins.
+  //
+  // THE LOCK IS NOT THE POLICY. `conciergeAiLockReason` wants `flag && entitled && credits`;
+  // `startConciergeTurn` — the authoritative gate, which refuses before spawning anything — wants
+  // `flag && (entitled || credits)`, because `conciergeTools/policyBinding` states that a concierge
+  // turn "runs on the user's own Claude Code subscription and costs Sparkle nothing, so a Sparkle
+  // balance cannot answer it". The credit gate was removed from that decision ON PURPOSE.
+  //
+  // So an ENTITLED user at a zero balance — exactly this row — keeps the escape hatch. The reverted
+  // guard locked them out of it over a number that does not describe what the turn costs.
+  it("still reaches the brain for an entitled user with no credits", async () => {
+    h.useHasAiCredits.mockReturnValue(false);
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+
+    // THE SIDE EFFECT, and the one that went red under the reverted guard.
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+    // …and it did NOT leak into the mounted agent's terminal as a consolation.
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    // The mounted reader is still told where the answer went — a real turn started, so the notice
+    // that points at it is the truth rather than a claim about a reply nobody is writing.
+    await waitFor(() => expect(notice().textContent).toContain("Asked Sparkle"));
+  });
+
+  // ══ …AND WHEN IT REALLY IS OFF, THE MOUNTED READER IS TOLD (roborev 64264) ════════════════════
+  // The row above covers the state that must SUCCEED. This is its twin: the state that must fail,
+  // and be seen to. `startConciergeTurn` rejects with `ConciergeAiDisabledError`, and its handler
+  // reported the loss only as a `failure` bubble in `ConciergeThread` — which a mounted column does
+  // not render. So the only thing on screen was `send`'s "Asked Sparkle — press … to unmount and
+  // read the reply": a promise of an answer for a turn refused at the door.
+  //
+  // NEWLY REACHABLE ON THIS BRANCH. Until the composer came back while mounted, every
+  // `conciergeAiEnabled()`-false state was also a `conciergeAiLockReason` lock (strictly stricter),
+  // so the column was blanked and the send could not be attempted. Restoring the box is what opened
+  // it, so pinning it belongs here.
+  it("tells a MOUNTED reader when the AI half is genuinely off, not just the hidden thread", async () => {
+    // THE FLAG IS REALLY OFF, not merely a forced rejection: the notice picks its wording from the
+    // lock reason, so a row that rejected while the lock still read healthy would exercise the
+    // fallback line and prove nothing about the `flag_off` copy it claims to cover.
+    useSettingsStore.setState({ aiConcierge: false } as never);
+    h.startConciergeTurn.mockRejectedValueOnce(new h.ConciergeAiDisabledError());
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+
+    // Both write the SINGLE notice slot, so the truth must be what is left standing — asserting
+    // only "contains the refusal" would pass with the stale promise still on screen beside it.
+    await waitFor(() => expect(notice().textContent).toMatch(/AI enhancements are off/i));
+    expect(notice().textContent).not.toContain("Asked Sparkle");
+    // …and nothing leaked into the mounted agent's terminal as a consolation.
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+  });
+
+  // ══ …AND THE REMEDY MATCHES WHY IT IS OFF (roborev 64277/64296) ═══════════════════════════════
+  // The row above is the `flag_off` case. This is the one that made the hard-coded sentence a bug: a
+  // user whose toggle is already ON was told to "turn them back on" — a switch already flipped.
+  // Worse mounted than anywhere else, because `lockBlanksColumn` means a mounted reader never sees
+  // `ConciergeAiLocked`, so this line is the ONLY route to a remedy on screen.
+  //
+  // THE STATE IS `not_entitled`, NOT `no_credits`, and that correction matters more than it looks.
+  // A first cut of this row used entitled-with-no-credits — which CANNOT reject at this call site:
+  // the gate is `flag && (entitled || credits)`, so `entitled` alone satisfies it, and the row only
+  // reached the branch because the rejection was FORCED with `mockRejectedValueOnce` against a lock
+  // that would never have produced it. That is the same fictional-state shape the `flag_off` row was
+  // corrected for in the same commit, and it left the paywall copy a REAL out-of-money user sees
+  // completely unpinned. Unentitled with no credits is the reachable state: lock and gate agree, so
+  // nothing has to be forced.
+  it("names the RIGHT remedy for an unentitled account, not the settings toggle", async () => {
+    useAuthStore.setState({
+      me: { clerkUserId: "u1", entitled: false, balanceCents: 0, tokenVersion: 1 },
+      creditFloorCents: 0,
+      refresh: async () => {},
+    });
+    h.aiEnhancementsEnabled.mockReturnValue(false);
+    h.useHasAiCredits.mockReturnValue(false);
+    // The REJECTION is simulated because `startConciergeTurn` is mocked in this suite — the real
+    // gate cannot run here. What matters, and what the first cut got wrong, is that the STATE is one
+    // production would genuinely reject in: unentitled AND no credits fails
+    // `flag && (entitled || credits)`, so this stands in for something that really happens rather
+    // than manufacturing a branch the gate could never take.
+    h.startConciergeTurn.mockRejectedValueOnce(new h.ConciergeAiDisabledError());
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+
+    await waitFor(() => expect(notice().textContent).toMatch(/Buy Sparkle/i));
+    // THE ASSERTION THAT FAILS ON THE HARD-CODED LINE, and the reason the pair is worth two rows:
+    // both texts are "a refusal", so only checking that one appeared would pass either way.
+    expect(notice().textContent).not.toMatch(/turn them back on/i);
+  });
+
+  // THE SIBLING FAILURE PATH, which is the one the founder actually hits: `startConciergeTurn`
+  // RESOLVES NULL for every non-typed failure — an expired Claude session, a quota rejection — and
+  // reports it through `onConciergeError`. That posted a `failure` bubble into the hidden thread and
+  // called no `noteMounted`, leaving the same false "Asked Sparkle" promise standing.
+  it("replaces the Asked-Sparkle promise when the turn fails for an ordinary reason", async () => {
+    mount();
+    await send("@Sparkle what is the status of the build?");
+    await elapse();
+    await waitFor(() => expect(notice().textContent).toContain("Asked Sparkle"));
+
+    act(() => {
+      h.conciergeError?.({ id: "t1", detail: "Invalid API key · Please run /login" });
+    });
+
+    // ASSERT THE CLASSIFIED TEXT, not merely that something replaced it (roborev 64296). The detail
+    // above classifies as `auth`, and a first cut checked only "Asked Sparkle" is gone plus
+    // `length > 0` — which passes for ANY replacement, including a generic "That message didn't get
+    // sent." So it did not pin the call site's own claim that the classified sentence is what shows,
+    // and it is why the surface mismatch below was invisible to this suite.
+    await waitFor(() => expect(notice().textContent).toMatch(/sign-in has expired/i));
+    expect(notice().textContent).not.toContain("Asked Sparkle");
+    // …AND IT NAMES AN ACTION REACHABLE WHILE MOUNTED. The bubble's own headline says "sign in
+    // again" beside a Sign in button that lives in the thread a mounted column does not render, and
+    // ends in a colon introducing evidence this row does not carry. The mounted variant must route
+    // through the unmount instead — the one control that puts that button back on screen.
+    expect(notice().textContent).toMatch(/unmount/i);
+    expect(notice().textContent).not.toMatch(/:\s*$/);
   });
 
   // ══ THE SCREEN GUARD MAY NOT VETO A CONCIERGE-BOUND MESSAGE (bead sparkle-k5kit) ═══════════════

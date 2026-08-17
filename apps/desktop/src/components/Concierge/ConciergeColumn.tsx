@@ -229,11 +229,21 @@ export function ConciergeColumn({
   // to a process they are already running, which no lock reason ("flag off", "not bought", "out of
   // credits") is a justification for.
   //
-  // THE PAID HALF IS STILL LOCKED, and the guarantee it rests on is unchanged: the `@Sparkle`
-  // escape hatch is the only path from this box to the brain, and the SERVICE-LEVEL refusal — which
-  // the composer's own comment below already names as the real line, this being merely "the
-  // structural half" — still refuses it. What is restored is the terminal relay, which that refusal
-  // was never about.
+  // WHAT GUARDS THE PAID HALF NOW, STATED EXACTLY (roborev 64206/64231 — the first cut of this
+  // comment overclaimed and the correction is the interesting part). The `@Sparkle` escape hatch is
+  // the only path from this box to the brain, and it is gated by `startConciergeTurn`, which
+  // refuses on `conciergeAiEnabled()` before spawning anything.
+  //
+  // THAT GATE IS NOT THE SAME RULE AS THIS LOCK, and the difference is deliberate rather than a
+  // gap to close. `aiGate` treats the concierge as SUBSCRIPTION-FUNDED — `flag && (entitled ||
+  // credits)` — while this lock also wants credits. `conciergeTools/policyBinding` says why in as
+  // many words: "the concierge turn runs on the user's own Claude Code subscription and costs
+  // Sparkle nothing, so a Sparkle balance cannot answer it". So an ENTITLED user with no balance
+  // can still use the escape hatch from a mounted column, and should — a credit gate there was
+  // removed on purpose, and an attempt to re-impose it here was reverted (see `askSparkle`).
+  //
+  // This lock therefore governs what the column RENDERS, not what may RUN. What is restored below
+  // is the terminal relay, which neither rule was ever about.
   //
   // UNMOUNTED, NOTHING CHANGES. With no cable there is no PTY to relay to, so the column is the
   // paid brain and only the paid brain — it still floods to `ConciergeAiLocked` with no composer,
@@ -1064,11 +1074,12 @@ export function ConciergeColumn({
           that state has nothing to type into and no Send to press, so a gated send can never be
           ATTEMPTED from here at all (the service-level refusal stays the backstop, not the only
           line).
-          MOUNTED, THE BOX COMES BACK, and the guarantee above is why that is safe rather than a
-          hole: the only route from here to the paid brain is the `@Sparkle` escape hatch, and the
-          service-level refusal this comment already calls "not the only line" is still that line.
-          What returns is the PTY relay to the human's own agent, which was never the paid half.
-          See `lockBlanksColumn` for the founder report that made this a bug rather than a policy. */}
+          MOUNTED, THE BOX COMES BACK. The only route from here to the paid brain is the `@Sparkle`
+          escape hatch, and `startConciergeTurn`'s own `conciergeAiEnabled()` check is what governs
+          that — a different, deliberately looser rule than this lock, for the reason spelled out at
+          `lockBlanksColumn`. What returns here is the PTY relay to the human's own agent, which
+          neither rule was ever about. See `lockBlanksColumn` too for the founder report that made
+          this a bug rather than a policy. */}
       {!lockBlanksColumn && (
         <ComposeBox
           /* One draft per conversation. Mounted, the box is addressed to that agent; unmounted it is

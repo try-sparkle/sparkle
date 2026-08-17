@@ -96,6 +96,9 @@ import { log } from "../logger";
 import { getAgentScrollback } from "./terminalScrollback";
 import { markAgentPrompt } from "./terminalMarkers";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
+// ONE definition of "which option is the plain Yes", shared with the module that already governs
+// these screens (bead sparkle-voudj7). See `isAffirmative` for what a second, looser copy cost.
+import { optionText, PLAIN_YES, YES_CONTINUATION } from "./suggestions/approvalClassifier";
 import { maybeAutoName } from "./agentNaming";
 import { recordTrialSend, trialSendAllowed } from "./trialMeter";
 import { aiFeatureNow } from "./aiGate";
@@ -313,33 +316,48 @@ const NO_WORDS =
   /^\s*(n|no|nope|deny|denied|reject|cancel|stop|don'?t|do not|no thanks|no thank you|not now)[.!?\s]*$/i;
 
 /**
- * The label with the DETECTOR'S OWN ordinal prefix removed (bead sparkle-voudj7).
+ * True when the button is the PLAIN-affirmative option: a bare "Yes…" label or the y/N `"y\n"`
+ * value. Deliberately does NOT match a label merely starting with a standalone "y" (e.g.
+ * "Y - use YAML"), which would let a "yes"-family answer select a non-affirmative option.
  *
- * `detectClaudeCodePicker` renders every option as ``${n} · ${label}`` (suggestions/heuristics), so
- * the real permission dialog reaches the matcher as `"1 · Yes"` / `"2 · Yes, and don't ask again"` /
- * `"3 · No, and tell Claude what to do"` — never as `"Yes"`. The `^yes\b` tests below therefore
- * matched NOTHING on the single most common picker in the app, and every unit fixture that "proved"
- * they worked was hand-built as `{ label: "Yes" }`: a shape production cannot produce.
+ * ══ IT READS THE LABEL THROUGH `optionText`, AND THAT IS THE WHOLE FIX (bead sparkle-voudj7) ═══
+ * `detectClaudeCodePicker` renders every option as ``${n} · ${label}``, so a real permission dialog
+ * arrives here as `"1 · Yes"` — never as `"Yes"`. Testing `^yes\b` against the WHOLE label therefore
+ * matched nothing on the single most common picker in the app, and every unit fixture that "proved"
+ * this predicate worked was hand-built as `{ label: "Yes" }`: a shape production cannot emit. The
+ * cost was the BLOCKED row's Approve button, which sends the literal word "approve" (a `YES_WORDS`
+ * member) and so fell straight through to `ambiguous-picker` on the exact dialogs it exists to
+ * answer.
  *
- * THE COST WAS THE APPROVE BUTTON. `ConciergeHost`'s nudge relay sends the literal word "approve",
- * which is a `YES_WORDS` member — so it reached this matcher and fell straight through to
- * `ambiguous-picker` on the exact dialogs the button exists to answer.
+ * ══ AND `!YES_CONTINUATION` IS NOT DECORATION — IT IS THE SAFETY HALF ═════════════════════════
+ * Stripping the ordinal without it is WORSE than the bug it fixes. Claude Code's plan-mode dialog
+ * offers only continuations:
  *
- * ONLY the detector's own prefix is stripped — `\d+ · ` — not arbitrary leading punctuation, so a
- * label that genuinely begins with something else still reads as itself.
+ *     1. Yes, and auto-accept edits
+ *     2. Yes, and manually approve edits
+ *     3. No, keep planning
+ *
+ * With a bare `^yes\b` every one of those is affirmative, so a single Approve click would press
+ * option 1 and turn on auto-accept edits FOR THE SESSION — a standing grant nobody asked for, from
+ * a button whose whole promise is answering one question. Before the ordinal strip these labels
+ * matched nothing and the press was safely refused, so widening the predicate alone would have
+ * converted a harmless refusal into a silent privilege escalation (roborev 64206).
+ *
+ * SHARED WITH `approvalClassifier`, NOT RE-DERIVED. That module governs the same screens and has
+ * always applied exactly this rule (`findApproveOption`); this predicate briefly carried a second,
+ * looser copy, which is how the two came apart. One definition, imported.
  */
-function withoutOrdinal(label: string): string {
-  return label.replace(/^\s*\d{1,2}\s*·\s*/, "");
-}
-/** True when the button is the plain-affirmative option: label "Yes…" or the y/N "y\n" value.
- *  Deliberately does NOT match any label merely starting with a standalone "y" (e.g. "Y - use YAML"),
- *  which would let a "yes"-family answer select a non-affirmative option on a non-yes/no picker. */
 function isAffirmative(b: SuggestionButton): boolean {
-  return /^\s*yes\b/i.test(withoutOrdinal(b.label)) || /^y[\r\n]*$/i.test(b.value);
+  const text = optionText(b);
+  return (PLAIN_YES.test(text) && !YES_CONTINUATION.test(text)) || /^y[\r\n]*$/i.test(b.value);
 }
-/** True when the button is the negative option ("No", or the y/N "n" answer). */
+/** True when the button is the negative option ("No", or the y/N "n" answer).
+ *
+ *  NO CONTINUATION EXCLUSION HERE, deliberately: "No, and tell Claude what to do" and "No, keep
+ *  planning" ARE the deny option on the dialogs above, and declining is never the escalation the
+ *  affirmative side has to guard against. */
 function isNegative(b: SuggestionButton): boolean {
-  return /^\s*no\b/i.test(withoutOrdinal(b.label)) || /^n[\r\n]*$/i.test(b.value);
+  return /^\s*no\b/i.test(optionText(b)) || /^n[\r\n]*$/i.test(b.value);
 }
 
 /**
@@ -373,18 +391,20 @@ export function matchAnswerToOption(
 
   // 3. Yes/approve family → the affirmative option; No/deny family → the negative option.
   //
-  // ══ THE NARROWEST AFFIRMATIVE WINS, NOT THE FIRST ONE (bead sparkle-voudj7) ═══════════════════
-  // Claude Code's permission dialog offers TWO affirmatives — "Yes" and "Yes, and don't ask again" —
-  // and they are not interchangeable: the second grants STANDING permission for every later
-  // invocation, which is not what anyone typing "yes" (or pressing an Approve button) asked for.
-  // Position is not a defence. `find` happens to return the plain "Yes" on today's dialog only
-  // because Claude Code lists it first; nothing in this codebase pins that order, and one release
-  // reordering the menu would silently upgrade every "yes" into a permanent grant with no diff to
-  // review. So the bare affirmative is preferred EXPLICITLY, and the loose one is reached only when
-  // there is no bare one to prefer.
+  // ══ AND "AFFIRMATIVE" MEANS THE PLAIN YES, NEVER A CONTINUATION (bead sparkle-voudj7) ═════════
+  // A "Yes, and …" option is not a stronger yes, it is a DIFFERENT act: "Yes, and don't ask again"
+  // and "Yes, and auto-accept edits" hand over a standing grant for the rest of the session, which
+  // is not what anyone typing "yes" — or pressing a one-click Approve — asked for. `isAffirmative`
+  // carries that exclusion, so this `find` cannot return one however the menu is ordered, and a
+  // dialog offering ONLY continuations (Claude Code's plan-mode prompt) matches nothing here and
+  // falls through to `ambiguous-picker` — a refusal whose copy says "open it to choose", which is
+  // the honest answer when no option means plain approval.
+  //
+  // Position is deliberately NOT the defence. An earlier cut of this preferred a bare Yes and fell
+  // back to the first affirmative, which is the same thing as trusting Claude Code's ordering — and
+  // on the plan-mode dialog, whose affirmatives are all continuations, that fallback pressed
+  // "auto-accept edits" (roborev 64206).
   if (YES_WORDS.test(t)) {
-    const bare = options.find((o) => /^\s*yes[.!\s]*$/i.test(withoutOrdinal(o.label)));
-    if (bare) return bare;
     const yes = options.find(isAffirmative);
     if (yes) return yes;
   }

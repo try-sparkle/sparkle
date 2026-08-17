@@ -918,6 +918,7 @@ describe("ConciergeHost", () => {
     expect(inThread("what needs me?")).toBeTruthy();
   });
 
+
   it("streams a brain reply into the thread (delta then done)", () => {
     h.feed = feedWith("approval");
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);

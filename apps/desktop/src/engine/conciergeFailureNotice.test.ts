@@ -8,7 +8,10 @@ import {
   FAILURE_EVIDENCE_MAX,
   QUOTA_FAILURE_HEADLINE,
   UNKNOWN_FAILURE_HEADLINE,
+  bubbleFailureHeadline,
   conciergeFailureNotice,
+  mountedFailureHeadline,
+  type ConciergeFailureKind,
 } from "./conciergeFailureNotice";
 
 /** Every distinct `concierge turn failed:` text logged on 2026-07-29, verbatim. These are the
@@ -118,5 +121,92 @@ describe("conciergeFailureNotice", () => {
 
   it("reports an empty detail as empty evidence rather than inventing one", () => {
     expect(conciergeFailureNotice("   \n  \n ").evidence).toBe("");
+  });
+});
+
+// ══ THE MOUNTED VARIANTS (bead sparkle-voudj7, roborev 64319/64327) ═══════════════════════════
+// PINNED HERE, not through a rendered tree, because that is this module's whole reason for being
+// pure and React-free — and because the bug that prompted these rows was invisible to the one
+// component test that touched them: it covered `auth` only, so `quota` and `unknown` shipped
+// violating both contracts the map declares.
+//
+// ══ THE KIND LIST IS EXHAUSTIVE BY CONSTRUCTION, NOT BY HAND ══════════════════════════════════
+// A first cut wrote `const KINDS: ConciergeFailureKind[] = ["quota", "auth", "unknown"]` and claimed
+// a kind added later would inherit the rules. It would not: `ConciergeFailureKind[]` is satisfied by
+// any SUBSET of the union, so a fourth kind type-checked with zero failures — while
+// `MOUNTED_HEADLINES` is a total `Record` and would force it to have an ENTRY. An entry that
+// violates every contract here IS the shipped defect (`unknown` had one and broke two rules).
+//
+// So the list is derived from a total `Record`: omitting a member is a COMPILE error, and the row
+// below pins the membership EXPLICITLY so growing the union reds this file and makes a reviewer
+// confirm the new kind against the three contracts rather than inheriting a pass.
+const KIND_SET: Record<ConciergeFailureKind, true> = { quota: true, auth: true, unknown: true };
+const KINDS = Object.keys(KIND_SET) as ConciergeFailureKind[];
+
+describe("mountedFailureHeadline", () => {
+  // ══ THIS ROW REPLACED A VACUOUS ONE (roborev 64334) ═════════════════════════════════════════
+  // It used to assert `KINDS.length >= 3` and that the keys were unique — both GUARANTEED by the
+  // compiler and by `Object.keys`, so no mutation could turn it red, and its comment claimed to
+  // catch a "stale hand-written list" that no longer existed. Pinning the membership is the thing
+  // the type system does NOT do: a fourth kind fails here, which is the point — the contracts below
+  // then have to be read for it deliberately.
+  it("pins the kind membership, so growing the union forces a review of the new kind", () => {
+    expect([...KINDS].sort()).toEqual(["auth", "quota", "unknown"]);
+  });
+
+  for (const kind of KINDS) {
+    it(`${kind}: names an action reachable from a mounted column`, () => {
+      const line = mountedFailureHeadline(kind);
+      expect(line.length).toBeGreaterThan(0);
+      // THE CONTRACT THE `unknown` ENTRY BROKE. A mounted column renders no `failure` bubble, so a
+      // line offering only "try again" leaves the reader with no route to what the machine said —
+      // and `unknown` is the lossy bucket that carries that text, so it needs the route most.
+      expect(line).toMatch(/unmount/i);
+    });
+
+    it(`${kind}: is a whole sentence, with no colon dangling into absent evidence`, () => {
+      // The bubble's `auth` and `quota` headlines END IN A COLON introducing the evidence block
+      // beneath them. The notice row carries no evidence, so a mirrored colon dangles mid-sentence.
+      expect(mountedFailureHeadline(kind)).not.toMatch(/:\s*$/);
+    });
+
+    // …AND IT IS NOT THE BUBBLE'S STRING. Copying those verbatim is the defect this map exists to
+    // prevent, so a regression to a passthrough has to fail rather than merely look different.
+    //
+    // READ THROUGH `bubbleFailureHeadline`, not a test-local copy of `HEADLINES` (roborev 64334). A
+    // second hand-maintained map is forced by its `Record` type to have an entry but not a correct
+    // one — map a new kind to `""` and this assertion passes emptily for exactly the kind it exists
+    // to cover — and it would also go inert if the module repointed a headline underneath it.
+    it(`${kind}: is not a passthrough of the bubble headline`, () => {
+      const bubble = bubbleFailureHeadline(kind);
+      // The comparison is only meaningful against a real sentence, so pin that too.
+      expect(bubble.length).toBeGreaterThan(0);
+      expect(mountedFailureHeadline(kind)).not.toBe(bubble);
+    });
+
+    // AND THE BUBBLE SIDE IS THE ONE THE PRODUCT ACTUALLY RENDERS.
+    //
+    // WHAT THIS GRIPS, STATED HONESTLY: the ACCESSOR, not the strings. Both sides resolve through
+    // the module's own `HEADLINES`, so repointing an entry moves both and this equality holds —
+    // verified by mutation, and it is why the row is not claimed as a check on the copy itself.
+    // What it does catch is `bubbleFailureHeadline` coming to read a DIFFERENT map than the one the
+    // host renders, which is the drift that would quietly hollow out the passthrough guard above
+    // (mutating the accessor to return `MOUNTED_HEADLINES` reds both rows, for every kind). The
+    // `notice.kind` assertion is the independent half: it pins that this detail really classifies as
+    // this kind, so the pair below is not testing the classifier against itself.
+    it(`${kind}: bubbleFailureHeadline agrees with what conciergeFailureNotice emits`, () => {
+      const detail = { quota: "You've hit your session limit", auth: "Invalid API key · Please run /login", unknown: "some other failure" }[kind];
+      const notice = conciergeFailureNotice(detail);
+      expect(notice.kind).toBe(kind);
+      expect(notice.headline).toBe(bubbleFailureHeadline(kind));
+    });
+  }
+
+  // The quota line drops the bubble's "not something Sparkle can route around:" tail, which only
+  // makes sense immediately above the evidence it introduces.
+  it("quota keeps the fact and drops the evidence-introducing tail", () => {
+    const line = mountedFailureHeadline("quota");
+    expect(line).toMatch(/out of room/i);
+    expect(line).not.toMatch(/route around/i);
   });
 });

@@ -48,7 +48,12 @@ vi.mock("./terminalViewport", () => ({ getAgentViewport: vi.fn(() => null) }));
 import { submitPrompt, writePtyChainedStrict } from "../pty";
 import { getAgentScrollback } from "./terminalScrollback";
 import { getAgentViewport } from "./terminalViewport";
-import { dispatchConciergeAnswer, liveOptionsFor, pickerPressFor } from "./conciergeDispatch";
+import {
+  dispatchConciergeAnswer,
+  liveOptionsFor,
+  matchAnswerToOption,
+  pickerPressFor,
+} from "./conciergeDispatch";
 import { APPROVAL_2_1_220, ASK_USER_QUESTION_2_1_220 } from "../engine/capturedScreens.fixture";
 import { refusalCopy, refusedPath } from "../components/Concierge/refusalCopy";
 
@@ -144,6 +149,49 @@ describe("Approve PRESSES the option instead of typing at it", () => {
 
     expect(r.ok).toBe(true);
     expect(ptyWrites()).toEqual(["2\r"]);
+  });
+
+  // ══ …AND REFUSES OUTRIGHT WHEN EVERY AFFIRMATIVE IS A STANDING GRANT (roborev 64206) ═════════
+  // Claude Code's PLAN-MODE dialog has no plain Yes at all — both affirmatives hand over session-
+  // wide permission. There is nothing here a one-click Approve can honestly press, so it must
+  // refuse rather than pick one.
+  //
+  // THIS IS THE ROW THAT CAUGHT A REGRESSION IN THE FIX ITSELF. Stripping the detector's ordinal so
+  // "1 · Yes" matches is only half the change; the first cut then fell back to the FIRST affirmative
+  // when no bare Yes existed, which on this screen is "auto-accept edits". Before the ordinal strip
+  // these labels matched nothing and the press was safely refused — so that half-fix turned a
+  // harmless refusal into a silent privilege escalation, from the button whose entire promise is
+  // answering ONE question.
+  it("refuses a plan-mode dialog rather than pressing 'Yes, and auto-accept edits'", async () => {
+    const PLAN_MODE = [
+      "Would you like to proceed?",
+      "❯ 1. Yes, and auto-accept edits",
+      "  2. Yes, and manually approve edits",
+      "  3. No, keep planning",
+      "",
+      "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+    showing(PLAN_MODE);
+    // The premise: the detector really does read all three, so this is a refusal by JUDGEMENT and
+    // not merely a screen nothing could parse.
+    expect(liveOptionsFor(AGENT).map((o) => o.label)).toEqual([
+      "1 · Yes, and auto-accept edits",
+      "2 · Yes, and manually approve edits",
+      "3 · No, keep planning",
+    ]);
+    expect(pickerPressFor(AGENT, "approve")).toBeUndefined();
+
+    const r = await pressApprove();
+
+    expect(r.ok).toBe(false);
+    // NOTHING was pressed — not "1\r", not anything. This is the assertion that fails on the
+    // half-fix, and `path` alone would not have caught it.
+    expect(ptyWrites()).toEqual([]);
+    // A typed "yes" must not reach it either: the exclusion lives in the matcher, not in the
+    // Approve relay, so every caller inherits it.
+    expect(matchAnswerToOption("yes", liveOptionsFor(AGENT))).toBeNull();
+    // …while the deny option stays reachable — refusing to escalate must not disarm declining.
+    expect(matchAnswerToOption("no", liveOptionsFor(AGENT))?.value).toBe("3\n");
   });
 
   it("refuses itself if the menu MOVED between reading it and pressing", async () => {
