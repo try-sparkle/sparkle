@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead, Board } from "../services/beads";
 import { C } from "../theme/colors";
@@ -242,6 +242,209 @@ beforeEach(() => {
   if (useProjectStore.getState().projects[0]?.rootPath !== project.rootPath) {
     throw new Error("BoardView tests: project store seed did not take effect — claim assertions would be vacuous");
   }
+});
+
+// ══ TERMINAL-COLUMN RENDER CAP ════════════════════════════════════════════════════════════════
+//
+// THE DEFECT THIS PINS: the cap was wired as `key === "archived"`, and NOTHING in this repo ever
+// writes `ARCHIVED_LABEL`. `columnOf` only ever READS it, so the Archived column is permanently
+// empty — the cap guarded an empty column while every closed bead fell through to DONE, uncapped.
+// On the founder's store that is 4,476 of 7,507 beads mounted as live cards behind a board he is
+// trying to click.
+//
+// BOTH COLUMNS ARE MOUNTED IN THE SAME RENDER, deliberately. Asserting only that Done is capped
+// would pass just as well if the cap had been applied to EVERY column, which would hide live work
+// in Backlog — the failure mode that makes a cap worse than the stall. The pair is the assertion:
+// terminal is capped, live is not.
+describe("BoardView — terminal columns are render-capped", () => {
+  const CAP = 50;
+  // > CAP * 3, so the paging assertions below still have cards left to reveal on the third page.
+  const OVER = 200;
+
+  /**
+   * EVERY COLUMN SEEDED PAST THE CAP, and that is the whole design of this fixture.
+   *
+   * The first version populated only `backlog` and `done`. Absence of an overflow marker in a
+   * column that was never mounted proves nothing (the N-targets rule in AGENTS.md), and the hole
+   * was concrete rather than theoretical: `TERMINAL_COLUMNS = new Set(["done"])` -- the cap
+   * silently dropped from Shipped and Archived -- passed that suite unchanged, and so did adding
+   * `"blocked"`, which would hide LIVE work. The two mutations originally reported as evidence
+   * happened to be the two that seeding could catch; the likelier regression, one key added to or
+   * dropped from the set, was invisible (roborev 65673).
+   */
+  function bigBoard(): Board {
+    const col = (p: string) =>
+      Array.from({ length: OVER }, (_, i) => bead({ id: `p1-${p}${i}`, title: `${p} ${i}` }));
+    return {
+      backlog: col("backlog"),
+      blocked: col("blocked"),
+      inProgress: col("prog"),
+      done: col("done"),
+      delivered: col("del"),
+      archived: col("arch"),
+    };
+  }
+
+  const cardsIn = (columnKey: string) => {
+    const col = document.querySelector(`[data-board-column="${columnKey}"]`);
+    if (col === null) throw new Error(`column ${columnKey} not mounted`);
+    // EXACT testids, not the `board-card-` PREFIX. The prefix form counted controls INSIDE a card
+    // as cards: `main` added `board-card-build-it` and `board-card-clear-stalled`, so a 50-card
+    // column measured 100 and every cap assertion here failed on a merge that had not touched the
+    // cap at all. A card is one of exactly two testids; anything else under that prefix is chrome.
+    return col.querySelectorAll(
+      '[data-testid="board-card-epic"], [data-testid="board-card-task"]',
+    ).length;
+  };
+
+  const LIVE = ["backlog", "blocked", "inProgress"] as const;
+  /** Archived is capped too, but it is COLLAPSED by default so it mounts nothing until opened. */
+  const TERMINAL_EXPANDED = ["done", "delivered"] as const;
+
+  beforeEach(() => {
+    snapshot = { beads: [], board: bigBoard(), loadedAt: Date.now() };
+  });
+
+  it("caps every terminal column and no live one, in a single render", () => {
+    render(<BoardView project={project} side="right" />);
+
+    for (const key of TERMINAL_EXPANDED) {
+      expect(cardsIn(key)).toBe(CAP);
+      expect(screen.getByTestId(`board-column-overflow-${key}`).textContent).toContain(
+        `+${OVER - CAP} more not shown`,
+      );
+    }
+    // THE HALF THAT FAILS IF THE CAP IS APPLIED TOO WIDELY. A card you cannot see in a live column
+    // is work you will not do, which is worse than the stall this cap fixes.
+    for (const key of LIVE) {
+      expect(cardsIn(key)).toBe(OVER);
+      expect(screen.queryByTestId(`board-column-overflow-${key}`)).toBeNull();
+    }
+  });
+
+  it("caps Archived once it is expanded, having mounted nothing while collapsed", () => {
+    render(<BoardView project={project} side="right" />);
+    expect(cardsIn("archived")).toBe(0); // collapsed: a header and a count, no cards
+
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    expect(cardsIn("archived")).toBe(CAP);
+  });
+
+  it("reveals one more page per Show more click, not the whole pile", () => {
+    render(<BoardView project={project} side="right" />);
+    expect(cardsIn("done")).toBe(CAP);
+
+    // WITHOUT THIS AFFORDANCE THE CAP IS A CONTENT BUG, not a perf fix: the beads past the cap
+    // would be unreachable. One page per click is what keeps the DOM bounded by what was asked for.
+    fireEvent.click(screen.getByTestId("board-column-show-more-done"));
+    expect(cardsIn("done")).toBe(CAP * 2);
+
+    fireEvent.click(screen.getByTestId("board-column-show-more-done"));
+    expect(cardsIn("done")).toBe(CAP * 3);
+  });
+
+  // ── THE PAGE COUNTER MUST NOT OUTLIVE THE REASON IT WAS RAISED ──────────────────────────────
+  it("resets paging when Archived is collapsed, so re-expanding is cheap again", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    fireEvent.click(screen.getByTestId("board-column-show-more-archived"));
+    fireEvent.click(screen.getByTestId("board-column-show-more-archived"));
+    expect(cardsIn("archived")).toBe(CAP * 3);
+
+    // Collapse is the user saying "make this cheap again". Keeping `pages` would mount 150 cards in
+    // one frame on the next expand -- worse than the unbounded column this replaced.
+    fireEvent.click(screen.getByText("Collapse"));
+    expect(cardsIn("archived")).toBe(0);
+
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    expect(cardsIn("archived")).toBe(CAP);
+  });
+
+  it("keeps Collapse reachable once a collapsible column is paged to its END", () => {
+    // THE STATE THE FIRST VERSION OF THIS SUITE NEVER ENTERED. `Collapse` used to live inside the
+    // `overflow > 0` block, so paging to the end unmounted the footer and took the only way back to
+    // the cheap state with it — permanently, for the session. Archived with 51-100 beads hits that
+    // after ONE click, so it is the common case, not a corner (roborev 65718).
+    snapshot = {
+      beads: [],
+      board: {
+        ...bigBoard(),
+        archived: Array.from({ length: 60 }, (_, i) =>
+          bead({ id: `p1-arch${i}`, title: `arch ${i}` }),
+        ),
+      },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    fireEvent.click(screen.getByTestId("board-column-show-more-archived"));
+
+    // Paged past the end: 60 of 60 shown, so there is no overflow left to report.
+    expect(cardsIn("archived")).toBe(60);
+    expect(screen.queryByTestId("board-column-show-more-archived")).toBeNull();
+
+    // ...and the escape hatch is STILL THERE, and still resets the paging.
+    fireEvent.click(screen.getByText("Collapse"));
+    expect(cardsIn("archived")).toBe(0);
+    fireEvent.click(screen.getByTestId("board-column-expand-archived"));
+    expect(cardsIn("archived")).toBe(CAP);
+  });
+
+  it("does not hand a filter-cleared dataset the previous column's page count", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-column-show-more-done"));
+    expect(cardsIn("done")).toBe(CAP * 2);
+
+    // NARROW, THEN CLEAR. Both are ordinary in-UI controls that swap `viewBoard[key]` wholesale
+    // under a reused Column, and the first fix only covered the Tasks/Epics toggles — so the leak
+    // survived on this path (roborev 65718). Paging is invisible while narrowed, which is what
+    // makes the restore surprising.
+    act(() => {
+      useUiStore.setState((st) => ({
+        boardAgentFilterBySide: { ...st.boardAgentFilterBySide, right: "agent-1" },
+      }));
+    });
+    act(() => {
+      useUiStore.setState((st) => ({
+        boardAgentFilterBySide: { ...st.boardAgentFilterBySide, right: null },
+      }));
+    });
+
+    expect(cardsIn("done")).toBe(CAP);
+  });
+
+  it("does not hand a PRIORITY-filter-cleared dataset the previous page count", () => {
+    // THE SECOND HALF OF `datasetKey`, pinned separately ON PURPOSE. The agent-filter test above
+    // and this one cover two DIFFERENT terms, and the earlier mutation check dropped both at once
+    // -- which proves only that at least one mattered. That is the "one fix, N call sites, only one
+    // site checked" shape in AGENTS.md: with just the agent test, deleting the `boardFilter` term
+    // leaves the suite green while the leak survives on the priority/date path, which has its own
+    // in-UI Clear (roborev 65726). Mutation-checked by removing ONLY the boardFilter term.
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-column-show-more-done"));
+    expect(cardsIn("done")).toBe(CAP * 2);
+
+    act(() => {
+      useUiStore.getState().setBoardFilter("right", { ...NO_BOARD_FILTER, priority: 0 });
+    });
+    act(() => {
+      useUiStore.getState().setBoardFilter("right", NO_BOARD_FILTER);
+    });
+
+    expect(cardsIn("done")).toBe(CAP);
+  });
+
+  it("does not hand a swapped dataset the previous column's page count", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-column-show-more-done"));
+    expect(cardsIn("done")).toBe(CAP * 2);
+
+    // The Tasks/Epics toggles swap `viewBoard[key]` wholesale while React reuses the Column
+    // instance, so a stale counter would mount pages of a dataset it was never expanded against.
+    fireEvent.click(screen.getByTestId("board-plan-kind-epics"));
+    fireEvent.click(screen.getByTestId("board-plan-kind-epics"));
+    expect(cardsIn("done")).toBe(CAP);
+  });
 });
 
 describe("BoardView", () => {

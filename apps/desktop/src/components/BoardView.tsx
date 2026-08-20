@@ -100,10 +100,16 @@ interface StageDefs {
 // belongs in the reading order — you scan left to right asking "what's next", and a blocked item is
 // something that WOULD be next except it can't be. Putting it after "Being built" would file it as
 // a kind of progress, which is the opposite of what it is.
-// ARCHIVED SITS LAST, after Shipped, and is the ONE column that is collapsed by default and
-// render-capped. A background sweep closes ~1,800 low-signal beads (each stamped `archived`, see
-// ARCHIVED_LABEL), and rendering that pile eagerly would jank the board and bury the columns the
-// user actually acts on. It is a resting place, not a worklist: opened on demand, capped when open.
+// ARCHIVED SITS LAST, after Shipped, and is the one column that is COLLAPSED by default.
+//
+// ── THE CAP USED TO GUARD THIS COLUMN AND ONLY THIS COLUMN, WHICH GUARDED NOTHING ────────────
+// The comment here used to say a background sweep closes ~1,800 low-signal beads "each stamped
+// `archived`". No such writer exists: `ARCHIVED_LABEL` is READ in `columnOf` and is written
+// nowhere in this repo, so the Archived column is permanently EMPTY and its 50-card cap protected
+// an empty column. Meanwhile every closed bead falls through to DONE, uncapped — 4,476 of them on
+// the founder's store, 60% of the whole DB, mounted as live cards behind a board the user is
+// trying to click. The cap is now wired to the TERMINAL columns (Done, Shipped, Archived), which
+// is what it was always for: they are resting places, not worklists.
 const COLUMNS: {
   key: "backlog" | "blocked" | "inProgress" | "done" | "delivered" | "archived";
   label: string;
@@ -116,10 +122,24 @@ const COLUMNS: {
   { key: "archived", label: "Archived" },
 ];
 
-/** How many Archived cards are rendered at once when the column is expanded — the rest are a
- *  "+N more" count, never DOM nodes. The bucketing still processes every archived bead (cheap,
- *  scalar work in `bucketBeads`); only the render is bounded, which is the part that janks. */
-const ARCHIVED_RENDER_CAP = 50;
+/** How many cards a TERMINAL column (Done, Shipped, Archived) renders at once — the rest are a
+ *  "+N more" count, never DOM nodes, until the user asks for another page. The bucketing still
+ *  visits every bead (cheap, scalar work in `bucketBeads`); only the render is bounded, which is
+ *  the part that janks.
+ *
+ *  50 is one screenful with room to scroll. The columns this guards are the ones that only grow:
+ *  nothing is ever removed from Done, so an uncapped Done is a DOM that grows without bound for
+ *  the life of the project. */
+const TERMINAL_RENDER_CAP = 50;
+
+/** The columns the cap applies to — terminal states, where volume accumulates and nobody is
+ *  working. A live column (Backlog, Blocked, Being built) is never capped: a card you cannot see
+ *  there is work you will not do. */
+const TERMINAL_COLUMNS: ReadonlySet<EpicLadderKey> = new Set<EpicLadderKey>([
+  "done",
+  "delivered",
+  "archived",
+]);
 
 const DESC_PREVIEW = 120;
 
@@ -460,6 +480,25 @@ export function BoardView({
       return { columns: COLUMNS, viewBoard: withPlanning(tasksOnly(displayBoard, allBeads)) };
     return { columns: COLUMNS, viewBoard: withPlanning(displayBoard) };
   }, [displayBoard, planKinds, allBeads]);
+
+  /**
+   * EVERY USER-DRIVEN CONTROL THAT SWAPS A COLUMN'S DATASET, as one string.
+   *
+   * Used only as part of the `Column` key, so any of them remounts the column rather than handing
+   * the new dataset the old one's `pages`/`expanded`. The kind toggles were the obvious pair; the
+   * AGENT and PRIORITY/DATE filters do the same thing and were missed on the first pass — both
+   * have an in-UI **Clear**, so: page Done out to 10 pages, narrow to one agent (paging is
+   * invisible there, `overflow === 0`), hit Clear, and the restored 4,476-bead column mounts 500
+   * cards in one frame against a dataset it was never expanded against (roborev 65718).
+   *
+   * ALL OF THESE CHANGE ONLY ON USER ACTION, which is what makes them safe to key on. The beads
+   * array was the other candidate and is not: it is rebuilt by every 5-second poll, so keying on it
+   * would reset the user's paging while they were reading.
+   */
+  const datasetKey =
+    `${planKinds.tasks ? "t" : ""}${planKinds.epics ? "e" : ""}` +
+    `|${boardAgentFilter ?? ""}` +
+    `|${filterActive ? JSON.stringify(boardFilter) : ""}`;
 
   /**
    * How many cards the PRIORITY/DATE filter removed — and only when it removed all of them.
@@ -821,7 +860,9 @@ export function BoardView({
         >
           {columns.map(({ key, label }) => (
             <Column
-              key={key}
+              // KEYED ON THE DATASET, not just the column — see `datasetKey` for which controls
+              // are in it and why the beads array deliberately is not.
+              key={`${datasetKey}:${key}`}
               columnKey={key}
               label={label}
               beads={viewBoard[key]}
@@ -833,10 +874,11 @@ export function BoardView({
               inReleaseByBead={inReleaseByBead}
               onDefine={setDefineStage}
               onOpen={(b) => setSelectedId(b.id)}
-              // Archived is the one volume column: collapsed by default (a header + count, no
-              // cards), and render-capped when opened. See ARCHIVED_RENDER_CAP.
+              // Archived stays the one COLLAPSED column (a header + count, no cards). The CAP is
+              // wider than that: every terminal column gets it, because Done is where the volume
+              // actually is. See TERMINAL_RENDER_CAP.
               collapsible={key === "archived"}
-              renderCap={key === "archived" ? ARCHIVED_RENDER_CAP : undefined}
+              renderCap={TERMINAL_COLUMNS.has(key) ? TERMINAL_RENDER_CAP : undefined}
             />
           ))}
         </div>
@@ -914,9 +956,15 @@ function Column({
   // "closed", which is the whole point — it must not compete with the columns that carry live work.
   const [expanded, setExpanded] = useState(false);
   const isCollapsed = collapsible && !expanded;
-  // When expanded, cap the rendered cards. `bucketBeads` already visited every archived bead; only
-  // the DOM is bounded here — the count above the cap is a number, never a node.
-  const cap = renderCap ?? beads.length;
+  // PAGES REVEALED BEYOND THE CAP. A capped column that offers no way past the cap does not bound
+  // the DOM, it HIDES work — fine for Archived, which is collapsible and explicitly a resting
+  // place, and not fine for Done, which people scroll to find what shipped. Each click mounts one
+  // more page instead of all 4,476, so the DOM stays bounded by what was actually asked for.
+  // Local and not persisted, like `expanded`: every time the board opens, the cheap state is back.
+  const [pages, setPages] = useState(1);
+  // When expanded, cap the rendered cards. `bucketBeads` already visited every bead; only the DOM
+  // is bounded here — the count above the cap is a number, never a node.
+  const cap = renderCap === undefined ? beads.length : renderCap * pages;
   const rendered = isCollapsed ? [] : beads.slice(0, cap);
   const overflow = isCollapsed ? beads.length : beads.length - rendered.length;
 
@@ -1008,7 +1056,7 @@ function Column({
               textAlign: "left",
             }}
           >
-            Show {overflow} archived {overflow === 1 ? "bead" : "beads"}
+            Show {overflow} {label.toLowerCase()} {overflow === 1 ? "bead" : "beads"}
           </button>
         ) : (
           <>
@@ -1025,20 +1073,57 @@ function Column({
                 onOpen={onOpen}
               />
             ))}
-            {/* Rendered fewer than there are → the remainder is a count, not DOM. This is the cap,
-                and (for a collapsible column) the way back to a closed, cheap column. */}
-            {overflow > 0 && (
+            {/* THE FOOTER RENDERS WHENEVER THERE IS SOMETHING FOR IT TO SAY — an overflow to
+                report, OR a collapsible column to close. Those are different conditions, and
+                collapsing the two was a real bug: `Collapse` used to live INSIDE `overflow > 0`, so
+                paging a collapsible column to its end unmounted the whole row and took the only
+                route back to the cheap state with it. Archived with 51-100 beads reaches that after
+                a SINGLE `Show more`, and from then on the column could not be closed again for the
+                rest of the session — the affordance vanishing exactly where the DOM is most
+                expensive (roborev 65718). */}
+            {(overflow > 0 || (collapsible && expanded)) && (
               <div
                 data-testid={`board-column-overflow-${columnKey}`}
                 style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 2px" }}
               >
-                <span style={{ color: C.muted, fontSize: 12 }}>
-                  +{overflow} more not shown
-                </span>
+                {overflow > 0 && (
+                  <span style={{ color: C.muted, fontSize: 12 }}>
+                    +{overflow} more not shown
+                  </span>
+                )}
+                {/* THE WAY PAST THE CAP. Without this the cap is a content bug: on the founder's
+                    store Done holds 4,476 beads, so a bare 50-card cap would make 4,426 of them
+                    unreachable. One more page per click, never the whole pile. */}
+                {overflow > 0 && (
+                <button
+                  type="button"
+                  data-testid={`board-column-show-more-${columnKey}`}
+                  onClick={() => setPages((n) => n + 1)}
+                  style={{
+                    background: "transparent",
+                    border: "none",
+                    padding: 0,
+                    color: C.accentInk,
+                    cursor: "pointer",
+                    font: "inherit",
+                    fontSize: 12,
+                    textDecoration: "underline",
+                  }}
+                >
+                  Show more
+                </button>
+                )}
                 {collapsible && (
                   <button
                     type="button"
-                    onClick={() => setExpanded(false)}
+                    // BOTH, not just `expanded`. Collapsing is the user saying "make this cheap
+                    // again"; leaving `pages` behind means the next expand mounts N x CAP cards in
+                    // one frame -- strictly worse than the unbounded column this cap replaced, and
+                    // on the one column that exists to be cheap by default (roborev 65673).
+                    onClick={() => {
+                      setExpanded(false);
+                      setPages(1);
+                    }}
                     style={{
                       background: "transparent",
                       border: "none",
