@@ -27,17 +27,23 @@ import { rollupEpicStatus } from "./planView";
  *  one genuinely new key, because the board has never had a bucket for it. */
 export type EpicLadderKey = BoardColumn | "planning";
 
-/** The founder's ladder, in his reading order:
- *  Backlog > Blocked > Planning > Building > Done > Shipped > Archived.
- *
- *  BLOCKED SITS SECOND for the same reason it does on the task board — you scan left to right
- *  asking "what is next", and a blocked epic is one that WOULD be next except it cannot be.
- *  PLANNING SITS THIRD, between "nobody has decided what this is" and "somebody is building it",
- *  which is exactly the gap it names. */
+/** The founder's ladder, in his reading order. The ORDER ITSELF is the array below, and the reason
+ *  for it is the comment inside it — deliberately NOT restated here. This doc used to carry its own
+ *  copy of the sequence plus a rationale for it, which is the shape that silently went stale the
+ *  first time the order changed: an IDE surfaces this block on hover, so a reader got a confident
+ *  argument for an order the code no longer had, and a stated reason to "restore" it. The pinned
+ *  test asserts the array, never a comment, so nothing would have flagged the drift. */
 export const EPIC_LADDER_COLUMNS = [
+  // PLANNING SITS BEFORE BLOCKED, on the founder's instruction: "let's put Planning to the left of
+  // Blocked so it should be Backlog, Planning, Blocked, Building, Done, Shipped, Archive."
+  //
+  // It also reads better as a LADDER, which is what this list is: Backlog → Planning → Building is
+  // the path work actually travels, and Blocked is not a rung on it — it is a state work falls into
+  // from any rung. Putting it between the first two rungs interrupted the only sequence here that
+  // means anything.
   { key: "backlog", label: "Backlog" },
-  { key: "blocked", label: "Blocked" },
   { key: "planning", label: "Planning" },
+  { key: "blocked", label: "Blocked" },
   { key: "inProgress", label: "Building" },
   { key: "done", label: "Done" },
   { key: "delivered", label: "Shipped" },
@@ -151,6 +157,49 @@ export function tasksOnly(board: Board, allBeads: readonly Bead[]): Board {
  *  render a Planning column to put anything in. */
 export function withPlanning(board: Board): EpicBoard {
   return { ...board, planning: [] };
+}
+
+/** BOTH KINDS ON: epics rise to the top of every column, tasks keep their order beneath them.
+ *
+ *  WHY THIS EXISTS. With both toggles on, the board is the six task columns and an epic is bucketed
+ *  by its own status like anything else — so it lands in Backlog among however many tasks are
+ *  there. The founder reported this as "I don't see any epics when I have tasks turned on", and he
+ *  was reading it correctly: on a store with thousands of open beads an epic is on the board and
+ *  unfindable, which is the same thing as absent. Epics-only worked, which is what made it look
+ *  like a filter bug rather than an ordering one.
+ *
+ *  It does NOT re-bucket. An epic stays in the column its status puts it in — moving it would make
+ *  the same bead sit in different columns depending on a toggle, and the Epics rail's own ladder is
+ *  where an epic-shaped view belongs. This only decides ORDER WITHIN a column.
+ *
+ *  STABLE, and that is load-bearing rather than incidental: the piles arrive in the order
+ *  `bucketBeads` preserved, and both groups have to keep it. A comparator returning ±1 on an
+ *  epic/epic or task/task pair would reshuffle each group on every render.
+ */
+export function epicsFirst(board: Board, allBeads: readonly Bead[]): Board {
+  // CACHED, not `buildEpicIndex` — same reason as `epicsOnly` above. main replaced the uncached
+  // walk here (the 43.5s -> 92ms epic-index wiring); this branch predates that, and the merge took
+  // main's import list while keeping this call site, so it referenced a name no longer imported.
+  // Re-importing `buildEpicIndex` would have compiled and silently undone the perf fix.
+  const index = epicIndexOf(allBeads);
+  const split = (pile: Bead[]): Bead[] => {
+    const epics = pile.filter((b) => isEpicIndexed(index, b));
+    // Nothing to reorder — hand the SAME array back so React sees an unchanged reference.
+    if (epics.length === 0 || epics.length === pile.length) return pile;
+    return [...epics, ...pile.filter((b) => !isEpicIndexed(index, b))];
+  };
+  return mapPiles(board, split);
+}
+
+function mapPiles(board: Board, f: (pile: Bead[]) => Bead[]): Board {
+  return {
+    backlog: f(board.backlog),
+    blocked: f(board.blocked),
+    inProgress: f(board.inProgress),
+    done: f(board.done),
+    delivered: f(board.delivered),
+    archived: f(board.archived),
+  };
 }
 
 function mapBoard(board: Board, keep: (b: Bead) => boolean): Board {

@@ -2195,6 +2195,58 @@ describe("BoardView — Tasks / Epics kind toggles", () => {
     expect(container.querySelector('[data-board-column="planning"]')).toBeNull();
   });
 
+  // ── EPICS RISE TO THE TOP OF THEIR COLUMN WHEN BOTH KINDS ARE ON ────────────────────────────
+  // The founder: "I don't see any epics in it when I have tasks turned on. I do see epics when it's
+  // only epics." Both halves of that were true and neither was a filter bug — the epic WAS on the
+  // board, bucketed by its own status into Backlog among the tasks, and on a real store that pile
+  // is thousands long.
+  //
+  // WHICH COLUMN is asserted alongside the order deliberately: an implementation that fixed
+  // findability by re-bucketing epics into their own column would satisfy an order-only assertion
+  // while making one bead sit in different columns depending on a toggle. Backlog is still Backlog.
+  it("puts epics ABOVE the tasks in the same column, without re-bucketing them", () => {
+    // Seeded so the epic is NOT already first: `bucketBeads` preserves input order, so a fixture
+    // with the epic written first would pass against no implementation at all.
+    const beads: Bead[] = [
+      bead({ id: "p1-task", title: "Plain task" }),
+      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic.1", title: "Epic child" }),
+      bead({ id: "p1-task2", title: "Second task" }),
+    ];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+
+    const { container } = render(<BoardView project={project} side="right" />);
+
+    const backlog = container.querySelector('[data-board-column="backlog"]')!;
+    const epic = titleNode("Parent rollup", backlog as HTMLElement)!;
+    const task = titleNode("Plain task", backlog as HTMLElement)!;
+    expect(epic).toBeTruthy();
+    expect(task).toBeTruthy();
+    // Still Backlog for both — the epic did not move columns.
+    expect(columnOf("Parent rollup")).toBe("backlog");
+    expect(columnOf("Plain task")).toBe("backlog");
+    // FALSE before this change, where input order put "Plain task" first.
+    expect(epic.compareDocumentPosition(task) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("leaves a column's order alone when it holds no epics", () => {
+    // The other half: a stable split must not reshuffle a pile it has nothing to lift. Without this
+    // an implementation that sorted unconditionally would pass the test above and churn every
+    // task-only column on every render.
+    const beads: Bead[] = [
+      bead({ id: "t1", title: "First task" }),
+      bead({ id: "t2", title: "Second task" }),
+      bead({ id: "t3", title: "Third task" }),
+    ];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+
+    const { container } = render(<BoardView project={project} side="right" />);
+    const backlog = container.querySelector('[data-board-column="backlog"]')! as HTMLElement;
+    const first = titleNode("First task", backlog)!;
+    const third = titleNode("Third task", backlog)!;
+    expect(first.compareDocumentPosition(third) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   // ══ THERE IS NO "BOTH" ═══════════════════════════════════════════════════════════════════════
   // The founder's actual instruction, and the one thing a rename of the old control would leave
   // untouched — so it is asserted directly rather than inferred from the two toggles existing.

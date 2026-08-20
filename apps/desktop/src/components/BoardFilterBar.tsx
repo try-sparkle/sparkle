@@ -9,7 +9,7 @@
 // and the hosts pass only `side`.
 import { useState, useRef, useEffect, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { FiChevronDown, FiX } from "react-icons/fi";
+import { FiChevronDown, FiFilter, FiX } from "react-icons/fi";
 import { C } from "../theme/colors";
 import { RADIUS, TYPE, FONT_UI, WEIGHT } from "../theme/scale";
 import { CHIP } from "./labelTreatment";
@@ -214,6 +214,17 @@ export function BoardFilterBar({ side }: { side: PairSide }) {
       data-testid="board-filter-bar"
       style={{ display: "inline-flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}
     >
+      {/* A MARK, NOT A CONTROL. The founder asked for "a little filter icon next to priority and
+          date" — it names what the group is, which matters more now that the row's first item is a
+          "Close Planning Board" link rather than a mode toggle. Deliberately inert: `aria-hidden`
+          and `pointerEvents: none`, so it adds nothing to the tab order and cannot swallow a press
+          aimed at the chip beside it. A react-icon rather than a character, per `glyphIcons.test`. */}
+      <FiFilter
+        data-testid="board-filter-mark"
+        aria-hidden
+        size={12}
+        style={{ color: C.muted, flex: "0 0 auto", pointerEvents: "none" }}
+      />
       <ChipMenu
         testId="board-filter-priority"
         label={filter.priority === null ? "Priority" : `P${filter.priority}`}

@@ -157,6 +157,8 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
+import { useBeadsStore } from "../stores/beadsStore";
+import { bucketBeads } from "../services/beads";
 import { useConnectionStore } from "../stores/connectionStore";
 import { resetVisitedProjects } from "../services/sessionProjects";
 import { resetCable } from "../stores/cableStore";
@@ -603,5 +605,90 @@ describe("switching the project tab while an agent is MOUNTED still paints the n
     });
 
     expect(terminalOnScreen("a3")).toBe(true);
+  });
+});
+
+// ══ EPIC FOCUS — the row is filtered away, so its terminal must go with it ══════════════════════
+//
+// The founder: "it could be true that I might've had an active build row that is now filtered and
+// hidden because I go from a build row over to the Epics column and I click on an epic... If it
+// ends up filtering the build row, you should remove the terminal output from that build row...
+// If it doesn't, you can keep the terminal output the same as it was."
+//
+// Both halves are asserted, and the second is what gives the first its meaning: a test that only
+// checked the hidden case would pass against an implementation that blanked the stage whenever ANY
+// epic was selected. The distinguishing fact is WHICH agent the epic contains, so the same epic is
+// focused in both cases and only the membership differs.
+//
+// HIDDEN, NOT UNMOUNTED. `paneFor` still resolves in the filtered case — the pane stays portalled
+// and stops being painted. That is deliberate: a Terminal unmount detaches, and for a local agent
+// detach IS kill, so deselecting instead of hiding would end the founder's session rather than
+// tidy his screen. It is also why "press Clear and the terminal is back" holds.
+describe("selecting an epic hides the terminal of a row it filters out", () => {
+  /** `a1` is the selected/mounted row. `owner` decides whose bead the epic owns. */
+  function seedEpic(owner: "a1" | "a2") {
+    seed();
+    const agents = [
+      { ...mkAgent("a1", MOUNTED), beadId: owner === "a1" ? "ep-1.a" : "other-1" },
+      { ...mkAgent("a2", OTHER), beadId: owner === "a2" ? "ep-1.a" : "other-1" },
+    ];
+    useProjectStore.setState({
+      projects: [mkProject("p1", "Alpha", agents as never, "a1")],
+      selectedProjectId: "p1",
+    } as never);
+    const beads = [
+      { id: "ep-1", title: "ep-1", status: "open", labels: [], parent: null },
+      { id: "ep-1.a", title: "ep-1.a", status: "open", labels: [], parent: "ep-1" },
+      { id: "other-1", title: "other-1", status: "open", labels: [], parent: null },
+    ];
+    useBeadsStore.setState({
+      byProject: { p1: { beads, board: bucketBeads(beads as never), polledAt: 0 } },
+      error: {},
+    } as never);
+  }
+
+  it("hides it when the focused epic does NOT contain the selected row's bead", async () => {
+    seedEpic("a2");
+    await mount();
+    // THE PREMISE. Without this the assertion below passes for a terminal that was never on screen.
+    expect(terminalOnScreen("a1")).toBe(true);
+
+    act(() => {
+      useUiStore.getState().setEpicFocus("right", "ep-1");
+    });
+
+    expect(terminalOnScreen("a1")).toBe(false);
+    // Portalled, not destroyed — the half that keeps the PTY alive.
+    expect(paneFor("a1")).toBeTruthy();
+  });
+
+  it("keeps it when the focused epic DOES contain the selected row's bead", async () => {
+    seedEpic("a1");
+    await mount();
+    expect(terminalOnScreen("a1")).toBe(true);
+
+    act(() => {
+      useUiStore.getState().setEpicFocus("right", "ep-1");
+    });
+
+    // Same gesture, same epic, opposite membership — so this pair cannot both pass by blanking or
+    // by doing nothing.
+    expect(terminalOnScreen("a1")).toBe(true);
+  });
+
+  it("brings it back when the focus is cleared", async () => {
+    seedEpic("a2");
+    await mount();
+    act(() => {
+      useUiStore.getState().setEpicFocus("right", "ep-1");
+    });
+    expect(terminalOnScreen("a1")).toBe(false);
+
+    act(() => {
+      useUiStore.getState().setEpicFocus("right", null);
+    });
+
+    // "You can keep the terminal output the same as it was" — the same pane, still mounted.
+    expect(terminalOnScreen("a1")).toBe(true);
   });
 });

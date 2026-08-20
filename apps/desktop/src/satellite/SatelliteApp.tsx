@@ -40,7 +40,7 @@ import { ZoomColumnOverride } from "../hooks/useZoomColumn";
 import type { PairSide } from "../engine/cable";
 import { useSettingsStore } from "../stores/settingsStore";
 import { AgentSidebar } from "../components/AgentSidebar";
-import { PlanBuildToggle } from "../components/PlanBuildToggle";
+import { HeaderLink } from "../components/HeaderLink";
 import { BoardFilterBar } from "../components/BoardFilterBar";
 import { PLAN_COLUMN_Z } from "../components/layers";
 import { ErrorBoundary, AgentPaneErrorCard } from "../components/ErrorBoundary";
@@ -118,9 +118,9 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   // ("right") side of the per-column mode map. It has no second pair to be confused with — the
   // singleton the map replaced was only ever a problem in the two-pair cockpit.
   const workMode = useUiStore((s) => s.workModeBySide[SATELLITE_PAIR_SIDE]);
-  // Both chevrons go through the store actions that own the mode-plus-yield pairing; nothing here
-  // writes a bare `setWorkMode`, which is why that selector is gone.
-  const openPlanBoard = useUiStore((s) => s.openPlanBoard);
+  // The exit goes through the store action that owns the mode-plus-yield pairing; nothing here
+  // writes a bare `setWorkMode`, which is why that selector is gone. There is no `openPlanBoard`
+  // either — the way IN is AgentSidebar's own link, under `showOpenBoardLink`.
   const showBuildStage = useUiStore((s) => s.showBuildStage);
   const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
   const stepColumnZoom = useUiStore((s) => s.stepColumnZoom);
@@ -295,9 +295,9 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
     return project.agents.filter((a) => openSet.has(a.id)).map((a) => ({ project, agent: a }));
   }, [project, openAgentIds, closing]);
 
-  const onPickPlan = () => {
-    openPlanBoard(SATELLITE_PAIR_SIDE);
-  };
+  // NO local `onPickPlan`. The way IN is the "Open Planning Board" link in this window's Build
+  // Agents header, which `AgentSidebar` renders and wires to its own handler under
+  // `showOpenBoardLink` — one owner for that gesture rather than two spellings of it.
   const onPickBuild = () => {
     showBuildStage(SATELLITE_PAIR_SIDE);
   };
@@ -327,6 +327,9 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
             mirrors the board's own render gate exactly — they must not be able to disagree. */}
         <AgentSidebar
           project={closing ? null : project}
+          // THE SATELLITE'S ONLY WAY INTO THE BOARD. This window renders columns 2 + 3 alone, so it
+          // has no Epics column to carry the link the main window puts there.
+          showOpenBoardLink
           showSparkleRow={false}
           forcePairSide={SATELLITE_PAIR_SIDE}
           covered={boardActive && !!project && !closing}
@@ -425,12 +428,16 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
                 flex: "0 0 auto",
               }}
             >
-              <PlanBuildToggle
-                mode={workMode}
-                beadsEnabled={beadsEnabled}
-                variant="mini"
-                onPickPlan={onPickPlan}
-                onPickBuild={onPickBuild}
+              {/* THE WAY OUT, and it stays FIRST in this `flex-start` row. That position is a founder
+                  requirement, not a leftover: "the build versus plan toggle should stay left justified
+                  when it's in plan mode... keep it where it is so I can switch between them easily."
+                  The control changed shape; the x it sits on did not. The filters still grow to its
+                  RIGHT, so a widening bar cannot push the exit around. */}
+              <HeaderLink
+                testId="plan-board-close"
+                hint="build"
+                label="Close Planning Board"
+                onClick={onPickBuild}
               />
               {workMode === "plan" && <BoardFilterBar side={SATELLITE_PAIR_SIDE} />}
             </div>

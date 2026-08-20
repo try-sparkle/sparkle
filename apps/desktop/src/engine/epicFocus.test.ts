@@ -27,6 +27,10 @@ const BEADS: Bead[] = [
   bead("sparkle-epic.2"),
   bead("sparkle-epic.2.a"), // dotted GRANDchild
   bead("sparkle-edge", { parent: "sparkle-epic" }), // explicit parent edge, undotted id
+  // A GRANDCHILD OF THAT UNDOTTED BEAD. Reachable only by walking the `parent` edge TWICE, and it
+  // is the shape the shipped one-level rule dropped: `sparkle-edge` was reparented onto the epic so
+  // it kept a flat id, and nothing beneath it carries the epic's dotted prefix. Bead sparkle-tyruz4.
+  bead("sparkle-edge-kid", { parent: "sparkle-edge" }),
   bead("sparkle-other"), // a different epic entirely
   bead("sparkle-other.1"),
 ];
@@ -43,6 +47,13 @@ describe("beadIdsInEpic", () => {
     expect(ids.has("sparkle-epic.1")).toBe(true);
     expect(ids.has("sparkle-epic.2.a")).toBe(true); // any depth, per the dotted prefix
     expect(ids.has("sparkle-edge")).toBe(true); // no dot in the id at all
+  });
+
+  it("walks a FLAT-ID parent chain to any depth, not just one link", () => {
+    // The measured gap. `sparkle-edge-kid` carries no dotted prefix and its parent is not the epic,
+    // so it is a member only if the rule closes over the edge. An orchestrator working it was
+    // silently hidden from the epic's build column.
+    expect(beadIdsInEpic(BEADS, "sparkle-epic").has("sparkle-edge-kid")).toBe(true);
   });
 
   it("does NOT reach into a different epic", () => {

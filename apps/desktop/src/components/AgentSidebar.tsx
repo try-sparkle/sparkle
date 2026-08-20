@@ -103,7 +103,6 @@ import { handleImproveSparkleClick } from "../services/sparkleReveal";
 import {
   topLevelAgents as topLevelOf,
   isTopLevelAgent,
-  firstVisibleAgentId,
 } from "../engine/agentOrdering";
 import { firstLadderRowId } from "../engine/ladderSelection";
 import { sideOf } from "../engine/pairs";
@@ -171,7 +170,7 @@ import { useNewAgentCalm, useNewAgentGraceTick } from "../hooks/useNewAgentCalm"
  *  resolves — a new array identity each time would re-arm its grace timer forever. */
 const NO_AGENTS: readonly AgentTab[] = [];
 import { reconcileWorkMode, type WorkMode } from "../engine/workMode";
-import { PlanBuildToggle } from "./PlanBuildToggle";
+import { HeaderLink } from "./HeaderLink";
 import {
   resolveStage,
   rollupHoldsWork,
@@ -236,6 +235,7 @@ export function AgentSidebar({
   project,
   slotSide = "right",
   forcePairSide,
+  showOpenBoardLink = false,
   showSparkleRow = true,
   showConciergeRow = true,
   covered = false,
@@ -263,6 +263,10 @@ export function AgentSidebar({
    *  Sparkle agent's id is keyed to the window label (`sparkleAgentIdFor`), and a satellite would
    *  therefore offer to reveal MAIN's copy — a second pane on one PTY, which is the one thing the
    *  tear-off ownership split exists to prevent. Defaults to true so the main window is untouched. */
+  /** Render "Open Planning Board" in this band. FALSE in the main window, where the Epics column
+   *  carries that link; TRUE in the satellite, which has no Epics column. Two live copies of one
+   *  navigation control is the hazard, not the extra prop. */
+  showOpenBoardLink?: boolean;
   showSparkleRow?: boolean;
   /**
    * Whether THIS sidebar renders the pinned "Concierge Agents" row.
@@ -1197,6 +1201,11 @@ export function AgentSidebar({
     // connection, and a pin of `null` would fall straight back to the selection-following bug.
     patchCable(pairSide, id);
   };
+  // A LIVE HANDLE TO THE ABOVE, for effects that must not re-run merely because it was rebuilt.
+  // `selectAndWire` closes over props and is redefined every render by design; a ref keeps the
+  // CURRENT one reachable without making it a dependency.
+  const selectAndWireRef = useRef(selectAndWire);
+  selectAndWireRef.current = selectAndWire;
   /**
    * SEAT THE AGENT AND HAND ITS TERMINAL THE CARET. A SINGLE CLICK, AND NO CABLE.
    *
@@ -1323,6 +1332,9 @@ export function AgentSidebar({
   // the section; clicking the SAME chevron AGAIN while already in Build spawns a fresh build agent
   // (same as the "+ New Build Agent" button). Plan stays a pure mode switch: it has no agent concept
   // and only opens the read-only Tasks board in the main pane.
+  // NO `onPickPreview` HERE ANY MORE, and no "Close Preview" either: the preview PANE is gone
+  // (origin/main d48af48e5), not merely its toggle segment. Preview is reached from the agent row's
+  // hover-card button, which also starts the dev server — something a mode switch never did.
   const onPickPlan = () => {
     // ONE WRITE FOR THE BOARD, to THIS column. It used to also set the window-global
     // `activeSpecial = "board"`, which is what made the board a singleton — that global was the
@@ -1360,31 +1372,12 @@ export function AgentSidebar({
     if (id) selectAndWire(id);
     return id;
   };
-  const onPickBuild = () => {
-    // `paneCoversMe` (component scope) rather than the bare global — see its definition. The
-    // chevron and the row highlighting have to answer "is my stage covered" the same way, or the
-    // press does something other than what the column is painting.
-    const alreadyHere = mode === "build" && !paneCoversMe;
-    // showBuildStage, not setMode + setActiveSpecial: the pairing lives in the store so this
-    // chevron and the concierge's `set_work_mode("build")` cannot answer the same request
-    // differently. It also SCOPES the yield to the pane-owning pair, where this used to clear the
-    // window-global unconditionally — a left column's Build press reaching across to close a
-    // right-pair surface, the mirror of the bug openPlanBoard's scoping prevents.
-    showBuildStage(pairSide);
-    if (!project) return;
-    if (alreadyHere) {
-      // Second click on the active chevron: spawn a fresh build agent (≡ the + button).
-      spawnBuildAgent();
-      return;
-    }
-    // Switching INTO Build: move selection to the row the column actually renders FIRST, so the
-    // pane matches the chevron (or clear it → the empty Build state with "+ New Build Agent").
-    // Ladder- and filter-aware: array order would happily select a row the user has filtered out.
-    const next = firstRenderedRowId(project.agents, "build") ?? firstVisibleAgentId(project.agents, "build");
-    // Wires too: switching into Build is the user putting a build agent in front of themselves,
-    // which is the same act as clicking its row.
-    selectAndWire(next);
-  };
+  // NO `onPickBuild` HERE ANY MORE. It was the toggle's handler and nothing else ever called it.
+  // Its two jobs outlived it in better places: dropping the Improve-Sparkle pane is `showBuildStage`
+  // in the store (so every path into Build agrees), and landing on a row the column actually renders
+  // is now an EFFECT above — which covers `agentReveal`, `landInAgent`, `captureSends` and the
+  // concierge tool too, none of which ever went through this button. Its third job, spawning on a
+  // second press, is gone with the gesture; "+ Local Agent" is the surviving path.
   // Stable so the memoized SparkleAgentRow doesn't re-render on unrelated status flips (sparkle-alrm.3).
   // Improve Sparkle is per-window: reveal THIS window's own copy in place (its own worktree/branch/
   // conversation keyed by sparkleAgentId). No cross-window focus/broadcast. See services/sparkleReveal.
@@ -2266,6 +2259,7 @@ export function AgentSidebar({
   );
 
 
+
   // Which orchestrators have their worker subtree collapsed. Subscribed (not read via getState) so
   // a chevron click re-renders the list. A Set of the COLLAPSED ids, derived from the persisted
   // record, keeping uiStore's "absent → collapsed" default: an id is collapsed unless it is
@@ -2567,6 +2561,62 @@ export function AgentSidebar({
     }
     return ids;
   }, [ordered, collapsed, childrenByParent]);
+
+  // ── ARRIVING IN BUILD LANDS ON A ROW THE COLUMN ACTUALLY RENDERS ────────────────────────────
+  // This lived inside the Build/Plan toggle's handler ("switching INTO Build: move selection to the
+  // row the column actually renders FIRST, so the pane matches"). The founder retired that toggle,
+  // and the rule has to survive it — every other route into Build (`agentReveal`, `landInAgent`,
+  // `captureSends`, the concierge tool, the board's "Close Planning Board" link) already skipped
+  // that button.
+  //
+  // ══ IT IS A TRANSITION, NOT A STANDING INVARIANT ═══════════════════════════════════════════
+  // The first cut of this fired whenever the selection was not rendered, and that was wrong in two
+  // ways roborev caught before it shipped (job 65606):
+  //
+  //   • `selectAndWire` does THREE things — `selectAgent`, `open(id)`, and `patchCable(pairSide)`.
+  //     The cable is a single global with a side, and BOTH pairs mount an `AgentSidebar`, so an
+  //     unconditional effect had the two racing at mount and the loser silently binding the
+  //     concierge composer to the other pair. That is exactly the "cable follows something other
+  //     than a gesture" failure the `patchCable` pin comment above was written to end.
+  //   • A deliberately-null selection (`selectionAfterClose` answering `next: null`, and the
+  //     "agents but nothing selected" empty state) was overwritten on the very next render.
+  //
+  // So it fires ONLY on an actual mode change into Build. `prev === null` is the mount, which is
+  // not a transition — that alone removes the mount race and the project-switch case.
+  //
+  // ══ AND MEMBERSHIP IS ASKED OF THE RENDERED LIST ═══════════════════════════════════════════
+  // `renderedRowIds` is the column's own output — heads plus the workers of any open head. The
+  // first cut re-ran the ladder derivation over a ONE-AGENT population instead, which answers a
+  // different question: `isTopLevelAgent` drops workers unconditionally, so a selected WORKER
+  // always came back "not rendered" and the effect bounced the selection up to its orchestrator on
+  // every click. A singleton also strips a head's children, so the worker roll-up that decides its
+  // stage and status band computed a different answer than the render.
+  const prevModeRef = useRef<WorkMode | null>(null);
+  useEffect(() => {
+    const prev = prevModeRef.current;
+    prevModeRef.current = mode;
+    if (mode !== "build" || prev === null || prev === "build") return;
+    // Not while the Improve-Sparkle pane covers this pair's stage: `mode` stays "build" underneath
+    // it, so without this the cable is wired to a build agent the user is not looking at.
+    if (paneCoversMe || !project) return;
+    const selected = project.selectedAgentId;
+    // ══ THE EPIC FILTER IS NOT AN ABSENCE ══════════════════════════════════════════════════════
+    // Carried over from the retired handler, and it has to be asked BEFORE membership. `sections`
+    // applies the epic narrowing at the ladder input, so `renderedRowIds` excludes a selection the
+    // filter is merely HIDING — which is a different fact from the row being gone. `epicFocusBySide`
+    // is transient but is NOT cleared on a mode change (only `setEpicFocus` writes it), so the round
+    // trip "focus an epic → open the planning board → close it" lands here with the selection still
+    // valid and simply out of view. Re-seating it there would `open()` another agent and re-patch
+    // the cable, and pressing Clear afterwards would restore a column showing a DIFFERENT terminal
+    // than the user left. Leaving the selection intact is what makes Clear restore the very
+    // terminal they were reading.
+    if (epicAgentIds && selected && !epicAgentIds.has(selected)) return;
+    if (selected && renderedRowIds.includes(selected)) return;
+    const first = renderedRowIds[0];
+    if (first !== undefined) selectAndWireRef.current(first);
+    // `selectAndWire` is read through a ref: it is rebuilt every render, so listing it would make
+    // this effect re-run on every paint for a rule that only cares about a mode change.
+  }, [mode, paneCoversMe, project, renderedRowIds, epicAgentIds]);
   // The selected row if it is on screen, else the first row. Never null while any row renders, so
   // the column can't become unreachable by keyboard just because selection points at a filtered-out
   // or folded-away agent.
@@ -3039,13 +3089,40 @@ export function AgentSidebar({
             borderBottom: `1px solid ${C.hairline}`,
           }}
         >
-          <PlanBuildToggle
-            variant="mini"
-            mode={mode}
-            beadsEnabled={beadsEnabled}
-            onPickPlan={onPickPlan}
-            onPickBuild={onPickBuild}
-          />
+          {/* THE COLUMN'S NAME, where the Build/Plan toggle used to be. The founder retired that
+              control: the planning board is something you OPEN and CLOSE, not a mode you toggle,
+              so this band names what the column holds instead — the twin of the Epics column's
+              header across the seam, at the same 34px band height.
+
+              THE FIVE FONT PROPERTIES ARE SPELLED OUT HERE because this band, unlike the Epics
+              header, sets NO font of its own — there the container carries them and the title span
+              inherits. Copying the values is what makes the two headers read as a pair. */}
+          <span
+            data-testid="build-column-title"
+            style={{
+              fontFamily: FONT_UI,
+              fontSize: TYPE.small,
+              fontWeight: FONT_WEIGHT.semibold,
+              color: C.muted,
+              letterSpacing: "0.01em",
+              flex: "0 0 auto",
+            }}
+          >
+            Build Agents
+          </span>
+          {/* THE SATELLITE'S WAY INTO THE BOARD, and ONLY the satellite's. That window renders
+              columns ② + ③ alone — it has no Epics column — so the link that lives in the Epics
+              header in the main window has nowhere to go there. Rendering it in BOTH windows would
+              put two live copies on screen in the main one, which is the duplicate-control hazard
+              the `covered` comments in Workspace.tsx were written for. */}
+          {showOpenBoardLink && beadsEnabled && (
+            <HeaderLink
+              testId="build-open-plan-board"
+              hint="plan"
+              label="Open Planning Board"
+              onClick={onPickPlan}
+            />
+          )}
           {/* Expand-all / collapse-all, where the `«` chevron used to sit. Hidden in Plan (no rows)
               and when NO head has workers — a control that would act on nothing is worse than none.
               Distinct from `PairCountControl` at the other end of the band: that one adds/removes a

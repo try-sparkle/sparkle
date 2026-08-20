@@ -30,7 +30,9 @@ import { NewAgentButtons } from "./NewAgentButtons";
 import { useNewBuildAgentDrop } from "../hooks/useNewBuildAgentDrop";
 import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z } from "./layers";
-import { PlanBuildToggle } from "./PlanBuildToggle";
+import { HeaderLink } from "./HeaderLink";
+import { agentIdsInEpic } from "../engine/epicFocus";
+import { useBeadsStore } from "../stores/beadsStore";
 // IN ITS OWN FILE, unlike `PlanBoardSlot` directly below — this file is already 2300+ lines, and
 // the preview slot brings an iframe whose attributes carry a security argument that deserves to be
 // read on its own.
@@ -1402,6 +1404,37 @@ export function Workspace() {
   // The LEFT pair's selected agent — which of its panes is visible in its stage. Same rule as
   // `activeAgentId`, read off that pair's own project.
   const leftActiveAgentId = leftProject?.selectedAgentId ?? null;
+
+  // ── AN EPIC-FILTERED ROW MUST NOT KEEP PAINTING ITS TERMINAL ────────────────────────────────
+  // The founder: "if it ends up filtering the build row, just clear the terminal... if it doesn't,
+  // you can keep the terminal output the same as it was."
+  //
+  // Selecting an epic narrows the build column to that epic's orchestrators, and the row you were
+  // on can be one of the ones it hides. Nothing followed that through to the STAGE, so the pane
+  // went on showing a terminal whose row was no longer beside it — the same "output with no row"
+  // mismatch the board and preview slots each force `null` to avoid.
+  //
+  // HIDDEN, NOT DESELECTED, and that distinction is the whole design. Clearing `selectedAgentId`
+  // would unmount the pane, and for a local agent a Terminal unmount DETACHES, which kills the PTY
+  // (agentTransport). Forcing the id to null here is the mechanism Plan and Preview already use:
+  // the pane stays mounted and stops being shown. It also makes the founder's second sentence true
+  // for free — press Clear and the same terminal is back, mid-scrollback, because nothing about it
+  // was torn down.
+  const epicFocusLeft = useUiStore((s) => s.epicFocusBySide.left);
+  const epicFocusRight = useUiStore((s) => s.epicFocusBySide.right);
+  const leftBeads = useBeadsStore((s) => (leftProject ? s.byProject[leftProject.id]?.beads : undefined));
+  const rightBeads = useBeadsStore((s) => (project ? s.byProject[project.id]?.beads : undefined));
+  // `agentIdsInEpic` is the ONE membership rule (engine/epicFocus) — the sidebar's own narrowing
+  // calls the same function, so the row and the stage cannot disagree about who belongs. `null`
+  // means no epic is selected, which is not a filter and must not hide anything.
+  const leftHiddenByEpic = useMemo(() => {
+    const ids = agentIdsInEpic(leftProject?.agents ?? [], leftBeads ?? [], epicFocusLeft);
+    return !!ids && !!leftActiveAgentId && !ids.has(leftActiveAgentId);
+  }, [leftProject?.agents, leftBeads, epicFocusLeft, leftActiveAgentId]);
+  const rightHiddenByEpic = useMemo(() => {
+    const ids = agentIdsInEpic(project?.agents ?? [], rightBeads ?? [], epicFocusRight);
+    return !!ids && !!activeAgentId && !ids.has(activeAgentId);
+  }, [project?.agents, rightBeads, epicFocusRight, activeAgentId]);
   // WHICH PAIR THE CONCIERGE IS TALKING TO. `wired` is the whole answer, exactly as MAPPING.md
   // requires ("`data-wired` is the whole connection feature … do NOT implement it as scattered
   // component state"): patching the cable into a left build row means the compose box routes there.
@@ -1839,14 +1872,19 @@ export function Workspace() {
   const paneStages = useMemo(() => ({ left: leftStage, right: rightStage }), [leftStage, rightStage]);
   const paneVisibleAgentId = useMemo(
     () => ({
-      // A column showing its board has no visible agent pane, and a stale id here is what routes a
-      // message into an unseen terminal. The preview slot used to be a second covering surface on
-      // this list; it no longer exists, so the board is the only one per column again.
-      left: leftBoardActive ? null : leftActiveAgentId,
-      right: sparkleActive || researchActive || boardActive ? null : activeAgentId,
+      // EVERY covering surface, not just the board — a stale id here is what routes a message into
+      // an unseen terminal. The list is the UNION of two changes that landed independently: the
+      // preview slot came OFF it (that pane no longer exists, origin/main d48af48e5), and the
+      // epic-filter narrowing went ON it. A row hidden by an epic filter is hidden, NOT deselected,
+      // so its PTY survives `Clear` — which is exactly why its id must stop counting as visible.
+      left: leftBoardActive || leftHiddenByEpic ? null : leftActiveAgentId,
+      right:
+        sparkleActive || researchActive || boardActive || rightHiddenByEpic ? null : activeAgentId,
     }),
     [
       leftBoardActive,
+      leftHiddenByEpic,
+      rightHiddenByEpic,
       leftActiveAgentId,
       sparkleActive,
       researchActive,
@@ -2540,8 +2578,6 @@ export function Workspace() {
  */
 function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) {
   const mode = useUiStore((s) => s.workModeBySide[side]);
-  const beadsEnabled = useSettingsStore((s) => s.beadsEnabled);
-  const openPlanBoard = useUiStore((s) => s.openPlanBoard);
   const showBuildStage = useUiStore((s) => s.showBuildStage);
   return (
     <div
@@ -2653,12 +2689,16 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
             x. The filters follow and grow to the RIGHT, which is what keeps the toggle pinned while
             the bar changes width — the old order pinned the toggle to the right corner and let the
             bar push it, which is exactly what the founder asked to stop. */}
-        <PlanBuildToggle
-          mode={mode}
-          beadsEnabled={beadsEnabled}
-          variant="mini"
-          onPickPlan={() => openPlanBoard(side)}
-          onPickBuild={() => showBuildStage(side)}
+        {/* THE WAY OUT, and it stays FIRST in this `flex-start` row. That position is a founder
+            requirement, not a leftover: "the build versus plan toggle should stay left justified
+            when it's in plan mode... keep it where it is so I can switch between them easily."
+            The control changed shape; the x it sits on did not. The filters still grow to its
+            RIGHT, so a widening bar cannot push the exit around. */}
+        <HeaderLink
+          testId="plan-board-close"
+          hint="build"
+          label="Close Planning Board"
+          onClick={() => showBuildStage(side)}
         />
         {mode === "plan" && <BoardFilterBar side={side} />}
       </div>

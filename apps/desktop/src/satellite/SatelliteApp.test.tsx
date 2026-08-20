@@ -339,7 +339,7 @@ describe("SatelliteApp — the board covers the agent column", () => {
   });
 });
 
-describe("SatelliteApp — the board header's toggle placement", () => {
+describe("SatelliteApp — the board header's exit placement", () => {
   // THE SECOND HOST OF ONE ROW. BoardFilterBar.tsx's header records that this top row is rendered
   // in TWO places — PlanBoardSlot in Workspace.tsx and here — and that a change made in only one
   // DRIFTS. Until now nothing tested this half of it, so the warning was a comment rather than a
@@ -356,20 +356,19 @@ describe("SatelliteApp — the board header's toggle placement", () => {
     useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
     useSettingsStore.setState({ beadsEnabled: true } as never);
     render(<SatelliteApp projectId="p1" />);
-    // VIA THE TOGGLE'S PARENT, NOT THE ROW'S OWN TESTID. `plan-board-header` is introduced by this
-    // change, so looking the row up by it would make every assertion below fail on the old code
-    // merely because the attribute was absent — the order claim would never be evaluated against
-    // the layout it rejects. The toggle and its parent row both predate the change.
+    // VIA THE EXIT CONTROL'S PARENT, NOT THE ROW'S OWN TESTID — the reasoning that picked this
+    // lookup still holds, only the control changed: the Build/Plan toggle was retired for a
+    // "Close Planning Board" link, which is the same first-child-of-the-row position.
     const mini = screen.getByTestId("plan-column").querySelector<HTMLElement>(
-      "[data-testid='plan-build-mini']",
+      "[data-testid='plan-board-close']",
     );
     expect(mini).toBeTruthy();
     return mini!.parentElement as HTMLElement;
   };
 
-  it("renders the toggle BEFORE the filter bar, so the filters sit to its right", () => {
+  it("renders the exit link BEFORE the filter bar, so the filters sit to its right", () => {
     const row = renderBoard();
-    const mini = row.querySelector<HTMLElement>("[data-testid='plan-build-mini']");
+    const mini = row.querySelector<HTMLElement>("[data-testid='plan-board-close']");
     const filters = row.querySelector<HTMLElement>("[data-testid='board-filter-bar']");
     // Presence first: an order assertion over an absent node passes for the wrong reason.
     expect(mini).toBeTruthy();
@@ -384,11 +383,12 @@ describe("SatelliteApp — the board header's toggle placement", () => {
     expect(kids.indexOf(mini!)).toBeLessThan(kids.indexOf(filters!));
   });
 
-  it("left-justifies the row on the Build header's own inset, so the toggle does not move", () => {
+  it("left-justifies the row on the Build header's own inset, so the exit does not move", () => {
     // jsdom does not lay out — getBoundingClientRect is all zeroes (docs/jsdom-test-caveats.md) —
     // so the x is asserted as the declared inset rather than measured. `0 10px` + `minHeight: 34`
     // is AgentSidebar's `.bhd` band, which is the top of the Build column this board covers, so
-    // matching it is what puts the toggle on the same pixel in both modes.
+    // matching it is what puts the exit on the same pixel in both modes — the founder's "keep it
+    // where it is so I can switch between them easily", which outlived the control it was said of.
     const row = renderBoard();
     expect(row.style.justifyContent).toBe("flex-start");
     expect(row.style.paddingLeft).toBe("10px");

@@ -23,15 +23,21 @@ const only = (b: ReturnType<typeof bucketEpics>, key: EpicLadderKey, ids: string
 
 describe("EPIC_LADDER", () => {
   // The founder's ladder, verbatim and in his reading order:
-  // Backlog > Blocked > Planning > Building > Done > Shipped > Archived.
+  // Backlog > Planning > Blocked > Building > Done > Shipped > Archived.
+  //
+  // PLANNING MOVED LEFT OF BLOCKED on his instruction ("let's put Planning to the left of Blocked").
+  // The earlier order had it third; this is the second spelling of the same list and the reason the
+  // order is asserted at all — it is a founder-facing reading sequence, so it changes when he says
+  // it does, and the change has to be visible here rather than silently in a render.
+  //
   // The KEYS reuse the Board snapshot's vocabulary wherever one already exists (inProgress,
   // delivered) so `Column`, its testids and its stage definitions keep working unchanged. Only
   // `planning` is new — the board never had a bucket for "the plan is written, nobody picked it up".
   it("is the seven stages, in the founder's reading order", () => {
     expect(EPIC_LADDER).toEqual([
       "backlog",
-      "blocked",
       "planning",
+      "blocked",
       "inProgress",
       "done",
       "delivered",

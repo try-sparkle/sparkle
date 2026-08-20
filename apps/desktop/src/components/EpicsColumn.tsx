@@ -35,13 +35,15 @@
 // second-consumer case. So mounting this column adds no fetch, no poller and no second source of
 // truth — it adds one more claim on a poll that was already running.
 
-import { useMemo, useState, useCallback, useEffect, useRef } from "react";
+import { Fragment, useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { ColumnPullTab, HEADER_H, TAB_TOP } from "./ColumnPullTab";
+import { HeaderLink } from "./HeaderLink";
+import { EpicInlineCard } from "./EpicInlineCard";
 import { EPICS_COLUMN_Z } from "./layers";
 import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
@@ -181,6 +183,7 @@ export function EpicsColumn({
   // ── SELECTION ────────────────────────────────────────────────────────────────────────────────
   const focusedEpicId = useUiStore((s) => s.epicFocusBySide[side]);
   const setEpicFocus = useUiStore((s) => s.setEpicFocus);
+  const openPlanBoard = useUiStore((s) => s.openPlanBoard);
 
   const [collapsed, setCollapsed] = useState<ReadonlySet<EpicLadderKey>>(
     () => new Set(EPIC_LADDER_COLUMNS.map((c) => c.key).filter((k) => !OPEN_BY_DEFAULT.has(k))),
@@ -309,31 +312,57 @@ export function EpicsColumn({
           fontSize: TYPE.small,
           fontWeight: FONT_WEIGHT.semibold,
           color: C.muted,
-          letterSpacing: "0.06em",
+          // 0.01em, not the 0.06em this carried as "EPICS". Tracking that wide is an UPPERCASE
+          // convention — it exists to open up caps, which have no ascenders or descenders to
+          // separate them. On sentence case the same value reads as spaced-out and loose.
+          letterSpacing: "0.01em",
         }}
       >
-        <span>EPICS</span>
-        {/* THE ONLY WAY BACK from a narrowed build column, and it lives here rather than in the
-            build column because this is where the narrowing was set. A filter whose clear control
-            is in a different column from the one that looks empty is the failure `uiStore`'s
-            transient-key comments keep naming. Rendered only while something is selected. */}
-        {focusedEpicId && (
-          <button
-            data-testid="epics-clear-focus"
-            onClick={() => setEpicFocus(side, null)}
-            style={{
-              background: "transparent",
-              border: "none",
-              color: C.tealInk,
-              cursor: "pointer",
-              fontFamily: FONT_UI,
-              fontSize: TYPE.micro,
-              padding: 0,
-            }}
-          >
-            Clear
-          </button>
-        )}
+        <span>Epics</span>
+        {/* THE RIGHT SLOT IS A GROUP NOW, not a single conditional child. The row is
+            `space-between`, so with only two children "right-aligned" was emergent — a third child
+            would have parked `Clear` in the MIDDLE of the header. Wrapping the controls keeps the
+            title at one end and every control at the other however many there are. */}
+        <span style={{ display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          {/* THE ONLY WAY BACK from a narrowed build column, and it lives here rather than in the
+              build column because this is where the narrowing was set. A filter whose clear control
+              is in a different column from the one that looks empty is the failure `uiStore`'s
+              transient-key comments keep naming. Rendered only while something is selected. */}
+          {focusedEpicId && (
+            <button
+              data-testid="epics-clear-focus"
+              onClick={() => setEpicFocus(side, null)}
+              style={{
+                background: "transparent",
+                border: "none",
+                color: C.tealInk,
+                cursor: "pointer",
+                fontFamily: FONT_UI,
+                fontSize: TYPE.micro,
+                padding: 0,
+                flex: "0 0 auto",
+              }}
+            >
+              Clear
+            </button>
+          )}
+          {/* THE WAY IN TO THE BOARD, and it is the ONLY one in the main window now that the
+              Build/Plan toggle is gone. Gated on `beadsEnabled` because `planBoardUp()` requires
+              it — an ungated link would be a control that visibly does nothing.
+
+              It can only ever say OPEN. While the board is up this whole column is `covered`, i.e.
+              `inert` + `visibility: hidden`, per the founder's own constraint quoted at the top of
+              this file ("when I'm on the Plan board I should not see the EPICS column"). The CLOSE
+              half therefore lives in the board's own header, where it stays visible. */}
+          {beadsEnabled && (
+            <HeaderLink
+              testId="epics-open-plan-board"
+              hint="plan"
+              label="Open Planning Board"
+              onClick={() => openPlanBoard(side)}
+            />
+          )}
+        </span>
       </div>
 
       {/* CLEARANCE FOR THE SEAM, on whichever side it is on. The pull tab is an absolute child at
@@ -408,14 +437,33 @@ export function EpicsColumn({
                 </button>
                 {!isCollapsed &&
                   rows.map((epic) => (
-                    <EpicRow
-                      key={epic.id}
-                      epic={epic}
-                      allBeads={allBeads}
-                      selected={focusedEpicId === epic.id}
-                      reveal={revealEpicId === epic.id}
-                      onSelect={() => setEpicFocus(side, epic.id)}
-                    />
+                    <Fragment key={epic.id}>
+                      <EpicRow
+                        epic={epic}
+                        allBeads={allBeads}
+                        selected={focusedEpicId === epic.id}
+                        reveal={revealEpicId === epic.id}
+                        onSelect={() => setEpicFocus(side, epic.id)}
+                      />
+                      {/* THE CARD OPENS IN PLACE, DIRECTLY UNDER ITS OWN ROW. A sibling rather than
+                          a child (EpicRow is a <button>, and this card carries buttons of its own),
+                          and in normal flow — so the epics below it are pushed down for free, with
+                          no positioning and no portal.
+
+                          `setEpicFocus` already TOGGLES, so the row that opened the card closes it,
+                          and the header's Clear does too. Both also drop the build column's
+                          narrowing, which is the same gesture from the user's side: this card being
+                          open IS "I am working this epic". */}
+                      {focusedEpicId === epic.id && project && (
+                        <EpicInlineCard
+                          bead={epic}
+                          projectId={project.id}
+                          rootPath={project.rootPath ?? null}
+                          allBeads={allBeads}
+                          onClose={() => setEpicFocus(side, null)}
+                        />
+                      )}
+                    </Fragment>
                   ))}
               </div>
             );

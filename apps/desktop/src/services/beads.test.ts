@@ -16,6 +16,7 @@ import {
   sweepRestartedAt,
   bucketBeads,
   childrenOf,
+  descendantsOf,
   isEpic,
   buildEpicIndex,
   isEpicIndexed,
@@ -387,6 +388,72 @@ describe("childrenOf", () => {
     ];
     const kids = childrenOf(beads, "epic-1");
     expect(kids.map((b) => b.id)).toEqual(["epic-1.1", "epic-1.2", "other"]);
+  });
+});
+
+// ══ descendantsOf — THE TRANSITIVE CLOSURE `childrenOf` IS NOT ═══════════════════════════════
+//
+// `childrenOf` is ONE level of the `parent` edge (plus any depth of the DOTTED id, which is a
+// different thing). That asymmetry is the bug bead sparkle-tyruz4 names: a bead reparented with
+// `bd update <id> --parent <epic>` keeps its FLAT id, so the dotted half cannot see it and the
+// `parent` half stops at it — and everything hanging beneath that bead is invisible to the epic.
+//
+// These cases FAIL against `childrenOf`. That is deliberate: each one is a shape the shipped
+// filter drops silently, and a test that passed both ways would prove nothing about the fix.
+describe("descendantsOf", () => {
+  it("closes over FLAT-ID parent links to any depth — the case childrenOf stops at", () => {
+    const beads = [
+      bead({ id: "epic-1" }),
+      // Reparented onto the epic, so it keeps a flat id: the dotted half cannot match it.
+      bead({ id: "child", parent: "epic-1" }),
+      // ...and ITS child is reachable only by walking the parent edge TWICE.
+      bead({ id: "grandchild", parent: "child" }),
+      bead({ id: "unrelated" }),
+    ];
+    const ids = descendantsOf(beads, "epic-1").map((b) => b.id);
+    expect(ids).toContain("child");
+    // The whole point. `childrenOf` returns ["child"] only.
+    expect(ids).toContain("grandchild");
+    expect(ids).not.toContain("unrelated");
+    // And the shipped one-level rule genuinely does NOT have it, so this pair cannot both pass by
+    // accident — if childrenOf ever grows the closure, this line is the thing that says so.
+    expect(childrenOf(beads, "epic-1").map((b) => b.id)).not.toContain("grandchild");
+  });
+
+  it("includes the epic itself — an orchestrator pointed straight at it is the most direct match", () => {
+    const beads = [bead({ id: "epic-1" }), bead({ id: "epic-1.1" })];
+    expect(descendantsOf(beads, "epic-1").map((b) => b.id)).toContain("epic-1");
+  });
+
+  it("still matches the dotted form at any depth, and does not match a prefix sibling", () => {
+    const beads = [
+      bead({ id: "epic-1" }),
+      bead({ id: "epic-1.2" }),
+      bead({ id: "epic-1.2.a" }),
+      bead({ id: "epic-10" }), // prefix-ish but not "epic-1." — must NOT match
+    ];
+    const ids = descendantsOf(beads, "epic-1").map((b) => b.id);
+    expect(ids).toContain("epic-1.2");
+    expect(ids).toContain("epic-1.2.a");
+    expect(ids).not.toContain("epic-10");
+  });
+
+  it("terminates on a parent CYCLE rather than hanging the render", () => {
+    // Not hypothetical enough to skip: `bd` does not forbid it, and this runs inside a useMemo on
+    // every board paint, so a cycle here is a frozen window rather than a wrong answer.
+    const beads = [
+      bead({ id: "epic-1" }),
+      bead({ id: "a", parent: "b" }),
+      bead({ id: "b", parent: "a" }),
+    ];
+    expect(descendantsOf(beads, "epic-1").map((b) => b.id)).toEqual(["epic-1"]);
+  });
+
+  it("returns each bead ONCE even when both edge forms point at it", () => {
+    // `epic-1.1` matches the dotted prefix AND carries the explicit parent. One bead, one entry.
+    const beads = [bead({ id: "epic-1" }), bead({ id: "epic-1.1", parent: "epic-1" })];
+    const ids = descendantsOf(beads, "epic-1").map((b) => b.id);
+    expect(ids).toEqual(["epic-1", "epic-1.1"]);
   });
 });
 

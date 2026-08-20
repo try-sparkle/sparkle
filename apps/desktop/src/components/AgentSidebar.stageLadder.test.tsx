@@ -17,9 +17,11 @@ vi.mock("./LogoWaveform", () => ({ LogoWaveform: () => null }));
 vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 
 import { AgentSidebar } from "./AgentSidebar";
+import { childRowOf, subtreeGroupExists } from "./subtreeTestUtils";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
+import { useBeadsStore } from "../stores/beadsStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { openAgentCard } from "../testing/rowGestures";
@@ -43,6 +45,14 @@ function seed(agents: AgentTab[]): Project {
 }
 
 const proj = () => useProjectStore.getState().projects[0]!;
+
+/** The minimum a bead needs to be walked by `descendantsOf` — id and parent edge. */
+function mkBead(id: string, parent: string | null = null) {
+  return {
+    id, title: id, type: "task", status: "open", parent,
+    labels: [], dependencies: [], priority: 2, description: "",
+  } as never;
+}
 
 /** Put each agent at a workflow stage via the runtime store's stage override. */
 function setStages(stages: Record<string, WorkflowStageId>) {
@@ -390,9 +400,17 @@ describe("AgentSidebar — selection never lands on a filtered-out row", () => {
     expect(screen.queryByText("Alpha")).toBeNull();
     expect(screen.queryByText("Beta")).toBeTruthy();
 
-    // Switch to Plan and back to Build via the chevrons.
-    fireEvent.click(screen.getByText("Plan"));
-    fireEvent.click(screen.getByText("Build"));
+    // Via the STORE ACTIONS the surviving controls call, not via a button in this column — the
+    // Build/Plan toggle that used to sit here is retired, and the rule deliberately no longer hangs
+    // off any one control. `openPlanBoard`/`showBuildStage` are exactly what the Epics header's
+    // "Open Planning Board" link and the board's "Close Planning Board" link invoke, so this drives
+    // the production path; the button that reaches them is asserted in the Workspace-level suites.
+    act(() => {
+      useUiStore.getState().openPlanBoard("right");
+    });
+    act(() => {
+      useUiStore.getState().showBuildStage("right");
+    });
 
     // Selection must be Beta — the row actually on screen — not Alpha (array index 0, hidden).
     expect(proj().selectedAgentId).toBe("a2");
@@ -531,5 +549,131 @@ describe("the `local_none` rung is actually WIRED to the column (roborev 57842)"
     const chip = screen.getByTestId("row-stage-chip");
     expect(chip.textContent).toBe("Unsaved");
     expect(chip.getAttribute("title")).toMatch(/loses this work/);
+  });
+});
+
+// ══ SELECTING A WORKER STICKS ══════════════════════════════════════════════════════════════════
+//
+// The regression roborev caught in review (job 65606) before it shipped, and the reason the
+// "arrive in Build" rule is a TRANSITION rather than a standing invariant.
+//
+// The first cut of that effect answered "is my selection still rendered?" by re-running the ladder
+// derivation over a ONE-AGENT population. `isTopLevelAgent` drops `kind: "worker"` unconditionally,
+// so a selected worker always came back "not rendered" — and since selecting one produces a new
+// `project` object, the effect re-fired and immediately re-seated the head. A user could not select
+// a worker in Build mode at all: every click bounced up to its orchestrator.
+//
+// The whole suite was green through that, because nothing here selected a worker. This is that
+// missing case, and it asserts the SIDE EFFECT — where the selection ended up — not that a handler
+// ran.
+describe("AgentSidebar — a worker row can be selected in Build mode", () => {
+  // THE TRANSITION IS THE POINT, and seeding it is not optional scaffolding. `mode` reads
+  // `workModeBySide`, whose default is `{left:"build", right:"build"}` — so a test that never
+  // writes it leaves the effect UNREACHABLE: `prev === null` returns on the first run (mount is not
+  // a transition) and `prev === "build"` returns on every run after. An earlier version of this
+  // case asserted `selectedAgentId` without seeding the mode, and so was asserting only the store
+  // write it had performed two lines earlier — the precondition, not the side effect. It passed
+  // against every mutation of the code it names, including deleting the guard outright.
+  type Rerender = ReturnType<typeof render>["rerender"];
+  function arriveInBuild(rerender: Rerender) {
+    act(() => {
+      useUiStore.setState({ workModeBySide: { left: "build", right: "build" } } as never);
+    });
+    rerender(<AgentSidebar project={proj()} />);
+  }
+
+  beforeEach(() => {
+    // Start in Plan on BOTH sides, so whichever side `sideOf(p1)` resolves to has a real
+    // `plan → build` edge to travel. Set before the first render: `prevModeRef` latches on mount.
+    useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } } as never);
+  });
+
+  it("leaves the selection ON the worker rather than bouncing it to the orchestrator", () => {
+    const head = mkAgent("h1", "Head");
+    const worker = mkAgent("w1", "Worker", { kind: "worker", parentId: "h1" });
+    seed([head, worker]);
+    setStages({ h1: "building_saved", w1: "building_saved" });
+    useRuntimeStore.setState({ openAgentIds: ["h1", "w1"] } as never);
+    // The head must be EXPANDED, or the worker is not a rendered row and the premise below is false
+    // — a closed head draws only a one-line peek. `false` means "not collapsed".
+    useUiStore.setState({ collapsedOrchestrators: { h1: false } } as never);
+
+    // RE-RENDERED WITH THE NEW PROJECT, not just written to the store. `project` is a PROP here, so
+    // a store write alone leaves this component holding the object it was given — the effect never
+    // re-runs and the test cannot reproduce the bug it is written for. `Workspace` passes a live
+    // project, so re-rendering is what production actually does.
+    const { rerender } = render(<AgentSidebar project={proj()} />);
+
+    act(() => {
+      useProjectStore.setState({
+        projects: [{ ...proj(), selectedAgentId: "w1" }],
+      } as never);
+    });
+    rerender(<AgentSidebar project={proj()} />);
+
+    arriveInBuild(rerender);
+
+    // The premise, asserted AFTER arriving: the worker really is a row the column renders, or "it
+    // stayed selected" would be a statement about a row that was never there. `childRowOf` is
+    // scoped to the head's subtree group, so a closed head's one-line PEEK cannot satisfy it.
+    expect(subtreeGroupExists("h1")).toBe(true);
+    expect(childRowOf("h1", "Worker")).toBe(true);
+
+    expect(proj().selectedAgentId).toBe("w1");
+  });
+
+  // THE CONTROL. Without it, the case above is satisfied by an effect that never fires at all —
+  // which is exactly the defect it was rewritten to close. This proves the SAME setup DOES reach
+  // the re-seating branch when the selection is genuinely absent, so the assertion above is a
+  // statement about the membership rule rather than about an inert effect.
+  it("DOES re-seat the selection when it names an agent the column does not render", () => {
+    const head = mkAgent("h1", "Head");
+    seed([head]);
+    setStages({ h1: "building_saved" });
+    useRuntimeStore.setState({ openAgentIds: ["h1"] } as never);
+
+    act(() => {
+      useProjectStore.setState({
+        projects: [{ ...proj(), selectedAgentId: "ghost" }],
+      } as never);
+    });
+    const { rerender } = render(<AgentSidebar project={proj()} />);
+    arriveInBuild(rerender);
+
+    expect(proj().selectedAgentId).toBe("h1");
+  });
+
+  // THE EPIC FILTER IS NOT AN ABSENCE. A selection hidden by the epic narrowing is out of
+  // `renderedRowIds` for a reason that has nothing to do with the row being gone, so re-seating it
+  // would `open()` another agent and re-patch the cable — and pressing Clear afterwards would
+  // restore a column showing a DIFFERENT terminal than the user left.
+  it("leaves an epic-filtered selection alone rather than re-seating it", () => {
+    // The narrowing reads each agent's OWN `beadId` against the epic's bead set, so membership is
+    // seeded on the agents themselves. `e1.1` is under epic `e1` by dotted id; `z9.1` is not.
+    const a = mkAgent("a1", "Alpha", { beadId: "e1.1" } as Partial<AgentTab>);
+    const b = mkAgent("b1", "Bravo", { beadId: "z9.1" } as Partial<AgentTab>);
+    seed([a, b]);
+    setStages({ a1: "building_saved", b1: "building_saved" });
+    useRuntimeStore.setState({ openAgentIds: ["a1", "b1"] } as never);
+    useBeadsStore.setState({
+      byProject: { p1: { beads: [mkBead("e1"), mkBead("e1.1"), mkBead("z9.1")] } },
+    } as never);
+
+    act(() => {
+      useProjectStore.setState({
+        projects: [{ ...proj(), selectedAgentId: "b1" }],
+      } as never);
+    });
+    const { rerender } = render(<AgentSidebar project={proj()} />);
+
+    // Narrow to an epic that contains ONLY a1, hiding the selected b1.
+    act(() => {
+      useUiStore.setState({ epicFocusBySide: { left: "e1", right: "e1" } } as never);
+    });
+    rerender(<AgentSidebar project={proj()} />);
+
+    arriveInBuild(rerender);
+
+    expect(proj().selectedAgentId).toBe("b1");
   });
 });

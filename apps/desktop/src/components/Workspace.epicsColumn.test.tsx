@@ -408,3 +408,97 @@ describe("the epics column is mounted between the concierge and the build column
     expect(bySide.left!.getAttribute("data-covered")).toBe("false");
   });
 });
+
+// ══ THE CARD OPENS IN PLACE, UNDER ITS OWN ROW ═════════════════════════════════════════════════
+//
+// The founder: "when I click on an Epic row... it would open that Epic card below that row and it
+// would push the rest of the epics down."
+//
+// jsdom does not lay out, so "below" and "pushes down" cannot be measured (see this file's header).
+// They are asserted as the two facts that DECIDE them for an in-flow element: the card is a SIBLING
+// of the row, and it sits BETWEEN that row and the next one. An implementation that portalled the
+// card, or absolutely positioned it, or appended it at the end of the list, fails all three.
+describe("clicking an epic opens its card inline", () => {
+  /** Three epics in ONE stage group, so "between this row and the next" is a real claim. */
+  const MANY: Bead[] = [
+    bead("ep-1"),
+    bead("ep-1.a", { status: "in_progress" }),
+    bead("ep-2"),
+    bead("ep-2.a", { status: "in_progress" }),
+    bead("ep-3"),
+    bead("ep-3.a", { status: "in_progress" }),
+  ];
+  function seedMany() {
+    useBeadsStore.setState({
+      byProject: {
+        p1: { beads: MANY, board: bucketBeads(MANY), polledAt: 0 },
+        p2: { beads: MANY, board: bucketBeads(MANY), polledAt: 0 },
+      },
+      error: {},
+    } as never);
+  }
+  const rows = () => Array.from(document.querySelectorAll<HTMLElement>('[data-epic-id]'));
+  const rowFor = (id: string) => document.querySelector<HTMLElement>(`[data-epic-id="${id}"]`);
+
+  beforeEach(seedMany);
+
+  it("puts the card BETWEEN its own row and the next one, as a sibling", () => {
+    render(<Workspace />);
+    const before = rows().length;
+    expect(before).toBeGreaterThanOrEqual(3); // the premise: several rows to be pushed down
+
+    fireEvent.click(rowFor("ep-2")!);
+
+    const card = document.querySelector<HTMLElement>('[data-testid="epic-inline-card"]')!;
+    expect(card).toBeTruthy();
+    // A SIBLING of the row — not a descendant of it (EpicRow is a <button>, which may not contain
+    // the buttons this card carries) and not portalled to the body.
+    expect(card.parentElement).toBe(rowFor("ep-2")!.parentElement);
+    // ...and immediately AFTER it, which is what "below that row" means in normal flow.
+    expect(rowFor("ep-2")!.nextElementSibling).toBe(card);
+    // The rows below are still there, now beneath the card — "it would push the rest down".
+    expect(card.compareDocumentPosition(rowFor("ep-3")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(rows().length).toBe(before);
+  });
+
+  it("opens exactly ONE card, and it belongs to the row that was clicked", () => {
+    // Every candidate row is mounted, which is what gives the absence claim any force: a card
+    // missing from a row that was never rendered proves nothing (AGENTS.md, the "N targets" case).
+    render(<Workspace />);
+    fireEvent.click(rowFor("ep-2")!);
+
+    const cards = document.querySelectorAll('[data-testid="epic-inline-card"]');
+    expect(cards.length).toBe(1);
+    expect(rowFor("ep-1")!.nextElementSibling).not.toBe(cards[0]);
+    expect(rowFor("ep-2")!.nextElementSibling).toBe(cards[0]);
+  });
+
+  // THE TWO THINGS THE FOUNDER ASKED THE CARD TO CARRY. "The card rendered" does not imply either:
+  // both are OPTIONAL props on `BeadCard` that the concierge's own wrapper omits for comments, so a
+  // card wired without them looks identical from the outside and is missing exactly what was asked
+  // for. Asserted by their own testids rather than by text, so a label change does not read as a
+  // missing feature.
+  it("carries Build It and a comment box", () => {
+    render(<Workspace />);
+    fireEvent.click(rowFor("ep-2")!);
+
+    const card = document.querySelector<HTMLElement>('[data-testid="epic-inline-card"]')!;
+    // "I should have a build it button as well to move it into a building state."
+    expect(card.querySelector('[data-testid="epics-bead-card-build-it"]')).toBeTruthy();
+    // "I want to make sure that I'll be able to make comments on that epic."
+    expect(card.querySelector('[data-testid="epics-bead-card-comments-input"]')).toBeTruthy();
+  });
+
+  it("closes on a second click of the same row", () => {
+    render(<Workspace />);
+    fireEvent.click(rowFor("ep-2")!);
+    expect(document.querySelector('[data-testid="epic-inline-card"]')).toBeTruthy();
+
+    fireEvent.click(rowFor("ep-2")!);
+
+    // `setEpicFocus` toggles, so the row that opened it closes it — and the build column's
+    // narrowing lifts with it, because they are the same piece of state.
+    expect(document.querySelector('[data-testid="epic-inline-card"]')).toBeNull();
+    expect(useUiStore.getState().epicFocusBySide.right).toBeNull();
+  });
+});

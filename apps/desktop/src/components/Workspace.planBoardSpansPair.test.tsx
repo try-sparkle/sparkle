@@ -206,15 +206,19 @@ describe("the Plan board takes over the whole pair", () => {
 
   // ── 2 ── THE WAY BACK. Covering the Build column takes the sidebar's toggle off screen, so the
   // board must carry one — and it must actually work, not merely render.
-  it("carries a reachable Plan/Build toggle, and Build returns the pair to Build", () => {
+  it("carries a reachable Close control, and it returns the pair to Build", () => {
     render(<Workspace />);
     planOn("left");
 
     const overlay = planColumn("left");
-    const build = overlay.querySelector<HTMLButtonElement>("button[data-hint='build']");
+    const build = overlay.querySelector<HTMLButtonElement>("[data-testid='plan-board-close']");
     expect(build).toBeTruthy();
-    // The Plan half is there too, showing which mode you are in.
-    expect(overlay.querySelector("button[data-hint='plan']")).toBeTruthy();
+    expect(build!.textContent).toBe("Close Planning Board");
+    // It KEEPS the retired toggle's `b` mnemonic rather than orphaning it — `hintTargets` still
+    // reserves the letter, and a reserved letter with no element is a keystroke that is swallowed
+    // and does nothing. There is no "Plan" half any more: the board being on screen IS the mode.
+    expect(build!.getAttribute("data-hint")).toBe("build");
+    expect(overlay.querySelector("button[data-hint='plan']")).toBe(null);
 
     fireEvent.click(build!);
 
@@ -225,20 +229,21 @@ describe("the Plan board takes over the whole pair", () => {
     expect(screen.getByTestId("terminal-stage-left")).toBeTruthy();
   });
 
-  // ── THE BOARD'S TOGGLE IS THE MINI CHICLET, NOT THE WIDE CHEVRON ────────────────────────────
-  // The founder: "on the plan board it should have a build plan toggle that looks the same as it
-  // does on the build board. Right now it's got the old Chevron." `PlanBuildToggle` already had
-  // both variants — the Build header renders `mini` and the board was simply never passing it.
-  //
-  // `plan-build-mini` is the real component's own testid (PlanBuildToggle is deliberately NOT
-  // stubbed in this file), so this asserts the VARIANT that actually rendered. MUTATION TARGET:
-  // dropping `variant="mini"` in PlanBoardSlot brings the chevron back and fails this.
-  it("renders the mini slider chiclet (the Build board's control), not the wide chevron", () => {
+  // ── THE TOGGLE IS GONE, AND THAT IS THE POINT ───────────────────────────────────────────────
+  // This replaces a test that pinned the mini chiclet as the board's control. The founder has since
+  // retired the toggle outright — the board is something you OPEN and CLOSE, not a mode you sit in
+  // — so the successor claim is that NO Build/Plan segment survives anywhere on this surface, in
+  // either its mini or its chevron form. Asserting only that the close link renders would pass with
+  // a leftover toggle sitting beside it, which is the thing that must not happen.
+  it("carries NO Build/Plan segment — neither chiclet nor chevron", () => {
     render(<Workspace />);
     planOn("left");
 
     const overlay = planColumn("left");
-    expect(overlay.querySelector("[data-testid='plan-build-mini']")).toBeTruthy();
+    expect(overlay.querySelector("[data-testid='plan-build-mini']")).toBe(null);
+    expect(overlay.querySelector("button[data-hint='plan']")).toBe(null);
+    // The whole window, not just the overlay: the sidebar underneath it carried its own copy.
+    expect(screen.queryByTestId("plan-build-mini")).toBe(null);
   });
 
   // ── WHERE THE TOGGLE SITS, AND WHY DOM ORDER IS THE ASSERTION ───────────────────────────────
@@ -262,12 +267,11 @@ describe("the Plan board takes over the whole pair", () => {
     for (const side of ["left", "right"] as const) {
       planOn(side);
       const overlay = planColumn(side);
-      // THE ROW IS FOUND VIA THE TOGGLE'S PARENT, NOT VIA ITS OWN TESTID — deliberately. Keying the
-      // lookup on `plan-board-header` (which this change introduces) would make every assertion
-      // below fail on the OLD code for the boring reason that the testid did not exist yet, so the
-      // order claim would never actually be evaluated against the layout it exists to reject. The
-      // toggle and its parent row both predate the change, so what fails there is the ORDER.
-      const mini = overlay.querySelector<HTMLElement>("[data-testid='plan-build-mini']");
+      // THE ROW IS FOUND VIA THE EXIT CONTROL'S PARENT, NOT VIA ITS OWN TESTID. The reasoning that
+      // chose this lookup is unchanged; only the control is. The founder's placement requirement
+      // outlived the toggle it was said of, so the order and alignment claims below still stand —
+      // what sits first in the row is now the "Close Planning Board" link.
+      const mini = overlay.querySelector<HTMLElement>("[data-testid='plan-board-close']");
       expect(mini).toBeTruthy();
       const row = mini!.parentElement as HTMLElement;
       const filters = row.querySelector<HTMLElement>("[data-testid='board-filter-bar']");
@@ -275,17 +279,17 @@ describe("the Plan board takes over the whole pair", () => {
       // wrong reason, so establish presence before comparing positions.
       expect(filters).toBeTruthy();
 
-      // THE ORDER. DOCUMENT_POSITION_FOLLOWING reads "the filter bar comes AFTER the toggle".
+      // THE ORDER. DOCUMENT_POSITION_FOLLOWING reads "the filter bar comes AFTER the exit link".
       // FALSE on the pre-change row, which rendered the bar first.
       expect(mini!.compareDocumentPosition(filters!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
       // …and again as sibling indices, so a re-parenting that preserved document order while
-      // nesting the bar elsewhere cannot satisfy it: they are siblings, and the toggle is first.
+      // nesting the bar elsewhere cannot satisfy it: they are siblings, and the exit is first.
       const kids = Array.from(row.children);
       expect(kids.indexOf(mini!)).toBe(0);
       expect(kids.indexOf(mini!)).toBeLessThan(kids.indexOf(filters!));
 
       // THE ALIGNMENT. flex-start rather than flex-end, and on the Build header's own inset, so
-      // the toggle lands on the x it already occupies in Build mode instead of moving when used.
+      // the exit lands on the x the toggle already occupied instead of moving when used.
       expect(row.style.justifyContent).toBe("flex-start");
       expect(row.style.minHeight).toBe("34px");
 

@@ -27,6 +27,7 @@ import {
   emptyEpicBoard,
   tasksOnly,
   withPlanning,
+  epicsFirst,
   type EpicBoard,
   type EpicLadderKey,
 } from "../services/epicBoard";
@@ -536,7 +537,10 @@ export function BoardView({
       return { columns: EPIC_LADDER_COLUMNS, viewBoard: bucketEpics(displayBoard, allBeads) };
     if (!planKinds.epics)
       return { columns: COLUMNS, viewBoard: withPlanning(tasksOnly(displayBoard, allBeads)) };
-    return { columns: COLUMNS, viewBoard: withPlanning(displayBoard) };
+    // BOTH KINDS ON. Same six columns and the same bucketing as before either toggle existed —
+    // only the ORDER within each column changes, so epics read as a band at the top instead of
+    // being scattered among the tasks. See `epicsFirst` for why re-bucketing would be wrong.
+    return { columns: COLUMNS, viewBoard: withPlanning(epicsFirst(displayBoard, allBeads)) };
   }, [displayBoard, planKinds, allBeads]);
 
   /**

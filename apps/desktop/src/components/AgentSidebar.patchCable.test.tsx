@@ -171,34 +171,64 @@ describe("selecting a build row patches the cable", () => {
     expect(useCableStore.getState().wired).toBe("right");
   });
 
-  // ── THE BUILD CHEVRON ───────────────────────────────────────────────────────────────────────
+  // ── ARRIVING IN BUILD ───────────────────────────────────────────────────────────────────────
   //
   // Switching INTO Build puts a build agent in front of you, which is the same act as clicking its
-  // row — so it wires. But it is also the one caller that passes NULL: a pair with no build rows
-  // clears the selection instead. Both directions live here because the second was the regression.
-  const clickBuildChevron = () => fireEvent.click(screen.getByTitle(/^Build mode/));
+  // row — so it wires. But it is also the one caller that can seat NOTHING: a pair with no build
+  // rows must leave the cable alone. Both directions live here because the second was the
+  // regression.
+  //
+  // THE GESTURE THESE USED TO DRIVE IS GONE. They clicked the Build chevron on `PlanBuildToggle`,
+  // which the founder retired — the planning board is something you open and close, not a mode you
+  // toggle. The BEHAVIOUR is unchanged and still worth pinning, so these now drive the transition
+  // that replaced the handler: a real `plan → build` edge on this pair's `workModeBySide`. The
+  // starting mode must be seeded BEFORE the first render, because the rule fires on a transition
+  // and `prevModeRef` latches on mount — a test that leaves the default in place never reaches the
+  // effect at all and asserts only its own setup.
+  const startInPlan = () =>
+    useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } } as never);
+  const arriveInBuild = () =>
+    act(() => {
+      useUiStore.setState({ workModeBySide: { left: "build", right: "build" } } as never);
+    });
 
-  it("wires when the Build chevron seats a row", () => {
-    // Parked on Sparkle, so this is a real switch INTO Build rather than the second-click spawn.
-    useUiStore.setState({ activeSpecial: "sparkle" } as never);
-    render(<AgentSidebar project={PROJECT} />);
-    clickBuildChevron();
+  it("wires when arriving in Build has to SEAT a row", () => {
+    // The selection names an agent this column does not render, so arriving in Build must re-seat
+    // it — and seating a row is what patches the cable.
+    const STALE: Project = { ...PROJECT, selectedAgentId: "gone" };
+    useProjectStore.setState({ projects: [STALE], selectedProjectId: "p1" } as never);
+    startInPlan();
+    render(<AgentSidebar project={STALE} />);
+    arriveInBuild();
     expect(useCableStore.getState().wired).toBe("right");
   });
 
-  it("does NOT patch when the chevron seats NOTHING — and cannot steal the other pair's cable", () => {
-    // `firstRenderedRowId ?? firstVisibleAgentId` is null when the pair has no build agents at all,
-    // and `onPickBuild` passes that null through deliberately (→ the empty Build state). Patching
-    // on it wires a circuit with no agent on the far end: `promptTarget` derives from the selected
-    // agent, so it falls back to Sparkle — and here it would ALSO drop a cable already seated on a
-    // real agent in the other pair, sending the user's next message somewhere they never plugged in.
+  // THE DELIBERATE HALF OF THE CHANGE, and the reason the case above had to be narrowed rather than
+  // just re-driven. The retired chevron wired on EVERY switch into Build. The rule that replaced it
+  // only acts when the selection is not rendered, so a still-valid selection is left alone and the
+  // cable stays where the user last plugged it in. That is the point: `selectAndWire` also
+  // `patchCable`s, and moving the single global cable without a gesture is the defect this rule was
+  // rewritten to stop (both sidebars raced over it at mount). Navigation is not a mount gesture.
+  it("leaves the cable ALONE when arriving in Build and the selection is still rendered", () => {
+    startInPlan();
+    render(<AgentSidebar project={PROJECT} />);
+    arriveInBuild();
+    expect(useCableStore.getState().wired).toBe("off");
+  });
+
+  it("does NOT patch when arriving in Build seats NOTHING — and cannot steal the other pair's cable", () => {
+    // `renderedRowIds[0]` is undefined when the pair has no build agents at all, and the rule skips
+    // `selectAndWire` entirely rather than passing the null through. Patching on it would wire a
+    // circuit with no agent on the far end: `promptTarget` derives from the selected agent, so it
+    // falls back to Sparkle — and here it would ALSO drop a cable already seated on a real agent in
+    // the other pair, sending the user's next message somewhere they never plugged in.
     const EMPTY: Project = { ...PROJECT, agents: [], selectedAgentId: null };
     useProjectStore.setState({ projects: [EMPTY], selectedProjectId: "p1" } as never);
     useRuntimeStore.setState({ openAgentIds: [], status: {} } as never);
-    useUiStore.setState({ activeSpecial: "sparkle" } as never);
     useCableStore.getState().patch("left", null);
+    startInPlan();
     render(<AgentSidebar project={EMPTY} />);
-    clickBuildChevron();
+    arriveInBuild();
     expect(useCableStore.getState().wired).toBe("left");
   });
 

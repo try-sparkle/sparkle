@@ -1,6 +1,13 @@
 // @vitest-environment jsdom
 //
-// THE PLAN CHEVRON WRITES **ITS OWN** COLUMN — the anti-paint test.
+// THE OPEN-BOARD CONTROL WRITES **ITS OWN** COLUMN — the anti-paint test.
+//
+// The control it was written against (a Build/Plan toggle in this band) is retired: the founder
+// made the planning board something you OPEN and CLOSE. The CLAIM is unchanged and still the point
+// — a per-column board whose button writes a shared value fails exactly like the mount-cable bug —
+// so these press the successor. `showOpenBoardLink` is the SATELLITE's configuration, the one that
+// still carries this link in this band; in the main window it lives in the Epics column beside it,
+// and the Workspace-level suites press it there.
 //
 // The Workspace-level test (Workspace.planBoardPerColumn.test.tsx) proves the RENDERER puts a
 // board in the right column. This one proves the BUTTON does, and the two are genuinely different
@@ -76,7 +83,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("puts only the LEFT column into Plan, leaving the right column in Build", () => {
     const projects = useProjectStore.getState().projects;
     const left = projects.find((p) => p.id === "p2")!;
-    render(<AgentSidebar project={left} slotSide="left" />);
+    render(<AgentSidebar showOpenBoardLink project={left} slotSide="left" />);
 
     const plan = document.querySelector('[data-hint="plan"]');
     expect(plan).toBeTruthy();
@@ -91,7 +98,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("puts only the RIGHT column into Plan when pressed there", () => {
     const projects = useProjectStore.getState().projects;
     const right = projects.find((p) => p.id === "p1")!;
-    render(<AgentSidebar project={right} slotSide="right" />);
+    render(<AgentSidebar showOpenBoardLink project={right} slotSide="right" />);
 
     fireEvent.click(document.querySelector('[data-hint="plan"]')!);
 
@@ -107,7 +114,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("drops the Improve-Sparkle pane when Plan is pressed in the column that owns it", () => {
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
     const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
-    render(<AgentSidebar project={right} slotSide="right" />);
+    render(<AgentSidebar showOpenBoardLink project={right} slotSide="right" />);
 
     fireEvent.click(document.querySelector('[data-hint="plan"]')!);
 
@@ -120,7 +127,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("leaves the Sparkle pane alone when Plan is pressed in the OTHER column", () => {
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
     const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
-    render(<AgentSidebar project={left} slotSide="left" />);
+    render(<AgentSidebar showOpenBoardLink project={left} slotSide="left" />);
 
     fireEvent.click(document.querySelector('[data-hint="plan"]')!);
 
@@ -134,7 +141,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   // and the FEEDBACK filter both become dead controls in that window.
   it("writes the FORCED side in a satellite, ignoring the project's pair assignment", () => {
     const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
-    render(<AgentSidebar project={left} forcePairSide="right" showSparkleRow={false} />);
+    render(<AgentSidebar showOpenBoardLink project={left} forcePairSide="right" showSparkleRow={false} />);
 
     fireEvent.click(document.querySelector('[data-hint="plan"]')!);
 
@@ -146,79 +153,38 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   // THE BUILD MIRROR OF THE TWO PLAN CASES ABOVE. Plan had both directions covered while Build's
   // matching claims lived only in comments — and that gap is exactly what let a scoped WRITE ship
   // beside an unscoped READ.
-  it("drops the Improve-Sparkle pane when Build is pressed in the column that owns it", () => {
+  it("drops the Improve-Sparkle pane when Build is entered in the column that owns it", () => {
+    // VIA `showBuildStage`, which is what the board's "Close Planning Board" link invokes. The
+    // pairing under test lives in the STORE precisely so it cannot drift between the paths that
+    // mean "show me the build stage" — the link, `agentReveal`, and the concierge tool all land
+    // here — so driving the action is driving the production path, not bypassing it.
     useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "build", right: "plan" } } as never);
-    const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
-    render(<AgentSidebar project={right} slotSide="right" />);
-
-    fireEvent.click(document.querySelector('[data-hint="build"]')!);
+    useUiStore.getState().showBuildStage("right");
 
     expect(modes().right).toBe("build");
     expect(useUiStore.getState().activeSpecial).toBeNull();
   });
 
-  it("leaves the Sparkle pane alone when Build is pressed in the OTHER column", () => {
+  it("leaves the Sparkle pane alone when Build is entered in the OTHER column", () => {
     useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "plan", right: "build" } } as never);
-    const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
-    render(<AgentSidebar project={left} slotSide="left" />);
-
-    fireEvent.click(document.querySelector('[data-hint="build"]')!);
+    useUiStore.getState().showBuildStage("left");
 
     expect(modes().left).toBe("build");
-    // ONE pane, and it sits in the primary pair's stage. A left press must not reach across.
+    // ONE pane, and it sits in the primary pair's stage. A left-column exit must not reach across.
     expect(useUiStore.getState().activeSpecial).toBe("sparkle");
   });
 
-  // ...and the consequence of that scoping, which is the part a mode assertion cannot see. Because
-  // the left column can never clear the window-global `activeSpecial`, a handler that reads the
-  // BARE global to decide "am I already here" is permanently false in that column while the pane
-  // is up: second-click-spawn goes dead and every press instead re-runs the switching-INTO-Build
-  // branch, re-selecting the first rendered row and yanking the cable off whatever the user had
-  // patched. The read has to be scoped exactly like the write.
-  it("still spawns on the second Build press in the LEFT column while the Sparkle pane is up", () => {
-    useUiStore.setState({ activeSpecial: "sparkle", workModeBySide: { left: "build", right: "build" } } as never);
-    const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
-    render(<AgentSidebar project={left} slotSide="left" />);
-
-    fireEvent.click(document.querySelector('[data-hint="build"]')!);
-
-    expect(spawnAgent).toHaveBeenCalledTimes(1);
-  });
-
-  // THE OTHER CONJUNCT. The left-column case above pins `activeSpecial !== null`; these two pin
-  // `pairSide === SPARKLE_PANE_SIDE`. Without them, collapsing `paneCoversMe` to the bare
-  // `pairSide === SPARKLE_PANE_SIDE` kills second-press-spawn in the RIGHT (primary) column
-  // permanently — every press re-runs the switching-INTO-Build branch and re-selects the first
-  // rendered row — and the suite stays green. `[data-hint="build"]` is clicked nowhere else.
-  it("spawns on the second Build press in the RIGHT column when no pane is up", () => {
-    useUiStore.setState({
-      activeSpecial: null,
-      workModeBySide: { left: "build", right: "build" },
-    } as never);
-    const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
-    render(<AgentSidebar project={right} slotSide="right" />);
-
-    fireEvent.click(document.querySelector('[data-hint="build"]')!);
-
-    expect(spawnAgent).toHaveBeenCalledTimes(1);
-  });
-
-  // ...and the negative: in the column the pane DOES cover, the first press is "get me back to the
-  // stage", not "spawn". This is the half that would break if `paneCoversMe` collapsed to a
-  // constant `false`.
-  it("does NOT spawn on the first Build press in the RIGHT column while the Sparkle pane is up", () => {
-    useUiStore.setState({
-      activeSpecial: "sparkle",
-      workModeBySide: { left: "build", right: "build" },
-    } as never);
-    const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
-    render(<AgentSidebar project={right} slotSide="right" />);
-
-    fireEvent.click(document.querySelector('[data-hint="build"]')!);
-
-    expect(spawnAgent).not.toHaveBeenCalled();
-    expect(useUiStore.getState().activeSpecial).toBeNull();
-  });
+  // ── SECOND-PRESS-SPAWN IS GONE, WITH THE CONTROL IT LIVED ON ────────────────────────────────
+  // Three tests stood here pinning "a second Build press spawns a build agent (≡ the + button)",
+  // plus the `paneCoversMe` scoping that decided whether a press counted as the second one. That
+  // behaviour was a hidden affordance of the Build/Plan toggle, and the founder retired the toggle:
+  // there is no second press to make any more. The surviving path is the visible one it was always
+  // equivalent to — "+ Local Agent" (`NewAgentButtons`, wired to the same `spawnBuildAgent`), which
+  // `AgentSidebar.rowChrome.test.tsx` covers.
+  //
+  // Deleted rather than re-pointed on purpose: re-pointing them at `spawnBuildAgent` directly would
+  // assert the hook still works while proving nothing about a gesture anyone can make, which is the
+  // vacuous shape AGENTS.md names. What replaced their real content is the scoping pair below.
 
   // THE PAINT, not just the press. The row highlighting has to answer "is my stage covered" the
   // same way the chevron does — reading the bare window-global made the LEFT column paint
@@ -227,7 +193,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("does not paint the Improve-Sparkle row active in the column the pane does not cover", () => {
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
     const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
-    const { container } = render(<AgentSidebar project={left} slotSide="left" />);
+    const { container } = render(<AgentSidebar showOpenBoardLink project={left} slotSide="left" />);
 
     const sparkleRow = container.querySelector('[data-hint="improve"]');
     expect(sparkleRow).toBeTruthy();
@@ -237,7 +203,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("paints the Improve-Sparkle row active in the column that DOES own the pane", () => {
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
     const right = useProjectStore.getState().projects.find((p) => p.id === "p1")!;
-    const { container } = render(<AgentSidebar project={right} slotSide="right" />);
+    const { container } = render(<AgentSidebar showOpenBoardLink project={right} slotSide="right" />);
 
     expect(container.querySelector('[data-hint="improve"]')!.getAttribute("data-active")).toBe("1");
   });
@@ -249,7 +215,7 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
     const left = useProjectStore.getState().projects.find((p) => p.id === "p2")!;
     const withSelection = { ...left, selectedAgentId: "p2-a1" };
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
-    const { container } = render(<AgentSidebar project={withSelection} slotSide="left" />);
+    const { container } = render(<AgentSidebar showOpenBoardLink project={withSelection} slotSide="left" />);
 
     const row = container.querySelector('[data-hint="agent"]');
     expect(row).toBeTruthy();
@@ -259,11 +225,10 @@ describe("the Plan chevron belongs to the column it is drawn in", () => {
   it("keeps the other column's Plan mode when this one switches back to Build", () => {
     // Left already parked on its board; the user now works the right column.
     useUiStore.setState({ workModeBySide: { left: "plan", right: "plan" } } as never);
-    const projects = useProjectStore.getState().projects;
-    const right = projects.find((p) => p.id === "p1")!;
-    render(<AgentSidebar project={right} slotSide="right" />);
-
-    fireEvent.click(document.querySelector('[data-hint="build"]')!);
+    // The right column's own "Close Planning Board" link, via the action it invokes. There is no
+    // Build control in this band any more — closing a board is the board's own affordance now —
+    // and the per-side scoping this asserts is a property of that action.
+    useUiStore.getState().showBuildStage("right");
 
     expect(modes().right).toBe("build");
     // The left column's board stays open. Closing one board used to close both.

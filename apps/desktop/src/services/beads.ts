@@ -714,6 +714,64 @@ export function childrenOf(beads: readonly Bead[], epicId: string): Bead[] {
 }
 
 /**
+ * Every bead in this epic's SUBTREE, the epic included — the transitive closure {@link childrenOf}
+ * deliberately is not.
+ *
+ * PICK THIS ONE when the question is "does this work belong to that epic" (membership, filtering,
+ * roll-up across a whole tree). Pick {@link childrenOf} when the question is "what hangs DIRECTLY
+ * off this bead" — the ladder's `open/total` count and `isEpic`'s has-children test both mean the
+ * direct edge and would change meaning under a closure.
+ *
+ * WHY THE CLOSURE IS NEEDED, and it is not a refinement — it is a bug fix (bead sparkle-tyruz4).
+ * `childrenOf` matches two forms, and only ONE of them is any-depth:
+ *
+ *   • the DOTTED id (`epic.2.a`) is matched at any depth by one `startsWith` — fine;
+ *   • the `parent` edge is matched at ONE level only.
+ *
+ * The docstring above claims those two forms are interchangeable. For the reparented bead itself
+ * they are; for ITS children they are not. A bead moved onto an epic with `bd update <id> --parent
+ * <epic>` KEEPS ITS FLAT ID, so nothing beneath it carries the epic's dotted prefix and the
+ * `parent` half stops one link short — the whole subtree under that bead is silently dropped from
+ * the epic. Walking the edge to fixpoint is what closes that.
+ *
+ * Cycle-safe: `bd` does not forbid a parent loop, and this runs inside a render memo, so a cycle
+ * has to terminate rather than hang the window. The `members` guard is what does it.
+ *
+ * Returns beads in INPUT ORDER, each exactly once, even when a bead matches both edge forms.
+ */
+export function descendantsOf(beads: readonly Bead[], epicId: string): Bead[] {
+  const prefix = `${epicId}.`;
+  // One index of the parent edge, then a walk — not a rescan per level, which would be O(n·depth).
+  const byParent = new Map<string, Bead[]>();
+  for (const b of beads) {
+    // Truthiness, not `=== null`: the field is `string | null | undefined`, so an === null guard
+    // lets `undefined` through and the Map key goes untyped. An empty-string parent is not an edge
+    // either, so one test covers both absent shapes.
+    if (!b.parent) continue;
+    const sibs = byParent.get(b.parent);
+    if (sibs) sibs.push(b);
+    else byParent.set(b.parent, [b]);
+  }
+  const members = new Set<string>([epicId]);
+  const queue: string[] = [epicId];
+  // Seed with the dotted form too: `epic.2.a` is a member even if no `parent` edge was ever written
+  // for it, which is the case for every bead bd named at creation time.
+  for (const b of beads) {
+    if (!b.id.startsWith(prefix) || members.has(b.id)) continue;
+    members.add(b.id);
+    queue.push(b.id);
+  }
+  while (queue.length > 0) {
+    for (const child of byParent.get(queue.pop()!) ?? []) {
+      if (members.has(child.id)) continue;
+      members.add(child.id);
+      queue.push(child.id);
+    }
+  }
+  return beads.filter((b) => members.has(b.id));
+}
+
+/**
  * Is this bead an epic? THE one predicate — every surface calls this.
  *
  * A bead is an epic when it HAS CHILDREN, whatever its `issue_type` says, OR when it is explicitly

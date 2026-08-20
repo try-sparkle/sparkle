@@ -23,6 +23,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
 import { C } from "../theme/colors";
+import { FONT_UI, TYPE } from "../theme/scale";
 import { asRgb, dotInk } from "./statusDotTestUtils";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -176,13 +177,24 @@ describe("Build column — the header is its own band, above the list", () => {
     expect(header().style.minHeight).toBe("34px");
   });
 
-  it("carries the Build/Plan segment and the filter chips, in that order", () => {
+  it("carries the column TITLE and the filter chips, in that order", () => {
+    // The Build/Plan segment that used to open this band is gone — the founder retired the toggle,
+    // and the band now NAMES the column ("Build Agents") the way the Epics header across the seam
+    // does. The order claim is unchanged and still load-bearing: the title anchors the band's left
+    // edge and the chips grow to its right.
     render(<AgentSidebar project={seed()} />);
-    const seg = header().querySelector('[data-testid="plan-build-mini"]')!;
+    const seg = header().querySelector('[data-testid="build-column-title"]')!;
     const chips = header().querySelector('[data-testid="status-filter-bar"]')!;
     expect(seg).toBeTruthy();
     expect(chips).toBeTruthy();
     expect(seg.compareDocumentPosition(chips) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(seg.textContent).toBe("Build Agents");
+    // The five properties that make it read as the Epics header's twin. This band sets NO font of
+    // its own, so a title that merely rendered would inherit whatever the list uses — asserting the
+    // string alone would pass for an unstyled span, which is the shape this is guarding against.
+    expect((seg as HTMLElement).style.fontSize).toBe(`${TYPE.small}px`);
+    expect((seg as HTMLElement).style.fontFamily).toBe(FONT_UI);
+    expect((seg as HTMLElement).style.color).toBe(C.muted);
   });
 
   // ONE FILTER MECHANISM. The chips governed the list from INSIDE the scrolling list, so the

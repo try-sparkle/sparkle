@@ -7,11 +7,11 @@
 // ── THE MEMBERSHIP RULE IS NOT RESTATED HERE ───────────────────────────────────────────────────
 //
 // An orchestrator belongs to the epic when the bead it is working IS that epic or any DESCENDANT of
-// it. That edge is `services/beads.childrenOf`, and it is deliberately not re-derived in this file:
+// it. That edge is `services/beads.descendantsOf`, and it is deliberately not re-derived here:
 // `scripts/lib/epic-membership-guard.sh` fails CI on a second definition of epic membership
 // anywhere outside the resolver, because this codebase already grew three incompatible answers to
 // "what is an epic" and the founder's constraint is "keep it one". So this module composes
-// `childrenOf`; it never re-derives the edge or the type test for itself.
+// `descendantsOf`; it never re-derives the edge or the type test for itself.
 //
 // ── AND WHY AN ORCHESTRATOR'S OWN BEAD IS NOT THE WHOLE QUESTION ───────────────────────────────
 //
@@ -22,7 +22,7 @@
 // looking for: the ones with the most work under them. A head matches when IT or ANY agent beneath
 // it is working a bead in the epic.
 
-import { childrenOf, type Bead } from "../services/beads";
+import { descendantsOf, type Bead } from "../services/beads";
 
 /** The shape this rule needs from an agent, and nothing more — so a test can hand it two fields
  *  rather than constructing a whole `Agent`, and so this module never grows a dependency on the
@@ -41,8 +41,12 @@ export interface EpicFocusAgent {
  * otherwise be the one row the filter hid.
  */
 export function beadIdsInEpic(allBeads: readonly Bead[], epicId: string): ReadonlySet<string> {
+  // Seeded with `epicId` rather than relying on `descendantsOf` to carry it: the id can name a bead
+  // that is not in THIS snapshot (a stale focus, a bead filtered out upstream), and the epic's own
+  // id has to stay a member in that case too — `agentIdsInEpic` distinguishes "no epic selected"
+  // from "this epic has no orchestrators", and a dropped seed would blur the two.
   const out = new Set<string>([epicId]);
-  for (const child of childrenOf(allBeads, epicId)) out.add(child.id);
+  for (const b of descendantsOf(allBeads, epicId)) out.add(b.id);
   return out;
 }
 

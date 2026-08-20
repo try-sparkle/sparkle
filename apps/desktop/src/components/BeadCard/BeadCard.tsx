@@ -46,7 +46,7 @@ import { statusDot, statusLabel } from "./beadStatus";
  * is the founder's ask; a `chrome` that could change what is SHOWN would be the drift this
  * component was written to end.
  */
-export type BeadCardChrome = "board" | "concierge";
+export type BeadCardChrome = "board" | "concierge" | "epics";
 
 interface ChromeSpec {
   testId: string;
@@ -60,6 +60,15 @@ interface ChromeSpec {
 const CHROME: Record<BeadCardChrome, ChromeSpec> = {
   board: { testId: "board-bead-card", surface: C.dialogSurface, padding: "16px 18px" },
   concierge: { testId: "concierge-bead-card", surface: C.forest, padding: "10px 12px", role: "status" },
+  // THE EPICS COLUMN'S INLINE CARD. Same fields and same controls as the other two — a `chrome`
+  // that changed WHAT is shown would be the drift this component exists to end — differing only in
+  // the box: the column is ~280px, so it takes the concierge's tighter padding rather than the
+  // board panel's, and `epicCardFill` so the open card reads as the selected row's continuation
+  // rather than as a foreign panel dropped into the ladder.
+  //
+  // `role: "status"` for the same reason the concierge has it: this card IS the result of clicking
+  // the row above it, so it announces itself instead of appearing silently mid-list.
+  epics: { testId: "epics-bead-card", surface: C.epicCardFill, padding: "10px 12px", role: "status" },
 };
 
 export interface BeadCardProps {
