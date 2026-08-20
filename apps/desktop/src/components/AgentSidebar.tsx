@@ -232,6 +232,30 @@ const NEW_AGENT_SLOT_STYLE: React.CSSProperties = {
   gap: 6,
 };
 
+// THE IN-FLOW "way back out of a filter" TREATMENT — a <button> that reads as a link, shared by the
+// two PROSE escape hatches: the status filter's "Show all" and the epic empty state's centered
+// link. Named once because those two sit within ~25 lines of each other and a second, drifted copy
+// would read as two different kinds of control.
+//
+// THE HEADER-BAND LINK IS NOT ONE OF THEM, and that is deliberate rather than drift. A link in the
+// `.bhd` band uses `HeaderLink` — the band's own shape, at `TYPE.micro` with `textUnderlineOffset`
+// — so it sits with `Open Planning Board` beside it rather than with the prose below. The rule, so
+// the size difference is legible to whoever edits this next: IN-FLOW PROSE uses this constant;
+// A HEADER BAND uses `HeaderLink`.
+//
+// `accentInk`, NOT `BRAND.accent` — a link, not a fill. The constant cyan reads at 1.6:1 on light
+// mode's white column; see the ink/fill split in colors.ts. `font: "inherit"` is what keeps it at
+// the 12px muted body size of the prose it sits in rather than the UA's button font.
+const FILTER_ESCAPE_LINK_STYLE: React.CSSProperties = {
+  background: "none",
+  border: "none",
+  padding: 0,
+  font: "inherit",
+  color: C.accentInk,
+  cursor: "pointer",
+  textDecoration: "underline",
+};
+
 export function AgentSidebar({
   project,
   slotSide = "right",
@@ -2284,6 +2308,12 @@ export function AgentSidebar({
   // set, which means "this epic has nothing" and renders nothing — nothing is selected on launch,
   // so collapsing those two would empty this column for every user on every start.
   const epicFocusId = useUiStore((s) => s.epicFocusBySide[pairSide]);
+  // The SAME setter the Epics column's own Clear button calls (EpicsColumn.tsx). Passing `null`
+  // is safe against its toggle semantics (uiStore: `st.epicFocusBySide[side] === epicId ? null :
+  // epicId`) — a null argument resolves to null whether or not something is focused, and clearing
+  // an already-clear side is a no-op. So the two entry points stay one code path rather than one
+  // of them re-implementing "clear".
+  const setEpicFocus = useUiStore((s) => s.setEpicFocus);
   const epicBeads = useBeadsStore((s) => (project ? s.byProject[project.id]?.beads : undefined));
   const epicAgentIds = useMemo(
     () => agentIdsInEpic(project?.agents ?? [], epicBeads ?? [], epicFocusId),
@@ -3189,6 +3219,37 @@ export function AgentSidebar({
               onReset={showAllStatusBands}
             />
           )}
+          {/* THE WAY BACK WHILE THE COLUMN IS NARROWED BUT NOT EMPTY — the case the empty state
+              below structurally cannot cover. That hint is gated on `ordered.length === 0`, so an
+              epic matching two of six agents narrows this column with no in-column escape at all,
+              which is exactly the "so that the user doesn't have to press the clear on the epic
+              column" the founder asked about. Mounted whenever an epic is focused, so it is never
+              a dead control; retired the moment nothing is.
+
+              `HeaderLink`, NOT a hand-rolled button — it is the band's own link shape ("used by
+              every header that offers a way somewhere"), it already sits beside this one for
+              `Open Planning Board`, and its own header warns that hand-rolled copies are how the
+              retired toggle's four mounts drifted. It also carries the `flex: 0 0 auto` and
+              `whiteSpace: nowrap` this needs: the band wraps, and this must never be the item
+              that absorbs the deficit or it truncates to nothing at the sidebar's MIN_WIDTH.
+              Using it also keeps the size on the TYPE scale, which `theme/scale.test.ts` ratchets.
+
+              No `hint`: the ⌘-tap mnemonics are a fixed pinned set (`hintTargets.test.ts`), and
+              this control is transient — it exists only while an epic is focused, so a standing
+              letter for it would point at nothing most of the time. */}
+          {mode !== "plan" && epicFocusId !== null && (
+            <HeaderLink
+              testId="epic-clear-focus-build"
+              label="Show all"
+              // WHICH filter this clears, because the label cannot say it. "Show all" is the
+              // status filter's wording too — its reset sits in this same band — and two more
+              // buttons in this column carry the identical string. Without this the header shows
+              // a bare "Show all" beside a differently-styled "Reset" with nothing distinguishing
+              // them (roborev 65983).
+              title="Show every build agent — clears the epic selected in the Epics column"
+              onClick={() => setEpicFocus(pairSide, null)}
+            />
+          )}
           <PairCountControl projectId={project.id} pairSide={pairSide} shown={headerHover} />
         </div>
       )}
@@ -3222,7 +3283,21 @@ export function AgentSidebar({
         // and `overflow-y: auto` with `overflow-x: visible` computes the other axis to `auto`, so
         // the whole list would gain a horizontal scrollbar and slide sideways. Clipping is the
         // degradation we want: the name ellipsizes, the tail is cut, the column never scrolls.
-        style={{ flex: 1, overflowY: "auto", overflowX: "hidden", padding: `0 ${LIST_PAD_X}px` }}
+        // `position: "relative"` is the CONTAINING BLOCK for the epic empty state's overlay at the
+        // bottom of this container, and nothing else — it changes no layout on its own. In a scroll
+        // container the containing block is the PADDING box, so that overlay's `inset: 0` resolves
+        // to this column's VISIBLE height, which is what "centered vertically in the build column"
+        // means. The alternative (flex column + `margin: auto` on the message) would center too,
+        // and would also turn the sticky New Agent wrapper, ChatSection and every stage group into
+        // flex items — changing how children contribute to `scrollHeight`, the input
+        // `listOverflows` is measured from just above. That perturbs every mode; this perturbs none.
+        style={{
+          flex: 1,
+          overflowY: "auto",
+          overflowX: "hidden",
+          padding: `0 ${LIST_PAD_X}px`,
+          position: "relative",
+        }}
       >
         {/* Per-mode "+ New … Agent" affordance — the only way to create agents now that the chevrons
             are a selector. Plan has none (no agents in Plan). Placement is dynamic (listOverflows):
@@ -3615,20 +3690,7 @@ export function AgentSidebar({
         {project && mode === "build" && hiddenByFilter && (
           <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
             All agents are hidden by the status filter.{" "}
-            <button
-              onClick={showAllStatusBands}
-              style={{
-                background: "none",
-                border: "none",
-                padding: 0,
-                font: "inherit",
-                // accentInk, not BRAND.accent — a link, not a fill. The constant cyan reads at
-                // 1.6:1 on light mode's white column; see the ink/fill split in colors.ts.
-                color: C.accentInk,
-                cursor: "pointer",
-                textDecoration: "underline",
-              }}
-            >
+            <button onClick={showAllStatusBands} style={FILTER_ESCAPE_LINK_STYLE}>
               Show all
             </button>
           </div>
@@ -3640,9 +3702,40 @@ export function AgentSidebar({
             off-screen is the failure `uiStore`'s transient-key comments keep naming; here the
             filter cannot be persisted, but it can still be set and forgotten within a session. */}
         {project && mode === "build" && epicAgentIds && topLevelAgents.length > 0 && ordered.length === 0 && (
-          <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
-            No orchestrators for the epic selected in the Epics column. Press <strong>Clear</strong>
-            {" "}there to see them all again.
+          <div
+            data-testid="epic-empty-overlay"
+            // OVERLAID, NOT IN FLOW. This hint is not alone in the container — the New Agent button
+            // renders in this state too — so styling the message div for centering would land it in
+            // the space ABOVE that button and read as off-centre. Absolute + `inset: 0` against the
+            // scroll container's padding box (see its `position: relative`) centres it over the
+            // column's visible height without touching any sibling's layout.
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              textAlign: "center",
+              padding: `0 ${LIST_PAD_X + 8}px`,
+              color: C.muted,
+              fontSize: 12,
+              lineHeight: 1.5,
+              // It paints over the create-button band. `none` here hands those clicks back to the
+              // button underneath; the link re-arms itself below.
+              pointerEvents: "none",
+            }}
+          >
+            <span>
+              No active build agents match your selected Epic.{" "}
+              <button
+                data-testid="epic-empty-show-all"
+                onClick={() => setEpicFocus(pairSide, null)}
+                // Re-armed against the wrapper's `none` — the one thing in here that IS clickable.
+                style={{ ...FILTER_ESCAPE_LINK_STYLE, pointerEvents: "auto" }}
+              >
+                Show all
+              </button>
+            </span>
           </div>
         )}
         {project && mode === "build" && topLevelAgents.length === 0 && (

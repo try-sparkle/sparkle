@@ -21,6 +21,7 @@ export function HeaderLink({
   onClick,
   testId,
   hint,
+  title,
   style,
 }: {
   label: string;
@@ -33,12 +34,19 @@ export function HeaderLink({
    *  working AND fixes a latent ambiguity: `data-hint="build"` used to match several live elements
    *  at once, and `HintOverlay` fires whichever is first in DOM order. */
   hint?: string;
+  /** Hover/tooltip text. OPTIONAL, but not decorative: `label` is a short verb phrase and the same
+   *  words recur on unrelated controls — "Show all" alone appears on three buttons in the build
+   *  column, one of them in this very band beside the status filter's own reset. Where a link's
+   *  label does not by itself say WHICH thing it acts on, pass this so hover and the accessible
+   *  name do. Omitted when the label is already unambiguous ("Open Planning Board"). */
+  title?: string;
   style?: CSSProperties;
 }) {
   return (
     <button
       data-testid={testId}
       {...(hint ? { "data-hint": hint } : null)}
+      {...(title ? { title, "aria-label": title } : null)}
       onClick={onClick}
       style={{
         background: "transparent",
