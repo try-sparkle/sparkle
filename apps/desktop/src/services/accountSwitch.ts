@@ -20,8 +20,17 @@
 // its current turn. That's the behavior that loses the least work.
 
 import type { AgentTabStatus } from "../types";
-import { setPinFromSwitch, hasHumanPin } from "./accountStore";
+import {
+  setPinFromSwitch,
+  hasHumanPin,
+  clearPin,
+  type Account,
+  type Usage,
+  type Identity,
+  type LiveUsage,
+} from "./accountStore";
 import { isStickyAccountKey } from "./accountSelection";
+import { switchRecommendation, type Ceiling } from "./headroom";
 import { releaseQuotaBlockForAgent } from "../engine/engineRegistry";
 
 /** Statuses at which an agent can be re-spawned without losing in-flight work. Everything except
@@ -186,6 +195,77 @@ export function planSwitchToAccount(
   return { fromAccountId: null, toAccountId, pending, moved: [] };
 }
 
+/** Distinct accounts a STICKY HELPER (Improve Sparkle, or a concierge pane) is currently running
+ *  under, read from the live pane map.
+ *
+ *  This is the set the exhaustion auto-switch was structurally BLIND to. `useAccountSwitch` and
+ *  `useLimitSync` only ever evaluated `busiestPaneAccount()`, so a helper pinned to its OWN dedicated
+ *  account — the whole reason `isStickyAccountKey` exists — was never checked whenever the build fleet
+ *  ran under a different account. That account could sit at 99% and no recommendation was produced,
+ *  which is the founder's reported failure: Automatic, helper at 99%, no auto-switch, a hand re-login. */
+export function stickyHelperAccounts(
+  agentAccounts: Record<string, string | undefined>,
+): string[] {
+  const seen = new Set<string>();
+  for (const [id, acct] of Object.entries(agentAccounts)) {
+    if (acct != null && isStickyAccountKey(id)) seen.add(acct);
+  }
+  return [...seen];
+}
+
+/** Build the plan to RESCUE a sticky helper off an exhausted account.
+ *
+ *  Differs from {@link planSwitch} in exactly one deliberate way: a sticky helper is enrolled even
+ *  when it carries a HUMAN PIN. The banner path leaves a hand-pinned agent alone because a pin is a
+ *  person's explicit "run here" — but an account at its wall is not a place anything CAN run, and a
+ *  pinned helper stranded there is the precise failure this rescue exists to end. Co-located
+ *  non-sticky agents keep their pin protection ({@link hasHumanPin}); only the sticky helper is
+ *  overridden, and {@link moveAgent} clears its pin on the move so it re-resolves onto the healthy
+ *  account rather than bouncing back to the walled one its pin still names. */
+export function planHelperRescue(
+  fromAccountId: string,
+  toAccountId: string,
+  agentAccounts: Record<string, string | undefined>,
+): SwitchPlan {
+  const pending = Object.entries(agentAccounts)
+    .filter((e): e is [string, string] => e[1] === fromAccountId)
+    .filter(([id]) => isStickyAccountKey(id) || !hasHumanPin(id))
+    .map(([id]) => id);
+  return { fromAccountId, toAccountId, pending, moved: [] };
+}
+
+/** Find a sticky helper stranded on an EXHAUSTED account and plan its rescue, or null if none is.
+ *
+ *  THE FIX FOR THE FOUNDER'S BUG. Sweeps every account a sticky helper actually runs on and asks
+ *  {@link switchRecommendation} the SAME authoritative question the fleet path asks about the busiest
+ *  account — an observed rate-limit wall, or real Anthropic utilization at/above `LIVE_AVOID_PERCENT`
+ *  — about each of them. `switchRecommendation` returns null unless that account is genuinely spent
+ *  AND a healthy, signed-in, different-identity target exists, so an UNREADABLE meter (state
+ *  "unknown", no live row) is never treated as exhausted and never triggers a false switch; and a
+ *  target that is itself exhausted or live-spent is excluded before ranking. Both properties come for
+ *  free by reusing the one oracle rather than re-deriving a second exhaustion rule here.
+ *
+ *  Pure given `switchRecommendation` is pure, so the hooks drive the effects and this stays testable.
+ *  Returns the FIRST non-empty rescue plan; the caller executes it through the same safe-boundary
+ *  advance (`advanceSwitch`) every other switch uses, so no in-flight turn is lost. */
+export function planStrandedHelperRescue(
+  accounts: Account[],
+  usage: Usage[],
+  ceilings: Ceiling[],
+  identities: Identity[],
+  now: number,
+  live: readonly LiveUsage[],
+  agentAccounts: Record<string, string | undefined>,
+): SwitchPlan | null {
+  for (const acct of stickyHelperAccounts(agentAccounts)) {
+    const rec = switchRecommendation(acct, accounts, usage, ceilings, identities, now, live);
+    if (!rec || rec.reason !== "exhausted") continue;
+    const plan = planHelperRescue(acct, rec.to.id, agentAccounts);
+    if (plan.pending.length > 0) return plan;
+  }
+  return null;
+}
+
 /** Which pending agents are ready to move right now, given live statuses. PURE — the caller
  *  performs the effects. */
 export function readyToMove(
@@ -232,15 +312,29 @@ export function moveAgent(
   // exists for: it fires precisely because their account hit its ceiling, so they are the ones most
   // likely to be carrying a block.
   releaseQuotaBlockForAgent(agentId);
-  // A STICKY CONSUMER IS RESCUED WITHOUT A PIN — re-spawn only. Only the banner can reach one here
-  // (the activation excludes them), and there the point is to get it off an account that has hit
-  // its ceiling, which a re-spawn alone achieves: it re-resolves through `chooseAccountForAgent`,
-  // and an OBSERVED `exhaustedUntil` is precisely what is allowed to move a sticky selection.
-  // Writing a pin instead would do two harms this branch has already had to undo — it launders a
-  // machinery choice into the slot the modal renders back as the user's own, and in a satellite
-  // window it lands on the `-win-<uuid>` VARIANT, which `stickyPin` prefers over the base key,
-  // detaching that window from the modal's control long after the limit resets.
-  if (isStickyAccountKey(agentId)) return restart(agentId);
+  // A STICKY CONSUMER IS RESCUED WITHOUT A PIN — re-spawn only. Only the banner and the HELPER
+  // RESCUE (planStrandedHelperRescue) can reach one here (the activation excludes them), and in both
+  // the point is to get it off an account that has hit its ceiling, which a re-spawn alone achieves:
+  // it re-resolves through `chooseAccountForAgent`, and an OBSERVED `exhaustedUntil` is precisely
+  // what is allowed to move a sticky selection. Writing a pin instead would do two harms this branch
+  // has already had to undo — it launders a machinery choice into the slot the modal renders back as
+  // the user's own, and in a satellite window it lands on the `-win-<uuid>` VARIANT, which
+  // `stickyPin` prefers over the base key, detaching that window from the modal's control long after
+  // the limit resets.
+  //
+  // But it must also CLEAR any human pin the helper carries. The banner path can never hand a
+  // hand-pinned sticky key to this function (`unpinnedRunning` drops it first), so historically the
+  // clear was unnecessary; the helper rescue deliberately DOES include a pinned sticky helper,
+  // because a pin promising "run here" is meaningless when "here" is a walled account, and the
+  // founder set to Automatic still had to re-login by hand. Without the clear, the re-spawn re-reads
+  // the pin (`chooseAccountForAgent` → `stickyPin`) and bounces straight back to the walled account.
+  // A no-op when there is no pin, so the banner path is unchanged. Both of the helper's components
+  // share ONE sticky key, so clearing it relocates the pane and the headless pass together — the
+  // invariant the pin protected, kept while the pair moves off the exhausted account.
+  if (isStickyAccountKey(agentId)) {
+    clearPin(agentId);
+    return restart(agentId);
+  }
   // `setPinFromSwitch`, not `setPin`: this pin is MACHINERY's, and a later activation has to be able
   // to clear the pins a previous one left without touching the ones a person set by hand.
   setPinFromSwitch(agentId, toAccountId);

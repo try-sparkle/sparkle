@@ -14,7 +14,8 @@ import { syncLimitsOnce, LIMIT_POLL_MS } from "../services/limitSync";
 import { raiseFirstLimitUnlessAutoSwitchHandles } from "../stores/accountLimitStore";
 import { listCeilings } from "../services/accountStore";
 import { switchRecommendation, type Ceiling } from "../services/headroom";
-import { busiestPaneAccount } from "../services/paneControl";
+import { planStrandedHelperRescue } from "../services/accountSwitch";
+import { busiestPaneAccount, paneAccountMap } from "../services/paneControl";
 
 /** Poll for real rate-limit events and bench the affected accounts until their true reset time.
  *  Best-effort throughout — a failure is logged by `syncLimitsOnce` and retried on the next tick,
@@ -73,16 +74,32 @@ export function useLimitSync(pollMs: number = LIMIT_POLL_MS): void {
         // recommendation does not need them; a failure here just leaves us raising the modal.
       }
       if (cancelled) return;
+      const now = Date.now();
+      const live = liveUsageRows();
       const rec = switchRecommendation(
         busiestPaneAccount(),
         fresh.accounts,
         fresh.usage,
         ceilings,
         fresh.identities,
-        Date.now(),
-        liveUsageRows(),
+        now,
+        live,
       );
-      raiseFirstLimitUnlessAutoSwitchHandles(applied, rec !== null);
+      // A helper stranded on its OWN exhausted account is rescued by `useAccountSwitch` even when it
+      // is not the busiest account — so the modal for it would ask the founder to do by hand what the
+      // automation is already doing. Suppress it on the SAME oracle the rescue acts on. Without this
+      // the busiest-account `rec` is null (that account is healthy) and the modal fires anyway.
+      const helperRescue =
+        planStrandedHelperRescue(
+          fresh.accounts,
+          fresh.usage,
+          ceilings,
+          fresh.identities,
+          now,
+          live,
+          paneAccountMap(),
+        ) !== null;
+      raiseFirstLimitUnlessAutoSwitchHandles(applied, rec !== null || helperRescue);
     };
 
     void tick(); // check immediately on mount — a limit hit while the app was closed still applies

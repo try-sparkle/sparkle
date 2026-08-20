@@ -49,6 +49,9 @@ vi.mock("../services/accountStore", async (importOriginal) => ({
 
 vi.mock("../services/paneControl", () => ({
   busiestPaneAccount: () => "walled",
+  // No sticky helper is mounted in this suite, so the helper-rescue sweep is a no-op and the
+  // busiest-account `rec` is the only thing gating the modal — which is what these tests isolate.
+  paneAccountMap: () => ({}),
 }));
 
 vi.mock("../services/headroom", () => ({

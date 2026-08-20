@@ -31,6 +31,7 @@ import {
   advanceSwitch,
   planSwitch,
   planSwitchToAccount,
+  planStrandedHelperRescue,
   type SwitchPlan,
 } from "../services/accountSwitch";
 import { busiestPaneAccount, paneAccountMap, restartPane } from "../services/paneControl";
@@ -179,6 +180,42 @@ export function useAccountSwitch(pollMs: number = HEADROOM_POLL_MS): AccountSwit
             setRecommendation(null);
             planRef.current = fresh;
             setPlan(fresh);
+            return;
+          }
+        }
+
+        // ══ HELPER RESCUE — the account the busiest check is STRUCTURALLY BLIND TO ════════════════
+        // `switchRecommendation` above only ever judged `busiestPaneAccount()`. A sticky helper
+        // (Improve Sparkle, the concierge pane) pinned to its OWN dedicated account is invisible to
+        // that whenever the build fleet runs elsewhere: the helper's account can sit at 99% and no
+        // recommendation is ever produced for it. That is the founder's exact failure — set to
+        // Automatic, helper at 99%, nothing moved, a re-login he did by hand.
+        //
+        // So sweep the accounts a helper is actually running on and rescue the first that has walled.
+        // Reached only when the busiest path did NOT start a plan (it `return`s on success, and moves
+        // an unpinned helper co-located with the fleet for free), and skipped on a tick we could not
+        // read (`state.failed` → every account looks absent, which is not evidence of a wall). The
+        // helper is sticky and re-resolves onto the healthy account via its own auto-pick, so — unlike
+        // the fleet path — this does NOT rewrite the fleet-wide preference; it only relocates the pair.
+        if (!state.failed) {
+          const rescue = planStrandedHelperRescue(
+            state.accounts,
+            state.usage,
+            ceilings,
+            state.identities,
+            Date.now(),
+            liveUsageRows(),
+            paneAccountMap(),
+          );
+          if (rescue) {
+            if (rescue.fromAccountId) {
+              // A manual limit modal for the account we are now rescuing is moot — same close the
+              // fleet path makes, so the founder is not asked to act on what the automation handled.
+              useAccountLimitStore.getState().resolveByAutoSwitch(rescue.fromAccountId);
+            }
+            setRecommendation(null);
+            planRef.current = rescue;
+            setPlan(rescue);
             return;
           }
         }
