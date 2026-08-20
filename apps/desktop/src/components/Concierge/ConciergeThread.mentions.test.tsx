@@ -3,10 +3,18 @@
 // A sent message draws the agents it addressed as PILLS, not as raw "@text" — the last half of the
 // founder's ask ("if I press enter it shows me the agent as a pill in the chat"). The composer is a
 // plain textarea and stays one, so the sent bubble is where a pill becomes visible.
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConciergeThread } from "./ConciergeThread";
+import { BeadPillProvider, type BeadPillContextValue } from "./BeadPill";
+import { beadMentionId } from "./mentions";
+import type { Bead } from "../../services/beads";
 import type { ConciergeMessage } from "./types";
+
+// NO BEADS-STORE MOCK, and that is deliberate rather than an omission: these rows mount
+// `BeadPillProvider` with a FIXTURE, never `BeadPillHost`, so nothing here arms the poller and
+// nothing shells out to `bd`. The fixture is also the honest shape for this surface — a sent bubble
+// renders from the mentions RECORDED on the message, not from a live board.
 
 afterEach(() => cleanup());
 
@@ -91,5 +99,126 @@ describe("ConciergeThread — @-mention pills", () => {
     ]);
     expect(pills()).toHaveLength(0);
     expect(bubble().textContent).toBe("the name is gone now");
+  });
+});
+
+// ══ A BEAD MENTION IS A REFERENCE THE READER CAN OPEN ═══════════════════════════════════════════
+//
+// The founder asked for the reference to be "a clickable pill carrying the bead id", and a sent
+// `you` bubble is the one surface where markdown is never involved — `MentionedText` splits the text
+// against the RECORDED mentions, so a `[title](sparkle-bead:id)` literal would show as literal
+// markdown. The pill therefore has to come out of the mention record, and the CONTROL has to be the
+// app's one bead control (`BeadPill`) rather than a lookalike that opens a different card.
+const BEAD_ID = "sparkle-1cpomd";
+const BEAD: Bead = {
+  id: BEAD_ID,
+  title: "Chat about a bead from its card",
+  description: "",
+  status: "open",
+  type: "feature",
+  priority: 1,
+  labels: [],
+  parent: null,
+};
+
+function ctx(beads: Bead[]): BeadPillContextValue {
+  return {
+    beads: new Map(beads.map((b) => [b.id, { bead: b, projectId: "p1" }])),
+    onViewOnBoard: vi.fn(() => true),
+  };
+}
+
+function beadThread(messages: ConciergeMessage[], value: BeadPillContextValue = ctx([BEAD])) {
+  render(
+    <BeadPillProvider value={value}>
+      <ConciergeThread messages={messages} onNudgeClick={vi.fn()} onNudgeAction={vi.fn()} />
+    </BeadPillProvider>,
+  );
+}
+
+/** A message naming BOTH an agent and a bead — the shape every row below uses, because "the bead is
+ *  a button" is only evidence when an agent mention in the same bubble is still NOT one. Rendering
+ *  the bead alone would pass identically if every mention had become a button. */
+const BOTH: ConciergeMessage = {
+  id: "u1",
+  kind: "you",
+  text: "@Kraken Auth please pick up @Chat about a bead from its card next",
+  mentions: [
+    { agentId: "a2", name: "Kraken Auth" },
+    { agentId: beadMentionId(BEAD_ID), name: "Chat about a bead from its card" },
+  ],
+};
+
+const beadPills = () => screen.queryAllByTestId("concierge-bead-pill");
+const beadCard = () => screen.queryByTestId("concierge-bead-card");
+
+describe("ConciergeThread — a bead mention is clickable", () => {
+  it("draws the bead's id as a BeadPill button while the agent beside it stays a plain pill", () => {
+    beadThread([BOTH]);
+    // The bead half is the app's real bead control, carrying the id…
+    expect(beadPills()).toHaveLength(1);
+    expect(beadPills()[0]!.getAttribute("data-bead-id")).toBe(BEAD_ID);
+    expect(beadPills()[0]!.tagName).toBe("BUTTON");
+    // …and the agent half is untouched: still a span, still no button. A change that made every
+    // mention clickable would satisfy the line above and fail this one.
+    const agentPill = pills().find((p) => p.getAttribute("data-agent-id") === "a2");
+    expect(agentPill?.tagName).toBe("SPAN");
+    expect(agentPill?.querySelector("button")).toBeNull();
+  });
+
+  // THE POINT OF THE WHOLE ROW. "Clickable" is not a style — a pill that cannot open anything is
+  // prose with a background colour (AgentPill.deadEnd.test.tsx exists to forbid exactly that).
+  it("OPENS THE BEAD'S CARD when the pill is clicked", () => {
+    beadThread([BOTH]);
+    expect(beadCard()).toBeNull();
+    fireEvent.click(beadPills()[0]!);
+    expect(beadCard()).toBeTruthy();
+    expect(beadCard()!.textContent).toContain("Chat about a bead from its card");
+  });
+
+  it("keeps the title as the mention pill, so the record reads as what was sent", () => {
+    beadThread([BOTH]);
+    const titlePill = pills().find(
+      (p) => p.getAttribute("data-agent-id") === beadMentionId(BEAD_ID),
+    );
+    expect(titlePill?.textContent).toBe("@Chat about a bead from its card");
+    // …and the id rides beside it in parentheses, which is exactly the form `beadWireText` puts on
+    // the wire. The founder's bubble and the concierge's copy of it say the same thing.
+    expect(bubble().textContent).toContain("@Chat about a bead from its card (sparkle-1cpomd)");
+  });
+
+  // `withMentionLabels` suffixes a bead's address with its own id when two titles collide. The id
+  // must not then appear twice — the suffix becomes the control rather than being printed beside a
+  // second copy of itself.
+  it("does not print the id twice when the address already carries it", () => {
+    beadThread([
+      {
+        id: "u2",
+        kind: "you",
+        text: "@Chat about a bead from its card (sparkle-1cpomd) is the one",
+        mentions: [
+          {
+            agentId: beadMentionId(BEAD_ID),
+            name: "Chat about a bead from its card (sparkle-1cpomd)",
+          },
+        ],
+      },
+    ]);
+    expect(bubble().textContent).toBe(
+      "@Chat about a bead from its card (sparkle-1cpomd) is the one",
+    );
+    expect(beadPills()).toHaveLength(1);
+  });
+
+  // A bead deleted after the message was sent. `BeadPill`'s own rule — an id that resolves to
+  // nothing is the prose it always was — and the title pill survives regardless, because history
+  // renders from the record and not from the live board.
+  it("degrades to plain text when the bead no longer exists, keeping the title pill", () => {
+    beadThread([BOTH], ctx([]));
+    expect(beadPills()).toHaveLength(0);
+    expect(bubble().textContent).toContain("@Chat about a bead from its card (sparkle-1cpomd)");
+    expect(
+      pills().some((p) => p.getAttribute("data-agent-id") === beadMentionId(BEAD_ID)),
+    ).toBe(true);
   });
 });

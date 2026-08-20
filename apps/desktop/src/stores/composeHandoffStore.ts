@@ -23,8 +23,17 @@ import type { CaptureAttachment } from "../capture/types";
 import { log } from "../logger";
 
 /** Where the handoff came from. Purely diagnostic — it is what the delivery log names, so a drop
- *  can be traced back to the surface that produced it. */
-export type ComposeHandoffOrigin = "capture-build" | "capture-chat" | "new-build-agent-drop";
+ *  can be traced back to the surface that produced it.
+ *
+ *  `bead-chat` is the bead card's Chat button (services/beadChat.ts, bead sparkle-1cpomd). It is
+ *  the first origin that is NOT a capture, which is why the replacement warning below no longer
+ *  says "capture": a drop there discards a draft the founder started by clicking a task, and a log
+ *  line naming the wrong surface is how a real loss gets read as somebody else's bug. */
+export type ComposeHandoffOrigin =
+  | "capture-build"
+  | "capture-chat"
+  | "new-build-agent-drop"
+  | "bead-chat";
 
 export interface ComposeHandoff {
   origin: ComposeHandoffOrigin;
@@ -47,14 +56,16 @@ export interface ComposeHandoff {
 interface ComposeHandoffState {
   handoff: ComposeHandoff | null;
   /** Queue a draft for the compose box. A second call before the first is consumed REPLACES it —
-   *  the user sent a newer capture and that is the one they are looking at.
+   *  the user produced a newer draft and that is the one they are looking at.
    *
-   *  THE REPLACEMENT IS LOGGED, because it discards a whole capture (narration AND screenshot) and
-   *  is the last path in this flow that could lose user work without saying so. It is reachable
+   *  THE REPLACEMENT IS LOGGED, because it discards whatever the displaced surface produced — a
+   *  whole capture (narration AND screenshot), or a bead reference the founder clicked for — and is
+   *  the last path in this flow that could lose user work without saying so. It is reachable
    *  whenever the consuming effect has not run yet — two sends while the owning window is still
-   *  hidden, before `focusThisWindow()`. `dispatchBuild` has already logged "handed off" for the
-   *  draft being dropped, so without this line the log positively asserts a delivery that never
-   *  happened, which is worse than silence (roborev 53836). */
+   *  hidden, before `focusThisWindow()`, or a second bead's Chat clicked before the first draft
+   *  reached the box. Every producer has already logged "handed off" for the draft being dropped,
+   *  so without this line the log positively asserts a delivery that never happened, which is worse
+   *  than silence (roborev 53836). */
   set: (h: ComposeHandoff) => void;
   /** Read AND clear. The clearing is the point — see the header. */
   take: () => ComposeHandoff | null;
@@ -68,7 +79,10 @@ export const useComposeHandoffStore = create<ComposeHandoffState>()((set, get) =
     const displaced = get().handoff;
     if (displaced) {
       // Kinds and counts, never paths or the text itself — this log ships with support tickets.
-      log.warn("composer", "a capture handoff was replaced before it was ever delivered", {
+      // NOT "a capture handoff" — `bead-chat` is not a capture, and the dropped surface is already
+      // named in `droppedOrigin`. A message that hard-codes one producer misattributes every other
+      // one's loss to a window the user never opened.
+      log.warn("composer", "a compose handoff was replaced before it was ever delivered", {
         droppedOrigin: displaced.origin,
         droppedProjectId: displaced.projectId,
         droppedChars: displaced.text.length,

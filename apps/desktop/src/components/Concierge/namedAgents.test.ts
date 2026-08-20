@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { namedAgentIds } from "./namedAgents";
+import { beadMentionId } from "./mentions";
 import type { MentionAgent } from "./mentions";
 
 const agent = (id: string, name: string): MentionAgent =>
@@ -75,5 +76,47 @@ describe("what must NOT count as naming an agent", () => {
   it("survives an empty roster and an empty message", () => {
     expect(namedAgentIds("anything", undefined, [])).toEqual([]);
     expect(namedAgentIds("", undefined, ROSTER)).toEqual([]);
+  });
+});
+
+// ══ A BEAD CAN NEVER GRANT RELAY PERMISSION (bead sparkle-1cpomd) ═══════════════════════════════
+//
+// Beads joined the mention roster so tasks and epics can be @mentioned like agents. This set is the
+// PERMISSION half of the relay gate, so a bead leaking into it is a safety question rather than a
+// tidiness one — and both paths into the set had to be closed, which is what the pairing below is
+// checking. Each row asserts the bead is absent WHILE an agent named the very same way is present,
+// so an implementation that simply returned fewer ids cannot pass.
+describe("beads are named work, not named recipients", () => {
+  const BEAD = beadMentionId("sparkle-1cpomd");
+  const BEAD_TITLE = "Chat button on every bead card";
+  const WITH_BEAD = [...ROSTER, agent(BEAD, BEAD_TITLE)];
+
+  // THE EASY-TO-MISS PATH. The @-mention loop used to add every resolved id unconditionally, so
+  // clicking Chat on a bead card dropped `bead:<id>` straight into the permission set. Harmless only
+  // because nothing could match it — the accident-of-lookup this feature refused to rely on.
+  it("keeps a bead @mention out of the set, while an agent @mention still counts", () => {
+    const ids = namedAgentIds(
+      `RE: @${BEAD_TITLE} — @Kraken Auth can you take this?`,
+      [
+        { agentId: BEAD, name: BEAD_TITLE },
+        { agentId: "ag-kraken", name: "Kraken Auth" },
+      ],
+      WITH_BEAD,
+    );
+    expect(ids).toContain("ag-kraken");
+    expect(ids).not.toContain(BEAD);
+  });
+
+  // THE PROSE PATH. `namedInProse` is deliberately generous, and that trade is priced for ~60 short
+  // agent names — over a backlog of sentences it inverts, because a bead title is made of the same
+  // words the message is.
+  it("does not let a bead title in prose grant permission, where an agent name still does", () => {
+    const ids = namedAgentIds(
+      `the Chat button on every bead card is done — tell Kraken Auth`,
+      undefined,
+      WITH_BEAD,
+    );
+    expect(ids).toContain("ag-kraken");
+    expect(ids).not.toContain(BEAD);
   });
 });

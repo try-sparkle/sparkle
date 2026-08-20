@@ -26,7 +26,7 @@
 // bead `sparkle-qogah`'s rule that a row needing action is never hidden: a card whose whole body
 // scrolled would take the priority control and the way out of the card with it.
 import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
-import { FiExternalLink, FiUsers, FiX } from "react-icons/fi";
+import { FiExternalLink, FiMessageSquare, FiUsers, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../../theme/colors";
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
 import { severityOf, type Bead } from "../../services/beads";
@@ -83,6 +83,20 @@ export interface BeadCardProps {
    * rather than buttons that cannot work.
    */
   onViewOnBoard?: () => void;
+  /**
+   * Start a concierge chat that already references this bead (bead sparkle-1cpomd). The founder
+   * asked for it on EVERY bead card, task or epic — which is why it needs no branching here:
+   * nothing in this component keys on `bead.type`, so "task or epic" is already the default.
+   *
+   * ITS ABSENCE IS THE HIDING MECHANISM, per this block's rule above, and one caller depends on
+   * that rather than on any window check: the SATELLITE window mounts no `ConciergeHost` and no
+   * composer anywhere in its tree, so a Chat button there would `set()` a draft into a store with
+   * no reader and it would be silently DROPPED. `satellite/SatelliteApp.tsx` therefore passes
+   * nothing to `BoardView`, and the callback-is-the-switch convention removes the button for free —
+   * no window-detection global, and nothing for a future surface to forget to consult.
+   * (`windowContext.useIsMainWindow` could not have done it: it is hard-coded `true`.)
+   */
+  onChat?: () => void;
   onSetPriority?: (priority: number) => Promise<void>;
   onClose?: () => void;
   onBuildIt?: () => Promise<void>;
@@ -128,6 +142,7 @@ export function BeadCard({
   projectName,
   descMaxHeight,
   onViewOnBoard,
+  onChat,
   onSetPriority,
   onClose,
   onBuildIt,
@@ -275,6 +290,48 @@ export function BeadCard({
         >
           {bead.title || bead.id}
         </span>
+        {onChat !== undefined && (
+          // ══ THE BLUE IS BUILD IT'S BLUE, THE METRICS ARE THE TITLE ROW'S ═════════════════════
+          // `C.teal` / `ON_BRAND_FILL` / `border: none` / `RADIUS.modal` are lifted verbatim from
+          // the Build It button below, because the founder asked for "the same blue as Build It"
+          // and a second near-teal would read as a different kind of action. Everything else is
+          // this ROW's scale — the compact padding and `TYPE.small` its two neighbours use — so it
+          // reads as a corner control rather than a second call-to-action shouting over the title.
+          //
+          // NO POSITIONING. The title span beside it is `flex: 1`, so `flex: "0 0 auto"` is the
+          // whole layout: the title takes the slack and this lands top-right. Absolute positioning
+          // here would overlap a wrapped title, which is the common case (bead titles are
+          // sentences).
+          //
+          // NOT GATED ON `buildBusy`. That flag exists because ONE shared flag made a priority save
+          // relabel the primary action to "Building…" (see the two-busy-flags note above); handing
+          // a draft to the composer is synchronous and starts nothing, so it has no busy state of
+          // its own to add and no business reading anyone else's.
+          <button
+            type="button"
+            data-testid={`${t}-chat`}
+            onClick={onChat}
+            title="Chat with Sparkle about this bead — starts a message that references it"
+            style={{
+              flex: "0 0 auto",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
+              background: C.teal,
+              color: ON_BRAND_FILL,
+              border: "none",
+              borderRadius: RADIUS.modal,
+              cursor: "pointer",
+              padding: "2px 8px",
+              fontFamily: FONT_UI,
+              fontSize: TYPE.small,
+              lineHeight: 1.4,
+            }}
+          >
+            <FiMessageSquare size={12} aria-hidden />
+            Chat
+          </button>
+        )}
         {onViewOnBoard !== undefined && (
           // A BUTTON, not a fake link. It was an underlined `accentInk` run — which reads as
           // navigation to somewhere else on the page and is the founder's item 3. It performs an

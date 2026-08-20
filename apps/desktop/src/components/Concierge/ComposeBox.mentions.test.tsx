@@ -373,3 +373,47 @@ describe("ComposeBox — mentions do not disturb what this box already does", ()
     expect(overlayWrapper.contains(picker())).toBe(false);
   });
 });
+
+// ══ WHAT MAY BE CHOSEN, NOW THAT DELIVERABILITY AND CHOOSABILITY ARE DIFFERENT QUESTIONS ════════
+//
+// They were one question until beads joined the roster (bead sparkle-1cpomd). `chooseMention` read
+// `!agent.canAcceptInput` and refused — which is right for a cloud agent (nothing can be sent to it,
+// so writing an address for it would be a lie) and WRONG for a bead, which carries the same
+// `canAcceptInput: false` honestly and is nonetheless entirely pickable: choosing it writes a
+// REFERENCE, not an address.
+//
+// Both directions are pinned here, in one describe, because either alone is half the evidence. The
+// bead-side row lives in ConciergeHost.beadMentions.test.tsx, where a real roster carries a real
+// bead; this file owns the agent-side refusal, which had no test at all.
+describe("ComposeBox — an agent that cannot take a message cannot be chosen", () => {
+  const CLOUD = agent({ id: "c1", name: "Cloud Runner", canAcceptInput: false });
+
+  it("refuses Enter on an undeliverable agent, leaving the query exactly as typed", () => {
+    setup({ mentionAgents: [CLOUD] });
+    type("@Cloud");
+    // The row IS offered — "no such agent" and "that one is a cloud agent" are different answers,
+    // and hiding it would collapse them (see mentions.orderMentionAgents).
+    expect(offeredIds()).toContain("c1");
+    fireEvent.keyDown(box(), { key: "Enter" });
+    // Nothing was inserted: no completed literal, no trailing space, and the picker is still up.
+    expect(box().value).toBe("@Cloud");
+    expect(picker()).toBeTruthy();
+  });
+
+  it("refuses the MOUSE on it too, so the two paths cannot disagree", () => {
+    setup({ mentionAgents: [CLOUD] });
+    type("@Cloud");
+    const row = options().find((o) => o.getAttribute("data-agent-id") === "c1");
+    fireEvent.mouseDown(row!);
+    expect(box().value).toBe("@Cloud");
+  });
+
+  // The PAIRED half — a deliverable agent in the same shape of test really does get inserted, so
+  // the two rows above cannot be satisfied by a composer that stopped choosing anything at all.
+  it("still chooses a deliverable agent, terminated by a space", () => {
+    setup({ mentionAgents: [CLOUD, KRAKEN] });
+    type("@Kraken");
+    fireEvent.keyDown(box(), { key: "Enter" });
+    expect(box().value).toBe("@Kraken Auth ");
+  });
+});

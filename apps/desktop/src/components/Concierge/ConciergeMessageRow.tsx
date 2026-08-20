@@ -32,7 +32,7 @@ import { Markdown } from "../Markdown";
 // Decides which of THIS message's bead cards render already-open. Wrapped around each answer's
 // `<Markdown>` rather than mounted once for the column, because the cap it applies is per-REPLY:
 // the founder lists eight or more beads in one message and the budget has to reset at the next one.
-import { BeadAutoExpandProvider } from "./BeadPill";
+import { BeadAutoExpandProvider, BeadPill } from "./BeadPill";
 import { bandColor } from "../../engine/statusBandLabels";
 import { CopyAnswerButton } from "./CopyAnswerButton";
 import { MessageStatusLive, type ConciergeMessageStatusText } from "./MessageStatus";
@@ -45,7 +45,7 @@ import { AttachmentStrip } from "../composer/AttachmentStrip";
 import { TextPill } from "../composer/TextPill";
 import { composeBody, type TextBlock } from "../composer/attachments";
 import { blockKey, SHOWN_ID_SEP } from "./collapsedBlocks";
-import { splitMentionText, type ConciergeMention } from "./mentions";
+import { parseBeadMentionId, splitMentionText, type ConciergeMention } from "./mentions";
 import { MentionPill } from "./MentionPill";
 // `ReplyAnchorViews`, not `ReplyAnchors` — the RULE module is `replyAnchors.ts`, and on a
 // case-insensitive filesystem two modules differing only in case are the same path to the resolver
@@ -171,20 +171,80 @@ function MentionedText({ text, mentions }: { text: string; mentions?: ConciergeM
   if (!mentions?.length) return <>{text}</>;
   return (
     <>
-      {splitMentionText(text, mentions).map((part, i) =>
-        part.kind === "text" ? (
+      {splitMentionText(text, mentions).map((part, i) => {
+        if (part.kind === "text") {
           // The index IS the identity here: these parts are positional slices of one immutable
           // string on a message that never re-renders with different content.
-          <span key={i}>{part.text}</span>
-        ) : (
-          // The SHARED pill (./MentionPill) — the same component the composer paints behind its
-          // textarea. It used to be six style properties inlined here, which is how the sent pill
-          // and the composer pill would have drifted a shade apart with nothing failing.
+          return <span key={i}>{part.text}</span>;
+        }
+        // A BEAD MENTION IS A REFERENCE THE READER CAN OPEN, not a label. `parseBeadMentionId` is
+        // the total test (see mentions' `BEAD_MENTION_PREFIX`), and it is read off the RECORDED
+        // agentId rather than off a live lookup for the same reason the split is: a sent bubble is
+        // history and must render what was addressed even after the board moves.
+        const beadId = parseBeadMentionId(part.agentId);
+        if (beadId !== null) {
+          return <BeadMentionRef key={i} agentId={part.agentId} beadId={beadId} text={part.text} />;
+        }
+        // The SHARED pill (./MentionPill) — the same component the composer paints behind its
+        // textarea. It used to be six style properties inlined here, which is how the sent pill
+        // and the composer pill would have drifted a shade apart with nothing failing.
+        return (
           <MentionPill key={i} agentId={part.agentId}>
             {part.text}
           </MentionPill>
-        ),
-      )}
+        );
+      })}
+    </>
+  );
+}
+
+/**
+ * One @mention of a BEAD, in a sent bubble: the title as a pill, then the id as the control.
+ *
+ * ══ WHY TWO ELEMENTS AND NOT ONE ════════════════════════════════════════════════════════════════
+ * The founder asked for two things that pull in opposite directions. The composer must carry the
+ * TITLE ("@mention task and epic titles … with that being what appears in the composer"), and the
+ * reference must be a CLICKABLE PILL CARRYING THE BEAD ID. `BeadPill` is the app's one answer to the
+ * second half — it resolves against the live board, opens the card in place, closes on Escape and
+ * offers "View on board" — and it renders the ID, always, deliberately: a bead's id is what the
+ * founder greps and pastes, and rendering an author-supplied label instead would let model-written
+ * text put reassuring words on a pill pointing somewhere else (see its own docstring).
+ *
+ * So the title is the pill and the id is the control, side by side, rather than one of the two facts
+ * being dropped. Reusing `BeadPill` rather than growing a second clickable-bead component is the
+ * point: "what the concierge names should read as one vocabulary whether it is an agent or a unit of
+ * work" (BeadPill's header) is not satisfied by a lookalike that opens a different card.
+ *
+ * ══ WHY IT MIRRORS `beadWireText` EXACTLY ═══════════════════════════════════════════════════════
+ * `mentionFreeText` puts `Title (bead-id)` on the wire, so the concierge receives the title and a
+ * handle it can resolve. Rendering the bubble the same way — `@Title (sparkle-1cpomd)` — means the
+ * founder's own record reads as what was actually sent, rather than as a prettier version of it.
+ * The parenthesis rule is `beadWireText`'s too: a label the collision pass has ALREADY suffixed with
+ * its id (`withMentionLabels` writes `Title (sparkle-x)` when two beads truncate to one title) is not
+ * given the id twice — the suffix is peeled off the pill and rendered as the control instead, so both
+ * cases come out identical on screen.
+ *
+ * An unresolved bead degrades to plain text, which is `BeadPill`'s own rule and the right one here:
+ * a bead deleted after the message was sent leaves the title pill intact and the id as the prose it
+ * always was, rather than a control that opens nothing.
+ */
+function BeadMentionRef({
+  agentId,
+  beadId,
+  text,
+}: {
+  agentId: string;
+  beadId: string;
+  text: string;
+}) {
+  const suffix = ` (${beadId})`;
+  const title = text.endsWith(suffix) ? text.slice(0, -suffix.length) : text;
+  return (
+    <>
+      <MentionPill agentId={agentId}>{title}</MentionPill>
+      {" ("}
+      <BeadPill beadId={beadId} />
+      {")"}
     </>
   );
 }

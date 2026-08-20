@@ -202,7 +202,22 @@ export function boardScrollDelta(
 // `side` is REQUIRED, deliberately. It defaulted to "right" for one commit and that is precisely
 // how the satellite's board silently read a different column than its own sidebar wrote — a
 // required prop surfaces every call site at compile time instead.
-export function BoardView({ project, side }: { project: Project; side: PairSide }) {
+//
+// `onBeadChat` is the OPPOSITE call — optional on purpose, and its absence is what hides the bead
+// card's Chat button in the satellite window (bead sparkle-1cpomd). The satellite mounts no
+// ConciergeHost and no composer anywhere in its tree, so a draft handed over there would land in a
+// store with no reader and be dropped silently; `Workspace` supplies it, `SatelliteApp` does not,
+// and `BeadCard`'s callback-is-the-switch rule does the hiding with no window check involved. See
+// BeadCardProps.onChat.
+export function BoardView({
+  project,
+  side,
+  onBeadChat,
+}: {
+  project: Project;
+  side: PairSide;
+  onBeadChat?: (bead: Bead) => void;
+}) {
   const snapshot = useBeadsStore((s) => s.byProject[project.id]);
   const error = useBeadsStore((s) => s.error[project.id]);
   // ══ THE OPEN CARD IS ADDRESSED BY ID, AND READ BACK FROM THE LIVE POLL ═══════════════════════
@@ -835,6 +850,7 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
           agents={agents}
           onClose={() => setSelectedId(null)}
           onOpen={(b) => setSelectedId(b.id)}
+          onBeadChat={onBeadChat}
         />
       )}
 
@@ -1708,6 +1724,7 @@ function DetailOverlay({
   agents,
   onClose,
   onOpen,
+  onBeadChat,
 }: {
   bead: Bead;
   projectId: string;
@@ -1716,6 +1733,9 @@ function DetailOverlay({
   onClose: () => void;
   /** Swap the overlay to another bead — a child row, so the epic↔task walk works here too. */
   onOpen: (b: Bead) => void;
+  /** Threaded straight through from `BoardView`. Absent in a window with no composer — see the
+   *  note on BoardView's own prop. */
+  onBeadChat?: (bead: Bead) => void;
 }) {
   const beadIsEpic = isEpicIndexed(epicIndexOf(allBeads), bead);
   const workers = workersForBead(agents, bead.id);
@@ -1870,6 +1890,9 @@ function DetailOverlay({
           // `overflowY: auto`). Capping the description again would put a second scrollbar inside
           // the first. The concierge passes 180 because it has no such panel of its own.
           onClose={onClose}
+          // Bound to THIS bead here rather than in `BeadCard`, which takes a bare `() => void` so it
+          // never has to know what a bead chat is addressed by.
+          onChat={onBeadChat === undefined ? undefined : () => onBeadChat(bead)}
           // A project missing from the store has no path, and every bd write is addressed by path —
           // so the card degrades to read-only rather than offering a control that cannot work.
           onSetPriority={

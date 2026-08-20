@@ -136,6 +136,7 @@ describe("BeadCard — every field, on both surfaces", () => {
   it("is built entirely from phrasing content, in both chromes", () => {
     const { container, rerender } = mount({
       onViewOnBoard: vi.fn(),
+      onChat: vi.fn(),
       onClose: vi.fn(),
       onSetPriority: vi.fn(async () => {}),
       onBuildIt: vi.fn(async () => {}),
@@ -158,6 +159,10 @@ describe("BeadCard — a surface with no project renders read-only", () => {
     expect(screen.queryByTestId(`${t}-priority-trigger`)).toBeNull();
     expect(screen.queryByTestId(`${t}-build-it`)).toBeNull();
     expect(screen.queryByTestId(`${t}-build-all-prd`)).toBeNull();
+    // The Chat button obeys the same rule, and its case is the load-bearing one: the SATELLITE
+    // window hides it purely by supplying no callback (bead sparkle-1cpomd), because that window
+    // mounts no composer and a draft handed over there is dropped silently.
+    expect(screen.queryByTestId(`${t}-chat`)).toBeNull();
   });
 
   // …but the priority is still SAID. It is the most decision-relevant field on the card, and a
@@ -461,5 +466,119 @@ describe("BeadCard — the comment thread and compose box", () => {
   it("renders NO thread section at all when neither comments nor onComment is given", () => {
     mount({});
     expect(screen.queryByTestId(ct)).toBeNull();
+  });
+});
+
+// ── 9. THE CHAT BUTTON ──────────────────────────────────────────────────────────────────────────
+//
+// bead sparkle-1cpomd. The founder: *"a Chat button in the TOP RIGHT of every bead card, task or
+// epic, in the same blue as Build It."*
+//
+// Every row here asserts something that was demonstrably false before the button existed. Nothing
+// asserts "it rendered" on its own — the absent-callback row in section 4 already carries the other
+// half of that, and the two together are what make the presence meaningful.
+describe("BeadCard — the Chat button", () => {
+  it("calls onChat exactly once per click, and starts nothing else", () => {
+    const onChat = vi.fn();
+    const onBuildIt = vi.fn(async () => {});
+    const onViewOnBoard = vi.fn();
+    mount({ onChat, onBuildIt, onViewOnBoard });
+    fireEvent.click(screen.getByTestId(`${t}-chat`));
+    expect(onChat).toHaveBeenCalledTimes(1);
+    // THE NEIGHBOURS ARE ASSERTED SILENT. They sit inches away and share the card's blue; a
+    // handler wired to the wrong element would still make the row above pass.
+    expect(onBuildIt).not.toHaveBeenCalled();
+    expect(onViewOnBoard).not.toHaveBeenCalled();
+  });
+
+  // TOP RIGHT, and LEFTMOST of the corner controls — the founder asked for a position, so the
+  // position is the assertion. The title span is `flex: 1`, so DOM order after it IS the visual
+  // order along the row; jsdom has no layout, so an x-coordinate assertion would be theatre
+  // (every rect here is zeroes).
+  it("sits in the title row, after the title and before View on board", () => {
+    mount({ onChat: vi.fn(), onViewOnBoard: vi.fn(), onClose: vi.fn() });
+    const row = screen.getByTestId(`${t}-title`).parentElement!;
+    const kids = Array.from(row.children);
+    const at = (id: string) => kids.indexOf(screen.getByTestId(`${t}-${id}`));
+    expect(at("chat")).toBeGreaterThan(kids.indexOf(screen.getByTestId(`${t}-title`)));
+    expect(at("chat")).toBeLessThan(at("view-on-board"));
+    expect(at("view-on-board")).toBeLessThan(at("close"));
+  });
+
+  // "THE SAME BLUE AS BUILD IT" — asserted against the Build It button rendered in the SAME tree,
+  // never against a hard-coded hex. A literal would go on passing after a theme change that made
+  // the two buttons different colours, which is the only thing this row exists to catch.
+  it("is filled in Build It's blue, read off Build It itself", () => {
+    mount({
+      onChat: vi.fn(),
+      onBuildIt: vi.fn(async () => {}),
+      onBuildAllPrd: vi.fn(async () => {}),
+      prdEpicCount: 2,
+    });
+    const chat = screen.getByTestId(`${t}-chat`);
+    const build = screen.getByTestId(`${t}-build-it`);
+    expect(chat.style.background).toBe(build.style.background);
+    expect(chat.style.color).toBe(build.style.color);
+    expect(chat.style.borderRadius).toBe(build.style.borderRadius);
+    expect(chat.style.background).not.toBe("");
+    // A FILL, not an outline. Asserted against the OUTLINED secondary rendered beside Build It
+    // ("Build all 2 epics"), not against the string "none" — jsdom normalises `border: none` to the
+    // empty string, so a literal check compares '' to 'none' and fails on correct code. Comparing
+    // the two buttons states the real distinction and survives that normalisation.
+    expect(chat.style.border).toBe(build.style.border);
+    expect(chat.style.border).not.toBe(screen.getByTestId(`${t}-build-all-prd`).style.border);
+  });
+
+  // …but at the TITLE ROW's scale, so it reads as a corner control rather than a second
+  // call-to-action shouting over the title it sits beside.
+  it("wears the title row's compact metrics, not Build It's", () => {
+    mount({ onChat: vi.fn(), onViewOnBoard: vi.fn(), onBuildIt: vi.fn(async () => {}) });
+    const chat = screen.getByTestId(`${t}-chat`);
+    const neighbour = screen.getByTestId(`${t}-view-on-board`);
+    expect(chat.style.padding).toBe(neighbour.style.padding);
+    expect(chat.style.fontSize).toBe(neighbour.style.fontSize);
+    expect(chat.style.flex).toBe("0 0 auto");
+    expect(chat.style.padding).not.toBe(screen.getByTestId(`${t}-build-it`).style.padding);
+  });
+
+  it("is a real button with a title that says what it does", () => {
+    mount({ onChat: vi.fn() });
+    const chat = screen.getByTestId(`${t}-chat`);
+    expect(chat.tagName).toBe("BUTTON");
+    expect(chat.getAttribute("type")).toBe("button");
+    expect(chat.getAttribute("title")).toMatch(/chat/i);
+    expect(chat.textContent).toContain("Chat");
+  });
+
+  // ══ NOT GATED ON `buildBusy` ═════════════════════════════════════════════════════════════════
+  // One shared busy flag is what made a PRIORITY save relabel the primary action to "Building…".
+  // Handing a draft to the composer starts nothing, so it must stay live while a build is in
+  // flight — otherwise the founder's way of ASKING about the build he just started is disabled by
+  // that build.
+  it("stays clickable while a build is in flight", async () => {
+    let release: () => void = () => {};
+    const onChat = vi.fn();
+    mount({ onChat, onBuildIt: () => new Promise<void>((r) => (release = r)) });
+    fireEvent.click(screen.getByTestId(`${t}-build-it`));
+    // The build really is in flight — otherwise the row below proves nothing.
+    await waitFor(() => expect(screen.getByTestId(`${t}-build-it`).textContent).toBe("Building…"));
+    const chat = screen.getByTestId(`${t}-chat`);
+    expect((chat as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(chat);
+    expect(onChat).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      release();
+    });
+  });
+
+  // TASK **OR** EPIC, the founder's words. Nothing in this component keys on `bead.type`, so this
+  // row is here to keep it that way: a future `type === "task"` gate would fail here rather than
+  // quietly removing the button from every epic.
+  it("renders for an epic exactly as for a task", () => {
+    mount({ onChat: vi.fn(), bead: bead({ id: "sparkle-epic1", type: "epic" }) });
+    expect(screen.getByTestId(`${t}-chat`)).toBeTruthy();
+    cleanup();
+    mount({ onChat: vi.fn(), bead: bead({ id: "sparkle-task1", type: "task" }) });
+    expect(screen.getByTestId(`${t}-chat`)).toBeTruthy();
   });
 });

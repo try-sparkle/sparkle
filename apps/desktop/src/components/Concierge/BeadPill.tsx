@@ -61,6 +61,7 @@ import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
 import { DELIVERED_LABEL, type Bead } from "../../services/beads";
 import { beadStage, workersForBead } from "../../services/planView";
+import { dispatchBeadChat } from "../../services/beadChat";
 import type { WorkflowStageId } from "../../engine/workflowStage";
 import type { AgentTab } from "../../types";
 import { BeadCard } from "../BeadCard/BeadCard";
@@ -893,6 +894,16 @@ function ConciergeBeadCard({
       descMaxHeight={DESC_MAX_H}
       onViewOnBoard={onViewOnBoard}
       onClose={onClose}
+      // ══ YES, EVEN INSIDE THE CONCIERGE ═══════════════════════════════════════════════════════
+      // Clicking Chat on a card that is ALREADY in a concierge thread looks like a loop, and it
+      // isn't: this thread is wherever the bead happened to come up — a board answer, a fleet
+      // summary, a support reply — and the button starts a NEW message pinned to this one bead, so
+      // the next thing the founder types is unambiguously about it. Omitting it here would also
+      // make "a Chat button on every bead card" false on the one surface where bead cards are most
+      // common. Gated on `canWrite` like its neighbours: a surface with no project path is the
+      // read-only card, and offering a chat about a bead we cannot even resolve a project for is
+      // the same dead control the gate exists to remove.
+      onChat={canWrite ? () => dispatchBeadChat(bead, projectId) : undefined}
       onSetPriority={
         canWrite ? (p) => setBeadPriority(rootPath, bead.id, p) : undefined
       }

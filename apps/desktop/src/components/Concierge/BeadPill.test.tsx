@@ -14,7 +14,7 @@
 //
 // So: the `ConciergeThread` describe below is load-bearing. If it is ever deleted as redundant, the
 // feature can regress to firing on nothing a reader will ever see.
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -48,6 +48,7 @@ import { useBeadsStore, __resetBeadsRefreshInFlightForTest } from "../../stores/
 import { useProjectStore } from "../../stores/projectStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
+import { useComposeHandoffStore } from "../../stores/composeHandoffStore";
 import type { Bead } from "../../services/beads";
 import type { ConciergeMessage } from "./types";
 import type { Project } from "../../types";
@@ -993,5 +994,91 @@ describe("BeadPill — picking a priority writes it through beads_update", () =>
     fireEvent.click(pills()[0]!);
     expect(screen.queryByTestId("concierge-bead-card-priority-trigger")).toBeNull();
     expect(screen.queryByTestId("concierge-bead-card-build-it")).toBeNull();
+  });
+});
+
+// ── THE CHAT BUTTON ON A CONCIERGE CARD ─────────────────────────────────────────────────────────
+//
+// bead sparkle-1cpomd. The founder asked for the button on EVERY bead card, and a card sitting in a
+// concierge reply is where bead cards are most common — so omitting it here would make "every card"
+// false on the surface that has the most of them.
+//
+// It is not the pointless loop it looks like. This thread is wherever the bead happened to come up
+// (a board answer, a fleet summary, a support reply); the button starts a NEW message pinned to
+// this ONE bead, so the next thing the founder types is unambiguously about it.
+//
+// ══ BOTH CANDIDATES ARE MOUNTED AT ONCE ═══════════════════════════════════════════════════════
+// The rule picks by `canWrite`, so absence has to be proven against a card that IS in the tree —
+// absence in a card nobody rendered is absence for a reason that has nothing to do with the rule.
+// One reply, two ids: one bead whose project has a checkout path and one whose does not, both
+// cards opened, and the assertions made against each.
+describe("BeadPill — the concierge card offers a chat about its own bead", () => {
+  const WRITABLE = bead({ id: "sparkle-t6wje", title: "Writable bead" });
+  const READONLY = bead({ id: "sparkle-qogah", title: "Pathless bead" });
+
+  /** A reply naming both beads. Only the first has a `rootPath`, which is what `canWrite` reads. */
+  function mountBoth() {
+    render(
+      <BeadPillProvider
+        value={{
+          beads: new Map([
+            [WRITABLE.id, { bead: WRITABLE, projectId: "p1", rootPath: "/tmp/sparkle" }],
+            [READONLY.id, { bead: READONLY, projectId: "p2" }],
+          ]),
+          onViewOnBoard: vi.fn(() => true),
+        }}
+        >
+        <Markdown text={`both: ${WRITABLE.id} and ${READONLY.id}`} />
+      </BeadPillProvider>,
+    );
+    const all = pills();
+    expect(all).toHaveLength(2);
+    fireEvent.click(all[0]!);
+    fireEvent.click(all[1]!);
+    const byTitle = (title: string) =>
+      screen
+        .queryAllByTestId("concierge-bead-card")
+        .find((c) => c.textContent?.includes(title));
+    const writable = byTitle("Writable bead");
+    const readonly = byTitle("Pathless bead");
+    // Both cards really are open — otherwise the absence assertion below is vacuous.
+    expect(writable).toBeTruthy();
+    expect(readonly).toBeTruthy();
+    return { writable: writable!, readonly: readonly! };
+  }
+
+  it("paints Chat on the writable card and not on the pathless one — both open", () => {
+    const { writable, readonly } = mountBoth();
+    expect(within(writable).getByTestId("concierge-bead-card-chat")).toBeTruthy();
+    // Gated with its neighbours: a surface we cannot even resolve a project path for is the
+    // read-only card, and a chat about a bead we cannot address is the same dead control.
+    expect(within(readonly).queryByTestId("concierge-bead-card-chat")).toBeNull();
+    // …and the pathless card is otherwise a real card, so the line above is about THIS control.
+    expect(within(readonly).getByTestId("concierge-bead-card-title").textContent).toBe(
+      "Pathless bead",
+    );
+  });
+
+  it("clicking it hands the composer a draft naming THAT bead, sparkle-routed", () => {
+    useComposeHandoffStore.setState({ handoff: null });
+    const { writable } = mountBoth();
+    fireEvent.click(within(writable).getByTestId("concierge-bead-card-chat"));
+    const h = useComposeHandoffStore.getState().take();
+    // The bead the founder clicked, not the other one on screen — this is why both are mounted.
+    expect(h?.text).toBe("RE: @Writable bead ");
+    expect(h?.text).not.toContain("Pathless");
+    expect(h?.origin).toBe("bead-chat");
+    // Without this the concierge's auto-router could aim the draft at whatever build agent is on
+    // screen — captureSends.ts:197-199.
+    expect(h?.route).toBe("sparkle");
+    // The bead's OWN project, which is not necessarily the selected one: a concierge answer is
+    // cross-project by construction.
+    expect(h?.projectId).toBe("p1");
+  });
+
+  it("leaves the card open — the chat is started beside it, not instead of it", () => {
+    const { writable } = mountBoth();
+    fireEvent.click(within(writable).getByTestId("concierge-bead-card-chat"));
+    expect(screen.queryAllByTestId("concierge-bead-card").length).toBeGreaterThan(0);
   });
 });

@@ -17,6 +17,12 @@
 //                                     (the mount is cable state, and nothing here writes).
 //   4. UNMOUNTED, plain text        → the concierge, exactly as before this module existed.
 //
+// ══ AND A FIFTH THING, WHICH IS A REFERENT RATHER THAN A CASE ═══════════════════════════════════
+// A leading `@<bead title>` is NOT case 3. A bead names the work a message is ABOUT; it can never be
+// a destination, in any position. See `addressingSpan` for why that is stated there rather than left
+// to fail safe downstream — it fails safe today only by an accident of lookup, and three silent
+// defects live in the gap.
+//
 // ══ WHY THE MOUNT MAY AIM AT A TERMINAL WHEN THE ROUTER MAY NOT ══════════════════════════════════
 // `conciergeRouter`'s header states an absolute rule — `routeMessage` NEVER returns `target: "agent"`
 // — because a message was once typed into a build agent's terminal on the strength of a HEURISTIC
@@ -69,6 +75,7 @@ import {
   SPARKLE_MENTION_ID,
   findMentionSpans,
   isAddressingPosition,
+  isBeadMentionId,
   rosterFromMentions,
   type ConciergeMention,
   type MentionSpan,
@@ -150,6 +157,26 @@ export function addressingSpan(
     : findMentionSpans(text, rosterFromMentions(mentions));
   const first = trusted[0];
   if (!first) return null;
+  // ══ A BEAD IS A SUBJECT IN EVERY POSITION, INCLUDING THE FIRST (bead sparkle-1cpomd) ═══════════
+  // Stated HERE rather than relied on downstream, and that distinction is the whole of it. Without
+  // this line a leading bead title still produces `{kind: "agent", agentId: "bead:sparkle-…"}`,
+  // because the `agent` arm below is the DEFAULT arm — everything that is not the concierge sentinel
+  // falls into it. Nothing reaches a terminal even so, but only by accident of lookup: the feed keys
+  // on uuids, so the host's `mentionAgentsRef.find` misses and the aim comes back empty.
+  //
+  // Three defects live in that accident, and all three are silent:
+  //   • IT ESCAPES A MOUNT. `mountRouted` is computed only for `via === "mount"`, as is the
+  //     unreachable-mount refusal — so a mounted founder opening a line with a bead reference has
+  //     his message quietly diverted to the concierge, with no receipt saying so.
+  //   • THE BOX PAINTS THE WRONG FACE. ComposeBox switches to its terminal metrics on
+  //     `kind === "agent"`, telling him his words are going to a PTY when they are not.
+  //   • THE TITLE IS DELETED FROM THE WIRE. `mentionFreeText` consumes a leading address whole, so
+  //     the subject of his sentence would vanish — the exact corruption commit 898cea330 closed.
+  //
+  // Returning null answers all three at once, and answers them the SAME way `mentionFreeText` does:
+  // same predicate, same id. There is no case for looking past a leading bead at a later span —
+  // every later span has this one's literal to its left, so none of them leads either.
+  if (isBeadMentionId(first.agentId)) return null;
   return isAddressingPosition(text, first.start) ? first : null;
 }
 

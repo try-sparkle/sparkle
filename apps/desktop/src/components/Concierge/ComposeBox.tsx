@@ -151,7 +151,12 @@ import {
   composeDragReleasesManual,
   composeRenderH,
 } from "../../engine/composeBoxHeight";
-import { MentionPicker, MENTION_LISTBOX_ID, mentionOptionId } from "./MentionPicker";
+import {
+  MentionPicker,
+  MENTION_LISTBOX_ID,
+  mentionOptionId,
+  mentionRowIsChoosable,
+} from "./MentionPicker";
 import {
   backspaceMention,
   dictatedSparkleAddress,
@@ -159,8 +164,8 @@ import {
   isComposingMention,
   mentionQuery,
   mentionRoster,
+  mentionCandidates,
   mentionsIn,
-  orderMentionAgents,
   scanMentions,
   SPARKLE_MENTION_AGENT,
   SPARKLE_MENTION_ID,
@@ -200,6 +205,28 @@ const IDLE_COUNTDOWN: SendTrayModel = {
  *  render. A `= []` default would mint a new one per render, and this list feeds the memo that
  *  builds the picker's rows — a fresh identity each time defeats it. */
 const EMPTY_MENTION_AGENTS: readonly MentionAgent[] = [];
+
+/**
+ * Put text into this box from outside it — a dictated segment, a draft handed back, a handoff.
+ *
+ * THREE MODES, AND THEY ARE THREE BECAUSE THEY JOIN DIFFERENTLY. Exported as one named type so the
+ * host and the box cannot describe the same function with two different signatures, which is how the
+ * trailing space below got lost in the first place: `ConciergeHost.registerInsert` typed its argument
+ * as a bare `(text: string) => void` while `insertRef` typed it with opts, so the seam typechecked
+ * with the options silently unreachable from the one side that needed them.
+ *
+ *   • DEFAULT — a dictated segment. Joined by `appendDictated`, which TRIMS: Deepgram pads its
+ *     segments and speech has no meaningful leading or trailing whitespace.
+ *   • `verbatim` — a composed draft coming BACK after a cancelled or failed send. Joined with a
+ *     NEWLINE and latches `heldExpansionRef`, because what is being restored is a whole message
+ *     including its collapsed pastes (roborev 55793).
+ *   • `keepSpacing` — a PREFILL somebody else composed for this box, where the whitespace is part of
+ *     what they wrote. Joined with at most one space and never trimmed.
+ */
+export type ComposeInsert = (
+  text: string,
+  opts?: { verbatim?: boolean; keepSpacing?: boolean },
+) => void;
 
 /** What the box is FOR, painted in the placeholder slot whenever the mic makes no voice promise —
  *  i.e. master mute, which is the DEFAULT (ambient listening is opt-in, dictationStore
@@ -658,9 +685,7 @@ export function ComposeBox({
   interim?: string;
   /** Must be referentially STABLE (useCallback upstream) — the box re-registers whenever it
    *  changes, and an unstable identity would churn the app-wide dictation target every render. */
-  registerInsert?: (
-    append: ((text: string, opts?: { verbatim?: boolean }) => void) | null,
-  ) => void;
+  registerInsert?: (append: ComposeInsert | null) => void;
   /** The user TYPED (or deleted) — reports the new value. Not fired for dictated segments or the
    *  clear-on-send, so the host can see the box being emptied by hand. */
   onTextEdit?: (text: string) => void;
@@ -940,7 +965,7 @@ export function ComposeBox({
   const rosterRef = useRef<readonly MentionAgent[]>(EMPTY_MENTION_AGENTS);
   useEffect(() => {
     if (!registerInsert) return;
-    const append = (segment: string, opts?: { verbatim?: boolean }) =>
+    const append: ComposeInsert = (segment, opts) =>
       setText((prev) => {
         // `verbatim` — a DRAFT COMING BACK, not a dictated segment. `appendDictated` trims what it
         // inserts, which is right for speech (Deepgram pads its segments) and destructive for a
@@ -953,6 +978,38 @@ export function ComposeBox({
           const restored = prev ? `${prev}${prev.endsWith("\n") ? "" : "\n"}${segment}` : segment;
           setCaret(restored.length);
           return restored;
+        }
+        // ── A PREFILL SOMEBODY ELSE COMPOSED, WHOSE SPACING IS PART OF IT ───────────────────────
+        //
+        // ══ THE BUG THIS EXISTS FOR (bead sparkle-1cpomd) ═══════════════════════════════════════
+        // The bead card's Chat button hands this box `RE: @<bead title> ` — with a TRAILING SPACE —
+        // and the founder's next keystroke is the first word of his question. Routed through the
+        // default arm above, `appendDictatedForClipboard` trims what it inserts, so the space died
+        // and his first character landed flush against the title. That is not cosmetic: the space is
+        // what TERMINATES the mention. Without it the next character extends the name, the literal
+        // stops matching any label, and — under this module's derive-from-text rule — the reference
+        // silently stops resolving. `insertMention`'s own docstring says the space is load-bearing
+        // twice over; this is the path that was throwing it away.
+        //
+        // ══ WHY NOT `verbatim` ══════════════════════════════════════════════════════════════════
+        // It looks like a free swap and it is not, in two ways that both show up on the founder's
+        // screen. `verbatim` joins with a NEWLINE, so a prefill into a box that already holds a
+        // half-written sentence would start a new line rather than continue the thought; and it
+        // latches `heldExpansionRef`, arming the collapsed-paste restore path for text that is not a
+        // restored draft. A distinct mode, not a reused one.
+        //
+        // Joins with AT MOST ONE SPACE and adds none where either side already supplies it, so
+        // pasting a prefill after existing text reads as one sentence and pasting into an empty box
+        // is byte-identical to what the producer wrote.
+        if (opts?.keepSpacing) {
+          const joined =
+            prev === "" || prev.endsWith(" ") || segment.startsWith(" ")
+              ? `${prev}${segment}`
+              : `${prev} ${segment}`;
+          // The caret follows the text to the END — past the trailing space, which is exactly the
+          // point: the next character the founder types has to land AFTER it, not before it.
+          setCaret(joined.length);
+          return joined;
         }
         // ── SPEAKING AN ADDRESS ──────────────────────────────────────────────────────────────────
         // You cannot say "@" out loud, so without this there is no spoken way to reach the concierge
@@ -1093,10 +1150,36 @@ export function ComposeBox({
   // is the narrower of the two (Escape closes it; a pause must survive Escape), and stating that
   // difference once is what keeps it from being read as an oversight.
   const composingMention = isComposingMention(pending, roster);
-  const matches =
-    pending && composingMention && pending.anchor !== dismissedAnchor
-      ? orderMentionAgents(roster, pending.query, preferredAgentId)
-      : [];
+  // ── THE ROWS THE PICKER OFFERS ────────────────────────────────────────────────────────────────
+  //
+  // `mentionCandidates`, not `orderMentionAgents`, and the swap is what makes the backlog survivable
+  // in here. This runs in the RENDER BODY, so it is on the founder's keystroke path: `orderMentionAgents`
+  // scores EVERY row with `matchScore`, whose word-prefix tier allocates a split array per candidate,
+  // and returns every match uncapped for the picker to mount into the DOM (`MAX_VISIBLE_ROWS` is a
+  // CSS `maxHeight`, not a slice). At ~60 agents that is free; with ~2,200 open beads in the roster it
+  // would put thousands of throwaway allocations and a row per bead between him and each character.
+  //
+  // `mentionCandidates` leaves the AGENT half completely untouched — a bare `@` still lists the whole
+  // fleet, uncapped, in exactly today's order — and bounds only the referent half: beads need a
+  // 2-character query, are scored allocation-free against labels lowercased once per roster identity,
+  // and are capped at 6 rows. All of that lives in ./mentions; this is one call, deliberately.
+  //
+  // ══ MEMOIZED, BECAUSE THIS BOX RENDERS ~3 TIMES PER CHARACTER ═════════════════════════════════
+  // `mentionCandidates` is pure in (roster, query, preferredId) and none of those change between the
+  // renders one keystroke provokes — so computing it in the raw render body meant scoring the whole
+  // backlog three times for one character. The memo is what makes the cost assertable as well as
+  // smaller: `ConciergeHost.typingCost.test.tsx` pins `mentionScanStats.beadScores` at ONE pass over
+  // the beads per keystroke, and a number that moved with React's render count could not be pinned at
+  // all. Keyed on the QUERY rather than on `pending`, which is a fresh object every render.
+  const pickerQuery =
+    pending && composingMention && pending.anchor !== dismissedAnchor ? pending.query : null;
+  const matches = useMemo(
+    () =>
+      pickerQuery === null
+        ? EMPTY_MENTION_AGENTS
+        : mentionCandidates(roster, pickerQuery, preferredAgentId),
+    [roster, pickerQuery, preferredAgentId],
+  );
   const pickerOpen = matches.length > 0;
   // Fresh rows restart the highlight at the top — adjusted DURING RENDER rather than in an effect,
   // the same pattern CommandPalette uses, so there is no frame where the highlight points at a row
@@ -1165,7 +1248,15 @@ export function ComposeBox({
 
   const chooseMention = useCallback(
     (agent: MentionAgent) => {
-      if (!pending || !agent.canAcceptInput) return;
+      if (!pending) return;
+      // NOT `!agent.canAcceptInput`. Those were the same test until beads joined the roster, and a
+      // bead carries `canAcceptInput: false` honestly — a unit of work cannot receive a prompt — while
+      // being entirely pickable, because choosing it writes a REFERENCE rather than an address. Under
+      // the old test every bead row was offered by the picker and then silently dropped by Enter and
+      // by the mouse: the founder's feature, visible and inert. `mentionRowIsChoosable` is the ONE
+      // rule, shared with the picker's own disabled styling so the list cannot offer a row this
+      // refuses.
+      if (!mentionRowIsChoosable(agent)) return;
       applyEdit(insertMention(text, pending.anchor, caret, agent));
       // NOT dismissed — the inserted literal ends in a space, so `mentionQuery` no longer sees an
       // open query and the picker closes on its own. Marking it dismissed would additionally

@@ -128,6 +128,8 @@ import { armedIntents, cancelIntent } from "../services/dispatchIntent";
 import { setConciergeChat } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { useProjectStore } from "../stores/projectStore";
+import { useBeadsStore } from "../stores/beadsStore";
+import { bucketBeads, type Bead } from "../services/beads";
 
 // ══ THE FIXTURE: A REAL FLEET AND A REAL DRAFT ══════════════════════════════════════════════════
 // 60 agents, because that is the order of magnitude the founder actually runs, and the cost of the
@@ -235,21 +237,24 @@ async function typeOne(value: string) {
 interface Measurement {
   scans: number;
   rosterSorts: number;
+  /** Bead labels scored for the picker — see `mentionScanStats.beadScores`. Zero unless a query is
+   *  actually open, because a closed picker asks for no candidates at all. */
+  beadScores: number;
   ms: number;
   perKeystroke: number;
 }
 
-/** Type `KEYSTROKES` characters onto the end of a ~200-char draft and report what it cost. */
-async function measureTyping(): Promise<Measurement> {
+/** Type `KEYSTROKES` characters onto the end of `seed` and report what it cost. */
+async function measureTyping(seed: string = BASE_DRAFT): Promise<Measurement> {
   render(<ConciergeHost feed={FEED} promptTarget={SELECTED} />);
   // Seed the draft OUTSIDE the measured window: the first keystroke also mounts pickers and runs
   // one-shot effects, and counting that would flatter or slander the steady state depending on the
   // day. What is measured is the steady state — the 26th character of a paragraph.
-  await typeOne(BASE_DRAFT);
+  await typeOne(seed);
 
   const before = { ...mentionScanStats };
   const t0 = performance.now();
-  let draft = BASE_DRAFT;
+  let draft = seed;
   for (let i = 0; i < KEYSTROKES; i += 1) {
     draft += "x";
     await typeOne(draft);
@@ -259,6 +264,7 @@ async function measureTyping(): Promise<Measurement> {
   return {
     scans,
     rosterSorts: mentionScanStats.rosterSorts - before.rosterSorts,
+    beadScores: mentionScanStats.beadScores - before.beadScores,
     ms,
     perKeystroke: scans / KEYSTROKES,
   };
@@ -403,5 +409,101 @@ describe("the transcript fold", () => {
     expect(folds.count).toBeGreaterThan(before);
     // …and the fold really did carry the new row through, rather than merely being called.
     expect(screen.getByText(/One more thing about the DMG/)).toBeTruthy();
+  });
+});
+
+// ══ …AND WITH THE WHOLE BACKLOG IN THE ROSTER ═══════════════════════════════════════════════════
+//
+// Beads became @mentionable (bead sparkle-1cpomd), which multiplied the roster by ~35: this repo has
+// ~2,200 open beads against ~60 agents. Every measurement above is about work that is O(roster) and
+// happens ON THE KEYSTROKE, so the same three numbers have to hold at the new size or the feature is
+// paid for out of the founder's typing.
+//
+// The agent-only rows above are KEPT rather than re-parameterised. If one of these goes red and one
+// of those stays green, the number tells you which population caused it — which is the first thing
+// anyone would want to know and is unrecoverable from a single combined figure.
+const BEAD_COUNT = 2000;
+/** Titles shaped like real bead titles — sentences, sharing leading words, several truncating past
+ *  `MAX_BEAD_MENTION_LABEL` — so the matcher's prefix and word-prefix tiers both do real work rather
+ *  than failing on character one. */
+const BEAD_FIXTURE: Bead[] = Array.from({ length: BEAD_COUNT }, (_, i) => ({
+  id: `sparkle-b${i}`,
+  title:
+    i % 3 === 0
+      ? `Notarization step is flaky since Tuesday and the DMG job retries ${i}`
+      : i % 3 === 1
+        ? `Rebuild the mention roster when the fleet changes ${i}`
+        : `Concierge composer keystroke cost ${i}`,
+  description: "",
+  status: "open",
+  type: "task",
+  priority: 1,
+  labels: [],
+  parent: null,
+}));
+
+/** A draft with an OPEN bead query at the caret — the only state in which the picker asks for bead
+ *  candidates at all. `@notariz` matches the fixture's first family at the prefix tier, so the pass
+ *  being counted is the full one and not an early bail. */
+const QUERY_DRAFT = `${BASE_DRAFT} @notariz`;
+
+const realPoller = {
+  startPolling: useBeadsStore.getState().startPolling,
+  stopPolling: useBeadsStore.getState().stopPolling,
+};
+
+describe("typing with ~2,000 beads in the roster", () => {
+  beforeEach(() => {
+    // The poller would shell out to `bd`; the SNAPSHOT is what the host reads, so it is written
+    // directly. That is also the production contract — the host fetches nothing of its own.
+    useBeadsStore.setState({ startPolling: () => {}, stopPolling: () => {} });
+    useBeadsStore.setState({
+      byProject: {
+        p1: { beads: BEAD_FIXTURE, board: bucketBeads(BEAD_FIXTURE), loadedAt: 1 },
+      },
+    });
+  });
+  afterEach(() => useBeadsStore.setState({ ...realPoller, byProject: {} }));
+
+  it("still scans the draft ONCE per keystroke, and still never re-sorts the roster", async () => {
+    const m = await measureTyping();
+    console.log(
+      `[typing cost] ${FLEET_SIZE} agents + ${BEAD_COUNT} beads, ${KEYSTROKES} keystrokes: ` +
+        `${m.scans} scans (${m.perKeystroke.toFixed(2)}/keystroke), ${m.rosterSorts} roster sorts, ` +
+        `${m.ms.toFixed(1)}ms end-to-end (${(m.ms / KEYSTROKES).toFixed(2)}ms/keystroke, jsdom)`,
+    );
+    // The SAME two ceilings as the 60-agent rows. A roster 35× larger must not buy a second scan or
+    // a re-sort — both of those are O(roster) and would land squarely on the keystroke.
+    expect(m.perKeystroke).toBeLessThanOrEqual(1);
+    expect(m.scans).toBeGreaterThan(0);
+    expect(m.rosterSorts).toBe(0);
+  });
+
+  // ── THE PASS NOTHING USED TO WATCH ───────────────────────────────────────────────────────────
+  // `mentionCandidates` walks every bead label on every character of an open query. Two ways that
+  // goes wrong and neither is visible in anything rendered: the walk could run per RENDER rather
+  // than per keystroke (this box renders ~3 times a character), or a future edit could re-route
+  // beads through `orderMentionAgents`, whose word-prefix tier allocates a split array per row.
+  it("scores every bead EXACTLY ONCE per keystroke while a query is open", async () => {
+    const m = await measureTyping(QUERY_DRAFT);
+    const perKeystroke = m.beadScores / KEYSTROKES;
+    console.log(
+      `[bead scoring] ${BEAD_COUNT} beads, open query: ${m.beadScores} scores ` +
+        `(${perKeystroke.toFixed(1)}/keystroke)`,
+    );
+    // ONE PASS, not "at most a few". The number is `BEAD_COUNT` on the nose because the picker's
+    // candidate list is memoized on (roster, query, preferred) — a ceiling with slack in it is a
+    // ceiling a per-render regression fits under.
+    expect(perKeystroke).toBe(BEAD_COUNT);
+    // …and the pass really is happening, so this cannot be satisfied by a picker that stopped
+    // offering beads altogether.
+    expect(m.beadScores).toBeGreaterThan(0);
+  });
+
+  // The PAIRED half of the row above: a closed picker asks for no candidates, so the backlog costs
+  // nothing at all while the founder is writing ordinary prose — which is almost all of the time.
+  it("scores NO beads at all when no mention query is open", async () => {
+    const m = await measureTyping();
+    expect(m.beadScores).toBe(0);
   });
 });

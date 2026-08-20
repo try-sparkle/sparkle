@@ -65,6 +65,18 @@ export interface MentionAgent {
    *  Everything that touches the text — matching, inserting, scoring, the pill — goes through
    *  {@link labelOf}, so an agent is addressed by exactly the string the user can see. */
   label?: string;
+  /** WHAT THIS ROW REFERS TO. Absent means `"agent"`, so every existing construction of this shape —
+   *  the feed's projection, {@link SPARKLE_MENTION_AGENT}, {@link rosterFromMentions} — is untouched.
+   *
+   *  A BEAD IS A REFERENT, NEVER A DESTINATION: it names the unit of work a message is ABOUT. The
+   *  routing rule deliberately does NOT read this field — it keys on the id, via
+   *  {@link isBeadMentionId} — because `rosterFromMentions` rebuilds a roster from a sent message's
+   *  `{agentId, name}` pairs and has nowhere to carry a kind. Deriving the safety-critical answer
+   *  from the id means a row that loses this field cannot become addressable by accident.
+   *
+   *  This exists for the surfaces that DRAW a row (the picker's copy and icon), where re-deriving
+   *  bead-ness from a string prefix at paint time would be coupling that drifts. */
+  kind?: "agent" | "bead";
 }
 
 /** The text that addresses this agent. See {@link MentionAgent.label}. */
@@ -120,16 +132,36 @@ function labelOf(a: MentionAgent): string {
  * the ambiguity this function exists to remove.
  */
 export function withMentionLabels(agents: readonly MentionAgent[]): MentionAgent[] {
-  const counts = new Map<string, number>();
+  // TWO COUNTS, because the two kinds collide on different terms — see the block above.
+  const agentCounts = new Map<string, number>();
+  const allCounts = new Map<string, number>();
   for (const a of agents) {
     const key = a.name.toLowerCase();
-    counts.set(key, (counts.get(key) ?? 0) + 1);
+    allCounts.set(key, (allCounts.get(key) ?? 0) + 1);
+    if (isBeadMentionId(a.id)) continue;
+    agentCounts.set(key, (agentCounts.get(key) ?? 0) + 1);
   }
-  return agents.map((a) =>
-    (counts.get(a.name.toLowerCase()) ?? 0) > 1 && a.id !== SPARKLE_MENTION_ID
+  return agents.map((a) => {
+    const key = a.name.toLowerCase();
+    // A BEAD IS DISAMBIGUATED AGAINST EVERYTHING, AND ITS ID ALWAYS SUCCEEDS. Two beads can share a
+    // title far more easily than two agents share a name — the backlog is thousands of sentences,
+    // many of them truncated to the same 48 characters here — and an unresolved duplicate falls back
+    // to roster order, which is exactly the invisible wrong-aim this function exists to remove. The
+    // id is unique by construction, so unlike the project suffix it cannot fail to separate them.
+    if (isBeadMentionId(a.id)) {
+      if ((allCounts.get(key) ?? 0) <= 1) return a;
+      const beadId = parseBeadMentionId(a.id);
+      return beadId === null ? a : { ...a, label: beadDisambiguatedLabel(a.name, beadId) };
+    }
+    // AN AGENT'S ADDRESS NEVER MOVES BECAUSE SOMEONE TITLED A BEAD AFTER IT. The founder has muscle
+    // memory for `@Kraken Auth`, and a backlog he does not control must not be able to rewrite it —
+    // the bead took the suffix above, so the pair is already unambiguous without touching this side.
+    // Same reasoning as the concierge exemption below, generalised: the side that can always
+    // disambiguate itself is the side that yields.
+    return (agentCounts.get(key) ?? 0) > 1 && a.id !== SPARKLE_MENTION_ID
       ? { ...a, label: `${a.name} (${a.projectName})` }
-      : a,
-  );
+      : a;
+  });
 }
 
 /** A resolved mention, as carried on a sent message so the thread can draw the pill. Deliberately
@@ -152,6 +184,138 @@ export const MENTION_SIGIL = "@";
  *  paragraph would leave the picker's query growing to the end of the message. Comfortably longer
  *  than any real agent name; short enough that a stray `@` stops mattering within a few words. */
 export const MAX_MENTION_QUERY = 48;
+
+// ══ BEADS ARE MENTIONABLE, AND THEY ARE NOT ADDRESSES ════════════════════════════════════════════
+//
+// THE ASK (founder, 2026-08-19): "@mention task and epic titles the same way I @mention build
+// agents, with that being what appears in the composer." Bead sparkle-1cpomd.
+//
+// ══ WHY A NAMESPACED ID, AND WHY THE SAFETY ANSWER IS READ OFF THE ID ═══════════════════════════
+// An @mention is an ADDRESS, and an address routes a message into a live PTY. `classifyComposerRoute`
+// has exactly two arms and `agent` is the DEFAULT one — anything that is not the concierge sentinel
+// is treated as a terminal. So dropping 2,000 beads into the roster naively makes every bead title a
+// potential destination, and the only reason nothing is written today is an accident of lookup: the
+// feed keys on uuids, so a bead id misses and the aim comes back empty. Three defects live in that
+// accident, all silent — a leading bead mention escapes a MOUNT with no notice, the compose box paints
+// its terminal face for a message that is not going to a terminal, and `mentionFreeText` consumes the
+// title off the wire as though it were an envelope, deleting the subject of the founder's sentence.
+//
+// So bead-ness is made EXPLICIT, and it is carried by the ID rather than by a field. That is the same
+// call {@link SPARKLE_MENTION_ID} makes and for the same reason: every lookup that could turn a
+// mention into a PTY write keys on a uuid and misses a prefixed id BY CONSTRUCTION. It also survives
+// the one place a field cannot — `rosterFromMentions` rebuilds a roster from a sent message's
+// `{agentId, name}` pairs, which is what `addressingSpan` and `mentionFreeText` re-match against, and
+// there is nowhere in that pair to put a kind. An id-derived answer is total; a field-derived one
+// would be undefined exactly on the replay path where the routing decision is remade.
+
+/** The namespace that marks a mention id as naming a BEAD rather than an agent. A bead id on its own
+ *  ("sparkle-1cpomd") is a perfectly good string and could not be told apart from a hypothetical
+ *  agent id by inspection; the prefix is what makes {@link isBeadMentionId} total. */
+export const BEAD_MENTION_PREFIX = "bead:";
+
+/** The mention id for a bead. The ONE place the prefix and the id are joined — mirroring
+ *  `beadRefs.beadRefHref`, which does the same job for the markdown link form. */
+export function beadMentionId(beadId: string): string {
+  return `${BEAD_MENTION_PREFIX}${beadId}`;
+}
+
+/** The bead this mention id names, or null when it names an agent. */
+export function parseBeadMentionId(id: string): string | null {
+  if (!id.startsWith(BEAD_MENTION_PREFIX)) return null;
+  const beadId = id.slice(BEAD_MENTION_PREFIX.length);
+  return beadId === "" ? null : beadId;
+}
+
+/** Does this mention name a bead? THE SAFETY PREDICATE — `composerRoute` uses it to refuse a bead as
+ *  an address, and `mentionFreeText` uses it to keep the title in the message. Total on any string,
+ *  which is why the answer lives on the id. */
+export function isBeadMentionId(id: string): boolean {
+  return parseBeadMentionId(id) !== null;
+}
+
+/**
+ * The longest ADDRESS a bead may have — the whole literal after the sigil, suffix included.
+ *
+ * DERIVED FROM {@link MAX_MENTION_QUERY}, NOT CHOSEN TO MATCH IT (roborev 65652). Bead titles are
+ * sentences — the longest open one is ~150 characters — and {@link insertMention} writes the WHOLE
+ * label into the box, so a cap is needed regardless. But an INDEPENDENT cap is a bug waiting on
+ * arithmetic: at 48 with a `slice(0, 48) + "…"` the address came out at 49, one character past the
+ * query ceiling, and a disambiguated one at ~65.
+ *
+ * What that costs is not cosmetic. `mentionQuery` returns null the moment the query passes
+ * {@link MAX_MENTION_QUERY}, and ComposeBox feeds that straight into `isComposingMention` — so for
+ * exactly the long titles this truncation exists to make addressable, the picker would shut mid-word
+ * AND the auto-send countdown would resume while the founder is still typing the name. That is the
+ * founder's own report in bead sparkle-14dtu, reintroduced through a different door.
+ *
+ * So the two are tied together here, and `withMentionLabels` budgets the ` (bead-id)` suffix INSIDE
+ * this ceiling rather than on top of it.
+ */
+export const MAX_BEAD_MENTION_LABEL = MAX_MENTION_QUERY;
+
+/** Cut `base` down to `room` characters, marking the cut with an ellipsis.
+ *
+ *  The ellipsis is deliberately NOT a name character (see NAME_CHAR), so a truncated address still
+ *  ends at a clean boundary and `blocksBoundary` cannot read the next character the founder types as
+ *  continuing it. `room` is the budget INCLUDING that ellipsis. */
+function ellipsize(base: string, room: number): string {
+  if (base.length <= room) return base;
+  if (room <= 1) return base.slice(0, Math.max(0, room));
+  return `${base.slice(0, room - 1).trimEnd()}…`;
+}
+
+/**
+ * What a bead is ADDRESSED as: its title, flattened, stripped of sigils, and truncated.
+ *
+ * THE RETURNED STRING IS THE ADDRESS, not a display name — it goes in as `MentionAgent.name`, so the
+ * collision pass counts on it and `findMentionSpans` matches on it. Three normalisations, each load
+ * bearing rather than cosmetic:
+ *
+ *   • WHITESPACE IS FLATTENED. `mentionQuery` stops at a newline, so a label containing one could be
+ *     inserted and then never re-matched — the aim would vanish on the next keystroke.
+ *   • SIGILS ARE STRIPPED. A `@` inside a label puts a second sigil offset inside a matched span,
+ *     which is a needless way to let two candidate matches overlap in `findMentionSpans`.
+ *   • THE ELLIPSIS IS NOT A NAME CHARACTER, so a truncated label still ends at a clean boundary and
+ *     `blocksBoundary` cannot read the next typed character as continuing it.
+ *
+ * A title that normalises to nothing falls back to the id, so every bead has an address.
+ */
+export function beadMentionLabel(title: string, beadId: string): string {
+  const flat = title.replace(/\s+/g, " ").split(MENTION_SIGIL).join("").trim();
+  return ellipsize(flat === "" ? beadId : flat, MAX_BEAD_MENTION_LABEL);
+}
+
+/**
+ * The address for a bead whose title collides with something else: its label plus its id.
+ *
+ * THE SUFFIX IS BUDGETED INSIDE {@link MAX_BEAD_MENTION_LABEL}, NOT ADDED TO IT. Appending it to an
+ * already-maximal label was how a disambiguated address reached ~65 characters and fell out of the
+ * picker's reach entirely — the collision case, which is precisely the one where being addressable
+ * matters most, because a bare title there resolves to nothing.
+ *
+ * The id is what makes this always succeed where the agents' `(projectName)` suffix could not: it is
+ * unique by construction, and beads have no project name to fall back on.
+ */
+export function beadDisambiguatedLabel(name: string, beadId: string): string {
+  const suffix = ` (${beadId})`;
+  return `${ellipsize(name, MAX_BEAD_MENTION_LABEL - suffix.length)}${suffix}`;
+}
+
+/**
+ * What a bead mention looks like ON THE WIRE — the title, then the id in parentheses.
+ *
+ * The id is the whole point. `mentionFreeText` strips the sigil and keeps the NAME, which for an
+ * agent is enough (the name is the referent). A bead title is not: titles repeat, they are truncated
+ * here, and the concierge needs something it can actually resolve against the board. `sparkle-1cpomd`
+ * is that handle, and `remarkBeadRefs` linkifies a bare id back into a pill anywhere markdown renders
+ * — so the id travels as prose and comes back as a clickable reference with no second scheme.
+ *
+ * Mirrors the `spoken` form `conciergeLine.bead()` already produces: meaning first, handle last.
+ * A label that ALREADY carries the id (a collision, disambiguated below) is not given it twice.
+ */
+export function beadWireText(label: string, beadId: string): string {
+  return label.endsWith(`(${beadId})`) ? label : `${label} (${beadId})`;
+}
 
 /** Characters that continue a NAME, for the boundary test on both sides of a candidate match — so
  *  an agent called "Blue" is not found inside `@Blueprint`, which would aim a message at the wrong
@@ -242,8 +406,27 @@ export function isAddressingPosition(text: string, start: number): boolean {
  *
  * `spans` — calls to {@link findMentionSpans}, the O(agents × textLength) matcher.
  * `rosterSorts` — length-orderings of the roster, the per-scan `[...agents].sort(…)` that was.
+ * `beadScores` — bead labels actually scored for the picker, counted INSIDE the loop. The two
+ *   counters above were enough while the roster was ~60 agents changing a few times a minute; the
+ *   backlog is thousands of rows the picker re-scores on every character.
+ * `beadCompares` — score comparisons made while selecting the top few bead rows. Bounded by
+ *   MAX_BEAD_MENTION_ROWS per hit BY CONSTRUCTION, which is the claim a test can hold against the
+ *   sort-then-slice this replaced: that version's comparison count grew with the whole hit list.
+ * `rosterSplits` — recomputes of the kind-split and its lowercased labels ({@link mentionCandidates}).
+ *   THE ONE THAT CAN FAIL, and the reason it exists (roborev 65652): `rosterSorts` is incremented
+ *   only by `longestLabelFirst`, which the candidate path never reaches, so an assertion on it there
+ *   reads zero no matter WHAT the implementation does — including a full `orderMentionAgents` pass
+ *   over every bead. `beadScores` has the same weakness on its own: the count is the same number
+ *   whichever matcher produced it. This counts the dominant per-keystroke ALLOCATION instead —
+ *   lowercasing every bead label — so deleting the cache moves it and a test can see that.
  */
-export const mentionScanStats = { spans: 0, rosterSorts: 0 };
+export const mentionScanStats = {
+  spans: 0,
+  rosterSorts: 0,
+  beadScores: 0,
+  beadCompares: 0,
+  rosterSplits: 0,
+};
 
 /** Where a mention's literal sits in the text. Half-open `[start, end)`, like every other range in
  *  this codebase's string handling. */
@@ -302,10 +485,17 @@ export function findMentionSpans(text: string, agents: readonly MentionAgent[]):
   for (const agent of byLength) {
     const label = labelOf(agent);
     if (!label) continue; // an unnamed agent has no literal to match — skip, never match "@"
-    const needle = MENTION_SIGIL + label;
+    // NO `MENTION_SIGIL + label` HERE, DELIBERATELY (roborev 65652). `at` came out of the sigil
+    // index above, so `text[at]` IS the sigil — comparing it again buys nothing, and building the
+    // needle to do so allocated one throwaway string PER CANDIDATE, PER SCAN. That was invisible at
+    // ~60 agents and is not at ~2,200 rows once the backlog is mentionable: it is precisely the
+    // "thousands of throwaway allocations between the founder and each character he types" that the
+    // sigil pre-pass above exists to prevent, reintroduced one line further in. Matching the LABEL
+    // one character past the sigil is the same test with nothing allocated.
+    const from = MENTION_SIGIL.length;
     for (const at of sigils) {
-      if (!text.startsWith(needle, at)) continue;
-      const end = at + needle.length;
+      if (!text.startsWith(label, at + from)) continue;
+      const end = at + from + label.length;
       // The sigil must START a token — `a@Blue` and `foo@bar.com` are not mentions. And the match
       // must not be a PREFIX of a longer word: `@Blue` inside `@Blueprint` is the wrong agent.
       // `blocksBoundary`, not `isNameChar`, so a sentence-final full stop still ends the mention.
@@ -505,6 +695,24 @@ export function mentionFreeText(text: string, agents: readonly MentionAgent[]): 
     // its NAME and loses only its sigil, which is all this function ever needed to do (the `@` is
     // what opens the CLI's file picker; the name is content the user wrote). A pill means nothing
     // inside a PTY, so the plain name is the right rendering there.
+    //
+    // ══ A BEAD IS NEVER AN ENVELOPE (bead sparkle-1cpomd) ═══════════════════════════════════════
+    // A bead names the work a message is ABOUT; it is a subject in every position, including the
+    // first. Consuming a leading one would do to a bead reference exactly what the ordinal rule
+    // above did to the founder's sentences — "@Fix the flaky notarization test can you pick this
+    // up?" reaching a terminal as "can you pick this up?" — and it would do it to the message the
+    // Chat button itself writes. `composerRoute` refuses the same span as a DESTINATION, off the
+    // same predicate, so what is routed and what is consumed stay one answer.
+    //
+    // It keeps its ID as well as its name. An agent's name IS its referent; a truncated bead title
+    // is not, so the handle rides along in prose where the concierge can resolve it.
+    const beadId = parseBeadMentionId(s.agentId);
+    if (beadId !== null) {
+      out += text.slice(at, s.start);
+      out += beadWireText(text.slice(s.start + MENTION_SIGIL.length, s.end), beadId);
+      at = s.end;
+      continue;
+    }
     const leads = isAddressingPosition(text, s.start);
     if (i > 0 || !leads) {
       out += text.slice(at, s.start);
@@ -661,6 +869,180 @@ export function orderMentionAgents(
     .map((s) => s.a);
 }
 
+// ══ THE PICKER'S CANDIDATES, AND WHY BEADS DO NOT GO THROUGH `orderMentionAgents` ═══════════════
+//
+// `orderMentionAgents` runs in ComposeBox's RENDER BODY, on every keystroke, over the whole roster.
+// At ~60 agents that is free. At ~2,200 rows it is a `matchScore` per row — and `matchScore`'s
+// word-prefix tier allocates an array per candidate (`n.split(/[^a-z0-9]+/)`) — so the backlog would
+// put thousands of throwaway allocations between the founder and each character he types. The picker
+// then rendered every match into the DOM: `MAX_VISIBLE_ROWS` is a CSS `maxHeight`, not a slice, so a
+// bare `@` would have mounted a row per open bead.
+//
+// Three bounds, and each answers a different one of those:
+//   • BEADS NEED A QUERY. A bare `@` is the "show me the fleet" affordance and must stay instant; a
+//     backlog has no useful default ordering to offer there anyway. Agents are untouched by this —
+//     `@` still lists every one of them, exactly as today.
+//   • BEADS ARE SCORED CHEAPLY. Prefix and word-prefix only, by `indexOf` against a lowercase label
+//     computed ONCE per roster, so the per-keystroke walk allocates nothing. The subsequence tier is
+//     dropped for beads deliberately: over thousands of sentences a fuzzy tier matches almost
+//     everything, which is noise rather than help.
+//   • BEADS ARE CAPPED. The agent rows are never truncated — that would silently hide a destination —
+//     so the cap applies only to the referent half of the list.
+
+/** How many characters a query needs before beads join the list. */
+export const BEAD_MENTION_MIN_QUERY = 2;
+
+/**
+ * How many bead rows the picker offers at once.
+ *
+ * SIZED AGAINST WHAT THE PICKER CAN SHOW, not against what looks generous (roborev 65677), and
+ * measured in PIXELS rather than rows (roborev 65710) — the overlay clips by height and its rows are
+ * not uniform. `mentions.test.ts` pins the whole spliced block against `LIST_MAX_H`, so raising this
+ * alone reds; it was briefly held only by self-referential assertions, which meant a value of 30
+ * would have buried every agent below the fold with the suite green (roborev 65730).
+ */
+export const MAX_BEAD_MENTION_ROWS = 3;
+
+/**
+ * How many agent rows sit ABOVE the bead block.
+ *
+ * ══ WHY BEADS ARE INSERTED RATHER THAN APPENDED (roborev 65677) ═════════════════════════════════
+ * Appending them after every matching agent is the obvious reading of "destinations first", and it
+ * made the feature look broken in exactly the case it was built for.
+ *
+ * The picker shows seven rows and does not scroll to the highlighted one. The agent half is
+ * deliberately UNCAPPED, and `matchScore`'s subsequence tier means a SHORT query matches almost the
+ * whole fleet — on this repo's own 60-agent fixture, `re` matches all 60. So at a two-character
+ * query, which is precisely where {@link BEAD_MENTION_MIN_QUERY} switches beads on, every bead row
+ * landed at DOM position 61 and below: present, correct, and invisible.
+ *
+ * The fix keeps both properties that mattered. A DESTINATION still leads the list, and NO agent is
+ * dropped — the rest follow below the bead block, exactly as before. What changes is that the bead
+ * block is spliced into the visible window instead of trailing it, so THREE agents and three beads
+ * are on screen. Costing three visible agent rows is the price of the feature working at all;
+ * hiding it behind sixty rows was not a trade, it was a defect.
+ *
+ * THE NUMBER IS THREE, NOT FOUR, and the reason is pixels rather than taste (roborev 65710). Rows
+ * are not uniform — a bead row carries its id on a second line — so the guarantee is stated against
+ * the worst case in which every row above the first bead is two-line. Four did not fit; three does.
+ * The guarantee it buys is narrow and worth stating exactly: the FIRST bead row is fully visible
+ * without scrolling. Beads two and three are reachable by scrolling, and the picker's own
+ * scroll-into-view effect is what carries the highlight to them.
+ */
+export const AGENT_ROWS_ABOVE_BEADS = 3;
+
+/** The roster split by kind, with each bead's lowercase address precomputed.
+ *
+ *  Cached on the roster's IDENTITY and one entry deep, the same shape as {@link longestLabelFirst}
+ *  and for the same reason: `mentionRoster` hands out one frozen object, so a stable board really
+ *  does hand over the same array every keystroke. The lowercase labels are the point — without them
+ *  the cheap matcher below would still allocate a string per bead per character. */
+interface RosterSplit {
+  agents: readonly MentionAgent[];
+  beads: readonly { a: MentionAgent; lower: string }[];
+  /** Every row's lowercase address. {@link isCompletedMention} asks an EXACT-match question on the
+   *  render path, and used to answer it with `agents.some(a => labelOf(a).toLowerCase() === done)` —
+   *  one string allocation per row, per keystroke whose query ends in whitespace. That is the exact
+   *  state a picked mention leaves behind (insertMention appends a space) and the state the Chat
+   *  button's `keepSpacing` prefill starts in, so it is the common case rather than a rare one. At
+   *  ~60 agents nobody could measure it; at ~2,200 rows it is the largest remaining allocation on
+   *  the typing path. A Set built once per roster answers the same question in O(1). */
+  lowered: ReadonlySet<string>;
+}
+let splitFor: readonly MentionAgent[] | null = null;
+let splitResult: RosterSplit | null = null;
+function splitRoster(roster: readonly MentionAgent[]): RosterSplit {
+  if (splitFor === roster && splitResult) return splitResult;
+  mentionScanStats.rosterSplits += 1;
+  const agents: MentionAgent[] = [];
+  const beads: { a: MentionAgent; lower: string }[] = [];
+  const lowered = new Set<string>();
+  for (const a of roster) {
+    const lower = labelOf(a).toLowerCase();
+    lowered.add(lower);
+    if (isBeadMentionId(a.id)) beads.push({ a, lower });
+    else agents.push(a);
+  }
+  splitResult = { agents, beads, lowered };
+  splitFor = roster;
+  return splitResult;
+}
+
+/** Prefix beats word-prefix, and nothing else matches. No regex, no allocation — see the block
+ *  above for why beads get their own matcher rather than {@link matchScore}. */
+function beadScore(lower: string, q: string): number {
+  if (lower.startsWith(q)) return MATCH_PREFIX;
+  let from = lower.indexOf(q);
+  while (from > 0) {
+    // A word boundary is anything that is not alphanumeric — the same class `matchScore` splits on,
+    // asked one character at a time instead of by building the whole word list.
+    const prev = lower[from - 1];
+    if (prev !== undefined && !ALNUM.test(prev)) return MATCH_WORD_PREFIX;
+    from = lower.indexOf(q, from + 1);
+  }
+  return MATCH_NONE;
+}
+
+/**
+ * THE PICKER'S LIST: every matching agent, then the best few matching beads.
+ *
+ * Agents first and uncapped, because they are DESTINATIONS — a row that can receive the message must
+ * never be pushed off the list by a row that merely names some work. Both halves are ordered by their
+ * own rules and then concatenated rather than merged by score, so a bead can never outrank an agent
+ * the founder was reaching for.
+ */
+export function mentionCandidates(
+  roster: readonly MentionAgent[],
+  query: string,
+  preferredId?: string | null,
+): MentionAgent[] {
+  const { agents, beads } = splitRoster(roster);
+  const rows = orderMentionAgents(agents, query, preferredId);
+  const q = query.trim().toLowerCase();
+  if (q.length < BEAD_MENTION_MIN_QUERY || beads.length === 0) return rows;
+  // ══ A BOUNDED TOP-K, NOT A SORT-THEN-SLICE (roborev 65677) ══════════════════════════════════
+  // This collected every hit, `sort`ed the whole list with `localeCompare`, and then took three.
+  // The sort is the problem, not the take: a prefix query against a real backlog matches thousands
+  // of rows — the worker's own fixture had 667 titles sharing a prefix — so a keystroke paid an
+  // O(n log n) LOCALE comparison over all of them to choose three. `localeCompare` is also the most
+  // expensive comparison available, and alphabetical order is not what anyone wants here.
+  //
+  // Insertion into a list capped at K is O(n·K) with K = 3, allocates nothing per row, and — the
+  // part that is a feature rather than an optimisation — TIES KEEP ROSTER ORDER. The roster arrives
+  // in board order, which is priority-bucketed, so equal-scoring beads are offered most-important
+  // first instead of alphabetically. `score <= worst` skips rather than replaces, which is what
+  // makes that stable.
+  const top: { a: MentionAgent; score: number }[] = [];
+  for (const b of beads) {
+    mentionScanStats.beadScores += 1;
+    const score = beadScore(b.lower, q);
+    if (score === MATCH_NONE) continue;
+    if (top.length === MAX_BEAD_MENTION_ROWS) {
+      // COUNTED, like every other comparison here. Counting only the shifts below made the cost
+      // assertion vacuous (roborev 65710): a backlog whose rows all score alike never shifts, so the
+      // counter read 0 — and a re-introduced full sort reads 0 too, so the number could not tell the
+      // two apart. The meaningful quantity is TOTAL comparisons, which is what a sort would inflate.
+      mentionScanStats.beadCompares += 1;
+      if (score <= top[top.length - 1]!.score) continue;
+      top.pop();
+    }
+    let i = top.length;
+    while (i > 0 && top[i - 1]!.score < score) {
+      mentionScanStats.beadCompares += 1;
+      i -= 1;
+    }
+    top.splice(i, 0, { a: b.a, score });
+  }
+  if (top.length === 0) return rows;
+  // Spliced into the visible window rather than appended — see AGENT_ROWS_ABOVE_BEADS.
+  rows.splice(
+    Math.min(rows.length, AGENT_ROWS_ABOVE_BEADS),
+    0,
+    ...top.map((t) => t.a),
+  );
+  return rows;
+}
+
 /**
  * Has this query already FINISHED naming an agent, so there is nothing left to pick?
  *
@@ -679,7 +1061,9 @@ export function isCompletedMention(query: string, agents: readonly MentionAgent[
   if (!/\s$/.test(query)) return false;
   const done = query.trim().toLowerCase();
   if (done === "") return false;
-  return agents.some((a) => labelOf(a).toLowerCase() === done);
+  // Through the roster's own lowercase index — see `RosterSplit.lowered` for why the obvious
+  // `agents.some(…toLowerCase()…)` is the wrong shape once the backlog is in the roster.
+  return splitRoster(agents).lowered.has(done);
 }
 
 /**
@@ -1018,6 +1402,10 @@ export function rosterFromMentions(mentions: readonly ConciergeMention[]): Menti
     projectName: "",
     band: "running" as StatusBand,
     canAcceptInput: false,
+    // Recovered from the id, which is the only thing a sent message carries — and the reason the
+    // routing rule reads the id rather than this field. Set anyway so a row rebuilt from history
+    // describes itself the way a live one does.
+    kind: isBeadMentionId(m.agentId) ? ("bead" as const) : ("agent" as const),
   }));
 }
 

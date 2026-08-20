@@ -15,7 +15,13 @@
 import { describe, expect, it } from "vitest";
 
 import { addressingSpan, carriesSigil, classifyComposerRoute } from "./composerRoute";
-import { SPARKLE_MENTION_ID, SPARKLE_MENTION_NAME, mentionFreeText, rosterFromMentions } from "./mentions";
+import {
+  SPARKLE_MENTION_ID,
+  SPARKLE_MENTION_NAME,
+  beadMentionId,
+  mentionFreeText,
+  rosterFromMentions,
+} from "./mentions";
 import type { ConciergeMention } from "./mentions";
 
 const KRAKEN: ConciergeMention = { agentId: "ag2", name: "Kraken Auth" };
@@ -210,5 +216,84 @@ describe("addressingSpan", () => {
     const text = "@Kraken Auth ship the DMG";
     const span = addressingSpan(text, [KRAKEN])!;
     expect(mentionFreeText(text, rosterFromMentions([KRAKEN]))).toBe(text.slice(span.end).trim());
+  });
+});
+
+// ══ CLAUSE 5: A BEAD IS A REFERENT, NEVER A DESTINATION (bead sparkle-1cpomd) ═══════════════════
+//
+// An @mention is an ADDRESS, and an address writes into a live PTY. Beads joined the roster so the
+// founder can name a task or an epic the way he names an agent — and the whole risk of that is the
+// `agent` arm below being the DEFAULT arm: anything that is not the concierge sentinel lands in it.
+//
+// EVERY ROW HERE IS A PAIR, and the pairing is what stops it being vacuous. "A bead does not route"
+// is trivially true of an implementation that never routes anything, so each row asserts the SAME
+// text with the SAME shape of mention, once naming an AGENT and once naming a BEAD, and the two
+// verdicts must differ. A `classifyComposerRoute` that ignored the bead prefix would satisfy the
+// agent half and fail the bead half; one that refused every address would do the reverse.
+describe("classifyComposerRoute — clause 5: a bead is a subject, in every position", () => {
+  const BEAD: ConciergeMention = {
+    agentId: beadMentionId("sparkle-1cpomd"),
+    name: "Chat button on every bead card",
+  };
+  /** The same words, opening with a name, differing only in WHAT the name refers to. */
+  const LEADING = (who: ConciergeMention) => `@${who.name} can you pick this up?`;
+
+  // THE ONE THAT MATTERS. Under a mount, a leading AGENT name overrules the cable (clause 3) — so if
+  // a bead were read the same way, naming a task while patched to a terminal would silently divert
+  // the founder's message to the concierge with no receipt. The mount must survive a bead.
+  it("does not escape a mount, where a leading AGENT name does", () => {
+    expect(route(LEADING(KRAKEN), [KRAKEN], MOUNT)).toEqual({
+      kind: "agent",
+      agentId: KRAKEN.agentId,
+      via: "address",
+    });
+    expect(route(LEADING(BEAD), [BEAD], MOUNT)).toEqual({
+      kind: "agent",
+      agentId: MOUNT,
+      via: "mount",
+    });
+  });
+
+  // The unmounted half of the same pair. A bead falls all the way through to the default, which is
+  // also what ComposeBox reads to decide whether to paint its terminal face: `kind: "agent"` here
+  // would tell the founder his words are going to a PTY when they are going to the concierge.
+  it("falls through to the concierge with no mount, where a leading AGENT name would not", () => {
+    expect(route(LEADING(KRAKEN), [KRAKEN], null)).toEqual({
+      kind: "agent",
+      agentId: KRAKEN.agentId,
+      via: "address",
+    });
+    expect(route(LEADING(BEAD), [BEAD], null)).toEqual({ kind: "sparkle", via: "default" });
+  });
+
+  // `addressingSpan` is the shared predicate, so pin it directly too — this is the function
+  // `mentionFreeText` consults to decide what to DELETE, and the two must agree.
+  it("is never an addressing span, where the same span naming an agent is", () => {
+    expect(addressingSpan(LEADING(KRAKEN), [KRAKEN])).toMatchObject({ agentId: KRAKEN.agentId });
+    expect(addressingSpan(LEADING(BEAD), [BEAD])).toBeNull();
+  });
+
+  // THE CONSEQUENCE THE FOUNDER WOULD ACTUALLY SEE. A consumed address is deleted from the wire, so
+  // reading a bead as one removes the subject of his sentence — the corruption 898cea330 closed for
+  // agents, reintroduced for beads. The agent half of the pair shows the deletion still happens
+  // where it should, so this cannot pass by disabling the strip.
+  it("keeps its title on the wire — with its id — while a leading agent address is still removed", () => {
+    expect(mentionFreeText(LEADING(KRAKEN), rosterFromMentions([KRAKEN]))).toBe(
+      "can you pick this up?",
+    );
+    expect(mentionFreeText(LEADING(BEAD), rosterFromMentions([BEAD]))).toBe(
+      "Chat button on every bead card (sparkle-1cpomd) can you pick this up?",
+    );
+  });
+
+  // The founder's own template. `RE: ` in front means the bead was never in addressing position to
+  // begin with — but the row exists because that is the message the Chat button writes, and it must
+  // reach the concierge with the reference intact and no sigil on it.
+  it("carries the Chat button's own draft to the concierge with the reference intact", () => {
+    const text = `RE: @${BEAD.name} what is left here?`;
+    expect(route(text, [BEAD], null)).toEqual({ kind: "sparkle", via: "default" });
+    const wire = mentionFreeText(text, rosterFromMentions([BEAD]));
+    expect(wire).toBe("RE: Chat button on every bead card (sparkle-1cpomd) what is left here?");
+    expect(carriesSigil(wire)).toBe(false);
   });
 });

@@ -143,6 +143,8 @@ import { NO_BOARD_FILTER } from "../services/boardFilters";
 import { dismissibleSurfaceOpen, unbindsOnKey } from "../engine/cable";
 import { useCableStore } from "../stores/cableStore";
 import { waitFor } from "@testing-library/react";
+import { useComposeHandoffStore } from "../stores/composeHandoffStore";
+import { beadChatDraft } from "../services/beadChat";
 
 /** Point the mocked config at a defined "Done" (a single criterion of the given kind). */
 function defineDone(criterion: StageCriterion = { text: "Merged into origin/main", kind: "auto", signal: "merged_to_main" }) {
@@ -2214,5 +2216,106 @@ describe("BoardView — epic vs task card treatment", () => {
     fireEvent.click(within(child).getByTestId("part-of-epic"));
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText("p1-e1")).toBeTruthy();
+  });
+});
+
+// ── THE BEAD CARD'S CHAT BUTTON, AND THE WINDOW THAT MUST NOT HAVE IT ────────────────────────────
+//
+// bead sparkle-1cpomd. `onBeadChat` is optional on BoardView, and its ABSENCE is the entire
+// mechanism that hides the Chat button in the satellite window — which mounts no `ConciergeHost`
+// and no composer anywhere in its tree, so a draft handed to `composeHandoffStore` there would land
+// in a store with NO READER and be dropped silently (ConciergeHost logs log.error on exactly that).
+//
+// ══ WHY BOTH BOARDS ARE MOUNTED IN ONE TREE ═══════════════════════════════════════════════════
+// AGENTS.md's rule for a rule that picks one of N targets: absence in a component that is not in
+// the tree proves NOTHING — it is absent because there is no element to paint, and it stays absent
+// when the switch is keyed to the wrong thing entirely. So both configurations render side by side
+// in the same document, both cards are OPENED, and the assertions are made against each container:
+// the main-window one PAINTS the button, the satellite one does not. One direction alone is half
+// the evidence.
+//
+// The satellite's real call site is pinned separately, in satellite/SatelliteApp.test.tsx — this
+// file can only prove what a BoardView configured that way renders, not that SatelliteApp
+// configures it that way.
+describe("BoardView — the bead card's Chat button follows onBeadChat, nothing else", () => {
+  function chatSnapshot() {
+    snapshot = {
+      beads: [],
+      board: {
+        backlog: [bead({ id: "p1-x1", title: "Detailed task", priority: 2 })],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+  }
+
+  /** Both windows' boards, in one document, each with its detail overlay OPEN. */
+  function mountBothWindows(onBeadChat: (b: Bead) => void) {
+    chatSnapshot();
+    render(
+      <>
+        {/* Exactly how Workspace.tsx calls it: there is a composer behind this board. */}
+        <div data-testid="main-window-tree">
+          <BoardView project={project} side="right" onBeadChat={onBeadChat} />
+        </div>
+        {/* Exactly how satellite/SatelliteApp.tsx calls it: no composer in this tree. */}
+        <div data-testid="satellite-tree">
+          <BoardView project={project} side="left" />
+        </div>
+      </>,
+    );
+    const main = screen.getByTestId("main-window-tree");
+    const satellite = screen.getByTestId("satellite-tree");
+    // Open the card in BOTH, so each container really does hold a rendered bead card.
+    fireEvent.click(within(main).getByText("Detailed task"));
+    fireEvent.click(within(satellite).getByText("Detailed task"));
+    // Self-verifying, for the reason the project seed above is: if either overlay failed to open,
+    // the absence assertion below would pass against an empty container — vacuously.
+    expect(within(main).getByTestId("board-bead-card")).toBeTruthy();
+    expect(within(satellite).getByTestId("board-bead-card")).toBeTruthy();
+    return { main, satellite };
+  }
+
+  it("paints the button in the window WITH a composer and not in the one without — both mounted", () => {
+    const { main, satellite } = mountBothWindows(vi.fn());
+    expect(within(main).getByTestId("board-bead-card-chat")).toBeTruthy();
+    expect(within(satellite).queryByTestId("board-bead-card-chat")).toBeNull();
+    // …while every other control the card offers is present on BOTH, which is what makes the line
+    // above a statement about THIS button rather than about a satellite card that renders nothing.
+    expect(within(satellite).getByTestId("board-bead-card-title")).toBeTruthy();
+    expect(within(satellite).getByTestId("board-bead-card-close")).toBeTruthy();
+  });
+
+  it("clicking it writes the RE: draft for THAT bead into the compose handoff", () => {
+    useComposeHandoffStore.setState({ handoff: null });
+    const onBeadChat = vi.fn((b: Bead) => {
+      useComposeHandoffStore.getState().set({
+        origin: "bead-chat",
+        projectId: project.id,
+        text: beadChatDraft(b),
+        attachments: [],
+        route: "sparkle",
+      });
+    });
+    const { main } = mountBothWindows(onBeadChat);
+    fireEvent.click(within(main).getByTestId("board-bead-card-chat"));
+    // THE BEAD IS BOUND AT THE CALL SITE. A handler that ignored its argument — or that closed over
+    // the wrong bead — would still fire, so the assertion is on WHICH bead came through.
+    expect(onBeadChat).toHaveBeenCalledTimes(1);
+    expect(onBeadChat.mock.calls[0]![0]!.id).toBe("p1-x1");
+    const h = useComposeHandoffStore.getState().take();
+    expect(h?.text).toBe("RE: @Detailed task ");
+    expect(h?.route).toBe("sparkle");
+    expect(h?.origin).toBe("bead-chat");
+  });
+
+  it("does not close the card — the reference is started, the card stays readable", () => {
+    const { main } = mountBothWindows(vi.fn());
+    fireEvent.click(within(main).getByTestId("board-bead-card-chat"));
+    expect(within(main).getByTestId("board-bead-card")).toBeTruthy();
   });
 });

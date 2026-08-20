@@ -109,6 +109,42 @@ describe("composeHandoffStore", () => {
     expect(taken?.agentId).toBeUndefined();
   });
 
+  // ══ THE WARNING NAMES NO PRODUCER ═════════════════════════════════════════════════════════════
+  // It used to read "a capture handoff was replaced". `bead-chat` — the bead card's Chat button
+  // (bead sparkle-1cpomd) — is the first origin that is not a capture, and a message hard-coding
+  // one producer misattributes every other one's loss to a window the user never opened. The
+  // dropped surface is already named, structurally, in `droppedOrigin`.
+  it("names no producer in the replacement warning — the origin field does that", () => {
+    const spy = vi.spyOn(log, "warn").mockImplementation(() => {});
+    store().set(handoff({ origin: "bead-chat", text: "RE: @A bead ", attachments: [] }));
+    store().set(handoff({ origin: "capture-build" }));
+    expect(spy).toHaveBeenCalledTimes(1);
+    const message = spy.mock.calls[0]![1] as string;
+    expect(message).toMatch(/replaced before it was ever delivered/i);
+    expect(message).not.toMatch(/capture/i);
+    // The producer is still recoverable — from the field, which is true for every origin.
+    expect(spy.mock.calls[0]![2]).toEqual({
+      droppedOrigin: "bead-chat",
+      droppedProjectId: "p1",
+      droppedChars: "RE: @A bead ".length,
+      droppedAttachments: 0,
+      replacedByOrigin: "capture-build",
+    });
+    spy.mockRestore();
+  });
+
+  // The bead card's Chat draft: sparkle-routed like capture-chat, but with no attachments and no
+  // agent. Its shape is what `services/beadChat.ts` writes, asserted there against the real call;
+  // this row is only that the STORE can carry it.
+  it("carries the bead-chat shape: sparkle route, no attachments, no agent", () => {
+    store().set(handoff({ origin: "bead-chat", route: "sparkle", attachments: [], agentId: undefined }));
+    const taken = store().take();
+    expect(taken?.origin).toBe("bead-chat");
+    expect(taken?.route).toBe("sparkle");
+    expect(taken?.attachments).toEqual([]);
+    expect(taken?.agentId).toBeUndefined();
+  });
+
   it("an attachment-only handoff is representable — an image alone is a message", () => {
     store().set(handoff({ text: "" }));
     const taken = store().take();

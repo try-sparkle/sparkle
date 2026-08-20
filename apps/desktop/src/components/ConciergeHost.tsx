@@ -290,12 +290,19 @@ import {
 } from "../services/conciergeReceipts";
 import { routeMessage } from "../services/conciergeRouter";
 import {
+  beadMentionId,
+  beadMentionLabel,
   mentionFreeText,
   mentionRoster,
   scanMentions,
   rosterFromMentions,
   type ConciergeMention,
+  type MentionAgent,
 } from "./Concierge/mentions";
+// TYPE ONLY — erased at compile, so this cannot make a runtime cycle with the column that renders
+// the box. One named signature for the box's insert fn, shared rather than restated; see its own
+// docstring for what the three modes are and which one the handoff needs.
+import type { ComposeInsert } from "./Concierge/ComposeBox";
 import { classifyComposerRoute } from "./Concierge/composerRoute";
 import {
   mountRefusalCause,
@@ -346,6 +353,11 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // host renders from the feed, and a project-store subscription would re-render it on every unrelated
 // agent write.
 import { useProjectStore } from "../stores/projectStore";
+// THE BACKLOG, read here so a bead can be @mentioned. Subscribed to `byProject` — the whole map,
+// which is exactly what `snapshotUnchanged` protects: a poll that finds nothing new returns the
+// SAME map object, so an idle board costs this host nothing. See `mentionAgents` below.
+import { useBeadsStore } from "../stores/beadsStore";
+import type { BoardColumn } from "../services/beads";
 // THE RAW CABLE, read here for ROUTING only — never `useEffectiveWired`, which is the DRAWING
 // projection and says "off" for states the cable is very much patched in. See `mountResolution`.
 import { useCableStore } from "../stores/cableStore";
@@ -404,6 +416,20 @@ const nextId = (p: string) => `${p}-${(seq += 1)}`;
  * actually resolve it.
  */
 const QUEUE_TASK_TIMEOUT_MS = 30_000;
+
+/**
+ * The board columns whose beads are OFFERED as @mentions — the open ones.
+ *
+ * Read off the bucketed `Board` rather than filtered out of the raw bead list, because the bucketing
+ * has already done two things this would otherwise re-derive and could get subtly wrong: it drops
+ * the `sparkle-auto` telemetry rows (see `bucketBeads`), and it spells "open" the way the board the
+ * founder is looking at spells it. A closed bead is deliberately not offered: the picker's job is to
+ * name work in flight, and three years of finished beads would bury it.
+ *
+ * A LIST, not `Object.keys(board)` minus a few, so adding a column to `Board` is a decision someone
+ * makes here rather than a silent enrolment of every closed bead in the backlog.
+ */
+const MENTIONABLE_BEAD_COLUMNS: readonly BoardColumn[] = ["backlog", "blocked", "inProgress"];
 
 /**
  * ONE REPLY HELD BACK WHILE ITS CORRECTION TURN RUNS — the whole state of the linter's block path.
@@ -1070,7 +1096,7 @@ export function ConciergeHost({
 
   // The compose box's own insert fn, kept so a send that dies AFTER the box already cleared can put
   // the user's words back. See `restoreDraft`.
-  const insertRef = useRef<((text: string, opts?: { verbatim?: boolean }) => void) | null>(null);
+  const insertRef = useRef<ComposeInsert | null>(null);
 
   /**
    * Put a draft back in the compose box.
@@ -1179,7 +1205,13 @@ export function ConciergeHost({
   }, []);
 
   const registerInsert = useCallback(
-    (append: ((text: string) => void) | null) => {
+    // `ComposeInsert`, not `(text: string) => void`. The narrow spelling was not merely imprecise:
+    // this parameter is the ONLY way a caller learns the box takes options at all, and TS accepts a
+    // wider function where a narrower one is asked for — so `insertRef` could declare the options
+    // while every reader of this signature was told they did not exist. A handoff carrying a
+    // load-bearing trailing space was therefore inserted through the trimming arm, silently (bead
+    // sparkle-1cpomd). One named type across the seam is what stops that from being expressible.
+    (append: ComposeInsert | null) => {
       insertRef.current = append;
       // NOT the place to retire `forceSparkleRef`, tempting as a null-append looks (roborev 53836).
       // `null` here does NOT mean "the box unmounted" — ComposeBox's effect re-runs on any identity
@@ -1613,19 +1645,85 @@ export function ConciergeHost({
   // disabled with a reason rather than hiding them, because "no such agent" and "that one is a
   // cloud agent" are different answers. `canAcceptInput` here is a snapshot for the LIST; the
   // authoritative check is the one `deliver` makes at send time against the live store.
-  const mentionAgents = useMemo(
-    () =>
-      allAgents(feed).map((a) => ({
-        id: a.id,
-        name: a.name,
-        projectId: a.projectId,
-        projectName: a.projectName,
-        band: a.band,
-        since: a.since,
-        canAcceptInput: agentCanAcceptPrompt(a.id),
-      })),
-    [feed],
-  );
+  //
+  // ══ AND THE BEADS, IN THIS SAME MEMO — THE IDENTITY IS THE WHOLE REASON ═══════════════════════
+  // The founder asked to "@mention task and epic titles the same way I @mention build agents"
+  // (bead sparkle-1cpomd), so the backlog joins the roster here. It has to join HERE, in the one
+  // memo, and not in a second list built beside it:
+  //
+  // `mentionRoster` is a ONE-ENTRY cache keyed on the ARRAY'S IDENTITY, and it has two callers —
+  // `ComposeBox` (for its picker, its resolve and its Backspace) and this host's auto-send rail. If
+  // those two are ever handed different array objects holding equal contents, the cache misses on
+  // every call and thrashes between them: two full orderings plus two label passes over ~2,200 rows
+  // PER KEYSTROKE. That is the exact defect `mentionRoster`'s own note records for the 60-agent
+  // fleet, at thirty-five times the size. One memo, one array, one cache entry.
+  //
+  // ══ WHY THE 5s POLL DOES NOT CHURN THAT IDENTITY ══════════════════════════════════════════════
+  // `beadsStore.refresh` writes a new snapshot ONLY when `snapshotUnchanged` says something moved,
+  // and that check is field-wise over every `Bead` field the UI reads — `title` included (see
+  // `COMPARED_BEAD_FIELDS`, which `beadsStore.identity.test.ts` pins against `Bead`'s own keys so a
+  // new field cannot slip out of the comparison). When it holds, the store returns the SAME
+  // `byProject` map, so this memo's dep is unchanged, so the array is unchanged, so `mentionRoster`
+  // hits. An idle board therefore costs a pointer comparison every five seconds, and a board that
+  // really did move pays one rebuild — which is correct, because a retitled bead is addressed by a
+  // different literal.
+  //
+  // ══ WHICH BEADS ══════════════════════════════════════════════════════════════════════════════
+  // The OPEN ones, taken from the board the poll already bucketed rather than from the raw list.
+  // Two things come free with that: `bucketBeads` drops the `sparkle-auto` telemetry beads (one per
+  // Build-agent spawn, titled from a throwaway display name — thousands of rows nobody filed and
+  // nobody would ever address), and "open" is spelled exactly the way the board spells it.
+  // Nothing is FETCHED here: this reads what the store already holds, and `BeadPillHost` is what
+  // keeps it polling.
+  const beadsByProject = useBeadsStore((s) => s.byProject);
+  const mentionAgents = useMemo(() => {
+    const rows: MentionAgent[] = allAgents(feed).map((a) => ({
+      id: a.id,
+      name: a.name,
+      projectId: a.projectId,
+      projectName: a.projectName,
+      band: a.band,
+      since: a.since,
+      canAcceptInput: agentCanAcceptPrompt(a.id),
+    }));
+    // DE-DUPLICATED BY BEAD ID across projects, and that is not defensive coding: `bd` resolves
+    // `.beads/` through `git-common-dir`, so a worktree registered as its own project reads THE
+    // SAME database as the repo it came from and every id collides. Two rows with one id would both
+    // carry the same label (a bead disambiguates using its id, which is identical), so
+    // `findMentionSpans` would have two indistinguishable candidates for one literal — the
+    // wrong-agent class of bug `withMentionLabels` exists to make unreachable. First writer wins,
+    // which mirrors `BeadPill.indexBeads`.
+    const seen = new Set<string>();
+    for (const snap of Object.values(beadsByProject)) {
+      if (!snap) continue;
+      for (const col of MENTIONABLE_BEAD_COLUMNS) {
+        for (const b of snap.board[col]) {
+          if (seen.has(b.id)) continue;
+          seen.add(b.id);
+          rows.push({
+            id: beadMentionId(b.id),
+            name: beadMentionLabel(b.title, b.id),
+            // NO PROJECT, and empty rather than the project it came from. These two fields feed
+            // `withMentionLabels`' agent-collision disambiguator (`@Docs (web)`), which a bead does
+            // not use — it disambiguates with its id — so a project name here would be dead weight
+            // carried on ~2,200 rows.
+            projectId: "",
+            projectName: "",
+            // Settled, so a bead can never sort above a destination in the default list.
+            band: "done",
+            // A BEAD GENUINELY CANNOT RECEIVE A PROMPT — it is a referent, not an address. This is
+            // the honest value, not a way of borrowing the disabled-agent styling: `MentionPicker`
+            // branches on `kind` for what it SAYS about the row, precisely so a bead does not read
+            // as a broken agent. The safety answer is read off the id (`isBeadMentionId`), never
+            // off either of these fields.
+            canAcceptInput: false,
+            kind: "bead",
+          });
+        }
+      }
+    }
+    return rows;
+  }, [feed, beadsByProject]);
   // …and the same list for the handlers, which are memoized on stable deps and run after render
   // (the feedRef/targetRef pattern above). `send` resolves a mention off this rather than closing
   // over a render-time value, so a message submitted after the fleet changed resolves against the
@@ -2028,7 +2126,13 @@ export function ConciergeHost({
     if (staged.length > 0) attachReady(staged);
     const insert = insertRef.current;
     if (h.text.trim()) {
-      if (insert) insert(h.text);
+      // `keepSpacing`, because THIS TEXT WAS COMPOSED FOR THIS BOX and its whitespace is part of
+      // what the producer wrote. The bead card's Chat button hands over `RE: @<bead title> `, whose
+      // TRAILING SPACE terminates the mention — without it the founder's next character extends the
+      // bead's name, the literal stops matching the roster, and the reference he was handed silently
+      // stops being one. The default arm trims (it is the dictation join, and speech has no
+      // meaningful edge whitespace), which is what was eating it. See ComposeBox's `ComposeInsert`.
+      if (insert) insert(h.text, { keepSpacing: true });
       else {
         // The one way this can still lose text, and it is now LOUD. Nothing in the shipping app
         // unmounts the compose box while the column is up, so this firing means that changed.
@@ -4239,6 +4343,12 @@ export function ConciergeHost({
             // `mentions` is only the `@`-picker's resolved list; `namedAgentIds` widens it to agents
             // he named in prose. Deliberately generous — see Concierge/namedAgents: every id here can
             // only ALLOW a relay, never cause a badge.
+            //
+            // THE ROSTER NOW CARRIES BEADS, and they are inert here rather than filtered out. A bead
+            // title matching the prose adds a `bead:`-prefixed id, which resolves to no agent in any
+            // relay lookup by construction (the same property that makes `isBeadMentionId` the safety
+            // predicate) — so it can allow nothing. Filtering would cost an allocation over ~2,200
+            // rows per turn to remove entries that already do nothing.
             mentionedAgentIds: namedAgentIds(
               bubble.text,
               bubble.mentions,

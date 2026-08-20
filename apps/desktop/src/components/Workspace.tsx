@@ -124,6 +124,7 @@ import { closeScopeProjectNames, planWindowClose, stopAgentsForClose } from "../
 import { clearWindowProject } from "../services/windowRegistry";
 import { clearWindowRoster } from "../services/attention";
 import { safeUnlisten } from "../services/safeUnlisten";
+import { dispatchBeadChat } from "../services/beadChat";
 import { TERMINAL_STAGE_DND_TARGET } from "../services/dndTargets";
 import { useImprovementScheduler } from "../useImprovementScheduler";
 import { ErrorBoundary, AgentPaneErrorCard } from "./ErrorBoundary";
@@ -2663,7 +2664,16 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
       </div>
       <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
         <Suspense fallback={<PaneFallback />}>
-          <BoardView project={project} side={side} />
+          {/* THE MAIN WINDOW SUPPLIES `onBeadChat`; the satellite deliberately does not (bead
+              sparkle-1cpomd). This tree is the one that mounts `ConciergeHost`, so a draft handed
+              to `composeHandoffStore` here has a reader. Passing it is therefore the assertion
+              "there is a composer behind this board" — and the satellite's silence is the
+              assertion that there isn't, which is what removes the button there. */}
+          <BoardView
+            project={project}
+            side={side}
+            onBeadChat={(bead) => dispatchBeadChat(bead, project.id)}
+          />
         </Suspense>
       </div>
     </div>

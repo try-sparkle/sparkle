@@ -28,7 +28,18 @@ import {
   SPARKLE_MENTION_AGENT,
   SPARKLE_MENTION_ID,
   type MentionAgent,
+  BEAD_MENTION_MIN_QUERY,
+  MAX_BEAD_MENTION_LABEL,
+  MAX_BEAD_MENTION_ROWS,
+  AGENT_ROWS_ABOVE_BEADS,
+  beadDisambiguatedLabel,
+  beadMentionId,
+  beadMentionLabel,
+  isBeadMentionId,
+  mentionCandidates,
+  parseBeadMentionId,
 } from "./mentions";
+import { LIST_MAX_H, MAX_VISIBLE_ROWS, ROW_H_TWO_LINE } from "./MentionPicker";
 // The APP-OWNED Improve-Sparkle agent's real id and name. Imported rather than spelled as literals
 // on purpose: the collision these tests are about exists because that name IS "Sparkle", so a test
 // that hardcoded the string would keep passing if the constant were ever renamed — and the bug would
@@ -1049,5 +1060,366 @@ describe("isComposingMention — what the auto-send countdown pauses on (sparkle
 
   it("gives up past MAX_MENTION_QUERY, so an abandoned @ cannot pause forever", () => {
     expect(composing("@" + "x".repeat(MAX_MENTION_QUERY + 1))).toBe(false);
+  });
+});
+
+// ══ BEADS AS MENTIONS (bead sparkle-1cpomd) ═════════════════════════════════════════════════════
+//
+// The founder wanted to @mention a task or an epic the way he @mentions a build agent. The rules
+// below are the ones that stop that from becoming a way to type into a terminal by accident, and the
+// ones that stop a 2,000-row backlog from being scanned like a 60-row fleet.
+//
+// `composerRoute.test.ts` holds the routing half — a bead is never an address — as pairs against the
+// same text naming an agent. These rows are about the ADDRESS ITSELF: what it reads as, how two of
+// them are told apart, and what the picker will offer.
+
+/** A bead as the roster carries it: a namespaced id, and a title normalised into an address. */
+function beadRow(id: string, title: string): MentionAgent {
+  return agent({
+    id: beadMentionId(id),
+    name: beadMentionLabel(title, id),
+    kind: "bead",
+    projectId: "",
+    projectName: "",
+    band: "done",
+    canAcceptInput: false,
+  });
+}
+
+describe("bead mention ids — the safety answer is read off the id, not off a field", () => {
+  // THE PAIR. A bare bead id is an ordinary string and must NOT read as a bead mention: the whole
+  // point of the namespace is that `isBeadMentionId` is total on any string a sent message can carry,
+  // including an agent uuid. Asserting only the positive half would pass for `() => true`.
+  it("recognises a namespaced id and refuses a bare one", () => {
+    expect(isBeadMentionId(beadMentionId("sparkle-1cpomd"))).toBe(true);
+    expect(isBeadMentionId("sparkle-1cpomd")).toBe(false);
+    expect(isBeadMentionId("a2")).toBe(false);
+    expect(isBeadMentionId(SPARKLE_MENTION_ID)).toBe(false);
+  });
+
+  it("round-trips the bead id, and refuses a prefix with nothing after it", () => {
+    expect(parseBeadMentionId(beadMentionId("sparkle-hiju.4"))).toBe("sparkle-hiju.4");
+    expect(parseBeadMentionId("bead:")).toBeNull();
+    expect(parseBeadMentionId("a2")).toBeNull();
+  });
+});
+
+describe("beadMentionLabel — the title becomes an address", () => {
+  // Each normalisation is asserted against what it PREVENTS, not merely that it happened.
+  it("flattens newlines, which would otherwise put the address out of the picker's reach", () => {
+    // `mentionQuery` stops at a newline, so a label containing one could be inserted and never
+    // re-matched — the aim would vanish on the next keystroke.
+    const label = beadMentionLabel("Fix the\nflaky test", "sparkle-x1");
+    expect(label).toBe("Fix the flaky test");
+    expect(mentionQuery(`@${label}`, label.length + 1)).not.toBeNull();
+  });
+
+  it("strips sigils, so the label cannot contain a second mention start", () => {
+    expect(beadMentionLabel("Wire @Sparkle into the relay", "sparkle-x2")).toBe(
+      "Wire Sparkle into the relay",
+    );
+  });
+
+  const LONG =
+    "Retire the Build/Plan toggle for open and close navigation and make epic focus actually work";
+
+  it("truncates a long title and still matches as a whole token", () => {
+    const label = beadMentionLabel(LONG, "sparkle-x3");
+    expect(label.endsWith("…")).toBe(true);
+    // THE POINT OF THE ELLIPSIS: it is not a name character, so the truncated address still ends at
+    // a clean boundary and `findMentionSpans` resolves it. A truncation ending mid-word in a name
+    // character would be blocked by the very next thing the founder types.
+    const row = agent({ id: beadMentionId("sparkle-x3"), name: label, kind: "bead" });
+    expect(findMentionSpans(`@${label} what is left?`, [row])).toHaveLength(1);
+  });
+
+  // ══ THE ADDRESS MUST FIT THE PICKER'S OWN QUERY CAP (roborev 65652) ═════════════════════════
+  // `mentionQuery` returns null past MAX_MENTION_QUERY, and ComposeBox feeds that straight into
+  // `isComposingMention` — which is what PAUSES the auto-send countdown while a name is being typed
+  // (the founder's report, bead sparkle-14dtu). An address one character over the cap therefore
+  // shuts the picker mid-word AND lets the countdown resume under him. The two caps were
+  // independent, and `slice(0, 48) + "…"` came out at 49.
+  //
+  // Asserted at the BOUNDARY with a title that actually overflows, because the newline row above
+  // uses an 18-character label and so could never have caught this.
+  it("keeps a truncated address inside the query cap, so the picker stays open", () => {
+    const label = beadMentionLabel(LONG, "sparkle-x3");
+    // The two caps are TIED, not merely equal by coincidence — that independence is what produced
+    // the 49-character address. Asserting the relationship keeps a future edit to either one honest.
+    expect(MAX_BEAD_MENTION_LABEL).toBe(MAX_MENTION_QUERY);
+    expect(label.length).toBeLessThanOrEqual(MAX_MENTION_QUERY);
+    expect(mentionQuery(`@${label}`, label.length + 1)).not.toBeNull();
+  });
+
+  // The collision case is where being addressable matters MOST — a bare title there resolves to
+  // nothing — and it was the worst offender at ~65 characters, because the suffix was added on top
+  // of an already-maximal label instead of budgeted inside it.
+  it("keeps a DISAMBIGUATED address inside the cap too, suffix included", () => {
+    const label = beadDisambiguatedLabel(beadMentionLabel(LONG, "sparkle-x3"), "sparkle-x3");
+    expect(label.endsWith("(sparkle-x3)")).toBe(true);
+    expect(label.length).toBeLessThanOrEqual(MAX_MENTION_QUERY);
+    expect(mentionQuery(`@${label}`, label.length + 1)).not.toBeNull();
+  });
+
+  it("falls back to the id when a title normalises to nothing, so every bead has an address", () => {
+    expect(beadMentionLabel("   ", "sparkle-x4")).toBe("sparkle-x4");
+    expect(beadMentionLabel("@@@", "sparkle-x5")).toBe("sparkle-x5");
+  });
+});
+
+describe("withMentionLabels — a bead disambiguates itself, and never moves an agent's address", () => {
+  // ══ THE ROW THAT MATTERS, AND WHY BOTH SIDES ARE MOUNTED ═══════════════════════════════════════
+  // Asserting only "the bead got a suffix" would pass for an implementation that suffixed BOTH — and
+  // that is the actual regression to fear. The founder has muscle memory for `@Kraken Auth`; a
+  // backlog he does not control must not be able to rewrite it out from under him, the way the
+  // Improve-Sparkle agent once rewrote `@Sparkle` and silently killed the escape hatch. So the
+  // agent's address is asserted UNCHANGED in the same breath.
+  it("suffixes the bead with its id and leaves the colliding agent addressed as it was", () => {
+    const clash = beadRow("sparkle-1cpomd", "Kraken Auth");
+    const [k, b] = withMentionLabels([KRAKEN, clash]);
+    expect(k?.label ?? k?.name).toBe("Kraken Auth");
+    expect(b?.label).toBe("Kraken Auth (sparkle-1cpomd)");
+  });
+
+  // Two beads truncated to the same 48 characters is the common collision, not a corner case — the
+  // backlog is thousands of sentences. The id always separates them, which the project suffix could
+  // not have done (beads have no project name).
+  it("separates two beads that share a title, where a project suffix could not", () => {
+    const a = beadRow("sparkle-aaa1", "Follow-up");
+    const b = beadRow("sparkle-bbb2", "Follow-up");
+    const [x, y] = withMentionLabels([a, b]);
+    expect(x?.label).toBe("Follow-up (sparkle-aaa1)");
+    expect(y?.label).toBe("Follow-up (sparkle-bbb2)");
+    // And the addresses really are distinct to the matcher, which is the property the labels exist
+    // for — roster ORDER must not be what decides which bead a mention names.
+    const roster = withMentionLabels([a, b]);
+    const spans = findMentionSpans(`RE: @${y?.label} ping`, roster);
+    expect(spans.map((s) => s.agentId)).toEqual([beadMentionId("sparkle-bbb2")]);
+  });
+
+  it("leaves a uniquely-titled bead bare, so the common case reads as the title", () => {
+    const only = beadRow("sparkle-zzz9", "Ship the DMG");
+    expect(withMentionLabels([KRAKEN, only])[1]?.label).toBeUndefined();
+  });
+
+  it("still gives two colliding AGENTS their project suffixes", () => {
+    const docsWeb = agent({ id: "d1", name: "Docs", projectName: "web" });
+    const docsMobile = agent({ id: "d2", name: "Docs", projectName: "mobile" });
+    const bead = beadRow("sparkle-d3", "Docs");
+    const [w, m, b] = withMentionLabels([docsWeb, docsMobile, bead]);
+    expect(w?.label).toBe("Docs (web)");
+    expect(m?.label).toBe("Docs (mobile)");
+    expect(b?.label).toBe("Docs (sparkle-d3)");
+  });
+});
+
+describe("mentionFreeText — a bead reaches the wire as title AND id", () => {
+  it("keeps the id so the concierge can resolve it, where an agent needs only its name", () => {
+    const bead = beadRow("sparkle-1cpomd", "Chat button on every bead card");
+    expect(mentionFreeText(`look at @${bead.name} today`, [bead])).toBe(
+      "look at Chat button on every bead card (sparkle-1cpomd) today",
+    );
+    // The agent half of the pair: a mid-sentence agent mention still loses only its sigil, so this
+    // cannot pass by appending an id to everything.
+    expect(mentionFreeText("look at @Kraken Auth today", FLEET)).toBe("look at Kraken Auth today");
+  });
+
+  it("does not write the id twice when the label already carries it", () => {
+    const a = beadRow("sparkle-aaa1", "Follow-up");
+    const b = beadRow("sparkle-bbb2", "Follow-up");
+    const roster = withMentionLabels([a, b]);
+    expect(mentionFreeText(`@${roster[0]?.label} bump`, roster)).toBe("Follow-up (sparkle-aaa1) bump");
+  });
+});
+
+describe("mentionCandidates — the picker's list is bounded by the query, not by the backlog", () => {
+  const BACKLOG = Array.from({ length: 40 }, (_, i) =>
+    beadRow(`sparkle-b${i}`, `Backlog item ${i} about notarization`),
+  );
+  const ROSTER = [...FLEET, ...BACKLOG];
+
+  // THE PAIR: agents are unaffected by the gate, beads are gated. An implementation that gated
+  // everything would break the bare-`@` affordance; one that gated nothing would put the backlog in
+  // front of the founder before he has typed anything to narrow it.
+  it("offers the whole fleet for a bare @ and no beads at all", () => {
+    const rows = mentionCandidates(ROSTER, "");
+    expect(rows.map((r) => r.id)).toEqual(expect.arrayContaining([BLUEPRINT.id, KRAKEN.id]));
+    expect(rows.filter((r) => isBeadMentionId(r.id))).toHaveLength(0);
+  });
+
+  it("keeps beads out until the query is long enough, then lets them in", () => {
+    const short = "n".repeat(BEAD_MENTION_MIN_QUERY - 1);
+    expect(mentionCandidates(ROSTER, short).filter((r) => isBeadMentionId(r.id))).toHaveLength(0);
+    expect(
+      mentionCandidates(ROSTER, "notarization").filter((r) => isBeadMentionId(r.id)).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it("caps the bead rows, so the picker cannot grow with the board", () => {
+    // 40 beads all match "notarization"; the cap is what stops every one of them being mounted.
+    const beads = mentionCandidates(ROSTER, "notarization").filter((r) => isBeadMentionId(r.id));
+    expect(beads).toHaveLength(MAX_BEAD_MENTION_ROWS);
+  });
+
+  // ══ ONE FIXTURE WHERE THE QUERY PROVABLY MATCHES BOTH KINDS ═══════════════════════════════════
+  // The rows below are about ORDERING, and ordering claims are vacuous unless both kinds are
+  // actually present in the result. The first draft of these used a query that matched ZERO agents
+  // — so "a bead must not lead" failed for the honest reason that there was no agent to lead, and
+  // the assertion proved nothing about the rule it named. Both names here start with "Release", so
+  // the query is a PREFIX hit on the agents and a WORD-PREFIX hit on the beads (the bead matcher has
+  // no subsequence tier, which is exactly why a shared prefix is required rather than assumed).
+  const BIG_FLEET = Array.from({ length: 60 }, (_, i) =>
+    agent({ id: `ag${i}`, name: `Release Pipeline ${i}` }),
+  );
+  const BIG_BACKLOG = Array.from({ length: 40 }, (_, i) =>
+    beadRow(`sparkle-r${i}`, `Release notes for the notarization step ${i}`),
+  );
+  const MIXED = [...BIG_FLEET, ...BIG_BACKLOG];
+  const BOTH = "rel";
+
+  it("leads with a destination and drops no agent, while still seating the beads", () => {
+    const rows = mentionCandidates(MIXED, BOTH);
+    // Precondition, stated so a fixture drift cannot make the rest pass trivially.
+    expect(rows.some((r) => isBeadMentionId(r.id))).toBe(true);
+    // An AGENT still leads: the first row is always something that can receive the message.
+    expect(isBeadMentionId(rows[0]!.id)).toBe(false);
+    // And nothing is lost — every agent that matched is still in the list; beads are additive.
+    expect(rows.filter((r) => !isBeadMentionId(r.id)).map((r) => r.id)).toEqual(
+      orderMentionAgents(BIG_FLEET, BOTH).map((r) => r.id),
+    );
+  });
+
+  // ══ THE ROW THE APPEND-AT-THE-END ORDERING FAILED (roborev 65677) ═════════════════════════════
+  // The picker clips at MAX_VISIBLE_ROWS and beads used to trail every matching agent. The agent
+  // half is uncapped and `matchScore`'s subsequence tier makes a SHORT query match nearly the whole
+  // fleet — which is exactly when BEAD_MENTION_MIN_QUERY switches beads on. So on a real fleet every
+  // bead row sat far below the visible window: present in the DOM, invisible to the founder, and
+  // the feature read as broken for precisely the queries it was built for.
+  //
+  // A 60-AGENT FLEET IS THE POINT. The existing rows use two agents, where a trailing bead is
+  // visible by accident and the bug cannot appear.
+  it("seats a bead inside the visible window even when the whole fleet matches", () => {
+    const rows = mentionCandidates(MIXED, BOTH);
+    // Precondition: the query really does match the ENTIRE fleet, so this is the hard case — with a
+    // handful of agents a trailing bead is visible by accident and the bug cannot appear at all.
+    expect(rows.filter((r) => !isBeadMentionId(r.id))).toHaveLength(60);
+    const firstBead = rows.findIndex((r) => isBeadMentionId(r.id));
+    expect(firstBead).toBeGreaterThanOrEqual(0);
+    expect(firstBead).toBeLessThan(MAX_VISIBLE_ROWS);
+  });
+
+  // ══ THE INVARIANT IS IN PIXELS, BECAUSE THE PICKER CLIPS IN PIXELS (roborev 65710) ═══════════
+  // This counted ROWS against MAX_VISIBLE_ROWS, and rows are not uniform: a bead row carries the id
+  // on a second line, and an agent that cannot take input carries its reason on one. So four
+  // two-line agent rows above three bead rows overflow a window sized for seven ONE-line rows —
+  // the guard stayed green while the last bead sat below the fold, which is the exact defect the
+  // splice was written to remove. A row-count invariant cannot see that; a pixel one can.
+  //
+  // The guarantee is deliberately about the FIRST bead row being FULLY visible in the WORST case
+  // (every row above it two-line). The second and third are reachable by scrolling, and the
+  // highlighted row is scrolled into view by the picker's own effect.
+  it("keeps the first bead row fully visible even when every row above it is two-line", () => {
+    expect((AGENT_ROWS_ABOVE_BEADS + 1) * ROW_H_TWO_LINE).toBeLessThanOrEqual(LIST_MAX_H);
+  });
+
+  // ══ AND THE BEAD CAP IS STILL PINNED TO THE WINDOW (roborev 65730) ═══════════════════════════
+  // The pixel guarantee above says nothing about MAX_BEAD_MENTION_ROWS — it only counts rows ABOVE
+  // the first bead. For one commit that left the cap held by nothing but self-referential
+  // assertions (`toHaveLength(MAX_BEAD_MENTION_ROWS)` passes for any value, and raising it only
+  // LOOSENS the cost bound), so a cap of 30 would have spliced thirty bead rows into a 294px window
+  // and buried every agent below the fold with the whole suite green. That is a straight regression
+  // of the guard the previous commit added, which is exactly the shape a self-referential assertion
+  // hides. BOTH bounds are needed: raising EITHER cap alone must red.
+  // AT THE WORST-CASE ROW HEIGHT, which is the correction (roborev 65738). This multiplied every
+  // row by ROW_H — including the bead rows, which are ALWAYS two-line and are laid out at
+  // ROW_H_TWO_LINE by the height the picker now sets. So it asserted a property that was already
+  // FALSE at the shipped constants (3*42 + 3*60 = 306 against a 294px window) and stayed green, and
+  // it was loose enough that raising the bead cap by ONE still passed (7*42 = 294) while painting
+  // 366px. The mutation evidence offered for it — 3 to 30 — only cleared the slack; the smallest
+  // raise is the one that matters, and it is the one a generous bound lets through.
+  it("keeps the whole spliced block inside the window, so neither cap can be raised alone", () => {
+    expect((AGENT_ROWS_ABOVE_BEADS + MAX_BEAD_MENTION_ROWS) * ROW_H_TWO_LINE).toBeLessThanOrEqual(
+      LIST_MAX_H,
+    );
+  });
+
+  // TIES KEEP BOARD ORDER, not alphabetical order. The roster arrives priority-bucketed, so equal
+  // scoring beads must be offered most-important-first; the localeCompare sort this replaced threw
+  // that away. Asserted against a set whose alphabetical order is the REVERSE of its board order,
+  // so a sort-based implementation cannot pass by coincidence.
+  it("breaks ties by board order, not by the alphabet", () => {
+    const beads = [
+      beadRow("sparkle-t1", "zulu notarization"),
+      beadRow("sparkle-t2", "yankee notarization"),
+      beadRow("sparkle-t3", "xray notarization"),
+    ];
+    const rows = mentionCandidates([...FLEET, ...beads], "notarization");
+    expect(rows.filter((r) => isBeadMentionId(r.id)).map((r) => r.id)).toEqual(
+      beads.map((b) => b.id),
+    );
+  });
+
+  // ══ THE COST CLAIM, ON A FIXTURE THAT CAN ACTUALLY EXERCISE IT (roborev 65710) ═══════════════
+  // The first version of this row asserted only upper bounds, against a backlog whose rows ALL
+  // score alike — so nothing ever shifted, the delta was exactly 0, and both bounds passed
+  // trivially. A re-introduced full sort reads 0 on that counter too, so the number could not tell
+  // the two implementations apart. That is the second vacuous cost assertion in this file; the
+  // lesson is the same one it already records, which is that an upper bound alone proves nothing
+  // unless the quantity is shown to be non-zero.
+  //
+  // MIXED SCORES, ORDERED WORST-FIRST, so every later hit must displace an earlier one and the
+  // insertion path is genuinely walked.
+  it("selects the top rows with a bounded, and non-zero, number of comparisons", () => {
+    const mixed = [
+      ...Array.from({ length: 20 }, (_, i) => beadRow(`sparkle-w${i}`, `Step about notarization ${i}`)),
+      ...Array.from({ length: 20 }, (_, i) => beadRow(`sparkle-p${i}`, `notarization prefix ${i}`)),
+    ];
+    const before = mentionScanStats.beadCompares;
+    const rows = mentionCandidates([...FLEET, ...mixed], "notarization");
+    const delta = mentionScanStats.beadCompares - before;
+    // NON-ZERO is the half that was missing — without it the assertion holds for doing no work.
+    expect(delta).toBeGreaterThan(0);
+    // …and still bounded by the CAP rather than by the hit list, which is the actual claim.
+    expect(delta).toBeLessThanOrEqual(mixed.length * MAX_BEAD_MENTION_ROWS);
+    // The prefix hits must have displaced the word-prefix ones, proving the insertions happened.
+    expect(rows.filter((r) => isBeadMentionId(r.id)).every((r) => r.id.includes("sparkle-p"))).toBe(
+      true,
+    );
+  });
+
+  // ══ THE COST ASSERTIONS, REWRITTEN BECAUSE THE FIRST PAIR COULD NOT FAIL (roborev 65652) ═════
+  // They were `beadScores === 40` and `rosterSorts === 0`. `rosterSorts` is incremented only by
+  // `longestLabelFirst`, which this path never reaches — so it read 0 for ANY implementation,
+  // including a full `orderMentionAgents` pass over every bead. And `beadScores` is the same number
+  // whichever matcher produced it. Both were green against the regression they named.
+  //
+  // What follows are two claims that a degenerate implementation genuinely fails.
+
+  // (1) THE ALLOCATION, which is the dominant per-keystroke cost: lowercasing every bead label.
+  // The pair is the test — same roster identity must add NOTHING, a new array must add exactly one.
+  // Asserting only the first would pass for a cache that never recomputes and froze the list.
+  it("lowercases the backlog once per roster, not once per keystroke", () => {
+    mentionCandidates(ROSTER, "notarization"); // prime
+    const primed = mentionScanStats.rosterSplits;
+    for (const q of ["notar", "notari", "notariz"]) mentionCandidates(ROSTER, q);
+    expect(mentionScanStats.rosterSplits - primed).toBe(0);
+    const sameContentNewArray = [...ROSTER];
+    mentionCandidates(sameContentNewArray, "notarization");
+    expect(mentionScanStats.rosterSplits - primed).toBe(1);
+  });
+
+  // (2) THE MATCHER ITSELF, pinned BEHAVIOURALLY rather than by a counter — which is the only thing
+  // that can tell the two apart. `orderMentionAgents` has a SUBSEQUENCE tier; the bead matcher
+  // deliberately does not, because over thousands of sentences a fuzzy tier matches nearly
+  // everything. So a subsequence-only query must reach a bead through the general matcher and NOT
+  // through the candidate builder. Swap the cheap matcher back for the expensive one and this reds.
+  it("scores beads with the cheap matcher — no subsequence tier", () => {
+    const bead = beadRow("sparkle-sub1", "Notarization pipeline");
+    const roster = [...FLEET, bead];
+    // "nzp" is a subsequence of "notarization pipeline" but neither a prefix nor a word prefix.
+    expect(orderMentionAgents(roster, "nzp").map((r) => r.id)).toContain(bead.id);
+    expect(mentionCandidates(roster, "nzp").map((r) => r.id)).not.toContain(bead.id);
+    // …while a real word prefix still finds it, so this cannot pass by matching nothing.
+    expect(mentionCandidates(roster, "pipeline").map((r) => r.id)).toContain(bead.id);
   });
 });

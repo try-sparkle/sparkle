@@ -81,7 +81,15 @@ vi.mock("../components/AgentSidebar", () => ({
     <div data-testid="sidebar" data-project={project?.id ?? "none"} data-covered={String(!!covered)} />
   ),
 }));
-vi.mock("../components/BoardView", () => ({ BoardView: () => <div data-testid="board" /> }));
+// The board is stubbed, but its PROPS are recorded — see the onBeadChat suite at the bottom of this
+// file for why that one prop is worth capturing rather than destructuring away.
+const boardProps = vi.hoisted(() => [] as Record<string, unknown>[]);
+vi.mock("../components/BoardView", () => ({
+  BoardView: (props: Record<string, unknown>) => {
+    boardProps.push(props);
+    return <div data-testid="board" />;
+  },
+}));
 
 import { SatelliteApp, CLOSE_SETTLE_MS } from "./SatelliteApp";
 import { useProjectStore } from "../stores/projectStore";
@@ -110,6 +118,9 @@ function mkProject(id: string, name: string, agents: AgentTab[]): Project {
 beforeEach(() => {
   vi.useFakeTimers();
   events.length = 0;
+  // Cleared per test: a leaked render from an earlier one would let the onBeadChat sweep below pass
+  // on props this test never produced.
+  boardProps.length = 0;
   destroySpy.mockClear();
   closeRequestedCb.current = null;
   redockCb.current = null;
@@ -403,5 +414,38 @@ describe("SatelliteApp — persistence", () => {
     // …and ownership went to its OWN map, not into the ui blob. A regression that moved ownership
     // into uiStore would fail both of these at once.
     expect(localStorage.getItem(SATELLITE_REGISTRY_KEY)).toBeTruthy();
+  });
+});
+
+// ── THE SATELLITE MUST NOT OFFER A BEAD CHAT ────────────────────────────────────────────────────
+//
+// bead sparkle-1cpomd. The bead card's Chat button hands a draft to `composeHandoffStore`, whose
+// ONLY consumer is `ConciergeHost` — and this window mounts no ConciergeHost and no composer
+// anywhere in its tree. A draft handed over here would therefore land in a store with no reader and
+// be dropped silently (ConciergeHost logs log.error on exactly that), so the button must not exist
+// on this side at all.
+//
+// The hiding mechanism is deliberately NOT a window check: `BoardView`'s `onBeadChat` is optional,
+// `BeadCard` renders no control for an absent callback, and THIS call site simply supplies nothing.
+// (`windowContext.useIsMainWindow` could not have done the job — it is hard-coded `true`.)
+//
+// So the fact this file alone can prove is that the real call site passes nothing. What a BoardView
+// configured each way actually RENDERS is pinned in components/BoardView.test.tsx, where both
+// windows' configurations are mounted side by side in one tree.
+describe("SatelliteApp — no bead chat, because there is no composer here", () => {
+  it("mounts the board with NO onBeadChat", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    useSettingsStore.setState({ beadsEnabled: true } as never);
+    render(<SatelliteApp projectId="p1" />);
+    // The board really mounted — otherwise "no onBeadChat" would be true of an empty array.
+    expect(screen.getByTestId("board")).toBeTruthy();
+    expect(boardProps.length).toBeGreaterThan(0);
+    for (const props of boardProps) {
+      expect(props.onBeadChat).toBeUndefined();
+      // …and the props that ARE passed came through, so the loop above is reading a real render
+      // rather than an object that happens to be empty.
+      expect(props.project).toBeTruthy();
+      expect(props.side).toBeTruthy();
+    }
   });
 });

@@ -15,6 +15,27 @@
 // did not quite ask for; being stingy costs him a working sentence and teaches him to distrust the
 // feature. (The BADGE has no such latitude — it is gated on the words themselves, in
 // ../../services/relayDerivation, and nothing here can make one appear.)
+//
+// ══ A BEAD IS NOT A NAMING, ON EITHER PATH (bead sparkle-1cpomd) ═══════════════════════════════
+// Beads joined the mention roster so tasks and epics can be @mentioned like agents, and that puts
+// ~2,000 rows into the list this walks — every one of them a SENTENCE rather than a name. Two things
+// follow, and the second is why this is a correctness fix and not a tidy-up.
+//
+//   • THE PROSE PASS MUST SKIP THEM. `namedInProse` is deliberately generous because being wrong
+//     costs a relay he did not quite ask for. That trade is priced for ~60 short agent names; run
+//     over a backlog of sentences it inverts, because a bead title is made of the same words the
+//     message is. It is also ~2,000 substring sweeps per turn for an answer that can only ever be
+//     "no agent".
+//   • THE @-MENTION PASS MUST SKIP THEM TOO, and that one is easy to miss: the loop below adds every
+//     resolved mention id unconditionally, so clicking Chat on a bead card would drop `bead:<id>`
+//     straight into the relay-permission set. Nothing could match it — the gate keys on agent ids —
+//     so it is harmless TODAY, by exactly the accident-of-lookup this feature refused to rely on in
+//     `composerRoute.addressingSpan`. A permission set is the last place to leave an entry whose
+//     safety is incidental rather than stated.
+//
+// The rule is one sentence in both halves: a bead names WORK, never a recipient, so it can never
+// grant permission to relay.
+import { isBeadMentionId } from "./mentions";
 import type { ConciergeMention, MentionAgent } from "./mentions";
 
 /** Characters that CONTINUE a name, for the boundary test on both sides of a prose match.
@@ -61,9 +82,13 @@ export function namedAgentIds(
   roster: readonly MentionAgent[],
 ): string[] {
   const ids = new Set<string>();
-  for (const m of mentions ?? []) if (m.agentId) ids.add(m.agentId);
+  for (const m of mentions ?? []) {
+    if (!m.agentId || isBeadMentionId(m.agentId)) continue;
+    ids.add(m.agentId);
+  }
   const haystack = text.toLowerCase();
   for (const a of roster) {
+    if (isBeadMentionId(a.id)) continue;
     if (ids.has(a.id)) continue;
     const name = a.name?.trim().toLowerCase();
     if (!name) continue;
