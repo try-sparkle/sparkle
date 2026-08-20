@@ -36,14 +36,18 @@ pub struct RosterAgentSlice {
     /// field still deserializes.
     #[serde(default)]
     pub rollup_dot: Option<String>,
-    /// `engine/agentGoal`'s `GoalState` for this agent — "none" | "unmet" | "met" | "expired" |
-    /// "escalated" — or `None` from a window that predates the field.
+    /// `engine/agentGoal`'s `GoalState` for this agent, verbatim — or `None` from a window that
+    /// predates the field. The vocabulary is NOT restated here: it is a value enumeration over a
+    /// string with no compile-time check on either side, and a hand-copied list in a doc comment is
+    /// how one goes stale (this one did — it never gained "discharged"). `nudger::goal_is_quiet`
+    /// classifies every member, and `nudger::goal_state_vocabulary_matches_the_frontend` pins that
+    /// classification against the union itself.
     ///
     /// Carried for the NUDGER, which has no other way to learn it: goals live in the frontend
-    /// store, and `nudge_ladder` must know that an agent's goal is met so it stops spending a full
-    /// agent turn asking a finished agent to "resume your goal" (the founder's 2026-08-07
-    /// fourteen-ping screenshot). `None` and "unmet" both mean "keep nudging" — the absence of the
-    /// field can never be read as done.
+    /// store, and `nudge_ladder` must know when an agent's goal leaves it nothing to ask, so it
+    /// stops spending a full agent turn telling a finished agent to "resume your goal" (the
+    /// founder's 2026-08-07 fourteen-ping screenshot). `None` and "unmet" both mean "keep nudging"
+    /// — the absence of the field can never be read as done.
     #[serde(default)]
     pub goal_state: Option<String>,
     pub parent_id: Option<String>,

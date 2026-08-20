@@ -25,7 +25,12 @@
 // parameters — so every rule is tested as arithmetic. The mount that spends real money on the
 // decision lives in services/goalContinuationRunner.
 import type { AgentTabStatus } from "@sparkle/ui";
-import { type AgentGoal, goalStateOf } from "./agentGoal";
+import {
+  AWAITING_CLOSE_STATE,
+  type AgentGoal,
+  type AwaitingCloseEvidence,
+  goalStateOf,
+} from "./agentGoal";
 // BOTH, and they are two halves of one rule rather than two rules. `agentOriginated` says text
 // SPARKLE authored carries no information about the agent (so a resume is neither a repeated command
 // nor progress); `quotaBlock` says an agent behind an account limit cannot act at all. Together they
@@ -118,6 +123,22 @@ export type NoContinueReason =
    *  from `goal-met`, which is somebody's CLAIM — the concierge reading these out should be able to
    *  say which of the two happened, because only one of them is auditable. */
   | "goal-discharged"
+  /** THE WORK IS DONE AND ONLY A PERSON MAY CLOSE THE GOAL — `agentGoal`'s `awaiting_close`.
+   *
+   *  ⚠️ DISTINCT FROM `already-escalated`, AND THE DISTINCTION IS THE WHOLE POINT. Both stop the
+   *  sweep, so a reader could reasonably ask why one reason would not do. Because they say opposite
+   *  things about the agent: `already-escalated` means auto-continue gave up with work UNFINISHED
+   *  and handed a stuck row to a person, while this means the row FINISHED and is waiting on a
+   *  bookkeeping click. Under one reason the concierge — and the founder's `needs_you` count —
+   *  cannot tell a stalled agent from a shipped one, which is the exact confusion this state was
+   *  added to end.
+   *
+   *  Reached from `unmet` as well as from `escalated`, so a landed row STOPS BEING RESUMED rather
+   *  than climbing `MAX_CONTINUES_WITHOUT_PROGRESS` → `MAX_CONTINUES_TOTAL` → escalation first.
+   *  That climb is what made the measured row (agent `d5d7056e`, PR #2188) read as blocked on a
+   *  human: it had merged work and a `{kind:"human"}` check, so every restart re-ran an agent that
+   *  had nothing left to do and could not close its own goal. */
+  | "goal-awaiting-close"
   | "goal-expired"
   | "already-escalated"
   | "not-idle"
@@ -342,6 +363,16 @@ export interface ContinuationInput {
    * argument. Absent means no gate is known, which escalates exactly as before.
    */
   externalWait?: ExternalWait;
+  /**
+   * Has this agent's work already shipped for THIS goal (engine/agentGoal `AwaitingCloseEvidence`)?
+   *
+   * OPTIONAL, and absence means the ordinary behaviour rather than a refusal — the same direction
+   * `AwaitingCloseEvidence` itself takes and the opposite of {@link cloud}'s fail-closed rule.
+   * The gate this feeds STOPS a resume, so a caller that forgot to look must not be able to strand
+   * an agent that still had work to do; the cost of the omission is only that the row keeps being
+   * resumed, which is what it does today.
+   */
+  awaitingClose?: AwaitingCloseEvidence;
 }
 
 /**
@@ -360,9 +391,21 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   const { goal, status, now, idleSince, hasTurnEndAuthority, canAcceptInput, mark, processAlive } =
     input;
 
-  const state = goalStateOf(goal, now);
+  const state = goalStateOf(goal, now, input.awaitingClose);
   if (state === "none") return { action: "none", reason: "no-goal" };
   if (state === "met") return { action: "none", reason: "goal-met" };
+  // WITH THE GOAL GATES, AHEAD OF THE QUOTA / CLOUD / STATUS GATES — the same placement argument
+  // `goal-discharged` makes directly below. This is finished work; falling through to the status
+  // checks would answer a landed-and-waiting agent with "it isn't idle" or "the sandbox is paused",
+  // sending whoever reads the reason to look at the wrong thing entirely.
+  //
+  // Its position among the goal gates is cosmetic — `goalStateOf` already resolved the precedence,
+  // and these arms test mutually exclusive values of one variable — but it is placed high because
+  // the reason it yields is the most informative one on this list.
+  //
+  // AGAINST THE EXPORTED CONSTANT, not a second copy of the literal — see its docblock; a frozen
+  // token that nothing references is not frozen.
+  if (state === AWAITING_CLOSE_STATE) return { action: "none", reason: "goal-awaiting-close" };
   // BESIDE `met`, NOT AFTER THE STATUS GATES. A discharged goal is finished work; without this arm
   // `discharged` falls past every goal gate to the status checks and a proven-complete agent is
   // auto-continued — restarted to do a job git has already confirmed it did.

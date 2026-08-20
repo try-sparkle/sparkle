@@ -407,6 +407,22 @@ const LIFECYCLE: ReadonlySet<StallCause> = new Set<StallCause>([
   // still owes a review-close. Amber "the machinery stopped, someone acts next" is the honest read —
   // the someone here is him, at his leisure, not a blocker he must clear now.
   "human-verified-goal",
+  // ── `awaiting-close` (2026-08-20) — AMBER, AND NEVER `OUTSTANDING` ──────────────────────────────
+  // Strictly calmer than `human-verified-goal` directly above, for the same reason and with more
+  // evidence behind it: that cause says "only a person may close this goal", while this one adds
+  // that GIT ALREADY PROVED THE WORK SHIPPED for it. If awaiting a review-close is not "stuck",
+  // awaiting a close on demonstrably-merged work certainly is not.
+  //
+  // ⚠️ IT IS ALSO WHAT DEMOTES A `blocked-on-human` ANSWER, so read this beside `OUTSTANDING`. The
+  // agent's own reply is the app's loudest signal and stays red everywhere else; `agentStall`
+  // re-reads it as THIS cause only for a row in `agentGoal`'s `awaiting_close` state. Adding this
+  // token to `OUTSTANDING` would therefore not merely re-redden one row — it would silently undo
+  // that demotion and restore the exact false red the state was introduced to remove.
+  //
+  // NOT CALM GRAY EITHER, on `human-verified-goal`'s argument: gray is the terminal "shipped and
+  // closed" state, and this row still owes a close. Amber — "the machinery stopped, someone acts
+  // next" — is the honest read, and the someone is him, at his leisure.
+  "awaiting-close",
   "escalated-goal",
   "unmet-goal",
   "open-pr",

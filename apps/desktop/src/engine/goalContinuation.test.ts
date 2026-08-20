@@ -997,3 +997,91 @@ describe("the mark measures WORK, not just self-reports", () => {
     );
   });
 });
+
+// ══ `goal-awaiting-close` — THE EXIT FOR A LANDED GOAL ONLY A PERSON MAY CLOSE ══════════════════
+//
+// Agent `d5d7056e` held merged work (PR #2188) behind a `{kind:"human"}` check. It could not close
+// the goal itself — correctly, and that refusal is UNCHANGED — so this sweep resumed it every pass
+// until `MAX_CONTINUES_WITHOUT_PROGRESS` escalated it to the founder, who read the result as a row
+// blocked on him. Every restart was spent on an agent with nothing left to do.
+//
+// ⚠️ EVERY CASE IS A PAIR, differing in exactly ONE field from a fixture that DOES continue. A test
+// that only proved "it stopped" would be satisfied by any of the dozen unrelated gates ahead of this
+// one (AGENTS.md, `sparkle-rvf6n` — seen 6×), and the assertion is on the DECISION, which is the
+// side effect, never on the evidence handed in.
+describe("goal-awaiting-close — a landed goal awaiting a person's close stops being resumed", () => {
+  const shipped = { landed: true, shippedAfterGoalSet: true } as const;
+  /** The measured row's goal: live, unmet, and checkable only by a person. */
+  const humanCheck = () => newGoal("PR #2188 is reviewed and merged", T0, DEFAULT_GOAL_TTL_MS, { kind: "human" });
+
+  it("DECLINES with goal-awaiting-close — and the SAME row with no git reading still continues", () => {
+    // The pair, in one test so neither half can be read in isolation. Only `awaitingClose` differs.
+    const landed = decideContinuation(ready({ goal: humanCheck(), awaitingClose: shipped }));
+    expect(landed).toEqual({ action: "none", reason: "goal-awaiting-close" });
+
+    const unread = decideContinuation(
+      ready({ goal: humanCheck(), awaitingClose: { landed: undefined, shippedAfterGoalSet: true } }),
+    );
+    expect(unread.action).toBe("continue");
+  });
+
+  it("continues exactly as before when the field is OMITTED — absence is not a refusal", () => {
+    // The direction matters: this gate STOPS a resume, so a caller that forgot to look must not be
+    // able to strand an agent that still had work. The cost of the omission is only the status quo.
+    expect(decideContinuation(ready({ goal: humanCheck() })).action).toBe("continue");
+  });
+
+  it("stops an ESCALATED landed row too, and says so with the RIGHT reason", () => {
+    // `already-escalated` would also have stopped it — and that is exactly the confusion this state
+    // was added to end. The two reasons say opposite things about the agent: one is "auto-continue
+    // gave up on unfinished work", the other is "the work is done". Asserting the reason, not just
+    // the stop, is what makes this test able to fail.
+    const escalated = escalateGoal(humanCheck(), T0 + 60_000, "The goal is still unmet");
+    expect(decideContinuation(ready({ goal: escalated, awaitingClose: shipped }))).toEqual({
+      action: "none",
+      reason: "goal-awaiting-close",
+    });
+    expect(decideContinuation(ready({ goal: escalated }))).toEqual({
+      action: "none",
+      reason: "already-escalated",
+    });
+  });
+
+  it("does NOT fire for an agent-closable check on the same landed evidence", () => {
+    // A `{kind:"landed"}` goal on landed work has no person to wait for — the agent may close it
+    // itself and simply has not. Resuming it is right, and it is the prompt that tells it how.
+    const landedKind = newGoal("the work is on origin/main", T0, DEFAULT_GOAL_TTL_MS, { kind: "landed" });
+    expect(decideContinuation(ready({ goal: landedKind, awaitingClose: shipped })).action).toBe("continue");
+    expect(decideContinuation(ready({ goal: humanCheck(), awaitingClose: shipped })).action).toBe("none");
+  });
+
+  it("does NOT fire for an INHERITED human check — an ordinary work goal is never stranded", () => {
+    // roborev 65987. `chargeGoalDebt` manufactures `{kind:"human"}` for any non-landing-shaped goal
+    // text that inherited a binding obligation, so this is the COMMON path, not an edge. Reaching
+    // the gate here would mean an agent with real work left is never auto-resumed for that goal
+    // again — the "a false positive strands an agent that still had work to do" outcome
+    // `AwaitingCloseEvidence` says must be avoided.
+    const inherited = { ...humanCheck(), verifyInherited: true };
+    expect(decideContinuation(ready({ goal: inherited, awaitingClose: shipped })).action).toBe("continue");
+    expect(decideContinuation(ready({ goal: humanCheck(), awaitingClose: shipped })).action).toBe("none");
+  });
+
+  it("does NOT fire when the landing predates the goal — the next objective still gets resumed", () => {
+    const stale = { landed: true, shippedAfterGoalSet: false } as const;
+    expect(decideContinuation(ready({ goal: humanCheck(), awaitingClose: stale })).action).toBe("continue");
+    expect(decideContinuation(ready({ goal: humanCheck(), awaitingClose: shipped })).action).toBe("none");
+  });
+
+  it("spends NO retry budget and never escalates — the streak bound is never reached", () => {
+    // The failure being fixed was not only a wrong colour: the row CLIMBED to escalation. A landed
+    // row sitting one continue below `MAX_CONTINUES_WITHOUT_PROGRESS` must decline, not escalate.
+    let goal = humanCheck();
+    for (let i = 0; i < MAX_CONTINUES_WITHOUT_PROGRESS; i += 1) goal = noteContinue(goal, "m0");
+    // Same goal, same mark: without the gate this is the escalation the founder was handed.
+    expect(decideContinuation(ready({ goal })).action).toBe("escalate");
+    expect(decideContinuation(ready({ goal, awaitingClose: shipped }))).toEqual({
+      action: "none",
+      reason: "goal-awaiting-close",
+    });
+  });
+});

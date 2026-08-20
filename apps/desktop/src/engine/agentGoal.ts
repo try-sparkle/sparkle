@@ -28,7 +28,12 @@
  *  never expires would be eligible for auto-continue forever, so a goal someone set and forgot
  *  becomes a permanent token burner. Four hours is long enough to cover a real build session and
  *  short enough that a forgotten goal dies the same working day. */
-import { mayReplaceVerify, inferGoalVerify, type GoalVerify } from "@sparkle/core";
+import {
+  mayReplaceVerify,
+  inferGoalVerify,
+  agentClosableKind,
+  type GoalVerify,
+} from "@sparkle/core";
 
 export const DEFAULT_GOAL_TTL_MS = 4 * 60 * 60_000;
 
@@ -227,7 +232,65 @@ export interface AgentGoal {
 
 /** Where a goal is in its life. `none` is the absence of a goal, kept in the union so every
  *  consumer branches over one exhaustive vocabulary rather than juggling `undefined`. */
-export type GoalState = "none" | "unmet" | "met" | "discharged" | "expired" | "escalated";
+export type GoalState =
+  | "none"
+  | "unmet"
+  | "met"
+  | "discharged"
+  | "expired"
+  | "escalated"
+  /** THE WORK IS DONE AND ONLY A PERSON MAY CLOSE THE GOAL. Not "blocked" — see
+   *  {@link awaitingClose} for the whole argument and {@link AwaitingCloseEvidence} for what a
+   *  caller must supply to reach it. */
+  | "awaiting_close";
+
+/**
+ * ⚠️ THE TOKEN `awaiting_close` IS FROZEN AND CROSSES A LANGUAGE BOUNDARY.
+ *
+ * `nudger.rs` will key a stand-down on this exact literal, read off the roster's `goal_state` field
+ * (`useRosterPublisher`). There is no compile-time check across that seam — it is a VALUE
+ * comparison over a string on both sides — so a variant spelling (`awaitingClose`, `awaiting-close`)
+ * silently reads as "unfinished" on the Rust side, which is the safe direction and therefore the
+ * SILENT one: the stand-down simply never fires and the feature ships permanently inert.
+ *
+ * ⚠️ SAY WHAT THE RUST SIDE DOES TODAY, not what it is about to do (roborev 65987). As of this
+ * commit `src-tauri` contains NO occurrence of this token: `nudger.rs::goal_is_met` matches
+ * `"met" | "discharged"` and nothing else, so an `awaiting_close` row reads to the ladder exactly as
+ * `escalated` did — a live goal, still pinged. That is UNCHANGED behaviour rather than a regression
+ * (the token this replaces was equally unrecognised), and it is the half of the founder's complaint
+ * this branch does not close; the matching stand-down is landing in parallel in a Rust-side change
+ * this worktree cannot see. A comment describing that as already-true would send the next reader
+ * looking for a branch that is not there.
+ *
+ * Note that the three tokens in this feature are deliberately spelled three different ways, each
+ * matching the convention of the vocabulary it joins: the GOAL STATE is `awaiting_close` (snake,
+ * beside `unmet`/`escalated` on the wire), the STALL CAUSE is `awaiting-close` (kebab, beside
+ * `blocked-on-human`), and the CONTINUATION REASON is `goal-awaiting-close` (kebab with the
+ * `goal-` prefix its siblings carry). Do not "harmonise" them.
+ */
+export const AWAITING_CLOSE_STATE = "awaiting_close" as const;
+
+/**
+ * What a caller has COMPUTED about whether an agent's work has already shipped for THIS goal.
+ *
+ * Both bits come from outside this module and neither can be derived from the goal record, which is
+ * why {@link goalStateOf} takes them as a parameter rather than reading them: `landed` is git
+ * ancestry (`services/agentGoalReading.landedEvidenceFor`) and `shippedAfterGoalSet` compares the
+ * merge watermark against `goal.setAt`. This module stays pure.
+ *
+ * ⚠️ BOTH DEFAULT TO REFUSING. `landed: undefined` means "nobody looked", not "not landed", and
+ * either reading must leave the goal in its ordinary state. That is the correct direction here even
+ * though it is the opposite of the usual fail-closed argument: reaching `awaiting_close` STOPS
+ * auto-continue, so a false positive strands an agent that still had work to do. A false negative
+ * costs only the status quo — the row keeps resuming, which is exactly what it does today.
+ */
+export interface AwaitingCloseEvidence {
+  /** Git says this agent's branch reached the default branch. `undefined` = not looked up. */
+  landed: boolean | undefined;
+  /** The landing postdates {@link AgentGoal.setAt} — so it is evidence about THIS goal rather than
+   *  about a watermark left by the previous one. */
+  shippedAfterGoalSet: boolean;
+}
 
 /**
  * When this goal's clock runs out.
@@ -300,13 +363,129 @@ export function newGoal(
  * receive the write, would read `unmet` forever, and would go on being auto-continued against a
  * mandate that had lapsed. Deriving it is what makes the sweeper's ABSENCE safe.
  */
-export function goalStateOf(goal: AgentGoal | undefined, now: number): GoalState {
+export function goalStateOf(
+  goal: AgentGoal | undefined,
+  now: number,
+  awaiting?: AwaitingCloseEvidence,
+): GoalState {
+  const base = baseGoalStateOf(goal, now);
+  // LAYERED OVER THE RECORD-ONLY ANSWER, never woven into it. `awaiting_close` is the only state
+  // here that depends on something outside the goal record, so it is applied as a post-pass — which
+  // is also what makes the two ordering guarantees below structural rather than a matter of where
+  // an `if` happens to sit.
+  if (base !== "unmet" && base !== "escalated") return base;
+  if (goal === undefined) return base;
+  return awaitingClose(goal, awaiting) ? "awaiting_close" : base;
+}
+
+/**
+ * Is this goal's WORK done, with only a person's close outstanding?
+ *
+ * All FIVE conditions, and each rules out a specific way this would otherwise fire wrongly:
+ *
+ *   1. `landed === true` — git, not the agent. `undefined` ("nobody looked") and `false` both
+ *      refuse, the same `=== true` discipline `canSelfMarkMet` uses on the same value.
+ *   2. `shippedAfterGoalSet` — the landing must POSTDATE the goal. `workflowShipped` is a monotonic
+ *      latch that survives into the next goal, so without this an agent that landed PR #1 and was
+ *      then given a fresh objective would read as finished the moment it went quiet.
+ *   3. The check is NOT agent-closable. If the agent could close it itself there is no person to
+ *      wait for, and the honest state is `unmet` — it simply has not called the tool yet.
+ *   4. A check was STATED at all. `verify === undefined` means the goal never claimed to be
+ *      verifiable, `canSelfMarkMet` waves it through, and there is again nobody to wait for.
+ *   5. ⚠️ THE CHECK WAS CHOSEN FOR THIS GOAL — `verifyStated === true && verifyInherited !== true`,
+ *      the same `chosenHere` term `agentStall`'s `human-verified-goal` requires (roborev 65987).
+ *      Without it this fires on the COMMON path, not an edge: `chargeGoalDebt` MANUFACTURES
+ *      `INHERITED_VERIFY = {kind:"human"}` for any goal whose text is not landing-shaped and which
+ *      inherited a binding obligation, so an ordinary work goal ends up carrying a sign-off nobody
+ *      asked for. Here the consequence is far worse than the colour decision that term was written
+ *      for: this state SHORT-CIRCUITS `decideContinuation`, so such an agent would never be
+ *      auto-resumed for that goal again — labelled "done — awaiting your close", waiting on a
+ *      verdict no person knows is owed. That is precisely the "a false positive strands an agent
+ *      that still had work to do" outcome {@link AwaitingCloseEvidence} says must be avoided, and it
+ *      is why this term is worth being narrower than the surrounding feature.
+ *
+ * ⚠️ WHAT THAT NARROWNESS COSTS, stated rather than left to be rediscovered: a genuinely-finished
+ * agent whose human check was INHERITED keeps today's behaviour exactly — resumed, escalated,
+ * and red if it answered `blocked-on-human`. The fix for that population is to stop manufacturing
+ * `human` for unrelated work, which is `chargeGoalDebt`'s problem, not to widen this term; widening
+ * it trades a bounded miss for an unbounded strand.
+ *
+ * ⚠️ THIS DOES NOT LET THE AGENT CLOSE ANYTHING. It changes what the ROW SAYS while it waits, and
+ * nothing else. `canSelfMarkMet`, `mayReplaceVerify` and the withholding of `landed` evidence from
+ * human-kind goals in `controlListener.handleSetGoalMet` are all untouched, deliberately: a
+ * `{kind:"human"}` goal still refuses `set_agent_goal_met` with `goal_not_self_markable` whether or
+ * not the work landed. The problem being fixed is a status that PRETENDS TO BE BLOCKED, not a
+ * sign-off the agent should have been allowed to forge.
+ */
+function awaitingClose(goal: AgentGoal, awaiting: AwaitingCloseEvidence | undefined): boolean {
+  if (awaiting?.landed !== true) return false;
+  if (awaiting.shippedAfterGoalSet !== true) return false;
+  if (goal.verify === undefined) return false;
+  // Condition 5 — the provenance term. Written as its own statement rather than folded into the
+  // return so the docblock's numbering maps one-to-one onto lines, and so mutating it is a
+  // single-line change a mutation check can name.
+  if (goal.verifyStated !== true || goal.verifyInherited === true) return false;
+  return !agentClosableKind(goal.verify.kind);
+}
+
+/** {@link goalStateOf} over the RECORD ALONE — the whole state machine as it stood before
+ *  `awaiting_close`, kept verbatim and kept private.
+ *
+ *  Two orderings survive from it unchanged, and both are guaranteed by this function running FIRST:
+ *
+ *  • `met` WINS. A goal somebody already closed is closed; re-opening it as "awaiting your close"
+ *    would ask the reader for a click they already made. Evidence cannot reach past `metAt`.
+ *  • `discharged` and `expired` WIN TOO. `awaiting_close` is entered only from `unmet` or
+ *    `escalated` — a discharged goal is finished by git's own proof and needs no human, and an
+ *    expired one has outlived its mandate, so neither is "waiting" on anybody.
+ *
+ *  An ESCALATED goal DOES reach `awaiting_close`, and that is the motivating case rather than an
+ *  edge: the row this feature exists for had already escalated (auto-continue spent its budget)
+ *  while its work sat merged on main. Note what is NOT done here — the `escalatedAt` LATCH is not
+ *  cleared, and nothing writes to the record at all. This is a reading, so a row that stops
+ *  qualifying (the evidence goes stale, a new goal is set) falls straight back to `escalated` with
+ *  its history intact. */
+function baseGoalStateOf(goal: AgentGoal | undefined, now: number): GoalState {
   if (goal === undefined) return "none";
   if (goal.metAt !== undefined) return "met";
   if (goal.escalatedAt !== undefined) return "escalated";
   if (goal.dischargedAt !== undefined) return "discharged";
   if (now >= goalDeadline(goal)) return "expired";
   return "unmet";
+}
+
+/**
+ * Do this goal's ESCALATION FIELDS apply — its reason, its stale-quote flag, its remaining re-arms?
+ *
+ * ⚠️ ONE PREDICATE, TWO CALLERS, AND THE DRIFT BETWEEN THEM WAS A REAL BUG (roborev 66027). It is
+ * NOT the bare `escalatedAt` latch, and it is NOT the bare state either — each of those is wrong in
+ * a different direction, which is exactly why this is a function rather than an inline test at each
+ * site:
+ *
+ *   • THE BARE LATCH IS TOO WIDE. `markGoalMet` does not clear `escalatedAt` and `baseGoalStateOf`
+ *     answers `met` BEFORE `escalated`, so an escalation that was RESOLVED — the normal terminal
+ *     shape — keeps the latch forever. Keyed on it alone, the roster publishes
+ *     `{ state: "met", rearmsRemaining: 2 }` for a finished agent, and `conciergeRearmAgentGoal`
+ *     gates only on `escalatedAt` too, so a concierge sweeping for a positive allowance is not
+ *     refused: it spends a re-arm and hands `REARM_GRANT` continues back to a met goal.
+ *
+ *     ⚠️ THAT WRITE PATH IS STILL UNGUARDED — this predicate removes the roster CUE, not the call
+ *     (`sparkle-0qq4hx`). A concierge acting on a stale notification or an older reading still
+ *     reaches `conciergeRearmAgentGoal` and is still charged. The symmetric guard belongs at the
+ *     source, the way `escalateGoal` added one for the mirror-image race (`sparkle-i5v42`).
+ *   • THE BARE STATE IS TOO NARROW, which is the trap that produced this predicate. The state layers
+ *     `escalated` into `awaiting_close`, so a row that escalated and then landed silently loses the
+ *     sentence explaining why the fleet gave up, and loses the field that says whether the concierge
+ *     may act on it — for the exact population `awaiting_close` exists for.
+ *
+ * So: the state must still be one where an escalation is OUTSTANDING, and for the derived state the
+ * latch must actually be set. `met`, `discharged` and `expired` are all false whatever the latch
+ * says. `agentStall` reaches the same conclusion for its own goal causes and states it at length.
+ */
+export function escalationFieldsApply(goal: AgentGoal | undefined, state: GoalState): boolean {
+  if (goal === undefined) return false;
+  if (state === "escalated") return true;
+  return state === "awaiting_close" && goal.escalatedAt !== undefined;
 }
 
 /** Is there outstanding, still-live goal work? True ONLY for `unmet`.

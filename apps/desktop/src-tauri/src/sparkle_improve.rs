@@ -84,6 +84,49 @@ pub struct SparkleImproveManager {
     pass: Mutex<Option<RunningPass>>,
 }
 
+/// THE PROCESS'S OWN ANSWER to "is a pass working right now" — the reading the pinned
+/// "Improve Sparkle" row needs and could not previously get.
+///
+/// The row is a raw read of `runtimeStore.status["__sparkle_self__"]`, and that key had exactly
+/// two writers, BOTH of them JS that can be absent while this child keeps working: a mounted
+/// `SparkleAgentPane` (its status engine detaches on unmount, freezing the key at its last
+/// resting value) and the in-process pass driver (whose latch is MODULE state, so a webview
+/// reload loses it while the child below survives up to `STALE_PASS_MAX`). With neither live the
+/// row falls to a GRAY dot on a plainly working agent and nothing can retract it.
+///
+/// This is deliberately a POLLED READING rather than an event: an event is exactly what a
+/// reloaded webview missed, so re-emitting one would rebuild the same hole.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImproveLiveness {
+    /// True while the slot holds a pass that has NOT yet outlived `STALE_PASS_MAX`. Past that
+    /// ceiling the pass is presumed hung (the same rule `sparkle_improve_run` reclaims on), so it
+    /// stops counting as live — one definition of "in flight" for this file, and it keeps a wedged
+    /// child from pinning the row green forever.
+    pub active: bool,
+    /// How long the occupying pass has been running, or `null` when the slot is empty. Present
+    /// even when `active` is false so a caller can tell "nothing running" from "running but past
+    /// the staleness ceiling".
+    ///
+    /// ⚠️ A Rust `Option` crosses the wire as `null`, NEVER as an absent key (no
+    /// `skip_serializing_if` here, deliberately). The TS side must therefore declare
+    /// `elapsedMs?: number | null` and any fixture must carry `null` rather than omit the key — a
+    /// parser written against `number | undefined` describes a shape this can never produce.
+    pub elapsed_ms: Option<u64>,
+}
+
+/// Pure decision behind [`SparkleImproveManager::liveness`], split out so the staleness ceiling is
+/// testable without spawning a child and waiting 35 minutes.
+fn liveness_for(elapsed: Option<Duration>) -> ImproveLiveness {
+    match elapsed {
+        Some(d) => ImproveLiveness {
+            active: d < STALE_PASS_MAX,
+            elapsed_ms: Some(d.as_millis() as u64),
+        },
+        None => ImproveLiveness { active: false, elapsed_ms: None },
+    }
+}
+
 impl SparkleImproveManager {
     /// Kill and RECORD an in-flight pass because the app is going away. Idempotent: it `take()`s
     /// the slot, so a second call (or a call after the pass already ended) is a cheap no-op.
@@ -95,6 +138,14 @@ impl SparkleImproveManager {
     /// the record from there is what makes the `app-teardown` log line actually appear on quit,
     /// which is the entire point of recording it. `Drop` stays as an idempotent backstop for the
     /// paths that DO drop (tests, and any non-macOS runtime that unwinds the state).
+    /// Is a pass child alive right now? Read from the SLOT, which the reader thread takes on the
+    /// child's stdout EOF (i.e. on process exit), so an occupied slot means a live process rather
+    /// than a stale flag. Read-only on purpose: it never `try_wait`s the child, which would reap it
+    /// out from under the reader thread that owns that.
+    pub fn liveness(&self) -> ImproveLiveness {
+        liveness_for(lock_pass(&self.pass).as_ref().map(|p| p.started.elapsed()))
+    }
+
     pub fn end_in_flight_pass(&self) {
         if let Some(pass) = lock_pass(&self.pass).take() {
             end_pass_early(pass, PassEnd::AppTeardown);
@@ -558,6 +609,26 @@ pub fn sparkle_improve_run(
     Ok(())
 }
 
+/// Report whether an hourly improvement pass child is alive — the AUTHORITATIVE, process-driven
+/// liveness signal behind the pinned "Improve Sparkle" row's status dot. See [`ImproveLiveness`]
+/// for why this exists and why it is polled rather than emitted. Infallible: an empty slot is a
+/// perfectly good answer (`active: false`), not an error.
+///
+/// ⚠️ `async` IS REQUIRED, NOT STYLE (bead sparkle-rfhu5, enforced by
+/// `cmd_timing::main_thread_guard::every_tauri_command_is_async_or_explicitly_exempt`). A SYNC
+/// `#[tauri::command]` runs its body inline on the AppKit main thread, so it freezes the whole UI
+/// for its duration. This body is one mutex read and would almost never be felt — but the guard is
+/// deliberately absolute rather than case-by-case, because "this one is cheap" is exactly the
+/// reasoning that accumulates into a hang, and because a later edit to `liveness()` would inherit
+/// the main-thread exposure silently. No `spawn_blocking`: there is nothing blocking to move, and
+/// wrapping a lock read would cost a task hop for no gain.
+///
+/// The frontend polls this every 10s, so it is also the wrong place to spend main-thread time.
+#[tauri::command]
+pub async fn sparkle_improve_active(manager: State<'_, SparkleImproveManager>) -> Result<ImproveLiveness, String> {
+    Ok(manager.liveness())
+}
+
 /// Kill an in-flight hourly pass — the whole process group, so nothing it spawned keeps
 /// mutating the worktree. A no-op if none is running. Called by the frontend when the user
 /// opens the interactive pane (so two `claude` processes never share the agent worktree) and
@@ -692,6 +763,72 @@ mod tests {
     #[cfg(unix)]
     fn is_alive(pid: i32) -> bool {
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// The row's whole problem was a signal that could be ABSENT while the child worked, so the
+    /// thing worth pinning is that an occupied slot reads live and an empty one does not — and that
+    /// a pass past the staleness ceiling stops counting, so a wedged child can't pin the row green.
+    #[test]
+    fn liveness_tracks_the_slot_and_stops_at_the_staleness_ceiling() {
+        assert_eq!(
+            liveness_for(None),
+            ImproveLiveness { active: false, elapsed_ms: None },
+            "an empty slot is not live"
+        );
+        let young = liveness_for(Some(Duration::from_secs(90)));
+        assert!(young.active, "a pass inside the ceiling is live");
+        assert_eq!(young.elapsed_ms, Some(90_000));
+        let stale = liveness_for(Some(STALE_PASS_MAX + Duration::from_secs(1)));
+        assert!(!stale.active, "a pass past STALE_PASS_MAX is presumed hung, not live");
+        assert!(
+            stale.elapsed_ms.is_some(),
+            "…but its age is still reported, so 'nothing running' stays distinguishable from 'hung'"
+        );
+    }
+
+    /// `Option<u64>` crosses the wire as `null`, NEVER as an absent key — the TS side declares
+    /// `elapsedMs?: number | null` on the strength of this, and a `skip_serializing_if` slipped in
+    /// here would silently make that type describe a shape the wire cannot produce (AGENTS.md).
+    #[test]
+    fn liveness_serializes_camel_case_with_an_explicit_null() {
+        let idle = serde_json::to_value(liveness_for(None)).expect("serialize");
+        assert_eq!(idle["active"], serde_json::Value::Bool(false));
+        assert!(idle.get("elapsedMs").is_some(), "the key must be PRESENT");
+        assert_eq!(idle["elapsedMs"], serde_json::Value::Null);
+        let live = serde_json::to_value(liveness_for(Some(Duration::from_millis(1234)))).expect("serialize");
+        assert_eq!(live["active"], serde_json::Value::Bool(true));
+        assert_eq!(live["elapsedMs"], serde_json::json!(1234));
+    }
+
+    /// THE SEAM, pinned from the side that can actually see both halves. This writer's failure mode
+    /// is SILENCE: an unregistered command makes `invoke` reject, the poller swallows the rejection
+    /// on purpose (a failed probe is not evidence the child died), and the row is back to being
+    /// gray forever with nothing logged. A misspelled name on either side does the same. Both
+    /// suites would stay green — so assert the two spellings and the registration together.
+    #[test]
+    fn the_liveness_command_is_registered_and_named_the_same_on_both_sides() {
+        const NAME: &str = "sparkle_improve_active";
+        assert!(
+            include_str!("lib.rs").contains(&format!("sparkle_improve::{NAME}")),
+            "{NAME} is missing from lib.rs's invoke handler list"
+        );
+        assert!(
+            include_str!("../../src/services/improvePassLiveness.ts").contains(&format!("\"{NAME}\"")),
+            "the TS poller does not invoke {NAME}"
+        );
+    }
+
+    /// End to end over the real manager: the slot a spawned pass occupies is what `liveness()`
+    /// reads, and taking the slot (cancel / teardown) releases it.
+    #[cfg(unix)]
+    #[test]
+    fn manager_liveness_follows_a_real_pass_in_and_out_of_the_slot() {
+        let manager = SparkleImproveManager::default();
+        assert!(!manager.liveness().active, "nothing spawned yet");
+        *lock_pass(&manager.pass) = Some(spawn_sleeper());
+        assert!(manager.liveness().active, "an occupied slot reads live");
+        manager.end_in_flight_pass();
+        assert!(!manager.liveness().active, "and a taken slot stops reading live");
     }
 
     #[test]

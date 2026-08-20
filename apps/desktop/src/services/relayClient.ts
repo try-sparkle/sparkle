@@ -88,12 +88,23 @@ export interface RosterAgentPayload {
    *  and therefore emits an explicit `null` for a slice published by an older window
    *  (roborev 54742) — see the same note in services/rosterTypes.ts. */
   rollup_dot?: RollupDot | null;
-  /** `engine/agentGoal`'s `GoalState` — "none" | "unmet" | "met" | "expired" | "escalated".
+  /** `engine/agentGoal`'s `GoalState`. DO NOT RE-ENUMERATE IT HERE — see the warning below.
    *
    *  Published for the RUST NUDGER, which has no other way to reach it: goals live in this store,
-   *  and `nudge_ladder` needs to know a goal is MET so it stops spending a full agent turn asking a
-   *  finished agent to "resume your goal". Only the exact "met" reads as done on the Rust side, so
-   *  a missing field or a new state is treated as a live goal and keeps the ladder running.
+   *  and `nudge_ladder` needs to know a goal leaves it NOTHING TO ASK so it stops spending a full
+   *  agent turn telling a finished agent to "resume your goal".
+   *
+   *  ⚠️ THIS COMMENT USED TO ENUMERATE THE UNION AND TO SAY "only the exact met reads as done".
+   *  Both went stale and the second became FACTUALLY WRONG: `discharged` and `awaiting_close` are
+   *  finished too, and the Rust side treats all three as quiet. Nothing executes a doc comment, so
+   *  neither claim could red anything — which is how it survived two state additions.
+   *
+   *  The authority is `engine/agentGoal.ts::GoalState`; the classification is
+   *  `nudger::goal_is_quiet`, pinned by `nudger::goal_state_vocabulary_matches_the_frontend`.
+   *
+   *  A missing field, an explicit null, or a state the reader does not recognise is treated as a
+   *  LIVE goal and keeps the ladder running — the safe direction, since a false "finished" silences
+   *  an agent that still needs help.
    *
    *  `| null` for the same reason as `rollup_dot` above: it mirrors a Rust `Option<String>` with no
    *  `skip_serializing_if`, so an older window emits an explicit `null`. */

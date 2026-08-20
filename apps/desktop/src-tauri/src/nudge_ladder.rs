@@ -457,8 +457,17 @@ pub struct Observation {
     /// ends. The delta cannot answer it: the ladder's top rung is 600s, so a founder handing an
     /// agent new work is invisible to a 5-second window on all but one look in a hundred and twenty.
     pub foreign_write_ms: u64,
-    /// The agent's goal is MET — it has said, through `set_agent_goal_met`, that the thing it was
-    /// sent to do is done.
+    /// The agent's goal is QUIET — whatever this ladder could ask about it, there is no longer an
+    /// answer worth having.
+    ///
+    /// ── THE NAME IS "met" FOR HISTORY; THE FACT IS BROADER, AND DELIBERATELY SO ────────────────
+    /// `nudger::goal_is_quiet` computes it from the goal state the frontend publishes, and THREE
+    /// distinct states now set it: `met` (the agent's own claim, via `set_agent_goal_met`),
+    /// `discharged` (git's claim — `goalExpiry` proved the work landed and the tree is clean), and
+    /// `awaiting_close` (the work is finished but the goal record is held open by a bookkeeping
+    /// close only a person can perform). Three different claims, one consequence: this ladder has
+    /// nothing to ask. Each of the last two was MISSING once and each cost the same defect — an
+    /// agent pinged over work that was already landed. See `nudger::goal_is_quiet` for both.
     ///
     /// ── WHY A FRONTEND-WRITTEN FACT IS TRUSTED HERE ───────────────────────────────────────────
     /// Every other roster-derived signal in this module is treated as suspect, because the roster

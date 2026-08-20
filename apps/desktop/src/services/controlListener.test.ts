@@ -224,6 +224,7 @@ import { noteThrashEvent, resetThrashTracking } from "../engine/agentThrash";
 // `MAX_CONCIERGE_REARMS` is the bound `set_agent_escalation` spends against — spelled as the
 // constant so a change to the allowance moves the test with it rather than leaving a stale `2`.
 import { MAX_CONCIERGE_REARMS, goalStateOf } from "../engine/agentGoal";
+import { awaitingCloseEvidenceFor } from "./agentGoalReading";
 // The thinking indicator's source of truth — asserted here because this file owns the one call site
 // that records it.
 import {
@@ -812,6 +813,162 @@ describe("controlListener", () => {
       });
       expect(rowFor(callerId).stall).toBe("stalled");
       expect(rowFor(callerId).stallCauses).toContain("escalated-goal");
+    });
+
+    // ⚠️ ONE PAYLOAD MUST NOT CONTRADICT ITSELF (roborev 65987). `goal` and `stallCauses` are built
+    // by two different readers on the same row, and the concierge branches on `goal.state` — so a
+    // `state: "escalated"` beside `stallCauses: ["awaiting-close"]` is not a cosmetic mismatch, it
+    // is the loud half winning and an agent being chased over finished work. Asserted on the WIRE
+    // payload rather than on either reader, because that is the object the divergence lives in.
+    it("reports awaiting_close on the GOAL and the CAUSE together, never one without the other", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "PR #2188 is reviewed and merged", undefined, "agent", {
+          kind: "human",
+        });
+      // The crossing is what dates the merge — `setWorkflowShipped` deliberately does not stamp
+      // `workflowShippedAt`. See the note in the `set_agent_goal_met` block below.
+      useRuntimeStore.getState().setWorkflowStage(callerId, "pull_request");
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      fire({ reqId: "gAC", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      expect(rowFor(callerId).goal).toMatchObject({ state: "awaiting_close" });
+      expect(rowFor(callerId).stallCauses).toContain("awaiting-close");
+      // …and the row must NOT still be claiming the states it came from, in either field.
+      expect(rowFor(callerId).stallCauses).not.toContain("unmet-goal");
+      expect(rowFor(callerId).stallCauses).not.toContain("blocked-on-human");
+
+      // THE PAIRED NEGATIVE, one writer apart. With the shipped latch cleared the same row publishes
+      // the ordinary pre-change payload — so the assertions above are about the evidence, not about
+      // every human-checked goal in the fleet.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, false);
+      fire({ reqId: "gAC2", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      expect(rowFor(callerId).goal).toMatchObject({ state: "unmet" });
+      expect(rowFor(callerId).stallCauses).toContain("unmet-goal");
+      expect(rowFor(callerId).stallCauses).not.toContain("awaiting-close");
+    });
+
+    // ⚠️ THE ESCALATION FIELDS FOLLOW `agentGoal.escalationFieldsApply` — NEITHER THE BARE LATCH NOR
+    // THE BARE DERIVED STATE (roborev 66019, then 66027). This case and the one below it are the two
+    // DIRECTIONS of that predicate, and each catches one of the two wrong keyings: `awaiting_close`
+    // layers over `escalated`, so a state-keyed field drops off exactly the population this branch
+    // exists for, while the latch outlives a `met` goal, so a latch-keyed one publishes an allowance
+    // for finished work. `rearmsRemaining`'s own contract makes either harmful:
+    // ABSENCE IS "NO OPINION", not "full allowance", and the field exists so the concierge can sweep
+    // the roster instead of finding out by being refused — a refusal that re-banners the human.
+    it("still carries the escalation fields once a landed goal reads awaiting_close", async () => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "PR #2188 is reviewed and merged", undefined, "agent", {
+        kind: "human",
+      });
+      store.escalateAgentGoal(projectId, callerId, "three continues, no sign of progress", Date.now());
+      useRuntimeStore.getState().setWorkflowStage(callerId, "pull_request");
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      fire({ reqId: "gACr", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const goal = rowFor(callerId).goal as {
+        state?: string;
+        rearmsRemaining?: number;
+        escalationReason?: string;
+      };
+      expect(goal.state).toBe("awaiting_close");
+      // BOTH escalation fields, together — one present and the other missing is the half-keyed
+      // shape this pins against, and either alone would pass a weaker assertion.
+      expect(goal.escalationReason).toMatch(/no sign of progress/);
+      expect(goal.rearmsRemaining).toEqual(expect.any(Number));
+    });
+
+    // ⚠️ AND THE OTHER DIRECTION — THE BARE LATCH IS TOO WIDE (roborev 66027). `markGoalMet` does
+    // NOT clear `escalatedAt` and `goalStateOf` answers `met` before `escalated`, so a RESOLVED
+    // escalation — the normal terminal shape — keeps the latch forever. Keyed on it alone the roster
+    // published `{ state: "met", rearmsRemaining: 2 }` with no reason beside it, and
+    // `conciergeRearmAgentGoal` gates only on `escalatedAt` too: a concierge sweeping for a positive
+    // allowance is NOT refused, it spends a re-arm and hands continues back to a finished goal.
+    //
+    // Paired with `still carries the escalation fields once a landed goal reads awaiting_close`
+    // directly above: those two are the TWO DIRECTIONS of `escalationFieldsApply`, and each catches
+    // exactly one of the two wrong keyings. Either alone passes for the other, and this field has
+    // been mis-keyed in both directions already. (The decoupling case below is a THIRD question —
+    // whether the two fields travel together — and distinguishes none of the keyings.)
+    it("drops the escalation fields once the escalated goal is MET — the latch outlives the state", async () => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "land the retry PR");
+      store.escalateAgentGoal(projectId, callerId, "three continues, no sign of progress", Date.now());
+      store.setAgentGoalMet(projectId, callerId, true);
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      // The latch really is still set — otherwise this test proves nothing about the keying.
+      const record = useProjectStore
+        .getState()
+        .projects.flatMap((pr) => pr.agents)
+        .find((a) => a.id === callerId)?.goal;
+      expect(record?.escalatedAt).toEqual(expect.any(Number));
+      fire({ reqId: "gACm", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const goal = rowFor(callerId).goal as {
+        state?: string;
+        rearmsRemaining?: number;
+        escalationReason?: string;
+      };
+      expect(goal.state).toBe("met");
+      expect(goal.rearmsRemaining).toBeUndefined();
+      expect(goal.escalationReason).toBeUndefined();
+    });
+
+    // ⚠️ THE TWO FIELDS ARE NOT STRICTLY COUPLED, and the wire contract used to claim they were
+    // (roborev 66106). They share the outstanding-escalation predicate, but the SENTENCE needs one
+    // more thing the allowance does not — a sentence to print — and a latched escalation carrying no
+    // reason string is a real shape the app itself writes. A consumer told this cannot happen has no
+    // handling for the row it will actually receive, so the asymmetry is pinned rather than asserted
+    // in prose.
+    it("publishes the allowance WITHOUT a sentence when the latch carries no reason", async () => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "land the retry PR");
+      store.escalateAgentGoal(projectId, callerId, "three continues, no sign of progress", Date.now());
+      // Strip the sentence, keeping the latch — the pre-field / debt-carry shape.
+      useProjectStore.setState((st) => ({
+        projects: st.projects.map((pr) => ({
+          ...pr,
+          agents: pr.agents.map((a) =>
+            a.id === callerId
+              ? { ...a, goal: { ...a.goal!, escalationReason: undefined } }
+              : a,
+          ),
+        })),
+      }));
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+      fire({ reqId: "gACn", op: "get_state", callerAgentId: callerId, payload: {} });
+      await flush();
+      const goal = rowFor(callerId).goal as {
+        state?: string;
+        rearmsRemaining?: number;
+        escalationReason?: string;
+      };
+      expect(goal.state).toBe("escalated");
+      expect(goal.rearmsRemaining).toEqual(expect.any(Number));
+      expect(goal.escalationReason).toBeUndefined();
     });
 
     it("flags an idle agent with an unmet goal as stalled, and names the cause", async () => {
@@ -1633,6 +1790,77 @@ describe("controlListener", () => {
       expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
       expect(String((lastReply() as { error?: string }).error)).toMatch(/person/i);
       expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    // ══ `awaiting_close` — THE STATE MOVES, THE REFUSAL DOES NOT ═══════════════════════════════
+    //
+    // Agent `d5d7056e`'s row, reproduced through the real op. The point of the new state is NOT to
+    // let the agent close a human sign-off — it is to stop the row PRETENDING TO BE BLOCKED while it
+    // waits for a person. So the two facts have to be asserted together, in one test: the refusal is
+    // byte-for-byte what it always was, AND the goal now reads `awaiting_close` instead of `unmet`.
+    // Split apart, the first half passes for a change that did nothing and the second for a change
+    // that quietly weakened the gate.
+    it("a LANDED human-kind goal still refuses to self-close, but its STATE becomes awaiting_close", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "PR #2188 is reviewed and merged", undefined, "agent", {
+          kind: "human",
+        });
+      // The evidence the app already computes for this agent, driven through the REAL writers.
+      //
+      // ⚠️ THE CROSSING IS WHAT DATES THE MERGE, not `setWorkflowShipped` — which deliberately does
+      // NOT stamp `workflowShippedAt` (see its note in runtimeStore). Only a stage transition INTO
+      // `merged` from a known earlier stage does, so a window with no history cannot date a
+      // months-old merge as "now". Writing the latch by hand here would test a state production
+      // cannot produce, and the goal would read `unmet` in the app while this test read
+      // `awaiting_close`.
+      useRuntimeStore.getState().setWorkflowStage(callerId, "pull_request");
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgAC1", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      // THE GUARANTEE. Unchanged, and it must stay that way: ancestry answers "is this on main",
+      // never "did a person approve it".
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+
+      // THE SIDE EFFECT. Read through the SAME builder the roster and the continuation sweep use, so
+      // this cannot pass against a state that is only reachable from a hand-built literal.
+      const goal = goalOf(callerId);
+      expect(goalStateOf(goal, Date.now(), awaitingCloseEvidenceFor(callerId, goal))).toBe(
+        "awaiting_close",
+      );
+      // …and the paired negative, one field apart: with the shipped latch cleared the same row is
+      // the ordinary `unmet` it has always been, so the state above is not simply what every
+      // human-kind goal now reads.
+      useRuntimeStore.getState().setWorkflowShipped(callerId, false);
+      expect(goalStateOf(goal, Date.now(), awaitingCloseEvidenceFor(callerId, goal))).toBe("unmet");
+    });
+
+    it("an UNLANDED human-kind goal refuses AND stays unmet — nothing was loosened", async () => {
+      // The other half of the pair, driven through the op rather than the reader. No watermark and
+      // no branch poll at all: this is every human-kind goal in the fleet, and it must behave today
+      // exactly as it did before `awaiting_close` existed.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the founder approves the onboarding copy", undefined, "agent", {
+          kind: "human",
+        });
+      fire({ reqId: "sgAC2", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+      const goal = goalOf(callerId);
+      expect(goalStateOf(goal, Date.now(), awaitingCloseEvidenceFor(callerId, goal))).toBe("unmet");
     });
 
     it("a goal that INHERITS its check on new landing-shaped text gets `landed`, not `human`", async () => {
@@ -3636,6 +3864,56 @@ describe("controlListener", () => {
       );
     });
 
+    // ⚠️ THE RAISE PATH IS A SECOND CALL SITE, PINNED SEPARATELY (roborev 66010). One fix landed at
+    // two `goalReading` sites and only the clear path was exercised — the repo's rule is
+    // mutation-check EACH site, not the change, because a single covered site goes green while its
+    // sibling carries the identical hole.
+    //
+    // What it protects is not inert. `goalReading` emits `escalationReason` off the LATCH now rather
+    // than off the derived state; keyed on the state, this reply would record a give-up sentence and
+    // return without it, which reads as the raise not having taken.
+    it("keeps the reason it just recorded when the raised goal reads awaiting_close", async () => {
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "PR #2188 is reviewed and merged", undefined, "agent", {
+          kind: "human",
+        });
+      // The stage crossing is what DATES the merge — `setWorkflowShipped` deliberately does not.
+      useRuntimeStore.getState().setWorkflowStage(callerId, "pull_request");
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+
+      fire({
+        reqId: "eACr",
+        op: "set_agent_escalation",
+        callerAgentId: CONCIERGE_CALLER_AGENT_ID,
+        payload: { targetAgentId: callerId, escalated: true, reason: "it is asking about your AWS keys" },
+      });
+      await flush();
+
+      const reply = lastReply() as {
+        escalated?: boolean;
+        goal?: { state?: string; escalationReason?: string };
+      };
+      // The raise TOOK — the latch is set, and the reply says so.
+      expect(reply).toMatchObject({ ok: true, escalated: true });
+      expect(goalOf(callerId)!.escalatedAt).toEqual(expect.any(Number));
+      // …and the derived state is the landed one, so this reply agrees with what the roster
+      // publishes for the same agent at the same moment rather than saying "escalated" alone.
+      expect(reply.goal?.state).toBe("awaiting_close");
+      // THE HALF THAT WOULD HAVE BEEN SILENTLY DROPPED.
+      expect(reply.goal?.escalationReason).toBe("it is asking about your AWS keys");
+    });
+
     it("undoing its OWN raise is free — it spends none of the allowance", async () => {
       useProjectStore.getState().setAgentGoal(projectId, callerId, "land the retry PR");
       useProjectStore.getState().conciergeEscalateAgentGoal(projectId, callerId, "raised by me", Date.now());
@@ -3701,6 +3979,43 @@ describe("controlListener", () => {
       // The clear DID happen — this is a successful op reporting an unsuccessful outcome.
       expect(lastReply()).toMatchObject({ ok: true, willResume: false, blockedBy: "goal-expired" });
       expect(goalOf(callerId)!.escalatedAt).toBeUndefined();
+    });
+
+    // ⚠️ ONE REPLY MUST NOT CONTRADICT ITSELF EITHER (roborev 66006). `resumeReading` computes
+    // `blockedBy` WITH the awaiting-close evidence and `goalReading` used to compute `goal.state`
+    // WITHOUT it, so this reply could return `{ goal: { state: "unmet" }, blockedBy:
+    // "goal-awaiting-close" }` — and the concierge branches on `goal.state`, so the loud half wins
+    // and it goes on chasing finished work. Same defect `get_state` had, in the other handler that
+    // publishes both facts. ASSERTED ON THE WIRE REPLY, because that is the object it lives in.
+    it("agrees with its OWN blockedBy about a landed goal awaiting a person's close", async () => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, callerId, "PR #2188 is reviewed and merged", undefined, "agent", {
+        kind: "human",
+      });
+      for (let i = 0; i < 20; i++) store.noteAgentGoalContinue(projectId, callerId, "stuck");
+      store.escalateAgentGoal(projectId, callerId, "three continues, no progress", Date.now());
+      // The stage crossing is what DATES the merge — `setWorkflowShipped` deliberately does not.
+      useRuntimeStore.getState().setWorkflowStage(callerId, "pull_request");
+      useRuntimeStore.getState().setWorkflowStage(callerId, "merged");
+      useRuntimeStore.getState().setWorkflowShipped(callerId, true);
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      useRuntimeStore.getState().setStatus(callerId, "idle");
+
+      clear("eAC", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      const reply = lastReply() as { blockedBy?: string; goal?: { state?: string } };
+      expect(reply).toMatchObject({ ok: true, willResume: false, blockedBy: "goal-awaiting-close" });
+      // THE HALF THAT USED TO DISAGREE.
+      expect(reply.goal?.state).toBe("awaiting_close");
     });
 
     // ── THE PREDICTION AND THE SWEEP MUST AGREE (roborev 65440, High) ────────────────────────────
@@ -3935,7 +4250,14 @@ describe("controlListener", () => {
       // A `human` goal ON PURPOSE. This is the population the founder was stuck on — work provable
       // by ancestry, behind a check only a person may discharge — so evidence must reach the
       // concierge for exactly the goals it cannot close on the agent's word.
-      expect(await rosterGoal("lv1")).toMatchObject({ state: "unmet", landed: true });
+      //
+      // ⚠️ THE STATE IS `awaiting_close`, NOT `unmet`, SINCE 2026-08-20 — and this fixture is not
+      // incidentally in that state, it IS that state's motivating row: a chosen human check over
+      // work git says merged after the goal was set. The expectation was updated rather than the
+      // fixture, because what this test is ABOUT is that `landed` rides along for a goal the agent
+      // cannot close, and that half is unchanged. A test left asserting `unmet` here would have been
+      // pinning the wrong-status reading the new state exists to end.
+      expect(await rosterGoal("lv1")).toMatchObject({ state: "awaiting_close", landed: true });
     });
 
     it("OMITS `landed` when no branch has been polled — absence is 'not looked up', never 'no'", async () => {

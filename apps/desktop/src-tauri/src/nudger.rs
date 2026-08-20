@@ -477,15 +477,7 @@ fn status_map<R: Runtime>(app: &AppHandle<R>) -> HashMap<String, AgentFacts> {
     crate::roster::merge(&guard)
         .into_iter()
         .flat_map(|p| p.agents)
-        .map(|a| {
-            let facts = AgentFacts {
-                goal_met: goal_is_met(a.goal_state.as_deref()),
-                status: a.status,
-                rollup_dot: a.rollup_dot.as_deref().and_then(nudge_ladder::intern_dot),
-                stage: a.workflow_stage.as_deref().and_then(nudge_ladder::intern_stage),
-            };
-            (a.id, facts)
-        })
+        .map(|a| (a.id.clone(), AgentFacts::from_slice(&a)))
         .collect()
 }
 
@@ -502,23 +494,127 @@ struct AgentFacts {
     stage: Option<&'static str>,
 }
 
-/// Is this agent's goal FINISHED? Only the exact tokens count.
+impl AgentFacts {
+    /// Project one roster slice onto the facts a tick needs.
+    ///
+    /// SPLIT OUT OF `status_map` SO THE GOAL-STATE HOP IS REACHABLE FROM A TEST (roborev 65977,
+    /// Medium). `status_map` needs an `AppHandle`, so nothing could drive the one line that turns
+    /// the published goal string into `goal_met` — the defaulted-seam shape AGENTS.md names:
+    /// delete that call and the whole suite stays green while the bug comes back. This is the
+    /// FIRST of the two hops between `goalStateOf` and the ladder; `observe` is the second, and
+    /// `the_goal_string_reaches_the_ladder_through_both_production_hops` covers them together.
+    fn from_slice(a: &crate::roster::RosterAgentSlice) -> Self {
+        Self {
+            goal_met: goal_is_quiet(a.goal_state.as_deref()),
+            status: a.status.clone(),
+            rollup_dot: a.rollup_dot.as_deref().and_then(nudge_ladder::intern_dot),
+            stage: a.workflow_stage.as_deref().and_then(nudge_ladder::intern_stage),
+        }
+    }
+}
+
+/// The goal states that leave the ladder NOTHING TO ASK. Membership is the contract; order is not.
 ///
-/// Free function so the tri-state is assertable. `None` is a window that predates the field and
-/// "unmet"/"expired"/"escalated"/"none" are all live goals — every one of them must read as NOT
-/// finished, because a false "finished" is the only reading here that can silence an agent that
-/// still needs help. `engine/agentGoal.ts::GoalState` is the vocabulary; a typo on either side reads
-/// as unfinished, which is the safe direction.
+/// These are three DIFFERENT claims that happen to share one consequence, which is exactly why the
+/// predicate below is `goal_is_quiet` and no longer `goal_is_met`: "met" is the agent's own word,
+/// "discharged" is git's, and "awaiting_close" is neither — it is a finished piece of work whose
+/// goal record is held open by a bookkeeping close only a person can perform. Reading the union of
+/// the three as "met" was a lie the moment the third joined.
+const QUIET_GOAL_STATES: [&str; 3] = ["met", "discharged", "awaiting_close"];
+
+/// …and the states that are LIVE: a goal still owed, where a nudge is precisely the right thing.
 ///
-/// ⚠️ "discharged" IS FINISHED TOO, and leaving it out was a live defect rather than an omission.
+/// Listed EXPLICITLY rather than left to the `_ => false` default, so that
+/// `goal_state_vocabulary_matches_the_frontend` can prove the classification is TOTAL over the
+/// frontend union. A state in neither list is a state nobody classified, and that is the shape the
+/// pin exists to catch — not a wrong answer, an unconsidered one.
+#[cfg(test)] // read only by the pin below; `goal_is_quiet` needs no live list
+const LIVE_GOAL_STATES: [&str; 4] = ["none", "unmet", "expired", "escalated"];
+
+/// Quiet tokens the frontend union does not carry YET, because the two halves land separately.
+///
+/// An entry here is a statement that the feature it guards is INERT until its TypeScript half
+/// lands — nothing publishes the token, so nothing can match it.
+///
+/// ── CLEANUP IS MANUAL, AND IT IS THE JOB OF WHOEVER MERGES THE TWO HALVES ─────────────────────
+/// Delete the entry in the merge that brings the TypeScript union in. Nothing enforces that, and
+/// nothing can: an assertion would be the merge-time red this list exists to avoid (below), and a
+/// printed note is worse than useless because libtest captures stderr for tests that PASS — it
+/// would be silent on the exact day it mattered (roborev 65989). So this comment IS the mechanism.
+///
+/// What a stale entry costs, stated so nobody has to guess: direction 2 of the pin stays blind to
+/// that ONE token, so if the frontend union later LOSES it, the phantom goes unreported. Direction
+/// 1 is unaffected and still catches every published state we do not classify. Dead weight with a
+/// small blind spot — not a hole, and not free either.
+///
+/// ── WHY THIS IS A SUBSET ALLOWANCE AND NOT AN EQUALITY ONE (roborev 65977, Medium) ────────────
+/// The first revision asserted this list was EXACTLY the difference, on the reasoning that the pin
+/// should fire at the seam. It bought NOTHING and cost real damage, and the arithmetic is worth
+/// writing down because it is not obvious:
+///
+///   * The dangerous case is the frontend landing a DIFFERENT SPELLING — `awaiting-close` — while
+///     we go on matching `awaiting_close`, shipping the feature inert with the suite green. That
+///     case is caught by the TOTALITY direction, which fails on `awaiting-close` being a published
+///     state nobody classified. Equality here is not what catches it.
+///   * The case equality DOES change is the frontend landing the token CORRECTLY: the difference
+///     goes empty, the lists stop being equal, and the test fails on a tree where both halves are
+///     right. GitHub tests a PR merged with the default branch, so that red lands on the sibling's
+///     TypeScript-only PR — a Rust test in a file it never touched — or, if the merges go the other
+///     way, on `main` itself until someone lands a follow-up.
+///   * The case NEITHER catches is the TS half never landing at all. Equality is green there too,
+///     since the difference still equals this list.
+///
+/// So equality only ever converted a correct tree into a red one. Containment keeps every failure
+/// the pin can actually detect and drops the one it manufactured.
+/// ⚠️ SPENT — EMPTY ON PURPOSE, and it must stay empty until another Rust half lands first.
+///
+/// It carried `"awaiting_close"` for exactly as long as the Rust stand-down was ahead of its
+/// TypeScript counterpart. Both halves are now on this branch — `agentGoal.ts::GoalState` publishes
+/// the token — so the allowance is spent and keeping it would cost a blind spot in the NO-PHANTOMS
+/// direction on the one token this pin most needs to watch.
+///
+/// The mechanism is kept rather than deleted because the situation recurs: a Rust half can always
+/// land before its TypeScript half, and this is the reviewable, one-line way to stay honest about
+/// it. Emptying it is the whole cleanup. As the pin's own comment records, nothing enforces this
+/// step — a stale entry reds nothing, which is exactly why it is called out here rather than left
+/// to a check that cannot exist.
+#[cfg(test)] // read only by the pin below; `goal_is_quiet` needs no live list
+const QUIET_GOAL_STATES_PENDING_FRONTEND: [&str; 0] = [];
+
+/// Does this agent's goal leave the ladder NOTHING TO ASK? Only the exact tokens count.
+///
+/// Free function so the tri-state is assertable. `None` is a window that predates the field, and
+/// every member of `LIVE_GOAL_STATES` is a goal still owed — all of them must read as NOT quiet,
+/// because a false "quiet" is the only reading here that can silence an agent that still needs
+/// help. `engine/agentGoal.ts::GoalState` is the vocabulary; a typo on either side reads as live,
+/// which is the safe direction.
+///
+/// ⚠️ "discharged" IS QUIET TOO, and leaving it out was a live defect rather than an omission.
 /// It is the terminal state `goalExpiry` writes when git PROVED the work landed and the tree is
 /// clean — a stronger claim than "met", which the agent asserts about itself. `useRosterPublisher`
 /// publishes `goalStateOf` verbatim, so a discharged goal arrived here as an unrecognised token,
 /// read as a live goal, and the agent was pinged to "resume your goal" over work git had already
 /// confirmed landed: the founder's fourteen-ping screenshot, reproduced on the new state. This is a
 /// VALUE enumeration over a string, so TypeScript could not flag it when the state was added.
-fn goal_is_met(goal_state: Option<&str>) -> bool {
-    matches!(goal_state, Some("met") | Some("discharged"))
+///
+/// ⚠️ "awaiting_close" IS THE NEXT INSTANCE OF THAT EXACT MECHANISM, for the exact same reason.
+/// Agent `d5d7056e` had MERGED work and a `{kind:"human"}` goal it had no lever to close. The
+/// ladder climbed `5+10+20+30+60+120` to `FIRST_NUDGE_RUNG` and demanded one of its seven tokens;
+/// the agent answered `blocked-on-human` — ACCURATE, it genuinely could not close the goal itself —
+/// and the row went RED. Two things were wrong with that and the fix addresses both: the ladder
+/// must not ping an agent whose work is landed, and "waiting on a bookkeeping close" must not
+/// render identically to "a human decision is blocking the work".
+///
+/// ⚠️ DO NOT READ THIS AS A LICENCE TO WIDEN. `awaiting_close` is admissible for one narrow
+/// reason: it is a GOAL-RECORD fact travelling the exact path `goal_met` already travels, exactly
+/// as `discharged` does. It is NOT a raw git fact. A general "skip any landed row" rule would
+/// violate the invariant `nudge_ladder` states at its `rollup_dot` field — frontend facts are
+/// trusted to RAISE a flag and NEVER to SUPPRESS one, because a wedged WebView freezes the roster
+/// and a suppressing rule would disarm this module in precisely the outage it was built for. That
+/// is why `obs.rollup_dot` and `obs.stage` are read only by `tick_unlanded_clock`, which can raise
+/// a concierge flag after thirty minutes and can never silence a nudge. Keep it that way.
+fn goal_is_quiet(goal_state: Option<&str>) -> bool {
+    goal_state.is_some_and(|s| QUIET_GOAL_STATES.contains(&s))
 }
 
 /// Start the nudger. Idempotent; safe to call more than once.
@@ -3019,29 +3115,361 @@ mod tests {
 
     // ══ THE GOAL FACT AND THE AGENT'S ANSWER ════════════════════════════════════════════════════
 
-    /// ONLY THE TWO FINISHED STATES READ AS DONE, and this is the one reading in the whole change
-    /// that can silence an agent that still needs help — so every other state is asserted explicitly
-    /// rather than left to a default. `expired` and `escalated` are the dangerous pair: both have
-    /// `metAt` unset and both describe UNFINISHED work, so an implementation that tested "not unmet"
-    /// would silence exactly the agents that most need a human.
+    /// ONLY THE EXPLICITLY QUIET STATES READ AS QUIET, and this is the one reading in the whole
+    /// change that can silence an agent that still needs help — so every other state is asserted
+    /// explicitly rather than left to a default. `expired` and `escalated` are the dangerous pair:
+    /// both have `metAt` unset and both describe UNFINISHED work, so an implementation that tested
+    /// "not unmet" would silence exactly the agents that most need a human.
     ///
-    /// `discharged` is the second finished state, and it is asserted here because it was MISSING —
-    /// a goal git proved landed read as live and the agent was nudged to resume it. The list is a
-    /// value enumeration over a string, so nothing but this test can catch the next such addition.
+    /// `discharged` is asserted here because it was MISSING — a goal git proved landed read as live
+    /// and the agent was nudged to resume it. `awaiting_close` is the next instance of that same
+    /// mechanism. The list is a value enumeration over a string, so nothing but this test and
+    /// `goal_state_vocabulary_matches_the_frontend` can catch the next such addition.
     #[test]
-    fn only_an_explicitly_finished_goal_reads_as_met() {
-        assert!(goal_is_met(Some("met")));
+    fn only_an_explicitly_quiet_goal_reads_as_quiet() {
+        assert!(goal_is_quiet(Some("met")));
         assert!(
-            goal_is_met(Some("discharged")),
+            goal_is_quiet(Some("discharged")),
             "discharged is git's own proof the work landed — a stronger claim than the agent's own"
         );
-        for live in ["unmet", "expired", "escalated", "none", "", "Met", "MET", "Discharged"] {
-            assert!(!goal_is_met(Some(live)), "{live:?} is not a finished goal");
+        assert!(
+            goal_is_quiet(Some("awaiting_close")),
+            "THE FROZEN TOKEN. `useRosterPublisher` publishes `goalStateOf` verbatim, so this exact \
+             spelling — lowercase, one underscore — is the entire cross-language contract"
+        );
+        // The near-miss spellings, because the contract is a string and nothing compiles it.
+        for live in [
+            "unmet",
+            "expired",
+            "escalated",
+            "none",
+            "",
+            "Met",
+            "MET",
+            "Discharged",
+            "awaiting-close",
+            "awaitingClose",
+            "awaiting_close ",
+            "AWAITING_CLOSE",
+            "closing",
+        ] {
+            assert!(!goal_is_quiet(Some(live)), "{live:?} is not a quiet goal");
         }
         assert!(
-            !goal_is_met(None),
-            "a window that predates the field publishes nothing — absence is never done"
+            !goal_is_quiet(None),
+            "a window that predates the field publishes nothing — absence is never quiet"
         );
+    }
+
+    /// One roster slice carrying a published goal state and nothing else of interest. Built by
+    /// DESERIALIZING, so the fixture is the wire shape rather than a hand-assembled struct — a
+    /// Rust `Option` crosses as `null` or as an absent key, never as `undefined`, and a fixture
+    /// that cannot express that is not testing what arrives.
+    fn slice_with_goal_state(goal_state: Option<&str>) -> crate::roster::RosterAgentSlice {
+        let published = match goal_state {
+            Some(g) => format!("\"{g}\""),
+            None => "null".to_string(),
+        };
+        serde_json::from_str(&format!(
+            r##"{{"id":"a1","name":"a1","kind":"build","status":"idle","status_color":"#000",
+                 "status_label":"x","goal_state":{published},"parent_id":null,
+                 "workflow_stage":null,"last_activity_at":null}}"##
+        ))
+        .expect("the roster slice fixture must deserialize")
+    }
+
+    /// An agent screen that unambiguously PERMITS a write, with an answer sitting unsent in the
+    /// live input box. Both halves matter: a refused screen makes "wrote nothing" true for a
+    /// reason unrelated to the goal, and rungs 4-6 press a bare Enter ONLY onto a prompt that
+    /// already holds text, so an empty box would do the same one rung band up.
+    fn writable_screen_with_typed_text() -> PtyObserver {
+        let o = observer();
+        o.ingest(
+            "\x1b[2J\x1b[H────────────────────────\r\n❯\u{a0}an unsent answer\r\n────────────────────────",
+        );
+        o
+    }
+
+    /// Drive the REAL ladder for an agent whose only distinguishing fact is its published goal
+    /// state, and return what the nudger would have DONE at each rung.
+    ///
+    /// ── THE POINT IS THE PRODUCTION SEAM, NOT THE PREDICATE ───────────────────────────────────
+    /// The string travels BOTH hops the app uses and neither is stubbed: the roster slice through
+    /// `AgentFacts::from_slice` (what `status_map` does), and that bool through `observe` (which
+    /// builds the `Observation` the ladder reads). An earlier revision called `goal_is_quiet`
+    /// inline and assigned the result straight to `Observation.goal_met`, which meant `observe`
+    /// could have dropped the flag entirely with all three tests still green — the exact
+    /// "defaulted seam, production call site untested by construction" shape (roborev 65977).
+    ///
+    /// ONE observation is reused for every look on purpose: an unchanging `hash` IS an agent
+    /// producing no output, which is what climbing the ladder means.
+    fn ladder_run_for_goal(
+        goal_state: Option<&str>,
+        looks: usize,
+    ) -> Vec<(Action, Option<nudge_ladder::Escalation>)> {
+        let o = writable_screen_with_typed_text();
+        let facts = AgentFacts::from_slice(&slice_with_goal_state(goal_state));
+        let obs = observe(&o, &facts.status, facts.goal_met, None, None, now_ms(), None);
+
+        // PRECONDITIONS, asserted rather than assumed. Each one is a way this test could go green
+        // for a reason that has nothing to do with the goal state under test.
+        assert_eq!(obs.refusal, None, "precondition: the screen must permit a write");
+        assert!(obs.prompt_has_text, "precondition: rungs 4-6 need text in the live box");
+        assert!(!obs.working, "precondition: the agent must read as idle, not mid-turn");
+        assert!(!obs.answerable, "precondition: no picker for the ladder to answer instead");
+        assert_eq!(
+            obs.since_other_write_ms,
+            u64::MAX,
+            "precondition: nobody else has typed, so no interlock stands the ladder down"
+        );
+
+        let mut state = AgentState::default();
+        (0..looks)
+            .map(|_| {
+                let d = nudge_ladder::step(&mut state, &obs);
+                (d.action, d.flagged)
+            })
+            .collect()
+    }
+
+    /// THE TWO HOPS, PINNED INDIVIDUALLY. `ladder_run_for_goal` proves they compose; this proves
+    /// each one carries the fact, so a break localises instead of showing up as "the ladder went
+    /// quiet". Every pre-existing `observe` test passes `false` here, so nothing else in this
+    /// module ever asserted that the flag is forwarded at all.
+    #[test]
+    fn the_goal_string_reaches_the_ladder_through_both_production_hops() {
+        // Hop 1 — roster slice → `AgentFacts`, the line `status_map` runs per agent.
+        for quiet in ["met", "discharged", "awaiting_close"] {
+            assert!(
+                AgentFacts::from_slice(&slice_with_goal_state(Some(quiet))).goal_met,
+                "{quiet:?} must survive the roster projection"
+            );
+        }
+        for live in [Some("unmet"), Some("escalated"), Some("awaiting-close"), None] {
+            assert!(
+                !AgentFacts::from_slice(&slice_with_goal_state(live)).goal_met,
+                "{live:?} must survive the roster projection as a LIVE goal"
+            );
+        }
+
+        // Hop 2 — `observe` must forward it, in both directions.
+        let o = writable_screen_with_typed_text();
+        assert!(
+            observe(&o, "idle", true, None, None, now_ms(), None).goal_met,
+            "observe dropped a quiet goal on the floor"
+        );
+        assert!(
+            !observe(&o, "idle", false, None, None, now_ms(), None).goal_met,
+            "observe manufactured a quiet goal out of a live one"
+        );
+    }
+
+    /// THE WRITE, NOT THE PREDICATE (agent `d5d7056e`).
+    ///
+    /// An `awaiting_close` agent must climb the WHOLE ladder and have zero bytes delivered to it:
+    /// no bare Enter at rungs 4-6, no nudge string at rung 7+, and no flag raised at any rung. A
+    /// test on `goal_is_quiet` alone passes for a change that is wired up to nothing, which is
+    /// exactly how a cross-language value enumeration ships inert.
+    #[test]
+    fn an_awaiting_close_agent_climbs_the_whole_ladder_and_is_never_written_to() {
+        // Well past `FIRST_NUDGE_RUNG` (6) and past both escalation thresholds.
+        let quiet = ladder_run_for_goal(Some("awaiting_close"), 14);
+        assert_eq!(quiet.len(), 14, "precondition: the ladder was actually driven");
+        for (i, (action, flagged)) in quiet.iter().enumerate() {
+            assert_eq!(
+                *action,
+                Action::Observe,
+                "rung {} wrote to an agent whose work is landed and whose goal only awaits a \
+                 bookkeeping close",
+                i + 1
+            );
+            assert!(flagged.is_none(), "rung {} raised a flag on a quiet goal", i + 1);
+        }
+    }
+
+    /// THE PAIRED NEGATIVE, and it is not optional: without it "writes nothing" also passes for a
+    /// ladder that is broken and never writes at all. Same rungs, same screen, same everything —
+    /// only the goal state differs.
+    #[test]
+    fn the_same_agent_with_a_live_goal_still_reaches_the_nudge_rung() {
+        let live = ladder_run_for_goal(Some("unmet"), 14);
+        assert!(
+            live.iter().any(|(a, _)| *a == Action::Enter),
+            "rungs 4-6 must still press a bare Enter for a live goal, got {live:?}"
+        );
+        assert!(
+            live.iter().any(|(a, _)| matches!(a, Action::Nudge { .. })),
+            "rung 7+ must still type the nudge string for a live goal, got {live:?}"
+        );
+        assert!(
+            live.iter().any(|(_, f)| f.is_some()),
+            "a live goal that never answers must still escalate, got {live:?}"
+        );
+    }
+
+    /// `met` and `discharged` KEEP THEIR BEHAVIOUR — the fix must not be a rewrite of the two
+    /// states that already worked. And the two directions that must stay UNSAFE-SIDE: an
+    /// unrecognised token and an absent field both keep the full ladder, because a typo on either
+    /// side of a string contract must fail towards nudging rather than towards silence.
+    #[test]
+    fn the_established_quiet_states_still_write_nothing_and_unknown_ones_still_nudge() {
+        for quiet in ["met", "discharged"] {
+            let run = ladder_run_for_goal(Some(quiet), 14);
+            assert!(
+                run.iter().all(|(a, _)| *a == Action::Observe),
+                "{quiet:?} regressed — the ladder wrote to it"
+            );
+        }
+        for live in [Some("awaiting-close"), Some("closing"), Some(""), None] {
+            let run = ladder_run_for_goal(live, 14);
+            assert!(
+                run.iter().any(|(a, _)| matches!(a, Action::Nudge { .. })),
+                "{live:?} is not a state we recognise, so it must keep the full ladder"
+            );
+        }
+    }
+
+    /// ══ THE CROSS-LANGUAGE PIN ═══════════════════════════════════════════════════════════════
+    ///
+    /// The twin of `nudge_ladder::stage_vocabulary_matches_the_frontend` and
+    /// `dot_vocabulary_matches_the_frontend`, for the third string vocabulary that crosses this
+    /// seam with no compile-time check on either side. That is not a hypothetical hazard here: it
+    /// is precisely what produced the `discharged` defect — `goalStateOf` published a state Rust
+    /// did not recognise, it read as a live goal, and an agent was nudged over landed work.
+    ///
+    /// TWO DIRECTIONS, and they catch different failures:
+    ///
+    ///   1. TOTALITY — every state the frontend can publish must be classified here, quiet or live.
+    ///      This is the direction `discharged` fell through, and the only one that can silence a
+    ///      real defect. An unclassified state is not a wrong answer, it is an unconsidered one.
+    ///   2. NO PHANTOMS — every token we classify must exist in the union, except the ones NAMED in
+    ///      `QUIET_GOAL_STATES_PENDING_FRONTEND`, which is how a Rust half that lands before its
+    ///      TypeScript half stays honest: the exception is one line, spelled out, and reviewable.
+    ///      An unnamed phantom is a spelling the frontend will never publish, so whatever it guards
+    ///      is inert. Direction 1 is what catches a MISSPELLED counterpart; see that const's own
+    ///      comment for why asserting equality here caught nothing extra and reddened correct
+    ///      trees, and why cleaning up a spent allowance is a manual step rather than a check.
+    #[test]
+    fn goal_state_vocabulary_matches_the_frontend() {
+        let ts = std::fs::read_to_string("../src/engine/agentGoal.ts")
+            .expect("engine/agentGoal.ts must be readable from the crate root");
+        let union = ts
+            .split_once("export type GoalState =")
+            .expect("agentGoal.ts must declare GoalState")
+            .1
+            .split_once(';')
+            .expect("the GoalState union must be terminated by `;`")
+            .0;
+        // ⚠️ STRIP COMMENTS BEFORE SPLITTING ON `|`, and this is load-bearing rather than tidy.
+        // The union INTERLEAVES doc comments between its members:
+        //
+        //     | "escalated"
+        //     /** THE WORK IS DONE AND ONLY A PERSON MAY CLOSE THE GOAL. … */
+        //     | "awaiting_close";
+        //
+        // A naive split glues the comment onto the PRECEDING member, so `escalated` parses as
+        // `escalated"\n  /** … */` — a token that matches nothing in either list and trips the
+        // TOTALITY assertion with a wall of prose, while the member the comment describes parses
+        // fine. The failure therefore names the WRONG state, which is worse than not firing.
+        //
+        // It was invisible until both halves of `awaiting_close` met: the Rust half was written
+        // against a union that had no interleaved comment, so nothing here ever saw one. That is
+        // the exact class this pin exists for — a disagreement only observable after the merge —
+        // and it surfaced by firing on itself the moment the two sides were put together.
+        let uncommented = {
+            let mut out = String::with_capacity(union.len());
+            let mut rest = union;
+            while let Some((before, after)) = rest.split_once("/*") {
+                out.push_str(before);
+                out.push(' '); // never let a comment fuse its neighbours into one token
+                match after.split_once("*/") {
+                    Some((_, tail)) => rest = tail,
+                    // Unterminated: the remainder is comment, so there is nothing left to keep.
+                    None => {
+                        rest = "";
+                        break;
+                    }
+                }
+            }
+            out.push_str(rest);
+            out
+        };
+        let uncommented: String = uncommented
+            .lines()
+            .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let from_ts: Vec<&str> = uncommented
+            .split('|')
+            .map(|s| s.trim().trim_matches('"'))
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(!from_ts.is_empty(), "parsed an EMPTY GoalState union — the pin cannot be vacuous");
+        // The parse must yield BARE TOKENS. Without this a future comment style that survives the
+        // stripping above degrades the pin into comparing prose, and the TOTALITY direction would
+        // report a mangled member instead of the missing one it exists to name.
+        //
+        // A HYPHEN IS ALLOWED DELIBERATELY. It is a legitimate spelling for a union member, and
+        // rejecting it here would make this guard — which is about PARSER health — pre-empt the two
+        // directions that are about VOCABULARY agreement. A misspelling like `awaiting-close` must
+        // be caught by NO PHANTOMS, whose message names the token and says what is inert; catching
+        // it here instead reports "the union's punctuation outran the parser", which is true of
+        // nothing and sends the reader to fix the wrong thing.
+        for t in &from_ts {
+            assert!(
+                t.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c == '-'),
+                "parsed {t:?} out of the GoalState union — not a bare token, so the union's \
+                 punctuation or comment style has outrun this parser. Fix the stripping above \
+                 rather than loosening this check; a pin that compares prose classifies nothing."
+            );
+        }
+
+        let ours: Vec<&str> =
+            QUIET_GOAL_STATES.iter().chain(LIVE_GOAL_STATES.iter()).copied().collect();
+
+        // 1. TOTALITY.
+        let unclassified: Vec<&str> =
+            from_ts.iter().copied().filter(|s| !ours.contains(s)).collect();
+        assert!(
+            unclassified.is_empty(),
+            "agentGoal.ts::GoalState publishes {unclassified:?}, which `goal_is_quiet` classifies \
+             as neither quiet nor live. An unclassified state reads as LIVE by default, which is \
+             how a finished agent gets nudged over landed work — put each one in \
+             QUIET_GOAL_STATES or LIVE_GOAL_STATES deliberately."
+        );
+
+        // 2. NO PHANTOMS.
+        let unpinned: Vec<&str> = ours
+            .iter()
+            .copied()
+            .filter(|s| !from_ts.contains(s))
+            .filter(|s| !QUIET_GOAL_STATES_PENDING_FRONTEND.contains(s))
+            .collect();
+        assert!(
+            unpinned.is_empty(),
+            "`goal_is_quiet` matches {unpinned:?}, which agentGoal.ts::GoalState does not publish. \
+             Nothing can ever send those tokens, so whatever they guard is INERT. Either fix the \
+             spelling, or — if the TypeScript half is genuinely still in flight — name each one in \
+             QUIET_GOAL_STATES_PENDING_FRONTEND so the exception is reviewable rather than silent."
+        );
+
+        // A pending entry may only ever excuse a QUIET token. Excusing a live one would let a state
+        // the frontend does publish sit unpinned in the direction that matters.
+        for t in QUIET_GOAL_STATES_PENDING_FRONTEND {
+            assert!(
+                QUIET_GOAL_STATES.contains(&t),
+                "{t:?} is pending the frontend but is not in QUIET_GOAL_STATES"
+            );
+        }
+
+        // NO "the allowance is spent" CHECK LIVES HERE, and that is a decision rather than an
+        // omission (roborev 65989, Medium). An earlier revision printed a note when a pending token
+        // had since appeared in the union; libtest CAPTURES stderr for tests that PASS, so on the
+        // one day it mattered nobody would ever have seen it — an inert mechanism presented as a
+        // safety net, which is worse than an acknowledged manual step. The only observable
+        // alternative is an assertion, and that is the merge-time red this direction was relaxed to
+        // remove. So cleanup is MANUAL and the const says so in its own comment.
     }
 
     /// AN UNOBSERVED AGENT KEEPS THE FULL LADDER. An agent missing from the roster has no goal fact

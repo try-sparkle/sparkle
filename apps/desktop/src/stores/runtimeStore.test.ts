@@ -135,13 +135,58 @@ describe("runtimeStore — persist + reconcile ()", () => {
 });
 
 describe("runtimeStore branch status", () => {
-  it("pollBranchStatus stores the fetched status", async () => {
-    const useRuntimeStore = await freshStore();
+  /** A fixed spawn stamp, so nothing below depends on the wall clock. */
+  const SPAWN_MS = 1_760_000_000_000;
+
+  /** A project + agent in the SAME module graph the runtime store reads from, since
+   *  `pollBranchStatus` looks the agent up in `useProjectStore` to find its spawn stamp. */
+  const seedAgent = async (over: { createdAt?: number } = {}) => {
+    const { runtime, projects } = await freshModules();
+    const projectId = projects.useProjectStore.getState().addProject("Demo", "/root");
+    const agentId = projects.useProjectStore
+      .getState()
+      .addAgent(projectId, { kind: "build", ...over })!;
+    // `pollBranchStatus` also fans out to the workflow refresh; give it a benign answer so these
+    // cases assert on the status call alone.
+    agentWorkflowState.mockResolvedValue({
+      inLocalMain: false, inOriginMain: false, inParent: false, aheadOfBase: 0,
+      prState: null, prNumber: null, prUrl: null,
+    });
+    return { store: runtime.useRuntimeStore, projects, projectId, agentId };
+  };
+
+  it("pollBranchStatus stores the fetched status and carries the agent's spawn stamp", async () => {
+    const { store, projectId, agentId } = await seedAgent({ createdAt: SPAWN_MS });
     const s = { ahead: 1, behind: 3, dirty: false, filesChanged: 2, insertions: 9, deletions: 1 };
     agentBranchStatus.mockResolvedValue(s);
-    await useRuntimeStore.getState().pollBranchStatus("/root", "p1", "a1", "main");
-    expect(useRuntimeStore.getState().branchStatus["a1"]).toEqual(s);
-    expect(agentBranchStatus).toHaveBeenCalledWith("/root", "p1", "a1", "main");
+    await store.getState().pollBranchStatus("/root", projectId, agentId, "main");
+    expect(store.getState().branchStatus[agentId]).toEqual(s);
+    // THE STAMP IS THE POINT, not just the four positional args. Rust compares each dirty file's
+    // mtime against it for `dirtySinceAgentCount`, and its guard is deliberately permissive — a
+    // missing stamp is a valid silent `null` — so a lookup that quietly stopped working would leave
+    // this path's attribution off forever with nothing failing (the "defaulted seam" shape).
+    expect(agentBranchStatus).toHaveBeenCalledWith("/root", projectId, agentId, "main", SPAWN_MS);
+  });
+
+  it("pollBranchStatus sends undefined for a row with NO spawn stamp, rather than inventing one", async () => {
+    const { store, projects, projectId, agentId } = await seedAgent();
+    // A re-adopted worker and every legacy persisted row genuinely read `createdAt: undefined`
+    // (projectStore.spawnStamp.test.ts pins that `adoptWorker` deliberately does not stamp), so
+    // strip it here rather than testing a shape that cannot occur.
+    projects.useProjectStore.setState((st) => ({
+      projects: st.projects.map((pr) =>
+        pr.id === projectId
+          ? { ...pr, agents: pr.agents.map(({ createdAt: _drop, ...rest }) => rest) }
+          : pr,
+      ),
+    }));
+    agentBranchStatus.mockResolvedValue({
+      ahead: 0, behind: 0, dirty: true, filesChanged: 0, insertions: 0, deletions: 0,
+    });
+    await store.getState().pollBranchStatus("/root", projectId, agentId, "main");
+    // …and the PAIR is what pins the split: a wiring that always sent `undefined` would satisfy
+    // this case alone, and the stamped case above is what refuses it.
+    expect(agentBranchStatus).toHaveBeenCalledWith("/root", projectId, agentId, "main", undefined);
   });
 
   it("pollBranchStatus swallows errors (no throw, no store change)", async () => {
@@ -1251,6 +1296,62 @@ describe("workflowShippedAt — the date on the merge, not on the first latch", 
     store.getState().setWorkflowStage("a4", "building_saved");
     store.getState().setWorkflowStage("a4", "merged_local");
     expect(store.getState().workflowShippedAt["a4"]).toBeUndefined();
+  });
+
+  // ── THE CROSSING AN ADOPTED NESTED BRANCH PRODUCES (bead `sparkle-d5muhf`) ────────────────────
+  //
+  // The three tests above drive `setWorkflowStage` by hand. This one drives it the way the poll
+  // does — through `deriveLiveStage` — for the agent shape the adoption feature exists for: its OWN
+  // branch carries nothing and was never pushed, while a worktree nested inside its checkout holds
+  // the work, and that work has now merged.
+  //
+  // Rust supplies `pushed` and `inOriginMain` by adopting that nested branch (see the Rust test
+  // `adopting_a_landed_nested_branch_supplies_the_signals_that_reach_merged`, which pins that the
+  // agent's own branch alone yields `pushed: false`). The claim being proved HERE is the last link:
+  // those signals really do carry the row across into `merged`, so `workflowShippedAt` is stamped.
+  it("stamps the crossing an adopted, landed nested branch produces", async () => {
+    const store = await freshStore();
+    const { deriveLiveStage } = await import("../engine/workflowStage");
+
+    // Poll 1 — before the nested branch landed. Nothing adopted has landed, so the row sits at the
+    // build start line and there is a PREVIOUS stage for the crossing to be measured against.
+    const before = deriveLiveStage({
+      kind: "build",
+      bs: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+      ws: {
+        inLocalMain: false,
+        inOriginMain: false,
+        inParent: false,
+        aheadOfBase: 0,
+        prState: null,
+        prNumber: null,
+        prUrl: null,
+      },
+    });
+    store.getState().setWorkflowStage("nested1", before);
+    expect(store.getState().workflowShippedAt["nested1"]).toBeUndefined();
+
+    // Poll 2 — the nested branch is now an ancestor of origin/main and its remote-tracking ref
+    // exists. `bs.ahead` is STILL 0: the row's own branch never carried any of this.
+    const after = deriveLiveStage({
+      kind: "build",
+      bs: { ahead: 0, behind: 0, dirty: false, filesChanged: 0, insertions: 0, deletions: 0 },
+      ws: {
+        inLocalMain: true,
+        inOriginMain: true,
+        inParent: false,
+        aheadOfBase: 0,
+        pushed: true,
+        prState: null,
+        prNumber: null,
+        prUrl: null,
+      },
+      pushed: true,
+      prev: before,
+    });
+    expect(after).toBe("merged");
+    store.getState().setWorkflowStage("nested1", after);
+    expect(store.getState().workflowShippedAt["nested1"]).toEqual(expect.any(Number));
   });
 });
 

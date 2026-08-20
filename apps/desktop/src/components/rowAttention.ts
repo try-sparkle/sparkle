@@ -25,6 +25,7 @@
 // `isStalled` deliberately renders no alarm for it.
 import {
   type AgentGoal,
+  type AwaitingCloseEvidence,
   goalRemainingMs,
   goalStateOf,
   escalationQuotesStaleText,
@@ -116,6 +117,15 @@ export function stallInputsFor(
   // of the agent's own answer about what is blocking it (`engine/humanBlock`). Not git evidence, so
   // not a member of `RowGitEvidence`; passed in, so this stays pure.
   humanBlock?: HumanBlock,
+  // Same reasoning again, from a third ledger: whether git says this agent's work already shipped
+  // FOR THIS GOAL (`services/agentGoalReading.awaitingCloseEvidenceFor`). Not git evidence in the
+  // `RowGitEvidence` sense — it is a comparison of the merge watermark against `goal.setAt` — and
+  // passed in so this stays pure.
+  //
+  // ⚠️ EVERY CALLER MUST SUPPLY IT, and the sidebar is the one that matters: this builder feeds the
+  // DOT the founder actually watches, so a caller that omits it leaves that row red while the
+  // control surfaces (which get it via `stallReadingFor`) call the same agent done.
+  awaitingClose?: AwaitingCloseEvidence,
 ): StallInput {
   return {
     status,
@@ -123,6 +133,7 @@ export function stallInputsFor(
     goal,
     ...(quotaBlock ? { quotaBlock } : {}),
     ...(humanBlock ? { humanBlock } : {}),
+    ...(awaitingClose ? { awaitingClose } : {}),
     hasOpenPr: openPrEvidence(ev.ws),
     hasUnlandedWork: unlandedEvidence(ev),
     hasUncommittedChanges: uncommittedEvidence(ev.bs),
@@ -147,6 +158,12 @@ export const STALL_CAUSE_LABEL: Record<StallCause, string> = {
   // left, so this names a task he does at his leisure — "awaiting", not "needs" — because the cause
   // is amber "awaiting review-close", not the red "a human is blocking this" it used to be.
   "human-verified-goal": "awaiting your sign-off",
+  // SAYS FINISHED FIRST. "needs your sign-off" was the wording this replaces and it is exactly
+  // wrong for this row: the reader's glance has to come away with "that one is done", and a chip
+  // that leads with a demand reads as a row that is stuck on him. It is also NOT
+  // "awaiting your sign-off" (the chip one line up) — a sign-off is a verdict on work he must
+  // assess, and this work is already on the default branch. All that is left is the click.
+  "awaiting-close": "done — awaiting your close",
   "escalated-goal": "auto-continue gave up",
   "unmet-goal": "goal unmet",
   "expired-goal": "goal expired",
@@ -206,20 +223,33 @@ export const STALL_CAUSE_RANK: Record<StallCause, number> = {
   // used to lead this whole list. It still ranks above the plain lifecycle causes below because it
   // names a task addressed to HIM (his sign-off) rather than work another actor finishes.
   "human-verified-goal": 3,
+  // NEVER RED, and BELOW EVERY RED CAUSE — the placement is the whole point rather than a detail.
+  // This map picks the chip's HEAD, and the dot is picked by `stallEscalation` from the same cause
+  // list; rank a calm cause above a red one and the row renders a red dot beside a chip reading
+  // "done — awaiting your close", which is the colour-vs-copy split this branch exists to close,
+  // inverted. (That is not hypothetical: it is roborev 65642's finding about `human-verified-goal`
+  // one line up, and this cause is reachable alongside `abandoned-goal` and `rearms-exhausted` on
+  // one row exactly as that one is.)
+  //
+  // IMMEDIATELY BELOW `human-verified-goal` because it addresses HIM the same way, and above the
+  // plain lifecycle causes for the same reason that one is: the remaining task is his, not another
+  // actor's. Below it, not above, because it asks for strictly less — a close on proven-landed work
+  // rather than a verdict on work still to be assessed.
+  "awaiting-close": 4,
   // NEVER RED. The four below are `stallEscalation.LIFECYCLE` → the amber `lapsed` status; they were
   // in the RED group until 2026-08-07 and moved together (see OUTSTANDING for who clears each). Their
   // relative order is unchanged — it is a genuine actionability ordering among things somebody else
   // will do, and `uncommitted-changes` stays last of them for the same reason it always did.
-  "unmet-goal": 4,
-  "open-pr": 5,
-  "unlanded-work": 6,
-  "uncommitted-changes": 7,
+  "unmet-goal": 5,
+  "open-pr": 6,
+  "unlanded-work": 7,
+  "uncommitted-changes": 8,
   // `escalated-goal` is LIFECYCLE too, and sorts BELOW the work causes: it says our retry budget ran
   // out, which is the quietest thing on this list. `expired-goal` is in NEITHER engine set → calm
   // gray. Do not "keep them in step" by adding expiry to LIFECYCLE; that module's own ⚠️ block
   // explains at length why it must stay out.
-  "escalated-goal": 8,
-  "expired-goal": 9,
+  "escalated-goal": 9,
+  "expired-goal": 10,
 };
 
 /** What a stalled row renders. `text` is the VISIBLE reading and it is the CAUSE, not the word
@@ -391,8 +421,16 @@ export interface GoalBadge {
   staleQuote?: string;
 }
 
-export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadge | null {
-  const state = goalStateOf(goal, now);
+export function goalBadgeFor(
+  goal: AgentGoal | undefined,
+  now: number,
+  // Optional for the same reason `goalReading`'s twin of this parameter is: a caller with no
+  // evidence renders exactly what it rendered before. A caller that HAS it must pass it — the goal
+  // chip and the stall chip sit on the same row, and a badge reading "auto-continue gave up" beside
+  // a chip reading "done — awaiting your close" is the colour-vs-copy split in one glance.
+  awaiting?: AwaitingCloseEvidence,
+): GoalBadge | null {
+  const state = goalStateOf(goal, now, awaiting);
   if (goal === undefined || state === "none") return null;
   switch (state) {
     case "unmet":
@@ -420,6 +458,17 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
         label: goal.dischargedSha
           ? `finished — ${goal.dischargedSha.slice(0, 7)} landed on main`
           : "finished — the work landed on main",
+      };
+    case "awaiting_close":
+      // Worded like `discharged` above, not like `escalated`: both describe finished work, and the
+      // only difference is who supplies the closing act. NOT green-ink "finished" though — see
+      // `rowAttentionChrome.GOAL_CHIP_COLOR`, where this state is amber because the goal is still
+      // open and success ink would say the click had already happened.
+      return {
+        state,
+        text: goal.text,
+        escalated: false,
+        label: "the work landed — awaiting a person's close",
       };
     case "expired":
       // Deliberately NOT worded as "done". An expired goal is unfinished work whose auto-continue

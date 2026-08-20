@@ -81,6 +81,7 @@ import { thrashReportFor } from "../../engine/agentThrash";
 import { quotaBlockForAgent } from "../../engine/engineRegistry";
 import { hasUnmetGoal } from "../../engine/agentGoal";
 import { goalBadgeFor, stallInputsFor } from "../rowAttention";
+import { awaitingCloseEvidenceFor } from "../../services/agentGoalReading";
 import { humanBlockIn } from "../../services/humanBlockFor";
 import { useNudgeFlagSnapshot } from "../../useNudgeFlags";
 import { pendingCount, useAgentInbox } from "../../stores/inboxStore";
@@ -147,6 +148,16 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
   const bs = useRuntimeStore((s) => s.branchStatus[agentId]);
   const ws = useRuntimeStore((s) => s.workflowState[agentId]);
   const stageOverride = useRuntimeStore((s) => s.workflowStage[agentId]);
+  // Subscribed to drive the recompute below, exactly as `AgentRow` does: the merge watermark is what
+  // makes `awaiting_close` reachable, and a composer pill that lags the row's chip is the
+  // cross-surface divergence every comment in this block is guarding against.
+  // ⚠️ OPTIONAL-CHAINED, and not defensively for its own sake. Several suites mock `useRuntimeStore`
+  // with a partial state that predates these two maps, so a bare index throws inside the selector and
+  // takes the whole component down — 72 tests across four files, none of them about goals. Every
+  // other reader of these maps (`landedEvidenceFor`, `shippedAfterGoalSet`) already chains for the
+  // same reason: an absent map means "not looked up", which is a real answer here.
+  const shipped = useRuntimeStore((s) => s.workflowShipped?.[agentId]);
+  const shippedAt = useRuntimeStore((s) => s.workflowShippedAt?.[agentId]);
   const goal = useProjectStore(
     (s) => s.projects.flatMap((p) => p.agents).find((a) => a.id === agentId)?.goal,
   );
@@ -195,8 +206,19 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
         { bs, ws, stageOverride },
         quota,
         humanBlockIn(nudgeFlags, agentId),
+        // …and the third input, so this surface can emit `stall:awaiting-close` at all. Omitting it
+        // would leave that pill's explainer copy unreachable while the row's chip already said
+        // "done — awaiting your close" — the same unreachable-explainer defect roborev 65339 caught
+        // one cause over.
+        awaitingCloseEvidenceFor(agentId, goal),
       ),
     );
+    // Referenced so the two subscriptions above are not read as unused — they exist to drive this
+    // recompute, whose evidence is read from the store rather than passed in.
+    // REACTIVITY ANCHORS, not dead code — `awaitingCloseEvidenceFor` reads the watermark from the
+    // store rather than taking it as an argument, so these are what put it in this memo's deps.
+    void shipped;
+    void shippedAt;
     return agentNotices({
       thrash,
       ...(isStalled(stall) ? { stall } : {}),
@@ -207,9 +229,11 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
       // THE GOAL, which the ROW does not pass (its own chip is that mark) and this surface must.
       // The founder's second scope addition: clicking the row's blue target or red octagon opens
       // the pill that says what it means, and the pill has to exist for that click to land on.
-      goal: goalBadgeFor(goal, now),
+      // With the evidence, same reason as the stall input above: the composer's goal pill and its
+      // stall pill sit in the same row and must not describe the agent differently.
+      goal: goalBadgeFor(goal, now, awaitingCloseEvidenceFor(agentId, goal)),
     });
-  }, [agentId, now, goal, status, bs, ws, stageOverride, pending, entries, nudgeFlags]);
+  }, [agentId, now, goal, status, bs, ws, stageOverride, shipped, shippedAt, pending, entries, nudgeFlags]);
 
   // ── WHICH PILL IS OPEN ───────────────────────────────────────────────────────────────────────
   // One at a time: two open explainers push the composer down twice as far, and the pill row sits

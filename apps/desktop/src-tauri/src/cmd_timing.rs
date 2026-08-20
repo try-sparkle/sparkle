@@ -437,7 +437,6 @@ mod main_thread_guard {
         "chief_pat_secure_set",
         "claude_chat_cancel",
         "clear_window_roster",
-        "concierge_cancel",
         "concierge_guidelines_path",
         "concierge_lint_log",
         "config_file_paths",

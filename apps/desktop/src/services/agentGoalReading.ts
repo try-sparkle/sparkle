@@ -18,8 +18,10 @@ import {
   escalationQuotesStaleText,
   goalRemainingMs,
   goalStateOf,
+  escalationFieldsApply,
   hasUnmetGoal,
   type AgentGoal,
+  type AwaitingCloseEvidence,
   type GoalState,
 } from "../engine/agentGoal";
 import { describeGoalVerify } from "@sparkle/core";
@@ -42,8 +44,15 @@ import type { AgentTabStatus } from "../types";
  *  along because "auto-continued 19 times" is the sentence that explains an imminent escalation. */
 export interface GoalReading {
   text: string;
-  /** `goalStateOf` at the clock passed in — "unmet" | "met" | "expired" | "escalated". Never
-   *  "none": this whole object is ABSENT when there is no goal (see {@link goalReading}). */
+  /** `goalStateOf` at the clock passed in — "unmet" | "met" | "discharged" | "expired" |
+   *  "escalated" | "awaiting_close". Never "none": this whole object is ABSENT when there is no goal
+   *  (see {@link goalReading}).
+   *
+   *  ⚠️ `awaiting_close` IS ONLY REACHABLE WHEN THE CALLER SUPPLIES EVIDENCE, and a caller that does
+   *  must supply it to the STALL reading too. `controlListener.goalAndStallFields` publishes this
+   *  object beside `stallCauses` and `resume.blockedBy` in ONE payload the concierge branches on, so
+   *  a `state: "escalated"` next to `stallCauses: ["awaiting-close"]` is a self-contradiction no
+   *  reader can resolve (roborev 65987). */
   state: Exclude<GoalState, "none">;
   /** Milliseconds until the TTL runs out; 0 once it has. */
   remainingMs: number;
@@ -51,8 +60,9 @@ export interface GoalReading {
   continues: number;
   /** Auto-continues spent on this goal ever — the bound that survives a flapping progress mark. */
   totalContinues: number;
-  /** Present ONLY when `state === "escalated"`: why auto-continue gave up, for the human who now
-   *  owns it. */
+  /** Present ONLY when the goal actually escalated — `state === "escalated"`, OR `awaiting_close`
+   *  layered over a set `escalatedAt` latch: why auto-continue gave up, for the human who now owns
+   *  it. Keyed on the LATCH rather than on the derived state, so a live goal can never carry it. */
   escalationReason?: string;
   /**
    * `true` when {@link escalationReason} QUOTES A GOAL THIS AGENT NO LONGER HOLDS. Absent otherwise
@@ -95,9 +105,16 @@ export interface GoalReading {
  * agents costs nothing to say so. (This is also why `state` excludes "none": if you are holding one
  * of these, there IS a goal.)
  */
-export function goalReading(goal: AgentGoal | undefined, now: number): GoalReading | undefined {
+export function goalReading(
+  goal: AgentGoal | undefined,
+  now: number,
+  // OPTIONAL, and absence means the record-only state — the same direction the engine takes. A
+  // caller with no evidence in hand publishes exactly what it published before; a caller that has it
+  // must pass it, or its own `stall` field will disagree with this one. See {@link GoalReading.state}.
+  awaiting?: AwaitingCloseEvidence,
+): GoalReading | undefined {
   if (goal === undefined) return undefined;
-  const state = goalStateOf(goal, now);
+  const state = goalStateOf(goal, now, awaiting);
   // Unreachable for a defined goal — `goalStateOf` returns "none" only for `undefined` — but the
   // implication lives in another module, so it is restated rather than cast away.
   if (state === "none") return undefined;
@@ -109,7 +126,18 @@ export function goalReading(goal: AgentGoal | undefined, now: number): GoalReadi
     totalContinues: goal.totalContinues,
     // Only when it actually escalated: an escalation reason on a live goal would read as though the
     // fleet had already given up on it.
-    ...(state === "escalated" && goal.escalationReason !== undefined
+    //
+    // ⚠️ `awaiting_close` COUNTS TOO WHEN THE LATCH IS SET (roborev 66010) — the state is DERIVED
+    // and layers over `escalated`, so without that term a row which escalated and then landed
+    // silently loses the sentence explaining why the fleet gave up. The history is not made false by
+    // the work landing afterwards; it is exactly the context a person closing the goal wants.
+    //
+    // THE RULE IS `engine/agentGoal.escalationFieldsApply`, NOT AN INLINE TEST (roborev 66027). It
+    // is neither the bare latch nor the bare state — both are wrong in different directions — and
+    // `controlListener`'s roster keys `rearmsRemaining` on the same predicate. Two inline copies of
+    // it had already drifted once, which published a met goal's re-arm allowance with no reason
+    // beside it and let the concierge spend a re-arm on finished work.
+    ...(escalationFieldsApply(goal, state) && goal.escalationReason !== undefined
       ? {
           escalationReason: goal.escalationReason,
           // Only ever WITH the sentence it qualifies. A stale flag on a reading that carries no
@@ -231,6 +259,54 @@ export function landedEvidenceFor(agentId: string): boolean | undefined {
   if (bs === undefined) return undefined;
   if (shipped !== true) return false;
   return unlandedWorkEvidence({ bs, ws, stageOverride: stage }) === true ? false : true;
+}
+
+/**
+ * Did this agent's work reach the default branch AT OR AFTER the goal was set?
+ *
+ * {@link landedEvidenceFor} answers "is this agent's branch landed", which is a fact about the
+ * AGENT, not about the goal it currently holds. `workflowShipped` is a monotonic latch cleared only
+ * on close or reset, so it survives into the NEXT goal — and without this comparison an agent that
+ * landed PR #1 and was then handed a fresh objective would read as finished the moment it went
+ * quiet, over work that predates the thing it is supposed to be doing.
+ *
+ * ⚠️ FALSE WHEN THE TIMESTAMP IS MISSING, which is the fail-closed direction and covers a real
+ * population: watermarks latched before `workflowShippedAt` existed persist without one. "I cannot
+ * tell when this merged" must not present as "it merged for this goal".
+ *
+ * ONE IMPLEMENTATION, deliberately. `controlListener` had a private copy of exactly this rule for
+ * the roster's own `shipped_after_goal_set` field; it now delegates here. Two answers to "has this
+ * shipped for this goal" would drift, and one of them now decides whether an agent is resumed.
+ */
+export function shippedAfterGoalSet(agentId: string, goal: AgentGoal | undefined): boolean {
+  if (goal === undefined) return false;
+  const at = useRuntimeStore.getState().workflowShippedAt?.[agentId];
+  return at !== undefined && at >= goal.setAt;
+}
+
+/**
+ * The evidence `engine/agentGoal.goalStateOf` needs to reach `awaiting_close`, or `undefined` when
+ * there is no goal to reach it for.
+ *
+ * ⚠️ NO GIT CALL. Both readers below are already-polled window-local store state, the same property
+ * {@link stallEvidenceFor} and {@link landedEvidenceFor} have — this is called once per agent per
+ * roster tick and per continuation sweep, so it has to stay a map lookup.
+ *
+ * A window that has never polled this agent's pane answers `landed: undefined`, and the engine
+ * treats that as "not looked up" and leaves the goal in its ordinary state. That is the safe
+ * direction HERE (unlike most gates in this app): `awaiting_close` STOPS auto-continue, so a
+ * mistaken positive strands an agent that still had work, while a mistaken negative costs only the
+ * status quo — the row keeps being resumed exactly as it does today.
+ */
+export function awaitingCloseEvidenceFor(
+  agentId: string,
+  goal: AgentGoal | undefined,
+): AwaitingCloseEvidence | undefined {
+  if (goal === undefined) return undefined;
+  return {
+    landed: landedEvidenceFor(agentId),
+    shippedAfterGoalSet: shippedAfterGoalSet(agentId, goal),
+  };
 }
 
 /**
@@ -367,6 +443,7 @@ export function stallReadingFor(
   now: number,
 ): StallReport {
   const humanBlock = humanBlockFor(agentId);
+  const awaitingClose = awaitingCloseEvidenceFor(agentId, goal);
   return stallReport({
     status: correctedStatusFor(agentId, status, now),
     now,
@@ -381,6 +458,12 @@ export function stallReadingFor(
     // a human block visible to the sidebar but not to them is the same one-object-contradicts-itself
     // divergence the two comments above exist to prevent (roborev 65339).
     ...(humanBlock ? { humanBlock } : {}),
+    // Whether the work already shipped for THIS goal, supplied HERE for the third time on the same
+    // argument the two comments above make: this report is what `get_agent_status`, the roster and
+    // the sidebar all publish, and a row that reads "done — awaiting your close" on one surface and
+    // "blocked on you" on another is the one-object-contradicts-itself divergence this function
+    // exists to prevent — in the loudest colour the app has.
+    ...(awaitingClose ? { awaitingClose } : {}),
     ...stallEvidenceFor(agentId),
   });
 }

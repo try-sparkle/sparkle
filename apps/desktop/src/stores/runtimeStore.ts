@@ -116,6 +116,29 @@ const deadWorktrees = new Set<string>();
 // batch cannot re-open the same hole.
 const forcedOnce = new Set<string>();
 
+/** Monotonic count of `setStatus` CALLS per agent, incremented even when the call is a redundant
+ *  re-assert of the value already in the map.
+ *
+ *  WHY IT CANNOT BE DERIVED FROM `status` ITSELF, which is the whole reason it exists. `setStatus`
+ *  bails out when the value is unchanged (see there), and zustand skips listener notification
+ *  entirely when `set` returns the identical state object — so a producer re-asserting `working`
+ *  over a `working` fires no subscriber callback and leaves the map byte-identical. Nothing
+ *  downstream of the store can tell that write from no write at all. That matters to anyone who
+ *  needs to know whether a value it wrote is STILL ITS OWN (services/improvePassLiveness retracts
+ *  the row's `working` only while it is), because "the value is what I left" and "nobody has
+ *  written since" are different questions and only the second is safe to act on.
+ *
+ *  Deliberately OUTSIDE zustand state, like `forcedOnce` above: a counter in the store would make
+ *  every redundant tick churn a render, which is exactly what the bail-out was added to stop
+ *  (sparkle-f2uz). Cleared in `close()` with the rest of this agent's live-only state. */
+const statusWrites = new Map<string, number>();
+
+/** How many times `setStatus` has been CALLED for this agent — see {@link statusWrites}. Redundant
+ *  re-asserts count; a never-written agent is 0. */
+export function statusWriteCount(agentId: string): number {
+  return statusWrites.get(agentId) ?? 0;
+}
+
 // roborev 54843 (Medium): `driveLifecycle` gates `maybePromptRoborevConsent`, but the stage
 // watermark above it is advanced UNCONDITIONALLY — intentionally, per the sweep's own design (it
 // exists to answer "does this branch hold unmerged work?", and the stage watermark is part of that
@@ -823,6 +846,10 @@ interface RuntimeState {
       name?: string;
       parentId?: string | null;
       force: boolean;
+      /** `AgentTab.createdAt` — epoch ms this row was spawned. Forwarded to Rust as `createdAtMs`,
+       *  which is what `dirtySinceAgentCount` compares each dirty file's mtime against. Undefined
+       *  for a re-adopted worker or a legacy persisted row; Rust then declines that reading. */
+      createdAt?: number;
     }>,
     probePrState: boolean,
   ) => Promise<void>;
@@ -895,6 +922,8 @@ export const useRuntimeStore = create<RuntimeState>()(
           // `branchStatus[id]` never gets set again — the exact bug this Set was added to fix,
           // through the door `close()`/`resetProgress()` leave open.
           forcedOnce.delete(agentId);
+          // Live-only, like `status` itself — a reopened agent must not inherit a stale write count.
+          statusWrites.delete(agentId);
           // Read-modify-MERGE the shared persisted set, then drop ONLY this id (): the
           // union retains other live windows' open ids in the persisted write, so closing a3 here
           // can't clobber window B's b1 — while still removing a3 itself.
@@ -954,7 +983,11 @@ export const useRuntimeStore = create<RuntimeState>()(
           };
         }),
 
-      setStatus: (agentId, status) =>
+      setStatus: (agentId, status) => {
+        // Count the CALL, before the bail-out below can discard it — see `statusWrites`. This is the
+        // only record that a redundant re-assert happened at all; the map and every subscriber are
+        // blind to it by construction.
+        statusWrites.set(agentId, (statusWrites.get(agentId) ?? 0) + 1);
         // Skip the write when the value is unchanged (sparkle-f2uz): setStatus makes a NEW `status`
         // map ref, which every whole-map subscriber (sidebar/TopBar) re-renders on. A redundant tick
         // of the SAME status (e.g. repeated "working"/"listening"/"blocked") must not churn a render.
@@ -999,7 +1032,8 @@ export const useRuntimeStore = create<RuntimeState>()(
             next.attentionScreenAt = attentionScreenAt;
           }
           return next;
-        }),
+        });
+      },
 
       setAgentMovement: (movement) =>
         // Same no-op guard `setStatus` uses, for the same reason: this map has whole-map subscribers
@@ -1095,7 +1129,13 @@ export const useRuntimeStore = create<RuntimeState>()(
         // A removed worktree never returns for the same agent id — skip it permanently ().
         if (deadWorktrees.has(agentId)) return;
         try {
-          const s = await agentBranchStatus(root, projectId, agentId, baseBranch);
+          // The agent's spawn stamp, so the single-agent path attributes dirt the same way the
+          // batch does. Absent row / absent stamp → undefined → Rust declines the reading.
+          const createdAt = useProjectStore
+            .getState()
+            .projects.find((p) => p.id === projectId)
+            ?.agents.find((a) => a.id === agentId)?.createdAt;
+          const s = await agentBranchStatus(root, projectId, agentId, baseBranch, createdAt);
           get().setBranchStatus(agentId, s);
           // Piggyback the Chief markdown sync on the same signal a commit would refresh —
           // debounced + coalesced per project.
@@ -1152,6 +1192,9 @@ export const useRuntimeStore = create<RuntimeState>()(
               parentBranch: a.parentBranch,
               kind: a.kind,
               force: a.force || !forcedOnce.has(a.id),
+              // `?? null`, never omitted: the field crosses into a Rust `Option<i64>`, and the two
+              // sides of that seam must agree that ABSENT and NULL mean the same "no stamp".
+              createdAtMs: a.createdAt ?? null,
             })),
             probePrState,
           );

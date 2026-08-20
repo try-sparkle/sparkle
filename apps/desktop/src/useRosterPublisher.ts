@@ -28,6 +28,7 @@ import {
 import { agentDisplayName } from "./engine/agentDisplayName";
 import { rollupDotAccessor } from "./engine/workerRollup";
 import { goalStateOf } from "./engine/agentGoal";
+import { awaitingCloseEvidenceFor } from "./services/agentGoalReading";
 import { calmNewAgent } from "./engine/newAgentAttention";
 import { useNewAgentGraceTick } from "./hooks/useNewAgentCalm";
 import { composerPrompts } from "./components/promptHistory";
@@ -164,7 +165,23 @@ export function buildRoster(
           // screenshot caught fourteen consecutive pings on one such agent, each a full agent turn.
           // Derived here rather than read off `a.goal.met` so an EXPIRED or ESCALATED goal (both of
           // which have `met` unset but are not "done") can never be published as met.
-          goal_state: goalStateOf(a.goal, now),
+          // ⚠️ PUBLISHED VERBATIM, INCLUDING `awaiting_close`. This field is the ONLY place the Rust
+          // side can read that token — the two sides compare strings with no compile-time check
+          // between them, so a rewrite here (camelCasing it, mapping it back onto `escalated` to
+          // "keep the wire stable") silently reads as "unfinished" over there and whatever consumes
+          // it never fires.
+          //
+          // ⚠️ AND THE MATCHING RUST ARM IS NOT HERE YET (roborev 66006). As of this commit
+          // `src-tauri` contains no occurrence of `awaiting_close`: `nudger.rs::goal_is_met` matches
+          // `"met" | "discharged"` and nothing else, so the ladder reads this row as a live goal
+          // exactly as it read `escalated`. Unchanged behaviour rather than a regression, and the
+          // stand-down is landing separately in a Rust change this worktree cannot see — which is
+          // precisely why the token must not be rewritten in the meantime. See
+          // `engine/agentGoal.AWAITING_CLOSE_STATE`.
+          //
+          // The evidence argument is what makes the state reachable at all: without it `goalStateOf`
+          // answers from the goal RECORD alone, which cannot know that git says the work shipped.
+          goal_state: goalStateOf(a.goal, now, awaitingCloseEvidenceFor(a.id, a.goal)),
           parent_id: a.parentId,
           workflow_stage: workflowStage[a.id] ?? null,
           last_activity_at: lastActivityAt(a, interaction),
@@ -180,6 +197,24 @@ export function useRosterPublisher(): void {
   const status = useRuntimeStore((s) => s.status);
   const workflowStage = useRuntimeStore((s) => s.workflowStage);
   const openAgentIds = useRuntimeStore((s) => s.openAgentIds);
+  // ⚠️ REACTIVITY ANCHORS FOR `awaiting_close`, and this is the one surface that FEEDS RUST
+  // (roborev 65987). `awaitingCloseEvidenceFor` reads these two maps imperatively out of the store,
+  // so nothing in the effect below mentions them — and neither is written by any input this effect
+  // already had: the branch poll writes `branchStatus`, and `setWorkflowShipped` deliberately does
+  // not touch `workflowStage`. Without them a row that BECAME awaiting-close through either writer
+  // keeps publishing `goal_state: "escalated"` until some unrelated input happens to change, which
+  // is the same gap already fixed in `AgentRow`, `AgentSidebar` and `MountedAgentNotices` — missed
+  // here, on the surface where a stale token is read by a nudge ladder rather than by an eye.
+  const branchStatus = useRuntimeStore((s) => s.branchStatus);
+  const workflowShipped = useRuntimeStore((s) => s.workflowShipped);
+  // ⚠️ `workflowState` TOO, and it is the one that matters most for the motivating population
+  // (roborev 66006). `unlandedWorkEvidence` clears its `ahead > 0` veto only via
+  // `ws.landed || ws.inOriginMain || ws.inLocalMain` — the SQUASH/REBASE-MERGE case, where `ahead`
+  // never returns to 0, which is most merges here. `setWorkflowState` is written independently of
+  // `setBranchStatus` and the stage is monotonic once `merged`, so a row that becomes awaiting-close
+  // purely through a reachability update would otherwise keep publishing the old token — and for an
+  // idle merged agent, `status` and `interaction` are exactly the inputs that have stopped moving.
+  const workflowState = useRuntimeStore((s) => s.workflowState);
   const interaction = useInteractionStore((s) => s.lastAt);
   const label = useCurrentWindowLabel();
 
@@ -199,6 +234,11 @@ export function useRosterPublisher(): void {
   );
 
   useEffect(() => {
+    // The anchors, referenced so they are real dependencies rather than ones the linter reads as
+    // unnecessary and a future cleanup deletes. See their declaration above for why they matter.
+    void branchStatus;
+    void workflowShipped;
+    void workflowState;
     // Coalesce rapid changes into one push.
     const t = setTimeout(() => {
       // SINGLE-WINDOW SHELL (CM-U7): this window hosts every project as a tab, so it is the only
@@ -220,6 +260,9 @@ export function useRosterPublisher(): void {
     projects,
     status,
     workflowStage,
+    branchStatus,
+    workflowShipped,
+    workflowState,
     openAgentIds,
     interaction,
     visitedVersion,

@@ -366,6 +366,19 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
       // AGENT saying a person is blocking it; this one is the GOAL RECORD saying only a person may
       // close it. An agent in this state self-reports not-blocked, which is exactly why it is amber.
       "human-verified-goal": "lapsed",
+      // AMBER, added 2026-08-20, and it is the CALMEST claim on this list that still says his name.
+      // It is strictly narrower than `human-verified-goal` directly above and carries strictly more
+      // evidence: that cause says "only a person may close this goal", this one adds that GIT
+      // ALREADY PROVED the work shipped for it. If awaiting a review-close is not "stuck", awaiting
+      // a close on demonstrably-merged work certainly is not.
+      //
+      // ⚠️ IT IS ALSO THE ONE CAUSE HERE THAT DEMOTES ANOTHER. `agentStall` re-reads a
+      // `blocked-on-human` reply as THIS cause for a row in `awaiting_close` — so putting this token
+      // in `OUTSTANDING` would not merely re-redden one row, it would silently undo that demotion
+      // and restore the false red the state was introduced to remove. Demotion trigger, stated so
+      // it is not rediscovered as a gap: there is none — the direction that could ever be justified
+      // is the other one, calm gray, once something closes these goals without him.
+      "awaiting-close": "lapsed",
       // RED, and the argument is who can clear it AND that the work is stuck: nobody but him. Sparkle
       // has stopped (the re-arm budget is spent and the goal is escalated, so nothing retries it), the
       // agent will not restart itself, and no PR is carrying the work — so what is left is a

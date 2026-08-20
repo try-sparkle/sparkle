@@ -314,6 +314,26 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
     idx = Math.max(idx, stageIndex(id));
   };
 
+  // AUTHORED COMMITS ARE COMMITTED WORK, WHEREVER THEY LIVE (bead `sparkle-d5muhf`).
+  //
+  // `gitDerivedStage` reads ONE number — `bs.ahead`, measured on the single branch the agent's
+  // worktree is checked out on — so an agent whose work sits anywhere else lands on
+  // `building_unsaved`, and `sectionOfStage` files that under "LOCAL: UNCOMMITTED" with an
+  // "Unsaved" chip whose copy says closing now loses the work. `ws.aheadOfBase` is the wider
+  // reading: since Rust adopts the branches of worktrees NESTED under the agent's own checkout
+  // (`nested_branch_checkouts`), it answers "commits this agent authored that are not in the base"
+  // for the whole subtree, not just for the one branch the row happens to name.
+  //
+  // Measured case: an agent's PR had merged and its own branch was ahead=0, while a nested checkout
+  // held four unlanded commits. The row said "Unsaved" — false in both directions at once, since
+  // the merged work was safe and the four commits were not even visible.
+  //
+  // This can only RAISE the floor and it never claims landedness: `building_saved` is the honest
+  // "there are commits, and closing keeps the branch". `committedSeen` above already trusts the
+  // same field, so nothing new is being believed here — the number simply now moves the bar as
+  // well as the gate.
+  if ((ws?.aheadOfBase ?? 0) > 0) bump("building_saved");
+
   // A pushed branch is at least Pushed (a PR implies the branch was pushed).
   if (input.pushed || ws?.prState != null) bump("pushed");
 

@@ -34,6 +34,7 @@ import { useProjectStore } from "../stores/projectStore";
 // `handleSetEscalation` for why replying without it would be an empty success.
 import {
   MAX_CONCIERGE_REARMS,
+  escalationFieldsApply,
   rearmsRemaining,
 } from "../engine/agentGoal";
 import type { AgentGoal } from "../engine/agentGoal";
@@ -123,7 +124,9 @@ import { livenessOf } from "./agentLiveness";
 // the roster sweep and the single-agent read cannot disagree about who is stalled.
 import {
   goalReading,
+  awaitingCloseEvidenceFor,
   landedEvidenceFor,
+  shippedAfterGoalSet,
   stallEvidenceFor,
   stallReadingFor,
   thrashReadingFor,
@@ -929,10 +932,16 @@ function capForRoster(text: string): string {
  * population: watermarks latched before `workflowShippedAt` existed persist without one. "I cannot
  * tell when this merged" must not present as "it merged for this goal".
  */
-function shippedAfterGoalSet(agent: AgentTab, goal: AgentGoal | undefined): boolean {
-  if (goal === undefined) return false;
-  const at = useRuntimeStore.getState().workflowShippedAt?.[agent.id];
-  return at !== undefined && at >= goal.setAt;
+/**
+ * ⚠️ THE RULE MOVED TO `services/agentGoalReading.shippedAfterGoalSet` (2026-08-20) AND THIS IS NOW
+ * A ONE-LINE DELEGATION. It is the same comparison it always was — the docblock above is unchanged
+ * and still describes it — but it is no longer only a roster field: `engine/agentGoal` reads the
+ * same fact to decide whether a goal is `awaiting_close`, which STOPS auto-continue. Two copies of
+ * a rule that now gates a resume would drift, and the drift would be invisible (both answers are
+ * plausible booleans about the same agent).
+ */
+function shippedAfterGoalSetFor(agent: AgentTab, goal: AgentGoal | undefined): boolean {
+  return shippedAfterGoalSet(agent.id, goal);
 }
 
 function goalAndStallFields(
@@ -941,7 +950,13 @@ function goalAndStallFields(
   now: number,
 ): Record<string, unknown> {
   const goalRecord = agent.goal;
-  const goal = goalReading(agent.goal, now);
+  // THE SAME EVIDENCE FOR BOTH FIELDS, or this one object contradicts itself (roborev 65987).
+  // `goalReading` used to take the record-only state while `stallReadingFor` computed its own with
+  // evidence, so a single entry could carry `goal.state: "escalated"` beside
+  // `stallCauses: ["awaiting-close"]` and `resume.blockedBy: "goal-awaiting-close"` — and the
+  // concierge branches on `goal.state`, so it would read the loud half and act on it.
+  const awaitingClose = awaitingCloseEvidenceFor(agent.id, agent.goal);
+  const goal = goalReading(agent.goal, now, awaitingClose);
   const stall = stallReadingFor(agent.id, status, agent.goal, now);
   const thrash = thrashReadingFor(agent.id, agent.goal, now);
   return {
@@ -976,7 +991,16 @@ function goalAndStallFields(
             // re-notifies the human — which is right when the concierge genuinely believed it had
             // fixed something, and pure noise when it could have read `0` here and left the row
             // alone.
-            ...(goal.state === "escalated"
+            //
+            // THE SHARED PREDICATE, not an inline test (roborev 66019, then 66027). This must agree
+            // with the escalation SENTENCE `goalReading` puts on the same row, and it drifted twice
+            // while the two were written out separately — first keyed on the derived state, which
+            // withheld the allowance from the awaiting-close rows this branch exists for; then on
+            // the bare latch, which published it for a MET goal (the latch is never cleared) where
+            // `conciergeRearmAgentGoal` would actually spend a re-arm on finished work. Absence
+            // means NO OPINION, not a full allowance, so getting this wrong in either direction
+            // breaks the sweep the field exists for.
+            ...(escalationFieldsApply(agent.goal, goal.state)
               ? { rearmsRemaining: rearmsRemaining(agent.goal) }
               : {}),
             // THE ESCALATION QUOTES A GOAL THE AGENT NO LONGER HOLDS. Carried only when TRUE and
@@ -1015,7 +1039,7 @@ function goalAndStallFields(
             // this field was added for is the one told it may close goals other agents may not.
             // Requiring the watermark to be at least as new as the goal is what makes the flag a
             // statement about THIS goal rather than about the agent's history.
-            ...(landedEvidenceFor(agent.id) === true && shippedAfterGoalSet(agent, goalRecord)
+            ...(landedEvidenceFor(agent.id) === true && shippedAfterGoalSetFor(agent, goalRecord)
               ? { landed: true }
               : {}),
           },
@@ -1823,6 +1847,7 @@ function resumeReading(
   );
   const runtime = agent.runtime === "cloud" ? "cloud" : "local";
   const evidence = continuationEvidenceFor(agent);
+  const awaitingClose = awaitingCloseEvidenceFor(agent.id, agent.goal);
   const decision = decideContinuation({
     goal: agent.goal,
     status: overlaid[agent.id] ?? "stopped",
@@ -1841,6 +1866,11 @@ function resumeReading(
     // cleared escalation answered `willResume: true` for an agent the next sweep would escalate.
     ...evidence,
     quotaBlock: quotaBlockForAgent(agent.id, now),
+    // SAME BUILDER THE SWEEP USES, for the reason the comment above gives about `evidence`: this
+    // reply's whole value is that it predicts the next sweep's decision, and omitting the gate the
+    // sweep applies would answer `willResume: true` for a landed row the sweep will decline with
+    // `goal-awaiting-close` — the false assurance this function was cleaned of.
+    ...(awaitingClose === undefined ? {} : { awaitingClose }),
   });
   if (decision.action === "continue") return { willResume: true };
   if (decision.action === "none") return { willResume: false, blockedBy: decision.reason };
@@ -1954,7 +1984,21 @@ function handleSetEscalation(req: ControlRequest): Record<string, unknown> {
     // abolish — the same reasoning (and the same banner) as `goalContinuationRunner.escalateToHuman`.
     notifyAttention({ projectId, agentId: asked, title: `${name} needs you`, body: reason });
     const stored = findAgent(asked)?.agent.goal;
-    const reading = goalReading(stored, raisedAt);
+    // WITH THE EVIDENCE, so this reply cannot describe the goal differently from the roster that is
+    // publishing the same agent at the same moment (roborev 66006).
+    //
+    // ⚠️ THIS REPLY *DOES* CARRY FIELDS THAT CAN DISAGREE WITH `goal.state`, and an earlier version
+    // of this comment claimed it did not (roborev 66010). `escalated: true` and `rearmsRemaining`
+    // are both statements about the escalation, and with evidence supplied `goalStateOf` layers
+    // `escalated → awaiting_close` — so a landed goal behind a chosen human check returns
+    // `escalated: true` beside a `goal.state` that is not "escalated". They are not in conflict:
+    // both are TRUE of that row, and the latch they describe is still set. What WOULD have been a
+    // contradiction is the reply silently dropping the reason the caller just recorded, which is
+    // why `goalReading` keys the escalation fields on `agentGoal.escalationFieldsApply` — which is
+    // NEITHER the bare latch NOR the derived state. This sentence used to prescribe the bare latch;
+    // that keying is too wide (the latch outlives a `met` goal) and was itself a defect, so read the
+    // predicate's own docblock rather than re-deriving the rule here (roborev 66027, then 66106).
+    const reading = goalReading(stored, raisedAt, awaitingCloseEvidenceFor(asked, stored));
     return {
       ok: true,
       escalated: true,
@@ -2021,7 +2065,13 @@ function handleSetEscalation(req: ControlRequest): Record<string, unknown> {
   const now = Date.now();
   const stored = after?.agent.goal;
   const resume = after ? resumeReading(projectId, after.agent, now) : { willResume: false };
-  const reading = goalReading(stored, now);
+  // ⚠️ THE SAME EVIDENCE `resumeReading` USED, or this reply contradicts itself in ONE object
+  // (roborev 66006). `resumeReading` passes `awaitingCloseEvidenceFor` to `decideContinuation`, so
+  // it can answer `blockedBy: "goal-awaiting-close"`; without it here the same reply reads
+  // `{ goal: { state: "unmet" }, willResume: false, blockedBy: "goal-awaiting-close" }` — and the
+  // concierge branches on `goal.state`, so the loud half wins and it goes on chasing finished work.
+  // This is `goalAndStallFields`' defect exactly, in the one other handler that publishes both.
+  const reading = goalReading(stored, now, awaitingCloseEvidenceFor(asked, stored));
   return {
     ok: true,
     escalated: false,

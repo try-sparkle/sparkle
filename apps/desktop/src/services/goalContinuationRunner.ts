@@ -40,7 +40,7 @@ import {
   type ExpiryDecision,
   type NoExpiryReason,
 } from "../engine/goalExpiry";
-import { expiryProofFor } from "./agentGoalReading";
+import { awaitingCloseEvidenceFor, expiryProofFor } from "./agentGoalReading";
 import type { WorkflowState } from "./branchStatus";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
@@ -950,6 +950,7 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         noteExpiryRefusal(agent, expiry.reason, now);
       }
 
+      const awaitingClose = awaitingCloseEvidenceFor(agent.id, agent.goal);
       const decision = decideContinuation({
         goal: agent.goal,
         status: composite.get(agent.id) ?? "stopped",
@@ -980,6 +981,12 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         // The wall the agent itself reported. Without this line the whole backoff is dead code: the
         // gate lives in the pure decision, and the pure decision only knows what this sweep hands it.
         quotaBlock: quotaBlockForAgent(agent.id, now),
+        // WHETHER THE WORK ALREADY SHIPPED FOR THIS GOAL — and, exactly as with the wall above, the
+        // `goal-awaiting-close` gate is dead code without this line. This is the sweep that kept
+        // resuming a finished agent: the measured row (`d5d7056e`, PR #2188) held merged work and a
+        // `{kind:"human"}` check it could not close itself, so every pass here spent a continue on
+        // an agent with nothing left to do until the streak bound escalated it to the founder.
+        ...(awaitingClose === undefined ? {} : { awaitingClose }),
       });
 
       if (decision.action === "none") {

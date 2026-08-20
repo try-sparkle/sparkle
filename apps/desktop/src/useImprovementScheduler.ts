@@ -14,6 +14,11 @@ import {
   runImprovementPass,
   shouldRunImprovementPass,
 } from "./services/improvementPass";
+import {
+  LIVENESS_POLL_MS,
+  pollImprovePassLiveness,
+  resetImprovePassLiveness,
+} from "./services/improvePassLiveness";
 import { SPARKLE_AGENT_ID } from "./services/sparkleAgent";
 import { useConnectionStore } from "./stores/connectionStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
@@ -70,9 +75,28 @@ export function useImprovementScheduler(enabled: boolean) {
     // A short first check (not immediate — let startup I/O settle), then the slow tick.
     const first = setTimeout(tick, 15_000);
     const id = setInterval(tick, IMPROVEMENT_TICK_MS);
+
+    // ── THE ROW'S THIRD, PROCESS-DRIVEN STATUS WRITER ────────────────────────────────────────────
+    //
+    // Rides this hook rather than getting a mount of its own, and that is the point: this is
+    // already the one place the app mounts exactly once, in the MAIN window only — which is also
+    // the only window whose Sparkle id is the canonical `SPARKLE_AGENT_ID` this writer keys on
+    // (`sparkleAgentIdFor`). A second mount site would be a second thing to forget to wire.
+    //
+    // Its OWN interval, not a line inside `tick`: the scheduler ticks every five minutes, and five
+    // minutes of a GRAY dot on a plainly working agent is the symptom this fixes, not the fix. It
+    // is also deliberately outside the tick's consent/due gating — a pass child that is alive is
+    // alive whatever the clock thinks, which is exactly the case (a webview reload lost the latch)
+    // that leaves the row stranded. See services/improvePassLiveness.
+    const livenessFirst = setTimeout(() => void pollImprovePassLiveness(), 1_000);
+    const liveness = setInterval(() => void pollImprovePassLiveness(), LIVENESS_POLL_MS);
     return () => {
       clearTimeout(first);
       clearInterval(id);
+      clearTimeout(livenessFirst);
+      clearInterval(liveness);
+      // Drop the hold without writing — an unmount is not evidence about the child.
+      resetImprovePassLiveness();
     };
   }, [enabled]);
 }

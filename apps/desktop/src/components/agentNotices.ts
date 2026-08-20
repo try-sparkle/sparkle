@@ -198,6 +198,21 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "neither of which any agent may mark met itself — and nothing is coming to retry it. The goal " +
     "itself is not blocked on anything but your review-close; the other marks on this row say what " +
     "else is outstanding. When you get to it, decide whether the goal is met.",
+  // SCOPED TO THE GOAL, like its sibling directly above and for the same reason (roborev 65642):
+  // this table sees ONE cause at a time and cannot know what else the row carries, so "nothing is
+  // blocking it" would be an absolute claim it has no standing to make. The clause below is about
+  // the GOAL, and the rest of the row is handed to the other marks.
+  //
+  // IT NAMES THE PROOF, because the whole difference from `stall:human-verified-goal` is evidence:
+  // that pill says a person must close the goal, this one adds that git already showed the work
+  // reached the default branch AFTER the goal was set. That is also why it says the agent is not
+  // waiting for anything — it is the one claim here backed by something the reader can check.
+  "stall:awaiting-close":
+    "This agent is DONE. Git shows its work reached the default branch after this goal was set, and " +
+    "the goal's own check is a sign-off no agent may mark met itself — so the only thing left on the " +
+    "goal is you closing it. Auto-continue has stopped rather than restarting an agent with nothing " +
+    "to do. The goal is not waiting on the agent or on any machine; the other marks on this row say " +
+    "what else, if anything, is outstanding.",
   "stall:escalated-goal":
     "Auto-continue has given up on this agent's goal and handed it back. Nothing is coming for it " +
     "— no retry is scheduled and no other agent is watching it. The other marks on this row say " +
@@ -263,6 +278,14 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
   // GOAL_GLYPH), so there is no second mark beside anything; the check the reader is looking at IS
   // this one. Describing a UI that does not exist is the same class of defect as describing behaviour
   // that does not: the reader goes looking, finds nothing, and trusts the surface less.
+  // The `awaiting_close` twin of `goal:discharged` below — same git proof, one thing short of it.
+  // Spelled with an UNDERSCORE because the key is the `GoalState` token verbatim (`goal:${state}`),
+  // and that token crosses into Rust; see `engine/agentGoal.AWAITING_CLOSE_STATE`.
+  "goal:awaiting_close":
+    "The work behind this goal is already on the default branch — Sparkle read that from git, not " +
+    "from the agent — but the goal's check is one only a person may answer, so it is still open. " +
+    "That is why the mark is amber rather than green: nothing is wrong and nothing is coming, the " +
+    "goal simply needs your close. The agent has stopped being auto-restarted for it.",
   "goal:discharged":
     "Sparkle closed this goal itself, on GIT'S evidence rather than the agent's word: the branch's " +
     "work is contained in the default branch and the worktree is clean, so there is nothing left " +
@@ -356,6 +379,10 @@ const GOAL_GLYPH: Record<GoalBadge["state"], NoticeGlyph> = {
   // share a shape while every other pair does not. The rule this table exists to keep is that the
   // pill and the chip agree, and they do.
   discharged: "check",
+  // Same `check` again, for `discharged`'s reason: the glyph answers "does this row still want
+  // something from me", and the honest answer for a landed-and-waiting row is "only a click". The
+  // words carry the difference, and the pill's own label below says it outright.
+  awaiting_close: "check",
 };
 
 /** The pill's visible words for each goal state. PLAIN, not the engine's token: "escalated" is the
@@ -368,6 +395,10 @@ export const GOAL_NOTICE_LABEL: Record<GoalBadge["state"], string> = {
   // Says WHO closed it, because this is the one goal state no person and no agent asked for — the
   // reader's first question on seeing a goal they did not close is who closed it.
   discharged: "Closed — the work landed on main",
+  // SAYS DONE FIRST, then the remainder — the same wording rule as the `awaiting-close` STALL CHIP
+  // (`rowAttention.STALL_CAUSE_LABEL`), and for the same reason: leading with the person makes a
+  // finished row scan as one that is stuck on him. It is deliberately NOT "needs your sign-off".
+  awaiting_close: "Done — awaiting your close",
 };
 
 /** Everything a surface needs to gather. Every field optional and every one meaning "not looked

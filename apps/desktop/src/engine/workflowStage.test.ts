@@ -16,6 +16,7 @@ import {
   LINE_TO,
   rollupHoldsWork,
   uncommittedWorkEvidence,
+  hasUnmergedCommittedWork,
 } from "./workflowStage";
 import { sectionOfRow } from "./buildSections";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
@@ -627,5 +628,106 @@ describe("uncommittedWorkEvidence — attribution, not safety", () => {
     expect(sectionOfRow("building_unsaved", rollupHoldsWork([head, renamedWorker]))).toBe(
       "local_none",
     );
+  });
+});
+
+describe("nested-worktree adoption reaches the stage ladder (sparkle-d5muhf)", () => {
+  // The measured row: an agent whose own branch is ahead=0 (its PR merged, nothing of its own left
+  // on it) while a worktree it cut INSIDE its own checkout holds four unlanded commits. Rust adopts
+  // that nested branch, so `aheadOfBase` reports the subtree's outstanding work; `bs.ahead` still
+  // reports the one branch the row names, and is still 0.
+  const adoptedFour = ws({ aheadOfBase: 4, inOriginMain: false, inLocalMain: false });
+
+  it("an adopted nested branch's commits lift the row off Unsaved", () => {
+    // ⚠️ THE ASSERTION IS ON THE SECTION, not only the stage: `building_unsaved` is what
+    // `sectionOfStage` maps to `local_uncommitted`, whose copy tells the founder that closing this
+    // agent loses the work. That heading and its "Unsaved" chip are the user-visible defect.
+    const stage = deriveLiveStage({ kind: "build", bs: bs(0), ws: adoptedFour });
+    expect(stageIndex(stage)).toBeGreaterThanOrEqual(stageIndex("building_saved"));
+    expect(sectionOfRow(stage, false)).not.toBe("local_uncommitted");
+    expect(sectionOfRow(stage, true)).not.toBe("local_uncommitted");
+  });
+
+  it("PAIRED NEGATIVE: with nothing adopted the reading is exactly what it always was", () => {
+    // An agent with NO nested worktree sends `aheadOfBase: 0`, and must be untouched — including
+    // the dirty-tree case, whose "Unsaved" heading is TRUE and must survive.
+    expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: ws() })).toBe("building_unsaved");
+    expect(deriveLiveStage({ kind: "build", bs: bs(0, true), ws: ws() })).toBe("building_unsaved");
+    expect(sectionOfRow("building_unsaved", true)).toBe("local_uncommitted");
+  });
+
+  it("LEAST-ADVANCED WINS: a subtree still holding work never reads as merged", () => {
+    // Rust AND-folds `inOriginMain` across the subtree, so the agent that motivated this — whose own
+    // branch IS an ancestor of origin/main — reads as holding unlanded work rather than as merged.
+    // That is the honest answer, and it is what this row must render.
+    expect(deriveLiveStage({ kind: "build", bs: bs(0), ws: adoptedFour })).toBe("building_saved");
+  });
+
+  // ── THE COST OF LEAST-ADVANCED-WINS, PINNED SO IT IS A DECISION AND NOT A SURPRISE ──────────
+  //
+  // roborev 65903 named this and it is real: an agent whose own work MERGED, but which left a
+  // `.claude/worktrees/<name>` scratch checkout holding committed-but-unlanded commits, is pulled
+  // back off `merged`. The monotonic watermark does not absorb it — `newCycle` fires precisely
+  // because prior work landed, the live signals fell back, and there IS fresh unlanded work — and
+  // that is the branch of `deriveLiveStage` doing exactly what it was written to do.
+  //
+  // The consequences are not cosmetic and are recorded here rather than discovered later:
+  // `hasUnmergedCommittedWork` goes true, so the finished agent sits in the `unmerged` attention
+  // tier; `beadLifecycle` closes at >= merged, so its bead stays open; the sidebar ✓ does not light.
+  // AGENTS.md actively tells agents to cut these scratch worktrees and `scripts/stale-worktrees.sh`
+  // exists because nobody tears them down, so this is a steady state, not a corner.
+  //
+  // It is nevertheless the RIGHT answer, and the reason is the same one the adoption exists for:
+  // those commits are real, unlanded, and reachable from nothing a row previously showed. Reporting
+  // "merged" over them is the false negative that loses work — measured at 39 unlanded commits
+  // across 8 nested branches on this machine. A row that says "still holds work" is actionable; a
+  // green row over lost commits is not. What is genuinely missing is that the row cannot yet name
+  // WHICH branch holds it back — that is a follow-up, not a reason to soften the reading.
+  it("DELIBERATE: a leftover nested checkout holding work demotes a merged row", () => {
+    const stage = deriveLiveStage({
+      kind: "build",
+      bs: bs(0),
+      ws: ws({ aheadOfBase: 2, inOriginMain: false, inLocalMain: false, landed: false }),
+      prev: "merged",
+    });
+    expect(stage).toBe("building_saved");
+    // The downstream consequence, asserted rather than left implicit.
+    expect(hasUnmergedCommittedWork(stage)).toBe(true);
+    expect(stageIndex(stage)).toBeLessThan(stageIndex("merged"));
+  });
+
+  it("PAIRED: a merged row with NOTHING nested keeps its watermark", () => {
+    // Without this the test above is satisfied by a `deriveLiveStage` that simply stopped honouring
+    // `prev` at all, which would demote every finished agent in the fleet.
+    expect(
+      deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ inOriginMain: true }), prev: "merged" }),
+    ).toBe("merged");
+  });
+
+  it("DOWNSTREAM: an adopted branch that HAS landed still crosses into `merged`", () => {
+    // The claim a later unit depends on. Once the adopted branch is an ancestor of origin/main,
+    // `aheadOfBase` is back to 0 — so the committedSeen gate is carried by `pushed`, which adoption
+    // is likewise what supplies (the agent's own no-op branch was never pushed). See the Rust test
+    // `adopting_a_landed_nested_branch_supplies_the_signals_that_reach_merged`.
+    const landed = ws({ aheadOfBase: 0, inOriginMain: true, pushed: true });
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: landed,
+        pushed: true,
+        prev: "building_unsaved",
+      }),
+    ).toBe("merged");
+    // …and WITHOUT the adopted signals the very same agent cannot get there at all, which is why
+    // the crossing depends on adoption rather than merely coexisting with it.
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ inOriginMain: true }),
+        prev: "building_unsaved",
+      }),
+    ).toBe("building_unsaved");
   });
 });

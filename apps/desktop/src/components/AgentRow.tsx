@@ -72,6 +72,7 @@ import {
   stallInputsFor,
   thrashChipLabel,
 } from "./rowAttention";
+import { awaitingCloseEvidenceFor } from "../services/agentGoalReading";
 import { agentNotices, rowGlyphsFor, withoutSeparatelyDrawn } from "./agentNotices";
 import { AgentInboxBadge } from "./AgentInboxBadge";
 import { AlertToggleButton } from "./AlertToggleButton";
@@ -889,6 +890,16 @@ export const AgentRow = memo(function AgentRow({
   // looked up". Passing a resolved stage would destroy exactly that distinction.
   const wfState = useRuntimeStore((s) => s.workflowState[a.id]);
   const stageOverride = useRuntimeStore((s) => s.workflowStage[a.id]);
+  // Subscribed so this row repaints when the merge watermark lands, not only when the branch poll
+  // does — `awaitingCloseEvidenceFor` reads both, and a chip that lags the dot is the divergence
+  // this row's own comment two lines down exists to prevent.
+  // ⚠️ OPTIONAL-CHAINED, and not defensively for its own sake. Several suites mock `useRuntimeStore`
+  // with a partial state that predates these two maps, so a bare index throws inside the selector and
+  // takes the whole component down — 72 tests across four files, none of them about goals. Every
+  // other reader of these maps (`landedEvidenceFor`, `shippedAfterGoalSet`) already chains for the
+  // same reason: an absent map means "not looked up", which is a real answer here.
+  const shippedLatch = useRuntimeStore((s) => s.workflowShipped?.[a.id]);
+  const shippedAt = useRuntimeStore((s) => s.workflowShippedAt?.[a.id]);
   // Subscribe so this row's OWN chip repaints when a flag lands — the dot is the sidebar's
   // derivation, the chip is this one, and they must not disagree about the same agent (roborev
   // 65339). Read as a SNAPSHOT rather than a counter so the dependency is real (roborev 65409).
@@ -907,8 +918,17 @@ export const AgentRow = memo(function AgentRow({
       // chip beside it never rendered "blocked on you" — a red row with no explanation attached,
       // which is the inverse of the founder's complaint rather than a fix for it.
       humanBlockIn(nudgeFlags, a.id),
+      // …and the third input, for the third time on the same argument. `shipped`/`shippedAt` above
+      // are subscribed ONLY to make this recompute; the value itself is read through the shared
+      // builder so this row cannot answer "has it shipped for this goal" differently from the
+      // sidebar's dot or from `get_state`.
+      awaitingCloseEvidenceFor(a.id, a.goal),
     ),
   );
+  // Referenced so the two subscriptions above are not read as unused — they exist to drive the
+  // recompute of `stall`, whose evidence is read from the store rather than passed as props.
+  void shippedLatch;
+  void shippedAt;
   // `isStalled` is the gate, not `verdict !== "finished"`: it is true ONLY for a confident stall, so
   // the `unknown` verdict — idle with git state we never read — raises nothing. A stall claim that
   // fires on missing data trains the human to ignore the signal, which costs more than the stall.
@@ -930,7 +950,10 @@ export const AgentRow = memo(function AgentRow({
  *  DO NOT reintroduce visible text here without re-photographing the row at 440px. A green suite
  *  will not tell you: jsdom has no layout engine, so every assertion in this file passes just as
  *  happily against two chips drawn on top of each other. */
-  const goalBadge = goalBadgeFor(a.goal, clockNow);
+  // WITH THE EVIDENCE — this row already subscribes the watermark for its stall chip, and the badge
+  // sits beside that chip. Without it the row renders "auto-continue gave up" next to "done —
+  // awaiting your close" about the same agent, in one glance (roborev 65987).
+  const goalBadge = goalBadgeFor(a.goal, clockNow, awaitingCloseEvidenceFor(a.id, a.goal));
   // `bs` is passed so an "uncommitted changes" chip can NAME the file it is talking about
   // (sparkle-biezi) — the same reading the stall question was built from, so the chip and the
   // verdict can never describe different worktree states.

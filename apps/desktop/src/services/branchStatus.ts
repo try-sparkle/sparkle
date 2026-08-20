@@ -47,6 +47,56 @@ export interface BranchStatus {
   // The TRUE number of uncommitted paths, which may exceed `dirtyFiles.length`. A "+N more"
   // affordance must count from THIS; `dirtyFiles` is a preview, not an inventory.
   dirtyCount?: number;
+  // Of those uncommitted paths, how many hold content the BASE does not already have (Rust
+  // `novel_dirty_paths`). A SECOND, NARROWER reading beside `dirtyCount`, never a replacement:
+  //   - `dirtyCount` answers SAFETY — "are there files at risk if this tree is torn down?" — which
+  //     the close prompt asks, and for which an identical-to-base file still counts.
+  //   - this answers SUBSTANCE — "is any of it actually work?". The motivating worktree held 131
+  //     dirty files of which 120 were repo-wide `cargo fmt` churn and 11 were byte-identical to
+  //     origin/main, and the row's "131 uncommitted files" was true and useless.
+  //
+  // ⚠️ `number | null | undefined`, and all three arms are DIFFERENT, none of them zero:
+  //   - `null`      — Rust looked and could not tell (unresolvable base, unreadable git answer, a
+  //                   file that vanished mid-read). A Rust `Option::None` crosses the wire as an
+  //                   explicit `null`, NOT as an absent key — writing `dirtyNovelCount?: number`
+  //                   would describe a shape the wire cannot produce (see AGENTS.md).
+  //   - `undefined` — a Rust build predating the field.
+  //   - `0`         — positively read: everything uncommitted here is already in the base.
+  // Treat null/undefined as UNKNOWN and fall back to `dirtyCount`; never render either as "0 real
+  // changes", which claims a tree holds nothing when nobody established that.
+  dirtyNovelCount?: number | null;
+  // Of those uncommitted paths, how many were last modified AT OR AFTER this agent's row was
+  // created — the dirt plausibly authored by THIS AGENT rather than ambient churn that was already
+  // sitting in the tree (Rust `dirt_since_agent_count`, compared against `AgentTab.createdAt`).
+  //
+  // A THIRD reading beside the two above, answering a THIRD question — none of them replaces
+  // another:
+  //   - `dirtyCount`      SAFETY    — "are there files at risk if this tree is torn down?" The
+  //                                   close prompt's question, and every file counts, whoever
+  //                                   made it.
+  //   - `dirtyNovelCount` SUBSTANCE — "does any of it differ from the base?"
+  //   - this              ATTRIBUTION — "is any of it THIS AGENT'S?"
+  // The motivating worktree needed all three: 131 dirty files, of which 11 were byte-identical to
+  // origin/main and 120 were a repo-wide `cargo fmt` reflow mtimed BEFORE the agent's first edit —
+  // genuinely novel content belonging to nobody, which only provenance can clear.
+  //
+  // ⚠️ `number | null | undefined`, all three DIFFERENT and none of them zero:
+  //   - `null`      — Rust looked and could not tell. In practice: the agent record carries no
+  //                   creation stamp (a re-adopted worker, a legacy persisted row). A Rust
+  //                   `Option::None` crosses the wire as an explicit `null`, NOT as an absent key,
+  //                   so `dirtySinceAgentCount?: number` would describe a shape the wire cannot
+  //                   produce (see AGENTS.md — a mismatch discards the WHOLE payload silently).
+  //   - `undefined` — a Rust build predating the field.
+  //   - `0`         — positively read: none of the dirt here postdates the agent.
+  // Treat null/undefined as UNKNOWN and fall back to `dirtyCount`; never render either as "0 of
+  // this is yours", which claims a provenance nobody established.
+  //
+  // ⚠️ ITS BOUND, so a consumer does not over-trust it: `git checkout`, `git merge` and a rebase
+  // REWRITE the mtime of every file they touch, so a catch-up merge run inside the worktree
+  // re-stamps ambient churn as agent-authored. That fails toward COUNTING — the same safe direction
+  // `engine/workflowStage.ts::uncommittedWorkEvidence` already errs in — so this can OVER-report the
+  // agent's share and must never be used to argue a tree is safe to discard.
+  dirtySinceAgentCount?: number | null;
   // WHICH BRANCH every number above was measured on — Rust's `resolve_agent_branch` output, not the
   // minted `sparkle/agent-<id>` name. See the Rust field for the case that put it on the wire
   // (sparkle-pgkbn4): a release agent that had shipped v0.114.0 read as "Local: Nothing Yet" because
@@ -274,8 +324,18 @@ export function agentBranchStatus(
   projectId: string,
   agentId: string,
   baseBranch: string,
+  /** Epoch ms this agent's row was created (`AgentTab.createdAt`). Omit it when you have no agent
+   *  record in hand — Rust then declines `dirtySinceAgentCount` instead of guessing, which is the
+   *  exact behaviour every caller had before the field existed. */
+  createdAtMs?: number | null,
 ): Promise<BranchStatus> {
-  return invoke<BranchStatus>("agent_branch_status", { root, projectId, agentId, baseBranch });
+  return invoke<BranchStatus>("agent_branch_status", {
+    root,
+    projectId,
+    agentId,
+    baseBranch,
+    createdAtMs: createdAtMs ?? null,
+  });
 }
 
 /** One agent's inputs for the batched project poll (sparkle-zlic). `parentBranch` is the
@@ -287,6 +347,11 @@ export interface AgentStatusInput {
   parentBranch: string;
   kind: string;
   force: boolean;
+  /** Epoch ms this agent's row was created (`AgentTab.createdAt`) — what Rust compares each dirty
+   *  file's mtime against for `dirtySinceAgentCount`. Optional/null when the row carries no stamp
+   *  (a re-adopted worker, a legacy persisted row), which makes that reading decline rather than
+   *  guess — today's exact behaviour. */
+  createdAtMs?: number | null;
 }
 
 /** One agent's result from the batched poll. `changed === false` means nothing moved since the last

@@ -25,7 +25,9 @@
 import type { AgentTabStatus } from "@sparkle/ui";
 import { agentClosableKind } from "@sparkle/core";
 import {
+  AWAITING_CLOSE_STATE,
   type AgentGoal,
+  type AwaitingCloseEvidence,
   escalationQuotesStaleText,
   goalStateOf,
   mayRearmGoal,
@@ -72,6 +74,28 @@ export type StallCause =
    *  colour system cannot read — so a row printed "blocked on human" while drawing amber, which is
    *  the founder's 2026-08-18 report. */
   | "blocked-on-human"
+  /** THE WORK SHIPPED AND ONLY A PERSON'S CLOSE IS LEFT — `agentGoal`'s `awaiting_close` state.
+   *
+   *  ⚠️ IT IS AMBER, AND IT VETOES THE RED CAUSE DIRECTLY ABOVE IT. This is the only place on this
+   *  surface where one cause SUPPRESSES another rather than riding alongside it, so the reasoning
+   *  has to be here rather than at the push site alone.
+   *
+   *  `blocked-on-human` is the agent's own answer to "what are you waiting on", and for a row in
+   *  this state that answer is ACCURATE — a person genuinely is the next actor. What is wrong is
+   *  the COLOUR it earns. Red is reserved for "the agent is stuck and only the founder can unblock
+   *  it" (the 2026-08-06 rule); an agent whose PR is merged and whose goal only needs a bookkeeping
+   *  click is not stuck, it is done. Painting it red is how the founder came to be handed a row he
+   *  read as blocked when nothing was blocked — *"this is not a blocked on human issue. The issue
+   *  is that it's in the wrong status"*.
+   *
+   *  ⚠️ AND THE VETO IS NARROW, WHICH IS THE HALF THAT MATTERS. It requires `awaiting_close`, which
+   *  requires git-proven landed work POSTDATING the goal. A `blocked-on-human` answer from any
+   *  other row — no landed work, work that landed for a previous goal, an agent-closable check —
+   *  stays RED, untouched. The nudge reply reads the AGENT ("a person is blocking me") and the goal
+   *  record reads the GOAL ("only a person may close this"); they are different questions, and
+   *  narrowing the red one to rows where the app can PROVE the work shipped is the only thing that
+   *  keeps this from being a general de-escalation of the loudest signal the app has. */
+  | "awaiting-close"
   | "human-verified-goal"
   /** The goal lapsed its whole re-arm budget and git POSITIVELY showed committed work the default
    *  branch does not contain, with no PR carrying it. Sparkle has stopped, cannot restart it, and
@@ -136,6 +160,14 @@ export interface StallInput {
    * from the Rust nudger's own ledger rather than git evidence, and this module stays pure.
    */
   humanBlock?: HumanBlock;
+  /**
+   * Has this agent's work already shipped for THIS goal (engine/agentGoal `AwaitingCloseEvidence`)?
+   *
+   * PASSED IN, not looked up, for the same reason {@link humanBlock} and {@link quotaBlock} are:
+   * `landed` comes from a git-backed store reading and this module stays pure. Absent leaves every
+   * cause exactly as it was.
+   */
+  awaitingClose?: AwaitingCloseEvidence;
 }
 
 export interface StallReport {
@@ -229,6 +261,14 @@ export function stallReport(input: StallInput): StallReport {
   const hasUnlandedWork = input.hasUnlandedWork ?? (status === "unmerged" ? true : undefined);
 
   const causes: StallCause[] = [];
+  // HOISTED ABOVE THE `blocked-on-human` PUSH (it used to sit just below it), because the goal state
+  // is now an INPUT to that push rather than only to the goal causes further down. See
+  // `awaiting-close` in the `StallCause` union for why one cause vetoes the other here.
+  const goalState = goalStateOf(goal, now, input.awaitingClose);
+  // COMPARED AGAINST THE EXPORTED CONSTANT, not a second copy of the literal (roborev 65987). The
+  // token is frozen because a Rust-side stand-down keys on it; a constant that nothing references is
+  // not a freeze, it is a comment.
+  const isAwaitingClose = goalState === AWAITING_CLOSE_STATE;
   // FIRST OF ALL, because it is the only cause here the AGENT ITSELF asserted. Every other cause on
   // this surface is something we inferred about it from git, the goal record or a clock; this one is
   // its answer to a direct question, so it is both the most actionable and the least deniable.
@@ -250,8 +290,34 @@ export function stallReport(input: StallInput): StallReport {
   // look where the agent has moved, and an agent whose status reads `working` is one producing
   // output — so the disagreement window closes itself. Reporting `stalled` for a row the app
   // simultaneously calls `working` would put a contradiction into the roster to buy nothing.
-  if (input.humanBlock !== undefined) causes.push("blocked-on-human");
-  const goalState = goalStateOf(goal, now);
+  //
+  // ⚠️ AND IT IS VETOED BY `awaiting-close`, which is the second half of this change. The agent's
+  // answer is not being disbelieved — it is being re-read. "A person is what I am waiting on" is
+  // true of a row whose PR merged and whose goal only a human may close; what is false is the RED
+  // that answer earns, because red means STUCK. So the same fact raises the amber cause instead,
+  // and ONLY when the app can prove from git that the work shipped for this goal. Every other
+  // `blocked-on-human` answer is untouched and still red.
+  if (input.humanBlock !== undefined && !isAwaitingClose) causes.push("blocked-on-human");
+  // RAISED WHETHER OR NOT THE AGENT WAS EVER NUDGED. The state is derived from git and the goal
+  // record, so a row reaches it silently — no ask, no reply — which is the common case: the nudge
+  // ladder only questions agents it has already noticed going quiet.
+  //
+  // IT REPLACES `human-verified-goal` FOR THESE ROWS rather than riding beside it. Both are amber,
+  // so this is a COPY decision, not a colour one: "awaiting your sign-off" describes a verdict he
+  // owes on work he must still assess, and this row's work is provably on main. Two chips saying
+  // near-identical things about one row is the "said the same fact twice" defect that folded
+  // `unlanded-work` into `open-pr`. The mechanism is structural rather than a suppression rule —
+  // `human-verified-goal` is gated on `goalState === "escalated"`, and this row's state is no
+  // longer `escalated`, so it simply does not fire.
+  //
+  // ⚠️ AND THAT SAME MECHANISM DISPLACES THREE MORE GOAL CAUSES — stated here rather than left to be
+  // discovered as a missing chip. `escalated-goal`, `rearms-exhausted` and `abandoned-goal` are all
+  // gated on `goalState === "escalated"` too, so none of them fires for a row in this state. Two of
+  // those are RED, and dropping them is the POINT rather than a side effect: "no machine may retry
+  // this goal" and "it gave up holding work nobody landed" are alarming claims about an agent whose
+  // work is demonstrably on the default branch. `awaiting-close` is raised unconditionally here, so
+  // the row always keeps an amber floor and can never fall through to calm gray.
+  if (isAwaitingClose) causes.push("awaiting-close");
   // NEXT AFTER THE AGENT'S OWN ANSWER, because it is the cause that identifies "the goal can only be
   // closed by a person" — the "awaiting your review-close" state. It led this list until the agent's
   // own `blocked-on-human` answer was added above it. Its TIER moved on 2026-08-18 as well: it is
@@ -515,6 +581,19 @@ function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): strin
         // names the fact that the agent was ASKED and answered, which is what separates this from
         // the free prose in `goal.escalationReason` that used to make the same claim unbacked.
         return "it was asked what is blocking it and answered that a person is";
+      case "awaiting-close":
+        // SAYS "DONE" BEFORE IT SAYS "YOU", and in that order deliberately. This sentence is read by
+        // the founder and by the concierge at the moment they are deciding whether a row needs
+        // attention, and leading with the person makes it scan as a demand. The finished fact is
+        // what changes the decision; the click is the small remainder.
+        //
+        // It also NAMES THE PROOF, the way `discharged`'s badge does, because the claim "its work is
+        // on the default branch" is exactly the one a reader will want backed — the whole failure
+        // this replaces was a row asserting a state nothing had verified.
+        return (
+          `its work is already on the default branch and the only thing left is a person closing ` +
+          `the goal${goal?.text ? ` ("${goal.text}")` : ""} — nothing is blocking it`
+        );
       case "rearms-exhausted":
         return "the concierge has no re-arms left for its goal, so nothing may restart it again";
       case "human-verified-goal":

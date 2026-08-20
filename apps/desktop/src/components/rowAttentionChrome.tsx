@@ -51,6 +51,10 @@ export const GOAL_CHIP_ICON: Record<GoalChipState, IconType> = {
   // differing only in WHO proved it (the agent said so / git showed it). That distinction belongs in
   // the words, where `goalBadgeFor` puts it along with the proving sha, not in a fifth shape the
   // reader has to learn.
+  // ⚠️ AN AWAITING-CLOSE GOAL IS A FINISHED ONE TO A SCANNING EYE, so it takes `met`'s CHECK exactly as
+  // `discharged` does — the two differ only in who supplies the closing act (git already did /
+  // a person still must), and that belongs in the words, not in a sixth shape to learn.
+  awaiting_close: FiCheckCircle,
   discharged: FiCheckCircle,
   unmet: FiTarget,
 };
@@ -96,6 +100,12 @@ export const GOAL_CHIP_COLOR: Record<GoalChipState, string> = {
   // The same success ink as `met`: a discharged goal is a finished one, and the row is calm. The
   // founder's 2026-08-06 rule survives here unchanged — expiry that resolves into PROVEN completion
   // is gray/green, and only expiry that resolves into proven UNLANDED work is loud.
+  // AMBER, NOT SUCCESS INK, and that is the one place this state parts from `discharged`. The work
+  // is done but the goal is NOT closed, and success green is the app's "finished, nothing left"
+  // signal — painting it green would say the click had already happened. Amber is the same tier the
+  // `awaiting-close` STALL CAUSE lands in (`stallEscalation.LIFECYCLE`), so the chip and the dot
+  // agree, which is the rule this whole feature turns on.
+  awaiting_close: C.amberInk,
   discharged: C.successInk,
   unmet: C.accentInk,
 };
@@ -116,6 +126,9 @@ export const GOAL_CHIP_SIZE: Record<GoalChipState, number> = {
   met: 10,
   // 10, with the rest. Escalated is the ONLY exceptional one and the size is now the sole signal
   // that says so — raising anything else to 12 would spend that distinction.
+  // 10, with the rest — `escalated` is the only exceptional one and 12 is now the sole signal that
+  // says so.
+  awaiting_close: 10,
   discharged: 10,
   unmet: 10,
 };
@@ -130,6 +143,10 @@ export const GOAL_CHIP_A11Y: Record<GoalChipState, (b: GoalBadge) => string> = {
   // Borrows the badge's own words the way `unmet` does, so the proving sha is SPOKEN rather than
   // being a visual-only detail. A reader who cannot see the chip is exactly the one who cannot go
   // and check the sha for themselves.
+  // Borrows the badge's own words the way `discharged` and `unmet` do — the label names both halves
+  // ("the work landed — awaiting a person's close"), and a reader who cannot see the amber ink is
+  // exactly the one who needs the second half spoken.
+  awaiting_close: (b) => `Goal ${b.label}`,
   discharged: (b) => `Goal ${b.label}`,
   unmet: (b) => `Goal ${b.label.replace(" · ", ", ")}`,
 };

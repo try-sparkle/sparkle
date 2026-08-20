@@ -88,6 +88,7 @@ import { movedSince, movedSinceStamp, windowRetractionLedger } from "../../engin
 import { isObserved, type AgentLiveness } from "../agentLiveness";
 import {
   goalReading,
+  awaitingCloseEvidenceFor,
   stallReadingFor,
   thrashReadingFor,
   type GoalReading,
@@ -886,7 +887,14 @@ export function getAgentStatus(agentId: string): AgentStatusReport {
   // `agent.tab` is the roster row; the other two `findKnownAgent` arms (the Sparkle agent, and an
   // observed-only id) have no AgentTab and therefore no goal, which reads as "no goal" — correct,
   // rather than inventing a synthetic row to hang one on.
-  const goal = goalReading(agent?.tab?.goal, now);
+  // WITH THE EVIDENCE, because `stallReadingFor` below computes its own — a report whose `goal.state`
+  // said `escalated` while its `stall.causes` said `awaiting-close` is one object disagreeing with
+  // itself, which is the divergence this whole module was extracted to prevent (roborev 65987).
+  const goal = goalReading(
+    agent?.tab?.goal,
+    now,
+    awaitingCloseEvidenceFor(agentId, agent?.tab?.goal),
+  );
   // `stallReadingFor` needs a STATUS to judge, and `status` is `undefined` for an unknown agent or
   // one this window never observed. There is no honest verdict there, so the field is omitted
   // rather than filled with a guess — see AgentStatusReport.stall.

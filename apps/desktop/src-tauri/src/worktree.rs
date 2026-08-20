@@ -2766,27 +2766,53 @@ pub(crate) const STATUS_DIRTY_FILES_CAP: usize = 5;
 /// listed — which is the founder's "respect .gitignore" requirement satisfied by the command itself
 /// rather than by a filter here that could fall out of step with the repo's ignore rules.
 pub(crate) fn parse_porcelain_capped(out: &str, cap: usize) -> (Vec<String>, u32) {
-    let mut paths: Vec<String> = Vec::new();
-    let mut count: u32 = 0;
+    let entries = parse_porcelain_entries(out);
+    let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+    // keep counting past the cap: `count` is the truth, `paths` is the preview
+    let paths = entries.into_iter().take(cap).map(|e| e.path).collect();
+    (paths, count)
+}
+
+/// One `git status --porcelain` line, split into the parts a caller can act on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PorcelainEntry {
+    /// The whitespace-trimmed status column — `M`, `??`, `A`, `AM`, `D`, … Empty when the line
+    /// carried no separator at all (a shape git does not emit, kept only so parsing is total).
+    pub code: String,
+    pub path: String,
+}
+
+impl PorcelainEntry {
+    /// `??` — the file is not in the index, so its content must be compared by HASHING IT rather
+    /// than by diffing against a tree (see [`novel_dirty_paths`]).
+    fn untracked(&self) -> bool {
+        self.code == "??"
+    }
+}
+
+/// EVERY porcelain line, uncapped, with its status column kept.
+///
+/// The one implementation both [`parse_porcelain_capped`] (which throws the code away and takes a
+/// bounded preview) and the content-aware dirty reading (which needs the WHOLE set and needs to
+/// know which paths are untracked) are built on. Splitting these apart would drift on exactly the
+/// two edge cases the doc above records, both of them already-fixed bugs.
+pub(crate) fn parse_porcelain_entries(out: &str) -> Vec<PorcelainEntry> {
+    let mut entries: Vec<PorcelainEntry> = Vec::new();
     for raw in out.lines() {
         let line = raw.trim_end_matches('\r');
         if line.trim().is_empty() {
             continue;
         }
-        count = count.saturating_add(1);
-        if paths.len() >= cap {
-            continue; // keep counting: `count` is the truth, `paths` is the preview
-        }
         let rest = line.trim_start();
-        let path = match rest.split_once(' ') {
-            Some((_, p)) => p.trim_start(),
-            None => rest,
+        let (code, path) = match rest.split_once(' ') {
+            Some((c, p)) => (c, p.trim_start()),
+            None => ("", rest),
         };
         // Rename/copy entries read `R  old -> new`; the file that exists on disk is the NEW one.
         let path = path.rsplit(" -> ").next().unwrap_or(path);
-        paths.push(path.to_string());
+        entries.push(PorcelainEntry { code: code.to_string(), path: path.to_string() });
     }
-    (paths, count)
+    entries
 }
 
 /// A worktree's uncommitted-changes reading: the boolean every existing consumer wants, plus the
@@ -2806,6 +2832,30 @@ pub(crate) struct DirtyReading {
     pub dirty: bool,
     pub files: Vec<String>,
     pub count: u32,
+    /// EVERY dirty entry, uncapped — the input the content-aware reading needs.
+    ///
+    /// ⚠️ NOT `files`. That one is capped at [`STATUS_DIRTY_FILES_CAP`] (5) because it is a preview
+    /// for a row with room for about three names; comparing only those against the base would
+    /// report a novelty count over the first five paths and call it the answer.
+    entries: Vec<PorcelainEntry>,
+    /// Each dirty entry's last-modified time, EPOCH MILLISECONDS — index-aligned with `entries`,
+    /// `None` for a path that could not be stat'd (deleted, or one git had to quote).
+    ///
+    /// ⚠️ IT COSTS NO EXTRA SYSCALL, and that is the whole reason it lives here rather than in the
+    /// reading that uses it ([`dirt_since_agent_count`]). The memo key below ALREADY stats every
+    /// dirty path; keeping the mtime it just read turns the attribution reading into an in-memory
+    /// fold. Statting them a second time from the caller would double the syscall count on the one
+    /// path the batch poll runs across dozens of agents per tick.
+    ///
+    /// Alignment with `entries` is by CONSTRUCTION — both are filled by the same loop, in order.
+    /// [`dirt_since_agent_count`] nonetheless walks them PAIRED (`entries.iter().zip(&mtimes_ms)`)
+    /// rather than folding over this vector alone, and that is not decoration: `zip` stops at the
+    /// shorter side, so a future edit that adds a `continue` to the stat loop can only make the
+    /// attribution count UNDER-report — it can never let it exceed `dirty_count`, which is the one
+    /// way this trio can produce a nonsense claim ("N of M are yours" with N > M).
+    mtimes_ms: Vec<Option<i64>>,
+    /// A hash of the raw porcelain output — one third of the memo key in [`novel_dirty_count`].
+    porcelain_hash: u64,
 }
 
 impl DirtyReading {
@@ -2826,9 +2876,335 @@ impl DirtyReading {
             &["status", "--porcelain"]
         };
         let out = git(wt_str, args)?;
-        let (files, count) = parse_porcelain_capped(&out, STATUS_DIRTY_FILES_CAP);
-        Ok(Self { dirty: count > 0, files, count })
+        let entries = parse_porcelain_entries(&out);
+        let count = u32::try_from(entries.len()).unwrap_or(u32::MAX);
+        let files =
+            entries.iter().take(STATUS_DIRTY_FILES_CAP).map(|e| e.path.clone()).collect::<Vec<_>>();
+        // ⚠️ THE PORCELAIN OUTPUT ALONE IS NOT A CONTENT SIGNAL (roborev 65896). It is status codes
+        // and path names, so EDITING AN ALREADY-DIRTY FILE IN PLACE changes nothing about it — the
+        // line stays ` M path`. A memo keyed on that would keep serving a stale
+        // `dirty_novel_count` for as long as an agent works within its existing dirty set, which is
+        // the normal shape of an ACTIVE agent — and the TS contract tells consumers that `0` means
+        // "positively read: everything uncommitted here is already in the base". So the key folds
+        // in each dirty path's size and mtime as well. That is a `stat` per dirty path and NO fork,
+        // which is the whole point: the poll's per-agent fork count is what is load-bearing here.
+        //
+        // ⚠️ This makes the MEMO honest; it does not make the batch poll re-read. That poll skips
+        // the agent entirely on an unchanged `StatusFingerprint`, which an in-place edit also does
+        // not move — see `novel_dirty_cache` for the full statement of that ceiling, which `dirty`
+        // and `dirty_count` have always shared.
+        //
+        // An untracked DIRECTORY entry (`dir/`) hashes the directory's own metadata, which does not
+        // move when a file inside it is edited. That costs nothing: the directory arm of
+        // `novel_dirty_paths` counts such an entry as novel unconditionally, so its content can
+        // never change the answer being memoized.
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(&out, &mut h);
+        let mut mtimes_ms: Vec<Option<i64>> = Vec::with_capacity(entries.len());
+        for e in &entries {
+            match std::fs::symlink_metadata(Path::new(wt_str).join(&e.path)) {
+                Ok(m) => {
+                    // Size is DELIBERATELY REDUNDANT with mtime below — cheap insurance for a
+                    // filesystem whose mtime granularity is coarse enough to hide a fast rewrite.
+                    // No test can isolate it (that would mean holding mtime still while length
+                    // moves), so a mutation-check FLAG on this line is expected, not a hole.
+                    std::hash::Hash::hash(&m.len(), &mut h);
+                    let modified =
+                        m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                    let mtime = modified.map(|d| d.as_nanos()).unwrap_or(0);
+                    std::hash::Hash::hash(&mtime, &mut h);
+                    // Milliseconds, because that is the unit the agent record's creation stamp is
+                    // in (`AgentTab.createdAt`, a `Date.now()`). A pre-1970 mtime or one past
+                    // i64 ms leaves this `None`, which reads as UNSTATTABLE below and therefore
+                    // COUNTS — the same safe direction as an outright stat failure.
+                    mtimes_ms.push(modified.and_then(|d| i64::try_from(d.as_millis()).ok()));
+                }
+                // Unstattable — a deleted path, or one git had to QUOTE (whose escaped form names
+                // no file). Both are already decided by `novel_dirty_paths` without reading the
+                // file, so a constant marker is enough to keep the hash total.
+                Err(_) => {
+                    std::hash::Hash::hash(&"unstattable", &mut h);
+                    mtimes_ms.push(None);
+                }
+            }
+        }
+        let porcelain_hash = std::hash::Hasher::finish(&h);
+        Ok(Self { dirty: count > 0, files, count, entries, mtimes_ms, porcelain_hash })
     }
+}
+
+/// Run git with `stdin` fed from `input`. Only [`novel_dirty_paths`] needs it — `git hash-object
+/// --stdin-paths` is the one call on these paths that takes its argument list on stdin rather than
+/// in argv, which is what keeps a worktree holding hundreds of untracked files to ONE fork instead
+/// of one per file (and out of `ARG_MAX` entirely).
+///
+/// ⚠️ THE STDIN WRITE RUNS ON ITS OWN THREAD, AND THAT IS NOT A STYLE CHOICE (roborev 65896).
+/// `--stdin-paths` is a STREAMING filter: it emits 41 bytes per path as it consumes them. Writing
+/// the whole payload with a blocking `write_all` and only THEN draining stdout deadlocks — git
+/// fills its stdout pipe, blocks in `write`, and stops reading stdin; we fill our stdin pipe and
+/// block in `write_all`; neither side ever moves again. macOS pipe buffers start at 16 KB and cap
+/// at 64 KB, so with ~30-character paths that is roughly a thousand untracked files — inside the
+/// very "hundreds of untracked files" case this function exists for. And it rides the ~30s status
+/// poll, so a wedge is not one lost read: the memo never records an answer, and a fresh stuck
+/// child piles onto Tauri's blocking pool every tick, forever. Write and drain must be concurrent.
+fn git_with_stdin(cwd: &str, args: &[&str], input: &str) -> Result<String, String> {
+    use std::io::Write;
+    note_git_spawn();
+    let mut cmd = Command::new(crate::preflight::git_program());
+    cmd.arg("-C").arg(cwd).args(args);
+    apply_noninteractive(&mut cmd);
+    cmd.stdin(std::process::Stdio::piped());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("failed to run git: {e}"))?;
+    let mut si = child.stdin.take().ok_or_else(|| "git stdin unavailable".to_string())?;
+    let payload = input.to_string();
+    let writer = std::thread::spawn(move || {
+        // A broken pipe is deliberately NOT an error here. A child that exits early (an unreadable
+        // path, a git version that rejects a flag) closes its end mid-write, and it is the child's
+        // EXIT STATUS below that decides the outcome — failing on the write instead would report a
+        // symptom in place of git's own message. `si` drops at the end of this closure, which is
+        // the EOF `--stdin-paths` needs in order to finish at all.
+        let _ = si.write_all(payload.as_bytes());
+    });
+    let out = child.wait_with_output().map_err(|e| format!("failed to run git: {e}"))?;
+    // The child is gone, so the writer cannot still be blocked; join only to reap it.
+    let _ = writer.join();
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+/// How many of the DIRTY paths hold content `base_ref` does not already have?
+///
+/// WHY A SECOND READING RATHER THAN A BETTER `dirty` (bead `sparkle-d5muhf`). `dirty` /
+/// `dirty_count` are a bare `git status --porcelain` count, so a file that is byte-identical to the
+/// base still counts as dirt. Measured on the agent that motivated this: 131 dirty files, of which
+/// **120 were repo-wide `cargo fmt` churn** and 11 were byte-identical to `origin/main`. A row that
+/// says "131 uncommitted files" over that is technically true and useless.
+///
+/// ⚠️ `dirty` IS NOT REDEFINED, and must not be. It has a second consumer — the close prompt —
+/// which asks a SAFETY question ("are there files at risk if I tear this tree down?"), and the
+/// answer to that is every file, identical-to-base ones included. This is a NARROWER reading beside
+/// it, not a replacement for it.
+///
+/// ⚠️ THE COMPARISON IS RESTRICTED TO THE DIRTY SET, which is why this is not
+/// `git diff --name-only origin/main`. A whole-tree diff over-reports catastrophically for a stale
+/// checkout: measured 412 differing paths on a worktree 310 commits behind, of which only 131 were
+/// dirty at all. The other 281 are simply commits the branch has not caught up to — nothing the
+/// worktree is holding.
+///
+/// Two halves, because git answers them differently:
+///   • TRACKED — one `git diff --name-only <base> -- <paths>`, base tree vs WORKING TREE. A path it
+///     does not list is byte-identical to the base.
+///   • UNTRACKED — not in any tree, so there is nothing to diff. `git ls-tree <base> -- <paths>`
+///     says what the base holds at those paths and one batched `git hash-object --stdin-paths` says
+///     what the worktree holds; equal blob shas mean the base already has this content.
+///
+/// `None` means COULD NOT TELL and never "zero" — an unreadable answer must not be able to report a
+/// worktree as holding nothing novel. Every fallible step returns it.
+fn novel_dirty_paths(wt_str: &str, base_ref: &str, entries: &[PorcelainEntry]) -> Option<u32> {
+    if entries.is_empty() {
+        return Some(0);
+    }
+    let mut novel: u32 = 0;
+
+    // A path git had to QUOTE (embedded quote, tab, newline, or a non-UTF8 byte) reaches us in its
+    // escaped form, which matches no pathspec. Counted as novel rather than compared: this reading
+    // must not understate what a tree is holding on the strength of a path we could not parse.
+    let (quoted, plain): (Vec<&PorcelainEntry>, Vec<&PorcelainEntry>) =
+        entries.iter().partition(|e| e.path.starts_with('"'));
+    novel = novel.saturating_add(u32::try_from(quoted.len()).unwrap_or(u32::MAX));
+
+    let tracked: Vec<&str> =
+        plain.iter().filter(|e| !e.untracked()).map(|e| e.path.as_str()).collect();
+    if !tracked.is_empty() {
+        let mut args: Vec<&str> =
+            vec!["--no-optional-locks", "diff", "--name-only", base_ref, "--"];
+        args.extend(tracked.iter().copied());
+        let out = git(wt_str, &args).ok()?;
+        let differing = out.lines().filter(|l| !l.trim().is_empty()).count();
+        novel = novel.saturating_add(u32::try_from(differing).unwrap_or(u32::MAX));
+    }
+
+    let untracked: Vec<&str> =
+        plain.iter().filter(|e| e.untracked()).map(|e| e.path.as_str()).collect();
+    if !untracked.is_empty() {
+        // `git status --porcelain` collapses a wholly-untracked DIRECTORY to one `dir/` entry, and
+        // `hash-object` cannot hash a directory (it fails, which would take the whole reading to
+        // `None`). A directory the base does not have as a blob is novel by construction.
+        let (dirs, files): (Vec<&str>, Vec<&str>) =
+            untracked.iter().partition(|p| p.ends_with('/'));
+        novel = novel.saturating_add(u32::try_from(dirs.len()).unwrap_or(u32::MAX));
+        if !files.is_empty() {
+            let mut args: Vec<&str> = vec!["ls-tree", base_ref, "--"];
+            args.extend(files.iter().copied());
+            let listing = git(wt_str, &args).ok()?;
+            // `<mode> <type> <sha>	<path>`
+            let mut in_base: HashMap<&str, &str> = HashMap::new();
+            for line in listing.lines() {
+                let Some((meta, path)) = line.split_once('\t') else { continue };
+                let Some(sha) = meta.split_whitespace().nth(2) else { continue };
+                in_base.insert(path, sha);
+            }
+            let stdin = format!("{}\n", files.join("\n"));
+            let hashed = git_with_stdin(wt_str, &["hash-object", "--stdin-paths"], &stdin).ok()?;
+            let shas: Vec<&str> = hashed.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+            // A short answer means a file vanished between the status read and the hash. Refuse to
+            // pair up shas with the wrong paths — that would misattribute content wholesale.
+            if shas.len() != files.len() {
+                return None;
+            }
+            for (path, sha) in files.iter().zip(shas) {
+                if in_base.get(path).copied() != Some(sha) {
+                    novel = novel.saturating_add(1);
+                }
+            }
+        }
+    }
+    Some(novel)
+}
+
+/// Per-worktree memo of [`novel_dirty_paths`] and the three inputs it is only valid for.
+///
+/// MOST ROWS PAY NOTHING AT ALL: the whole reading is skipped for a clean tree (`dirty == false`),
+/// which is the overwhelming majority, so this cache exists for the dirty minority.
+///
+/// THE KEY IS COMPLETE, and getting there took a correction (roborev 65896). It is (branch tip,
+/// base tip, DIRT hash), where the dirt hash covers the porcelain output AND each dirty path's size
+/// and mtime — see [`DirtyReading::read`]. Keying on the porcelain output alone could not see the
+/// one transition this field exists to report: a file edited IN PLACE stays ` M path`, so a
+/// not-novel `cargo fmt` line turning into real work would have kept serving `Some(0)` — which the
+/// TS contract states means "positively read: everything uncommitted here is already in the base" —
+/// for as long as the agent kept working within its existing dirty set.
+///
+/// The residual window FOR THIS MEMO is a file rewritten to the same byte length within one mtime
+/// tick.
+///
+/// ⚠️ THAT IS A CLAIM ABOUT THIS MEMO ONLY, NOT ABOUT WHAT THE SIDEBAR SHOWS (roborev 65902). On
+/// the BATCH path this function is not even reached until [`StatusFingerprint`] says the agent
+/// moved, and that fingerprint is `(tip, base_tip, default_tip, nested, index_mtime_ms)` — none of
+/// which an in-place edit of an already-dirty file touches. `--no-optional-locks` exists precisely
+/// so the status read cannot bump the index mtime either. So the agent is skipped wholesale, the
+/// frontend keeps its prior reading, and the transition surfaces only once something WRITES the
+/// index (any `git add`, and in practice any of the many git commands a live agent runs).
+///
+/// This is the fingerprint's pre-existing ceiling, not a new one: `dirty` and `dirty_count` are
+/// served through exactly the same skip and have always been. It is recorded here, and pinned by
+/// `an_in_place_edit_does_not_re_report_through_the_batch_poll`, so it is a known bound rather than
+/// a surprise. Closing it would mean putting a dirt signal INTO the fingerprint, which means
+/// running `git status` before the skip that exists to avoid running anything — a deliberate
+/// trade-off owned by sparkle-zlic, not something to change in passing.
+fn novel_dirty_cache() -> &'static Mutex<HashMap<String, (String, String, u64, Option<u32>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, String, u64, Option<u32>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`novel_dirty_paths`], memoized — see [`novel_dirty_cache`]. `None` in, `None` out: a clean tree
+/// is `Some(0)` and never runs a subprocess.
+fn novel_dirty_count(
+    wt_str: &str,
+    base_ref: &str,
+    head_sha: &str,
+    base_tip: &str,
+    d: &DirtyReading,
+) -> Option<u32> {
+    if !d.dirty {
+        return Some(0);
+    }
+    if let Ok(cache) = novel_dirty_cache().lock() {
+        if let Some((h, b, ph, answer)) = cache.get(wt_str) {
+            if h == head_sha && b == base_tip && *ph == d.porcelain_hash {
+                return *answer;
+            }
+        }
+    }
+    let answer = novel_dirty_paths(wt_str, base_ref, &d.entries);
+    if let Ok(mut cache) = novel_dirty_cache().lock() {
+        cache.insert(
+            wt_str.to_string(),
+            (head_sha.to_string(), base_tip.to_string(), d.porcelain_hash, answer),
+        );
+    }
+    answer
+}
+
+/// How many of the DIRTY paths were last modified AT OR AFTER this agent came into existence —
+/// i.e. how much of the tree's dirt is plausibly THIS AGENT'S, rather than ambient repo churn that
+/// was already sitting there.
+///
+/// WHY A THIRD READING (bead `sparkle-d5muhf`, change 1B). Agent `d5d7056e` wore an "Unsaved" chip
+/// while its work was merged. Its worktree held 131 dirty files. Content comparison
+/// ([`novel_dirty_paths`], change 1A) clears the 11 that were byte-identical to `origin/main` — and
+/// leaves the other 120, because those genuinely DO differ from the base: they are a repo-wide
+/// `cargo fmt` reflow, mtimed `2026-08-19 17:43`, which PREDATES every edit the agent made
+/// (`19:38` through `00:11`). They are novel content belonging to NOBODY. Novelty cannot see that;
+/// only provenance can.
+///
+/// ⚠️ A DIFFERENT QUESTION FROM `dirty_count` AND `dirty_novel_count`, NOT A BETTER ANSWER TO
+/// THEIRS, and none of the three may be redefined into another. `dirty_count` answers SAFETY ("are
+/// there files at risk if this tree is torn down?") — the close prompt asks it and every file
+/// counts, whoever made it. `dirty_novel_count` answers SUBSTANCE ("is any of it different from the
+/// base?"). This answers ATTRIBUTION ("is any of it THIS AGENT'S?"). The frontend states the same
+/// separation at length in `engine/workflowStage.ts::uncommittedWorkEvidence`; this follows its
+/// posture.
+///
+/// THREE-VALUED, like every other evidence rule here. `None` is COULD NOT TELL and never zero:
+/// without a creation stamp there is no instant to compare against, so the reading declines rather
+/// than reporting a tree as holding none of the agent's work. That preserves today's behaviour
+/// exactly for the rows that have no stamp — a re-adopted worker and every legacy persisted row
+/// read `AgentTab.createdAt` as `undefined` (see `projectStore.spawnStamp.test.ts`). Absence of
+/// evidence must not buy the calmer heading; `buildSections.ts::sectionOfRow` states that rule.
+///
+/// ⚠️ THE LIMITATION, PLAINLY: `git checkout`, `git merge` and a rebase REWRITE the mtime of every
+/// file they touch. A catch-up merge run inside the worktree therefore re-stamps ambient churn with
+/// a time after the agent was born, and this reading will attribute it to the agent. There is no
+/// defeating that from mtimes alone — the filesystem simply does not record who wrote a byte — so
+/// it is recorded here as a known bound rather than fought. Note the DIRECTION: it fails toward
+/// COUNTING the file, i.e. toward reporting more unsaved work than the agent really has, which is
+/// the same safe direction `uncommittedWorkEvidence` already errs in. The opposite bound is
+/// narrower and also toward safety-by-over-counting: an unstattable path (deleted, or one git had
+/// to quote) has no mtime at all and is COUNTED.
+///
+/// The one under-counting bound worth knowing: `git status --porcelain` collapses a wholly
+/// untracked DIRECTORY to a single `dir/` entry, and a directory's mtime moves only when its
+/// immediate entry list changes. An agent editing a file inside a pre-existing untracked directory
+/// therefore leaves that entry reading as pre-agent. It is one entry, not one per file.
+///
+/// COSTS NO SYSCALL AND NO FORK. The mtimes were already read by [`DirtyReading::read`] for the
+/// memo key, so this is an in-memory fold — which is what makes it safe on the batch poll's
+/// per-agent path (sparkle-zlic). A clean tree short-circuits to `Some(0)` without touching them.
+fn dirt_since_agent_count(d: &DirtyReading, created_at_ms: Option<i64>) -> Option<u32> {
+    if !d.dirty {
+        return Some(0);
+    }
+    // A missing or non-positive stamp is NO INSTANT, not instant zero. Treating `0` as a real
+    // creation time would put every file on earth after it and attribute the whole tree.
+    let born = created_at_ms.filter(|ms| *ms > 0)?;
+    debug_assert_eq!(
+        d.entries.len(),
+        d.mtimes_ms.len(),
+        "mtimes_ms must stay index-aligned with entries",
+    );
+    // WALK THEM PAIRED, not over `mtimes_ms` alone: `zip` stops at the shorter side, so if the two
+    // ever desync this can only under-report. Folding over the mtimes by themselves could report
+    // MORE attributed paths than there are dirty paths, which is a claim no consumer can render.
+    let mine = d
+        .entries
+        .iter()
+        .zip(&d.mtimes_ms)
+        // `>=` so a file written in the same millisecond the row was created counts — the tie
+        // falls toward the agent, matching the over-count direction documented above.
+        .filter(|(_, m)| m.map(|ms| ms >= born).unwrap_or(true))
+        .count();
+    Some(u32::try_from(mine).unwrap_or(u32::MAX))
 }
 
 #[derive(Serialize, Clone)]
@@ -2864,6 +3240,40 @@ pub struct BranchStatus {
     /// The TRUE number of uncommitted paths, which may exceed `dirty_files.len()`. A "+N more"
     /// affordance must count from THIS; `dirty_files` is a preview, not an inventory.
     dirty_count: u32,
+    /// Of those uncommitted paths, how many hold content the BASE does not already have — see
+    /// [`novel_dirty_paths`], which explains the two halves of the comparison and why it is
+    /// restricted to the dirty set.
+    ///
+    /// ⚠️ THIS IS A SECOND, NARROWER READING BESIDE `dirty_count`, NOT A REPLACEMENT FOR IT. The
+    /// two answer different questions and both have consumers: `dirty_count` answers SAFETY ("are
+    /// there files at risk if this tree is torn down?"), which the close prompt asks and for which
+    /// every file counts; this answers SUBSTANCE ("is any of it actually work?"). The motivating
+    /// worktree held 131 dirty files of which 120 were repo-wide `cargo fmt` churn and 11 were
+    /// byte-identical to `origin/main`.
+    ///
+    /// `None` = COULD NOT TELL, never zero: an unresolvable base, an unreadable git answer, or a
+    /// file that vanished mid-read all yield it, and none of those is evidence a tree holds
+    /// nothing novel. Serde emits the key with a `null` value for `None`, so the TypeScript side
+    /// is `dirtyNovelCount?: number | null` — see AGENTS.md on why an absent key is the WRONG
+    /// shape to parse for, and why getting it wrong discards the whole payload silently.
+    dirty_novel_count: Option<u32>,
+    /// Of those uncommitted paths, how many were last modified AT OR AFTER this agent was created —
+    /// the dirt that is plausibly THIS AGENT'S rather than ambient churn that was already sitting in
+    /// the tree. See [`dirt_since_agent_count`], which states the mtime limitation in full.
+    ///
+    /// ⚠️ A THIRD READING BESIDE `dirty_count` AND `dirty_novel_count`, answering a THIRD question.
+    /// `dirty_count` = SAFETY (every file at risk, whoever made it — the close prompt's question,
+    /// and it must keep counting all of them). `dirty_novel_count` = SUBSTANCE (does it differ from
+    /// the base?). This = ATTRIBUTION (is it this agent's?). The motivating worktree needed all
+    /// three: of 131 dirty files, 11 were byte-identical to the base and 120 were `cargo fmt` churn
+    /// that predated the agent — novel content belonging to nobody, which only provenance can clear.
+    ///
+    /// `None` = COULD NOT TELL, never zero — in practice, an agent record with no creation stamp
+    /// (a re-adopted worker, a legacy persisted row). Serde emits the key with a `null` value for
+    /// `None`, so the TypeScript side is `dirtySinceAgentCount?: number | null`; see AGENTS.md on
+    /// why an absent key is the WRONG shape to parse for and why getting it wrong silently discards
+    /// the whole payload.
+    dirty_since_agent_count: Option<u32>,
     /// WHICH BRANCH every number above was measured on — the output of `resolve_agent_branch`, not
     /// the minted `sparkle/agent-<id>` name the caller passed an id for.
     ///
@@ -2884,12 +3294,24 @@ pub struct BranchStatus {
 /// so count the branch's OWN commits as `ahead` (behind 0) and skip the base diff. `dirty` is passed
 /// through from the caller's worktree read. Shared by both the single-agent and batched status paths
 /// so their unresolvable-base guards can't drift apart.
-fn ahead_only_status(root: &str, branch: &str, d: &DirtyReading, worktree_on_branch: bool) -> BranchStatus {
+///
+/// `dirty_since_agent_count` is passed in ALREADY COMPUTED rather than derived here: attribution is
+/// a question about mtimes and the agent's creation stamp alone, so — unlike novelty — it still has
+/// an answer when the base does not resolve, and the caller has already folded it.
+fn ahead_only_status(
+    root: &str,
+    branch: &str,
+    d: &DirtyReading,
+    worktree_on_branch: bool,
+    dirty_since_agent_count: Option<u32>,
+) -> BranchStatus {
     let ahead = git(root, &["rev-list", "--count", branch])
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    BranchStatus { ahead, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, branch: branch.to_string() }
+    // `dirty_novel_count: None` — this guard exists precisely because the base does NOT resolve,
+    // and "novel relative to a base that isn't there" has no answer. Not zero.
+    BranchStatus { ahead, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, dirty_novel_count: None, dirty_since_agent_count, branch: branch.to_string() }
 }
 
 /// The branch an agent's worktree is actually checked out on, or "" when the tree is missing, the
@@ -3327,12 +3749,18 @@ fn observe_worktree_branch(
 
 /// Core (AppHandle-free, testable): live ahead/behind + dirty + size of an agent branch vs its
 /// (no-fetch) effective base. The worktree lives OUTSIDE the project, under `app_data`.
+///
+/// `created_at_ms` is the agent RECORD's creation stamp (`AgentTab.createdAt`, epoch ms — the same
+/// value the sidebar renders row ages from). `None` when the row has no stamp (a re-adopted worker,
+/// a legacy persisted row), which makes `dirty_since_agent_count` `None` — see
+/// [`dirt_since_agent_count`].
 pub fn agent_branch_status_at(
     root: &str,
     project_id: &str,
     agent_id: &str,
     base_branch: &str,
     app_data: &Path,
+    created_at_ms: Option<i64>,
 ) -> Result<BranchStatus, String> {
     let base = effective_base(root, base_branch, false); // status never hits the network
     let wt = worktree_path(app_data, project_id, agent_id)?;
@@ -3370,6 +3798,11 @@ pub fn agent_branch_status_at(
     // loses data (see shouldPromptOnClose, which already errs toward prompting on unknown).
     // So: report what is there, publish `worktree_on_branch`, and let each consumer decide.
     let d = DirtyReading::read(&wt_str, wt.exists(), false)?;
+    // ATTRIBUTION, folded ONCE and before the guards below, because it is answerable in every case
+    // they are not: it needs only the mtimes `DirtyReading::read` already gathered and the agent's
+    // creation stamp, so a missing branch ref or an unresolvable base — which take novelty to
+    // `None` — leave this reading intact.
+    let dirty_since_agent_count = dirt_since_agent_count(&d, created_at_ms);
 
     // A brand-new or non-git agent (chat/think/shell, or one polled before its first commit) has no
     // `sparkle/agent-<id>` ref yet. `rev-list <base>...<missing>` then hard-fails with
@@ -3378,14 +3811,20 @@ pub fn agent_branch_status_at(
     // tick for the app's lifetime, spam the log, and never resolve. There's no divergence to count
     // against a ref that doesn't exist: return a zeroed status (mirrors the born-fresh model), still
     // reflecting the worktree's dirty state.
-    if git(
+    // Bound rather than discarded: these two guards ALREADY read the branch tip and the base tip,
+    // and `novel_dirty_count`'s memo keys on both. Reusing them is what keeps the content-aware
+    // dirty reading free of extra `rev-parse` forks.
+    let branch_tip = match git(
         root,
         &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")],
-    )
-    .is_err()
-    {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, branch: branch.clone() });
-    }
+    ) {
+        Ok(sha) => sha,
+        Err(_) => {
+        // The branch ref is missing, so there is no head sha to key the memo on and nothing has been
+        // established about the base yet. Report the dirt, decline to characterise it.
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, dirty_novel_count: None, dirty_since_agent_count, branch: branch.clone() });
+        }
+    };
 
     // The agent branch exists, but its RESOLVED base may not: `effective_base` documents an
     // unborn/HEAD-less fallback that can hand back a name git cannot resolve. `rev-list
@@ -3394,9 +3833,20 @@ pub fn agent_branch_status_at(
     // resolving. There's no divergence to measure against a base that doesn't exist, so report the
     // branch's own commits as `ahead` (behind 0 — the born-off-nothing model), still reflecting the
     // worktree's dirty state, instead of erroring.
-    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]).is_err() {
-        return Ok(ahead_only_status(root, &branch, &d, worktree_on_branch));
-    }
+    let base_tip =
+        match git(root, &["rev-parse", "--verify", "--quiet", &format!("{base}^{{commit}}")]) {
+            Ok(t) => t,
+            Err(_) => {
+                return Ok(ahead_only_status(
+                    root,
+                    &branch,
+                    &d,
+                    worktree_on_branch,
+                    dirty_since_agent_count,
+                ))
+            }
+        };
+    let dirty_novel_count = novel_dirty_count(&wt_str, &base, &branch_tip, &base_tip, &d);
 
     // `--left-right --count A...B` emits "<left>\t<right>": left = base-only = behind,
     // right = branch-only = ahead.
@@ -3415,7 +3865,7 @@ pub fn agent_branch_status_at(
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
 
-    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count, branch })
+    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count, dirty_novel_count, dirty_since_agent_count, branch })
 }
 
 /// Live ahead/behind + dirty + size of an agent branch vs its (no-fetch) effective base.
@@ -3428,10 +3878,14 @@ pub async fn agent_branch_status(
     project_id: String,
     agent_id: String,
     base_branch: String,
+    // Epoch ms this agent's row was created, from the frontend store. Optional so a caller with no
+    // agent record in hand (the pusher mount, the concierge tools) simply gets `None` — and `None`
+    // means the attribution reading declines, preserving that caller's exact prior behaviour.
+    created_at_ms: Option<i64>,
 ) -> Result<BranchStatus, String> {
     let app_data = app_data_dir(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        agent_branch_status_at(&root, &project_id, &agent_id, &base_branch, &app_data)
+        agent_branch_status_at(&root, &project_id, &agent_id, &base_branch, &app_data, created_at_ms)
     })
     .await
     .map_err(|e| format!("agent_branch_status task failed: {e}"))?
@@ -3961,6 +4415,178 @@ fn branch_carries_no_own_work(
             None => true,
         },
     }
+}
+
+/// One record from `git worktree list --porcelain`: the checkout's path, its HEAD sha, and the
+/// branch it has checked out (`branch` is EMPTY for a detached HEAD, which names no branch).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WorktreeRecord {
+    pub path: String,
+    pub head: String,
+    /// Short branch name — `refs/heads/` already stripped — or "" when the checkout is detached.
+    pub branch: String,
+    /// Symlink-resolved `path`, resolved ONCE for the whole batch by [`canonicalize_records`].
+    ///
+    /// WHY IT IS CACHED HERE (roborev 65903). `nested_branch_checkouts` runs per AGENT over the
+    /// same record list, and comparing paths requires canonicalizing both sides — git reports
+    /// symlink-resolved paths on macOS (`/private/var/…`) while ours are not. Doing it inside the
+    /// loop is O(agents × records) filesystem walks per poll, paid before the fingerprint skip, so
+    /// idle agents pay it too. `None` = never resolved, or the path no longer exists; the caller
+    /// falls back to resolving on the fly, so this is an optimisation and never a behaviour change.
+    canonical: Option<PathBuf>,
+}
+
+/// Parse `git worktree list --porcelain` BY LINE PREFIX.
+///
+/// ⚠️ NEVER SPLIT THESE LINES ON WHITESPACE, and this is not a style preference. Every worktree this
+/// app owns lives under `~/Library/Application Support/…`, so **its path contains a space**. A parser
+/// that takes `line.split_whitespace().nth(1)` therefore truncates the path at "Application" and the
+/// record silently describes a directory that does not exist — measured while building this feature:
+/// a whitespace-splitting probe reported 10 nested worktrees on this machine where there are 29, and
+/// ZERO of the agent-nested ones, i.e. it missed exactly the population the feature exists for. The
+/// failure is silent because a truncated path is still a valid-looking string and `path_is_inside`
+/// simply answers `false` for it.
+///
+/// So: take EVERYTHING after the `worktree ` / `HEAD ` / `branch ` prefix, to end of line. Only `\r`
+/// is trimmed (git writes LF, but a CRLF-configured pipe would otherwise leave it inside the path);
+/// leading/trailing spaces are part of the path and are kept.
+pub(crate) fn parse_worktree_records(listing: &str) -> Vec<WorktreeRecord> {
+    let mut recs: Vec<WorktreeRecord> = Vec::new();
+    for raw in listing.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(p) = line.strip_prefix("worktree ") {
+            recs.push(WorktreeRecord {
+                path: p.to_string(),
+                head: String::new(),
+                branch: String::new(),
+                canonical: None,
+            });
+        } else if let Some(h) = line.strip_prefix("HEAD ") {
+            if let Some(r) = recs.last_mut() {
+                r.head = h.trim().to_string();
+            }
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            if let Some(r) = recs.last_mut() {
+                let b = b.trim();
+                r.branch = b.strip_prefix("refs/heads/").unwrap_or(b).to_string();
+            }
+        }
+    }
+    recs
+}
+
+/// The branches checked out in worktrees NESTED UNDER `parent` — i.e. worktrees an agent cut inside
+/// its own checkout. Returned as `(branch, head sha)`, sorted, de-duplicated, and never including
+/// `own_branch` (which the caller has already measured directly).
+///
+/// WHY A ROW MUST LOOK HERE AT ALL (bead `sparkle-d5muhf`). The row measures the branch the agent's
+/// worktree is on, and AGENTS.md actively tells agents to cut scratch worktrees at
+/// `.claude/worktrees/<name>` or `.wt-<name>` and to work on a NAMED branch there. So the agent's
+/// real work routinely lives on a branch its own row never looks at, and the row then reports the
+/// empty branch it does look at. That is a FLEET-WIDE blind spot, not a one-off: measured across
+/// this machine, 19 nested worktrees live inside app agent worktrees across ~5 agents, and 8 of
+/// their branches carry 39 unlanded commits between them.
+///
+/// Both directions of the same defect follow from it. The FALSE POSITIVE is what got noticed — an
+/// agent whose PR had merged sat under "LOCAL: UNCOMMITTED" with an "Unsaved" chip, because its own
+/// branch was `ahead == 0`. The FALSE NEGATIVE is what costs work — four unlanded commits sitting in
+/// a nested checkout that no row, no close prompt and no landing sweep can see.
+///
+/// A DETACHED nested checkout is deliberately skipped: it names no branch, so there is nothing to
+/// adopt into a branch-keyed signal. Those are covered by a different mechanism at a different
+/// moment — `rescue_nested_detached_heads` writes them a ref at teardown so their commits survive.
+fn nested_branch_checkouts(
+    records: &[WorktreeRecord],
+    parent: &Path,
+    own_branch: &str,
+) -> Vec<(String, String)> {
+    // ONCE per agent, not once per record (roborev 65903). This used to go through
+    // `path_is_inside`, which canonicalizes BOTH sides on every call — so the parent was re-walked
+    // for every worktree in the repo, for every agent, on every poll, before the fingerprint skip.
+    let parent_c = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    let mut out: Vec<(String, String)> = Vec::new();
+    for r in records {
+        if r.branch.is_empty() || r.head.is_empty() {
+            continue; // detached, or a record we could not read a head for
+        }
+        if r.branch == own_branch {
+            continue; // already measured directly by the caller
+        }
+        if out.iter().any(|(b, _)| b == &r.branch) {
+            continue;
+        }
+        // STRICT descendant. Both sides symlink-resolved, because git reports resolved paths on
+        // macOS while ours are not, and a raw `starts_with` between the two forms answers false for
+        // the same directory. `canonical` is the batch's precomputed answer when it has one.
+        let child = match &r.canonical {
+            Some(c) => c.clone(),
+            None => std::fs::canonicalize(&r.path).unwrap_or_else(|_| PathBuf::from(&r.path)),
+        };
+        if child == parent_c || !child.starts_with(&parent_c) {
+            continue;
+        }
+        out.push((r.branch.clone(), r.head.clone()));
+    }
+    out.sort();
+    out
+}
+
+/// Resolve every record's path once, for the whole batch — see [`WorktreeRecord::canonical`].
+fn canonicalize_records(recs: &mut [WorktreeRecord]) {
+    for r in recs.iter_mut() {
+        r.canonical = std::fs::canonicalize(&r.path).ok();
+    }
+}
+
+/// A stable string for the adopted `(branch, head)` set, folded into the poll's fingerprint so a
+/// nested branch that COMMITS re-evaluates the agent. Without it the row would keep serving a
+/// cached answer until one of the agent's own three tips happened to move — which, for exactly the
+/// parked/no-own-work agent this feature rescues, may be never.
+///
+/// Costs no git call: `git worktree list --porcelain` already carries each checkout's HEAD, and the
+/// batch runs that listing ONCE for the whole fleet.
+fn nested_fingerprint(nested: &[(String, String)]) -> String {
+    nested.iter().map(|(b, h)| format!("{b}@{h}")).collect::<Vec<_>>().join(",")
+}
+
+/// Per-branch memo of [`branch_ever_committed`], keyed by `(root, branch)` and invalidated when the
+/// branch's tip moves.
+///
+/// WHY IT IS SOUND. The reflog is a record of ref MOVEMENTS, so it can only gain a work entry by
+/// moving the ref — which moves the tip and invalidates this entry. The one way it changes without
+/// the tip moving is expiry (`gc.reflogExpire`, 90 days for reachable entries), which only ever
+/// REMOVES entries; a memo that keeps answering `Some(true)` through an expiry is answering with
+/// better evidence than a fresh read would, not worse.
+///
+/// WHY IT EXISTS. `branch_ever_committed` is one `git reflog show` per agent per recompute already,
+/// and nested-branch adoption adds one more per nested branch. This makes the whole family cached
+/// rather than adding uncached forks to a poll whose per-agent fork count is load-bearing
+/// (`landed_cache` documents what those forks cost: macOS takes a PROCESS-WIDE lock around
+/// `posix_spawn`, so a spawn storm blocks the main thread inside the CoreAnimation commit).
+fn ever_committed_cache() -> &'static Mutex<HashMap<String, (String, Option<bool>)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (String, Option<bool>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// [`branch_ever_committed`], memoized on the branch's tip — see [`ever_committed_cache`].
+/// An empty `tip` skips the cache entirely (there is nothing to key on) and reads through.
+fn branch_ever_committed_memo(root: &str, branch: &str, tip: &str) -> Option<bool> {
+    if tip.trim().is_empty() {
+        return branch_ever_committed(root, branch);
+    }
+    let key = format!("{root}\u{1}{branch}");
+    if let Ok(cache) = ever_committed_cache().lock() {
+        if let Some((prev_tip, answer)) = cache.get(&key) {
+            if prev_tip == tip {
+                return *answer;
+            }
+        }
+    }
+    let answer = branch_ever_committed(root, branch);
+    if let Ok(mut cache) = ever_committed_cache().lock() {
+        cache.insert(key, (tip.to_string(), answer));
+    }
+    answer
 }
 
 /// True iff the agent branch has been pushed to `origin` — its remote-tracking ref exists locally.
@@ -5601,7 +6227,11 @@ pub fn agent_workflow_state_in(
     ctx: Option<(&Path, &str)>,
 ) -> Result<WorkflowState, String> {
     let default_branch_for_resolve = resolve_default_branch(root);
-    let branch = match ctx.and_then(|(app_data, pid)| worktree_path(app_data, pid, agent_id).ok()) {
+    // Kept so the nested-worktree adoption below can ask which checkouts live UNDER this agent's
+    // tree. `None` = no `ctx`, hence no worktree path, hence nothing nested to adopt.
+    let agent_wt: Option<PathBuf> =
+        ctx.and_then(|(app_data, pid)| worktree_path(app_data, pid, agent_id).ok());
+    let branch = match agent_wt.clone() {
         Some(wt) => {
             let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
             // `ctx` is what carries `app_data`; without it there is no ownership table to read and
@@ -5651,6 +6281,20 @@ pub fn agent_workflow_state_in(
     // `None`: this is the single-agent, event-driven path (a pane opening, a Land/Refresh), not the
     // 15s batch. It holds no precomputed target tips, and resolving them here would cost the two
     // `rev-parse` calls the memo exists to save. Uncached is the same answer.
+    // One `worktree list` for the whole repo — the same listing `worktree_on_branch` and
+    // `rescue_nested_detached_heads` read. Skipped entirely when we have no worktree path to
+    // compare against, so a ctx-less caller pays nothing.
+    let nested = match agent_wt.as_deref() {
+        Some(wt) => git(root, &["worktree", "list", "--porcelain"])
+            .ok()
+            .map(|l| {
+                let mut recs = parse_worktree_records(&l);
+                canonicalize_records(&mut recs);
+                nested_branch_checkouts(&recs, wt, &branch)
+            })
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
     Ok(workflow_state_shared(
         root,
         &branch,
@@ -5659,6 +6303,7 @@ pub fn agent_workflow_state_in(
         has_origin,
         &tip,
         None,
+        &nested,
     ))
 }
 
@@ -5711,6 +6356,15 @@ pub struct AgentStatusInput {
     /// The frontend sets this when the agent is actively working (PTY live): never skip it, so its
     /// dirty/ahead counts stay fresh while Claude edits/commits. Idle agents can be skipped.
     force: bool,
+    /// Epoch ms this agent's row was created (`AgentTab.createdAt`) — what
+    /// [`dirt_since_agent_count`] compares each dirty file's mtime against.
+    ///
+    /// `#[serde(default)]` so a frontend that predates the field (or an agent row with no stamp —
+    /// a re-adopted worker, a legacy persisted row) deserializes to `None` rather than failing the
+    /// WHOLE batch payload. `None` makes the attribution reading decline, which is today's exact
+    /// behaviour.
+    #[serde(default)]
+    created_at_ms: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -5737,6 +6391,19 @@ struct StatusFingerprint {
     tip: String,
     base_tip: String,
     default_tip: String,
+    /// `branch@head` for every worktree NESTED under this agent's checkout (see
+    /// `nested_fingerprint`). Without it a commit made in a nested worktree moves NONE of the three
+    /// tips above, so the skip below would keep serving the stale answer — and for the parked,
+    /// no-own-work agent this whole feature rescues, its own tip may never move again.
+    /// Empty string for the overwhelming majority, which have no nested checkout.
+    nested: String,
+    /// ⚠️ WHAT THIS CANNOT SEE: a file EDITED IN PLACE. The index is only rewritten by commands
+    /// that touch it, and the poll's own status read passes `--no-optional-locks` precisely so it
+    /// does not. So an agent that only rewrites already-dirty files is skipped, and every
+    /// worktree-derived field — `dirty`, `dirty_count`, `dirty_novel_count` — is served from the
+    /// frontend's prior reading until something writes the index. Long-standing and deliberate
+    /// (sparkle-zlic): closing it means running `git status` before the skip whose whole purpose is
+    /// to run nothing. Pinned by `an_in_place_edit_does_not_re_report_through_the_batch_poll`.
     index_mtime_ms: u128,
 }
 
@@ -5758,6 +6425,9 @@ struct WorkflowIdentity {
     tip: String,
     base_tip: String,
     default_tip: String,
+    /// Same nested-checkout token as [`StatusFingerprint::nested`], for the same reason: every
+    /// adopted signal is derived from those heads, so the memo must not outlive them.
+    nested: String,
 }
 
 /// Per-worktree-path memo of the last computed [`WorkflowState`] and the tips it was computed from
@@ -5839,6 +6509,7 @@ fn rev_parse_tip(root: &str, refname: &str) -> String {
 /// Live ahead/behind + dirty + size for an agent branch vs an ALREADY-RESOLVED base ref. Mirrors
 /// `agent_branch_status_at` but takes the base ref precomputed, so a batch resolves `effective_base`
 /// once per distinct base instead of once per agent.
+/// `created_at_ms`: see [`agent_branch_status_at`].
 fn branch_status_with_base(
     root: &str,
     project_id: &str,
@@ -5846,6 +6517,7 @@ fn branch_status_with_base(
     base_ref: &str,
     wt: &Path,
     app_data: &Path,
+    created_at_ms: Option<i64>,
 ) -> Result<BranchStatus, String> {
     let wt_str = wt.to_string_lossy().to_string();
     // `--no-optional-locks`: a plain `git status` refreshes and REWRITES the worktree index (to
@@ -5865,24 +6537,47 @@ fn branch_status_with_base(
     let (branch, worktree_on_branch) =
         resolve_agent_branch(root, &head_branch, agent_id, base_ref, head_claim, Some(wt));
     let d = DirtyReading::read(&wt_str, wt.exists(), true)?;
+    // ATTRIBUTION, folded ONCE and before the guards below, because it is answerable in every case
+    // they are not: it needs only the mtimes `DirtyReading::read` already gathered and the agent's
+    // creation stamp, so a missing branch ref or an unresolvable base — which take novelty to
+    // `None` — leave this reading intact.
+    let dirty_since_agent_count = dirt_since_agent_count(&d, created_at_ms);
     // A brand-new/non-git agent polled before its first commit has no `sparkle/agent-<id>` ref yet;
     // `rev-list <base>...<missing>` then hard-fails with "ambiguous argument ... unknown revision",
     // which fails the WHOLE batch read for that agent and re-logs "batch branch status failed" every
     // 30s poll for the app's lifetime. Mirror `agent_branch_status_at`'s guard (the #291 fix, lost in
     // the batch refactor): return a zeroed status — still reflecting the worktree's dirty state — when
     // the branch ref doesn't exist, so there's nothing to count against a ref that isn't there.
-    if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, branch: branch.clone() });
-    }
+    // Bound rather than discarded — see the same pair in `agent_branch_status_at`.
+    let branch_tip =
+        match git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]) {
+            Ok(sha) => sha,
+            Err(_) => {
+        // The branch ref is missing, so there is no head sha to key the memo on and nothing has been
+        // established about the base yet. Report the dirt, decline to characterise it.
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, dirty_novel_count: None, dirty_since_agent_count, branch: branch.clone() });
+            }
+        };
     // The branch exists, but the RESOLVED base may not (`effective_base`'s documented unborn/HEAD-less
     // fallback can return a name git can't resolve). `rev-list <unresolvable-base>...<branch>` then
     // hard-fails with "fatal: ambiguous argument", failing the whole batch read for that agent and
     // re-logging "batch branch status failed" every 30s tick for the app's lifetime. There's nothing to
     // diverge from when the base doesn't exist, so report the branch's own commits as `ahead` (behind 0)
     // instead of erroring — mirrors `agent_branch_status_at`'s base guard.
-    if git(root, &["rev-parse", "--verify", "--quiet", &format!("{base_ref}^{{commit}}")]).is_err() {
-        return Ok(ahead_only_status(root, &branch, &d, worktree_on_branch));
-    }
+    let base_tip =
+        match git(root, &["rev-parse", "--verify", "--quiet", &format!("{base_ref}^{{commit}}")]) {
+            Ok(t) => t,
+            Err(_) => {
+                return Ok(ahead_only_status(
+                    root,
+                    &branch,
+                    &d,
+                    worktree_on_branch,
+                    dirty_since_agent_count,
+                ))
+            }
+        };
+    let dirty_novel_count = novel_dirty_count(&wt_str, base_ref, &branch_tip, &base_tip, &d);
     let counts = git(root, &["rev-list", "--left-right", "--count", &format!("{base_ref}...{branch}")])?;
     let mut it = counts.split_whitespace();
     let behind: u32 = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -5895,7 +6590,7 @@ fn branch_status_with_base(
         insertions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
-    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count, branch })
+    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count, dirty_novel_count, dirty_since_agent_count, branch })
 }
 
 /// The agent's workflow state given ALREADY-RESOLVED shared inputs (default branch, origin presence)
@@ -5914,22 +6609,36 @@ fn workflow_state_shared(
     // be memoized against it (see `landed_cache`). `None` = don't cache; behaviour is identical
     // either way, only the subprocess count differs.
     target_tips: Option<&str>,
+    // `(branch, head)` for every worktree NESTED UNDER this agent's own checkout — see
+    // `nested_branch_checkouts`, which is what produces this list, and the adoption block below,
+    // which is what folds it in. EMPTY is the overwhelmingly common case and is byte-for-byte the
+    // old behaviour: not one extra subprocess, not one changed signal.
+    nested: &[(String, String)],
 ) -> WorkflowState {
     if tip.trim().is_empty() {
         return WorkflowState::default();
     }
-    let in_local_main = ref_contains(root, default_branch, tip);
+    // `mut` only so the nested-worktree adoption below can roll a subtree's LEAST-ADVANCED reading
+    // into them. With no nested checkout (the common case) not one of these is reassigned.
+    let mut in_local_main = ref_contains(root, default_branch, tip);
     let origin_ref = format!("origin/{default_branch}");
-    let in_origin_main = ref_contains(root, &origin_ref, tip);
-    let in_parent = ref_contains(root, parent_branch, tip);
+    let mut in_origin_main = ref_contains(root, &origin_ref, tip);
+    let mut in_parent = ref_contains(root, parent_branch, tip);
     // ONE probe, TWO facts. `branch_landed_scope_memo` runs the identical arms in the identical order
     // as `branch_landed_memo` (which is now a projection of it), so this costs no extra subprocess —
     // it just stops discarding WHICH ref proved it. See `LandedScope`.
+    //
+    // ⚠️ `landed_on_origin` IS `mut` AND IS FOLDED, for the same reason `in_origin_main` is. A
+    // subtree whose adopted nested branch is not on origin is not on origin, whatever the own
+    // branch says — and this signal is precisely the one that decides `merged` vs `merged_local`.
+    // Left unfolded it would let a row claim the terminal rung on the strength of an own branch
+    // that carries nothing while an adopted branch still holds unlanded commits, which is the exact
+    // false negative the adoption block exists to remove.
     let landed_scope = branch_landed_scope_memo(root, default_branch, &branch, tip, target_tips);
-    let landed = landed_scope.is_landed();
-    let landed_on_origin = landed_scope.is_origin();
+    let mut landed = landed_scope.is_landed();
+    let mut landed_on_origin = landed_scope.is_origin();
     // Live Pushed signal (sparkle-v7d0) — a pure local, offline-safe remote-tracking-ref lookup.
-    let pushed = branch_pushed(root, &branch);
+    let mut pushed = branch_pushed(root, &branch);
     // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
     // Measured against the ref the branch was actually CUT FROM — `origin/<default>` when a
     // remote-tracking ref exists (see `effective_base`, which cuts new branches from origin),
@@ -5942,7 +6651,7 @@ fn workflow_state_shared(
     } else {
         default_branch.to_string()
     };
-    let ahead_of_base = commits_beyond(root, &base_for_ahead, &branch);
+    let mut ahead_of_base = commits_beyond(root, &base_for_ahead, &branch);
 
     // ── The no-op-branch guard for TIP-INHERITED facts (sparkle: "Build 5 → Remote: Merged") ─────
     // `tip_in_release` and `probe_pr_by_commit` both answer a question about a COMMIT, not about
@@ -5966,8 +6675,123 @@ fn workflow_state_shared(
     let cut_relative = cut_from_ref(root, parent_branch, &base_for_ahead).map(|cut_ref| {
         (commits_beyond(root, &cut_ref, &branch), ref_contains(root, &cut_ref, tip))
     });
-    let no_own_work = branch_carries_no_own_work(branch_ever_committed(root, &branch), cut_relative);
-    let shipped = !no_own_work && tip_in_release(root, tip);
+    let no_own_work =
+        branch_carries_no_own_work(branch_ever_committed_memo(root, &branch, tip), cut_relative);
+    let mut shipped = !no_own_work && tip_in_release(root, tip);
+
+    // ── NESTED-WORKTREE ADOPTION (bead `sparkle-d5muhf`) ─────────────────────────────────────────
+    // A branch checked out in a worktree the agent cut INSIDE its own checkout is that agent's work,
+    // and until now no row could see it. `nested_branch_checkouts` explains the measured blind spot;
+    // this is the fold. Three rules, and each of them is load-bearing:
+    //
+    // 1. ONLY BRANCHES THAT CARRY THEIR OWN WORK ARE ADOPTED, decided by the SAME predicate the
+    //    no-op guard above uses (`branch_carries_no_own_work`, reflog-backed). A pool slot or a
+    //    scratch checkout sitting exactly on `origin/main` would otherwise drag a whole subtree's
+    //    reading around by describing main's history — the identical misattribution
+    //    `branch_carries_no_own_work` exists to prevent, arriving through a new door. An UNKNOWN
+    //    reflog reads as "no own work" here, so an unreadable branch is skipped rather than adopted.
+    //
+    // 2. LEAST-ADVANCED WINS for every landedness signal — the same precedence `rollupHoldsWork`
+    //    applies on the frontend, and for the same reason: a subtree holding unlanded work must be
+    //    reported as holding unlanded work, NEVER as merged. So these are AND-folded, and
+    //    `ahead_of_base` takes the MAX (the most outstanding work anywhere in the subtree).
+    //    Consequence, and it is the point rather than a wart: the agent that motivated this reads as
+    //    HOLDING 4 UNLANDED COMMITS instead of as merged, because one of its two nested branches is
+    //    4 ahead of origin/main. That is correct, and it is strictly better than "Unsaved".
+    //
+    // 3. A BRANCH WITH NO WORK OF ITS OWN CONTRIBUTES NO EVIDENCE, so when the agent's own branch is
+    //    a no-op the roll-up is seeded from the identity rather than from that branch's readings.
+    //    This is the case that motivated the whole change: after its PR merged, the agent's own
+    //    branch was `ahead == 0`, an ancestor of origin/main, and never pushed — so AND-ing its
+    //    `pushed == false` in would suppress `committedSeen` on the frontend and hold the row at
+    //    "Unsaved" even with the real work adopted. Same asymmetry `branch_carries_no_own_work`
+    //    already applies to the PR probe and the release check.
+    //
+    // `pr_state` is deliberately NOT adopted. It is a network probe, the batch runs it across the
+    // whole fleet, and the tip-relative half is suppressed for a no-own-work branch by design (see
+    // below). Adopting it would mean one more `gh` call per nested branch per TTL window.
+    let adopted: Vec<&(String, String)> = nested
+        .iter()
+        .filter(|(nb, nhead)| {
+            !branch_carries_no_own_work(branch_ever_committed_memo(root, nb, nhead), None)
+        })
+        .collect();
+    if !adopted.is_empty() {
+        let (
+            mut a_local,
+            mut a_origin,
+            mut a_parent,
+            mut a_landed,
+            mut a_landed_origin,
+            mut a_pushed,
+            mut a_shipped,
+            mut a_ahead,
+        ) = if no_own_work {
+            // Rule 3: the own branch abstains. The identity for an AND-fold is `true`, for a MAX 0.
+            (true, true, true, true, true, true, true, 0u32)
+        } else {
+            (
+                in_local_main,
+                in_origin_main,
+                in_parent,
+                landed,
+                landed_on_origin,
+                pushed,
+                shipped,
+                ahead_of_base,
+            )
+        };
+        // ⚠️ EACH FOLD SHORT-CIRCUITS, and that is a COST bound, not a micro-optimisation
+        // (roborev 65903). Written as `a &= f(…)` every predicate runs for every adopted branch —
+        // up to ~7 git forks each, on a poll whose fork count is load-bearing (`landed_cache`
+        // records why: macOS takes a PROCESS-WIDE lock around `posix_spawn`, so a spawn storm
+        // blocks the main thread inside the CoreAnimation commit). Once an AND accumulator is
+        // false nothing can change it, so the call is pure waste.
+        //
+        // It bounds `tip_in_release` in particular, which is the one predicate here with no memo
+        // of its own (`git tag --contains` walks every tag) and which the OWN-branch path
+        // deliberately gates behind `no_own_work`. `a_shipped` starts false for any agent whose own
+        // branch carries work, so an ordinary agent never reaches it at all.
+        for (nb, nhead) in adopted {
+            if a_local {
+                a_local = ref_contains(root, default_branch, nhead);
+            }
+            if a_origin {
+                a_origin = ref_contains(root, &origin_ref, nhead);
+            }
+            if a_parent {
+                a_parent = ref_contains(root, parent_branch, nhead);
+            }
+            // ONE probe, TWO facts here too, exactly as on the own branch above: both accumulators
+            // come from a SINGLE `branch_landed_scope_memo` call, so folding the second signal costs
+            // no extra subprocess. Guarded on EITHER still being live — once both are false the call
+            // is pure waste, which is the cost bound this loop's header describes.
+            //
+            // The two cannot come apart: `LandedScope::Origin` implies landed, so `a_landed_origin`
+            // can never outlive `a_landed`. Both initialisers above are consistent in that direction
+            // and every fold ANDs them with a consistent pair, so the invariant holds by induction.
+            if a_landed || a_landed_origin {
+                let scope = branch_landed_scope_memo(root, default_branch, nb, nhead, target_tips);
+                a_landed &= scope.is_landed();
+                a_landed_origin &= scope.is_origin();
+            }
+            if a_pushed {
+                a_pushed = branch_pushed(root, nb);
+            }
+            if a_shipped {
+                a_shipped = tip_in_release(root, nhead);
+            }
+            a_ahead = a_ahead.max(commits_beyond(root, &base_for_ahead, nb));
+        }
+        in_local_main = a_local;
+        in_origin_main = a_origin;
+        in_parent = a_parent;
+        landed = a_landed;
+        landed_on_origin = a_landed_origin;
+        pushed = a_pushed;
+        shipped = a_shipped;
+        ahead_of_base = a_ahead;
+    }
 
     // Only spend a network round-trip on the PR probe when asked AND a remote exists. Try the
     // TIP-RELATIVE lookup first (finds the PR by commit, so a renamed head still resolves and a
@@ -6058,6 +6882,18 @@ pub fn project_agents_status_at(
         rev_parse_tip(root, &origin_default_ref),
     );
 
+    // ONE `worktree list` for the WHOLE batch (bead `sparkle-d5muhf`). Nested-worktree adoption
+    // needs to know which checkouts live under each agent's tree, and this listing answers it for
+    // every agent at once — path, HEAD sha AND branch per record — so the per-agent cost of the
+    // enumeration is zero forks, not one each. Unreadable ⇒ empty ⇒ every agent behaves exactly as
+    // it did before adoption existed.
+    let mut worktree_records: Vec<WorktreeRecord> = git(root, &["worktree", "list", "--porcelain"])
+        .ok()
+        .map(|l| parse_worktree_records(&l))
+        .unwrap_or_default();
+    // Symlink-resolve every path ONCE here rather than per agent per record — see
+    // `WorktreeRecord::canonical`.
+    canonicalize_records(&mut worktree_records);
     // Memoize effective base ref + its tip per distinct logical base (avoid re-resolving per agent).
     let mut base_ref_memo: HashMap<String, String> = HashMap::new();
     let mut base_tip_memo: HashMap<String, String> = HashMap::new();
@@ -6150,15 +6986,19 @@ pub fn project_agents_status_at(
             .as_deref()
             .map(|d| worktree_index_mtime_ms(d, &a.agent_id))
             .unwrap_or(0);
+        let nested = nested_branch_checkouts(&worktree_records, wt.as_path(), &branch);
+        let nested_fp = nested_fingerprint(&nested);
         let wf_identity = WorkflowIdentity {
             tip: tip.clone(),
             base_tip: base_tip.clone(),
             default_tip: default_tip.clone(),
+            nested: nested_fp.clone(),
         };
         let fp = StatusFingerprint {
             tip: tip.clone(),
             base_tip,
             default_tip: default_tip.clone(),
+            nested: nested_fp,
             index_mtime_ms,
         };
         let wt_key = wt.to_string_lossy().to_string();
@@ -6200,6 +7040,7 @@ pub fn project_agents_status_at(
             &base_ref,
             &wt,
             app_data,
+            a.created_at_ms,
         ) {
             Ok(bs) => bs,
             Err(e) => {
@@ -6261,6 +7102,7 @@ pub fn project_agents_status_at(
                     has_origin,
                     &tip,
                     Some(&default_tip),
+                    &nested,
                 );
                 if let Ok(mut cache) = workflow_cache().lock() {
                     cache.insert(wt_key.clone(), (wf_identity, w.clone()));
@@ -6447,7 +7289,7 @@ pub fn refresh_agent_branch_at(
     apply_noninteractive(&mut rebase);
     match rebase.output() {
         Ok(o) if o.status.success() => {
-            let st = agent_branch_status_at(root, project_id, agent_id, base_branch, app_data)?;
+            let st = agent_branch_status_at(root, project_id, agent_id, base_branch, app_data, None)?;
             Ok(RefreshOutcome::Ok { ok: true, ahead: st.ahead, behind: st.behind })
         }
         _ => {
@@ -12041,6 +12883,7 @@ mod tests {
             parent_branch: String::new(),
             kind: "build".into(),
             force,
+            created_at_ms: None,
         };
         // probe_pr_state=false ⇒ no origin fetch / gh probe, purely local + offline-safe.
         let first = project_agents_status_at(&r, "p1", &[input(false)], false, &app_data);
@@ -12076,6 +12919,70 @@ mod tests {
     //
     // Asserted as a SUBPROCESS COUNT, not as "the answer is the same" — the answer is the same
     // either way, so that assertion would hold against the un-memoized code and prove nothing.
+    /// THE CEILING ON EVERY WORKTREE-DERIVED FIELD, PINNED (roborev 65902).
+    ///
+    /// `dirty`, `dirty_count` and `dirty_novel_count` are the only fields read from the DIRECTORY
+    /// rather than from a ref, and the batch poll does not read the directory unless
+    /// [`StatusFingerprint`] says the agent moved. That fingerprint is `(tip, base_tip,
+    /// default_tip, nested, index_mtime_ms)` — and an in-place rewrite of an ALREADY-DIRTY file
+    /// moves none of them. The status read itself passes `--no-optional-locks` specifically so it
+    /// cannot bump the index mtime (sparkle-zlic), so nothing in the tick creates the signal
+    /// either.
+    ///
+    /// This test asserts the SKIP, which is an odd-looking thing to want. The point is that the
+    /// bound becomes a decision on the record instead of a surprise: `dirty_novel_count`'s own memo
+    /// key was fixed to see an in-place edit, and it would be easy to read that as "the row now
+    /// tracks in-place edits" when the outer skip means it does not. Closing this would mean
+    /// running `git status` BEFORE the skip whose entire purpose is to run nothing.
+    ///
+    /// The paired half matters as much: once something writes the index — any `git add`, and in
+    /// practice any of the many git commands a live agent runs — the recompute happens and the new
+    /// reading is correct. So this is a latency bound, not a wrong answer that persists.
+    #[test]
+    fn an_in_place_edit_does_not_re_report_through_the_batch_poll() {
+        let r = init_repo("batch-in-place");
+        let app_data = unique_root("batch-in-place-appdata");
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let wt = info.path;
+
+        let input = || AgentStatusInput {
+            agent_id: "a1".into(),
+            base_branch: "main".into(),
+            parent_branch: String::new(),
+            kind: "build".into(),
+            force: false,
+            created_at_ms: None,
+        };
+
+        // Make the tree dirty and let one tick observe it.
+        std::fs::write(format!("{wt}/d.txt"), "one").unwrap();
+        let first = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+        assert!(first[0].changed, "PRECONDITION: the first tick computes");
+        assert!(
+            first[0].branch.as_ref().unwrap().dirty,
+            "PRECONDITION: and it observes the dirty file",
+        );
+
+        // Rewrite that same file IN PLACE. Same path, same porcelain status code, different bytes —
+        // the shape of an agent working inside the dirty set it already has.
+        std::fs::write(format!("{wt}/d.txt"), "two — different content entirely").unwrap();
+        let second = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+        assert!(
+            !second[0].changed,
+            "THE CEILING: the batch skips this agent, so every worktree-derived field — dirty, \
+             dirty_count and dirty_novel_count alike — is served from the frontend's prior reading",
+        );
+
+        // THE PAIRED HALF: writing the index is what releases it, so this is latency, not a wrong
+        // answer that sticks.
+        git(&wt, &["add", "."]).unwrap();
+        let third = project_agents_status_at(&r, "p1", &[input()], false, &app_data);
+        assert!(third[0].changed, "an index write re-reports the agent");
+        assert!(third[0].branch.as_ref().unwrap().dirty);
+
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
     #[test]
     fn an_index_only_change_reuses_the_workflow_state_instead_of_reforking_it() {
         let r = init_repo("batch-index-only");
@@ -12092,6 +12999,7 @@ mod tests {
             parent_branch: String::new(),
             kind: "build".into(),
             force: false,
+            created_at_ms: None,
         };
 
         // Tick 1 — cold. Populates both caches.
@@ -12184,6 +13092,7 @@ mod tests {
             parent_branch: String::new(),
             kind: "build".into(),
             force: true, // force so neither is fingerprint-skipped
+            created_at_ms: None,
         };
         let results =
             project_agents_status_at(&r, "p1", &[input("live"), input("dead")], false, &app_data);
@@ -12247,6 +13156,7 @@ mod tests {
             parent_branch: String::new(),
             kind: "build".into(),
             force,
+            created_at_ms: None,
         };
         let wt_key =
             worktree_path(&app_data, "p1", "a1").unwrap().to_string_lossy().to_string();
@@ -15046,7 +15956,7 @@ mod tests {
         let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
 
         // The single-agent path.
-        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert_eq!(
             crate::pr_owner::resolve_owner(
                 &crate::pr_owner::load_store(&app_data),
@@ -15064,7 +15974,7 @@ mod tests {
         // against a fresh store — fixing only the single-agent path would leave the feature dead
         // where it is used.
         let batch_data = unique_root("observe-branch-batch");
-        branch_status_with_base(&root_str, "p", "s1", "main", Path::new(&info.path), &batch_data)
+        branch_status_with_base(&root_str, "p", "s1", "main", Path::new(&info.path), &batch_data, None)
             .unwrap();
         assert_eq!(
             crate::pr_owner::resolve_owner(
@@ -15082,7 +15992,7 @@ mod tests {
         // identifies the agent, and the mapping is recorded anyway. Same `app_data` as above,
         // because that is where the worktree this poll reads actually lives.
         git(&info.path, &["checkout", "-b", "sparkle/left-pair"]).unwrap();
-        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert_eq!(
             crate::pr_owner::resolve_owner(
                 &crate::pr_owner::load_store(&app_data),
@@ -15100,7 +16010,7 @@ mod tests {
         // map every detached worktree in the project to whichever agent was polled last.
         let head_sha = git(&info.path, &["rev-parse", "HEAD"]).unwrap();
         git(&info.path, &["checkout", "--detach", head_sha.trim()]).unwrap();
-        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         let branches = crate::pr_owner::load_store(&app_data).branches;
         let recorded = branches.get("p").expect("the earlier polls recorded branches");
         assert!(
@@ -15117,6 +16027,738 @@ mod tests {
         for d in [&root, &app_data, &batch_data] {
             let _ = std::fs::remove_dir_all(d);
         }
+    }
+
+    /// ⚠️ THE PATH-WITH-A-SPACE CASE IS THE WHOLE TEST, not a nicety. Every worktree this app owns
+    /// lives under `~/Library/Application Support/…`, so a parser that splits these lines on
+    /// whitespace truncates the path at "Application" — and a truncated path is still a plausible
+    /// string, so `path_is_inside` simply answers false and the record vanishes silently. Measured
+    /// while building this: a whitespace-splitting probe reported 10 nested worktrees on this
+    /// machine where there are 29, and ZERO of the agent-nested ones — i.e. it missed exactly the
+    /// population the feature exists for, while passing every test that omits a space.
+    #[test]
+    fn parse_worktree_records_reads_by_prefix_so_a_path_with_a_space_survives() {
+        let listing = "\
+worktree /Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/p/a1
+HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+branch refs/heads/sparkle/agent-a1
+
+worktree /Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/p/a1/.claude/worktrees/gray box
+HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+branch refs/heads/sparkle/terminal-only-gray
+
+worktree /Users/x/scratch/detached
+HEAD cccccccccccccccccccccccccccccccccccccccc
+detached
+";
+        let recs = parse_worktree_records(listing);
+        assert_eq!(recs.len(), 3, "three records");
+        assert_eq!(
+            recs[0].path,
+            "/Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/p/a1",
+            "the space in 'Application Support' is part of the path, not a delimiter",
+        );
+        assert_eq!(
+            recs[1].path,
+            "/Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/p/a1/.claude/worktrees/gray box",
+            "and so is the space in the nested directory's own name",
+        );
+        assert_eq!(recs[1].branch, "sparkle/terminal-only-gray", "refs/heads/ is stripped");
+        assert_eq!(recs[1].head, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(recs[2].branch, "", "a detached checkout names no branch");
+    }
+
+    /// The measured defect (bead `sparkle-d5muhf`) end to end, on a real repo.
+    ///
+    /// An agent whose own branch carries ZERO commits and is an ancestor of `origin/main` — the
+    /// state a branch is left in after its work merges — while the work itself sits on a branch
+    /// checked out in a worktree the agent cut INSIDE its own tree. Before adoption the row read
+    /// `aheadOfBase: 0`, which the frontend maps to `building_unsaved` → "LOCAL: UNCOMMITTED" with
+    /// an "Unsaved" chip, over work that was merged and over four commits that were not.
+    ///
+    /// The app-data root here deliberately CONTAINS A SPACE, because that is the shape every real
+    /// one on this machine has.
+    #[test]
+    fn a_nested_worktrees_branch_is_adopted_into_the_agents_workflow_state() {
+        let root = unique_root("adopt nested");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("adopt nested appdata");
+        assert!(app_data.to_string_lossy().contains(' '), "PRECONDITION: the path has a space");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        git(&root_str, &["update-ref", "refs/remotes/origin/main", "refs/heads/main"]).unwrap();
+
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let wt = PathBuf::from(&info.path);
+        let branch = "sparkle/agent-s1";
+        let tip = rev_parse_tip(&root_str, branch);
+        // A SIBLING agent, to prove adoption is scoped to the tree the checkout is nested under.
+        let sib = create_worktree_at(&root_str, "p", "s2", "main", &app_data).unwrap();
+        let sib_wt = PathBuf::from(&sib.path);
+
+        let records = || {
+            parse_worktree_records(
+                &git(&root_str, &["worktree", "list", "--porcelain"]).unwrap(),
+            )
+        };
+
+        // ── THE PAIRED NEGATIVE: no nested checkout ⇒ byte-for-byte the old reading. ──
+        let none = nested_branch_checkouts(&records(), &wt, branch);
+        assert!(none.is_empty(), "no nested checkout yet");
+        let before =
+            workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &none);
+        assert_eq!(before.ahead_of_base, 0, "the agent's own branch authored nothing");
+        assert!(before.in_origin_main, "and its tip is trivially an ancestor of origin/main");
+
+        // ── Cut a worktree INSIDE the agent's tree, on a named branch, and commit there. ──
+        // Directory name carries a space too, matching `.claude/worktrees/<name>` in the wild.
+        std::fs::create_dir_all(wt.join(".claude").join("worktrees")).unwrap();
+        let nested_dir = wt.join(".claude").join("worktrees").join("gray box");
+        let nested_str = nested_dir.to_string_lossy().to_string();
+        git(
+            &info.path,
+            &["worktree", "add", "-b", "sparkle/terminal-only-gray", &nested_str, "main"],
+        )
+        .unwrap();
+        std::fs::write(nested_dir.join("n1.txt"), "n1").unwrap();
+        git(&nested_str, &["add", "-A"]).unwrap();
+        git(&nested_str, &["commit", "-m", "work that no row could see"]).unwrap();
+
+        let adopted = nested_branch_checkouts(&records(), &wt, branch);
+        assert_eq!(adopted.len(), 1, "the nested checkout is adopted: {adopted:?}");
+        assert_eq!(adopted[0].0, "sparkle/terminal-only-gray");
+        assert!(
+            nested_branch_checkouts(&records(), &sib_wt, "sparkle/agent-s2").is_empty(),
+            "a SIBLING agent must not adopt a checkout nested under someone else's tree",
+        );
+
+        let after =
+            workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &adopted);
+        // THE SIDE EFFECT: the agent is now reported as holding its own unlanded work. This is what
+        // establishes `committedSeen` on the frontend and lifts the row off "Unsaved".
+        assert_eq!(after.ahead_of_base, 1, "the nested branch's unlanded commit is this agent's");
+        // LEAST-ADVANCED WINS: a subtree holding unlanded work is never reported as merged, even
+        // though the branch the row tracks IS an ancestor of origin/main.
+        assert!(!after.in_origin_main, "the subtree has not landed");
+        assert!(!after.landed, "and merging it in would not be a no-op");
+
+        // ── A nested checkout that carries NO WORK OF ITS OWN is not adopted. ──
+        // A pool slot or a scratch checkout sitting exactly on the base would otherwise drag the
+        // whole subtree's reading around by describing main's history.
+        let idle_dir = wt.join(".claude").join("worktrees").join("idle slot");
+        let idle_str = idle_dir.to_string_lossy().to_string();
+        git(&info.path, &["worktree", "add", "-b", "sparkle/idle-slot", &idle_str, "main"]).unwrap();
+        let with_idle = nested_branch_checkouts(&records(), &wt, branch);
+        assert_eq!(with_idle.len(), 2, "both are ENUMERATED …");
+        let with_idle_state =
+            workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &with_idle);
+        assert_eq!(
+            with_idle_state.ahead_of_base, 1,
+            "… but only the one that authored something is ADOPTED — an idle slot sitting on the \
+             base must not pull the subtree's reading back to main's history",
+        );
+        assert!(!with_idle_state.in_origin_main, "and the unlanded branch still holds it back");
+
+        // ── THE FORK BUDGET, measured where the SHORT-CIRCUIT actually bites (roborev 65909) ────
+        //
+        // A first attempt at this measured the two-checkout case above and was VACUOUS, for two
+        // reasons that both have to be designed around: only ONE of those two is adopted (the idle
+        // slot is filtered out by Rule 1 before the fold), and the short-circuit can only save
+        // anything on the SECOND and later adopted branch — the first branch's predicates run
+        // either way. Rewriting the loop back to `a_x &= f(…)` produced an identical count.
+        //
+        // So: a SECOND branch that carries its own work. `sparkle/terminal-only-gray` sorts first
+        // and drives every AND accumulator to false (it is not in main, not in origin/main, not
+        // landed, not pushed, in no release tag), after which the short-circuit means this branch
+        // runs ONE predicate — `commits_beyond` — instead of six.
+        //
+        // Six PREDICATES, but TWELVE forks: `branch_landed` is a whole chain (two `merge-tree
+        // --write-tree` full three-way merges plus their `rev-parse ^{tree}` companions, two
+        // `ref_contains`, and `cherry_empty`), so it is worth several by itself. Measured 23 with
+        // the short-circuit and 35 without. Do not read the delta as "six" — a 12-fork regression
+        // per extra adopted branch is not noise.
+        //
+        // WHY A BUDGET AT ALL: this poll's per-agent subprocess count is load-bearing.
+        // `landed_cache` records why — macOS takes a PROCESS-WIDE lock around `posix_spawn`, so a
+        // spawn storm blocks the main thread inside the CoreAnimation commit — and the measured
+        // population is 19 nested worktrees across ~5 agents, so how adoption scales with subtree
+        // size is exactly the axis that matters.
+        //
+        // ⚠️ The count below is an UPPER bound relative to the batch path, not a match for it. This
+        // call passes `target_tips: None`, under which `branch_landed_memo` is `branch_landed` with
+        // no cache at all, so the full multi-fork landed probe is inside the number.
+        // `project_agents_status_at` passes the tips and pays less.
+        let more_dir = wt.join(".claude").join("worktrees").join("more work");
+        let more_str = more_dir.to_string_lossy().to_string();
+        git(&info.path, &["worktree", "add", "-b", "sparkle/zz-more-work", &more_str, "main"])
+            .unwrap();
+        for n in ["m1.txt", "m2.txt"] {
+            std::fs::write(more_dir.join(n), n).unwrap();
+            git(&more_str, &["add", "-A"]).unwrap();
+            git(&more_str, &["commit", "-m", n]).unwrap();
+        }
+        let with_two = nested_branch_checkouts(&records(), &wt, branch);
+        assert_eq!(with_two.len(), 3, "gray + idle slot + the second worker: {with_two:?}");
+        assert_eq!(
+            with_two.iter().map(|(b, _)| b.as_str()).collect::<Vec<_>>(),
+            vec!["sparkle/idle-slot", "sparkle/terminal-only-gray", "sparkle/zz-more-work"],
+            "PRECONDITION on the FOLD ORDER. The list is sorted, and the idle slot is dropped by \
+             Rule 1 before the fold, so `terminal-only-gray` is the first branch ADOPTED — which \
+             is what drives every AND accumulator false and leaves the second worker with nothing \
+             to short-circuit past. Reorder these names and the budget below stops measuring \
+             anything.",
+        );
+
+        let forks_before = git_spawns_on_this_thread();
+        let two_state =
+            workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &with_two);
+        let forks = git_spawns_on_this_thread() - forks_before;
+        assert_eq!(
+            two_state.ahead_of_base, 2,
+            "the MAX fold reports the MOST outstanding work anywhere in the subtree",
+        );
+        assert!(
+            forks <= NESTED_FORK_CEILING,
+            "adoption spent {forks} git forks for one agent with three nested checkouts, two of \
+             them adopted; the ceiling is {NESTED_FORK_CEILING}. If this is a deliberate increase, \
+             move the ceiling and say why — do not delete the assertion.",
+        );
+
+        for d in [&root, &app_data] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Ceiling for the git subprocesses one agent's whole `workflow_state_shared` may spend over the
+    /// fixture in `a_nested_worktrees_branch_is_adopted_into_the_agents_workflow_state`: THREE
+    /// nested checkouts, TWO of them adopted (the third carries no work of its own and is dropped
+    /// by Rule 1 before the fold).
+    ///
+    /// It is an UPPER bound relative to the batch path, not a match for it: that call passes
+    /// `target_tips: None`, under which `branch_landed_memo` is `branch_landed` with no cache, so
+    /// the full multi-fork landed probe is inside the number. `project_agents_status_at` passes
+    /// the tips and pays less. The test's own note at the measurement point says the same.
+    ///
+    /// ⚠️ WHAT IT IS GUARDING, before you move it. Measured 23 with the AND-folds short-circuiting
+    /// and 35 without — so this number is what makes reverting that short-circuit fail rather than
+    /// pass quietly. Three review rounds went into making this assertion non-vacuous. A failure
+    /// here means adoption's fork cost moved; raise the ceiling only with the new number measured
+    /// and the reason written down, and never by widening it to whatever the run happened to print.
+    const NESTED_FORK_CEILING: u64 = 25;
+
+    /// RULE 1, pinned where it actually bites (roborev 65903).
+    ///
+    /// The adoption fold only takes branches that carry work OF THEIR OWN, decided by the same
+    /// reflog-backed `branch_carries_no_own_work` the no-op guard uses. The sibling test above
+    /// cannot prove that: its idle slot sits exactly on the base, so it contributes `0` to the MAX
+    /// fold and `true` to every AND fold — the identities — and deleting the filter changes none of
+    /// its assertions.
+    ///
+    /// The state where the filter DOES bite is this one: an agent whose own branch is a no-op and
+    /// whose ONLY nested checkout is work-free. Rule 3 then seeds the fold all-true (the own branch
+    /// abstains), so without the filter a work-free branch sitting on main's HEAD would AND in
+    /// main's OWN history — and `tip_in_release` against that tip reports the release tag main is
+    /// inside, marking an agent that has authored nothing as SHIPPED. That is precisely the
+    /// misattribution `branch_carries_no_own_work` exists to prevent, arriving through the new door
+    /// adoption opens.
+    #[test]
+    fn a_nested_checkout_that_carries_no_work_is_not_adopted() {
+        let root = unique_root("adopt idle only");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("adopt idle only appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        git(&root_str, &["update-ref", "refs/remotes/origin/main", "refs/heads/main"]).unwrap();
+        // main is inside a published release, which is what makes the misattribution observable.
+        git(&root_str, &["tag", "v1.0.0"]).unwrap();
+
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let wt = PathBuf::from(&info.path);
+        let branch = "sparkle/agent-s1";
+        let tip = rev_parse_tip(&root_str, branch);
+
+        // A scratch checkout that has authored NOTHING — a pool slot, or a worktree cut and never
+        // used. AGENTS.md tells agents to cut these, so they are the common nested shape.
+        std::fs::create_dir_all(wt.join(".claude").join("worktrees")).unwrap();
+        let idle = wt.join(".claude").join("worktrees").join("idle slot");
+        let idle_str = idle.to_string_lossy().to_string();
+        git(&info.path, &["worktree", "add", "-b", "sparkle/idle-slot", &idle_str, "main"]).unwrap();
+
+        let mut recs = parse_worktree_records(
+            &git(&root_str, &["worktree", "list", "--porcelain"]).unwrap(),
+        );
+        canonicalize_records(&mut recs);
+        let enumerated = nested_branch_checkouts(&recs, &wt, branch);
+        assert_eq!(
+            enumerated.len(),
+            1,
+            "PRECONDITION: it IS enumerated — the guard under test is the own-work filter inside \\
+             the fold, not the enumeration",
+        );
+
+        let alone = workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &[]);
+        assert!(!alone.shipped, "PRECONDITION: a branch that authored nothing is not shipped");
+
+        let with_idle =
+            workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &enumerated);
+        assert!(
+            !with_idle.shipped,
+            "a work-free nested checkout must not hand this agent main's release tag",
+        );
+        assert_eq!(with_idle.ahead_of_base, alone.ahead_of_base);
+        assert_eq!(with_idle.in_origin_main, alone.in_origin_main);
+        assert_eq!(with_idle.in_local_main, alone.in_local_main);
+        assert_eq!(with_idle.landed, alone.landed);
+        assert_eq!(with_idle.pushed, alone.pushed);
+
+        for d in [&root, &app_data] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// The DOWNSTREAM CLAIM, proved on the Rust side: an agent whose nested branch IS an ancestor of
+    /// `origin/main` must produce a WorkflowState that reaches stage `merged` — because that upward
+    /// crossing is what `runtimeStore.setWorkflowStage` stamps `workflowShippedAt` on, and a later
+    /// unit depends on the stamp.
+    ///
+    /// The load-bearing signal is `pushed`. `aheadOfBase` is 0 once the work is an ancestor of the
+    /// base, and the tip-relative PR probe stays suppressed for a no-own-work branch by design — so
+    /// with the agent's own branch alone, NOTHING establishes the frontend's `committedSeen` gate
+    /// and the row cannot reach `merged` at all. Adoption is what supplies it. The paired
+    /// assertion below pins exactly that: `pushed` is false without adoption and true with it.
+    #[test]
+    fn adopting_a_landed_nested_branch_supplies_the_signals_that_reach_merged() {
+        let root = unique_root("adopt landed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("adopt landed appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let wt = PathBuf::from(&info.path);
+        let branch = "sparkle/agent-s1";
+        let tip = rev_parse_tip(&root_str, branch);
+
+        // The nested checkout does the work …
+        std::fs::create_dir_all(wt.join(".claude").join("worktrees")).unwrap();
+        let nested_dir = wt.join(".claude").join("worktrees").join("gray box");
+        let nested_str = nested_dir.to_string_lossy().to_string();
+        git(&info.path, &["worktree", "add", "-b", "sparkle/gray", &nested_str, "main"]).unwrap();
+        std::fs::write(nested_dir.join("n1.txt"), "n1").unwrap();
+        git(&nested_str, &["add", "-A"]).unwrap();
+        git(&nested_str, &["commit", "-m", "the work"]).unwrap();
+        let nested_tip = rev_parse_tip(&root_str, "sparkle/gray");
+        // … it gets pushed, and then it MERGES: origin/main now contains it.
+        git(&root_str, &["update-ref", "refs/remotes/origin/sparkle/gray", &nested_tip]).unwrap();
+        git(&root_str, &["update-ref", "refs/remotes/origin/main", &nested_tip]).unwrap();
+
+        let recs = parse_worktree_records(
+            &git(&root_str, &["worktree", "list", "--porcelain"]).unwrap(),
+        );
+        let adopted = nested_branch_checkouts(&recs, &wt, branch);
+        assert_eq!(adopted.len(), 1);
+
+        let alone = workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &[]);
+        assert!(
+            !alone.pushed,
+            "PRECONDITION: the agent's OWN branch was never pushed, so nothing establishes \
+             committedSeen and the row cannot reach `merged`",
+        );
+
+        let with_nested =
+            workflow_state_shared(&root_str, branch, "", "main", false, &tip, None, &adopted);
+        assert!(with_nested.pushed, "adoption supplies `pushed` — the committedSeen source");
+        assert!(with_nested.in_origin_main, "and the subtree really is on origin main");
+        assert_eq!(with_nested.ahead_of_base, 0, "nothing outstanding once it landed");
+
+        for d in [&root, &app_data] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// CONTENT-AWARE DIRTY READING (bead `sparkle-d5muhf`).
+    ///
+    /// `dirty_count` is a bare porcelain count, so a file byte-identical to the base still counts.
+    /// The motivating worktree held 131 dirty files of which 120 were repo-wide `cargo fmt` churn
+    /// and 11 were byte-identical to `origin/main`; "131 uncommitted files" was true and useless.
+    ///
+    /// ⚠️ FIVE dirty files, not one, and the mix is chosen so that NO cheaper rule reproduces the
+    /// answer. A single file cannot distinguish the new reading from the old: with one file,
+    /// "count the dirty paths" and "count the dirty paths that differ from the base" agree whenever
+    /// the file differs, and a test built on it passes against today's code. Nor is it enough to
+    /// have one of each KIND — with a single not-novel untracked file, INVERTING the untracked
+    /// comparison swaps which one it counts and the total is unchanged (mutation-check found
+    /// exactly that hole). So the untracked side carries TWO not-novel-vs-novel pairs that do not
+    /// balance:
+    ///   • `same.txt`      tracked,   edited back to exactly what the base holds  → not novel
+    ///   • `diff.txt`      tracked,   really differs from the base                → NOVEL
+    ///   • `ghost.txt`     untracked, base holds this same content at this path   → not novel
+    ///   • `ghost2.txt`    untracked, base holds this PATH but different content  → NOVEL
+    ///   • `brand-new.txt` untracked, base has never seen this path               → NOVEL
+    ///
+    /// …and three shapes that only occur BELOW THE ROOT or outside the ordinary path, each of which
+    /// takes its own arm of `novel_dirty_paths` and was uncovered until roborev 65896 said so:
+    ///   • `sub/nested-same.txt` / `sub/nested-diff.txt` — the `ls-tree` half is least obvious in a
+    ///     subdirectory: its pathspec-driven descent, `in_base` keying on the whole path after the
+    ///     tab, and porcelain's own directory collapse all interact only there. `sub/keep.txt`
+    ///     stays TRACKED so that `sub/` is not wholly untracked and git lists the two individually.
+    ///   • `newdir/` — a wholly-untracked DIRECTORY, which porcelain collapses to one entry and
+    ///     `hash-object` cannot hash. It must contribute exactly 1 without being hashed.
+    ///   • `we"ird.txt` — a name git has to QUOTE, whose escaped form matches no pathspec. Counted
+    ///     novel rather than compared, so an unparseable path never understates a tree.
+    ///
+    /// NOT covered, and deliberately so: the `shas.len() != files.len()` arm, which fires when a
+    /// file disappears between the status read and the hash. It is a race with no deterministic
+    /// trigger from a test, and faking one would mean injecting a seam that the production path
+    /// does not have.
+    #[test]
+    fn dirty_novel_count_ignores_files_the_base_already_has() {
+        let root = unique_root("novel-dirt");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("novel-dirt-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        // The BASE content. `ghost.txt` is tracked here and untracked on the branch below, which is
+        // what exercises the ls-tree/hash-object half.
+        std::fs::write(root.join("same.txt"), "S\n").unwrap();
+        std::fs::write(root.join("diff.txt"), "D\n").unwrap();
+        std::fs::write(root.join("ghost.txt"), "G\n").unwrap();
+        std::fs::write(root.join("ghost2.txt"), "G2\n").unwrap();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub").join("keep.txt"), "K\n").unwrap();
+        std::fs::write(root.join("sub").join("nested-same.txt"), "NS\n").unwrap();
+        std::fs::write(root.join("sub").join("nested-diff.txt"), "ND\n").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "base content"]).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let wt = PathBuf::from(&info.path);
+        // The branch moves BOTH tracked files away from the base and drops `ghost.txt` out of the
+        // index, so every reading below is about the worktree, not about HEAD == base.
+        std::fs::write(wt.join("same.txt"), "committed-X\n").unwrap();
+        std::fs::write(wt.join("diff.txt"), "committed-Y\n").unwrap();
+        // Stage the two edits EXPLICITLY, then drop ghost.txt from the index. `add -A` here would
+        // re-stage ghost.txt and leave it tracked-and-clean, which silently removes the untracked
+        // half of this test.
+        git(&info.path, &["add", "same.txt", "diff.txt"]).unwrap();
+        git(
+            &info.path,
+            &[
+                "rm",
+                "--cached",
+                "ghost.txt",
+                "ghost2.txt",
+                "sub/nested-same.txt",
+                "sub/nested-diff.txt",
+            ],
+        )
+        .unwrap();
+        git(&info.path, &["commit", "-m", "branch work"]).unwrap();
+
+        // Now the nine uncommitted paths.
+        std::fs::write(wt.join("same.txt"), "S\n").unwrap(); //  dirty, EQUAL to the base
+        std::fs::write(wt.join("diff.txt"), "Z\n").unwrap(); //  dirty, DIFFERENT from the base
+        // ghost.txt is untracked on this branch and still holds "G\n" — exactly what the base has.
+        std::fs::write(wt.join("ghost2.txt"), "rewritten\n").unwrap(); // untracked, base differs
+        std::fs::write(wt.join("brand-new.txt"), "N\n").unwrap(); // untracked, base never saw it
+        // sub/nested-same.txt is untracked here and still holds "NS\n" — what the base has.
+        std::fs::write(wt.join("sub").join("nested-diff.txt"), "changed\n").unwrap();
+        std::fs::create_dir_all(wt.join("newdir")).unwrap();
+        std::fs::write(wt.join("newdir").join("inside.txt"), "I\n").unwrap();
+        std::fs::write(wt.join("we\"ird.txt"), "Q\n").unwrap();
+
+        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
+        assert!(st.dirty, "the tree is dirty");
+        assert_eq!(
+            st.dirty_count, 9,
+            "SAFETY reading unchanged: every uncommitted path still counts, because the close \
+             prompt asks whether files are at risk and an identical-to-base file still is one — \
+             got {:?}",
+            st.dirty_files,
+        );
+        assert_eq!(
+            st.dirty_novel_count,
+            Some(6),
+            "SUBSTANCE reading: diff.txt (tracked, differs), ghost2.txt (untracked, base holds \
+             this path with OTHER content), brand-new.txt (untracked, absent from the base), \
+             sub/nested-diff.txt (the same question one directory down), newdir/ (a wholly \
+             untracked directory, counted without hashing) and the quoted name. same.txt, \
+             ghost.txt and sub/nested-same.txt hold exactly what the base already has.",
+        );
+
+        // ── THE MEMO MUST SEE AN IN-PLACE EDIT (roborev 65896). ──
+        // `same.txt` stays dirty and keeps its ` M same.txt` porcelain line, so the porcelain
+        // output is UNCHANGED — but its content crosses from identical-to-base into real work.
+        // That is the exact transition this field exists to report, and it is the normal shape of
+        // an active agent: keep working inside the dirty set you already have. A memo keyed on the
+        // porcelain output alone serves the stale count forever.
+        // ⚠️ THIS MUST RUN WHILE THE MEMO STILL HOLDS THE READING ABOVE. The cache keeps ONE
+        // entry per worktree, so any read that changes the dirty SET in between evicts it and the
+        // next read recomputes for a reason that has nothing to do with content — which passes
+        // whatever the key contains, and so tests nothing.
+        // SAME BYTE LENGTH as before ("S\n" → "X\n"), deliberately: a length change would be caught
+        // by the size half of the key on its own, and the mtime half — the one that carries the
+        // general case — would go untested. This edit is discriminated by mtime alone.
+        std::fs::write(wt.join("same.txt"), "X\n").unwrap();
+        let edited = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
+        assert_eq!(edited.dirty_count, 9, "the dirty SET did not change — same paths, same codes");
+        assert_eq!(
+            edited.dirty_novel_count,
+            Some(7),
+            "…but same.txt now holds content the base does not have, and the reading must say so",
+        );
+        std::fs::write(wt.join("same.txt"), "S\n").unwrap();
+
+
+        // ── THE BATCH PATH — the one that actually drives the sidebar. ──
+        // The same fix lands at TWO call sites, and a test covering only the single-agent path
+        // passes a whole-change mutation check while the site the user actually sees carries the
+        // identical hole (AGENTS.md: mutation-check EACH site).
+        //
+        // A SIXTH dirty path is added first, deliberately: it changes the porcelain output, so this
+        // read misses the memo and recomputes for real rather than being handed the answer the
+        // single-agent read just cached.
+        std::fs::write(wt.join("extra-new.txt"), "E\n").unwrap();
+        let base_ref = effective_base(&root_str, "main", false);
+        let batch =
+            branch_status_with_base(&root_str, "p", "s1", &base_ref, &wt, &app_data, None).unwrap();
+        assert_eq!(batch.dirty_count, 10, "got {:?}", batch.dirty_files);
+        assert_eq!(
+            batch.dirty_novel_count,
+            Some(7),
+            "the batch path computes the same narrower reading, plus the new untracked file",
+        );
+        let _ = std::fs::remove_file(wt.join("extra-new.txt"));
+
+        // A CLEAN tree is positively zero, and pays no subprocess to say so.
+        for f in ["same.txt", "diff.txt", "brand-new.txt"] {
+            let _ = std::fs::remove_file(wt.join(f));
+        }
+        git(&info.path, &["checkout", "--", "."]).unwrap();
+        for f in ["ghost.txt", "ghost2.txt", "we\"ird.txt"] {
+            let _ = std::fs::remove_file(wt.join(f));
+        }
+        let _ = std::fs::remove_file(wt.join("sub").join("nested-same.txt"));
+        let _ = std::fs::remove_file(wt.join("sub").join("nested-diff.txt"));
+        let _ = std::fs::remove_dir_all(wt.join("newdir"));
+        let clean = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
+        assert!(!clean.dirty, "PRECONDITION: the tree is clean again");
+        assert_eq!(clean.dirty_novel_count, Some(0), "a clean tree holds nothing novel");
+
+        for d in [&root, &app_data] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// Force a file's mtime to an exact epoch-millisecond instant.
+    ///
+    /// Real clock sleeps would make the split below depend on filesystem timestamp granularity and
+    /// on how long the surrounding git calls happen to take. Setting both sides EXPLICITLY is what
+    /// makes "before the agent" and "after the agent" facts of the fixture rather than a race.
+    fn set_mtime_ms(path: &Path, ms: u64) {
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms)),
+        )
+        .unwrap();
+    }
+
+    /// ATTRIBUTION: dirt older than the agent is not the agent's work (bead `sparkle-d5muhf`, 1B).
+    ///
+    /// THE MEASURED CASE this reproduces in miniature. Agent `d5d7056e` wore an "Unsaved" chip
+    /// while its work was merged. 131 dirty files: 11 byte-identical to `origin/main` (change 1A's
+    /// `dirty_novel_count` clears those) and 120 that genuinely DIFFER — a repo-wide `cargo fmt`
+    /// reflow mtimed hours before the agent's own first edit. Novelty cannot clear those, because
+    /// they really are novel content; they simply belong to nobody. So the fixture holds THREE
+    /// dirty files that all differ from the base, split only by when they were written.
+    ///
+    /// ⚠️ ONE WORKTREE, FILES ON BOTH SIDES OF THE INSTANT. A fixture with a single dirty file
+    /// cannot tell this reading apart from the old one — every "1" it could produce is also what
+    /// `dirty_count` says. The split is the assertion.
+    ///
+    /// The three sibling readings are asserted TOGETHER on every call, because the whole contract is
+    /// that they are different questions: `dirty_count` (SAFETY — the close prompt's, and it must
+    /// keep counting every file whoever made it), `dirty_novel_count` (SUBSTANCE) and this one
+    /// (ATTRIBUTION). A change that quietly redefined either of the first two would pass an
+    /// assertion about this one alone.
+    #[test]
+    fn dirty_since_agent_count_splits_dirt_by_whether_it_predates_the_agent() {
+        // A fixed instant, so nothing here depends on the wall clock.
+        const BORN_MS: u64 = 1_760_000_000_000;
+
+        let root = unique_root("dirt-provenance");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("dirt-provenance-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        for f in ["ambient.txt", "same-instant.txt", "mine.txt"] {
+            std::fs::write(root.join(f), "base\n").unwrap();
+        }
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "base content"]).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        let info = create_worktree_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let wt = PathBuf::from(&info.path);
+        // All three now differ from the base — this is the `cargo fmt` shape, where content
+        // comparison has nothing left to clear.
+        for f in ["ambient.txt", "same-instant.txt", "mine.txt"] {
+            std::fs::write(wt.join(f), "changed\n").unwrap();
+        }
+        // An hour BEFORE the agent existed: ambient churn nobody on this row authored.
+        set_mtime_ms(&wt.join("ambient.txt"), BORN_MS - 3_600_000);
+        // EXACTLY the creation instant. The tie falls toward the agent (`>=`) — the documented
+        // over-count direction, and the only arm that pins which comparison operator is in use.
+        set_mtime_ms(&wt.join("same-instant.txt"), BORN_MS);
+        // A second after: unambiguously this agent's.
+        set_mtime_ms(&wt.join("mine.txt"), BORN_MS + 1_000);
+
+        let born = Some(i64::try_from(BORN_MS).unwrap());
+        let st =
+            agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, born).unwrap();
+        assert!(st.dirty, "PRECONDITION: the tree is dirty");
+        assert_eq!(
+            st.dirty_count, 3,
+            "SAFETY reading UNCHANGED by this addition: the close prompt asks whether files are at \
+             risk, and a file the agent did not write is still at risk — got {:?}",
+            st.dirty_files,
+        );
+        assert_eq!(
+            st.dirty_novel_count,
+            Some(3),
+            "SUBSTANCE reading UNCHANGED: all three differ from the base, which is exactly why \
+             content comparison alone could not clear the motivating row",
+        );
+        assert_eq!(
+            st.dirty_since_agent_count,
+            Some(2),
+            "ATTRIBUTION: same-instant.txt and mine.txt were written at or after the agent was \
+             created; ambient.txt predates it and is not this agent's unsaved work",
+        );
+
+        // ── NO CREATION STAMP ⇒ NO ANSWER, and today's counts EXACTLY. ──
+        // A re-adopted worker and every legacy persisted row read `AgentTab.createdAt` as
+        // undefined. Absence of evidence must not buy the calmer reading, so this declines rather
+        // than reporting 0 — and the two sibling counts must be bit-for-bit what they were before
+        // this field existed.
+        let unknown =
+            agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
+        assert_eq!(unknown.dirty_since_agent_count, None, "could not tell — never zero");
+        assert_eq!(unknown.dirty_count, 3, "today's SAFETY count, to the number");
+        assert_eq!(unknown.dirty_novel_count, Some(3), "today's SUBSTANCE count, to the number");
+        assert!(unknown.dirty, "and `dirty` itself is untouched");
+
+        // A ZERO/negative stamp is NOT an instant either. Treating it as one would put every file
+        // on earth after it and attribute the whole tree to the agent.
+        let epoch =
+            agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, Some(0)).unwrap();
+        assert_eq!(epoch.dirty_since_agent_count, None, "a 0 stamp is 'unset', not 1970");
+
+        // ── THE BATCH PATH — the one that actually drives the sidebar. ──
+        // The fix lands at TWO call sites; a test covering only the single-agent path passes a
+        // whole-change mutation check while the site the user sees carries the identical hole
+        // (AGENTS.md: mutation-check EACH site).
+        let base_ref = effective_base(&root_str, "main", false);
+        let batch =
+            branch_status_with_base(&root_str, "p", "s1", &base_ref, &wt, &app_data, born).unwrap();
+        assert_eq!(batch.dirty_count, 3, "got {:?}", batch.dirty_files);
+        assert_eq!(
+            batch.dirty_since_agent_count,
+            Some(2),
+            "the batch path splits the same way — this is the reading the sidebar renders from",
+        );
+        let batch_unknown =
+            branch_status_with_base(&root_str, "p", "s1", &base_ref, &wt, &app_data, None).unwrap();
+        assert_eq!(batch_unknown.dirty_since_agent_count, None);
+        assert_eq!(batch_unknown.dirty_count, 3, "…with today's count preserved there too");
+
+        // ── A DELETED PATH HAS NO MTIME, AND COUNTS. ──
+        // The documented safe direction: an unreadable provenance must never let a row understate
+        // what it is holding. `git rm` leaves a ` D` porcelain line for a file that is gone from
+        // disk, so `symlink_metadata` fails and there is no instant to compare.
+        std::fs::remove_file(wt.join("ambient.txt")).unwrap();
+        let deleted =
+            agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, born).unwrap();
+        assert_eq!(deleted.dirty_count, 3, "still three dirty paths — got {:?}", deleted.dirty_files);
+        assert_eq!(
+            deleted.dirty_since_agent_count,
+            Some(3),
+            "the vanished path is COUNTED, not silently cleared: no mtime means no evidence it \
+             predates the agent, and this reading errs toward counting",
+        );
+
+        // ── A CLEAN TREE IS POSITIVELY ZERO, whatever the stamp says. ──
+        git(&info.path, &["checkout", "--", "."]).unwrap();
+        let clean =
+            agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, born).unwrap();
+        assert!(!clean.dirty, "PRECONDITION: the tree is clean again");
+        assert_eq!(
+            clean.dirty_since_agent_count,
+            Some(0),
+            "nothing is held, so nothing is the agent's — and this arm pays no stat at all",
+        );
+        // …and it still declines with no stamp only because there is nothing to attribute; a clean
+        // tree short-circuits BEFORE the stamp is consulted.
+        let clean_unknown =
+            agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
+        assert_eq!(
+            clean_unknown.dirty_since_agent_count,
+            Some(0),
+            "a clean tree is answerable without a creation stamp",
+        );
+
+        for d in [&root, &app_data] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    /// `Option::None` must reach the wire as an EXPLICIT `null`, never as an absent key.
+    ///
+    /// This is the seam AGENTS.md warns about: the TypeScript side is hand-written, and a parser
+    /// declared `dirtyNovelCount?: number` describes `number | undefined` — a shape serde cannot
+    /// produce for a field with no `skip_serializing_if`. A fixture written to match it (key
+    /// omitted) would test a case that never occurs, while the real payload carrying `null` gets
+    /// rejected — and an all-or-nothing parser discards the WHOLE object, so the feature ships
+    /// permanently inert with nothing logged. Asserting the JSON here is what pins the two halves
+    /// together, since neither suite can see the other.
+    #[test]
+    fn an_unknown_novel_count_serializes_as_null_not_as_an_absent_key() {
+        let st = BranchStatus {
+            ahead: 0,
+            behind: 0,
+            dirty: true,
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+            worktree_on_branch: true,
+            dirty_files: vec!["a.txt".into()],
+            dirty_count: 1,
+            dirty_novel_count: None,
+            dirty_since_agent_count: None,
+            branch: "sparkle/agent-s1".into(),
+        };
+        let v = serde_json::to_value(&st).unwrap();
+        assert!(
+            v.as_object().unwrap().contains_key("dirtyNovelCount"),
+            "the key is PRESENT even for None — an absent key is the shape the wire cannot produce",
+        );
+        assert_eq!(v["dirtyNovelCount"], serde_json::Value::Null);
+        // The ATTRIBUTION count crosses the same seam and carries the same hazard.
+        assert!(
+            v.as_object().unwrap().contains_key("dirtySinceAgentCount"),
+            "same rule for the attribution count: `None` is an explicit null, never a missing key",
+        );
+        assert_eq!(v["dirtySinceAgentCount"], serde_json::Value::Null);
+        // …and a known count is a plain number, camelCased like every sibling.
+        let known = BranchStatus { dirty_novel_count: Some(2), dirty_since_agent_count: Some(1), ..st };
+        let kv = serde_json::to_value(&known).unwrap();
+        assert_eq!(kv["dirtyNovelCount"], serde_json::json!(2));
+        assert_eq!(kv["dirtySinceAgentCount"], serde_json::json!(1));
     }
 
     #[test]
@@ -15140,7 +16782,7 @@ mod tests {
         git(&root_str, &["add", "-A"]).unwrap();
         git(&root_str, &["commit", "-m", "main work"]).unwrap();
 
-        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert_eq!(st.ahead, 2, "two agent commits");
         assert_eq!(st.behind, 1, "one main commit (left/right mapping correct, not transposed)");
         assert!(!st.dirty, "clean tree");
@@ -15155,7 +16797,7 @@ mod tests {
 
         // Make it dirty.
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
-        let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let st2 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert!(st2.dirty, "uncommitted file flips dirty");
         // THE POINT OF THE FIELD: it says WHICH. "Local: Uncommitted" naming no file is what the
         // founder could not act on — a forgotten fix and a leftover build artifact read identically.
@@ -15173,7 +16815,7 @@ mod tests {
         git(&info.path, &["add", "-A"]).unwrap();
         git(&info.path, &["commit", "-m", "ignore rule"]).unwrap();
         std::fs::write(Path::new(&info.path).join("ignored.log"), "noise").unwrap();
-        let st3 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let st3 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert!(!st3.dirty, "an ignored file is not uncommitted work");
         assert!(st3.dirty_files.is_empty(), "and is never named");
 
@@ -15181,7 +16823,7 @@ mod tests {
         for i in 0..(STATUS_DIRTY_FILES_CAP + 3) {
             std::fs::write(Path::new(&info.path).join(format!("f{i}.txt")), "x").unwrap();
         }
-        let st4 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let st4 = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert_eq!(st4.dirty_files.len(), STATUS_DIRTY_FILES_CAP, "preview is bounded");
         assert_eq!(
             st4.dirty_count as usize,
@@ -15225,7 +16867,7 @@ mod tests {
 
         // Baseline: on its own branch, a dirty tree IS the branch's dirt and must be reported.
         std::fs::write(Path::new(&info.path).join("uncommitted.txt"), "u").unwrap();
-        let before = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let before = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert!(before.dirty, "on its own branch, dirt belongs to the branch");
         assert!(before.worktree_on_branch, "worktree is on the agent branch");
         assert_eq!(before.ahead, 1);
@@ -15245,7 +16887,7 @@ mod tests {
             "parked tree really is dirty — so a naive read WOULD report dirty=true"
         );
 
-        let parked = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let parked = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert!(
             !parked.worktree_on_branch,
             "probe must notice the worktree is not on sparkle/agent-s1"
@@ -15301,7 +16943,7 @@ mod tests {
             "precondition: the tree is clean — nothing is actually unsaved"
         );
 
-        let st = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data, None).unwrap();
         assert_eq!(
             st.ahead, 2,
             "the renamed branch's commits must be counted — ahead=0 is what renders 'Unsaved'"
@@ -15349,6 +16991,7 @@ mod tests {
                 base_branch: "main".to_string(),
                 parent_branch: String::new(),
                 force: false,
+                created_at_ms: None,
             }],
             false,
             &app_data,
@@ -15409,6 +17052,7 @@ mod tests {
                 base_branch: "main".to_string(),
                 parent_branch: "sparkle/agent-boss".to_string(),
                 force: false,
+                created_at_ms: None,
             }],
             false,
             &app_data,
@@ -15918,7 +17562,7 @@ mod tests {
         // Poll twice so the ownership row exists and the claim really is `Mine` — this must be
         // refused for the CONTINUATION reason, not because identity happened to be missing.
         for _ in 0..2 {
-            let _ = agent_branch_status_at(&root_str, "p", "landed", "main", &app_data);
+            let _ = agent_branch_status_at(&root_str, "p", "landed", "main", &app_data, None);
         }
         assert_eq!(
             HeadClaim::from_store(app_data.as_path(), "p", "feature/not-mine", "landed"),
@@ -16103,7 +17747,7 @@ mod tests {
         );
         assert!(!minted_tip.is_empty());
         for _ in 0..2 {
-            let _ = agent_branch_status_at(&root_str, "p", "hopped", "main", &app_data);
+            let _ = agent_branch_status_at(&root_str, "p", "hopped", "main", &app_data, None);
         }
         assert_eq!(
             HeadClaim::from_store(app_data.as_path(), "p", "feature/not-mine", "hopped"),
@@ -16225,7 +17869,7 @@ mod tests {
         std::fs::write(Path::new(&owner.path).join("f.txt"), "their work").unwrap();
         git(&owner.path, &["add", "-A"]).unwrap();
         git(&owner.path, &["commit", "-m", "their work"]).unwrap();
-        let owned = agent_branch_status_at(&root_str, "p", "owner", "main", &app_data).unwrap();
+        let owned = agent_branch_status_at(&root_str, "p", "owner", "main", &app_data, None).unwrap();
         assert_eq!(owned.branch, "sparkle/theirs", "precondition: the owner is recorded on it");
 
         // A DIFFERENT agent that never started, whose tree is then checked out onto that branch.
@@ -16234,7 +17878,7 @@ mod tests {
         let idle = create_worktree_at(&root_str, "p", "idle", "main", &app_data).unwrap();
         git(&idle.path, &["checkout", "sparkle/theirs"]).unwrap();
 
-        let st = agent_branch_status_at(&root_str, "p", "idle", "main", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "idle", "main", &app_data, None).unwrap();
         assert_eq!(
             st.branch, "sparkle/agent-idle",
             "a branch another agent is recorded on is not this agent's work"
@@ -16249,7 +17893,7 @@ mod tests {
         // one-shot for a commit (roborev 65183): the same call that returned the refusal also
         // latched the row `ambiguous`, and the next tick read that as "unknown" and adopted. Thirty
         // seconds is all it took for the wrong branch to be reported as this agent's, permanently.
-        let again = agent_branch_status_at(&root_str, "p", "idle", "main", &app_data).unwrap();
+        let again = agent_branch_status_at(&root_str, "p", "idle", "main", &app_data, None).unwrap();
         assert_eq!(
             again.branch, "sparkle/agent-idle",
             "the refusal must SURVIVE the observation the first poll wrote"
@@ -16355,6 +17999,7 @@ mod tests {
                 parent_branch: String::new(),
                 kind: "build".into(),
                 force: true,
+                created_at_ms: None,
             }],
             false,
             &app_data,
@@ -16399,7 +18044,7 @@ mod tests {
         git(&info.path, &["commit", "-m", "the work"]).unwrap();
 
         // One poll, which is what records the branch → agent mapping.
-        let before = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        let before = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data, None).unwrap();
         assert_eq!(before.branch, "sparkle/feature-work", "precondition: the rename is picked up");
 
         // main moves on, and the park resets the agent's MINTED ref onto it — one ref, forward,
@@ -16414,7 +18059,7 @@ mod tests {
             "fixture: the minted ref is now AHEAD of the renamed branch — an ancestry test would refuse here"
         );
 
-        let after = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        let after = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data, None).unwrap();
         assert_eq!(
             after.branch, "sparkle/feature-work",
             "a park moving the minted ref must not un-rename the agent"
@@ -16447,7 +18092,7 @@ mod tests {
         std::fs::write(Path::new(&a1.path).join("f.txt"), "work").unwrap();
         git(&a1.path, &["add", "-A"]).unwrap();
         git(&a1.path, &["commit", "-m", "first agent's work"]).unwrap();
-        let solo = agent_branch_status_at(&root_str, "p", "first", "main", &app_data).unwrap();
+        let solo = agent_branch_status_at(&root_str, "p", "first", "main", &app_data, None).unwrap();
         assert_eq!(solo.branch, "sparkle/shared-name", "precondition: recorded and adopted");
 
         // A second agent sits on it, which latches the row `ambiguous` — the mapping now names
@@ -16455,13 +18100,13 @@ mod tests {
         git(&a1.path, &["checkout", "--detach"]).unwrap();
         let a2 = create_worktree_at(&root_str, "p", "second", "main", &app_data).unwrap();
         git(&a2.path, &["checkout", "sparkle/shared-name"]).unwrap();
-        let _ = agent_branch_status_at(&root_str, "p", "second", "main", &app_data).unwrap();
+        let _ = agent_branch_status_at(&root_str, "p", "second", "main", &app_data, None).unwrap();
 
         // THE ASSERTION THAT MATTERS: the first agent, whose work this genuinely is, must not be
         // demoted to its empty minted ref just because something else touched its branch once.
         git(&a2.path, &["checkout", "--detach"]).unwrap();
         git(&a1.path, &["checkout", "sparkle/shared-name"]).unwrap();
-        let after = agent_branch_status_at(&root_str, "p", "first", "main", &app_data).unwrap();
+        let after = agent_branch_status_at(&root_str, "p", "first", "main", &app_data, None).unwrap();
         assert_eq!(
             after.branch, "sparkle/shared-name",
             "a permanent ambiguity latch must not strand a real agent at 'Nothing Yet'"
@@ -16489,7 +18134,7 @@ mod tests {
         std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
         git(&info.path, &["add", "-A"]).unwrap();
         git(&info.path, &["commit", "-m", "work"]).unwrap();
-        let st = agent_branch_status_at(&root_str, "p", "named", "main", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "named", "main", &app_data, None).unwrap();
         assert_eq!(st.branch, "sparkle/descriptive", "name what the numbers were measured on");
         assert_eq!(st.ahead, 1, "and they are the descriptive branch's numbers");
 
@@ -16500,7 +18145,7 @@ mod tests {
         git(&info2.path, &["commit", "-m", "work"]).unwrap();
         git(&root_str, &["branch", "elsewhere", "main"]).unwrap();
         git(&info2.path, &["checkout", "elsewhere"]).unwrap();
-        let st2 = agent_branch_status_at(&root_str, "p", "sitting", "main", &app_data).unwrap();
+        let st2 = agent_branch_status_at(&root_str, "p", "sitting", "main", &app_data, None).unwrap();
         assert_eq!(st2.branch, "sparkle/agent-sitting", "a parked tree still reports its own branch");
         assert!(!st2.worktree_on_branch, "…and flags that the tree is elsewhere");
 
@@ -16529,7 +18174,7 @@ mod tests {
         std::fs::remove_dir_all(&info.path).unwrap();
         assert!(!Path::new(&info.path).exists(), "worktree dir removed");
 
-        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert_eq!(st.ahead, 1, "ahead/behind still computed from refs in root");
         assert_eq!(st.behind, 0);
         assert!(!st.dirty, "a removed worktree reports clean, not an error");
@@ -16559,7 +18204,7 @@ mod tests {
             "precondition: agent branch ref absent",
         );
 
-        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "s1", "main", &app_data, None).unwrap();
         assert_eq!(st.ahead, 0, "no ref ⇒ nothing ahead");
         assert_eq!(st.behind, 0, "no ref ⇒ nothing behind");
         assert!(!st.dirty, "no worktree ⇒ clean");
@@ -16598,7 +18243,7 @@ mod tests {
         // touch the real store.
         let owners = tempfile::tempdir().unwrap();
         let st =
-            branch_status_with_base(&root_str, "p", "s1", "main", &wt, owners.path()).unwrap();
+            branch_status_with_base(&root_str, "p", "s1", "main", &wt, owners.path(), None).unwrap();
         assert_eq!(st.ahead, 0, "no ref ⇒ nothing ahead");
         assert_eq!(st.behind, 0, "no ref ⇒ nothing behind");
         assert!(!st.dirty, "no worktree ⇒ clean");
@@ -16648,7 +18293,7 @@ mod tests {
 
         let wt = root.join("nonexistent-wt");
         let owners = tempfile::tempdir().unwrap();
-        let st = branch_status_with_base(&root_str, "p", "s1", ghost, &wt, owners.path()).unwrap();
+        let st = branch_status_with_base(&root_str, "p", "s1", ghost, &wt, owners.path(), None).unwrap();
         assert_eq!(st.ahead, total, "unresolvable base ⇒ ahead = the branch's own commits");
         assert_eq!(st.behind, 0, "unresolvable base ⇒ nothing to be behind");
         assert!(!st.dirty, "no worktree ⇒ clean");
@@ -16682,7 +18327,7 @@ mod tests {
 
         // The recorded base "sparkle/ghost-base" resolves to nothing; effective_base recovers the
         // detected default `main`, so the call succeeds and measures against it (ahead == 1).
-        let st = agent_branch_status_at(&root_str, "p", "s1", "sparkle/ghost-base", &app_data).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "s1", "sparkle/ghost-base", &app_data, None).unwrap();
         assert_eq!(st.ahead, 1, "drifted base name recovers to `main`; agent-s1 is 1 ahead");
         assert_eq!(st.behind, 0, "nothing to be behind");
 
@@ -17295,6 +18940,7 @@ mod tests {
             parent_branch: String::new(),
             kind: "build".into(),
             force: true,
+            created_at_ms: None,
         };
         let results = project_agents_status_at(&root_str, "p1", &[input], false, &app_data);
         assert_eq!(results.len(), 1);

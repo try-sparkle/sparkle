@@ -161,6 +161,7 @@ import { useNudgeFlagSnapshot } from "../useNudgeFlags";
 import {
   stallInputsFor,
 } from "./rowAttention";
+import { awaitingCloseEvidenceFor } from "../services/agentGoalReading";
 // ONE producer for what an agent is complaining about, shared with the composer's pill row so the
 // two surfaces cannot drift — the taxonomy drift engine/workerRollup.ts warns about twice.
 import { splitStatusPollTargets } from "../engine/statusPollTargets";
@@ -438,6 +439,11 @@ export function AgentSidebar({
   const nudgeFlags = useNudgeFlagSnapshot();
   const stallReportOf = useCallback(
     (id: string) => {
+      // REACTIVITY ANCHOR, not dead code. `awaitingCloseEvidenceFor` reads the merge watermark from
+      // the store rather than taking it as an argument, so nothing in this body mentions
+      // `workflowShipped` and the dep would read as unnecessary — while dropping it leaves a row
+      // that has just merged painting its old colour until some other input happens to change.
+      void workflowShipped;
       const agent = agentsById.get(id);
       if (agent === undefined) return undefined;
       return stallReport(
@@ -448,10 +454,23 @@ export function AgentSidebar({
           { bs: branchStatus[id], ws: workflowState[id], stageOverride: workflowStage[id] },
           quotaBlockForAgent(id, Date.now()),
           humanBlockIn(nudgeFlags, id),
+          // Whether git says this agent's work already shipped FOR THIS GOAL. Without it this
+          // surface cannot reach `awaiting_close`, so a row whose PR is merged behind a check only a
+          // person may answer keeps raising the RED `blocked-on-human` cause — the exact
+          // wrong-status reading this state was added to remove, on the one surface he watches.
+          awaitingCloseEvidenceFor(id, agent.goal),
         ),
       );
     },
-    [agentsById, calmStatus, branchStatus, workflowState, workflowStage, nudgeFlags],
+    [
+      agentsById,
+      calmStatus,
+      branchStatus,
+      workflowState,
+      workflowStage,
+      workflowShipped,
+      nudgeFlags,
+    ],
   );
   /** Positively read as FINISHED, or `undefined` when the git state was never read. `undefined` is a
    *  real answer and it demotes nothing — see engine/finishedHeadCalm. */
@@ -468,6 +487,11 @@ export function AgentSidebar({
       project.agents,
       calmStatus,
       (id) => {
+        // REACTIVITY ANCHOR, not dead code. `awaitingCloseEvidenceFor` reads the merge watermark from
+        // the store rather than taking it as an argument, so nothing in this body mentions
+        // `workflowShipped` and the dep would read as unnecessary — while dropping it leaves a row
+        // that has just merged painting its old colour until some other input happens to change.
+        void workflowShipped;
         const agent = agentsById.get(id);
         if (agent === undefined) return undefined;
         return stallReport(
@@ -488,6 +512,10 @@ export function AgentSidebar({
             // the founder actually watches — cannot see the only structural "blocked on human" signal
             // the app produces, so the row renders amber while its goal badge says otherwise.
             humanBlockIn(nudgeFlags, id),
+            // …and the same third input, for the same reason. This is the derivation that writes the
+            // DOT, so omitting it here would leave a landed-and-awaiting row red while the chip one
+            // component over read "done — awaiting your close" — the colour-vs-copy split inverted.
+            awaitingCloseEvidenceFor(id, agent.goal),
           ),
         );
       },
@@ -502,6 +530,7 @@ export function AgentSidebar({
     branchStatus,
     workflowStage,
     workflowState,
+    workflowShipped,
     openIds,
     nudgeFlags,
   ]);
@@ -758,6 +787,9 @@ export function AgentSidebar({
           name: a.name,
           parentId: a.parentId,
           force: status[a.id] === "working",
+          // The spawn stamp, forwarded so Rust can tell dirt this agent made from ambient churn
+          // that was already in the tree (`dirtySinceAgentCount`).
+          createdAt: a.createdAt,
         });
         await pollProjectStatus(proj.rootPath, proj.id, all.map(toInput), true);
         // The CLOSED rows, with the PR probe OFF. `probePrState: false` is what keeps this cheap:

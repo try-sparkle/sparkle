@@ -831,6 +831,7 @@ pub fn run() {
             claude_chat::claude_chat_cancel,
             sparkle_improve::sparkle_improve_run,
             sparkle_improve::sparkle_improve_cancel,
+            sparkle_improve::sparkle_improve_active,
             concierge::concierge_turn,
             concierge::concierge_cancel,
             concierge::concierge_proactive_turn,

@@ -1122,6 +1122,12 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
     expect(dot.style.background).not.toBe(asRgb(AGENT_STATUS.working.color));
     // …and not gray either, now that gray is reserved for work that is effectively finished.
     expect(dot.style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
+    // THE DISCRIMINATOR (bead sparkle-ex3wkh). The colour above no longer separates this case from
+    // its resting sibling — both are amber — so the assertion that this row was NOT escalated has
+    // to be made on the STATUS MAP instead. The floor RECOLOURS and leaves `st` alone; the
+    // escalation WRITES its status in. `StatusDot`'s title is `AGENT_STATUS[st].label`, so the map
+    // is observable exactly there while the paint is not.
+    expect(dot.title).toBe(AGENT_STATUS.unmerged.label);
   });
 
   it("but a head whose whole subtree is RESTING with unlanded work leaves the calm tier", () => {
@@ -1137,8 +1143,36 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
     render(<AgentSidebar project={project} />);
     const dot = rowFor("Alpha").querySelector<HTMLElement>("span[title]")!;
     expect(dot.style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
-    // The property the case is really about: it did NOT stay calm like the in-motion head above.
-    expect(dot.style.background).not.toBe(asRgb(AGENT_STATUS.idle.color));
+    // THE PROPERTY THE CASE IS REALLY ABOUT — and it is no longer the colour (bead sparkle-ex3wkh).
+    //
+    // This line used to read "it did NOT stay calm like the in-motion head above", which became
+    // literally false when the terminal-gray floor started painting that head amber too. Both
+    // siblings then asserted the SAME colour for OPPOSITE subtree states, so the pair stopped
+    // discriminating: deleting the escalation's lifecycle membership — the documented one-line
+    // escape hatch — left both cases green.
+    //
+    // The escalation WRITES `lapsed` into the status map; the floor only recolours and leaves `st`
+    // as `unmerged`. So the title is where the two come apart, and it is what proves the escalation
+    // actually REACHED the rendered row rather than the floor having painted over its absence.
+    expect(dot.title).toBe(AGENT_STATUS.lapsed.label);
+  });
+
+  it("and the two heads' titles are what tell them apart, now that the colour cannot", () => {
+    // The pair's discrimination, asserted as a single fact so it cannot rot the way the colour
+    // comparison did. Both rows are rendered here, in ONE test: a title assertion in each sibling
+    // separately still passes if `unmerged` and `lapsed` ever come to share a label, and absence in
+    // a component that is not mounted proves nothing (AGENTS.md, sparkle-foqoe).
+    const titleOf = (status: Record<string, AgentTabStatus>) => {
+      const { unmount } = render(<AgentSidebar project={seedUnmerged(status)} />);
+      const t = rowFor("Alpha").querySelector<HTMLElement>("span[title]")!.title;
+      unmount();
+      return t;
+    };
+    const inMotion = titleOf({ a1: "idle", w1: "working", w2: "idle" });
+    const resting = titleOf({ a1: "idle", w1: "idle", w2: "idle" });
+    expect(inMotion).toBe(AGENT_STATUS.unmerged.label);
+    expect(resting).toBe(AGENT_STATUS.lapsed.label);
+    expect(inMotion).not.toBe(resting);
   });
 
   it("counts it under Done, not Running", () => {

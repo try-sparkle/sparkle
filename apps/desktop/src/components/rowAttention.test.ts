@@ -14,6 +14,7 @@ import {
   stallInputsFor,
   thrashChipLabel,
   STALL_CAUSE_LABEL,
+  STALL_CAUSE_RANK,
 } from "./rowAttention";
 import { escalationFor } from "../engine/stallEscalation";
 import type { StallCause, StallReport } from "../engine/agentStall";
@@ -597,6 +598,7 @@ describe("stallChipFor — a red cause always heads the chip", () => {
     "blocked-on-human": 0,
     "rearms-exhausted": 0,
     "human-verified-goal": 0,
+    "awaiting-close": 0,
     "abandoned-goal": 0,
     "unmet-goal": 0,
     "open-pr": 0,
@@ -649,5 +651,128 @@ describe("stallChipFor — a red cause always heads the chip", () => {
     // THE PAIRED NEGATIVE. If the head selection were broken toward red generally, this would fail.
     expect(stallChipFor(chipOf(["human-verified-goal"]))?.text).toBe("awaiting your sign-off");
     expect(stallChipFor(chipOf(["escalated-goal", "unmet-goal"]))?.text).toBe("goal unmet +1");
+  });
+});
+
+// ══ `awaiting-close` — A `blocked-on-human` ANSWER FROM A LANDED ROW PAINTS AMBER, NOT RED ═══════
+//
+// The founder, on agent `d5d7056e` (PR #2188 merged, `{kind:"human"}` goal): *"this is not a blocked
+// on human issue. The issue is that it's in the wrong status and you're nudging it in a way that
+// it's saying that it's blocked on a human."* The agent's nudge answer was ACCURATE — a person IS
+// the next actor — but red means "stuck, and only the founder can unblock it", and a row whose PR is
+// merged and whose goal needs one click is not stuck.
+//
+// ⚠️ BOTH ROWS ARE BUILT IN ONE TEST, and that is the point rather than tidiness. Asserting "the
+// amber row is not red" on its own is satisfied by a change that de-reddens EVERY `blocked-on-human`
+// answer — a general demotion of the loudest signal the app has, dressed as a narrow fix. Absence
+// proves nothing unless the thing that should still be present is built beside it (AGENTS.md,
+// `sparkle-foqoe`). The two fixtures differ in exactly one field.
+describe("awaiting-close — the RED veto is narrow", () => {
+  const HUMAN_GOAL = () =>
+    newGoal("PR #2188 is reviewed and merged", NOW, DEFAULT_GOAL_TTL_MS, { kind: "human" });
+  const SAID_BLOCKED = { raisedAtMs: NOW - 60_000 };
+  const SHIPPED = { landed: true, shippedAfterGoalSet: true } as const;
+  /** A quiet row that answered `blocked-on-human` when the nudger asked, with clean git evidence. */
+  const rowThatSaidBlocked = (awaitingClose?: { landed: boolean | undefined; shippedAfterGoalSet: boolean }) =>
+    stallReport({
+      status: "idle",
+      now: NOW + 60_000,
+      goal: HUMAN_GOAL(),
+      humanBlock: SAID_BLOCKED,
+      hasOpenPr: false,
+      hasUnlandedWork: false,
+      hasUncommittedChanges: false,
+      ...(awaitingClose ? { awaitingClose } : {}),
+    });
+
+  it("paints AMBER for the landed row and RED for the one beside it — both built here", () => {
+    const landed = rowThatSaidBlocked(SHIPPED);
+    const notLanded = rowThatSaidBlocked({ landed: false, shippedAfterGoalSet: true });
+
+    // THE DOT. `lapsed` is amber and bands into `done`; `blocked` is the red tier.
+    expect(escalationFor(landed)).toBe("lapsed");
+    expect(escalationFor(notLanded)).toBe("blocked");
+
+    // THE CAUSE the dot is derived from — the red one is GONE from the landed row and PRESENT on
+    // the other, so this cannot pass by both rows simply carrying it.
+    expect(landed.causes).toContain("awaiting-close");
+    expect(landed.causes).not.toContain("blocked-on-human");
+    expect(notLanded.causes).toContain("blocked-on-human");
+    expect(notLanded.causes).not.toContain("awaiting-close");
+
+    // THE WORDS. The chip head is picked by rank, so this also pins that the calm cause did not
+    // sneak above a red one — a mis-rank puts a calm chip beside a red dot, which is the exact
+    // colour-vs-copy split this whole feature closes, inverted.
+    expect(stallChipFor(landed)?.text).toContain("done — awaiting your close");
+    expect(stallChipFor(notLanded)?.text).toContain("blocked on you");
+  });
+
+  it("stallInputsFor THREADS the evidence through — the sidebar's own builder, not just the service", () => {
+    // ⚠️ THIS IS THE GAP THAT NEARLY SHIPPED. `services/agentGoalReading.stallReadingFor` feeds
+    // `get_state` and `get_agent_status`; THIS builder feeds `AgentSidebar`, `AgentRow` and the
+    // composer's pill row — the surfaces the founder actually looks at. Wiring only the first would
+    // have left the control surfaces calling an agent done while the dot beside his eyes stayed red,
+    // which is the cross-surface split every comment in `stallInputsFor` is guarding against.
+    const goal = HUMAN_GOAL();
+    const ev = { bs: CLEAN_BS, ws: undefined, stageOverride: undefined };
+    const withEvidence = stallReport(
+      stallInputsFor("idle", NOW + 60_000, goal, ev, undefined, SAID_BLOCKED, SHIPPED),
+    );
+    expect(withEvidence.causes).toContain("awaiting-close");
+    expect(escalationFor(withEvidence)).toBe("lapsed");
+
+    // The paired omission — one argument apart — so this cannot pass against a builder that hard-codes
+    // the state, and so the "a caller that forgot to look changes nothing" direction is pinned too.
+    const without = stallReport(
+      stallInputsFor("idle", NOW + 60_000, goal, ev, undefined, SAID_BLOCKED),
+    );
+    expect(without.causes).not.toContain("awaiting-close");
+    expect(escalationFor(without)).toBe("blocked");
+  });
+
+  it("says DONE, and never asks for a sign-off", () => {
+    // The wording was specified: a chip leading with a demand makes a finished row scan as one that
+    // is stuck on him, which is the misreading this state exists to remove.
+    expect(STALL_CAUSE_LABEL["awaiting-close"]).toBe("done — awaiting your close");
+    expect(STALL_CAUSE_LABEL["awaiting-close"]).not.toMatch(/needs your/i);
+  });
+
+  it("ranks BELOW every red cause, so a red dot can never head a calm chip", () => {
+    // Derived from the engine rather than restated: a guard tested against a copy of its own
+    // mechanism proves nothing about the mechanism.
+    const isRed = (c: StallCause) =>
+      escalationFor({ verdict: "stalled", causes: [c], detail: "" }) === "blocked";
+    const reds = (Object.keys(STALL_CAUSE_RANK) as StallCause[]).filter(isRed);
+    expect(reds.length).toBeGreaterThan(0);
+    for (const r of reds) {
+      expect(STALL_CAUSE_RANK["awaiting-close"], `vs ${r}`).toBeGreaterThan(STALL_CAUSE_RANK[r]);
+    }
+  });
+
+  it("raises the cause with NO nudge answer at all — the common case is a silent row", () => {
+    // The state is derived from git and the goal record, so it must not need the agent to have been
+    // asked anything. The paired negative is the same row with no landed evidence.
+    const silentLanded = stallReport({
+      status: "idle",
+      now: NOW + 60_000,
+      goal: HUMAN_GOAL(),
+      hasOpenPr: false,
+      hasUnlandedWork: false,
+      hasUncommittedChanges: false,
+      awaitingClose: SHIPPED,
+    });
+    expect(silentLanded.causes).toContain("awaiting-close");
+    expect(escalationFor(silentLanded)).toBe("lapsed");
+
+    const silentUnlanded = stallReport({
+      status: "idle",
+      now: NOW + 60_000,
+      goal: HUMAN_GOAL(),
+      hasOpenPr: false,
+      hasUnlandedWork: false,
+      hasUncommittedChanges: false,
+    });
+    expect(silentUnlanded.causes).not.toContain("awaiting-close");
+    expect(silentUnlanded.causes).toContain("unmet-goal");
   });
 });
