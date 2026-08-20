@@ -849,7 +849,8 @@ pub async fn project_default_branch(root: String) -> Result<String, String> {
 /// Three normalizations, each load-bearing:
 ///   * git answers RELATIVE to the cwd it was run in for the common case (a bare `.git`), so it is
 ///     joined onto `root` before anything else — otherwise every project in the app would share the
-///     key `.git` and the app would treat all of them as one project.
+///     key `.git` and the app would treat all of them as one project. That join (and the empty
+///     answer check beside it) lives in [`git_common_dir_raw`], shared with `common_dir_for`.
 ///   * `canonicalize` resolves symlinks, so `/tmp/x` and `/private/tmp/x` (macOS) agree. Two
 ///     projects reached by different symlinked routes to one repo are the same repo.
 ///   * failure is `None`, never a guess. A folder that is not a repo has no repository identity,
@@ -867,19 +868,10 @@ pub fn repo_key_at(root: &str) -> Option<String> {
     if top != std::fs::canonicalize(root).ok()? {
         return None;
     }
-    let raw = git(root, &["rev-parse", "--git-common-dir"]).ok()?;
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    let joined = {
-        let p = std::path::Path::new(raw);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            std::path::Path::new(root).join(p)
-        }
-    };
+    // `?`, not a fallback: the `None` stays HERE rather than inside the shared helper, because
+    // this caller must propagate it while `common_dir_for` must swallow it. See
+    // `git_common_dir_raw` for why that split is the whole reason the helper stops at `Option`.
+    let joined = git_common_dir_raw(root)?;
     // Canonicalize when the path exists; fall back to the joined form otherwise so a readable
     // answer is never thrown away just because the filesystem call failed.
     let resolved = std::fs::canonicalize(&joined).unwrap_or(joined);
@@ -1139,16 +1131,55 @@ fn hooks_dir_for(repo_root: &str) -> PathBuf {
 /// comment for why each branch exists (gitlink files, relative answers, and the ENOTDIR trap when
 /// git cannot answer at all).
 fn common_dir_for(repo_root: &str) -> PathBuf {
-    let common = git(repo_root, &["rev-parse", "--git-common-dir"])
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-    match common {
-        Some(dir) if dir.is_absolute() => dir,
-        Some(dir) => Path::new(repo_root).join(dir),
-        None => gitfile_common_dir(repo_root)
-            .unwrap_or_else(|| Path::new(repo_root).join(".git")),
+    // The fallback chain is this caller's OWN policy and stays here: an unresolved hooks dir means
+    // hooks never install, so a guess beats nothing. `repo_key_at` needs the exact opposite from
+    // the same `None` — see `git_common_dir_raw`.
+    git_common_dir_raw(repo_root).unwrap_or_else(|| {
+        gitfile_common_dir(repo_root).unwrap_or_else(|| Path::new(repo_root).join(".git"))
+    })
+}
+
+/// `git rev-parse --git-common-dir` for `repo_root`, re-anchored — or `None` when git can't answer.
+///
+/// The ONE copy of the two rules every caller needs and none may skip:
+///   * git answers RELATIVE to the cwd it ran in for the common case (a bare `.git`), so a
+///     relative answer is joined onto `repo_root`. Skip that and every project in the app shares
+///     the key `.git` — they would all read as one repository.
+///   * an empty answer is NO answer. Joining `""` yields `repo_root` itself, which is the worst
+///     shape a wrong answer can take: a real, plausible directory that is not a gitdir.
+///
+/// It deliberately stops at `Option` and applies NO policy of its own, because its three callers
+/// need three DIFFERENT things from a `None` and every difference is load-bearing.
+/// [`repo_key_at`] must PROPAGATE it — a guessed identity merges every non-repo project into one
+/// phantom, so `<root>/.git` there is worse than no answer. [`common_dir_for`] must SWALLOW it —
+/// an unresolved hooks dir means hook install silently never happens, so its `gitfile_common_dir`
+/// → `<root>/.git` chain is right for it and only for it. The fleet fingerprint just drops the
+/// input. Returning a guess from here would quietly take that choice away from all three, which is
+/// exactly how a de-duplication of this resolution turns `repo_key_at` into a project-merging bug.
+fn git_common_dir_raw(repo_root: &str) -> Option<PathBuf> {
+    // `git()` already trims, so a successful answer is either a path or the empty string.
+    anchor_common_dir(&git(repo_root, &["rev-parse", "--git-common-dir"]).ok()?, repo_root)
+}
+
+/// The PURE half of [`git_common_dir_raw`]: everything that happens to git's answer once we have
+/// one. Split out so BOTH of the rules above are reachable from a test.
+///
+/// That split is not tidiness — it repairs a pin that claimed grip it did not have. When the empty
+/// check lived inside `git_common_dir_raw`, no test could reach it: the only way to get a `None` in
+/// a test is a non-repo directory, where `git()` itself returns `Err` and `?` returns FIRST, so
+/// `raw.is_empty()` was never evaluated. Deleting that branch left the whole suite green — and it
+/// is precisely the rule the extraction NEWLY applies to the fleet-fingerprint call site, which had
+/// no empty filter before. A commit arguing that pins must be measured rather than assumed must not
+/// ship one of its own.
+///
+/// `anchor_common_dir("", root)` is the mutation that now reds: without the check the join yields
+/// `root` itself — a real, plausible directory that is not a gitdir.
+fn anchor_common_dir(raw: &str, repo_root: &str) -> Option<PathBuf> {
+    if raw.is_empty() {
+        return None;
     }
+    let p = Path::new(raw);
+    Some(if p.is_absolute() { p.to_path_buf() } else { Path::new(repo_root).join(p) })
 }
 
 /// THE canonical no-subprocess parser for a repo root's git layout: `(own_gitdir, common_gitdir)`.
@@ -5872,10 +5903,7 @@ pub fn project_agents_status_at(
     // instant (sparkle-prpb).
     let now = Instant::now();
     // git-common-dir for locating each worktree's private index (fingerprint input). Best-effort.
-    let git_common_dir: Option<PathBuf> = git(root, &["rev-parse", "--git-common-dir"]).ok().map(|d| {
-        let p = PathBuf::from(&d);
-        if p.is_absolute() { p } else { Path::new(root).join(p) }
-    });
+    let git_common_dir: Option<PathBuf> = git_common_dir_raw(root);
     // The integration-branch tips — BOTH local <default> and origin/<default> — folded into EVERY
     // agent's fingerprint so ANY advance of main re-evaluates everyone. This matters for reachability
     // ("On Main"/"Merged") that moves without the agent's OWN tip changing: a LOCAL merge advances
@@ -12618,6 +12646,104 @@ mod tests {
         // `None`, never a guess: a fabricated identity would merge every non-repo project into one.
         let d = tempfile::tempdir().unwrap();
         assert_eq!(repo_key_at(&d.path().to_string_lossy()), None);
+    }
+
+    // `git_common_dir_raw` MUST NOT ACQUIRE A FALLBACK. Mutate the helper to answer `<root>/.git`
+    // and this goes red immediately.
+    //
+    // WHAT IT DOES NOT CATCH, stated because an earlier version of this comment claimed it did:
+    // dropping the EMPTY-ANSWER check is invisible here. This test's `None` comes from `git()`
+    // returning `Err` on a non-repo directory, so `?` returns before the empty branch is ever
+    // evaluated. That rule is pinned by `anchor_common_dir_treats_an_empty_answer_as_no_answer`
+    // below, against the pure half where it is actually reachable.
+    //
+    // It is deliberately a test of the HELPER and not of `repo_key_at`, because `repo_key_at`
+    // cannot express this property — see the divergence test below for why.
+    #[test]
+    fn git_common_dir_raw_answers_none_rather_than_guessing() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+        assert_eq!(
+            git_common_dir_raw(&root),
+            None,
+            "the shared resolver must report that git could not answer, never invent a path — its \
+             three callers each need a different response to that and only they may choose it",
+        );
+        // A real repo root still resolves, so the `None` above is about the missing repository and
+        // not about the helper being broken for everyone.
+        let r = scratch_repo();
+        assert!(git_common_dir_raw(&r.path().to_string_lossy()).is_some());
+    }
+
+    /// THE EMPTY-ANSWER RULE, pinned where it is REACHABLE.
+    ///
+    /// "An empty answer is no answer" is the second of the two rules `git_common_dir_raw`'s doc
+    /// comment calls load-bearing, and until this test it was asserted by nothing: every route to a
+    /// `None` in a test goes through a non-repo directory, where `git()` errors and `?` returns
+    /// before the empty check runs. So the check could be deleted with the whole suite green — on
+    /// the very rule the extraction newly applies to the fleet-fingerprint call site, which had no
+    /// empty filter of its own before.
+    ///
+    /// Testing the pure half is what makes it reachable. Delete the `is_empty` branch and the join
+    /// yields `repo_root` itself, so this assertion reds — which is the grip the sibling above was
+    /// mistakenly credited with.
+    #[test]
+    fn anchor_common_dir_treats_an_empty_answer_as_no_answer() {
+        let root = "/somewhere/a-project";
+        assert_eq!(
+            anchor_common_dir("", root),
+            None,
+            "an empty answer must be NO answer: joining it yields the repo root itself, which is a \
+             real, plausible directory that is not a gitdir — the worst shape a wrong answer takes",
+        );
+        // The paired positives, so the rule above cannot be satisfied by rejecting everything.
+        assert_eq!(
+            anchor_common_dir(".git", root),
+            Some(Path::new(root).join(".git")),
+            "a RELATIVE answer is anchored onto the repo root — unjoined, every project in the app \
+             shares the key `.git` and they all read as one repository",
+        );
+        assert_eq!(
+            anchor_common_dir("/elsewhere/repo/.git", root),
+            Some(PathBuf::from("/elsewhere/repo/.git")),
+            "an ABSOLUTE answer is taken as-is (the linked-worktree shape)",
+        );
+    }
+
+    // THE TWO CONTRACTS DIVERGE ON PURPOSE, and this records that — but read what it does and does
+    // NOT prove, because the honest version is narrower than it first looks.
+    //
+    // `common_dir_for` cannot fail: on a non-repo folder it answers a guessed `<root>/.git`,
+    // correctly, because an unresolved hooks dir means hooks never install. `repo_key_at` must
+    // never answer that, because a fabricated identity merges every non-repo project the user
+    // opens into one phantom repository.
+    //
+    // What this does NOT prove is that `repo_key_at` would survive being rewritten to call
+    // `common_dir_for` — and that was measured, not assumed. Making exactly that swap leaves this
+    // test AND all four of its neighbours green, because `repo_key_at`'s `--show-toplevel` gate
+    // returns `None` for every non-repo folder before the common-dir line is ever reached; and
+    // where the gate passes, git is demonstrably working on a real checkout root, so
+    // `--git-common-dir` cannot fail either. The swap is inert today rather than catastrophic.
+    //
+    // That inertness is a property of the UPSTREAM GATE, not of this line, which is exactly why
+    // the `?` stays: it costs nothing and it is what keeps the guess unreachable if the gate is
+    // ever reordered or relaxed. The property with real grip lives one level down, in
+    // `git_common_dir_raw_answers_none_rather_than_guessing` above.
+    #[test]
+    fn repo_key_and_common_dir_for_answer_a_non_repo_folder_differently() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().to_string_lossy().to_string();
+
+        assert_eq!(
+            common_dir_for(&root),
+            d.path().join(".git"),
+            "common_dir_for must keep its fallback — it has nothing better to offer its caller",
+        );
+        assert_eq!(
+            repo_key_at(&root),
+            None,
+            "repo_key_at must have no repository identity for a non-repo folder",
+        );
     }
 
     #[test]

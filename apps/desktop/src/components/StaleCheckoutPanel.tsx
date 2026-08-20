@@ -10,8 +10,9 @@
 //     is 1,935 rows of other people's work that answers no question the badge raised.
 //   • NO "FIX ANYWAY" ON THE BLOCKED CASE. See `remedyAction`.
 //
-// WHAT IT IS: one row per stale checkout — the one you clicked FIRST, then every other stale
-// project — each carrying the backend's own cause sentence and, when there is something safe to do,
+// WHAT IT IS: one row per stale checkout the CALLER hands it — the one you clicked FIRST, then the
+// others it was given (the open projects in that tab strip, NOT every project in the app; see
+// `targets`) — each carrying the backend's own cause sentence and, when there is something safe to do,
 // exactly one button that says what it will do. Plus a "Fix all safe" that runs the actionable rows
 // SEQUENTIALLY and names, on screen, every row it declined to touch. Half-succeeding silently is
 // the failure mode a bulk action has that a per-row button does not, so the bulk action is the one
@@ -149,7 +150,10 @@ export function StaleCheckoutPanel({
 }: {
   /** The badge that opened this. The panel hangs off its bottom-right; see `panelPlacement`. */
   anchorEl: HTMLElement | null;
-  /** Every stale checkout, THE CLICKED ONE FIRST. Order is the caller's, not re-sorted here. */
+  /** The stale checkouts this panel accounts for, THE CLICKED ONE FIRST. Order is the caller's,
+   *  not re-sorted here. NOT every stale checkout in the app: the only caller (`ProjectTabs`, off a
+   *  badge in one tab strip) passes the OPEN projects on THIS side of the pair. The section header
+   *  below says so, and must keep saying whatever this list really holds. */
   targets: StaleTarget[];
   onClose: () => void;
 }) {
@@ -439,7 +443,7 @@ export function StaleCheckoutPanel({
             : stillDiagnosing
               ? "Diagnosing these checkouts…"
               : actionableCount === 0
-                ? "Nothing here can be fixed automatically — every stale checkout is blocked, diverged, or could not be diagnosed. Each row says which."
+                ? "Nothing here can be fixed automatically — every checkout listed here is blocked, diverged, or could not be diagnosed. Each row says which."
                 : `Fast-forward the ${actionableCount} checkout${actionableCount === 1 ? "" : "s"} that can be moved safely; every other row is left alone with its reason shown.`}
         </div>
 
@@ -458,6 +462,17 @@ export function StaleCheckoutPanel({
 
         {others.length > 0 && (
           <>
+            {/* THE SCOPE IN THIS LABEL IS THE SCOPE OF `targets`, AND `targets` IS NARROW.
+                It used to read "All stale checkouts", which was wrong on both axes: this section
+                holds the rows OTHER than the clicked one (the clicked one is rendered above it),
+                and the caller's list is already filtered twice over — `ProjectTabsBar` measures
+                staleness only for `projectsOnSide(openProjectsOf(...))`, i.e. the OPEN projects in
+                THIS tab strip. A user whose projects are split across the two sides of a pair read
+                "All", saw half of them, and had no way to know the other half existed.
+
+                Say what the list actually is. If you ever widen `targets`, widen this line in the
+                same change — a header that overstates its scope sits above buttons that move real
+                git checkouts. */}
             <div
               data-testid="stale-others-header"
               style={{
@@ -471,7 +486,7 @@ export function StaleCheckoutPanel({
                 textTransform: "uppercase",
               }}
             >
-              All stale checkouts
+              Other stale checkouts in this tab strip
             </div>
             {others.map((t) => (
               <StaleRow

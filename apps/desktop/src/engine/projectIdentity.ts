@@ -30,6 +30,7 @@
 // Pure (no store, no React, no Tauri) so every rule below is unit-testable on its own — the same
 // split engine/openProjects.ts and engine/pairs.ts use.
 
+import { normalizeProjectPath } from "../services/openTarget";
 import type { PairAssignment, PairSide } from "./pairs";
 import { sideOf } from "./pairs";
 import { isProjectOpen, type OpenProjectIds } from "./openProjects";
@@ -46,17 +47,31 @@ export interface IdentifiableProject {
 /**
  * A folder path in the one form two spellings of the same folder agree on.
  *
- * Identical to `services/openTarget.normalizeProjectPath` composed with a case fold, and duplicated
- * here ON PURPOSE rather than imported: `openTarget` is the picker's module and this is the engine
- * layer, and the engine may not depend on a service (every other `engine/*` module holds that
- * line). `projectIdentity.test.ts` pins the two against each other so they cannot drift.
+ * `services/openTarget.normalizeProjectPath` composed with a case fold.
  *
- * Case-folded for the default case-insensitive macOS volume, NFC-normalized because the native
- * picker hands back NFD for accented segments while a typed or stored path is usually NFC — the
- * two compare unequal as UTF-16 and name the same directory.
+ * This USED to be a hand copy of that expression, justified here on the grounds that "the engine
+ * may not depend on a service (every other `engine/*` module holds that line)". THAT RULE DOES NOT
+ * EXIST. No lint rule, eslint config, or dependency check anywhere in the repo enforces an
+ * engine→services boundary, and twelve non-test `engine/*` modules import VALUES from
+ * `../services` today (`statusEngine`, `agentCta`, `workerAttention`, `screenClassifier`,
+ * `quotaBlock`, `epicFocus`, …) — the comment was the only place the rule was ever stated.
+ * `openTarget` is in any case a zero-import pure leaf (no store, no React, no Tauri, by its own
+ * header), so importing it costs this module none of the properties it actually holds.
+ *
+ * The copy was also less safe than it read. Its drift pin fed only ASCII, lowercase,
+ * trailing-slash inputs, so it pinned the separator strip and NOTHING ELSE: deleting
+ * `.normalize("NFC")` from either side left the pin — and every other test in the desktop suite —
+ * green, while silently breaking the NFD/NFC dedupe that is one of the two reasons the
+ * normalization exists at all. One implementation cannot drift from itself, so composing DELETES
+ * that failure mode rather than testing for it.
+ *
+ * Case-folded for the default case-insensitive macOS volume; NFC-normalized (inside
+ * `normalizeProjectPath`) because the native picker hands back NFD for accented segments while a
+ * typed or stored path is usually NFC — the two compare unequal as UTF-16 and name the same
+ * directory.
  */
 export function pathKey(rootPath: string): string {
-  return rootPath.replace(/[/\\]+$/, "").normalize("NFC").toLowerCase();
+  return normalizeProjectPath(rootPath).toLowerCase();
 }
 
 /**

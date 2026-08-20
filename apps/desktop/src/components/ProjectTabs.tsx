@@ -786,7 +786,7 @@ export function ProjectTabs({
   } | null>(null);
   // Which project's stale-checkout panel is open, and the badge elements to hand focus back to when
   // it closes. Kept at the STRIP level rather than inside the badge because the panel lists every
-  // stale project, not just the one clicked — see `staleTargetsFor`.
+  // stale project THIS STRIP holds, not just the one clicked — see `staleTargetsFor`.
   const [stalePanelFor, setStalePanelFor] = useState<string | null>(null);
   const staleBadgeEls = useRef(new Map<string, HTMLButtonElement>());
 
@@ -1088,6 +1088,14 @@ export function ProjectTabs({
 
   /**
    * Every stale checkout the panel should account for, THE CLICKED ONE FIRST.
+   *
+   * "Every" IS BOUNDED BY THIS COMPONENT'S INPUTS, and the panel's header says so out loud. Both
+   * `projects` and `stalenessByProject` arrive from `ProjectTabsBar` already narrowed to
+   * `projectsOnSide(openProjectsOf(...))` — the OPEN projects in THIS tab strip — so a project on
+   * the other side of the pair, or one that is simply closed, can never appear here. That is
+   * deliberate (the panel hangs off one strip's badge and its buttons move git checkouts); if it
+   * ever changes, `StaleCheckoutPanel`'s "Other stale checkouts in this tab strip" header is the
+   * copy that has to change with it.
    *
    * A project with no `rootPath` is dropped rather than listed: the panel's whole job is to diagnose
    * and remedy a directory, and a row naming a project it cannot look at is a row that can only say
@@ -1617,7 +1625,9 @@ export function ProjectTabs({
         </div>
       )}
       {/* The remedy panel for whichever badge was clicked. Rendered once at the strip level (it
-          lists every stale project, not just that one) and portaled to root by `ModalLayer`. */}
+          lists every stale project IN THIS STRIP, not just the one clicked — `projects` here is
+          already the open projects on this side of the pair, so it is NOT app-wide) and portaled to
+          root by `ModalLayer`. */}
       {stalePanelFor && (
         <StaleCheckoutPanel
           anchorEl={staleBadgeEls.current.get(stalePanelFor) ?? null}

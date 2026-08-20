@@ -12,7 +12,13 @@ vi.mock("../services/dialog", () => ({
   basename: (p: string) => p.split("/").pop() ?? p,
 }));
 const resolveOpenTarget = vi.fn(() => ({ kind: "existing", id: "p2" }) as const);
-vi.mock("../services/openTarget", () => ({ resolveOpenTarget: () => resolveOpenTarget() }));
+// PARTIAL mock: only `resolveOpenTarget` is stubbed. `engine/projectIdentity.pathKey` composes
+// this module's `normalizeProjectPath`, so a total mock would drop that export and every path
+// comparison in the tree under test would throw on `undefined`.
+vi.mock("../services/openTarget", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/openTarget")>()),
+  resolveOpenTarget: () => resolveOpenTarget(),
+}));
 
 const openProjectTab = vi.fn();
 const focusExistingProject = vi.fn();

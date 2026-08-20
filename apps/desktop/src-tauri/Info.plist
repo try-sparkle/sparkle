@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
   <key>NSMicrophoneUsageDescription</key>
-  <string>Sparkle uses your microphone for on-device voice dictation.</string>
+  <string>Sparkle uses your microphone for voice dictation. Audio is sent to a cloud speech service for transcription, or transcribed on-device when the cloud service is unavailable or disabled in Settings.</string>
   <key>CFBundleURLTypes</key>
   <array>
     <dict>

@@ -1397,7 +1397,23 @@ pub(crate) fn decide_coverage_from(
     }
 }
 
-/// The permanent record posted when an unreviewed head is merged anyway.
+/// The permanent record posted when an unreviewed head is merged over anyway.
+///
+/// THE SIBLING OF [`override_comment_body`], AND IT IS BOUND BY THE SAME TWO RULES. Both are
+/// returned as the `body` of [`Decision::RecordThenAllow`], which means exactly what it says: the
+/// record is POSTED FIRST and the merge is attempted afterwards. So:
+///
+///   * It must NOT say the PR "was merged". At the instant this text is written the merge has not
+///     run, and it can still be declined (`gh` refuses one whose required checks are red). A record
+///     asserting a merge that did not happen is a lie left on the PR forever. This copy claimed one
+///     for a while, which is why the rule is now written on BOTH writers rather than only on the
+///     one that got it right — and why `no_override_record_claims_a_merge_that_has_not_run_yet`
+///     asserts it over both bodies at once.
+///   * It must NOT name a probe in CITATION form (`Probe 1`), or [`cites_probe`] would score this
+///     record as answering the very probes the merge bypassed. Nothing this function renders can:
+///     `reason` is one of [`coverage`]'s own four sentences (a stale-review note, a no-SHA note, or
+///     one naming hex oids), never user text, and `supplied` is quoted line-by-line below, which
+///     `cites_probe` discounts. Keep both properties if you touch the copy.
 fn coverage_override_body(reason: &str, supplied: &str) -> String {
     // EVERY line quoted, not just the first. A multi-line reason with a bare leading `> ` renders
     // its second line onward as body text, breaking out of the blockquote — the same defect
@@ -1409,8 +1425,10 @@ fn coverage_override_body(reason: &str, supplied: &str) -> String {
         .join("\n");
     format!(
         "{OVERRIDE_MARKER}\n\n\
-         **knightwatch convergence gate overridden** — this PR was merged without a review \
-         covering its final head.\n\n\
+         **knightwatch convergence gate overridden** — a merge of this PR was initiated from \
+         Sparkle without a review covering its final head. This record is written BEFORE the merge \
+         runs — deliberately, because the merge is the irreversible half — so the merge itself may \
+         still have been declined afterwards.\n\n\
          {reason}.\n\n\
          Reason given:\n\n{quoted}\n"
     )
@@ -2506,6 +2524,71 @@ mod tests {
         let body = coverage_override_body("the review read 275f462", "first line\nsecond line");
         assert!(body.contains("> first line"), "{body}");
         assert!(body.contains("> second line"), "the second line must be quoted too: {body}");
+    }
+
+    /// ONE ASSERTION OVER **BOTH** RECORD-WRITERS — because there are two of them in this file and
+    /// they drifted. `override_comment_body` documented the rule and obeyed it; `coverage_override_body`
+    /// said "this PR **was merged** without a review covering its final head", which is a claim the
+    /// code cannot support: both bodies are the `body` of [`Decision::RecordThenAllow`], and
+    /// `RecordThenAllow` posts the record FIRST and attempts the merge afterwards. `gh` still
+    /// refuses a merge whose required checks are red, so the record can outlive a merge that never
+    /// happened — permanently, on the PR, asserting something false.
+    ///
+    /// Checking only the writer that was just fixed would let the NEXT one reintroduce it, so the
+    /// same two checks run over every body this module can post. Both directions are asserted: the
+    /// past-tense claim must be ABSENT, and the before-the-merge caveat must be PRESENT — absence
+    /// alone passes for a body that says nothing about timing at all.
+    #[test]
+    fn no_override_record_claims_a_merge_that_has_not_run_yet() {
+        let reason = "the runner was offline and this head is a version bump only";
+        let review = format!("{REVIEW_MARKER}\n1. [blocking] [from: a] a real finding");
+        let gate = evaluate(&[comment(1, &review)]);
+        let bypassed = gate.unanswered_blocking();
+        assert!(!bypassed.is_empty(), "the fixture must carry a probe, or the probe body is vacuous");
+
+        // Every body `enforce` can hand to `post_override_comment`, named so a failure says WHICH.
+        let bodies = [
+            ("coverage_override_body", coverage_override_body("the newest review read 275f462", reason)),
+            ("override_comment_body/probes", override_comment_body(&bypassed, reason, None)),
+            (
+                "override_comment_body/unknown",
+                override_comment_body(&[], reason, Some("gh api exited non-zero")),
+            ),
+        ];
+
+        for (who, body) in &bodies {
+            let lower = body.to_lowercase();
+            for claim in ["was merged", "were merged", "has been merged", "have been merged"] {
+                assert!(
+                    !lower.contains(claim),
+                    "{who} claims a completed merge (\"{claim}\") in a record written BEFORE the \
+                     merge runs — the merge can still be declined, and this text stays on the PR \
+                     forever: {body}"
+                );
+            }
+            assert!(
+                body.contains("BEFORE the merge runs"),
+                "{who} must say the record precedes the merge — merely omitting the false claim \
+                 leaves a reader assuming the merge happened: {body}"
+            );
+            assert!(
+                body.contains("may still have been declined"),
+                "{who} must say the merge can still have been declined afterwards: {body}"
+            );
+        }
+
+        // AND THE SECOND RULE STILL HOLDS for the copy just rewritten: nothing the coverage record
+        // renders may read as a probe citation, or it would answer probes it never looked at.
+        // `reason` there is one of `coverage`'s own sentences, so no wording of it can — asserted
+        // with the user's text removed, so this measures what THIS module renders.
+        let (_, coverage_body) = &bodies[0];
+        let generated_only = coverage_body.replace(reason, "");
+        for n in 1..=3 {
+            assert!(
+                !cites_ignoring_quoting(&generated_only, n),
+                "the coverage record must not name a probe in citation form: {coverage_body}"
+            );
+        }
     }
 
     /// THE WIRING, STRUCTURALLY — because calling `decide_coverage` from a test asserts the same

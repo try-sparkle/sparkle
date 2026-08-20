@@ -117,14 +117,26 @@ describe("the path fallback, for records with no repo key yet", () => {
     expect(findDuplicateOpen(b, [a, b], ["a"], {})).not.toBeNull();
   });
 
-  it("agrees with the picker's own normalizer, so the two cannot drift", () => {
-    for (const p of [
-      "/Users/x/Projects/sparkle/",
-      "/Users/x/Projects/sparkle",
-      "/Users/x/Projects/sparkle//",
-    ]) {
-      expect(pathKey(p)).toBe(normalizeProjectPath(p).toLowerCase());
-    }
+  // `pathKey` IS `normalizeProjectPath` + a case fold now, so there is no longer a drift to pin —
+  // the copy that needed one is gone. What the old pin left unguarded is what these assert.
+  //
+  // It fed only ASCII, lowercase, trailing-slash inputs, so it exercised exactly one of the
+  // normalizer's three rules. Deleting `.normalize("NFC")` from `normalizeProjectPath` kept the
+  // pin green, kept `openTarget.test.ts` green, and kept the whole desktop suite green — measured,
+  // not assumed — while breaking the picker's NFD-vs-NFC dedupe. Each assertion below fails if its
+  // own rule is removed.
+  it("the shared normalizer strips a trailing separator", () => {
+    expect(normalizeProjectPath("/Users/x/Projects/sparkle//")).toBe("/Users/x/Projects/sparkle");
+  });
+
+  it("the shared normalizer NFC-folds, so the picker's NFD spelling matches a stored NFC one", () => {
+    const nfd = "/Users/x/caf\u00e9".normalize("NFD");
+    expect(normalizeProjectPath(nfd)).toBe("/Users/x/caf\u00e9".normalize("NFC"));
+    expect(normalizeProjectPath(nfd)).not.toBe(nfd); // precondition: the input really was NFD
+  });
+
+  it("pathKey adds the case fold on top of it", () => {
+    expect(pathKey("/Users/x/Projects/Sparkle/")).toBe("/users/x/projects/sparkle");
   });
 
   it("NFD and NFC spellings of one accented folder are the same project", () => {

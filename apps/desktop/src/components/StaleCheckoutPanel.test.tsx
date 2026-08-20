@@ -61,6 +61,14 @@ function target(over: Partial<StaleTarget> = {}): StaleTarget {
   return { id: "sparkle", name: "sparkle", rootPath: "/repos/sparkle", behind: 1935, base: "origin/main", ...over };
 }
 
+/** Does this header promise a wider scope than the rows beneath it? A bare universal quantifier
+ *  ("all", "every") is honest only when nothing was left out — and this panel is always handed one
+ *  tab strip's worth. Anything that names the narrower scope instead is fine, which is why this is
+ *  a rule and not an equality against one sentence. */
+function claimsEverything(text: string): boolean {
+  return /\b(all|every)\b/i.test(text) && !/\b(this|these|here|open)\b/i.test(text);
+}
+
 /** Diagnose from a root→diagnosis table, so a multi-row panel gives each row its own answer. */
 function byRoot(table: Record<string, StaleDiagnosis>) {
   diagnoseStale.mockImplementation((root: string) => {
@@ -206,7 +214,7 @@ describe("running a remedy", () => {
 });
 
 describe("the clicked project first, then everything else", () => {
-  it("puts the clicked project above an 'All stale checkouts' section holding the rest", async () => {
+  it("puts the clicked project above the section header holding the rest", async () => {
     byRoot({
       "/repos/sparkle": diag(),
       "/repos/website": diag({ behind: 12, cause: "website is 12 behind." }),
@@ -222,6 +230,57 @@ describe("the clicked project first, then everything else", () => {
       .map((el) => el.getAttribute("data-testid"))
       .filter((id): id is string => !!id && (id.startsWith("stale-row-") || id === "stale-others-header"));
     expect(order).toEqual(["stale-row-sparkle", "stale-others-header", "stale-row-website"]);
+  });
+
+  // ── THE HEADER MAY NOT PROMISE MORE THAN THE PANEL WAS HANDED ────────────────────────────────
+  //
+  // `targets` is NOT app-wide, however much the old copy said so. `ProjectTabsBar` measures
+  // staleness for `projectsOnSide(openProjectsOf(projects, openProjectIds), pairAssignment, side)`
+  // — the OPEN projects on ONE side of the pair — and that narrowed map is the only thing
+  // `staleTargetsFor` can draw a row from. So a user whose projects are split across the two sides
+  // read "All stale checkouts", saw half of them, and had nothing on screen telling them the other
+  // half existed. Underneath that header are buttons that move real git checkouts.
+  //
+  // THE ASSERTION IS THE RELATION, NOT THE STRING. Checking the new copy against itself would prove
+  // nothing (AGENTS.md, "Tests must assert the SIDE EFFECT"): what has power is that the panel is
+  // handed a strict SUBSET of the stale checkouts that exist and therefore may not use a bare
+  // universal quantifier over it. Restore "All stale checkouts" and this goes red; any honest
+  // wording keeps it green, so it constrains the claim rather than pinning one sentence.
+  it("does not claim to list every stale checkout when it was handed one strip's worth", async () => {
+    // Four stale checkouts exist. Two are open in THIS tab strip and are what the caller passes;
+    // two sit on the other side of the pair and never reach the panel — the shipped wiring.
+    const universe = [
+      target(),
+      target({ id: "website", name: "drodio-website", rootPath: "/repos/website", behind: 12 }),
+      target({ id: "ledger", name: "ledger", rootPath: "/repos/ledger", behind: 40 }),
+      target({ id: "atlas", name: "atlas", rootPath: "/repos/atlas", behind: 7 }),
+    ];
+    const thisStrip = universe.slice(0, 2);
+    byRoot({
+      "/repos/sparkle": diag(),
+      "/repos/website": diag({ behind: 12, cause: "website is 12 behind." }),
+    });
+    await renderPanel(thisStrip);
+    await screen.findByTestId("stale-cause-website");
+
+    const panel = screen.getByTestId("stale-panel");
+    const order = Array.from(panel.querySelectorAll("[data-testid]"))
+      .map((el) => el.getAttribute("data-testid") ?? "")
+      .filter((id) => id.startsWith("stale-row-") || id === "stale-others-header");
+    const under = order.slice(order.indexOf("stale-others-header") + 1);
+
+    // WHAT IT LISTS: one row, out of the three stale checkouts that are not the clicked one — and
+    // the clicked one is rendered ABOVE the header, so it is not covered by this label either.
+    expect(under).toEqual(["stale-row-website"]);
+    expect(under).not.toContain("stale-row-sparkle");
+    expect(under.length).toBeLessThan(universe.length - 1);
+
+    // WHAT IT CLAIMS: consequently, not everything. A bare "all"/"every" over a strict subset is
+    // the defect; a quantifier that names the narrower scope it really covers is not.
+    const claim = screen.getByTestId("stale-others-header").textContent ?? "";
+    expect(claimsEverything(claim)).toBe(false);
+    // Still a real section label, not blanked out to dodge the rule above.
+    expect(claim.trim().length).toBeGreaterThan(0);
   });
 });
 
