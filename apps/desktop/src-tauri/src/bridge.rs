@@ -449,6 +449,50 @@ fn remove_persisted_bridge(app_data: &Path, build_agent_id: &str) {
     }
 }
 
+/// Remove SEVERAL stale entries from the registry in ONE locked read-modify-write (sparkle-jmjm).
+/// The boot prune below discards every dead agent at once; doing it as N separate
+/// `remove_persisted_bridge` calls would take and drop REGISTRY_LOCK N times and rewrite the file N
+/// times, widening the window in which a concurrent `start` could lost-update. One acquisition, one
+/// write. A no-op on an empty list, and only writes when something was actually removed.
+fn remove_persisted_bridges(app_data: &Path, build_agent_ids: &[String]) {
+    if build_agent_ids.is_empty() {
+        return;
+    }
+    let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut map = read_bridge_registry(app_data);
+    let mut changed = false;
+    for id in build_agent_ids {
+        if map.remove(id).is_some() {
+            changed = true;
+        }
+    }
+    if changed {
+        write_bridge_registry(app_data, &map);
+    }
+}
+
+/// sparkle-jmjm: whether a persisted build agent still has a worktree on disk. The orchestration
+/// bridge is per-build-agent, and every build agent runs in
+/// `<app_data>/worktrees/<projectId>/<buildAgentId>` (see `worktree::worktree_path`). When that
+/// directory is gone the agent was torn down — or its launch was lost before it ever created one —
+/// so its registry entry is STALE: rebinding it (as the old `reconcile_bridges_at` did for every
+/// entry) spawns a permanent accept thread nothing ever joins, which is the thread leak this bead
+/// tracks. This check is the token-INDEPENDENT removal path the bead asks for: a spin-down that
+/// lost its launch token never sets `torn=true` and so never forgets the entry, but the worktree
+/// being gone still proves the agent is dead.
+///
+/// A path we cannot even COMPUTE (an id that fails `worktree_path`'s validation) is treated as
+/// PRESENT, never pruned: we only remove what we can positively confirm is gone, so a live worker is
+/// never evicted on a validation quirk. Since the same validation gates worktree *creation*, such an
+/// id could not have a live worktree anyway — keeping it merely defers to the boot-reconcile's own
+/// best-effort rebind rather than deleting on an ambiguous signal.
+fn build_agent_worktree_present(app_data: &Path, project_id: &str, build_agent_id: &str) -> bool {
+    match crate::worktree::worktree_path(app_data, project_id, build_agent_id) {
+        Ok(p) => p.exists(),
+        Err(_) => true,
+    }
+}
+
 /// Forget the persisted token IFF the stop actually tore the bridge down. Extracted from
 /// `stop_orchestration_bridge` so the torn→forget wiring is unit-testable without a Tauri runtime:
 /// a stale-token no-op stop (torn=false, the sub-second close-reopen race) MUST keep the entry so the
@@ -470,8 +514,34 @@ pub fn reconcile_bridges_at(app: Option<AppHandle>, manager: &BridgeManager, app
         let _g = REGISTRY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         read_bridge_registry(app_data)
     };
-    let mut rebound = 0usize;
+    // sparkle-jmjm: partition the registry into agents that still exist (worktree present) and STALE
+    // ones (worktree gone — a crash or a spin-down that lost its launch token, which never set
+    // torn=true and so never forgot the entry). The old code rebound EVERY entry unconditionally,
+    // spawning a permanent accept thread per dead agent that nothing ever joins — the unbounded
+    // thread growth this bead reports (168 -> 311 in 20 min). We now prune the stale ones so their
+    // threads are never spawned, and their registry rows never accumulate across boots.
+    let mut live: Vec<(String, PersistedBridge)> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
     for (build_agent_id, entry) in registry {
+        if build_agent_worktree_present(app_data, &entry.project_id, &build_agent_id) {
+            live.push((build_agent_id, entry));
+        } else {
+            append_orch_log(
+                app_data,
+                &format!(
+                    "bridge_reconcile_pruned build={build_agent_id} project={} reason=worktree-gone",
+                    entry.project_id
+                ),
+            );
+            stale.push(build_agent_id);
+        }
+    }
+    // Drop the stale rows in ONE locked write BEFORE rebinding, so a dead agent is neither rebound
+    // nor left on disk to be re-evaluated next boot.
+    remove_persisted_bridges(app_data, &stale);
+
+    let mut rebound = 0usize;
+    for (build_agent_id, entry) in live {
         match start_bridge_at(app.clone(), manager, app_data, &entry.project_id, &build_agent_id, &entry.token) {
             Ok(_) => {
                 rebound += 1;
@@ -1697,6 +1767,11 @@ mod tests {
     #[test]
     fn reconcile_rebinds_persisted_sockets_at_boot() {
         let app_data = short_unique_dir("i95d-recon");
+        // sparkle-jmjm: reconcile now only rebinds agents that still EXIST — a persisted entry whose
+        // worktree is gone is pruned rather than rebound. So model two LIVE agents: create each one's
+        // worktree dir (the deterministic <app_data>/worktrees/<proj>/<id> path) before reconciling.
+        std::fs::create_dir_all(crate::worktree::worktree_path(&app_data, "proj", "recon-a").unwrap()).unwrap();
+        std::fs::create_dir_all(crate::worktree::worktree_path(&app_data, "proj", "recon-b").unwrap()).unwrap();
         // Seed two agents' registry entries via a first "process", then drop that manager.
         let (tok_a, tok_b) = {
             let mgr = BridgeManager::default();
@@ -1772,6 +1847,91 @@ mod tests {
         assert!(persisted_bridge_token(&app_data, "torn-agent").is_none(), "real teardown forgets the entry");
 
         stop_bridge(&mgr, "torn-agent", None);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-jmjm — the core leak fix. A boot reconcile over a registry holding one LIVE agent
+    // (worktree on disk) and one STALE agent (worktree gone — a crash / lost-token spin-down that
+    // never forgot the row) must rebind ONLY the live one and REMOVE the stale row. This asserts the
+    // side effects, not that a prune was "called": the accept-thread count (proxied by the bridges
+    // map — one accept loop per live handle) is BOUNDED to the live agent, the stale row is gone from
+    // disk, and the paired half proves the live agent is NOT removed (row kept, socket bound).
+    #[test]
+    fn reconcile_prunes_stale_entry_and_keeps_live() {
+        let app_data = short_unique_dir("jmjm-prune");
+        // Live agent: its deterministic worktree dir exists.
+        std::fs::create_dir_all(crate::worktree::worktree_path(&app_data, "proj", "live-agent").unwrap()).unwrap();
+        // Seed BOTH rows directly (no thread spawned) so the precondition is "two persisted entries".
+        persist_bridge_entry(&app_data, "live-agent", "proj", "LIVETOK");
+        persist_bridge_entry(&app_data, "dead-agent", "proj", "DEADTOK"); // no worktree → stale
+        assert!(persisted_bridge_token(&app_data, "dead-agent").is_some(), "precondition: stale row present before reconcile");
+        assert_eq!(read_bridge_registry(&app_data).len(), 2, "precondition: two rows before reconcile");
+
+        let mgr = BridgeManager::default();
+        let rebound = reconcile_bridges_at(None, &mgr, &app_data);
+
+        // SIDE EFFECT — bounded thread/handle count: only the live agent got an accept loop, NOT one
+        // per registry entry. (Reverting the prune rebinds both → this fails.)
+        assert_eq!(rebound, 1, "only the live agent is rebound");
+        assert_eq!(
+            mgr.bridges.lock().unwrap_or_else(|e| e.into_inner()).len(),
+            1,
+            "exactly one accept-loop handle spawned — the leak would spawn one per stale row"
+        );
+
+        // SIDE EFFECT — the stale row is actually REMOVED from disk (not merely skipped).
+        assert!(persisted_bridge_token(&app_data, "dead-agent").is_none(), "stale entry removed by reconcile");
+        assert_eq!(read_bridge_registry(&app_data).len(), 1, "registry reclaimed down to the live agent");
+
+        // PAIRED — the LIVE worker is NOT removed: its row survives and its socket is bound.
+        assert_eq!(
+            persisted_bridge_token(&app_data, "live-agent").as_deref(),
+            Some("LIVETOK"),
+            "live agent's row must survive the prune"
+        );
+        let sock = bridge_socket_path(&app_data, "proj", "live-agent");
+        assert!(UnixStream::connect(&sock).is_ok(), "live agent's socket is bound after reconcile");
+
+        stop_bridge(&mgr, "live-agent", None);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // sparkle-jmjm — the unbounded-growth property directly: across N "boots", each of which adds a
+    // fresh dead agent (a build agent that started then vanished without a clean stop), the accept-
+    // thread count AND the on-disk registry both stay at the LIVE baseline of 1 rather than climbing
+    // with N (the measured 168 -> 311 growth). Without the prune, ghosts accumulate: the bridges map
+    // and the registry would grow to N+1, so both assertions fail on every cycle after the first.
+    #[test]
+    fn reconcile_thread_and_registry_stay_at_baseline_across_cycles() {
+        let app_data = short_unique_dir("jmjm-baseline");
+        // One agent that genuinely persists across every boot.
+        std::fs::create_dir_all(crate::worktree::worktree_path(&app_data, "proj", "keeper").unwrap()).unwrap();
+        persist_bridge_entry(&app_data, "keeper", "proj", "KEEP");
+
+        const N: usize = 8;
+        for i in 0..N {
+            // A build agent whose row was persisted but whose worktree never exists (crash / lost token).
+            persist_bridge_entry(&app_data, &format!("ghost-{i}"), "proj", "G");
+            assert_eq!(read_bridge_registry(&app_data).len(), 2, "cycle {i}: keeper + this cycle's ghost before reconcile");
+
+            // Each boot reconciles with a FRESH manager (in-memory bridges don't survive a restart).
+            let mgr = BridgeManager::default();
+            let rebound = reconcile_bridges_at(None, &mgr, &app_data);
+
+            // Baseline holds no matter how many ghosts have been seen: exactly one rebind, one handle...
+            assert_eq!(rebound, 1, "cycle {i}: only the live agent rebound");
+            assert_eq!(
+                mgr.bridges.lock().unwrap_or_else(|e| e.into_inner()).len(),
+                1,
+                "cycle {i}: accept-thread count stays at baseline 1, not growing with N"
+            );
+            // ...and the registry is reclaimed back to just the keeper — it does NOT grow with N.
+            assert_eq!(read_bridge_registry(&app_data).len(), 1, "cycle {i}: registry size returns to baseline");
+
+            stop_bridge(&mgr, "keeper", None); // tear down this boot's listener before the next
+        }
+        // The keeper survived every cycle — a live worker is never pruned by the reclaim.
+        assert_eq!(persisted_bridge_token(&app_data, "keeper").as_deref(), Some("KEEP"), "live agent kept across all cycles");
         let _ = std::fs::remove_dir_all(&app_data);
     }
 
