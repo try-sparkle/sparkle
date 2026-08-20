@@ -146,6 +146,7 @@ mod conflict_watch;
 mod concierge;
 mod concierge_guidelines;
 mod concierge_inbox;
+mod mention;
 mod concierge_lint_log;
 mod webview_drop_gate;
 
@@ -833,6 +834,16 @@ pub fn run() {
             concierge::concierge_cancel,
             concierge::concierge_proactive_turn,
             concierge_inbox::concierge_inbox_ack,
+            // The cross-agent + human @mention channel (bead sparkle-hdlhox). `mention_send` routes a
+            // mention to @improve/@sparkle: it posts the CONTENT to the bead, doorbells the target's
+            // inbox (content-free), and WAKES the target — spawning a scoped @improve responder, or
+            // emitting `concierge://mention` for a frontend listener to turn into an immediate
+            // concierge turn. `mention_status` reads the bead's ACK so silence past a deadline reads
+            // as UNDELIVERED. See mention.rs.
+            mention::mention_send,
+            mention::mention_ack,
+            mention::mention_reply,
+            mention::mention_status,
             claude::claude_has_session,
             claude::claude_latest_session_id,
             claude::claude_latest_session_path,
@@ -1181,6 +1192,10 @@ pub fn run() {
                 // group kill that stops a detached pass from outliving the app — only actually
                 // happen when driven from here. `Drop` remains an idempotent backstop.
                 app.state::<sparkle_improve::SparkleImproveManager>().end_in_flight_pass();
+                // Same reasoning: a scoped @mention responder is a headless `claude -p` in the
+                // canonical worktree; kill it here so it can't outlive the app. The slot is a module
+                // global (no managed state), so this is a free call. Idempotent when none is running.
+                mention::end_in_flight_responders();
                 // Same reasoning, same path: a preview's dev server is a supervised child spawned
                 // OUTSIDE a PTY, so nothing else would ever stop it. `Drop` on the manager is the
                 // idempotent backstop for the paths that actually drop.

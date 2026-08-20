@@ -1136,6 +1136,21 @@ fn comment_bead(project_path: &str, id: &str, text: &str, env: ChildEnv<'_>) -> 
     bd_ack(project_path, &build_comment_args(id, text), env)
 }
 
+/// Post a comment on a bead, for callers OUTSIDE the `beads_comment` command (the @mention channel,
+/// `mention.rs`). Routes through the same `comment_bead` → `build_comment_args` assembly the command
+/// uses, so the `--` argument-terminator handling (see `build_comment_args`) is shared rather than
+/// re-derived — a hand-rolled copy in another module is exactly the bug that doc warns about.
+pub(crate) fn comment_for_mention(project_path: &str, id: &str, text: &str) -> Result<(), BeadsError> {
+    comment_bead(project_path, id, text, NO_EXTRA_ENV)
+}
+
+/// Read a bead's comment thread (oldest-first), for the @mention channel's ACK/round detection.
+/// Reuses `detail_bead`'s `bd show … --include-comments` path — the only reader that carries the
+/// comment thread — so the two cannot drift on how a comment is parsed.
+pub(crate) fn comments_for_mention(project_path: &str, id: &str) -> Result<Vec<BeadComment>, BeadsError> {
+    Ok(detail_bead(project_path, id, NO_EXTRA_ENV)?.comments)
+}
+
 // ── Commands ──────────────────────────────────────────────────────────────────────────────────
 
 /// Query the work graph. Returns a BOUNDED page — see the module note on the cap.

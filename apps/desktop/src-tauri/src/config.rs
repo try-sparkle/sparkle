@@ -1471,6 +1471,20 @@ pub struct FreshnessConfig {
     pub auto_fast_forward: bool,
 }
 
+/// The cross-agent + human @mention channel (bead sparkle-hdlhox, `mention.rs`). Per-project
+/// overridable like [freshness]. The frontend reads these and passes them to `mention_send`; Rust
+/// enforces the cap regardless (a hard stop lives in `route_mention`).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MentionConfig {
+    /// ANTI-LOOP: how many rounds an @improve↔@sparkle exchange may run before it is hard-stopped.
+    /// A round is one `mention_send`. Mirrors `DEFAULT_MAX_MENTION_ROUNDS` in `mention.rs`.
+    pub max_rounds: u32,
+    /// How long the sender waits for the recipient's ACK bead comment before treating the mention as
+    /// UNDELIVERED (silence is never read as agreement). Mirrors `DEFAULT_ACK_DEADLINE_MS`.
+    pub ack_deadline_ms: u32,
+}
+
 /// WHICH PR-SCOPED REVIEWER WATCHES A REPO, or `none` if there isn't one. Per-project overridable
 /// (like [freshness]) because one machine routinely works on repos that have a reviewer and repos
 /// that do not — this is a property of the REPO, not of the laptop.
@@ -1728,6 +1742,8 @@ pub struct SparkleConfig {
     /// destination is a network egress target Sparkle sends a bearer token to.
     pub publish: PublishConfig,
     pub freshness: FreshnessConfig,
+    /// The cross-agent + human @mention channel knobs (anti-loop cap, ACK deadline).
+    pub mention: MentionConfig,
     /// Which PR-scoped reviewer watches this repo, or `none`. Per-project overridable; the shell
     /// merge gate reads the same key out of `.sparkle/config.toml`.
     pub review: ReviewConfig,
@@ -1874,6 +1890,8 @@ impl Default for SparkleConfig {
                 require_fresh_branch: true,
                 auto_fast_forward: true,
             },
+            // Keep in sync with DEFAULT_MAX_MENTION_ROUNDS / DEFAULT_ACK_DEADLINE_MS in mention.rs.
+            mention: MentionConfig { max_rounds: 6, ack_deadline_ms: 3 * 60 * 1000 },
             review: ReviewConfig {
                 // Today's behaviour: assume a PR-scoped reviewer IS watching, so a repo that never
                 // writes this key keeps its coverage gate. Keep in sync with the bash fallback
@@ -2223,6 +2241,12 @@ struct PartialFreshness {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialMention {
+    max_rounds: Option<u32>,
+    ack_deadline_ms: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialReview {
     pr_reviewer: Option<String>,
 }
@@ -2313,6 +2337,7 @@ struct PartialConfig {
     onepassword: Option<PartialOnePassword>,
     publish: Option<PartialPublish>,
     freshness: Option<PartialFreshness>,
+    mention: Option<PartialMention>,
     review: Option<PartialReview>,
     worktree_pool: Option<PartialWorktreePool>,
     preview: Option<PartialPreview>,
@@ -2410,6 +2435,16 @@ fn apply_freshness(into: &mut FreshnessConfig, p: Option<PartialFreshness>) {
     }
     if let Some(v) = p.auto_fast_forward {
         into.auto_fast_forward = v;
+    }
+}
+
+fn apply_mention(into: &mut MentionConfig, p: Option<PartialMention>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.max_rounds {
+        into.max_rounds = v;
+    }
+    if let Some(v) = p.ack_deadline_ms {
+        into.ack_deadline_ms = v;
     }
 }
 
@@ -4159,6 +4194,7 @@ fn build_effective(
                 // no second layer whose warnings could interleave (same reasoning as [concierge]).
                 warnings.extend(apply_publish(&mut cfg.publish, p.publish));
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_mention(&mut cfg.mention, p.mention);
                 apply_review(&mut cfg.review, p.review);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_preview(&mut cfg.preview, p.preview, Layer::Global, &mut warnings);
@@ -4343,6 +4379,7 @@ fn build_effective(
                 apply_workflow(&mut cfg.workflow, p.workflow);
                 rejected_plugins.extend(apply_plugins(&mut cfg.plugins, p.plugins));
                 apply_freshness(&mut cfg.freshness, p.freshness);
+                apply_mention(&mut cfg.mention, p.mention);
                 apply_review(&mut cfg.review, p.review);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_preview(&mut cfg.preview, p.preview, Layer::Project, &mut warnings);

@@ -1040,7 +1040,9 @@ pub async fn inbox_claim_for_idle(
 }
 
 /// Minimal RFC-4122-shaped v4 uuid. Avoids adding a dependency for the one place we mint ids.
-fn uuid_v4() -> String {
+/// `pub(crate)` so the @mention channel (`mention.rs`) mints doorbell ids the same way rather than
+/// growing a second generator.
+pub(crate) fn uuid_v4() -> String {
     use std::collections::hash_map::RandomState;
     use std::hash::{BuildHasher, Hasher};
     let mut bytes = [0u8; 16];
