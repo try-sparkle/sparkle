@@ -169,10 +169,35 @@ const PROSE_ROW = {
  */
 function MentionedText({ text, mentions }: { text: string; mentions?: ConciergeMention[] }) {
   if (!mentions?.length) return <>{text}</>;
+  // ══ THE HANDLE IS PRINTED ONCE, WHEREVER IT SITS (roborev 65676) ══════════════════════════════
+  // `BeadMentionRef` draws the id itself, and peels it off the label so it is not shown twice — but
+  // it can only see the MATCHED SPAN, and the id is usually not inside it. A recorded mention's name
+  // is whatever `findMentionSpans` matched, and `withMentionLabels` appends the id only on a title
+  // COLLISION, so in the ordinary case the span is a bare `@Title` and the handle sits in the text
+  // that FOLLOWS it. That is not a rare shape: it is the wire form the app itself writes
+  // (`beadWireText`), so any message quoting or pasting one back renders
+  //
+  //     @Title (sparkle-1cpomd) (sparkle-1cpomd) is the one
+  //
+  // which is exactly the doubling `BeadMentionRef`'s docstring claims to prevent. The peel has to be
+  // decided with the following text in view, and this is the only place that has it.
+  const parts = splitMentionText(text, mentions);
+  const peeled = parts.map((part, i) => {
+    if (part.kind !== "text") return part;
+    const prev = i > 0 ? parts[i - 1] : undefined;
+    if (prev === undefined || prev.kind !== "mention") return part;
+    const prevBead = parseBeadMentionId(prev.agentId);
+    if (prevBead === null) return part;
+    const lead = ` (${prevBead})`;
+    return part.text.startsWith(lead) ? { ...part, text: part.text.slice(lead.length) } : part;
+  });
   return (
     <>
-      {splitMentionText(text, mentions).map((part, i) => {
+      {peeled.map((part, i) => {
         if (part.kind === "text") {
+          // A part emptied by the peel above draws nothing — an empty <span> would be harmless but
+          // would make `bubble().children` disagree with what a reader sees.
+          if (part.text === "") return null;
           // The index IS the identity here: these parts are positional slices of one immutable
           // string on a message that never re-renders with different content.
           return <span key={i}>{part.text}</span>;
@@ -237,8 +262,12 @@ function BeadMentionRef({
   beadId: string;
   text: string;
 }) {
-  const suffix = ` (${beadId})`;
-  const title = text.endsWith(suffix) ? text.slice(0, -suffix.length) : text;
+  // THE SAME PREDICATE `beadWireText` USES, deliberately (roborev 65676). This tested for a leading
+  // SPACE before the parenthetical while the wire form's own de-duplication does not, so a label
+  // ending in the handle with no separator was collapsed on the wire and doubled in the bubble —
+  // two spellings of one rule, disagreeing exactly where it matters.
+  const bare = `(${beadId})`;
+  const title = text.endsWith(bare) ? text.slice(0, -bare.length).trimEnd() : text;
   return (
     <>
       <MentionPill agentId={agentId}>{title}</MentionPill>

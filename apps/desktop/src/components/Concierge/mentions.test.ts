@@ -39,7 +39,7 @@ import {
   mentionCandidates,
   parseBeadMentionId,
 } from "./mentions";
-import { LIST_MAX_H, MAX_VISIBLE_ROWS, ROW_H_TWO_LINE } from "./MentionPicker";
+import { LIST_MAX_H, MAX_OVERLAY_H, ROW_H_TWO_LINE } from "./MentionPicker";
 // The APP-OWNED Improve-Sparkle agent's real id and name. Imported rather than spelled as literals
 // on purpose: the collision these tests are about exists because that name IS "Sparkle", so a test
 // that hardcoded the string would keep passing if the constant were ever renamed — and the bug would
@@ -1303,9 +1303,13 @@ describe("mentionCandidates — the picker's list is bounded by the query, not b
     // Precondition: the query really does match the ENTIRE fleet, so this is the hard case — with a
     // handful of agents a trailing bead is visible by accident and the bug cannot appear at all.
     expect(rows.filter((r) => !isBeadMentionId(r.id))).toHaveLength(60);
+    // BOUNDED BY THE RESERVE, NOT BY THE WINDOW (roborev 65743). This used to read
+    // `toBeLessThan(MAX_VISIBLE_ROWS)` — a row-INDEX bound written in the constant that sizes the
+    // panel, so raising the window silently loosened the only test that checks the runtime SPLICE
+    // seats a bead early. (The pixel bounds constrain the constants; they say nothing about what
+    // `mentionCandidates` does.) The splice puts the block at exactly the reserve, so say that.
     const firstBead = rows.findIndex((r) => isBeadMentionId(r.id));
-    expect(firstBead).toBeGreaterThanOrEqual(0);
-    expect(firstBead).toBeLessThan(MAX_VISIBLE_ROWS);
+    expect(firstBead).toBe(AGENT_ROWS_ABOVE_BEADS);
   });
 
   // ══ THE INVARIANT IS IN PIXELS, BECAUSE THE PICKER CLIPS IN PIXELS (roborev 65710) ═══════════
@@ -1318,8 +1322,18 @@ describe("mentionCandidates — the picker's list is bounded by the query, not b
   // The guarantee is deliberately about the FIRST bead row being FULLY visible in the WORST case
   // (every row above it two-line). The second and third are reachable by scrolling, and the
   // highlighted row is scrolled into view by the picker's own effect.
-  it("keeps the first bead row fully visible even when every row above it is two-line", () => {
-    expect((AGENT_ROWS_ABOVE_BEADS + 1) * ROW_H_TWO_LINE).toBeLessThanOrEqual(LIST_MAX_H);
+  // ══ THE WINDOW IS PINNED FROM ABOVE, OR THE CAPS ARE FREE (roborev 65743) ════════════════════
+  // Every bound below is `<rows> * <row height> <= LIST_MAX_H`, and LIST_MAX_H was derived from a
+  // constant with no ceiling of its own — so a cap raise could always be bought by enlarging the
+  // panel, which is the self-referential escape the previous two rounds closed, moved one term to
+  // the right. It was not hypothetical: the window really was grown 294 -> 378 to make a bound true,
+  // shipping a bottom-anchored overlay 29% taller in every case with nobody looking at it.
+  //
+  // This is also the row that replaces the old first-bead bound, which had become UNFALSIFIABLE:
+  // the block bound requires A + B <= 4, and with B >= 1 that already forces A <= 4, which is all
+  // the first-bead bound asked. Two assertions where one could fail is not two guards.
+  it("does not let a bigger cap be bought by covering more of the conversation", () => {
+    expect(LIST_MAX_H).toBeLessThanOrEqual(MAX_OVERLAY_H);
   });
 
   // ══ AND THE BEAD CAP IS STILL PINNED TO THE WINDOW (roborev 65730) ═══════════════════════════
@@ -1354,8 +1368,11 @@ describe("mentionCandidates — the picker's list is bounded by the query, not b
       beadRow("sparkle-t3", "xray notarization"),
     ];
     const rows = mentionCandidates([...FLEET, ...beads], "notarization");
+    // CAP-AGNOSTIC, so this row does not have to be rewritten every time the cap moves — and it
+    // still discriminates: these titles are in REVERSE alphabetical order, so a localeCompare sort
+    // would return a different set entirely, not merely a different order.
     expect(rows.filter((r) => isBeadMentionId(r.id)).map((r) => r.id)).toEqual(
-      beads.map((b) => b.id),
+      beads.slice(0, MAX_BEAD_MENTION_ROWS).map((b) => b.id),
     );
   });
 

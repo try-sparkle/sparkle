@@ -900,8 +900,13 @@ export const BEAD_MENTION_MIN_QUERY = 2;
  * not uniform. `mentions.test.ts` pins the whole spliced block against `LIST_MAX_H`, so raising this
  * alone reds; it was briefly held only by self-referential assertions, which meant a value of 30
  * would have buried every agent below the fold with the suite green (roborev 65730).
+ *
+ * WHAT HOLDS IT AT TWO is that block bound and nothing else (roborev 65743): with the overlay fixed
+ * at its long-standing height, two agent rows plus two bead rows is 4 x 60 = 240px of worst case
+ * inside a 294px window, and a third of either would not fit. It was briefly three of each, bought
+ * by enlarging the panel 29% — which is not a trade a guard may make on its own.
  */
-export const MAX_BEAD_MENTION_ROWS = 3;
+export const MAX_BEAD_MENTION_ROWS = 2;
 
 /**
  * How many agent rows sit ABOVE the bead block.
@@ -922,14 +927,17 @@ export const MAX_BEAD_MENTION_ROWS = 3;
  * are on screen. Costing three visible agent rows is the price of the feature working at all;
  * hiding it behind sixty rows was not a trade, it was a defect.
  *
- * THE NUMBER IS THREE, NOT FOUR, and the reason is pixels rather than taste (roborev 65710). Rows
- * are not uniform — a bead row carries its id on a second line — so the guarantee is stated against
- * the worst case in which every row above the first bead is two-line. Four did not fit; three does.
- * The guarantee it buys is narrow and worth stating exactly: the FIRST bead row is fully visible
- * without scrolling. Beads two and three are reachable by scrolling, and the picker's own
- * scroll-into-view effect is what carries the highlight to them.
+ * THE NUMBER IS PIXELS RATHER THAN TASTE (roborev 65710). Rows are not uniform — a bead row carries
+ * its id on a second line — so the budget is stated against the worst case in which every reserved
+ * row is two-line, and what holds this at two is the block bound in `mentions.test.ts`, not the
+ * count itself.
+ *
+ * WHAT IT GUARANTEES, EXACTLY (roborev 65743): the whole reserved block — these agent rows and every
+ * bead row — fits inside the overlay in the worst case, so no bead needs scrolling to reach. The
+ * AGENT rows below the block are uncapped and do run past the fold; the picker's scroll-into-view
+ * effect is what follows the highlight down to those.
  */
-export const AGENT_ROWS_ABOVE_BEADS = 3;
+export const AGENT_ROWS_ABOVE_BEADS = 2;
 
 /** The roster split by kind, with each bead's lowercase address precomputed.
  *

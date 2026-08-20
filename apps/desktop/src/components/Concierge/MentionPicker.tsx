@@ -73,14 +73,16 @@ export function mentionRowIsChoosable(a: MentionAgent): boolean {
  *  {@link ROW_H_TWO_LINE}. The budget that actually clips is {@link LIST_MAX_H}, and `mentions.ts`
  *  is held to that in PIXELS.
  *
- *  IT IS 9, NOT 7, AND THE NUMBER IS DERIVED (roborev 65738). The guard has to be true at the
- *  shipped constants, and at 7 it was not: three agent rows above three bead rows is 306px of
- *  content against a 294px window, so the assertion named a property the layout did not have while
- *  staying green. Worse, it was loose enough that raising the bead cap from 3 to 4 still passed
- *  (7 x 42 = 294) while painting 366px — the smallest raise, and the one a mutation check that only
- *  tried 3 -> 30 never exercised. The window is now sized for the WORST case of the whole reserved
- *  block, every row two-line: (3 + 3) x 60 = 360 <= 378. */
-export const MAX_VISIBLE_ROWS = 9;
+ *  IT IS BACK TO 7, AND THE REASON IS WORTH KEEPING (roborev 65743). It was briefly raised to 9 to
+ *  make the block bound in `mentions.test.ts` true — which is backwards: that satisfies a guard by
+ *  GROWING THE THING IT MEASURES, and since nothing bounded this constant from above, any cap could
+ *  be bought the same way. It also shipped a real visual change nobody looked at, a bottom-anchored
+ *  overlay 29% taller in EVERY case, including the common one — against a docstring promising the
+ *  panel "never swallows the thread behind it".
+ *
+ *  So the window is fixed at what it always was and the CAPS were lowered to fit inside it instead.
+ *  {@link MAX_OVERLAY_H} pins this from above so the trade cannot be reversed silently. */
+export const MAX_VISIBLE_ROWS = 7;
 
 /**
  * A ONE-LINE row: an agent that can take input, drawn as a single line of label.
@@ -108,6 +110,17 @@ export const ROW_H = 42;
  * only.
  */
 export const ROW_H_TWO_LINE = 60;
+
+/**
+ * THE CEILING ON THE PANEL ITSELF — the constraint {@link MAX_VISIBLE_ROWS}'s docstring has always
+ * claimed and nothing enforced.
+ *
+ * Without it the row caps in `mentions.ts` can be raised for free: every bound that holds them is of
+ * the form `<rows> * <row height> <= LIST_MAX_H`, and `LIST_MAX_H` was derived from a constant in
+ * this file with no upper bound of its own. Pinning it means a bigger cap has to be paid for by
+ * showing fewer rows, not by covering more of the founder's conversation.
+ */
+export const MAX_OVERLAY_H = 294;
 
 /** The overlay's own height budget, in pixels — what actually clips. */
 export const LIST_MAX_H = MAX_VISIBLE_ROWS * ROW_H;
@@ -158,9 +171,9 @@ export function MentionPicker({
     // unguarded call would throw in every test that renders this picker — the tests that DO assert
     // this install the method themselves.
     //
-    // It carries more weight than it used to. The ordering rule in mentions.ts guarantees the FIRST
-    // bead row is visible without scrolling; beads two and three are reachable only by scrolling, so
-    // this effect is what makes them selectable rather than a nicety on top of the ordering.
+    // It carries more weight than it used to. The ordering rule in mentions.ts seats the bead block
+    // inside the visible window, but the AGENT rows below it are uncapped — so on a large fleet the
+    // highlight still walks well past the fold, and this is what follows it there.
     selectedRowRef.current?.scrollIntoView?.({ block: "nearest" });
   }, [selected, rowKey]);
 

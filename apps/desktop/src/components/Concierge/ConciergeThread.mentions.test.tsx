@@ -210,6 +210,34 @@ describe("ConciergeThread — a bead mention is clickable", () => {
     expect(beadPills()).toHaveLength(1);
   });
 
+  // ══ …NOR WHEN THE HANDLE SITS OUTSIDE THE SPAN, WHICH IS THE COMMON CASE (roborev 65676) ══════
+  // The row above records the mention under the SUFFIXED label, which only happens on a title
+  // COLLISION. In the ordinary case the recorded name is the bare `@Title` and the handle lives in
+  // the text that FOLLOWS the span — and that is not a rare shape, it is the wire form the app
+  // itself writes (`beadWireText`), so any message quoting or pasting one back takes this path.
+  //
+  // Identical text to the row above; ONLY the recorded name differs. That pairing is the whole
+  // point: the peel used to inspect the matched span alone, so it fired for one and not the other
+  // and printed `(sparkle-1cpomd) (sparkle-1cpomd)` here while the row above stayed green.
+  it("does not print the id twice when the handle follows the mention instead", () => {
+    beadThread([
+      {
+        id: "u3",
+        kind: "you",
+        text: "@Chat about a bead from its card (sparkle-1cpomd) is the one",
+        mentions: [
+          { agentId: beadMentionId(BEAD_ID), name: "Chat about a bead from its card" },
+        ],
+      },
+    ]);
+    expect(bubble().textContent).toBe(
+      "@Chat about a bead from its card (sparkle-1cpomd) is the one",
+    );
+    expect(beadPills()).toHaveLength(1);
+    // Belt and braces on the thing that actually regressed: the handle appears ONCE in the record.
+    expect(bubble().textContent!.split(BEAD_ID).length - 1).toBe(1);
+  });
+
   // A bead deleted after the message was sent. `BeadPill`'s own rule — an id that resolves to
   // nothing is the prose it always was — and the title pill survives regardless, because history
   // renders from the record and not from the live board.
