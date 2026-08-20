@@ -389,4 +389,35 @@ describe("the epic index is beads.ts's, not a second private copy", () => {
     expect(r.result.current.prdEpics).toHaveLength(2);
     expect(r.result.current.buildAllPrd).not.toBeNull();
   });
+
+  // THE THIRD READER, and the one whose staleness is not advisory. `epic` is not a display flag:
+  // `buildIt` picks `buildTask` vs `buildEpic` from it, so a stale `false` dispatches sendToBuild
+  // in "task" MODE against work that now has children — the exact wrong-mode bug roborev 55145
+  // closed, re-entered through a cache. The subject MUST be a non-epic that BECOMES one; the two
+  // tests above both use `type: "epic"`, where the answer is true before and after the push and
+  // the memo's dep list cannot matter (roborev 65777).
+  it("re-reads epic-ness on an in-place push, so a bead that gains a child is not built as a task", async () => {
+    const t = bead({ id: "tk", type: "task" });
+    const all = [t];
+
+    const r = renderHook(
+      ({ list }) => useBeadBuildActions({ bead: t, projectId: "p1", allBeads: list }),
+      { initialProps: { list: all as Bead[] } },
+    );
+    await act(async () => {
+      await r.result.current.buildIt?.();
+    });
+    expect(sendToBuild).toHaveBeenCalledWith(expect.objectContaining({ epicId: "tk", mode: "task" }));
+
+    // It acquires its first child by in-place push — same array object, length 1 -> 2. `isEpic`
+    // keys on CHILDREN, not on `type`, so this bead is an epic from here on.
+    sendToBuild.mockClear();
+    all.push(bead({ id: "tk.1", parent: "tk", status: "open" }));
+    r.rerender({ list: all });
+
+    await act(async () => {
+      await r.result.current.buildIt?.();
+    });
+    expect(sendToBuild).toHaveBeenCalledWith(expect.objectContaining({ epicId: "tk", mode: "epic" }));
+  });
 });

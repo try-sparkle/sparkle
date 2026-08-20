@@ -26,7 +26,6 @@ import { useCallback, useMemo } from "react";
 import {
   claimBead,
   epicIndexOf,
-  isEpic,
   isEpicIndexed,
   STALLED_LABEL,
   type Bead,
@@ -136,6 +135,12 @@ export interface BeadBuildActions {
  * remaining identity-only cache is {@link blockedIdsOf}, and it is keyed on a DIFFERENT array (the
  * store's `board.blocked` lane, not `allBeads`), so `epicIndexOf`'s guard could not cover it
  * anyway — it relies on the fresh-array-per-snapshot contract `beadsStore` actually keeps.
+ *
+ * That sentence was ALSO too strong when first written: the `epic` useMemo down in the hook body
+ * was keyed on `allBeads` as well, so "everything else is length-guarded" was false a third time
+ * (roborev 65777). It is keyed on the index now — see the note there — and this claim is finally
+ * one a reader can rely on. Three rounds of the same shape in one file is the lesson: when a cache
+ * derives from the index, KEY IT ON THE INDEX, and do not add a second thing that decides staleness.
  */
 
 /**
@@ -291,11 +296,28 @@ export function useBeadBuildActions({
   // per-render to per-`allBeads`-change.
   //
   // Keyed on `bead.id`/`bead.type` rather than on `bead`, whose identity changes on every poll even
-  // when the row came back byte-identical — those are the only two fields `isEpic` reads.
+  // when the row came back byte-identical — those are the only two fields the lookup reads.
+  //
+  // ══ AND ON THE INDEX, NOT ON THE ARRAY — THE LAST HALF-FRESH READER ══════════════════════════
+  // This dep list was `[allBeads, …]`. `isEpic` is length-guarded internally, so the resolver was
+  // never the stale part; the MEMO WRAPPING IT was. On an in-place push — same array object, new
+  // length — `startable`, `byPath` and `prdEpics` all re-read a rebuilt index while this memo held
+  // its old answer, which is the identical half-fresh/half-stale split the two commits before this
+  // one set out to end, just moved up a scope (roborev 65777).
+  //
+  // Its consequences are the worst of the three, because `epic` is not advisory: `buildAllPrd` is
+  // gated on `epic &&`, so a bead that just acquired its first child keeps the batch button hidden
+  // while `prdEpics.length > 1` says it should be there; and `buildIt` hands that same bead to
+  // `buildTask`, dispatching `sendToBuild` in "task" mode against work that now HAS children.
+  //
+  // Keying on the index object fixes it for free — `epicIndexOf` already decides when a snapshot is
+  // stale, and a rebuilt index is a new object — and hoisting that one call also retires the two
+  // repeated `epicIndexOf(allBeads)` reads below.
+  const index = epicIndexOf(allBeads);
   const epic = useMemo(
-    () => isEpic(allBeads, bead),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `isEpic` reads only these two fields
-    [allBeads, bead.id, bead.type],
+    () => isEpicIndexed(index, bead),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- the lookup reads only these two fields
+    [index, bead.id, bead.type],
   );
   // ══ A MAP LOOKUP, NOT A WHOLE-BACKLOG WALK ══════════════════════════════════════════════════
   // See {@link prdEpicsByPath} for why this is grouped once per bead-list identity rather than
@@ -312,8 +334,8 @@ export function useBeadBuildActions({
     // one press on a DIFFERENT epic's card (roborev 65607).
     const group = byPath.get(prdPath);
     if (!group) return NO_EPICS;
-    return group.filter((b) => isStartable(b, epicIndexOf(allBeads), blockedIds));
-  }, [byPath, allBeads, prdPath, blockedIds]);
+    return group.filter((b) => isStartable(b, index, blockedIds));
+  }, [byPath, index, prdPath, blockedIds]);
 
   // ══ THE GATE IS THE BEAD'S OWN STATE, NOT THE COLUMN IT IS DRAWN IN ══════════════════════════
   // The founder's ask arrived truncated — "if it is in a backlog state, I should be able to click
@@ -341,7 +363,7 @@ export function useBeadBuildActions({
   // the pressed bead left `buildAllPrd` claiming every sibling in `prdEpics` regardless — one press
   // reopening a CLOSED epic to `in_progress` with an orchestrator against finished work
   // (roborev 65607).
-  const startable = isStartable(bead, epicIndexOf(allBeads), blockedIds);
+  const startable = isStartable(bead, index, blockedIds);
 
   const buildOne = useCallback(
     async (mode: "epic" | "task") => {
