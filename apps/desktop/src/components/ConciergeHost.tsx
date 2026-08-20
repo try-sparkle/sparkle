@@ -5908,20 +5908,28 @@ export function ConciergeHost({
       // THE CONCIERGE INTO THAT AGENT just like it would a regular builder agent."* An ordinary build
       // agent reaches its terminal through `mountRouted` below and through nothing else, and that is
       // CABLE-gated — so this agent now does too. `AgentSidebar.onMountSparkle` patches the cable, and
-      // the row runs it on EVERY activation — single click, double click, Enter/Space, and the
-      // `detail === 0` assistive-tech press (SparkleAgentRow) — which is what makes any press on that
-      // row a mount rather than a selection; Escape unpatches it, and an unpatched cable means the
+      // the row asks `engine/cable.mountsOnRowActivation` which activations run it — the SAME
+      // predicate every build row asks; Escape unpatches it, and an unpatched cable means the
       // concierge, exactly as it does for every other row.
       //
-      // THE GESTURE TABLE MATTERS TO THIS PARAGRAPH, so it is stated rather than implied (roborev
-      // 65160). The premise here is *"a press on that row always leaves the cable pinned to it"*, and
-      // that is what makes having NO replacement for `mountAddress` safe: there is no state in which
-      // the founder is looking at this pane while the cable names something else. This row therefore
-      // does NOT use `engine/cable.mountsOnRowActivation` — the shared predicate's "a plain single
-      // press selects without patching" rule would reintroduce exactly that state, and this pane has
-      // no composer with which to disambiguate it. SparkleAgentRow's `onClick` block carries the
-      // reproduction; if that row is ever changed to select-without-mounting, this reasoning is void
-      // and the escape hatch has to come back.
+      // ══ THE PREMISE THIS PARAGRAPH USED TO REST ON IS GONE, AND NOTHING BROKE WITH IT ═══════════
+      // Written for roborev 65160, this block used to claim *"a press on that row always leaves the
+      // cable pinned to it"* — no state in which the founder looks at this pane while the cable names
+      // something else — and cited that as what made having no `mountAddress` safe. Founder,
+      // 2026-08-20 (bead sparkle-9useo2): *"it shouldn't mount the concierge pane unless I double
+      // click on improve sparkle just like any other build agent works."* A single press now seats
+      // that pane without patching, so the premise is FALSE and is retracted here rather than left
+      // standing as a guarantee the code no longer provides.
+      //
+      // The escape hatch still does not come back, and the reason is the one that made the premise
+      // dispensable in the first place: `resolveMountedTarget` reads the mount from the CABLE'S OWN
+      // PIN (bead sparkle-9gsjqm), so the concierge column — the surface the founder types into —
+      // keeps rendering the pinned agent's "Chatting with ● <Agent>" chip and that agent's
+      // conversation no matter what the build column is drawing. The state the premise excluded is
+      // therefore a LABELLED state, and it is the same one every build row has had since the
+      // single/double split landed. Restoring `mountAddress` would re-aim his words at
+      // `__sparkle_self__` on the strength of a visible pane, which is exactly what it was deleted
+      // for.
       //
       // THE ONE THING THIS BUYS BEYOND THE REFUSAL: a concierge-bound message is now structurally
       // incapable of being screen-checked here. `addressable` requires `mentionAim`, which requires

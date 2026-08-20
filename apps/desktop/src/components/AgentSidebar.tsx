@@ -1389,11 +1389,12 @@ export function AgentSidebar({
   // Improve Sparkle is per-window: reveal THIS window's own copy in place (its own worktree/branch/
   // conversation keyed by sparkleAgentId). No cross-window focus/broadcast. See services/sparkleReveal.
   //
-  // AND IT MOUNTS, like every other build row. Founder, 2026-07-29: "I also want this same mounting
-  // functionality to work for the improve sparkle agent at the bottom of the build column. It should
-  // work the same way." Its own pane's composer is gone (SparkleAgentPane), so patching the cable is
-  // now the ONLY way to talk to this agent — a click that seated the pane without patching would
-  // leave it with no input surface but the raw terminal.
+  // AND IT MOUNTS ON THE SAME GESTURES, like every other build row. Founder, 2026-07-29: "I also want
+  // this same mounting functionality to work for the improve sparkle agent at the bottom of the build
+  // column. It should work the same way." — and, narrowing it on 2026-08-20 (bead sparkle-9useo2):
+  // "it shouldn't mount the concierge pane unless I double click on improve sparkle just like any
+  // other build agent works." So WHICH activations mount is `engine/cable.mountsOnRowActivation`,
+  // asked by the row itself; there is no branch here or in SparkleAgentRow for this agent.
   //
   // `patchCable(pairSide)` and NOT `selectAndWire`: that helper calls `selectAgent(project.id, id)`,
   // and this id is not one of the project's agents. Same side, same reducer, same ONE LIVE CIRCUIT —
@@ -1402,8 +1403,9 @@ export function AgentSidebar({
   // These were ONE callback that revealed the pane and patched the cable together, which is why the
   // row could not run the shared `mountsOnRowActivation` predicate: that rule exists precisely to
   // decide whether an activation is a SELECT or a MOUNT, and it has nothing to decide when the two
-  // are inseparable. `SparkleAgentRow.onMount`'s header has the founder's report and the full
-  // reasoning; do not restate it here.
+  // are inseparable. The split is what makes the predicate answerable, and the row now asks it —
+  // `SparkleAgentRow`'s `onClick` block has the founder's report and the full reasoning; do not
+  // restate it here.
   //
   // The pair mirrors `onSelect`/`onMount` for a build row, including the ORDERING guarantee: the
   // mount half re-reveals rather than assuming the select half already ran, so a `dblclick` (which
