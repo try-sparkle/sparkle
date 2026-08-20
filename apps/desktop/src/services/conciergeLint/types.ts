@@ -157,10 +157,14 @@ export interface LintContext {
    */
   founderMessages: readonly string[];
   policy: LintPolicy;
-  /** Owning build agent for a PR number. Returning `null` means UNRESOLVED OR AMBIGUOUS and NEVER
-   *  a guess — a pill carrying the wrong id opens the wrong agent and the reader cannot tell,
-   *  which is strictly worse than the bare number it replaced (`pr_owner.rs`'s discipline). */
-  resolvePrOwner?: (prNumber: string) => string | null;
+  // NO `resolvePrOwner` HOOK HERE, and it was DELETED rather than left declared (bead
+  // `sparkle-jjm27e`). It sat on this contract with no production implementation — its only caller
+  // was this file's own test — while the real number→agent→pill join lived, and still lives, in
+  // `components/OpenPrMenu.agentLinkForPr`. A declared-but-unimplemented hook is worse than no hook:
+  // it reads as a wired capability, so the next reader builds against it and discovers at runtime
+  // that nothing ever supplies it. The approval card resolves PR owners through the ledger entry's
+  // `subject` and that same existing join; if this module ever needs owners, it should call that one
+  // rather than reopen a third half-built path.
 }
 
 /** One finding. `span` is a CHARACTER COUNT of the matched text, never the text — the violation log

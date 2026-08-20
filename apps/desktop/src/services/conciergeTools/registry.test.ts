@@ -146,12 +146,16 @@ vi.mock("../helper", async (orig) => ({
   setHelperBounds: vi.fn(() => {}),
 }));
 
+import { z } from "zod";
 import {
   CONCIERGE_TOOL_DOMAINS,
   CONCIERGE_TOOL_OPS,
   REGISTRY_CODES,
+  RELAY_GATED_OPS,
+  describeIssues,
   dispatchConciergeTool,
   permissiveToolPolicy,
+  relayRefusalFor,
   type ConciergeToolCall,
   type ConciergeToolPolicy,
   type ConciergeToolReply,
@@ -1066,6 +1070,124 @@ describe("dispatchConciergeTool — the policy seam", () => {
       expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
       expect(refusal(r).message).toContain("scope");
       expect(invokedCommands()).not.toContain("history_search");
+    });
+  });
+
+  // -------------------------------------------------------------------------------------------
+  // A CARD MUST NEVER BE RAISED FOR A CALL THE DISPATCH WOULD REFUSE (bead `sparkle-jjm27e`).
+  //
+  // THE LIVE INCIDENT. The founder was shown an approval card for `workflow.merge_pr` carrying
+  // `prNumber: 2165`. `mergePrArgs` is `.strict()` and spells the field `number`, so approving
+  // would have SPENT the single-use grant and then failed with `bad-args: unrecognised argument(s)
+  // prNumber` plus a missing `number`. He nearly pressed it. The card was raised because the
+  // approval is minted as a side effect INSIDE the policy call, and the policy ran before zod.
+  //
+  // The fix validates first. The ordering property the old code had is preserved and is asserted
+  // here too: a DENIED tool must still be refused as DENIED, never as a validation error that
+  // leaks which arguments it would have wanted (registry.ts's own gate-order docstring).
+  //
+  // Driven through the REAL `configuredToolPolicy`, deliberately: a stub returning `ask` would
+  // never call `requestApproval`, so the ledger would be empty for a reason that has nothing to do
+  // with the fix and every one of these tests would pass against the broken code.
+  // -------------------------------------------------------------------------------------------
+  describe("arguments are validated BEFORE an approval card is minted", () => {
+    const cards = () => pendingApprovals(useConciergeApprovals.getState().entries);
+
+    beforeEach(() => {
+      useSettingsStore.setState({
+        aiConcierge: true,
+        conciergeToolPolicy: {},
+        conciergeToolPolicyHydrated: true,
+      } as never);
+      useAuthStore.setState({
+        me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+        creditFloorCents: 0,
+      } as never);
+      clearConciergeApprovals();
+    });
+
+    afterEach(() => clearConciergeApprovals());
+
+    it("the founder's incident: merge_pr with `prNumber` refuses and leaves NO card behind", async () => {
+      const projectId = seedProject();
+      const r = await dispatchConciergeTool(
+        call({ domain: "workflow", op: "merge_pr", args: { projectId, prNumber: 2165 } }),
+        { policy: configuredToolPolicy },
+      );
+      expect(refusal(r).code).toBe(REGISTRY_CODES.badArgs);
+      // THE ASSERTION THAT MATTERS. Everything else about this call was already true before the
+      // fix — it was always going to fail at dispatch. What was NOT true is that the human was
+      // never asked: the card was minted, sat in his column, and spending it would have burned the
+      // grant on a call that could not run.
+      expect(cards()).toEqual([]);
+    });
+
+    it("names BOTH the rejected argument and the missing one, so one retry can fix it", async () => {
+      // A misspelled field is always two issues — the unknown key, and the required one it
+      // displaced. Reporting only `issues[0]` said "`number`: Required", which is true and invites
+      // the repair `{projectId, prNumber, number}` — failing again on the key nobody mentioned.
+      // One typo, an unbounded retry loop, a turn per lap. Both halves are asserted because either
+      // one alone passes against the single-issue form this replaced.
+      const projectId = seedProject();
+      const r = await dispatchConciergeTool(
+        call({ domain: "workflow", op: "merge_pr", args: { projectId, prNumber: 2165 } }),
+        { policy: configuredToolPolicy },
+      );
+      const message = refusal(r).message;
+      expect(message).toContain("prNumber");
+      expect(message).toContain("number");
+    });
+
+    it("a WELL-FORMED merge_pr still raises a card — the gate did not simply stop asking", async () => {
+      // The paired half of the test above. Without it, deleting `requestApproval` outright would
+      // make every assertion in this describe block pass while removing the whole feature.
+      const projectId = seedProject();
+      const r = await dispatchConciergeTool(
+        call({ domain: "workflow", op: "merge_pr", args: { projectId, number: 2165 } }),
+        { policy: configuredToolPolicy },
+      );
+      expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
+      const [card] = cards();
+      expect(card).toBeDefined();
+      expect(card!.op).toBe("merge_pr");
+    });
+
+    it("stamps WHAT the call acts on onto the card it does raise", async () => {
+      const projectId = seedProject();
+      await dispatchConciergeTool(
+        call({ domain: "workflow", op: "merge_pr", args: { projectId, number: 2165 } }),
+        { policy: configuredToolPolicy },
+      );
+      // The founder's ask: the card must be able to name WHICH BUILD AGENT the work belongs to.
+      // This is the durable reference the column resolves into a clickable pill.
+      expect(cards()[0]!.subject).toEqual({ kind: "pr", projectId, number: 2165 });
+    });
+
+    it("stamps an AGENT subject for an op that names one", async () => {
+      const projectId = seedProject();
+      const agentId = seedBuild(projectId);
+      await dispatchConciergeTool(
+        call({ domain: "lifecycle", op: "discard_agent", args: { agentId } }),
+        { policy: configuredToolPolicy },
+      );
+      const [card] = cards();
+      expect(card).toBeDefined();
+      expect(card!.subject).toEqual({ kind: "agent", agentId });
+    });
+
+    it("a DENY still reads as denied, never as a validation error that leaks the schema", async () => {
+      // The property registry.ts's gate-order docstring calls deliberate, re-asserted at the level
+      // that could regress it: validating earlier must not turn a denial into a `bad-args` reply
+      // naming fields the human's own rule said this tool may never have.
+      const deny: ConciergeToolPolicy = () => ({ tier: "deny", reason: "the human said no" });
+      const r = await dispatchConciergeTool(
+        call({ domain: "workflow", op: "merge_pr", args: { nonsense: true } }),
+        { policy: deny },
+      );
+      expect(refusal(r).code).toBe(REGISTRY_CODES.denied);
+      expect(refusal(r).message).toContain("the human said no");
+      expect(refusal(r).message).not.toContain("nonsense");
+      expect(cards()).toEqual([]);
     });
   });
 
@@ -2248,10 +2370,72 @@ describe("the relay gate refuses BEFORE the approval tier", () => {
     setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] });
     const r = await send(FOUNDER, ask);
     // THE ASSERTION THAT PINS THE ORDER. Under the old placement this read `needs-approval`: the
-    // policy answered first and the gate never ran. The human must not be asked to approve a send
-    // that is not allowed to happen.
+    // policy answered first and the gate never ran.
     expect(refusal(r).code).toBe(REGISTRY_CODES.unaddressedRelay);
     expect(refusal(r).code).not.toBe(REGISTRY_CODES.needsApproval);
+  });
+
+  // ══ AND NO CARD IS LEFT BEHIND — THE HALF THE REPLY CODE CANNOT SEE (bead `sparkle-jjm27e`) ═════
+  //
+  // The row above used to carry the comment "the human must not be asked to approve a send that is
+  // not allowed to happen", and it did not check that. It cannot: `ask` is a STUB that returns a
+  // tier without ever calling `requestApproval`, so the ledger is empty in that row for a reason
+  // that has nothing to do with the gate — it would be empty against the broken code too. A test
+  // that documents an invariant it does not check is worse than no test, because the next person
+  // reads the comment and believes the class is covered.
+  //
+  // It was NOT covered, and the defect was real: minting the card is a side effect INSIDE the
+  // policy call, and the gate sat below that call. A refused send therefore left a pressable card
+  // in the founder's column — proved live with a probe, not inferred. These rows drive the REAL
+  // `configuredToolPolicy`, which is the only way the ledger can be a witness to anything.
+  describe("and leaves NO approval card behind — driven through the real policy", () => {
+    const cards = () => pendingApprovals(useConciergeApprovals.getState().entries);
+
+    beforeEach(() => {
+      useSettingsStore.setState({
+        aiConcierge: true,
+        conciergeToolPolicy: {},
+        conciergeToolPolicyHydrated: true,
+      } as never);
+      useAuthStore.setState({
+        me: { clerkUserId: "u1", entitled: true, balanceCents: 5_000, tokenVersion: 1 },
+        creditFloorCents: 0,
+      } as never);
+      clearConciergeApprovals();
+    });
+
+    afterEach(() => clearConciergeApprovals());
+
+    it("a refused relay puts NOTHING on the founder's screen", async () => {
+      setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] });
+      const r = await send(FOUNDER, configuredToolPolicy);
+      expect(refusal(r).code).toBe(REGISTRY_CODES.unaddressedRelay);
+      // THE ASSERTION THAT MATTERS, and the one the stub-policy row structurally could not make.
+      // Before the fix this held one pending `send_to_agent_terminal` card: a dead button for a
+      // send this very dispatch had just refused.
+      expect(cards()).toEqual([]);
+    });
+
+    it("but an ALLOWED send still raises one — the gate did not simply stop asking", async () => {
+      // THE PAIRED HALF. Without it, deleting `requestApproval` outright, or making this op
+      // read-only, would make the row above pass while removing the approval flow entirely.
+      setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] });
+      const r = await send("STOP — you are 42 commits ahead of origin/main", configuredToolPolicy);
+      expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
+      const [card] = cards();
+      expect(card).toBeDefined();
+      expect(card!.op).toBe("send_to_agent_terminal");
+    });
+
+    it("a relay he DID address still raises one — the suppression is keyed to the refusal", async () => {
+      // The other direction of the same pair: same text, same op, same policy — only the founder's
+      // own addressing differs. Without this row the suppression could be keyed to the op, or to
+      // the text carrying his words at all, and both would pass the two rows above.
+      setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: ["ag-unnamed"] });
+      const r = await send(FOUNDER, configuredToolPolicy);
+      expect(refusal(r).code).toBe(REGISTRY_CODES.needsApproval);
+      expect(cards().map((c) => c.op)).toEqual(["send_to_agent_terminal"]);
+    });
   });
 
   it("still refuses on the APPROVED re-run — the path conciergeApprovalResume takes", async () => {
@@ -2278,5 +2462,114 @@ describe("the relay gate refuses BEFORE the approval tier", () => {
   it("lets a relay through to the approval gate when he NAMED the agent", async () => {
     setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: ["ag-unnamed"] });
     expect(refusal(await send(FOUNDER, ask)).code).toBe(REGISTRY_CODES.needsApproval);
+  });
+});
+
+// ══ THE GATE'S POPULATION IS A NAMED LIST, AND DISPATCH MUST HONOUR IT ═══════════════════════════
+//
+// `relayGate.test.ts` pins RELAY_GATED_OPS against the receipt classifier — that no message-carrying
+// op is MISSING from the list. This is the other direction: that an op which is NOT on the list is
+// not gated merely because it happens to carry an `agentId` and a `text`. No such op exists in the
+// registry today, which is exactly why nothing caught it: mutation-check flagged the membership
+// test as removable with the whole suite green, because every dispatch fixture that reaches this
+// code is on the list. Widening the gate would refuse ordinary calls whose `text` is a search
+// query, not a message — a refusal nobody could explain from the reply.
+describe("relayRefusalFor is scoped to the ops that carry a message", () => {
+  const FOUNDER = "You should have better memory now. can you tell me if that's true?";
+  const relayArgs = { agentId: "ag-unnamed", text: FOUNDER };
+
+  beforeEach(() =>
+    setConciergeTurnOrigin("bubble-1", { text: FOUNDER, mentionedAgentIds: [] }),
+  );
+  afterEach(() => setConciergeTurnOrigin(null));
+
+  it("refuses for every op ON the list", () => {
+    // The positive half, over the WHOLE list rather than one member: a gate that fired for the
+    // terminal op alone is the hole `RELAY_GATED_OPS` was introduced to close (roborev 64191).
+    for (const op of RELAY_GATED_OPS) {
+      const args = op === "inbox_broadcast" ? { agentIds: ["ag-unnamed"], text: FOUNDER } : relayArgs;
+      expect(relayRefusalFor(op, args), op).not.toBeNull();
+    }
+  });
+
+  it("does NOT refuse for an op off the list carrying the same argument shape", () => {
+    // Identical arguments, identical turn state — only the op name differs. This is the row that
+    // goes red if the membership test is deleted.
+    expect(relayRefusalFor("read_agent_terminal", relayArgs)).toBeNull();
+    expect(relayRefusalFor("create_item", relayArgs)).toBeNull();
+  });
+
+  it("reports how many recipients the refused send would have reached", () => {
+    // The log line's only source. A broadcast that refuses on ONE unnamed recipient still reports
+    // every agent it would have reached, which is what makes the warning readable.
+    const many = relayRefusalFor("inbox_broadcast", {
+      agentIds: ["ag-a", "ag-b", "ag-c"],
+      text: FOUNDER,
+    });
+    expect(many?.recipients).toBe(3);
+    expect(relayRefusalFor("send_to_agent_terminal", relayArgs)?.recipients).toBe(1);
+  });
+
+  it("fails OPEN on a shape that yields no recipients or no text", () => {
+    // ./relayGate's stated direction: an unprovable case must not block legitimate work.
+    expect(relayRefusalFor("send_to_agent_terminal", { text: FOUNDER })).toBeNull();
+    expect(relayRefusalFor("send_to_agent_terminal", { agentId: "ag-unnamed" })).toBeNull();
+    expect(relayRefusalFor("send_to_agent_terminal", undefined)).toBeNull();
+  });
+});
+
+// ══ "AND N MORE" MUST COUNT WHAT WAS OMITTED, NOT WHAT WAS DEDUPED (roborev job 65624) ═══════════
+//
+// `describeIssues` collapses duplicate descriptions — a union schema reports the same failure once
+// per branch — and then says how many it left out. Computing that remainder from the DEDUPED list
+// counts every collapsed duplicate as an omission, so a refusal that described everything still
+// ended "; and 2 more". That is the worst possible lie in this particular string: it is now the
+// model's only chance to repair the call inside the turn, so a phantom remainder sends it hunting
+// for problems that do not exist — the unbounded-retry shape the change exists to end.
+//
+// Issues come from a REAL `safeParse`, never hand-built: the arithmetic is only interesting for
+// input zod actually produces.
+describe("describeIssues — the remainder counts omissions, not duplicates", () => {
+  /** Real zod output for a schema that emits the same issue twice (no registry schema does today,
+   *  which is why no dispatch fixture can reach this). */
+  const duplicateIssues = () => {
+    const schema = z.object({ a: z.string() }).superRefine((_v, ctx) => {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "nothing to update" });
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: "nothing to update" });
+    });
+    const r = schema.safeParse({ a: "x" });
+    expect(r.success).toBe(false);
+    return r.success ? [] : r.error.issues;
+  };
+
+  it("says nothing about a remainder when the only extras were duplicates", () => {
+    const issues = duplicateIssues();
+    expect(issues).toHaveLength(2);
+    const out = describeIssues(issues);
+    // One description…
+    expect(out).toContain("nothing to update");
+    // …and NO invented remainder. Before the fix this read "; and 1 more".
+    expect(out).not.toContain("more");
+  });
+
+  it("still reports a genuine remainder, and counts it from what was consumed", () => {
+    // Eight distinct missing fields against a cap of five: five are described and three are
+    // genuinely omitted. The paired half — without it, deleting the remainder entirely would pass
+    // the row above.
+    const wide = z.object(
+      Object.fromEntries(
+        Array.from({ length: 8 }, (_v, i) => [`f${i}`, z.string()]),
+      ) as Record<string, z.ZodString>,
+    );
+    const r = wide.safeParse({});
+    expect(r.success).toBe(false);
+    const issues = r.success ? [] : r.error.issues;
+    expect(issues).toHaveLength(8);
+    expect(describeIssues(issues)).toContain("and 3 more");
+  });
+
+  it("describes a lone issue with no remainder at all", () => {
+    const r = z.object({ a: z.string() }).safeParse({});
+    expect(describeIssues(r.success ? [] : r.error.issues)).toBe("`a`: Required");
   });
 });

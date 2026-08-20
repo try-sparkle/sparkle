@@ -71,15 +71,10 @@ describe("the pinned public contract", () => {
       prevReply: null,
       founderMessages: [],
       policy,
-      resolvePrOwner: (prNumber: string) => (prNumber === "918" ? "a1" : null),
     };
 
     expect(severities).toHaveLength(3);
     expect(Object.keys(policy.checks)).toEqual(["hedge-words"]);
-    // `resolvePrOwner` returns null for unresolved/ambiguous and NEVER a guess.
-    expect(ctx.resolvePrOwner?.("918")).toBe("a1");
-    expect(ctx.resolvePrOwner?.("777")).toBeNull();
-
     const result: LintResult = lintReply("The build should finish soon.", ctx);
     expect(Object.keys(result).sort()).toEqual(["blocked", "text", "violations"]);
 

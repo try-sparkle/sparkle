@@ -54,6 +54,9 @@
 import { create } from "zustand";
 
 import type { ConciergeRiskClass } from "../services/conciergeTools/policy";
+// TYPE ONLY — the derivation lives beside the registry that produces the arguments it reads, so
+// there is one definition of what a subject is rather than a copy on each side of the seam.
+import type { ApprovalSubject } from "../services/conciergeTools/approvalSubject";
 // The concierge's drainable event log. Imported for ONE purpose: to announce that a question
 // reached the human and that they answered it. Nothing is read back from it, and nothing in this
 // file's behaviour depends on it — see `emitApprovalEvent`.
@@ -102,6 +105,10 @@ const SECRETISH_KEY = /(token|secret|password|passphrase|credential|api[-_]?key|
 
 /** Where an entry has got to. `pending` is the only state the column renders. */
 export type ApprovalOutcome = "pending" | "approved" | "denied" | "expired";
+
+/** Re-exported so a card or its container has ONE import for everything on a ledger entry, rather
+ *  than reaching into the tool registry for a type it only ever reads off an approval. */
+export type { ApprovalSubject };
 
 /** One `name: value` line of the "here is what I would run" block. */
 export interface ApprovalArgLine {
@@ -162,6 +169,30 @@ export interface ConciergeApprovalRequest {
    * Absent means "no relay claim", matching every other fail-closed reader of this verdict.
    */
   relayedFounderWords?: true;
+  /**
+   * WHAT this call would act on — the fact the card used to be missing (bead `sparkle-jjm27e`).
+   *
+   * The founder's complaint was that a card reading `workflow.merge_pr` / `projectId ed5d0ece-…` /
+   * `prNumber 2165` states the tool's internal name and a raw uuid, neither of which he can act on,
+   * while omitting the one thing he needs: WHICH BUILD AGENT the work belongs to, clickable. This
+   * field is the durable half of that answer — a REFERENCE to the subject, resolved to a live pill
+   * by the container at render time (components/Concierge/ConciergeApprovals).
+   *
+   * STAMPED AT RAISE, for the same reason as {@link relayedFounderWords} above: approving runs the
+   * call from a click handler arbitrarily long after the requesting turn ended. Deriving it there
+   * would mean re-reading {@link rawArgs} — untyped model JSON — inside the view, which is exactly
+   * the raw-args coupling this change removes.
+   *
+   * DERIVED FROM UNTRUSTED ARGUMENTS. On the registry path the dispatch has validated them first,
+   * but `resolveAskTier`'s other caller (`controlOpPolicy`, behind `appOpPolicy`/`chiefOpPolicy`)
+   * has no schema at all — see {@link ApprovalSubject}'s module for why its guards are load-bearing
+   * rather than redundant.
+   *
+   * ABSENT means the op names neither an agent nor a pull request, which is ordinary — the card
+   * falls back to the catalog summary it already renders. It does NOT mean "no owner": an
+   * unresolvable OWNER is rendered as "owner unresolved" beside a subject that is present.
+   */
+  subject?: ApprovalSubject;
   /** `concierge.tools.<op>` — named in the card so "stop asking me" is one click from discoverable. */
   configPath: string;
   /** Canonical identity of this exact call. Build with {@link approvalFingerprint}. */

@@ -281,6 +281,37 @@ export const RELAY_GATED_OPS = new Set<string>([
   "inbox_send",
   "inbox_broadcast",
 ]);
+
+/**
+ * The relay verdict for one call: the refusal sentence and how many agents it would have reached,
+ * or `null` when this send may proceed.
+ *
+ * SEPARATED FROM THE GATE so that it can be evaluated BEFORE the policy is consulted. Minting an
+ * approval card is a side effect inside the policy call, and a send that is about to be refused
+ * must not put a question on the founder's screen — see `dispatchConciergeTool`'s relay-gate block
+ * for the incident. Pure apart from `refuseUnaddressedRelay`'s one read of the live turn state.
+ *
+ * ARGS READ DEFENSIVELY. Belt and braces: gate 2 has already validated them against the op's own
+ * schema by the time dispatch calls this, but the reads cost nothing and keep the function safe to
+ * call on untyped model JSON. A shape that yields no recipients, or a non-string `text`, simply
+ * cannot be shown to be an unaddressed relay — which is this gate's fail-open direction
+ * (see ./relayGate).
+ */
+export function relayRefusalFor(
+  op: string,
+  args: unknown,
+): { message: string; recipients: number } | null {
+  if (!RELAY_GATED_OPS.has(op)) return null;
+  const a = (args ?? {}) as Record<string, unknown>;
+  // The recipients, however this op spells them: one for a send, all of them for a broadcast.
+  const ids = [
+    ...(typeof a.agentId === "string" ? [a.agentId] : []),
+    ...(Array.isArray(a.agentIds) ? a.agentIds.filter((x): x is string => typeof x === "string") : []),
+  ];
+  if (ids.length === 0 || typeof a.text !== "string") return null;
+  const message = refuseUnaddressedRelay(ids, a.text);
+  return message ? { message, recipients: ids.length } : null;
+}
 import { conciergeToolAuthority, type ToolPolicyDecision } from "../dispatchAuthority";
 import { useProjectStore } from "../../stores/projectStore";
 // The SAME predicate spawn_worker gates on — one copy, shared, so the two dispatch surfaces cannot
@@ -409,6 +440,26 @@ export interface ToolPolicyQuery {
    * NARROWS what an approval covers and can never widen it.
    */
   args: unknown;
+  /**
+   * May this query RAISE a question with the human? Defaults to true; only dispatch passes false.
+   *
+   * Minting an approval card is a SIDE EFFECT of evaluating an ask-tier op (`policyBinding`'s
+   * `resolveAskTier` calls `requestApproval`), which is what made the two questions below
+   * inseparable — and made the bug in bead `sparkle-jjm27e` unavoidable:
+   *
+   *   • "what tier is this op?"  — pure, and dispatch needs the answer for arguments that are
+   *                                about to be REFUSED, purely to decide whether the refusal reads
+   *                                as `denied` or as `bad-args`.
+   *   • "ask the human about it" — a card on the founder's screen, which must NOT happen for a call
+   *                                the dispatch is about to reject.
+   *
+   * With bad arguments in hand, dispatch consults the policy with this set to `false`: it learns
+   * the tier — so a DENIED tool is still refused as denied and never leaks which arguments it would
+   * have wanted — while no question reaches the human about a call that can never run.
+   *
+   * A policy with no side effects may ignore this entirely; `permissiveToolPolicy` does.
+   */
+  raiseApproval?: boolean;
 }
 
 /** The seam. Pure: a query in, a decision out. `services/conciergeTools/policy.ts`'s
@@ -482,29 +533,95 @@ function parseArgs<T>(ctx: OpContext, schema: z.ZodType<T>, raw: unknown): Parse
   // stops being one.
   const r = schema.safeParse(raw === undefined ? {} : raw);
   if (r.success) return { ok: true, value: r.data };
-  const first = r.error.issues[0];
   return {
     ok: false,
     reply: err(
       ctx,
       REGISTRY_CODES.badArgs,
-      `${ctx.domain}.${ctx.op} was called with bad arguments — ${first ? describeIssue(first) : "the arguments did not validate"}.`,
+      `${ctx.domain}.${ctx.op} was called with bad arguments — ${describeIssues(r.error.issues)}.`,
     ),
   };
 }
 
+/** How many issues a refusal spells out before it summarises the rest. Enough to describe a
+ *  misspelled field (which is two issues — the unknown key and the required one it displaced),
+ *  with room to spare; bounded so a deeply nested union cannot turn one refusal into a wall. */
+const MAX_REPORTED_ISSUES = 5;
+
+/**
+ * EVERY issue, not just the first — because a half-described refusal is one the model cannot act on.
+ *
+ * This used to report `issues[0]` alone, and the founder's `merge_pr` incident is exactly what that
+ * costs (bead `sparkle-jjm27e`). Sending `{projectId, prNumber: 2165}` to a `.strict()` schema that
+ * spells the field `number` produces TWO issues: `prNumber` is unrecognised, and `number` is
+ * missing. Reporting only the first said `` `number`: Required `` — true, and incomplete in the
+ * worst way, because the obvious repair it invites is `{projectId, prNumber, number}`, which fails
+ * again on the key nobody mentioned. One misspelled argument, an unbounded retry loop, and every
+ * lap costs a turn.
+ *
+ * That mattered less when validation ran after the policy layer had already stopped the call; now
+ * that a malformed call is refused BEFORE the human is asked, this refusal is the model's only
+ * chance to get it right inside the same turn, so it has to carry the whole story.
+ *
+ * EXPORTED FOR ITS OWN TEST. The remainder arithmetic below has a failure mode that no dispatch
+ * fixture can reach today — no registry schema currently emits duplicate issues — so the test
+ * feeds it real `safeParse` output from a schema built for the purpose. Formatting a refusal the
+ * model must act on is worth pinning directly rather than leaving to a future union schema.
+ */
+export function describeIssues(issues: readonly z.ZodIssue[]): string {
+  if (issues.length === 0) return "the arguments did not validate";
+  // Deduped: a union schema reports the same failure once per branch, and repeating it verbatim
+  // three times reads as three separate problems.
+  const seen = new Set<string>();
+  // COUNTED SEPARATELY FROM `seen`, and that is the whole subtlety (roborev job 65624). `seen` is
+  // the DEDUPED set, so subtracting its size would re-report collapsed duplicates as omitted
+  // items — three identical union-branch issues would describe one and claim "and 2 more" with
+  // nothing left out, which is the phantom this refusal can least afford: it is the model's only
+  // chance to repair the call inside the turn, so an invented remainder sends it hunting for
+  // problems that do not exist. What was left out is `issues.length` minus what we CONSUMED.
+  let consumed = 0;
+  for (const issue of issues) {
+    consumed++;
+    seen.add(describeIssue(issue));
+    if (seen.size >= MAX_REPORTED_ISSUES) break;
+  }
+  const described = [...seen];
+  const rest = issues.length - consumed;
+  // The count is only appended when something was genuinely left out — never a bare "and 0 more".
+  return rest > 0 ? `${described.join("; ")}; and ${rest} more` : described.join("; ");
+}
+
 /** One op: its argument schema and what to do with the parsed value. */
-type Handler = (raw: unknown, ctx: OpContext) => Promise<ConciergeToolReply>;
+type Handler = ((raw: unknown, ctx: OpContext) => Promise<ConciergeToolReply>) & {
+  /**
+   * The op's own argument schema, hung on the handler so DISPATCH can reach it.
+   *
+   * It used to be reachable only from inside the closure below, which meant validation could not
+   * happen until the handler ran — i.e. after the policy layer had already minted an approval card
+   * as a side effect. That is the bug in bead `sparkle-jjm27e`: a card could be raised for a call
+   * `.strict()` was always going to reject, and approving it would spend the single-use grant on
+   * something that could not run. Exposing the schema is what lets the gate order be fixed without
+   * every one of the 96 routes having to declare its schema twice.
+   */
+  schema: z.ZodType<unknown>;
+};
 
 function route<T>(
   schema: z.ZodType<T>,
   run: (value: T, ctx: OpContext) => ConciergeToolReply | Promise<ConciergeToolReply>,
 ): Handler {
-  return async (raw, ctx) => {
+  const handler = (async (raw, ctx) => {
+    // STILL PARSED HERE, and deliberately not skipped when dispatch has already parsed. This is
+    // belt-and-braces of the cheap kind: `parseArgs` is pure and the schemas are small, so paying
+    // for it twice costs nothing measurable, while a handler that trusted a caller to have
+    // validated would be one refactor away from running on unvalidated input. The handler stays
+    // safe to call directly — which every one of this file's own route tests does.
     const parsed = parseArgs(ctx, schema, raw);
     if (!parsed.ok) return parsed.reply;
     return run(parsed.value, ctx);
-  };
+  }) as Handler;
+  handler.schema = schema as z.ZodType<unknown>;
+  return handler;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2242,12 +2359,35 @@ function isDomain(v: string): v is ConciergeToolDomain {
  *
  * Order of gates, and it matters:
  *   1. the domain and op must exist            → `unknown-op`
- *   2. the policy must permit the op           → `denied` / `needs-approval`
- *   3. the arguments must validate             → `bad-args`
- *   4. the domain's OWN guards run last        → the domain's own code, verbatim
+ *   2. the arguments must validate             → `denied` if the policy denies it, else `bad-args`
+ *   3. the relay gate must not refuse the send → `unaddressed-relay`
+ *   4. the policy must permit the op           → `denied` / `needs-approval`
+ *   5. the domain's OWN guards run last        → the domain's own code, verbatim
  *
- * Policy BEFORE arguments is deliberate: a denied tool must be refused as denied, not as a
- * validation error that leaks which arguments it would have wanted.
+ * Gates 2 and 3 are the two that RAISE NOTHING. Both are judged before the policy is allowed to
+ * mint an approval card, because minting one is a side effect inside the policy call and a call
+ * this dispatch is about to refuse must not put a question on the founder's screen. See each
+ * gate's own block below.
+ *
+ * ══ WHY VALIDATION MOVED AHEAD OF POLICY, AND WHAT DID NOT CHANGE (bead `sparkle-jjm27e`) ═══════
+ *
+ * This used to run the policy first, and the reason given was sound: A DENIED TOOL MUST BE REFUSED
+ * AS DENIED, not as a validation error that leaks which arguments it would have wanted. That
+ * property is INTACT — see step 2, which still consults the policy and still answers `denied` for a
+ * denied tool no matter how malformed the arguments are. `registry.test.ts` asserts it directly.
+ *
+ * What the old order also did, unintentionally, was mint an APPROVAL CARD for calls that could
+ * never run. Raising the card is a side effect INSIDE the policy call (`policyBinding`'s
+ * `resolveAskTier` → `requestApproval`), so an ask-tier op with bad arguments put a question on the
+ * founder's screen and only failed validation later, when he pressed Approve — spending the
+ * single-use grant on a call that then died with `bad-args`. The measured incident: a `merge_pr`
+ * card carrying `prNumber: 2165` against a `.strict()` schema that spells the field `number`. He
+ * nearly pressed it.
+ *
+ * So the two questions are now separated rather than reordered. With bad arguments in hand, the
+ * policy is consulted with `raiseApproval: false` — dispatch learns the tier (preserving the
+ * no-leak property above) while no question reaches the human about a call that cannot run. The
+ * model gets a `bad-args` refusal naming the offending field and can retry inside the same turn.
  */
 export async function dispatchConciergeTool(
   call: ConciergeToolCall,
@@ -2280,9 +2420,44 @@ export async function dispatchConciergeTool(
     }
 
     const policy = opts.policy ?? permissiveToolPolicy;
-    const decision = policy({ domain, op, write: entry.write(op), toolCallId, args: call.args });
-    const ctx: OpContext = { domain, op, toolCallId, decision };
-    // ══ THE RELAY GATE, AND IT MUST SIT ABOVE THE APPROVAL TIER ══════════════════════════════════
+    const write = entry.write(op);
+
+    // ══ GATE 2: THE ARGUMENTS, JUDGED BEFORE ANY QUESTION REACHES THE HUMAN ═════════════════════
+    //
+    // Pure — `parseArgs` reads nothing and writes nothing — so running it this early costs only the
+    // parse. Both refusals below leave the approval ledger untouched, which is the whole point of
+    // the change: see this function's gate-order docstring for the incident.
+    const preflight = parseArgs(
+      { domain, op, toolCallId, decision: { tier: "allow" } },
+      handler.schema,
+      call.args,
+    );
+    if (!preflight.ok) {
+      // The tier, WITHOUT raising a card — the one thing we still need from the policy. A denied
+      // tool must read as denied rather than as a validation error naming fields the human's own
+      // rule said this tool may never have.
+      const tier = policy({
+        domain,
+        op,
+        write,
+        toolCallId,
+        args: call.args,
+        raiseApproval: false,
+      });
+      if (tier.tier === "deny") {
+        return bareErr(
+          domain,
+          op,
+          REGISTRY_CODES.denied,
+          tier.reason?.trim()
+            ? `I'm not allowed to run ${domain}.${op}: ${tier.reason}`
+            : `I'm not allowed to run ${domain}.${op}.`,
+        );
+      }
+      return preflight.reply;
+    }
+
+    // ══ THE RELAY GATE, AND IT MUST SIT ABOVE THE APPROVAL TIER — INCLUDING ITS SIDE EFFECT ═══
     //
     // GATE 0, ahead of policy — because the two returns below END THE CALL, and one of them comes
     // BACK. `send_to_agent_terminal` is `disruptive`, whose default decision is `ask`, so the common
@@ -2294,40 +2469,44 @@ export async function dispatchConciergeTool(
     // agent he never named is refused only for the tools that DON'T ask, which is the opposite of
     // the population that matters.
     //
-    // Here it is judged on the FIRST call, while the turn state is live — and a send that must not
-    // happen never even raises an approval prompt for the human to answer.
+    // ══ WHY THE VERDICT IS COMPUTED ABOVE `policy()`, NOT MERELY ABOVE ITS RETURN (`sparkle-jjm27e`)
     //
-    // ARGS READ DEFENSIVELY: this is above zod (see the gate order in this function's header), so
-    // the fields are whatever the model sent. That is fine — both are compared, never dispatched,
-    // and a non-string simply fails the comparison and allows the call, which is this gate's own
-    // fail-open direction (see ./relayGate).
+    // Sitting above the ask-tier RETURN was never enough, and the comment here used to claim more
+    // than the code delivered: "a send that must not happen never even raises an approval prompt
+    // for the human to answer". It raised one. Minting the card is a side effect INSIDE the policy
+    // call (`policyBinding`'s `resolveAskTier` → `requestApproval`), so by the time this gate
+    // refused, the question was already in the founder's column: a PRESSABLE card for a send this
+    // dispatch had just refused, sitting there until it expired. Pressing it would spend the
+    // single-use grant and re-run a call that refuses again.
     //
-    // EVERY OP THAT CARRIES A MESSAGE TO AN AGENT, not just the terminal one. `fleet.inbox_send`
-    // takes the same `text`, classifies to the same `kind: "sent"`, and the badge gate admits
-    // `channel: "inbox"` — so gating only the terminal write leaves the founder's ruling walkable by
-    // choosing the other tool. `inbox_broadcast` passes every recipient, and is refused if his words
-    // would reach ANY agent he did not name.
-    if (RELAY_GATED_OPS.has(op)) {
-      const a = (call.args ?? {}) as Record<string, unknown>;
-      // The recipients, however this op spells them. Read defensively: this is above zod, so the
-      // fields are whatever the model sent — a shape that yields no ids simply cannot be shown to
-      // be an unaddressed relay, which is this gate's fail-open direction (see ./relayGate).
-      const ids = [
-        ...(typeof a.agentId === "string" ? [a.agentId] : []),
-        ...(Array.isArray(a.agentIds) ? a.agentIds.filter((x): x is string => typeof x === "string") : []),
-      ];
-      const unaddressed =
-        ids.length > 0 && typeof a.text === "string"
-          ? refuseUnaddressedRelay(ids, a.text)
-          : null;
-      if (unaddressed) {
-        log.warn("concierge-tools", "send refused — unaddressed relay of the founder's words", {
-          domain,
-          op,
-          recipients: ids.length,
-        });
-        return err(ctx, REGISTRY_CODES.unaddressedRelay, unaddressed);
-      }
+    // That is the same defect as the `bad-args` one in gate 2 above, in the same code path, and it
+    // was proved live with a probe rather than inferred. Same remedy, too: the verdict is computed
+    // FIRST, and a refused relay consults the policy with `raiseApproval: false` — dispatch still
+    // learns the tier, so `ctx` and every downstream read of `decision` are unchanged, while no
+    // question about a send that cannot happen reaches the human.
+    //
+    // EVERY OP THAT CARRIES A MESSAGE TO AN AGENT is gated, not just the terminal one — see
+    // `RELAY_GATED_OPS` and `relayRefusalFor`, which hold the population and the defensive reads.
+    const relayRefusal = relayRefusalFor(op, call.args);
+
+    const decision = policy({
+      domain,
+      op,
+      write,
+      toolCallId,
+      args: call.args,
+      // THE SUPPRESSION. Spread rather than passed as `undefined` so that an ordinary call's query
+      // is byte-for-byte what it always was, and only a refused relay carries the flag.
+      ...(relayRefusal ? { raiseApproval: false as const } : {}),
+    });
+    const ctx: OpContext = { domain, op, toolCallId, decision };
+    if (relayRefusal) {
+      log.warn("concierge-tools", "send refused — unaddressed relay of the founder's words", {
+        domain,
+        op,
+        recipients: relayRefusal.recipients,
+      });
+      return err(ctx, REGISTRY_CODES.unaddressedRelay, relayRefusal.message);
     }
     if (decision.tier === "deny") {
       return err(

@@ -71,6 +71,7 @@ import {
 } from "./policy";
 import { primeRepoSlug, slugForRoot } from "./repoSlug";
 import type { ConciergeToolPolicy, ToolPolicyQuery } from "./registry";
+import { approvalSubject } from "./approvalSubject";
 import type { ChiefOp } from "./chief";
 
 /** Read the human's `[concierge.tools]` rules off the live settings store, WITH whether we have
@@ -183,6 +184,15 @@ interface AskContext {
    *  nothing here reads a `confirm` flag out of them. */
   args: unknown;
   evaluation: ToolPolicyEvaluation;
+  /**
+   * May this evaluation put a CARD on the human's screen? Defaults to true.
+   *
+   * False when dispatch is only asking what tier the op is, having already found the arguments
+   * invalid — see `ToolPolicyQuery.raiseApproval`. Spending an EXISTING approval stays allowed
+   * either way: that is a read of a grant the human already gave, not a new question, and the call
+   * it authorises is one they already read and agreed to.
+   */
+  raise?: boolean;
 }
 
 /**
@@ -220,6 +230,15 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
 
   const entry = CATALOG_BY_NAME.get(c.op);
   const riskClass = c.evaluation.riskClass;
+
+  // ASKING IS A SIDE EFFECT, AND DISPATCH SOMETIMES NEEDS THE VERDICT WITHOUT IT (bead
+  // `sparkle-jjm27e`). When the arguments have already failed their schema, dispatch consults this
+  // policy purely to decide whether the refusal reads as `denied` or as `bad-args` — and a card for
+  // a call that cannot run must not reach the founder. Note this sits BELOW the `claimApproval`
+  // check above on purpose: spending an existing grant is a read, not a question, so suppressing
+  // the raise never suppresses an approval the human already gave.
+  if (c.raise === false) return { tier: "ask", approvedByUser: false };
+
   requestApproval({
     id: c.id,
     domain: c.domain,
@@ -233,6 +252,20 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
     // The same value the fingerprint above was computed from, kept verbatim so approving can replay
     // this exact call instead of waiting for the model to reproduce it. See the ledger's `rawArgs`.
     rawArgs: c.args,
+    // WHAT this call would act on, so the card can name WHICH BUILD AGENT the work belongs to
+    // instead of dumping the model's raw argument keys at the founder (bead `sparkle-jjm27e`).
+    // Derived HERE, at raise time, for the same reason `relayedFounderWords` below is: the card's
+    // click handler runs long after this turn ended, and re-deriving it there would mean the view
+    // reading untyped model JSON — the coupling this change removes.
+    //
+    // ARGUMENTS ARE VALIDATED ON THE REGISTRY PATH ONLY. `dispatchConciergeTool` parses before it
+    // consults this policy, so a registry-raised card can never describe a call the dispatch would
+    // refuse. `controlOpPolicy` below (`appOpPolicy` / `chiefOpPolicy`) reaches here with no schema
+    // on the path, so `approvalSubject` must stay total and keep its own field guards.
+    ...(() => {
+      const subject = approvalSubject(c.domain, c.op, c.args);
+      return subject ? { subject } : {};
+    })(),
     // JUDGED NOW, BECAUSE NOW IS THE ONLY TIME IT CAN BE. This runs during the founder's turn, so
     // the turn's text is still live; the approval's click handler runs after it has been dropped and
     // could only guess. See the field's own doc for what goes wrong without it — an approved genuine
@@ -414,6 +447,7 @@ export const configuredToolPolicy: ConciergeToolPolicy = (q: ToolPolicyQuery) =>
     op: q.op,
     args: q.args,
     evaluation,
+    raise: q.raiseApproval,
   });
 };
 
