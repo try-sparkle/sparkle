@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, it, expect } from "vitest";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, realpathSync, symlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -425,6 +425,207 @@ describe("blocksSecretStaging — CASE 2 fails OPEN when repo state is undetermi
       expect(blocksSecretStaging("cd /some/other/place && git add -f .env", repo)).not.toBeNull();
     } finally {
       rmSync(repo, { recursive: true, force: true });
+    }
+  });
+});
+
+// A SHELL REDIRECT MUST NOT BE ABLE TO NULL THE PROBE.
+//
+// `>` and `<` are not word characters, so a lexer that only splits on `;` `&` `|` `(` `)` leaves the
+// redirect operator and its TARGET sitting in the token stream as if they were pathspecs. CASE 2
+// then hands them to `git status -- '>' /dev/null`; `/dev/null` is outside the repo, git exits 128,
+// the probe returns null, and the guard FAILS OPEN. `git add -A > /dev/null` is not an exotic
+// incantation — it is how an agent silences a noisy command — so this was the guard's widest hole:
+// the whole-repo sweep it exists to judge, waved through by four trailing characters.
+//
+// Every case here is paired. A test that only proves the block is half the evidence: a fix that
+// simply refused everything with a `>` in it would satisfy it, while destroying ordinary work.
+describe("blocksSecretStaging — a shell redirect cannot smuggle a sweep past the probe", () => {
+  let repo: string;
+  beforeEach(() => {
+    repo = makeRepo();
+  });
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it("blocks `git add -A > /dev/null` — a spaced redirect to a target OUTSIDE the repo", () => {
+    write(repo, ".env");
+    write(repo, "src/app.ts", "export const x = 1;\n");
+    const verdict = blocksSecretStaging("git add -A > /dev/null", repo);
+    expect(verdict, "a redirect must not turn a judged sweep into an allowed one").not.toBeNull();
+    expect(verdict?.kind).toBe("sweep");
+    expect(verdict?.files).toContain(".env");
+  });
+
+  it("blocks `git add -A >/dev/null 2>&1` — attached target plus an fd-prefixed redirect", () => {
+    // The fd digit is the second half of this hole: drop `2>` but keep the bare `2`, and the `2`
+    // becomes a bogus pathspec that errors git exactly like `/dev/null` did.
+    write(repo, ".env");
+    const verdict = blocksSecretStaging("git add -A >/dev/null 2>&1", repo);
+    expect(verdict).not.toBeNull();
+    expect(verdict?.kind).toBe("sweep");
+    expect(verdict?.files).toContain(".env");
+  });
+
+  it("blocks the append, fd and here-string spellings too", () => {
+    write(repo, ".env");
+    for (const cmd of [
+      "git add -A >> log.txt",
+      "git add -A 1> /dev/null",
+      "git add -A 1>>/tmp/out.log",
+      "git add -A &> /dev/null",
+      "git add -A &>>/dev/null",
+      "git add -A >| /dev/null",
+      "git add -A < /dev/null",
+      'git add -A > "my log.txt"',
+    ]) {
+      expect(blocksSecretStaging(cmd, repo), `expected a sweep refusal for: ${cmd}`).not.toBeNull();
+    }
+  });
+
+  // THE PAIRED NEGATIVE CONTROL. Without this, a "fix" that blocked every redirect would pass.
+  it("allows `git add -A > /dev/null` when there is NO secret to find", () => {
+    write(repo, "src/app.ts", "export const x = 1;\n");
+    write(repo, "README.md", "# hi\n");
+    expect(blocksSecretStaging("git add -A > /dev/null", repo)).toBeNull();
+    expect(blocksSecretStaging("git add -A >/dev/null 2>&1", repo)).toBeNull();
+  });
+
+  // The redirect must be DROPPED, not merely tolerated: the command has to keep its true shape, so
+  // a scoped add stays scoped. Widening it into an unscoped sweep would block on the root .env and
+  // be a false refusal with no approval path.
+  it("does not eat a real pathspec: `git add -- src/ > /dev/null` stays scoped to src/", () => {
+    write(repo, ".env"); // OUTSIDE the scope — must not be reported
+    write(repo, "src/app.ts", "export const x = 1;\n");
+    expect(blocksSecretStaging("git add -- src/ > /dev/null", repo)).toBeNull();
+    expect(blocksSecretStaging("git add src/ > /dev/null", repo)).toBeNull();
+    // …and the same scope still finds a secret that IS inside it.
+    write(repo, "src/.env");
+    const verdict = blocksSecretStaging("git add -- src/ > /dev/null", repo);
+    expect(verdict?.kind).toBe("sweep");
+    expect(verdict?.files).toContain("src/.env");
+  });
+
+  // QUOTING / ESCAPING CONTROLS. A `>` that is not an operator must stay a literal character —
+  // otherwise the fix mangles ordinary commands, which is the failure mode this guard cannot have.
+  it("leaves a `>` inside quotes or backslash-escaped alone", () => {
+    write(repo, ".env");
+    // A commit MESSAGE mentioning `>` is not a redirect, and this commit sweeps nothing.
+    expect(blocksSecretStaging('git commit -m "fix > bug"', repo)).toBeNull();
+    expect(blocksSecretStaging("git commit -m 'fix > bug'", repo)).toBeNull();
+    // A named secret after a quoted `>` is still seen — proof the quoted `>` did not swallow it.
+    expect(blocksSecretStaging('git add "weird>name.txt" .env', repo)?.kind).toBe("named");
+    // A backslash-escaped `>` is a literal character in the word, so `.env` is still a pathspec.
+    expect(blocksSecretStaging("git add file\\>name .env", repo)?.kind).toBe("named");
+  });
+
+  it("still blocks a NAMED secret that carries a redirect (CASE 1 is unaffected)", () => {
+    expect(blocksSecretStaging("git add -f .env > /dev/null", repo)?.kind).toBe("named");
+  });
+});
+
+// DEFENCE IN DEPTH FOR THE SAME CLASS. The lexer fix above removes the way a redirect target reached
+// the pathspec list, but ANY unsatisfiable pathspec nulls the whole probe the same way — git exits
+// non-zero for the entire invocation, not just for the offending spec. A spec that provably cannot
+// name a file in this repo can be dropped with no loss of coverage, so one stray spec can no longer
+// take the sweep judgement down with it.
+//
+// The boundary is the REPO, not the cwd: `git add ../src/` from a subdirectory is an ordinary,
+// in-repo command and must keep its coverage.
+describe("blocksSecretStaging — an out-of-repo pathspec cannot null the probe", () => {
+  let repo: string;
+  beforeEach(() => {
+    repo = makeRepo();
+  });
+  afterEach(() => rmSync(repo, { recursive: true, force: true }));
+
+  it("keeps judging the sweep when an ABSOLUTE out-of-repo pathspec rides along", () => {
+    write(repo, ".env");
+    const verdict = blocksSecretStaging("git add -A . /dev/null", repo);
+    expect(verdict, "an unsatisfiable pathspec must not null the sweep probe").not.toBeNull();
+    expect(verdict?.files).toContain(".env");
+  });
+
+  it("keeps judging the sweep when a `..`-escaping pathspec rides along", () => {
+    write(repo, ".env");
+    const verdict = blocksSecretStaging("git add -A . ../outside-this-repo", repo);
+    expect(verdict).not.toBeNull();
+    expect(verdict?.files).toContain(".env");
+  });
+
+  // The counterpart, and the reason the boundary is the repo root rather than the probe directory:
+  // from a subdirectory, `..` walks back INTO the repo and must still be probed.
+  it("keeps a `..` pathspec that lands back inside the repo", () => {
+    write(repo, "src/.env");
+    write(repo, "sub/keep.txt", "x\n");
+    const verdict = blocksSecretStaging("git add -A -- ../src", join(repo, "sub"));
+    expect(verdict, "`../src` from a subdir is in-repo and must keep its coverage").not.toBeNull();
+    expect(verdict?.files).toContain("src/.env");
+  });
+
+  // Dropping every spec must NOT widen into an unscoped probe — that would block a command whose
+  // own scope contains nothing secret, a false refusal with no approval path.
+  it("does not widen to an unscoped probe when every pathspec is dropped", () => {
+    write(repo, ".env");
+    expect(blocksSecretStaging("git add /dev/null/", repo)).toBeNull();
+  });
+
+  // Pathspec MAGIC is never judged as a filesystem path — `:!x` and `:(top)y` are git syntax, and
+  // second-guessing them here would drop an exclusion the agent deliberately wrote.
+  it("never drops a magic pathspec", () => {
+    write(repo, ".env");
+    const verdict = blocksSecretStaging("git add -A . ':(top).env'", repo);
+    expect(verdict?.files).toContain(".env");
+    expect(blocksSecretStaging("git add . ':!.env'", repo)).toBeNull();
+  });
+
+  // AN EXCLUSION-ONLY SURVIVOR MUST NOT WIDEN THE PROBE. Keeping magic (above) and dropping
+  // out-of-repo positives (above) compose into a trap: if the only POSITIVE spec is dropped, the
+  // survivors are all exclusions — and git treats an all-negative pathspec list as if `.` had also
+  // been given, so the probe silently becomes the whole-repo sweep the design forbids. The command's
+  // real scope is outside this repo, so refusing it on a root `.env` is a false refusal with no
+  // approval path. Length alone cannot see this; only a POSITIVE survivor counts.
+  it("does not widen when the only positive pathspec is dropped and an exclusion survives", () => {
+    write(repo, ".env");
+    expect(blocksSecretStaging("git add ../outside-this-repo/ ':!*.log'", repo)).toBeNull();
+    expect(blocksSecretStaging("git add /dev/null/ ':(exclude)*.log'", repo)).toBeNull();
+  });
+
+  // …but an add that names NO positive spec at all is git's own "everything except" form, and
+  // scoping the probe the same way git scopes the command is correct, not a widening.
+  it("still judges an all-exclusion commit the way git scopes it", () => {
+    write(repo, ".env");
+    expect(blocksSecretStaging("git add . ':!*.log'", repo)?.files).toContain(".env");
+  });
+});
+
+// A SYMLINKED PROBE DIRECTORY MUST NOT DROP IN-REPO PATHSPECS. `git rev-parse --show-toplevel`
+// reports the PHYSICALLY resolved path (git derives it from getcwd()), while `dir` and an absolute
+// pathspec arrive verbatim. On macOS `/tmp` is a symlink to `/private/tmp`, so comparing the two
+// unresolved makes every in-repo spec look like it escapes — dropping `.` itself. All specs dropped
+// then reports "clean" with NO probe having run, which is worse than the documented fail-open: it
+// is a positive claim of safety in exactly the class this filter exists to close.
+describe("blocksSecretStaging — a symlinked probe directory keeps its coverage", () => {
+  it("still finds the secret when the repo is reached through a symlinked path", () => {
+    const real = realpathSync(mkdtempSync(join(tmpdir(), "secretguard-realdir-")));
+    const linkParent = realpathSync(mkdtempSync(join(tmpdir(), "secretguard-link-")));
+    const link = join(linkParent, "via-symlink");
+    try {
+      const repo = join(real, "repo");
+      mkdirSync(repo, { recursive: true });
+      execFileSync("git", ["init", "-q", repo], { stdio: "ignore" });
+      execFileSync("git", ["-C", repo, "config", "core.hooksPath", "/dev/null"], { stdio: "ignore" });
+      execFileSync("git", ["-C", repo, "config", "core.excludesFile", "/dev/null"], { stdio: "ignore" });
+      writeFileSync(join(repo, ".env"), "SECRET=live\n");
+      symlinkSync(repo, link, "dir");
+
+      // `.` is an ordinary in-repo pathspec; the out-of-repo `../elsewhere` is what turns the
+      // filter on. Reached through the symlink, `.` must NOT be judged as escaping the repo.
+      const verdict = blocksSecretStaging("git add -A . ../elsewhere", link);
+      expect(verdict, "a symlinked probe dir must not drop `.` and report the repo clean").not.toBeNull();
+      expect(verdict?.files).toContain(".env");
+    } finally {
+      rmSync(linkParent, { recursive: true, force: true });
+      rmSync(real, { recursive: true, force: true });
     }
   });
 });

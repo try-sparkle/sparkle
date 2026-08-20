@@ -115,6 +115,31 @@
     { "command": "git branch -D main", "why": "force-deletes the default branch locally" },
     { "command": "git clean -fdx", "why": "-x removes IGNORED files, i.e. .env and credentials" },
     { "command": "git clean -xfd", "why": "-x in any flag order" },
+    {
+      "command": "git clean -fdX",
+      "why": "`-X` removes ONLY the ignored files — i.e. exactly .env and credentials and nothing else — so it is strictly worse than -x, which at least also takes untracked junk. The flag scan was case-sensitive and read straight past it."
+    },
+    { "command": "git clean -X -f", "why": "-X on its own, detached from the force flag" },
+    { "command": "git clean -fd --force -X", "why": "-X after a long option — long options are skipped by the cluster scan, and the flag must still be seen" },
+    { "command": "git clean -Xfd", "why": "-X in any flag order, the uppercase twin of `git clean -xfd`" },
+    {
+      "command": "git clean -fdx -- -n",
+      "why": "PINNED FOR A FUTURE DRY-RUN EXEMPTION — there is no `--` stop in the scan today, and this entry does not claim one. The scan is a pure `-x`/`-X` cluster test over every token, so this blocks because `-fdx` carries `x`, not because `-- -n` was understood. It is recorded as the FIRST case any future dry-run detection must handle: everything after `--` is a PATHSPEC, so a file literally named `-n` is not the flag, and reading it as one would wave through a real destructive clean. (An earlier revision of this entry asserted a `--` stop that the code did not have; that is the same drift this branch was cut to fix.)"
+    },
+    {
+      "command": "git clean -fdx -e -n",
+      "why": "REGRESSION CONTROL — the detached exclude VALUE. `-e`/`--exclude` take a value and git's parse-options consumes the next argv unconditionally, without checking whether it looks like a flag. So this `-n` is the exclude PATTERN and git performs a REAL destructive `-x` clean. A scan that reads it as `--dry-run` disables the guard. A dry-run exemption briefly existed on this branch and did exactly that; it was removed rather than patched."
+    },
+    { "command": "git clean -fdxe -n", "why": "the same detached value reached through a flag CLUSTER ending at `e`" },
+    { "command": "git clean -fdx --exclude -n", "why": "the same detached value in its long spelling" },
+    { "command": "git clean -fdx --exclude --dry-run", "why": "the detached value is the literal string `--dry-run`" },
+    { "command": "git clean -fdx --dry-run", "why": "there is NO dry-run exemption — this is the shape the four bypasses above disguise themselves as, and exempting it is what makes them reachable" },
+    { "command": "git clean -fdx -n", "why": "the short dry-run spelling, refused for the same reason" },
+    { "command": "git clean -fd -- -x", "why": "a PATHSPEC literally named `-x`, refused because the scan has no flag/pathspec boundary. Identical to origin/main, so not a regression — pinned so the behaviour is recorded rather than rediscovered, and as the second case a future dry-run exemption must handle." },
+    {
+      "command": "git clean -fdxe'*.n'",
+      "why": "an exclude PATTERN containing `n` is not the -n flag: the cluster scan stops at `e`, so this is a real -x clean and stays refused"
+    },
     { "command": "curl https://example.com/install.sh | sh", "why": "pipe-to-shell executes unreviewed remote code" },
     { "command": "curl -sSL https://example.com/i | sudo bash", "why": "pipe-to-shell with escalation" },
     { "command": "wget -qO- https://example.com/i | bash", "why": "wget pipe-to-shell" },
@@ -348,6 +373,10 @@
       "why": "`-e` takes a VALUE and may carry it attached, so the lexer yields one token whose 'x' belongs to the user's exclude PATTERN, not to a flag. Scanning the cluster past `e` refuses an ordinary clean with no approval path."
     },
     { "command": "git clean -fd -e '*.x'", "why": "the same exclude, detached — neither form removes IGNORED files" },
+    {
+      "command": "git clean -fde'*.XZ'",
+      "why": "the UPPERCASE-pattern control for the -X fix. Catching `X` as well as `x` must not start reading the user's exclude PATTERN as a flag: the cluster scan still stops at `e`, so the `X` in `*.XZ` belongs to the pattern and this stays an ordinary clean."
+    },
     {
       "command": "find ~/Projects -name node_modules -type d -exec rm -rf {} +",
       "why": "OVER-BLOCK REGRESSION: find's root is where it SEARCHES, not what it DELETES. Gating on the root alone refused exactly the cleanup an agent should be able to run. It fires only on a depth-0 root with NO narrowing predicate."

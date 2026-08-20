@@ -963,10 +963,27 @@ pub const AFFIRMATIVE_KEY: &str = "1";
 /// other arm of this module -- "every unknown is a refusal to write". The cost of a false refusal
 /// is one prompt a human clears; the cost of a false permit is a command nobody read.
 ///
-/// Every entry is READ-ONLY: it inspects state and cannot mutate a repo, the filesystem, the
-/// network, or an account. That is the property that makes answering safe, so keep it when adding
-/// entries -- a build or test command belongs here only if you are certain it has no side effects,
-/// which for this repo's suites it does not.
+/// -- AN ENTRY AUTHORISES A NAME, NEVER ITS ARGUMENTS --------------------------------------------
+/// This comment used to CLAIM every entry was read-only. It was an aspiration, not something the
+/// code checked, and several entries reach a mutating mode from the same prefix: `git branch -D
+/// main` force-deletes a ref, `git branch feature-x` creates one, `git diff --output=f` writes a
+/// file, `find . -fls f` writes one too, `tree -o f` likewise, and `git remote -v add x url` still
+/// runs `add` because `-v` is a GLOBAL flag rather than the end of the command. Every one of those
+/// prefix-matched an entry here and was auto-approved.
+///
+/// The claim is now ENFORCED rather than asserted, in two halves. A command is answerable only if
+///   1. its NAME matches an entry below on a word boundary, AND
+///   2. `args_are_read_only` vouches for the arguments that follow it.
+///
+/// WHEN YOU ADD AN ENTRY it must be one of:
+///   * argument-free-safe -- no spelling of its flags can mutate a repo, the filesystem, the
+///     network or an account (`pwd`, `wc`, `stat`); or
+///   * given its own arm in `args_are_read_only`, narrowing it to its read-only forms.
+///
+/// A build or test command belongs here only if you are certain it has no side effects, which for
+/// this repo's suites it does not. `answerable_entries_have_no_unguarded_mutating_form` in this
+/// module's tests holds you to this: it enumerates EVERY entry and fails on one whose mutating
+/// suffix is unaccounted for.
 const ANSWERABLE_COMMANDS: &[&str] = &[
     "git status",
     "git log",
@@ -1008,7 +1025,8 @@ const SHELL_CHAINERS: &[char] = &[';', '&', '|', '>', '<', '`', '$', '(', ')', '
 /// Is this command safe for the machine to approve on its own?
 ///
 /// Fails closed on everything it does not positively recognise: an empty command, a chainer, an
-/// `-exec`/`-delete` argument, or any prefix not on the list.
+/// `-exec`/`-delete` argument, any prefix not on the list, or arguments `args_are_read_only`
+/// cannot vouch for.
 pub fn command_is_answerable(cmd: &str) -> bool {
     let cmd = cmd.trim();
     if cmd.is_empty() {
@@ -1024,11 +1042,205 @@ pub fn command_is_answerable(cmd: &str) -> bool {
     }
     ANSWERABLE_COMMANDS.iter().any(|allowed| {
         // Prefix match on a WORD boundary, so `git showoff` never matches `git show`.
-        cmd == *allowed
-            || cmd
-                .strip_prefix(*allowed)
-                .is_some_and(|rest| rest.starts_with(' '))
+        let rest = if cmd == *allowed {
+            Some("")
+        } else {
+            cmd.strip_prefix(*allowed).filter(|rest| rest.starts_with(' '))
+        };
+        // The NAME matching is only half the gate; the arguments have to be read-only too.
+        rest.is_some_and(|rest| args_are_read_only(allowed, rest))
     })
+}
+
+/// Do these arguments keep an allowlisted command READ-ONLY?
+///
+/// The second half of the gate `ANSWERABLE_COMMANDS` describes. Every entry gets the general
+/// file-writing check; an entry with a mutating mode of its own gets an arm here. Fails CLOSED in
+/// the same direction as everything above it -- an arm exists to NARROW an entry, never to widen
+/// one.
+///
+/// THE SHARED CHECK RUNS BEFORE THE MATCH, not inside each arm, and that placement is the point. An
+/// arm written as `!something_specific(&args)` REPLACES whatever the default arm would have done,
+/// so composing it back in (`… && !args_write_a_file(&args)`) is a step every future arm has to
+/// remember and none of them will fail visibly for forgetting: the entry simply stops receiving the
+/// shared spelling, and the invariant table cannot see it because that row now exercises only the
+/// arm. Hoisting it makes opting out impossible rather than merely discouraged, and
+/// `every_answerable_entry_refuses_the_shared_file_write_spelling` pins it.
+fn args_are_read_only(allowed: &str, rest: &str) -> bool {
+    let args: Vec<&str> = rest.split_whitespace().collect();
+    if args_write_a_file(&args) {
+        return false;
+    }
+    match allowed {
+        "git branch" => git_branch_args_are_read_only(&args),
+        // `-v` is a GLOBAL flag on `git remote`, NOT the end of the command: `git remote -v add foo
+        // url` still adds the remote. So this entry is answerable only as EXACTLY itself.
+        "git remote -v" => args.is_empty(),
+        "find" => !args.iter().any(|a| FIND_WRITING_PREDICATES.contains(a)),
+        // ripgrep RUNS A COMMAND for two of its flags -- `--pre` executes `<COMMAND> <path>` for
+        // every file it walks, so `rg --pre rm -e needle .` deletes the tree it is searching.
+        "rg" => !args.iter().any(|a| RG_EXECUTING_FLAGS.iter().any(|f| flag_is(a, f))),
+        // `file -C` COMPILES the magic file, writing a `.mgc` next to it.
+        "file" => {
+            !args.iter().any(|a| short_cluster_contains(a, 'C') || flag_is(a, "--compile"))
+        }
+        // tree's `-o <file>` writes the listing to a file instead of the terminal. Judged as a
+        // CLUSTER, not as a whole token: tree takes the value from the rest of the token when there
+        // is one, so `-oout.txt` and `-ao out.txt` both write while `args.contains(&"-o")` is false.
+        "tree" => !args.iter().any(|a| short_cluster_contains(a, 'o')),
+        _ => true,
+    }
+}
+
+/// ripgrep flags whose VALUE IS A COMMAND ripgrep then executes.
+///
+/// `--pre` is the dangerous one and it is not obscure: it runs `<COMMAND> <path>` once per file
+/// walked, so it turns a search into an arbitrary-command runner over the whole tree -- the same
+/// shape as `find -exec`, which this module already refuses by substring. `--hostname-bin` executes
+/// its value too. `--pre-glob` only selects which files reach `--pre`, and is refused with it
+/// because a command carrying it is a `--pre` command whether or not this call caught the pair.
+///
+/// A DENY-SET here is the weakest arm in this function and the code should say so: unlike `find`'s
+/// POSIX-frozen predicate grammar, ripgrep's flag space grows, so a future executing flag fails
+/// OPEN. If that ever becomes a live worry the answer is to drop `rg` from `ANSWERABLE_COMMANDS`
+/// entirely -- a refused `rg` costs one prompt.
+const RG_EXECUTING_FLAGS: &[&str] = &["--pre", "--pre-glob", "--hostname-bin"];
+
+/// Is this argument the long flag `flag`, in either the `--flag value` or `--flag=value` spelling?
+fn flag_is(arg: &str, flag: &str) -> bool {
+    arg == flag || arg.strip_prefix(flag).is_some_and(|rest| rest.starts_with('='))
+}
+
+/// Does this argument carry the SHORT flag `flag` -- alone (`-o`), in a cluster (`-ao`), or with
+/// its value attached to it (`-oout.txt`)?
+///
+/// The same letter-by-letter reading `git_branch_args_are_read_only` uses, for the same reason: a
+/// whole-token `== "-o"` test is blind to every spelling but one, and the shell hands the tool the
+/// cluster either way. A LONG option is not a short cluster, so `--noreport` is not read as
+/// carrying `-o`.
+fn short_cluster_contains(arg: &str, flag: char) -> bool {
+    if arg.starts_with("--") {
+        return false;
+    }
+    arg.strip_prefix('-').is_some_and(|shorts| shorts.contains(flag))
+}
+
+/// `find` predicates that WRITE -- a file, or an arbitrary command it asks about first.
+///
+/// A deny-set rather than an allowlist here, unlike `git branch` below, because `find`'s grammar is
+/// CLOSED in a way git's flag space is not: POSIX froze the predicate list, and GNU's writing
+/// additions to it are exactly these four `-f*` forms plus the two interactive `-ok` ones. The
+/// three that matter most -- `-exec`, `-execdir`, `-delete` -- are caught earlier by substring and
+/// stay there.
+const FIND_WRITING_PREDICATES: &[&str] =
+    &["-fls", "-fprint", "-fprint0", "-fprintf", "-ok", "-okdir"];
+
+/// `--output <file>` / `--output=<file>`: git's diff machinery writes to a FILE rather than to the
+/// terminal, and it is spelled the same way on `git diff`, `git log`, `git show` and `git stash
+/// list`.
+///
+/// Matched EXACTLY, not by prefix: `--output-indicator-new=+` is an ordinary read-only diff option,
+/// and refusing it would buy nothing.
+fn args_write_a_file(args: &[&str]) -> bool {
+    args.iter().any(|a| *a == "--output" || a.starts_with("--output="))
+}
+
+/// `git branch` flags that only LOOK at refs.
+///
+/// An ALLOWLIST, not a deny-list of `-D`/`-d`/`-m`/`-M`/`-c`/`-C`/`--force`/..., for the reason
+/// `ANSWERABLE_COMMANDS`' own header gives: a deny-list fails OPEN on the next flag git adds, and
+/// `git branch` has grown mutating flags repeatedly (`--set-upstream-to`, `--edit-description`).
+const GIT_BRANCH_READ_ONLY_LONG: &[&str] = &[
+    "--all",
+    "--remotes",
+    "--verbose",
+    "--list",
+    "--show-current",
+    "--merged",
+    "--no-merged",
+    "--contains",
+    "--no-contains",
+    "--points-at",
+    "--format",
+    "--sort",
+    "--color",
+    "--no-color",
+    "--ignore-case",
+    "--omit-empty",
+];
+
+/// The short spellings as CHARACTERS, so a cluster (`-av`, `-vv`) is judged letter by letter.
+///
+/// Case matters and is the whole point: `-r` lists remotes while `-D` force-deletes.
+const GIT_BRANCH_READ_ONLY_SHORT: &[char] = &['a', 'r', 'v', 'l', 'i'];
+
+/// Read-only `git branch` flags that consume the NEXT word as their value, so that word is a
+/// commit-ish or a format string rather than a branch name to create.
+const GIT_BRANCH_VALUE_FLAGS: &[&str] = &[
+    "--merged",
+    "--no-merged",
+    "--contains",
+    "--no-contains",
+    "--points-at",
+    "--format",
+    "--sort",
+];
+
+/// Is this `git branch` invocation a LISTING rather than a ref edit?
+///
+/// THE STRICT READING, deliberately: any bare POSITIONAL refuses unless `-l`/`--list` is present,
+/// because `git branch <name>` CREATES a ref -- no flag required, nothing on screen that looks
+/// dangerous. `git branch --list 'rel/*'` stays answerable, because with `--list` the positional is
+/// a glob to match rather than a name to create.
+fn git_branch_args_are_read_only(args: &[&str]) -> bool {
+    let mut listing = false;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i];
+        i += 1;
+        if let Some(long) = arg.strip_prefix("--") {
+            // `--sort=-committerdate`: judge the FLAG, and its value is not a positional.
+            let (name, inline_value) = match long.split_once('=') {
+                Some((name, _)) => (name, true),
+                None => (long, false),
+            };
+            let name = format!("--{name}");
+            if !GIT_BRANCH_READ_ONLY_LONG.contains(&name.as_str()) {
+                return false;
+            }
+            if name == "--list" {
+                listing = true;
+            }
+            if !inline_value && GIT_BRANCH_VALUE_FLAGS.contains(&name.as_str()) {
+                // Consume the next word as this flag's VALUE -- but ONLY a bare word. A
+                // `-`-prefixed word is a flag to git too (`git branch --merged -D x` deletes), so
+                // swallowing it here would hand a mutating flag a way past the allowlist.
+                if i < args.len() && !args[i].starts_with('-') {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if let Some(shorts) = arg.strip_prefix('-') {
+            if shorts.is_empty() {
+                return false;
+            }
+            for c in shorts.chars() {
+                if !GIT_BRANCH_READ_ONLY_SHORT.contains(&c) {
+                    return false;
+                }
+                if c == 'l' {
+                    listing = true;
+                }
+            }
+            continue;
+        }
+        // A POSITIONAL. `git branch feature-x` creates a ref; only a listing may carry a pattern.
+        if !listing {
+            return false;
+        }
+    }
+    true
 }
 
 /// The command a permission prompt is asking about, read off the live region.
@@ -1209,6 +1421,230 @@ mod tests {
             "ls $(rm -rf /)",
         ] {
             assert!(!may_answer(&proceed_screen(cmd)), "must REFUSE: {cmd}");
+        }
+    }
+
+    // == THE ALLOWLIST AUTHORISES A NAME, NOT ITS ARGUMENTS ======================================
+    //
+    // Every command below prefix-matched an entry on `ANSWERABLE_COMMANDS`, carried no shell
+    // chainer and no `-exec`/`-delete`, and was AUTO-APPROVED -- while the list's own doc comment
+    // claimed "every entry is READ-ONLY". The two tests are halves of one piece of evidence: a
+    // refusal on its own could be bought by breaking the entry outright, so each refused form has
+    // a sibling read-only form of the SAME command that must still be answered.
+
+    /// The mutating forms. `git branch -D main` force-deletes the default branch.
+    #[test]
+    fn a_mutating_form_of_an_allowlisted_command_is_refused() {
+        for cmd in [
+            // `git branch` -- ref edits, every spelling of them.
+            "git branch -D main",
+            "git branch -d old",
+            "git branch -m a b",
+            "git branch -M main",
+            "git branch -c a b",
+            "git branch -C a b",
+            "git branch --delete x",
+            "git branch --move a b",
+            "git branch --force x y",
+            "git branch --set-upstream-to=origin/main",
+            "git branch --unset-upstream",
+            "git branch --edit-description",
+            // A BARE POSITIONAL creates a ref -- no flag, nothing on screen that looks dangerous.
+            "git branch feature-x",
+            // A mutating flag hiding behind a read-only one that takes a value.
+            "git branch --merged -D doomed",
+            // `--output` writes a FILE, on every command that takes git's diff options.
+            "git diff --output=/tmp/x",
+            "git diff --output /tmp/x",
+            "git log --output=/tmp/x",
+            "git show --output=/tmp/x",
+            "git stash list --output=/tmp/x",
+            // `find` writes files with these, and asks-then-runs with `-ok`.
+            "find . -fls /tmp/out",
+            "find . -fprint /tmp/o",
+            "find . -fprint0 /tmp/o",
+            "find . -fprintf /tmp/o '%p'",
+            "find . -okdir rm {} +",
+            // `tree -o` writes the listing to a file, in all three of its spellings.
+            "tree -o out.txt",
+            "tree -oout.txt",
+            "tree -ao out.txt",
+            // ripgrep EXECUTES the value of these -- `--pre` runs it once per file walked.
+            "rg --pre rm -e needle .",
+            "rg --pre=rm needle",
+            "rg --hostname-bin rm",
+            "rg --pre-glob '*.rs' needle",
+            // `file -C` compiles the magic file and writes a `.mgc`, clustered spellings included.
+            "file -C -m /tmp/x",
+            "file --compile -m /tmp/x",
+            "file -bC -m /tmp/x",
+            // `-v` is a GLOBAL flag on `git remote`, so the `add` subcommand still runs.
+            "git remote -v add foo url",
+        ] {
+            assert!(!command_is_answerable(cmd), "must REFUSE: {cmd}");
+            assert!(!may_answer(&proceed_screen(cmd)), "must REFUSE at the prompt: {cmd}");
+        }
+    }
+
+    /// `-ok`/`-okdir` RUN a command after asking about it, and the two spellings are refused by
+    /// DIFFERENT gates: the `;` terminator is a SHELL_CHAINER, so that form never reaches the
+    /// allowlist at all, while the `+` form gets there and is stopped by
+    /// `FIND_WRITING_PREDICATES`. Pinned together so neither gate can be weakened on the
+    /// assumption that the other one is covering this.
+    #[test]
+    fn the_interactive_find_actions_are_refused_by_both_gates() {
+        assert!(!command_is_answerable("find . -ok rm {} ;"));
+        assert!(!command_is_answerable("find . -ok rm {} +"));
+    }
+
+    /// THE OTHER HALF OF THE EVIDENCE. Narrowing the allowlist must not have simply broken these
+    /// commands -- the read-only form of every command refused above is still answered.
+    #[test]
+    fn the_read_only_form_of_the_same_command_is_still_answered() {
+        for cmd in [
+            "git branch",
+            "git branch -a",
+            "git branch -r",
+            "git branch -vv",
+            "git branch -av",
+            "git branch --list 'rel/*'",
+            "git branch --show-current",
+            "git branch --merged main",
+            "git branch --sort=-committerdate",
+            // NB `--format='%(refname:short)'` cannot be tested here: its parens are
+            // SHELL_CHAINERS, so it is refused one gate earlier and says nothing about this one.
+            "git branch --points-at HEAD",
+            "git status",
+            "git log --oneline -20",
+            "git diff HEAD~1",
+            "git diff --output-indicator-new=+",
+            "git show HEAD",
+            "git stash list",
+            "git remote -v",
+            "ls -la",
+            "find . -name '*.ts'",
+            "find . -type f -newer README.md",
+            "tree -L 2",
+            "tree -a -L 2",
+            "rg -n needle",
+            "rg --files",
+            "rg -t rust needle",
+            "file README.md",
+            "file -b README.md",
+            "cat README.md",
+        ] {
+            assert!(command_is_answerable(cmd), "should ANSWER: {cmd}");
+            assert!(may_answer(&proceed_screen(cmd)), "should ANSWER at the prompt: {cmd}");
+        }
+    }
+
+    /// `git branch` gets the STRICT reading: no arguments, or read-only flags, and NOTHING else.
+    /// A positional is a ref to create unless `-l`/`--list` turns it into a pattern to match.
+    #[test]
+    fn git_branch_is_answerable_only_as_a_listing() {
+        assert!(command_is_answerable("git branch --list release-*"), "--list takes a pattern");
+        assert!(command_is_answerable("git branch -l release-*"), "-l is --list");
+        assert!(!command_is_answerable("git branch release-9"), "a bare positional CREATES a ref");
+        // A clustered short is judged LETTER BY LETTER, so one bad letter sinks the cluster.
+        assert!(command_is_answerable("git branch -ar"));
+        assert!(!command_is_answerable("git branch -aD doomed"));
+    }
+
+    /// A SHORT FLAG IS READ LETTER BY LETTER, wherever it is judged. A whole-token `== "-o"` test
+    /// sees exactly one of the three spellings the shell can hand a tool, and the other two write a
+    /// file just the same. Both directions, so the letter test cannot be bought by refusing `tree`
+    /// outright.
+    #[test]
+    fn a_short_flag_is_recognised_attached_and_in_a_cluster() {
+        for cmd in ["tree -o out.txt", "tree -oout.txt", "tree -ao out.txt", "file -bC -m /tmp/x"] {
+            assert!(!command_is_answerable(cmd), "must REFUSE: {cmd}");
+        }
+        for cmd in ["tree -a -L 2", "tree -L2", "file -b README.md", "file -bi README.md"] {
+            assert!(command_is_answerable(cmd), "should ANSWER: {cmd}");
+        }
+        // A LONG option is not a short cluster -- `--noreport` does not carry `-o`.
+        assert!(command_is_answerable("tree --noreport"));
+    }
+
+    /// THE SHARED SPELLING REACHES EVERY ENTRY. `args_write_a_file` is the one refusal the whole
+    /// list has in common, and an arm that replaces the default rather than composing with it
+    /// silently drops it -- invisibly, because that entry's invariant row then exercises only the
+    /// arm. Asserted against `ANSWERABLE_COMMANDS` itself so a new arm cannot opt out.
+    #[test]
+    fn every_answerable_entry_refuses_the_shared_file_write_spelling() {
+        for entry in ANSWERABLE_COMMANDS {
+            for spelling in ["--output=/tmp/x", "--output /tmp/x"] {
+                let cmd = format!("{entry} {spelling}");
+                assert!(
+                    !command_is_answerable(&cmd),
+                    "{entry} does not receive the shared file-write refusal: {cmd}"
+                );
+            }
+            // ...and the entry itself still answers, so this cannot be bought by breaking it.
+            assert!(command_is_answerable(entry), "{entry} must still answer bare");
+        }
+    }
+
+    /// The INVARIANT the list's doc comment now states, pinned against the list ITSELF so that
+    /// adding an entry without thinking about its arguments fails here rather than in production.
+    ///
+    /// Each row is (entry, a mutating suffix that MUST be refused, a read-only suffix that MUST
+    /// still be answered). `None` means the entry has no argument spelling that mutates -- state
+    /// that deliberately, do not reach for it to make this test pass.
+    #[test]
+    fn answerable_entries_have_no_unguarded_mutating_form() {
+        const COVERAGE: &[(&str, Option<&str>, &str)] = &[
+            ("git status", None, "--short"),
+            ("git log", Some("--output=/tmp/x"), "--oneline -5"),
+            ("git diff", Some("--output=/tmp/x"), "HEAD~1"),
+            ("git show", Some("--output=/tmp/x"), "HEAD"),
+            ("git branch", Some("-D main"), "-a"),
+            ("git rev-parse", None, "--show-toplevel"),
+            ("git rev-list", None, "--count HEAD"),
+            ("git merge-base", None, "HEAD origin/main"),
+            ("git remote -v", Some("add foo url"), ""),
+            ("git stash list", Some("--output=/tmp/x"), ""),
+            ("roborev list", None, "--open"),
+            ("roborev show", None, "12"),
+            ("bd list", None, "--status all"),
+            ("bd show", None, "sparkle-abcde"),
+            ("ls", None, "-la"),
+            ("find", Some("-fls /tmp/out"), ". -name '*.ts'"),
+            ("grep", None, "-rn needle ."),
+            ("rg", Some("--pre rm -e needle ."), "-n needle"),
+            ("cat", None, "README.md"),
+            ("head", None, "-20 README.md"),
+            ("tail", None, "-5 README.md"),
+            ("wc", None, "-l README.md"),
+            ("pwd", None, ""),
+            ("which", None, "git"),
+            ("file", Some("-C -m /tmp/x"), "README.md"),
+            ("stat", None, "README.md"),
+            ("tree", Some("-o out.txt"), "-L 2"),
+        ];
+
+        // The table must cover the list EXACTLY -- that is what makes a new entry red here.
+        let covered: Vec<&str> = COVERAGE.iter().map(|(entry, _, _)| *entry).collect();
+        assert_eq!(
+            covered, ANSWERABLE_COMMANDS,
+            "every ANSWERABLE_COMMANDS entry needs a row here, in order: either a mutating suffix \
+             that args_are_read_only refuses, or an explicit None saying it has no mutating form"
+        );
+
+        for (entry, mutating, read_only) in COVERAGE {
+            if let Some(mutating) = mutating {
+                let cmd = format!("{entry} {mutating}");
+                assert!(
+                    !command_is_answerable(&cmd),
+                    "{entry} has a mutating form that is still auto-approved: {cmd}"
+                );
+            }
+            let cmd = format!("{entry} {read_only}");
+            let cmd = cmd.trim();
+            assert!(
+                command_is_answerable(cmd),
+                "{entry} must still answer its read-only form: {cmd}"
+            );
         }
     }
 

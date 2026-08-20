@@ -207,23 +207,66 @@ export function isSecretPath(p) {
   return false;
 }
 
+/** Length of the unquoted REDIRECTION OPERATOR starting at `s[i]`, or 0 if there is none.
+ *
+ *  Covers every spelling Bash has: `>` `>>` `<` `<<` `<<<` `>|` `>&` `<&` `&>` `&>>`. The `&`
+ *  forms have to be recognised HERE rather than left to the segment splitter, because a bare `&`
+ *  is a command separator and `&>` is not one.
+ *
+ *  `<<` deliberately consumes only the heredoc's TERMINATOR word, never its body — the body is
+ *  already removed upstream by `stripHeredocBodies`, which is what keeps `cat > note.txt <<'EOF'`
+ *  … `EOF` from being read as commands. */
+function redirectOperatorLength(s, i) {
+  const c = s[i];
+  if (c === ">") {
+    const n = s[i + 1];
+    return n === ">" || n === "|" || n === "&" ? 2 : 1;
+  }
+  if (c === "<") {
+    if (s[i + 1] === "<") return s[i + 2] === "<" ? 3 : 2;
+    return s[i + 1] === "&" ? 2 : 1;
+  }
+  if (c === "&" && s[i + 1] === ">") return s[i + 2] === ">" ? 3 : 2;
+  return 0;
+}
+
 /** Lex a Bash command string into a list of SEGMENTS, each an array of word tokens, splitting on
  *  unquoted `;` `&&` `||` `|` `(` `)` and newlines. Quote- and backslash-aware so `git add "my
  *  dir/.env"` yields one path token and `echo 'git add -A'` yields no git segment at all. This is a
  *  guardrail's approximation of a shell, not a shell: exotica (command substitution, process
  *  substitution) simply degrades toward tokens we then fail to recognise as a git invocation, which
- *  is the safe direction for a check that must never fire spuriously. */
+ *  is the safe direction for a check that must never fire spuriously.
+ *
+ *  REDIRECTIONS ARE RECOGNISED AND DROPPED, operator and target both, so the command keeps its true
+ *  shape as ONE segment. This is not tidiness — leaving them in was a real fail-open. `>` and `<`
+ *  are not word characters, so `git add -A > /dev/null` used to lex to
+ *  `["git","add","-A",">","/dev/null"]`, and the two trailing tokens were then read as PATHSPECS:
+ *  the CASE 2 secret sweep ran `git status --porcelain -uall -- '>' /dev/null`, git exited 128 with
+ *  "is outside repository", the probe returned null, and the guard allowed a whole-repo add that
+ *  would have staged an untracked `.env`. Four characters an agent types to silence a noisy command
+ *  turned the guard off. Handled: `>` `>>` `<` `<<` `<<<` `>|` `>&` `<&` `&>` `&>>`, an optional
+ *  leading file-descriptor digit (`2>`, `1>>` — the digit is dropped too, or it becomes a bogus
+ *  pathspec in its own right), and both spaced (`> /dev/null`) and attached (`>/dev/null`) targets,
+ *  including a quoted one (`> "my log.txt"`).
+ *
+ *  A `>` that is not an operator stays a literal character: inside quotes (`git commit -m "fix >
+ *  bug"`) the quote branch has already claimed it, and backslash-escaped (`file\>name`) the escape
+ *  branch runs FIRST and must keep doing so. */
 function lexCommand(command) {
   const segments = [];
   let cur = [];
   let word = "";
   let hasWord = false;
+  // Whether the pending word contains any QUOTED text. A file-descriptor prefix is bare digits by
+  // definition, so `"2">file` is an ordinary word plus a redirect, not fd 2.
+  let wordQuoted = false;
   let quote = null;
   const flushWord = () => {
     if (hasWord) {
       cur.push(word);
       word = "";
       hasWord = false;
+      wordQuoted = false;
     }
   };
   const flushSegment = () => {
@@ -250,6 +293,7 @@ function lexCommand(command) {
     if (c === "'" || c === '"') {
       quote = c;
       hasWord = true;
+      wordQuoted = true;
       continue;
     }
     if (c === "\\" && i + 1 < command.length) {
@@ -259,6 +303,48 @@ function lexCommand(command) {
     }
     if (c === " " || c === "\t" || c === "\r") {
       flushWord();
+      continue;
+    }
+    // A REDIRECTION — drop the operator and its target. Must come BEFORE the separator split,
+    // because `&>` and `&>>` begin with the `&` that otherwise ends the segment.
+    const opLen = redirectOperatorLength(command, i);
+    if (opLen > 0) {
+      // An optional file-descriptor prefix is part of the OPERATOR, not a word: `2>` must drop the
+      // `2` as well, or it survives as a bogus `2` pathspec and errors git exactly as the target
+      // would have. `&>` never carries one. Bare digits only, and never through quotes.
+      if (c !== "&" && hasWord && !wordQuoted && /^[0-9]+$/.test(word)) {
+        word = "";
+        hasWord = false;
+      }
+      flushWord();
+      // Consume the target word: optional whitespace, then one quote-and-backslash-aware word.
+      let j = i + opLen;
+      while (j < command.length && (command[j] === " " || command[j] === "\t")) j++;
+      let tq = null;
+      while (j < command.length) {
+        const t = command[j];
+        if (tq !== null) {
+          if (t === tq) tq = null;
+          else if (tq === '"' && t === "\\" && j + 1 < command.length) j++;
+          j++;
+          continue;
+        }
+        if (t === "'" || t === '"') {
+          tq = t;
+          j++;
+          continue;
+        }
+        if (t === "\\" && j + 1 < command.length) {
+          j += 2;
+          continue;
+        }
+        // The target ends at whitespace, at a separator, or at the next redirection (`>a >b`).
+        if (t === " " || t === "\t" || t === "\r" || t === "\n") break;
+        if (t === ";" || t === "&" || t === "|" || t === "(" || t === ")") break;
+        if (t === ">" || t === "<") break;
+        j++;
+      }
+      i = j - 1; // the loop's own i++ lands on the first character after the target
       continue;
     }
     if (c === ";" || c === "\n" || c === "&" || c === "|" || c === "(" || c === ")") {
@@ -487,6 +573,68 @@ function unquoteStatusPath(p) {
   }
 }
 
+/** Drop pathspecs that PROVABLY cannot name a file in this repo, returning the rest.
+ *
+ *  DEFENCE IN DEPTH, for the class of bug the redirect fix removed one instance of. `git status`
+ *  fails the WHOLE invocation when any single pathspec is unsatisfiable — `/dev/null` exits 128
+ *  with "is outside repository" — and both probes below read that as "repo state undeterminable"
+ *  and fail OPEN. So one stray spec silently takes the entire sweep judgement down with it. A spec
+ *  that cannot match anything here contributes no coverage, so dropping it loses nothing and stops
+ *  it from nulling the specs that DO.
+ *
+ *  Three deliberate limits, each one a false-refusal or lost-coverage bug avoided:
+ *
+ *  - THE BOUNDARY IS THE REPO ROOT, NOT `dir`. From a subdirectory, `git add ../src/` is an
+ *    ordinary in-repo command; judging it against `dir` would drop it and lose real coverage. The
+ *    root costs one `rev-parse`, and only when a spec actually looks suspicious — the overwhelmingly
+ *    common case (plain relative paths) never pays for it.
+ *  - MAGIC PATHSPECS ARE NEVER JUDGED. `:!x`, `:(top)y`, `:/` are git syntax, not filesystem paths,
+ *    and second-guessing them here could drop an exclusion the agent deliberately wrote.
+ *  - IF THE ROOT CANNOT BE READ, NOTHING IS DROPPED. Proving a spec is out of repo requires knowing
+ *    where the repo is; without that the existing behaviour (hand it all to git, fail open if git
+ *    objects) is unchanged.
+ *
+ *  Returns `null` for "nothing this command names can be in this repo" — the caller then reports NO
+ *  HITS rather than probing. Callers must never treat that as an unscoped probe: widening a scoped
+ *  add into a whole-repo sweep would block on an unrelated `.env` and be a false refusal with no
+ *  approval path.
+ *
+ *  Two composition traps, each of which flips this filter into the very bug it closes:
+ *
+ *  - AN EXCLUSION-ONLY SURVIVOR IS NOT A SCOPE. Magic is always kept and out-of-repo positives are
+ *    dropped, so `git add ../sibling/ ':!*.log'` can leave `[":!*.log"]` behind — and git reads an
+ *    all-negative pathspec list as if `.` had also been given, silently making the probe the whole
+ *    repo. Counting survivors cannot see this; only a POSITIVE survivor counts. (An add that names
+ *    no positive spec to begin with is git's own "everything except" form, and scoping the probe
+ *    the way git scopes the command is correct — so the check keys on losing the positives, not on
+ *    their absence.)
+ *  - BOTH SIDES MUST BE CANONICALISED. `rev-parse --show-toplevel` reports the PHYSICAL path (git
+ *    derives it from `getcwd()`), while `dir` and an absolute spec arrive verbatim — and on macOS
+ *    `/tmp` is a symlink to `/private/tmp`. Compared unresolved, every in-repo spec looks like it
+ *    escapes, `.` itself is dropped, and the probe reports "clean" having never run. That is worse
+ *    than the documented fail-open: it is a positive claim of safety. Anything that cannot be
+ *    resolved KEEPS the spec — this filter may never drop on a guess. */
+function inRepoPathspecs(dir, pathspecs) {
+  const judgeable = (p) => !p.startsWith(":"); // magic is git syntax, never a filesystem path
+  const isPositive = (p) => !parsePathspec(p).excluded;
+  const suspicious = (p) => isAbsolute(p) || /(^|\/)\.\.(\/|$)/.test(p);
+  if (!pathspecs.some((p) => judgeable(p) && suspicious(p))) return pathspecs;
+  const root = gitToplevel(dir);
+  if (root === null) return pathspecs; // cannot prove anything → change nothing
+  const rootReal = realResolve(root);
+  const dirReal = realResolve(dir);
+  if (rootReal === null || dirReal === null) return pathspecs;
+  const kept = pathspecs.filter((p) => {
+    if (!judgeable(p)) return true;
+    const abs = realResolve(isAbsolute(p) ? p : `${dirReal}${sep}${p}`);
+    if (abs === null) return true; // unresolvable → keep; never drop on a guess
+    const rel = relative(rootReal, abs);
+    return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+  });
+  if (pathspecs.some(isPositive) && !kept.some(isPositive)) return null;
+  return kept;
+}
+
 /** Secret-shaped files that are UNTRACKED AND NOT IGNORED in `dir`, optionally scoped to
  *  `pathspecs`. Returns [] when the repo is clean of them, or null when the repo state could not be
  *  determined at all — the caller treats null as "allow" (see the fail-open note above).
@@ -498,7 +646,13 @@ function unquoteStatusPath(p) {
 function untrackedSecrets(dir, pathspecs) {
   if (typeof dir !== "string" || dir.length === 0) return null;
   const args = ["-C", dir, "status", "--porcelain", "--untracked-files=all"];
-  if (pathspecs.length > 0) args.push("--", ...pathspecs);
+  if (pathspecs.length > 0) {
+    const scoped = inRepoPathspecs(dir, pathspecs);
+    // Nothing this command names can be in here — no hits, and deliberately NOT an unscoped probe
+    // (that would be a false refusal; see inRepoPathspecs).
+    if (scoped === null || scoped.length === 0) return [];
+    args.push("--", ...scoped);
+  }
   let out;
   try {
     out = execFileSync("git", args, {
@@ -541,7 +695,12 @@ function untrackedSecrets(dir, pathspecs) {
 function stagedSecrets(dir, pathspecs = []) {
   if (typeof dir !== "string" || dir.length === 0) return null;
   const args = ["-C", dir, "status", "--porcelain", "--untracked-files=no"];
-  if (pathspecs.length > 0) args.push("--", ...pathspecs);
+  if (pathspecs.length > 0) {
+    const scoped = inRepoPathspecs(dir, pathspecs);
+    // see untrackedSecrets — never widen to an unscoped probe
+    if (scoped === null || scoped.length === 0) return [];
+    args.push("--", ...scoped);
+  }
   let out;
   try {
     out = execFileSync("git", args, {
@@ -1733,22 +1892,55 @@ function judgeSegment(tokens, depth) {
           }
         }
         if (git.sub === "clean") {
-          // `-x` is the flag that removes IGNORED files — i.e. .env and credentials. `git clean -fd`
-          // leaves them alone and stays allowed.
+          // `-x` and `-X` are the flags that remove IGNORED files — i.e. .env and credentials.
+          // `git clean -fd` leaves them alone and stays allowed.
+          //
+          // BOTH CASES, because they are not variants of one flag: `-x` adds ignored files to the
+          // untracked sweep, while `-X` removes ONLY the ignored ones. `-X` is therefore strictly
+          // worse here — it deletes the credentials and nothing else — and a case-sensitive test
+          // read straight past it.
           //
           // Scanning stops at `e`, because `-e` takes a VALUE and may carry it attached: in
           // `git clean -e'*.x'` the lexer yields the single token `-e*.x`, whose "x" belongs to the
           // user's exclude PATTERN, not to a flag. A plain `.includes("x")` refuses that — a false
           // refusal with no approval path, which is the thing this whole posture exists to remove.
+          // Adding `X` widens what the cluster test matches, so this stop matters MORE, not less:
+          // an uppercase pattern (`-fde'*.XZ'`) is an ordinary clean and must stay allowed.
+          //
+          // LONG OPTIONS ARE SKIPPED BECAUSE GIT CANNOT EXPRESS THIS FLAG AS ONE — not as an
+          // oversight. git-clean's synopsis is `[-d] [-f] [-i] [-n] [-q] [-e <pattern>] [-x | -X]`
+          // and its only long forms are --force, --interactive, --dry-run, --quiet and
+          // --exclude=<pattern>; `--ignored`, `--ignored-only` and `--exclude-ignored` are all
+          // rejected by git with "unknown option". There is no long spelling to catch, so do not
+          // invent one. (Pinned by destructiveCommands.test.ts.)
+          // NO DRY-RUN EXEMPTION. A `--dry-run` clean really does delete nothing, so exempting it
+          // looks free — and it is not, because `-e`/`--exclude` take a value that may be DETACHED.
+          // git's parse-options consumes the next argv unconditionally for a required-argument
+          // option, without checking whether it looks like a flag, so in `git clean -fdx -e -n` the
+          // exclude PATTERN is the literal string `-n` and git performs a REAL, destructive `-x`
+          // clean. Any scan that reads that trailing `-n` as `--dry-run` waves it through. The same
+          // holds for `-fdxe -n`, `--exclude -n` and `--exclude --dry-run`.
+          //
+          // That asymmetry is why this stays a pure `-x`/`-X` test: misreading a pathspec as a FLAG
+          // is a harmless false refusal, but misreading a VALUE as `--dry-run` disables the guard.
+          // Modelling git's option grammar well enough to tell them apart is a standing obligation
+          // that grows with every flag git adds — on the one code path whose whole job is to stop a
+          // credential deletion. A refused dry run costs one sentence to a human (the refusal
+          // message says to ask rather than rephrase); a missed real clean costs the credentials.
+          // If the dry run is ever worth exempting it needs its own change, with the detached-value
+          // case handled and pinned. `destructiveCommands.test.ts` pins all four bypass spellings.
           const removesIgnored = git.args.some((a) => {
             if (!a.startsWith("-") || a.startsWith("--")) return false;
             const cluster = a.slice(1);
             const valueAt = cluster.indexOf("e");
             const flags = valueAt === -1 ? cluster : cluster.slice(0, valueAt);
-            return flags.includes("x");
+            return flags.includes("x") || flags.includes("X");
           });
           if (removesIgnored) {
-            return { rule: "git clean -x", why: "`-x` deletes IGNORED files, which is where credentials live" };
+            return {
+              rule: "git clean -x",
+              why: "`-x`/`-X` delete IGNORED files, which is where credentials live",
+            };
           }
         }
       }

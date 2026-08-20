@@ -192,3 +192,122 @@ describe("blocksDestructiveCommand — the env reading budget refuses, and reset
     expect(find?.why).not.toMatch(/too many option-arity readings/);
   });
 });
+
+describe("blocksDestructiveCommand — git clean, the ignored-file flag in both cases", () => {
+  // `-X` removes ONLY ignored files, which is precisely .env and credentials — strictly worse than
+  // `-x`, which at least sweeps untracked junk alongside them. The corpus above drives the
+  // spellings; these assert the two PROPERTIES that make the fix correct rather than merely green.
+
+  it("names the same rule for `-X` as for `-x` (one rule, not a bolted-on second one)", () => {
+    const lower = blocksDestructiveCommand("git clean -fdx");
+    const upper = blocksDestructiveCommand("git clean -fdX");
+    expect(lower).not.toBeNull();
+    expect(upper).not.toBeNull();
+    expect(upper!.rule).toBe(lower!.rule);
+  });
+
+  // THE `-e` VALUE SCAN, IN BOTH CASES. `-e` takes a value that may be ATTACHED, so the cluster
+  // scan must stop there: in `git clean -fde'*.XZ'` the lexer yields one token whose `X` belongs to
+  // the user's exclude PATTERN. Adding `X` to the flag test without preserving that scan turns an
+  // ordinary clean into a false refusal with no approval path — the thing this posture exists to
+  // remove. Asserting only the lowercase case would have passed the broken fix.
+  it("stops the cluster scan at `-e`, so an exclude PATTERN is never read as a flag", () => {
+    for (const cmd of [
+      "git clean -fde'*.xz'",
+      "git clean -fde'*.XZ'",
+      "git clean -fd -e '*.x'",
+      "git clean -fd -e '*.X'",
+      "git clean -fde'*.X'",
+      "git clean -e'*.X' -fd",
+    ]) {
+      expect(blocksDestructiveCommand(cmd), `expected NO refusal for: ${cmd}`).toBeNull();
+    }
+  });
+
+  // WHY THERE IS NO LONG-OPTION SPELLING TO CATCH — pinned so the next reader does not re-derive it
+  // and, worse, invent one. git-clean's synopsis is
+  //   git clean [-d] [-f] [-i] [-n] [-q] [-e <pattern>] [-x | -X] [--] [<pathspec>...]
+  // and its ONLY long forms are --force, --interactive, --dry-run, --quiet and --exclude=<pattern>.
+  // `-x`/`-X` have no long spelling at all: `--ignored`, `--ignored-only` and `--exclude-ignored`
+  // are all rejected by git with "unknown option". So the cluster scan skipping `--`-prefixed words
+  // is complete, not a gap — there is nothing for a long-option branch to catch.
+  it("skips long options because git cannot express -x/-X as one", () => {
+    // A long option is not a flag cluster, so it contributes no `x`/`X` — and an invented one must
+    // not be treated as if it removed ignored files.
+    expect(blocksDestructiveCommand("git clean -fd --force")).toBeNull();
+    expect(blocksDestructiveCommand("git clean -fd --quiet")).toBeNull();
+    expect(blocksDestructiveCommand("git clean -fd --exclude='*.x'")).toBeNull();
+    expect(blocksDestructiveCommand("git clean -fd --exclude='*.X'")).toBeNull();
+    // …but a long option must not SHADOW a real short flag sitting beside it.
+    expect(blocksDestructiveCommand("git clean -fd --force -X")).not.toBeNull();
+    expect(blocksDestructiveCommand("git clean --quiet -x")).not.toBeNull();
+  });
+
+  // THERE IS DELIBERATELY NO DRY-RUN EXEMPTION, and this test exists because one was briefly added
+  // on this branch and had to be removed. The reasoning FOR it is genuinely sound — git-clean(1)
+  // says "-n, --dry-run  Don't actually remove anything… clean.requireForce is ignored, as nothing
+  // will be deleted anyway" — which is exactly what makes the hole it opens so easy to miss.
+  //
+  // `-e`/`--exclude` take a REQUIRED value, and git's parse-options consumes the next argv for one
+  // unconditionally, without checking whether it looks like a flag. So in `git clean -fdx -e -n`
+  // the exclude PATTERN is the literal string `-n`, git performs a REAL destructive `-x` clean, and
+  // any scan that reads that trailing `-n` as `--dry-run` hands it through. Four spellings reach it.
+  //
+  // The asymmetry is the whole point: misreading a pathspec as a FLAG is a harmless false refusal,
+  // but misreading a VALUE as `--dry-run` turns the guard off on the one path whose job is to stop
+  // a credential deletion. So the scan stays a pure `-x`/`-X` test.
+  // WHAT CLOSING `-X` COSTS, stated plainly rather than waved past (roborev 66236 asked for exactly
+  // this). At origin/main `git clean -nx` was REFUSED but `git clean -nX` / `-ndX` /
+  // `--dry-run -X` were ALLOWED — not as a considered dry-run exemption, but purely because the
+  // scan missed `-X` altogether. So the uppercase dry-run spellings are NEWLY refused by the `-X`
+  // fix, and the falsely-refused set does strictly grow. That is the accepted price of closing a
+  // credential-deletion hole, and it makes the two cases consistent instead of accidentally split.
+  it("has no dry-run exemption — every dry-run spelling with -x/-X is still refused", () => {
+    for (const cmd of [
+      "git clean -nx",
+      "git clean -nX",
+      "git clean -ndX",
+      "git clean -n -x",
+      "git clean -fdnx",
+      "git clean --dry-run -x",
+      "git clean --dry-run -X",
+      "git clean -fd --dry-run -X",
+      "git clean -fdx --dry-run",
+      "git clean -fdx -n",
+    ]) {
+      expect(
+        blocksDestructiveCommand(cmd),
+        `no dry-run exemption exists, so this must still be refused: ${cmd}`,
+      ).not.toBeNull();
+    }
+  });
+
+  // THE REGRESSION CONTROL. Each of these was refused at origin/main, ALLOWED by the dry-run
+  // exemption, and is refused again now. If a dry-run exemption is ever reintroduced, these are the
+  // cases it has to handle before it is safe — a detached value is not visible to a per-token scan.
+  it("pins the PATHSPEC and exclude-VALUE cases any future dry-run exemption must handle", () => {
+    // NOTE: nothing in the guard reads anything as the dry-run flag today, so these pass because
+    // the cluster carries `x`/`X` — not because a `--` stop or a value-skip exists. They are here as
+    // the cases a future exemption has to get right, and they would go red the moment one is added
+    // naively. Everything after `--` is a pathspec: a file literally named `-n` is not the flag.
+    expect(blocksDestructiveCommand("git clean -fdx -- -n")).not.toBeNull();
+    expect(blocksDestructiveCommand("git clean -fdX -- -n --dry-run")).not.toBeNull();
+    // An `n` inside an ATTACHED exclude pattern is not the flag.
+    expect(blocksDestructiveCommand("git clean -fdxe'*.n'")).not.toBeNull();
+    expect(blocksDestructiveCommand("git clean -fdXe'no-such'")).not.toBeNull();
+    // …and the DETACHED value, which is the one the removed exemption got wrong. git really does
+    // delete here: `-n` is the pattern, not the flag.
+    for (const cmd of [
+      "git clean -fdx -e -n",
+      "git clean -fdxe -n",
+      "git clean -fdx --exclude -n",
+      "git clean -fdx --exclude --dry-run",
+      "git clean -fdx -e --dry-run",
+    ]) {
+      expect(
+        blocksDestructiveCommand(cmd),
+        `the exclude VALUE is not a flag — git performs a real -x clean here: ${cmd}`,
+      ).not.toBeNull();
+    }
+  });
+});
