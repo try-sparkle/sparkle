@@ -87,6 +87,124 @@ export function isBdMissing(e: unknown): boolean {
   return toBeadsError(e).kind === "binaryNotFound";
 }
 
+/** THE WALL-CLOCK BOUND ON THE WHOLE `create_plan` CHAIN, and the only budget that has to be right.
+ *
+ *  WHY A SINGLE TOTAL RATHER THAN A SUM OF STAGES. Two review rounds found the same defect in the
+ *  same place: a guard that added up the bd budgets and passed while the real worst case blew the
+ *  bridge ceiling. First it forgot the dedupe read this feature added (40s modelled, 70s real).
+ *  Then, with the dedupe counted, it still forgot `READER_DRAIN_GRACE` — after a bd child exits,
+ *  `run_cmd_timed` waits up to 5s on stdout and then up to another 5s on stderr, serially, skipped
+ *  only on the kill path, so every COMPLETED invocation is `timeout + 2 x grace`, not `timeout`
+ *  (65s real). Both times the guard read as pinning the ceiling while the chain could exceed it.
+ *
+ *  The lesson is not "count more carefully". It is that a model of another process's internals is
+ *  wrong by default and gets wronger as that process changes — and nothing in the Rust crate fails
+ *  when it drifts. So the chain now carries ONE deadline measured on the clock the bridge is
+ *  actually watching, which is complete by construction: whatever bd, its drains, IPC or a future
+ *  stage do, this fires first.
+ *
+ *  EXPIRING HERE IS STRICTLY BETTER THAN BEING KILLED BY THE BRIDGE, which is what makes the bound
+ *  safe rather than a way of losing writes. Both outcomes are "we do not know whether the epic was
+ *  filed" — but a bridge kill delivers that as a transport error the model cannot classify, while
+ *  this delivers the domain's own `outcome-unknown` refusal, whose message names `list_plans` as
+ *  the thing to do instead of retrying. Same fact, actionable instead of opaque. */
+export const CREATE_PLAN_TOTAL_BUDGET_MS = 42_000;
+
+/** What must remain between {@link CREATE_PLAN_TOTAL_BUDGET_MS} and the bridge's own ceiling.
+ *
+ *  The ceiling is a KILL point, and the budget above bounds only the awaited work — IPC, JSON
+ *  serialization and the app's own scheduling sit on top of it. */
+export const CREATE_PLAN_BRIDGE_HEADROOM_MS = 8_000;
+
+/** Returned by {@link withDeadlineOrExpired} when the promise did not settle in time. A unique
+ *  symbol, so it can never collide with a legitimate resolved value. */
+export const DEADLINE_EXPIRED = Symbol("deadline-expired");
+
+/** Like {@link withDeadline}, but for the case where a REJECTION and an EXPIRY must be told apart.
+ *
+ *  `withDeadline` collapses both to `null`, which is right for a fail-open read and wrong for a
+ *  WRITE: a rejected create has to be classified (see `createFailureVerdict`), while an expired one
+ *  is genuinely unknown. Rejections still reject; only the timeout resolves to the sentinel.
+ *
+ *  A rejection arriving AFTER expiry is still consumed by the handler below, so abandoning a call
+ *  never leaves an unhandled rejection behind. */
+export function withDeadlineOrExpired<T>(
+  p: Promise<T>,
+  ms: number,
+): Promise<T | typeof DEADLINE_EXPIRED> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(DEADLINE_EXPIRED), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** How long `create_plan`'s PRE-WRITE DEDUPE READ may take before it is abandoned.
+ *
+ *  SUBORDINATE TO {@link CREATE_PLAN_TOTAL_BUDGET_MS}, which is what actually guarantees the chain
+ *  fits. This one exists so the dedupe cannot eat the budget the CREATE needs: `create_plan` is
+ *  three bd invocations in one bridge call, and on the full `BD_TIMEOUT` the read alone could spend
+ *  30s of a 42s total, leaving the write to expire for the sake of a check that is only an
+ *  optimisation. Capping it at 5s keeps at least 37s for the part that matters.
+ *
+ *  ABANDONING IT IS SAFE IN A WAY ABANDONING THE OTHER TWO WOULD NOT BE. This is a READ, it leaves
+ *  nothing behind, and the dedupe already fails OPEN on any error — so an expiry costs at worst a
+ *  duplicate epic the user can see and close, which is exactly the pre-existing behaviour. The bd
+ *  child keeps running to its own bound after we stop waiting; that is one extra reader against a
+ *  contended store, not a leak.
+ *
+ *  Deliberately NOT the thing the contract test sums — see {@link CREATE_PLAN_TOTAL_BUDGET_MS} for
+ *  why summing stages was abandoned after it under-counted twice. */
+export const CREATE_PLAN_DEDUPE_BUDGET_MS = 5_000;
+
+/** Resolve `p`, or `null` if it has not settled within `ms` — and `null` on rejection too.
+ *
+ *  Deliberately never REJECTS: every caller of this is a fail-open read where "we could not find
+ *  out" and "we found nothing" lead to the same next action, and a distinct rejection would only
+ *  invite a caller to treat a slow store as an error. */
+export function withDeadline<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(null);
+      },
+    );
+  });
+}
+
+/** The phrase `beads_cmd.rs::write_dropped` puts in its message, and the ONE bd failure that PROVES
+ *  nothing was filed.
+ *
+ *  `beads_create` probes the store after every create, and this error is raised only when that probe
+ *  RAN CLEANLY and the row was absent. Every other create failure — a timeout, a busy store, a
+ *  non-zero bd exit — leaves the outcome genuinely UNKNOWN, and the difference decides whether a
+ *  caller may safely retry. Substring-matched for the same reason `isBeadsUnavailable` is in
+ *  `beads.ts`: the kind alone (`badOutput`) covers version skew and partial reads too, which are
+ *  not proof of anything. A Rust test in `beads_cmd.rs` pins `write_dropped`'s wording against this
+ *  constant's text, so the two cannot drift silently. */
+export const WRITE_DROPPED_MARKER = "the write did not land";
+
+/** True when the failure PROVES the create did not land — as opposed to merely failing to prove it
+ *  did. See {@link WRITE_DROPPED_MARKER}: only a clean probe finding no row qualifies. */
+export function isWriteDropped(e: unknown): boolean {
+  const { kind, message } = toBeadsError(e);
+  return kind === "badOutput" && message.includes(WRITE_DROPPED_MARKER);
+}
+
 /** True when the call lost a race for the store rather than being wrong — the failure whose remedy
  *  is to re-issue the SAME request in a moment.
  *

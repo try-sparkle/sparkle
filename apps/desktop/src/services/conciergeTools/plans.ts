@@ -26,7 +26,20 @@ import {
   isBeadsUnavailable,
   type Bead,
 } from "../beads";
-import { createBeadFull } from "../tasks";
+import {
+  CREATE_PLAN_DEDUPE_BUDGET_MS,
+  CREATE_PLAN_TOTAL_BUDGET_MS,
+  DEADLINE_EXPIRED,
+  beadsCreate,
+  beadsQuery,
+  withDeadline,
+  withDeadlineOrExpired,
+  isBdMissing,
+  isNoWorkspace,
+  isWriteDropped,
+  toBeadsError,
+  type BeadsError,
+} from "../beadsCommands";
 import { epicStatus, epicChildViews, orchestratorNameForEpic } from "../planView";
 import { columnFor } from "../beads";
 import { sendToBuild, AtCapacityError } from "../sendToBuild";
@@ -240,28 +253,176 @@ export async function getPlan(
 // Writes
 // ---------------------------------------------------------------------------------------------
 
+/** What a `create_plan` actually did. Two SUCCESS outcomes, because "there is already an epic for
+ *  this" is not a failure — the user gets a working id either way and the concierge must not report
+ *  a second card that it did not file. */
+export type CreatePlanOutcome = "created" | "already-filed";
+
+export interface CreatedPlan {
+  id: string;
+  title: string;
+  outcome: CreatePlanOutcome;
+}
+
+/**
+ * WHAT A FAILED CREATE PROVES — three answers, not one, and the difference is the whole point.
+ *
+ * The old path collapsed every failure onto `beads-failed`, which reads to a model as "nothing
+ * happened". That is a guess dressed as a fact: the store is one embedded Dolt database shared by
+ * every worktree and polled every 5s, so the ORDINARY failure here is losing a race, and a create
+ * killed on its own timeout may very well have landed. Telling the user nothing was filed and
+ * retrying produces two epics for one idea — the exact duplicate `alreadyFiledId` below exists to
+ * prevent, manufactured by the error handler.
+ *
+ *   `unavailable`  bd is missing or the project has no work graph. A supported state, not a fault.
+ *   `not-created`  PROVEN nothing was filed. Safe to retry unchanged.
+ *   `unknown`      Genuinely unresolved. Do NOT retry blind; read the plan list first.
+ *
+ * Only two things prove absence, and both are narrow on purpose. `invalidInput` is rejected in Rust
+ * before bd is ever invoked. `isWriteDropped` fires only when the post-create probe RAN CLEANLY and
+ * found no row — a probe that could not run fails OPEN in `confirm_written`, precisely so an
+ * unreadable probe can never condemn a create that landed. Everything else is `unknown`, which is
+ * the fail-safe direction: over-reporting "unknown" costs one extra read, over-reporting
+ * "not-created" costs a duplicate epic.
+ *
+ * Pure and exported so this can be tested against every kind without a bd that fails on cue.
+ */
+export function createFailureVerdict(e: unknown): "unavailable" | "not-created" | "unknown" {
+  if (isNoWorkspace(e) || isBdMissing(e)) return "unavailable";
+  if (isWriteDropped(e)) return "not-created";
+  if (toBeadsError(e).kind === "invalidInput") return "not-created";
+  return "unknown";
+}
+
+/** Normalized for comparison only — case and inner whitespace, which is all a model varies when it
+ *  re-files the same idea a minute later. Deliberately NOT fuzzy: a near-match is a judgement call,
+ *  and refusing to file a genuinely new epic is worse than filing a near-duplicate the user can see
+ *  and close. */
+function sameTitle(a: string, b: string): boolean {
+  const norm = (t: string) => t.trim().toLowerCase().replace(/\s+/g, " ");
+  return norm(a) === norm(b);
+}
+
+/**
+ * An OPEN, typed epic already carrying this exact title, or null.
+ *
+ * FAILS OPEN, and that is the important half: a dedupe read that errors is not evidence of a
+ * duplicate, so it must never block a create. The cost of getting this wrong in the other direction
+ * is the user asking for an epic and being told one already exists when it does not.
+ *
+ * Scoped to `issueType: "epic"` rather than to this module's broader `isEpic` (typed epic OR has
+ * children) on purpose: this is asking "did create_plan already file this", and create_plan only
+ * ever writes typed epics. Widening it would let an ordinary task with a matching title suppress a
+ * real epic.
+ */
+async function alreadyFiledId(projectPath: string, title: string): Promise<string | null> {
+  // BOUNDED, because this read is the FIRST of three bd invocations inside one bridge call and the
+  // bridge kills the call at 50s. On the full BD_TIMEOUT the chain is 30 + 30 + 10 = 70s, so a slow
+  // dedupe read alone reintroduces the failure the confirmation probe exists to remove — and it
+  // does not need every stage maxed: any dedupe slower than ~10s already pushes create + probe past
+  // the ceiling. See CREATE_PLAN_DEDUPE_BUDGET_MS for why abandoning THIS one specifically is safe.
+  const page = await withDeadline(
+    beadsQuery(projectPath, {
+      issueType: "epic",
+      titleContains: title.trim(),
+      includeClosed: false,
+      limit: 50,
+    }),
+    CREATE_PLAN_DEDUPE_BUDGET_MS,
+  );
+  // `withDeadline` never rejects: an expiry and an error both arrive as null, and both mean the
+  // same thing here — we could not find out, so proceed and file. A dedupe read that failed is not
+  // evidence of a duplicate.
+  if (!page) return null;
+  return page.beads.find((b) => sameTitle(b.title, title))?.id ?? null;
+}
+
 /**
  * File a new plan. Children are added with the board domain's `create_item`.
  *
- * MUST go through `createBeadFull` with an explicit `"epic"` type. The shorter `createBead` helper
- * runs `bd create <title> -d <body> --json` with NO `-t`, so bd applies its default type — `task` —
- * and the result then fails `isEpic` EVERYWHERE in this module: invisible to `list_plans`, and
- * refused as `not-a-plan` by both `get_plan` and `promote_plan_to_build`. The create → inspect →
- * promote workflow this domain exists to deliver would dead-end at its first step (roborev 55131).
+ * MUST carry an explicit `"epic"` type. A create with no type takes bd's default — `task` — and the
+ * result then fails `isEpic` EVERYWHERE in this module: invisible to `list_plans`, and refused as
+ * `not-a-plan` by both `get_plan` and `promote_plan_to_build`. The create → inspect → promote
+ * workflow this domain exists to deliver would dead-end at its first step (roborev 55131).
  *
- * `createBeadFull` also THROWS on a bd failure and returns a non-empty id, rather than resolving
- * null — so the "created nothing nameable" case is the `attempt` catch below, not a null check.
+ * GOES THROUGH `beadsCreate`, NOT `createBeadFull`, AND THAT IS THE POINT OF THIS FUNCTION.
+ * `createBeadFull` reaches `notes.rs::create_bead_full` → `run_bd` → a hard 30s bound with NO
+ * read-back, so a create that bd acknowledged but the store dropped is reported as success, and a
+ * create that timed out is reported as failure — with no way to tell either from the truth.
+ * `beadsCreate` runs the create, then PROBES the store for the row before reporting anything (see
+ * `beads_cmd.rs::create_bead`), and it deliberately does not retry, because re-running a create
+ * whose first write actually landed is how one epic becomes two.
  */
 export async function createPlan(
   projectPath: string,
   title: string,
   body: string,
-): Promise<PlansResult<{ id: string }>> {
-  const created = await attempt("create_plan", () =>
-    createBeadFull(projectPath, title, body, "epic", "", "", ""),
-  );
-  if (!created.ok) return created;
-  return ok("create_plan", { id: created.data });
+): Promise<PlansResult<CreatedPlan>> {
+  // BEFORE the write, not after. The founder's own use is to reel off several efforts he has been
+  // asking about for weeks, so "have I already filed this one" is the common case rather than an
+  // edge one — and once a duplicate exists, nothing in the app removes it.
+  // ONE WALL-CLOCK DEADLINE OVER THE WHOLE CHAIN, measured on the clock the bridge is watching.
+  // Two review rounds caught a guard that summed the Rust budgets and still under-counted — first
+  // missing the dedupe read, then missing `READER_DRAIN_GRACE`, which adds up to 2x5s to every
+  // COMPLETED bd invocation. Modelling another process's internals is wrong by default; a deadline
+  // here is complete by construction. See CREATE_PLAN_TOTAL_BUDGET_MS.
+  const startedAt = Date.now();
+  const existing = await alreadyFiledId(projectPath, title);
+  if (existing) {
+    return ok("create_plan", { id: existing, title, outcome: "already-filed" });
+  }
+  const remaining = CREATE_PLAN_TOTAL_BUDGET_MS - (Date.now() - startedAt);
+  try {
+    const created = await withDeadlineOrExpired(
+      beadsCreate(projectPath, { title, description: body, issueType: "epic" }),
+      Math.max(remaining, 0),
+    );
+    if (created === DEADLINE_EXPIRED) {
+      // NOT a failure claim. We stopped waiting; bd may well be finishing the write right now — so
+      // this is the honest `unknown`, and it is the SAME fact a bridge kill would have delivered,
+      // except it arrives as a refusal the model can act on instead of an opaque transport error.
+      return refuse(
+        "create_plan",
+        "outcome-unknown",
+        `The work graph didn't answer within ${Math.round(CREATE_PLAN_TOTAL_BUDGET_MS / 1000)}s, so I ` +
+          "stopped waiting before the tool call itself would have been cut off. The epic may or may " +
+          "not have been filed. Check `list_plans` for it before creating another one; filing a " +
+          "second is worse than waiting, because nothing removes a duplicate epic.",
+      );
+    }
+    return ok("create_plan", { id: created.id, title, outcome: "created" });
+  } catch (e) {
+    return refuseCreate(e);
+  }
+}
+
+/** Turn a create failure into a refusal that says WHICH of the three things happened — see
+ *  {@link createFailureVerdict}. Split out so the message wording is testable on its own. */
+function refuseCreate(e: unknown): PlansRefusal {
+  const err: BeadsError = toBeadsError(e);
+  switch (createFailureVerdict(e)) {
+    case "unavailable":
+      return refuse(
+        "create_plan",
+        "beads-unavailable",
+        "This project doesn't have a beads database (or `bd` isn't installed), so it has no plans. " +
+          "Run `bd init` in the project to start one.",
+      );
+    case "not-created":
+      return refuse(
+        "create_plan",
+        "not-created",
+        `Nothing was filed — ${err.message}. No epic exists, so it is safe to try again as-is.`,
+      );
+    default:
+      return refuse(
+        "create_plan",
+        "outcome-unknown",
+        `I couldn't confirm what happened — ${err.message}. The epic may or may not have been ` +
+          "filed. Check `list_plans` for it before creating another one; filing a second is worse " +
+          "than waiting, because nothing removes a duplicate epic.",
+      );
+  }
 }
 
 /**

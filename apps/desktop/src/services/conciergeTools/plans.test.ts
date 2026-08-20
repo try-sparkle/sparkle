@@ -22,6 +22,19 @@ vi.mock("../beads", async (importOriginal) => {
 });
 
 vi.mock("../tasks", () => ({ createBeadFull: (...a: unknown[]) => createBeadFull(...a) }));
+
+// The create path's REAL seam now. `beadsCommands` is the typed wrapper over the Rust command that
+// creates AND probes; only the two functions the plans domain calls are stubbed, and everything
+// else — `toBeadsError`, `isWriteDropped`, `isNoWorkspace`, the `WRITE_DROPPED_MARKER` itself — is
+// kept REAL, because those are the classifiers under test. Stubbing them would make every verdict
+// assertion below a test of the stub.
+const beadsCreate = vi.fn();
+const beadsQuery = vi.fn();
+vi.mock("../beadsCommands", async (orig) => ({
+  ...(await orig<typeof import("../beadsCommands")>()),
+  beadsCreate: (...a: unknown[]) => beadsCreate(...a),
+  beadsQuery: (...a: unknown[]) => beadsQuery(...a),
+}));
 vi.mock("../agentCapacity", async (orig) => ({
   ...(await orig<typeof import("../agentCapacity")>()),
   localAgentCapacity: () => capacityMock(),
@@ -33,9 +46,17 @@ vi.mock("../sendToBuild", async (orig) => ({
   sendToBuild: (...a: unknown[]) => sendToBuildMock(...(a as [])),
 }));
 
-const { PLANS_OPS, PLANS_RISK, listPlans, getPlan, createPlan, promotePlanToBuild } = await import(
-  "./plans"
-);
+const {
+  PLANS_OPS,
+  PLANS_RISK,
+  listPlans,
+  getPlan,
+  createPlan,
+  createFailureVerdict,
+  promotePlanToBuild,
+} = await import("./plans");
+const { WRITE_DROPPED_MARKER, CREATE_PLAN_DEDUPE_BUDGET_MS, CREATE_PLAN_TOTAL_BUDGET_MS } =
+  await import("../beadsCommands");
 const { useProjectStore } = await import("../../stores/projectStore");
 const { AtCapacityError } = await import("../sendToBuild");
 
@@ -67,6 +88,10 @@ beforeEach(() => {
   beadShow.mockResolvedValue(null);
   blockedBeadIds.mockResolvedValue(new Set<string>());
   createBeadFull.mockResolvedValue("sparkle-plan");
+  beadsCreate.mockResolvedValue({ id: "sparkle-plan", title: "Ship auth" });
+  // NOTHING already filed, by default — the dedupe read runs on every create, so a suite-wide
+  // default that returned a match would silently turn every other case into the duplicate path.
+  beadsQuery.mockResolvedValue({ beads: [], total: 0, omitted: 0, omittedIds: [], limit: 50 });
   capacityMock.mockReturnValue({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" });
   sendToBuildMock.mockReturnValue("agent-new");
 });
@@ -231,8 +256,12 @@ describe("create_plan", () => {
   // through list_plans and require it to show up.
   it("files an EPIC — and the result is visible as a plan", async () => {
     const r = await createPlan(ROOT, "Ship auth", "the body");
-    expect(createBeadFull).toHaveBeenCalledWith(ROOT, "Ship auth", "the body", "epic", "", "", "");
-    expect(r.ok && r.data).toEqual({ id: "sparkle-plan" });
+    expect(beadsCreate).toHaveBeenCalledWith(ROOT, {
+      title: "Ship auth",
+      description: "the body",
+      issueType: "epic",
+    });
+    expect(r.ok && r.data).toEqual({ id: "sparkle-plan", title: "Ship auth", outcome: "created" });
 
     // Round-trip: a bead carrying the type the create path asked for IS listed as a plan.
     const projectId = seedProject();
@@ -249,13 +278,256 @@ describe("create_plan", () => {
     expect(listed.ok && listed.data).toEqual([]);
   });
 
-  // createBeadFull THROWS on a bd failure (it does not resolve null), so the failure arm is the
-  // `attempt` catch rather than a null check.
-  it("surfaces a bd failure as a refusal rather than a phantom success", async () => {
-    createBeadFull.mockRejectedValue(new Error("bd exploded"));
+  // ── THE PATH ITSELF ──────────────────────────────────────────────────────────────────────────
+  //
+  // `createBeadFull` reaches `notes.rs::create_bead_full` → `run_bd`, a hard 30s bound with NO
+  // read-back: a create the store dropped is reported as SUCCESS and a create that merely timed out
+  // is reported as FAILURE, with nothing able to tell either from the truth. `beadsCreate` probes
+  // the store for the row before reporting. Asserting the seam is not ceremony — it is the entire
+  // change, and it is invisible in the result shape.
+  it("goes through the CONFIRMING create, never the unverified one", async () => {
+    await createPlan(ROOT, "Ship auth", "the body");
+    expect(beadsCreate).toHaveBeenCalledTimes(1);
+    expect(createBeadFull).not.toHaveBeenCalled();
+  });
+
+  // ── DEDUPE ───────────────────────────────────────────────────────────────────────────────────
+  it("returns the EXISTING epic instead of filing a second one for the same title", async () => {
+    beadsQuery.mockResolvedValue({
+      beads: [{ id: "", title: "  ship   AUTH " }],
+      total: 1,
+      omitted: 0,
+      omittedIds: [],
+      limit: 50,
+    });
+    const r = await createPlan(ROOT, "Ship auth", "the body");
+    // The SIDE EFFECT, not the reply: nothing may be written on this path.
+    expect(beadsCreate).not.toHaveBeenCalled();
+    expect(r.ok && r.data).toEqual({
+      id: "",
+      title: "Ship auth",
+      outcome: "already-filed",
+    });
+  });
+
+  it("asks only about OPEN, TYPED epics — a matching task must not suppress a real epic", async () => {
+    await createPlan(ROOT, "Ship auth", "");
+    expect(beadsQuery).toHaveBeenCalledWith(ROOT, {
+      issueType: "epic",
+      titleContains: "Ship auth",
+      includeClosed: false,
+      limit: 50,
+    });
+  });
+
+  it("still files when the title merely OVERLAPS an existing epic", async () => {
+    // `titleContains` is a substring match, so the query returns near-misses too. Suppressing on
+    // one would refuse to file a genuinely new epic, which is the worse of the two mistakes.
+    beadsQuery.mockResolvedValue({
+      beads: [{ id: "", title: "Ship auth and billing" }],
+      total: 1,
+      omitted: 0,
+      omittedIds: [],
+      limit: 50,
+    });
+    const r = await createPlan(ROOT, "Ship auth", "");
+    expect(beadsCreate).toHaveBeenCalledTimes(1);
+    expect(r.ok && r.data.outcome).toBe("created");
+  });
+
+  it("FAILS OPEN when the dedupe read itself errors — an unreadable store is not a duplicate", async () => {
+    beadsQuery.mockRejectedValue({ kind: "storeBusy", message: "locked", exitCode: null });
+    const r = await createPlan(ROOT, "Ship auth", "");
+    expect(beadsCreate).toHaveBeenCalledTimes(1);
+    expect(r.ok && r.data.outcome).toBe("created");
+  });
+
+  it("ABANDONS a hung dedupe read and files anyway, instead of spending the bridge's whole budget", async () => {
+    // `create_plan` is THREE bd invocations inside ONE bridge call, and the bridge kills the call at
+    // 50s. On the full BD_TIMEOUT the chain is 30 + 30 + 10 = 70s, so an unbounded dedupe read
+    // reintroduces the exact failure the confirmation probe was added to remove: the call killed for
+    // an epic that is sitting in the store. The read is abandoned and the create proceeds — failing
+    // open, which is what the dedupe already does for an error.
+    vi.useFakeTimers();
+    try {
+      beadsQuery.mockReturnValue(new Promise(() => {})); // never settles
+      const pending = createPlan(ROOT, "Ship auth", "the body");
+      await vi.advanceTimersByTimeAsync(CREATE_PLAN_DEDUPE_BUDGET_MS + 1);
+      const r = await pending;
+      expect(beadsCreate).toHaveBeenCalledTimes(1);
+      expect(r.ok && r.data.outcome).toBe("created");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops waiting on a hung CREATE before the bridge would cut the call off, and says UNKNOWN", async () => {
+    // The chain carries ONE wall-clock deadline because summing bd's internal budgets under-counted
+    // TWICE — first missing this feature's own dedupe read, then missing READER_DRAIN_GRACE, which
+    // adds up to 2x5s to every completed bd invocation. What matters is not that the arithmetic is
+    // now right; it is that the call cannot outlive the bridge whatever the arithmetic turns out to
+    // be.
+    //
+    // ASSERTS THE VERDICT, NOT JUST THAT IT RETURNED. Expiring must produce `outcome-unknown` — the
+    // honest answer, since bd may be finishing the write right now — and never `not-created`, which
+    // would invite the retry that duplicates the epic.
+    vi.useFakeTimers();
+    try {
+      beadsCreate.mockReturnValue(new Promise(() => {})); // never settles
+      const pending = createPlan(ROOT, "Ship auth", "the body");
+      await vi.advanceTimersByTimeAsync(CREATE_PLAN_TOTAL_BUDGET_MS + 1);
+      const r = await pending;
+      expect(r.ok).toBe(false);
+      if (!r.ok) {
+        expect(r.reason).toBe("outcome-unknown");
+        expect(r.message).toMatch(/list_plans/);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("measures the deadline from the START of the chain, not from the start of the CREATE", async () => {
+    // THE LINE THIS EXISTS FOR: `remaining = CREATE_PLAN_TOTAL_BUDGET_MS - (Date.now() - startedAt)`.
+    // That subtraction is the only thing making the budget a TOTAL rather than a per-stage bound,
+    // and every other test here lets the dedupe resolve instantly — so elapsed is ~0, `remaining`
+    // equals the whole constant, and replacing the subtraction with a bare
+    // `CREATE_PLAN_TOTAL_BUDGET_MS` keeps them all green while the real worst case becomes
+    // dedupe + total = 47s under a 50s ceiling. The contract test cannot see it either: it asserts
+    // against the constant, not against what the code does with it. That is the same under-count
+    // this whole design removed, arriving through a different door.
+    //
+    // So the discriminating window is between TOTAL and TOTAL + DEDUPE, measured cumulatively from
+    // the first call: correct code has already expired there, the per-stage bug has not.
+    vi.useFakeTimers();
+    try {
+      beadsQuery.mockReturnValue(new Promise(() => {})); // dedupe hangs, then fails open on expiry
+      beadsCreate.mockReturnValue(new Promise(() => {})); // create never answers either
+      let settled = false;
+      const pending = createPlan(ROOT, "Ship auth", "the body").then((r) => {
+        settled = true;
+        return r;
+      });
+
+      // THE WINDOW IS DERIVED FROM THE DEDUPE BUDGET, NOT HARD-CODED, and that is load-bearing.
+      // With a literal margin the test only discriminates while the dedupe budget exceeds it: the
+      // per-stage mutant expires at `D + total`, so once `D` shrinks below the margin the mutant
+      // has settled by the final checkpoint too, `settled` is true either way, and the ONE test
+      // that catches this bug goes vacuous with nothing to say so. `D` is freely shrinkable — the
+      // only other constraint on it is an UPPER bound in the contract test — so that is a real
+      // drift, and it is precisely the failure class this whole design exists to close: a
+      // guarantee that reads as pinned while nothing fails when its premise moves.
+      //
+      // A quarter of the budget keeps `margin < D` true by construction for any sane `D`.
+      const margin = Math.max(2, Math.floor(CREATE_PLAN_DEDUPE_BUDGET_MS / 4));
+      expect(margin, "the window must stay strictly inside the dedupe budget to discriminate")
+        .toBeLessThan(CREATE_PLAN_DEDUPE_BUDGET_MS);
+
+      // Burn the dedupe budget. The read is abandoned and the create starts.
+      await vi.advanceTimersByTimeAsync(CREATE_PLAN_DEDUPE_BUDGET_MS + 1);
+      expect(settled).toBe(false);
+
+      // Just short of the cumulative total — nothing may have given up yet, in either version.
+      await vi.advanceTimersByTimeAsync(
+        CREATE_PLAN_TOTAL_BUDGET_MS - CREATE_PLAN_DEDUPE_BUDGET_MS - margin,
+      );
+      expect(settled).toBe(false);
+
+      // Now at cumulative `TOTAL + 1 + margin`: past the total, but still short of the per-stage
+      // mutant's `DEDUPE + TOTAL` because `margin < DEDUPE`. Correct code has expired here; a
+      // per-stage bound has not.
+      await vi.advanceTimersByTimeAsync(2 * margin);
+      expect(
+        settled,
+        "the deadline is measured from the start of the CHAIN — a create that gets its own full " +
+          "budget after the dedupe already spent some makes the tool call outlive the bridge",
+      ).toBe(true);
+      const r = await pending;
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe("outcome-unknown");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does NOT expire a create that answers inside the budget", async () => {
+    // The paired direction. A deadline that fired early — or one wired to the wrong clock — would
+    // pass the test above while breaking every ordinary create, and nothing else here would notice.
+    vi.useFakeTimers();
+    try {
+      let settle: (v: unknown) => void = () => {};
+      beadsCreate.mockReturnValue(new Promise((res) => (settle = res)));
+      const pending = createPlan(ROOT, "Ship auth", "the body");
+      await vi.advanceTimersByTimeAsync(CREATE_PLAN_TOTAL_BUDGET_MS - 1_000);
+      settle({ id: "sparkle-plan", title: "Ship auth" });
+      const r = await pending;
+      expect(r.ok && r.data.outcome).toBe("created");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ── THREE OUTCOMES, NOT ONE ──────────────────────────────────────────────────────────────────
+  //
+  // The old path collapsed every failure onto `beads-failed`, which a model reads as "nothing
+  // happened". Under a store shared by every worktree and polled every 5s, losing a race is the
+  // ORDINARY failure — and a create killed on its own timeout may well have landed. Reporting that
+  // as "not filed" invites a retry, and the retry is how one epic becomes two.
+  it("says NOT-CREATED only when the store proves the write never landed", async () => {
+    beadsCreate.mockRejectedValue({
+      kind: "badOutput",
+      message: `bd reported creating sparkle-x, but sparkle-x does not read back — ${WRITE_DROPPED_MARKER}, so nothing was filed`,
+      exitCode: 0,
+    });
     const r = await createPlan(ROOT, "Ship auth", "");
     expect(r.ok).toBe(false);
-    if (!r.ok) expect([r.reason, r.message]).toEqual(["beads-failed", "bd exploded"]);
+    if (!r.ok) {
+      expect(r.reason).toBe("not-created");
+      expect(r.message).toMatch(/safe to try again/);
+    }
+  });
+
+  it("says UNKNOWN for a timeout — the create may have landed after we stopped waiting", async () => {
+    beadsCreate.mockRejectedValue({ kind: "timeout", message: "bd timed out", exitCode: null });
+    const r = await createPlan(ROOT, "Ship auth", "");
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.reason).toBe("outcome-unknown");
+      // The remedy has to be IN the message: a model told only "unknown" retries, which is the one
+      // thing that must not happen here.
+      expect(r.message).toMatch(/list_plans/);
+    }
+  });
+
+  it("still reports a missing work graph as the supported state it is", async () => {
+    beadsCreate.mockRejectedValue({
+      kind: "noWorkspace",
+      message: "no beads database found",
+      exitCode: 1,
+    });
+    const r = await createPlan(ROOT, "Ship auth", "");
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("beads-unavailable");
+  });
+
+  // The classifier on its own, over EVERY kind — so a kind added in Rust without a decision here
+  // lands in the fail-safe bucket rather than silently claiming a create did not happen.
+  it("classifies every beads failure kind, defaulting to UNKNOWN", () => {
+    const verdict = (kind: string, message = "boom") =>
+      createFailureVerdict({ kind, message, exitCode: null });
+    expect(verdict("binaryNotFound")).toBe("unavailable");
+    expect(verdict("noWorkspace")).toBe("unavailable");
+    expect(verdict("invalidInput")).toBe("not-created");
+    expect(verdict("badOutput", `x — ${WRITE_DROPPED_MARKER}, so nothing was filed`)).toBe(
+      "not-created",
+    );
+    // badOutput WITHOUT the marker is version skew or a partial read, which proves nothing.
+    expect(verdict("badOutput", "unparseable json")).toBe("unknown");
+    expect(verdict("timeout")).toBe("unknown");
+    expect(verdict("storeBusy")).toBe("unknown");
+    expect(verdict("bdFailed")).toBe("unknown");
+    // A rejection that is not a BeadsError at all must not read as proof of anything either.
+    expect(createFailureVerdict(new Error("ipc down"))).toBe("unknown");
   });
 });
 

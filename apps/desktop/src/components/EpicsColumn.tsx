@@ -35,7 +35,7 @@
 // second-consumer case. So mounting this column adds no fetch, no poller and no second source of
 // truth — it adds one more claim on a poll that was already running.
 
-import { useMemo, useState, useCallback, useEffect } from "react";
+import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import { FiChevronDown, FiChevronRight } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../theme/colors";
 import { FONT_UI, TYPE } from "../theme/scale";
@@ -78,12 +78,21 @@ const NO_BEADS: Bead[] = [];
 
 /** Which stages start OPEN.
  *
- *  The three the founder scans for "what is happening and what is stuck" — everything else is
- *  history or not-yet, and opening all seven puts a hundred rows in a 280px column. Collapsing is
- *  per-side session state rather than persisted: this is a reading posture, not a preference, and
- *  a restored one is a column that looks empty for a reason the user did not set this session
- *  (the same argument `uiStore` makes for every transient key it has). */
+ *  The four the founder scans for "what have I asked for, what is happening, and what is stuck" —
+ *  everything else is history, and opening all seven puts a hundred rows in a 280px column.
+ *  Collapsing is per-side session state rather than persisted: this is a reading posture, not a
+ *  preference, and a restored one is a column that looks empty for a reason the user did not set
+ *  this session (the same argument `uiStore` makes for every transient key it has).
+ *
+ *  BACKLOG IS ON THIS LIST BECAUSE IT IS WHERE NEW WORK ARRIVES, and leaving it off broke the one
+ *  gesture this column exists to serve. `create_plan` files a typed epic with no children, which
+ *  `openEpicStage` buckets to `backlog` — so with Backlog collapsed the founder describes a feature
+ *  to the concierge, the bead is filed correctly, and what he sees is a COUNT tick from 3 to 4
+ *  behind a closed chevron. It is also the pile he came here to read: "so much that I have asked
+ *  for that I have not been able to track" is a description of Backlog. Done/Shipped/Archived stay
+ *  collapsed — those are history, and they are the piles that actually grow without bound. */
 const OPEN_BY_DEFAULT: ReadonlySet<EpicLadderKey> = new Set<EpicLadderKey>([
+  "backlog",
   "blocked",
   "planning",
   "inProgress",
@@ -184,6 +193,66 @@ export function EpicsColumn({
       return next;
     });
   }, []);
+
+  // ── A NEWLY FILED EPIC REVEALS ITSELF ────────────────────────────────────────────────────────
+  //
+  // `OPEN_BY_DEFAULT` above answers the GLANCE case (the column he walks up to already shows
+  // Backlog). This answers the LIVE case, which is the one the founder actually described: he is
+  // mid-conversation, he asks the concierge for an epic, and the card has to come to HIM. Two
+  // things defeat the default on its own — he may have collapsed Backlog himself to read something
+  // else, and a `create_plan` against an epic that already has children does not land in Backlog at
+  // all (its child roll-up sends it to Planning, Building or Done). A reveal keyed to one stage
+  // would miss both.
+  //
+  // THE DIFF IS AGAINST WHAT WE HAVE SEEN, NOT AGAINST THE PREVIOUS RENDER. `ladder` is a fresh
+  // object on every poll (5s), so "did this list change" is true constantly and would re-open every
+  // stage he closed, forever. A set of ids seen so far is the only thing that distinguishes an
+  // ARRIVAL from a re-render — and it is SEEDED, not empty, on the first snapshot, because
+  // otherwise every epic in the store is an arrival at mount and all seven stages fly open.
+  //
+  // THE SEED IS KEYED TO THE PROJECT, NOT TO THIS COMPONENT. `EpicsColumn` takes `project` as a
+  // PROP and is not remounted when the pair's project changes, so a bare ref survives the switch —
+  // and every epic in the newly selected project is then, correctly by the ref's reckoning, unseen.
+  // The first one would expand its stage and scroll, on the most ordinary navigation gesture in the
+  // app, re-opening a stage the founder had deliberately closed. That is the same "everything is new
+  // at mount" failure the seeding exists to prevent, arriving through a door the mount case does not
+  // cover — and a test that only ever renders ONE project cannot see it (bead `sparkle-foqoe`'s
+  // shape: absence asserted against a state that was never mounted).
+  const seenEpicIds = useRef<{ projectId: string | null; ids: ReadonlySet<string> } | null>(null);
+  const [revealEpicId, setRevealEpicId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!ladder) return;
+    const present = new Set<string>();
+    let arrived: { id: string; key: EpicLadderKey } | null = null;
+    // A different project is a FIRST SNAPSHOT, not a wave of arrivals.
+    const prior = seenEpicIds.current;
+    const seen = prior && prior.projectId === (projectId ?? null) ? prior.ids : null;
+    for (const { key } of EPIC_LADDER_COLUMNS) {
+      for (const epic of ladder[key]) {
+        present.add(epic.id);
+        // FIRST in ladder order wins, which is deliberate rather than arbitrary: the ladder reads
+        // Backlog-first, and a create lands in the earliest stage it can. If two arrive at once the
+        // founder is shown the newer-looking end of the ladder rather than the archive.
+        if (seen && !seen.has(epic.id) && !arrived) arrived = { id: epic.id, key };
+      }
+    }
+    seenEpicIds.current = { projectId: projectId ?? null, ids: present };
+    if (!seen || !arrived) {
+      // Clear any reveal held over from the PREVIOUS project — its row is gone, so leaving the id
+      // set would re-fire the scroll the moment an unrelated epic happened to share it.
+      if (!seen) setRevealEpicId(null);
+      return; // first snapshot for this project, or nothing new — leave his posture alone
+    }
+    const target = arrived;
+    setCollapsed((prev) => {
+      if (!prev.has(target.key)) return prev; // already open; don't churn the set
+      const next = new Set(prev);
+      next.delete(target.key);
+      return next;
+    });
+    setRevealEpicId(target.id);
+  }, [ladder, projectId]);
 
   return (
     <div
@@ -344,6 +413,7 @@ export function EpicsColumn({
                       epic={epic}
                       allBeads={allBeads}
                       selected={focusedEpicId === epic.id}
+                      reveal={revealEpicId === epic.id}
                       onSelect={() => setEpicFocus(side, epic.id)}
                     />
                   ))}
@@ -436,11 +506,15 @@ function EpicRow({
   epic,
   allBeads,
   selected,
+  reveal = false,
   onSelect,
 }: {
   epic: Bead;
   allBeads: readonly Bead[];
   selected: boolean;
+  /** This row just ARRIVED and the column has expanded its stage for it — bring it on screen. Only
+   *  ever true for one row at a time (see `revealEpicId`). */
+  reveal?: boolean;
   onSelect: () => void;
 }) {
   // Still the RESOLVER's edge, never a local re-derivation — see this file's header and
@@ -451,10 +525,22 @@ function EpicRow({
   const epicIndex = epicIndexOf(allBeads);
   const total = childrenOfIndexed(epicIndex, epic.id).length;
   const open = openChildCountIndexed(epicIndex, epic.id);
+
+  const rowRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    if (!reveal) return;
+    // CALLED DEFENSIVELY, and not for jsdom's benefit — WKWebView is the target and it does have
+    // this, but a row can also be unmounted between the state write and the effect. `block:
+    // "nearest"` scrolls the ladder only as far as it must, so revealing a Backlog card does not
+    // yank a column the founder is already reading.
+    rowRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [reveal]);
   return (
     <button
+      ref={rowRef}
       data-testid="epic-row"
       data-epic-id={epic.id}
+      data-revealed={reveal ? "true" : undefined}
       data-selected={String(selected)}
       aria-pressed={selected}
       onClick={onSelect}

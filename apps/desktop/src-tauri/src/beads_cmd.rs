@@ -67,6 +67,24 @@ const ERROR_MESSAGE_CHARS: usize = 600;
 /// second one. Both modules drive the same Dolt store through the same binary, so two constants
 /// would be two policies that silently drift apart.
 pub(crate) const BD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long the POST-CREATE CONFIRMATION PROBE may run — deliberately shorter than `BD_TIMEOUT`,
+/// and it is the only bd call in this module that is not on the full budget.
+///
+/// The probe is the second bd invocation inside ONE `beads_create`, so its budget is not free: it
+/// adds to the create's. `plans:create_plan` reaches this through the concierge bridge, and that
+/// bridge kills a tool call at `CONCIERGE_TOOL_TIMEOUT_MS` — 50s
+/// (apps/mcp-control/src/tools.ts). At the full 30s each, a slow store puts the pair at 60s, so the
+/// bridge would kill the call ten seconds AFTER bd had already confirmed the write: the model is
+/// told the tool timed out for a bead that is sitting in the store, which is precisely the
+/// "unknown outcome" this whole confirmation exists to eliminate. 30 + 10 = 40s fits with headroom.
+///
+/// SHORTENING IT COSTS NOTHING IN CORRECTNESS, and that is what makes 10s safe rather than a
+/// guess: `confirm_written` fails OPEN on a probe that could not run (see its doc comment), and a
+/// probe killed on this bound is exactly that case. So the worst outcome of too short a budget is
+/// the pre-existing behaviour — an unconfirmed create reported as success — never a landed write
+/// reported as lost. It is also a `bd show` of ONE id against a store the create just opened, so
+/// the cold-open argument that earns `BD_TIMEOUT` its 30s does not apply to it.
+const BD_CONFIRM_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long we wait for the pipe readers once the child itself is gone.
 ///
 /// This is NOT a second timeout for bd; it is the bound that makes BD_TIMEOUT mean anything. bd is
@@ -797,7 +815,19 @@ fn check_run(out: &BdOutput) -> Result<(), BeadsError> {
 /// Run bd and return its stdout, applying `check_run`. The choke point every READ goes through; its
 /// caller is always a parser, which is what makes `check_run`'s deferral safe.
 fn bd_stdout(project_path: &str, args: &[String], env: ChildEnv<'_>) -> Result<String, BeadsError> {
-    let out = run_bd_timed(project_path, args, BD_TIMEOUT, env)?;
+    bd_stdout_within(project_path, args, BD_TIMEOUT, env)
+}
+
+/// `bd_stdout` with an explicit budget, for the one read that must fit INSIDE another call's.
+/// Everything else goes through `bd_stdout` and gets `BD_TIMEOUT`; this exists so the confirmation
+/// probe can be bounded separately rather than by declaring a second default anywhere.
+fn bd_stdout_within(
+    project_path: &str,
+    args: &[String],
+    timeout: Duration,
+    env: ChildEnv<'_>,
+) -> Result<String, BeadsError> {
+    let out = run_bd_timed(project_path, args, timeout, env)?;
     check_run(&out)?;
     Ok(out.stdout)
 }
@@ -1020,9 +1050,11 @@ fn confirm_written(probe: Result<String, BeadsError>, id: &str) -> Result<(), Be
 /// filed, so passing that back unverified is the same class of lie `ack_outcome` closed for failed
 /// mutations, just arriving through a bd exit of ZERO instead of non-zero.
 ///
-/// Cost is one extra `bd show` per create, which is a cold-Dolt-open candidate with the full
-/// BD_TIMEOUT budget (see `detail_bead`). Creates are user-initiated and rare; silently losing one
-/// is not worth saving that read.
+/// Cost is one extra `bd show` per create, bounded by `BD_CONFIRM_PROBE_TIMEOUT` (10s) rather than
+/// the full `BD_TIMEOUT` — the sum of the two is what a concierge bridge call has to fit inside, and
+/// this is a single-id read against a store the create just opened, so the cold-Dolt-open argument
+/// that earns `BD_TIMEOUT` its 30s does not apply to it. Creates are user-initiated and rare;
+/// silently losing one is not worth saving that read.
 ///
 /// NOT a retry. Re-running `bd create` on a row we cannot see would duplicate the item whenever the
 /// first write actually landed and only the probe was wrong, and a duplicated work item is worse
@@ -1062,8 +1094,15 @@ fn create_bead(project_path: &str, bead: &NewBead, env: ChildEnv<'_>) -> Result<
             format!("bd create returned an unusable bead id: {}", created.id),
         ));
     }
-    let probe =
-        bd_stdout(project_path, &["show".into(), created.id.clone(), "--json".into()], env);
+    // BOUNDED SEPARATELY, and shorter — see `BD_CONFIRM_PROBE_TIMEOUT`. Two full budgets in one
+    // command exceed the concierge bridge's own ceiling, which turns a CONFIRMED create into a
+    // reported timeout.
+    let probe = bd_stdout_within(
+        project_path,
+        &["show".into(), created.id.clone(), "--json".into()],
+        BD_CONFIRM_PROBE_TIMEOUT,
+        env,
+    );
     confirm_written(probe, &created.id)?;
     Ok(created)
 }
@@ -1877,6 +1916,35 @@ pub(crate) mod tests {
         assert!(confirm_written(Ok("".into()), id).is_ok());
         assert!(confirm_written(Ok("   ".into()), id).is_ok());
         assert!(confirm_written(Ok("not json at all".into()), id).is_ok());
+    }
+
+    /// The confirmation probe made `beads_create` a TWO-INVOCATION command, so its budget is the
+    /// SUM — and `plans:create_plan` reaches it through the concierge bridge, which kills a tool
+    /// call at `CONCIERGE_TOOL_TIMEOUT_MS` (50s, apps/mcp-control/src/tools.ts). At the full 30s
+    /// each the pair is 60s, so the bridge would kill the call TEN SECONDS AFTER bd confirmed the
+    /// write: the model is told the tool timed out for a bead sitting in the store — the
+    /// unknown-outcome case this confirmation exists to remove, reintroduced by the confirmation.
+    ///
+    /// THE CROSS-FILE HALF OF THIS GUARD IS IN TYPESCRIPT ON PURPOSE, not here
+    /// (`src/services/beadsCommands.rustContract.test.ts` reads BOTH constants and asserts the real
+    /// relationship). A Rust test reading `tools.ts` would have to add that path to `RUST_RE` in
+    /// ci.yml — the filter that decides whether the macOS (10x billing) and Windows (2x) legs run —
+    /// and `tools.ts` is an actively edited file. Same coverage, since any non-docs change already
+    /// sets `code=true` and runs the TS suite, at none of the spend. What stays here is the local
+    /// invariant, which is what a Rust-side widening trips first.
+    #[test]
+    fn the_confirmation_probe_is_bounded_well_under_a_full_bd_budget() {
+        assert!(
+            BD_CONFIRM_PROBE_TIMEOUT < BD_TIMEOUT,
+            "a probe on the full budget doubles beads_create's worst case"
+        );
+        // 40s, against the bridge's 50s. Stated as a bound rather than an equality so shortening
+        // either constant stays green and only a WIDENING reds — and shortening is always safe
+        // here, because `confirm_written` fails OPEN on a probe that could not run.
+        assert!(
+            BD_TIMEOUT + BD_CONFIRM_PROBE_TIMEOUT <= Duration::from_secs(40),
+            "create + probe must leave headroom under the 50s concierge bridge ceiling"
+        );
     }
 
     /// `is_missing_issue` decides which bd failures are allowed to condemn a create, so it must not

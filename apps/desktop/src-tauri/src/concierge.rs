@@ -204,6 +204,26 @@ relay — and message the sender back saying what you actually see. Never silent
 directive you neither relay nor answer disappears, and that is worse than either. This is the one \
 place where being slower is correct: several agents once undid each other's work because each was \
 reasoning well from partial evidence and nothing reconciled them.\n\n\
+FILE A FEATURE AS AN EPIC — THAT IS HOW THE USER TRACKS BIG IDEAS. The rule above splits an \
+improvement between the Improve-Sparkle agent and a one-off build agent, and both are about getting \
+one thing DONE. A FEATURE is a third thing: a coherent deliverable with several pieces to it, that \
+the user wants to be able to SEE, come back to, and watch progress on. When they describe one — \
+'I want to build X', 'I need a way to Y', 'here is a project I keep asking for and losing track of' \
+— call `sparkle_plans` with op `create_plan`, passing the project's id (it is REQUIRED here, unlike \
+the plan reads), a ONE-LINE `title`, and THEIR OWN description as the `body`. That files an epic, \
+and the epic appears within seconds as a card in the BACKLOG of their Epics column. Then say the \
+new id back to them on its own — the app renders a bare bead id as a clickable pill, so the id is \
+what lets them open the card you just made. Write a title they will still recognise six weeks from \
+now, and do not compress their description away: the body is the only record of what they meant.\n\n\
+AN EPIC IS FOR TRACKING, NOT FOR STARTING. Filing one spends nothing, starts nobody, and is \
+undoable — so when you cannot tell whether they want a thing BUILT now or merely CAPTURED, the epic \
+is the safe half and you can offer the build after. Building is a separate, later step \
+(`promote_plan_to_build`, or an ordinary build agent), so offer it rather than assuming it — and \
+never file an epic INSTEAD of doing something they asked you to do now. When they name several \
+features in one breath, file one epic EACH rather than one epic holding a list; a card per idea is \
+the entire point of the column. And when it sounds like something they have raised before, check \
+`list_plans` first: two epics for one idea splits its history in half and neither card tells the \
+whole story.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -2412,6 +2432,55 @@ mod tests {
             !CONCIERGE_PERSONA.contains("NEVER try to type into its terminal"),
             "this prohibition is false and cost a working channel; see persona_tells_the_truth_about_reaching_improve_sparkle"
         );
+    }
+
+    #[test]
+    fn persona_routes_a_described_feature_into_an_epic() {
+        // THE FOUNDER'S ASK, IN ONE SENTENCE: "I might have a new feature that I want to build, and
+        // I want to be able to describe it to you. And have you create an epic around it... to
+        // create a new epic card entry that shows up in the backlog status of the epics column."
+        //
+        // Every layer under that already existed — `create_plan` is classified `routine` so policy
+        // derives allow with no approval round-trip, it files a typed `epic` bead, and a childless
+        // typed epic buckets to Backlog. What was missing was that the persona had ZERO mentions of
+        // epics, plans, or `create_plan`: its only "turn an idea into work" guidance routed to a
+        // `for:improve-sparkle` bead or a build agent, and both are the wrong answer for a feature
+        // the user wants to TRACK. A tool the model is never told to reach for is, from the user's
+        // seat, a tool that does not exist.
+        //
+        // These are tripwires on prose handed to a model, so nothing else in the build can fail
+        // when a rule quietly goes missing in a rewrite — the same argument the @-mention relay
+        // assertions below make for themselves.
+        assert!(CONCIERGE_PERSONA.contains("FILE A FEATURE AS AN EPIC"));
+        // The tool and the op, both by the exact name the model must type. `sparkle_plans` is the
+        // MCP tool; `create_plan` is the op inside it. Naming only one of them points at nothing.
+        assert!(CONCIERGE_PERSONA.contains("sparkle_plans"));
+        assert!(CONCIERGE_PERSONA.contains("create_plan"));
+        // Reachable through the SAME allowlist entry `sparkle_research` arrives by — asserted
+        // directly rather than assumed, because a persona pointing at a tool the gate refuses is
+        // the exact defect the delegation test above exists to prevent.
+        assert!(CONCIERGE_ALLOWED_TOOLS.contains("mcp__sparkle-control__*"));
+        // WHERE THE CARD LANDS. The founder asked for the backlog by name, and the persona has to
+        // say so or the model cannot tell him where to look for what it just filed.
+        assert!(CONCIERGE_PERSONA.contains("BACKLOG of their Epics column"));
+        // THE ID MUST COME BACK. `remarkBeadRefs` linkifies a bare bead id into a pill, so the id
+        // is the user's only handle on the card — a reply that says "done" and swallows it leaves
+        // him with nothing to click.
+        assert!(CONCIERGE_PERSONA.contains("say the new id back"));
+        // TRACKING IS NOT BUILDING. This is the safety clause of the paragraph: filing an epic must
+        // not be read as permission to start an agent, and it must not be substituted for work the
+        // user asked for NOW.
+        assert!(CONCIERGE_PERSONA.contains("AN EPIC IS FOR TRACKING, NOT FOR STARTING"));
+        assert!(CONCIERGE_PERSONA.contains("never file an epic INSTEAD of"));
+        // ONE EPIC PER IDEA — the founder listed four efforts in one breath (Night Watch, social
+        // posting, the mobile app, token-maxxing), and one card holding a list of four would defeat
+        // the column he asked for.
+        assert!(CONCIERGE_PERSONA.contains("file one epic EACH"));
+        // The routing it sits BESIDE must still be intact, or this paragraph has replaced the
+        // distinction rather than extended it: systemic → @Sparkle, one-off → build agent,
+        // feature-to-track → epic are three answers, not two.
+        assert!(CONCIERGE_PERSONA.contains("for:improve-sparkle"));
+        assert!(CONCIERGE_PERSONA.contains("DECIDE WHERE AN IMPROVEMENT GOES"));
     }
 
     #[test]
