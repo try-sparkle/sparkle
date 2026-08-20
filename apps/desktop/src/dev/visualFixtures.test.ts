@@ -2,6 +2,9 @@
 // and the guards — not the specific agent names, which are free to change as long as they stay
 // constants.
 import { describe, expect, it, afterEach, beforeEach, vi } from "vitest";
+import { AGENT_STATUS } from "@sparkle/ui";
+import { sectionOfStage } from "../engine/buildSections";
+import { GRAY_LEGAL_SECTIONS, grayFloorFor } from "../engine/stallEscalation";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { DEV_BYPASS_AUTH_FLAG } from "./devBypassAuth";
@@ -1135,6 +1138,44 @@ describe("the sparkle-biezi capture row — its ONE load-bearing property", () =
     for (const r of rows) {
       expect(bandOfStatus(status[r.id] as AgentTabStatus), `${r.name} is not calm`).toBe("done");
     }
+  });
+
+  // ── THE PIN THE 2026-08-19 RULE REWRITES ────────────────────────────────────────────────────────
+  // The test above says CALM, and calm is still true of every one of these rows: `lapsed` bands
+  // `done` exactly as `idle` does, so expiry still never reddens anything and sparkle-biezi holds.
+  //
+  // What changed is the DOT, which is what the capture actually photographs. The founder, 2026-08-19:
+  // *"Nothing should ever be gray unless it has been effectively finished. So that would be like a
+  // remote merge domain or shipped status."* So "sole-expiry ⇒ gray" is no longer one rule — it
+  // splits on section, and these fixtures happen to hold one row on each side of that split.
+  //
+  // BOTH POPULATIONS ARE ASSERTED NON-EMPTY. Absence in a section nothing occupies proves nothing —
+  // it is the same vacuity the row's own comment warns about — so a fixture drifting entirely to one
+  // side must fail here rather than silently testing a single case twice.
+  it("after the terminal-gray floor, ONLY the merged-section expiry row keeps its gray dot", () => {
+    const { rows, status, workflowStage } = soleExpiryRows();
+    const seen = { gray: 0, amber: 0 };
+    for (const r of rows) {
+      const st = status[r.id] as AgentTabStatus;
+      const section = sectionOfStage(workflowStage[r.id]!);
+      const floored = grayFloorFor(st, section) ?? st;
+      if (GRAY_LEGAL_SECTIONS.has(section)) {
+        expect(AGENT_STATUS[floored].color, `${r.name} has shipped — gray is legal`).toBe(
+          AGENT_STATUS.idle.color,
+        );
+        seen.gray += 1;
+      } else {
+        expect(floored, `${r.name} is short of a terminal section and must not read finished`).toBe(
+          "lapsed",
+        );
+        expect(AGENT_STATUS[floored].color).toBe(AGENT_STATUS.lapsed.color);
+        seen.amber += 1;
+      }
+    }
+    expect(seen.gray, "no sole-expiry row in a terminal section — the control is gone").toBeGreaterThan(0);
+    expect(seen.amber, "no sole-expiry row in a pre-terminal section — the rule is unphotographed").toBeGreaterThan(0);
+    // The two colours must actually differ, or the capture shows one dot twice.
+    expect(AGENT_STATUS.lapsed.color).not.toBe(AGENT_STATUS.idle.color);
   });
 
   it("covers BOTH stages the founder saw the bug at — merged, and pre-commit", () => {

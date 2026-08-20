@@ -46,6 +46,7 @@
 // the taxonomy.
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { StallCause, StallReport } from "./agentStall";
+import type { BuildSectionId } from "./buildSections";
 import { isAlertSuppressed, type AgentAlertRecord } from "./alertDismissal";
 import { isInMotion, type MotionAgent } from "./inMotion";
 
@@ -69,6 +70,89 @@ const ESCALATABLE: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>(["idle"
 
 /** What a stalled row is escalated TO. Red, "needs you to unstick it", no badge, no banner. */
 export const ESCALATED_STATUS: AgentTabStatus = "blocked";
+
+/**
+ * ══ GRAY IS LEGAL ONLY WHERE THE WORK IS EFFECTIVELY FINISHED (the founder, 2026-08-19) ══════════
+ *
+ * His ruling, verbatim: *"Nothing should ever be gray unless it has been effectively finished. So
+ * that would be like a remote merge domain or shipped status. If it's above those statuses, it
+ * should never be gray and needs to be pinged with the watcher and the pusher or whatever is
+ * required to get it to its final state."*
+ *
+ * This RESTORES the intent of this file's own header — "GRAY IS A TERMINAL STATE" — which the
+ * 2026-08-06 and 2026-08-07 demotions had eroded. Those demotions are not reverted and should not
+ * be: each was right about the question it answered (*which* tier a stalled row belongs in). This
+ * rule answers a DIFFERENT question, which is why it is a separate floor rather than another edit
+ * to {@link OUTSTANDING}.
+ *
+ * ── WHY A FLOOR AND NOT ANOTHER CAUSE ───────────────────────────────────────────────────────────
+ * Every mechanism above it is CAUSE-DRIVEN: something must be detected — a stall verdict, an unmet
+ * goal, a spent re-arm budget — before a row leaves the calm tier. That is exactly why the founder's
+ * complaint survived all of it. A row resting in a pre-terminal section with NO detected cause is
+ * the case the cause-driven path cannot reach by construction, and it is the case he is looking at.
+ * So this asks a question no cause can answer: *is this row allowed to look finished at all?*
+ *
+ * ── WHY `lapsed` AND NOT `blocked` ──────────────────────────────────────────────────────────────
+ * Because the token already says the true thing: `lapsed` is AMBER, labelled **"Unfinished, not
+ * yours"**. A row this floor catches is unfinished BY DEFINITION (its section is short of the
+ * terminal ones) and is demonstrably not the founder's problem (no `OUTSTANDING` cause fired, or it
+ * would already be red). Red would re-create the wall this file's entire history is a record of
+ * retreating from — 27 of 51 agents in the committed-but-unlanded band — and would page him about
+ * rows nobody has claimed need him. Amber is not in the badge or banner set, so this recolours dots
+ * without firing a single notification.
+ *
+ * ── THE ESCAPE HATCH, stated now so it is not rediscovered as a wall of amber ────────────────────
+ * If this proves too loud, the cut is {@link GRAY_LEGAL_SECTIONS} — adding `remote_pr` and
+ * `remote_pushed` to it confines the floor to genuinely local work, in one line, with no other file
+ * involved. Do NOT instead narrow {@link GRAY_STATUSES}: `unmerged` and `idle` are the two the
+ * founder is actually looking at, so removing either silently un-fixes the complaint.
+ */
+export const GRAY_LEGAL_SECTIONS: ReadonlySet<BuildSectionId> = new Set<BuildSectionId>([
+  "remote_merged",
+  "remote_shipped",
+]);
+
+/**
+ * Every status that renders GRAY, per `packages/ui/tokens.ts`: "nothing is stopping you".
+ *
+ * Kept as an explicit set, and DELIBERATELY WIDER than {@link ESCALATABLE}. That set is the calm
+ * tier a *stall* may escalate, and it excludes `done`/`stopped` because a dead PTY must never be
+ * told it "needs you to unstick it". This floor makes no such claim — amber says the opposite, that
+ * the row is NOT yours — so a finished-but-unlanded `done` row is exactly the population the
+ * founder's rule is about, and excluding it here would leave his complaint half-fixed.
+ *
+ * `new` is in the set for completeness but is unreachable in practice, and that falls out of the
+ * evidence rule in {@link grayFloorFor} rather than from an exemption: an unbriefed agent has no
+ * stage reading, so it has no section, so the floor declines to touch it. That keeps
+ * `engine/newAgentAttention`'s "spawned but never briefed is the ABSENCE of an alarm" intact by
+ * construction — the same way {@link ESCALATABLE}'s own comment keeps it.
+ */
+export const GRAY_STATUSES: ReadonlySet<AgentTabStatus> = new Set<AgentTabStatus>([
+  "idle",
+  "unmerged",
+  "done",
+  "stopped",
+  "new",
+]);
+
+/**
+ * The status a row must be repainted to so it does not render gray outside a terminal section, or
+ * `undefined` to leave it exactly as it is.
+ *
+ * EVIDENCE, NOT INFERENCE — an `undefined` section leaves the row alone. That is the same principle
+ * {@link escalationFor} applies to an `unknown` stall verdict, and it is load-bearing twice over:
+ * it is what keeps a brand-new agent calm (see {@link GRAY_STATUSES}), and it is what stops a window
+ * that has not read git state from repainting the whole fleet amber on its own ignorance.
+ */
+export function grayFloorFor(
+  status: AgentTabStatus | undefined,
+  section: BuildSectionId | undefined,
+): AgentTabStatus | undefined {
+  if (status === undefined || !GRAY_STATUSES.has(status)) return undefined;
+  if (section === undefined) return undefined;
+  if (GRAY_LEGAL_SECTIONS.has(section)) return undefined;
+  return LAPSED_STATUS;
+}
 
 /**
  * What a LIFECYCLE-only row is escalated to instead. Amber, "Auto-continue stopped", no badge, no
@@ -391,6 +475,48 @@ export function withStallAttention<T extends MotionAgent & { id: string; alert?:
     ensure()[a.id] = to;
   }
   return out ?? statusMap;
+}
+
+/**
+ * The status whose COLOUR a row should RENDER, given its own status and its build section — or
+ * `undefined` to render exactly what it already has.
+ *
+ * ══ RECOLOUR, NEVER REPLACE — AND THAT DISTINCTION IS THE WHOLE DESIGN ═══════════════════════════
+ *
+ * The first cut of this rule was a map overlay that rewrote `unmerged` → `lapsed` in the published
+ * status map. It was WRONG, and wrong in a way this repo had already paid for once (roborev 53886,
+ * recorded on `workerRollup.ts`): `withUnmergedWork` writes `unmerged` ONLY for stages in
+ * `[building_saved, merged)`, and every one of those maps to a pre-terminal section — so the overlay
+ * floored EVERY `unmerged` row and made the value effectively unreachable downstream. A dozen live
+ * consumers key on that literal and would all have silently read zero: the "Needs merge" label
+ * (`WorkerPeek`), `isOwedAction` / `accountedUnmerged` / `owedCounts.unmerged` (`conciergeFeed`),
+ * the digest's `unmerged` variant, `workerExpansion.isOwedAsk`, and BOTH of `workerRollup`'s locks.
+ *
+ * The status VALUE carries semantics other systems depend on. Only its COLOUR is what the founder
+ * was looking at. So this returns a status to PAINT WITH and never touches the map: nothing
+ * downstream can lose a fact it was relying on.
+ *
+ * ── THE RULE (the founder, 2026-08-19) ──────────────────────────────────────────────────────────
+ * *"Nothing should ever be gray unless it has been effectively finished. So that would be like a
+ * remote merge domain or shipped status. If it's above those statuses, it should never be gray."*
+ *
+ * ── WHY `lapsed` IS THE PAINT ───────────────────────────────────────────────────────────────────
+ * Its token already says the true thing — AMBER, labelled "Unfinished, not yours". A row this
+ * catches is unfinished by definition (its section is short of the terminal pair) and is not the
+ * founder's to act on, or a cause would already have reddened it. Amber is deliberately outside the
+ * badge and banner sets, so this recolours dots without firing one notification.
+ *
+ * ── EVIDENCE, NOT INFERENCE ─────────────────────────────────────────────────────────────────────
+ * An `undefined` section renders unchanged. `resolveStage` FLOORS at the first rung rather than
+ * returning `undefined`, so a caller that routed through it would manufacture a pre-terminal section
+ * for a row nobody polled and paint the fleet amber on its own ignorance. This is also what keeps a
+ * brand-new agent calm without an exemption written for it.
+ */
+export function displayStatusFor(
+  status: AgentTabStatus | undefined,
+  section: BuildSectionId | undefined,
+): AgentTabStatus | undefined {
+  return grayFloorFor(status, section);
 }
 
 /**

@@ -1087,16 +1087,29 @@ describe("Build column — an unmerged head outranks its green rollup, and what 
   const seedUnmerged = (status: Record<string, AgentTabStatus>) =>
     seedExpanded(status, {}, { a1: "building_saved", w1: "building_saved", w2: "building_saved" });
 
-  it("keeps the head's dot gray rather than promoting it to green", () => {
-    // Unchanged, and the stall escalation deliberately does NOT fire here: this head's worker is
-    // `working`, so its subtree is IN MOTION and it is not stalled — the same refusal
-    // withRedWorkerAttention makes with the same predicate. Painting it red would say "needs you to
-    // unstick it" about a subtree visibly making progress (roborev 55423/55434). The escalation is
-    // covered by the sibling case below, where the workers are idle.
+  it("does not let a green rollup paint over the head's own ask", () => {
+    // THE PROPERTY THIS CASE EXISTS FOR IS **NOT-GREEN**: `unmerged` is still an ASK ("open or merge
+    // the PR"), so a running worker does not get to paint over it. That is unchanged and is asserted
+    // first and explicitly below.
+    //
+    // ⚠️ IT EXPECTED GRAY UNTIL 2026-08-19, and the tier moved for the same kind of reason the
+    // sibling case below moved from red to amber. The founder: *"Nothing should ever be gray unless
+    // it has been effectively finished. So that would be like a remote merge domain or shipped
+    // status."* This head sits at `building_saved` → `local_committed`, short of both, so gray would
+    // now be the column claiming a head with unlanded commits is finished. Amber says the true
+    // thing: "Unfinished, not yours".
+    //
+    // The stall escalation still deliberately does NOT fire here — the worker is `working`, so the
+    // subtree is IN MOTION and not stalled (roborev 55423/55434) — and that refusal is untouched:
+    // amber here comes from the terminal-gray floor, which asks whether the row may LOOK finished,
+    // not whether anyone is stuck. Nothing about this row says "needs you to unstick it".
     const project = seedUnmerged({ a1: "idle", w1: "working", w2: "idle" });
     render(<AgentSidebar project={project} />);
     const dot = rowFor("Alpha").querySelector<HTMLElement>("span[title]")!;
-    expect(dot.style.background).toBe(asRgb(AGENT_STATUS.idle.color));
+    // The load-bearing half, asserted on its own so a future tier change cannot quietly erase it.
+    expect(dot.style.background).not.toBe(asRgb(AGENT_STATUS.working.color));
+    // …and not gray either, now that gray is reserved for work that is effectively finished.
+    expect(dot.style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
   });
 
   it("but a head whose whole subtree is RESTING with unlanded work leaves the calm tier", () => {

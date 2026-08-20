@@ -710,7 +710,10 @@ const ROWS: Row[] = [
     // direct readout of `stallEscalation.OUTSTANDING` membership.
     //
     // Modelled on the live agent in the founder's screenshot (11a52157, "Babysit PR 1104"): idle,
-    // calm, asking nothing, work merged to main, goal expired — and painted red. It must render GRAY.
+    // calm, asking nothing, work merged to main, goal expired — and painted red. It must render GRAY,
+    // and after the 2026-08-19 terminal-gray floor it is the row that still may: its work IS merged
+    // to main, so its section is `remote_merged` and gray is legal there. It is now the CONTROL for
+    // `vfx-agent-9`, which sits in a pre-terminal section and goes amber.
     id: "vfx-agent-8",
     name: "Babysit the release PR",
     kind: "build",
@@ -728,7 +731,14 @@ const ROWS: Row[] = [
     // own, whole job was babysitting somebody else's PR. It demonstrates BOTH bugs on ONE row:
     // `gitDerivedStage` maps its `ahead === 0` to `building_unsaved` (so it filed under a heading
     // claiming its work was one close away from being lost), and its expired goal painted it red.
-    // After the fix it must render GRAY, under "Local: Nothing Yet".
+    // It must file under "Local: Nothing Yet" — that half is unchanged and is what BUG 1 was about.
+    //
+    // ⚠️ ITS DOT IS NO LONGER GRAY (the founder, 2026-08-19): *"Nothing should ever be gray unless it
+    // has been effectively finished… If it's above those statuses, it should never be gray."* This
+    // row's section is `local_none`, which is short of the terminal pair, so the terminal-gray floor
+    // repaints it AMBER (`lapsed`, "Unfinished, not yours"). The sparkle-biezi property it was
+    // written for is UNCHANGED and is the reason it still earns its place: an expired goal must not
+    // make a row RED. Amber is not red. See `stallEscalation.GRAY_LEGAL_SECTIONS`.
     id: "vfx-agent-9",
     name: "Watch the roborev queue",
     kind: "build",

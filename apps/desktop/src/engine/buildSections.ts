@@ -12,7 +12,13 @@
 //
 // Kept free of React so it's unit-tested in isolation; the rendering lives in AgentSidebar.tsx.
 import type { AgentTabStatus } from "../types";
-import { stageMeta, type WorkflowStageId, type WorkflowStageMeta } from "./workflowStage";
+import {
+  resolveStage,
+  stageMeta,
+  type WorkflowStageId,
+  type WorkflowStageMeta,
+} from "./workflowStage";
+import type { BranchStatus } from "../services/branchStatus";
 
 // ── The ladder ───────────────────────────────────────────────────────────────────────────────
 export type BuildSectionId =
@@ -45,6 +51,7 @@ export interface BuildSectionMeta {
 // squash/rebase `ws.landed` tree-match, both bump to merged_local and outrank `pushed`). So the
 // copy below must claim only what its stage actually observed; saying "never pushed" there would
 // tell a user their work is at risk when it is sitting safely on the remote.
+
 export const BUILD_SECTIONS: readonly BuildSectionMeta[] = [
   {
     // THE ROW THAT HOLDS NOTHING — split out of `local_uncommitted` (sparkle-biezi).
@@ -137,6 +144,28 @@ export function sectionMeta(id: BuildSectionId): BuildSectionMeta {
 // never hits it. If you ever need to close that gap, give `merged_local` its own slot after the PR
 // section rather than reordering the engine — the engine's monotonic index is load-bearing
 // elsewhere (see deriveLiveStage).
+/**
+ * A row's section from its RAW git readings, or `undefined` for "this window never read it".
+ *
+ * ⚠️ THE `undefined` IS THE WHOLE VALUE, AND IT IS WHY THIS IS NOT `sectionOfStage(resolveStage(…))`.
+ * `resolveStage` FLOORS at the first rung rather than returning `undefined`, so composing the two
+ * would hand back a PRE-TERMINAL section for a row nobody polled. Any caller keyed on "is this
+ * section terminal" would then treat the entire unpolled fleet as unfinished — for the terminal-gray
+ * rule that means repainting every such row amber on our own ignorance. Both readings absent means
+ * we did not look, and callers must render such a row unchanged.
+ *
+ * Exported (rather than left a closure in `AgentSidebar`) so this property is directly testable: it
+ * is load-bearing for the founder's 2026-08-19 gray rule and is exactly the kind of guard that goes
+ * quietly wrong.
+ */
+export function sectionFromReadings(
+  bs: BranchStatus | undefined,
+  override: WorkflowStageId | undefined,
+): BuildSectionId | undefined {
+  if (bs === undefined && override === undefined) return undefined;
+  return sectionOfStage(resolveStage(bs, override));
+}
+
 export function sectionOfStage(stage: WorkflowStageId): BuildSectionId {
   switch (stage) {
     case "thought":

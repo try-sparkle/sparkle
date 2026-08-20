@@ -3,6 +3,9 @@ import { AGENT_STATUS, C } from "../theme/colors";
 import { FONT_MONO, TYPE } from "../theme/scale";
 import { GLYPH_SLOT_H } from "../engine/rowGeometry";
 import type { RollupDot } from "../engine/workerRollup";
+import type { AgentTabStatus } from "../types";
+import type { BuildSectionId } from "../engine/buildSections";
+import { displayStatusFor } from "../engine/stallEscalation";
 import { formatElapsed } from "../engine/elapsed";
 
 /**
@@ -41,6 +44,54 @@ export const ROLLUP_DOT_COLOR: Record<RollupDot, string> = {
   gray: AGENT_STATUS.idle.color,
   orange: C.mixedInk,
 };
+
+/**
+ * What a build row's DISC is filled with, or `undefined` to let `StatusDot` use the status's own
+ * tier colour.
+ *
+ * ══ WHY THIS IS A FUNCTION AND NOT THREE LINES AT THE CALL SITE ══════════════════════════════════
+ * Because the call site is the thing that was wrong, twice. `StatusDot` computes `ink = color ??
+ * meta.color`, so a row that passes `undefined` here is painted from its RAW status — and the first
+ * attempt at the founder's terminal-gray rule passed the floored status to `AgentRow` as
+ * `statusColor`, which feeds only the founder-ask chip, the kind glyph and the alert toggle
+ * (`AgentRow.tsx:813` says so outright). The disc never saw it, so an ordinary `unmerged` row in a
+ * pre-terminal section went on rendering gray — the exact case the rule exists for — while a test
+ * that re-implemented the expression locally stayed green. Exporting the decision means the test
+ * and the row read the SAME code.
+ *
+ * ── THE RULE (the founder, 2026-08-19) ──────────────────────────────────────────────────────────
+ * *"Nothing should ever be gray unless it has been effectively finished ... a remote merge domain or
+ * shipped status."* A row short of those paints AMBER (`lapsed`, "Unfinished, not yours").
+ *
+ * ── RAW COLOUR, NOT `statusInk` ─────────────────────────────────────────────────────────────────
+ * Same reasoning as {@link ROLLUP_DOT_COLOR} above: this is a FILLED SHAPE, not text, so it takes
+ * the tier colour straight. `statusInk` resolves a colour to a legible text ink and would leave the
+ * amber disc a near-miss of the rolled-up amber rather than pixel-identical to it.
+ *
+ * ── EVIDENCE, NOT INFERENCE ─────────────────────────────────────────────────────────────────────
+ * `section === undefined` means this window never read the row's git state, and then nothing is
+ * repainted. Deriving a section through `resolveStage` instead would floor at the first rung and
+ * manufacture a pre-terminal section for every unpolled row.
+ */
+export function dotFillFor(
+  status: AgentTabStatus,
+  section: BuildSectionId | undefined,
+  rollup: RollupDot,
+  rollupOverrides: boolean,
+): string | undefined {
+  // A rolled-up subtree speaks for the row, and its gray obeys the same rule.
+  if (rollupOverrides) {
+    const repaint = displayStatusFor("idle", section);
+    return rollup === "gray" && repaint !== undefined
+      ? AGENT_STATUS[repaint].color
+      : ROLLUP_DOT_COLOR[rollup];
+  }
+  // Otherwise the row's OWN status paints the disc. Return a colour ONLY when the rule actually
+  // repaints it, so every unaffected row keeps `StatusDot`'s own fallback and this cannot become a
+  // second, drifting source of truth for ordinary colours.
+  const repaint = displayStatusFor(status, section);
+  return repaint === undefined ? undefined : AGENT_STATUS[repaint].color;
+}
 
 /**
  * One ticking clock per agent row. Returns a `now` (epoch ms) that advances every 1s while the

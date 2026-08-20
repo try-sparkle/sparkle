@@ -12,10 +12,16 @@
 // them is what produced the undismissable red.
 //
 // TWO THINGS TO BE PRECISE ABOUT, because a reader will otherwise assume the comfortable version:
-//   • It is NOT wired yet. `withStallAttention` has no production caller — the composition sites
-//     (AgentSidebar.effectiveStatus, useAttentionNotifications.publishedStatusFor) still end at
-//     withDismissedAlerts(withUnmergedWork(...)). Until that lands, nothing takes an `unmerged` row
-//     out of the calm tier, and the mitigation agentStall's comment defers to does not run.
+//   • IT IS WIRED NOW, and this bullet used to say the opposite. `withStallAttention` runs at
+//     AgentSidebar.effectiveStatus. `useAttentionNotifications.publishedStatusFor` does NOT run it
+//     — that asymmetry is real and is why the repaint used to hold only in the displayed project's
+//     sidebar while notifications, the dock badge, cross-project banding, the concierge feed and the
+//     rollup dots all still painted gray.
+//   • THE SURFACE GAP IS CLOSED BY A DIFFERENT MECHANISM, not by wiring `withStallAttention` there.
+//     `stallEscalation.withTerminalOnlyGray` composes outermost in BOTH chains (the founder,
+//     2026-08-19: gray is legal only in a terminal section). It is not cause-driven, so it does not
+//     inherit this module's coupling below, and it lands on AMBER rather than red — which is what
+//     lets an `unmerged` row leave the calm tier without re-creating the undismissable red.
 //   • Its predicate is not NARROWER than this band, it is coextensive with it: agentStall defaults
 //     `hasUnlandedWork` from `status === "unmerged"` and `unlanded-work` is in stallEscalation's
 //     OUTSTANDING set, so once composed, EVERY live row this module writes goes red. That is the

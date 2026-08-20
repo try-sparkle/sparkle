@@ -49,7 +49,8 @@ import { AgentSidebar } from "./AgentSidebar";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
-import { dotInk } from "./statusDotTestUtils";
+import { asRgb, dotInk } from "./statusDotTestUtils";
+import { bandColor } from "../engine/statusBandLabels";
 import { subtreeDomIdFor } from "./subtreeTestUtils";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 // NOT from `../types` — `WorkflowStageId` lives in the engine module that owns the stage ladder.
@@ -232,8 +233,32 @@ describe('a worker that is "Needs merge" does not claim to need you', () => {
     expect(line!.textContent).toContain("needs merge");
     expect(label).toContain("needs merge");
 
-    // The dot is the ROW's colour — grey — not the alarm red.
+    // The dot is the ROW's colour — not the alarm red. Since the founder's 2026-08-19 terminal-gray
+    // rule this fixture's worker sits at a pre-terminal stage, so BOTH discs are amber rather than
+    // gray; what this pins is that they still AGREE, which is the property the file exists for.
     const peekInk = dotInk(discIn(line!, "the unmerged peek"));
+    // THE MARKER IS A BAND LEGEND, and what that buys is ONE thing: a "needs merge" can never
+    // arrive wearing the alarm colour. So THAT is what is asserted.
+    //
+    // ⚠️ AN EARLIER VERSION ASSERTED `marker.color !== dot.color`, WHICH WAS THE WRONG PROPERTY in
+    // both directions (roborev 65723). It would stay green if the marker were changed to
+    // `bandColor("needs_you")` — alarm red is also "not the amber disc", so the one regression the
+    // comment names went unguarded — and it would go RED for an `unmerged` worker at a TERMINAL
+    // section, where the disc is legitimately the same gray as the marker and every colour on the
+    // line is exactly what was intended. That is the "expectation encodes the incidental collision
+    // instead of the capability" shape in AGENTS.md; mutation grip does not judge an expected value.
+    const marker = Array.from(line!.querySelectorAll("span")).find((el) =>
+      (el.textContent ?? "").includes("needs merge"),
+    ) as HTMLElement | undefined;
+    expect(marker, "no marker span found on the unmerged peek line").toBeTruthy();
+    // ⚠️ `asRgb`, NOT the raw token. jsdom normalises `style.color` to `rgb(...)` while `bandColor`
+    // returns a hex, so comparing them directly can NEVER be equal and the assertion is vacuous —
+    // caught by mutation-checking this very line: painting the marker `bandColor("needs_you")` left
+    // it green. The sibling assertions in this file already go through `asRgb`/`dotInk` for exactly
+    // this reason.
+    expect(marker!.style.color, "a 'needs merge' must never wear the alarm colour").not.toBe(
+      asRgb(bandColor("needs_you")),
+    );
     cleanup();
     expect(peekInk).toBe(rowInkFor("unmerged"));
   });

@@ -8,6 +8,10 @@ import { withNudgeLoopCalm } from "./nudgeLoopCalm";
 import { withFinishedHeadCalm } from "./finishedHeadCalm";
 import type { ThrashReport } from "./agentThrash";
 import {
+  GRAY_LEGAL_SECTIONS,
+  GRAY_STATUSES,
+  displayStatusFor,
+  grayFloorFor,
   mustLeaveCalm,
   withDismissedStallAttention,
   withStallAttention,
@@ -730,5 +734,112 @@ describe("blocked-on-human survives the whole sidebar chain", () => {
     // coupling was unpinned, and a change to `stallInputsFor` could break it invisibly.
     expect(stallReport(humanBlocked()).verdict).toBe("stalled");
     expect(painted(() => humanBlocked(), () => true).said).toBe("blocked");
+  });
+});
+
+
+// ══ GRAY IS LEGAL ONLY WHERE THE WORK IS EFFECTIVELY FINISHED (the founder, 2026-08-19) ═══════════
+//
+// *"Nothing should ever be gray unless it has been effectively finished. So that would be like a
+// remote merge domain or shipped status. If it's above those statuses, it should never be gray."*
+//
+// These assert the SIDE EFFECT — the status a row ends up rendering — not the membership of the sets
+// that produce it, because membership is the precondition and the colour is the thing he is looking
+// at.
+describe("gray is legal only in a terminal section", () => {
+  it("repaints a gray row in EVERY pre-terminal section, and leaves BOTH terminal ones alone", () => {
+    // The whole ladder in one assertion, so a future section added to the middle cannot slip through
+    // by nobody having written a case for it. Mounting every candidate at once is the point: a test
+    // that checked only one pre-terminal section would pass against a floor keyed to the wrong rung.
+    const pre = [
+      "local_none",
+      "local_uncommitted",
+      "local_committed",
+      "local_merged",
+      "remote_pushed",
+      "remote_pr",
+    ] as const;
+    for (const section of pre) {
+      expect(grayFloorFor("idle", section), `${section} must not stay gray`).toBe("lapsed");
+    }
+    for (const section of ["remote_merged", "remote_shipped"] as const) {
+      expect(grayFloorFor("idle", section), `${section} is where gray is legal`).toBeUndefined();
+    }
+  });
+
+  it("covers every GRAY status, not just the two the complaint named", () => {
+    // `done`/`stopped` are deliberately included even though `ESCALATABLE` excludes them: that set
+    // guards a RED claim about a dead PTY, and amber makes the opposite claim. A finished-but-
+    // unlanded row is exactly the population the rule is about.
+    for (const st of GRAY_STATUSES) {
+      expect(grayFloorFor(st, "local_committed"), `${st} is gray and must be floored`).toBe(
+        "lapsed",
+      );
+    }
+  });
+
+  it("never touches a status that is not gray", () => {
+    // Guards the floor's blast radius. Were it keyed on anything but grayness it could demote a red
+    // row to amber — silently un-paging the founder, the opposite of the rule's intent.
+    const notGray: AgentTabStatus[] = [
+      "working",
+      "questions",
+      "waiting",
+      "approval",
+      "errored",
+      "blocked",
+      "lapsed",
+    ];
+    for (const st of notGray) {
+      expect(grayFloorFor(st, "local_none"), `${st} must be left alone`).toBeUndefined();
+    }
+    // And the set itself must agree with the token table, or the loop above tests the wrong rows.
+    for (const st of notGray) expect(GRAY_STATUSES.has(st)).toBe(false);
+  });
+
+  it("EVIDENCE, NOT INFERENCE — an unread section leaves the row calm", () => {
+    // The load-bearing refusal. `resolveStage` floors at the first rung rather than returning
+    // undefined, so a window that never read git state would otherwise manufacture a pre-terminal
+    // section for every row and repaint the whole fleet amber on its own ignorance. This is also
+    // what keeps a brand-new agent calm without an exemption written for it.
+    expect(grayFloorFor("idle", undefined)).toBeUndefined();
+    expect(grayFloorFor("new", undefined)).toBeUndefined();
+  });
+
+  it("the two legal sections are exactly the terminal pair", () => {
+    expect([...GRAY_LEGAL_SECTIONS].sort()).toEqual(["remote_merged", "remote_shipped"]);
+  });
+
+  it("RECOLOURS, and never asks the caller to replace the status", () => {
+    // THE LOAD-BEARING PROPERTY, and the one the first cut got wrong. `displayStatusFor` returns a
+    // status to PAINT WITH; the caller keeps its own value. `withUnmergedWork` writes `unmerged`
+    // only for pre-terminal stages, so an overlay that rewrote the map would have floored EVERY
+    // `unmerged` row and made the literal unreachable — silently zeroing the "Needs merge" label,
+    // conciergeFeed's owed counts, the digest, workerExpansion and both workerRollup locks. That is
+    // roborev 53886, which this repo had already paid for once.
+    expect(displayStatusFor("unmerged", "local_committed")).toBe("lapsed");
+    // The mapping is PURE and returns a paint colour only — there is no map to mutate and no
+    // overload that takes one. This is the API-shape guard: if a future change reintroduces a
+    // map-rewriting overload, `unmerged` becomes unreachable again.
+    expect(typeof displayStatusFor).toBe("function");
+    expect(displayStatusFor.length, "takes (status, section) — not a status MAP").toBe(2);
+  });
+
+  it("returns undefined — 'paint it unchanged' — rather than echoing the status back", () => {
+    // A caller writes `displayStatusFor(st, sec) ?? st`, so `undefined` must mean "leave it alone".
+    // Echoing the input back would work for colour but would hide, from any future caller, whether
+    // the mapping had an opinion at all.
+    expect(displayStatusFor("idle", "remote_merged")).toBeUndefined();
+    expect(displayStatusFor("blocked", "local_committed")).toBeUndefined();
+  });
+
+  it("the colour it lands on is AMBER, and its label is the true claim", () => {
+    // Not red: no OUTSTANDING cause fired, so nothing has established the founder is the actor.
+    // `lapsed`'s own label already says what is true of these rows.
+    expect(AGENT_STATUS.lapsed.label).toBe("Unfinished, not yours");
+    expect(AGENT_STATUS[grayFloorFor("unmerged", "local_merged")!].color).toBe(
+      AGENT_STATUS.lapsed.color,
+    );
+    expect(AGENT_STATUS.lapsed.color).not.toBe(AGENT_STATUS.idle.color);
   });
 });

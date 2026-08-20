@@ -38,7 +38,7 @@ import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { useBeadsStore } from "../stores/beadsStore";
 import { agentIdsInEpic } from "../engine/epicFocus";
-import { formatElapsed, useRowClock, ROLLUP_DOT_COLOR } from "./rowClock";
+import { formatElapsed, useRowClock, ROLLUP_DOT_COLOR, dotFillFor } from "./rowClock";
 import { useColumnZoom, useZoomColumnForSide } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
@@ -120,7 +120,9 @@ import {
   bandOfStatus,
   flattenSections,
   groupAgentsByStage,
+  sectionFromReadings,
   sectionOfRow,
+  sectionOfStage,
   type BuildSectionId,
   type StatusBand,
 } from "../engine/buildSections";
@@ -142,7 +144,11 @@ import { withUnmergedWork } from "../engine/unmergedAttention";
 import { withNudgeLoopCalm } from "../engine/nudgeLoopCalm";
 import { withFinishedHeadCalm } from "../engine/finishedHeadCalm";
 import { thrashReportFor } from "../engine/agentThrash";
-import { withDismissedStallAttention, withStallAttention } from "../engine/stallEscalation";
+import {
+  displayStatusFor,
+  withDismissedStallAttention,
+  withStallAttention,
+} from "../engine/stallEscalation";
 import { processAliveFor } from "../services/goalContinuationRunner";
 // The never-idle overlay: three pure cores, read ALONGSIDE `status` (never folded into it — see the
 // architecture note at the top of engine/agentStall.ts). ./rowAttention does the evidence-gathering
@@ -645,6 +651,15 @@ export function AgentSidebar({
   // The workflow stage an agent's own git state + any known override resolves to.
   const stageOf = (id: string): WorkflowStageId =>
     resolveStage(branchStatus[id], workflowStage[id]);
+  /** Which build section a row is in, or `undefined` for "this window never read its git state".
+   *
+   *  ⚠️ NOT `sectionOfStage(stageOf(id))`, and that is the whole point. `resolveStage` FLOORS at the
+   *  first rung rather than returning `undefined`, so routing through it would manufacture a
+   *  pre-terminal section for a row nobody polled — and the terminal-gray rule would then repaint
+   *  the entire unpolled fleet amber on our own ignorance. Both readings absent means we did not
+   *  look. This is also what keeps a brand-new agent calm without an exemption written for it. */
+  const sectionOf = (id: string): BuildSectionId | undefined =>
+    sectionFromReadings(branchStatus[id], workflowStage[id]);
   // Has this agent ever shipped (reached On Main+)? Sticky flag set by refreshWorkflowStage, OR'd
   // with the current resolved stage so the ✓ shows even on the first tick that lands it.
   const shippedOf = (id: string): boolean =>
@@ -2386,6 +2401,44 @@ export function AgentSidebar({
     [childrenByParent, branchStatus, workflowStage],
   );
 
+  /** The section the terminal-gray rule judges a HEAD by: the LEAST-ADVANCED stage among the rows
+   *  that have actually been READ — the head itself and its workers — or `undefined` when none has.
+   *
+   *  ⚠️ IT IS NOT `sectionOfStage(headStageOf(id))`, and the two differ deliberately in BOTH
+   *  directions. `headStageOf` is the BUCKET rule and answers a different question ("where does this
+   *  row file"); this answers "may this row look finished". Composing them was wrong twice over:
+   *
+   *   1. UNREAD KIDS. `headStageOf` maps an unread worker through `resolveStage(undefined, undefined)`,
+   *      which FLOORS to the first rung — so ONE unread worker dragged the whole subtree to a
+   *      pre-terminal section and the head painted amber even when its own branch had merged. That is
+   *      reachable constantly (a just-spawned worker before its first tick, a latched-dead poll) and
+   *      PERMANENTLY for a child that is never polled at all, which is the "amber out of our own
+   *      ignorance" failure this guard exists to prevent. Unread rows are skipped, not floored.
+   *   2. THE HEAD'S OWN WORK. `headStageOf` ignores the head's own readings entirely once it has
+   *      kids. Wiring the paint to that propagated the blind spot into the disc: a delegating head
+   *      whose own branch still held unlanded work, under a worker that had merged, was bucketed
+   *      `remote_merged` and painted CALM GRAY — the column asserting "effectively finished" about a
+   *      row that owns unfinished work, which is precisely the claim the founder's rule exists to
+   *      stop. The head's own stage is rolled up WITH its workers here.
+   *
+   *  CONSEQUENCE, STATED SO IT IS NOT READ AS A BUG: the disc may now be amber under a terminal
+   *  heading, for exactly that case. The heading is the bucket's pre-existing policy; the disc is
+   *  this rule's. Where they disagree the disc is the conservative one — it only ever declines to
+   *  call something finished — and declining is the safe direction for a signal about lost work. */
+  const headPaintSectionOf = useCallback(
+    (id: string): BuildSectionId | undefined => {
+      const kids = childrenByParent.get(id) ?? [];
+      const readIds = [id, ...kids.map((w) => w.id)].filter(
+        (x) => branchStatus[x] !== undefined || workflowStage[x] !== undefined,
+      );
+      if (readIds.length === 0) return undefined;
+      const stages = readIds.map((x) => resolveStage(branchStatus[x], workflowStage[x]));
+      const rolled = rollupStages(stages);
+      return sectionOfStage(rolled ? rolled.stage : stages[0]!);
+    },
+    [childrenByParent, branchStatus, workflowStage],
+  );
+
   // Does this row's SUBTREE hold anything uncommitted? Rolled up exactly like `headStageOf` above,
   // and for the reason that comment gives: the head is bucketed by its least-advanced worker, so
   // answering from its own tree alone would file a head under "Local: Nothing Yet" while the bar on
@@ -3136,7 +3189,12 @@ export function AgentSidebar({
               // statusInk's FIRST case and stopped there, so a worker row's name — which is an
               // underlined-on-hover LINK (WorkerRow below) — was painted with the raw brand green
               // at 2.22:1 and the raw brand red at 3.83:1 on light's white column.
-              const wcolor = statusInk(AGENT_STATUS[wst].color);
+              // Same terminal-gray rule as the row's own dot (the founder, 2026-08-19). This is the
+              // head's hover-card worker list — a SEPARATE paint from the worker's own row, which
+              // goes through `renderRow` below — so leaving it out would let one worker show two
+              // different colours depending on whether you were hovering the head.
+              const wPaint = displayStatusFor(wst, sectionOf(w.id)) ?? wst;
+              const wcolor = statusInk(AGENT_STATUS[wPaint].color);
               return {
                 id: w.id,
                 name: w.name,
@@ -3169,6 +3227,28 @@ export function AgentSidebar({
               // a same-section reorder (honored) from a cross-section drag (refused — a row's
               // section is derived from git state, not something a drag may change).
               rowSection?: BuildSectionId,
+              // WHICH SECTION THE TERMINAL-GRAY RULE JUDGES THIS ROW BY. SEPARATE from `rowSection`
+              // on purpose, and the separation is load-bearing in both directions:
+              //
+              //  * `rowSection` carries DRAG SEMANTICS — `AgentRow` gates draggability on
+              //    `rowSection != null` and passes it to `onDragStartAgent`. Reusing it for paint
+              //    made every nested worker row draggable the moment workers were given a section,
+              //    which is a behaviour change nobody asked for.
+              //  * `rowSection` is the LADDER BUCKET, and buckets come from `groupAgentsByStage` →
+              //    `resolveStage`, which FLOORS at the first rung. So a head's `rowSection` is never
+              //    `undefined` — even before its first branch-status poll — and the rule's evidence
+              //    guard would be unreachable at the one site that reaches it. An unpolled head
+              //    would paint amber "unfinished" purely from ignorance, which is the exact failure
+              //    the guard exists to prevent.
+              //
+              // So paint is judged from RAW READINGS, which answer `undefined` when this window has
+              // not read the row's git state.
+              //
+              // ⚠️ HEADS AND WORKERS DERIVE IT DIFFERENTLY, deliberately. A worker has no subtree, so
+              // it uses its own readings (`sectionOf`). A head is judged by the least-advanced READ
+              // row among itself and its workers (`headPaintSectionOf`) — see that helper for why it
+              // is neither the bucket rule nor the head's own branch alone.
+              paintSection?: BuildSectionId,
             ) => {
           // The EFFECTIVE status (dismissed reds de-escalated) drives the whole row's appearance —
           // color, glyph, tooltip — so a dismissed row reads calm. The TRUE status is read separately
@@ -3188,7 +3268,27 @@ export function AgentSidebar({
           // blocked, done, stopped) and the brand green (working) are too light on the white
           // light sidebar, so statusInk darkens both in light mode while keeping them brand-color
           // in dark; red/amber pass through. (See statusInk — it tracks the AGENT_STATUS taxonomy.)
-          const color = statusInk(AGENT_STATUS[st].color);
+          // GRAY IS LEGAL ONLY IN A TERMINAL SECTION (the founder, 2026-08-19): "Nothing should
+          // ever be gray unless it has been effectively finished ... a remote merge domain or
+          // shipped status." A row short of those paints AMBER ("Unfinished, not yours") instead.
+          //
+          // ⚠️ THIS RECOLOURS AND DOES NOT REPLACE, which is the entire design. The first cut
+          // rewrote `unmerged` → `lapsed` in the status MAP, and because `withUnmergedWork` writes
+          // `unmerged` only for pre-terminal stages that floored EVERY such row — making the value
+          // unreachable and silently zeroing every consumer keyed on it (the "Needs merge" label,
+          // conciergeFeed's owed counts, the digest, both of workerRollup's locks). That is the
+          // lesson roborev 53886 had already taught this repo once. `st` is therefore left ALONE
+          // and only the paint is derived. `rowSection` is `undefined` for a row whose git state
+          // was never read, and the mapping renders such a row unchanged — evidence, not inference.
+          const paintSt = displayStatusFor(st, paintSection) ?? st;
+          const color = statusInk(AGENT_STATUS[paintSt].color);
+          // ⚠️ `color` ABOVE DOES NOT PAINT THE DISC. It goes to `AgentRow` as `statusColor`, which
+          // feeds the founder-ask chip, the kind glyph and the alert toggle only (`AgentRow.tsx:813`
+          // states this). `StatusDot` computes `ink = color ?? meta.color`, so a disc handed
+          // `undefined` is painted from the RAW status — which is how the first cut of the
+          // terminal-gray rule left every ordinary `unmerged` row still rendering gray. The disc is
+          // painted by `dotFillFor` below, and that decision is EXPORTED so this call site and its
+          // test read the same code rather than two copies of the same three lines.
           // The alert toggle to show on this row's expanded card: "dismiss" when it's truly red and
           // not yet dismissed, "reenable" when red-underneath but dismissed, null otherwise.
           const alertControl = alertControlKind(a.alert, trueSt);
@@ -3241,7 +3341,7 @@ export function AgentSidebar({
               calmSt={calmStatus[a.id] ?? "stopped"}
               statusColor={color}
               isTabStop={a.id === tabStopId}
-              dotColor={rollupOverrides ? ROLLUP_DOT_COLOR[rollup] : undefined}
+              dotColor={dotFillFor(st, paintSection, rollup, rollupOverrides)}
               dotLabel={rollupOverrides ? rollupLabel(rollup) : undefined}
               // A BORROWED RED IS DRAWN AS A RING, an own red as a fill. `rollupOverrides` already
               // means "this disc is reporting the SUBTREE, not this row", so a red/orange under it
@@ -3333,11 +3433,21 @@ export function AgentSidebar({
               // tree may own only treeitems and groups" rule this structure exists to satisfy, one
               // level down (roborev 53891).
               <Fragment key={top.id}>
-                {renderRow(top, headStage, section.id)}
+                {/* `section.id` stays the DRAG section (the ladder bucket it is rendered in);
+                    the paint section is read separately so an unpolled head is not judged. */}
+                {renderRow(top, headStage, section.id, headPaintSectionOf(top.id))}
                 {peek.length > 0 && (
                   <WorkerPeek
                     workers={peek}
                     statusOf={peekStatusOf}
+                    // ONE EXPRESSION FOR BOTH DISCS. The expanded row paints via `dotFillFor`; the
+                    // peek must too, or the same worker reads gray collapsed and amber expanded —
+                    // the founder-screenshot bug `workerPeekRowAgreement.test.tsx` exists to prevent,
+                    // reproduced in the opposite direction. `rollup`/`overrides` are fixed here
+                    // because a peek line speaks for ONE worker and has no subtree of its own.
+                    dotColorOf={(id) =>
+                      dotFillFor(peekStatusOf(id), sectionOf(id), "gray", false)
+                    }
                     headName={top.name}
                     onOpen={() => toggleOrchestratorCollapsed(top.id)}
                   />
@@ -3356,7 +3466,13 @@ export function AgentSidebar({
                     role="group"
                     aria-label={`Workers for ${top.name}`}
                   >
-                    {kids.map((w) => renderRow(w, stageOf(w.id)))}
+                    {/* A WORKER ROW NEEDS ITS OWN PAINT SECTION. Without it the rule declined by
+                        its evidence guard and the worker's disc stayed gray — while the SAME worker
+                        painted amber in the head's hover-card list two pixels above, simultaneously
+                        visible. Derived from the worker's own readings, not the head's: a worker's
+                        stage is its own. `rowSection` stays UNDEFINED here, exactly as before, so
+                        worker rows remain non-draggable. */}
+                    {kids.map((w) => renderRow(w, stageOf(w.id), undefined, sectionOf(w.id)))}
                   </div>
                 )}
               </Fragment>

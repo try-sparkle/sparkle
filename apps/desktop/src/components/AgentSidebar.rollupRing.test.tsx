@@ -214,3 +214,149 @@ describe("AgentSidebar — the pinned rows ring too", () => {
     expect(dot.style.background).not.toBe("transparent");
   });
 });
+
+// ── THE TERMINAL-GRAY RULE, AT THE RENDER SITE (the founder, 2026-08-19) ─────────────────────────
+// *"Nothing should ever be gray unless it has been effectively finished. So that would be like a
+// remote merge domain or shipped status."*
+//
+// ══ THE SUBJECTS ARE `done` / `stopped`, AND THAT IS MEASURED, NOT ASSUMED ═══════════════════════
+// I probed all 15 (status × stage) cells against the base branch to find which ones this rule
+// actually moves. It is exactly three, all at a pre-terminal stage:
+//
+//     done @ building_saved     GRAY → AMBER
+//     stopped @ building_saved  GRAY → AMBER
+//     new @ building_saved      GRAY → AMBER
+//
+// Every other cell is unchanged, because the PRE-EXISTING stall escalation already handles it:
+// `idle` and `unmerged` at a pre-terminal stage were ALREADY amber via `unlanded-work` → LIFECYCLE.
+// So this rule's whole incremental effect is the population the cause-driven path REFUSES —
+// `withStallAttention` skips a dead process and only ever looks at `ESCALATABLE` (`idle`/`unmerged`).
+//
+// ⚠️ AN EARLIER VERSION OF THIS BLOCK USED `idle`/`unmerged` AND WAS VACUOUS. It passed with the
+// call site reverted, because it was pinning that pre-existing escalation rather than this rule —
+// the exact "assert the side effect, not the precondition" trap in AGENTS.md. The mutation check
+// below is what caught it; the cases here are chosen so reverting `dotColor={dotFillFor(...)}` goes
+// red.
+function seedStage(
+  headStatus: AgentTabStatus,
+  stage: string | null,
+): Project {
+  const project = seed(headStatus, "idle");
+  useRuntimeStore.setState({
+    branchStatus: {},
+    // `null` = this window has read NOTHING for the head — the cold-start / failed-poll case.
+    // BOTH ROWS get the stage, because a head is BUCKETED by `headStageOf`, which rolls up its
+    // least-advanced worker — an unread worker floors to the first rung and would drag the head into
+    // a pre-terminal heading no matter what its own branch says. These cases are about a uniform
+    // subtree; the split-stage disagreement gets its own fixture below.
+    workflowStage: (stage === null ? {} : { a1: stage, w1: stage }) as never,
+    status: { a1: headStatus, w1: "idle" } as Record<string, AgentTabStatus>,
+    openAgentIds: [],
+    open: vi.fn(),
+    pollBranchStatus: vi.fn(() => Promise.resolve()),
+  } as never);
+  return project;
+}
+
+describe("AgentSidebar — gray is legal only in a terminal section", () => {
+  it("paints a FINISHED head amber when its work is not on main yet", () => {
+    // The founder's case, and the one the cause-driven path cannot reach: `done` is not in
+    // `ESCALATABLE`, so nothing took it out of the calm tier before this rule.
+    render(<AgentSidebar project={seedStage("done", "building_saved")} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
+  });
+
+  it("paints a STOPPED head amber too — a dead process still owes the work", () => {
+    // `withStallAttention` refuses a dead process on purpose (it must never say a dead PTY "needs
+    // you"). Amber makes the opposite claim — "unfinished, NOT yours" — so this population is
+    // reachable here without reopening that refusal.
+    render(<AgentSidebar project={seedStage("stopped", "building_saved")} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
+  });
+
+  it("leaves a finished head GRAY once its work is on main — the paired positive", () => {
+    // Without this, "nothing is gray" would also pass for a rule that repainted unconditionally,
+    // destroying the one state the founder said gray is FOR.
+    render(<AgentSidebar project={seedStage("done", "merged")} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.idle.color));
+  });
+
+  it("EVIDENCE, NOT INFERENCE — an UNPOLLED head is not repainted", () => {
+    // A head's ladder bucket comes from `resolveStage`, which FLOORS at the first rung, so reusing
+    // it for paint would make every head look pre-terminal before its first branch-status poll and
+    // paint the whole cold-start fleet amber out of ignorance. The paint section is read from the
+    // raw readings for exactly that reason.
+    render(<AgentSidebar project={seedStage("done", null)} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.idle.color));
+  });
+
+  // ── THE DISC MUST NOT CONTRADICT THE HEADING IT SITS UNDER ──────────────────────────────────
+  // A head is BUCKETED by `headStageOf`, which rolls up its LEAST-ADVANCED WORKER and only falls
+  // back to the head's own readings when it has none. Judging the paint by the head's own branch
+  // instead produced two disagreements at once, and both are visible in one glance:
+  //   * a delegating head whose OWN branch had merged painted calm gray under a pre-terminal
+  //     heading — the rule under-firing on exactly the row the ladder calls unfinished;
+  //   * and the louder mirror, a head bucketed under a terminal heading painting amber
+  //     "Unfinished, not yours" directly beneath it.
+  // Both are pinned here because the fix is to share ONE roll-up, and a single case would let the
+  // other direction regress silently.
+  function seedSplit(headStage: string, workerStage: string): Project {
+    const project = seed("done", "done");
+    useRuntimeStore.setState({
+      branchStatus: {},
+      workflowStage: { a1: headStage, w1: workerStage } as never,
+      status: { a1: "done", w1: "done" } as Record<string, AgentTabStatus>,
+      openAgentIds: [],
+      open: vi.fn(),
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    return project;
+  }
+
+  it("a head whose OWN branch merged still paints amber while a worker lags", () => {
+    // Bucket rolls up the worker → `local_committed`, a pre-terminal heading. Judged by the head's
+    // own `merged` section it would have been gray-legal and stayed calm.
+    render(<AgentSidebar project={seedSplit("merged", "building_saved")} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
+  });
+
+  it("a head that still owes its OWN work paints amber, even under a terminal heading", () => {
+    // ⚠️ THIS CASE PREVIOUSLY ASSERTED GRAY, AND THAT WAS PINNING THE DEFECT. The BUCKET rule
+    // (`headStageOf`) ignores a head's own readings once it has kids, so this row files under a
+    // merged heading; wiring the paint to that rule made the disc agree — and agree WRONGLY, with
+    // the column asserting "effectively finished" about a head holding unlanded local work. A
+    // mutation check cannot catch that: the test had a perfect grip on an expectation nobody wanted
+    // (the "a test can pin the defect" shape in AGENTS.md).
+    //
+    // The disc is judged by the least-advanced READ row among the head and its workers, so it
+    // declines to call this finished. It may therefore disagree with the heading — deliberately, and
+    // in the conservative direction: the disc only ever refuses to say "finished".
+    render(<AgentSidebar project={seedSplit("building_saved", "merged")} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.lapsed.color));
+  });
+
+  it("an UNREAD worker does not drag a merged head into amber", () => {
+    // The other half of the same helper. The bucket rule maps an unread worker through a
+    // stage-resolver that FLOORS to the first rung, so one unpolled kid would drag the whole subtree
+    // pre-terminal and paint a merged head amber out of pure ignorance — reachable for any
+    // just-spawned worker, and PERMANENTLY for a child that is never polled at all. Unread rows are
+    // skipped rather than floored.
+    const project = seed("done", "done");
+    useRuntimeStore.setState({
+      branchStatus: {},
+      workflowStage: { a1: "merged" } as never, // w1 deliberately absent
+      status: { a1: "done", w1: "done" } as Record<string, AgentTabStatus>,
+      openAgentIds: [],
+      open: vi.fn(),
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    render(<AgentSidebar project={project} />);
+    expect(headDot().style.background).toBe(asRgb(AGENT_STATUS.idle.color));
+  });
+
+  it("does not repaint a head that is asking for something", () => {
+    // Blast radius: a red disc must survive, or the rule silently un-pages the founder.
+    render(<AgentSidebar project={seedStage("waiting", "building_saved")} />);
+    expect(headDot().style.background).toBe(RED);
+  });
+});

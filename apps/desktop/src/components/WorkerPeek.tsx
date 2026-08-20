@@ -37,15 +37,23 @@ import type { AgentTab, AgentTabStatus } from "../types";
  * worker at the same instant: the founder caught a worker showing a red dot and "needs you" in the
  * peek, and a gray dot with "Saved" once he expanded its parent. At most one of those can be true.
  *
- * So the dot is a real {@link StatusDot} carrying that worker's status — the SAME component, and
- * therefore the same `AGENT_STATUS[status].color` expression, that the expanded row's disc uses
- * (`AgentRow`, which passes no `color` override for a worker). Agreement is structural rather than a
- * claim two files each make separately, which is what let them drift.
+ * So the dot is a real {@link StatusDot} carrying that worker's status — the SAME component the
+ * expanded row's disc uses. Agreement is structural rather than a claim two files each make
+ * separately, which is what let them drift.
  * `workerPeekRowAgreement.test.tsx` walks the whole status taxonomy and pins it.
+ *
+ * ⚠️ THE AGREEMENT IS NO LONGER "NEITHER SIDE OVERRIDES THE COLOUR". It used to rest on `AgentRow`
+ * passing no `color` for a worker, so both sides fell through to `AGENT_STATUS[status].color`. The
+ * row now DOES override it — the founder's 2026-08-19 rule repaints a disc whose work is short of a
+ * terminal section — so the peek must be handed the same paint or the two drift again, in the
+ * opposite direction to the original bug (gray collapsed, amber expanded). That is what
+ * {@link WorkerPeekProps.dotColorOf} is for: the caller resolves BOTH discs through one expression.
+ * It is REQUIRED, so there is no fallback path to lean on — see the prop's own doc for why.
  */
 export function WorkerPeek({
   workers,
   statusOf,
+  dotColorOf,
   headName,
   onOpen,
 }: {
@@ -54,6 +62,17 @@ export function WorkerPeek({
    *  made from, threaded in rather than looked up again here. A second status source is precisely
    *  how the peek and the row came to disagree, and a pure component cannot reach for one. */
   statusOf: (id: string) => AgentTabStatus;
+  /** The dot's fill for a given worker, or `undefined` FROM THE RESOLVER to let {@link StatusDot}
+   *  use the status's own tier colour. Supplied by the caller so the peek and the expanded row
+   *  resolve the SAME expression — see the header.
+   *
+   *  ⚠️ REQUIRED, DELIBERATELY. An optional prop with a silent fallback is the exact shape that has
+   *  now produced this same defect three times on this branch (`rowSection?`, then `paintSection?`,
+   *  then this) — the defaulted-seam trap in AGENTS.md: the production call site is the only thing
+   *  that supplies the real value, so a caller that forgets it compiles, renders, and quietly
+   *  reinstates the founder-screenshot bug. There is exactly one caller; making it mandatory means a
+   *  second one cannot be added without answering this question. */
+  dotColorOf: (id: string) => string | undefined;
   headName: string;
   onOpen: () => void;
 }) {
@@ -128,7 +147,11 @@ export function WorkerPeek({
       <span aria-hidden style={{ display: "flex", flex: "0 0 auto" }}>
         {/* 6px, the signpost size this line has always used — a peek is a smaller mark than a row's
             disc on purpose. Only the SIZE is local; the ink comes from the shared taxonomy. */}
-        <StatusDot status={status} size={6} />
+        <StatusDot
+          status={status}
+          size={6}
+          color={spokesman === undefined ? undefined : dotColorOf(spokesman.id)}
+        />
       </span>
       <span
         style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}
@@ -143,6 +166,17 @@ export function WorkerPeek({
           marginLeft: "auto",
           fontSize: TYPE.micro,
           fontWeight: 600,
+          // ⚠️ BAND INK, AND THE GRAY-RULE EXEMPTION IS DELIBERATE (roborev 65719). The disc beside
+          // this marker now obeys the founder's 2026-08-19 terminal-gray rule and can read amber
+          // while these words stay gray. That is not an oversight and it is not fixable by sourcing
+          // the ink from the painted status: `lapsed` and `unmerged` are in the SAME band (`done`),
+          // so `bandColor(bandOfStatus(...))` returns the identical gray either way.
+          //
+          // The marker is a BAND LEGEND, not a finishedness signal — it is inked from the same band
+          // it is WORDED from, which is what stops a "needs merge" ever arriving in the alarm
+          // colour. The words already say the row is unfinished; the disc carries the
+          // finished-or-not claim. Re-inking this from the status would break the legend invariant
+          // to restate something the text next to it says in words.
           color: bandColor(bandOfStatus(status)),
         }}
       >
