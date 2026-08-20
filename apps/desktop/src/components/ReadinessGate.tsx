@@ -57,6 +57,7 @@ import {
 } from "../preflight";
 import { readinessStage, authGateDecision, type RotationHealth } from "../services/readiness";
 import { onClaudeAuthFailed } from "../services/claudeAuthSignal";
+import { setCredentialHealth } from "../services/credentialHealth";
 import { loadAccountState, liveUsageRows } from "../services/accountSelection";
 import {
   eligibleAccounts,
@@ -239,6 +240,20 @@ export function ReadinessGate({ children }: { children: ReactNode }) {
     overridden || stage !== "auth" || rotation === undefined
       ? "none"
       : authGateDecision(stage, rotation);
+
+  // ══ PUBLISH THE ONE CREDENTIAL-HEALTH STATE (bead sparkle-s8xi35) ═══════════════════════════════
+  // A "block" is precisely "the default account cannot authenticate AND no other account is usable" —
+  // auth-expiry detected with no healthy fallback, the frontend twin of `concierge.rs::plan_retry`
+  // returning None. That is the ONE fact the concierge send path, the research auto-dispatch and the
+  // proactive scheduler must all stop working against, so it is centralised in `credentialHealth`
+  // rather than re-derived per consumer. It SELF-HEALS: every re-probe (focus, the auth-failure
+  // signal, a confirmed sign-in) recomputes `decision`, so once the human runs /login and a healthy
+  // account exists again the decision leaves "block" and this returns to "ok" with no manual reset.
+  // An override clears it too — `decision` is "none" then — matching the user's explicit "continue
+  // anyway", and a still-probing gate is "none", so nothing is gated before the block is confirmed.
+  useEffect(() => {
+    setCredentialHealth(decision === "block" ? "expired" : "ok");
+  }, [decision]);
 
   const onSignedIn = useCallback(() => {
     // Re-probe rather than optimistically setting `loggedIn: true`: the gate's whole job is to

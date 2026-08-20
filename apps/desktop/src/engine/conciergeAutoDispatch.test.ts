@@ -59,6 +59,7 @@ function obs(over: Partial<AutoDispatchObservation> = {}): AutoDispatchObservati
     liveResearch: 0,
     researchHydrated: true,
     dispatched: NONE,
+    credentialExpired: false,
     now: T0,
     ...over,
   };
@@ -98,6 +99,33 @@ describe("the founder's rule: fire when agents are FEWER than waiting messages",
     expect(decideAutoDispatch(obs({ waiting: [] }))).toEqual({
       action: "none",
       reason: "queue-empty",
+    });
+  });
+});
+
+describe("all Claude accounts OAuth-expired: nothing is dispatched (bead sparkle-s8xi35)", () => {
+  // The SIDE EFFECT is the absence of a dispatch — a research child would only die on the dead auth.
+  // Paired with the identical observation that WOULD dispatch when the credential is healthy, so the
+  // no-dispatch is proven to be CAUSED by the gate rather than by some other exclusion. This is also
+  // the mutation guard: delete the `credentialExpired` short-circuit in `decideAutoDispatch` and the
+  // expired case dispatches `["w1"]`, reding the first assertion below.
+  it("refuses to dispatch a ready waiter while credentials are expired, and resumes when healthy", () => {
+    const ready = { waiting: [waiter("w1", OLD)], liveResearch: 0 };
+    // Healthy: this exact queue dispatches. That is what makes the expired assertion meaningful.
+    expect(chosen(decideAutoDispatch(obs({ ...ready, credentialExpired: false })))).toEqual(["w1"]);
+    // Expired: nothing dispatches, and the reason names the credential rather than the queue.
+    expect(decideAutoDispatch(obs({ ...ready, credentialExpired: true }))).toEqual({
+      action: "none",
+      reason: "credential-expired",
+    });
+  });
+
+  it("wins over every other reason — even an otherwise-dispatchable multi-waiter queue", () => {
+    const waiting = [waiter("w1", OLD), waiter("w2", OLD), waiter("w3", OLD)];
+    // 0 agents / 3 waiting is the most acute dispatch case; the gate still stands down.
+    expect(decideAutoDispatch(obs({ waiting, liveResearch: 0, credentialExpired: true }))).toEqual({
+      action: "none",
+      reason: "credential-expired",
     });
   });
 });

@@ -195,8 +195,13 @@ import { REPLY_WITHOUT_QUOTE_CHECK_ID } from "../services/conciergeLint/checks/r
 import type { LintPolicy, LintResult, Violation } from "../services/conciergeLint";
 import type { LintAction } from "../stores/conciergeLintMetrics";
 import { getConfig, onConfigChanged, type EffectiveConfig } from "../services/config";
-import { conciergeFailureNotice, mountedFailureHeadline } from "../engine/conciergeFailureNotice";
+import {
+  conciergeFailureNotice,
+  mountedFailureHeadline,
+  bubbleFailureHeadline,
+} from "../engine/conciergeFailureNotice";
 import { reportClaudeAuthFailed } from "../services/claudeAuthSignal";
+import { isCredentialExpired } from "../services/credentialHealth";
 import {
   rotateStickyConsumerOffFailedAccount,
   CONCIERGE_ACCOUNT_KEY,
@@ -904,6 +909,11 @@ export function ConciergeHost({
           pendingSince,
           now,
         ),
+        // ALL ACCOUNTS OAUTH-EXPIRED → the decider dispatches nothing (bead sparkle-s8xi35). A
+        // research child is a metered `claude` turn that would die on the same dead auth every
+        // concierge turn dies on, so pausing auto-dispatch is half the outage-control this state buys.
+        // Read live from the one source of truth; it clears itself when a /login restores an account.
+        credentialExpired: isCredentialExpired(),
         now,
       });
       if (decision.action !== "dispatch") return;
@@ -3387,6 +3397,11 @@ export function ConciergeHost({
       now: () => Date.now(),
       setTimer: (fn, ms) => window.setTimeout(fn, ms),
       clearTimer: (h) => window.clearTimeout(h),
+      // ALL ACCOUNTS OAUTH-EXPIRED → the scheduler stands down (bead sparkle-s8xi35). A proactive push
+      // and a research answer are both `claude` turns that die on the same dead auth; volunteering one
+      // that will fail is the opposite of the single quiet "sign in again" state this exists to
+      // surface. Read live at fire time, so the pause lifts on the next tick after a /login.
+      credentialExpired: () => isCredentialExpired(),
       // The research drain's second seam (§3.3's free improvement). Consulted by `fire` only once
       // it has already decided to speak, so a finding never buys a push of its own.
       peekResearch: () => researchDrain.peek(),
@@ -4276,6 +4291,40 @@ export function ConciergeHost({
     // `conciergeSawAnswerText`, never the liveness flag: a tool call is a sign of life but not an
     // answer, and reading a terminal before replying is the concierge's normal first move — so the
     // liveness flag would exempt the most common shape of a dropped question (roborev 55442-M1).
+    // ══ CREDENTIAL-HEALTH GATE — REFUSE, DON'T PILE ON (bead sparkle-s8xi35) ══════════════════════
+    // When every Claude account is OAuth-expired, `startConciergeTurn` cannot succeed on ANY account:
+    // there is no healthy fallback for `concierge.rs::plan_retry` to rotate to, so each send just
+    // dead-ends the same way. Rather than enqueue another turn onto a provably-dead credential — which
+    // is the "founder keeps queuing prompts while every turn silently fails" outage this exists to end
+    // — refuse the send BEFORE it reaches the queue and surface the one sticky "sign in again" state.
+    //
+    // NOT SILENT: the user's `you` bubble is already on screen (postSparkle added it), and this adds a
+    // `failure` bubble carrying the auth remedy plus the in-place Sign in control (`canReauth`), so the
+    // one action that fixes it is right there. On a mounted column the thread is not rendered, so the
+    // same fact is mirrored to the notice row. `reportClaudeAuthFailed` re-probes the gate so the state
+    // self-heals the instant a /login lands — the refusal is never a one-way door.
+    //
+    // Read from the ONE source of truth (`credentialHealth`), whose only writer is the authoritative
+    // ReadinessGate probe, so a transient or misclassified failure cannot gate here — only a confirmed,
+    // rotation-checked "all accounts expired" does.
+    if (isCredentialExpired()) {
+      setChat((prev) => [
+        ...prev,
+        {
+          id: nextId("err"),
+          kind: "failure",
+          headline: bubbleFailureHeadline("auth"),
+          // No machine `evidence` to show — this is a pre-send refusal, not a failed turn's stderr.
+          evidence: "",
+          canReauth: true,
+        },
+      ]);
+      if (displayMountedRef.current) noteMounted(mountedFailureHeadline("auth"), "warn");
+      // Re-probe so the sticky state clears itself once the human signs in again. Cheap and idempotent
+      // — the gate runs its own live `claude auth status` and decides; a false alarm costs one probe.
+      reportClaudeAuthFailed();
+      return;
+    }
     const orphan = awaitingBubbleRef.current;
     if (orphan && !conciergeSawAnswerText()) {
       setChat((prev) =>
@@ -4395,10 +4444,11 @@ export function ConciergeHost({
       return;
     }
     dispatchTurnRef.current(outcome.dispatch);
-    // `announce` only — it is a `useCallback(…, [])` and therefore stable, so this keeps `askSparkle`
-    // stable too. Everything else here is a ref or a module function, deliberately, because it is
-    // installed on `askSparkleRef` and a changing identity would churn that.
-  }, [announce]);
+    // `announce` and `noteMounted` only — both are `useCallback(…, [])` and therefore stable, so this
+    // keeps `askSparkle` stable too (`noteMounted` is the credential-gate's mounted-column mirror).
+    // Everything else here is a ref or a module function, deliberately, because it is installed on
+    // `askSparkleRef` and a changing identity would churn that.
+  }, [announce, noteMounted]);
 
   /**
    * Actually start a turn — the half of the old `askSparkle` tail that must only run for a send

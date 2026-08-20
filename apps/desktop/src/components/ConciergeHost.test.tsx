@@ -327,6 +327,11 @@ import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { PINNED_BLOCKERS_TESTID, PINNED_BLOCKER_TESTID } from "./Concierge/PinnedBlockers";
 import { NUDGE_CARD_TESTID } from "./Concierge/NudgeCard";
 import { ANONYMOUS_SUBJECT } from "./Concierge/conciergeLine";
+import {
+  setCredentialHealth,
+  resetCredentialHealthForTests,
+} from "../services/credentialHealth";
+import { FAILURE_REAUTH_TESTID } from "./Concierge/ConciergeMessageRow";
 
 // PRECONDITION, stated rather than inherited: this suite's subject is the concierge CONVERSATION,
 // and the column locks that half — thread and composer both — whenever the AI gate is shut
@@ -379,6 +384,9 @@ function feedWith(status: string, band: StatusBand = "needs_you", statusLabel = 
 
 afterEach(() => {
   cleanup();
+  // Credential-health is a MODULE-level singleton, so a row that publishes "expired" would gate every
+  // send in every later row until something republished "ok". Reset it, like the other globals here.
+  resetCredentialHealthForTests();
   // Presence is app-global state, so a row that goes Away would leak into the next one.
   usePresenceStore.getState().reset();
   useRuntimeStore.setState({ status: {} });
@@ -916,6 +924,52 @@ describe("ConciergeHost", () => {
     expect(snapshot).toContain("what needs me?");
     // the user's message shows in the thread
     expect(inThread("what needs me?")).toBeTruthy();
+  });
+
+  // ══ THE SEND GATE — REFUSE TO ENQUEUE ONTO A DEAD CREDENTIAL (bead sparkle-s8xi35) ══════════════
+  // When every Claude account is OAuth-expired, `startConciergeTurn` cannot succeed on any account, so
+  // piling more turns onto the queue just fails each one silently — the founder's outage. The SIDE
+  // EFFECTS under test: the brain turn is NOT started (nothing enqueued), and the user is TOLD why,
+  // with the in-place Sign in control. Driven through the REAL send path (textarea → Send → route →
+  // askSparkle), so it exercises the production gate rather than a hand-built precondition.
+  //
+  // MUTATION GUARD: remove the `isCredentialExpired()` refusal at the top of `askSparkle` and the
+  // expired case starts a turn AND drops the sign-in bubble — reding both assertions in the first row.
+  // The second row is the paired healthy control that proves the refusal is CAUSED by the gate.
+  it("REFUSES to start a brain turn while all Claude accounts are expired, and surfaces the sign-in state", async () => {
+    setCredentialHealth("expired");
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "what needs me?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    // Nothing was enqueued/dispatched against the dead credential.
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    // The user is told why, and the in-place Sign in control is right there.
+    expect(inThread(/sign-in has expired/i)).toBeTruthy();
+    expect(screen.getByTestId(FAILURE_REAUTH_TESTID)).toBeTruthy();
+    // The message the user typed is still visible — refused, not silently swallowed.
+    expect(inThread("what needs me?")).toBeTruthy();
+  });
+
+  it("resumes starting brain turns once a healthy account exists again (self-healing)", async () => {
+    // The gate engaged...
+    setCredentialHealth("expired");
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "first?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+
+    // ...then a /login restores a usable account, which the gate publishes as healthy. The next send
+    // goes through — proving the refusal was the credential state, not a host that stopped sending.
+    setCredentialHealth("ok");
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "second?" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+    expect(h.startConciergeTurn).toHaveBeenCalledTimes(1);
+    expect(h.startConciergeTurn.mock.calls[0]![0]).toContain("second?");
   });
 
 

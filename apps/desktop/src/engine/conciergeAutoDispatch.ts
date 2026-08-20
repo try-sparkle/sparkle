@@ -238,11 +238,29 @@ export interface AutoDispatchObservation {
    * express. See the header on the latch (bead `sparkle-zx9knz`).
    */
   dispatched: ReadonlyMap<string, BubbleDispatchState>;
+  /**
+   * Are ALL of this machine's Claude accounts OAuth-expired (`credentialHealth.isCredentialExpired`)?
+   *
+   * WHEN TRUE, NOTHING DISPATCHES — see {@link decideAutoDispatch}. A research pass is a metered
+   * `claude` child, and every one of them dies on the same dead auth the concierge's own turns die on,
+   * so dispatching against it spends money to produce nothing while the founder is being told, once,
+   * to sign in again (bead sparkle-s8xi35). It is a whole-pool fact, not a per-waiter one, so it gates
+   * the whole decision rather than feeding {@link excludeReason}. Self-heals: the credential-health
+   * state returns to healthy the moment a `/login` gives the machine a usable account, and the next
+   * tick dispatches normally.
+   */
+  credentialExpired: boolean;
   now: number;
 }
 
 /** Why nothing was dispatched. Named rather than boolean, so the log says which rule held. */
 export type AutoDispatchSkip =
+  /**
+   * Every Claude account is OAuth-expired, so a research child would only die on the same dead auth.
+   * Checked FIRST — it is a fact about the whole credential pool, not about any waiter — so it wins
+   * over every other reason including {@link AutoDispatchObservation.credentialExpired}'s siblings.
+   */
+  | "credential-expired"
   /** Nothing is waiting. The overwhelmingly common case, and the whole life of a single send. */
   | "queue-empty"
   /** An agent for every waiting message. The queue is being served — see {@link decideAutoDispatch}. */
@@ -470,6 +488,12 @@ function excludeReason(
  * true — if research gains write powers — this rule must be revisited in the same change.
  */
 export function decideAutoDispatch(obs: AutoDispatchObservation): AutoDispatchDecision {
+  // BEFORE ANYTHING ELSE, EVEN THE EMPTY-QUEUE CHECK. When every account is OAuth-expired a research
+  // pass is a metered `claude` child that dies on the same dead auth every concierge turn dies on, so
+  // there is nothing worth spending on until a human signs in again (bead sparkle-s8xi35). This is a
+  // whole-pool fact — it does not depend on what is waiting — so it short-circuits the whole decision
+  // rather than being one more per-waiter exclusion. It clears itself when the credential recovers.
+  if (obs.credentialExpired) return { action: "none", reason: "credential-expired" };
   if (obs.waiting.length === 0) return { action: "none", reason: "queue-empty" };
   // BEFORE THE COUNT, never after. An unhydrated store reports zero live agents, which reads as the
   // most acute possible version of the very condition being detected — and this mechanism spends

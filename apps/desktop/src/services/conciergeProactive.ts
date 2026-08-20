@@ -99,6 +99,17 @@ export interface ProactiveDeps {
   setTimer(fn: () => void, ms: number): number;
   clearTimer(handle: number): void;
   /**
+   * Are ALL of this machine's Claude accounts OAuth-expired (`credentialHealth.isCredentialExpired`)?
+   *
+   * When it returns true, {@link ProactiveScheduler} spends NOTHING — a proactive push and a research
+   * answer are both `claude` turns that die on exactly the dead auth the concierge's own turns die on,
+   * and volunteering an unbidden turn that will fail is the opposite of the "sign in again" state the
+   * app is trying to surface once and quietly (bead sparkle-s8xi35). Optional: a scheduler wired
+   * without it never pauses, so existing callers are unchanged. It is re-read at FIRE time rather than
+   * cached, so the pause lifts on the next tick once a `/login` restores a usable account — no reset.
+   */
+  credentialExpired?(): boolean;
+  /**
    * THE RESEARCH DRAIN'S SECOND SEAM (bead `sparkle-s7rfc`, §3.3 of the reporting-channel PRD).
    *
    * Returns the unread research findings to fold into this turn's prompt, and the ids they came
@@ -900,6 +911,14 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
    * four-second coalescing window.
    */
   const fire = (now: number, mainReady: boolean, researchReady: boolean) => {
+    // ══ ALL ACCOUNTS OAUTH-EXPIRED → SPEND NOTHING (bead sparkle-s8xi35) ═══════════════════════════
+    // Read at fire time, not cached, and BEFORE any attempt clock is touched: both a proactive push
+    // and a research answer are `claude` turns that would die on the same dead auth the concierge's
+    // own turns die on. Standing down here spends no hourly slot and charges no attempt (nothing below
+    // runs), so the whole thing is simply deferred — the next tick after a `/login` fires normally.
+    // This is deliberately the outermost gate: neither the feed track nor the research track may
+    // smuggle a turn past a dead credential.
+    if (deps.credentialExpired?.()) return;
     // NOTHING FROM THE MAIN TRACK IS READ WHEN IT IS NOT ITS TURN. A research wake can come due
     // while a feed change is still held by the two-minute floor; taking the feed here anyway would
     // let research smuggle the fleet past its own limiter, which is §3.3's objection with the

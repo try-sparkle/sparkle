@@ -52,6 +52,7 @@ vi.mock("./ClaudeSignIn", () => ({
 import { ReadinessGate, READINESS_AUTH_BANNER_TESTID } from "./ReadinessGate";
 import { reportClaudeAuthFailed, resetClaudeAuthSignalForTests } from "../services/claudeAuthSignal";
 import { getPreferredAccountId, setPreferredAccountId } from "../services/accountStore";
+import { getCredentialHealth, resetCredentialHealthForTests } from "../services/credentialHealth";
 
 const report = (over: Partial<Record<"git" | "node" | "claude", boolean>> = {}) => {
   const f = (installed: boolean) => ({ installed, path: installed ? "/x" : null });
@@ -111,6 +112,7 @@ const WORK_IDENT = ident("work", "drodio@work.com", "Amforge");
 beforeEach(() => {
   vi.clearAllMocks();
   resetClaudeAuthSignalForTests();
+  resetCredentialHealthForTests();
   localStorage.clear();
   liveUsageRowsMock.mockReturnValue([]);
   // Default: a rotation with NO usable alternative (single default account), so every existing
@@ -190,6 +192,47 @@ describe("ReadinessGate", () => {
     });
     await waitFor(() => expect(screen.queryByText("CLAUDE SIGN IN")).toBeNull());
     expect(screen.getByText("APP")).toBeTruthy();
+  });
+
+  // ══ THE CREDENTIAL-HEALTH PUBLISHER (bead sparkle-s8xi35) ══════════════════════════════════════
+  // The gate is the ONE authoritative computer of "all accounts expired": a full-screen BLOCK is
+  // exactly that fact. This asserts it PUBLISHES that fact into `credentialHealth`, which the send
+  // path, the auto-dispatch and the proactive scheduler read. A wiring bug needs a wiring test — the
+  // pure `authGateDecision` is already covered, but nothing proved the gate feeds it into the state.
+  // Verified to FAIL with the publishing effect removed (the store stays "ok" on a block).
+  it("publishes credential-health = expired while it BLOCKS, and clears it on a confirmed sign-in", async () => {
+    checkPrereqs.mockResolvedValue(report());
+    // Expired then healthy, so the sign-in re-probe recovers — the self-healing half of the state.
+    checkClaudeAuthStatus.mockResolvedValueOnce(auth(false)).mockResolvedValue(auth(true));
+    render(app);
+    const btn = await screen.findByText("CLAUDE SIGN IN");
+    // The block is on screen → the one state the consumers gate on is expired.
+    await waitFor(() => expect(getCredentialHealth()).toBe("expired"));
+
+    await act(async () => {
+      btn.click();
+    });
+    // The human signed in → the gate re-probes, the decision leaves "block", the state self-heals.
+    await waitFor(() => expect(screen.queryByText("CLAUDE SIGN IN")).toBeNull());
+    expect(getCredentialHealth()).toBe("ok");
+  });
+
+  it("does NOT publish expired when a healthy alternative keeps the app working (banner, not block)", async () => {
+    checkPrereqs.mockResolvedValue(report());
+    checkClaudeAuthStatus.mockResolvedValue(auth(false));
+    // A rotation WITH a usable alternative → banner, not block. The default lapsed but the app keeps
+    // running on another account, so this is not the all-expired dead end and must not gate sends.
+    loadAccountStateMock.mockResolvedValue(
+      accountState({
+        accounts: [DEFAULT_ACCT, WORK_ACCT],
+        identities: [DEFAULT_IDENT, WORK_IDENT],
+        usage: [usageRow("default"), usageRow("work")],
+      }),
+    );
+    render(app);
+    expect(await screen.findByTestId(READINESS_AUTH_BANNER_TESTID)).toBeTruthy();
+    expect(screen.queryByText("CLAUDE SIGN IN")).toBeNull();
+    expect(getCredentialHealth()).toBe("ok");
   });
 
   // The handoff the founder actually asked for: install runs unattended, then auth is the first

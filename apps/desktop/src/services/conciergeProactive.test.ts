@@ -194,6 +194,33 @@ describe("createProactiveScheduler", () => {
     s.dispose();
   });
 
+  // ══ ALL CLAUDE ACCOUNTS OAUTH-EXPIRED → NO PROACTIVE TURN FIRES (bead sparkle-s8xi35) ═══════════
+  // The SIDE EFFECT under test is that `startTurn` is never invoked while credentials are dead — a
+  // push is a `claude` turn that would die on the same auth every concierge turn dies on. Driven
+  // through the REAL fire path (a genuine needs_you change, coalescing window elapsed), and paired
+  // with the identical scenario at a healthy credential which DOES fire, so the silence is proven to
+  // be caused by the gate. This is the mutation guard: delete the `credentialExpired` check at the top
+  // of `fire` and the expired case fires a turn, reding the first assertion.
+  it("stands down while credentials are expired, and fires once they recover", () => {
+    let expired = true;
+    const h = harness({ credentialExpired: () => expired });
+    const s = createProactiveScheduler(h.deps);
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+    // Expired: the coalescing window elapsed on a real change, and STILL nothing was sent.
+    expect(h.fired).toHaveLength(0);
+
+    // The credential recovers (a /login landed). The next genuine change fires normally — proving the
+    // stand-down was the credential, not a scheduler that had gone permanently quiet.
+    expired = false;
+    s.observe(feed([agent({ id: "a", status: "working", band: "running" })]));
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    s.dispose();
+  });
+
   it("coalesces a burst of ticks inside the window into ONE turn", () => {
     const h = harness();
     const s = createProactiveScheduler(h.deps);
