@@ -100,6 +100,7 @@ mod proc;
 mod promotion;
 mod project_window;
 mod pty;
+mod pty_write_watch;
 /// The publish destination's MCP client — the outbound JSON-RPC calls and the HTTP-200
 /// `isError` decoder that keeps a failed publish from reading as a successful one.
 mod publish_client;

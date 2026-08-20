@@ -481,7 +481,6 @@ mod main_thread_guard {
         "pty_live_sessions",
         "pty_resize",
         "pty_set_paused",
-        "pty_write",
         "publish_helper_vitals",
         "publish_window_roster",
         "quit_app",
@@ -546,6 +545,11 @@ mod main_thread_guard {
             "dictation/commands.rs",
             &["list_audio_inputs"],
         ),
+        // `pty_write` ends in a blocking `write(2)` to a PTY master. Sync, it froze the whole app
+        // twice — 73.5 s once — with the main thread 6715/6715 samples inside `write_all`
+        // (bead `sparkle-epc1zh`). Named here as well as covered by the sweep below, because the
+        // sweep says only "not sync" while this says "this specific command, deliberately".
+        (include_str!("pty.rs"), "pty.rs", &["pty_write"]),
         (include_str!("stale_build.rs"), "stale_build.rs", &["stale_build_probe"]),
         (include_str!("drag_paths.rs"), "drag_paths.rs", &["recover_drag_paths"]),
     ];

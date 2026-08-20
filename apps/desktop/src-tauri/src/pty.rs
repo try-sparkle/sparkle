@@ -1551,11 +1551,73 @@ fn acquire_writer(
     Ok(guard.get(id).ok_or(NO_SUCH_PTY)?.writer.clone())
 }
 
+/// Perform the actual blocking write to a session's stdin, under the in-flight watch.
+///
+/// The ONE place bytes reach a PTY master, shared by `pty_write` and `write_session` so the
+/// instrument cannot cover one path and miss the other. `write_all` here is a blocking `write(2)`:
+/// when the child stops draining stdin the slave's input queue fills and this does not return —
+/// measured at 73.5 seconds (bead `sparkle-epc1zh`). Nothing here bounds or cancels it; the guard
+/// only makes it NAME ITSELF while it is stuck, which neither hang capture could do.
+///
+/// The caller is responsible for keeping this off the main thread. It takes the writer handle
+/// rather than the manager so it has no `State` in scope and can therefore be moved into a
+/// `spawn_blocking` closure.
+fn write_watched(
+    id: &str,
+    writer: &Mutex<Box<dyn Write + Send>>,
+    data: &[u8],
+) -> Result<(), String> {
+    let watch = crate::pty_write_watch::begin(id, data.len());
+    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
+    // Past the writer mutex and about to enter write(2) — the phase both measured hangs were in.
+    watch.writing();
+    writer.write_all(data).map_err(|e| e.to_string())?;
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Write to a PTY's stdin — e.g. an approval decision ("y\n" / "n\n") or user input.
+///
+/// ## Why this is `async` (bead `sparkle-epc1zh`)
+///
+/// A sync `#[tauri::command]` runs its body INLINE on the AppKit main thread. This one ends in a
+/// blocking `write(2)` to a PTY master, so when a child stops reading its stdin the whole UI
+/// freezes until the write returns — measured twice, once for 73.5 seconds, with the webview
+/// itself idle (458/459 samples in `mach_msg`) and the main thread 6715/6715 samples inside
+/// `UnixMasterWriter::write_all`. Every other `pty_write` in that same 99-second window returned
+/// in under 0.1ms, so this is not a slow path, it is a blocked one.
+///
+/// `sparkle-4orh` already narrowed the blast radius by taking the write off the GLOBAL `sessions`
+/// lock, so one stalled child no longer freezes other terminals; it deliberately left the write
+/// itself on the main thread. That lock discipline is preserved below and this is the part it did
+/// not do — moving the write to the blocking pool, so a stalled child freezes NOTHING.
+///
+/// ## KNOWN CONSEQUENCE: same-session write ORDER is no longer guaranteed by arrival
+///
+/// This is a real behaviour change and it is recorded here rather than discovered later. While this
+/// command was sync, its body ran inline on the main thread, so two writes to the SAME session
+/// executed in IPC arrival order — ordering was a free side effect of the very inlining that caused
+/// the freeze. It is not free any more: `tauri`'s `respond_async` spawns the WHOLE future onto the
+/// multi-threaded runtime (`tauri-2.11.3/src/ipc/mod.rs:329`), including the part before the first
+/// `.await`, so two concurrent invokes race and the per-session writer mutex grants mutual
+/// exclusion but NOT first-come-first-served.
+///
+/// It is reachable: `writePty` (pty.ts) is fire-and-forget, and live xterm `onData` keystrokes are
+/// DELIBERATELY not routed through `chainPtyOp` — chaining them behind a background submit would
+/// reorder what the user typed, so that decision is load-bearing and cannot simply be reversed.
+/// Two keystrokes therefore can be in flight at once, and a sufficiently descheduled first task
+/// could land after the second.
+///
+/// It is NOT fixed here, deliberately. The fix is a per-session ordered write queue drained by one
+/// thread, which is a larger change with its own new failure mode (a queue in front of a stalled
+/// child grows without bound, where an awaited `spawn_blocking` applies natural backpressure), and
+/// it should not ride along with a freeze fix. Tracked as its own bead. The window is microseconds
+/// wide and needs the runtime to deschedule the first task for the whole of the second one, so the
+/// trade made here is a rare byte-order race against a reproducible 73-second whole-app freeze.
 #[tauri::command]
-pub fn pty_write(
-    manager: State<PtyManager>,
-    observers: State<crate::nudger::Observers>,
+pub async fn pty_write(
+    manager: State<'_, PtyManager>,
+    observers: State<'_, crate::nudger::Observers>,
     id: String,
     data: String,
 ) -> Result<(), String> {
@@ -1574,11 +1636,22 @@ pub fn pty_write(
     // Take this session's OWN writer handle, releasing the global `sessions` lock BEFORE the write.
     // A large paste into a stalled child then blocks only this writer, leaving spawn/write/resize/
     // kill for every other terminal responsive (sparkle-4orh).
+    //
+    // This map lookup stays on the calling thread ON PURPOSE. It is a `HashMap::get` plus an
+    // `Arc::clone` under a lock held by nobody who blocks, so it cannot stall; doing it here rather
+    // than inside the closure keeps `NO_SUCH_PTY` a synchronous answer and keeps `State` — which is
+    // borrowed from the app handle and cannot cross into a `'static` closure — out of the blocking
+    // pool entirely.
     let writer = acquire_writer(&manager.sessions, &id)?;
-    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
-    writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    // THE BLOCKING WRITE, ON THE BLOCKING POOL. `spawn_blocking` and not `spawn`: this is a
+    // synchronous `write(2)` that can park its thread indefinitely, which would starve the async
+    // runtime's worker pool the same way it used to freeze the main thread.
+    tauri::async_runtime::spawn_blocking(move || write_watched(&id, &writer, data.as_bytes()))
+        .await
+        // A join error means the blocking task panicked or the runtime is shutting down. Reported
+        // rather than swallowed: `pty_write`'s `Err` is surfaced in the terminal, and silently
+        // returning `Ok` would tell the frontend bytes were delivered that never were.
+        .map_err(|e| format!("pty write task failed: {e}"))?
 }
 
 /// Write to a PTY's stdin from INSIDE Rust, without the `note_foreign_write` stamp `pty_write`
@@ -1595,10 +1668,17 @@ pub fn write_session<R: tauri::Runtime>(
 ) -> Result<(), String> {
     let manager = app.try_state::<PtyManager>().ok_or(NO_SUCH_PTY)?;
     let writer = acquire_writer(&manager.sessions, id)?;
-    let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
-    writer.write_all(data.as_bytes()).map_err(|e| e.to_string())?;
-    writer.flush().map_err(|e| e.to_string())?;
-    Ok(())
+    // Same `write_watched` as `pty_write`, so the in-flight instrument covers this path too and a
+    // blocked nudger write names its session exactly like a blocked user keystroke.
+    //
+    // STILL SYNCHRONOUS, and one of its two callers is still on the main thread — `deliver` runs on
+    // the nudger's own off-thread tick, but `nudger_send_escape` is a sync `#[tauri::command]` and
+    // therefore inline on AppKit. That is real residual exposure of the same shape `sparkle-epc1zh`
+    // fixes here, at far lower odds: it writes a SINGLE escape byte, where the two measured hangs
+    // carried 632 and 260. It is not fixed in this change because the fix is to convert
+    // `nudger_send_escape` itself, which is a different command with its own callers, and it is
+    // already carried as debt in `cmd_timing`'s `EXEMPT` list under bead `sparkle-11i4v`.
+    write_watched(id, &writer, data.as_bytes())
 }
 
 /// Pause or resume the PTY reader for flow control (). The frontend calls this when its
@@ -2066,7 +2146,7 @@ mod epoch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, apply_heap_cap, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, SpawnAccount,
+        acquire_writer, apply_heap_cap, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, write_watched, SpawnAccount,
         guard_resize_size, guard_spawn_size,
         insert_or_cancel,
         next_pty_epoch,
@@ -3474,6 +3554,177 @@ mod tests {
             let _ = s.killer.kill();
             let _ = child.wait();
         }
+    }
+
+    // ── sparkle-epc1zh: the write must reach the BLOCKING POOL, not just an async body ─────────
+    /// `cmd_timing`'s guard proves `pty_write` is `async`, which is what keeps it off the AppKit
+    /// main thread. That is necessary and NOT sufficient: an `async fn` that performs the blocking
+    /// `write(2)` inline in its body has merely moved the wedge from the UI thread onto an async
+    /// runtime worker, where it starves every other async command instead. The write has to reach
+    /// `spawn_blocking`.
+    ///
+    /// A source assertion, in the same spirit as `command_is_async` — the property is structural
+    /// and there is no runtime observation that distinguishes the two without a live Tauri app.
+    #[test]
+    fn pty_write_hands_the_blocking_write_to_the_blocking_pool() {
+        // PRODUCTION SOURCE ONLY. `include_str!("pty.rs")` includes THIS MODULE, whose source
+        // contains every needle below as a string literal — so scanning the whole file matches the
+        // test's own text and passes no matter what the command does. That is not hypothetical:
+        // the first version of this test did exactly that and stayed green against a deliberately
+        // reverted, fully synchronous `pty_write`.
+        // Cut at the first COLUMN-ZERO `#[cfg(test)]`: the indented ones inside `impl` blocks
+        // earlier in this file are not module boundaries, and splitting on those would cut above
+        // `pty_write` itself and make the test fail for the wrong reason.
+        let src = include_str!("pty.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("split always yields a first element");
+        // Anchored to the start of a line, so an indented mention inside a string or a comment
+        // cannot satisfy it either.
+        let start = src
+            .find("\npub async fn pty_write(")
+            .expect("pty_write must be declared `pub async fn` at the top level");
+        // Bound the search to this function so a `spawn_blocking` elsewhere in the file cannot
+        // satisfy it — the other half of the same vacuity.
+        let end = src[start + 1..].find("\n}\n").map(|i| start + 1 + i).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("spawn_blocking"),
+            "pty_write's blocking write must be handed to spawn_blocking; an inline blocking \
+             write in an async body starves the async runtime instead of the main thread"
+        );
+        assert!(
+            body.contains("write_watched"),
+            "pty_write must go through write_watched, or a blocked write stops naming its session"
+        );
+    }
+
+    // ── sparkle-epc1zh: a blocked write must be isolated AND must name itself ──────────────────
+    /// A PTY write that is GENUINELY BLOCKED — real PTY, real child that never reads its stdin,
+    /// enough bytes to fill the tty input queue — must leave every other session writable, and must
+    /// name itself in the in-flight registry while it is stuck.
+    ///
+    /// This is the test the two measured hangs would have needed. It is deliberately not a
+    /// stopwatch assertion: both real occurrences were writes that NEVER RETURNED, so any assertion
+    /// about a completed write's duration would pass here while proving nothing about them. What is
+    /// asserted instead is what an investigator actually needs mid-hang — WHICH session is stuck —
+    /// and that the rest of the app is unaffected while it is.
+    ///
+    /// Skips if the environment has no PTY. Every wait is bounded, so a regression fails the test
+    /// rather than wedging the suite.
+    #[test]
+    fn a_blocked_write_names_its_session_and_leaves_others_writable() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        use std::sync::mpsc;
+
+        let sys = native_pty_system();
+        let open = || sys.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 });
+        let (Ok(stuck), Ok(healthy)) = (open(), open()) else {
+            return; // no PTY in this environment — skip
+        };
+        // `sleep` never reads its stdin, so the slave input queue fills and never drains. `cat`
+        // drains continuously, so writes to it always complete — that contrast is the test.
+        // The argument is load-bearing: bare `/bin/sleep` exits immediately on a usage error, which
+        // still blocks the write but leaves nothing to kill, so teardown can never release it.
+        let mut sleep_cmd = CommandBuilder::new("/bin/sleep");
+        sleep_cmd.arg("120");
+        let Ok(mut stuck_child) = stuck.slave.spawn_command(sleep_cmd) else {
+            return;
+        };
+        let Ok(mut healthy_child) = healthy.slave.spawn_command(CommandBuilder::new("/bin/cat"))
+        else {
+            let _ = stuck_child.clone_killer().kill();
+            return;
+        };
+        let mut stuck_killer = stuck_child.clone_killer();
+        let mut healthy_killer = healthy_child.clone_killer();
+        // Drop the slaves, exactly as `pty_spawn` does — the child holds its own fds, and while a
+        // slave stays open here NOTHING closes when the child dies, so the blocked write below
+        // could never be released and teardown would hang forever.
+        drop(stuck.slave);
+        drop(healthy.slave);
+
+        let stuck_writer =
+            Arc::new(Mutex::new(stuck.master.take_writer().expect("take_writer")));
+        let healthy_writer =
+            Arc::new(Mutex::new(healthy.master.take_writer().expect("take_writer")));
+
+        // Far more than any tty input queue (MAX_CANON is a few KB), so write(2) is certain to
+        // block rather than merely being slow.
+        let payload = vec![b'x'; 4 * 1024 * 1024];
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (blocked_tx, blocked_rx) = mpsc::channel();
+        let blocked = {
+            let w = Arc::clone(&stuck_writer);
+            std::thread::spawn(move || {
+                started_tx.send(()).ok();
+                // Blocks here until the child is killed at the end of the test.
+                blocked_tx.send(write_watched("stuck-session", &w, &payload)).ok();
+            })
+        };
+        started_rx.recv_timeout(Duration::from_secs(5)).expect("writer thread started");
+
+        // Wait for the write to actually be blocked, rather than sleeping a fixed amount: poll the
+        // registry until it reports the session in the `Writing` phase.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let named = loop {
+            let seen = crate::pty_write_watch::in_flight();
+            if let Some(e) = seen.iter().find(|e| e.id == "stuck-session") {
+                if e.phase == crate::pty_write_watch::Phase::Writing {
+                    break true;
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            named,
+            "a blocked PTY write must name its session in the in-flight registry — naming it is \
+             the entire fix for a hang that twice left no record of WHICH session was stuck"
+        );
+        assert!(!blocked.is_finished(), "the write must still be blocked for the rest of this test");
+
+        // THE ISOLATION PROPERTY. While that write is stuck inside write(2), a write to a DIFFERENT
+        // session must complete promptly. Run it on its own thread with a bounded wait so a
+        // regression fails the test instead of hanging the suite.
+        let (done_tx, done_rx) = mpsc::channel();
+        {
+            let w = Arc::clone(&healthy_writer);
+            std::thread::spawn(move || {
+                done_tx.send(write_watched("healthy-session", &w, b"hello\n")).ok();
+            });
+        }
+        let other = done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a write to an unrelated session must not wait on a blocked one");
+        assert!(other.is_ok(), "unrelated write failed: {other:?}");
+
+        // …and the blocked one is still blocked, so the assertion above really was made under the
+        // condition it claims. Without this, a test that raced past the block would still pass.
+        assert!(
+            !blocked.is_finished(),
+            "the isolation assertion is only meaningful while the other write is still stuck"
+        );
+
+        // Teardown: killing the child closes the last slave fd, which releases the blocked write.
+        let _ = stuck_killer.kill();
+        let _ = healthy_killer.kill();
+        let _ = stuck_child.wait();
+        let _ = healthy_child.wait();
+        // Bounded, never `join()`: a regression that leaves the write permanently blocked must FAIL
+        // this test, not wedge the suite for whoever runs it next.
+        blocked_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the blocked write must be released once its child is gone");
+        let _ = blocked.join();
+        // The guard deregisters on drop even though the write ERRORED — a leaked entry would read
+        // as a permanently wedged session forever after.
+        assert!(
+            !crate::pty_write_watch::in_flight().iter().any(|e| e.id == "stuck-session"),
+            "the in-flight entry must be released even when the write fails"
+        );
     }
 
     // ── sparkle-4orh: per-session write lock ──────────────────────────────────────────────────

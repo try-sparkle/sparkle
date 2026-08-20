@@ -71,7 +71,7 @@ const TAURI_RESPONSE_HEADER_OK: &str = "ok";
 const SPARKLE_IPC_HEADER_NAME: &str = "x-";
 
 /// The dump document's schema tag. Bump it when a reader would have to change.
-const DUMP_SCHEMA: &str = "sparkle.ipc.timeline/1";
+const DUMP_SCHEMA: &str = "sparkle.ipc.timeline/2";
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // The protocol handler
@@ -119,6 +119,60 @@ fn correlation_id(headers: &HeaderMap) -> u64 {
     ((epoch as u32 as u64) << 32) | (seq as u32 as u64)
 }
 
+/// Which argument names the SUBJECT of a request, per command — the allowlist, and the only way an
+/// argument value can reach a dump.
+///
+/// `arg_bytes` records that a request carried 632 bytes; it cannot say WHICH terminal they were
+/// bound for. That is the fact both `sparkle-epc1zh` hang captures lacked: a `pty_write` entered at
+/// 03:56:23.349 with 632 arg bytes and never completed, and nothing in the process could name the
+/// session it was writing to.
+///
+/// AN ALLOWLIST, never a general "record the args" switch. Command arguments carry prompts, file
+/// paths, tokens and user text, and a dump is attached to bug reports. Two independent limits keep
+/// this safe: a command must be named here, AND the value must parse as a uuid
+/// (`ipc_ring::parse_uuid`) or it is dropped. Adding an entry can therefore leak an identifier at
+/// worst, never a secret.
+fn subject_arg_for(cmd: &str) -> Option<&'static str> {
+    match cmd {
+        // The PTY session uuid. Not a secret: it is minted by the app per terminal and already
+        // appears in `pty:output` / `pty:exit` events.
+        "pty_write" => Some("id"),
+        _ => None,
+    }
+}
+
+/// The value of a top-level JSON string field named `key`, without parsing the document.
+///
+/// A hand-rolled byte scan rather than `serde_json`, because this runs on the IPC hot path for
+/// every `pty_write` — i.e. every keystroke — and a paste can be megabytes. Parsing the payload
+/// here would double the parse cost of the very command whose latency this module exists to
+/// measure.
+///
+/// It returns the FIRST `"key":"…"` in the body. A nested occurrence inside another string value
+/// could in principle be matched instead; Tauri serialises the parameters in declaration order so
+/// in practice the real one comes first, and the uuid filter at the call site means a mismatch
+/// yields a wrong identifier at worst — never a leak. Correctness of the value is not a safety
+/// property here, only its shape is.
+fn json_string_field<'a>(body: &'a [u8], key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\":\"");
+    let n = needle.as_bytes();
+    let start = body.windows(n.len()).position(|w| w == n)? + n.len();
+    let rest = body.get(start..)?;
+    let end = rest.iter().position(|&c| c == b'"')?;
+    std::str::from_utf8(rest.get(..end)?).ok()
+}
+
+/// The subject uuid to record for this request, or `None`.
+///
+/// `path` is the raw request path (`/pty_write`). Matched undecoded: a command name is
+/// `[a-z0-9_]+`, which percent-encoding never alters, so decoding first would allocate on the hot
+/// path to reach the same answer.
+fn subject_for(path: &str, body: &[u8]) -> Option<u128> {
+    let cmd = path.strip_prefix('/')?;
+    let arg = subject_arg_for(cmd)?;
+    ipc_ring::parse_uuid(json_string_field(body, arg)?)
+}
+
 /// The body of the `ipc:` handler, with the responder abstracted so a test can observe it.
 ///
 /// `respond` is `FnOnce`: every path through this function calls it EXACTLY once, which is the
@@ -155,6 +209,9 @@ pub(crate) fn handle_ipc<R: Runtime, F>(
                 ipc_ring::note_unjoined();
             }
             let arg_bytes = request.body().len().min(u32::MAX as usize) as u32;
+            // BEFORE `parse_invoke_request`, which consumes the request. Cheap and allowlisted —
+            // see `subject_for`.
+            let subject = subject_for(request.uri().path(), request.body());
 
             let Some(win) = app.get_webview_window(label) else {
                 respond(plain_500("failed to acquire webview reference"));
@@ -175,6 +232,7 @@ pub(crate) fn handle_ipc<R: Runtime, F>(
                 crate::cmd_timing::on_main_thread(),
                 corr_id,
                 t_entry_ns,
+                subject,
             );
 
             win.on_message(
@@ -412,6 +470,7 @@ fn render(rows: &[Record], commands: &[String], meta: &Meta) -> String {
     let mut handler = Vec::with_capacity(n);
     let mut arg_bytes = Vec::with_capacity(n);
     let mut ret_bytes = Vec::with_capacity(n);
+    let mut subject = Vec::with_capacity(n);
     let mut in_flight = Vec::with_capacity(n);
     let mut on_main = Vec::with_capacity(n);
     let mut errored = Vec::with_capacity(n);
@@ -427,6 +486,9 @@ fn render(rows: &[Record], commands: &[String], meta: &Meta) -> String {
         handler.push(r.handler_ns);
         arg_bytes.push(r.arg_bytes);
         ret_bytes.push(r.ret_bytes);
+        // `null` for a command not on the subject allowlist, so "we did not record one" is
+        // distinguishable from "this request had no session".
+        subject.push(r.subject.map(ipc_ring::format_uuid));
         in_flight.push(r.in_flight);
         on_main.push(r.on_main_thread);
         errored.push(r.errored);
@@ -471,6 +533,7 @@ fn render(rows: &[Record], commands: &[String], meta: &Meta) -> String {
             "handler_ns": handler,
             "arg_bytes": arg_bytes,
             "ret_bytes": ret_bytes,
+            "subject": subject,
             "in_flight": in_flight,
             "on_main_thread": on_main,
             "errored": errored,
@@ -732,6 +795,81 @@ mod tests {
     }
 
     // ── The local copy of tauri's parser ───────────────────────────────────────────────────────
+    // ── sparkle-epc1zh: the subject allowlist ─────────────────────────────────────────────────
+    /// A `pty_write` entered at 03:56:23.349 with 632 arg bytes and never returned, freezing the
+    /// app for 73.5 s — and nothing in the process could say WHICH terminal it was writing to.
+    /// This is the extraction that answers that next time.
+    #[test]
+    fn subject_extraction_names_the_session_for_pty_write() {
+        let id = "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7b";
+        let body = format!(r#"{{"id":"{id}","data":"ls -la\n"}}"#);
+        assert_eq!(
+            subject_for("/pty_write", body.as_bytes()).map(ipc_ring::format_uuid).as_deref(),
+            Some(id),
+            "a pty_write must record WHICH session it was writing to — the fact both hang \
+             captures lacked"
+        );
+    }
+
+    /// The allowlist is the safety boundary: a command that is not on it records nothing, even
+    /// when its payload contains a field literally named `id`.
+    #[test]
+    fn a_command_not_on_the_allowlist_records_no_subject() {
+        let body = br#"{"id":"3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7b","data":"x"}"#;
+        assert_eq!(subject_for("/write_config_text", body), None);
+        assert_eq!(subject_for("/frontend_log", body), None);
+        assert_eq!(subject_for("/pty_kill", body), None);
+        // …and the one that IS on it does record, so the assertions above are about the allowlist
+        // rather than about the extractor being broken.
+        assert!(subject_for("/pty_write", body).is_some());
+    }
+
+    /// The SECOND limit, independent of the allowlist: a value that is not a uuid is dropped. Even
+    /// if a future entry named an argument carrying user text or a token, nothing reaches a dump.
+    #[test]
+    fn a_non_uuid_argument_is_dropped_rather_than_recorded() {
+        for body in [
+            br#"{"id":"a-credential-shaped-string-not-a-uuid","data":"x"}"#.as_slice(),
+            br#"{"id":"/Users/someone/private/notes.txt","data":"x"}"#.as_slice(),
+            br#"{"id":"","data":"x"}"#.as_slice(),
+            br#"{"data":"x"}"#.as_slice(),
+            br#"not json at all"#.as_slice(),
+            b"".as_slice(),
+        ] {
+            assert_eq!(
+                subject_for("/pty_write", body),
+                None,
+                "non-uuid argument must not be recorded: {:?}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    /// A large paste must not change the answer — the extractor is a bounded byte scan, and this
+    /// pins that a realistic megabyte payload still yields the session rather than tripping over
+    /// its own size.
+    #[test]
+    fn a_large_paste_still_yields_its_session() {
+        let id = "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7b";
+        let paste = "y".repeat(1024 * 1024);
+        let body = format!(r#"{{"id":"{id}","data":"{paste}"}}"#);
+        assert_eq!(
+            subject_for("/pty_write", body.as_bytes()).map(ipc_ring::format_uuid).as_deref(),
+            Some(id)
+        );
+    }
+
+    #[test]
+    fn json_string_field_reads_only_a_string_value() {
+        assert_eq!(json_string_field(br#"{"a":"one","b":"two"}"#, "a"), Some("one"));
+        assert_eq!(json_string_field(br#"{"a":"one","b":"two"}"#, "b"), Some("two"));
+        assert_eq!(json_string_field(br#"{"a":"one"}"#, "missing"), None);
+        // A non-string value is not a string field, so it is not returned as one.
+        assert_eq!(json_string_field(br#"{"a":42}"#, "a"), None);
+        // An unterminated value yields nothing rather than running off the end.
+        assert_eq!(json_string_field(br#"{"a":"unterminated"#, "a"), None);
+    }
+
     /// Round-trip, mirroring tauri's own test (`src/ipc/protocol.rs:564-644`). Goes red if any
     /// header name, the URL decode, or the content-type switch drifts from the original.
     #[test]
@@ -973,7 +1111,7 @@ mod tests {
         let rows = &doc["rows"];
         assert!(rows["rid"].is_array(), "columnar: rows.rid must be an array");
         for field in
-            ["rid", "corr", "cmd", "t_entry_ns", "t_dispatch_ns", "handler_ns", "arg_bytes", "ret_bytes"]
+            ["rid", "corr", "cmd", "t_entry_ns", "t_dispatch_ns", "handler_ns", "arg_bytes", "ret_bytes", "subject"]
         {
             assert_eq!(
                 rows[field].as_array().unwrap_or_else(|| panic!("{field} missing")).len(),

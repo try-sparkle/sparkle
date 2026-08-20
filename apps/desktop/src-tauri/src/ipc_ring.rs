@@ -120,9 +120,60 @@ struct Slot {
     t_complete_ns: AtomicU64,
     arg_bytes: AtomicU32,
     ret_bytes: AtomicU32,
+    /// WHICH THING this request was about, as a 128-bit uuid — 0 for "none recorded".
+    ///
+    /// `arg_bytes` says a request carried 632 bytes; it cannot say WHICH terminal those bytes were
+    /// going to, and that is exactly the fact both `sparkle-epc1zh` hang captures lacked. The
+    /// subject is recorded only for the commands on `ipc_trace`'s allowlist.
+    ///
+    /// A UUID rather than a string for two reasons, and the second is the important one. It costs
+    /// 16 bytes per slot instead of a 36-byte buffer, and it keeps this module's no-allocation,
+    /// no-lock hot path intact. But it also makes "this is a session id, not a secret" a
+    /// STRUCTURAL property instead of a convention: a value that is not a uuid cannot be
+    /// represented here at all, so no argument that happens to be a token, a path, or a prompt can
+    /// ever reach a dump through this field, whatever a future allowlist entry names.
+    subject_hi: AtomicU64,
+    subject_lo: AtomicU64,
     cmd_id: AtomicU16,
     in_flight: AtomicU16,
     flags: AtomicU8,
+}
+
+/// Parse a hyphenated lowercase-or-uppercase uuid into 128 bits, or `None`.
+///
+/// Deliberately strict — exact length, hyphens in the four canonical positions, hex everywhere
+/// else. Strictness is the safety property described on `subject_hi`: anything that is not a uuid
+/// is dropped rather than recorded, so this is the filter that makes the field un-abusable.
+pub fn parse_uuid(s: &str) -> Option<u128> {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return None;
+    }
+    let mut out: u128 = 0;
+    for (i, &c) in b.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if c != b'-' {
+                return None;
+            }
+            continue;
+        }
+        let nybble = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            b'A'..=b'F' => c - b'A' + 10,
+            _ => return None,
+        };
+        out = (out << 4) | nybble as u128;
+    }
+    // A uuid of all zeroes is indistinguishable from "none recorded" in the slot, so it is refused
+    // here rather than round-tripping as a subject nobody set.
+    (out != 0).then_some(out)
+}
+
+/// Render 128 bits back to the canonical hyphenated lowercase form. Dump-time only.
+pub fn format_uuid(v: u128) -> String {
+    let h = format!("{v:032x}");
+    format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
 }
 
 fn slots() -> &'static [Slot] {
@@ -257,7 +308,7 @@ pub fn total_seen() -> u64 {
 /// entry stamp — the entry stamp then collapses onto dispatch, which is the honest reading rather
 /// than a zero that a dump would have to special-case.
 pub fn begin(cmd_id: u16, arg_bytes: u32, on_main: bool) -> Option<Ticket> {
-    begin_traced(cmd_id, arg_bytes, on_main, 0, 0)
+    begin_traced(cmd_id, arg_bytes, on_main, 0, 0, None)
 }
 
 /// Record that a request has begun, carrying the renderer's correlation id and the instant the
@@ -273,6 +324,7 @@ pub fn begin_traced(
     on_main: bool,
     corr_id: u64,
     t_entry_ns: u64,
+    subject: Option<u128>,
 ) -> Option<Ticket> {
     if !is_enabled() {
         return None;
@@ -290,6 +342,9 @@ pub fn begin_traced(
     s.t_entry_ns.store(if t_entry_ns == 0 { t_dispatch } else { t_entry_ns }, Ordering::Relaxed);
     s.corr_id.store(corr_id, Ordering::Relaxed);
     s.arg_bytes.store(arg_bytes, Ordering::Relaxed);
+    let subject = subject.unwrap_or(0);
+    s.subject_hi.store((subject >> 64) as u64, Ordering::Relaxed);
+    s.subject_lo.store(subject as u64, Ordering::Relaxed);
     s.ret_bytes.store(0, Ordering::Relaxed);
     s.cmd_id.store(cmd_id, Ordering::Relaxed);
     s.in_flight.store(outstanding.min(u16::MAX as u32) as u16, Ordering::Relaxed);
@@ -340,6 +395,9 @@ pub struct Record {
     pub handler_ns: Option<u64>,
     pub arg_bytes: u32,
     pub ret_bytes: u32,
+    /// WHICH thing this request was about (a session uuid), or `None` when the command is not on
+    /// the subject allowlist. See `Slot::subject_hi`.
+    pub subject: Option<u128>,
     pub in_flight: u16,
     pub on_main_thread: bool,
     pub errored: bool,
@@ -370,6 +428,12 @@ pub fn snapshot() -> Vec<Record> {
             handler_ns: if t1 > t0 && f & flags::COMPLETED != 0 { Some(t1 - t0) } else { None },
             arg_bytes: s.arg_bytes.load(Ordering::Relaxed),
             ret_bytes: s.ret_bytes.load(Ordering::Relaxed),
+            subject: {
+                let hi = s.subject_hi.load(Ordering::Relaxed);
+                let lo = s.subject_lo.load(Ordering::Relaxed);
+                let v = ((hi as u128) << 64) | lo as u128;
+                (v != 0).then_some(v)
+            },
             in_flight: s.in_flight.load(Ordering::Relaxed),
             on_main_thread: f & flags::ON_MAIN_THREAD != 0,
             errored: f & flags::ERRORED != 0,
@@ -386,6 +450,8 @@ pub fn reset() {
         s.t_entry_ns.store(0, Ordering::Relaxed);
         s.t_dispatch_ns.store(0, Ordering::Relaxed);
         s.t_complete_ns.store(0, Ordering::Relaxed);
+        s.subject_hi.store(0, Ordering::Relaxed);
+        s.subject_lo.store(0, Ordering::Relaxed);
         s.flags.store(0, Ordering::Relaxed);
     }
     CURSOR.store(0, Ordering::Relaxed);
@@ -572,7 +638,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         let entry = now_ns();
         std::thread::sleep(std::time::Duration::from_millis(5));
-        let t = begin_traced(cmd, 4, false, 0xDEAD_BEEF, entry).expect("armed");
+        let t = begin_traced(cmd, 4, false, 0xDEAD_BEEF, entry, None).expect("armed");
         complete(t, 8, false);
 
         let rows = snapshot();
@@ -693,6 +759,107 @@ mod tests {
             250,
             "the difference is the evicted count a dump reports"
         );
+    }
+
+    // ── sparkle-epc1zh: the subject column ────────────────────────────────────────────────────
+    /// A recorded subject must survive the round trip through the slot's two atomics and come back
+    /// as the same uuid — this is the fact a hang investigator reads.
+    #[test]
+    fn a_recorded_subject_round_trips_through_the_slot() {
+        let _g = guard();
+        reset();
+        set_enabled(true);
+        let id = "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7b";
+        let cmd = intern("pty_write_subject_roundtrip");
+        let t = begin_traced(cmd, 632, true, 0, 0, parse_uuid(id)).expect("armed");
+        complete(t, 0, false);
+
+        let row = snapshot()
+            .into_iter()
+            .find(|r| r.cmd_id == cmd)
+            .expect("the request was recorded");
+        assert_eq!(
+            row.subject.map(format_uuid).as_deref(),
+            Some(id),
+            "the session uuid must be readable back out of the ring"
+        );
+    }
+
+    /// A command with no subject must read back as `None`, not as a zero uuid — "we did not record
+    /// one" and "this request was about 00000000-…" are different facts and a dump must not
+    /// conflate them.
+    #[test]
+    fn no_subject_reads_back_as_none() {
+        let _g = guard();
+        reset();
+        set_enabled(true);
+        let cmd = intern("no_subject_command");
+        let t = begin_traced(cmd, 4, false, 0, 0, None).expect("armed");
+        complete(t, 0, false);
+
+        let row = snapshot().into_iter().find(|r| r.cmd_id == cmd).expect("recorded");
+        assert_eq!(row.subject, None);
+    }
+
+    /// A slot is reused. A later request WITHOUT a subject must not inherit the previous
+    /// occupant's — that would attribute a hang to a session that had nothing to do with it, which
+    /// is worse than recording nothing at all.
+    #[test]
+    fn a_reused_slot_does_not_inherit_the_previous_subject() {
+        let _g = guard();
+        reset();
+        set_enabled(true);
+        let first = intern("subject_bearing_command");
+        let second = intern("subjectless_command");
+        let t = begin_traced(first, 1, false, 0, 0, parse_uuid("11111111-2222-3333-4444-555555555555"))
+            .expect("armed");
+        complete(t, 0, false);
+        // Wrap the ring exactly once so the same slot is claimed again, this time with no subject.
+        for _ in 0..CAPACITY {
+            if let Some(t) = begin_traced(second, 1, false, 0, 0, None) {
+                complete(t, 0, false);
+            }
+        }
+        assert!(
+            snapshot().iter().filter(|r| r.cmd_id == second).all(|r| r.subject.is_none()),
+            "a subjectless request must never show a stale session id"
+        );
+    }
+
+    /// THE SAFETY PROPERTY. Only a well-formed uuid can be represented, so no argument that happens
+    /// to be a token, a path or user text can reach a dump through this field — whatever a future
+    /// allowlist entry names. Strictness here is what makes the field un-abusable.
+    #[test]
+    fn only_a_well_formed_uuid_can_become_a_subject() {
+        assert!(parse_uuid("3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7b").is_some());
+        // Uppercase is still a uuid.
+        assert!(parse_uuid("3BEBE26E-D8F9-4EB8-80CD-1DB4EACC0B7B").is_some());
+
+        for bad in [
+            "",
+            "not-a-uuid",
+            "/Users/someone/secret/path.txt",
+            // Deliberately NOT shaped like a real provider key: the assertion is about non-uuid
+            // input being refused, and a realistic key literal trips the publish scrub gate
+            // (`publish-public-scrub.test.sh`) that guards the public mirror.
+            "a-credential-shaped-string-that-is-not-a-uuid",
+            "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7",      // 35 chars
+            "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7bb",    // 37 chars
+            "3bebe26ed8f9-4eb8-80cd-1db4eacc0b7b1",     // hyphen misplaced
+            "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7g",     // non-hex
+            "00000000-0000-0000-0000-000000000000",     // nil == "none recorded"
+        ] {
+            assert!(parse_uuid(bad).is_none(), "must refuse {bad:?}");
+        }
+    }
+
+    #[test]
+    fn uuid_formatting_round_trips() {
+        let id = "3bebe26e-d8f9-4eb8-80cd-1db4eacc0b7b";
+        assert_eq!(format_uuid(parse_uuid(id).unwrap()), id);
+        // Leading zeroes must not be dropped — a `{:x}` without width would lose them.
+        let z = "00000000-0000-0000-0000-000000000001";
+        assert_eq!(format_uuid(parse_uuid(z).unwrap()), z);
     }
 
     /// Interning is what keeps the hot path allocation-free, so the same name must not grow the
