@@ -184,12 +184,32 @@ describe("moveAgent", () => {
     expect(getPin("__sparkle_self__-win-6f2c")).toBeUndefined();
   });
 
-  it("…and leaves a sticky consumer's EXISTING human pin exactly as the user set it", () => {
-    // PAIRED: "writes no pin" must not mean "clears the one there". The modal's control set this,
-    // and a banner accept passing through here must not launder or erase it.
+  it("…and CLEARS a sticky consumer's existing human pin, because it points at the walled account", () => {
+    // ⚠️ THIS TEST ASSERTED THE OPPOSITE UNTIL 8829eaebc, and the reversal is deliberate — see the
+    // rationale on `accountSwitch.ts`'s `isStickyAccountKey` branch, which states it directly: "a
+    // pin promising 'run here' is meaningless when 'here' is a walled account… Without the clear,
+    // the re-spawn re-reads the pin (`chooseAccountForAgent` → `stickyPin`) and bounces straight
+    // back to the walled account."
+    //
+    // The old name ("leaves … exactly as the user set it") described the banner path, which can
+    // never hand a hand-pinned sticky key here (`unpinnedRunning` drops it first). The HELPER
+    // RESCUE deliberately does, which is what made the clear necessary. The commit changed the
+    // behaviour and left this test describing the old one, turning main red for every open PR.
     setPin("__sparkle_self__", "personal");
     moveAgent("__sparkle_self__", "b", vi.fn(() => true));
-    expect(getPin("__sparkle_self__")).toBe("personal");
+    expect(getPin("__sparkle_self__")).toBeUndefined();
+  });
+
+  it("…and still writes NO machinery pin of its own while doing it", () => {
+    // The half of the original claim that SURVIVES, kept separate so the reversal above cannot be
+    // read as licence to start pinning: the rescue re-spawns and lets `chooseAccountForAgent`
+    // re-resolve. Writing a pin would launder a machinery choice into the slot the modal renders
+    // back as the user's own — and in a satellite window it lands on the `-win-<uuid>` variant,
+    // detaching that window from the modal long after the limit resets.
+    const restart = vi.fn(() => true);
+    moveAgent("__sparkle_self__", "b", restart);
+    expect(restart).toHaveBeenCalledWith("__sparkle_self__");
+    expect(getPin("__sparkle_self__")).toBeUndefined();
   });
 });
 

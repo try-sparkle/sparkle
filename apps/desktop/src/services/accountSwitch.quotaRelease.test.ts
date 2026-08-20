@@ -46,7 +46,16 @@ import { setPinFromSwitch } from "./accountStore";
 // suite is about the QUOTA BLOCK, not about pinning: a mock missing the symbol under test throws
 // inside `moveAgent` before the release is ever reached, which is what made these two tests red
 // after the merge that introduced the rename.
-vi.mock("./accountStore", () => ({ setPin: vi.fn(), setPinFromSwitch: vi.fn(), hasHumanPin: vi.fn(() => false) }));
+// `clearPin` joined this list with 8829eaebc, which clears a sticky consumer's human pin before
+// re-spawning it (see the rationale at accountSwitch.ts's `isStickyAccountKey` branch). A TOTAL
+// mock drops every export it does not name, so the new call was a load-time
+// `No "clearPin" export is defined` for this whole file.
+vi.mock("./accountStore", () => ({
+  setPin: vi.fn(),
+  setPinFromSwitch: vi.fn(),
+  clearPin: vi.fn(),
+  hasHumanPin: vi.fn(() => false),
+}));
 
 /** Verbatim from the founder's screenshot — the same string `quotaBlock.test.ts` pins. */
 const SESSION_LIMIT =
