@@ -1,8 +1,10 @@
 // @vitest-environment jsdom
 import { describe, it, expect } from "vitest";
-import { detectPlanPrompt } from "./planPrompt";
+import { detectPlanPrompt, isPlanExitDialog } from "./planPrompt";
 import {
   PLAN_EXIT_PROMPT,
+  PLAN_EXIT_PROMPT_RENAMED,
+  STALE_PLAN_QUESTION_OVER_ANOTHER_PICKER,
   PLAN_EXIT_PROMPT_WRAPPED,
   PLAN_EXIT_PROMPT_STICKY,
   PLAN_ARTIFACT_PROMPT,
@@ -65,5 +67,31 @@ describe("detectPlanPrompt", () => {
       "Enter to select · ↑/↓ to navigate · Esc to cancel",
     ].join("\n");
     expect(detectPlanPrompt(impostor)).toBeNull();
+  });
+});
+
+// ── The QUESTION-level predicate, which answers a different question from the detector ──────────
+describe("isPlanExitDialog", () => {
+  it("recognises a plan whose affirmatives were RENAMED, where the detector cannot", () => {
+    // The split's whole purpose. `detectPlanPrompt` has no keystroke to offer here and says so; the
+    // rules that ask "is this a plan" — the escalation arm and the `plan = "ask"` opt-out — must
+    // still hold, or a rename silently reopens both holes.
+    expect(detectPlanPrompt(PLAN_EXIT_PROMPT_RENAMED)).toBeNull();
+    expect(isPlanExitDialog(PLAN_EXIT_PROMPT_RENAMED)).toBe(true);
+  });
+
+  it("refuses an unrelated picker that merely INHERITED the plan question from scrollback", () => {
+    // The other direction, and the dangerous one. On a borderless dialog `pickerQuestionBlock` falls
+    // back to the ten preceding lines, so a picker drawn just after a plan prompt was answered sees
+    // that question above it. Classifying it as a plan swaps the five-class sweep for the plan arm,
+    // which deliberately does not escalate `destructive` — so "Force push over origin/main" would go
+    // to the concierge. The option SHAPE is what the stale question cannot fake.
+    expect(isPlanExitDialog(STALE_PLAN_QUESTION_OVER_ANOTHER_PICKER)).toBe(false);
+  });
+
+  it("agrees with the detector on the ordinary dialog", () => {
+    expect(isPlanExitDialog(PLAN_EXIT_PROMPT)).toBe(true);
+    expect(isPlanExitDialog(PLAN_ARTIFACT_PROMPT)).toBe(false);
+    expect(isPlanExitDialog(BASH_PERMISSION_PROMPT)).toBe(false);
   });
 });

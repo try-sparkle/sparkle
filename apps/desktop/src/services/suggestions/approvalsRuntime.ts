@@ -17,7 +17,7 @@ import { notePromptAnswerOutcome } from "../../engine/blockedPromptGrace";
 import { classifyApproval, headerRegion } from "./approvalClassifier";
 import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
 import { detectResumePrompt, pickerSignature } from "./heuristics";
-import { detectPlanPrompt } from "./planPrompt";
+import { detectPlanPrompt, isPlanExitDialog } from "./planPrompt";
 import { routeUnclassifiedPrompt } from "./conciergeEscalation";
 import { handOffToConcierge } from "./conciergeHandoff";
 import {
@@ -330,10 +330,16 @@ export function maybeAutoPlan(
   scrollback: string,
   handled: Set<string>,
 ): PlanOutcome | null {
-  const detected = detectPlanPrompt(scrollback);
-  // No report — the exact parallel of `!classification` / `!detected` above: a screen that is not
-  // the plan-exit prompt is not a decision about anything.
-  if (!detected) return null;
+  // THE BAIL IS THE PLAN PREDICATE, NOT THE ANSWERABILITY ONE — the same distinction this module's
+  // router fix turns on, applied to the gate that enforces the opt-out. Bailing on
+  // `detectPlanPrompt` meant that under a rename of the affirmatives (the shape that fix exists for)
+  // this returned BEFORE the rule was read, so `plan = "ask"` stopped holding and the screen fell
+  // through to `maybeAutoApprove` → the concierge. `detectPlanPrompt` is still required below, but
+  // only by the arms that actually need a keystroke.
+  //
+  // No report on this arm — the exact parallel of `!classification` above: a screen that is not the
+  // plan-exit prompt is not a decision about anything.
+  if (!isPlanExitDialog(scrollback)) return null;
   // THE RULE IS READ BEFORE THE MASTER TOGGLE, and the order is load-bearing. An explicit
   // `plan = "ask"` is a statement about WHO decides, and it must hold whichever way the blind
   // presser is switched — checking the toggle first meant that turning OFF the more conservative
@@ -377,10 +383,12 @@ export function maybeAutoPlan(
     declineOrHandOff(agentId, scrollback);
     return "asked";
   }
-  const option = rule === "auto" ? detected.autoOption : detected.manualOption;
-  // The option this rule needs is not on THIS build's dialog. Fail safe exactly as the detector
-  // does: surface the prompt rather than pressing the other affirmative, which would silently give
-  // the opposite of what the rule asked for.
+  const detected = detectPlanPrompt(scrollback);
+  const option = rule === "auto" ? detected?.autoOption : detected?.manualOption;
+  // The option this rule needs is not on THIS build's dialog — either the labels were renamed past
+  // what `detectPlanPrompt` recognises, or only the other affirmative is present. Fail safe: surface
+  // the prompt rather than pressing the option we DO recognise, which would silently give the
+  // opposite of what the rule asked for.
   if (!option) {
     log.info("approvals", "plan prompt recognised but the rule's option is absent", {
       agentId,

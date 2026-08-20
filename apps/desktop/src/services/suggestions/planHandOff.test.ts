@@ -37,7 +37,7 @@ import {
   windowPromptGraceLedger,
   type PromptAnswerOutcome,
 } from "../../engine/blockedPromptGrace";
-import { PLAN_EXIT_PROMPT } from "./planPrompt.fixture";
+import { PLAN_EXIT_PROMPT, PLAN_EXIT_PROMPT_RENAMED } from "./planPrompt.fixture";
 
 const reported = (agentId: string): PromptAnswerOutcome | undefined =>
   windowPromptGraceLedger().outcome.get(agentId)?.outcome;
@@ -83,5 +83,29 @@ describe("maybeAutoPlan — an explicit plan='ask' never routes onward", () => {
     expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBe("asked");
     expect(handOffToConcierge).not.toHaveBeenCalled();
     expect(reported("a1")).toBe("declined");
+  });
+});
+
+// ── The opt-out must survive a RENAME of the affirmatives ──────────────────────────────────────
+// `maybeAutoPlan` used to bail on `detectPlanPrompt` — an ANSWERABILITY test — which returned before
+// the rule was ever read. So under the one shape the split exists for, `plan = "ask"` stopped
+// holding and the screen fell through to `maybeAutoApprove`, whose unclassified arm hands a plan
+// dialog to the concierge by construction. The verbatim fixture cannot see this: the detector
+// recognises it, so the ask case passes either way.
+describe("maybeAutoPlan — affirmatives renamed past what the detector knows", () => {
+  it("plan='ask' still CLAIMS the screen and never routes it onward", () => {
+    useSettingsStore.setState({ planRule: "ask" });
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT_RENAMED, new Set())).toBe("asked");
+    expect(handOffToConcierge).not.toHaveBeenCalled();
+    expect(reported("a1")).toBe("declined");
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("plan='auto' surfaces it rather than pressing an option it does not recognise", () => {
+    // The paired case: the claim above is only meaningful if the same screen is NOT simply pressed.
+    // With no recognised affirmative there is no safe keystroke, so it goes to an answerer.
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT_RENAMED, new Set())).toBe("asked");
+    expect(handOffToConcierge).toHaveBeenCalled();
+    expect(writePty).not.toHaveBeenCalled();
   });
 });

@@ -61,6 +61,13 @@ export function normalizePromptText(s: string): string {
   return s.replace(/[│┃|╎┆┊╷╵]/g, " ").replace(/\s+/g, " ").trim();
 }
 
+/** An affirmative, by SHAPE rather than wording — "Yes, and use auto mode", "Yes, proceed
+ *  automatically", whatever Claude Code calls it next. Used only to corroborate that the plan
+ *  question belongs to the picker on screen (see {@link isPlanExitDialog}), never to choose a
+ *  keystroke: {@link PLAN_AUTO_LABEL} and {@link PLAN_MANUAL_LABEL} do that, and they have to stay
+ *  specific because pressing the wrong affirmative is the whole hazard. */
+const PLAN_AFFIRMATIVE_SHAPE = /^\s*yes\b/i;
+
 /** The dialog's own text, border- and wrap-normalized, or "" when there is no picker to read. */
 function planHeader(scrollback: string): string {
   // `true` for the yes/no half would be the wrong block: this dialog HAS option rows. The block
@@ -82,10 +89,31 @@ function planHeader(scrollback: string): string {
  * three times — would put a genuine plan-exit dialog back on the general sweep, where `destructive`
  * and `legal` escalate ordinary engineering prose out of the ten lines of plan text the borderless
  * fallback window pulls in. A rename would then reintroduce the exact stall this feature ends.
+ *
+ * ── IT IS NOT QUESTION-ONLY, AND THAT IS THE OTHER HALF ──────────────────────────────────────
+ * The question alone would be unsafe in the opposite direction. For a dialog with no top border,
+ * `pickerQuestionBlock` falls back to a fixed window of the ten preceding lines — which, moments
+ * after a plan-exit prompt is answered, still contains "…has written up a plan and is ready to
+ * execute…". Any borderless picker drawn inside that window would inherit it. The consequence is a
+ * SAFETY DOWNGRADE of exactly the kind `conciergeEscalation`'s header warns about ("a false
+ * 'concierge' lets an agent press an irreversible button"): the plan arm deliberately does not
+ * escalate `destructive` or `legal`, so the roborev-63621 shape — a neutral header over "Force push
+ * over origin/main" / "Open a PR instead" — would go to the concierge instead of the founder.
+ *
+ * So the question is corroborated by THIS picker's own OPTION SHAPE, the rule `isPlanModeDialog`'s
+ * doc states: a plan-exit dialog offers at least one affirmative and at least one way out that is
+ * not one. That is deliberately shape, not wording — the whole point of the split is to survive a
+ * rename — and it is what the stale-question case cannot fake, because the options belong to the
+ * picker actually on screen.
  */
 export function isPlanExitDialog(scrollback: string): boolean {
   const header = planHeader(scrollback);
-  return header.length > 0 && PLAN_QUESTION.test(header);
+  if (header.length === 0 || !PLAN_QUESTION.test(header)) return false;
+  const opts = parsePickerOptions(scrollback);
+  if (opts.length < 2) return false;
+  const affirmative = opts.some((o) => PLAN_AFFIRMATIVE_SHAPE.test(o.label));
+  const wayOut = opts.some((o) => !PLAN_AFFIRMATIVE_SHAPE.test(o.label));
+  return affirmative && wayOut;
 }
 
 /** Detect Claude Code's plan-exit prompt. Returns the keystroke for each affirmative it could find

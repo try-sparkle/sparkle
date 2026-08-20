@@ -67,3 +67,33 @@ export const BASH_PERMISSION_PROMPT = [
   "",
   FOOTER,
 ].join("\n");
+
+/** The plan-exit prompt with its affirmatives RENAMED — the shape Claude Code is most likely to ship
+ *  next, since it has already renamed this option three times. `detectPlanPrompt` cannot answer it
+ *  (no label matches), but it is unmistakably a plan, and every rule that keys on "is this a plan"
+ *  rather than "can I answer it" must still hold. */
+export const PLAN_EXIT_PROMPT_RENAMED = [
+  "⏺ Step 1: delete the dead helper and its test.",
+  "",
+  "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "❯ 1. Yes, proceed automatically",
+  "  2. Yes, review each edit",
+  "  3. Tell Claude what to change",
+  "",
+  FOOTER,
+].join("\n");
+
+/** An UNRELATED picker drawn while the plan question is still within the ten-line window
+ *  `pickerQuestionBlock` falls back to on a borderless dialog. Its own options are the roborev-63621
+ *  shape: a neutral header over an irreversible act. Nothing here may be classified as a plan — the
+ *  plan arm does not escalate `destructive`, so doing so would hand a force-push to the concierge. */
+export const STALE_PLAN_QUESTION_OVER_ANOTHER_PICKER = [
+  "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "⏺ Running the release step now.",
+  "",
+  "How should I proceed?",
+  "❯ 1. Force push over origin/main",
+  "  2. Open a PR instead",
+  "",
+  FOOTER,
+].join("\n");

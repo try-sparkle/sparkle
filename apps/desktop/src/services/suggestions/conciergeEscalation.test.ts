@@ -564,3 +564,30 @@ describe("routeUnclassifiedPrompt — a plan-exit dialog whose affirmatives were
     expect(routeUnclassifiedPrompt(renamed)).toMatchObject({ route: "concierge" });
   });
 });
+
+// The NEGATIVE direction of the plan predicate, which the positive tests above cannot pin. On a
+// borderless dialog `pickerQuestionBlock` falls back to the ten preceding lines, so a picker drawn
+// right after a plan prompt was answered still sees that question above it. Treating it as a plan
+// swaps the five-class sweep for the plan arm — which deliberately does not escalate `destructive` —
+// so an irreversible option would be routed to the concierge, which may press it. That is the
+// roborev-63621 shape, and the exact asymmetry this module's header calls out.
+describe("routeUnclassifiedPrompt — a stale plan question above an UNRELATED picker", () => {
+  const stale = [
+    "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+    "⏺ Running the release step now.",
+    "",
+    "How should I proceed?",
+    "❯ 1. Force push over origin/main",
+    "  2. Open a PR instead",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+
+  it("keeps the general five-class sweep, so the irreversible option still reaches the founder", () => {
+    expect(routeUnclassifiedPrompt(stale)).toMatchObject({
+      route: "founder",
+      reason: "founder-only",
+      founderClass: "destructive",
+    });
+  });
+});
