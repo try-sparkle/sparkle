@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
-import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
+import {
+  createAgentWorktree,
+  installWorktreeGuard,
+  assertWorkspaceIntegrity,
+  acquireWorktreeLease,
+  releaseWorktreeLease,
+} from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { registerSparkleTranscript } from "../services/sparkleTranscript";
 import { buildClaudeExec, buildControlMcpConfig } from "../services/claudeSpawn";
@@ -44,6 +50,11 @@ import { markTerminalAutoFocus } from "../services/terminalFocusIntent";
 type Phase = "preparing" | "ready" | "no-claude" | "error";
 
 const SHELL = "/bin/zsh";
+
+/** How often the mounted pane refreshes its worktree lease (bead sparkle-hc7hvm). Far below the
+ *  Rust-side TTL (`WORKTREE_LEASE_TTL_DEFAULT_SECS = 600s` in worktree.rs) so a live holder is never
+ *  misread as stale between beats, and far above a render, so it costs nothing. */
+const WORKTREE_LEASE_HEARTBEAT_MS = 60_000;
 
 interface SpawnCmd {
   command: string;
@@ -133,6 +144,11 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
   const setStatus = useRuntimeStore((s) => s.setStatus);
   const termFocusRef = useRef<(() => void) | null>(null);
   const terminalBoxRef = useRef<HTMLDivElement | null>(null);
+  // The clone root this pane holds the WORKTREE LEASE against, captured once the repo is located in
+  // prepare(). While a lease is held the hourly headless improvement pass refuses to reset this
+  // shared worktree's branch out from under the live session (bead sparkle-hc7hvm). Null until
+  // prepare() resolves the repo path; the heartbeat below is a no-op until then.
+  const leaseRootRef = useRef<string | null>(null);
   // A file dropped ON THIS TERMINAL pastes its (shell-quoted) path at the CLI's input line, exactly
   // like a build agent's terminal — a drop lands where it was dropped. Before this, the pane
   // composer's catch-all listener took the whole pane, so a terminal drop was loaded as an
@@ -174,6 +190,15 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
       await cancelImprovementPass().catch(() => {});
       // App-owned workspace: clone the OSS repo (once) + locate the log dir. Never the user's project.
       const ws = await ensureSparkleRepo();
+      // CLAIM THE WORKTREE (bead sparkle-hc7hvm). This pane and the hourly headless pass share the
+      // `__sparkle_self__` checkout; the pass parks it with `checkout -B`, which would switch HEAD
+      // out from under this live session. Take the lease NOW — before the worktree is even cut — and
+      // heartbeat it from the effect below, so the park declines `in-use` for as long as this pane is
+      // alive. Best-effort: a failed claim costs the backstop, not the session.
+      leaseRootRef.current = ws.repoPath;
+      void acquireWorktreeLease(ws.repoPath, SPARKLE_PROJECT_ID, agentId).catch((e) =>
+        console.warn("worktree lease claim failed (park's own valves still protect):", e),
+      );
       // Cut this agent's isolated worktree off the clone's actual default branch (reuses the normal
       // worktree machinery; the clone already has a born HEAD so no ensure_project_repo needed).
       const wt = await createAgentWorktree(
@@ -344,6 +369,30 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
     },
     [agentId],
   );
+  // WORKTREE LEASE HEARTBEAT (bead sparkle-hc7hvm). While this pane is mounted, keep refreshing the
+  // lease so the hourly headless pass reads it as fresh and refuses to reset this shared worktree's
+  // branch. Interval is far below the Rust-side TTL (WORKTREE_LEASE_TTL_DEFAULT_SECS = 600s) so a
+  // live holder is never misread as stale; on unmount, RELEASE it so the pass may run again at once
+  // rather than waiting out the TTL. prepare() takes the first lease before this runs; this only
+  // refreshes and tears down. Best-effort throughout — the park's own valves stand underneath it.
+  useEffect(() => {
+    const beat = () => {
+      const root = leaseRootRef.current;
+      if (root)
+        void acquireWorktreeLease(root, SPARKLE_PROJECT_ID, agentId).catch((e) =>
+          console.warn("worktree lease heartbeat failed:", e),
+        );
+    };
+    const id = setInterval(beat, WORKTREE_LEASE_HEARTBEAT_MS);
+    return () => {
+      clearInterval(id);
+      const root = leaseRootRef.current;
+      if (root)
+        void releaseWorktreeLease(root, SPARKLE_PROJECT_ID, agentId).catch((e) =>
+          console.warn("worktree lease release failed (TTL will reclaim it):", e),
+        );
+    };
+  }, [agentId]);
   // Flush anything held while this pane's PTY was coming up. No-op when nothing is held.
   useEffect(() => {
     if (!ptyReady) return;

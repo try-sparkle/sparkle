@@ -534,7 +534,7 @@ describe("runImprovementPass watchdog", () => {
   // that fell through to an empty string would put a red row on screen explaining nothing, which is
   // the state this whole surface exists to remove.
   it("has a remedy sentence for every decline reason, including an unknown one", () => {
-    for (const reason of ["unpushed", "dirty", "no-base", "checkout-failed", "something-new"]) {
+    for (const reason of ["in-use", "unpushed", "dirty", "no-base", "checkout-failed", "something-new"]) {
       const text = refusalDetail(reason);
       expect(text.length, reason).toBeGreaterThan(40);
       expect(text, reason).toMatch(/Improve Sparkle/);
@@ -542,6 +542,20 @@ describe("runImprovementPass watchdog", () => {
     // The fallback still names the machine token, so a reason nobody wrote copy for is at least
     // diagnosable from what the user can see.
     expect(refusalDetail("something-new")).toContain("something-new");
+  });
+
+  // `in-use` is the lease-guard decline (bead sparkle-hc7hvm): a LIVE interactive session holds the
+  // shared worktree, so the pass skipped rather than reset that session's branch. Its copy must read
+  // as a self-clearing SKIP, not a "you must act" fault — and it must promise it runs again on its
+  // own, so a user is not sent to clear a workspace that is fine. Pinning the SIDE the copy takes,
+  // not just that some sentence exists.
+  it("names the in-use decline as a transient, self-clearing skip", () => {
+    const text = refusalDetail("in-use");
+    expect(text).toMatch(/interactive session/i);
+    expect(text).toMatch(/run again on its own once the session ends/i);
+    // It must NOT tell the user their workspace is broken or that they must clear/push anything —
+    // that is the copy the genuinely-stuck reasons carry, and following it here would be wrong.
+    expect(text).not.toMatch(/push that branch|delete it|by hand/i);
   });
 
   it("an external cancel settles the pass at once instead of leaving it to the watchdog", async () => {

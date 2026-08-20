@@ -87,6 +87,10 @@ vi.mock("../services/worktree", () => ({
   ),
   installWorktreeGuard: vi.fn(() => Promise.resolve()),
   assertWorkspaceIntegrity: vi.fn(() => Promise.resolve()),
+  // Worktree lease heartbeat (bead sparkle-hc7hvm): the pane claims/refreshes/releases it while
+  // mounted so the hourly park won't reset this shared worktree out from under the live session.
+  acquireWorktreeLease: vi.fn(() => Promise.resolve()),
+  releaseWorktreeLease: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("../preflight", () => ({
   checkClaude: vi.fn(() => Promise.resolve({ installed: true, path: "/usr/local/bin/claude" })),

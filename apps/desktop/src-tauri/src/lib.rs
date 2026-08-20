@@ -871,6 +871,8 @@ pub fn run() {
             worktree::warm_worktree_pool,
             worktree::create_agent_worktree,
             worktree::park_worktree_on_base,
+            worktree::acquire_worktree_lease,
+            worktree::release_worktree_lease,
             worktree::create_worker_worktree,
             worktree::remove_agent_worktree,
             worktree::move_project,

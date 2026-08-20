@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -1901,7 +1901,9 @@ pub enum DirtyPolicy {
 pub struct ParkOutcome {
     /// True only when the worktree now sits on the freshly-fetched base.
     pub parked: bool,
-    /// `already-fresh` | `no-worktree` | `dirty` | `unpushed` | `no-base` | `checkout-failed`.
+    /// `already-fresh` | `no-worktree` | `in-use` | `dirty` | `unpushed` | `no-base` |
+    /// `checkout-failed`. `in-use` means a LIVE session holds the worktree lease, so the park
+    /// refused to reset the branch out from under it (bead sparkle-hc7hvm).
     pub reason: String,
     /// True when this park pushed a stash — session-tooling churn, or (under
     /// [`DirtyPolicy::Stash`]) the whole leftover tree. It means "something was set aside and is
@@ -2140,6 +2142,100 @@ fn head_is_at_risk(head_branch: Option<&str>, agent_branch: &str) -> bool {
     }
 }
 
+/// How long a worktree LEASE is honoured after its last heartbeat before it is treated as STALE.
+///
+/// WHY A LEASE EXISTS (bead sparkle-hc7hvm — 4+ agents clobbered in a single session). The
+/// `__sparkle_self__` checkout is the app-owned improvement worktree, but it is ALSO where an
+/// interactive "Improve Sparkle" session runs: both key on the same `(project, agent)` id, so
+/// [`worktree_path`] resolves them to the SAME directory. The hourly headless pass parks that
+/// worktree with `checkout -B sparkle/agent-<id> <base>` (see [`park_worktree_on_base_at`]), which
+/// moves HEAD. When a live interactive session is mid-task on its OWN feature branch, that reset
+/// switches HEAD out from under it — the reported "the app moved my commit onto another branch".
+///
+/// The pass already holds on the pane's in-memory `working` status, but that is a renderer-side
+/// latch the Rust park cannot see, and it loses a start-of-session race. A filesystem lease is the
+/// durable, cross-process backstop: the live occupant heartbeats it and the park REFUSES to switch
+/// while it is fresh. It is deliberately NOT a security boundary — it is a cooperative brake that
+/// turns the racy in-memory signal into one the destructive step can actually read.
+///
+/// The TTL sits well above the occupant's refresh interval so a live holder is never misread as
+/// stale, and short enough that a CRASHED holder frees the worktree within one improvement slot —
+/// a stale lease must never wedge the pass forever. `SPARKLE_WORKTREE_LEASE_TTL_SECS` overrides it
+/// for tests and for an operator who needs to widen it (or set it to `0` to disable the brake).
+const WORKTREE_LEASE_TTL_DEFAULT_SECS: u64 = 10 * 60;
+
+fn worktree_lease_ttl() -> Duration {
+    match std::env::var("SPARKLE_WORKTREE_LEASE_TTL_SECS") {
+        Ok(s) => match s.trim().parse::<u64>() {
+            Ok(secs) => Duration::from_secs(secs),
+            Err(_) => Duration::from_secs(WORKTREE_LEASE_TTL_DEFAULT_SECS),
+        },
+        Err(_) => Duration::from_secs(WORKTREE_LEASE_TTL_DEFAULT_SECS),
+    }
+}
+
+/// The lease file for one worktree, under the SHARED git-common-dir so every worktree and clone of
+/// the same repo resolves to ONE path: the occupant writes it from the linked worktree, the park
+/// reads it from the main clone, and both must land on the same file. It is never tracked (nothing
+/// under the common gitdir is), and both ids are `validate_id`'d by every caller, so they are safe
+/// filename bytes.
+fn worktree_lease_path(root: &str, project_id: &str, agent_id: &str) -> PathBuf {
+    common_dir_for(root).join(format!("sparkle-worktree-lease-{project_id}-{agent_id}"))
+}
+
+/// Is the lease at `lease_path` FRESH — heartbeated within `ttl` of `now`?
+///
+/// Absent or unreadable reads as NOT held. That is the safe direction for a BRAKE: an unreadable
+/// brake must not itself wedge the pass, and the park's own conservative valves (`unpushed`
+/// declines; `dirty` declines under the default policy) still stand underneath it. A heartbeat in
+/// the FUTURE (clock skew between the writer and this reader) counts as fresh, so skew can never
+/// silently release a lease a live occupant is still holding.
+fn worktree_lease_is_fresh_at(lease_path: &Path, ttl: Duration, now: SystemTime) -> bool {
+    let mtime = match std::fs::metadata(lease_path).and_then(|m| m.modified()) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+    match now.duration_since(mtime) {
+        Ok(age) => age <= ttl,
+        Err(_) => true,
+    }
+}
+
+/// Acquire or refresh (heartbeat) the worktree lease. Writing the file is the heartbeat — it stamps
+/// the mtime [`worktree_lease_is_fresh_at`] reads. Idempotent; the live occupant calls it on an
+/// interval comfortably below [`worktree_lease_ttl`].
+pub fn acquire_worktree_lease_at(
+    root: &str,
+    project_id: &str,
+    agent_id: &str,
+) -> Result<(), String> {
+    validate_id("project_id", project_id)?;
+    validate_id("agent_id", agent_id)?;
+    let p = worktree_lease_path(root, project_id, agent_id);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(&p, agent_id.as_bytes())
+        .map_err(|e| format!("could not write worktree lease: {e}"))
+}
+
+/// Release the worktree lease. Best-effort: an already-absent lease is success, so a double release
+/// or a release after the TTL swept the file is never an error.
+pub fn release_worktree_lease_at(
+    root: &str,
+    project_id: &str,
+    agent_id: &str,
+) -> Result<(), String> {
+    validate_id("project_id", project_id)?;
+    validate_id("agent_id", agent_id)?;
+    let p = worktree_lease_path(root, project_id, agent_id);
+    match std::fs::remove_file(&p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("could not release worktree lease: {e}")),
+    }
+}
+
 /// Summarise a `git status --porcelain` tree by STATUS CODE ONLY, for the log line that accompanies
 /// a `dirty` decline.
 ///
@@ -2244,6 +2340,26 @@ pub fn park_worktree_on_base_at(
     if !wt.exists() || git(&wt_str, &["rev-parse", "--is-inside-work-tree"]).is_err() {
         // Nothing to park — the caller creates it fresh from the base anyway.
         return Ok(ParkOutcome::declined("no-worktree"));
+    }
+
+    // GUARD — never switch the branch out from under a LIVE occupant of this worktree
+    // (bead sparkle-hc7hvm). See [`worktree_lease_ttl`] for the full mechanism: `__sparkle_self__`
+    // is shared between this headless park and an interactive session, and the `checkout -B` at the
+    // end of this function moves HEAD. If a live session is heartbeating the lease, DECLINE right
+    // here — BEFORE the fetch, and before anything is stashed or checked out — so nothing this park
+    // does can touch a tree someone else is editing. A stale lease (the holder ended or crashed) is
+    // ignored, so an old lease never wedges the park; that self-healing is the whole reason the
+    // lease carries a TTL rather than being a plain lockfile. This is the durable backstop for the
+    // renderer-side `pane-busy` hold, which the Rust park cannot see and which loses a
+    // start-of-session race.
+    let lease = worktree_lease_path(root, project_id, agent_id);
+    if worktree_lease_is_fresh_at(&lease, worktree_lease_ttl(), SystemTime::now()) {
+        tracing::warn!(
+            %agent_id,
+            "park declined: a live session holds the worktree lease, so the branch was \
+             NOT reset out from under it"
+        );
+        return Ok(ParkOutcome::declined("in-use"));
     }
 
     // Freshen the base BEFORE anything reads an origin ref. Best-effort and time-bounded
@@ -2600,6 +2716,31 @@ pub async fn park_worktree_on_base(
     })
     .await
     .map_err(|e| format!("park_worktree_on_base task failed: {e}"))?
+}
+
+/// Acquire or refresh (heartbeat) the worktree lease for `(project_id, agent_id)`. The interactive
+/// occupant of an app-owned shared worktree (notably `__sparkle_self__`) calls this on mount and on
+/// an interval below the lease TTL, so the headless park refuses to reset the branch out from under
+/// it (bead sparkle-hc7hvm). Cheap, idempotent, and best-effort — see [`acquire_worktree_lease_at`].
+#[tauri::command]
+pub async fn acquire_worktree_lease(
+    root: String,
+    project_id: String,
+    agent_id: String,
+) -> Result<(), String> {
+    acquire_worktree_lease_at(&root, &project_id, &agent_id)
+}
+
+/// Release the worktree lease for `(project_id, agent_id)` — the occupant calls this on unmount so
+/// the park is free to run again immediately rather than waiting out the TTL. An already-absent
+/// lease is success (see [`release_worktree_lease_at`]).
+#[tauri::command]
+pub async fn release_worktree_lease(
+    root: String,
+    project_id: String,
+    agent_id: String,
+) -> Result<(), String> {
+    release_worktree_lease_at(&root, &project_id, &agent_id)
 }
 
 /// How many porcelain paths a BRANCH STATUS carries. Deliberately far smaller than
@@ -11195,6 +11336,196 @@ mod tests {
             "residue\n",
             "`-u`: untracked residue must be recoverable too, not silently deleted"
         );
+    }
+
+    // ── worktree lease guard (bead sparkle-hc7hvm) ──────────────────────────────────────────────
+    //
+    // The park ends in `checkout -B sparkle/agent-<id> <base>`, which switches HEAD. When a LIVE
+    // interactive session shares the `__sparkle_self__` worktree (4+ agents were clobbered this way
+    // in a single session), that reset moves HEAD out from under it. A fresh filesystem lease must
+    // make the park REFUSE rather than switch. These tests build a worktree that WOULD park and pin
+    // the lease as the ONE fact that flips the outcome — asserting on the SIDE EFFECT (did HEAD
+    // move, did the edits survive), never on the reason token alone.
+
+    /// Put the worktree on a FOREIGN feature branch, clean, and leave it behind the base — exactly
+    /// the shape of a live interactive session mid-task. Returns the branch name and the tip sha so
+    /// a test can prove the park did NOT move either.
+    fn stage_live_foreign_session(r: &str, wt: &str, tag: &str) -> (String, String) {
+        git(wt, &["checkout", "-q", "-b", "feature/live"]).unwrap();
+        advance_origin_main_elsewhere(r, tag, "up1");
+        // Fetch so the worktree can SEE it is behind (the park fetches too, but the precondition
+        // assertion below reads the remote-tracking ref this establishes).
+        git(wt, &["fetch", "-q", "origin", "main"]).unwrap();
+        let behind: u32 = git(wt, &["rev-list", "--count", "HEAD..origin/main"])
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(behind, 1, "precondition: the live session's branch is behind the base");
+        let tip = git(wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        ("feature/live".to_string(), tip)
+    }
+
+    #[test]
+    fn park_declines_in_use_and_leaves_head_untouched_when_a_live_session_holds_the_lease() {
+        let (r, wt, app_data) = init_repo_with_origin("park-lease-held");
+        let (branch, tip) = stage_live_foreign_session(&r, &wt, "park-lease-held");
+
+        // A live occupant heartbeats the lease.
+        acquire_worktree_lease_at(&r, "p1", "a1").unwrap();
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        // THE SIDE EFFECT: the branch switch did NOT happen.
+        assert!(!out.parked, "a held lease must stop the park: {out:?}");
+        assert_eq!(out.reason, "in-use", "the machine token names the live occupant: {out:?}");
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            branch,
+            "HEAD must still be on the live session's branch — NOT reset onto sparkle/agent-a1"
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(),
+            tip,
+            "the tip must not have moved onto the fresh base"
+        );
+    }
+
+    // THE PAIR (per the vacuous-test rule): the IDENTICAL worktree, with NO lease, DOES park and
+    // DOES switch HEAD. Without this, the decline above is ambiguous — it would read the same if the
+    // worktree were simply unparkable for an unrelated reason. The lease is the only difference.
+    #[test]
+    fn park_switches_the_same_worktree_when_no_lease_is_held() {
+        let (r, wt, app_data) = init_repo_with_origin("park-lease-absent");
+        stage_live_foreign_session(&r, &wt, "park-lease-absent");
+
+        // No acquire_worktree_lease_at — nobody is holding the worktree.
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        assert!(out.parked, "with no lease the clean, behind worktree parks: {out:?}");
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "the park switched HEAD onto the agent branch — the very move the lease must prevent"
+        );
+        assert_eq!(
+            git(&wt, &["rev-list", "--count", "HEAD..origin/main"]).unwrap().trim(),
+            "0",
+            "and landed it on the fresh base"
+        );
+    }
+
+    #[test]
+    fn park_preserves_uncommitted_work_when_a_live_session_holds_the_lease() {
+        let (r, wt, app_data) = init_repo_with_origin("park-lease-dirty");
+        // A live session on its own branch with a genuine uncommitted edit.
+        git(&wt, &["checkout", "-q", "-b", "feature/live"]).unwrap();
+        std::fs::write(format!("{wt}/wip.rs"), "fn work_in_progress() {}\n").unwrap();
+        acquire_worktree_lease_at(&r, "p1", "a1").unwrap();
+
+        // Stash policy is what the hourly pass uses — it is the one that would otherwise SWEEP the
+        // edit into a stash. The lease must stop that before it happens.
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        assert!(!out.parked, "a held lease must stop the park: {out:?}");
+        assert_eq!(out.reason, "in-use");
+        assert!(!out.stashed, "the uncommitted edit must NOT have been set aside: {out:?}");
+        // THE SIDE EFFECT: the work is exactly where the live session left it — in the working tree,
+        // uncommitted, its content intact — not moved into a shared stash it would have to recover.
+        assert_eq!(
+            std::fs::read_to_string(format!("{wt}/wip.rs")).unwrap(),
+            "fn work_in_progress() {}\n",
+            "the uncommitted edit survives verbatim in the working tree"
+        );
+        assert!(
+            git(&wt, &["status", "--porcelain"]).unwrap().contains("wip.rs"),
+            "the edit is still UNCOMMITTED in place, not swept into a stash"
+        );
+        assert!(
+            git(&wt, &["stash", "list"]).unwrap().trim().is_empty(),
+            "nothing was stashed — the park touched the tree not at all"
+        );
+    }
+
+    #[test]
+    fn park_proceeds_normally_when_the_lease_is_stale() {
+        let (r, wt, app_data) = init_repo_with_origin("park-lease-stale");
+        stage_live_foreign_session(&r, &wt, "park-lease-stale");
+
+        // A lease exists but its holder is long gone: stamp its heartbeat well beyond the TTL. A
+        // stale lease must never wedge the park forever — that self-healing is why it is a TTL'd
+        // lease and not a plain lockfile.
+        acquire_worktree_lease_at(&r, "p1", "a1").unwrap();
+        let lease = worktree_lease_path(&r, "p1", "a1");
+        let f = std::fs::File::options().write(true).open(&lease).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(WORKTREE_LEASE_TTL_DEFAULT_SECS + 60))
+            .unwrap();
+        drop(f);
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+
+        assert!(out.parked, "a stale lease must not block the park: {out:?}");
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "with the holder gone the park proceeds and switches HEAD as usual"
+        );
+    }
+
+    #[test]
+    fn worktree_lease_freshness_classifies_strictly_by_ttl() {
+        let dir = unique_root("lease-fresh");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lease = dir.join("lease");
+        std::fs::write(&lease, b"x").unwrap();
+        let mtime = std::fs::metadata(&lease).unwrap().modified().unwrap();
+        let ttl = Duration::from_secs(60);
+
+        // Just heartbeated → fresh.
+        assert!(worktree_lease_is_fresh_at(&lease, ttl, mtime + Duration::from_secs(1)));
+        // Older than the TTL → stale (this is the "does not wedge forever" property in isolation).
+        assert!(!worktree_lease_is_fresh_at(&lease, ttl, mtime + Duration::from_secs(3600)));
+        // Exactly at the TTL boundary is still fresh (<=), never off-by-one into stale.
+        assert!(worktree_lease_is_fresh_at(&lease, ttl, mtime + ttl));
+        // A heartbeat in the FUTURE (clock skew) must read fresh, never release a held lease.
+        assert!(worktree_lease_is_fresh_at(&lease, ttl, mtime - Duration::from_secs(30)));
+        // An absent lease is not held.
+        assert!(!worktree_lease_is_fresh_at(&dir.join("nope"), ttl, mtime));
+    }
+
+    #[test]
+    fn acquire_then_release_flips_the_park_from_declined_to_parked() {
+        let (r, wt, app_data) = init_repo_with_origin("park-lease-roundtrip");
+        stage_live_foreign_session(&r, &wt, "park-lease-roundtrip");
+
+        // ACQUIRE → the park declines.
+        acquire_worktree_lease_at(&r, "p1", "a1").unwrap();
+        let held =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+        assert_eq!(held.reason, "in-use", "while held, the park is refused: {held:?}");
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "feature/live",
+            "and HEAD is untouched"
+        );
+
+        // RELEASE → the very next park proceeds. Proves release actually removes the brake (a no-op
+        // release would leave this still declined).
+        release_worktree_lease_at(&r, "p1", "a1").unwrap();
+        let freed =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Stash).unwrap();
+        assert!(freed.parked, "after release the park runs: {freed:?}");
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "and HEAD is switched onto the agent branch"
+        );
+        // A second release with the file already gone is still success — not an error.
+        release_worktree_lease_at(&r, "p1", "a1").unwrap();
     }
 
     // THE OPT-IN, pinned. `park_worktree_on_base_at` is generic over worktrees and a future caller

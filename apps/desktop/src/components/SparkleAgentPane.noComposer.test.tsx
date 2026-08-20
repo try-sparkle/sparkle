@@ -117,6 +117,8 @@ vi.mock("../services/worktree", () => ({
   ),
   installWorktreeGuard: vi.fn(() => Promise.resolve()),
   assertWorkspaceIntegrity: vi.fn(() => Promise.resolve()),
+  acquireWorktreeLease: vi.fn(() => Promise.resolve()),
+  releaseWorktreeLease: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("../preflight", () => ({
   checkClaude: vi.fn(() => Promise.resolve({ installed: true, path: "/usr/local/bin/claude" })),

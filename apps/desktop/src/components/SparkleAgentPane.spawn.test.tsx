@@ -24,6 +24,8 @@ vi.mock("../services/worktree", () => ({
   createAgentWorktree: vi.fn(() => Promise.resolve({ path: "/wt/sparkle-self", branch: "sparkle/agent-self" })),
   installWorktreeGuard: vi.fn(() => Promise.resolve()),
   assertWorkspaceIntegrity: vi.fn(() => Promise.resolve()),
+  acquireWorktreeLease: vi.fn(() => Promise.resolve()),
+  releaseWorktreeLease: vi.fn(() => Promise.resolve()),
 }));
 vi.mock("../preflight", () => ({
   checkClaude: vi.fn(() => Promise.resolve({ installed: true, path: "/usr/local/bin/claude" })),

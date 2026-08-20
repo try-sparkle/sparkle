@@ -117,7 +117,9 @@ export type DirtyPolicy = "decline" | "stash";
 /** What `parkWorktreeOnBase` did, or the machine token for why it declined. */
 export interface ParkOutcome {
   parked: boolean;
-  /** `parked` | `already-fresh` | `no-worktree` | `dirty` | `unpushed` | `no-base` | `checkout-failed`. */
+  /** `parked` | `already-fresh` | `no-worktree` | `in-use` | `dirty` | `unpushed` | `no-base` |
+   *  `checkout-failed`. `in-use` means a LIVE session holds the worktree lease, so the park refused
+   *  to reset the branch out from under it (bead sparkle-hc7hvm). */
   reason: string;
   /** True when the park pushed a stash — session-tooling churn, or (under `"stash"`) the whole
    *  leftover tree. Means "something was set aside and is recoverable from `git stash list`".
@@ -149,6 +151,32 @@ export function parkWorktreeOnBase(
     baseBranch,
     dirtyPolicy,
   });
+}
+
+/** Acquire or refresh (heartbeat) the worktree lease for `(projectId, agentId)`.
+ *
+ *  The INTERACTIVE occupant of an app-owned SHARED worktree — notably the "Improve Sparkle" pane,
+ *  which keys on the same `__sparkle_self__` id as the hourly headless pass — calls this on mount
+ *  and on an interval below the lease TTL. While the lease is fresh, `parkWorktreeOnBase` refuses to
+ *  reset the branch out from under the live session (`reason: "in-use"`) instead of switching HEAD
+ *  and stashing its edits (bead sparkle-hc7hvm). Best-effort; a failure here is not fatal — the
+ *  park's own conservative valves still stand underneath the lease. */
+export function acquireWorktreeLease(
+  root: string,
+  projectId: string,
+  agentId: string,
+): Promise<void> {
+  return invoke("acquire_worktree_lease", { root, projectId, agentId });
+}
+
+/** Release the worktree lease so the headless park may run again immediately rather than waiting
+ *  out the TTL. An already-absent lease is success. */
+export function releaseWorktreeLease(
+  root: string,
+  projectId: string,
+  agentId: string,
+): Promise<void> {
+  return invoke("release_worktree_lease", { root, projectId, agentId });
 }
 
 /** Remove an agent's worktree (leaves the branch so it can resume later). */

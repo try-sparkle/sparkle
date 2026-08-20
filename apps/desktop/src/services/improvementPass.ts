@@ -545,6 +545,12 @@ async function reportTimeoutLeftovers(
  */
 export function refusalDetail(reason: string): string {
   switch (reason) {
+    case "in-use":
+      return (
+        "Improve Sparkle skipped this hourly pass: an interactive session is actively working in its " +
+        "workspace, so it left that session's branch and changes exactly as they are rather than reset " +
+        "them out from under it. It will run again on its own once the session ends."
+      );
     case "unpushed":
       return (
         "Improve Sparkle can't start a pass: its workspace still holds commits that exist nowhere " +
