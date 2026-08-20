@@ -1014,9 +1014,27 @@ export interface ConciergeToolEntry {
  *  else — see ConciergeConfig in config.rs — so this removes exactly the policy and nothing more. */
 export const CONCIERGE_TOOLS_CONFIG_TABLE = "concierge.tools";
 
-/** The dotted `config.toml` path for one tool's rule (`[concierge.tools]`). */
-export function conciergeToolConfigPath(tool: string): string {
-  return `${CONCIERGE_TOOLS_CONFIG_TABLE}.${tool}`;
+/** The dotted path of the PER-PROJECT policy table (`[concierge.projects]`).
+ *
+ *  Stored GLOBALLY, keyed by repo slug — never in the repo's own `.sparkle/config.toml`. That is
+ *  the existing security boundary in config.rs (`apply_project`'s section allowlist ignores
+ *  `[concierge]` from a project file), and it matters most for exactly the repos this feature is
+ *  about: a repo we do not own must never get a vote on what Sparkle may do inside it. */
+export const CONCIERGE_PROJECTS_CONFIG_TABLE = "concierge.projects";
+
+/** The dotted `config.toml` path for one tool's rule.
+ *
+ *  With no slug this is the GLOBAL rule (`[concierge.tools]`) and behaves exactly as it always
+ *  has — every existing caller passes one argument and is unaffected.
+ *
+ *  With a slug it is that project's own rule
+ *  (`concierge.projects."owner/repo".tools.<tool>`). The quotes are LOAD-BEARING, not decoration:
+ *  a slug contains a `/`, and TOML's dotted-key syntax would otherwise read it as two more table
+ *  levels. `set_dotted`/`unset_dotted` in config.rs parse the quoted segment as one key. */
+export function conciergeToolConfigPath(tool: string, slug?: string | null): string {
+  const normalized = normalizeSlug(slug ?? null);
+  if (normalized === null) return `${CONCIERGE_TOOLS_CONFIG_TABLE}.${tool}`;
+  return `${CONCIERGE_PROJECTS_CONFIG_TABLE}."${normalized}".tools.${tool}`;
 }
 
 function entryFor(name: ConciergeToolName, domain: ConciergeToolDomain): ConciergeToolEntry {
@@ -1072,6 +1090,153 @@ export type ToolPolicyOverrides = Readonly<Record<string, string | null | undefi
 /** The empty table — no explicit rules, everything on its derived default. */
 export const NO_TOOL_POLICY_OVERRIDES: ToolPolicyOverrides = Object.freeze({});
 
+// ---------------------------------------------------------------------------------------------
+// THE STRICTNESS LATTICE — per-project policy (bead sparkle-gylxbo)
+// ---------------------------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. A tool tier used to be ONE GLOBAL NUMBER. The owner of this machine holds
+// commit access to repos he does not own, and his standing rule there is that no PR merges without
+// a human — while in his OWN repo he wants the concierge to merge a green PR unprompted. A single
+// tier cannot hold both facts, so the conflict was being resolved by pinning the global tier to
+// `ask`: he was interrupted for every merge in his own repo IN ORDER TO protect a repo he does not
+// own. `policy.test.ts`'s "THE GOAL" test is those two facts asserted in one body.
+//
+// THE ONE ALGORITHM, and there is deliberately only one:
+//
+//   effective = strictest(base, pinnedFloor, foreignFloor, projectTier)
+//
+// Every contributor can only RAISE the answer. That single property is the whole security model:
+// a project may tighten what the human already granted globally and can never widen it, so a
+// hand-edited (or malformed, or hostile) project entry has no permissive direction to fail in.
+// Global `deny` + project `allow` is `deny`, and that is its own named test.
+//
+// FAIL CLOSED IN EVERY DIRECTION. An unreadable project entry is `ask`, never the project's
+// default. An unresolvable slug is FOREIGN, which floors merge-class tools at `ask` — we would
+// rather ask once than merge in a repo we could not name.
+
+/** allow(0) < ask(1) < deny(2). The rank IS the semantics; nothing else orders the three. */
+export const POLICY_STRICTNESS: Readonly<Record<PolicyDecision, number>> = Object.freeze({
+  allow: 0,
+  ask: 1,
+  deny: 2,
+});
+
+/** The strictest of the given decisions. No arguments is `allow` — the identity, so a `strictest`
+ *  over an empty contributor set adds nothing rather than inventing a refusal. */
+export function strictestDecision(...decisions: PolicyDecision[]): PolicyDecision {
+  let out: PolicyDecision = "allow";
+  for (const d of decisions) if (POLICY_STRICTNESS[d] > POLICY_STRICTNESS[out]) out = d;
+  return out;
+}
+
+/** Trim + lowercase a slug, rejecting anything that is not exactly `owner/repo`.
+ *  GitHub compares slugs case-insensitively, so every comparison in this module lowercases first. */
+function normalizeSlug(slug: string | null | undefined): string | null {
+  if (typeof slug !== "string") return null;
+  // Destructured rather than indexed: under `noUncheckedIndexedAccess` an array read is typed
+  // possibly-undefined, and the `!owner || !repo` guard below narrows both halves in one step.
+  // `...rest` is what rejects `a/b/c` — a three-part path is not a slug, and guessing at one would
+  // point the policy at a repo nobody named.
+  const [owner, repo, ...rest] = slug.trim().toLowerCase().split("/");
+  if (rest.length > 0) return null;
+  if (!owner || !repo) return null;
+  return `${owner}/${repo}`;
+}
+
+/** The `owner` half of `owner/repo`, lowercased, or null when there isn't one to read. */
+export function ownerOfSlug(slug: string | null): string | null {
+  const normalized = normalizeSlug(slug);
+  return normalized === null ? null : (normalized.split("/")[0] ?? null);
+}
+
+/**
+ * Is this repo one we do NOT own?
+ *
+ * NULL IS FOREIGN, and that is the fail-closed rule rather than an edge case. "We could not work
+ * out which repo this is" and "this is somebody else's repo" get the same answer, because the
+ * expensive mistake in both is the same mistake: merging on somebody else's behalf.
+ */
+export function isForeignSlug(slug: string | null, ownOrgs: readonly string[]): boolean {
+  const owner = ownerOfSlug(slug);
+  if (owner === null) return true;
+  return !ownOrgs.some((o) => typeof o === "string" && o.trim().toLowerCase() === owner);
+}
+
+/**
+ * Repos where Sparkle will NEVER merge on its own authority, whatever any config says.
+ *
+ * A FLOOR COMPILED INTO THE BUILD, not a default: config can tighten past it and nothing can
+ * loosen it. That is what makes the owner's standing rule survive a future change to the global
+ * default, a reset config file, or a hand-edit. Declared here rather than imported from the JSON so
+ * `policy.ts` needs no build-config change (`resolveJsonModule`, bundler asset handling); the test
+ * `policy.pinnedRepos.test.ts` reads `shared/merge-protected-repos.json` FROM DISK and pins this
+ * list against it, exactly as `worktree.rs` pins `SPARKLE_DENY_RULES` against
+ * `destructive-commands.json`. A slug added on one side and forgotten here fails a test.
+ */
+export const MERGE_PROTECTED_SLUGS: readonly string[] = Object.freeze([
+  "plow-pbc/tkmx-client",
+  "plow-pbc/tkmx-server",
+]);
+
+/** Is this slug on the shipped merge-protected list? A null slug is NOT pinned — it cannot name a
+ *  pinned repo — and does not need to be: null is foreign, which floors it at `ask` anyway. */
+export function isPinnedMergeProtectedSlug(slug: string | null): boolean {
+  const normalized = normalizeSlug(slug);
+  return normalized !== null && MERGE_PROTECTED_SLUGS.includes(normalized);
+}
+
+/** Per-project context for one call. Supplied by policyBinding; absent in most tests, and its
+ *  absence means "no project layer at all" — byte-identical behaviour to before this existed. */
+export interface ToolPolicyProjectContext {
+  /** `owner/repo`, LOWERCASED. `null` when it could not be resolved — treated as foreign. */
+  readonly slug: string | null;
+  /** Owner not in `own_orgs`, OR slug is null. Fail-closed. */
+  readonly foreign: boolean;
+  /** This project's `[concierge.projects."<slug>".tools]` entries. */
+  readonly overrides: ToolPolicyOverrides;
+}
+
+/**
+ * Build the context the evaluator wants from the three raw store values.
+ *
+ * The one place the "is this foreign?" question is answered, so the binding, the settings pane and
+ * the tests cannot each derive it slightly differently.
+ */
+export function projectPolicyContextFor(
+  slug: string | null,
+  ownOrgs: readonly string[],
+  projectPolicies: Readonly<Record<string, ToolPolicyOverrides>>,
+): ToolPolicyProjectContext {
+  const normalized = normalizeSlug(slug);
+  const overrides =
+    (normalized !== null ? projectPolicies[normalized] : undefined) ?? NO_TOOL_POLICY_OVERRIDES;
+  return {
+    slug: normalized,
+    foreign: isForeignSlug(normalized, ownOrgs),
+    overrides,
+  };
+}
+
+/**
+ * What the UI shows when it says WHICH TIER IS IN FORCE AND WHERE IT CAME FROM (requirement 3 of
+ * the brief). The pane can only show what this returns, so the inherited answer travels alongside
+ * the effective one rather than being recomputed — a second computation is the one that drifts.
+ *
+ * Present ONLY when the caller supplied `ctx.project`, so nothing existing changes shape.
+ */
+export interface ToolPolicyProjectAttribution {
+  slug: string | null;
+  foreign: boolean;
+  pinned: boolean;
+  /** What the tier WOULD be with no project context — i.e. the inherited global answer. */
+  inheritedDecision: PolicyDecision;
+  inheritedSource: ToolPolicySource;
+  /** The project's raw entry verbatim, or null when it set none. */
+  projectEntry: string | null;
+  /** True when project/pin/foreign made this stricter than the inherited answer. */
+  tightened: boolean;
+}
+
 /**
  * Everything the decision needs, as explicit parameters. Pure by construction: this module reads no
  * store and performs no IO, so whatever the call site knows has to arrive here.
@@ -1111,6 +1276,14 @@ export interface ToolPolicyContext {
    * a permanently-asking one.
    */
   readonly args?: unknown;
+  /**
+   * WHICH PROJECT this call is about, when the caller knows.
+   *
+   * OPTIONAL, and its absence is not a gap: a caller with no project gets exactly today's answer,
+   * byte for byte. The settings pane asks about a TOOL in the abstract and supplies nothing here;
+   * the dispatch binding, which has the call's `root` in hand, supplies it.
+   */
+  readonly project?: ToolPolicyProjectContext;
 }
 
 /** Where a decision came from — the pane shows it, and the concierge can say it out loud. */
@@ -1128,7 +1301,20 @@ export type ToolPolicySource =
   /** No classification for this name at all. Resolved to `deny`; see the header, property 2. */
   | "unclassified"
   /** AI enhancements are off for the concierge, so nothing can run regardless of the rules. */
-  | "ai-disabled";
+  | "ai-disabled"
+  /** THIS PROJECT'S own rule (`[concierge.projects."owner/repo".tools]`) tightened the global
+   *  answer. It can only ever tighten — see {@link applyProjectPolicyLayer}. */
+  | "project-override"
+  /** This project's rule is not allow/ask/deny. Resolved to `ask`, never to the project's default,
+   *  for the same reason `unreadable-override` does not fall back: a typo in a rule someone wrote
+   *  to TIGHTEN something must not hand back the looser answer. */
+  | "unreadable-project-override"
+  /** The repo's owner is not in `[concierge].own_orgs` (or the repo could not be identified at
+   *  all), so anything that mutates main is floored at `ask`. */
+  | "foreign-repo"
+  /** A slug shipped in `shared/merge-protected-repos.json`. Merge-class tools are floored at
+   *  `deny` and no config can loosen it. */
+  | "pinned-repo";
 
 export interface ToolPolicyEvaluation {
   /** The name as asked about, verbatim — including a name that resolved `unclassified`. */
@@ -1146,6 +1332,9 @@ export interface ToolPolicyEvaluation {
   overridden: boolean;
   /** Convenience mirror of `decision === "ask"`, so a caller can gate on one boolean. */
   requiresConfirmation: boolean;
+  /** The per-project story, present ONLY when the caller supplied `ctx.project`. This is what the
+   *  UI reads to say "denied for THIS repo, though you allowed it globally". */
+  project?: ToolPolicyProjectAttribution;
 }
 
 /**
@@ -1172,8 +1361,12 @@ export interface ToolPolicyEvaluation {
  *   evaluateToolPolicy("chief_call", { overrides: { chief_call: "allow" },
  *                                      args: { tool: "delete_chat" } })
  *     → { decision: "ask",   riskClass: "irreversible", source: "per-call-escalation", … }
+ *
+ * The BASE answer — everything above, with no project layer. `evaluateToolPolicy` is this plus the
+ * strictness lattice, and the split is what makes "a caller who supplies no project gets exactly
+ * today's answer" true by construction rather than by inspection.
  */
-export function evaluateToolPolicy(
+function evaluateBaseToolPolicy(
   toolName: string,
   ctx: ToolPolicyContext,
 ): ToolPolicyEvaluation {
@@ -1311,4 +1504,116 @@ export function toToolPolicyOverrides(raw: unknown): ToolPolicyOverrides {
     if (typeof value === "string") out[key] = value;
   }
   return out;
+}
+
+/**
+ * Apply the PER-PROJECT layer on top of a base answer. The whole lattice lives here.
+ *
+ *   effective = strictest(base, pinnedFloor, foreignFloor, projectTier)
+ *
+ * Each contributor can only RAISE the answer, which is the entire security property: a project
+ * entry saying `allow` under a global `deny` resolves `deny`, and no arrangement of inputs can
+ * produce an `allow` the global answer did not already grant.
+ *
+ * ATTRIBUTION. `source` reports the contributor that DETERMINED the answer — precedence
+ * `project-override > pinned-repo > foreign-repo` among contributors whose value equals
+ * `effective` — but ONLY when `effective` is strictly stricter than the base. When they agree, the
+ * base's own source is kept: the global answer already decided it, and claiming otherwise would
+ * tell the human to go and edit a project rule that changed nothing.
+ */
+function applyProjectPolicyLayer(
+  base: ToolPolicyEvaluation,
+  toolName: string,
+  project: ToolPolicyProjectContext,
+): ToolPolicyEvaluation {
+  const slug = project.slug;
+  const pinned = isPinnedMergeProtectedSlug(slug);
+  // BOTH FLOORS ARE SCOPED TO `mutates-main` — deliberately, and it is the reason a foreign repo is
+  // still fully usable. Reading its board, driving its terminals and spawning agents in it are
+  // unaffected; what is floored is the class that pushes something into somebody else's main.
+  const mutatesMain = base.riskClass === "mutates-main";
+  const pinnedFloor: PolicyDecision = pinned && mutatesMain ? "deny" : "allow";
+  const foreignFloor: PolicyDecision = project.foreign && mutatesMain ? "ask" : "allow";
+
+  const rawEntry = project.overrides[toolName];
+  const projectEntry = typeof rawEntry === "string" ? rawEntry : null;
+  const parsedEntry = projectEntry === null ? null : asPolicyDecision(projectEntry);
+  // An entry we cannot read is `ask`, NOT the absent-entry `allow`. Falling back to "contributes
+  // nothing" would let a typo in a rule somebody wrote to TIGHTEN merge rights silently restore
+  // the looser global answer — on the exact repo they were protecting.
+  const projectTier: PolicyDecision =
+    projectEntry === null ? "allow" : (parsedEntry ?? "ask");
+
+  const effective = strictestDecision(base.decision, pinnedFloor, foreignFloor, projectTier);
+  const tightened = POLICY_STRICTNESS[effective] > POLICY_STRICTNESS[base.decision];
+
+  const named = slug ?? "this repo (which Sparkle could not identify)";
+  let source = base.source;
+  let reason = base.reason;
+  if (tightened) {
+    if (projectEntry !== null && projectTier === effective) {
+      if (parsedEntry === null) {
+        source = "unreadable-project-override";
+        reason = `The rule for “${toolName}” under ${named} in config.toml is “${projectEntry}”, which is not allow, ask, or deny — asking first until it is fixed.`;
+      } else {
+        source = "project-override";
+        reason = `Your rule for ${named} sets “${toolName}” to ${POLICY_DECISION_LABEL[parsedEntry]}, tighter than the ${POLICY_DECISION_LABEL[base.decision]} you set for every project. A project rule can only tighten, never loosen.`;
+      }
+    } else if (pinnedFloor === effective) {
+      // NO CONFIG LEVER IS NAMED HERE, and that is not an omission. The reader cannot loosen a pin
+      // — it is compiled into the build — so pointing them at config.toml would be an instruction
+      // that fails, and a remedy string is an instruction people follow (AGENTS.md).
+      source = "pinned-repo";
+      reason = `${named} is a merge-protected repo: Sparkle will never merge there on its own authority, whatever the settings say. Hand this merge to a human.`;
+    } else if (foreignFloor === effective) {
+      source = "foreign-repo";
+      reason = `${named} isn't one of your own repos, so I'll check with you before anything that touches its main branch. Add the org to \`[concierge].own_orgs\` in config.toml if it is yours.`;
+    }
+  }
+
+  return {
+    ...base,
+    decision: effective,
+    source,
+    reason,
+    // A project entry is a config entry too — but only say so when it actually governed, so the
+    // settings pane's "default" marker keeps meaning what it means for the global row.
+    overridden:
+      base.overridden ||
+      source === "project-override" ||
+      source === "unreadable-project-override",
+    requiresConfirmation: effective === "ask",
+    project: {
+      slug,
+      foreign: project.foreign,
+      pinned,
+      inheritedDecision: base.decision,
+      inheritedSource: base.source,
+      projectEntry,
+      tightened,
+    },
+  };
+}
+
+/**
+ * Decide what the concierge may do with one tool — the PUBLIC entry point.
+ *
+ * With no `ctx.project` this is `evaluateBaseToolPolicy` verbatim: same object, same fields, no
+ * `project` key. With one, the strictness lattice runs on top (see
+ * {@link applyProjectPolicyLayer}), and it can only ever tighten.
+ *
+ *   evaluateToolPolicy("merge_pr", { overrides: { merge_pr: "allow" },
+ *                                    project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {}) })
+ *     → { decision: "allow", … }
+ *   evaluateToolPolicy("merge_pr", { overrides: { merge_pr: "allow" },
+ *                                    project: projectPolicyContextFor("plow-pbc/tkmx-server", ["drodio"], {}) })
+ *     → { decision: "deny", source: "pinned-repo", … }
+ */
+export function evaluateToolPolicy(
+  toolName: string,
+  ctx: ToolPolicyContext,
+): ToolPolicyEvaluation {
+  const base = evaluateBaseToolPolicy(toolName, ctx);
+  if (!ctx.project) return base;
+  return applyProjectPolicyLayer(base, toolName, ctx.project);
 }

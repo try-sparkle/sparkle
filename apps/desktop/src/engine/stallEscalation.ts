@@ -176,6 +176,35 @@ export const LAPSED_STATUS: AgentTabStatus = "lapsed";
  * one layer up, and now also in {@link LIFECYCLE}'s own amber tier.
  */
 const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
+  // ── THE AGENT'S OWN ANSWER, ADDED 2026-08-18 ────────────────────────────────────────────────────
+  // The founder, on a row reading blocked-on-human while drawing amber: *"It seems like this should
+  // be a red dot so that seems problematic that it's not showing as red when it says it's blocked on
+  // human."*
+  //
+  // It passes this set's bar — "who can clear it" — as directly as any cause ever will: `nudge_ladder`
+  // asked the agent which actor it is waiting on, and it named a person. Nothing here is inferred
+  // from silence, a clock or a retry budget, which is what keeps it from re-reddening the population
+  // the 2026-08-06 demotion cleared. `escalated-goal` below is untouched and still amber.
+  //
+  // ⚠️ IT DOES NOT REPLACE `human-verified-goal`, and the two are different questions. That cause
+  // reads the GOAL RECORD: a stated check no agent may discharge. This one reads the AGENT: it says
+  // it is stuck on a person, whatever its goal says. Either alone is a real founder blocker.
+  //
+  // ⚠️ WHY THE STALE RULE DOES NOT VETO IT (the founder's second instruction, same day: a stale
+  // escalation must never be red). Staleness is a property of `goal.escalationReason` — a frozen
+  // SENTENCE that `chargeGoalDebt` carries onto later goal text, so it outlives what it describes and
+  // `escalationQuotesStaleText` exists to say so. A nudger flag cannot acquire that property:
+  // `nudger.rs::apply_flags` clears it on the first look where the agent has moved, so a live flag
+  // means the agent is still silent and still standing on this answer. The veto belongs on the prose
+  // path — see `rowAttention.goalBadgeFor`, which no longer renders a stale sentence as a live claim.
+  "blocked-on-human",
+  // ── THE STATE WHOSE COPY ALREADY SAID "YOURS" ───────────────────────────────────────────────────
+  // An escalated goal whose concierge re-arm allowance is entirely spent. `goalBadgeFor` renders it
+  // as "re-armed N× and stuck again — no re-arms left, this one is yours" and the row drew amber
+  // anyway, because plain `escalated-goal` was the only cause raised. Strictly narrower than that
+  // cause — it fires only AFTER the concierge tried and ran out — so the machine actor this tier
+  // asks about has demonstrably been exhausted rather than merely assumed absent.
+  "rearms-exhausted",
   "human-verified-goal",
   // ── `abandoned-goal` IS THE "OWN CHANGE WITH ITS OWN EVIDENCE" THE EXPIRY ARGUMENT INVITES ──────
   // The block above ends "If expiry ever needs to be louder, that is its own change with its own
@@ -337,11 +366,27 @@ export function withStallAttention<T extends MotionAgent & { id: string; alert?:
     // about a subtree visibly making progress — precisely the false alarm this module's header says it
     // must avoid, and the class of red that made the previous version worthless. The row's own status
     // cannot see this: delegation is work the PARENT is not doing itself.
-    if (isInMotion(a.id, agents, statusMap)) continue;
+    // …UNLESS THE AGENT ITSELF SAID A PERSON IS BLOCKING IT (2026-08-18). The refusal above is about
+    // an INFERENCE: this module guesses "stalled" from a resting status, and delegation is work the
+    // parent is not doing itself, so the guess is wrong for a head whose workers are grinding.
+    // `blocked-on-human` is not a guess — `nudge_ladder` asked the agent what was blocking it and it
+    // named a person. A busy subtree does not discharge that: an orchestrator can be waiting on a
+    // decision from the founder while every worker under it runs, and on this fleet the heads most
+    // likely to be blocked on him are exactly the ones with workers. Vetoing on motion would have
+    // made the whole fix unreachable for orchestrators, silently — the row would stay amber with
+    // nothing to indicate the signal had been dropped.
+    //
+    // NARROW ON PURPOSE: it is this ONE cause, not the whole red tier. `human-verified-goal` and
+    // `abandoned-goal` are still derived facts about the goal record, so a working subtree is still
+    // a good reason to hold off on them, and `roborev 55423/55434`'s protection is untouched for
+    // every cause it was written about.
+    const report = reportOf(a.id);
+    const saidHumanBlocked = report?.causes.includes("blocked-on-human") === true;
+    if (!saidHumanBlocked && isInMotion(a.id, agents, statusMap)) continue;
     // WHICH tier, not just whether. RED FIRST — a row with outstanding WORK is `blocked` even when
     // auto-continue also gave up on it; only a row whose sole causes are lifecycle facts goes amber.
     // See LIFECYCLE for why that ordering is the safety property of this whole change.
-    const to = escalationFor(reportOf(a.id));
+    const to = escalationFor(report);
     if (to === undefined) continue;
     ensure()[a.id] = to;
   }

@@ -251,10 +251,38 @@ pub struct SubmitCapability {
 }
 
 /// `owner/repo` for a GitHub clone URL. Pure so the slug the probe asks about is testable without
-/// touching the network. Handles the `https://…/owner/repo(.git)` form this app ships with; any
-/// other shape yields None rather than a guess (a wrong slug would probe the wrong repo).
+/// touching the network.
+///
+/// THREE shapes, all of them GitHub and nothing else:
+///   * `https://github.com/owner/repo(.git)` — what this app clones with.
+///   * `git@github.com:owner/repo(.git)` — the scp-like form `gh repo clone` writes by default.
+///   * `ssh://[git@]github.com/owner/repo(.git)` — the explicit-scheme spelling of the same thing.
+///
+/// The two SSH forms were added for the per-project tool policy: a slug that fails to resolve is
+/// treated as a FOREIGN repo, which floors merge-class tools at `ask`, so a user whose remote is
+/// SSH (the common case for anyone with push access) would be interrupted for every merge in his
+/// OWN repo. Fail-closed is the right default, but it must not fire on a URL shape we simply never
+/// learned to read.
+///
+/// Any other shape still yields None rather than a guess: a wrong slug would probe — or grant
+/// authority over — the wrong repo. Non-GitHub hosts, deeper paths and ports are all None. Case is
+/// preserved here (GitHub itself is case-insensitive); the policy path lowercases, see
+/// [`repo_slug_for_root`].
 pub fn repo_slug_from_url(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://github.com/")?;
+    let url = url.trim();
+    // Exact host prefixes only. A substring test would accept `github.com.evil.example/owner/repo`,
+    // which is precisely the input that must NOT resolve to a slug the policy layer trusts.
+    let rest = if let Some(rest) = url.strip_prefix("https://github.com/") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("git@github.com:") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
+        rest
+    } else if let Some(rest) = url.strip_prefix("ssh://github.com/") {
+        rest
+    } else {
+        return None;
+    };
     let rest = rest.strip_suffix(".git").unwrap_or(rest);
     let mut parts = rest.split('/');
     let owner = parts.next().filter(|s| !s.is_empty())?;
@@ -263,6 +291,50 @@ pub fn repo_slug_from_url(url: &str) -> Option<String> {
         return None; // deeper path — not a bare repo URL
     }
     Some(format!("{owner}/{repo}"))
+}
+
+/// The `owner/repo` a worktree (or a plain checkout) belongs to, from its `remote.origin.url`.
+///
+/// LOWERCASED, unlike [`repo_slug_from_url`]. This is the policy path: the answer is compared
+/// against `[concierge].own_orgs` and `[concierge.projects."<slug>".tools]` keys, both of which are
+/// lowercased on read, and against the shipped merge-protected pin, which is lowercase by
+/// construction. GitHub treats owner and repo case-insensitively, so `DRodio/Sparkle` and
+/// `drodio/sparkle` are ONE repo — leaving the case alone here would let a differently-cased remote
+/// slip a pinned repo past its floor.
+///
+/// `None` on anything we cannot answer: no git, no remote, a non-GitHub host, an unreadable URL.
+/// The caller must treat that as FOREIGN (the fail-closed direction), never as "no restriction".
+pub fn repo_slug_for_root(root: &str) -> Option<String> {
+    let mut cmd = Command::new(crate::preflight::git_program());
+    cmd.arg("-C").arg(root).args(["config", "--get", "remote.origin.url"]);
+    apply_noninteractive(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let url = String::from_utf8_lossy(&out.stdout);
+    repo_slug_from_url(url.trim()).map(|s| s.to_lowercase())
+}
+
+/// Tauri commands for this module. A submodule so the command can carry the SAME name as the pure
+/// helper it wraps (`repo_slug_for_root`) — Tauri derives the invoke name from the fn ident, and
+/// the frontend contract names that string.
+pub mod commands {
+    /// `owner/repo` for a worktree root, or `null` when it cannot be resolved.
+    ///
+    /// `async` + `spawn_blocking`: it shells out to git, and a sync `#[tauri::command]` body runs on
+    /// the MAIN thread — a per-project policy lookup must never be able to stall the UI.
+    ///
+    /// The frontend caches the answer (`services/conciergeTools/repoSlug.ts`) because
+    /// `evaluateToolPolicy` is synchronous; a cache miss reads as `null`, which is foreign, which is
+    /// the fail-closed direction.
+    #[tauri::command]
+    pub async fn repo_slug_for_root(root: String) -> Option<String> {
+        tauri::async_runtime::spawn_blocking(move || super::repo_slug_for_root(&root))
+            .await
+            // A join failure is "we could not answer", which is exactly what None means here.
+            .unwrap_or(None)
+    }
 }
 
 /// What one `gh api repos/<slug>` probe told us. Most outcomes are decided on the spot; the
@@ -419,9 +491,87 @@ mod tests {
         // A wrong slug would probe the WRONG repo and could report CanSubmit for a repo the user
         // happens to own — so anything unexpected must be None, never a best guess.
         assert!(repo_slug_from_url("https://example.com/owner/repo.git").is_none());
-        assert!(repo_slug_from_url("git@github.com:owner/repo.git").is_none());
         assert!(repo_slug_from_url("https://github.com/owner").is_none());
         assert!(repo_slug_from_url("https://github.com/owner/repo/tree/main").is_none());
+    }
+
+    /// DELIBERATE BEHAVIOUR CHANGE. This assertion used to read
+    /// `repo_slug_from_url("git@github.com:owner/repo.git").is_none()` — the SSH forms were
+    /// unreadable, which was harmless while the only caller was a `gh api` probe against a
+    /// hardcoded https URL. It stopped being harmless when the per-project tool policy started
+    /// treating an unresolvable slug as a foreign repo: an SSH remote (what anyone with push access
+    /// actually has) would floor every merge-class tool at `ask` in the user's OWN repo.
+    #[test]
+    fn repo_slug_reads_the_two_ssh_forms() {
+        assert_eq!(
+            repo_slug_from_url("git@github.com:owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            repo_slug_from_url("git@github.com:owner/repo").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            repo_slug_from_url("ssh://git@github.com/owner/repo.git").unwrap(),
+            "owner/repo"
+        );
+        assert_eq!(
+            repo_slug_from_url("ssh://github.com/plow-pbc/tkmx-server").unwrap(),
+            "plow-pbc/tkmx-server"
+        );
+        // Surrounding whitespace is what `git config --get` hands back (a trailing newline).
+        assert_eq!(
+            repo_slug_from_url("  git@github.com:owner/repo.git\n").unwrap(),
+            "owner/repo"
+        );
+    }
+
+    /// The half that must NOT widen. A slug the policy layer trusts decides whether Sparkle may
+    /// merge, so a host that merely LOOKS like GitHub must stay unresolvable.
+    #[test]
+    fn repo_slug_still_refuses_lookalike_hosts_and_deeper_paths() {
+        assert!(repo_slug_from_url("git@github.com.evil.example:owner/repo.git").is_none());
+        assert!(repo_slug_from_url("git@gitlab.com:owner/repo.git").is_none());
+        assert!(repo_slug_from_url("ssh://git@github.com:22/owner/repo.git").is_none());
+        assert!(repo_slug_from_url("git@github.com:owner").is_none());
+        assert!(repo_slug_from_url("git@github.com:owner/repo/extra").is_none());
+        assert!(repo_slug_from_url("ssh://git@example.com/owner/repo.git").is_none());
+        assert!(repo_slug_from_url("").is_none());
+    }
+
+    /// The side effect the policy layer depends on: a real repo whose origin is an SSH remote in
+    /// MIXED case resolves to the lowercased slug. Case matters because the answer is compared
+    /// against lowercased config keys and a lowercase pin list — a `DRodio/Sparkle` remote that
+    /// came back verbatim would miss every one of them.
+    #[test]
+    fn repo_slug_for_root_reads_origin_and_lowercases_it() {
+        let dir = unique_dir("slug-root");
+        let repo = dir.join("checkout");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run = |args: &[&str]| {
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(&repo).args(args);
+            apply_noninteractive(&mut cmd);
+            assert!(cmd.status().unwrap().success(), "git {args:?} failed");
+        };
+        run(&["init"]);
+        // No remote yet: unresolvable, which the caller reads as FOREIGN.
+        assert_eq!(repo_slug_for_root(repo.to_str().unwrap()), None);
+
+        run(&["remote", "add", "origin", "git@github.com:Plow-PBC/TKMX-Server.git"]);
+        assert_eq!(
+            repo_slug_for_root(repo.to_str().unwrap()).as_deref(),
+            Some("plow-pbc/tkmx-server"),
+            "an SSH origin resolves, lowercased"
+        );
+
+        // A non-GitHub origin stays None rather than becoming a slug we would then trust.
+        run(&["remote", "set-url", "origin", "git@gitlab.com:owner/repo.git"]);
+        assert_eq!(repo_slug_for_root(repo.to_str().unwrap()), None);
+
+        // A path that is not a repo at all answers None instead of erroring.
+        assert_eq!(repo_slug_for_root(dir.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn decided(ok: bool, stdout: &str, stderr: &str) -> SubmitVerdict {

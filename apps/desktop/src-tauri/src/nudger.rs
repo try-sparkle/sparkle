@@ -289,6 +289,25 @@ pub struct NudgeFlag {
     /// `blocked-on-human` tells the reader what is owed; the same row with only `blocked_by: null`
     /// tells them an agent has been quiet for a while and nothing about why.
     pub reply: Option<String>,
+    /// The STAND-DOWN in force, if any — `login-expired`, `blocked-on-quota`, `blocked-on-human`, …
+    ///
+    /// A THIRD, DISTINCT FACT from the two above, and the one an agent that cannot speak still
+    /// produces. `reply` is what the agent TYPED, so it is `None` for every wall that stops the
+    /// agent from typing at all — a dead Claude session most of all. `blocked_by` is why WE could
+    /// not write. This is what the ladder CONCLUDED, whoever said it and however it was seen, so a
+    /// row raised off a screen banner is as legible to the consumer as one raised off an answer.
+    /// Without it a founder-level `login-expired` row arrives carrying `reply: null` and
+    /// `blocked_by: null`, which by their own contracts says "quiet for a while, cause unknown".
+    pub standdown: Option<String>,
+    /// WHICH LOGIN the human has to fix, when that is the problem.
+    ///
+    /// An expired OAuth session is only actionable if the person reading the row knows which
+    /// account to re-authenticate — this machine runs several Claude Max logins, each pinned to its
+    /// own `CLAUDE_CONFIG_DIR`. `None` when the question does not arise (any other stand-down) or
+    /// when the spawn's config dir could not be resolved to an account; a caller must not read
+    /// `None` as "the default account", because "we could not tell" produces the same value. See
+    /// [`account_label_from`], which states the ambiguity it cannot resolve.
+    pub account: Option<String>,
 }
 
 /// Live flags, keyed by agent id so a stuck agent contributes one row rather than a stream.
@@ -515,8 +534,8 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
         loop {
             std::thread::sleep(TICK);
             let now = now_ms();
-            let overshoot = clock.suspended_ms(now, started.elapsed().as_millis() as u64);
-            if overshoot > SUSPEND_OVERSHOOT_MS {
+            let skew = clock.sample(now, started.elapsed().as_millis() as u64);
+            if let Some(overshoot) = rebaseline_reason(skew) {
                 // We were frozen alongside everything else, so the silence means nothing. Push
                 // every deadline out rather than reading a suspend as eight rungs of stall.
                 //
@@ -571,14 +590,123 @@ impl LoopClock {
         }
     }
 
-    /// Milliseconds of this iteration attributable to a SUSPEND: wall clock that passed while the
-    /// monotonic clock did not. Zero for any iteration that merely took a long time.
-    fn suspended_ms(&mut self, wall_ms: u64, mono_ms: u64) -> u64 {
-        let wall = wall_ms.saturating_sub(self.last_wall_ms);
-        let mono = mono_ms.saturating_sub(self.last_mono_ms);
+    /// What this iteration did to our sense of time.
+    ///
+    /// BOTH DIRECTIONS, because the wall clock can lie either way and only one of them was being
+    /// read. `wall - mono` is a suspend or a forward step; `mono - wall` is a BACKWARD step, and
+    /// discarding it blinded the whole module (roborev 64324): every `due_at_ms` and `last_look_ms`
+    /// is epoch-based, so after the wall clock jumps back N minutes, `now < due_at_ms` holds for
+    /// EVERY tracked agent and `tick` skips all of them for the full N minutes — silently, because
+    /// the detector reported "no suspend". An NTP correction, a VM or laptop resync after a bad RTC
+    /// read, or someone changing the clock does it. `rebaseline_after_suspend` is already the right
+    /// response: it re-anchors both fields to the new `now`, which is exactly what a step needs.
+    fn sample(&mut self, wall_ms: u64, mono_ms: u64) -> Skew {
+        let (last_wall, last_mono) = (self.last_wall_ms, self.last_mono_ms);
         self.last_wall_ms = wall_ms;
         self.last_mono_ms = mono_ms;
-        wall.saturating_sub(mono)
+        let mono = mono_ms.saturating_sub(last_mono);
+
+        // THE OUTRIGHT BACKWARD CASE MUST BE TAKEN FIRST, because these are unsigned epoch
+        // milliseconds and `saturating_sub` would clamp the reversal to zero — reporting a
+        // ten-minute step back as a skew of merely the monotonic delta, comfortably inside the
+        // slack, so nothing would rebaseline and the blindness this arm exists to catch would
+        // survive it. The step is how far the clock went back PLUS the time that really passed
+        // while it did.
+        if wall_ms < last_wall {
+            return Skew::Backward {
+                ms: (last_wall - wall_ms).saturating_add(mono),
+                // No forward wall time elapsed at all on this arm — the clock ended up BEHIND where
+                // it started — so there is no overshoot for the backstop to measure.
+                wall_ms: 0,
+            };
+        }
+
+        let wall = wall_ms - last_wall;
+        match wall.cmp(&mono) {
+            std::cmp::Ordering::Greater => Skew::Forward {
+                ms: wall - mono,
+                wall_ms: wall,
+            },
+            std::cmp::Ordering::Less => Skew::Backward {
+                ms: mono - wall,
+                wall_ms: wall,
+            },
+            std::cmp::Ordering::Equal => Skew::None { wall_ms: wall },
+        }
+    }
+}
+
+/// What one turn of the loop did to our sense of time.
+///
+/// `wall_ms` rides along on EVERY arm because of the FAIL-SAFE below: the monotonic comparison is
+/// the primary signal, but it rests on an assumption, and a wrong assumption must degrade rather
+/// than disappear.
+///
+/// IT RIDES ON THE BACKWARD ARM TOO, and leaving it off there was the fail-safe's own hole (roborev
+/// 64342). In the pessimistic world the backstop exists for — a monotonic clock that counted the
+/// sleep — a six-hour freeze produces `wall ≈ mono`, and WHICH SIDE IS LARGER is then decided by
+/// sub-second clock discipline rather than by the freeze: RTC/NTP drift is tens of ppm, about a
+/// second either way over six hours. So the resume lands on `Forward` (backstop fires), `None`
+/// (fires, but only on a millisecond-exact tie), or `Backward` — and with no `wall_ms` on that arm
+/// the sub-slack backward tip left the detector silently dead about half the time, on a coin flip
+/// that has nothing to do with the freeze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Skew {
+    /// The two clocks agree. An ordinary iteration — or a slow one, which is not a suspend.
+    None { wall_ms: u64 },
+    /// Wall clock ran ahead of monotonic: a suspend, or a forward step.
+    Forward { ms: u64, wall_ms: u64 },
+    /// Wall clock ran BEHIND monotonic: it was stepped backwards. `wall_ms` is the forward wall
+    /// time the iteration still took — zero when the clock ended up behind where it started.
+    Backward { ms: u64, wall_ms: u64 },
+}
+
+/// A wall-clock overshoot so large that no `tick` could produce it, used as a BACKSTOP.
+///
+/// The monotonic comparison is the primary detector and is far more precise, but it rests on a
+/// property Rust does not promise: that `Instant` does not advance while the machine is asleep.
+/// That happens to hold on both targets this ships to — std uses `CLOCK_UPTIME_RAW` on Apple and
+/// `CLOCK_MONOTONIC` on Linux, neither of which counts suspended time — but it is not guaranteed,
+/// and `watchdog.rs`'s header reaches the OPPOSITE conclusion for its own detector, deliberately
+/// measuring in wall time because "whether a monotonic clock counts suspended time is platform- and
+/// clock-specific". The two modules are reconciled by this constant rather than by one of them
+/// being wrong: the nudger needs the precision (a slow `tick` must not read as a freeze, see
+/// `LoopClock`), and it pays for that precision by keeping the wall clock as a floor.
+///
+/// IF THE ASSUMPTION IS EVER FALSE, `Skew::Forward` never fires and suspend detection is silently,
+/// permanently dead — strictly worse than the false positive it replaced, because a false positive
+/// is loud and bounded while this one is invisible. No test can catch it either: the unit tests feed
+/// plain integers, so they pin the arithmetic and say nothing about which clocks the loop supplies.
+/// So a wall overshoot past a minute rebaselines regardless of what the monotonic reading says. It
+/// is twelve times the `tick` interval and an order of magnitude above `SUSPEND_OVERSHOOT_MS`, so a
+/// fleet-sized nudge burst cannot reach it, but a multi-hour freeze trips it even if the monotonic
+/// clock counted every second of the sleep.
+const WALL_BACKSTOP_MS: u64 = 60_000;
+
+/// Should this iteration re-anchor the whole roster, and by how much was our clock wrong?
+///
+/// THREE REASONS, ONE PLACE, so they cannot drift apart — and all three end in the same response
+/// because `rebaseline_after_suspend` re-anchors `due_at_ms` and `last_look_ms` to the new `now`,
+/// which is what every one of them needs:
+///
+///   * a SUSPEND (or forward step) past the slack — the frozen span must not be credited as silence;
+///   * a BACKWARD step past the slack — otherwise `now` sits behind every deadline and `tick` skips
+///     the entire roster until the wall clock catches up;
+///   * a wall overshoot past `WALL_BACKSTOP_MS` whatever the monotonic clock said — the fail-safe
+///     for the one assumption this detector rests on.
+///
+/// `None` means the iteration was ordinary, INCLUDING an iteration that merely took a long time:
+/// that is the distinction `LoopClock` exists to draw, and re-blurring it here would undo it.
+fn rebaseline_reason(skew: Skew) -> Option<u64> {
+    match skew {
+        Skew::Forward { ms, wall_ms } if ms > SUSPEND_OVERSHOOT_MS || wall_ms > WALL_BACKSTOP_MS => {
+            Some(ms.max(wall_ms))
+        }
+        Skew::None { wall_ms } if wall_ms > WALL_BACKSTOP_MS => Some(wall_ms),
+        Skew::Backward { ms, wall_ms } if ms > SUSPEND_OVERSHOOT_MS || wall_ms > WALL_BACKSTOP_MS => {
+            Some(ms.max(wall_ms))
+        }
+        _ => None,
     }
 }
 
@@ -777,13 +905,30 @@ fn tick<R: Runtime>(app: &AppHandle<R>, tracked: &mut HashMap<String, Tracked>, 
         }
 
         if let Some(flags) = app.try_state::<NudgeFlags>() {
-            if let Some(flag) = apply_flags(&flags, agent_id, &decision, &entry.state) {
+            let escalated = apply_flags(&flags, agent_id, &decision, &entry.state);
+            // WHICH LOGIN — resolved only for the one stand-down where the answer is the whole
+            // point of the row. An expired OAuth session is actionable only if the person reading
+            // knows which of several Claude Max accounts to re-authenticate; every other row would
+            // pay the IO for a field nobody reads. See `stamp_account`.
+            if decision.flagged.is_some()
+                && entry.state.standdown() == Some(nudge_ladder::Standdown::LoginExpired)
+            {
+                stamp_account(&flags, agent_id, account_label(app, agent_id));
+            }
+            if let Some(flag) = escalated {
+                // Re-read AFTER the stamp, so the event carries the account too. The pull
+                // (`nudger_flags`) would have it either way — the event is an optimisation on top,
+                // per this module's header — but a consumer that acts on the event alone must not
+                // see a strictly poorer row than one that polls.
+                let flag = flags.get(agent_id).unwrap_or(flag);
                 tracing::warn!(
                     target: "nudger",
                     agent = %agent_id,
                     escalate = flag.target.as_str(),
                     nudges = flag.nudges,
                     silent_secs = flag.silent_secs,
+                    standdown = flag.standdown.as_deref().unwrap_or("-"),
+                    account = flag.account.as_deref().unwrap_or("-"),
                     "nudger escalated: agent has not moved after repeated nudges"
                 );
                 let _ = app.emit("nudger://escalation", &flag);
@@ -897,6 +1042,17 @@ fn observe(
         } else {
             None
         },
+        // THE QUESTION WE DID NOT HAVE TO ASK. Same grid, same fail-closed rule as `reply`: a
+        // parked reader makes the banner as stale as anything else on the screen, and a stale
+        // banner must not stand an agent down for half an hour.
+        quota_blocked: screen_readable && nudge_gate::screen_shows_account_limit(&text),
+        // THE QUESTION THAT CAN NEVER BE ANSWERED. `Login expired · Please run /login` means the
+        // agent's OAuth session is dead, so every nudge from here dies at the auth layer and emits
+        // this banner again — which re-satisfies the no-output condition and reloops. The founder
+        // watched pings #5, #6, #7 and #8 land that way. Same grid, same fail-closed rule as
+        // `quota_blocked`: a parked reader makes the banner as stale as anything else on screen,
+        // and a stale banner must never stand a HEALTHY agent down.
+        login_expired: screen_readable && nudge_gate::screen_shows_login_expired(&text),
         // MAY WE ANSWER THIS PROMPT OURSELVES? The verdict is re-derived here, on the nudger
         // thread, from the grid this module owns -- never taken from the WebView, for the same
         // reason `nudger_send_escape` re-derives its own: a wedged WebView's last opinion is
@@ -1060,12 +1216,22 @@ fn build_flag(
     NudgeFlag {
         agent_id: agent_id.to_string(),
         target: target.as_str().to_string(),
-        raised_at_ms: previous.map(|f| f.raised_at_ms).unwrap_or_else(now_ms),
+        raised_at_ms: previous.as_ref().map(|f| f.raised_at_ms).unwrap_or_else(now_ms),
         nudges: state.attempts(),
         delivered: state.delivered(),
         blocked_by: state.last_blocked().map(str::to_string),
         silent_secs: state.silent_secs(),
         reply: state.last_reply().map(|r| r.as_str().to_string()),
+        // WHAT THE LADDER CONCLUDED, which is the only one of the three that survives an agent
+        // being unable to type. A dead Claude session answers nothing, so `reply` is null for it
+        // forever; this is where `login-expired` reaches the consumer.
+        standdown: state.standdown().map(|s| s.as_str().to_string()),
+        // CARRIED, NOT REBUILT — same rule as `raised_at_ms` above and for the same reason. It is
+        // the one field here that costs IO (accounts.json plus the PTY table), so it is stamped by
+        // `stamp_account` on the looks that need it rather than re-resolved on every refresh; a
+        // rebuild-from-nothing here would blank it between escalations and the founder's row would
+        // stop naming the login halfway through the outage.
+        account: previous.as_ref().and_then(|f| f.account.clone()),
         // Live by construction: this is only built while the agent is still being ticked, which
         // requires a live observer. `sweep_dead_flags` is the one place that sets it.
     }
@@ -1092,6 +1258,109 @@ fn build_flag(
 ///     optimisation on top, not the channel" — so the consumer picks this up on its next poll.
 ///
 /// Nothing here can loop forever: the episode reset clears `escalated`, so an agent that produces
+
+// ══ WHICH LOGIN THE FOUNDER HAS TO FIX ══════════════════════════════════════════════════════════
+
+/// Stamp WHICH ACCOUNT an already-raised row is about.
+///
+/// ── WHY THIS IS NOT A `build_flag` FIELD ──────────────────────────────────────────────────────
+/// Every other field on the row is read from the ladder's own state — free, and available on every
+/// look. This one costs real IO: the PTY table for the agent's `CLAUDE_CONFIG_DIR`, then
+/// `accounts.json` to turn that path into a name a person recognises. `build_flag` runs on every
+/// flagging look of every flagged agent, and the answer only MATTERS for a dead session, so paying
+/// that cost there would spend it on the whole fleet to serve one row. It is stamped here instead,
+/// on the looks that need it, and `build_flag` CARRIES it forward the way it carries `raised_at_ms`.
+///
+/// A no-op for an agent with no row: this is only ever called after `apply_flags`, and a look that
+/// raised nothing has nothing to describe.
+///
+/// ── IT ONLY EVER WRITES A POSITIVE ANSWER (roborev 65501, Medium) ─────────────────────────────
+/// An unconditional `flag.account = account` would let a LATER look BLANK a name an earlier one had
+/// already resolved, which defeats the carry-forward `build_flag` exists to provide and is exactly
+/// the "row stops naming the login halfway through the outage" this pair was written to prevent.
+///
+/// It is not hypothetical, and the likeliest path is the one this feature creates: the agent's
+/// `claude` process EXITS, so its session leaves `PtyManager` and `account_label` starts answering
+/// `None` — while the observer's last grid still shows the banner, so `login_expired` is still true
+/// and the founder's row is still up. The row would survive with its account silently erased. A
+/// transient `accounts.json` or app-data read failure does the same thing for a different reason.
+///
+/// So `None` means "no NEW answer this look", never "the answer is nothing". The name can still
+/// change — a positive answer always wins, so an agent re-spawned onto a different account
+/// re-labels correctly — it just cannot be erased by a look that failed to look it up.
+fn stamp_account(flags: &NudgeFlags, agent_id: &str, account: Option<String>) {
+    let Some(account) = account else {
+        return;
+    };
+    let mut map = flags.0.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(flag) = map.get_mut(agent_id) {
+        flag.account = Some(account);
+    }
+}
+
+/// Resolve the account an agent's PTY was launched under, as a label a human can act on.
+///
+/// `None` when any link in the chain is missing — no PTY manager, no session, no readable
+/// `accounts.json`. Deliberately not an error: a row that names no account is still a row, and
+/// failing to name the login must never be able to suppress the flag itself.
+fn account_label<R: Runtime>(app: &AppHandle<R>, agent_id: &str) -> Option<String> {
+    let manager = app.try_state::<crate::pty::PtyManager>()?;
+    // ── THREE ANSWERS, AND TWO OF THEM MUST NOT NAME ANYTHING (roborev 65537, Medium) ────────
+    // `spawn_account` keeps apart what a bare `Option<String>` collapsed:
+    //
+    //   * `None`                    — no session under this id. We know nothing.
+    //   * `Some(Unknown)`           — there WAS an export and it could not be decoded. We know
+    //                                 nothing, and saying "the default account" here would be a
+    //                                 guess dressed as a fact.
+    //   * `Some(Default)`           — no export at all, which positively IS the imported default.
+    //   * `Some(Dir(d))`            — that dir.
+    //
+    // The middle case is the whole reason this exists. Every fail-closed refusal in the parser (an
+    // unterminated quote, an empty value, an export outside the prelude) lands there, and under the
+    // collapsed form each one arrived at the founder as the default account BY NAME — the exact
+    // confident-wrong-login outcome the refusals are written to prevent, reintroduced one layer
+    // down. A row that says "could not identify" is worth more than a row that is sure and wrong.
+    let app_data = crate::dev_identity::app_data_dir(app).ok()?;
+    let accounts =
+        crate::accounts::read_accounts_at(&crate::accounts::accounts_json_path(&app_data)).ok()?;
+    match manager.spawn_account(agent_id)? {
+        crate::pty::SpawnAccount::Unknown => None,
+        crate::pty::SpawnAccount::Default => Some(account_label_from(&accounts, None)),
+        crate::pty::SpawnAccount::Dir(dir) => Some(account_label_from(&accounts, Some(&dir))),
+    }
+}
+
+/// The PURE half of the above: a config dir plus the registered accounts → the words on the row.
+///
+/// ── THE AMBIGUITY IT CANNOT RESOLVE, STATED RATHER THAN PAPERED OVER ──────────────────────────
+/// `config_dir` is `None` for BOTH "this agent runs as the imported default account, which exports
+/// no `CLAUDE_CONFIG_DIR` at all" and "we have no PTY session for this id". `account_label` screens
+/// the second out with a liveness check before calling here, because nothing about the value itself
+/// separates them. Even then this cannot always NAME the default: an install with no default
+/// account registered leaves nothing to name it with. So the empty-dir branch says what is actually
+/// known rather than asserting a login — a founder sent to re-authenticate the wrong account is
+/// worse served than one told the account could not be identified.
+///
+/// An UNREGISTERED dir is reported verbatim. That is deliberately not a failure: the dir IS the
+/// answer (`claude auth login` with `CLAUDE_CONFIG_DIR` set to it re-authenticates exactly that
+/// account), and a path is a worse label than a nickname but an infinitely better one than nothing.
+pub(crate) fn account_label_from(
+    accounts: &[crate::accounts::Account],
+    config_dir: Option<&str>,
+) -> String {
+    let dir = config_dir.unwrap_or("");
+    match accounts.iter().find(|a| a.config_dir == dir) {
+        Some(a) if dir.is_empty() => {
+            format!("{} — the default login, no CLAUDE_CONFIG_DIR set", a.nickname)
+        }
+        Some(a) => format!("{} (CLAUDE_CONFIG_DIR={dir})", a.nickname),
+        None if dir.is_empty() => {
+            "the default login (no CLAUDE_CONFIG_DIR), or the account could not be identified"
+                .to_string()
+        }
+        None => format!("an unregistered account (CLAUDE_CONFIG_DIR={dir})"),
+    }
+}
 
 fn action_name(action: &Action) -> &'static str {
     match action {
@@ -1125,21 +1394,116 @@ mod tests {
         let mut clock = LoopClock::new(1_000, 1_000);
 
         // An ordinary iteration: one second of sleep, both clocks agree.
-        assert_eq!(clock.suspended_ms(2_000, 2_000), 0, "an ordinary iteration is not a suspend");
+        assert_eq!(clock.sample(2_000, 2_000), Skew::None { wall_ms: 1_000 });
+        assert_eq!(rebaseline_reason(Skew::None { wall_ms: 1_000 }), None);
 
         // THE REGRESSION CASE. Eight seconds of real work — well past SUSPEND_OVERSHOOT_MS — with
         // the machine awake throughout, so the monotonic clock advanced just as far.
-        let slow = clock.suspended_ms(10_000, 10_000);
-        assert_eq!(slow, 0, "a slow tick advances BOTH clocks, so none of it is frozen time");
-        assert!(
-            slow <= SUSPEND_OVERSHOOT_MS,
-            "…and so it must never trip the detector (got {slow}ms)"
+        let slow = clock.sample(10_000, 10_000);
+        assert_eq!(
+            slow,
+            Skew::None { wall_ms: 8_000 },
+            "a slow tick advances BOTH clocks, so none of it is frozen time"
+        );
+        assert_eq!(
+            rebaseline_reason(slow),
+            None,
+            "…and so it must never rewrite the roster, however long the tick took"
         );
 
         // A real six-hour sleep: the wall clock ran, the monotonic clock did not.
-        let frozen = clock.suspended_ms(10_000 + 6 * 60 * 60 * 1_000, 11_000);
-        assert_eq!(frozen, 6 * 60 * 60 * 1_000 - 1_000, "the frozen span is wall minus monotonic");
-        assert!(frozen > SUSPEND_OVERSHOOT_MS, "and it must trip the detector");
+        let frozen = clock.sample(10_000 + 6 * 60 * 60 * 1_000, 11_000);
+        assert_eq!(
+            frozen,
+            Skew::Forward { ms: 6 * 60 * 60 * 1_000 - 1_000, wall_ms: 6 * 60 * 60 * 1_000 },
+            "the frozen span is wall minus monotonic"
+        );
+        assert!(rebaseline_reason(frozen).is_some(), "and it must rebaseline");
+    }
+
+    /// THE WALL CLOCK CAN LIE THE OTHER WAY TOO, and discarding that direction blinded the module.
+    ///
+    /// `due_at_ms` and `last_look_ms` are epoch-based, so after the wall clock is stepped BACK N
+    /// minutes, `now` sits behind every deadline: `tick` skips the entire roster for the full N
+    /// minutes and nothing logs it, because a detector that only reads `wall - mono` reports "no
+    /// suspend". An NTP correction or a VM resync after a bad RTC read does exactly this.
+    #[test]
+    fn a_backward_wall_clock_step_rebaselines_instead_of_blinding_the_loop() {
+        let mut clock = LoopClock::new(600_000, 1_000);
+        // One second of monotonic time passed; the wall clock went back ten minutes.
+        let stepped = clock.sample(0, 2_000);
+        assert_eq!(
+            stepped,
+            Skew::Backward { ms: 601_000, wall_ms: 0 },
+            "the step is monotonic plus the reversal, and no forward wall time elapsed"
+        );
+        assert!(
+            rebaseline_reason(stepped).is_some(),
+            "a backward step must re-anchor the roster, not be read as an ordinary iteration"
+        );
+
+        // A tiny backward nudge is ordinary clock discipline, not a step — it must NOT rewrite the
+        // roster, which is what makes the assertion above about the STEP rather than about sign.
+        let mut clock = LoopClock::new(10_000, 10_000);
+        let jitter = clock.sample(10_900, 11_000);
+        assert_eq!(jitter, Skew::Backward { ms: 100, wall_ms: 900 });
+        assert_eq!(rebaseline_reason(jitter), None, "slack applies in both directions");
+    }
+
+    /// THE FAIL-SAFE. The monotonic comparison rests on a property Rust does not promise — that
+    /// `Instant` does not advance while the machine is asleep — and `watchdog.rs` reaches the
+    /// opposite conclusion for its own detector on exactly that ambiguity. If the assumption is
+    /// ever false, `Skew::Forward` never fires and suspend detection is silently, permanently dead:
+    /// strictly worse than the false positive it replaced, because that one was loud and bounded.
+    ///
+    /// So a wall overshoot past `WALL_BACKSTOP_MS` rebaselines whatever the monotonic clock says.
+    ///
+    /// DRIVEN THROUGH `sample`, IN ALL THREE TIPS, because the variant this lands on is the entire
+    /// question the fail-safe turns on and it is not the freeze that decides it (roborev 64342).
+    /// When both clocks ran for six hours the two deltas differ only by drift — tens of ppm, about
+    /// a second either way — so the arm is chosen by sub-second clock discipline: `Forward` if the
+    /// wall clock ran a hair fast, `Backward` if the monotonic did, `None` only on a
+    /// millisecond-exact tie that is measure-zero in production. A test that hand-builds `None`
+    /// pins one third of the input space and passes with the other two thirds broken, and mutation
+    /// checking cannot reveal that — deleting the backstop reds it, so the check reports grip on an
+    /// expectation that never constructs the failing case.
+    #[test]
+    fn a_multi_hour_freeze_still_rebaselines_even_if_the_monotonic_clock_counted_it() {
+        const SIX_HOURS: u64 = 6 * 60 * 60 * 1_000;
+        // The pessimistic world: a six-hour sleep the monotonic clock counted in full, so the
+        // primary signal sees at most a second of drift and nothing that looks like a suspend.
+        for (label, mono) in [
+            ("the monotonic clock ran a hair FAST — the backward tip", SIX_HOURS + 800),
+            ("the wall clock ran a hair fast — the forward tip", SIX_HOURS - 800),
+            ("a millisecond-exact tie", SIX_HOURS),
+        ] {
+            let mut clock = LoopClock::new(0, 0);
+            let both_ran = clock.sample(SIX_HOURS, mono);
+            assert!(
+                rebaseline_reason(both_ran).is_some(),
+                "the backstop must catch a freeze the monotonic clock failed to reveal: {label} \
+                 (got {both_ran:?})"
+            );
+        }
+
+        // …and it must stay clear of the case the primary signal was introduced to protect: a
+        // fleet-sized nudge burst is seconds, an order of magnitude under the backstop — again in
+        // every tip, since the same coin flip decides the arm for a slow tick.
+        assert!(8_000 < WALL_BACKSTOP_MS, "premise: a slow tick is far below the backstop");
+        for (label, mono) in [
+            ("monotonic ahead", 8_100_u64),
+            ("wall ahead", 7_900),
+            ("dead even", 8_000),
+        ] {
+            let mut clock = LoopClock::new(0, 0);
+            let slow_burst = clock.sample(8_000, mono);
+            assert_eq!(
+                rebaseline_reason(slow_burst),
+                None,
+                "the backstop must not re-introduce the false positive it sits above: {label} \
+                 (got {slow_burst:?})"
+            );
+        }
     }
 
     /// The freeze this whole line of work started from: one that begins INSIDE the `tick` body.
@@ -1153,9 +1517,12 @@ mod tests {
         let mut clock = LoopClock::new(0, 0);
         // The sleep was ordinary (1s); the freeze happened afterwards, while `tick` was running.
         // Both facts arrive together at the NEXT sample, which is the point of carrying the clock.
-        let frozen = clock.suspended_ms(3_600_000, 1_000);
-        assert_eq!(frozen, 3_599_000);
-        assert!(frozen > SUSPEND_OVERSHOOT_MS, "a freeze inside the tick body must still be seen");
+        let frozen = clock.sample(3_600_000, 1_000);
+        assert_eq!(frozen, Skew::Forward { ms: 3_599_000, wall_ms: 3_600_000 });
+        assert!(
+            rebaseline_reason(frozen).is_some(),
+            "a freeze inside the tick body must still be seen"
+        );
     }
 
     /// A forward `SystemTime` step is caught for free — `now_ms` is not monotonic, and a clock that
@@ -1163,9 +1530,16 @@ mod tests {
     #[test]
     fn a_forward_wall_clock_step_is_not_credited_as_elapsed() {
         let mut clock = LoopClock::new(1_000, 1_000);
-        let stepped = clock.suspended_ms(61_000, 2_000);
-        assert_eq!(stepped, 59_000, "the step is wall clock the monotonic clock never saw");
-        assert!(stepped > SUSPEND_OVERSHOOT_MS, "so it rebaselines rather than being credited");
+        let stepped = clock.sample(61_000, 2_000);
+        assert_eq!(
+            stepped,
+            Skew::Forward { ms: 59_000, wall_ms: 60_000 },
+            "the step is wall clock the monotonic clock never saw"
+        );
+        assert!(
+            rebaseline_reason(stepped).is_some(),
+            "so it rebaselines rather than being credited"
+        );
     }
 
     /// A SUSPEND IS NOT ELAPSED TIME — and the deadline is only half of saying so.
@@ -1561,6 +1935,293 @@ mod tests {
         );
     }
 
+    // ══ THE DEAD SESSION — THE SEAM FROM SCREEN TO FOUNDER ROW ═════════════════════════════════
+
+    /// THE WHOLE FEATURE, END TO END, DRIVEN FROM A REAL RENDERED SCREEN.
+    ///
+    /// The ladder's own tests set `login_expired` by hand, which proves the RULE and is blind to
+    /// the WIRING — exactly the shape this repo's #1 finding warns about, and the shape that let a
+    /// Rust/TS seam ship inert with both suites green. So this one ingests the founder's actual
+    /// terminal bytes into a real `PtyObserver`, runs `observe`, and asserts the side effect out
+    /// the far end: no more writes, and a founder row.
+    #[test]
+    fn a_login_expired_banner_on_a_real_screen_halts_the_ladder_and_flags_the_founder() {
+        let o = observer();
+        o.ingest("\x1b[2J\x1b[H● Working on the retry PR\r\nLogin expired · Please run /login");
+
+        let obs = observe(&o, "idle", false, None, None, now_ms(), None);
+        assert!(obs.screen_readable, "precondition — this grid IS current");
+        assert!(obs.login_expired, "the wiring must actually read the banner off the screen");
+        assert_eq!(obs.reply, None, "precondition — a dead session answers nothing, ever");
+
+        let mut state = AgentState::default();
+        let decisions: Vec<_> = (0..20).map(|_| nudge_ladder::step(&mut state, &obs)).collect();
+        assert!(
+            decisions.iter().all(|d| !matches!(d.action, Action::Enter | Action::Nudge { .. })),
+            "twenty looks and not one byte typed at a session that cannot receive it"
+        );
+        assert!(
+            decisions
+                .iter()
+                .all(|d| d.flagged == Some(nudge_ladder::Escalation::Founder)),
+            "and the founder is told from the first look — nobody else can re-authenticate"
+        );
+    }
+
+    /// THE CONTROL. The same observer, the same looks, the banner replaced by ordinary output — it
+    /// must still be nudged. Without this the assertion above would pass against a `screen_shows_
+    /// login_expired` that returned `true` for everything, which would silence the entire fleet.
+    #[test]
+    fn an_ordinary_idle_screen_is_not_read_as_a_dead_session() {
+        let o = observer();
+        o.ingest("\x1b[2J\x1b[H● Working on the retry PR\r\n────────────\r\n❯\u{a0}\r\n────────────");
+
+        let obs = observe(&o, "idle", false, None, None, now_ms(), None);
+        assert!(!obs.login_expired, "a healthy agent must never be read as logged out");
+
+        let mut state = AgentState::default();
+        let decisions: Vec<_> = (0..20).map(|_| nudge_ladder::step(&mut state, &obs)).collect();
+        // Asserted on the REFUSAL rather than on a nudge landing: an unrelated gate (a prompt the
+        // screen happens to satisfy, say) could legitimately hold the write back, and a control
+        // that a neighbouring rule can defeat proves nothing about the rule under test.
+        assert!(
+            decisions.iter().all(|d| d.refusal != Some("login-expired")),
+            "a healthy agent must never be stood down as logged out: {:?}",
+            decisions.iter().filter_map(|d| d.refusal).collect::<Vec<_>>()
+        );
+    }
+
+    /// A PARKED READER MAKES THE BANNER AS STALE AS ANYTHING ELSE ON THE GRID.
+    ///
+    /// Same fail-closed rule `reply` and `quota_blocked` follow. The failure direction matters:
+    /// reading a months-old banner off a frozen screen would stand a HEALTHY agent down and mark
+    /// it blocked-on-human forever, which is strictly worse than one extra ping.
+    #[test]
+    fn an_unreadable_screen_never_latches_a_dead_session() {
+        let o = observer();
+        o.ingest("\x1b[2J\x1b[HLogin expired · Please run /login");
+        o.set_reader_parked(true);
+
+        let obs = observe(&o, "idle", false, None, None, now_ms(), None);
+        assert!(!obs.screen_readable, "precondition — the grid stopped advancing");
+        assert!(
+            !obs.login_expired,
+            "a stale banner is not evidence; the ordinary ladder (and its own escalation) applies"
+        );
+    }
+
+    /// THE ROW HAS TO SAY WHAT IT IS ABOUT.
+    ///
+    /// A dead session leaves `reply` null by construction (it cannot type) and `blocked_by` null
+    /// (the gate had no objection — we simply chose not to write). By those fields' own contracts
+    /// that row reads "quiet for a while, cause unknown", which is the silence the founder was
+    /// already getting. `standdown` is the field that carries the cause.
+    #[test]
+    fn a_founder_row_for_a_dead_session_names_the_cause() {
+        let o = observer();
+        o.ingest("\x1b[2J\x1b[HLogin expired · Please run /login");
+        let obs = observe(&o, "idle", false, None, None, now_ms(), None);
+
+        let mut state = AgentState::default();
+        let decision = nudge_ladder::step(&mut state, &obs);
+        assert_eq!(decision.flagged, Some(nudge_ladder::Escalation::Founder));
+
+        let flags = NudgeFlags::default();
+        apply_flags(&flags, "agent-1", &decision, &state);
+        let row = &flags.list()[0];
+        assert_eq!(row.target, "founder");
+        assert_eq!(
+            row.standdown.as_deref(),
+            Some("login-expired"),
+            "the machine-readable cause, on a row whose agent could not report it"
+        );
+        assert_eq!(row.reply, None, "and it is NOT pretending the agent said anything");
+    }
+
+    /// …AND IT MUST SURVIVE THE REFRESH THAT REBUILDS THE ROW.
+    ///
+    /// `build_flag` runs again on every flagging look and rebuilds most fields from scratch. The
+    /// account is stamped separately (it costs IO), so it is CARRIED from the previous row — and a
+    /// rebuild that dropped it would blank the one field that makes the row actionable, silently,
+    /// on the second look of an outage that lasts hours.
+    #[test]
+    fn the_account_name_survives_a_row_refresh() {
+        let flags = NudgeFlags::default();
+        let state = AgentState::default();
+        apply_flags(
+            &flags,
+            "agent-1",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &state,
+        );
+        stamp_account(&flags, "agent-1", Some("work — the default login".to_string()));
+        assert_eq!(flags.list()[0].account.as_deref(), Some("work — the default login"));
+
+        // A later flagging look for the same episode: same row, rebuilt.
+        apply_flags(
+            &flags,
+            "agent-1",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &state,
+        );
+        assert_eq!(
+            flags.list()[0].account.as_deref(),
+            Some("work — the default login"),
+            "a refresh must not blank the field that tells the founder WHICH login to fix"
+        );
+    }
+
+    /// …AND A LOOK THAT COULD NOT LOOK IT UP MUST NOT ERASE IT EITHER (roborev 65501, Medium).
+    ///
+    /// The likeliest path is the one this feature creates. The dead agent's `claude` process EXITS,
+    /// so its session leaves `PtyManager` and `account_label` starts answering `None` — while the
+    /// observer's last grid still shows the banner, so the stand-down holds and the founder's row is
+    /// still up. An unconditional assignment would leave that row standing with its account silently
+    /// blanked, which is the "stops naming the login halfway through the outage" failure the
+    /// carry-forward exists to prevent. A transient `accounts.json` read failure does the same.
+    ///
+    /// So `None` means "no new answer this look", never "the answer is nothing" — and the paired
+    /// half proves that did not simply freeze the field: a POSITIVE answer still wins, so an agent
+    /// re-spawned onto a different account re-labels correctly.
+    #[test]
+    fn a_lookup_that_failed_never_blanks_an_account_already_resolved() {
+        let flags = NudgeFlags::default();
+        let state = AgentState::default();
+        apply_flags(
+            &flags,
+            "agent-1",
+            &decision(Some(nudge_ladder::Escalation::Founder), false),
+            &state,
+        );
+        stamp_account(&flags, "agent-1", Some("work (CLAUDE_CONFIG_DIR=/a/work)".to_string()));
+
+        // The PTY session is gone; `account_label` can no longer answer.
+        stamp_account(&flags, "agent-1", None);
+        assert_eq!(
+            flags.list()[0].account.as_deref(),
+            Some("work (CLAUDE_CONFIG_DIR=/a/work)"),
+            "a look that could not resolve the account must not erase the one that could"
+        );
+
+        // …but a real answer still wins, so the field is not merely frozen.
+        stamp_account(&flags, "agent-1", Some("personal (CLAUDE_CONFIG_DIR=/a/me)".to_string()));
+        assert_eq!(
+            flags.list()[0].account.as_deref(),
+            Some("personal (CLAUDE_CONFIG_DIR=/a/me)"),
+            "a positive answer still updates it — protecting the field must not pin it"
+        );
+    }
+
+    /// NAMING THE LOGIN — every branch, including the two that cannot give a confident answer.
+    #[test]
+    fn the_account_label_names_the_login_or_says_it_cannot() {
+        let accounts = vec![
+            crate::accounts::Account {
+                id: "a1".into(),
+                nickname: "personal".into(),
+                config_dir: String::new(),
+                is_default: true,
+                created_at: 0,
+                exhausted_until: None,
+                exhausted_identity: None,
+            },
+            crate::accounts::Account {
+                id: "a2".into(),
+                nickname: "work".into(),
+                config_dir: "/data/accounts/a2".into(),
+                is_default: false,
+                created_at: 0,
+                exhausted_until: None,
+                exhausted_identity: None,
+            },
+        ];
+
+        let named = account_label_from(&accounts, Some("/data/accounts/a2"));
+        assert!(named.contains("work"), "the nickname a human recognises: {named}");
+        assert!(named.contains("/data/accounts/a2"), "and the dir that re-authenticates it");
+
+        let default = account_label_from(&accounts, None);
+        assert!(default.contains("personal"), "the imported default is a real account: {default}");
+
+        // An unregistered dir is still the ANSWER — `claude auth login` with CLAUDE_CONFIG_DIR set
+        // to it fixes exactly that login — so it is reported, never swallowed.
+        let stranger = account_label_from(&accounts, Some("/data/accounts/zz"));
+        assert!(stranger.contains("/data/accounts/zz"), "{stranger}");
+
+        // …and with NO accounts registered at all, `None` must not be asserted as "the default":
+        // it is also what "we have no PTY session for this id" produces, and sending the founder
+        // to re-authenticate the wrong login is worse than telling them it could not be identified.
+        let unknown = account_label_from(&[], None);
+        assert!(
+            unknown.contains("could not be identified"),
+            "the ambiguity is stated, not papered over: {unknown}"
+        );
+    }
+
+    /// AN EXPORT WE COULD NOT DECODE MUST NOT BE RENDERED AS A LOGIN (roborev 65537, Medium).
+    ///
+    /// This is the END-TO-END half of the three-state fix, and it is the one that was missing. The
+    /// parser's refusals (an unterminated quote, an empty value) all yield `SpawnAccount::Unknown`
+    /// — but under the old collapsed `Option<String>` they arrived here as `None`, and `None` maps
+    /// through the empty-dir branch to the DEFAULT ACCOUNT BY NAME whenever one is registered. So
+    /// every fail-closed refusal in the parser came out the far end as a confident, named, wrong
+    /// login: the precise harm the refusals exist to prevent, reintroduced one layer down.
+    ///
+    /// Driving `SpawnAccount` rather than the label function alone is deliberate — the defect lived
+    /// in the MAPPING between them, so a test that only exercised `account_label_from` could not
+    /// have caught it.
+    #[test]
+    fn an_undecodable_export_never_renders_as_the_default_accounts_nickname() {
+        use crate::pty::{spawn_account_from_args, SpawnAccount};
+
+        let accounts = vec![crate::accounts::Account {
+            id: "a1".into(),
+            nickname: "personal".into(),
+            config_dir: String::new(),
+            is_default: true,
+            created_at: 0,
+            exhausted_until: None,
+            exhausted_identity: None,
+        }];
+
+        // What the parser really produces for a script it cannot read.
+        let undecodable = spawn_account_from_args(&[
+            "-c".to_string(),
+            "export CLAUDE_CONFIG_DIR='/never/closed".to_string(),
+        ]);
+        assert_eq!(
+            undecodable,
+            SpawnAccount::Unknown,
+            "precondition — the parser refuses this rather than guessing"
+        );
+
+        // The mapping `account_label` applies. `Unknown` must produce NO label at all.
+        let label = match undecodable {
+            SpawnAccount::Unknown => None,
+            SpawnAccount::Default => Some(account_label_from(&accounts, None)),
+            SpawnAccount::Dir(d) => Some(account_label_from(&accounts, Some(&d))),
+        };
+        assert_eq!(
+            label, None,
+            "an undecodable export must name NOTHING — under the collapsed form it named \
+             'personal', sending the founder to re-authenticate an account that was never involved"
+        );
+
+        // The paired positive: a genuine absence of any export IS the default, and still names it.
+        let default = match spawn_account_from_args(&[
+            "-c".to_string(),
+            "export PATH=/bin; exec claude".to_string(),
+        ]) {
+            SpawnAccount::Unknown => None,
+            SpawnAccount::Default => Some(account_label_from(&accounts, None)),
+            SpawnAccount::Dir(d) => Some(account_label_from(&accounts, Some(&d))),
+        };
+        assert!(
+            default.as_deref().is_some_and(|l| l.contains("personal")),
+            "…and a real default still names the default, so refusing did not cost the answer: {default:?}"
+        );
+    }
+
     // ══ THE ESCAPE WRITE — THE ONLY MACHINE KEYSTROKE AT A BILLING DIALOG ═══════════════════════
     //
     // The labels are assembled at runtime rather than written contiguously, for the same reason the
@@ -1733,6 +2394,8 @@ mod tests {
             blocked_by: None,
             silent_secs: 900,
             reply: None,
+            standdown: None,
+            account: None,
             };
         flags.raise(mk("concierge", 1));
         flags.raise(mk("founder", 2));
@@ -2066,6 +2729,8 @@ mod tests {
                 refusal: None,
                 screen_readable: true,
                 prompt_has_text: false,
+                quota_blocked: false,
+                login_expired: false,
                 since_other_write_ms: u64::MAX,
                 foreign_write_ms: 0,
                 goal_met: false,
@@ -2206,6 +2871,8 @@ mod tests {
             refusal: None,
             screen_readable: true,
             prompt_has_text: false,
+            quota_blocked: false,
+            login_expired: false,
             since_other_write_ms: u64::MAX,
             foreign_write_ms: 0,
             goal_met: false,
@@ -2400,6 +3067,8 @@ mod tests {
             refusal: None,
             screen_readable: true,
             prompt_has_text: false,
+            quota_blocked: false,
+            login_expired: false,
             since_other_write_ms: u64::MAX,
             foreign_write_ms: 0,
             goal_met: false,

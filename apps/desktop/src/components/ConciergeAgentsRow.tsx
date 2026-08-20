@@ -51,29 +51,55 @@
 // that is always present — so a live count of zero is a fact the row reports rather than a badge it
 // suppresses. `hydrated` is what separates that from "we have not looked yet": before the first
 // `listResearch()` lands, the row shows NO badge at all rather than claiming zero.
+//
+// ══ THE THIRD NUMBER: THE QUEUE, WHICH IS NOT A RESEARCH FACT AT ALL ═══════════════════════════
+//
+// Bead `sparkle-zx9knz`. The founder had SIXTEEN messages queued to the concierge while this row
+// read `+2`, and asked why ten agents were not spun up. Both of the numbers above were telling the
+// truth and neither could answer him: `+[n]` is a LIVE GAUGE with no denominator — `liveTasks`
+// counts `queued` + `running` only — so it decays toward zero as passes finish, while the
+// concierge's own turn queue stays deep, because dispatching research DEQUEUES NOTHING (only
+// `turnFinished` advances that queue). `+0` therefore meant BOTH "nothing to do" and "sixteen of
+// your messages are still unanswered and nobody is currently working on any of them".
+//
+// `queuedCount` is the denominator, and it is the SAME shape of fix as `recentCount` one paragraph
+// up: a second population the founder can act on, rendered beside the gauge rather than folded into
+// it. It is deliberately NOT a research number — the queue belongs to the concierge, not to any
+// task — so it is kept out of `researchRollupStatuses` and touches no disc. Painting the disc from
+// it would be the second status derivation this file's header forbids by name.
 import { memo, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { C } from "../theme/colors";
-import { FONT_MONO, TYPE } from "../theme/scale";
 import { DOT_SIZE, DOT_SLOT_W, GLYPH_SLOT_H, DEPTH_INDENT } from "../engine/rowGeometry";
 import type { PairSide } from "../engine/rowGeometry";
 import { ActiveFillets, rowBoxFor } from "./rowAnatomy";
 import { StatusDot } from "./StatusDot";
 import { AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
-import { useRowClock, ElapsedTimer, formatElapsed } from "./rowClock";
+import { useRowClock, ElapsedTimer } from "./rowClock";
 import type { AgentTabStatus } from "../types";
 import {
-  cancelResearch,
+  groupTasks,
   refreshResearch,
   RESEARCH_POLL_INTERVAL_MS,
   useResearchStore,
-  visibleTasks,
 } from "../services/research/store";
 import {
+  closeResearchPane,
+  openResearchTaskInPane,
+} from "../services/research/selection";
+import { useUiStore } from "../stores/uiStore";
+import {
   isLive,
+  isRetired,
   type ResearchDepth,
   type ResearchStatus,
   type ResearchTask,
 } from "../services/research/types";
+import {
+  countsTowardRollup,
+  dotVariantFor,
+  titleInkFor,
+  type RowLiveness,
+} from "../engine/retiredRowTreatment";
 
 /** The row's label. A CONSTANT because two surfaces read it — the row and its tests — and a literal
  *  in each is a place for them to disagree, the same reason `SPARKLE_AGENT_DISPLAY_NAME` exists. */
@@ -135,12 +161,41 @@ export function agentStatusForResearch(status: ResearchStatus): AgentTabStatus {
  * genuinely blocks the founder, add it here and the whole rollup/band/chip chain follows for free.
  */
 export function researchRollupStatuses(tasks: readonly ResearchTask[]): AgentTabStatus[] {
-  return tasks.filter(isLive).map((t) => agentStatusForResearch(t.status));
+  // TWO FILTERS, and the second is the one that reads as redundant today. `isLive` is the narrow
+  // rule this row has always applied (queued + running); `countsTowardRollup` is the name of the
+  // WIDER rule `engine/retiredRowTreatment` states for every surface that shows finished work —
+  // *"whatever surface adopts this treatment must filter retired rows OUT of its rollup"*. Every
+  // live-phase task is by construction un-retired, so the conjunction changes no answer now. It is
+  // written anyway because the expanded group is a union that DOES carry retired tasks (see
+  // `groupTasks`): the day someone widens the first filter to include terminal-but-unclaimed work,
+  // the second is what stops a retired `failed` task riding in with it and painting the header red
+  // forever. The rule is imported rather than restated, so the reasoning behind it stays in one
+  // place (engine/retiredRowTreatment) rather than being re-argued at this call site.
+  return tasks
+    .filter((t) => isLive(t) && countsTowardRollup(livenessOfResearch(t)))
+    .map((t) => agentStatusForResearch(t.status));
 }
 
-/** The human word for a task's state, used in the detail block. Sentence case, like every other
- *  label in the column. */
-function researchStatusLabel(status: ResearchStatus): string {
+/**
+ * A research task's liveness in the shared vocabulary of `engine/retiredRowTreatment`.
+ *
+ * The one place this row translates its own notion of "finished" into that module's single bit. The
+ * mapping is `isRetired` — terminal AND claimed by the concierge — which is exactly the population
+ * `visibleTasks` drops and `groupTasks` brings back: a row is drawn as history precisely when it has
+ * said everything it is ever going to say and been heard.
+ *
+ * NOT `isTerminal`. A finished task whose findings are still owed to the prompt preamble is
+ * unfinished BUSINESS — it is about to be read out to the founder — and drawing it hollow-and-muted
+ * would dim the one row that still has something to deliver.
+ */
+export function livenessOfResearch(task: ResearchTask): RowLiveness {
+  return isRetired(task) ? "retired" : "live";
+}
+
+/** The human word for a task's state, used in the main-pane view. Sentence case, like every other
+ *  label in the column. Exported so `ConciergeResearchPane` renders the SAME word this row's disc
+ *  label uses — one vocabulary, not two. */
+export function researchStatusLabel(status: ResearchStatus): string {
   switch (status) {
     case "queued":
       return "Queued";
@@ -163,13 +218,71 @@ function researchStatusLabel(status: ResearchStatus): string {
  * is the cheaper/faster model, `deep` the bigger one on a longer wall clock (see research/types.ts).
  * So the detail names the tier rather than inventing a model-id coupling the frontend does not own.
  */
-function researchTierLabel(depth: ResearchDepth): string {
+export function researchTierLabel(depth: ResearchDepth): string {
   return depth === "deep" ? "Deep research" : "Quick research";
 }
 
-/** When this task's clock started, and when it stopped (`null` = still running). */
-function spanOf(task: ResearchTask): { since: number; until: number | null } {
+/** When this task's clock started, and when it stopped (`null` = still running). Exported for the
+ *  main-pane view's elapsed reading, so the row and the pane measure the same span. */
+export function spanOf(task: ResearchTask): { since: number; until: number | null } {
   return { since: task.startedAt ?? task.createdAt, until: task.finishedAt };
+}
+
+/**
+ * Does the badge carry a queue segment at all?
+ *
+ * ONE predicate, read by the visible text and by BOTH copy strings, so a tooltip cannot come to
+ * describe a segment the row is not drawing — the "one derivation used twice, never two
+ * derivations" rule this file applies to every other number it shows. The repo treats user-facing
+ * copy as code, and a string that describes the old behaviour is the specific failure it calls out.
+ *
+ * TWO SUPPRESSIONS, and they are different facts:
+ *
+ *   • `undefined` is WE DID NOT LOOK, never an empty queue. That is the rule
+ *     `stores/conciergeQueueStore` states for itself — see its "`undefined` MEANS WE DID NOT LOOK"
+ *     header — and it is what a window with no `ConciergeHost` mounted reports. Rendering it as `0`
+ *     would put the fail-open answer at the front of a display built to end a silence.
+ *   • `0` is a real, measured empty queue, and it is suppressed for exactly the reason `recentCount`
+ *     is: it is the ordinary state of every single send, so a permanent `· 0 queued` would be a
+ *     second zero saying what `+0` already says.
+ *
+ * The two therefore render identically and mean different things. That is deliberate; do not
+ * "simplify" it into a truthiness test, because the day this row grows a treatment for one of them
+ * the other must not come with it.
+ */
+function showsQueue(queuedCount: number | undefined): queuedCount is number {
+  return queuedCount !== undefined && queuedCount > 0;
+}
+
+/**
+ * The badge's accessible description — the same segments the eye gets, in the same order.
+ *
+ * Terse on purpose: this is read aloud in a list of rows, so it names the numbers rather than
+ * explaining them. {@link badgeTitle} is where the explanation lives.
+ */
+function badgeAria(liveCount: number, recentCount: number, queuedCount: number | undefined): string {
+  const parts = [`${liveCount} running`];
+  if (showsQueue(queuedCount)) parts.push(`${queuedCount} queued`);
+  if (recentCount > 0) parts.push(`${recentCount} recently`);
+  return parts.join(", ");
+}
+
+/**
+ * The badge's hover copy — each number in the words that say WHICH population it counts.
+ *
+ * The queue clause is worded against the field's actual definition: `ConciergeQueueDepth.waiting`
+ * EXCLUDES the turn in flight ("Messages waiting BEHIND the running turn"), so "waiting behind the
+ * concierge's current turn" is true of it and "messages outstanding" would not be.
+ */
+function badgeTitle(liveCount: number, recentCount: number, queuedCount: number | undefined): string {
+  const parts = [`${liveCount} research ${liveCount === 1 ? "agent" : "agents"} running`];
+  if (showsQueue(queuedCount)) {
+    parts.push(
+      `${queuedCount} ${queuedCount === 1 ? "message" : "messages"} waiting behind the concierge's current turn`,
+    );
+  }
+  if (recentCount > 0) parts.push(`${recentCount} dispatched in the last 12 hours`);
+  return parts.join(" · ");
 }
 
 /**
@@ -187,6 +300,7 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   dotLabel,
   liveCount,
   recentCount,
+  queuedCount,
   hydrated,
   paneSide,
   jointOpen,
@@ -212,6 +326,21 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
    * `liveCount`: computed by the caller through the store's own selector, never re-counted here.
    */
   recentCount: number;
+  /**
+   * How many messages are waiting behind the running concierge turn — `undefined` for WE DID NOT
+   * LOOK.
+   *
+   * THE DENOMINATOR THE OTHER TWO NUMBERS LACK (bead `sparkle-zx9knz`). See the header: `+[n]`
+   * decays to zero as passes finish while the turn queue stays deep, so without this a row reading
+   * `+0` means both "nothing to do" and "sixteen of your messages are unanswered".
+   *
+   * OPTIONAL is load-bearing, and `undefined` is NOT `0` — that is the rule
+   * `stores/conciergeQueueStore` states for itself; see {@link showsQueue}. Same discipline as the
+   * two counts above: a PRIMITIVE PROP computed by the caller through the store's own selector
+   * (`useConciergeQueueStore((s) => s.depth)?.waiting`), never re-derived in here, and no store
+   * subscription of this row's own.
+   */
+  queuedCount?: number;
   /** Has the first `listResearch()` landed? Separates "+0" from "we have not looked yet". */
   hydrated: boolean;
   /** The same two geometry inputs every row in this column takes — see engine/rowGeometry. */
@@ -222,21 +351,37 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   const byId = useResearchStore((s) => s.byId);
   const openTaskId = useResearchStore((s) => s.openTaskId);
   const openTaskSeq = useResearchStore((s) => s.openTaskSeq);
-  const setOpenTask = useResearchStore((s) => s.setOpenTask);
+  // Is the research pane the ACTIVE main-pane view right now? A child row paints as selected only
+  // when its task is BOTH the open one AND on screen in the main pane — so selecting a worker (which
+  // clears `activeSpecial` via showBuildStage) drops this row's fill even though `openTaskId` stays
+  // sticky, exactly as a worker row de-highlights when you switch to Improve Sparkle.
+  const researchActive = useUiStore((s) => s.activeSpecial === "research");
   // Newest first, through the store's OWN selector. Sorting here instead would be a second answer to
   // "which task is the latest", which is the drift `sortedTasks` exists to prevent.
   //
-  // ══ AND RETIRED TASKS ARE NOT RENDERED AT ALL ═══════════════════════════════════════════════════
+  // ══ LIVE WORK, PLUS WHAT FINISHED RECENTLY ══════════════════════════════════════════════════════
   //
   // This was `sortedTasks(Object.values(byId))` — every task the store had ever seen, for the life of
   // the install, because nothing anywhere retired one. The founder's sidebar reached 28 stacked rows,
   // 11 of them red at exactly 3m: dead research runs that had already said everything they were ever
-  // going to say, sitting there looking like live work.
+  // going to say, sitting there looking like live work. `visibleTasks` fixed that by dropping every
+  // RETIRED task — one the concierge has been TOLD about.
   //
-  // `visibleTasks` drops only what the concierge has been TOLD about. It cannot drop a finding still
-  // owed — that predicate and `isUnread` read the same `readAt`, so there is no second piece of state
-  // for the row and the drain to disagree about — and it cannot drop anything still running.
-  const tasks = useMemo(() => visibleTasks(Object.values(byId)), [byId]);
+  // It overshot, and the founder reported the overshoot the next day: he clicked
+  // `Concierge Agents +0 · 15 recently` and nothing opened. The `· N recently` badge counts
+  // `recentTasks`, which KEEPS retired tasks on purpose, so the header promised fifteen rows onto a
+  // group that rendered none of them. *"I wanna be able to see the recent ones as well as the active
+  // ones."*
+  //
+  // `groupTasks` is the union of the two sets, bounded by the same 12h window the badge already uses
+  // — so the label and the click are computed from one another and cannot drift again. Retired rows
+  // are drawn as history (hollow disc, muted title; see `livenessOfResearch`) rather than hidden, and
+  // they are still kept out of every rollup — see `researchRollupStatuses`.
+  //
+  // `Date.now()` at render rather than a clock of its own, exactly as `AgentSidebar` reads it for the
+  // badge: this component re-renders on every `byId` change and the row polls every 5s, so the window
+  // slides on the poll and a stale reading can only be seconds old.
+  const tasks = useMemo(() => groupTasks(Object.values(byId), Date.now()), [byId]);
 
   // HYDRATE ON MOUNT, THEN KEEP POLLING. The store is a cache and the disk is the truth: the
   // concierge that dispatched a task has usually exited by the time this window paints, so a row
@@ -390,15 +535,8 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
                 header for why this one does not hide itself. */}
             {hydrated && (
               <span
-                aria-label={
-                  recentCount > 0
-                    ? `${liveCount} running, ${recentCount} recently`
-                    : `${liveCount} running`
-                }
-                title={
-                  `${liveCount} research ${liveCount === 1 ? "agent" : "agents"} running` +
-                  (recentCount > 0 ? ` · ${recentCount} dispatched in the last 12 hours` : "")
-                }
+                aria-label={badgeAria(liveCount, recentCount, queuedCount)}
+                title={badgeTitle(liveCount, recentCount, queuedCount)}
                 style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, lineHeight: 1 }}
               >
                 {/* ── WHY A SECOND NUMBER, AND WHY IT IS CONDITIONAL ──────────────────────────
@@ -411,8 +549,29 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
                     The recent count is SUPPRESSED at zero rather than rendered as `· 0`, which is
                     the opposite of the rule above it and deliberately so: `+0` is a measurement of
                     something that is always measurable, while `· 0` would add a second zero saying
-                    the same thing twice. When it is absent, `+0` means what it has always meant. */}
+                    the same thing twice. When it is absent, `+0` means what it has always meant.
+
+                    ── AND WHY A THIRD, IN THE MIDDLE ──────────────────────────────────────────
+                    NOW, then WAITING, then ALREADY BEEN THROUGH — the founder's own reading order,
+                    and the only one in which `+0 · 16 queued · 12 recently` is a sentence. The
+                    queue segment sits between the two research numbers because it is the thing
+                    they are both about: `+0` is how much of that queue is being worked right now
+                    and `12 recently` is how much of it has already had a pass.
+
+                    NO DIALECT FOR THE "ALL DISPATCHED, ALL FINISHED, STILL QUEUED" STATE, which is
+                    a decision rather than an omission. That state — `queuedCount > 0` with
+                    `liveCount === 0` — is the one named in bead `sparkle-zx9knz`, and the three
+                    numbers already say it in full: nothing running, sixteen waiting, twelve have
+                    been. Wording it as "waiting on the concierge" would additionally claim the
+                    queue has STOPPED MOVING, and this row has no evidence for that — a sixteen-deep
+                    queue draining one turn at a time is healthy and looks identical from here. The
+                    store says so where the evidence actually lives: `oldestAt` exists because *"a
+                    count says the queue is deep; only this says it has STOPPED MOVING, which is the
+                    actual complaint"* (stores/conciergeQueueStore). A diagnosis on a number that
+                    cannot support it is worse than three honest numbers, and a fourth grammar is
+                    exactly the per-row dialect SparkleAgentRow's header argues against. */}
                 +{liveCount}
+                {showsQueue(queuedCount) && ` · ${queuedCount} queued`}
                 {recentCount > 0 && ` · ${recentCount} recently`}
               </span>
             )}
@@ -433,8 +592,7 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
             <ConciergeTaskRow
               key={task.id}
               task={task}
-              open={openTaskId === task.id}
-              onToggle={setOpenTask}
+              selected={openTaskId === task.id && researchActive}
               paneSide={paneSide}
               jointOpen={jointOpen}
             />
@@ -451,17 +609,26 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
  * `depthIndent: DEPTH_INDENT` through the SAME `rowBoxFor` a worker row uses, so the task's disc
  * lands on the header's TITLE line — the hanging indent engine/rowGeometry describes — rather than
  * on some second, arbitrary column of this row's own invention.
+ *
+ * ══ CLICKING SELECTS INTO THE MAIN PANE — NOTHING OPENS INLINE ═════════════════════════════════
+ *
+ * Founder, 2026-08-17: a research agent should work "exactly like any other worker" — click its
+ * name and the RIGHT pane shows what was sent and what is happening, with nothing expanding in the
+ * builder column that eats its width. So the click routes to the main pane
+ * (`openResearchTaskInPane`), and clicking the row that is already showing closes the pane
+ * (`closeResearchPane`) — the same click-again-to-put-away gesture a selected build head uses. The
+ * old inline detail below this row is GONE (see `ConciergeResearchPane`).
  */
 const ConciergeTaskRow = memo(function ConciergeTaskRow({
   task,
-  open,
-  onToggle,
+  selected,
   paneSide,
   jointOpen,
 }: {
   task: ResearchTask;
-  open: boolean;
-  onToggle: (id: string | null) => void;
+  /** Is THIS task the one currently shown in the main pane? Drives the selected fill and the
+   *  reveal-scroll. From the parent: `openTaskId === task.id && activeSpecial === "research"`. */
+  selected: boolean;
   paneSide: PairSide;
   jointOpen: boolean;
 }) {
@@ -472,27 +639,36 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
   const box = rowBoxFor({
     paneSide,
     jointOpen,
-    isActive: open,
+    isActive: selected,
     depthIndent: DEPTH_INDENT,
     pinned: true,
   });
   const st = agentStatusForResearch(task.status);
-  // OPEN/CLOSE, not "select" — clicking the open task closes its detail, which is the same
-  // click-again-to-fold gesture a selected build head uses on its subtree.
-  const toggle = useCallback(
-    () => onToggle(open ? null : task.id),
-    [onToggle, open, task.id],
-  );
+  // IS THIS ROW HISTORY? The one bit `engine/retiredRowTreatment` takes, and the only place this
+  // component decides it. Both halves of the treatment below are read from that module rather than
+  // branched on here, so the reasoning for the treatment lives with the treatment.
+  //
+  // NOTE FOR A FUTURE EDITOR: this row is that module's only caller. The build-agent list was going
+  // to be the second one and the founder explicitly descoped it — regular build-agent rows are to
+  // keep looking exactly as they do today. See that module's header.
+  const liveness = livenessOfResearch(task);
+  // SELECT INTO THE MAIN PANE, or put it away if it is already the one showing. `closeResearchPane`
+  // rather than `setOpenTask(null)` so the pane's active-view flag is cleared too — see
+  // services/research/selection.
+  const onActivate = useCallback(() => {
+    if (selected) closeResearchPane();
+    else openResearchTaskInPane(task.id);
+  }, [selected, task.id]);
 
-  // BRING THE ROW TO THE FOUNDER when it opens — the second half of a chat-link click (the first is
-  // `ConciergeAgentsRow` expanding the group). A `sparkle-research:` pill can point at a task far
-  // down a long group, so seating it is not the same as the founder FINDING it. Optional-called
-  // because jsdom does not implement `scrollIntoView`, and a `block: "nearest"` so an already-visible
-  // row is not yanked. Only fires on the open→true edge; a manual header expansion moves nothing.
+  // BRING THE ROW TO THE FOUNDER when it becomes the selected task — the second half of a chat-link
+  // click (the first is `ConciergeAgentsRow` expanding the group). A `sparkle-research:` pill can
+  // point at a task far down a long group, so selecting it is not the same as the founder FINDING
+  // its row. Optional-called because jsdom does not implement `scrollIntoView`, and `block: "nearest"`
+  // so an already-visible row is not yanked. Only fires on the false→true edge.
   const rowRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
-    if (open) rowRef.current?.scrollIntoView?.({ block: "nearest" });
-  }, [open]);
+    if (selected) rowRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [selected]);
 
   return (
     <>
@@ -502,12 +678,14 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
         data-task-id={task.id}
         role="button"
         tabIndex={0}
-        aria-expanded={open}
-        onClick={toggle}
+        // A SELECTION, not a disclosure: this row no longer opens a subtree, it points the main pane
+        // at its task. `aria-pressed` is the toggle-selection state a worker-like row carries.
+        aria-pressed={selected}
+        onClick={onActivate}
         onKeyDown={(e) => {
           if (e.key === "Enter" || e.key === " ") {
             e.preventDefault();
-            toggle();
+            onActivate();
           }
         }}
         title={task.question}
@@ -520,9 +698,9 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
           margin: `0 ${box.marginRight}px 2px ${box.marginLeft}px`,
           padding: box.padding,
           cursor: "pointer",
-          // The build row's selected fill, on the one row here that CAN be selected: the open task
-          // is the one whose detail the founder is reading. Same `forest`, same fillets below.
-          background: open ? C.forest : "transparent",
+          // The build row's selected fill, on the one row here that CAN be selected: the task whose
+          // view the founder is reading in the main pane. Same `forest`, same fillets below.
+          background: selected ? C.forest : "transparent",
           borderRadius: box.borderRadius,
         }}
       >
@@ -536,7 +714,18 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
             justifyContent: "center",
           }}
         >
-          <StatusDot status={st} size={DOT_SIZE} label={researchStatusLabel(task.status)} />
+          {/* HUE says what happened (the existing taxonomy, untouched); FILL says whether it is
+              still happening. A retired row is drawn hollow in its own status colour, so a run that
+              DIED still reads differently from one that answered — which a flat grey would have
+              destroyed. `ring` is unambiguous here because a task row is a LEAF: it owns no children,
+              so the variant's other meaning ("a row under this one is in this state") is unreachable.
+              See engine/retiredRowTreatment. */}
+          <StatusDot
+            status={st}
+            size={DOT_SIZE}
+            variant={dotVariantFor(liveness)}
+            label={researchStatusLabel(task.status)}
+          />
         </div>
         <div
           style={{
@@ -554,9 +743,13 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
             style={{
               flex: "0 1 auto",
               minWidth: 0,
-              color: C.cream,
+              // The other half of the treatment: an 8px disc is not enough on a column the founder
+              // scans at speed, so a retired row's NAME drops to muted too. The live ink is still
+              // `C.cream`, passed in rather than read inside the engine so that module stays free of
+              // the theme layer (both are CSS custom properties, so light/dark is handled there).
+              color: titleInkFor(liveness, C.cream, C.muted),
               fontSize: AGENT_NAME_FONT_SIZE,
-              fontWeight: rowTitleWeight(open),
+              fontWeight: rowTitleWeight(selected),
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
@@ -567,101 +760,6 @@ const ConciergeTaskRow = memo(function ConciergeTaskRow({
         </div>
         <ActiveFillets ends={box.filletEnds} paneSide={paneSide} />
       </div>
-      {open && <ConciergeTaskDetail task={task} />}
     </>
   );
 });
-
-/**
- * THE DETAIL: the question as asked, where it stands, how long it took, and the findings IN FULL.
- *
- * Untruncated on purpose — `types.ts` records the same rule on the write side: "a clipped finding is
- * a confidently-wrong answer — strictly worse than a long one the reader can scroll."
- */
-function ConciergeTaskDetail({ task }: { task: ResearchTask }) {
-  const { since, until } = spanOf(task);
-  const clockNow = useRowClock(until === null ? since : undefined);
-  const live = isLive(task);
-  const [cancelling, setCancelling] = useState(false);
-
-  const onCancel = useCallback(async () => {
-    setCancelling(true);
-    try {
-      // THE KILL. The founder chose no cap on concurrent research, so "visible and killable" is the
-      // whole guardrail — this is the killable half, and it is the only surface that has it.
-      useResearchStore.getState().upsert(await cancelResearch(task.id));
-    } finally {
-      setCancelling(false);
-    }
-  }, [task.id]);
-
-  return (
-    <div
-      data-testid="concierge-agent-detail"
-      // Indented past the child row's own disc, so the detail reads as belonging to the task above
-      // it rather than as another row.
-      style={{
-        margin: `0 ${DEPTH_INDENT}px 6px ${DEPTH_INDENT + DOT_SLOT_W}px`,
-        display: "flex",
-        flexDirection: "column",
-        gap: 6,
-        fontSize: 12,
-        lineHeight: 1.5,
-        color: C.cream,
-      }}
-    >
-      <div style={{ color: C.cream }}>{task.question}</div>
-      <div
-        style={{
-          display: "flex",
-          alignItems: "center",
-          gap: 8,
-          color: C.muted,
-          fontFamily: FONT_MONO,
-          fontSize: TYPE.micro,
-          fontVariantNumeric: "tabular-nums",
-        }}
-      >
-        <span>{researchStatusLabel(task.status)}</span>
-        {/* The tier — the founder's "which model", named by the stable `depth` field rather than a
-            model id the frontend does not own. */}
-        <span data-testid="concierge-agent-tier">{researchTierLabel(task.depth)}</span>
-        <span>{formatElapsed(Math.max(0, (until ?? clockNow) - since))}</span>
-        {live && (
-          <button
-            onClick={(e) => {
-              // The row above toggles on click; a Cancel that also folded the detail away would
-              // hide the outcome of the button you just pressed.
-              e.stopPropagation();
-              void onCancel();
-            }}
-            disabled={cancelling}
-            style={{
-              background: "none",
-              border: "none",
-              padding: 0,
-              font: "inherit",
-              // accentInk, not BRAND.accent — a link, not a fill (see the ink/fill split in
-              // colors.ts; the constant cyan reads at 1.6:1 on light mode's white column).
-              color: C.accentInk,
-              cursor: cancelling ? "default" : "pointer",
-              textDecoration: "underline",
-            }}
-          >
-            Cancel
-          </button>
-        )}
-      </div>
-      {task.findings !== null && (
-        <div data-testid="concierge-agent-findings" style={{ whiteSpace: "pre-wrap" }}>
-          {task.findings}
-        </div>
-      )}
-      {task.error !== null && (
-        <div data-testid="concierge-agent-error" style={{ color: C.muted }}>
-          {task.error}
-        </div>
-      )}
-    </div>
-  );
-}

@@ -70,8 +70,9 @@ vi.mock("../services/conciergeDispatch", () => ({
   onDeferredSendOutcome: () => () => {},
 }));
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.routeMessage }));
-// THE MOUNT, as one knob — same seam ConciergeHost.mounted.test.tsx drives. `useEffectiveWired` is
-// the host's only reader of the cable, and `mountedAgentId` is that cable plus the prompt target.
+// `h.wired` NO LONGER MOUNTS ANYTHING — the mount is the CABLE's own pin as of bead sparkle-9gsjqm,
+// and `useEffectiveWired` is the DRAWING projection its own header always said it was. The knob is
+// kept because every row below reads off it; `wireCableTo` turns it into a real `cableStore.patch`.
 vi.mock("../hooks/useEffectiveWired", () => ({
   useEffectiveWired: () => h.wired(),
   usePairIsLive: () => false,
@@ -123,6 +124,8 @@ import { setConciergeChat } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { useUiStore } from "../stores/uiStore";
 import { useProjectStore } from "../stores/projectStore";
+// THE REAL CABLE — what actually mounts, as of bead sparkle-9gsjqm.
+import { useCableStore, resetCable } from "../stores/cableStore";
 
 function agent(id: string, name: string) {
   return {
@@ -183,10 +186,13 @@ beforeEach(() => {
   h.routeMessage.mockResolvedValue({ target: "sparkle", reason: "test", source: "heuristic" });
   h.wired.mockReset();
   h.wired.mockReturnValue("off");
-  // THE MOUNTED NAME IS READ OFF THIS ROW, not off the feed: `mountedName` is
-  // `mountedRow?.name`, looked up in `projectStore` (the host needs that row's worktree path for
-  // the transcript). Without it a mount resolves an id but NO name, and every mounted row below
-  // would fall back to "Concierge" and pass against the unfixed code.
+  // The cable is a module singleton and now decides the mount — a leaked patch would mount a later
+  // row that never asked for one.
+  resetCable();
+  // THE MOUNTED NAME IS READ OFF THIS ROW, not off the feed: `mountedName` comes from the roster row
+  // this pin resolves to in `projectStore` (the host needs that row's worktree path for the
+  // transcript). Without it the pin is UNRESOLVABLE, and the rail says "the mounted agent" — never
+  // "Concierge", but not the agent's name either, which is what most rows below are about.
   useProjectStore.setState({
     projects: [
       {
@@ -205,10 +211,21 @@ afterEach(() => {
   for (const i of armedIntents()) cancelIntent(i.id);
   cleanup();
   useUiStore.setState({ conciergeSendMode: "send" });
+  resetCable();
   vi.clearAllMocks();
 });
 
+/** THE MOUNTING GESTURE, spelled as `AgentRow` spells it, driven off the same `h.wired` knob the
+ *  rows already set. `"off"` unbinds — which is what those rows have always meant by it. */
+function wireCableTo(target: ConciergePromptTarget | null) {
+  const side = h.wired();
+  act(() => {
+    if (side === "off" || !target) useCableStore.getState().unbind();
+    else useCableStore.getState().patch(side, target.agentId);
+  });
+}
 function mount() {
+  wireCableTo(SELECTED);
   return render(<ConciergeHost feed={FEED} promptTarget={SELECTED} />);
 }
 
@@ -385,6 +402,14 @@ describe("the rail names the MOUNTED agent when nothing in the text overrides it
   // Bead `sparkle-gw8yi` records a real agent in exactly that state, so this is a shape the app
   // has already produced once. The rail must name the target the send aims at, and above all must
   // NOT name the concierge over a message bound for a terminal.
+  //
+  // ══ WHAT IT NAMES CHANGED, AND THE CHANGE IS THE FIX (bead sparkle-9gsjqm) ═════════════════════
+  // It used to fall back to `promptTarget.name`, i.e. the SELECTION's name. That is the wrong agent
+  // in the founder's reproduction B — with the Improve-Sparkle pane visible over a mounted build
+  // agent the selection is `__sparkle_self__`, so the rail would have promised "Sparkle" over words
+  // bound for that build agent's PTY, which is the same lie this row exists against wearing a
+  // different name. The placeholder is the honest answer for a mount this window cannot name; what
+  // the row still pins, and pins first, is that it is never "Concierge".
   it("REGRESSION: names the mount, not Concierge, when the agent has no projectStore row", async () => {
     useProjectStore.setState({
       projects: [] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
@@ -395,9 +420,8 @@ describe("the rail names the MOUNTED agent when nothing in the text overrides it
     // The lie this row exists to catch. Asserted first and on its own, so a future refactor that
     // returns some third string still cannot quietly reintroduce "Concierge" here.
     expect(await railTarget()).not.toBe("Concierge");
-    // …and it names the agent the send actually aims at — `promptTarget.name`, which
-    // `ConciergePromptTarget` requires and which the mount is derived from.
-    expect(await railTarget()).toBe(SELECTED.name);
+    // …and it says a mount is where this is going, without inventing a name for it.
+    expect(await railTarget()).toBe("the mounted agent");
   });
 
   // ── A NAME THAT DOES NOT LEAD IS THE SENTENCE'S SUBJECT ──────────────────────────────────────

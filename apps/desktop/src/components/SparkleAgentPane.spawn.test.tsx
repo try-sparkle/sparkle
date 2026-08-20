@@ -33,6 +33,22 @@ vi.mock("../preflight", () => ({
 // is covered end-to-end in services/sparkleTranscript.test.ts; what was unguarded is that this pane
 // calls it at all — the suite went green with both call sites deleted (roborev 55363).
 vi.mock("../services/sparkleTranscript", () => ({ registerSparkleTranscript: vi.fn() }));
+// The control-MCP bridge. Spread from the real module so nothing else in the pane's import graph
+// loses an export; only the two calls this pane makes are stubbed. `startControlBridge` is the seam
+// the paired negative below drives — a bridge that cannot start must leave the spawn exactly as it
+// is today, not half-wired.
+vi.mock("../services/orchestrationLaunch", async (importOriginal) => {
+  const real = await importOriginal<typeof import("../services/orchestrationLaunch")>();
+  return {
+    ...real,
+    startControlBridge: vi.fn(() =>
+      Promise.resolve({ socketPath: "/tmp/sparkle-ctrl-test.sock", token: "test-token" }),
+    ),
+    controlMcpPaths: vi.fn(() =>
+      Promise.resolve({ nodePath: "/usr/bin/node", serverPath: "/app/mcp-control/server.js" }),
+    ),
+  };
+});
 // Keep the REAL persona/prompt builders (they're what we assert on); mock only the Tauri call.
 vi.mock("../services/sparkleAgent", async (importOriginal) => {
   const real = await importOriginal<typeof import("../services/sparkleAgent")>();
@@ -51,6 +67,7 @@ import { useSettingsStore, DEFAULT_SPARKLE_CONSENT } from "../stores/settingsSto
 // same ones the headless mirror asserts on, so a reword cannot desynchronize the two suites.
 import { GH_AUTH_ASK_USER, GH_AUTH_UNATTENDED_STOP } from "../services/sparkleAgent";
 import { registerSparkleTranscript } from "../services/sparkleTranscript";
+import { startControlBridge } from "../services/orchestrationLaunch";
 
 const LOG_DIR = "/app-data/logs/sparkle";
 
@@ -67,6 +84,10 @@ beforeEach(() => {
   captured.props.length = 0;
   useSettingsStore.getState().setSparkleImprovementConsent(DEFAULT_SPARKLE_CONSENT);
   (claudeHasSession as Mock).mockResolvedValue(false);
+  (startControlBridge as Mock).mockResolvedValue({
+    socketPath: "/tmp/sparkle-ctrl-test.sock",
+    token: "test-token",
+  });
 });
 afterEach(() => cleanup());
 
@@ -142,5 +163,57 @@ describe("SparkleAgentPane — spawn arg assembly per consent mode", () => {
     // so a file pinned here would be the previous session's for the whole session.
     await spawned();
     expect(registerSparkleTranscript).toHaveBeenCalledWith("__sparkle_self__", "/wt/sparkle-self");
+  });
+});
+
+// ── The sparkle-control MCP, bead sparkle-hdlhox ────────────────────────────────────────────────
+//
+// THE DEFECT THIS GUARDS. This pane assembled its exec with appendSystemPrompt / inboxAgentId /
+// addDirs / initialPrompt and NO mcpConfig — `grep -ci mcp` on the component returned 0 — while
+// AgentPane's generic branch passed `mcpConfig: controlMcpConfig`. So Improve Sparkle had no
+// sparkle-control tools at all: it could not read `get_state({scope:"fleet"})` (the app-global
+// address book) and could not call `send_peer_message` to reach the concierge at
+// `sparkle:concierge`. The whole cross-agent channel (bead sparkle-179b2s) was already on main and
+// this one agent could not see it, which is why it reported itself blind.
+//
+// Asserted at the REAL call site, not on buildClaudeExec: the builder has always handled mcpConfig
+// correctly. What was missing is a call site passing it, and only driving prepare() can see that.
+describe("SparkleAgentPane — sparkle-control MCP wiring (bead sparkle-hdlhox)", () => {
+  it("spawns with --mcp-config carrying the sparkle-control server and this agent's id", async () => {
+    const { exec } = await spawned();
+    expect(exec).toContain("--mcp-config");
+    expect(exec).toContain("sparkle-control");
+    // The anti-spoofing caller identity: ops arriving on the shared socket are stamped with this,
+    // so a wrong id here would make every per-agent op resolve to the wrong agent.
+    expect(exec).toContain('"SPARKLE_AGENT_ID":"__sparkle_self__"');
+    // NOT strict: the user's own global MCP servers must still load, matching AgentPane's generic
+    // branch. --strict-mcp-config would silently drop them.
+    expect(exec).not.toContain("--strict-mcp-config");
+  });
+
+  it("tells the persona the channel exists ONLY when the bridge actually came up", async () => {
+    // Two halves of one rule. Advertising tools that are not there yields confusing "tool not
+    // found" attempts (AgentPane.tsx:985-989), so the protocol prose is gated on the same value
+    // that produces the flag — never emitted unconditionally.
+    const up = await spawned();
+    expect(up.exec).toContain("CONTROLLING THE SPARKLE UI");
+
+    cleanup();
+    captured.props.length = 0;
+    (startControlBridge as Mock).mockRejectedValue(new Error("bridge unavailable"));
+    const down = await spawned();
+    expect(down.exec).not.toContain("--mcp-config");
+    expect(down.exec).not.toContain("CONTROLLING THE SPARKLE UI");
+  });
+
+  it("still spawns a WORKING agent when the bridge is down — degrades, never fails", async () => {
+    // The brief's hard constraint: the channel must degrade safely when the other side is absent.
+    // A bridge failure must cost the agent its cross-agent tools and NOTHING else — the pane still
+    // reaches Terminal with its persona, its log dir and its mission prompt intact.
+    (startControlBridge as Mock).mockRejectedValue(new Error("bridge unavailable"));
+    const { exec } = await spawned();
+    expect(exec).toContain("Start your first improvement pass");
+    expect(exec).toContain(`--add-dir '${LOG_DIR}'`);
+    expect(exec).toContain("export SPARKLE_INBOX_AGENT='__sparkle_self__'; ");
   });
 });

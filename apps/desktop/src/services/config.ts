@@ -86,6 +86,25 @@ export interface ConciergeConfig {
    *  "lint with defaults" — services/conciergeLintPolicy.ts resolves it to the disabled policy, so
    *  an older backend can never have a gate switched on underneath it. */
   checks?: ConciergeChecksConfigPayload;
+  /** The orgs whose repos count as OURS (`[concierge].own_orgs`). Everything else is FOREIGN, which
+   *  floors anything touching its main branch at `ask` — see conciergeTools/policy.ts's lattice.
+   *
+   *  `?: T | null`, not `?: T`, and the difference is not style. A Rust `Option` crosses the wire as
+   *  an explicit `null`; it is omitted only when the field carries `skip_serializing_if`. So `?: T`
+   *  alone describes a shape the wire cannot produce, and a parser written against it rejects the
+   *  payload — all-or-nothing, silently, leaving the feature permanently inert. AGENTS.md has the
+   *  measured case. Absent (an older backend) and null (no orgs configured) mean the same thing
+   *  here: no org is ours, which is the fail-closed reading. */
+  own_orgs?: string[] | null;
+  /** Per-project rules, keyed by LOWERCASED `owner/repo`
+   *  (`[concierge.projects."owner/repo".tools]`). A project entry can only ever TIGHTEN the global
+   *  tier above it, so a hand-edited (or hostile) value has no permissive direction to fail in.
+   *
+   *  Stored GLOBALLY, never in the repo's own `.sparkle/config.toml` — `apply_project`'s section
+   *  allowlist in config.rs keeps ignoring `[concierge]` from a project file, which matters most
+   *  for exactly the repos this feature is about: a repo we do not own must not get a vote on what
+   *  Sparkle may do inside it. Same `| null` reasoning as `own_orgs`, at both levels. */
+  projects?: Record<string, { tools?: Record<string, string> | null } | null> | null;
 }
 /** One `[concierge.checks.<id>]` row EXACTLY as Rust serializes it (`ConciergeCheck` in config.rs,
  *  `rename_all = "snake_case"`).
@@ -125,6 +144,9 @@ export interface ToolsConfig {
    *  defaults FALSE. Optional so callers guard: a Rust backend predating it omits the key, and
    *  an absent value must read as "off". */
   builder_index?: boolean;
+  /** The second reporting destination (straude.com). Default OFF, independent of
+   *  `builder_index` — turning one on says nothing about the other. */
+  straude?: boolean;
 }
 /** Claude Code marketplace plugins Sparkle pre-enables for every agent it spawns. Repo-scoped and
  *  per-project overridable (like [workflow]), so a repo can pick the plugins its codebase wants. */
@@ -195,6 +217,23 @@ export interface ReviewConfig {
 export interface CaptureConfig {
   popover_shortcut: string;
 }
+/** Reader-facing display preferences — today, the shape a bead card draws in when the concierge
+ *  names a bead. Machine-wide (like [capture]); a per-project value is ignored with a warning, and
+ *  here that is not merely tidiness: the concierge column is cross-project by construction, so one
+ *  reply can name beads from three repos and there would be no coherent "the project's" answer.
+ *
+ *  Mirrors `UiConfig` in config.rs. Both fields are plain Rust scalars (`bool`/`u32`), never
+ *  `Option`, so neither can cross the wire as `null` — see AGENTS.md, "A Rust `Option` crosses the
+ *  wire as `null`". They stay OPTIONAL here only for the usual back-compat reason every sibling
+ *  block carries: a Rust backend predating [ui] omits the section outright. */
+export interface UiConfig {
+  /** Render a bead card EXPANDED the moment the concierge names it, rather than as a pill to
+   *  click open. Default true; `false` restores the pre-2026-08 click-to-expand behaviour exactly. */
+  bead_cards_expanded?: boolean;
+  /** How many cards ONE reply may expand before the rest fall back to pills. `0` = no cap (the
+   *  shipped default). Counted over ids that RESOLVE, never over id-shaped prose. */
+  bead_cards_expanded_max?: number;
+}
 /** One criterion in a stage definition. `kind` is "auto" (observed via `signal`) or "manual"
  *  (a human ticks it); `signal` is a known auto-signal id, present iff kind === "auto".
  *  Field casing mirrors the Rust serde output exactly (snake_case, Option → value | null). */
@@ -204,6 +243,19 @@ export interface StageCriterion {
   signal: string | null;
 }
 /** Per-project "Done" stage definition. Undefined = null description + empty criteria. */
+/** The `[advisor]` wire shape. Mirrors `AdvisorConfig` in `config.rs` (serde snake_case).
+ *
+ *  Both fields OPTIONAL for the back-compat reason `tools?` records: a payload from a Rust backend
+ *  predating `[advisor]` omits the whole section. An absent section reads as the SHIPPED DEFAULTS
+ *  (`resolveAdvisorConfig` in `services/advisor/config`), not as disabled — treating "the backend is
+ *  older than the section" as off would silently stop a pass that build is in fact running, and the
+ *  user would have no switch to turn back on. That is safe to do here ONLY because the zero-spend
+ *  gate, not this flag, is what bounds spend. */
+export interface AdvisorConfigPayload {
+  enabled?: boolean;
+  model?: string;
+}
+
 /** The `[babysit]` wire shape. Mirrors `BabysitConfig` in `config.rs` (serde snake_case). */
 export interface BabysitConfigPayload {
   enabled?: boolean;
@@ -252,6 +304,11 @@ export interface SparkleConfig {
    *  fail-closed default — never read it as "no reviewer, gate off". */
   review?: ReviewConfig;
   capture: CaptureConfig;
+  /** Reader-facing display preferences (bead-card expansion). Optional for the same back-compat
+   *  reason as `tools?`/`roborev?` above: a payload from a Rust backend predating [ui] omits it.
+   *  An absent section reads as the SHIPPED DEFAULTS (expanded, uncapped) rather than as off —
+   *  `hydrateFromConfig` resolves each key through `?? <default>`. */
+  ui?: UiConfig;
   // Optional so callers must guard: an older Rust backend (predating [voice]) omits it at runtime.
   // The current backend always sends it, but the type stays honest about the config-changed payload.
   /** Per-category Sparkle Auto-Approve rules. Optional so callers guard: an older Rust backend
@@ -277,6 +334,9 @@ export interface SparkleConfig {
    * is in fact running, and the user would have no switch to turn back on.
    */
   babysit?: BabysitConfigPayload;
+  /** The second-model advisor pass at the epic handoff. Optional for the same back-compat reason as
+   *  `babysit?` above; an absent section reads as the shipped defaults, not as disabled. */
+  advisor?: AdvisorConfigPayload;
   /** Per-project "Done" stage definition (Definable Done & Delivered feature). */
   done: DoneConfig;
   /** Per-project "Delivered" stage definition + detected production-ship signal. */
@@ -290,7 +350,7 @@ export interface SparkleConfig {
    *  as `builder_index?`/`pushers?` above: a payload from a Rust backend predating [preview] omits
    *  it. An absent section reads as "no preview support in this build" — callers that need a
    *  default fall back to the shipped ones (`enabled: true`, `idle_grace_min: 10`,
-   *  `auto_open: "returning"`) rather than treating an absent section as disabled. */
+   *  `agent_eagerness: "visual"`) rather than treating an absent section as disabled. */
   preview?: PreviewConfig;
 }
 /** The `[builder_index]` table as Rust serializes it. Machine-wide; ignored in a per-project file —
@@ -309,11 +369,13 @@ export interface PreviewConfig {
   enabled: boolean;
   /** How long a preview keeps serving after its pane is covered, before it is stopped. */
   idle_grace_min: number;
-  /** `"returning" | "never" | "always"`. Kept as `string` rather than a union: Rust validates and
-   *  falls back to `"returning"` on anything else, so the wire can only ever carry one of the
-   *  three, but typing it as `string` here matches how this file treats every other enum-ish
-   *  config string (see `auto_open`'s neighbours) and avoids a second copy of the literal list. */
-  auto_open: string;
+  /** `"visual" | "always" | "never"` — how eagerly an AGENT is told to open a preview of its own
+   *  work, in the brief it is given. Kept as `string` rather than a union: Rust validates and falls
+   *  back to `"visual"`, so the wire can only ever carry one of the three, and typing it as
+   *  `string` matches how this file treats every other enum-ish config value. (There used to be a
+   *  sibling `auto_open` governing when a preview PANE revealed itself; the pane was removed on
+   *  2026-08-19 in favour of a concierge card, which surfaces itself.) */
+  agent_eagerness: string;
 }
 /** The merged effective config plus any non-fatal load warnings (malformed layer, ignored keys). */
 export interface EffectiveConfig {

@@ -205,8 +205,13 @@ export function overlapCoefficient(a: string, b: string): number {
   return shared / Math.min(left.size, right.size);
 }
 
-/** The founder messages this check is entitled to demand a quote of. */
-function quotableMessages(messages: readonly string[] | undefined): string[] {
+/** The founder messages this check is entitled to demand a quote of.
+ *
+ *  EXPORTED so the deterministic floor under this check (`../enforceLeadingQuote`) filters the
+ *  founder-message set by the SAME rule the check judges by — app-authored "N attachments" quotes
+ *  are dropped in both places, so the enforcer can never prepend a blockquote of a message the
+ *  check would have stood down on. One rule, two readers. */
+export function quotableMessages(messages: readonly string[] | undefined): string[] {
   if (!Array.isArray(messages)) return [];
   return messages
     .filter((m): m is string => typeof m === "string")

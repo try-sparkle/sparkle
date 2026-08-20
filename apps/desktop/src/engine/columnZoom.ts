@@ -9,10 +9,11 @@
 // at the time. The founder's ask is that the gesture apply to WHATEVER COLUMN HAS FOCUS, and that
 // each column remember its own level.
 //
-// The cockpit is `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`, so that is five independently zoomable
-// regions. Those are exactly `engine/columnResize`'s `ColumnKey`s minus the two rails, and they are
+// The cockpit is `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`, so that is seven
+// independently zoomable regions. Those are exactly `engine/columnResize`'s `ColumnKey`s minus
+// the two rails, and they are
 // spelled here as a SUBSET of that type rather than as a fresh list — the two modules describe the
-// same five boxes, and a second private spelling of "the columns of the cockpit" is the one-constant-
+// same boxes, and a second private spelling of "the columns of the cockpit" is the one-constant-
 // two-files drift `columnResize` already exists to prevent.
 //
 // ── WHY DOM FOCUS ALONE CANNOT ANSWER IT ───────────────────────────────────────────────────────
@@ -61,7 +62,9 @@ import type { ColumnKey } from "./columnResize";
 export type ZoomColumn =
   | "terminal-left"
   | "build-left"
+  | "epics-left"
   | "concierge"
+  | "epics-right"
   | "build-right"
   | "terminal-right"
   | "satellite";
@@ -72,7 +75,15 @@ export type ZoomColumn =
 const _cockpitZoomColumnsAreColumnKeys = [
   "terminal-left",
   "build-left",
+  // THE EPICS COLUMNS HAD TO BE ADDED BY HAND, and the `satisfies` above is exactly why that is
+  // worth a comment. It proves every member here IS a `ColumnKey` — it does NOT prove every
+  // `ColumnKey` is here, so it breaks on a RENAME and stays green on an ADDITION. A new column
+  // therefore compiles perfectly while being silently non-zoomable: Cmd +/- inside it resolves to
+  // `null` and does nothing, in a keyboard handler nobody is watching. Nothing else in the type
+  // system catches that; `columnZoom.test.ts`'s census is the guard.
+  "epics-left",
   "concierge",
+  "epics-right",
   "build-right",
   "terminal-right",
 ] as const satisfies readonly ColumnKey[];
@@ -96,7 +107,7 @@ export function isZoomColumn(v: unknown): v is ZoomColumn {
  *
  * AN APP-OWNED ATTRIBUTE, for the reason `TERMINAL_SURFACE_ATTR` gives for the same choice: matching
  * on class names or component structure couples this to vendor details and to the layout, both of
- * which move. One attribute, set at five render sites, found by a single `closest`.
+ * which move. One attribute, set at seven render sites, found by a single `closest`.
  */
 export const ZOOM_COLUMN_ATTR = "data-zoom-column";
 
@@ -124,7 +135,10 @@ export function classifyZoomColumn(el: Element | null | undefined): ZoomColumn |
 
 /** The cockpit column a pane belongs to, from the two facts a pane actually knows about itself.
  *  One spelling, so the render sites and the tests cannot disagree about which key is which side. */
-export function zoomColumnFor(kind: "terminal" | "build", side: "left" | "right"): ZoomColumn {
+export function zoomColumnFor(
+  kind: "terminal" | "build" | "epics",
+  side: "left" | "right",
+): ZoomColumn {
   return `${kind}-${side}`;
 }
 

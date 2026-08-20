@@ -10,6 +10,9 @@ import {
   KEYCHAIN_SAFETY_RULE,
   WORKER_RESULT_RELPATH,
   retroEmissionProtocol,
+  previewProtocol,
+  genericAgentProtocol,
+  DEFAULT_PREVIEW_EAGERNESS,
 } from "./buildAgent";
 import { RETRO_MARKER_TEMPLATE, RETRO_SEVERITY_SCALE_LINE } from "./retroMarker";
 
@@ -370,6 +373,113 @@ describe("guardrails gating in personas", () => {
     expect(orchestrationPersona({ ...base, guardrails: true })).toContain(guardrailsProtocol());
     expect(orchestrationPersona({ ...base, guardrails: false })).not.toContain(guardrailsProtocol());
     expect(orchestrationPersona(base)).not.toContain(guardrailsProtocol());
+  });
+});
+
+describe("the preview protocol — an agent that is never TOLD about previews never opens one", () => {
+  /** The composed brief is what an agent actually reads. Asserting only that the constant exists
+   *  would be vacuous: the constant existed in every version of this file that shipped a brief
+   *  WITHOUT it, which is exactly the bug (bead sparkle-3475b.8). */
+  const base = { ownBranch: "sparkle/agent-build1", maxConcurrentWorkers: 4 };
+
+  it("puts the preview instruction in the COMPOSED orchestrator brief by default", () => {
+    // No `previewEagerness` at all — a caller that has not been taught about the knob. It must
+    // still get the shipped default, not silence.
+    const brief = orchestrationPersona(base);
+    expect(brief).toContain(previewProtocol({ eagerness: DEFAULT_PREVIEW_EAGERNESS }));
+    expect(brief).toMatch(/OPEN A LIVE PREVIEW/);
+  });
+
+  it("tells the agent HOW, by tool name and exact payload key", () => {
+    // An instruction an agent cannot act on is worse than none. `previewOp`, NOT `op`: the wire
+    // envelope's own reserved `op` is written after the spread and stripped by the Rust bridge, so
+    // an inner field named `op` never arrives (controlListener.handlePreview).
+    const brief = orchestrationPersona(base);
+    expect(brief).toContain("`preview` tool");
+    expect(brief).toContain('{ previewOp: "open" }');
+    expect(brief).toContain('{ previewOp: "close" }');
+    expect(brief).toContain('{ previewOp: "list" }');
+  });
+
+  it("CHANGES the composed brief with the config knob — all three modes differ", () => {
+    const visual = orchestrationPersona({ ...base, previewEagerness: "visual" });
+    const always = orchestrationPersona({ ...base, previewEagerness: "always" });
+    const never = orchestrationPersona({ ...base, previewEagerness: "never" });
+
+    // "never" removes the section outright — the manual affordances are untouched, but the brief
+    // stops asking.
+    expect(never).not.toMatch(/OPEN A LIVE PREVIEW/);
+    expect(never).not.toContain('{ previewOp: "open" }');
+
+    // The other two both carry it, and they do not say the same thing: "visual" scopes the ask to
+    // work with something to look at, "always" drops that qualifier.
+    expect(visual).toMatch(/OPEN A LIVE PREVIEW/);
+    expect(always).toMatch(/OPEN A LIVE PREVIEW/);
+    expect(visual).not.toEqual(always);
+    expect(visual).toMatch(/a person would LOOK at/);
+    expect(always).not.toMatch(/a person would LOOK at/);
+    expect(always).toMatch(/on every task this project can preview at all/);
+  });
+
+  it("reaches a GENERIC agent too", () => {
+    // The title used to read "it is not a worker, so it may call the tool", drawing a distinction
+    // that NO LONGER EXISTS: `CONTROL_OP_TIERS.preview` is `free`, so every agent kind may call it
+    // (beads `sparkle-q3b4c6` / `sparkle-wnnye0`) and the worker case is covered by its own test
+    // above. The reason a generic agent gets the fragment is now simply that it is the pane a
+    // person is most likely to be typing into while looking at something.
+    const generic = genericAgentProtocol({ previewEagerness: "visual" });
+    expect(generic).toMatch(/OPEN A LIVE PREVIEW/);
+    // …and it still carries the control preamble it carried before, so this ADDS rather than
+    // replaces. Asserting both together is what stops a future edit from swapping one for the other.
+    expect(generic).toContain(sparkleControlProtocol());
+  });
+
+  it("a generic agent's preview section obeys the same knob", () => {
+    const never = genericAgentProtocol({ previewEagerness: "never" });
+    expect(never).not.toMatch(/OPEN A LIVE PREVIEW/);
+    // The control preamble survives `"never"` — the knob governs previews, not the whole prompt.
+    expect(never).toContain(sparkleControlProtocol());
+    // An omitted option is the shipped default, not silence.
+    expect(genericAgentProtocol()).toMatch(/OPEN A LIVE PREVIEW/);
+  });
+
+  // THIS TEST USED TO ASSERT THE OPPOSITE, and the flip is the point (beads `sparkle-q3b4c6` /
+  // `sparkle-wnnye0`). While `CONTROL_OP_TIERS.preview` was `privileged`, `callerMayAdminister`
+  // refused every `worker` kind, so briefing a worker about the tool would have been the
+  // unactionable instruction the fragment's own header forbids. The tier is `free` now — a worker
+  // reaches `handlePreview` and is served its own worktree — so withholding the fragment is what
+  // would make the capability inert: the agent that actually built the visual change would still
+  // never be told it can show it.
+  it("puts it in the WORKER brief too, because a worker can now call the tool", () => {
+    // BOTH PERSONAS ARE COMPOSED HERE, so neither assertion can pass on an accident of the other:
+    // a fragment deleted outright fails the orchestrator line, and a worker brief that merely
+    // stopped composing would fail the worker line.
+    const worker = workerPersona({ parentBranch: "b", resultPath: "/r" });
+    const orchestrator = orchestrationPersona(base);
+    expect(orchestrator).toMatch(/OPEN A LIVE PREVIEW/);
+    expect(worker).toMatch(/OPEN A LIVE PREVIEW/);
+    // The whole fragment, not just its banner — a worker that gets the headline without the payload
+    // key would try `{ op: "open" }`, which the bridge strips before the handler ever sees it.
+    expect(worker).toContain(previewProtocol({ eagerness: DEFAULT_PREVIEW_EAGERNESS }));
+    expect(worker).toContain('{ previewOp: "open" }');
+  });
+
+  it("a worker's preview section obeys the SAME knob as everyone else's", () => {
+    // The knob, not the tier, is what a project reaches for when it does not want N workers each
+    // holding a dev server — so it has to actually reach the worker brief.
+    const never = workerPersona({ parentBranch: "b", resultPath: "/r", previewEagerness: "never" });
+    expect(never).not.toMatch(/OPEN A LIVE PREVIEW/);
+    // …and the rest of the brief survives `"never"`: the knob governs previews, not the prompt.
+    expect(never).toContain(sparkleControlProtocol());
+
+    const always = workerPersona({ parentBranch: "b", resultPath: "/r", previewEagerness: "always" });
+    const visual = workerPersona({ parentBranch: "b", resultPath: "/r", previewEagerness: "visual" });
+    expect(always).toMatch(/on every task this project can preview at all/);
+    expect(visual).toMatch(/a person would LOOK at/);
+    expect(always).not.toEqual(visual);
+    // An omitted option is the shipped default, not silence — the same fail-open-to-the-default
+    // rule the orchestrator call site documents.
+    expect(workerPersona({ parentBranch: "b", resultPath: "/r" })).toEqual(visual);
   });
 });
 

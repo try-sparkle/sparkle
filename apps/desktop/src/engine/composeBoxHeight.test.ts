@@ -5,6 +5,7 @@ import {
   COMPOSE_CAP_LINES,
   COMPOSE_CHROME_H,
   COMPOSE_LINE_H,
+  COMPOSE_LINE_PX,
   COMPOSE_MIN_H,
   COMPOSE_MIN_THREAD_H,
   composeDragH,
@@ -37,7 +38,43 @@ describe("composeRenderH — auto-grow", () => {
     // Past the cap the textarea scrolls its own overflow — the box must not eat the conversation.
     const huge = composeRenderH({ contentH: 5000, userH: null, availableH: AVAILABLE });
     expect(huge).toBe(COMPOSE_CAP_H);
-    expect(COMPOSE_CAP_H).toBe(COMPOSE_LINE_H * COMPOSE_CAP_LINES + 22);
+    // TEN LINES EXACTLY — the cap's text area is `COMPOSE_CAP_LINES` RENDERED lines and no more.
+    //
+    // Asserted against `COMPOSE_LINE_PX` (18.2, the real 13 × 1.4) rather than `COMPOSE_LINE_H`
+    // (19, that value rounded up for the one-line floor). Multiplying the ROUNDED line by the cap
+    // multiplies the rounding error by ten, which is what made a cap named "ten lines" resolve to
+    // 10.4 of them — the eleventh line half-showing under a rule that says it should not show.
+    expect(COMPOSE_CAP_H - COMPOSE_CHROME_H).toBe(Math.ceil(COMPOSE_LINE_PX * COMPOSE_CAP_LINES));
+    expect((COMPOSE_CAP_H - COMPOSE_CHROME_H) / COMPOSE_LINE_PX).toBeCloseTo(COMPOSE_CAP_LINES, 1);
+  });
+
+  it("the cap is TEN LINES AT ANY WIDTH, because a line's height does not depend on width", () => {
+    // The founder's constraint: *"no matter what the width is … show the first 10 lines of text."*
+    //
+    // Wrapping changes how many LINES the content occupies; it does not change how TALL a line is.
+    // So the same cap is ten rendered lines in a narrow column and in a wide one — what differs is
+    // only how much text those ten lines hold. Modelled here by measuring the same paragraph at two
+    // widths: narrow wraps it to 40 lines, wide to 12, and the box is the identical height for both
+    // and shows ten lines of each.
+    //
+    // (`contentH` is a wrapped `scrollHeight`, so the WIDTH's effect lives entirely in that input —
+    // which is why ComposeBox must re-measure on a column resize, and why `columnWidth` is a
+    // dependency of its layout effect.)
+    const lines = (n: number) => Math.ceil(COMPOSE_LINE_PX * n) + COMPOSE_CHROME_H - COMPOSE_BORDER_H;
+    const narrow = composeRenderH({ contentH: lines(40), userH: null, availableH: AVAILABLE });
+    const wide = composeRenderH({ contentH: lines(12), userH: null, availableH: AVAILABLE });
+    expect(narrow).toBe(wide);
+    expect((narrow - COMPOSE_CHROME_H) / COMPOSE_LINE_PX).toBeCloseTo(COMPOSE_CAP_LINES, 1);
+  });
+
+  it("shows a NINE-line draft whole — the cap only bites past ten", () => {
+    // The other side of the boundary, and the one the founder actually lives in. Without it the
+    // rows above would pass for a cap set anywhere at or below nine lines: "it stops at ten" says
+    // nothing about whether nine are ever reached. His measured box was stuck at TWO.
+    const nine = Math.ceil(COMPOSE_LINE_PX * 9) + COMPOSE_CHROME_H - COMPOSE_BORDER_H;
+    const h = composeRenderH({ contentH: nine, userH: null, availableH: AVAILABLE });
+    expect(h).toBeLessThan(COMPOSE_CAP_H);
+    expect((h - COMPOSE_CHROME_H) / COMPOSE_LINE_PX).toBeCloseTo(9, 1);
   });
 
   it("never renders below the one-line floor, even on a bogus measurement", () => {
@@ -93,25 +130,55 @@ describe("composeRenderH — the words being spoken lift the box", () => {
     ).toBe(typed + COMPOSE_BORDER_H + extra);
   });
 
-  it("a long TYPED draft never lifts a dragged box — only speech does", () => {
-    // THE OSCILLATION roborev 57354 caught, and the reason this input is an increment. While the
-    // measurement was the mirror's TOTAL it carried the whole draft, so a two-line box holding a
-    // fifteen-line draft jumped to the cap on the first partial and snapped back on every settle —
-    // several times an utterance, which is the "text jumps" class this branch exists to remove.
+  it("a long TYPED draft raises a dragged box TO THE CAP — and does not oscillate there", () => {
+    // THIS ROW REVERSES ITS OWN EARLIER ASSERTION, deliberately, and the reason it can is that the
+    // defect it was written for is now unreachable rather than merely re-guarded.
+    //
+    // It used to assert `toBe(dragged)`: a fifteen-line draft in a two-line dragged box stayed two
+    // lines. That was the rule the founder overruled — his own box sat at 59px (two lines) with the
+    // ten-line cap unreachable, which is what "it doesn't change height at all" was. Content now
+    // raises a dragged box to the cap, exactly as it would an undragged one.
+    //
+    // THE OSCILLATION roborev 57354 CAUGHT IS STILL GONE, and this row still proves it — by the two
+    // assertions being EQUAL rather than by either one's value. That bug was the box jumping to the
+    // cap on a partial and snapping back on the settle, several times an utterance. It needed the
+    // draft's height to apply only WHILE speaking; here it applies either way, so there is no
+    // settle to snap back to. Silence and speech agree, which is the property that matters.
     const dragged = COMPOSE_MIN_H + 20;
     const fifteenLines = 300;
-    expect(
-      composeRenderH({ contentH: fifteenLines, userH: dragged, availableH: AVAILABLE, interimH: 0 }),
-    ).toBe(dragged);
-    // …and while speaking it grows by the spoken lines ALONE, not by the draft it sits on.
-    expect(
-      composeRenderH({
-        contentH: fifteenLines,
-        userH: dragged,
-        availableH: AVAILABLE,
-        interimH: 40,
-      }),
-    ).toBe(dragged + 40);
+    const silent = composeRenderH({
+      contentH: fifteenLines,
+      userH: dragged,
+      availableH: AVAILABLE,
+      interimH: 0,
+    });
+    const speaking = composeRenderH({
+      contentH: fifteenLines,
+      userH: dragged,
+      availableH: AVAILABLE,
+      interimH: 40,
+    });
+    expect(silent).toBe(COMPOSE_CAP_H);
+    expect(speaking).toBe(silent);
+  });
+
+  it("THE FOUNDER'S STUCK BOX: a 59px drag no longer pins the cap out of reach", () => {
+    // His measured `conciergeComposeH`, read off the app's persisted UI state: 59.13px — two lines,
+    // and fractional because it came off a pointer drag. Above the ≤ MIN release threshold, so it
+    // stuck; and persisted, so it survived every relaunch. He had never once reached a cap that has
+    // said ten lines since the day it was written.
+    //
+    // NOT REDUNDANT with the row above, which uses a tidy `MIN + 20`. This is the actual number
+    // from the actual bug report, and a fix that worked for round values and not for his would be
+    // indistinguishable from no fix at all — to him.
+    const HIS = 59.1328125;
+    const longDraft = 5000;
+    expect(composeRenderH({ contentH: longDraft, userH: HIS, availableH: AVAILABLE })).toBe(
+      COMPOSE_CAP_H,
+    );
+    // …and the half of the old rule that was RIGHT still holds: it does not collapse back under him
+    // when he deletes the draft. The drag is a floor, not a freeze — not a floor, not a nothing.
+    expect(composeRenderH({ contentH: 20, userH: HIS, availableH: AVAILABLE })).toBe(HIS);
   });
 
   it("…and hands the height straight back when the phrase settles", () => {
@@ -180,6 +247,25 @@ describe("composeRenderH — a dragged height wins", () => {
     const tall = COMPOSE_CAP_H + 100;
     expect(composeRenderH({ contentH: 5000, userH: tall, availableH: AVAILABLE })).toBe(tall);
     expect(composeRenderH({ contentH: 20, userH: tall, availableH: AVAILABLE })).toBe(tall);
+  });
+
+  it("a SHORT drag can no longer clip the voice-error notice out of reach", () => {
+    // A side effect of the drag becoming a floor, and the one worth a row of its own because it
+    // reverses the old rule rather than extending it: an explicit drag used to outrank the
+    // placeholder floor, so a box dragged short clipped the notice that carries Dismiss / Open
+    // System Settings — stranding the user at a broken mic with the remedy just below the edge.
+    //
+    // The floor can only make the box TALLER, so the direction is the safe one.
+    const tallNotice = 90; // the error overlay's natural height — three lines of copy plus controls
+    const draggedShort = COMPOSE_MIN_H;
+    const h = composeRenderH({
+      contentH: null,
+      userH: draggedShort,
+      availableH: AVAILABLE,
+      placeholderH: tallNotice,
+    });
+    expect(h).toBe(composePlaceholderFloorH(tallNotice));
+    expect(h).toBeGreaterThan(draggedShort);
   });
 
   it("still leaves room for the thread", () => {

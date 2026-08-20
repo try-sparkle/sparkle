@@ -62,11 +62,14 @@ import {
   cancelImprovementPass,
   IMPROVEMENT_RETRY_MS,
   isPassRunning,
+  PARK_DECLINE_ESCALATE_AFTER,
+  parkDeclineStreakAt,
   PASS_TIMEOUT_MS,
   passRetryDueAt,
   PROBE_KILL_WAIT_MS,
   PROBE_TIMEOUT_MS,
   refusalDetail,
+  resetParkDeclineStreakForTests,
   resetPassRetryForTests,
   runImprovementPass,
 } from "./improvementPass";
@@ -114,6 +117,10 @@ function resetHarness() {
   clearAllPins();
   vi.clearAllMocks();
   resetPassRetryForTests();
+  // The consecutive-decline tally is module-level and OUTLIVES a test, exactly like the retry latch:
+  // an unpushed decline in one case would otherwise carry a streak into the next and escalate a first
+  // refusal there to `errored`. Forget it, so every test starts from a clean count.
+  resetParkDeclineStreakForTests();
   useRuntimeStore.getState().setStatus(SPARKLE_AGENT_ID, "stopped");
   useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, "");
   // The transcript registry is module-level state that OUTLIVES a test, so a pass in one case would
@@ -327,6 +334,92 @@ describe("runImprovementPass watchdog", () => {
         refusalDetail("unpushed"),
       );
     });
+  });
+
+  // ESCALATION: a refusal that RECURS for the same reason must stop hiding in the silent `blocked`
+  // pill. The founder-requested prevention — the hourly loop stopped for days behind a red row nobody
+  // was pinged about, because the park declined every hour and `blocked` is deliberately not in the
+  // notify set. On the Nth consecutive same-reason decline the row rises to `errored`, which IS.
+  it("escalates a STUCK loop to errored after N consecutive same-reason declines", async () => {
+    harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // The refusals BELOW the threshold stay on the silent pill — no escalation, no error log.
+      for (let i = 1; i < PARK_DECLINE_ESCALATE_AFTER; i++) {
+        await runImprovementPass("always");
+        expect(parkDeclineStreakAt()).toBe(i);
+        expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      }
+      expect(errorSpy).not.toHaveBeenCalled();
+
+      // The Nth consecutive refusal crosses the threshold: THE SIDE EFFECT is the notifying status.
+      await runImprovementPass("always");
+      expect(parkDeclineStreakAt()).toBe(PARK_DECLINE_ESCALATE_AFTER);
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("errored");
+      // And it is loud where `blocked` was silent: an error log naming the streak, and an attention
+      // screen (tier (b), relayed to the phone) that says how long it has been stuck — not just the
+      // bare remedy, so the reader learns this is a persistent loop, not a one-off.
+      expect(errorSpy).toHaveBeenCalled();
+      const screen = useRuntimeStore.getState().attentionScreen[SPARKLE_AGENT_ID] ?? "";
+      expect(screen).toContain(String(PARK_DECLINE_ESCALATE_AFTER));
+      expect(screen).toContain("in a row");
+      // The pass STILL never spawned — escalation changes the signal, not the (correct) refusal.
+      expectNoRunInvoked();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("a DIFFERENT decline reason restarts the streak (only the SAME reason accumulates)", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+      for (let i = 1; i < PARK_DECLINE_ESCALATE_AFTER; i++) await runImprovementPass("always");
+      expect(parkDeclineStreakAt()).toBe(PARK_DECLINE_ESCALATE_AFTER - 1);
+
+      // A refusal for a NEW reason is not a continuation of the old loop — the count restarts at 1,
+      // so it does not escalate on the strength of unrelated earlier refusals.
+      harness.parkImpl = () => Promise.resolve({ parked: false, reason: "no-base" });
+      await runImprovementPass("always");
+      expect(parkDeclineStreakAt()).toBe(1);
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  it("a SUCCESSFUL park breaks the streak, so a later refusal starts a fresh count", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+      for (let i = 1; i < PARK_DECLINE_ESCALATE_AFTER; i++) await runImprovementPass("always");
+      expect(parkDeclineStreakAt()).toBe(PARK_DECLINE_ESCALATE_AFTER - 1);
+
+      // A park that CLEARS (the base self-heals) is exactly the outcome the streak is watching for the
+      // absence of — it must reset the count, or a self-healing hour would still escalate later.
+      harness.parkImpl = () => Promise.resolve({ parked: true, reason: "parked" });
+      const pass = runImprovementPass("always");
+      await untilRunInvoked(); // the successful park proceeds to spawn the pass
+      expect(parkDeclineStreakAt()).toBe(0);
+      harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+      await pass;
+
+      // The next refusal is a first offence again: back to a single `blocked`, not straight to errored.
+      harness.parkImpl = () => Promise.resolve({ parked: false, reason: "unpushed" });
+      await runImprovementPass("always");
+      expect(parkDeclineStreakAt()).toBe(1);
+      expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).toBe("blocked");
+      expect(errorSpy).not.toHaveBeenCalled();
+    } finally {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
   });
 
   it("an ALREADY-FRESH worktree is not a refusal: the pass runs normally", async () => {
@@ -758,6 +851,59 @@ describe("runImprovementPass watchdog", () => {
   });
 });
 
+// THE ROW IS GREEN FOR THE WHOLE PASS, INCLUDING SETUP — not only once the run invoke fires.
+//
+// A build agent's row goes green the instant its PTY spawns; the headless pass has no PTY and no
+// StatusEngine, so its row is driven only by the explicit `setStatus` calls in the service. `working`
+// used to be claimed AFTER the networked preamble (clone → worktree → fetch-heavy park), so the row
+// sat GRAY (the previous pass's idle/stopped) for that whole window while the pass was actively
+// working. These pin that the green now starts at the top of the work, and that it still sits BEHIND
+// the Claude-installed gate so a machine that will never run is not falsely painted green.
+describe("row is working from the start of the pass, not the end of setup", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("is already GREEN by the time the (slow, networked) setup runs, not only at the run invoke", async () => {
+    // Deterministic and timing-free: capture the row status at the exact moment the FIRST setup step
+    // runs — `ensureSparkleRepo`, which on a cold start is the OSS clone (minutes) and is the head of
+    // the whole preamble. Before the fix, `working` was set only after this + the worktree + the
+    // fetch-heavy park, so the row still read the reset `stopped` here; the pass was actively working
+    // and the dot was gray. After it, `working` is already claimed by the time setup begins.
+    const { ensureSparkleRepo } = await import("./sparkleAgent");
+    let statusAtSetup: string | undefined = "UNSET";
+    vi.mocked(ensureSparkleRepo).mockImplementationOnce(async () => {
+      statusAtSetup = useRuntimeStore.getState().status[SPARKLE_AGENT_ID];
+      return { repoPath: "/app-data/oss", logDir: "/app-data/logs", defaultBranch: "main" };
+    });
+
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+    await pass;
+
+    // THE SIDE EFFECT: green while the pass is still in its setup, not merely once it spawns.
+    expect(statusAtSetup).toBe("working");
+  });
+
+  it("does NOT go green when Claude is not installed — the green sits behind the install gate", async () => {
+    // The negative that keeps the fix from drifting into a false-green: a machine with no Claude runs
+    // no turn at all, so painting it green would show work that never happens. `working` must stay
+    // BELOW the `!claude.installed` return — moving it above turns this red.
+    const { checkClaude } = await import("../preflight");
+    vi.mocked(checkClaude).mockResolvedValueOnce({ installed: false, path: null, version: null });
+
+    await runImprovementPass("always");
+
+    expect(useRuntimeStore.getState().status[SPARKLE_AGENT_ID]).not.toBe("working");
+    expectNoRunInvoked();
+  });
+});
+
 describe("connectivity re-attempt", () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -1143,5 +1289,92 @@ describe("improvement pass account binding", () => {
       await completePass();
     });
     expect(runConfigDir()).toBe("/data/accounts/work");
+  });
+});
+
+// ── The control MCP on the HEADLESS pass, bead sparkle-hdlhox ────────────────────────────────────
+//
+// The pass already DRAINS its inbox (`build_improve_exec` exports SPARKLE_INBOX_AGENT), so before
+// this it could be told things and had no way to answer. Half-duplex is the original defect
+// relocated: the concierge's job on this channel is to reply "that contradicts what I observe", and
+// a correction the corrected party cannot respond to ends the exchange rather than starting one.
+//
+// Asserted at the REAL call site. The Rust unit tests cover `build_improve_exec`'s flag emission;
+// what only this suite can see is whether anything ever PASSES a config to it — the same class of
+// gap that left the interactive pane with no `mcpConfig` for as long as it did.
+describe("headless pass — sparkle-control MCP (bead sparkle-hdlhox)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    resetHarness();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** The two invokes `buildPassControlMcp` makes, answered as the real bridge would. */
+  const bridgeUp = (cmd: string): Promise<unknown> | undefined => {
+    if (cmd === "start_control_bridge")
+      return Promise.resolve({ socketPath: "/tmp/ctrl.sock", token: "tok" });
+    if (cmd === "control_mcp_paths")
+      return Promise.resolve({ nodePath: "/usr/bin/node", serverPath: "/app/server.js" });
+    return undefined;
+  };
+
+  it("hands sparkle_improve_run a config naming the control server and THIS agent's id", async () => {
+    harness.invokeImpl = bridgeUp;
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    const run = harness.invokes.find((c) => c.cmd === "sparkle_improve_run");
+    const args = run?.args as { mcpConfig?: string; persona?: string } | undefined;
+    expect(args?.mcpConfig).toContain("sparkle-control");
+    // The anti-spoofing caller identity. A wrong id here would make every per-agent op this pass
+    // issues resolve to some other agent — silently, since the op would still succeed.
+    expect(args?.mcpConfig).toContain("__sparkle_self__");
+    // The tools are useless unadvertised: the discovery prose must ride with the config.
+    expect(args?.persona).toContain("CONTROLLING THE SPARKLE UI");
+
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+    await pass;
+  });
+
+  it("STILL RUNS when the bridge is down, with no flag and no advertisement", async () => {
+    // The paired negative and the degradation contract, which matters more here than anywhere else
+    // in this change: an hourly unattended pass that died because a socket was slow would be a far
+    // worse regression than one with no cross-agent tools. `undefined` must reach Rust so NO flag
+    // is emitted — never an empty string, which `claude` would reject and which would take the
+    // whole pass down.
+    harness.invokeImpl = (cmd) =>
+      cmd === "start_control_bridge" ? Promise.reject(new Error("no bridge")) : undefined;
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    const run = harness.invokes.find((c) => c.cmd === "sparkle_improve_run");
+    const args = run?.args as { mcpConfig?: string; persona?: string } | undefined;
+    expect(args?.mcpConfig).toBeUndefined();
+    expect(args?.persona).not.toContain("CONTROLLING THE SPARKLE UI");
+    // …and the pass itself is completely intact: same persona, same prompt, same run.
+    expect(args?.persona).toContain("Sparkle Improvement Agent");
+
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+    await pass;
+  });
+
+  it("still tells the headless persona about the channel even with no MCP", async () => {
+    // The address book and the send are named in the persona unconditionally, because the pass may
+    // be resumed by the interactive pane (which shares this worktree and DOES have the tools). The
+    // channel section is not gated on the bridge; only the UI-control prose is.
+    harness.invokeImpl = (cmd) =>
+      cmd === "start_control_bridge" ? Promise.reject(new Error("no bridge")) : undefined;
+    const pass = runImprovementPass("always");
+    await untilRunInvoked();
+
+    const run = harness.invokes.find((c) => c.cmd === "sparkle_improve_run");
+    const persona = (run?.args as { persona?: string } | undefined)?.persona ?? "";
+    expect(persona).toContain("sparkle:concierge");
+    expect(persona).toContain("send_peer_message");
+
+    harness.handlers.get("sparkle_improve:done")?.({ payload: { sessionId: "s", text: "" } });
+    await pass;
   });
 });

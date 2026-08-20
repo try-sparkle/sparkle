@@ -3,6 +3,8 @@ import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
 import { buildConciergeFeed } from "./conciergeFeed";
 import { useRuntimeStore, RUNTIME_PERSIST_KEY } from "../stores/runtimeStore";
+import { continuationEvidenceFor, sweepGoalContinuations } from "./goalContinuationRunner";
+import { noteHooksLive, trackAgent } from "../engine/turnEndAuthority";
 import { useUiStore } from "../stores/uiStore";
 // The app-owned Improve Sparkle agent (bead sparkle-x0pvw). `SPARKLE_AGENT_ID` is the canonical id
 // this window answers for — `sparkleAgentIdFor(APP_WINDOW_LABEL)` resolves to exactly it, and the
@@ -16,6 +18,8 @@ import { SPARKLE_AGENT_ID } from "./sparkleAgent";
 // in sparkleBusy.test.ts, so standing this in tests the contract rather than restating it.
 import { sparkleActivityLine } from "./sparkleBusy";
 import { ZOOM_COLUMNS } from "../engine/columnZoom";
+import { LIFECYCLE_OPS } from "./conciergeTools/lifecycle";
+import { SCREENSHOT_OPS } from "./conciergeTools/screenshot";
 
 // --- mock the Tauri event layer: capture the registered handler so tests can fire events. ---
 let firedHandler: ((e: { payload: unknown }) => void) | undefined;
@@ -189,6 +193,7 @@ import {
   CHIEF_CONNECT_TIMEOUT_MS,
   isControlOpSuccess,
   CONCIERGE_CALLER_AGENT_ID,
+  CONCIERGE_SELF_NAME,
   setChiefClient,
   controlExpiredSkipCounts,
   _resetControlExpiredSkipsForTests,
@@ -1107,6 +1112,28 @@ describe("controlListener", () => {
     expect(lastReply()).toMatchObject({ ok: false });
   });
 
+  // ── THE ROSTER CARRIES THE SELF-REPORT'S AGE (bead sparkle-s8y5t6) ───────────────────────────
+  // This roster is the surface a WATCHER / concierge agent scans, and the bug is that it read a
+  // dead agent's hours-old self-report as current state. The row must now carry `activityAgeMs` so a
+  // machine reader can treat the line as a timestamped quote. Non-vacuous: it drives the real op
+  // (which stamps activityAt) and asserts the derived age is present and small right after stamping.
+  it("list roster carries activityAgeMs for an agent with a self-report, and omits it otherwise", async () => {
+    fire({ reqId: "age1", op: "set_agent_activity", callerAgentId: callerId, payload: { activity: "Wiring the listener" } });
+    await flush();
+    fire({ reqId: "age2", op: "get_state", callerAgentId: callerId, payload: { scope: "all" } });
+    await flush();
+    const res = lastReply() as { agents: Array<Record<string, unknown>> };
+    const mine = res.agents.find((a) => a.id === callerId)!;
+    expect(mine.activity).toBe("Wiring the listener");
+    expect(typeof mine.activityAgeMs).toBe("number");
+    expect(mine.activityAgeMs as number).toBeGreaterThanOrEqual(0);
+    expect(mine.activityAgeMs as number).toBeLessThan(60_000); // just stamped → a tiny age
+    // COMPACT AND ABSENT BY DEFAULT: a row with no self-report carries no age key at all.
+    const sibling = res.agents.find((a) => a.id === otherId)!;
+    expect(sibling.activity == null).toBe(true);
+    expect("activityAgeMs" in sibling).toBe(false);
+  });
+
   // ── WHO MAY WRITE ANOTHER AGENT'S NAME / ACTIVITY ───────────────────────────────────────────────
   //
   // `rename_agent` and `set_agent_activity` were freely targetable long after the identical hole was
@@ -1282,9 +1309,54 @@ describe("controlListener", () => {
 
     // FAILS CLOSED on an unresolvable caller. An empty stamped id cannot establish ownership of
     // anything, and the only safe answer to "does this anonymous caller own that agent" is no.
-    it("REFUSES a caller with no stamped id naming someone else", async () => {
+    //
+    // But it refuses with `no_caller_identity`, NOT `not_yours` (bead `sparkle-gcuxq`). Both are a
+    // refusal, so the write half of this test is unchanged — what changed is the REASON, and the
+    // reason is the whole product here: `not_yours` ends in "only the agent itself, an orchestrator
+    // above it, or the concierge may write it", which is advice a caller carrying no id cannot act
+    // on. It cannot become any of the three by retrying. Its actual problem is upstream of ownership
+    // entirely, and only a distinct code says so.
+    it("REFUSES a caller with no stamped id naming someone else — as no_caller_identity, not not_yours", async () => {
       useProjectStore.getState().selfNameAgent(projectId, otherId, "Sub Task");
       fire({ reqId: "own12", op: "rename_agent", callerAgentId: "", payload: { targetAgentId: otherId, name: "Hijacked" } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "no_caller_identity" });
+      expect(agentOf(otherId)!.name).toBe("Sub Task");
+      // The refusal must not send this caller off to fix an ownership problem it does not have.
+      expect(String((lastReply() as { error: string }).error)).not.toContain("orchestrator above it");
+    });
+
+    // A MISTYPED TARGET IS NOT A PERMISSION PROBLEM. The ownership walk refuses an id that names no
+    // agent (an absent target has no parent chain to walk), so this used to come back "agent X is
+    // not yours to rename" — a refusal that sends the caller to hunt for ownership when the id is
+    // simply wrong. Every one of these handlers checks `findAgent` two lines further down and
+    // answers "unknown agent X"; the gate just got there first, so it now gives the same answer.
+    //
+    // Asserted on a STRANGER caller on purpose: with the caller naming its own id, or the concierge,
+    // the gate allows and `findAgent` produces this message anyway — so that setup would pass
+    // against the old code and prove nothing about the gate.
+    it("tells a stranger naming a NONEXISTENT agent that it is unknown, not that it is not theirs", async () => {
+      const stranger = strangerCaller();
+      fire({
+        reqId: "own13",
+        op: "rename_agent",
+        callerAgentId: stranger,
+        payload: { targetAgentId: "no-such-agent", name: "X" },
+      });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false });
+      expect(lastReply()).not.toMatchObject({ code: "not_yours" });
+      expect(String((lastReply() as { error: string }).error)).toContain("unknown agent no-such-agent");
+    });
+
+    // …and the ownership refusal itself is UNCHANGED for a target that really exists. Paired with
+    // the test above on purpose: one test showing the new reason is ambiguous on its own, because a
+    // gate that answered `unknown agent` for everything would also pass it. This is the half that
+    // pins that the policy refusal still fires where policy is genuinely what refused.
+    it("still refuses a stranger naming an agent that DOES exist with not_yours", async () => {
+      const stranger = strangerCaller();
+      useProjectStore.getState().selfNameAgent(projectId, otherId, "Sub Task");
+      fire({ reqId: "own14", op: "rename_agent", callerAgentId: stranger, payload: { targetAgentId: otherId, name: "X" } });
       await flush();
       expect(lastReply()).toMatchObject({ ok: false, code: "not_yours" });
       expect(agentOf(otherId)!.name).toBe("Sub Task");
@@ -3542,6 +3614,88 @@ describe("controlListener", () => {
       expect(goalOf(callerId)!.escalatedAt).toBeUndefined();
     });
 
+    // ── THE PREDICTION AND THE SWEEP MUST AGREE (roborev 65440, High) ────────────────────────────
+    // `resumeReading`'s entire value is that it predicts what the next sweep will decide, and it
+    // once built the progress mark by hand from the three self-report fields while the sweep built
+    // it from those PLUS artifact evidence. For any agent carrying evidence the two strings then
+    // differed, which `decideContinuation` reads as PROGRESS — so `consecutive` collapsed to 0 here
+    // and the streak arm became unreachable in the prediction alone. Both cases below go through the
+    // streak arm, which is why the escalation is raised by the CONCIERGE: its clear is the free undo
+    // (`unraiseGoal`), which leaves `continues` and `mark` standing, where a machine re-arm zeroes
+    // them and the arm could not be reached at all.
+    const spendStreakThenConciergeRaise = (id: string, mark: string) => {
+      const store = useProjectStore.getState();
+      store.setAgentGoal(projectId, id, "land the retry PR");
+      for (let i = 0; i < 3; i++) store.noteAgentGoalContinue(projectId, id, mark);
+      store.conciergeEscalateAgentGoal(projectId, id, "stop retrying this", Date.now());
+    };
+
+    /**
+     * Open every gate that stands BEFORE the bounds, so the reading actually reaches them.
+     *
+     * Without this both cases below stop at `not-idle` and assert nothing about the streak arm —
+     * the vacuous shape this file keeps catching. The idle clock is the awkward one: it is the
+     * runner's private module state, written only by a sweep, so the sweep is driven here at an
+     * instant well in the PAST. `resumeReading` judges at the real `Date.now()`, so a stamp from
+     * two hundred seconds ago is comfortably settled. The goal is escalated throughout, so those
+     * sweeps decide `already-escalated` and send nothing.
+     */
+    const openTheGatesBeforeTheBounds = async (id: string) => {
+      useRuntimeStore.getState().setStatus(id, "idle");
+      useRuntimeStore.setState({ openAgentIds: [id] } as never);
+      trackAgent(id, "test-engine");
+      noteHooksLive(id);
+      const past = Date.now() - 200_000;
+      await sweepGoalContinuations({ now: past, ownsProject: () => true });
+      await sweepGoalContinuations({ now: past + 46_000, ownsProject: () => true });
+    };
+
+    it("a spent streak WITH artifact evidence and no gate predicts a re-escalation", async () => {
+      // ⚠️ THE ARTIFACT EVIDENCE IS THE WHOLE TEST, and its first version left it out (roborev
+      // 65483). With an evidence-free fixture every artifact token is empty, so the shared builder
+      // and the hand-built three-field call produce a BYTE-IDENTICAL string — `progressMark` pads
+      // the missing fields with "" — and the case passes just as well against the drift it names.
+      // A hand-mutation to the real pre-fix line proved it: the old code passed.
+      //
+      // `merged` rather than `open`, deliberately: it puts a `prMark` token in the mark (so the two
+      // builders MUST differ if the prediction stops sharing one) while producing NO `ExternalWait`
+      // (so the streak arm is the arm under test rather than the gate).
+      useRuntimeStore.setState({
+        workflowState: { [callerId]: { prState: "merged", prNumber: 2117 } },
+      } as never);
+      spendStreakThenConciergeRaise(callerId, continuationEvidenceFor(agentOf(callerId)).mark);
+      await openTheGatesBeforeTheBounds(callerId);
+
+      clear("e6-pair", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      // Under the old hand-built mark this answers `willResume: true`: the recomputed string lacks
+      // the `merged#2117` token, so `live.mark !== mark` reads as progress, `consecutive` collapses
+      // to 0 and the streak arm is skipped entirely.
+      expect(lastReply()).toMatchObject({
+        ok: true,
+        willResume: false,
+        blockedBy: "would-re-escalate",
+      });
+    });
+
+    it("…and an OPEN PR flips it to willResume:true, exactly as the sweep would", async () => {
+      // THE GATE HALF. Its partner above is what carries the mark-parity claim: this case answers
+      // `willResume: true` in BOTH worlds, by different routes (post-fix the gate suppresses the
+      // escalate arm; pre-fix the mark simply differed and the arm was skipped), so on its own it
+      // discriminates nothing. Kept because it pins the gate, which nothing else here does.
+      useRuntimeStore.setState({
+        workflowState: { [callerId]: { prState: "open", prNumber: 2117 } },
+      } as never);
+      spendStreakThenConciergeRaise(callerId, continuationEvidenceFor(agentOf(callerId)).mark);
+      await openTheGatesBeforeTheBounds(callerId);
+
+      clear("e6-gated", CONCIERGE_CALLER_AGENT_ID);
+      await flush();
+
+      expect(lastReply()).toMatchObject({ ok: true, willResume: true });
+    });
+
     it("…and a different blocker for a different state — a busy agent reads not-idle", async () => {
       escalateMachine(callerId);
       useRuntimeStore.getState().setStatus(callerId, "working");
@@ -4231,6 +4385,7 @@ describe("controlListener", () => {
         projectId,
         projectName: "Demo",
         activity: null, // nothing observed yet this run
+        activityAgeMs: null, // the concierge line is an observation, not a stamped self-report
       });
     });
 
@@ -4544,6 +4699,30 @@ describe("controlListener", () => {
       // The limitation travels WITH the remedy, same as the capture branch: an agent that landed a
       // lifecycle fix must be told the packaged build cannot show it, not sent hunting for a path.
       expect(message).toContain("packaged build");
+      expect(message).not.toContain("Agents drive the app through the ordinary sparkle-control ops");
+      expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
+    });
+
+    // EVERY op in both domains, read from the domains' own lists rather than named here. The two
+    // cases above pin one op apiece, which is what let the capture branch hand-list its ops: a
+    // third one added to `SCREENSHOT_OPS` would have missed the branch and silently drawn the
+    // generic sentence — the exact false remedy this function exists to remove — with both of
+    // those tests still green, because neither one ever names it. Driving the whole list is what
+    // makes the assertion fail when the domain grows.
+    it.each([
+      ...SCREENSHOT_OPS.map((op) => ["screenshot", op] as const),
+      ...LIFECYCLE_OPS.map((op) => ["lifecycle", op] as const),
+    ])("never gives the generic remedy for %s op %s, named by the op alone", async (_domain, op) => {
+      fire({
+        reqId: `t9b-${op}`,
+        op: "concierge_tool",
+        callerAgentId: callerId,
+        // DOMAIN DELIBERATELY EMPTY: the domain half of each branch is already covered above, and
+        // an op-only call is the shape that goes generic when a list falls out of date.
+        payload: { domain: "", op, args: {}, toolCallId: `tc-all-${op}` },
+      });
+      await flush();
+      const message = String(lastReply().message);
       expect(message).not.toContain("Agents drive the app through the ordinary sparkle-control ops");
       expect(dispatchConciergeToolMock).not.toHaveBeenCalled();
     });
@@ -6015,17 +6194,60 @@ describe("send_peer_message", () => {
     expect(inboxSends).toHaveLength(0);
   });
 
-  it("refuses the concierge — it has its own channel and no roster row", async () => {
-    // THIS IS ALSO THE EXEMPTION PIN. `send_peer_message` is in `CONCIERGE_EXEMPT_OPS` because the
-    // handler can only ever decline it, and asserting `unknown_caller` HERE is what holds that:
-    // drop the op from the runtime Set and the policy layer answers first with a different code, so
-    // this reds. No separate case is needed, and adding one that asserts the error text lacks
-    // `concierge.tools` would be worse than redundant — with the op absent from `APP_TOOL_NAMES`
-    // that string is unreachable, so such an assertion could not fail either way.
+  it("delivers from the concierge — a valid sender resolving its project from the selection", async () => {
+    // A1 (bead sparkle-179b2s). The concierge is now a valid SENDER. Its reserved id matches no roster
+    // row, so it is special-cased BEFORE the findAgent guard and resolves its project from
+    // `selectedProjectId` (which `addProject` set to `projectId` in beforeEach). It reaches `otherId`,
+    // a sibling in that project.
+    //
+    // Assert the ENQUEUE SIDE EFFECT, not just the reply: the message lands, and its `from` is the
+    // concierge's own self name (NOT the `Name [id]` peer label an agent gets). Removing the
+    // special-case reverts the concierge to `unknown_caller` and queues nothing, so this reds — it is
+    // not vacuous.
+    //
+    // THIS IS ALSO THE EXEMPTION PIN. `send_peer_message` stays in `CONCIERGE_EXEMPT_OPS`; asserting
+    // `ok:true` HERE holds that — drop the op from the Set and the policy layer denies the concierge
+    // before the handler runs, so this reds with a different (non-ok) reply.
     send({ to: otherId, message: "from the concierge" }, CONCIERGE_CALLER_AGENT_ID);
     await flush();
 
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: otherId } });
+    expect(inboxSends).toHaveLength(1);
+    expect(inboxSends[0]).toMatchObject({ agentId: otherId, text: "from the concierge" });
+    expect(inboxSends[0]!.from).toBe(CONCIERGE_SELF_NAME);
+  });
+
+  it("still refuses an ordinary unresolvable caller — the concierge special-case is not a wildcard", async () => {
+    // The paired negative: only the RESERVED concierge id is special-cased. A random unresolvable id
+    // still fails closed, so A1 opened exactly one door, not the whole wall.
+    send({ to: otherId, message: "who am I" }, "sparkle:not-the-concierge");
+    await flush();
+
     expect(lastReply()).toMatchObject({ ok: false, code: "unknown_caller" });
+    expect(inboxSends).toHaveLength(0);
+  });
+
+  it("resolves the canonical Improve Sparkle id APP-GLOBALLY, from any project", async () => {
+    // B2 (bead sparkle-179b2s). `__sparkle_self__` is not a project row, so the project-scoped
+    // resolution can never find it — it resolves OUTSIDE the boundary. A build agent in `projectId`
+    // reaches it and the message enqueues to that exact id (`inbox/__sparkle_self__.jsonl`). It is
+    // addressable with no pane open because the headless pass drains it (Phase B3).
+    send({ to: SPARKLE_AGENT_ID, message: "unstick yourself" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: true, to: { id: SPARKLE_AGENT_ID } });
+    expect(inboxSends).toHaveLength(1);
+    expect(inboxSends[0]).toMatchObject({ agentId: SPARKLE_AGENT_ID });
+  });
+
+  it("still refuses a bogus id as not_in_project — only the two special ids resolve app-globally", async () => {
+    // The boundary control for B2: app-global resolution is NOT a wildcard. An id that is neither a
+    // project sibling nor one of the two special ids fails closed, indistinguishable from a
+    // cross-project target (the anti-oracle property is preserved).
+    send({ to: "__not_sparkle__", message: "x" });
+    await flush();
+
+    expect(lastReply()).toMatchObject({ ok: false, code: "not_in_project" });
     expect(inboxSends).toHaveLength(0);
   });
 
@@ -6321,5 +6543,67 @@ describe("get_state scope: project", () => {
     });
     await flush();
     expect(lastReply()).toMatchObject({ ok: true, to: { id: otherId } });
+  });
+});
+
+describe("get_state scope: fleet — the cross-project address book (bead sparkle-179b2s)", () => {
+  let projectId: string;
+  let callerId: string;
+  let cleanup: (() => void) | undefined;
+
+  beforeEach(async () => {
+    firedHandler = undefined;
+    controlResponds.length = 0;
+    inboxSends.length = 0;
+    inboxSendError = null;
+    _resetPeerRateLimitsForTests();
+    vi.mocked(sparkleActivityLine).mockReturnValue(null);
+    useSettingsStore.setState({ conciergeToolPolicy: {}, conciergeToolPolicyHydrated: true });
+    useProjectStore.setState({ projects: [], selectedProjectId: null } as never);
+    useRuntimeStore.setState({ openAgentIds: [] } as never);
+    const store = useProjectStore.getState();
+    projectId = store.addProject("Mine", "/tmp/mine");
+    callerId = store.addAgent(projectId, { kind: "build" })!;
+    cleanup = await startControlListener();
+  });
+  afterEach(() => {
+    cleanup?.();
+    cleanup = undefined;
+    vi.restoreAllMocks();
+  });
+
+  const ids = (r: unknown) =>
+    ((r as { agents: Array<{ id: string }> }).agents ?? []).map((a) => a.id);
+
+  it("lists the two app-global addressees: the canonical Improve Sparkle and the concierge", async () => {
+    // B1. A build agent asks for the fleet directory and gets the ids it may address across project
+    // boundaries. The canonical Improve Sparkle id is listed unconditionally (the headless pass drains
+    // it), and the concierge is listed with its own self name.
+    fire({ reqId: "f1", op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+    await flush();
+
+    expect(ids(lastReply())).toEqual(
+      expect.arrayContaining([SPARKLE_AGENT_ID, CONCIERGE_CALLER_AGENT_ID]),
+    );
+    const conciergeRow = (
+      lastReply() as { agents: Array<{ id: string; name: string }> }
+    ).agents.find((a) => a.id === CONCIERGE_CALLER_AGENT_ID);
+    expect(conciergeRow!.name).toBe(CONCIERGE_SELF_NAME);
+  });
+
+  it("keeps those two ABSENT from scope project — the boundary is preserved in both directions", async () => {
+    // The paired boundary control. The same two ids the fleet scope returns must NOT appear in the
+    // project roster (they are not project rows), or the project scope would leak app-global
+    // participants into the peer-messaging list. Assert both directions off one setup.
+    fire({ reqId: "f2", op: "get_state", callerAgentId: callerId, payload: { scope: "fleet" } });
+    await flush();
+    expect(ids(lastReply())).toEqual(
+      expect.arrayContaining([SPARKLE_AGENT_ID, CONCIERGE_CALLER_AGENT_ID]),
+    );
+
+    fire({ reqId: "f3", op: "get_state", callerAgentId: callerId, payload: { scope: "project" } });
+    await flush();
+    expect(ids(lastReply())).not.toContain(SPARKLE_AGENT_ID);
+    expect(ids(lastReply())).not.toContain(CONCIERGE_CALLER_AGENT_ID);
   });
 });

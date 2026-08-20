@@ -25,7 +25,7 @@ import { useUiStore } from "../stores/uiStore";
 import { markProjectVisited, resetVisitedProjects, wasProjectVisited } from "./sessionProjects";
 import { localAgentCapacity } from "./agentCapacity";
 import { spawnBuildAgentInProject } from "./buildAgentSpawn";
-import { briefForLaunch, hasUndeliveredBrief, resetAgentBriefs } from "./agentBrief";
+import { briefForLaunch, briefRecord, hasUndeliveredBrief, resetAgentBriefs } from "./agentBrief";
 import { claimSatellite, isTornOut, resetSatellites } from "./satelliteWindows";
 import type { Project } from "../types";
 
@@ -213,6 +213,26 @@ describe("spawnBuildAgentInProject({ background: true }) — spawn without hijac
     // The whole point of the brief surviving: it rides the launch of the pane the open-set entry
     // above guarantees.
     expect(useRuntimeStore.getState().openAgentIds).toContain(bg);
+  });
+
+  it("marks the background brief MACHINE-authored, and leaves the foreground one unmarked", () => {
+    // BOTH CANDIDATES MOUNTED IN ONE TEST, on purpose. Asserting only the background half would pass
+    // against a change that marks EVERY spawn machine-authored — which would silently stop billing
+    // the "+ New Build Agent" and concierge spawns that are supposed to bill. The pair is what pins
+    // the rule; one direction alone is half the evidence.
+    //
+    // What the mark buys, at the other end of the chain: `recordPromptSideEffects` keys the free-
+    // trial debit, the ghost-text corpus and auto-naming on the record's PRESENCE, so an unmarked
+    // babysit brief billed a prompt for a timer-driven dispatch nobody made and taught the corpus a
+    // generated brief. No `promptId` either way — nothing was written to the store here, so the
+    // delivery path must still append the row.
+    const { b } = seedHumanSelection();
+
+    const bg = spawnBuildAgentInProject(b, { background: true, prompt: "Babysit PR #1234." })!;
+    const fg = spawnBuildAgentInProject(b, { prompt: "Investigate the dead pill." })!;
+
+    expect(briefRecord(bg)).toEqual({ humanAuthored: false });
+    expect(briefRecord(fg)).toBeUndefined();
   });
 
   it("does not request compose focus, on the EMPTY path that normally earns it", () => {

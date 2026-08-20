@@ -1,6 +1,6 @@
 // THE SELECTED ROW'S BOX — WHICH END OPENS INTO WHAT, AS A PURE RULE.
 //
-// The cockpit is `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`, so a row has TWO ends and which one is
+// The cockpit is `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`, so a row has TWO ends and which one is
 // which flips with the pair:
 //
 //     left  pair = TERM │ BUILD │ concierge   → the terminal is to the row's LEFT

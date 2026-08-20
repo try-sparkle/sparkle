@@ -40,6 +40,7 @@ export const RESEARCH_COMMANDS = {
   dispatch: "research_dispatch",
   list: "research_list",
   get: "research_get",
+  tail: "research_tail",
   cancel: "research_cancel",
   markRead: "research_mark_read",
 } as const;
@@ -72,6 +73,18 @@ export interface DispatchResearchInput {
    */
   projectRoot: string;
   depth: ResearchDepth;
+  /**
+   * OPTIONAL model override for this ONE child, checked against `RESEARCH_MODEL_ALLOWLIST` in
+   * `research.rs`. Omitted (every pre-existing caller) means the depth's pinned model.
+   *
+   * It exists for the second-model advisor pass (bead `sparkle-revqiv`), whose whole premise is
+   * running on a model DIFFERENT from the one that wrote the plan — unreachable while every child
+   * is pinned to one id. VALIDATED IN RUST, not here: `ai.rs` already clamps `max_tokens` because
+   * "an unclamped budget from a compromised renderer would be a costly-output amplifier", and a
+   * free-form model string is the same hazard class with a 10x-priced model reachable. An off-list
+   * id is refused at dispatch, before a task record is written.
+   */
+  model?: string;
 }
 
 /**
@@ -89,6 +102,10 @@ export async function dispatchResearch(input: DispatchResearchInput): Promise<Re
     projectId: input.projectId,
     projectRoot: input.projectRoot,
     depth: input.depth,
+    // `null`, not `undefined`, for an absent override: Tauri drops undefined keys, and the Rust
+    // param is `Option<String>` which reads an absent key and a null alike — but sending the key
+    // explicitly keeps the wire shape stable for a reader diffing the two call sites.
+    model: input.model ?? null,
   });
 }
 
@@ -100,6 +117,21 @@ export async function listResearch(): Promise<ResearchTask[]> {
  *  findings, which is why this is not an empty-object success. */
 export async function getResearch(taskId: string): Promise<ResearchTask | null> {
   return invoke<ResearchTask | null>(RESEARCH_COMMANDS.get, { taskId });
+}
+
+/**
+ * THE LIVE TAIL of a running task — a capped, human-readable log of what the research child is doing
+ * right now (bead sparkle-s7rfc). The empty string means "nothing to show": never dispatched on this
+ * install, or already finished (the runner removes the sidecar the instant a task goes terminal, so
+ * a done task's pane shows its findings, not a stale tail).
+ *
+ * The bound lives in the RUNNER (research.rs caps the sidecar to a few dozen lines / a few KB), so
+ * this reads a small file no matter how much the child emitted — the reason the founder's "avoid it
+ * becoming a big problem" holds. The running task's pane polls this on the existing research cadence;
+ * it is never pushed, so it can never outrun its reader.
+ */
+export async function getResearchTail(taskId: string): Promise<string> {
+  return invoke<string>(RESEARCH_COMMANDS.tail, { taskId });
 }
 
 export async function cancelResearch(taskId: string): Promise<ResearchTask> {
@@ -195,6 +227,53 @@ export function recentTasks(
  */
 export function visibleTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
   return sortedTasks(tasks.filter((t) => !isRetired(t)));
+}
+
+/**
+ * WHAT THE EXPANDED "Concierge Agents" GROUP RENDERS — the live rows AND the recently-finished ones.
+ *
+ * ══ THE LABEL AND THE CLICK MUST NEVER DISAGREE AGAIN ═════════════════════════════════════════
+ *
+ * The founder clicked `Concierge Agents +0 · 15 recently` and nothing happened. Neither number was
+ * wrong and the click was not broken: the badge counts {@link recentTasks} (which deliberately keeps
+ * retired tasks — being TOLD about a delegation is the most complete kind there is) while the group
+ * rendered {@link visibleTasks} (which deliberately drops them). Replayed against the records on
+ * disk at the moment of his screenshot: live 0, recent 15, rendered 0. A header that promises
+ * fifteen rows and opens onto nothing reads as a dead row, and he reported it as one.
+ *
+ * So the group is defined as the UNION of the two sets rather than as either one, and that is the
+ * whole point: whatever `· N recently` counts, the click shows. The two can no longer drift, because
+ * neither is computed independently of the other — the label's selector is one of this one's inputs.
+ *
+ * ══ WHY A UNION AND NOT SIMPLY `recentTasks` ══════════════════════════════════════════════════
+ *
+ * `recentTasks` is bounded by a 12h dispatch window, and a task can outlive it: a `deep` run started
+ * fourteen hours ago and still going is live work the founder must be able to reach. Rendering only
+ * the recent set would tear its row out from under him while it was running. `visibleTasks` has no
+ * window and always carries it, so the union is "everything still happening, plus everything that
+ * happened recently" — each half covering the other's blind spot.
+ *
+ * The window is the ONE the label already uses ({@link RECENT_RESEARCH_WINDOW_MS}); this function
+ * invents no second bound and no last-N cap. Ordering is {@link sortedTasks}, the store's single
+ * answer to "which is the latest" — never a second sort at a call site.
+ *
+ * NOTHING HERE CHANGES WHAT ROLLS UP. This set contains retired tasks by construction, so it must
+ * never be fed to a badge or a parent disc — see `researchRollupStatuses`, which filters to live
+ * tasks, and `engine/retiredRowTreatment`'s `countsTowardRollup`. A retired `failed` task reaching a
+ * rollup paints the header red forever for work nobody can act on.
+ */
+export function groupTasks(
+  tasks: readonly ResearchTask[],
+  now: number,
+  windowMs: number = RECENT_RESEARCH_WINDOW_MS,
+): ResearchTask[] {
+  // Deduped by ID rather than by object identity: the two selectors return the SAME task objects for
+  // anything in both sets (a live task dispatched an hour ago is in both), and a row rendered twice
+  // would be a duplicate React key as well as a duplicate row.
+  const union = new Map<string, ResearchTask>();
+  for (const t of visibleTasks(tasks)) union.set(t.id, t);
+  for (const t of recentTasks(tasks, now, windowMs)) union.set(t.id, t);
+  return sortedTasks([...union.values()]);
 }
 
 /**

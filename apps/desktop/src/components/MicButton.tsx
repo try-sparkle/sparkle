@@ -31,9 +31,14 @@ export function shouldBlockMicArm(me: Me | null): boolean {
 //   active    = enabled && status listening && phase active — actively dictating right now
 //
 // A click never jumps straight from active to off: it PAUSES first. The full cycle:
-//   off → setEnabled(true) → paused
+//   off → setEnabled(true)+setPhase("active") → active   (arm AND route — the mic actually listens)
 //   active → setPhase("passive") → paused   (stays on; stops dictating)
 //   paused → setEnabled(false) → off
+// Arming straight to "active" (not the old "paused") is deliberate (bead sparkle-yvvu27): a plain
+// click must yield a mic that transcribes, not a hot-but-silent one — enabled with phase passive
+// captures audio and routes nothing, with no on-screen sign routing is off. Before this, the app's
+// ONLY setPhase("active") call site was the hover pill's "Listening" option, so a click-only user
+// could never reach the routing state (field evidence: 49 toggles produced 1 transcript).
 // Preparing clicks like paused (→ off), so the user can always back out of a long first-run
 // download rather than being stuck watching it.
 
@@ -117,7 +122,15 @@ export function useMicToggle(): {
       // refill-then-rearm within the 5s window can't be force-disarmed (and the notice can't
       // linger next to an armed mic).
       clearOutOfCreditsNotice();
-      setEnabled(true); // off → paused (arm the mic; capture resumes, routing does not)
+      // off → active: arm the mic AND route speech to the box, so a plain click yields a mic that
+      // actually listens+transcribes (bead sparkle-yvvu27). Mirrors useMicActions.setActive (the
+      // hover pill's "Listening") — previously the only setPhase("active") call site, which left a
+      // click-only user with a hot-but-silent mic and nothing on screen saying routing was off.
+      // Setting phase here is INTENT, not a route during a model download: `preparing` still outranks
+      // `active` in deriveMicState, and nothing transcribes until capture is genuinely live — the
+      // same contract setActive already relies on ("phase-active takes effect once capture resumes").
+      setEnabled(true);
+      setPhase("active");
     } else if (state === "active")
       setPhase("passive"); // active → paused (stop dictating, stay listening — never turn off)
     else setEnabled(false); // paused (or preparing) → off

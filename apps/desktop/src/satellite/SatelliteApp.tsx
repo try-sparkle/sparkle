@@ -49,6 +49,7 @@ import { subscribeToCrossWindowSync } from "../services/crossWindowSync";
 import { startPresenceTracking } from "../stores/presenceStore";
 import { startAgentGoalDiskMirror } from "../services/agentGoalDisk";
 import { startGoalContinuationRunner } from "../services/goalContinuationRunner";
+import { startEpicSweepRunner } from "../services/epicSweepRunner";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { setWindowProject, clearWindowProject } from "../services/windowRegistry";
 import { FONT_UI } from "../theme/scale";
@@ -168,6 +169,11 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
   // torn-off window was ever auto-continued or escalated (bead sparkle-l7bmm). Mounting it here
   // makes the owning satellite the one handler; main still defers, so there is no double-sweep.
   useEffect(() => startGoalContinuationRunner(), []);
+
+  // The EPIC sweep, mounted here for exactly the reason the agent sweep above is: this window OWNS
+  // the project it displays, so main defers to it. Mounted only in App.tsx, a torn-off project's
+  // stalled epics would be swept by nobody.
+  useEffect(() => startEpicSweepRunner(), []);
 
   // The goal's durable mirror, mounted here for exactly the reason the runner above is: this
   // window OWNS the project it displays, so main defers to it. Mounted only in App.tsx, a
@@ -395,19 +401,30 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
               zIndex: PLAN_COLUMN_Z,
             }}
           >
-            {/* Same mini chiclet, same top-right placement as the main window's PlanBoardSlot —
-                a satellite board that kept the wide chevron would be the one surface still showing
-                the control the founder asked to retire. */}
+            {/* THE SAME ROW AS THE MAIN WINDOW'S PlanBoardSlot, AND IT HAS TO STAY THAT WAY.
+                BoardFilterBar.tsx's header records that this top row has TWO hosts and that a change
+                made in only one DRIFTS; this is the second host. Toggle FIRST and left-justified,
+                filters to its RIGHT, on AgentSidebar's `.bhd` geometry (`minHeight: 34`,
+                `padding: "0 10px"`) so the control sits on the same x and y in Plan as in Build —
+                the founder's "keep it where it is so I can switch between them easily". The long
+                rationale, including why these are literals and not an imported constant, is on the
+                Workspace.tsx copy; the tests pin both hosts to the same numbers. */}
             <div
+              data-testid="plan-board-header"
               style={{
                 display: "flex",
                 alignItems: "center",
-                justifyContent: "flex-end",
+                justifyContent: "flex-start",
+                flexWrap: "wrap",
                 gap: 8,
-                padding: "12px 12px 8px",
+                minHeight: 34,
+                padding: "0 10px",
+                // A margin, not bottom padding: padding would pull the toggle off the Build
+                // header's centre line, which is the alignment this row exists to hold.
+                marginBottom: 8,
+                flex: "0 0 auto",
               }}
             >
-              {workMode === "plan" && <BoardFilterBar side={SATELLITE_PAIR_SIDE} />}
               <PlanBuildToggle
                 mode={workMode}
                 beadsEnabled={beadsEnabled}
@@ -415,6 +432,7 @@ export function SatelliteApp({ projectId }: { projectId: string }) {
                 onPickPlan={onPickPlan}
                 onPickBuild={onPickBuild}
               />
+              {workMode === "plan" && <BoardFilterBar side={SATELLITE_PAIR_SIDE} />}
             </div>
             <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
               <Suspense fallback={<PaneFallback />}>

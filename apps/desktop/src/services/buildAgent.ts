@@ -128,6 +128,110 @@ export function guardrailsProtocol(): string {
   ].join("\n");
 }
 
+/** `[preview].agent_eagerness` — how eagerly an agent is TOLD to open a preview of its own work.
+ *
+ *  NOT the same question as `[preview].auto_open` (`PreviewAutoOpen` in settingsStore): that one
+ *  decides when an EXISTING preview reveals itself in a pane; this one decides whether a preview is
+ *  ever opened at all. Both were needed because the two failures are independent — a preview nobody
+ *  opened cannot be revealed by any pane policy. */
+export type PreviewEagerness = "visual" | "always" | "never";
+
+/** The shipped default. A PRODUCT default, not one person's preference: every Sparkle user judges a
+ *  change by looking at it, and a dev-server URL printed into a terminal is a change nobody looked
+ *  at. Mirrors `PreviewConfig::default()` in config.rs. */
+export const DEFAULT_PREVIEW_EAGERNESS: PreviewEagerness = "visual";
+
+/**
+ * Tell an agent to SHOW its work — the preview protocol (bead `sparkle-3475b.8`).
+ *
+ * ══ WHY THIS FRAGMENT EXISTS ════════════════════════════════════════════════════════════════════
+ * The preview subsystem is built and shipped, and previews still almost never happen, because
+ * nothing in any brief ever mentioned them. An agent that does not know a capability exists does
+ * not use it — so the gap was never in `preview.rs`, it was here.
+ *
+ * ══ WHY IT NAMES THE TOOL AND ITS ARGUMENTS ═════════════════════════════════════════════════════
+ * An instruction an agent cannot act on is worse than none: it produces an agent that tries, fails,
+ * and learns to distrust the brief. So this says the tool (`preview`), the exact payload key
+ * (`previewOp`, deliberately NOT `op` — see `controlListener.handlePreview` for why an inner `op`
+ * never arrives), and what each op does.
+ *
+ * ══ EVERY AGENT KIND GETS IT NOW, AND THAT IS THE SAME RULE ═════════════════════════════════════
+ * This block used to read "ORCHESTRATORS ONLY", and the reason was the tier gate rather than taste:
+ * `CONTROL_OP_TIERS.preview` was `privileged`, `callerMayAdminister` refuses every agent whose kind
+ * IS `worker`, so shipping the fragment to `workerPersona` would have been exactly the unactionable
+ * instruction the paragraph above forbids. That tier is now `free` (beads `sparkle-q3b4c6` /
+ * `sparkle-wnnye0` — the op is caller-stamped and can only ever reach the caller's own worktree),
+ * so a worker CAN call the tool, and withholding the fragment from it would make the fix inert:
+ * the capability would exist and nothing would ever mention it to the agent doing the visual work.
+ *
+ * So the rule is unchanged and its answer flipped — the fragment goes wherever the tool is
+ * REACHABLE. It stays governed by `[preview] agent_eagerness`, which is the knob a project reaches
+ * for when it does not want N workers each holding a dev server; the tier is not.
+ */
+export function previewProtocol(opts: { eagerness: PreviewEagerness }): string {
+  return [
+    "SHOW YOUR WORK — OPEN A LIVE PREVIEW",
+    "- People judge a change by LOOKING at it, not by reading a diff. A dev-server URL printed into",
+    "  a terminal scrolls away unread, so a visual change nobody previewed reaches the person waiting",
+    "  on you as a wall of text. Opening a preview is part of DELIVERING visual work, not a nicety.",
+    ...(opts.eagerness === "always"
+      ? [
+          "- WHEN: on every task this project can preview at all — open one whatever the change is.",
+          "  (This project is configured `[preview].agent_eagerness = \"always\"`.)",
+        ]
+      : [
+          "- WHEN: whenever your work changes something a person would LOOK at — a page, a screen, a",
+          "  component, a layout, styling, on-screen copy, a chart. Work with nothing to see (a pure",
+          "  refactor, a config edit, a docs change, backend-only plumbing) does not need one.",
+        ]),
+    "- HOW: call the `preview` tool on the `sparkle-control` MCP server with `{ previewOp: \"open\" }`.",
+    "  It detects the project's dev server, starts it against YOUR OWN worktree on a loopback port,",
+    "  and shows the live site in a pane. The key is `previewOp`, not `op`.",
+    "    • `{ previewOp: \"open\" }` — start (or return) your preview.",
+    "    • `{ previewOp: \"open\", path: \"/settings\" }` — same, landing on a particular route.",
+    "    • `{ previewOp: \"list\" }` — what is already running. Opening twice is safe; it returns the",
+    "      preview you already have rather than starting a second server.",
+    "    • `{ previewOp: \"close\" }` — stop it when the work it showed is done.",
+    "- It always targets YOUR OWN worktree. There is no agentId parameter, by design: you cannot open",
+    "  or close another agent's preview, and you do not need to name yourself.",
+    "- OPEN IT EARLY, as soon as there is something renderable — not as a flourish at the end. The",
+    "  whole value is that the person watching can redirect you while it is still cheap.",
+    "- SAY THE URL in your report as well, so it survives outside the pane.",
+    "- If the project has no detectable dev server the call DECLINES and says why. Report that; do",
+    "  not hand-roll a server to work around it.",
+    "- A preview is not a substitute for the project's tests. Run those too.",
+  ].join("\n");
+}
+
+/**
+ * The control-MCP preamble a GENERIC (non-worker, non-orchestrator) agent gets, plus the preview
+ * protocol when the knob asks for it.
+ *
+ * WHY THIS PAIRING IS ONE FUNCTION rather than two strings joined at the call site: the preview
+ * protocol is only ACTIONABLE when the `sparkle-control` MCP is actually wired, because the
+ * `preview` tool lives on that server. The one call site already gates `sparkleControlProtocol()`
+ * on exactly that fact, so binding the two here makes it impossible to ship the instruction into a
+ * session that has no tool to satisfy it.
+ *
+ * A generic agent may call `preview` — as may EVERY agent kind now, workers included:
+ * `CONTROL_OP_TIERS.preview` is `free` (beads `sparkle-q3b4c6` / `sparkle-wnnye0`). This paragraph
+ * used to justify the fragment by saying the tier "refuses `worker` kinds specifically", and that
+ * is no longer true; it is spelled out rather than deleted because it was the load-bearing reason a
+ * reader would re-derive the gate from, and a stale justification is worse than none.
+ *
+ * So what governs the ask is the KNOB, not the tier: `[preview] agent_eagerness`. The reason this
+ * pane still gets the fragment is now the second half of the old sentence, which survives intact —
+ * it is the pane a person is most likely to be typing into while looking at something, which is
+ * exactly when a preview is worth having.
+ */
+export function genericAgentProtocol(opts: { previewEagerness?: PreviewEagerness } = {}): string {
+  const eagerness = opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS;
+  return [
+    sparkleControlProtocol(),
+    ...(eagerness === "never" ? [] : ["", previewProtocol({ eagerness })]),
+  ].join("\n");
+}
+
 /** Shared persona block: the FROZEN retro emit contract every agent ends on. Two synchronized
  *  copies — a human-readable retro in the founder's format, and a single-line
  *  `<!-- sparkle:retro {json} -->` marker embedded in the PR body so the merge-time capture hook
@@ -358,6 +462,12 @@ export function workerPersona(opts: {
   parentBranch: string;
   resultPath: string;
   guardrails?: boolean;
+  /** Mirrors `[preview].agent_eagerness`, exactly as `orchestrationPersona` does. A worker may call
+   *  the `preview` tool (`CONTROL_OP_TIERS.preview` is `free`), and it is usually the agent that
+   *  actually built the visual change — so `"never"` omits the section and an ABSENT value reads as
+   *  the shipped default rather than as off, because an unwired call site must not silently mean
+   *  "stop asking this whole class of agent for previews". */
+  previewEagerness?: PreviewEagerness;
 }): string {
   return [
     "You are a Sparkle WORKER agent — a focused individual contributor.",
@@ -394,6 +504,14 @@ export function workerPersona(opts: {
     "",
     sparkleControlProtocol(),
     ...(opts.guardrails ? ["", guardrailsProtocol()] : []),
+    // The worker is USUALLY the agent doing the visual work, and until `CONTROL_OP_TIERS.preview`
+    // became `free` it was the one kind that could not show it. `?? DEFAULT_PREVIEW_EAGERNESS`, not
+    // `?? "never"`, for the same reason as the orchestrator's call below: an omitted option is a
+    // caller that has not been taught about the knob, and reading that as "say nothing about
+    // previews" would make the default silently the opposite of the shipped one.
+    ...((opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS) === "never"
+      ? []
+      : ["", previewProtocol({ eagerness: opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS })]),
   ].join("\n");
 }
 
@@ -454,6 +572,11 @@ export function orchestrationPersona(opts: {
   maxConcurrentWorkers: number;
   epicId?: string;
   guardrails?: boolean;
+  /** Mirrors `[preview].agent_eagerness`. `"never"` omits the preview protocol entirely; the two
+   *  other modes change what the WHEN clause says. Absent reads as the shipped default rather than
+   *  as off — an absent config must not silently mean "stop asking for previews", which is the
+   *  failure this whole fragment exists to end. */
+  previewEagerness?: PreviewEagerness;
 }): string {
   return [
     "You are a Sparkle BUILD agent — the master ORCHESTRATOR.",
@@ -593,5 +716,11 @@ export function orchestrationPersona(opts: {
     // Bind the orchestrator to a specific beads epic when one was handed off (Send to Build).
     ...(opts.epicId ? ["", beadsProtocol({ epicId: opts.epicId })] : []),
     ...(opts.guardrails ? ["", guardrailsProtocol()] : []),
+    // `?? DEFAULT_PREVIEW_EAGERNESS`, not `?? "never"`: an omitted option is a caller that has not
+    // been taught about the knob yet, and reading that as "say nothing about previews" would make
+    // the default silently the opposite of the shipped one.
+    ...((opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS) === "never"
+      ? []
+      : ["", previewProtocol({ eagerness: opts.previewEagerness ?? DEFAULT_PREVIEW_EAGERNESS })]),
   ].join("\n");
 }

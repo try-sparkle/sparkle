@@ -129,7 +129,30 @@ export type DispatchAuthority =
    * `IDLE_SETTLE_MS`, some source actually witnessed the turn ending, the process is alive, and the
    * retry bounds are unspent. This arm is the receipt for that decision, not a second copy of it.
    */
-  | { kind: "goal-continue"; agentId: string };
+  | { kind: "goal-continue"; agentId: string }
+  /**
+   * The EPIC SWEEP restarted a stalled epic's orchestrator and handed the epic back
+   * (services/epicSweepRunner, deciding through engine/epicContinuation).
+   *
+   * Its OWN arm, for the reason `goal-continue` gives directly above and `mount` gives above that:
+   * this union exists so the audit line names the REAL cause. The sweep could mint a
+   * `goal-continue` — it has an agent id and nothing else is checked — and every gate would pass.
+   * But a "why did it type that?" complaint would then be answered "goal auto-continue resumed a
+   * turn that ended with the goal unmet", naming a goal that may not exist and a turn that never
+   * ended. The write is real and machine-authored, and it happened because an EPIC went stale; the
+   * union should say that.
+   *
+   * Carries the epic id as well as the agent id, because unlike every other arm the target is not
+   * the whole story: the sweep reuses one orchestrator per epic, so the agent id alone does not say
+   * which epic's stall spent the restart. `authorityRef` still returns the agent id — the thing
+   * written to — and the epic rides along for the log line.
+   *
+   * What makes it legal is not recorded here but in the DECISION: `decideEpicSweep` refuses unless
+   * the epic was promoted to Build, its plan was written, no child has moved for `EPIC_STALL_MS`,
+   * the stall is inside the `EPIC_MAX_STALL_AGE_MS` reach, and the one-shot `sweep-restarted`
+   * budget is unspent. This arm is the receipt for that decision, not a second copy of it.
+   */
+  | { kind: "epic-restart"; agentId: string; epicId: string };
 
 export type DispatchAuthorityKind = DispatchAuthority["kind"];
 
@@ -167,6 +190,13 @@ const HUMAN_AUTHORED: Record<DispatchAuthorityKind, boolean> = {
   // prose did not, and it is the prose that constitutes "the human changed the picture".
   "concierge-tool": false,
   "goal-continue": false,
+  // MACHINE-AUTHORED, and here that is load-bearing rather than merely accurate. The epic sweep
+  // REUSES the orchestrator already bound to the epic, and a human-authored send on that reuse path
+  // runs `releaseGoalDebt` — un-latching an escalation nothing spent and zeroing `totalContinues`.
+  // `services/sendToBuild` already passes `humanAuthored: false` for exactly this reason on the
+  // draft it appends; the delivered instruction has to agree, or the two halves of one handoff
+  // would disagree about who wrote it.
+  "epic-restart": false,
 };
 
 export function isHumanAuthored(a: DispatchAuthority): boolean {
@@ -191,6 +221,7 @@ const AUTHORITY_REF_FIELD: Readonly<Record<DispatchAuthorityKind, string>> = Obj
   suggestion: "agentId",
   "concierge-tool": "toolCallId",
   "goal-continue": "agentId",
+  "epic-restart": "agentId",
 });
 
 /**
@@ -235,6 +266,11 @@ const AUTHORITY_EXTRA_CHECK: Readonly<
   // `engine/goalContinuation.decideContinuation` BEFORE this authority is built, and re-stating a
   // slice of that decision here would be a second copy of it that can disagree with the first.
   "goal-continue": () => true,
+  // The agent id is checked generically above; the EPIC id is this arm's own requirement. It is not
+  // decoration — it is the only thing that says which epic's one-shot restart budget was spent, so
+  // an authority carrying a blank one cannot produce the audit line the arm exists for. Refuse it
+  // here rather than logging "restarted agent X for epic ''".
+  "epic-restart": (v) => typeof v.epicId === "string" && v.epicId.trim() !== "",
 });
 
 /**
@@ -329,6 +365,10 @@ export function authorityRef(a: DispatchAuthority): string {
       return a.toolCallId;
     case "goal-continue":
       return a.agentId;
+    case "epic-restart":
+      // The AGENT, not the epic: this is "the id the authority points at", and what is written to
+      // is the orchestrator's terminal. The epic is the reason, and it is in `describeAuthority`.
+      return a.agentId;
     default: {
       const unhandled: never = a;
       void unhandled;
@@ -368,6 +408,10 @@ export function describeAuthority(a: DispatchAuthority): string {
         : "a concierge tool call ran under an allow-tier policy";
     case "goal-continue":
       return "goal auto-continue resumed a turn that ended with the goal unmet";
+    case "epic-restart":
+      // Names the epic, because "the epic sweep restarted something" is not an answer to a
+      // forwarding complaint — WHICH stalled epic bought this write is the whole fact.
+      return `the epic sweep restarted stalled epic ${a.epicId}`;
     default: {
       const unhandled: never = a;
       void unhandled;

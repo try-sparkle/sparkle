@@ -698,3 +698,56 @@ describe("sparklePersona — blocked verdicts that the present user can clear", 
     expect(p).not.toContain("the user IS here");
   });
 });
+
+// ── The concierge channel, bead sparkle-hdlhox ───────────────────────────────────────────────────
+//
+// WHY THESE ASSERT ON THE PERSONA AND NOT ON A TOOL. The channel itself already shipped (bead
+// sparkle-179b2s): `send_peer_message` resolves `sparkle:concierge` app-globally and the concierge
+// drains its inbox at turn assembly. This agent still reported itself unable to reach the concierge
+// — correctly, from where it stood, because nothing had ever TOLD it. Wiring the MCP without this
+// section ships a tool nobody reaches for, so the prose is load-bearing, not documentation.
+describe("sparklePersona — the concierge channel", () => {
+  const modes = ["always", "case_by_case", "never"] as const;
+
+  it.each(modes)("%s: names the address book AND the send", (consent) => {
+    // Both halves or neither is useful: an agent told it can message but not how to discover the id
+    // guesses, and a guessed id is refused identically to a nonexistent one.
+    const p = sparklePersona(LOG_DIR, REPO, consent, "unknown", { attended: true });
+    expect(p).toContain('get_state({ scope: "fleet" })');
+    expect(p).toContain("send_peer_message");
+    expect(p).toContain("sparkle:concierge");
+  });
+
+  it("survives the chat-only mode — the channel is not a log-consent question", () => {
+    // "never" strips every log-mining instruction. The channel has nothing to do with logs, and an
+    // agent that loses its only route to the fleet because the user declined log review would be
+    // blind for a reason unrelated to what they actually declined.
+    const p = sparklePersona(LOG_DIR, REPO, "never", "unknown", { attended: true });
+    expect(p).toContain("sparkle:concierge");
+    expect(p).not.toContain(LOG_DIR);
+  });
+
+  it("disowns the HARNESS tools by name — this is what produced the false blindness report", () => {
+    // The measured failure: this agent ran the harness's ListAgents, saw a roster that structurally
+    // cannot contain the concierge, and concluded it had no channel. Naming both tools explicitly
+    // is the only thing that stops the next agent re-deriving the same wrong conclusion from the
+    // same correct observation.
+    const p = sparklePersona(LOG_DIR, REPO, "always", "unknown", { attended: false });
+    expect(p).toContain("ListAgents");
+    expect(p).toContain("SendMessage");
+  });
+
+  it("states that its cross-agent claims are INFERENCES the concierge may overrule", () => {
+    // The safety half. This agent's 'stand down / hold' directives were inferred from
+    // notifications, not observed; the concierge reads live rows. Without this the directive
+    // travels as an order and the channel makes a blind instruction FASTER rather than safer.
+    const p = sparklePersona(LOG_DIR, REPO, "always", "unknown", { attended: false });
+    expect(p).toContain("inference");
+    expect(p).toContain("expect to be corrected");
+  });
+
+  it("forbids using the channel to launder a refused permission", () => {
+    const p = sparklePersona(LOG_DIR, REPO, "always", "unknown", { attended: false });
+    expect(p).toContain("your own permissions refused");
+  });
+});

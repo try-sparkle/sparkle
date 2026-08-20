@@ -83,7 +83,7 @@ export type AgentRowProps = {
   dragSection: BuildSectionId | null;
   dragActive: boolean;
   /** Which side of this row its own terminal is on — this sidebar's pair side. The cockpit is
-   *  `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`, so it decides which end bleeds and which end takes
+   *  `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`, so it decides which end bleeds and which end takes
    *  the leading radius. See engine/rowGeometry. */
   paneSide: PairSide;
   /** Does this pair hold the live cable? Opens the row's CONCIERGE end too, so a wired row reads as

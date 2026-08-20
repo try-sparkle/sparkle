@@ -26,6 +26,7 @@ import { WAVE_HEIGHT } from "../waveGeometry";
 import { SparkleLogoLink } from "../SparkleLogoLink";
 import { ComposeBox } from "./ComposeBox";
 import { PinnedBlockers } from "./PinnedBlockers";
+import { PreviewCards } from "./PreviewCards";
 import { ConciergeAiLocked } from "./ConciergeAiLocked";
 import { ConciergeUnavailable } from "./ConciergeUnavailable";
 import { useConciergeAiLock } from "./conciergeAiLock";
@@ -35,6 +36,7 @@ import { MountedNotice } from "./MountedNotice";
 import { MountedAgentNotices } from "./MountedAgentNotices";
 import { ConciergeTopRight } from "./KebabMenu";
 import { WindowSpanButton } from "./WindowSpanButton";
+import { PipelineHealthChip } from "./PipelineHealthChip";
 import { AgentPillProvider, type AgentPillContextValue } from "./AgentPill";
 import { BeadPillHost } from "./BeadPill";
 import { KeyPill } from "./KeyPill";
@@ -199,6 +201,7 @@ export function ConciergeColumn({
   pttHeld,
   onComposedText,
   onMentionComposing,
+  onPasted,
   registerSubmit,
   onOpenAgent,
   onSeeAgentHistory,
@@ -585,6 +588,14 @@ export function ConciergeColumn({
             list, merge from it, and jump to the owning agent — so the integration layer hands the
             real menu in through here instead, and this directory stays presentational. */}
         {prSlot}
+        {/* THE DEPLOYMENT-PIPELINE HEALTH ICON, beside the merge chiclet (bead sparkle-m6jov5).
+            Green check = all pipeline infra healthy; amber triangle = a non-blocking issue (roborev
+            wedged, runners saturated, or a probe we could not read); red exclamation = a deployment
+            IS blocked (no CI runner can test, or the release runner is offline). Click for the
+            per-component breakdown. Self-contained and store-driven like WindowSpanButton next door.
+            Exists because a silent roborev wedge once stopped code review for ~1h36m with no surface
+            to the founder — this makes such an outage visible. */}
+        <PipelineHealthChip />
         {/* THE SPAN-ALL-DISPLAYS SHORTCUT, and its position here is the founder's literal ask:
             "Give me a little icon next to the three dot menu… Between the PR button and the three
             dot menu" (bead sparkle-6b96h). It is a shortcut to Settings → Appearance → Window's
@@ -874,6 +885,22 @@ export function ConciergeColumn({
             onNudgeClick={controller.onNudgeClick}
             onNudgeAction={controller.onNudgeAction}
           />
+          {/* LIVE PREVIEWS, AS CARDS (bead sparkle-3475b.8). *"[dot color] [build agent name] has a
+              preview for you to review: [preview card]"* — the founder's shape.
+
+              INSIDE THIS PROVIDER, and that is why it is here rather than in a region of its own:
+              the card names its agent with an `AgentPill`, which resolves the live name, the status
+              dot and the click-through from this context. Outside it the pill would render the
+              "…is closed" dead-end variant, naming an agent the reader cannot open — the exact
+              failure `AgentPill.deadEnd.test.tsx` forbids, and it would look like a working pill.
+
+              BELOW the blockers on purpose. A blocker is something that needs the reader NOW; a
+              preview is an invitation. The more urgent thing keeps the position nearest the eye.
+
+              NO PROPS: it reads `previewStore`/`projectStore` itself, so `ConciergeColumn` stays a
+              pure renderer (the same split `MountedAgentNotices` below uses). It renders nothing at
+              all when no preview is live, which is the ordinary state. */}
+          <PreviewCards />
         </AgentPillProvider>
       )}
       {/* THE ONE EXPLANATION THAT SURVIVES THE MOUNT SWAP. Mounted, the thread above is the AGENT's
@@ -1118,6 +1145,7 @@ export function ConciergeColumn({
           pttHeld={pttHeld}
           onComposedText={onComposedText}
           onMentionComposing={onMentionComposing}
+          onPasted={onPasted}
           registerSubmit={registerSubmit}
         />
       )}

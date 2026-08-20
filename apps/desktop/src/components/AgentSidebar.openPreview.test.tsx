@@ -134,14 +134,17 @@ describe("AgentSidebar — Preview", () => {
 
   // ── WHAT USING IT DOES ───────────────────────────────────────────────────────────────────────
 
-  it("puts this column into Preview and asks for THAT agent's worktree", () => {
+  it("starts a server for THAT agent's worktree, and does NOT touch the column's mode", () => {
     render(<AgentSidebar project={mkProject([mkAgent({ id: "a7" })])} />);
     openCard("Parser Agent");
     fireEvent.click(item()!);
 
-    // Both halves of the side effect. The mode alone would show an empty pane forever; the invoke
-    // alone would start a server nobody can see.
-    expect(useUiStore.getState().workModeBySide.right).toBe("preview");
+    // ONE SIDE EFFECT NOW, not two. This used to also flip the column into Preview mode, because a
+    // pane was the surface; the surface is a concierge card (founder, 2026-08-19), which appears on
+    // its own from the preview lifecycle. So the mode must be LEFT ALONE — flipping it would now
+    // move the column to a mode that no longer exists, and even in Build it would be an unasked
+    // navigation for a button whose whole job is "start the server".
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
     expect(openPreviewServer).toHaveBeenCalledTimes(1);
     expect(openPreviewServer.mock.calls[0]?.[0]).toMatchObject({
       agentId: "a7",

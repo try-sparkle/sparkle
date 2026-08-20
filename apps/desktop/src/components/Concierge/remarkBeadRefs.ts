@@ -27,7 +27,9 @@
 // same `inLink` flag as a hand-written one. The reverse order would linkify inside a URL that had
 // not become a link yet.
 
-import { findBeadIds } from "./beadRefs";
+import { fromMarkdown } from "mdast-util-from-markdown";
+
+import { findBeadIds, type BeadIdSpan } from "./beadRefs";
 import { beadRefHref } from "./beadRefs";
 
 /** The subset of mdast this plugin touches. Structural, matching `beadRefs.ts`'s choice not to take
@@ -52,11 +54,54 @@ interface Node {
  */
 export function remarkBeadRefs() {
   return (tree: Node): void => {
-    walk(tree, false);
+    walk(tree, false, (value) => split(value));
   };
 }
 
-function walk(node: Node, inLink: boolean): void {
+/**
+ * Every bead-id candidate this plugin WOULD linkify in `text`, in document order.
+ *
+ * ══ WHY THIS LIVES HERE RATHER THAN BESIDE ITS CALLER ═══════════════════════════════════════════
+ * Its caller — `autoExpandedBeadIds` in `BeadPill.tsx`, which decides how many cards a reply opens
+ * — needs to know which ids will actually become PILLS, and that is this module's rule, not its
+ * own. It first asked `findBeadIds(text)` directly, over the raw markdown SOURCE, and the two
+ * answers are not the same set: `findBeadIds` knows nothing about fences, code spans or links,
+ * because the plugin's job has always been to keep it away from those nodes. So an id inside
+ * `bd show sparkle-x` was counted, drew no pill, and silently consumed one of the founder's cap
+ * slots (roborev 65335) — worst at a small cap, where a reply that opens with a quoted command
+ * could expand NOTHING while the config plainly said the feature was on.
+ *
+ * It shares ONE traversal with the linkifier above rather than restating the rule, which is the
+ * whole point: a `walk` that skipped a new node type here and not there would put the drift back.
+ *
+ * ══ WHAT IT DOES NOT CLOSE ══════════════════════════════════════════════════════════════════════
+ * `fromMarkdown` here is plain CommonMark, while the renderer runs `remarkGfm` first (see the
+ * ordering note above). The one difference that reaches this rule is GFM's AUTOLINK LITERAL: a bare
+ * `https://…/sparkle-x` is a `link` in the renderer's tree and protected by `inLink`, but stays
+ * ordinary text here — so such an id can still consume a slot without drawing a pill. Deliberately
+ * not chased: closing it means adding `micromark-extension-gfm` + `mdast-util-gfm` as direct
+ * dependencies (today they are only transitive through `remark-gfm`), and the residual is one rare
+ * shape against the three common ones — inline code, fences, and written links — that this closes.
+ * `stripBeadRefs` parses the same way for the same reason.
+ */
+export function linkifiableBeadIds(text: string): BeadIdSpan[] {
+  const out: BeadIdSpan[] = [];
+  walk(fromMarkdown(text) as Node, false, (value) => {
+    out.push(...findBeadIds(value));
+    return null; // collect only — nothing is rewritten
+  });
+  return out;
+}
+
+/**
+ * THE ONE TRAVERSAL, shared by the linkifier and by `linkifiableBeadIds` above.
+ *
+ * `onText` is called for every text node the linkifier would split, in document order. Returning
+ * nodes replaces that node (what the plugin does); returning `null` leaves it alone (what the
+ * collector does). Two callers, one statement of "which nodes are eligible" — see the note on
+ * `linkifiableBeadIds` for the drift this shape exists to prevent.
+ */
+function walk(node: Node, inLink: boolean, onText: (value: string) => Node[] | null): void {
   const children = node.children;
   if (children === undefined) return;
   // A link's SUBTREE is off limits, not merely its immediate children: `[**sparkle-17hm1**](…)`
@@ -67,11 +112,11 @@ function walk(node: Node, inLink: boolean): void {
   let changed = false;
   for (const child of children) {
     if (child.type !== "text" || nested || typeof child.value !== "string") {
-      walk(child, nested);
+      walk(child, nested, onText);
       out.push(child);
       continue;
     }
-    const replacement = split(child.value);
+    const replacement = onText(child.value);
     if (replacement === null) {
       out.push(child);
       continue;

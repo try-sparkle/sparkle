@@ -26,6 +26,10 @@ import {
   type ConflictingPr,
   type FleetSnapshot,
 } from "./pusherFleet";
+// The pool cap, from the module that mirrors `research.rs` and is drift-tested against it —
+// never restated as a literal here, which is exactly how the old comment on the cap-interaction
+// case below came to assert a value that had been wrong for six days.
+import { MAX_CONCURRENT_RESEARCH } from "./researchPool";
 import { checkCitations } from "./pusherGate";
 // The growth rule lives in the report engine, so the one `died-holding-work` case that is about the
 // cooldown is asserted through the real `decideFleetReport` rather than by reading `members`.
@@ -861,11 +865,22 @@ describe("queue-unfanned", () => {
   });
 
   // THE CAP INTERACTION, pinned because getting it wrong makes the condition UNSATISFIABLE rather
-  // than merely wrong. `MAX_CONCURRENT_RESEARCH` is 2, so if `liveAgents` counted only RUNNING
-  // children it could never reach a depth of 6 and this would report an abandoned queue forever.
-  // It counts queued+running (services/research `isLive`), so a full fan-out clears it.
+  // than merely wrong. If `liveAgents` counted only RUNNING children it could never exceed
+  // `MAX_CONCURRENT_RESEARCH` and a deeper queue would report as abandoned forever. It counts
+  // queued+running (services/research `isLive`), so a full fan-out clears it at ANY depth.
+  //
+  // ASSERTED PAST THE ACTUAL CAP, not at a hand-picked 6. The old version of this test asserted a
+  // depth of 6 while its own comment claimed the cap was 2 — a claim that stayed in the file for
+  // six days after the cap became 16 (`bf597a494`, 2026-08-13), because nothing read the number.
+  // Deriving the depth from the imported constant means the case stays past-the-cap whatever the
+  // cap becomes, and the comment cannot go stale independently of it.
   it("clears when every waiting message has been dispatched, even past the concurrency cap", () => {
     expect(fire({ queued: 6, liveAgents: 6 })).toEqual([]);
+    const past = MAX_CONCURRENT_RESEARCH + 4;
+    expect(fire({ queued: past, liveAgents: past })).toEqual([]);
+    // …and the same depth with the cap's worth of agents is still a backlog, so the assertion above
+    // is not passing for the trivial reason that everything clears.
+    expect(fire({ queued: past, liveAgents: MAX_CONCURRENT_RESEARCH })).toHaveLength(1);
   });
 
   // A queue that formed seconds ago is the ordinary shape of a fan-out about to happen. Reporting it

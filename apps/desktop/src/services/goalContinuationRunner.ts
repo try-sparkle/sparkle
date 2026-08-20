@@ -29,6 +29,8 @@
 // absent evidence here resolves to "don't send".
 import {
   type CloudEvidence,
+  type ExternalWait,
+  burstsOf,
   decideContinuation,
   progressMark,
 } from "../engine/goalContinuation";
@@ -39,6 +41,7 @@ import {
   type NoExpiryReason,
 } from "../engine/goalExpiry";
 import { expiryProofFor } from "./agentGoalReading";
+import type { WorkflowState } from "./branchStatus";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
@@ -395,6 +398,135 @@ export function _resetGoalContinuationRunnerForTests(): void {
   inFlight.clear();
   undelivered.clear();
   suppressedUntil.clear();
+  toolActivity.clear();
+}
+
+/**
+ * agentId → the last windowed tool count we saw, and how many times it has been seen to GO UP.
+ *
+ * ⚠️ THE RAW COUNT IS NOT A PROGRESS SIGNAL, AND USING IT AS ONE WAS A DEFECT (roborev 65440,
+ * Medium). `HookFacts.toolsRecent` is a count over a SLIDING 15-minute window, so it moves for two
+ * reasons and only one of them is work:
+ *
+ *   • it goes UP when the agent runs tools — real evidence;
+ *   • it goes DOWN, all by itself, as old events age out of the window.
+ *
+ * Fed straight into `progressMark`, the second one reads exactly like the first: an agent that
+ * genuinely stopped decays 41 → 30 → … → 0 over a quarter of an hour, and EVERY decrement moves the
+ * mark, resets the consecutive streak, and pushes the escalation further away. The same is true of a
+ * failed digest poll, which republishes `{}` and drops the reading to null.
+ *
+ * So the count is folded into a MONOTONE counter instead: `bursts` advances only when the reading is
+ * strictly greater than the previous one. Decay leaves it flat, a poll gap leaves it flat, and only
+ * new tool activity moves it — which is the property the mark's string comparison needs and the raw
+ * sample cannot provide. This is `engine/movementRetraction.noteMovement`'s high-water-mark trick
+ * applied to the other consumer of the same stream, and for the same underlying reason (that
+ * module's header note 3).
+ *
+ * WHAT THIS DELIBERATELY DOES NOT FIX, stated because the review raised it and the answer is a
+ * judgement rather than an oversight: tools the agent runs INSIDE the resumed turn still count, so
+ * an agent that answers every resume with a couple of `Read`s keeps its streak alive and is only
+ * caught by {@link MAX_CONTINUES_TOTAL}. That is weaker than the 3-strike bound but it is NOT the
+ * `turnsRecent` failure the doc rejects: a turn counter moves on every attempt with certainty,
+ * including for an agent that answers with pure prose and stops — which is precisely the observed
+ * pathology (`continuePrompt`'s note: "three identical banners, three status reports, no progress").
+ * Prose runs no tools, so the streak bound is still reachable for the case it was written for. The
+ * residual costs a LATER page; reading decay as progress cost false ones, and this is the founder's
+ * stated ordering.
+ */
+const toolActivity = new Map<string, { lastSeen: number; bursts: number }>();
+
+/**
+ * Fold ONE tick's windowed tool count into {@link toolActivity} and return the burst counter.
+ *
+ * ⚠️ THIS ADVANCES STATE, so it must be called exactly ONCE per agent per sweep, and never from a
+ * read-only surface — see {@link continuationEvidenceFor}, which only reads. A second caller folding
+ * the same tick would double-count nothing (the counter moves on a strict increase, and the second
+ * fold sees an unchanged `lastSeen`), but it WOULD move `lastSeen` forward for a reader that has no
+ * business advancing anyone's clock.
+ *
+ * `null` — no digest for this agent — is SILENCE, not a reading: the counter is returned unchanged
+ * and `lastSeen` is left alone, so a poll gap cannot manufacture movement when the digest returns.
+ */
+export function noteToolActivity(
+  agentId: string,
+  toolsRecent: number | null,
+  /**
+   * The burst count this agent's PERSISTED mark already carries — see {@link burstsOf}.
+   *
+   * ⚠️ WITHOUT IT, EVERY APP RESTART HANDS EVERY AGENT ONE FREE "PROGRESSED" (roborev 65483). This
+   * ledger is module-local webview state; the mark it feeds is persisted on the goal
+   * (`projectStore`, beside `continues`). After a reload the ledger is empty, so a cold baseline of
+   * 0 is compared against a stored mark reading `…␀4␀…` — the two differ, `decideContinuation` calls
+   * that progress, and `noteAgentGoalContinue` rewrites `continues` to 1. A wedged agent on a
+   * machine that restarts more often than it accumulates three settled strikes could then never
+   * reach the 3-strike escalation at all. Seeding from the stored value closes it, and closes the
+   * same gap between two WINDOWS: a satellite window's sweep and the main window's prediction both
+   * start from the one number that is actually shared.
+   */
+  seedBursts: number | null = null,
+): number {
+  const prev = toolActivity.get(agentId);
+  if (toolsRecent === null) return prev?.bursts ?? seedBursts ?? 0;
+  if (prev === undefined) {
+    // FIRST SIGHTING IS A BASELINE, NOT A BURST. Counting it would make every agent's first sweep
+    // after a window start read as progress — including the ones that have been idle for hours.
+    // The LEVEL starts here; the COUNT resumes from whatever the persisted mark already claimed.
+    const bursts = seedBursts ?? 0;
+    toolActivity.set(agentId, { lastSeen: toolsRecent, bursts });
+    return bursts;
+  }
+  const bursts = toolsRecent > prev.lastSeen ? prev.bursts + 1 : prev.bursts;
+  toolActivity.set(agentId, { lastSeen: toolsRecent, bursts });
+  return bursts;
+}
+
+/** What {@link continuationEvidenceFor} hands to `decideContinuation` — the two fields BOTH callers
+ *  must agree on. */
+export interface ContinuationEvidence {
+  mark: string;
+  externalWait: ExternalWait | undefined;
+}
+
+/**
+ * The progress mark and the external gate for one agent — THE ONE PLACE either is built.
+ *
+ * ⚠️ `decideContinuation` HAS TWO PRODUCTION CALLERS AND THEY MUST NOT DRIFT (roborev 65440, High).
+ * The sweep decides; `controlListener.resumeReading` PREDICTS what the sweep will decide, and that
+ * prediction is its entire value — its own docstring says so ("A second answer would drift from the
+ * one that actually decides"). When the artifact signals were added to the sweep only, the two marks
+ * stopped matching for any agent with evidence: the sweep would record
+ * `0␀␀␀2␀3␀open#2117` while the prediction recomputed `0␀␀␀␀␀`, so `live.mark !== mark` read as
+ * PROGRESS, the streak arm could never fire in the prediction, and `set_agent_escalation` answered
+ * `willResume: true` for an agent the very next sweep would escalate — the empty success that
+ * function exists to prevent. The gate drifted the other way: a gated agent the sweep will CONTINUE
+ * was reported `willResume: false, blockedBy: "would-re-escalate"`.
+ *
+ * READ-ONLY. It never advances {@link toolActivity} — the sweep folds the tick itself, once, before
+ * calling this. A prediction between sweeps therefore reads the evidence as of the last sweep, which
+ * is exactly what "what will the next sweep do" means.
+ *
+ * Every input is already-polled window-local state: no git call, no network. See the note at the
+ * sweep's call site for why that is a requirement rather than an optimisation.
+ */
+export function continuationEvidenceFor(agent: AgentTab): ContinuationEvidence {
+  const rt = useRuntimeStore.getState();
+  const ws = rt.workflowState?.[agent.id];
+  return {
+    mark: progressMark({
+      promptHistoryLength: agent.promptHistory.length,
+      activity: agent.activity,
+      aiTitle: agent.aiTitle,
+      // The MONOTONE counter, never the raw window sample — see `toolActivity`. Falls back to the
+      // count the agent's own PERSISTED mark carries, so a window whose ledger is cold (a fresh
+      // launch, or a prediction taken before this window has ever swept the agent) reproduces the
+      // recorded token instead of manufacturing a difference from its own ignorance.
+      toolBursts: toolActivity.get(agent.id)?.bursts ?? burstsOf(agent.goal?.mark),
+      commitsAhead: rt.branchStatus?.[agent.id]?.ahead ?? null,
+      prMark: prMarkOf(ws),
+    }),
+    externalWait: externalWaitOf(ws),
+  };
 }
 
 /**
@@ -465,6 +597,44 @@ export const MAX_UNDELIVERED_CONTINUES = 3;
  * under the wrong remedy without a compiler complaint.
  */
 type UndeliveredPath = ConciergeDispatchPath | "threw";
+
+/**
+ * The agent branch's pull request as ONE opaque token for {@link progressMark}, or `null` when this
+ * window has no reading.
+ *
+ * `state#number` rather than either alone: the state moving (`open` → `merged`) and the number
+ * appearing (no PR → `open#2117`) are both the agent having done something, and joining them means
+ * one field in the mark covers both without the engine learning GitHub's vocabulary.
+ *
+ * A `prState` of `null` yields `null`, deliberately, and it is NOT the same as "no PR". Rust sends
+ * `null` both for "probed, found nothing" and for a poll that never probed (`probePrState` is
+ * gated), so the two are indistinguishable here — the ambiguity `WorkflowState.hasRemote`
+ * documents for its own `false`. `progressMark` renders `null` as an empty token, which is right:
+ * we are saying we do not know, not that there is no PR.
+ *
+ * Exported as a test seam, like {@link undeliveredStreakFor} below: it is the one place the
+ * store's PR reading is turned into evidence, and the ambiguity note above is a rule no assertion
+ * on the sweep's output could pin.
+ */
+export function prMarkOf(ws: WorkflowState | undefined): string | null {
+  if (ws === undefined || ws.prState === null) return null;
+  return `${ws.prState}#${ws.prNumber ?? ""}`;
+}
+
+/**
+ * Is this agent's work parked behind an external gate — see `engine/goalContinuation.ExternalWait`.
+ *
+ * ONLY `prState === "open"` QUALIFIES, and only the positive reading is used. `merged`/`closed` mean
+ * the gate has already answered, so there is nothing to wait for and an idle agent there really may
+ * be stuck. `null` is the ambiguous reading above and must not be turned into a negative finding
+ * either way: it simply produces no gate, which escalates exactly as before.
+ *
+ * Exported as a test seam for the same reason as {@link prMarkOf}.
+ */
+export function externalWaitOf(ws: WorkflowState | undefined): ExternalWait | undefined {
+  if (ws?.prState !== "open") return undefined;
+  return { kind: "open-pr", prNumber: ws.prNumber };
+}
 
 /** Test/introspection seam: how many auto-continues in a row have failed to reach `agentId`? */
 export function undeliveredStreakFor(agentId: string): number {
@@ -671,6 +841,13 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
   for (const key of loggedExpiryRefusal) {
     if (!composite.has(key.slice(0, key.lastIndexOf(":")))) loggedExpiryRefusal.delete(key);
   }
+  // …and the tool-burst ledger, where the SAME argument bites HARDER than for either sibling
+  // (roborev 65483). What it holds is a LEVEL, not a counter: a row torn down and recreated under
+  // the same id would inherit its predecessor's `lastSeen` — say 41 — so the new agent's own
+  // genuine tool activity (5, 9, 14 …) never exceeds it, `bursts` stays flat, the mark never moves,
+  // and three sweeps later a WORKING agent is escalated with "no sign of progress". That is
+  // verbatim the false page this whole feature exists to end, reintroduced by a stale map entry.
+  for (const id of toolActivity.keys()) if (!composite.has(id)) toolActivity.delete(id);
 
   const outcomes: SweepOutcome[] = [];
   const pending: Promise<void>[] = [];
@@ -707,11 +884,20 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
       // The mark is computed ONCE, here, and the same value is both decided on and recorded. Two
       // reads would let the store move in between and record a mark that was never compared
       // against — silently resetting the consecutive-retry streak the escalation bound reads.
-      const mark = progressMark({
-        promptHistoryLength: agent.promptHistory.length,
-        activity: agent.activity,
-        aiTitle: agent.aiTitle,
-      });
+      // ── THE ARTIFACT HALF OF THE MARK, AND THE GATE ──────────────────────────────────────────
+      // FOLD FIRST, THEN READ. `noteToolActivity` is the only writer of the burst ledger and this
+      // is its only call site: the sweep advances the counter once per agent per tick, and
+      // `continuationEvidenceFor` — which `controlListener.resumeReading` also calls — only reads.
+      // See the ledger's own note for why the RAW windowed count could not be used directly.
+      noteToolActivity(
+        agent.id,
+        rt.agentMovement?.[agent.id]?.toolsRecent ?? null,
+        burstsOf(agent.goal?.mark),
+      );
+      // ONE builder, shared with the prediction surface, so the two cannot drift. Computed ONCE
+      // here and passed below rather than re-derived: two reads of the same store can disagree,
+      // and the mark that is DECIDED on must be the mark that is RECORDED.
+      const { mark, externalWait } = continuationEvidenceFor(agent);
 
       // STATED, not inferred — see ContinuationInput.runtime. `AgentTab.runtime` is the store's own
       // record of where the agent runs, and the same field `getTransport` selects a transport by.
@@ -784,6 +970,11 @@ export async function sweepGoalContinuations(opts: SweepOptions = {}): Promise<S
         // local sweep reads no auth store and no relay socket.
         cloud: runtime === "cloud" ? cloudEvidenceFor(agent.id, now) : undefined,
         mark,
+        // WHAT THE WORK IS PARKED BEHIND, so the streak bound does not diagnose a CI queue as a
+        // stuck agent. See engine/goalContinuation.ExternalWait — absent means no gate was found,
+        // which escalates exactly as before, so a window that has not polled this agent keeps
+        // today's behaviour rather than silently going quiet.
+        ...(externalWait === undefined ? {} : { externalWait }),
         // The wall the agent itself reported. Without this line the whole backoff is dead code: the
         // gate lives in the pure decision, and the pure decision only knows what this sweep hands it.
         quotaBlock: quotaBlockForAgent(agent.id, now),

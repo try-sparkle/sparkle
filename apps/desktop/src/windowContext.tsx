@@ -8,7 +8,6 @@ import { useEffect, useMemo, useSyncExternalStore, type ReactNode } from "react"
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useUiStore } from "./stores/uiStore";
-import { useDictationStore } from "./stores/dictationStore";
 import { bootSelection } from "./engine/openProjects";
 import { markProjectOpen } from "./services/projectTabs";
 import { selectProjectOnItsSide } from "./services/openProjectTab";
@@ -56,7 +55,8 @@ function openDeepLinkAgent(projectId: string, agentId: string | null): void {
 /**
  * Boot-time effects for the single window (mounted once from App, wraps nothing):
  *  - cold-start hygiene: the window registry / cross-webview status maps persist in localStorage
- *    and outlive the process, so stale entries are wiped; a persisted "active" mic phase resets;
+ *    and outlive the process, so stale entries are wiped. The mic's persisted `phase` is NOT among
+ *    them — it is restored untouched, on the same terms as `enabled`; see the note in the effect;
  *  - boot selection: adopt a `?project=` deep link, else keep a valid persisted selection, else
  *    the first project — tolerating a store that hydrates a tick after mount;
  *  - the `?agent=` deep link landing.
@@ -110,12 +110,30 @@ export function AppBoot({ children }: { children: ReactNode }) {
     } catch {
       // best-effort
     }
-    // The mic's active/paused `phase` is persisted, so it survives a relaunch. Reset a stale
-    // "active" back to "passive" on a cold start. Must run AFTER the store hydrates, or the
-    // persisted value would overwrite the reset.
-    const resetMicPhase = () => useDictationStore.getState().setPhase("passive");
-    if (useDictationStore.persist.hasHydrated()) return void resetMicPhase();
-    return useDictationStore.persist.onFinishHydration(resetMicPhase);
+    // THE MIC'S `phase` IS DELIBERATELY LEFT ALONE HERE. Boot used to force a persisted "active"
+    // back to "passive" on the theory that relaunching should never resume mid-dictation. That
+    // reset restored only HALF of a two-field setting: `dictationStore` persists `enabled` (on/off)
+    // and `phase` (paused vs. listening) together, and stripping just the second brought the mic
+    // back ARMED AND CAPTURING with routing silently off — every hold recording audio and
+    // transcribing nothing, with nothing on screen saying why.
+    //
+    // It cost the founder a live session (bead sparkle-ysv1gj): 49 mic toggles across ten minutes,
+    // 0 cloud streams opened, 1 transcript — against 3 toggles / 24 opens on the previous launch,
+    // with every file in the mic path byte-identical between the two builds. The reset was the
+    // entire difference.
+    //
+    // What made it a trap rather than an annoyance WAS that the obvious gesture could not undo it:
+    // `useMicToggle` (the mic button) cycled off → paused → off and never reached "active" — the
+    // app's only `setPhase("active")` call site was the hover pill's Listening option, so a user who
+    // did not know about the pill had no way back. That half is now fixed too (bead sparkle-yvvu27):
+    // a plain mic click arms AND routes (off → active), so the button itself reaches the routing
+    // state and this phase-restore is no longer the only path back to a working mic
+    // (components/MicButton.tsx).
+    //
+    // "Never resume mid-dictation" is still honoured, by the half that actually decides it: capture
+    // is driven by `enabled` and the arm gestures, and a relaunched window with no hold in flight
+    // routes nothing until the user speaks. Restoring `phase` restores the user's stated intent,
+    // which is the same contract `enabled` has always had. Pinned by windowContext.test.tsx.
   }, []);
 
   // Boot selection. Resolve ONCE against the hydrated store, then stop — so this can never fight

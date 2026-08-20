@@ -17,7 +17,7 @@ import { C, FONT_WEIGHT, ON_BRAND_FILL, ON_GOLD_FILL } from "../theme/colors";
 import type { AgentTab, Project } from "../types";
 import { useProjectStore } from "../stores/projectStore";
 import { ConciergeHost } from "./ConciergeHost";
-import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
+import { ColumnPullTab, publishColumnWidthVar, HEADER_H } from "./ColumnPullTab";
 import { CommandPalette, PaletteTrigger, useCommandPalette } from "./Concierge";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
@@ -33,8 +33,7 @@ import { PLAN_COLUMN_Z } from "./layers";
 import { PlanBuildToggle } from "./PlanBuildToggle";
 // IN ITS OWN FILE, unlike `PlanBoardSlot` directly below — this file is already 2300+ lines, and
 // the preview slot brings an iframe whose attributes carry a security argument that deserves to be
-// read on its own. The two are otherwise the same component shape; see PreviewSlot's header.
-import { PreviewSlot } from "./PreviewSlot";
+// read on its own.
 import { BoardFilterBar } from "./BoardFilterBar";
 import { ProjectTabsBar } from "./ProjectTabsBar";
 import { OfflineBanner } from "./OfflineBanner";
@@ -59,11 +58,13 @@ import { isCalmBand, useConciergeFeed } from "../useConciergeFeed";
 import { useCableStore } from "../stores/cableStore";
 import { useEffectiveWired } from "../hooks/useEffectiveWired";
 import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
+import { EpicsColumn } from "./EpicsColumn";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { focusedZoomColumn, installColumnFocusTracker } from "../services/columnFocusTracker";
 import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
+  BUILD_COLUMN_PAINTED_WIDTH,
   CONCIERGE_MAX_WIDTH,
   CONCIERGE_MIN_WIDTH,
   // CONCIERGE_PAIRED_HARD_MAX is no longer read here — `acceptsStoredConciergeWidth` owns the
@@ -98,7 +99,6 @@ import {
   type PairAssignment,
 } from "../engine/pairs";
 import { planBoardUp } from "../engine/planBoard";
-import { previewSlotUp } from "../engine/previewSlot";
 import { decidePromptTarget, resolvePinnedProjectId } from "../engine/shellResolve";
 import {
   markProjectVisited,
@@ -140,6 +140,9 @@ import { FONT_MONO, FONT_UI } from "../theme/scale";
 const AgentPane = lazy(() => import("./AgentPane").then((m) => ({ default: m.AgentPane })));
 const SparkleAgentPane = lazy(() =>
   import("./SparkleAgentPane").then((m) => ({ default: m.SparkleAgentPane })),
+);
+const ConciergeResearchPane = lazy(() =>
+  import("./ConciergeResearchPane").then((m) => ({ default: m.ConciergeResearchPane })),
 );
 const BoardView = lazy(() => import("./BoardView").then((m) => ({ default: m.BoardView })));
 const ProjectModal = lazy(() => import("./ProjectModal").then((m) => ({ default: m.ProjectModal })));
@@ -372,6 +375,57 @@ const MemoAgentPaneList = memo(AgentPaneList);
  * thing. The only seam is at the concierge boundary, which is why `.build` carries a border on
  * exactly one side (its inboard one) and the terminal carries none. See `index.css`.
  */
+/** The custom property each pair publishes its tab-strip height into. */
+export const pairTabsHeightVar = (side: PairSide) => `--pairtabs-h-${side}`;
+
+/** Where a pull tab in the ROW must start to line up with one inside a pair's columns.
+ *
+ *  A `calc()` rather than a number, because the strip is content-sized and the answer is only known
+ *  at layout time. The fallback is `0px`, which is exactly right before the observer has run and on
+ *  a pair with no strip: the grip simply sits where it always did. */
+export const rowGripTop = (side: PairSide) =>
+  `calc(var(${pairTabsHeightVar(side)}, 0px) + ${HEADER_H}px)`;
+
+/**
+ * Publish a pair's tab-strip height as a custom property on the root.
+ *
+ * WHY A MEASUREMENT AND NOT A CONSTANT. `.pairtabs` is `flex: 0 0 auto` and sized by its content —
+ * uniform-height tabs, but the strip's own padding and any wrap make the total a layout outcome, not
+ * a number anyone wrote down. Pinning a constant here would put the grips back out of line the first
+ * time the strip changed, silently, which is the failure this is fixing.
+ *
+ * PER SIDE, because the two pairs are independent and a shared property would be last-writer-wins
+ * between them — the same reason the build width is keyed per side rather than shared.
+ *
+ * `ResizeObserver` NEVER FIRES IN JSDOM (no layout), so under test the property is simply never set
+ * and every consumer falls back to `0px`. That is why the tests below assert the `calc()` the grip
+ * renders rather than a resolved pixel offset: the resolution is a browser fact, and claiming to
+ * have checked it here would be a lie the suite tells itself.
+ */
+function usePairTabsHeightVar(side: PairSide) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const name = pairTabsHeightVar(side);
+    const publish = () => {
+      // `offsetHeight` and not the observer's own box: it is integral and it is what the grip's
+      // `top` is compared against, so rounding cannot put the two a sub-pixel apart.
+      document.documentElement.style.setProperty(name, `${el.offsetHeight}px`);
+    };
+    publish();
+    const ro = new ResizeObserver(publish);
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      // LEAVE THE PROPERTY SET. A pair unmounts when its project is torn out to a satellite, and
+      // clearing it here would snap the surviving concierge grip upward mid-gesture. It is
+      // overwritten by the next pair that mounts on this side, which is the only time it is wrong.
+    };
+  }, [side]);
+  return ref;
+}
+
 export function Pair({
   side,
   tabs,
@@ -388,6 +442,7 @@ export function Pair({
    *  over both columns without displacing either. See `PlanBoardSlot`. */
   children: React.ReactNode;
 }) {
+  const tabStripRef = usePairTabsHeightVar(side);
   return (
     <div
       className="pair"
@@ -421,7 +476,20 @@ export function Pair({
         position: "relative",
       }}
     >
-      <div className="pairtabs" data-side={side} data-testid={`pair-tabs-${side}`}>
+      {/* THE STRIP'S HEIGHT IS PUBLISHED, because a grip in ANOTHER column needs it.
+          The concierge rail spans the whole row; this pair's rail is absolute inside `.paircols`,
+          which starts BELOW this strip. So the two pull tabs sat at the same offset from their own
+          rails and at visibly different heights on screen — the founder's "those 6 dots are placed
+          in a different place vertically... they should be in the same spot". The build grip cannot
+          rise to meet the concierge one without overhanging these tabs, so the concierge grip comes
+          down instead, and to do that it has to know how far. Measured rather than assumed: the
+          strip is content-sized (`flex: 0 0 auto`), so there is no constant to read. */}
+      <div
+        className="pairtabs"
+        data-side={side}
+        data-testid={`pair-tabs-${side}`}
+        ref={tabStripRef}
+      >
         {tabs}
       </div>
       {/* Position:relative so Plan mode can lay ONE wide card column over both columns —
@@ -1654,6 +1722,12 @@ export function Workspace() {
   // this window's sparkleAgentId).
   const sparkleActive = activeSpecial === "sparkle";
   const sparkleOpen = openAgentIds.includes(sparkleAgentId);
+  // THE CONCIERGE RESEARCH VIEW is the third special surface over the primary pair's stage (bead
+  // sparkle-s7rfc). It carries the same gating as `sparkleActive` everywhere below — it forces the
+  // agent pane hidden (`paneVisibleAgentId`), suppresses the board/preview and the empty-state
+  // hints, and keeps a prompt from routing to an unseen terminal. WHICH task it shows lives in the
+  // research store's `openTaskId`, not here — this flag is only "the research pane is the surface".
+  const researchActive = activeSpecial === "research";
   // The read-only Tasks board (bead sparkle-hiju.10) is the Plan view. Only meaningful with a
   // project open, and only when the Beads tool ([tools].beads) is enabled — off means the board is
   // used nowhere (the Plan chevron hides and mode reconciles away from it).
@@ -1668,19 +1742,17 @@ export function Workspace() {
   // TERMINAL_PANE_Z, the board at PLAN_COLUMN_Z) and clicking Improve Sparkle from the board looks
   // like it did nothing. Gating the RENDER rather than forcing the column out of Plan keeps the
   // user's Plan choice: leaving Sparkle brings their board back.
-  const boardActive = planBoardUp(workModeBySide.right, !!project, beadsEnabled) && !sparkleActive;
+  const boardActive =
+    planBoardUp(workModeBySide.right, !!project, beadsEnabled) && !sparkleActive && !researchActive;
   const leftBoardActive = planBoardUp(workModeBySide.left, !!leftProject, beadsEnabled);
-  // THE SAME QUESTION FOR THE PREVIEW SLOT, per column, and it carries the same `!sparkleActive`
-  // term as the board for the same reason: the slot and the Improve-Sparkle pane render into the
-  // same pair, and without it the pane would mount INVISIBLY behind the slot (it paints at
-  // TERMINAL_PANE_Z, the slot at PLAN_COLUMN_Z), so clicking Improve Sparkle would look like it did
-  // nothing. Gating the RENDER rather than forcing the column out of Preview keeps the user's
-  // choice — leaving Sparkle brings their preview back.
+  // NO PREVIEW SLOT ANY MORE (founder, 2026-08-19). A preview is not a peer column beside Build
+  // and Plan — it is a CARD IN THE CONCIERGE CHAT (`Concierge/PreviewCards.tsx`): a snapshot of the
+  // running site that opens the real localhost url when clicked. So there is no third covering
+  // surface here, no `previewActive`/`leftPreviewActive`, and every "is the pair covered" test
+  // below is back to asking about the board alone.
   //
-  // These can never be true at the same time as their board twin: one `workMode` per side, and
-  // "plan" and "preview" are two of its values. That is what lets both slots share PLAN_COLUMN_Z.
-  const previewActive = previewSlotUp(workModeBySide.right, !!project) && !sparkleActive;
-  const leftPreviewActive = previewSlotUp(workModeBySide.left, !!leftProject);
+  // The preview ENGINE is untouched — dev servers still start, and the card is what shows them.
+  // What is gone is the pane that used to cover a pair to frame one.
 
   // Is the selected agent actually ON SCREEN? `project.selectedAgentId` stays non-null while the
   // Plan board or the Improve Sparkle pane is showing, and while the agent's tab isn't open at all.
@@ -1696,24 +1768,30 @@ export function Workspace() {
   // typed at the Plan board from landing in an unseen terminal — it now admits the sparkle pane
   // BECAUSE it is on screen, gated on `sparkleOpen` so a mount whose PTY has not come up yet still
   // routes to the brain (recoverable) rather than a terminal that isn't there.
-  // `!previewActive` alongside `!boardActive`, and for the identical reason spelled out above: the
-  // preview slot COVERS the pair, so the selected agent's terminal is off screen exactly as it is
-  // under the board. Without this term an imperative typed while watching the preview would be
-  // written into a terminal the user cannot see.
+  // `!researchActive` alongside `!boardActive`, and for the identical reason: the
+  // research pane COVERS the pair, so the selected agent's terminal is off screen. A research task
+  // is a read-only view, not a chat target — a prompt typed while looking at it must route to the
+  // brain (concierge), never into a terminal the founder cannot see.
   const promptTargetShown = sparkleActive
     ? sparkleOpen
-    : !boardActive && !previewActive && activeIsOpen;
+    : !researchActive && !boardActive && activeIsOpen;
 
   // Calm terminal (PRD §3 / prototype `.terminal.calm`): when the agent you're looking at has
   // nothing for you, its terminal TEXT desaturates, so only a screen that wants something from you
   // carries color. Read from the same feed the tabs and the concierge use, so "calm" means one
   // thing app-wide.
   //
+  // CALM MEANS "THIS AGENT'S PROCESS HAS EXITED" — the status is `done` or `stopped` AND the feed
+  // actually observed it. Nothing a live session passes through is calm, because every one of those
+  // is a boundary the founder can watch the text change across (bead sparkle-e7a3f3).
+  //
   // This is now the ONLY calm treatment. It used to run alongside a matching one in the sidebar —
   // a `grayscale(1) opacity(.72)` filter over any row this same predicate called calm — which was
-  // removed on 2026-07-27 because `working` is in the calm set, so it desaturated the status dot of
-  // every agent that was actually running. Do not restore a row filter here or there; the sidebar
-  // carries status by DOT COLOR now. See services/conciergeFeed.isCalmBand for the full note.
+  // removed on 2026-07-27 because `working` WAS in the calm set then, so it desaturated the status
+  // dot of every agent that was actually running. `working` is no longer calm (bead sparkle-e7a3f3)
+  // and the removal still stands: the sidebar carries status by DOT COLOR now, so a row filter would
+  // fight that whatever this predicate answers. Do not restore one here or there.
+  // See services/conciergeFeed.isCalmBand for the full note.
   //
   // It asks `isCalmBand(status)` and not the agent's status BAND. Those are different sets by
   // design and `unmerged` is the difference: it bands `done` (it must not buy a nudge card) but is
@@ -1729,14 +1807,25 @@ export function Workspace() {
   // with. The desaturation now rides the terminal's own theme (AgentPane → Terminal → xtermTheme),
   // which also keeps it off the WebGL canvas's per-frame composite path.
   const terminalCalm = useMemo(() => {
-    if (sparkleActive || boardActive || !activeAgentId || !activeIsOpen) return false;
+    if (sparkleActive || researchActive || boardActive || !activeAgentId || !activeIsOpen) return false;
     // Keyed off the RESOLVED project, not `currentProjectId`: the two differ for a commit after the
     // selected project moves pairs, and a miss here reads as CALM and desaturates a busy terminal.
     const p = feed.projects.find((x) => x.id === project?.id);
-    // An agent the feed doesn't know reads `undefined`, which isCalmBand treats as calm — the same
-    // answer the old `?? 2` default gave.
-    return isCalmBand(p?.agents.find((a) => a.id === activeAgentId)?.status);
-  }, [feed, project, activeAgentId, activeIsOpen, sparkleActive, boardActive]);
+    // REQUIRES AN OBSERVED STATUS, and that is the whole of the second half of bead sparkle-e7a3f3.
+    // `isCalmBand(undefined)` is now `false`, but `undefined` only ever reaches here on the feed
+    // LOOKUP MISS (roborev 55149) — never on the ordinary mount path, because the feed substitutes
+    // `DEFAULT_STATUS = "stopped"` for an agent it has no entry for, and `stopped` IS calm. Since
+    // `runtimeStore.status` is live-only with a mounted `AgentPane` as its only writer, every pane
+    // read `stopped` before its first `setStatus` — so it painted GREY and snapped to full contrast
+    // the instant the engine emitted `working`. The same mount flash, running grey→white.
+    //
+    // `statusObservedLocally` is the feed's own answer to "did WE actually read this", so the gate
+    // is one term rather than a second guess at the default. Absent agent → no row → false. The
+    // local-only narrowing is exactly right here and nowhere else: this governs a pane THIS window
+    // hosts, so another window's reading is not evidence about the terminal in front of us.
+    const a = p?.agents.find((x) => x.id === activeAgentId);
+    return !!a?.statusObservedLocally && isCalmBand(a.status);
+  }, [feed, project, activeAgentId, activeIsOpen, sparkleActive, researchActive, boardActive]);
 
   // THE PANE LIST'S PROPS, HOISTED OUT OF THE RENDER so `MemoAgentPaneList` can actually bail out.
   // Object literals inline at the call site are a fresh identity every render, which on a seam drag is
@@ -1749,18 +1838,18 @@ export function Workspace() {
   const paneStages = useMemo(() => ({ left: leftStage, right: rightStage }), [leftStage, rightStage]);
   const paneVisibleAgentId = useMemo(
     () => ({
-      // Both covering surfaces, not just the board — a pair showing its preview has no visible
-      // agent pane either, and a stale id here is what routes a message into an unseen terminal.
-      left: leftBoardActive || leftPreviewActive ? null : leftActiveAgentId,
-      right: sparkleActive || boardActive || previewActive ? null : activeAgentId,
+      // A column showing its board has no visible agent pane, and a stale id here is what routes a
+      // message into an unseen terminal. The preview slot used to be a second covering surface on
+      // this list; it no longer exists, so the board is the only one per column again.
+      left: leftBoardActive ? null : leftActiveAgentId,
+      right: sparkleActive || researchActive || boardActive ? null : activeAgentId,
     }),
     [
       leftBoardActive,
-      leftPreviewActive,
       leftActiveAgentId,
       sparkleActive,
+      researchActive,
       boardActive,
-      previewActive,
       activeAgentId,
     ],
   );
@@ -1866,7 +1955,7 @@ export function Workspace() {
           renders its own strip; see the `tabs` prop below. Taking main's line back would put a
           second, contradicting tab bar above the whole shell. */}
       <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
-        {/* THE LEFT PAIR — the other half of `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`.
+        {/* THE LEFT PAIR — the other half of `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`.
             Rendered only when something is assigned to it, so an install that has never used it
             gets byte-identical layout to the single-pair shell. `Pair` mirrors the flow, so the
             children are given in the SAME [build, terminal] order as the right pair and the
@@ -1907,6 +1996,29 @@ export function Workspace() {
                 founder reported) with no fillets, while a click patched the cable LEFT and mounted
                 the pane RIGHT. It stays fully mountable from the right column — this hides a
                 duplicate, it does not remove the agent from the build columns. Bead sparkle-x0pvw. */}
+            {/* ③ THE EPICS COLUMN — the FIRST child of the pair box, which is the entire placement
+                change. `.paircols` is `row-reverse` on the left pair and `row` on the right, so ONE
+                insertion mirrors itself: on the right it paints nearest the concierge, and on the
+                left `row-reverse` puts it nearest the concierge there too. The row reads
+                `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`.
+
+                THREE THINGS FALL OUT OF THAT AND ALL THREE ARE WANTED:
+                  • `epics-left` appears exactly when the left pair does, which is the founder's
+                    requirement (5) — `pairCountFor()` already gates this whole `Pair`.
+                  • `PlanBoardSlot` covers it with ZERO change, which is requirement (4) ("when I'm
+                    on the Plan board I should not see the EPICS column"): the board is an absolute
+                    `inset: 0` sibling over this same box, so a third column in it is covered on
+                    mount.
+                  • `assertRowStructure()` stays green. It pins "a rail immediately either side of
+                    the concierge box, and nothing else inside it"; this column is OUTBOARD of those
+                    rails, inside the pair, so that adjacency is untouched. */}
+            <EpicsColumn
+              project={leftProject}
+              side="left"
+              // Covered by EITHER slot, on the same terms as the build column beside it — `covered`
+              // is what makes a hidden column UNREACHABLE rather than merely unpainted.
+              covered={leftBoardActive}
+            />
             <MemoAgentSidebar
               project={leftProject}
               slotSide="left"
@@ -1916,7 +2028,7 @@ export function Workspace() {
               // key fires the HIDDEN button (its handler takes the first match in DOM order). That
               // was roborev 57292 for the board; the preview slot carries its own toggle for the
               // same reason and so reproduces it exactly.
-              covered={leftBoardActive || leftPreviewActive}
+              covered={leftBoardActive}
               showSparkleRow={false}
               // Same reason, same bug (sparkle-x0pvw): one pinned row per WINDOW, not per sidebar.
               showConciergeRow={false}
@@ -1952,12 +2064,6 @@ export function Workspace() {
                 item and the two columns underneath keep their widths. Its project is its own;
                 nothing about it is shared with the right pair's board. */}
             {leftBoardActive && leftProject && <PlanBoardSlot project={leftProject} side="left" />}
-            {/* THE LEFT PAIR'S PREVIEW — a sibling of the board above and of both columns, never a
-                child of the stage. Same geometry, same z, and mutually exclusive with the board by
-                construction (one mode per side), so the two conditions can never both hold. */}
-            {leftPreviewActive && leftProject && (
-              <PreviewSlot project={leftProject} side="left" />
-            )}
           </Pair>
         )}
         {/* ① The persistent cross-project concierge column. Unconditional — the concierge IS the
@@ -1993,6 +2099,9 @@ export function Workspace() {
             cssVar={CONCIERGE_WIDTH_VAR}
             label="Sparkle column"
             testId="left-pair-pull-tab"
+            // DOWN PAST THE LEFT PAIR'S TAB STRIP, so this grip lines up with the build grip in the
+            // pair beside it. See `rowGripTop`.
+            topOffset={rowGripTop("left")}
             // JOINED ONLY WHEN THE LEFT PAIR HOLDS THE CABLE. This rail is the concierge's LEFT
             // boundary, so it is the one the left pair's mounted row runs into.
             seamFill={shownWired === "left" ? C.forest : undefined}
@@ -2090,6 +2199,8 @@ export function Workspace() {
           cssVar={CONCIERGE_WIDTH_VAR}
           label="Sparkle column"
           testId="concierge-pull-tab"
+          // DOWN PAST THE RIGHT PAIR'S TAB STRIP — the mirror of the left rail above.
+          topOffset={rowGripTop("right")}
           // THE SEAM THE FOUNDER HAS REPORTED FIVE TIMES, in the single-pair cockpit: this rail is
           // the concierge's RIGHT boundary and therefore the right pair's joint.
           //
@@ -2106,7 +2217,7 @@ export function Workspace() {
         />
         </div>
         {/* THE PAIR — build + its terminal, one project, never split, with its OWN project tabs.
-            The single-pair cockpit is the right half of `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`,
+            The single-pair cockpit is the right half of `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`,
             so this pair is `data-side="right"`: build adjacent to the concierge, terminal outboard.
             Children are always [build, terminal]; `Pair` mirrors the flow for a left pair. */}
         <Pair
@@ -2114,10 +2225,18 @@ export function Workspace() {
           wired={wired === "right"}
           tabs={<MemoProjectTabsBar side="right" feed={feed} onOpenProjectSettings={setSettingsProject} />}
         >
+          {/* ③ THE EPICS COLUMN — first child of the pair box, mirrored from the left pair by
+              `.paircols`'s flow direction alone. See the left pair for why one insertion is the
+              whole placement. */}
+          <EpicsColumn
+            project={sidebarProject}
+            side="right"
+            covered={boardActive}
+          />
           {/* ② Builder agents. The sidebar owns the Plan/Build toggle as its header in BUILD mode;
               in Plan the board is painted over this whole column and carries its own, so this one
               goes unreachable rather than merely invisible — see AgentSidebar's `covered`. */}
-          <MemoAgentSidebar project={sidebarProject} covered={boardActive || previewActive} />
+          <MemoAgentSidebar project={sidebarProject} covered={boardActive} />
           {/* ③ The terminal stage. Darkest layer; the selected agent row docks into it (the row
               paints in C.forest too, so the join is seamless).
 
@@ -2168,7 +2287,18 @@ export function Workspace() {
               </Suspense>
             )}
 
-            {!sparkleActive && !boardActive && !project && (
+            {/* THE CONCIERGE RESEARCH VIEW — a research task in the main pane (bead sparkle-s7rfc).
+                Mounted only while its surface is active (there is one, window-global), and last among
+                the stage's own children so it paints over the empty-state hints; `paneVisibleAgentId`
+                already forces the agent pane hidden when `researchActive`, so the two never overlap.
+                Which task it shows is the research store's `openTaskId`. */}
+            {researchActive && (
+              <Suspense fallback={<PaneFallback />}>
+                <ConciergeResearchPane visible={researchActive} />
+              </Suspense>
+            )}
+
+            {!sparkleActive && !researchActive && !boardActive && !project && (
               <Hint title="Welcome to Sparkle">
                 Open a project with the <strong>+</strong> in the tab bar and choose a folder on your
                 Mac to start building.
@@ -2178,7 +2308,7 @@ export function Workspace() {
                 that window, or take it back — because otherwise a torn-out tab looks like a project
                 that lost its agents. "Bring it back here" is also the ONLY recovery path when the
                 satellite has ended up on a monitor that is no longer plugged in. */}
-            {!sparkleActive && !boardActive && selectedIsTornOut && project && (
+            {!sparkleActive && !researchActive && !boardActive && selectedIsTornOut && project && (
               <Hint title={project.name}>
                 <div style={{ marginBottom: 18 }}>
                   This project is open in its own window.
@@ -2227,7 +2357,7 @@ export function Workspace() {
                 </div>
               </Hint>
             )}
-            {!sparkleActive && !boardActive && !selectedIsTornOut && project && project.agents.length === 0 && (
+            {!sparkleActive && !researchActive && !boardActive && !selectedIsTornOut && project && project.agents.length === 0 && (
               <Hint title={project.name}>
                 {/* The same two create options as the sidebar, so the user can start an agent right
                     here. Hovering the local one also lights up the sidebar's copy (shared
@@ -2251,10 +2381,10 @@ export function Workspace() {
                 </div>
               </Hint>
             )}
-            {!sparkleActive && !boardActive && !selectedIsTornOut && project && project.agents.length > 0 && !activeAgentId && (
+            {!sparkleActive && !researchActive && !boardActive && !selectedIsTornOut && project && project.agents.length > 0 && !activeAgentId && (
               <Hint title={project.name}>Pick an agent on the left.</Hint>
             )}
-            {!sparkleActive && !boardActive && !selectedIsTornOut && project && activeAgentId && !activeIsOpen && (
+            {!sparkleActive && !researchActive && !boardActive && !selectedIsTornOut && project && activeAgentId && !activeIsOpen && (
               <Hint title={project.name}>
                 <button
                   onClick={() => open(activeAgentId)}
@@ -2280,8 +2410,6 @@ export function Workspace() {
               over the terminal alone. Last child, so it paints over the stage's empty-state hints
               and the portalled panes as well as the Build column. */}
           {boardActive && project && <PlanBoardSlot project={project} side="right" />}
-          {/* ...and the right pair's preview, on the same terms as its board. */}
-          {previewActive && project && <PreviewSlot project={project} side="right" />}
         </Pair>
       </div>
 
@@ -2427,30 +2555,103 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
         zIndex: PLAN_COLUMN_Z,
       }}
     >
-      {/* TOP RIGHT, BOTH SIDES, AND THE SAME MINI CHICLET THE BUILD BOARD USES.
-          This used to be the wide `chevron` variant, aligned to the pair's INBOARD edge (left pair
-          right, right pair left) so the control stayed under the cursor that opened it. The founder
-          overruled both halves in one instruction — "just have it be top right … and the same build
-          plan slider style chiclet that the build board has" — so it is `flex-end` unconditionally
-          and `variant="mini"`, which is exactly what AgentSidebar renders in the Build header.
-          No `width` either: the mini segment is intrinsically sized (`flex: 0 0 auto`), and a 320px
-          box would stretch the two segments back into a strip. */}
+      {/* TOP LEFT, BOTH SIDES, ON THE BUILD HEADER'S OWN x AND y.
+          The founder: "The build versus plan toggle should stay left justified when it's in plan
+          mode. It should stay in the same spot that it is when it's in build mode, so it shouldn't
+          be going to the right side. And then the filters can be to the right of the build and plan
+          toggle, not to the left. So don't move build and plan to the right. Keep it where it is so
+          I can switch between them easily."
+
+          THIS REVERSES the previous instruction ("just have it be top right"), and the reversal is
+          the whole point rather than a change of taste: this toggle is the control you ROUND-TRIP
+          on, so it must not move when you use it. A control that jumps corners between the two
+          modes it switches makes its own second press a hunt.
+
+          THE GEOMETRY IS AgentSidebar's `.bhd` BAND, COPIED ON PURPOSE. This overlay is `inset: 0`
+          over the pair's column box, and the Build header is the TOP of the Build column, which is
+          that box's first in-flow child — so the two rows share an origin, and matching `minHeight`
+          + `padding` lands the toggle on the same x AND the same y in both modes.
+
+          The numbers are LITERALS rather than an import, deliberately: `BUILD_HEADER_H` is
+          module-private to AgentSidebar, and 17 test files replace that module with a mock factory,
+          so exporting it would make it `undefined` in every one of them — silently un-pinning the
+          alignment the import was meant to hold. The tests pin it instead, against AgentSidebar's
+          own source, and do it for BOTH hosts of this row (see the note in BoardFilterBar.tsx).
+
+          `variant="mini"` is the same chiclet AgentSidebar renders in the Build header. No `width`:
+          the mini segment is intrinsically sized (`flex: 0 0 auto`), and a fixed box would stretch
+          the two segments back into a strip. */}
       <div
+        data-testid="plan-board-header"
         style={{
           display: "flex",
           alignItems: "center",
-          justifyContent: "flex-end",
+          // ── INSET TO THE BUILD COLUMN, WHICH IS WHERE "LEFT JUSTIFIED" ACTUALLY MEANS ────────
+          // `.paircols` is `row-reverse` on the LEFT pair (PairShell) while its children are
+          // `[build, terminal]` in DOM order on BOTH sides — so the Build column paints on the
+          // RIGHT of a left pair and on the LEFT of a right pair. This overlay is `inset: 0` over
+          // that box and `inset` ignores `row-reverse`, so a bare `flex-start` row anchors to the
+          // pair's PHYSICAL left on both sides: the Build header's own x on the right pair, and a
+          // full terminal-width away from it on the left one.
+          //
+          // TWO EARLIER ATTEMPTS AND WHY NEITHER WAS ENOUGH, because the second looks right:
+          //   1. Bare `flex-start` — correct on the right pair, terminal-width jump on the left.
+          //   2. Mirroring the ROW with its pair — put the toggle on the pair's right EDGE, still
+          //      a whole Build-column width from the Build header's left inner edge, and worse, it
+          //      flipped the filters to the toggle's LEFT on that pair, which is the one thing the
+          //      founder named explicitly ("the filters can be to the right of the build and plan
+          //      toggle, not to the left").
+          // A comment here previously claimed a full-pair overlay "cannot know the Build column's
+          // width". That was simply wrong, and roborev 65299 was right to refuse it: AgentSidebar
+          // PUBLISHES that width document-wide via `publishColumnWidthVar(buildWidthVar(side))`,
+          // and every constant in its clamp is exported from `engine/columnResize`. So the row
+          // stays an unmirrored `row` — filters always grow rightward from the toggle, on both
+          // pairs — and simply insets its start edge by the Build column's width on the mirrored
+          // side. The toggle then lands on the Build header's exact x on BOTH pairs.
+          flexDirection: "row",
+          justifyContent: "flex-start",
+          // Wraps for the same reason the Build header does. Both children are `flex: 0 0 auto`
+          // (the mini segment and BoardFilterBar's own span), so neither can give width up: at a
+          // narrow pair width the row would overflow a box that sets no `overflow`. Wrapping drops
+          // the filter bar to a second line and grows the band instead.
+          flexWrap: "wrap",
           gap: 8,
-          // Was the toggle's own `margin: "0 12px 8px"`. Moved onto the row now that the row holds
-          // two things — a margin on one child cannot space both, and the shorthand must not sit
-          // beside a `paddingTop` it silently overrides.
-          padding: "12px 12px 8px",
+          // `--hd-h` from rev4.html, the height AgentSidebar's `.bhd` uses. minHeight, not height,
+          // so the band grows when the filter bar wraps.
+          minHeight: 34,
+          // 10px is AgentSidebar's `.bhd` inset. On the mirrored pair the Build column starts a
+          // full column-width in from the right, so the row's own start edge moves with it.
+          //
+          // THE ROW WRAPS SOONER ON THE MIRRORED PAIR, AND THAT IS THE ACCEPTED TRADE (roborev
+          // 65327). Padding removes its own space from the content box, so on a left pair the
+          // header line is `BUILD_W - 20` wide rather than the full pair. At the 220px default the
+          // mini segment (~80) plus a populated BoardFilterBar (~130-250) does not fit, and the bar
+          // drops to a second line — on that pair only.
+          //
+          // It is not fixable by moving the inset onto the toggle as a margin, which is the obvious
+          // remedy: a flex item's margins count toward its outer size for line-breaking, so the
+          // same total still exceeds the same line. The constraint is geometric, not a choice of
+          // property — anchoring the toggle to the Build column's left edge on a pair where that
+          // column is the RIGHTMOST one leaves exactly `BUILD_W` of room to its right, and
+          // toggle+filters are wider than that. Something has to give: wrap, overflow, or drop the
+          // alignment. Wrapping is chosen because it keeps BOTH of the founder's stated
+          // requirements (same x as Build mode, filters to the RIGHT of the toggle) and because it
+          // is precisely what AgentSidebar's own Build header does at the same width — see the
+          // `flexWrap: "wrap"` note there, which reasons this through for the identical case.
+          paddingRight: 10,
+          paddingLeft: side === "left" ? `calc(100% - ${BUILD_COLUMN_PAINTED_WIDTH("left")} + 10px)` : 10,
+          // The old row spent 8px of BOTTOM PADDING on the gap above the board. Padding would now
+          // pull the toggle off the Build header's centre line, so the gap is a MARGIN instead —
+          // outside the band, so it cannot move what the band centres.
+          marginBottom: 8,
+          flex: "0 0 auto",
         }}
       >
-        {/* The filters sit LEFT of the toggle: the toggle is the way OUT of the board and stays
-            pinned to the corner it has always been in, so a growing filter bar pushes inward
-            rather than moving the exit. */}
-        {mode === "plan" && <BoardFilterBar side={side} />}
+        {/* THE TOGGLE IS FIRST, and DOM order is the requirement rather than a consequence of it:
+            this is a `flex-start` row, so whatever comes first is what sits on the Build header's
+            x. The filters follow and grow to the RIGHT, which is what keeps the toggle pinned while
+            the bar changes width — the old order pinned the toggle to the right corner and let the
+            bar push it, which is exactly what the founder asked to stop. */}
         <PlanBuildToggle
           mode={mode}
           beadsEnabled={beadsEnabled}
@@ -2458,6 +2659,7 @@ function PlanBoardSlot({ project, side }: { project: Project; side: PairSide }) 
           onPickPlan={() => openPlanBoard(side)}
           onPickBuild={() => showBuildStage(side)}
         />
+        {mode === "plan" && <BoardFilterBar side={side} />}
       </div>
       <div style={{ flex: 1, position: "relative", minHeight: 0 }}>
         <Suspense fallback={<PaneFallback />}>

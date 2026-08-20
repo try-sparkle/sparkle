@@ -2110,7 +2110,10 @@ export function Terminal({
             }}
           >
             <FiPlay aria-hidden="true" style={{ marginRight: 6, verticalAlign: "-0.125em" }} />
-            Start again
+            {/* The button is ALWAYS here — a permanent refusal changes what we claim about the
+                retry, never whether the user is allowed to take it (terminalOverlay.ts). "anyway"
+                is the whole difference between an affordance that lied and one that didn't. */}
+            {overlay.permanent ? "Start again anyway" : "Start again"}
           </button>
         </div>
       ) : overlay.kind === "loading" ? (

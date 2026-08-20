@@ -15,11 +15,16 @@
 // THE LIST IS THE VALUE, and the type is derived from it. A bare union type cannot be iterated at
 // runtime, so every place that has to VALIDATE a mode string — the concierge's `set_work_mode` is
 // the one that exists today — ends up re-listing the members by hand, and the re-listing is what
-// goes stale: that guard refused `"preview"` with the message `the chevrons are "plan" and "build"`
-// for one commit after the union already had three members, i.e. it told the user a real mode did
-// not exist. Deriving both from one array means a fourth mode cannot be accepted by the type and
+// goes stale: that guard once refused a mode the union already had, i.e. it told the user a real
+// mode did not exist. Deriving both from one array means a mode cannot be accepted by the type and
 // rejected by the guard.
-export const WORK_MODES = ["plan", "build", "preview"] as const;
+//
+// BACK TO TWO (founder, 2026-08-19). `"preview"` was a third member for a pane that covered a pair;
+// he decided a preview does not belong as a peer column beside Build and Plan and should be a CARD
+// IN THE CONCIERGE CHAT instead (`Concierge/PreviewCards.tsx`). The mode, its slot and its toggle
+// segment went with it. The preview ENGINE is untouched — dev servers still start; what changed is
+// only where their output is shown.
+export const WORK_MODES = ["plan", "build"] as const;
 export type WorkMode = (typeof WORK_MODES)[number];
 
 /** Is this arbitrary string one of the modes? A TYPE PREDICATE, not a bare boolean, so a caller
@@ -34,29 +39,29 @@ export function isWorkMode(value: string): value is WorkMode {
  * The work mode that should be active given what the pane is showing, or `null` when no change is
  * warranted. Rules, in order:
  *  - A special view (Sparkle / the Plan board) owns the pane → leave the mode alone (`null`).
- *  - ANY OVERLAY MODE (Plan, Preview) is a surface with no agent of its own → never auto-changed
+ *  - ANY OVERLAY MODE (today just Plan) is a surface with no agent of its own → never auto-changed
  *    here (`null`). See the note below: this guard is `mode !== "build"`, not `mode === "plan"`.
  *  - No selection (empty pane) → keep the user's chosen mode so its empty state shows (`null`).
  *  - Otherwise a real agent is selected and its terminal is showing, so the mode should be Build.
  *    Returns "build" only when the current mode isn't already Build.
  *
- * THE GUARD IS `mode !== "build"` AND THAT IS LOAD-BEARING, not a tidier spelling of the same
- * thing. It was `mode === "plan"`, written when the union had exactly two members — under which it
- * is equivalent, because the only mode reaching the last line was "build" and it answered `null`.
- * Adding "preview" broke that equivalence and made the difference severe: `mode === "preview"` with
- * an agent selected falls through to the final line and returns `"build"`, so AgentSidebar's effect
- * kicks the column straight back out of Preview the instant any row is selected — i.e. always,
- * since selecting a row is how you get there. The old comment at AgentSidebar's call site predicted
- * exactly this ("if that helper ever grows a third mode").
+ * THE GUARD IS `mode !== "build"`, AND IT STAYS THAT WAY EVEN THOUGH THE UNION IS BACK TO TWO —
+ * which is the whole point of writing it down. With two members it is once again EQUIVALENT to
+ * `mode === "plan"`, and that equivalence is exactly what made the original bug invisible: when
+ * `"preview"` was added, `mode === "preview"` fell through to the final line and returned `"build"`,
+ * so the column was kicked out of Preview the instant any row was selected — i.e. always. The
+ * property being asked is "is the pane showing an agent\'s terminal?", not "which overlay is this",
+ * and asking it that way is what makes the NEXT overlay mode safe by construction. Do not "simplify"
+ * it back to an enumeration now that it looks equivalent again.
  *
  * THE LAST LINE STILL RETURNS A MODE, and that is deliberate rather than vestigial (roborev 60625).
  * It was briefly a bare `return null`, which made the guard PROVABLY DEAD — every path answered
  * null, so reverting the guard to `mode === "plan"` changed nothing and the tests that claim to pin
  * it stayed green. A guard whose documented mutation cannot red anything is not a guard. With the
- * final line live, the guard is the only thing deciding the "preview" cases, which is what both
- * `workMode.test.ts` and `AgentSidebar.previewMode.test.tsx` assert.
+ * final line live, the guard is the only thing deciding the non-Build cases, which is what
+ * `workMode.test.ts` asserts.
  *
- * Enumerating the overlay modes here instead would reintroduce the same trap for the fourth mode.
+ * Enumerating the overlay modes here instead would reintroduce the same trap for the next mode.
  * Ask the property — "is the pane showing an agent's terminal?" — which is what "build" means.
  */
 export function reconcileWorkMode(

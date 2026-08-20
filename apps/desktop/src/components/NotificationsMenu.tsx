@@ -10,7 +10,7 @@ import { SettingCheckbox } from "./SettingCheckbox";
 //
 // We surface the statuses a user actually reasons about — the red tier (needs you / crashed) and
 // the finished tier (your turn / done). The remaining states are intentionally NOT offered:
-// `working` flips on every turn (notification spam) and `blocked`/`stopped`/`new` are passive. They
+// `working` flips on every turn (notification spam) and `stopped`/`new` are passive. They
 // stay off and UNLISTED HERE — which is not the same as unreachable: `set_notification_rule`
 // (services/conciergeTools/settings.ts) validates against the store's own key set, so the concierge
 // can still turn any of them on. Widen this list if that changes. (`new` — spawned, never briefed —
@@ -21,6 +21,22 @@ const NOTIFY_OPTIONS: Array<{ status: AgentTabStatus; label: string }> = [
   { status: "waiting", label: "Needs your answer (a question)" },
   { status: "approval", label: "Needs your approval" },
   { status: "errored", label: "Errored or crashed" },
+  // ── LISTED 2026-08-18, AND ITS OLD JUSTIFICATION FOR BEING HIDDEN IS NOW FALSE ────────────────
+  // `blocked` sat with `stopped`/`new` above under the word "passive", from when it meant only
+  // statusEngine's quiet-settle stall timer. It no longer does. `stallEscalation.OUTSTANDING` now
+  // admits a cause ONLY when the founder is the one actor who can clear it, and one of its members
+  // is `blocked-on-human` — the agent was asked point-blank what was blocking it and answered that a
+  // PERSON is. Calling that passive is exactly the mismatch the founder reported on 2026-08-18, one
+  // layer up from the dot.
+  //
+  // ⚠️ STILL OFF BY DEFAULT (DEFAULT_NOTIFY_STATUSES.blocked === false) and that is not a nicety.
+  // The status is shared by every OUTSTANDING cause, so this toggle cannot be scoped to the
+  // blocked-on-human one alone — the notification pipeline keys on STATUS (`attention.newlyEntered`
+  // over the enabled set) and has no access to stall causes, which are computed in AgentSidebar.
+  // Defaulting it on would page for the whole red tier, which is the storm `attention.ATTENTION`
+  // deliberately avoids. Listing it makes the choice discoverable instead of concierge-only; a
+  // cause-scoped banner needs plumbing that does not exist yet.
+  { status: "blocked", label: "Blocked — only you can unstick it" },
   { status: "idle", label: "Finished a turn — your turn" },
   { status: "done", label: "Done / completed" },
 ];

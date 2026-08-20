@@ -112,6 +112,13 @@ describe("the call sites actually use the treatment", () => {
     "components/OnePasswordPane.tsx",
     "components/CardCriteria.tsx",
     "components/SelectionPopup.tsx",
+    // Migrated on other branches, and left OUT of this list by both of them — which is the gap
+    // roborev caught: the tree-wide ratchet below only holds while its ceiling exactly equals the
+    // count, so a later migration that lowers the count without lowering the ceiling hands these
+    // two files a free slot to silently re-drift into. A per-file entry costs nothing and pins
+    // them at exact zero regardless of what the ceiling is doing.
+    "components/ConciergeResearchPane.tsx",
+    "components/Concierge/PipelineHealthChip.tsx",
   ];
 
   it.each(MIGRATED)("%s spreads SECTION_LABEL", (rel) => {
@@ -162,7 +169,14 @@ describe("nothing in the tree reaches for a capsule where the spec draws a box",
   // cannot make on its own, which is why it is written down here instead of quietly hidden from the
   // scanner by hoisting the 0.5 into a named constant — that trick is the one three earlier rounds
   // on this branch were spent closing.
-  const MAX_HAND_TYPED_TRACKING = 9;
+  //
+  // 9 -> 8. `ConciergeResearchPane` shipped with TWO hand-typed 0.3 sites, which pushed the count to
+  // 10 and reddened this ratchet on every unrelated PR until they were migrated. Both were exact
+  // hand-copies of the treatment — mono, `TYPE.micro`, uppercase, `C.muted` — so they became
+  // `SECTION_LABEL` spreads and the count fell to 8. A ratchet that is not tightened after a
+  // migration hands the next drift a free slot, which is the whole failure mode this number exists
+  // to prevent, so it falls with the count rather than being left at the old ceiling.
+  const MAX_HAND_TYPED_TRACKING = 8;
 
   it("the count of hand-typed label tracking never rises, tree-wide", () => {
     const hits = sourceFiles(SRC).flatMap((f) =>

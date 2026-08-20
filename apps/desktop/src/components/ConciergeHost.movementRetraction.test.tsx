@@ -154,6 +154,9 @@ const acted = (event: string, atMs: number, sessionId: string | null = MAIN): Mo
   lastEvent: event,
   lastEventMs: atMs,
   sessionId,
+  // Retraction reads the event NAME and its instant; the digest's tool COUNT is carried for
+  // engine/goalContinuation and is deliberately absent from these fixtures.
+  toolsRecent: null,
 });
 
 beforeEach(() => {

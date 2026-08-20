@@ -24,8 +24,14 @@
 // than the stall did. `unknown` is a real answer here (mirroring `rollupDot`'s null arm).
 import type { AgentTabStatus } from "@sparkle/ui";
 import { agentClosableKind } from "@sparkle/core";
-import { type AgentGoal, goalStateOf } from "./agentGoal";
+import {
+  type AgentGoal,
+  escalationQuotesStaleText,
+  goalStateOf,
+  mayRearmGoal,
+} from "./agentGoal";
 import { SESSION_LIMIT_FALLBACK_MS, type QuotaBlock, isQuotaBlocked } from "./quotaBlock";
+import type { HumanBlock } from "./humanBlock";
 import { joinList } from "./joinList";
 
 /** What an idle row actually means.
@@ -53,6 +59,19 @@ export type StallVerdict = "stalled" | "finished" | "unknown" | "active" | "quot
  *  `redAttentionTaxonomy.test.ts` makes an unclassified cause a TYPE error rather than letting it
  *  inherit a tier by falling through — answer the question there when you add one. */
 export type StallCause =
+  /** THE AGENT SAID SO ITSELF. `nudge_ladder.rs` asked a silent agent which actor it is waiting on
+   *  and it answered `blocked-on-human`, which Rust routed to `Escalation::Founder`. Relayed here by
+   *  `engine/humanBlock`, which requires BOTH the reply and the founder target — several
+   *  blocked-shaped replies (`no-task-assigned`, `out-of-context`) are deliberately concierge
+   *  matters and must not reach this tier.
+   *
+   *  ⚠️ THIS IS THE ONLY CAUSE SOURCED FROM THE AGENT'S OWN WORDS RATHER THAN FROM GIT OR THE GOAL
+   *  RECORD, and that is what makes it narrow enough to be red. It is not inferred from silence, a
+   *  clock, or a retry budget: something asked, and it answered. Before it existed the app's only
+   *  expression of "a person is blocking me" was free prose in `goal.escalationReason`, which the
+   *  colour system cannot read — so a row printed "blocked on human" while drawing amber, which is
+   *  the founder's 2026-08-18 report. */
+  | "blocked-on-human"
   | "human-verified-goal"
   /** The goal lapsed its whole re-arm budget and git POSITIVELY showed committed work the default
    *  branch does not contain, with no PR carrying it. Sparkle has stopped, cannot restart it, and
@@ -63,6 +82,21 @@ export type StallCause =
    *  argument for it — see `engine/goalExpiry.decideExpiry`, which is the only writer of the latch it
    *  reads. Plain `expired-goal` below stays calm gray exactly as it was. */
   | "abandoned-goal"
+  /** The goal is escalated AND the concierge has spent its ENTIRE re-arm allowance
+   *  (`agentGoal.MAX_CONCIERGE_REARMS`), so no machine actor may restart it again.
+   *
+   *  ⚠️ ITS COPY ALREADY SAID THIS AND THE COLOUR DID NOT. `rowAttention.goalBadgeFor` renders this
+   *  exact state as *"re-armed N× and stuck again — no re-arms left, this one is yours"* — a
+   *  sentence addressed to the founder — while the row drew amber, because plain `escalated-goal`
+   *  was the only cause it raised. A row that says "yours" and colours "not yours" is the same
+   *  text/colour split as {@link blocked-on-human} above, in the app's own copy rather than in an
+   *  agent's prose.
+   *
+   *  WHY RED, in `stallEscalation`'s own terms — who can clear it. Nobody but him: auto-continue has
+   *  given up (escalated) and the one machine actor allowed to overrule that has exhausted its
+   *  budget. It is strictly narrower than `escalated-goal`, which stays amber: this fires only after
+   *  the concierge has tried and run out, so it cannot rebuild the 2026-08-06 wall of false red. */
+  | "rearms-exhausted"
   | "unmet-goal"
   | "escalated-goal"
   | "expired-goal"
@@ -94,6 +128,14 @@ export interface StallInput {
    * agent read healthy for hours.
    */
   quotaBlock?: QuotaBlock;
+  /**
+   * The agent's own `blocked-on-human` answer to a nudge (engine/humanBlock). `undefined` = it never
+   * said so, NEVER "we did not ask" — this is the loudest tier the app has, so absence is silence.
+   *
+   * PASSED IN, not looked up here, for the same reason {@link quotaBlock} is: it is an observation
+   * from the Rust nudger's own ledger rather than git evidence, and this module stays pure.
+   */
+  humanBlock?: HumanBlock;
 }
 
 export interface StallReport {
@@ -187,6 +229,28 @@ export function stallReport(input: StallInput): StallReport {
   const hasUnlandedWork = input.hasUnlandedWork ?? (status === "unmerged" ? true : undefined);
 
   const causes: StallCause[] = [];
+  // FIRST OF ALL, because it is the only cause here the AGENT ITSELF asserted. Every other cause on
+  // this surface is something we inferred about it from git, the goal record or a clock; this one is
+  // its answer to a direct question, so it is both the most actionable and the least deniable.
+  //
+  // NOT GATED ON THE GOAL, deliberately. An agent can be blocked on a person with no goal set at
+  // all, with a met goal, or with one nobody escalated — `nudge_ladder` asks every silent agent
+  // regardless. Requiring an escalated goal here would have made this cause unreachable for exactly
+  // the rows that never got one, which is the population the nudger exists to find.
+  //
+  // ⚠️ IT *IS* GATED ON STATUS, THOUGH — stated rather than left to be rediscovered (roborev 65339).
+  // This sits below the `isQuiet` gate, so a flagged agent whose status is `working` (or absent, and
+  // therefore defaulted to `stopped` by every caller) returns `active` and never reaches here.
+  //
+  // THAT IS DELIBERATE, and the alternative was considered: `quotaBlock` IS hoisted above the gate,
+  // because a quota-walled agent keeps redrawing and so reads `working` while being totally barred —
+  // its status is actively misleading. This case is different in two ways. First, escalation cannot
+  // follow anyway: `stallEscalation.ESCALATABLE` is `idle`/`unmerged` only, so hoisting would change
+  // no dot. Second, the flag is self-correcting — `nudger.rs::apply_flags` clears it on the first
+  // look where the agent has moved, and an agent whose status reads `working` is one producing
+  // output — so the disagreement window closes itself. Reporting `stalled` for a row the app
+  // simultaneously calls `working` would put a contradiction into the roster to buy nothing.
+  if (input.humanBlock !== undefined) causes.push("blocked-on-human");
   const goalState = goalStateOf(goal, now);
   // FIRST, because it is the only cause in this file that means "a human is required" — see the
   // corrected paragraph further down, which said no such cause existed until 2026-08-07.
@@ -280,6 +344,15 @@ export function stallReport(input: StallInput): StallReport {
   // the human's problem, not less. Folding it into `finished` would hide precisely the agent the
   // escalation was raised about.
   if (goalState === "escalated") causes.push("escalated-goal");
+  // RIDES ALONGSIDE `escalated-goal` rather than replacing it, exactly as `abandoned-goal` does and
+  // for the same reason: the amber cause is a FLOOR, so if this red one is ever demoted the row
+  // still cannot fall back to calm.
+  //
+  // GATED ON THE STATE, like every other goal cause here. `mayRearmGoal` reads a spent counter that
+  // nothing decrements, so read on its own it would fire forever, in every goal state — including on
+  // an agent whose goal was later met. `goalStateOf` answers `met` before `escalated`, so gating on
+  // the state lets a re-armed-and-then-finished agent clear itself.
+  if (goalState === "escalated" && !mayRearmGoal(goal)) causes.push("rearms-exhausted");
   // READ OFF THE LATCH, not re-derived from evidence. `goalExpiry.decideExpiry` is the sole writer,
   // and it only reaches an abandon after clearing seven gates (expired, local runtime, has a
   // worktree, evidence readable, worktree not parked, budget spent, no open PR, and BOTH the
@@ -429,6 +502,14 @@ function quotaBlockedDetail(block: QuotaBlock): string {
 function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): string {
   const parts = causes.map((c) => {
     switch (c) {
+      case "blocked-on-human":
+        // QUOTES THE MECHANISM, not just the conclusion. This sentence is the loudest claim the
+        // surface can make about a person, and the reader's first question is "says who" — so it
+        // names the fact that the agent was ASKED and answered, which is what separates this from
+        // the free prose in `goal.escalationReason` that used to make the same claim unbacked.
+        return "it was asked what is blocking it and answered that a person is";
+      case "rearms-exhausted":
+        return "the concierge has no re-arms left for its goal, so nothing may restart it again";
       case "human-verified-goal":
         // Names the PERSON explicitly, because this is the one sentence on the surface that is
         // asking for something. Every other cause here describes work someone else will do.
@@ -455,6 +536,13 @@ function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): strin
         // abandoned-goal arm above already carries the evidence, so this one keeps the short clause.
         if (goal?.abandonedEvidence !== undefined && goal.escalationReason === goal.abandonedEvidence)
           return "auto-continue gave up on its goal";
+        // ⚠️ A STALE SENTENCE IS DROPPED HERE TOO (roborev 65339, a Medium). Gating only the goal
+        // BADGE's label left this string — the stall chip's tooltip and the composer pill's `detail`
+        // — still interpolating the same frozen prose as a live claim, on the same row, about the
+        // same escalation. Half a fix reads as a whole one precisely because the surface that still
+        // lies is the one nobody re-checked. `escalationQuotesStaleText` is the same predicate the
+        // badge uses, asked once here rather than restated.
+        if (escalationQuotesStaleText(goal)) return "auto-continue gave up on its goal";
         return `auto-continue gave up on its goal${goal?.escalationReason ? ` — ${goal.escalationReason}` : ""}`;
       case "expired-goal":
         return `its goal ran out of time without being met ("${goal?.text ?? ""}")`;

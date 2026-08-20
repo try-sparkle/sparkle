@@ -50,6 +50,21 @@ struct PtySession {
     /// transcript redraw takes seconds; an idle resumed agent may emit nothing for minutes).
     /// That is a death notice with no retraction path, and it is what this field closes.
     epoch: u64,
+    /// The `CLAUDE_CONFIG_DIR` this PTY was launched under, decoded at spawn time out of the
+    /// `zsh -c '<script>'` body by [`config_dir_from_args`] — i.e. WHICH CLAUDE MAX ACCOUNT this
+    /// agent is running as.
+    ///
+    /// This is the ONLY place the Rust side learns that. Account selection happens entirely in
+    /// TypeScript (`accountSelection.ts` → `claudeSpawn.ts`) and the roster slice
+    /// (`roster.rs::RosterAgentSlice`) carries no account field, so a native-side flag — "this
+    /// agent's screen says `Login expired · Please run /login`" — would otherwise have no way to
+    /// tell the founder WHICH of several pinned config dirs to re-authenticate.
+    ///
+    /// THREE-STATE, deliberately — see [`SpawnAccount`]. `Default` (no export at all) and
+    /// `Unknown` (an export we could not decode) are OPPOSITE answers to "which login should a
+    /// human go fix", and collapsing them into one `None` is how a fail-closed refusal came out the
+    /// far end as a confidently named wrong account (roborev 65537).
+    config_dir: SpawnAccount,
 }
 
 /// "No PTY has spawned." Never minted by [`next_pty_epoch`] (which starts at 1), so it can never
@@ -66,6 +81,267 @@ const NO_EPOCH: u64 = 0;
 fn next_pty_epoch() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The literal `claudeSpawn.ts` writes into the spawn script when an account was chosen. Matched as
+/// a whole, `export` included — and only at the very START of the arg, because the agent's own
+/// prompt travels inside this same script string and can quote the identical line. See
+/// [`find_config_dir_export`] for why anchoring rather than searching is what keeps a prompt from
+/// naming a login the spawn never used.
+const CONFIG_DIR_EXPORT: &str = "export CLAUDE_CONFIG_DIR=";
+
+/// Which Claude Max account a spawn was launched under, decoded out of its raw spawn arguments.
+///
+/// WHY IT IS PARSED RATHER THAN PASSED. Account selection lives entirely in TypeScript
+/// (`accountSelection.ts` → `claudeSpawn.ts`) and nothing hands the answer to Rust: the roster
+/// slice carries no account field. But the fact already crosses the boundary, as text.
+/// `buildClaudeExec` (and `buildClaudeLoginExec`) prepend
+///
+/// ```text
+/// export CLAUDE_CONFIG_DIR='/Users/x/.claude-accounts/work'; export PATH="$HOME/.local/bin:$PATH"; exec …
+/// ```
+///
+/// and that whole script arrives at `pty_spawn` as ONE entry in `args` — the `zsh -c '<script>'`
+/// body. Reading it back here is what lets a native-side "login expired" flag NAME the login a
+/// human has to re-authenticate, on a machine running several accounts pinned to separate dirs.
+///
+/// FAIL CLOSED. Every ambiguous input answers `None`, because this value ends up in front of the
+/// founder as an account to go fix: naming the WRONG login is strictly worse than naming none. So
+/// `None` for an absent export, an empty value, and — deliberately — an unterminated quote, where a
+/// half-parsed path would be a plausible-looking string pointing at the wrong account.
+///
+/// THE FIRST OCCURRENCE DECIDES, INCLUDING WHEN IT FAILS TO PARSE. `zsh` itself would let a later
+/// `export` win, but this app emits exactly one, so a second means something unexpected is going
+/// on; we answer from the first and never search past it. Falling through to a later occurrence
+/// would turn a malformed script into a confident wrong answer, which is the one outcome the
+/// fail-closed rule above exists to prevent.
+///
+/// Quoting understood: single-quoted (including `shellQuote`'s `'\''` embedded-apostrophe escape,
+/// decoded back to a literal `'`), double-quoted, and a bare word terminated by `;` or whitespace.
+///
+/// Pure and total — it runs on the spawn path and must never panic, whatever the frontend sends.
+pub(crate) fn config_dir_from_args(args: &[String]) -> Option<String> {
+    match spawn_account_from_args(args) {
+        SpawnAccount::Dir(dir) => Some(dir),
+        SpawnAccount::Default | SpawnAccount::Unknown => None,
+    }
+}
+
+/// WHICH ACCOUNT a spawn was launched under — the THREE-STATE answer.
+///
+/// ── WHY `Option<String>` WAS NOT ENOUGH (roborev 65537, Medium) ───────────────────────────────
+/// `config_dir_from_args` collapses two facts that must not be collapsed: "the script exported no
+/// `CLAUDE_CONFIG_DIR`, so this is the imported DEFAULT account" and "there was an export and we
+/// could not decode it, so we do not KNOW the account". Both came back `None`, and the consumer
+/// (`nudger::account_label_from`) renders `None` as the default account BY NAME whenever one is
+/// registered.
+///
+/// So every fail-closed refusal in this parser — an unterminated quote, an empty value, an export
+/// that is not where we require it — arrived at the founder as a confident, named, WRONG login.
+/// That is the precise harm the refusals exist to prevent, reintroduced one layer down. Anchoring
+/// the match made it worse rather than better: it moved MORE inputs into the refusing branch, and
+/// every one of them landed in "the default account" instead of "unknown".
+///
+/// `Unknown` is therefore a first-class answer, and the consumer must render it as "could not
+/// identify", never as a login anybody should go re-authenticate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnAccount {
+    /// No `export CLAUDE_CONFIG_DIR=` anywhere in the prelude — the imported default account. An
+    /// ordinary, POSITIVE answer.
+    Default,
+    /// An export was present and could not be decoded. The account is genuinely unknown; naming
+    /// anything here would be a guess.
+    Unknown,
+    /// The decoded config dir.
+    Dir(String),
+}
+
+/// Decode [`SpawnAccount`] out of raw spawn arguments. Pure and total.
+pub(crate) fn spawn_account_from_args(args: &[String]) -> SpawnAccount {
+    let Some((arg, at)) = args.iter().find_map(|a| find_config_dir_export(a).map(|i| (a, i)))
+    else {
+        return SpawnAccount::Default;
+    };
+    // `CONFIG_DIR_EXPORT` is pure ASCII, so `at + len` is always a char boundary.
+    match decode_export_value(&arg[at + CONFIG_DIR_EXPORT.len()..]) {
+        Some(dir) => SpawnAccount::Dir(dir),
+        None => SpawnAccount::Unknown,
+    }
+}
+
+/// Byte offset of `export CLAUDE_CONFIG_DIR=` when it is the very FIRST thing in `arg`, else `None`.
+///
+/// ── WHY IT IS ANCHORED AND NOT SEARCHED (roborev 65501, Medium) ───────────────────────────────
+/// A scan for the literal anywhere in the arg is unsafe HERE in a way it would not be elsewhere,
+/// because the agent's own PROMPT is inside this same string: `pty_spawn` receives one `zsh -c`
+/// script whose tail embeds the persona and task text. So a task that merely QUOTES a shell line —
+///
+/// ```text
+/// … run: export CLAUDE_CONFIG_DIR=/tmp/x && claude …
+/// ```
+///
+/// is matched by any word-boundary rule, since inside the script it genuinely does start a word.
+/// On the common single-account spawn (no real export at all) that prose is then the ONLY match,
+/// and the founder's row would name `/tmp/x` as the login to go re-authenticate: a confidently
+/// WRONG account, which is the exact outcome every other rule in this parser fails closed to avoid.
+/// Being wrong here is worse than being silent, because a wrong name is acted on.
+///
+/// ── AND WHY THE BOUNDARY IS `exec `, NOT BYTE 0 (roborev 65537, Medium) ──────────────────────
+/// A first fix required the export to be the very first thing in the script. That is TRUE of
+/// `buildClaudeExec` and `buildClaudeLoginExec` today — but it made this parser's correctness rest
+/// on a TypeScript ordering invariant that nothing pinned. Move `beadsReadonlyExport`, the inbox
+/// export, or a future `cd …` ahead of the config export and BOTH suites stay green while the
+/// account label silently dies — and, per [`SpawnAccount`], "dies" used to mean "names the default
+/// account" rather than "says nothing". A cross-language invariant that only a comment enforces is
+/// the seam shape `AGENTS.md` warns about.
+///
+/// So the dependency is removed rather than documented. The real structural fact is not *first* but
+/// *before the command*: every producer emits `…exports…; exec <claude> … '<prompt>'`, and the
+/// agent's prompt — the only adversarial text in the string — is an ARGUMENT to the exec'd command,
+/// so it always lies after `exec`. Searching only the prelude is therefore immune to prompt text
+/// AND indifferent to how the exports are ordered among themselves.
+///
+/// With no `exec ` in the arg there is no prelude to bound, so it falls back to requiring byte 0 —
+/// the strict rule, applied only where the permissive one has nothing to anchor against.
+fn find_config_dir_export(arg: &str) -> Option<usize> {
+    let prelude_end = find_exec_word(arg).unwrap_or(0);
+    if prelude_end == 0 {
+        return arg.starts_with(CONFIG_DIR_EXPORT).then_some(0);
+    }
+    let bytes = arg.as_bytes();
+    let mut from = 0usize;
+    while let Some(rel) = arg[from..prelude_end].find(CONFIG_DIR_EXPORT) {
+        let at = from + rel;
+        // Still a shell WORD, so `noexport CLAUDE_CONFIG_DIR=…` is not a selection.
+        let starts_word = at == 0
+            || matches!(
+                bytes[at - 1],
+                b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b'{'
+            );
+        if starts_word {
+            return Some(at);
+        }
+        // The needle is ASCII, so `at + 1` is a char boundary — safe to re-slice from.
+        from = at + 1;
+    }
+    None
+}
+
+/// Byte offset of the first `exec` that stands as its own shell WORD, i.e. the start of the command
+/// the prelude is setting up. `None` when the arg has none.
+///
+/// Word-bounded on BOTH sides so neither `noexec ` nor `execute ` is mistaken for it — a false
+/// `exec` here would shrink the prelude and lose a real export, and a missed one would widen the
+/// search region back over the prompt.
+///
+/// ── AND QUOTED TEXT IS SKIPPED, FOR THE SAME REASON THE WHOLE PARSER FAILS CLOSED ────────────
+/// A bare `exec` inside a quoted VALUE (`export NOTE='foo exec bar'`) is not the command word — it
+/// is data. Counting it would truncate the prelude before a real `CLAUDE_CONFIG_DIR` export, which
+/// reports [`SpawnAccount::Default`]: a POSITIVE claim that this agent runs on the default account,
+/// made on the strength of an export we simply failed to look at. That is the same
+/// confident-wrong-login shape as rendering `Unknown` as the default, so it gets the same
+/// treatment rather than a comment noting it is unlikely.
+///
+/// Quote tracking is deliberately shell-shaped and minimal: inside `'…'` nothing escapes (the
+/// `'\''` idiom is *close, literal, reopen*, which this sees as two separate quoted runs — the
+/// right reading), and inside `"…"` a backslash escapes the next character.
+fn find_exec_word(arg: &str) -> Option<usize> {
+    let bytes = arg.as_bytes();
+    let is_sep = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r' | b';' | b'&' | b'|' | b'(' | b'{');
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match quote {
+            Some(q) => {
+                if q == b'"' && c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => {
+                if c == b'\'' || c == b'"' {
+                    quote = Some(c);
+                } else if bytes[i..].starts_with(b"exec") {
+                    let before_ok = i == 0 || is_sep(bytes[i - 1]);
+                    let after_ok = bytes.get(i + 4).is_some_and(|c| is_sep(*c));
+                    if before_ok && after_ok {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Decode everything after the `=` of one `export CLAUDE_CONFIG_DIR=` into the literal path it
+/// denotes. `None` on an empty or undecodable value (see [`config_dir_from_args`] on failing closed).
+fn decode_export_value(rest: &str) -> Option<String> {
+    let mut chars = rest.chars();
+    let value = match chars.next() {
+        Some('\'') => decode_single_quoted(chars.as_str())?,
+        Some('"') => decode_double_quoted(chars.as_str())?,
+        // Bare word: ends at the first `;` or whitespace, which also covers `export FOO=` with
+        // nothing after it (an empty take_while → rejected as empty just below).
+        _ => rest.chars().take_while(|c| *c != ';' && !c.is_whitespace()).collect(),
+    };
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// Body of a single-quoted shell word (everything AFTER the opening `'`), decoded up to its closing
+/// quote. Handles the one escape a single-quoted word can carry — `shellQuote`'s `'\''`, which is
+/// *close quote, literal apostrophe, reopen quote* — by emitting a literal `'` and staying inside.
+/// `None` when no closing quote is ever reached.
+fn decode_single_quoted(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = body;
+    loop {
+        let i = rest.find('\'')?; // unterminated → fail closed
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.strip_prefix("\\''") {
+            // `'\''` — an embedded apostrophe; the word continues.
+            Some(tail) => {
+                out.push('\'');
+                rest = tail;
+            }
+            // A plain `'` — the word ends here.
+            None => return Some(out),
+        }
+    }
+}
+
+/// Body of a double-quoted shell word (everything AFTER the opening `"`), decoded up to its closing
+/// quote. Inside double quotes a backslash escapes only `"`, `\`, `$` and a backtick; before anything
+/// else it is an ordinary character and is kept. `None` when no closing quote is ever reached.
+fn decode_double_quoted(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next() {
+                Some(n @ ('"' | '\\' | '$' | '`')) => out.push(n),
+                Some(n) => {
+                    out.push('\\');
+                    out.push(n);
+                }
+                // A trailing backslash — the word never closed.
+                None => return None,
+            },
+            _ => out.push(c),
+        }
+    }
+    None
 }
 
 /// Cooperative pause gate shared between a session's reader thread and `pty_set_paused`. The reader
@@ -430,6 +706,53 @@ impl PtyManager {
             .collect()
     }
 
+    /// The `CLAUDE_CONFIG_DIR` the session under `id` was SPAWNED with — i.e. which Claude Max
+    /// account that agent is running as. Recorded at spawn time by [`config_dir_from_args`], which
+    /// decodes it out of the spawn script; see [`PtySession::config_dir`].
+    ///
+    /// This exists so a native-side flag can be ACTIONABLE. "An agent's screen says `Login expired ·
+    /// Please run /login`" is not something a human can fix on a machine running several accounts
+    /// pinned to separate config dirs — "re-authenticate THIS account" is.
+    ///
+    /// `None` IS AMBIGUOUS, AND THE RETURN VALUE ALONE CANNOT DISAMBIGUATE IT. It means EITHER:
+    ///
+    /// 1. there IS a live session and it was launched with no explicit `CLAUDE_CONFIG_DIR` — the
+    ///    imported default account, the ordinary case for anyone who never set up multiple
+    ///    accounts; OR
+    /// 2. there is NO session under this id at all — never spawned, already exited, or an id whose
+    ///    life was replaced by a newer one (see [`PtyManager::insert_session`]).
+    ///
+    /// A caller that reads `None` as "definitely the default account" WILL NAME THE WRONG LOGIN
+    /// every time it is really case 2: it would tell the founder to re-authenticate the default
+    /// account over a failure that had nothing to do with it, which is exactly the wrong-account
+    /// outcome the parser fails closed to avoid. If you need the two apart, pair this with a
+    /// liveness check — [`PtyManager::live_epoch`] answers [`NO_EPOCH`] for an unknown id — and
+    /// treat "no session" as *we don't know*, never as a named account.
+    ///
+    /// Takes the sessions lock briefly and clones, exactly like [`PtyManager::live_epoch`] and
+    /// [`PtyManager::session_pids`]: the global lock is never held across anything that can block.
+    pub fn spawn_config_dir(&self, id: &str) -> Option<String> {
+        match self.spawn_account(id) {
+            Some(SpawnAccount::Dir(dir)) => Some(dir),
+            _ => None,
+        }
+    }
+
+    /// WHICH ACCOUNT this agent's PTY was launched under, without collapsing the three answers.
+    ///
+    /// `None` = no session under this id. `Some(SpawnAccount::Default)` = the imported default
+    /// account, a positive answer. `Some(SpawnAccount::Unknown)` = there WAS an export and it could
+    /// not be decoded, so the account is genuinely unidentified and a caller must say so rather
+    /// than name anything (roborev 65537 — the collapsed form rendered every refusal as the default
+    /// account by name, which is the confident wrong answer this parser fails closed to avoid).
+    pub fn spawn_account(&self, id: &str) -> Option<SpawnAccount> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .map(|s| s.config_dir.clone())
+    }
+
     /// EVERY live session id — the process-global answer to "is this agent already running".
     ///
     /// The session id IS the agent id, so this needs no mapping table that could drift. It is the
@@ -785,6 +1108,31 @@ fn apply_heap_cap(cmd: &mut CommandBuilder, inherited: Option<String>, heap_mb: 
     }
 }
 
+/// The `SPARKLE_TEST_MAX_WORKERS` value to set on an agent's PTY child, or None to leave it alone.
+///
+/// Bounds the vitest worker fan-out ONE agent may create so N concurrent agents each running their
+/// suite can't oversubscribe the cores (`config::agent_test_worker_cap`). Two ways this yields None,
+/// both meaning "do not touch the child's env":
+///   - `user_already_set` — the user exported `SPARKLE_TEST_MAX_WORKERS` themselves (it is the
+///     documented escape hatch in `vitest.pool.mjs`); their choice wins verbatim, exactly as
+///     `node_options_with_cap` defers to a user-pinned heap flag.
+///   - `cap` is None — the machine-wide division is already at or above the pool's own default, or
+///     the core count was unmeasurable, so the pool keeps the value it would have picked anyway.
+fn test_worker_env_value(user_already_set: bool, cap: Option<u32>) -> Option<String> {
+    if user_already_set {
+        return None;
+    }
+    cap.map(|c| c.to_string())
+}
+
+/// Set the per-agent vitest worker cap on `cmd` when one applies. Split from the spawn body so the
+/// "respect the user's value / inject ours" decision is unit-testable without a real PTY.
+fn apply_test_worker_cap(cmd: &mut CommandBuilder, user_already_set: bool, cap: Option<u32>) {
+    if let Some(v) = test_worker_env_value(user_already_set, cap) {
+        cmd.env("SPARKLE_TEST_MAX_WORKERS", v);
+    }
+}
+
 /// What a reader thread does about its observer once it knows [`Reap`]'s verdict.
 ///
 /// TWO LINES, EXTRACTED SO THEY CAN BE TESTED — and that is the whole point, not tidiness. The bug
@@ -897,6 +1245,12 @@ pub async fn pty_spawn(
     app.state::<PtyManager>().begin_spawn(&id);
     // Read the configured per-agent heap cap once, on this side of the thread hop.
     let heap_mb = crate::config::current_effective().config.workers.agent_heap_mb;
+    // And the per-agent vitest worker cap (a lock + core-count read), computed here so the blocking
+    // half only touches the command. `None` when the machine-wide division doesn't narrow below the
+    // pool's own default — see config::agent_test_worker_cap.
+    let test_worker_cap = crate::config::agent_test_worker_cap_env();
+    // Whether the user pinned the override themselves (their choice wins) — read on this side too.
+    let test_worker_user_set = std::env::var_os("SPARKLE_TEST_MAX_WORKERS").is_some();
     let (session, reader, child) = tauri::async_runtime::spawn_blocking(
         move || -> Result<SpawnedPty, String> {
             let validated_cwd = validate_spawn(&spawn_app, &command, cwd.as_deref())?;
@@ -934,6 +1288,10 @@ pub async fn pty_spawn(
             // default ceiling (sparkle-01xv). Merges with — never clobbers — a NODE_OPTIONS the
             // user already set; see node_options_with_cap.
             apply_heap_cap(&mut cmd, std::env::var("NODE_OPTIONS").ok(), heap_mb);
+            // Bound how many vitest workers this agent's test runs may fan out to, so N concurrent
+            // agents each running the suite can't oversubscribe the cores (the process/CPU storm
+            // behind the swap-thrash incident). Never clobbers a value the user set themselves.
+            apply_test_worker_cap(&mut cmd, test_worker_user_set, test_worker_cap);
             // Spawn into the *validated, canonicalized* cwd (not the original string), so a symlink
             // swap between check and use can't redirect the working dir outside the worktrees tree.
             // Every spawn now has a validated cwd (a provided one is worktree-contained; a null one
@@ -981,6 +1339,11 @@ pub async fn pty_spawn(
                     // somehow reached the map without going through that path would read as "no PTY
                     // has spawned" rather than impersonating a real life.
                     epoch: NO_EPOCH,
+                    // WHICH ACCOUNT this PTY runs as, read back out of the spawn script — the only
+                    // point at which Rust can learn it (see `config_dir_from_args`). Decoded HERE,
+                    // while `args` is still in hand: the script is not retained anywhere, so a
+                    // later caller has nothing left to parse.
+                    config_dir: spawn_account_from_args(&args),
                 },
                 reader,
                 child,
@@ -1703,9 +2066,11 @@ mod epoch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_writer, apply_heap_cap, guard_resize_size, guard_spawn_size, insert_or_cancel,
+        acquire_writer, apply_heap_cap, apply_test_worker_cap, config_dir_from_args, spawn_account_from_args, SpawnAccount,
+        guard_resize_size, guard_spawn_size,
+        insert_or_cancel,
         next_pty_epoch,
-        node_options_with_cap, run_flusher, validate_spawn_inner, Credit, FlushBuf, InflightState,
+        node_options_with_cap, run_flusher, test_worker_env_value, validate_spawn_inner, Credit, FlushBuf, InflightState,
         finish_teardown, PauseState, PtyManager, PtyEnd, PtySession, Reap,
         await_session_end_flush, drain_then_release, session_end_flushed, take_and_signal_session,
         Drain,
@@ -1854,6 +2219,57 @@ mod tests {
             cmd.get_env("NODE_OPTIONS").map(|v| v.to_owned()),
             before,
             "a disabled cap must leave NODE_OPTIONS exactly as inherited"
+        );
+    }
+
+    // ── per-agent vitest worker cap ───────────────────────────────────────────────────────
+    #[test]
+    fn test_worker_env_value_injects_the_cap_when_the_user_has_not() {
+        // The narrowing case: no user override, a computed cap → inject its string form.
+        assert_eq!(test_worker_env_value(false, Some(1)), Some("1".to_string()));
+        assert_eq!(test_worker_env_value(false, Some(4)), Some("4".to_string()));
+    }
+
+    #[test]
+    fn test_worker_env_value_defers_to_a_user_override() {
+        // The user exported SPARKLE_TEST_MAX_WORKERS themselves — their choice wins, so we set
+        // nothing regardless of what the machine-wide division would have picked.
+        assert_eq!(test_worker_env_value(true, Some(1)), None);
+        assert_eq!(test_worker_env_value(true, None), None);
+    }
+
+    #[test]
+    fn test_worker_env_value_is_none_when_nothing_narrows() {
+        // No cap to apply (division at/above the pool default, or cores unmeasurable) → leave the
+        // pool's own default in charge.
+        assert_eq!(test_worker_env_value(false, None), None);
+    }
+
+    #[test]
+    fn apply_test_worker_cap_sets_the_override_on_the_spawned_command() {
+        // env() overrides any inherited value, so this is robust even when the suite itself runs
+        // inside a Sparkle agent that already has SPARKLE_TEST_MAX_WORKERS set.
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        apply_test_worker_cap(&mut cmd, false, Some(2));
+        assert_eq!(
+            cmd.get_env("SPARKLE_TEST_MAX_WORKERS").and_then(|v| v.to_str()),
+            Some("2"),
+            "a computed cap must reach the child as SPARKLE_TEST_MAX_WORKERS"
+        );
+    }
+
+    #[test]
+    fn apply_test_worker_cap_touches_nothing_when_the_user_set_it() {
+        // Before/after rather than asserting None: the builder inherits the process env, so an
+        // ambient SPARKLE_TEST_MAX_WORKERS (a Sparkle agent running these tests) would otherwise
+        // make a "None" assertion depend on who launched the suite. The intent is "touches nothing".
+        let mut cmd = CommandBuilder::new("/bin/echo");
+        let before = cmd.get_env("SPARKLE_TEST_MAX_WORKERS").map(|v| v.to_owned());
+        apply_test_worker_cap(&mut cmd, true, Some(1));
+        assert_eq!(
+            cmd.get_env("SPARKLE_TEST_MAX_WORKERS").map(|v| v.to_owned()),
+            before,
+            "a user override must leave SPARKLE_TEST_MAX_WORKERS exactly as inherited"
         );
     }
 
@@ -2149,6 +2565,523 @@ mod tests {
 
     // ── sparkle-0bye: the memory watchdog's view of live sessions ─────────────────────────────
 
+    // ── which account a PTY was launched under (config_dir_from_args / spawn_config_dir) ───────
+    //
+    // These decode the ONE fact the Rust side has no other way to learn: which Claude Max account
+    // an agent runs as. It is consumed by a founder-facing flag that says "re-authenticate THIS
+    // login", so the failure that matters is not "no answer" — it is a CONFIDENT WRONG answer.
+    // Hence the fail-closed cases below are asserted as deliberate behaviour, not as edge cases.
+
+    /// The realistic shape: `buildClaudeExec` with an account chosen, arriving as the `zsh -l -c`
+    /// body. The whole script is ONE arg, so the parser has to find the export inside it.
+    #[test]
+    fn config_dir_from_a_real_build_claude_exec_script_is_the_account_path() {
+        let script = r#"export CLAUDE_CONFIG_DIR='/Users/agent/.claude-accounts/work'; export PATH="$HOME/.local/bin:$PATH"; exec '/Users/agent/.local/bin/claude' --dangerously-skip-permissions --model 'claude-opus-5' -- 'go build the thing'"#;
+        let args = vec!["-l".to_string(), "-c".to_string(), script.to_string()];
+        assert_eq!(
+            config_dir_from_args(&args).as_deref(),
+            Some("/Users/agent/.claude-accounts/work"),
+            "the account path must come back WITHOUT its shell quoting — it is compared against \
+             on-disk config dirs, not re-fed to a shell"
+        );
+    }
+
+    /// A path with an apostrophe, written exactly the way `shellQuote` writes it: `'\''` is
+    /// close-quote / literal-apostrophe / reopen-quote. Decoding it naively stops at the first
+    /// inner quote and yields a TRUNCATED path — which is the wrong-account failure mode, since a
+    /// truncated path is still a plausible-looking string a flag would happily show a human.
+    #[test]
+    fn a_config_dir_containing_an_apostrophe_decodes_back_to_the_literal_character() {
+        let script = r#"export CLAUDE_CONFIG_DIR='/Users/x/O'\''Brien/.claude'; export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude'"#;
+        let args = vec!["-l".to_string(), "-c".to_string(), script.to_string()];
+        assert_eq!(
+            config_dir_from_args(&args).as_deref(),
+            Some("/Users/x/O'Brien/.claude"),
+            "shellQuote's '\\'' escape must decode back to one literal apostrophe, not truncate \
+             the path at it"
+        );
+    }
+
+    /// No export at all — the imported DEFAULT account. This is an ordinary, correct answer, not a
+    /// parse failure: `buildClaudeExec` omits the export entirely when no account was chosen.
+    #[test]
+    fn a_spawn_with_no_config_dir_export_reports_no_explicit_account() {
+        let script = r#"export PATH="$HOME/.local/bin:$PATH"; exec '/Users/agent/.local/bin/claude' --dangerously-skip-permissions"#;
+        let args = vec!["-l".to_string(), "-c".to_string(), script.to_string()];
+        assert_eq!(
+            config_dir_from_args(&args),
+            None,
+            "no export means the default account — there is no path to report"
+        );
+    }
+
+    /// `export CLAUDE_CONFIG_DIR=''` is not an account named "". An empty path would name a
+    /// directory that cannot exist, so it must read the same as "no explicit dir".
+    #[test]
+    fn an_empty_config_dir_export_is_no_account_not_an_empty_path() {
+        let args = vec![
+            "-c".to_string(),
+            r#"export CLAUDE_CONFIG_DIR=''; export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude'"#
+                .to_string(),
+        ];
+        assert_eq!(config_dir_from_args(&args), None, "an empty value names no account");
+
+        let bare = vec!["-c".to_string(), "export CLAUDE_CONFIG_DIR=; exec claude".to_string()];
+        assert_eq!(
+            config_dir_from_args(&bare),
+            None,
+            "an unquoted export with nothing after the `=` names no account either"
+        );
+    }
+
+    /// An unterminated quote answers `None` ON PURPOSE. The tempting alternative — take everything
+    /// to the end of the string — yields a path that LOOKS like an answer, and this value is shown
+    /// to a human as the login to go re-authenticate. Naming the wrong account is worse than
+    /// naming none, so the parser fails closed.
+    #[test]
+    fn an_unterminated_quote_fails_closed_rather_than_naming_a_truncated_path() {
+        let single =
+            vec!["-c".to_string(), "export CLAUDE_CONFIG_DIR='/Users/x/.claude".to_string()];
+        assert_eq!(
+            config_dir_from_args(&single),
+            None,
+            "FAIL CLOSED IS DELIBERATE: an unterminated single quote must not yield a \
+             best-effort path — a half-parsed path names the WRONG login, which is worse than \
+             naming none"
+        );
+
+        let double =
+            vec!["-c".to_string(), r#"export CLAUDE_CONFIG_DIR="/Users/x/.claude"#.to_string()];
+        assert_eq!(
+            config_dir_from_args(&double),
+            None,
+            "FAIL CLOSED IS DELIBERATE: the same rule holds for an unterminated double quote"
+        );
+    }
+
+    /// `buildClaudeLoginExec`'s shape — the config export followed by the ANTHROPIC unset block.
+    /// This is the spawn where the account matters MOST: it is the one that performs the sign-in,
+    /// so a flag naming the wrong dir sends the founder to re-authenticate the wrong account.
+    #[test]
+    fn a_login_spawn_script_reports_the_account_it_is_signing_into() {
+        let script = r#"export CLAUDE_CONFIG_DIR='/Users/agent/.claude-accounts/second'; unset ANTHROPIC_API_KEY ANTHROPIC_API ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL ANTHROPIC_CUSTOM_HEADERS CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX; export PATH="$HOME/.local/bin:$PATH"; exec '/Users/agent/.local/bin/claude' auth login"#;
+        let args = vec!["-l".to_string(), "-c".to_string(), script.to_string()];
+        assert_eq!(
+            config_dir_from_args(&args).as_deref(),
+            Some("/Users/agent/.claude-accounts/second"),
+            "the unset block sits between the export and the exec — it must not confuse the scan"
+        );
+    }
+
+    /// The variable NAME appearing in prose is not a selection. Spawn args carry the user's prompt
+    /// and persona text, so a message that merely talks about `CLAUDE_CONFIG_DIR` is a normal
+    /// thing to see — and reading it as an account would attribute an agent to a login at random.
+    #[test]
+    fn an_arg_that_merely_mentions_the_variable_in_prose_is_not_a_selection() {
+        let args = vec![
+            "-l".to_string(),
+            "-c".to_string(),
+            r#"export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude' -- 'Check whether CLAUDE_CONFIG_DIR is set correctly, and echo $CLAUDE_CONFIG_DIR if so'"#
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&args),
+            None,
+            "only a real `export CLAUDE_CONFIG_DIR=` counts — a mention in prompt text does not"
+        );
+
+        let glued = vec!["-c".to_string(), "noexport CLAUDE_CONFIG_DIR=/tmp/x; exec claude".to_string()];
+        assert_eq!(
+            config_dir_from_args(&glued),
+            None,
+            "the export must start a shell word, not be glued to the end of another token"
+        );
+    }
+
+    /// "NO EXPORT" AND "AN EXPORT WE COULD NOT READ" ARE DIFFERENT ANSWERS (roborev 65537, Medium).
+    ///
+    /// Collapsed into one `None`, every fail-closed refusal in this parser reached the founder as
+    /// the DEFAULT ACCOUNT BY NAME — a confident wrong login, which is the precise harm the
+    /// refusals exist to prevent. The three-state result is what lets the consumer say "could not
+    /// identify" instead of guessing.
+    #[test]
+    fn an_undecodable_export_is_unknown_and_never_reads_as_the_default_account() {
+        assert_eq!(
+            spawn_account_from_args(&[
+                "-c".to_string(),
+                r#"export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude'"#.to_string(),
+            ]),
+            SpawnAccount::Default,
+            "no export at all IS the imported default — a positive answer, not a failure"
+        );
+
+        for (label, script) in [
+            ("an unterminated quote", "export CLAUDE_CONFIG_DIR='/never/closed"),
+            ("an empty value", "export CLAUDE_CONFIG_DIR=''; exec claude"),
+            ("the needle with nothing after it", "export CLAUDE_CONFIG_DIR="),
+        ] {
+            assert_eq!(
+                spawn_account_from_args(&["-c".to_string(), script.to_string()]),
+                SpawnAccount::Unknown,
+                "{label}: an export we cannot decode means the account is UNKNOWN — reporting it \
+                 as the default would name a login the spawn never used"
+            );
+        }
+
+        assert_eq!(
+            spawn_account_from_args(&[
+                "-c".to_string(),
+                "export CLAUDE_CONFIG_DIR='/a/work'; exec claude".to_string(),
+            ]),
+            SpawnAccount::Dir("/a/work".to_string()),
+            "and a decodable one still answers the dir, so the three-state form did not cost the \
+             ordinary answer"
+        );
+    }
+
+    /// THE PARSER MUST NOT DEPEND ON AN UNPINNED TYPESCRIPT ORDERING (roborev 65537, Medium).
+    ///
+    /// A first fix required the export to be the script's very FIRST token. That is true of
+    /// `buildClaudeExec` today, but it made this parser's correctness rest on a cross-language
+    /// invariant nothing enforced: move `BD_READONLY`, the inbox export, or a future `cd …` ahead
+    /// of it and BOTH suites stay green while the account label silently dies.
+    ///
+    /// The boundary is `exec` instead, which is structural rather than incidental: the exports set
+    /// the command up, and the agent's PROMPT — the only adversarial text in the string — is an
+    /// argument TO that command, so it always lies after `exec`.
+    #[test]
+    fn the_export_is_found_anywhere_in_the_prelude_but_never_after_exec() {
+        let reordered = vec![
+            "-c".to_string(),
+            r#"export BD_READONLY=1; export SPARKLE_INBOX_AGENT='a-1'; export CLAUDE_CONFIG_DIR='/a/work'; export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude' -- 'hi'"#
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&reordered).as_deref(),
+            Some("/a/work"),
+            "an export that is not FIRST but is still in the prelude must be found — otherwise a \
+             harmless reorder in claudeSpawn.ts silently unnames the login"
+        );
+
+        let only_after_exec = vec![
+            "-c".to_string(),
+            r#"export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude' -- 'run: export CLAUDE_CONFIG_DIR=/tmp/attacker && claude'"#
+                .to_string(),
+        ];
+        assert_eq!(
+            spawn_account_from_args(&only_after_exec),
+            SpawnAccount::Default,
+            "everything after `exec` is the command's ARGUMENTS, prompt included — never a \
+             selection, and not even an `Unknown`, because no export was really attempted"
+        );
+
+        // `noexec`/`execute` must not be mistaken for the boundary: a false `exec` shrinks the
+        // prelude and loses a real export; a missed one widens the search back over the prompt.
+        let decoy = vec![
+            "-c".to_string(),
+            "export NOTE='noexec execute'; export CLAUDE_CONFIG_DIR='/a/work'; exec claude"
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&decoy).as_deref(),
+            Some("/a/work"),
+            "`noexec` and `execute` are not the exec word"
+        );
+
+        // A BARE `exec` inside a quoted VALUE is data, not the command word. Counting it would cut
+        // the prelude short, miss the real export, and report Default — a positive claim that this
+        // agent runs on the default account, made because we failed to look. Same
+        // confident-wrong-login shape the three-state result exists to stop.
+        let exec_inside_a_value = vec![
+            "-c".to_string(),
+            "export NOTE='run exec later'; export CLAUDE_CONFIG_DIR='/a/work'; exec claude"
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&exec_inside_a_value).as_deref(),
+            Some("/a/work"),
+            "a quoted `exec` must not truncate the prelude and silently lose the real export"
+        );
+
+        // …and the double-quoted form, where a backslash escapes the next character.
+        let exec_inside_a_double_quoted_value = vec![
+            "-c".to_string(),
+            r#"export NOTE="run exec \" later"; export CLAUDE_CONFIG_DIR='/a/work'; exec claude"#
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&exec_inside_a_double_quoted_value).as_deref(),
+            Some("/a/work"),
+            "double-quoted values are skipped too, escapes included"
+        );
+    }
+
+    /// THE AGENT'S OWN PROMPT CANNOT NAME A LOGIN (roborev 65501, Medium).
+    ///
+    /// The prompt travels INSIDE the same `zsh -c` script string as the exports, so a task that
+    /// quotes a shell line genuinely does start a shell word — a word-boundary rule matches it. On
+    /// the common single-account spawn there is no real export at all, so that prose would be the
+    /// ONLY match and the founder's row would name a login the spawn never used. A wrong name is
+    /// worse than no name, because a wrong name is acted on.
+    ///
+    /// The paired positive is the point: a REAL export in the same script still wins, so anchoring
+    /// bought safety without costing the answer. Without that half this test would pass against a
+    /// parser that had simply stopped working.
+    #[test]
+    fn a_config_dir_export_quoted_inside_the_prompt_never_names_an_account() {
+        let prose_only = vec![
+            "-c".to_string(),
+            r#"export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude' -- 'To reproduce, run: export CLAUDE_CONFIG_DIR=/tmp/attacker && claude -p hi'"#
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&prose_only),
+            None,
+            "a full export quoted in the TASK TEXT must not be read as this spawn's account — \
+             that is the confidently-wrong login the whole parser fails closed to avoid"
+        );
+
+        let real_export_plus_prose = vec![
+            "-c".to_string(),
+            r#"export CLAUDE_CONFIG_DIR='/Users/x/.claude-accounts/work'; export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude' -- 'To reproduce, run: export CLAUDE_CONFIG_DIR=/tmp/attacker && claude -p hi'"#
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&real_export_plus_prose).as_deref(),
+            Some("/Users/x/.claude-accounts/work"),
+            "and the REAL export still decides, so anchoring did not just break the parser"
+        );
+    }
+
+    /// Double-quoted and bare values are accepted too — nothing in `claudeSpawn.ts` emits them
+    /// today, but a hand-built or future spawn script is not a reason to lose the account.
+    #[test]
+    fn double_quoted_and_bare_config_dir_values_are_both_decoded() {
+        let quoted = vec![
+            "-c".to_string(),
+            r#"export CLAUDE_CONFIG_DIR="/Users/x/.claude-accounts/a b"; exec claude"#.to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&quoted).as_deref(),
+            Some("/Users/x/.claude-accounts/a b"),
+            "a double-quoted value keeps its spaces and drops its quotes"
+        );
+
+        let bare = vec![
+            "-c".to_string(),
+            "export CLAUDE_CONFIG_DIR=/Users/x/.claude; exec claude".to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&bare).as_deref(),
+            Some("/Users/x/.claude"),
+            "a bare value ends at the `;` — the rest of the script is not part of the path"
+        );
+
+        let bare_space = vec![
+            "-c".to_string(),
+            "export CLAUDE_CONFIG_DIR=/Users/x/.claude exec claude".to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&bare_space).as_deref(),
+            Some("/Users/x/.claude"),
+            "a bare value ends at whitespace too"
+        );
+    }
+
+    /// The FIRST occurrence decides, across args and within one arg — and it decides even when it
+    /// is the malformed one. Falling through to a later, parseable export would turn a script we
+    /// do not understand into a confident answer, which is the outcome fail-closed exists to stop.
+    #[test]
+    fn the_first_config_dir_export_wins_even_when_it_is_the_unparseable_one() {
+        let two_args = vec![
+            "export CLAUDE_CONFIG_DIR='/first/.claude'; exec a".to_string(),
+            "export CLAUDE_CONFIG_DIR='/second/.claude'; exec b".to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&two_args).as_deref(),
+            Some("/first/.claude"),
+            "the earlier arg's export is the answer"
+        );
+
+        let one_arg = vec![
+            "-c".to_string(),
+            "export CLAUDE_CONFIG_DIR='/first/.claude'; export CLAUDE_CONFIG_DIR='/second/.claude'; exec a"
+                .to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&one_arg).as_deref(),
+            Some("/first/.claude"),
+            "within one script the first export is the answer"
+        );
+
+        // A genuinely unterminated first export (its quote never closes, in its own arg) followed
+        // by a perfectly good one. Falling through would answer /second with total confidence.
+        let broken_first = vec![
+            "export CLAUDE_CONFIG_DIR='/unterminated".to_string(),
+            "export CLAUDE_CONFIG_DIR='/second/.claude'; exec b".to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&broken_first),
+            None,
+            "a malformed FIRST export must not fall through to a later one and name /second — \
+             that would be exactly the confident wrong answer we fail closed to avoid"
+        );
+
+        // Worth pinning because it LOOKS unterminated and is not: zsh closes that first quote with
+        // the one that opens `/second`, making the whole middle one single-quoted word. We read it
+        // the same way the shell would rather than guessing at the author's intent.
+        let quote_swallows_the_next_export = vec![
+            "-c".to_string(),
+            "export CLAUDE_CONFIG_DIR='/a; export CLAUDE_CONFIG_DIR='/second/.claude'".to_string(),
+        ];
+        assert_eq!(
+            config_dir_from_args(&quote_swallows_the_next_export).as_deref(),
+            Some("/a; export CLAUDE_CONFIG_DIR="),
+            "the first quote is closed by the second export's opening quote — shell semantics, \
+             not a fall-through to /second"
+        );
+    }
+
+    /// This runs on the spawn path, on whatever the frontend sent. It must be total: no panic, no
+    /// slice-on-a-char-boundary crash, for empty args, bare needles, or multi-byte paths.
+    #[test]
+    fn the_config_dir_parser_never_panics_on_degenerate_or_multibyte_input() {
+        assert_eq!(config_dir_from_args(&[]), None, "no args at all");
+        assert_eq!(config_dir_from_args(&["".to_string()]), None, "an empty arg");
+        assert_eq!(
+            config_dir_from_args(&["export CLAUDE_CONFIG_DIR=".to_string()]),
+            None,
+            "the needle with nothing after it"
+        );
+        assert_eq!(
+            config_dir_from_args(&["export CLAUDE_CONFIG_DIR='/Users/x/日本/.claude'; exec c"
+                .to_string()])
+            .as_deref(),
+            Some("/Users/x/日本/.claude"),
+            "multi-byte text inside the value must not break the byte-index slicing"
+        );
+        assert_eq!(
+            config_dir_from_args(&["日本語 export CLAUDE_CONFIG_DIR='/Users/x/日本/.claude'; exec c"
+                .to_string()])
+            .as_deref(),
+            Some("/Users/x/日本/.claude"),
+            "…and multi-byte text BEFORE it must not break the byte indexing either: the export is \
+             still in the prelude (before `exec`), so it is still the real signal"
+        );
+        assert_eq!(
+            config_dir_from_args(&["日本語CLAUDE_CONFIG_DIR=x".to_string()]),
+            None,
+            "a multi-byte character immediately before a non-export mention must not panic"
+        );
+    }
+
+    /// The reader half. `spawn_config_dir` must hand back what the session recorded — and its
+    /// `None` must be understood as AMBIGUOUS: it is the same answer for "this session is on the
+    /// default account" and "there is no such session". A caller that reads it as the former will
+    /// name the wrong login every time it is really the latter, which is why the doc comment says
+    /// so and why both halves are pinned here.
+    #[test]
+    fn spawn_config_dir_reports_the_recorded_account_and_is_ambiguous_when_it_reports_none() {
+        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+        let sys = native_pty_system();
+        let Ok(pair) =
+            sys.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        else {
+            return; // no PTY in this environment — skip
+        };
+        let Ok(mut child) = pair.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer = child.clone_killer();
+        let pid = child.process_id();
+        let writer = pair.master.take_writer().expect("take_writer");
+        let mgr = PtyManager::default();
+
+        // Insert the way production does — through `insert_session`, carrying the field the spawn
+        // decoded, so this exercises the same path `pty_spawn` uses rather than a hand-built map.
+        let epoch = mgr.insert_session(
+            "agent-on-work-account".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer)),
+                master: pair.master,
+                killer,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                pid,
+                epoch: NO_EPOCH,
+                config_dir: spawn_account_from_args(&[
+                    "-c".to_string(),
+                    r#"export CLAUDE_CONFIG_DIR='/Users/agent/.claude-accounts/work'; export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude'"#
+                        .to_string(),
+                ]),
+            },
+        );
+        assert!(epoch > NO_EPOCH, "the session must actually have been inserted");
+
+        assert_eq!(
+            mgr.spawn_config_dir("agent-on-work-account").as_deref(),
+            Some("/Users/agent/.claude-accounts/work"),
+            "the account decoded at spawn must survive into the map and come back out"
+        );
+
+        // Case 2 of the documented ambiguity: no session under this id.
+        assert_eq!(
+            mgr.spawn_config_dir("agent-that-never-spawned"),
+            None,
+            "an unknown id answers None — and a caller must NOT read that as 'the default \
+             account'; `live_epoch` is what separates 'no session' from 'no explicit dir'"
+        );
+        assert_eq!(
+            mgr.live_epoch("agent-that-never-spawned"),
+            NO_EPOCH,
+            "…which is the check that disambiguates it"
+        );
+
+        // Case 1 of the ambiguity: a LIVE session with no explicit dir gives the identical answer.
+        let sys2 = native_pty_system();
+        let Ok(pair2) =
+            sys2.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+        else {
+            return;
+        };
+        let Ok(mut child2) = pair2.slave.spawn_command(CommandBuilder::new("/bin/cat")) else {
+            return;
+        };
+        let killer2 = child2.clone_killer();
+        let pid2 = child2.process_id();
+        let writer2 = pair2.master.take_writer().expect("take_writer");
+        mgr.insert_session(
+            "agent-on-default-account".to_string(),
+            PtySession {
+                writer: Arc::new(Mutex::new(writer2)),
+                master: pair2.master,
+                killer: killer2,
+                pause: Arc::new(PauseState::new()),
+                inflight: Arc::new(InflightState::new()),
+                pid: pid2,
+                epoch: NO_EPOCH,
+                config_dir: spawn_account_from_args(&[
+                    "-c".to_string(),
+                    r#"export PATH="$HOME/.local/bin:$PATH"; exec '/usr/bin/claude'"#.to_string(),
+                ]),
+            },
+        );
+        assert_eq!(
+            mgr.spawn_config_dir("agent-on-default-account"),
+            None,
+            "a live default-account session answers None too — SAME value as the unknown id above"
+        );
+        assert!(
+            mgr.live_epoch("agent-on-default-account") > NO_EPOCH,
+            "…and only liveness tells the two Nones apart, which is the whole doc-comment caveat"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = child2.kill();
+        let _ = child2.wait();
+    }
+
     /// `session_pids` must report the REAL spawned pid, keyed by session id, for every session that
     /// has one — and skip the ones that don't. `memwatch::agent_footprints` walks the process tree
     /// from these roots, so a wrong or missing pid silently makes an agent invisible to the
@@ -2180,6 +3113,7 @@ mod tests {
                 inflight: Arc::new(InflightState::new()),
                 pid,
                 epoch: next_pty_epoch(),
+                config_dir: SpawnAccount::Default,
             },
         );
 
@@ -2244,6 +3178,7 @@ mod tests {
                     inflight: Arc::new(InflightState::new()),
                     pid: None,
                     epoch: NO_EPOCH,
+                    config_dir: SpawnAccount::Default,
                 },
                 child,
             ));
@@ -2317,6 +3252,7 @@ mod tests {
                     inflight: Arc::new(InflightState::new()),
                     pid: None,
                     epoch: NO_EPOCH,
+                    config_dir: SpawnAccount::Default,
                 },
                 child,
             ));
@@ -2391,6 +3327,7 @@ mod tests {
                 inflight: Arc::new(InflightState::new()),
                 pid: None,
                 epoch: NO_EPOCH,
+                config_dir: SpawnAccount::Default,
             },
         );
 
@@ -2495,6 +3432,7 @@ mod tests {
                 // No pid yet — a spawn that has not finished reporting one.
                 pid: None,
                 epoch: NO_EPOCH,
+                config_dir: SpawnAccount::Default,
             },
         );
         assert!(inserted > NO_EPOCH, "insert_session must stamp a real epoch, not the sentinel");
@@ -2566,6 +3504,7 @@ mod tests {
             inflight: Arc::new(InflightState::new()),
             pid,
             epoch: next_pty_epoch(),
+            config_dir: SpawnAccount::Default,
         };
         let sessions: Mutex<HashMap<String, PtySession>> = Mutex::new(HashMap::new());
         sessions.lock().unwrap().insert("a".to_string(), session);
@@ -2729,6 +3668,7 @@ mod tests {
                 inflight: inflight.clone(),
                 pid: None,
                 epoch: NO_EPOCH,
+                config_dir: SpawnAccount::Default,
             },
         );
 
@@ -2831,6 +3771,7 @@ mod tests {
                 inflight: Arc::new(InflightState::new()),
                 pid: None,
                 epoch: NO_EPOCH,
+                config_dir: SpawnAccount::Default,
             },
         );
 
@@ -2970,6 +3911,7 @@ mod tests {
             inflight: Arc::new(InflightState::new()),
             pid: None,
             epoch: NO_EPOCH,
+            config_dir: SpawnAccount::Default,
         };
 
         let started = std::time::Instant::now();
@@ -3015,6 +3957,7 @@ mod tests {
                 inflight: Arc::new(InflightState::new()),
                 pid: None,
                 epoch: NO_EPOCH,
+                config_dir: SpawnAccount::Default,
             },
         );
 
@@ -3301,6 +4244,7 @@ mod tests {
                     inflight: Arc::new(InflightState::new()),
                     pid: None,
                     epoch: NO_EPOCH,
+                    config_dir: SpawnAccount::Default,
                 },
                 child,
             ))
@@ -3388,6 +4332,7 @@ mod tests {
                     inflight: Arc::new(InflightState::new()),
                     pid: None,
                     epoch: NO_EPOCH,
+                    config_dir: SpawnAccount::Default,
                 },
                 child,
             ))

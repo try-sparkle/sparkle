@@ -8,6 +8,8 @@ import {
   enforcedWorkerCap,
   concurrencyBasis,
   AI_FEATURE_FIELD,
+  toConciergeOwnOrgs,
+  toConciergeProjectPolicy,
   type AiFeatureFlags,
 } from "./settingsStore";
 import type { EffectiveConfig } from "../services/config";
@@ -295,72 +297,14 @@ describe("hydrateFromConfig — [improvement].consent mirror", () => {
   });
 });
 
-// `[preview] auto_open` — the setting that decides whether a pane may open UNASKED, so the two
-// facts worth pinning are that a written value is adopted and that nothing else can reach
-// `"always"` by accident. See `previewOpenOutcomeFor` for what each value means.
-describe("hydrateFromConfig — [preview].auto_open mirror", () => {
-  const baseConfig = {
-    workflow: {
-      require_pr: true,
-      worktree_isolation: true,
-      default_branch: "",
-      born_fresh_from_base: true,
-      delete_merged_branch: true,
-      drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
-    },
-    workers: { max_concurrent: 5 },
-    ai: {
-      auto_rename: true,
-      voice_dictation: true,
-      composer: true,
-      suggested_actions: true,
-      auto_approve: true,
-    },
-    freshness: {
-      staleness_warn_commits: 25,
-      stale_build_block_commits: 25,
-      require_fresh_branch: true,
-    },
-    capture: { popover_shortcut: "ctrl+shift+r" },
-    done: { description: null, criteria: [] },
-    delivered: {
-      description: null,
-      detected_method: null,
-      confidence: null,
-      confidence_note: null,
-      learned: false,
-      criteria: [],
-    },
-  };
-  const eff = (preview?: { enabled: boolean; idle_grace_min: number; auto_open: string }) =>
-    ({
-      config: { ...baseConfig, ...(preview ? { preview } : {}) },
-      warnings: [],
-    }) as EffectiveConfig;
-  const section = (auto_open: string) => ({ enabled: true, idle_grace_min: 10, auto_open });
-
-  it.each(["never", "always", "returning"] as const)("adopts %s from the file", (value) => {
-    useSettingsStore.setState({ previewAutoOpen: "returning" });
-    useSettingsStore.getState().hydrateFromConfig(eff(section(value)));
-    expect(useSettingsStore.getState().previewAutoOpen).toBe(value);
-  });
-
-  it("falls back to the shipped default when the [preview] section is absent", () => {
-    // A backend predating [preview]. `config.ts` states the rule for the whole section: an absent
-    // one means "use the shipped defaults", NOT "the feature is off".
-    useSettingsStore.setState({ previewAutoOpen: "always" });
-    useSettingsStore.getState().hydrateFromConfig(eff());
-    expect(useSettingsStore.getState().previewAutoOpen).toBe("returning");
-  });
-
-  it("degrades an unrecognized value to the default, NEVER to always", () => {
-    // Rust validates, so this should be unreachable — which is exactly why it is worth pinning.
-    // The direction is the point: a fail-open coercion here pops panes on a typo nobody can see.
-    useSettingsStore.setState({ previewAutoOpen: "never" });
-    useSettingsStore.getState().hydrateFromConfig(eff(section("ALWAYS")));
-    expect(useSettingsStore.getState().previewAutoOpen).toBe("returning");
-  });
-});
+// `[preview] auto_open` IS GONE, along with the preview PANE it governed (founder, 2026-08-19: a
+// preview is a card in the concierge chat, not a peer column). The block that used to pin its
+// coercion was deleted with it rather than left asserting a field nothing reads — a test for a
+// retired setting is the kind of green that makes a suite less trustworthy, not more.
+//
+// What replaced it is asserted where it lives: `hydrateFromConfig — reflect config.toml into the
+// store` below covers `[preview].agent_eagerness`, and the card's own surfacing (which needs no
+// setting at all) is covered by `Concierge/PreviewCards.test.tsx`.
 
 describe("settingsStore — Chief doc state", () => {
   beforeEach(() => {
@@ -1099,6 +1043,17 @@ describe("1Password setters", () => {
     expect(useSettingsStore.getState().onepasswordVaultId).toBeNull();
   });
 
+  it("setToolEnabled drives the straude flag through TOOL_FIELD", () => {
+    useSettingsStore.getState().setToolEnabled("straude", true);
+    expect(useSettingsStore.getState().straudeEnabled).toBe(true);
+    useSettingsStore.getState().setToolEnabled("straude", false);
+    expect(useSettingsStore.getState().straudeEnabled).toBe(false);
+    // And it does not reach the sibling destination's field.
+    useSettingsStore.setState({ builderIndexEnabled: true });
+    useSettingsStore.getState().setToolEnabled("straude", true);
+    expect(useSettingsStore.getState().builderIndexEnabled).toBe(true);
+  });
+
   it("setToolEnabled drives the onepassword flag through TOOL_FIELD", () => {
     useSettingsStore.getState().setToolEnabled("onepassword", true);
     expect(useSettingsStore.getState().onepasswordEnabled).toBe(true);
@@ -1329,5 +1284,148 @@ describe("claimChiefLibrary — atomic, and blind to ghosts (sparkle-ojgvp)", ()
     // is nothing to destroy and refusing would strand the live project with no in-app remedy.
     useSettingsStore.setState({ chiefProjectByProject: { a: "chief_shared", ghost: "chief_shared" } });
     expect(s().claimChiefLibrary("a", "chief_shared", ["a"])).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// `[concierge].own_orgs` and `[concierge.projects]` — the per-project policy mirror
+// ---------------------------------------------------------------------------------------------
+//
+// Both are read STRICTLY: an org that does not survive narrowing makes its repos foreign (the
+// stricter answer), while a RULE that does not survive narrowing would restore the looser global
+// tier. So the two halves have deliberately different discipline, and the tests below say which.
+
+describe("toConciergeOwnOrgs", () => {
+  it("trims, lowercases and de-duplicates, preserving order", () => {
+    expect(toConciergeOwnOrgs(["  DROdio ", "plow-pbc", "drodio"])).toEqual(["drodio", "plow-pbc"]);
+  });
+
+  it("drops everything that is not a usable org, and never throws", () => {
+    expect(toConciergeOwnOrgs([1, null, undefined, "", "   ", {}, ["x"]])).toEqual([]);
+    // A Rust `Option<Vec<String>>` arrives as an explicit null, not as an absent key.
+    expect(toConciergeOwnOrgs(null)).toEqual([]);
+    expect(toConciergeOwnOrgs(undefined)).toEqual([]);
+    expect(toConciergeOwnOrgs("drodio")).toEqual([]);
+  });
+});
+
+describe("toConciergeProjectPolicy", () => {
+  it("keys by lowercased slug and keeps rule values VERBATIM", () => {
+    // The verbatim half is the load-bearing one: `evaluateToolPolicy` reads an unrecognized rule as
+    // `ask`, which is STRICTER than absent. Narrowing "Deny" away here would hand back the global
+    // tier on exactly the project someone was tightening.
+    expect(
+      toConciergeProjectPolicy({
+        "DROdio/Sparkle": { tools: { merge_pr: "Deny" } },
+        " plow-pbc/tkmx-server ": { tools: { merge_pr: "deny", spawn_build_agent: 7 } },
+      }),
+    ).toEqual({
+      "drodio/sparkle": { merge_pr: "Deny" },
+      "plow-pbc/tkmx-server": { merge_pr: "deny" },
+    });
+  });
+
+  it("survives every shape the wire can produce", () => {
+    // A Rust `Option` crosses as null at BOTH levels — the projects table and each `tools` map.
+    expect(toConciergeProjectPolicy({ "a/b": null })).toEqual({ "a/b": {} });
+    expect(toConciergeProjectPolicy({ "a/b": { tools: null } })).toEqual({ "a/b": {} });
+    expect(toConciergeProjectPolicy({ "a/b": {} })).toEqual({ "a/b": {} });
+    expect(toConciergeProjectPolicy(null)).toEqual({});
+    expect(toConciergeProjectPolicy(undefined)).toEqual({});
+    expect(toConciergeProjectPolicy([])).toEqual({});
+    expect(toConciergeProjectPolicy("nope")).toEqual({});
+  });
+});
+
+describe("hydrateFromConfig — the concierge per-project mirror", () => {
+  const baseConfig = {
+    workflow: {
+      require_pr: true,
+      worktree_isolation: true,
+      default_branch: "",
+      born_fresh_from_base: true,
+      delete_merged_branch: true,
+      drift: { behind_nudge: 10, ahead_nudge: 15, changed_lines: 1000 },
+    },
+    workers: { max_concurrent: 5 },
+    ai: {
+      auto_rename: true,
+      voice_dictation: true,
+      composer: true,
+      suggested_actions: true,
+      auto_approve: true,
+    },
+    freshness: {
+      staleness_warn_commits: 25,
+      stale_build_block_commits: 25,
+      require_fresh_branch: true,
+    },
+    capture: { popover_shortcut: "ctrl+shift+r" },
+    done: { description: null, criteria: [] },
+    delivered: {
+      description: null,
+      detected_method: null,
+      confidence: null,
+      confidence_note: null,
+      learned: false,
+      criteria: [],
+    },
+  };
+  const eff = (concierge?: unknown) =>
+    ({
+      config: { ...baseConfig, ...(concierge === undefined ? {} : { concierge }) },
+      warnings: [],
+    }) as EffectiveConfig;
+
+  beforeEach(() => {
+    useSettingsStore.setState({
+      conciergeToolPolicy: {},
+      conciergeOwnOrgs: [],
+      conciergeProjectPolicy: {},
+      conciergeToolPolicyHydrated: false,
+    });
+  });
+
+  it("hydrates all three under the ONE existing flag", () => {
+    // One config read settles the global rules, the orgs and the project rules together. A window
+    // where the global rules are loaded and the project ones are not would resolve every project to
+    // the looser global answer, which is the failure this flag exists to prevent.
+    useSettingsStore.getState().hydrateFromConfig(
+      eff({
+        tools: { merge_pr: "allow" },
+        own_orgs: ["DROdio"],
+        projects: { "plow-pbc/tkmx-server": { tools: { merge_pr: "deny" } } },
+      }),
+    );
+    const s = useSettingsStore.getState();
+    expect(s.conciergeToolPolicy).toEqual({ merge_pr: "allow" });
+    expect(s.conciergeOwnOrgs).toEqual(["drodio"]);
+    expect(s.conciergeProjectPolicy).toEqual({
+      "plow-pbc/tkmx-server": { merge_pr: "deny" },
+    });
+    expect(s.conciergeToolPolicyHydrated).toBe(true);
+  });
+
+  it("a backend predating the fields leaves the strict defaults in place", () => {
+    // Absent section, absent keys, and explicit nulls all mean the same thing: no org is ours, so
+    // every repo is foreign — which floors anything touching main at `ask`, i.e. exactly today's
+    // global stopgap. Nobody gains a permission on upgrade.
+    useSettingsStore.getState().hydrateFromConfig(eff({ tools: { merge_pr: "allow" } }));
+    expect(useSettingsStore.getState().conciergeOwnOrgs).toEqual([]);
+    expect(useSettingsStore.getState().conciergeProjectPolicy).toEqual({});
+    useSettingsStore
+      .getState()
+      .hydrateFromConfig(eff({ tools: {}, own_orgs: null, projects: null }));
+    expect(useSettingsStore.getState().conciergeOwnOrgs).toEqual([]);
+    expect(useSettingsStore.getState().conciergeProjectPolicy).toEqual({});
+  });
+
+  it("a later hydrate REPLACES the mirror rather than merging into it", () => {
+    // Config is the source of truth for these; a removed org that lingered in the store would keep
+    // granting the looser answer for a repo the human just stopped claiming.
+    useSettingsStore.getState().hydrateFromConfig(eff({ tools: {}, own_orgs: ["drodio"] }));
+    expect(useSettingsStore.getState().conciergeOwnOrgs).toEqual(["drodio"]);
+    useSettingsStore.getState().hydrateFromConfig(eff({ tools: {}, own_orgs: [] }));
+    expect(useSettingsStore.getState().conciergeOwnOrgs).toEqual([]);
   });
 });

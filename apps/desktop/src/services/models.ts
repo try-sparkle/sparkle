@@ -31,6 +31,16 @@ export const DEFAULT_MODEL_ID = "default";
  *  short/long labels for. This is what renders before (or instead of) a dynamic fetch. */
 export const CLAUDE_MODELS: ClaudeModelOption[] = [
   { id: DEFAULT_MODEL_ID, label: "Default (Claude Code setting)", short: "Default" },
+  // Opus 5 sits FIRST among the real models, and the position is load-bearing rather than
+  // cosmetic. `services/advisor/model.ts` resolves the second-model advisor's model as "the first
+  // catalog entry that is not the planner's" when no `[advisor].model` is configured, so whatever
+  // leads this list is what an unconfigured install spends on. Fable led it, and Fable is the most
+  // expensive row in `spend.rs`'s table ($10/$50 per Mtok against Opus 5's $5/$25) — an unconfigured
+  // fallback onto the dearest model is not a default anybody chose. `research.rs` already pins
+  // `claude-opus-5` as the model every research child runs on, so this adds no new capability, only
+  // the catalog entry that makes it nameable (models.ts is the source of truth — `model_catalog.rs`
+  // deliberately returns an empty vec, so "a newly-released model needs one line added here").
+  { id: "claude-opus-5", label: "Opus 5", short: "Opus 5" },
   { id: "claude-fable-5", label: "Fable 5", short: "Fable" },
   { id: "claude-opus-4-8", label: "Opus 4.8", short: "Opus" },
   { id: "claude-sonnet-5", label: "Sonnet 5", short: "Sonnet" },

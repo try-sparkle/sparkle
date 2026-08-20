@@ -78,10 +78,11 @@ function harness(opts: {
   return { deps, onLogin, removeAccount };
 }
 
-/** Click "Switch login" on slot A's row specifically (other rows carry the same label). */
+/** Open slot A's ⋮ kebab and click its "Switch login" item (the control moved into the kebab). */
 async function reloginSlotA() {
-  const row = await screen.findByTestId("account-row-slotA");
-  fireEvent.click(within(row).getByText("Switch login"));
+  fireEvent.click(await screen.findByTestId("account-menu-button-slotA"));
+  const menu = await screen.findByTestId("account-menu-slotA");
+  fireEvent.click(within(menu).getByText("Switch login"));
 }
 
 describe("AccountsScreen — identity-keyed re-login reconciliation", () => {

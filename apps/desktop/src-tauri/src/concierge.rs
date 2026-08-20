@@ -187,10 +187,23 @@ workflow, a 'this keeps happening' — is work for the Improve-Sparkle agent (@S
 continuously hardens the app: file a bead labelled `for:improve-sparkle` describing it, rather than \
 spawning a build agent for a symptom that will recur. A ONE-OFF task the user wants done NOW — a \
 specific fix, feature, or change with a clear finish line — is a build agent, spawned the way you \
-spawn any build agent. When in doubt, ask which they meant. And to REACH the Improve-Sparkle agent, \
-file or comment on a bead — NEVER try to type into its terminal: it runs a full-screen TUI, so \
-keystrokes are read as commands and your message is lost (the app correctly refuses the write). The \
-bead is the durable channel it actually reads.\n\n\
+spawn any build agent. When in doubt, ask which they meant.\n\n\
+TALKING TO THE IMPROVE-SPARKLE AGENT — IT CAN NOW TALK BACK. Prefer `send_peer_message` to \
+`__sparkle_self__`: it is queued to that agent's next turn boundary and it is the channel it uses \
+to reach YOU. A terminal send also works and is worth it when you need it read now — the one thing \
+that stops it is the `sparkle-busy` hold while an hourly improvement pass is mid-flight, and its \
+roster row's `activity` says when that is, so read it first. A bead remains the durable fallback \
+and the right home for anything that should outlive the session. What you must NOT do is press a \
+button on a screen you cannot read: if a send is refused because a full-screen app owns the \
+terminal, that refusal is correct — do not retry it another way.\n\n\
+WHEN IMPROVE-SPARKLE SENDS YOU A DIRECTIVE, YOUR OBSERVATION WINS. It cannot address a build agent \
+and cannot read one's live row, so anything it tells you about what OTHER agents are doing is \
+inferred from notifications, not seen. You read the real rows. So check its directive against what \
+you can observe before you relay it: if they agree, fan it out; if they conflict, HOLD it — do not \
+relay — and message the sender back saying what you actually see. Never silently drop it; a \
+directive you neither relay nor answer disappears, and that is worse than either. This is the one \
+place where being slower is correct: several agents once undid each other's work because each was \
+reasoning well from partial evidence and nothing reconciled them.\n\n\
 Be a real collaborator: give ideas, push back when you think the user is wrong, and flag risks \
 you notice. Stay calm and brief — no filler, no alarmism. When nothing needs them, say so in a \
 sentence. Respond in clean GitHub-flavored markdown, tightest-first: lead with what needs the \
@@ -859,6 +872,85 @@ fn should_retry_without_resume(ok: bool, resume_session_id: Option<&str>) -> boo
     !ok && matches!(resume_session_id, Some(sid) if !sid.is_empty())
 }
 
+/// How long the concierge benches an account it rotated OFF because its OAuth expired, in seconds.
+/// Mirrors the frontend's `REACTIVE_BENCH_MS` (5 minutes): an OAuth expiry has no real reset instant
+/// — the account is dead until the human re-signs in and recorded state can never see that — so this
+/// is a short reactive nudge that lets the account back into the pool once it may have recovered, not
+/// an authoritative wall. Kept in seconds to match the accounts store's `exhausted_until`.
+const AUTH_ROTATE_BENCH_SECS: i64 = 5 * 60;
+
+/// Does this turn's failure carry the OAuth-expiry signature? Classified off the SAME two sources
+/// [`failure_detail`] prefers — the child's stderr and claude's own `result` error text — reusing the
+/// shared [`crate::roborev_account::is_auth_expired`] / `AUTH_EXPIRY_PHRASES` so the concierge and the
+/// roborev shim can never disagree about what "auth-dead" means. Pure for tests.
+fn outcome_is_auth_expired(stderr: &str, error_detail: Option<&str>) -> bool {
+    crate::roborev_account::is_auth_expired(stderr)
+        || error_detail.is_some_and(crate::roborev_account::is_auth_expired)
+}
+
+/// What ONE post-failure retry should do — the whole decision as a pure value so every arm is
+/// unit-testable without spawning a real `claude` (AGENTS.md: assert the SIDE EFFECT, which here is
+/// the config dir the retry actually runs under, and whether the dead account gets benched).
+#[derive(Debug, PartialEq, Eq)]
+struct RetryPlan {
+    /// The account the retry runs under, as its `CLAUDE_CONFIG_DIR`. `None`/empty = inherit.
+    config_dir: Option<String>,
+    /// The account the concierge is rotating OFF (auth-dead) and must bench so every consumer routes
+    /// around it. `None` for the plain stale-resume self-heal, which does not change account.
+    bench_config_dir: Option<String>,
+}
+
+/// Decide the single post-failure retry. `None` means DO NOT retry — surface the failure.
+///
+/// Three outcomes, in priority order:
+///  1. AUTH-DEAD WITH A HEALTHY ALTERNATIVE — the founder's bug. The pinned account's OAuth expired,
+///     so retrying it (with or without `--resume`) can only fail the same way; rotate to the best
+///     healthy fallback the frontend supplied — dropping `--resume`, since that session id lives in
+///     the dead account's transcript tree — and bench the dead account. A single auth failure becomes
+///     a ROTATED retry, not a same-account one.
+///  2. AUTH-DEAD WITH NO ALTERNATIVE — never bench the last healthy account: return `None` so the
+///     turn fails into the existing sign-in dead-end, exactly as the frontend's last-account guard
+///     does. This is why the auth branch does NOT fall through to the stale-resume retry: retrying a
+///     known-auth-dead account without `--resume` is a wasted turn that ends in the same sign-in.
+///  3. A NON-AUTH failure with a resume id — the existing stale-`--resume` self-heal: retry the SAME
+///     account without `--resume` (a stale resume is the #1 cause of an empty-stderr failure).
+fn plan_retry(
+    ok: bool,
+    auth_expired: bool,
+    primary_config_dir: Option<&str>,
+    fallback_config_dirs: &[String],
+    resume_session_id: Option<&str>,
+) -> Option<RetryPlan> {
+    if ok {
+        return None;
+    }
+    if auth_expired {
+        // The first fallback that is a real, DIFFERENT account than the one that just failed. The
+        // frontend ranks these healthiest-first and already excludes the primary and clobbered
+        // defaults, but guard against an empty or duplicate entry so a rotation can never land back
+        // on the dead account.
+        let rotate_to = fallback_config_dirs
+            .iter()
+            .map(String::as_str)
+            .find(|d| !d.is_empty() && Some(*d) != primary_config_dir);
+        return rotate_to.map(|d| RetryPlan {
+            config_dir: Some(d.to_string()),
+            // Bench only a real dedicated account (non-empty dir). The shared `$HOME/.claude` default
+            // (empty dir) is steered away from by the clobbered-default guard, not benched by id.
+            bench_config_dir: primary_config_dir
+                .filter(|p| !p.is_empty())
+                .map(str::to_string),
+        });
+    }
+    if should_retry_without_resume(ok, resume_session_id) {
+        return Some(RetryPlan {
+            config_dir: primary_config_dir.map(str::to_string),
+            bench_config_dir: None,
+        });
+    }
+    None
+}
+
 /// Build the `concierge:error` detail for a failed turn. Same priority order as
 /// `claude_chat::build_error_message` / `sparkle_improve::failure_message` (both private to
 /// their modules), so a failure reads the same wherever it surfaces:
@@ -1405,6 +1497,12 @@ pub async fn concierge_turn(
     // account selection now covers build agents, Improve Sparkle AND the concierge. Optional so an
     // older frontend — or a build with no accounts configured — still spawns exactly as before.
     config_dir: Option<String>,
+    // Healthy DEDICATED accounts to rotate to, best-first, as their `CLAUDE_CONFIG_DIR`s — the
+    // frontend ranks them with the same `pickAccount`/`eligibleAccounts` selection and excludes the
+    // primary and any clobbered default (Tauri maps JS `fallbackConfigDirs` → this). When the pinned
+    // account's OAuth expires, the retry rotates to the first of these instead of re-running the dead
+    // account. Optional/empty (older frontend, or one healthy account) = no rotation, sign-in as before.
+    fallback_config_dirs: Option<Vec<String>>,
 ) -> Result<String, String> {
     if prompt.trim().is_empty() {
         return Err("concierge_turn: prompt must be non-empty".into());
@@ -1514,6 +1612,9 @@ pub async fn concierge_turn(
     };
 
     let started_id = token.to_string();
+    // Healthy dedicated accounts to rotate to on an auth-expiry failure, moved into the reader thread
+    // (where the retry decision is made). Empty when the frontend supplied none.
+    let fallback = fallback_config_dirs.unwrap_or_default();
     let read_app = app.clone();
     // The clock the `elapsed_ms` fields report against. Taken here rather than inside the thread so
     // it covers the spawn itself, which is part of what the user waits for — and a RETRY is
@@ -1540,28 +1641,62 @@ pub async fn concierge_turn(
         // the floor says here, the install site is the backstop — see `continuation_install`.
         let retired = is_retired(token, RETIRE_BELOW.load(Ordering::Relaxed));
         if retired {
-            tracing::info!(id = %id, "concierge: turn was superseded; not retrying the stale resume");
+            tracing::info!(id = %id, "concierge: turn was superseded; not retrying");
         }
-        if !retired && should_retry_without_resume(outcome.ok, resume_session_id.as_deref()) {
-            tracing::info!(
-                id = %id,
-                "concierge_turn: turn failed with a resume session id; retrying once without --resume"
-            );
+        // The whole retry decision as one pure value (see `plan_retry`): rotate to a healthy account
+        // on an auth-expiry failure, else the stale-`--resume` self-heal, else nothing. `None` when
+        // retired, so a turn the user has moved past never retries.
+        let auth_expired = outcome_is_auth_expired(&outcome.stderr, outcome.error_detail.as_deref());
+        let plan = if retired {
+            None
+        } else {
+            plan_retry(
+                outcome.ok,
+                auth_expired,
+                config_dir.as_deref(),
+                &fallback,
+                resume_session_id.as_deref(),
+            )
+        };
+        if let Some(plan) = plan {
+            if let Some(dead) = plan.bench_config_dir.as_deref() {
+                // Rotating OFF an auth-dead account: bench it in the shared accounts store so the
+                // FRONTEND's next resolution, the roborev shim and every build agent all route around
+                // it — convergence, not just this one turn's rescue. Best-effort: a bench that cannot
+                // be written still leaves the rotated retry to answer on the healthy account.
+                match crate::accounts::bench_config_dir_auth_dead(
+                    &read_app,
+                    dead,
+                    AUTH_ROTATE_BENCH_SECS,
+                ) {
+                    Ok(benched) => tracing::info!(
+                        id = %id, benched,
+                        "concierge_turn: account OAuth expired; rotating to a healthy account and retrying"
+                    ),
+                    Err(e) => tracing::warn!(
+                        id = %id, error = %e,
+                        "concierge_turn: rotating to a healthy account, but could not bench the dead one"
+                    ),
+                }
+            } else {
+                tracing::info!(
+                    id = %id,
+                    "concierge_turn: turn failed with a resume session id; retrying once without --resume"
+                );
+            }
             let (kind2, token2) = continuation_install(token);
-            // SAME account as the attempt that failed. The retry exists to drop a `--resume` the
-            // config dir no longer holds, and switching accounts is now one of the ways that
-            // happens: the session id belongs to the PREVIOUS account's transcript tree, so the
-            // first attempt fails and this retry starts a fresh session — which must be created
-            // under the account the user is actually on, not under whatever the child would
-            // inherit. Passing `config_dir` here is what makes an account switch self-heal into a
-            // fresh concierge conversation on the new account instead of a dead turn.
+            // The retry ALWAYS drops `--resume`: the session id belongs to the previous account's (or
+            // the now-stale) transcript tree, so it must start a fresh session — created under
+            // `plan.config_dir`, which is the ROTATED healthy account on an auth failure and the same
+            // account on a stale-resume self-heal. Passing the wrong dir here is the original bug: the
+            // retry inheriting the dead pinned account (roborev — see `plan_retry`).
             match spawn_turn(
                 &read_app,
                 &prompt,
                 &cwd,
                 &claude_path,
                 None,
-                config_dir.as_deref(),
+                plan.config_dir.as_deref(),
                 kind2,
                 token2,
             ) {
@@ -1944,31 +2079,34 @@ mod tests {
         panic!("unbalanced parentheses after `{name}(` — the call never closes");
     }
 
-    /// The account must survive the STALE-RESUME RETRY, and this is the case an account switch
-    /// actually lands on: the stored session id belongs to the previous account's transcript tree,
-    /// so `--resume` fails and the retry re-spawns without it. If that retry dropped the account,
-    /// the self-heal would quietly recreate the conversation back on `$HOME/.claude` — re-opening
-    /// the bug on the exact path a switch takes.
+    /// The retry must run under the account `plan_retry` chose — the SAME account on a stale-resume
+    /// self-heal, the ROTATED healthy account on an auth-expiry failure. Both cases funnel through
+    /// `plan.config_dir`, so the retry's `spawn_turn` must pass exactly that, never the raw
+    /// `config_dir` (which is the dead pinned account on the auth path — the founder's bug) and never
+    /// `None` (which would recreate the concierge session on `$HOME/.claude`).
     ///
-    /// Pinned in source because the retry runs inside a spawned reader thread holding an
-    /// `AppHandle`, which the sibling `Command::get_envs()` tests cannot reach. The window is
-    /// extracted by BALANCED PARENS from the retry's own `spawn_turn(` call, and every step
-    /// panics on a miss: an earlier version sliced to a literal `"{\n                Ok("` with
-    /// `unwrap_or(len)`, so any reindentation would have widened the window to the rest of the
-    /// file — which contains both `blk_config_dir.as_deref()` and this assertion's own literal, and
-    /// would therefore have passed even with the argument reverted to `None`.
+    /// Pinned in source because the retry runs inside a spawned reader thread holding an `AppHandle`,
+    /// which the sibling `Command::get_envs()` tests cannot reach; the DECISION itself is asserted
+    /// directly and exhaustively in `plan_retry_*` below. The window is extracted by BALANCED PARENS
+    /// from the retry's own `spawn_turn(` call, and every step panics on a miss.
+    ///
+    /// The match is `plan.config_dir.as_deref()` and NOT the bare `config_dir.as_deref()`: the latter
+    /// is a substring of the former, so asserting the bare form would pass even if the retry reverted
+    /// to the dead pinned account. The leading `plan.` is exactly what distinguishes "runs the plan's
+    /// account" from "runs whatever it was pinned to".
     #[test]
-    fn the_stale_resume_retry_keeps_the_account() {
+    fn the_retry_runs_under_the_planned_account() {
         let src = include_str!("concierge.rs");
         let retry = src
             .split("let (kind2, token2) = continuation_install(token);")
             .nth(1)
-            .expect("the stale-resume retry must still spawn a continuation");
+            .expect("the retry must still spawn a continuation");
         let args = call_args(retry, "spawn_turn");
         assert!(
-            args.contains("config_dir.as_deref()"),
-            "the retry must re-spawn under the SAME account; passing None here would recreate the \
-             concierge session on $HOME/.claude after every account switch. Saw args: {args}"
+            args.contains("plan.config_dir.as_deref()"),
+            "the retry must re-spawn under `plan.config_dir` (the rotated account on an auth failure, \
+             the same account on a stale-resume self-heal) — not the raw pinned `config_dir` and not \
+             None. Saw args: {args}"
         );
     }
 
@@ -1978,6 +2116,88 @@ mod tests {
     fn call_args_stops_at_the_matching_paren_and_spans_nested_calls() {
         assert_eq!(call_args("f(a, g(b, c), d) then h(x)", "f"), "a, g(b, c), d");
         assert_eq!(call_args("let v = spawn_turn(\n  a,\n  b.as_deref(),\n);", "spawn_turn"), "\n  a,\n  b.as_deref(),\n");
+    }
+
+    // ── auth-expiry rotated-retry decision (bead sparkle-concierge-auth-failover) ──────────────────
+
+    fn dirs(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// THE FOUNDER'S BUG, as a decision. A turn on account A fails with the OAuth-expiry signature and
+    /// a healthy account B exists → the retry runs under B (SIDE EFFECT: `config_dir == Some(B)`) and
+    /// A is benched (`bench_config_dir == Some(A)`). Asserting on B, not just "rotated" — a rotation
+    /// that landed anywhere but a healthy account is exactly the bug.
+    #[test]
+    fn plan_retry_rotates_to_a_healthy_account_and_benches_the_dead_one_on_auth_expiry() {
+        let plan = plan_retry(false, true, Some("/acct/A"), &dirs(&["/acct/B", "/acct/C"]), Some("sid-1"))
+            .expect("an auth failure with a healthy fallback must retry, not surface");
+        assert_eq!(plan.config_dir.as_deref(), Some("/acct/B"), "the retry must rotate to the first healthy fallback, not stay on the dead account");
+        assert_eq!(plan.bench_config_dir.as_deref(), Some("/acct/A"), "the dead pinned account must be benched so every consumer routes around it");
+    }
+
+    /// PAIRED NEGATIVE #1 — a NON-auth failure must NOT rotate. The same failed turn with a resume id
+    /// but no auth signature is the ordinary stale-`--resume` self-heal: retry the SAME account, bench
+    /// nothing. Mutating the auth classifier to `true` would flip this to a rotation, so this pins that
+    /// only the auth signature spends a fallback.
+    #[test]
+    fn plan_retry_does_not_rotate_a_non_auth_failure() {
+        let plan = plan_retry(false, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid-1"))
+            .expect("a non-auth failure with a resume id must still do the stale-resume self-heal");
+        assert_eq!(plan.config_dir.as_deref(), Some("/acct/A"), "a non-auth self-heal must keep the same account");
+        assert_eq!(plan.bench_config_dir, None, "a non-auth failure must never bench an account");
+    }
+
+    /// PAIRED NEGATIVE #2 — the LAST-ACCOUNT GUARD. An auth failure with NO healthy alternative must
+    /// NOT retry (returns `None`, so the turn falls into the existing sign-in dead-end) and must NOT
+    /// bench the only account. This is the counterpart to the frontend's `no-healthy-alternative`
+    /// guard: never bench the fleet down to nothing.
+    #[test]
+    fn plan_retry_surfaces_signin_when_no_healthy_alternative_on_auth_expiry() {
+        assert_eq!(plan_retry(false, true, Some("/acct/A"), &[], Some("sid-1")), None, "auth-dead with no fallback must surface the sign-in, not retry the dead account");
+        // A fallback list that is only the dead account itself is not an alternative either.
+        assert_eq!(plan_retry(false, true, Some("/acct/A"), &dirs(&["/acct/A"]), None), None, "a fallback equal to the failed account is not a rotation target");
+    }
+
+    /// An auth failure can hit the FIRST turn, before any resume id exists — the rotation must still
+    /// fire there (it does not depend on `resume_session_id`, unlike the stale-resume self-heal).
+    #[test]
+    fn plan_retry_rotates_on_a_first_turn_auth_failure_with_no_resume_id() {
+        let plan = plan_retry(false, true, Some("/acct/A"), &dirs(&["/acct/B"]), None)
+            .expect("a first-turn auth failure must rotate even with no resume id");
+        assert_eq!(plan.config_dir.as_deref(), Some("/acct/B"));
+        assert_eq!(plan.bench_config_dir.as_deref(), Some("/acct/A"));
+    }
+
+    /// A successful turn is never retried, whatever the other inputs say.
+    #[test]
+    fn plan_retry_never_retries_a_successful_turn() {
+        assert_eq!(plan_retry(true, false, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid")), None);
+        assert_eq!(plan_retry(true, true, Some("/acct/A"), &dirs(&["/acct/B"]), Some("sid")), None);
+    }
+
+    /// The rotation skips empty fallback entries (the shared `$HOME/.claude` default records `""`) and
+    /// benches only a real dedicated account. So a default-account primary that auth-fails is not
+    /// benched by id — the clobbered-default guard steers away from it instead.
+    #[test]
+    fn plan_retry_skips_empty_dirs_and_does_not_bench_the_default() {
+        let plan = plan_retry(false, true, Some(""), &dirs(&["", "/acct/B"]), None)
+            .expect("must rotate to the first non-empty fallback");
+        assert_eq!(plan.config_dir.as_deref(), Some("/acct/B"), "an empty fallback dir must be skipped");
+        assert_eq!(plan.bench_config_dir, None, "an empty (default) primary must not be benched by id");
+    }
+
+    /// The concierge and the roborev shim must agree on what "auth-dead" means: the classifier reuses
+    /// the shared `roborev_account::is_auth_expired`, matched off EITHER the child's stderr or claude's
+    /// own result-error text (the two sources `failure_detail` prefers). A quota wall or an unrelated
+    /// error is NOT auth-dead, so it never spends a rotation.
+    #[test]
+    fn outcome_is_auth_expired_reads_stderr_or_error_detail_and_ignores_non_auth() {
+        assert!(outcome_is_auth_expired("Failed to authenticate: OAuth session expired and could not be refreshed", None));
+        assert!(outcome_is_auth_expired("", Some("oauth token has expired")));
+        assert!(!outcome_is_auth_expired("You've hit your monthly spend limit", Some("rate_limit")));
+        assert!(!outcome_is_auth_expired("", None));
+        assert!(!outcome_is_auth_expired("connection reset by peer", None));
     }
 
     #[test]
@@ -1999,6 +2219,51 @@ mod tests {
         // `shell_quote` renders each embedded `'` as the four-character `'\''`, which contributes
         // THREE quotes — so a correctly-escaped script routinely has an odd total. The assertion
         // failed against known-good output, which is the useful kind of wrong to find in a test.
+    }
+
+    #[test]
+    fn persona_tells_the_truth_about_reaching_improve_sparkle() {
+        // ══ A STRING THAT WAS FALSE, AND WAS FOLLOWED ═══════════════════════════════════════════
+        // This persona used to say: to reach Improve-Sparkle, use a bead and "NEVER try to type
+        // into its terminal ... the app correctly refuses the write". That contradicted
+        // SPARKLE_AGENT_TOOL_NOTE in the very same model's tool descriptions, which says these ops
+        // "reach it exactly as they reach a build agent". The alternate-screen guard refuses an
+        // UNRECOGNISED full-screen app, not Claude Code's own prompt, so the ordinary case was
+        // never refused at all.
+        //
+        // A remedy string is an instruction the model follows, so a false one costs a real channel:
+        // this is why the bead was believed to be the only route, and why a human ended up relaying
+        // messages between two windows by hand. The repo rule is explicit — a fix that changes
+        // behaviour must update every string that described the old behaviour. Pinned here so it
+        // cannot come back (bead sparkle-hdlhox).
+        assert!(!CONCIERGE_PERSONA.contains("NEVER try to type into its terminal"));
+        assert!(!CONCIERGE_PERSONA.contains("the app correctly refuses the write"));
+        // The accurate ladder, in order of preference. `send_peer_message` first because it is the
+        // symmetric one — the same channel that agent uses to reach the concierge.
+        assert!(CONCIERGE_PERSONA.contains("send_peer_message"));
+        assert!(CONCIERGE_PERSONA.contains("__sparkle_self__"));
+        // The REAL constraint on a terminal send, which is a transient worktree hold and not the
+        // TUI. Naming it is what keeps the model from re-deriving the old, wider prohibition.
+        assert!(CONCIERGE_PERSONA.contains("sparkle-busy"));
+        // The alternate-screen refusal is still correct and must still be honoured — correcting an
+        // overstatement must not read as permission to route around the real guard.
+        assert!(CONCIERGE_PERSONA.contains("that refusal is correct"));
+    }
+
+    #[test]
+    fn persona_makes_observation_beat_a_blind_directive() {
+        // THE SAFETY HALF of the two-way channel. Improve-Sparkle can now send fleet directives
+        // ("tell the blocked agents to stand down") reasoned entirely from notifications, because
+        // it has no route to a build agent and cannot read one's live row. The concierge does.
+        //
+        // Without this rule the channel makes the measured failure FASTER: several agents purging
+        // the same shared resource and undoing each other, every one of them individually
+        // reasoning well from partial evidence. The rule is that the observing side may refuse.
+        assert!(CONCIERGE_PERSONA.contains("YOUR OBSERVATION WINS"));
+        assert!(CONCIERGE_PERSONA.contains("HOLD it"));
+        // Holding must not collapse into dropping — an unanswered directive is indistinguishable
+        // from one never sent, which is the failure mode this whole bead exists to remove.
+        assert!(CONCIERGE_PERSONA.contains("Never silently drop it"));
     }
 
     #[test]
@@ -2123,12 +2388,30 @@ mod tests {
         // into a second guidelines file.
         assert!(CONCIERGE_PERSONA.contains("NOT for how the user wants you to talk"));
 
-        // The comms routing rule: systemic → the Improve-Sparkle agent via a labelled bead; one-off
-        // → a build agent. Both the label and the terminal refusal must be stated.
+        // The comms routing rule: systemic → the Improve-Sparkle agent; one-off → a build agent.
         assert!(CONCIERGE_PERSONA.contains("for:improve-sparkle"));
         assert!(CONCIERGE_PERSONA.contains("SYSTEMIC or RECURRING"));
-        // Reaching @Sparkle is via a bead, NEVER the terminal — the safety half of the routing rule.
-        assert!(CONCIERGE_PERSONA.contains("NEVER try to type into its terminal"));
+        // ══ THIS ASSERTION USED TO PIN A FALSE SENTENCE (bead sparkle-hdlhox) ════════════════════
+        // It read `contains("NEVER try to type into its terminal")` and was described as "the
+        // safety half of the routing rule". It was neither safe nor true: the alternate-screen
+        // guard refuses an UNRECOGNISED full-screen app, not Claude Code's own prompt, and
+        // SPARKLE_AGENT_TOOL_NOTE told the same model these ops "reach it exactly as they reach a
+        // build agent". So the persona forbade a channel that worked, and this test held that
+        // prohibition in place.
+        //
+        // This is the vacuous-test family the repo keeps catching, in its harder form: the test
+        // GRIPPED the source perfectly — remove the sentence and it goes red, as it did — so a
+        // mutation check would pass it cleanly. Only re-reading the expectation as a user-facing
+        // claim finds it. Flipped to pin the CAPABILITY the routing rule is supposed to protect
+        // (that a real channel to that agent is named) rather than the wording of a prohibition.
+        assert!(
+            CONCIERGE_PERSONA.contains("send_peer_message"),
+            "the routing rule must name a channel that actually reaches Improve-Sparkle"
+        );
+        assert!(
+            !CONCIERGE_PERSONA.contains("NEVER try to type into its terminal"),
+            "this prohibition is false and cost a working channel; see persona_tells_the_truth_about_reaching_improve_sparkle"
+        );
     }
 
     #[test]

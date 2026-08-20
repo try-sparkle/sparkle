@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
   correctedStatusFor,
   expiryProofFor,
+  goalReading,
   stallEvidenceFor,
   stallReadingFor,
 } from "./agentGoalReading";
@@ -20,7 +21,7 @@ import { decideExpiry } from "../engine/goalExpiry";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useInteractionStore } from "../stores/interactionStore";
-import { newGoal } from "../engine/agentGoal";
+import { escalateGoal, newGoal } from "../engine/agentGoal";
 import type { AgentTab, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "./branchStatus";
 
@@ -334,5 +335,53 @@ describe("expiryProofFor — the evidence a goal can be latched permanently clos
     expect(proof.clean).toBe(false);
     expect(proof.unlanded).toBe(false);
     expect("hasOpenPr" in proof).toBe(false);
+  });
+});
+
+describe("goalReading — a frozen escalation beside a goal that has moved on", () => {
+  // THE FOUNDER'S SECOND REPORT (2026-08-18): a goal he had REPLACED was still being quoted back at
+  // him as the thing blocking the agent. `escalationReason` is stamped at give-up and
+  // `chargeGoalDebt` carries it onto the next goal on purpose — an agent must not launder an
+  // escalation away by rewording — so the sentence and the live text legitimately disagree, and
+  // nothing in this payload said so.
+  //
+  // The rule EXISTED. It was computed in `controlListener.handleGetState`, for the roster only, and
+  // not in `goalReading` — which is what `get_agent_status` (the concierge's per-agent read, the one
+  // whose output a human actually hears) returns. One rule in two places, disagreeing exactly where
+  // it mattered most.
+  const T = 1_800_000_000_000;
+
+  it("flags the stale quote", () => {
+    const escalated = escalateGoal(newGoal("cut the DMG", T), T + 1, "gave up on the DMG");
+    // The agent restates its objective; the escalation rides along, quoting the old text.
+    const moved = { ...escalated, text: "add spot autoscaling to the CI runners" };
+    const reading = goalReading(moved, T + 2)!;
+    expect(reading.escalationReason).toContain("DMG");
+    expect(reading.escalationStale).toBe(true);
+  });
+
+  it("PAIR — an escalation quoting the CURRENT goal is not flagged", () => {
+    // Without this the assertion above is satisfied by a field that is simply always true, which
+    // would mark every genuine escalation as stale — a strictly worse failure than the one it fixes,
+    // since a real blocker would then read as an artefact.
+    const escalated = escalateGoal(newGoal("cut the DMG", T), T + 1, "gave up on the DMG");
+    const reading = goalReading(escalated, T + 2)!;
+    expect(reading.escalationReason).toContain("DMG");
+    expect(reading.escalationStale).toBeUndefined();
+  });
+
+  it("a LEGACY escalation with no recorded quote is not flagged", () => {
+    // Absence is "cannot tell", never "stale" — every escalation persisted before
+    // `escalatedGoalText` existed carries no quote, and marking those would dismiss real blockers.
+    const escalated = escalateGoal(newGoal("cut the DMG", T), T + 1, "gave up");
+    const { escalatedGoalText: _dropped, ...legacy } = escalated;
+    const reading = goalReading({ ...legacy, text: "something else entirely" }, T + 2)!;
+    expect(reading.escalationStale).toBeUndefined();
+  });
+
+  it("an UNESCALATED goal carries neither field", () => {
+    const reading = goalReading(newGoal("cut the DMG", T), T + 2)!;
+    expect(reading.escalationReason).toBeUndefined();
+    expect(reading.escalationStale).toBeUndefined();
   });
 });

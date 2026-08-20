@@ -489,3 +489,138 @@ describe("a picker press is recorded, and is not called a message", () => {
     expect(r?.viaPicker).toBeUndefined();
   });
 });
+
+// ── retire_agent: the op that records its own success, so this spine must not record a second ─────
+//
+// THE DEFECT (the founder's 2026-08-18 screenshot). One retirement put two lines in his thread, and
+// he retired twelve agents in a row and got twelve pairs:
+//
+//     Retired Sparkle-nudge #1 — Nudge-ladder test fixture, not real work. Idle with no goal…
+//     Retired that agent.
+//
+// *"just saying retired that agent doesn't really mean anything to me."*
+//
+// The second line is this classifier's. It cannot do better: `retireAgentArgs` is `.strict()` and
+// carries no `agentName`, and by the time the reply settles the agent has been torn down, so the
+// renderer's `resolve(agentId)` misses and the subject degrades to `ANONYMOUS_SUBJECT`. Meanwhile
+// `lifecycle.retireAgent`'s `noteReceipt` has already recorded the same action WITH the name and the
+// verbatim judgement.
+//
+// THE PAIR OF CASES IS THE POINT, and neither half proves the fix alone. Suppressing the whole op
+// would also pass the first case while deleting the refusal line — the one receipt that says a
+// retirement did NOT happen and why, which is precisely what `services/conciergeReceipts` exists to
+// guarantee. So the gate is on `ok`, and the second case is what pins it there.
+describe("retire_agent — recorded by lifecycle, not by this spine", () => {
+  it("mints NO receipt on success, because `noteReceipt` already minted the real one", () => {
+    expect(
+      classifyConciergeActionReceipt(
+        call({
+          domain: "lifecycle",
+          op: "retire_agent",
+          args: { agentId: "agent-4", reason: "Never-named placeholder: idle, no goal." },
+          ok: true,
+          data: { agentIds: ["agent-4"], projectId: "p1", outcome: "retire" },
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  // THE CONTROL. Same op, same args, only `ok` flipped — so a fix that suppressed `retire_agent`
+  // outright rather than its SUCCESS fails here. A refused retirement is invisible to `noteReceipt`
+  // (which runs only after a teardown that happened), making this line the founder's only witness.
+  it("still mints the REFUSAL receipt, which nothing else records", () => {
+    const refused = classifyConciergeActionReceipt(
+      call({
+        domain: "lifecycle",
+        op: "retire_agent",
+        args: { agentId: "agent-4", reason: "idle" },
+        ok: false,
+        data: undefined,
+        reason: "I won't retire “Kraken Auth”. It has unlanded commits.",
+      }),
+    );
+    expect(refused).toMatchObject({
+      kind: "retired",
+      ok: false,
+      agentId: "agent-4",
+      op: "lifecycle.retire_agent",
+    });
+    expect(refused?.reason).toBe("I won't retire “Kraken Auth”. It has unlanded commits.");
+  });
+
+  // AND THE SUPPRESSION IS SCOPED TO THE OP THAT EARNED IT. `close_agent` has no hand-written
+  // recorder behind it, so its success receipt is the ONLY one — a blanket "lifecycle records its
+  // own" would silently delete it, and the founder would lose every close line in the thread.
+  it("does not suppress a sibling lifecycle op that has no recorder of its own", () => {
+    expect(
+      classifyConciergeActionReceipt(
+        call({
+          domain: "lifecycle",
+          op: "close_agent",
+          args: { agentId: "agent-9" },
+          ok: true,
+          data: { agentIds: ["agent-9"], projectId: "p1" },
+        }),
+      ),
+    ).toMatchObject({ kind: "closed", ok: true, agentId: "agent-9" });
+  });
+});
+
+// ── the close family: named by the reply, because nothing else can name them ───────────────────────
+//
+// THE SAME CONTENTLESS SENTENCE AS "Retired that agent.", reached by a different route and NOT by
+// duplication — these ops emit one line, and it was the empty one. Each is argued by id alone, and
+// each REMOVES the roster row it reports on, so the renderer's id→name lookup is guaranteed to miss
+// and `actionReceiptLine` degrades to `ANONYMOUS_SUBJECT`: "Closed that agent."
+//
+// The fix is that the ops now carry the name they held at teardown. These cases assert the receipt
+// carries it — the thing that decides whether the founder can read the line — rather than that the
+// payload has a field.
+describe("the close family carries the name it was holding at teardown", () => {
+  it.each([
+    ["close_agent", { agentIds: ["a-1"], projectId: "p1", outcome: "close", agentName: "Kraken Auth" }],
+    ["discard_agent", { destroyed: { targets: [] }, agentName: "Kraken Auth" }],
+    ["spin_down_worker", { agentIds: ["a-1"], projectId: "p1", outcome: "spin-down", agentName: "Kraken Auth" }],
+  ])("%s names its subject from the reply", (op, data) => {
+    expect(
+      classifyConciergeActionReceipt(
+        call({ domain: "lifecycle", op, args: { agentId: "a-1" }, ok: true, data }),
+      ),
+    ).toMatchObject({ kind: "closed", ok: true, agentId: "a-1", agentName: "Kraken Auth" });
+  });
+
+  // THE CONTROL FOR THE PRECEDENCE RULE. An argued name is the caller's own label for its subject; a
+  // reply that overrode it would be silently re-labelling what the caller asked for. This fails if
+  // the two sources are ever swapped — which reads identically in every case above, where only one
+  // of them is present.
+  it("prefers an ARGUED name over the reply's", () => {
+    expect(
+      classifyConciergeActionReceipt(
+        call({
+          domain: "lifecycle",
+          op: "close_agent",
+          args: { agentId: "a-1", agentName: "what the caller called it" },
+          ok: true,
+          data: { agentIds: ["a-1"], projectId: "p1", agentName: "what the reply called it" },
+        }),
+      )?.agentName,
+    ).toBe("what the caller called it");
+  });
+
+  // AND THE SUBJECT ITSELF IS STILL ARGS-ONLY. Reading the NAME from the reply must not have opened
+  // the door to reading the SUBJECT from it — that is the mis-subjecting `subjectOf`'s header
+  // forbids, and this is the case that would catch it.
+  it("still takes the subject ID from the args, never from the reply", () => {
+    expect(
+      classifyConciergeActionReceipt(
+        call({
+          domain: "lifecycle",
+          op: "close_agent",
+          args: { agentId: "argued-id" },
+          ok: true,
+          data: { agentId: "reply-id", agentIds: ["reply-id"], projectId: "p1" },
+        }),
+      )?.agentId,
+    ).toBe("argued-id");
+  });
+});

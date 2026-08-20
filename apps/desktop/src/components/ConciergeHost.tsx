@@ -190,11 +190,17 @@ import {
   runReplyLint,
 } from "../services/conciergeLintRunner";
 import { DISABLED_POLICY, toLintPolicy } from "../services/conciergeLintPolicy";
+import { ensureLeadingFounderQuote } from "../services/conciergeLint/enforceLeadingQuote";
+import { REPLY_WITHOUT_QUOTE_CHECK_ID } from "../services/conciergeLint/checks/replyWithoutQuote";
 import type { LintPolicy, LintResult, Violation } from "../services/conciergeLint";
 import type { LintAction } from "../stores/conciergeLintMetrics";
 import { getConfig, onConfigChanged, type EffectiveConfig } from "../services/config";
 import { conciergeFailureNotice, mountedFailureHeadline } from "../engine/conciergeFailureNotice";
 import { reportClaudeAuthFailed } from "../services/claudeAuthSignal";
+import {
+  rotateStickyConsumerOffFailedAccount,
+  CONCIERGE_ACCOUNT_KEY,
+} from "../services/accountSelection";
 import {
   createProactiveScheduler,
   markStaleProactive,
@@ -219,10 +225,14 @@ import {
 // working it. See `engine/conciergeAutoDispatch`'s header for why four rounds of asking came first.
 import {
   AUTO_DISPATCH_TICK_MS,
+  AUTO_REDISPATCH_COOLDOWN_MS,
+  DISPATCH_SETTLE_MS,
   autoDispatchNotice,
   decideAutoDispatch,
+  dispatchStateFor,
 } from "../engine/conciergeAutoDispatch";
 import { liveTasks } from "../services/research/store";
+import { isLivePhase } from "../services/research/types";
 import { dispatchResearchTask } from "../services/conciergeTools/research";
 // THE APP-WIDE SEAM FOR THE TURN QUEUE'S DEPTH. Read by `services/pusherSnapshots` from a
 // background sweep that has no component to ask — see that store's header, and the publisher effect
@@ -282,6 +292,11 @@ import {
   type ConciergeMention,
 } from "./Concierge/mentions";
 import { classifyComposerRoute } from "./Concierge/composerRoute";
+import {
+  mountRefusalCause,
+  mountRefusalTail,
+  mountRefusalText,
+} from "../engine/mountRefusal";
 import { useMountedNotice } from "../hooks/useMountedNotice";
 import { useScreenHoldDrain } from "../hooks/useScreenHoldDrain";
 import { buildDigest, type DigestReadiness } from "../services/conciergeDigest";
@@ -326,6 +341,10 @@ import { usePendingAttachmentsStore } from "../stores/pendingAttachmentsStore";
 // host renders from the feed, and a project-store subscription would re-render it on every unrelated
 // agent write.
 import { useProjectStore } from "../stores/projectStore";
+// THE RAW CABLE, read here for ROUTING only — never `useEffectiveWired`, which is the DRAWING
+// projection and says "off" for states the cable is very much patched in. See `mountResolution`.
+import { useCableStore } from "../stores/cableStore";
+import { resolveMountedTarget } from "../engine/shellResolve";
 import { useMountedThread } from "../stores/mountedThreadStore";
 import { useAgentTranscript } from "../hooks/useAgentTranscript";
 // The SELECTED project id, for the header's "here" segment. A scalar selector, deliberately — it
@@ -829,31 +848,63 @@ export function ConciergeHost({
   // nothing like the per-agent cost that forced `fleetWatch` up to thirty seconds.
   //
   // ── EVERY GUARD THAT MATTERS IS IN THE DECIDER, NOT HERE ───────────────────────────────────────
-  // This effect owns delivery and the already-dispatched memory; it decides nothing. Same split the
-  // delegation ladder keeps, and the reason is that a judgement made in an effect is a judgement no
-  // unit test can reach.
+  // This effect owns DELIVERY and nothing else; it decides nothing. Same split the delegation ladder
+  // keeps, and the reason is that a judgement made in an effect is a judgement no unit test can
+  // reach. Note what it no longer owns: the memory of what has been sent. That used to live here as
+  // a `Set<string>` and it was the bead (`sparkle-zx9knz`) — a set inside a `[]`-dep effect is
+  // permanent within a mount and empty across one, so it latched the queue shut AND re-dispatched
+  // the whole thing on remount. What has been sent is now DERIVED from the research store by
+  // `dispatchStateFor`, and all this holds is the few-second window before the store can see our own
+  // dispatch.
   useEffect(() => {
-    // WHAT WE HAVE ALREADY SENT, held across ticks. A dispatched message KEEPS WAITING — research
-    // does not dequeue anything — so without this the same question is re-dispatched every tick.
-    const dispatched = new Set<string>();
-    // ONE AT A TIME. `dispatchResearchTask` awaits a round-trip, and a tick that fired while the
+    // OUR OWN IN-FLIGHT DISPATCHES — bubbleId -> when we fired. NOT a ledger of what has been sent
+    // (the store answers that); only the few seconds in which our dispatch is invisible to it. The
+    // research poll is 5s against a 15s tick, and a dispatch can also come back `not-acknowledged`
+    // with NO TASK ID AT ALL — a case `dispatchResearchTask`'s header says must never be retried,
+    // because such a dispatch has very probably started. See `DISPATCH_SETTLE_MS`.
+    const pendingSince = new Map<string, number>();
+    // ONE TICK AT A TIME. `dispatchResearchTask` awaits a round-trip, and a tick that fired while the
     // previous one was still in flight would decide against a live count that does not yet include
-    // the child it is about to create — the double-spend the `dispatched` set cannot catch, because
-    // the bubble id is not recorded until the dispatch returns.
+    // the children it is about to create — the double-spend `pendingSince` cannot catch on its own,
+    // because a stamp is only written as each dispatch in the batch is reached.
     let inFlight = false;
 
     const tick = async (): Promise<void> => {
       if (inFlight) return;
+      const now = Date.now();
+      // PRUNED EVERY TICK so a long-lived mount cannot accumulate a stamp per message forever. The
+      // bound is the settle window PLUS the cooldown behind it, not the settle window alone: an
+      // expired-but-unconfirmed stamp is what `dispatchStateFor` turns into "a pass that finished
+      // when the window closed", and dropping it at expiry would delete exactly the evidence that
+      // keeps an unacknowledged dispatch out of an immediate retry.
+      for (const [bubbleId, at] of pendingSince) {
+        if (!(now - at < DISPATCH_SETTLE_MS + AUTO_REDISPATCH_COOLDOWN_MS)) pendingSince.delete(bubbleId);
+      }
+
       const research = useResearchStore.getState();
+      const tasks = allResearchTasks();
+      const waiting = turnQueueRef.current.waiting;
       const decision = decideAutoDispatch({
-        waiting: turnQueueRef.current.waiting,
+        waiting,
         // THE SIDEBAR'S OWN SELECTOR, so the number this acts on is the number the founder is
         // reading off the "Concierge Agents" row. A private count here is how the two come to
         // disagree about whether anything is running.
-        liveResearch: liveTasks(allResearchTasks()).length,
+        liveResearch: liveTasks(tasks).length,
         researchHydrated: research.hydrated,
-        dispatched,
-        now: Date.now(),
+        // DERIVED FROM THE STORE, never remembered — see the effect's header. The mapping is the
+        // whole reason the decider takes `ResearchPassRecord` rather than `ResearchTask`: it keeps
+        // that module free of the store, and this is the one place that translation happens.
+        dispatched: dispatchStateFor(
+          waiting,
+          tasks.map((t) => ({
+            question: t.question,
+            live: isLivePhase(t.status),
+            finishedAt: t.finishedAt,
+          })),
+          pendingSince,
+          now,
+        ),
+        now,
       });
       if (decision.action !== "dispatch") return;
 
@@ -866,35 +917,51 @@ export function ConciergeHost({
       if (!project) return;
 
       inFlight = true;
-      // CLAIMED BEFORE THE AWAIT, not after. The round-trip is bounded but not instant, and a
-      // second tick that read an unclaimed id would dispatch the same question twice. A failed
-      // dispatch therefore does not retry — deliberately: `dispatchResearchTask`'s own header warns
-      // that an unacknowledged dispatch has very probably STARTED, so a retry buys a second metered
-      // child for one question. The message stays in the queue and the concierge still owes it.
-      dispatched.add(decision.entry.bubbleId);
+      // SEQUENTIALLY, not `Promise.all`. Each dispatch is a bridge round trip, and the batch is
+      // already bounded by the decider against the pool's headroom; firing them at once would buy
+      // nothing but a burst the runner has to queue anyway, while making a partial failure harder to
+      // report honestly.
+      const sent: QueuedTurn[] = [];
       try {
-        const result = await dispatchResearchTask({
-          question: decision.entry.text,
-          projectId: project.id,
-          projectRoot: project.rootPath,
-          // `quick` is the contract's default — cheap by default, escalated on demand. An
-          // auto-dispatch is the last place to spend a deep pass: nobody asked for it.
-          depth: "quick",
-        });
-        if (result.ok) {
-          notifyConcierge(autoDispatchNotice(decision.entry, decision.queued, decision.live));
+        for (const entry of decision.entries) {
+          // CLAIMED BEFORE THE AWAIT, not after. The round-trip is bounded but not instant, and a
+          // second tick that read an unclaimed bubble would dispatch the same question twice. A
+          // failed dispatch therefore does NOT retry and the stamp is NOT rolled back — deliberately:
+          // `dispatchResearchTask`'s own header warns that an unacknowledged dispatch has very
+          // probably STARTED, so a retry buys a second metered child for one question. The message
+          // stays in the queue and the concierge still owes it.
+          pendingSince.set(entry.bubbleId, Date.now());
+          try {
+            const result = await dispatchResearchTask({
+              question: entry.text,
+              projectId: project.id,
+              projectRoot: project.rootPath,
+              // `quick` is the contract's default — cheap by default, escalated on demand. An
+              // auto-dispatch is the last place to spend a deep pass: nobody asked for it.
+              depth: "quick",
+            });
+            if (result.ok) sent.push(entry);
+            // SAID OUT LOUD rather than swallowed. A silent failure here is indistinguishable from
+            // the mechanism not existing, which is the exact state this whole branch is fixing.
+            else log.warn("concierge", `auto-dispatch refused: ${result.reason} — ${result.message}`);
+          } catch (e) {
+            // PER-ENTRY, so one bad dispatch does not abandon the rest of a batch the decider
+            // already judged the pool had room for.
+            log.warn("concierge", `auto-dispatch threw: ${String(e)}`);
+          }
+        }
+
+        // ONE NOTICE PER TICK, covering everything that actually went out — and none at all when
+        // nothing did, so the concierge is never told about work that does not exist.
+        if (sent.length > 0) {
+          notifyConcierge(autoDispatchNotice(sent, decision.queued, decision.live));
           log.warn(
             "concierge",
-            `auto-dispatched research for a queued message: ${decision.queued} waiting, ` +
-              `${decision.live} live, oldest waited ${Math.round(decision.waitedMs / 1000)}s`,
+            `auto-dispatched research for ${sent.length} queued message${sent.length === 1 ? "" : "s"}: ` +
+              `${decision.queued} waiting, ${decision.live} live, oldest waited ` +
+              `${Math.round(decision.waitedMs / 1000)}s`,
           );
-        } else {
-          // SAID OUT LOUD rather than swallowed. A silent failure here is indistinguishable from
-          // the mechanism not existing, which is the exact state this whole branch is fixing.
-          log.warn("concierge", `auto-dispatch refused: ${result.reason} — ${result.message}`);
         }
-      } catch (e) {
-        log.warn("concierge", `auto-dispatch threw: ${String(e)}`);
       } finally {
         inFlight = false;
       }
@@ -1132,9 +1199,13 @@ export function ConciergeHost({
   // them; only `attachments`/`dropActive` change per render.
   const {
     attachments,
+    stagedSeq,
     dropActive,
     attachNotice,
     dismissNotice: dismissAttachNotice,
+    // Whether a native picker is on screen right now — the auto-send countdown's second pause
+    // signal, beside `composingMention`. See useAutoSend's `attachPickerOpen`.
+    pickerOpen: attachPickerOpen,
     attach,
     attachPaths,
     attachReady,
@@ -1177,10 +1248,30 @@ export function ConciergeHost({
   // exactly one fact — which agent is mounted — and that fact is already computed above, so this
   // reads it and adds nothing to the routing path.
   //
-  // Gated on `wired`, not on `target` alone: `target` is non-null whenever the founder has an agent
-  // selected, mounted or not, and swapping the thread for an UNMOUNTED selection would replace the
-  // Sparkle conversation during ordinary use — the same bug as today's, pointing the other way.
-  const mountedAgentId = wired !== "off" ? (target?.agentId ?? null) : null;
+  // ══ THE MOUNT IS THE CABLE. NOT THE SELECTION, NOT WHAT IS ON SCREEN (bead sparkle-9gsjqm) ══════
+  // This was `wired !== "off" ? (target?.agentId ?? null) : null` — the DRAWING projection ANDed with
+  // `decidePromptTarget`'s answer — and every one of the four predicates behind those two values
+  // except the cable itself is about the SURFACE. `engine/shellResolve.resolveMountedTarget`'s header
+  // has the whole diagnosis and the founder's two reproductions; the short version is that navigating
+  // the right column away from a mounted Improve Sparkle evaporated the mount while the cable stayed
+  // patched (so every later message became a silent concierge turn), and opening the Improve-Sparkle
+  // pane over a mounted BUILD agent re-aimed his words at `__sparkle_self__` because a different pane
+  // became visible.
+  //
+  // The pin is written by exactly the gesture that mounts and cleared by exactly the gestures that
+  // unmount, so nothing sits between the founder's click and where his words go. `wired` above is now
+  // DRAWING-ONLY, which is what `hooks/useEffectiveWired`'s own header has always asked for.
+  const cableWired = useCableStore((s) => s.wired);
+  const cablePin = useCableStore((s) => s.agentId);
+  // The pinned agent's project, for the `projectId` a `ConciergePromptTarget` carries. A SEPARATE
+  // selector from `mountedRow` below rather than one returning a fresh `{row, projectId}` object:
+  // zustand compares snapshots with `Object.is`, so a new object per render would re-render this host
+  // on every projectStore write anywhere in the app.
+  const mountedProjectId = useProjectStore((s) =>
+    cablePin
+      ? (s.projects.find((p) => p.agents.some((a) => a.id === cablePin))?.id ?? null)
+      : null,
+  );
   // The worktree is what keys the transcript (Claude Code stores sessions per encoded worktree path,
   // not per agent id). Taken from the roster row the app itself wrote when it CUT the worktree — no
   // id-to-path guessing, and nothing a model said.
@@ -1192,9 +1283,7 @@ export function ConciergeHost({
   // re-rendered this host. The selector returns the AGENT OBJECT, so this wakes when that one agent
   // changes rather than on every write anywhere in the project store.
   const mountedRow = useProjectStore((s) =>
-    mountedAgentId
-      ? s.projects.flatMap((p) => p.agents).find((a) => a.id === mountedAgentId)
-      : undefined,
+    cablePin ? s.projects.flatMap((p) => p.agents).find((a) => a.id === cablePin) : undefined,
   );
   // ══ …AND THE ONE MOUNTABLE AGENT THAT HAS NO ROW (bead sparkle-gw8yi) ═══════════════════════════
   // The scan above IS the roster, and the app-owned Improve-Sparkle agent is deliberately never in it
@@ -1214,6 +1303,27 @@ export function ConciergeHost({
   // `isSparkleAgentId` and not `findKnownAgent`: this is not asking whether the id is addressable
   // (that question is `deliver`'s, and it is asked against the live store at send time). It is asking
   // which of two places to read a name and a worktree from, and only the namespace decides that.
+  //
+  // ══ AND THAT IS THE WHOLE LOOKUP — ONE PLACE, FED TO ONE PURE RULE ══════════════════════════════
+  // The two arms above are the only two ways this window can NAME a pinned far end, so they are the
+  // whole of the `lookup` handed to `resolveMountedTarget`. A pin that satisfies neither is not "no
+  // mount": it is a mount this window cannot name, which the resolution reports as its own arm so a
+  // send under it can refuse where the founder can see it instead of falling through to the brain.
+  const mountResolution = useMemo(
+    () =>
+      resolveMountedTarget({ wired: cableWired, agentId: cablePin }, (id) => {
+        if (mountedRow) return { name: mountedRow.name, projectId: mountedProjectId ?? "" };
+        // `projectId: ""` for the app-owned agent, exactly as `Workspace`'s `sparkleTarget` writes it
+        // — it owns no project row, and the dispatcher keys a PTY by agent id.
+        if (isSparkleAgentId(id)) return { name: SPARKLE_AGENT_NAME, projectId: "" };
+        return undefined;
+      }),
+    [cableWired, cablePin, mountedRow, mountedProjectId],
+  );
+  // The mount this window can NAME — display, transcript, draft key, notice, and routing alike. Null
+  // both when nothing is patched and when the pin cannot be resolved; `routableMountedAgentId` below
+  // is the value that still knows the difference.
+  const mountedAgentId = mountResolution.kind === "mounted" ? mountResolution.target.agentId : null;
   const mountedIsSparkle = !!mountedAgentId && isSparkleAgentId(mountedAgentId);
   const sparkleWorktreePath = useSyncExternalStore(
     subscribeAgentTranscriptWorktrees,
@@ -1234,13 +1344,17 @@ export function ConciergeHost({
   //
   // That is the founder's original defect exactly — the pane says one thing, the words go somewhere
   // else — so fixing it at `railTargetName` alone (the first cut) left the lie standing on every
-  // surface but the rail. `target` is what `mountedAgentId` is derived from and
-  // `ConciergePromptTarget` requires `name`, so this resolves whenever the mount routes. Gated on
-  // `mountedAgentId` so an UNMOUNTED selection cannot lend its name to a mount that does not exist.
-  const mountedName =
-    mountedRow?.name ??
-    (mountedIsSparkle ? SPARKLE_AGENT_NAME : undefined) ??
-    (mountedAgentId ? target?.name : undefined);
+  // surface but the rail.
+  //
+  // ══ THE STATE IT GUARDED AGAINST IS NOW UNREPRESENTABLE, WHICH IS WHY THE THIRD `??` IS GONE ════
+  // Those three fallbacks used to end in `target?.name` — the SELECTION's name — and that last arm
+  // was the mount lying about where the founder was, one identifier over: with the Improve-Sparkle
+  // pane visible over a mounted build agent, `target` is `__sparkle_self__`, so the chip would have
+  // called his build agent "Sparkle" (bead sparkle-9gsjqm, reproduction B). The name now comes from
+  // the SAME resolution the id does, so there is no state where one resolves and the other does not
+  // — which is exactly what roborev 59232 was defending, obtained structurally rather than by a
+  // fallback that could name the wrong agent.
+  const mountedName = mountResolution.kind === "mounted" ? mountResolution.target.name : undefined;
   const mountedWorktreePath = mountedRow?.worktreePath ?? sparkleWorktreePath;
   // THE PANE-LESS AGENT'S BINDING. `useAgentTranscript` below fails closed on an agent whose Claude
   // sessions it does not know, and the app-owned Sparkle agent — the one this host explicitly
@@ -1332,7 +1446,14 @@ export function ConciergeHost({
   // `mountedAgentIdRef`, the composer's typeface through the prop the column hands down, and the
   // "Chatting with" chip — and the state where the header named an agent and the words went
   // elsewhere is no longer representable.
-  const routableMountedAgentId = mountedAgentId;
+  //
+  // ══ AND IT IS THE PIN, NOT THE RESOLVED MOUNT (bead sparkle-9gsjqm) ════════════════════════════
+  // The one place these two values legitimately differ: a cable patched at an agent this window
+  // cannot NAME right now. `mountedAgentId` is null there, because there is nothing to draw — but
+  // the founder is still mounted, and routing on the resolved value would hand `classifyComposerRoute`
+  // a null mount and turn his words into `via: "default"`, silently, which is the whole defect. So
+  // ROUTING follows the pin, and the unresolvable case is refused visibly in `send` instead.
+  const routableMountedAgentId = mountResolution.kind === "none" ? null : cablePin;
   // `send` is memoized on stable deps and runs after render, so it reads this through a ref exactly
   // as it reads the aim through `targetRef` — and for the same reason: the value has to be the one
   // that was true AT SUBMIT. Re-reading a live store inside the queued half would route a message at
@@ -1349,10 +1470,12 @@ export function ConciergeHost({
   // have left the founder's bug exactly where it was, one identifier over: the id would resolve, the
   // cross-check would fail against `null`, and the message would fall through to the concierge again.
   //
-  // Derived from the very same `target` that `mountedAgentId` is derived from, so the two cannot
-  // disagree about which agent is mounted. That is the property the old comment claimed for
-  // `targetRef`, and it only held while both values were gated the same way.
-  const mountTarget = mountedAgentId ? target : null;
+  // Derived from the very same RESOLUTION that `mountedAgentId` is, so the two cannot disagree about
+  // which agent is mounted. That is the property the old comment claimed for `targetRef`, and it only
+  // held while both values were gated the same way — it was written as `mountedAgentId ? target :
+  // null`, which is a cross of the mount with the SELECTION and named the wrong agent outright the
+  // moment the Improve-Sparkle pane was visible over a mounted build agent (sparkle-9gsjqm).
+  const mountTarget = mountResolution.kind === "mounted" ? mountResolution.target : null;
   const mountTargetRef = useRef(mountTarget);
   useEffect(() => {
     mountTargetRef.current = mountTarget;
@@ -1373,13 +1496,13 @@ export function ConciergeHost({
   //     keyed on a routing id that stays `null` throughout. A stale "Not sent" row for the rest of
   //     the session, sitting over later successful sends.
   //
-  // ══ AND AS OF THE MOUNTED-SEND FIX, THE TWO MOUNTS HOLD THE SAME VALUE ═════════════════════════
-  // This used to end "routing and the typeface take `routableMountedAgentId`; the notice takes this",
-  // and that distinction is GONE: `routableMountedAgentId` is now `mountedAgentId` unmodified, so
-  // this ref and `mountedAgentIdRef` mirror one value. Both are kept because their NAMES are the
-  // documentation at ~12 call sites — "is the thread hidden" and "where do the words go" are still
-  // two different questions, and a reader at either call site should not have to know they currently
-  // share an answer.
+  // ══ THE TWO MOUNTS AGREE EXCEPT IN ONE STATE, AND THAT STATE IS THE DEFECT'S ═══════════════════
+  // `routableMountedAgentId` is the CABLE'S PIN and this is the RESOLVED mount, so they differ only
+  // when the cable is patched at an agent this window cannot name. This ref is right to be null
+  // there: the thread is NOT swapped away (`mountedAgent` needs a name), so a `postSparkle` line is
+  // perfectly visible and a banner would be the third copy roborev 57424's second bullet is about.
+  // The refusal that state produces writes `noteMounted` unconditionally instead — `MountedNotice`
+  // renders on the notice alone, deliberately ungated (ConciergeColumn) — so nothing is lost.
   //
   // WHAT MUST NOT HAPPEN IS THE TWO DRIFTING APART AGAIN. The first bullet above is precisely the
   // founder's bug seen from the notice's side: the split existed because routing was gated and
@@ -1397,6 +1520,21 @@ export function ConciergeHost({
   // `target.name`, and that is the whole point: a notice naming an agent the chip does not would
   // reintroduce the header-disagrees-with-the-truth defect this branch exists to remove, in one line
   // of prose instead of in the router.
+  // ══ THE NAME A REFUSAL CAN STILL USE ONCE THE MOUNT STOPS RESOLVING ════════════════════════════
+  // `mountedName` is undefined in exactly the state the unresolvable-mount refusal fires in, which is
+  // the one instant a refusal needs a name most — "I couldn't reach Kraken Auth" is an explanation,
+  // "I couldn't reach it" is a shrug. So the last name this window could give THIS pin is kept, and
+  // it carries the id it belongs to: without that, a cable moved to a second agent would let the
+  // first one's name be spoken over the second one's refusal, which is the same
+  // header-names-the-wrong-agent lie one layer over.
+  const lastMountNameRef = useRef<{ agentId: string; name: string } | null>(null);
+  useEffect(() => {
+    if (mountResolution.kind === "mounted")
+      lastMountNameRef.current = {
+        agentId: mountResolution.target.agentId,
+        name: mountResolution.target.name,
+      };
+  }, [mountResolution]);
   const displayMountedNameRef = useRef(mountedName);
   useEffect(() => {
     displayMountedNameRef.current = mountedName;
@@ -1406,7 +1544,12 @@ export function ConciergeHost({
   // release effect used to be declared rather than where the state was: that keeps the effect at its
   // exact position among this component's effects. Nothing between the old two positions reads
   // `mountedNotice` or calls `noteMounted`, so nothing moves relative to its producer.
-  const { mountedNotice, noteMounted } = useMountedNotice(mountedAgentId);
+  // KEYED ON THE PIN, not on the resolved mount. The release effect retires a notice with the mount
+  // it describes, and the unresolvable-pin refusal writes a notice while `mountedAgentId` is already
+  // null — so keying on that value would leave that one line standing for the rest of the session,
+  // outliving the cable it was about. The pin changes on every mount, re-mount and unbind, which is
+  // exactly the set of moments a mounted notice stops being true.
+  const { mountedNotice, noteMounted } = useMountedNotice(routableMountedAgentId);
   // Delivers a mounted send held by `holdForScreenClear` (services/conciergeDispatch) the moment
   // that agent's screen clears — see hooks/useScreenHoldDrain for why this has to poll and why it
   // is NOT scoped to the current mount (a hold can outlive the mount that created it).
@@ -1497,6 +1640,15 @@ export function ConciergeHost({
   // the caret is the textarea's. See ComposeBox's `onMentionComposing`.
   const [composingMention, setComposingMention] = useState(false);
   const onMentionComposing = useCallback((v: boolean) => setComposingMention(v), []);
+  // …and how many times the user has PUT SOMETHING IN the box by a deliberate gesture, which
+  // restarts the countdown from full (sparkle-3kqg2v). The founder's three cases arrive on two
+  // channels — a paste is the textarea's own event, while a dropped image and a picked file both
+  // funnel through `useConciergeAttachments.add` — so the two counts are SUMMED into the one
+  // sequence the rail reads. A sum rather than a max: the channels move independently, and a max
+  // would swallow a paste that landed while the attachment count was ahead of it.
+  const [pastedSeq, setPastedSeq] = useState(0);
+  const onPasted = useCallback(() => setPastedSeq((n) => n + 1), []);
+  const draftGrewSeq = pastedSeq + stagedSeq;
 
   // The compose box hands us its own submit, so an expired countdown fires the SAME path the button
   // does — clearing the box, resolving mentions, restoring the draft on failure. Sending the text
@@ -1651,6 +1803,17 @@ export function ConciergeHost({
     // message is not finished, so the clock freezes — from the `@` itself, not from the name
     // resolving. Straight from the box, which is the only holder of the caret this depends on.
     composingMention,
+    // …AND THE SAME PAUSE FOR THE OTHER WAY HE TAKES AN ACTION: *"pause the countdown while those
+    // are active … because it means that I'm taking an action, basically."* True from the click on
+    // Screenshot or Upload until the crosshairs/Finder panel closes — including a cancel, which is
+    // what stops a dismissed panel leaving the rail frozen with nothing to un-freeze it. Straight
+    // from the attachment controller, the only holder of that fact.
+    attachPickerOpen,
+    // THE RESET HE ASKED FOR NEXT (sparkle-3kqg2v): *"reset the countdown if I paste something in
+    // or if I drop in an image or upload a file."* Paste comes from the box; the drop and the
+    // picker come from the attachment controller. Both are counts of GESTURES, not of content —
+    // see `draftGrewSeq` above and useAutoSend's arg of the same name.
+    draftGrewSeq,
     interim: dictation.interim,
     // THE MIS-ROUTE SAFETY NET: the rail's only label is where this send would land, so the
     // countdown is also the moment you can notice you are about to dictate into the wrong agent.
@@ -2344,8 +2507,31 @@ export function ConciergeHost({
       // a hold is `dispatchTurn`, which settles the hold as its FIRST statement and raises typing
       // afterwards — so this always runs before that, never after it.
       setTyping(false);
-      const marks = toLintMarks(violations);
-      upsert(held.turnId, text, true, marks, held.answers);
+      // ══ THE DETERMINISTIC FLOOR — EVERY HELD REPLY IS RENDERED QUOTING (bead sparkle-j6jra) ═══════
+      // `settleHold` is the ONLY exit from a hold, so a `reply-without-quote` block that the model
+      // never fixed — the correction re-prompt ignored, the correction turn timed out, a queued send
+      // that stole the retry — arrives HERE with no opening quote. Re-prompting once is still an
+      // instruction the model can ignore; this is the structural guarantee under it.
+      //
+      // GATED ON THE CHECK'S OWN VERDICT, not on a second coverage derivation. The floor fires only
+      // when `reply-without-quote` is among the violations being rendered — which is exactly when the
+      // check decided this reply does not quote (the give-up original, or a correction that STILL did
+      // not quote). When the correction landed a compliant reply, that violation is absent and the
+      // model's own quote is preserved. Deferring to the check means the floor can never disagree with
+      // it about whether a reply already quotes. `ensureLeadingFounderQuote` still re-checks coverage
+      // internally, so a partial burst quote is topped up rather than duplicated.
+      const enforced = violations.some((v) => v.check === REPLY_WITHOUT_QUOTE_CHECK_ID)
+        ? ensureLeadingFounderQuote(text, (held.answers ?? []).map((a) => a.quote))
+        : { text, inserted: false };
+      const shownText = enforced.text;
+      // A reply the code just made quote must not also carry the "Didn't open by quoting" mark. The
+      // telemetry that the model failed was already recorded through `reports` above; this governs
+      // only what the founder is SHOWN.
+      const shownViolations = enforced.inserted
+        ? violations.filter((v) => v.check !== REPLY_WITHOUT_QUOTE_CHECK_ID)
+        : violations;
+      const marks = toLintMarks(shownViolations);
+      upsert(held.turnId, shownText, true, marks, held.answers);
       const lintLine = lintMarkText(marks);
       if (lintLine && displayMountedRef.current) noteMounted(lintLine, "info");
       // AFTER the upsert, which is what creates the bubble when a hold was taken before one existed:
@@ -2363,7 +2549,7 @@ export function ConciergeHost({
       try {
         for (const p of noteConciergeTurnForPromises({
           id: held.turnId,
-          text,
+          text: shownText,
           toolCalls: toLintToolCalls(toolCalls),
           at: Date.now(),
         })) {
@@ -2374,8 +2560,9 @@ export function ConciergeHost({
       }
       // The RENDERED form, like the non-blocked path: `restated-state` asks whether the human is
       // being told the same thing twice, and a correction they never saw is not what they were told.
-      prevReplyRef.current = text;
-      if (text) announce(text);
+      // `shownText` is what the founder actually read, including any code-inserted opening quote.
+      prevReplyRef.current = shownText;
+      if (shownText) announce(shownText);
     };
 
     /** Give up on the correction and render the HELD ORIGINAL, marked. Every failure path lands
@@ -2803,8 +2990,29 @@ export function ConciergeHost({
           console.warn("conciergeLint: reporting an unretried blocked reply failed", err);
         }
       }
-      const marks = toLintMarks(linted?.violations);
-      if (e.text) upsert(e.id, linted?.text ?? e.text, true, marks);
+      // ══ THE SAME DETERMINISTIC FLOOR ON THE NON-HELD PATH (bead sparkle-j6jra) ════════════════════
+      // A reply reaches this branch without a hold when it was blocked by `reply-without-quote` but
+      // `canHoldFor` refused the retry (a queued send, an already-spent retry), OR the check is set to
+      // `warn` rather than `block`. Either way it would reach the founder unquoted unless the floor is
+      // here too — so the guarantee does not depend on the hold being taken or on the `block` tier.
+      //
+      // GATED ON THE CHECK'S OWN VERDICT, exactly as `settleHold` is: the floor fires only when
+      // `reply-without-quote` is among this reply's violations, so it never second-guesses a reply the
+      // check judged clean (covered, or stood down on a proactive push / attachments-only send), and
+      // never disagrees with the check about coverage. The anchors are read the SAME way the linter
+      // read them at `founderMessages` above, so the enforcer quotes exactly the messages it judged.
+      const doneNeedsQuote = (linted?.violations ?? []).some(
+        (v) => v.check === REPLY_WITHOUT_QUOTE_CHECK_ID,
+      );
+      const doneAnchors = doneNeedsQuote ? answerFields(chatRef.current, e.id).answers ?? [] : [];
+      const enforcedDone = doneNeedsQuote
+        ? ensureLeadingFounderQuote(linted?.text ?? e.text, doneAnchors.map((a) => a.quote))
+        : { text: linted?.text ?? e.text, inserted: false };
+      const shownDoneViolations = enforcedDone.inserted
+        ? (linted?.violations ?? []).filter((v) => v.check !== REPLY_WITHOUT_QUOTE_CHECK_ID)
+        : linted?.violations;
+      const marks = toLintMarks(shownDoneViolations);
+      if (e.text) upsert(e.id, enforcedDone.text, true, marks);
       // ══ AND THE MOUNTED COLUMN, WHICH CANNOT SHOW A THREAD ROW AT ALL (roborev 57360's problem) ═
       // Display-mounted, `ConciergeColumn` renders the agent's transcript and does NOT render
       // `ConciergeThread` — so the mark, which lives inside a thread row, is written off screen
@@ -2890,7 +3098,9 @@ export function ConciergeHost({
       // rather than against itself. Stores the text as RENDERED (autofixes included): the check asks
       // whether the human is being told the same thing twice, and what they were told is the
       // rendered form.
-      if (e.text) prevReplyRef.current = linted?.text ?? e.text;
+      // `enforcedDone.text` is what the founder was shown (the reply, plus any code-inserted opening
+      // quote), which is the honest baseline for next turn's `restated-state` comparison.
+      if (e.text) prevReplyRef.current = enforcedDone.text;
       const full = brainTextRef.current[e.id] ?? "";
       delete brainTextRef.current[e.id];
       // The reply is FINISHED here — announce it once, rather than per delta. Via `announce`, so
@@ -3067,6 +3277,18 @@ export function ConciergeHost({
       // decides. So a misclassified failure costs one cheap probe and changes nothing, which is why
       // it is safe to fire on the classifier's word.
       if (notice.kind === "auth") reportClaudeAuthFailed();
+      // ══ AUTO-SWITCH OFF A DEAD ACCOUNT (bead sparkle-08mq3t) ═════════════════════════════════
+      // The concierge is a STICKY consumer pinned to one account, and `autoPick`'s eviction is blind
+      // to the case that actually stuck the founder: an OAuth expiry leaves the account reading
+      // "signed in" in recorded state, so nothing ever moves the concierge off it and every turn
+      // fails identically — while healthy accounts sit right there. The turn failure is the only
+      // signal that the account is dead, so we rotate reactively from it. Fire-and-forget: this
+      // turn is already lost; the effect is that the NEXT turn lands on a live account instead of
+      // needing an app restart. Guarded internally to `auth`/`quota` (never a transient `unknown`),
+      // to skip when a human pinned the concierge, and to never bench the fleet's last usable
+      // account — see `rotateStickyConsumerOffFailedAccount`.
+      if (notice.kind === "auth" || notice.kind === "quota")
+        void rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, notice.kind);
       // Through the column's ONE live region, like every other bookkeeping line. The HEADLINE only:
       // the evidence can be a multi-line stderr dump, and a screen reader reading forty lines of
       // warnings aloud buries the sentence that says what to do.
@@ -3241,11 +3463,24 @@ export function ConciergeHost({
   // What stays here is the DRAIN's view of the store. `observe` has to watch every task the cache
   // learns about, whoever refreshed it, so it subscribes rather than polling; the mount refresh is
   // kept so a host that opens before any row exists still sees what is already on disk.
+  //
+  // ...AND THE SCHEDULER'S. This same subscription is the WAKE EDGE for a finished research run
+  // (bead sparkle-wo4c79): the store already learns about a terminal task within one poll, and
+  // before this the scheduler was simply never told, so a finished answer sat until some unrelated
+  // turn happened to carry it — which on a quiet fleet is never, and is the reported bug.
+  //
+  // ONE subscription feeding both, rather than a second one: they must see the SAME snapshot. The
+  // drain decides what a prompt says and the scheduler decides whether to speak at all, and a
+  // scheduler running a tick ahead of the drain would wake for a finding the drain no longer
+  // reports as owed. Note the scheduler is read through the ref, not captured — this effect runs
+  // once, and the scheduler is created by a sibling effect that may not have run yet.
   useEffect(() => {
     void refreshResearch();
-    const unsubscribe = useResearchStore.subscribe((s) =>
-      researchDrain.observe(Object.values(s.byId)),
-    );
+    const unsubscribe = useResearchStore.subscribe((s) => {
+      const tasks = Object.values(s.byId);
+      researchDrain.observe(tasks);
+      schedulerRef.current?.observeResearch(tasks);
+    });
     return unsubscribe;
   }, []);
 
@@ -3847,6 +4082,29 @@ export function ConciergeHost({
           shown && (shouldPasteAsPill(shown) || flattened.length > OUTCOME_QUOTE_CHARS)
             ? collapseText(nextId("pill"), shown)
             : undefined;
+        // ══ A DROPPED SCREEN HOLD GIVES THE WORDS BACK, NOT ONLY THE FILES (bead sparkle-9gsjqm) ══
+        // The three arms below quoted the founder's own text into a Sparkle chat line and restored
+        // only `restoreAttachments(held)` — so a mounted send that aged out ENDED UP AS A CONCIERGE
+        // MESSAGE, which is this bead's defect arriving by the slow road, and the copy told him to
+        // "send it again" while the words themselves existed nowhere he could send them from.
+        //
+        // SCOPED TO `heldReason === "screen"`, which is precisely the mounted holds: only a MOUNTED
+        // send passes `holdForScreenClear` (see `promptAgent`'s parameter), so a screen hold is by
+        // construction his mounted message. The startup holds beside it are reached from other call
+        // sites and keep their existing behaviour.
+        //
+        // The DISPLAY rendering, never `r.sent` — that is the wire payload and carries the
+        // attachments' temp paths (roborev 46925). The files came back a few lines up, so the two
+        // halves of the message are restored together rather than one without the other.
+        if (
+          r.heldReason === "screen" &&
+          shown &&
+          (r.path === "expired" || r.path === "abandoned" || r.path === "queue-full")
+        )
+          // `null`: a held send's quote was staged in a draft that is long gone, and `restoreDraft`
+          // treats null as "this send carried no quote" rather than writing the slot (see its note on
+          // why an unconditional `restore(null)` would wipe a quote staged for the NEXT message).
+          restoreDraft(shown, null);
         // Each non-delivery says what actually happened; a wrong reason is its own small lie
         // (roborev 46485-M — `abandoned` used to be reported as "the terminal closed", which is
         // false when the spawn failed and no terminal ever opened).
@@ -3890,7 +4148,7 @@ export function ConciergeHost({
         // one starts to, it should get its own arm with its own remedy rather than this bare line.
         else postSparkle(line`${who} didn't take the message I was holding${plain(quoted)}.`, collapsed);
       }),
-    [postSparkle, takeHeldAttachments, restoreAttachments],
+    [postSparkle, takeHeldAttachments, restoreAttachments, restoreDraft],
   );
 
   // ══ ACTION RECEIPTS — the concierge's OWN actions, posted where the founder can check them ═════
@@ -4748,6 +5006,63 @@ export function ConciergeHost({
       // say it either — it names Sparkle, not the agent that turned out to be unreachable.
       const addressed = mentionAim !== null;
       const addressable = addressed && !!aim && canAcceptInput;
+      // ══ A MOUNTED SEND NEVER FALLS THROUGH TO THE CONCIERGE (bead sparkle-9gsjqm) ═══════════════
+      // The arm below posts an explanation and then FALLS THROUGH to `askSparkle` at the tail of this
+      // function — with no `restoreDraft` and no retract — so the founder's mounted message became a
+      // concierge turn anyway. That single fall-through is the last road to his P0, and it is reached
+      // by an entirely routine state: `addressable` is false whenever `agentCanAcceptPrompt` is, and
+      // for the app-owned agent that includes `liveness === "unknown"`, which is transient.
+      //
+      // His decision, verbatim from today's interview: *the concierge must NOT answer a mounted send.*
+      // So a mount refuses here, visibly, and hands the words back — it does not get quietly re-aimed
+      // at the brain. (HOLDING it until the screen clears is the answer when the SCREEN is the only
+      // problem; that path is `holdForScreenClear`, further down, and it is unchanged.)
+      //
+      // Structured exactly like the screen refusal below it, for the reason roborev 57360 made both
+      // of those instants identical: retract when the words are demonstrably back in the box, and post
+      // a `refused` receipt when they are not, so no outcome is reported two different ways.
+      if (addressed && !addressable && mentionAim.via === "mount") {
+        const who = mentionAim.target.name;
+        // ══ THE REFUSAL NAMES WHICH GATE FIRED (bead sparkle-gyvjyt) ═══════════════════════════
+        // This used to say "<Agent> can't take a message right now" for BOTH states below — true of
+        // each and diagnostic of neither. The founder reported "I still can't send in the mounted
+        // pane for Improve-Sparkle" across several builds, and every round had to open by GUESSING
+        // which gate had fired, because the only instrument pointed at it is the sentence he reads.
+        //
+        // It matters most for exactly this agent. `agentCanAcceptPrompt` is `findKnownAgent(id) !==
+        // undefined`, and for the app-owned id that arm additionally requires `livenessOf(...) !==
+        // "unknown"` — a state `services/agentLiveness` documents as covering "a just-spawned agent
+        // whose pane has not mounted yet", i.e. transient and routine. A routine transient and a
+        // permanent break read identically under one sentence, and the remedies are opposites:
+        // wait, versus re-mount the row. See `engine/mountRefusal` for the split.
+        // `selfAgent` IS THE WHOLE INPUT, and the two booleans this used to also pass are gone on
+        // purpose: `hasAim` and `canAcceptInput` NEST rather than vary independently — a feed member
+        // is always a roster member, so `hasAim ⟹ canAcceptInput` — which made the arm they selected
+        // unreachable. `engine/mountRefusal`'s header carries the derivation.
+        const cause = mountRefusalCause({
+          selfAgent: isSparkleAgentId(mentionAim.target.agentId),
+        });
+        const tail = mountRefusalTail(cause);
+        postSparkle(line`${ref(asAgent(mentionAim.target))}${plain(tail)}`);
+        // UNCONDITIONAL: the mount is the whole reason this refusal exists, and the state that
+        // produces it is one where `displayMountedRef` may already have gone null (see
+        // `routableMountedAgentId`). Gating it is what made the original defect silent.
+        noteMounted(mountRefusalText(who, cause), "warn");
+        const returned = restoreDraft(text, sentQuote);
+        restoreAttachments(staged);
+        if (returned) {
+          retractSend(id);
+          return true;
+        }
+        setReceipt(id, {
+          target: "agent",
+          refused: true,
+          agentName: who,
+          agentId: mentionAim.target.agentId,
+          redirectable: false,
+        });
+        return true;
+      }
       if (addressed && !addressable) {
         postSparkle(
           line`${ref(asAgent(mentionAim.target))} can't take a message right now, so I've kept this here instead.`,
@@ -5459,9 +5774,21 @@ export function ConciergeHost({
       // like every other build row: *"When I click on the Improve Sparkle agent, I want it to MOUNT
       // THE CONCIERGE INTO THAT AGENT just like it would a regular builder agent."* An ordinary build
       // agent reaches its terminal through `mountRouted` below and through nothing else, and that is
-      // CABLE-gated — so this agent now does too. `AgentSidebar.onSelectSparkle` already patches the
-      // cable on click, which is what makes the click a mount rather than a selection; Escape unpatches
-      // it, and an unpatched cable means the concierge, exactly as it does for every other row.
+      // CABLE-gated — so this agent now does too. `AgentSidebar.onMountSparkle` patches the cable, and
+      // the row runs it on EVERY activation — single click, double click, Enter/Space, and the
+      // `detail === 0` assistive-tech press (SparkleAgentRow) — which is what makes any press on that
+      // row a mount rather than a selection; Escape unpatches it, and an unpatched cable means the
+      // concierge, exactly as it does for every other row.
+      //
+      // THE GESTURE TABLE MATTERS TO THIS PARAGRAPH, so it is stated rather than implied (roborev
+      // 65160). The premise here is *"a press on that row always leaves the cable pinned to it"*, and
+      // that is what makes having NO replacement for `mountAddress` safe: there is no state in which
+      // the founder is looking at this pane while the cable names something else. This row therefore
+      // does NOT use `engine/cable.mountsOnRowActivation` — the shared predicate's "a plain single
+      // press selects without patching" rule would reintroduce exactly that state, and this pane has
+      // no composer with which to disambiguate it. SparkleAgentRow's `onClick` block carries the
+      // reproduction; if that row is ever changed to select-without-mounting, this reasoning is void
+      // and the escape hatch has to come back.
       //
       // THE ONE THING THIS BUYS BEYOND THE REFUSAL: a concierge-bound message is now structurally
       // incapable of being screen-checked here. `addressable` requires `mentionAim`, which requires
@@ -5486,6 +5813,36 @@ export function ConciergeHost({
         route.kind === "agent" &&
         route.via === "mount" &&
         mountTargetRef.current?.agentId === route.agentId;
+      // ══ AN UNRESOLVABLE MOUNT REFUSES OUT LOUD — IT NEVER BECOMES A CONCIERGE TURN ══════════════
+      // (bead sparkle-9gsjqm, the founder's repeated P0.) `route.via === "mount"` means the cable is
+      // patched and he is typing into a mounted column; `!mountRouted` means this window cannot NAME
+      // that far end right now. Those two facts used to fall through together to the ordinary
+      // unaddressed path, so his words became `via: "default"` — a concierge turn with no refusal and
+      // no notice, which is the single most expensive failure this file can have.
+      //
+      // A refusal here is the ONLY safe direction. The alternative — routing at an id the window
+      // cannot resolve — is `deliver` reducing it to "no usable aim" and falling through to the brain
+      // anyway, one screen later and with the words already spent.
+      //
+      // NOTHING HAS BEEN CONSUMED YET. This sits above `takeAttachments()`, above the bubble and above
+      // the remembered renderings, so `false` costs the founder nothing: the staged files are still
+      // staged and ComposeBox's own `onSend === false` path keeps the draft where he typed it. That is
+      // why it is here and not inside `deliver`, which runs after all three.
+      if (route.kind === "agent" && route.via === "mount" && !mountRouted) {
+        const held =
+          lastMountNameRef.current?.agentId === route.agentId
+            ? lastMountNameRef.current.name
+            : null;
+        const who = held ?? "the agent you're mounted to";
+        const why = `I can't reach ${who} right now, so I didn't send that — your words are still in the box.`;
+        postSparkle(line`${plain(why)}`);
+        // UNCONDITIONAL, unlike every other `noteMounted` in this file, and that is the point: the
+        // DISPLAY mount has already gone null in this state, so a `displayMountedRef` gate would
+        // silence the one line that explains it — which is precisely how the founder's original bug
+        // stayed invisible. `MountedNotice` renders on the notice alone (ConciergeColumn).
+        noteMounted(why, "warn");
+        return Promise.resolve(false);
+      }
       // NO GUARD HERE FOR "named but unresolvable", deliberately, and it is worth saying why since it
       // is the obvious thing to add. `named` exists only when the COMPOSER's roster recognised the
       // span, and this lookup uses the same feed — one render, one source — so a recognised name is
@@ -5770,7 +6127,10 @@ export function ConciergeHost({
       if (stagedQuote) void outcome.then((ok) => { if (!ok) restoreQuote?.(stagedQuote); });
       return outcome;
     },
-    [deliver, enqueue, takeAttachments],
+    // `postSparkle` and `noteMounted` are the unresolvable-mount refusal's two voices. Both are
+    // `useCallback(…, [])`, so naming them cannot churn this callback's identity — and desktop lint
+    // requires every referenced value in the array regardless.
+    [deliver, enqueue, takeAttachments, postSparkle, noteMounted],
   );
 
   /** Send an already-routed message the OTHER way. Additive: the first delivery stands (see
@@ -6626,6 +6986,7 @@ export function ConciergeHost({
         // The countdown's pause signal (sparkle-14dtu). Drop this one line and the rail goes back
         // to sending mid-name with a green suite — which is why the hook's own arg is required.
         onMentionComposing={onMentionComposing}
+        onPasted={onPasted}
         registerSubmit={registerSubmit}
         // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME
         // reveal the notifications and the command palette use — `openProjectTab` opens the owning

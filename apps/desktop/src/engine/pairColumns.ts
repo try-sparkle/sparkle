@@ -11,7 +11,7 @@
 // above the TERMINAL — which is why the founder saw the bug on one tab and not on another, and why
 // the answer cannot be a constant. The tab's own x position is the input.
 //
-// It is genuinely both orders, too: the cockpit is `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`, and
+// It is genuinely both orders, too: the cockpit is `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`, and
 // the left pair mirrors its flow (`flexDirection: row-reverse`), so "build is the left column" is
 // false for half the shell. Deciding from CLIENT RECTS rather than from a child index is what makes
 // one rule correct on both sides — the same reasoning `ProjectTabs`' own expansion anchor follows.

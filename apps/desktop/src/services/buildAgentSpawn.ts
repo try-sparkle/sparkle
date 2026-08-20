@@ -13,6 +13,7 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { landInAgent } from "./landInAgent";
+import { attentionHold } from "../engine/attentionGuard";
 import { createBeadFull } from "./tasks";
 import { isBeadsUnavailable, AUTO_LABEL } from "./beads";
 import { localAgentCapacity } from "./agentCapacity";
@@ -90,6 +91,29 @@ export interface SpawnBuildAgentOpts {
    *     and feeds the roster publisher), so it requires the project to be on screen already.
    */
   background?: boolean;
+  /**
+   * Did a PERSON make this gesture? Defaults to `"user"`, which is NEVER declined.
+   *
+   * ── WHY THE DEFAULT MUST BE `"user"`, NOT THE OTHER WAY ROUND ────────────────────────────────
+   * This function is the body of three DIRECT human gestures (`hooks/useSpawnBuildAgent`: the
+   * sidebar's "+ New Build Agent" row, the Workspace empty-state start button, and
+   * `useNewBuildAgentDrop`) as well as of the concierge's `spawn_build_agent` tool. Reading the
+   * attention hold for all of them was the first cut of this guard and it was wrong — the whole
+   * safety argument for `engine/attentionGuard` is that it declines only jumps the APP starts, and
+   * an earlier, wider terminal-focus veto had to be reverted precisely because it declined things
+   * the user had just asked for (services/terminalMidCommand's header).
+   *
+   * The DROP flow is the concrete failure that default prevents: a native Tauri drag/drop moves no
+   * DOM focus, so with the caret in a terminal — the steady state in a terminal-first shell — a drop
+   * on "+ New Build Agent" would create the agent off-screen, never select it, and skip the caret
+   * pull, while `useNewBuildAgentDrop` queues the dropped paths for "the new agent's composer to
+   * drain once it mounts", which never becomes the aim. The files would silently go nowhere.
+   *
+   * So `"auto"` is opt-IN, and today exactly one caller passes it: the concierge's lifecycle tool,
+   * which is the machine acting on the founder's behalf rather than his own hand on a control.
+   * `background` is the stronger, separate statement that nobody asked at all.
+   */
+  attention?: "user" | "auto";
 }
 
 /** Create + open a local Build agent in `project`, returning its id — or null when the spawn did not
@@ -179,6 +203,35 @@ export function spawnBuildAgentInProject(
     });
     return null;
   }
+  // ══ IS THE FOUNDER TYPING SOMEWHERE RIGHT NOW? ════════════════════════════════════════════════
+  // Read ONCE, here, and threaded through every decision below. Three separate steps turn on this
+  // answer (`select: false`, the project switch, and the landing), and re-reading the live caret at
+  // each of them is how a guard ends up describing one element and acting on another — the caret
+  // moves, and `addAgent` is itself capable of moving it. See engine/attentionGuard.
+  //
+  // ONLY an `attention: "auto"` caller may be declined — see the field's own doc for why the
+  // default is `"user"` and what breaks when it is not. A BACKGROUND spawn does not need to ask
+  // either: it already suppresses everything this could, so the read would be pure cost on a path
+  // that runs on a timer.
+  const hold = background || opts.attention !== "auto" ? null : attentionHold();
+  if (hold) {
+    log.info("build-agent", "spawn will not take the view: the founder's attention is held", {
+      projectId: project.id,
+      hold,
+    });
+  }
+  // "QUIET" IS THE UNION, AND IT IS NOT THE SAME AS `background`. Background additionally REFUSES a
+  // project that is not on screen and declines to write the visited/open sets, because nobody asked
+  // for it. This spawn WAS asked for — the founder told the concierge to start it — so it keeps every
+  // one of those, and drops only the steps that move his eyes.
+  const quiet = background || hold !== null;
+  // The caret is a SEPARATE grant from the view, even though today they are decided together: the
+  // empty-spawn path below pulls the caret into the concierge composer, which is the loudest form of
+  // the steal (it moves the keyboard out of his terminal with no pane change to even hint at why).
+  // Named here rather than written inline at its `if` so the decision is one readable statement and
+  // so a mutation aimed at it can be judged (a bare `if (!quiet) {` cannot be mutated without
+  // breaking the parse, which leaves the site unverified).
+  const mayTakeCaret = !quiet;
   const store = useProjectStore.getState();
   const id = store.addAgent(project.id, {
     kind: "build",
@@ -186,7 +239,7 @@ export function spawnBuildAgentInProject(
     // at the STORE rather than selecting-then-restoring, so there is no intermediate state a render
     // can observe and no phantom `switch:` perf waterfall from a selection that never painted.
     // `select: false` is ABSOLUTE — it will not backfill a null selection either (AddAgentOpts.select).
-    ...(background ? { select: false as const } : {}),
+    ...(quiet ? { select: false as const } : {}),
     // Both are already first-class AddAgentOpts fields, so naming and model selection need no new
     // persistence — they are simply settled here instead of by a follow-up call.
     ...(opts.name ? { name: opts.name } : {}),
@@ -268,7 +321,17 @@ export function spawnBuildAgentInProject(
         // holds if the selection lands in the pair that OWNS the project. For a left-assigned one, a
         // bare selectProject is reverted by the Workspace's reconcile effect and `leftProjectId` never
         // moves, so the freshly spawned agent lands off-screen (roborev 55158).
-        selectProjectOnItsSide(project.id);
+        //
+        // THE ONE STEP A HELD SPAWN DROPS FROM THIS BLOCK, and it is dropped because it is the only
+        // one the founder can SEE: it changes which project his window is showing, which is the
+        // coarsest version of the yank he asked us to stop. Its two neighbours stay, deliberately —
+        // they are what makes the spawn real rather than fictional, and neither moves his eyes:
+        //   * `markProjectOpen` adds a tab to the strip; the pane he is typing in is untouched.
+        //   * `markProjectVisited` is half of Workspace's mount gate, and the mount is what launches
+        //     the PTY. Background must not write it (nobody asked, and the set leaks to the tray for
+        //     the rest of the session — knightwatch #1251 probe 1); a held spawn WAS asked for by the
+        //     founder, into a project he owns, so the leak argument does not apply.
+        if (!quiet) selectProjectOnItsSide(project.id);
         // Visited is the OTHER half of the mount gate: a project selected but never marked is skipped
         // again as soon as the user navigates elsewhere.
         markProjectVisited(project.id);
@@ -286,7 +349,10 @@ export function spawnBuildAgentInProject(
       // no launch ⇒ the brief's argv is never emitted, while everything downstream reports success.
       useRuntimeStore.getState().open(id);
     } else {
-      landInAgent(project.id, id);
+      // `hold` is passed rather than re-read: this is the SAME decision `quiet` was computed from a
+      // few lines up, and letting `landInAgent` take its own reading would let the two disagree.
+      // When it is held, `landInAgent` degrades to exactly the `open(id)` above — see its header.
+      landInAgent(project.id, id, { attention: "auto", hold });
     }
     if (opts.prompt) {
       // ATTACH the brief for the LAUNCH ARGV — do NOT call `appendPrompt`, and no longer
@@ -312,7 +378,30 @@ export function spawnBuildAgentInProject(
       // startup. There is no paste, no carriage return, and so no window in which the submit can be
       // dropped. The prompt side-effects still happen on the delivery path, once (AgentPane), which is
       // what keeps the brief atomic *and* real.
-      attachBrief(id, opts.prompt);
+      // THE RECORD IS AUTHORSHIP, NOT BOOKKEEPING, ON THIS PATH — and only `background` can say it.
+      // A foreground spawn's brief is a send the human asked for (the "+ New Build Agent" body, or a
+      // concierge spawn the user just requested), and `send_to_agent_terminal` already establishes
+      // that LLM-composed prose dispatched on a person's behalf BILLS. So it attaches no record and
+      // the delivery path does all five writes, exactly as before.
+      //
+      // A BACKGROUND spawn is the one class where that is false, and this interface already defines
+      // it that way: "A spawn THE HUMAN DID NOT INITIATE — an automatic sweep, a watchdog, a
+      // scheduled dispatch." Its only caller today is the `/babysit-pr` dispatcher, which fires on a
+      // TIMER, possibly several times an hour per watched PR, with nobody watching. Left unmarked,
+      // each of those debited a free-trial prompt for a send nobody made and taught the ghost-text
+      // corpus a generated babysit brief — the corpus whose own doc reserves it for what a person
+      // actually TYPED. `conciergeDispatch.recordPromptSideEffects` keys those effects on the
+      // record's presence, so declaring one here is what suppresses them.
+      //
+      // No `promptId`: nothing was written to the store, so the delivery path must still APPEND the
+      // row. That half is keyed on the id, not on the record — see the two-axis note there.
+      //
+      // AUTO-NAMING IS SUPPRESSED TOO, AND THAT IS DECIDED, NOT INCIDENTAL: the only background
+      // caller passes an explicit `name` (`Babysit #<pr>`), so there is nothing for the naming model
+      // to add — and asking it to summarize a generated brief would spend a paid call to rename a
+      // row that is already named. A future background caller that wants a generated name should
+      // pass `name` rather than relying on the ladder.
+      attachBrief(id, opts.prompt, background ? { humanAuthored: false } : undefined);
       // PAST THE POINT OF NO RETURN: the pane is mounted and the brief will be claude's argv. From
       // here a failure is the caller's to hear about, not a reason to unmake a running agent.
       launched = true;
@@ -320,7 +409,9 @@ export function spawnBuildAgentInProject(
       // An empty spawn has no brief to attach, so its pane mounting IS its launch — for the
       // background flavour too, which takes neither branch below.
       launched = true;
-      if (!background) {
+      // `mayTakeCaret` (i.e. `!quiet`), NOT `!background`: taking the caret is the very thing a held
+      // spawn must not do — see where it is computed.
+      if (mayTakeCaret) {
         // The caret is the half landInAgent deliberately leaves to the caller, and the EMPTY spawn
         // has earned it: the next thing the user does is type. A briefed spawn has not — sendToBuild
         // skips the focus request for exactly this reason, since taking the caret for a composer the

@@ -415,14 +415,35 @@ describe("goalBadgeFor", () => {
       expect(badge?.text).toBe("drain roborev findings");
     });
 
-    it("leaves the LABEL untouched, so the Build column's chip does not grow words", () => {
-      // The founder's constraint, pinned where it can actually regress. `label` is the string the
-      // compact row puts in its tooltip and aria-label; widening it here is how "just icons"
-      // quietly becomes a paragraph.
+    it("DROPS the dead sentence from the label — it is not a live claim (founder, 2026-08-18)", () => {
+      // ⚠️ THIS REVERSES AN EARLIER EXPECTATION, AND THE CONSTRAINT BEHIND IT STILL HOLDS. The test
+      // here used to assert the label carried the quoted sentence verbatim, under the founder's rule
+      // that the chip must not GROW words. It does not grow — this makes it shorter — so that rule is
+      // satisfied; what changed is the founder's 2026-08-18 report, where a row read "blocked on
+      // human" about a release run that had already terminally failed. `escalationReason` is prose
+      // frozen at the give-up instant, and `chargeGoalDebt` deliberately carries it onto whatever the
+      // goal becomes next, so it OUTLIVES the work it describes and nothing regenerates it.
+      // Interpolated into a one-line label there is no room to say it is out of date, so it reads as
+      // current — and was acted on as current.
       const badge = goalBadgeFor(movedOnAfterEscalating(), NOW);
-      expect(badge?.label).toBe(
-        'auto-continue gave up — Auto-continued 3 times with no sign of progress. ' +
-          'The goal is still unmet: "land PR #42".',
+      expect(badge?.label).toBe("auto-continue gave up");
+      // ⚠️ WHAT SURVIVES IS THE GOAL TEXT, NOT THE SENTENCE. `staleQuote` is `escalatedGoalText`, so
+      // the card's "Gave up on: X. Now working on: Y." line tells the reader the escalation is about
+      // older work; the reason sentence is dropped from THIS LABEL and from `agentStall`'s stall
+      // detail. It is still carried — marked `escalationStale` — by the roster, the wake-up brief
+      // and `goalReading`. See the enumeration on `goalBadgeFor`, which this comment used to
+      // contradict in one direction and then the other (roborev 65339, then 65369/65370).
+      expect(badge?.staleQuote).toBe("land PR #42");
+    });
+
+    it("…while a FRESH escalation still carries its reason — the label is not blanked wholesale", () => {
+      // THE PAIRED NEGATIVE, and without it the assertion above is satisfied by a change that drops
+      // `escalationReason` from EVERY escalated label. That would delete the one sentence explaining
+      // why auto-continue stopped from the common (non-stale) row, which is strictly worse than the
+      // bug being fixed. Staleness must be what does the work here, nothing else.
+      const fresh = escalateGoal(newGoal("land PR #42", NOW), NOW, "the build never went green");
+      expect(goalBadgeFor(fresh, NOW)?.label).toBe(
+        "auto-continue gave up — the build never went green",
       );
     });
 
@@ -536,5 +557,20 @@ describe("formatRemaining", () => {
     expect(formatRemaining(30_000)).toBe("<1m");
     expect(formatRemaining(0)).toBe("0m");
     expect(formatRemaining(-5)).toBe("0m");
+  });
+});
+
+// ── `stallInputsFor` MUST CARRY THE HUMAN BLOCK THROUGH (roborev 65339) ────────────────────────────
+describe("stallInputsFor threads the human block", () => {
+  it("passes a supplied block into the StallInput", () => {
+    const input = stallInputsFor("idle", NOW, undefined, {}, undefined, { raisedAtMs: NOW });
+    expect(input.humanBlock).toEqual({ raisedAtMs: NOW });
+  });
+
+  it("omits the key entirely when there is none — absence must not read as a block", () => {
+    // The same spread convention `quotaBlock` uses. An explicit `humanBlock: undefined` would be
+    // harmless today but makes `"humanBlock" in input` lie, and this surface's whole discipline is
+    // that "not looked up" and "false" stay distinguishable.
+    expect("humanBlock" in stallInputsFor("idle", NOW, undefined, {})).toBe(false);
   });
 });

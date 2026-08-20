@@ -1,6 +1,6 @@
 {
   "name": "@sparkle/desktop",
-  "version": "0.110.1",
+  "version": "0.119.0",
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
@@ -25,6 +25,8 @@
     "visual:tab-seam": "node scripts/visual/tab-seam-probe.mjs",
     "visual:tab-column": "node scripts/visual/tab-column-probe.mjs",
     "visual:quote-surface": "node scripts/visual/quote-surface-probe.mjs",
+    "visual:prose-row-wrap": "node scripts/visual/prose-row-wrap-probe.mjs",
+    "visual:reply-quote": "node scripts/visual/reply-quote-shot.mjs",
     "visual": "pnpm visual:capture && pnpm visual:compare",
     "lint": "eslint src --max-warnings 12",
     "typecheck": "tsc --noEmit",

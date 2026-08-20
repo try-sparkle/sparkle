@@ -103,13 +103,16 @@ const BIG_STEP = 32;
 // the whole tab ~20% smaller, and 8 is what the approved page shipped. Ten would re-inflate the one
 // dimension the correction was about.
 
-/** `--hd-h`. The hover zone starts BELOW the header band so it never overlaps the header's own controls. */
-const HEADER_H = 34;
+/** `--hd-h`. The hover zone starts BELOW the header band so it never overlaps the header's own controls.
+ *  EXPORTED because the grips have to line up ACROSS columns, and a caller that needs to offset one
+ *  of them has to be able to say "the default, plus the thing in my way" without re-spelling 34. */
+export const HEADER_H = 34;
 /** The hover zone that straddles the seam — 30px wide, so it overhangs 15px into each column. */
 const ZONE_W = 30;
 const ZONE_H = 52;
-/** The tab's inset from the top of the zone. */
-const TAB_TOP = 6;
+/** The tab's inset from the top of the zone. Exported with `HEADER_H`, and for the same reason: a
+ *  caller cancelling a zoom has to reason about where the TAB lands, not where the zone starts. */
+export const TAB_TOP = 6;
 /** Arrow → dots. */
 const TAB_GAP = 8;
 const TAB_PAD = 5;
@@ -227,7 +230,7 @@ export interface ColumnPullTabProps {
    * How far down the seam the hover zone starts. Defaults to the header band, which is what keeps
    * the tab clear of the header's own controls; a boundary whose columns have no header can pass 0.
    */
-  topOffset?: number;
+  topOffset?: number | string;
   testId?: string;
 }
 
@@ -1166,10 +1169,15 @@ const tab: CSSProperties = {
   transition: "opacity 120ms ease",
 };
 
+// A HIT TARGET, not just a glyph. This was `padding: 0` around a 12px icon — roughly 12x12, inside
+// a 6px rail whose own `pointerdown` starts a resize. A near-miss therefore landed on the rail and
+// began a zero-travel drag that commits nothing, which looks EXACTLY like the arrow doing nothing —
+// so it made the real overlay bug (see `overlaidColumnWidth`) harder to tell apart from a mis-click.
+// The padding grows the target without moving the glyph, because the tab is a centred flex column.
 const zoneBtn: CSSProperties = {
   display: "grid",
   placeItems: "center",
-  padding: 0,
+  padding: 4,
   background: "transparent",
   border: "none",
   color: C.muted,

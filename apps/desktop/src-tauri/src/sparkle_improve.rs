@@ -48,6 +48,12 @@ use crate::claude_chat::{
 /// Login shell, as `zsh -l -c 'exec …'` — matches `pty.rs` / `claude_chat.rs` / `claudeSpawn.ts`.
 const SHELL: &str = "/bin/zsh";
 
+/// The CANONICAL Improve-Sparkle agent id. MUST match `SPARKLE_CANONICAL_AGENT_ID` in
+/// `sparkle_agent.rs` and `SPARKLE_AGENT_ID` in `src/services/sparkleAgent.ts`. Mirrored here
+/// (rather than made `pub`) so this file stays self-contained; it is exported into the headless
+/// pass as `SPARKLE_INBOX_AGENT` — see `build_improve_exec`.
+const SPARKLE_CANONICAL_AGENT_ID: &str = "__sparkle_self__";
+
 /// A pass older than this is presumed hung (network stall, wedged subprocess) and is killed +
 /// reclaimed by the next `sparkle_improve_run`. Generous: a legitimate pass — review logs,
 /// implement one small change, draft/submit a PR — finishes well inside it. MUST strictly
@@ -236,7 +242,13 @@ fn session_announcement(session_id: &str, announced: &mut bool) -> Option<String
 /// no `--resume`: each hourly pass starts FRESH — the persona + mission carry all needed
 /// context, and the interactive pane resumes the pass's session afterwards anyway (it picks
 /// the worktree's most recent session), which is how a case-by-case draft reaches the user.
-fn build_improve_exec(claude_path: &str, prompt: &str, persona: &str, log_dir: &str) -> String {
+fn build_improve_exec(
+    claude_path: &str,
+    prompt: &str,
+    persona: &str,
+    log_dir: &str,
+    mcp_config: Option<&str>,
+) -> String {
     let mut cmd = format!("exec {}", shell_quote(claude_path));
     cmd.push_str(" -p ");
     cmd.push_str(&shell_quote(prompt));
@@ -245,9 +257,40 @@ fn build_improve_exec(claude_path: &str, prompt: &str, persona: &str, log_dir: &
     cmd.push_str(&shell_quote(persona));
     cmd.push_str(" --add-dir ");
     cmd.push_str(&shell_quote(log_dir));
+    // THE sparkle-control MCP (bead sparkle-hdlhox). Without it this pass can RECEIVE a message —
+    // the `SPARKLE_INBOX_AGENT` export below makes it a draining recipient — and cannot SEND one.
+    // That half-duplex shape is the original defect relocated rather than fixed: the concierge can
+    // answer a directive with "that contradicts what I observe", and the agent it is correcting has
+    // no way to reply, so the correction is the end of the conversation instead of the start of one.
+    // It also matters which body this is: the hourly pass does the log-mining and bead triage, so it
+    // is the one that HAS the cross-agent findings worth pushing, while the interactive pane is
+    // mostly the user chatting.
+    //
+    // SCOPE, stated because this pass is unattended and auto-approving: what it gains is the
+    // ORDINARY agent surface (`get_state`, `send_peer_message`, self-narration), not the
+    // concierge's. The wide `concierge_tool` domains refuse a non-concierge caller frontend-side in
+    // `controlListener.dispatch`, which is the real gate — `--allowedTools` deliberately is NOT
+    // relied on here, because it does not gate MCP tools at all (see concierge.rs's P0 note).
+    //
+    // No `--strict-mcp-config`: same as every other agent kind, the user's own servers still load.
+    // Placed before a following FLAG, never before the positional prompt — `--mcp-config` is
+    // variadic and would otherwise swallow it.
+    if let Some(json) = mcp_config {
+        cmd.push_str(" --mcp-config ");
+        cmd.push_str(&shell_quote(json));
+    }
     // Unattended pass: see the module docs for why this is required and how it is fenced.
     cmd.push_str(" --dangerously-skip-permissions");
-    format!("export PATH=\"$HOME/.local/bin:$PATH\"; {cmd}")
+    // EXPORT THE INBOX-OWNER ID (bead sparkle-179b2s). `mayDrain` in sparkle-hook.mjs only drains an
+    // inbox when `SPARKLE_INBOX_AGENT === <that agent's id>`; the hourly headless pass never sets it,
+    // so Improve Sparkle's inbox was written but never drained by the pass that has no pane. Export
+    // the canonical id here — mirroring `claudeSpawn.ts`'s `inboxAgentExport` — so the headless pass
+    // is a first-class draining recipient, not a black hole. `shell_quote` keeps it fenced like every
+    // other value in this exec string.
+    format!(
+        "export PATH=\"$HOME/.local/bin:$PATH\"; export SPARKLE_INBOX_AGENT={}; {cmd}",
+        shell_quote(SPARKLE_CANONICAL_AGENT_ID)
+    )
 }
 
 /// Assemble the `Command` for one improvement pass — everything up to (but not including)
@@ -332,6 +375,10 @@ pub fn sparkle_improve_run(
     persona: String,
     prompt: String,
     log_dir: String,
+    // Inline JSON for `claude --mcp-config`, assembled by the frontend (it owns the control
+    // bridge's socket + token). Optional so a pass whose bridge did not start spawns exactly as
+    // before, with its cross-agent tools absent rather than the pass failing.
+    mcp_config: Option<String>,
     // The chosen account's `CLAUDE_CONFIG_DIR` (Tauri maps JS `configDir` → this `config_dir`),
     // resolved by the frontend through the SAME `pickAccount` the build-agent spawn uses. Optional
     // so a build with no accounts configured spawns exactly as before.
@@ -342,7 +389,7 @@ pub fn sparkle_improve_run(
         .join("worktrees");
     let real_cwd = validate_run_inner(&worktrees, &claude_path, &cwd, &log_dir)?;
 
-    let script = build_improve_exec(&claude_path, &prompt, &persona, &log_dir);
+    let script = build_improve_exec(&claude_path, &prompt, &persona, &log_dir, mcp_config.as_deref());
     // Log paths only — the script embeds the persona/prompt (which reference the log dir and
     // could quote user-visible strings), matching the "args may contain prompt text" caution.
     // The account is logged as a BOOLEAN, never the dir (it is account-identifying).
@@ -789,6 +836,7 @@ mod tests {
             "hourly pass",
             "persona text",
             "/logs/dir",
+            None,
         );
         assert!(script.contains("export PATH=\"$HOME/.local/bin:$PATH\";"));
         assert!(script.contains("exec '/usr/local/bin/claude'"));
@@ -804,8 +852,58 @@ mod tests {
     }
 
     #[test]
+    fn build_exec_carries_the_control_mcp_so_the_headless_pass_can_SEND_not_just_receive() {
+        // bead sparkle-hdlhox. The export asserted in the test below makes this pass a draining
+        // RECIPIENT; without `--mcp-config` it had no way to send anything back. Half-duplex is the
+        // original defect relocated: the concierge can reply "that contradicts what I observe" and
+        // the agent being corrected cannot answer, so the correction ends the exchange.
+        let script = build_improve_exec("/bin/claude", "p", "persona", "/logs", Some("{\"mcpServers\":{}}"));
+        assert!(
+            script.contains("--mcp-config '{\"mcpServers\":{}}'"),
+            "the pass must carry the control MCP when one was assembled; got: {script}"
+        );
+        // NOT strict — the user's own MCP servers must still load, same as every other agent kind.
+        assert!(!script.contains("--strict-mcp-config"));
+        // `--mcp-config` is VARIADIC: a following flag has to terminate it, or it swallows whatever
+        // comes next. The prompt is positional and already consumed by `-p` above, but this pins the
+        // ordering so a later edit cannot move the flag to the end of the string.
+        let at = script.find("--mcp-config").expect("flag present");
+        assert!(
+            script[at..].contains("--dangerously-skip-permissions"),
+            "a FLAG must follow --mcp-config so its variadic list is terminated; got: {script}"
+        );
+    }
+
+    #[test]
+    fn build_exec_omits_the_mcp_flag_entirely_when_no_bridge_came_up() {
+        // THE PAIRED NEGATIVE, and the degradation contract. A control bridge that will not start
+        // must cost this pass its cross-agent tools and nothing else — never an empty or malformed
+        // `--mcp-config`, which `claude` would reject and which would take the whole hourly pass
+        // down with it. Absent, not empty.
+        let script = build_improve_exec("/bin/claude", "p", "persona", "/logs", None);
+        assert!(!script.contains("--mcp-config"), "no bridge must mean no flag at all; got: {script}");
+        // …and the pass is otherwise completely intact.
+        assert!(script.contains("--dangerously-skip-permissions"));
+        assert!(script.contains("export SPARKLE_INBOX_AGENT='__sparkle_self__';"));
+    }
+
+    #[test]
+    fn build_exec_exports_inbox_agent_id_so_the_headless_pass_drains_its_inbox() {
+        // bead sparkle-179b2s. `mayDrain` (sparkle-hook.mjs) only drains an inbox when
+        // SPARKLE_INBOX_AGENT equals that agent's id. Without this export the hourly headless pass —
+        // which owns no pane — writes an inbox nobody drains. Assert the SIDE EFFECT (the export is in
+        // the exec string the pass actually runs), quoted exactly the way `shell_quote` emits it, so a
+        // mutation that drops the export turns this red.
+        let script = build_improve_exec("/bin/claude", "p", "persona", "/logs", None);
+        assert!(
+            script.contains("export SPARKLE_INBOX_AGENT='__sparkle_self__';"),
+            "headless pass must export its inbox-owner id; got: {script}"
+        );
+    }
+
+    #[test]
     fn build_exec_quotes_hostile_values() {
-        let script = build_improve_exec("/bin/claude", "'; rm -rf /; echo '", "p", "/l");
+        let script = build_improve_exec("/bin/claude", "'; rm -rf /; echo '", "p", "/l", None);
         assert!(script.contains(r"-p ''\''; rm -rf /; echo '\'''"));
     }
 

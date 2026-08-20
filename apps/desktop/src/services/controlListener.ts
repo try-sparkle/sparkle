@@ -34,15 +34,11 @@ import { useProjectStore } from "../stores/projectStore";
 // `handleSetEscalation` for why replying without it would be an empty success.
 import {
   MAX_CONCIERGE_REARMS,
-  escalationQuotesStaleText,
   rearmsRemaining,
 } from "../engine/agentGoal";
 import type { AgentGoal } from "../engine/agentGoal";
-import {
-  decideContinuation,
-  progressMark,
-  type NoContinueReason,
-} from "../engine/goalContinuation";
+import { activityAgeMs as activityAgeMsOf } from "../engine/activityFreshness";
+import { decideContinuation, type NoContinueReason } from "../engine/goalContinuation";
 import { hasTurnEndAuthority } from "../engine/turnEndAuthority";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
 import { withUnmergedWork } from "../engine/unmergedAttention";
@@ -53,6 +49,7 @@ import { resolveStage } from "../engine/workflowStage";
 import {
   canAcceptContinuation,
   cloudEvidenceFor,
+  continuationEvidenceFor,
   idleSinceFor,
   processAliveFor,
 } from "./goalContinuationRunner";
@@ -68,7 +65,12 @@ import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { rollupDotAccessor } from "../engine/workerRollup";
 import { agentDisplayName } from "../engine/agentDisplayName";
-import { sparkleAgentIdFor, SPARKLE_AGENT_DISPLAY_NAME } from "./sparkleAgent";
+import {
+  sparkleAgentIdFor,
+  SPARKLE_AGENT_DISPLAY_NAME,
+  SPARKLE_AGENT_ID,
+  isSparkleAgentId,
+} from "./sparkleAgent";
 import { sparkleActivityLine } from "./sparkleBusy";
 import { APP_WINDOW_LABEL } from "../windowContext";
 import { getConfig, setConfigValue, setConfigValues } from "./config";
@@ -113,6 +115,7 @@ import { APP_TOOL_NAMES, type AppToolName } from "./conciergeTools/policy";
 // The lifecycle op NAMES, read from their one definition rather than re-listed here, so a new
 // lifecycle op inherits the refusal remedy that tells the truth about it (see refusedCallerRemedy).
 import { LIFECYCLE_OPS } from "./conciergeTools/lifecycle";
+import { SCREENSHOT_OPS } from "./conciergeTools/screenshot";
 import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
 // The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
@@ -330,27 +333,49 @@ const CONTROL_OP_TIERS: Record<ControlOp, "free" | "privileged"> = {
   // refuses everyone else with `escalation_not_yours`. Both gates matter: this op spends a bounded
   // allowance that only a HUMAN can refill, so a near-miss caller must not get within reach of it.
   set_agent_escalation: "privileged",
-  // PRIVILEGED — and this entry is where the founder's preview rule is ENFORCED rather than merely
-  // described (docs/live-browser-preview.md, "Decisions — amended 2026-08-08": *only interactive
-  // agents may open a preview; workers may not*).
+  // FREE, AND — LIKE `chief_tool` ABOVE — THAT IS A DECISION RATHER THAN AN OMISSION (beads
+  // `sparkle-q3b4c6` / `sparkle-wnnye0`). This entry read `privileged` from the op's first day,
+  // which made `callerMayAdminister`'s predicate (`kind != null && kind !== "worker"`) the
+  // enforcement point for the founder's 2026-08-08 rule — *only interactive agents may open a
+  // preview; workers may not*. That rule is spent, and this tier follows it rather than outliving
+  // it.
   //
-  // `callerMayAdminister` IS that rule's predicate — `kind != null && kind !== "worker"` — so this
-  // tier makes ONE gate carry it, in the single place `dispatch` enforces the free/privileged
-  // decision. A second copy of the check inside `handlePreview` would be unreachable from here and
-  // would rot into exactly the decorative per-handler guard this table exists to replace.
+  // WHY THE RULE EXISTED, AND WHY IT NO LONGER BINDS. Its stated reason was a RESOURCE bound, never
+  // a trust one (docs/live-browser-preview.md, "Decisions — amended 2026-08-08"): "with `[workers]
+  // max_concurrent = 80` and `agent_memory_watchdog` still unwired, an interactive-only caller is
+  // the sole bound available until `[preview] idle_grace_min` lands. **Revisit when it does.**"
+  // It landed — `config.rs`'s `PreviewConfig` ships `idle_grace_min = 10` and
+  // `services/previewIdleGrace.ts` runs the timer — so this entry IS that revisit.
   //
-  // IT COVERS close AND list TOO, which is a decision rather than a side effect of the tier. A
-  // preview is A PANE THE HUMAN LOOKS AT, so it sits in the same class as zoom/ordering/navigation
-  // above: an unattended worker must not change the human's UI on its own initiative. Under the
-  // open rule a worker can never have started one, so the only preview its `close` could ever reach
-  // is one a HUMAN opened on that worker's row — blanking the human's pane, which is the very thing
-  // this tier denies. Refusing all three is both safer and simpler to explain than a rule that
-  // turns on which door was used.
+  // WHY `free` IS SAFE, which is the `chief_tool` argument one step sharper: what gates this op is
+  // not "is this caller interactive" but WHOSE WORKTREE it can reach, and that answer is
+  // structurally "its own, always". `handlePreview` takes NO `agentId`/`targetAgentId`, and the op
+  // is deliberately absent from `PER_AGENT_OPS`; all three sub-ops resolve `req.callerAgentId`,
+  // which Rust stamps from the socket the request arrived on (`bridge.rs resolve_control_caller`).
+  // So a worker cannot start a dev server in a sibling's checkout, cannot read a sibling's loopback
+  // URL, and cannot stop a preview a human is watching on another row — none of which the tier was
+  // holding shut in the first place.
   //
-  // The concierge clears this gate outright (it is the human's own front-of-house), so the one
-  // caller that must still be refused is refused by the handler — see `handlePreview`: a headless
-  // `claude -p` child has no roster row and no checkout, so there is no worktree to serve.
-  preview: "privileged",
+  // `close` AND `list` FOLLOW `open`, and that is a decision too. The old entry refused all three on
+  // the grounds that the only preview a worker's `close` could reach was one a HUMAN had opened on
+  // its row. With `open` reachable that premise is gone: the only preview either sub-op can name is
+  // the one this caller started itself, so refusing them would strand a worker's own dev server with
+  // no way to stop it — the exact opposite of the resource argument above.
+  //
+  // WHY IT MATTERS: the worker is usually the agent doing the visual work. An orchestrator fans a UI
+  // change out to a worker and then had nothing to show it with, which made the whole "show your
+  // work" protocol unreachable for precisely the agents that had something to show.
+  //
+  // ⚠️ THE RESOURCE QUESTION IS BOUNDED, NOT ELIMINATED — stated rather than hidden, because an
+  // accepted risk nobody wrote down is indistinguishable from one nobody noticed. `openPreviewServer`
+  // re-attaches rather than starting a second server, so the ceiling is ONE per live agent, not one
+  // per call. But the two-pane layout ceiling design-doc §4 leaned on is gone (previews became
+  // concierge cards, 2026-08-19), and the grace clock no longer reclaims a healthy `ready`/`serving`
+  // server whose card is therefore always on screen (bead `sparkle-9yck3i`). The lever for a project
+  // that cannot afford that is `[preview] agent_eagerness = "never"`, which withholds the
+  // instruction from every brief — NOT this tier, which could only turn the tool into an error
+  // message for the agents most likely to need it.
+  preview: "free",
 };
 
 /**
@@ -370,12 +395,12 @@ const CONCIERGE_EXEMPT_OPS = new Set<ControlOp>([
   // the refusing handler is UNREACHABLE from the concierge instead of being advertised as a
   // togglable Settings row for a tool that can only decline.
   "unpin_agent",
-  // Same rule, a live op rather than a retired one: `handleSendPeerMessage` refuses the concierge
-  // UNCONDITIONALLY — the reserved caller id matches no roster row, so `findAgent` can never resolve
-  // it — because this is an agent-to-agent channel and the concierge already reaches the inbox
-  // through its own tools. Classifying it would render a togglable Settings row promising a tool the
-  // handler can only decline, and a human who switched it on would get `unknown_caller` with nothing
-  // saying why the toggle did nothing.
+  // Exempt because the concierge is a VALID sender (bead sparkle-179b2s) — it now reaches this
+  // handler on purpose. `handleSendPeerMessage` special-cases the reserved caller id (which matches
+  // no roster row, so `findAgent` can never resolve it) and resolves its project from the selected
+  // project, exactly as `selfIdentity` does. Classifying it would render a togglable Settings row for
+  // a channel the concierge is meant to use unconditionally; keeping it exempt is what lets the
+  // concierge message the fleet without a human first flipping a toggle.
   "send_peer_message",
   // Same rule again, for the same structural reason: a preview serves an AGENT'S OWN WORKTREE, and
   // the concierge is a headless `claude -p` child with no roster row — `findAgent` can never resolve
@@ -533,12 +558,37 @@ function resolveTargetId(req: ControlRequest): string | undefined {
  *
  * FAILS CLOSED on an unresolvable caller: no id means we cannot establish ownership, and the only
  * safe answer to "does this anonymous caller own that agent" is no.
+ *
+ * IT RETURNS A REASON, NOT A BOOLEAN, because a bare `false` collapses three different situations
+ * into one refusal — and the refusal it produced named the wrong one twice (bead `sparkle-gcuxq`:
+ * "nothing distinguishes 'refused by policy' from 'caller does not exist'"). A refusal is an
+ * INSTRUCTION the caller acts on, so naming the wrong cause sends it to fix something that is not
+ * broken:
+ *
+ *   - `no_caller_identity` — the caller carries no stamped id. `not_yours` told it that "only the
+ *     agent itself, an orchestrator above it, or the concierge" may write, which is unactionable
+ *     advice for a caller whose problem is that it is nobody: it cannot become any of the three by
+ *     retrying. The answer it needs is that its own identity did not arrive.
+ *   - `unknown_target` — the id names no agent at all. The ownership walk refuses it (an absent
+ *     target has no parent chain), so a MISTYPED target id came back "agent X is not yours to
+ *     rename" — sending the caller to hunt for a permission problem when the id is simply wrong.
+ *     The handlers all check `findAgent` two lines later and say "unknown agent X"; this gate just
+ *     got there first, so the fix is to give the same answer it would have.
+ *   - `not_owned` — the real policy refusal, and the only one `not_yours` ever described correctly.
+ *
+ * Distinguishing `unknown_target` leaks nothing: `get_state` is free-tier and returns the roster, so
+ * whether an id exists is already one call away. The secret this surface protects is the WRITE, not
+ * the target's existence.
  */
-function mayWriteAgentFieldFor(req: ControlRequest, targetId: string): boolean {
-  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) return true;
+type AgentFieldWriteVerdict =
+  | { allowed: true }
+  | { allowed: false; reason: "no_caller_identity" | "unknown_target" | "not_owned" };
+
+function mayWriteAgentFieldFor(req: ControlRequest, targetId: string): AgentFieldWriteVerdict {
+  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) return { allowed: true };
   const caller = (req.callerAgentId || "").trim();
-  if (!caller) return false;
-  if (caller === targetId) return true;
+  if (!caller) return { allowed: false, reason: "no_caller_identity" };
+  if (caller === targetId) return { allowed: true };
   // Walk UP from the target: an orchestrator owns its workers at any depth, matching how
   // `rollupDot` folds a nested head's subtree into its parent. Bounded by the roster size so a
   // corrupted parent cycle cannot spin here.
@@ -548,12 +598,15 @@ function mayWriteAgentFieldFor(req: ControlRequest, targetId: string): boolean {
       .projects.flatMap((p) => p.agents)
       .map((a) => [a.id, a] as const),
   );
+  // Checked BEFORE the walk, and it changes no verdict — an absent target has no parent chain, so
+  // the loop below already refused it. It only changes which reason the caller is told.
+  if (!byId.has(targetId)) return { allowed: false, reason: "unknown_target" };
   let cursor = byId.get(targetId)?.parentId ?? null;
   for (let hops = 0; cursor && hops <= byId.size; hops++) {
-    if (cursor === caller) return true;
+    if (cursor === caller) return { allowed: true };
     cursor = byId.get(cursor)?.parentId ?? null;
   }
-  return false;
+  return { allowed: false, reason: "not_owned" };
 }
 
 /** The name the human sees on the concierge — used as its `self.name` so the identity get_state
@@ -613,6 +666,12 @@ export interface SelfIdentity {
    *  So this field is honest about a WEAKER thing: a call was observed, and this was the most recent
    *  one, at some point since the app started. A caller must not read it as "this turn". */
   activity: string | null;
+  /** Age in ms of the agent's `activity` self-report, so a reader treats it as a timestamped quote
+   *  rather than current state (bead sparkle-s8y5t6). `null` when there is no line, when the line has
+   *  no stamp (legacy/restored — unknown age, treat as stale), or for the CONCIERGE, whose `activity`
+   *  is a last-tool-call observation with its own recency rules (see the field above), not a stamped
+   *  self-report. */
+  activityAgeMs: number | null;
 }
 
 /** Build the caller's {@link SelfIdentity}, or `null` when the caller resolves to nothing. */
@@ -633,6 +692,9 @@ function selfIdentity(req: ControlRequest): SelfIdentity | null {
       projectId: project?.id ?? null,
       projectName: project?.name ?? null,
       activity: latest ? (conciergeActivityLine(latest)?.text ?? null) : null,
+      // The concierge line is a last-tool-call observation, not a stamped agent self-report, so it
+      // has no per-agent `activityAt` to age — its recency rules live in `seq` (see the field docs).
+      activityAgeMs: null,
     };
   }
   const found = findAgent(req.callerAgentId);
@@ -645,6 +707,10 @@ function selfIdentity(req: ControlRequest): SelfIdentity | null {
     projectId: found.projectId,
     projectName: projects.find((p) => p.id === found.projectId)?.name ?? null,
     activity: found.agent.activity ?? null,
+    // Age the self-report so the caller reads it as a quote, not present-tense state. `null` with no
+    // line or no stamp (unknown age → treat as stale). get_state's self is built once, so sampling
+    // Date.now() here is fine — there is no per-row clock to share the way the roster map has.
+    activityAgeMs: found.agent.activity ? activityAgeMsOf(found.agent.activityAt, Date.now()) : null,
   };
 }
 
@@ -673,9 +739,13 @@ function targetRequired(op: string, req: ControlRequest): Record<string, unknown
   return { ok: false, code: "target_required", error: `${op} requires an explicit targetAgentId: ${why}` };
 }
 
-/** The typed refusal for a per-agent WRITE aimed at an agent the caller does not own — the reply
- *  half of `mayWriteAgentFieldFor`, shared by every op behind it so the four cannot drift into
- *  four failure shapes a caller has to decode separately.
+/** The typed refusal for a per-agent WRITE the gate declined — the reply half of
+ *  `mayWriteAgentFieldFor`, shared by every op behind it so the four cannot drift into four failure
+ *  shapes a caller has to decode separately.
+ *
+ *  It takes the VERDICT, not just a target, because the gate has three refusal reasons and only one
+ *  of them is an ownership problem. See `AgentFieldWriteVerdict` for why naming the wrong one is a
+ *  bug and not a wording nit: each branch below is the answer the caller can act on.
  *
  *  `code: "not_yours"` is the stable machine-readable half (the concierge brain is an LLM reading a
  *  tool result, and the UI decodes one code, not prose). NOT a silent `{ ok: true }` no-op: a caller
@@ -686,7 +756,30 @@ function targetRequired(op: string, req: ControlRequest): Record<string, unknown
  *  `what` completes "is not yours to …" and `why` states the harm, so the message names the specific
  *  field rather than a generic denial. The remedy clause is shared: it lists exactly the three
  *  callers the predicate admits, so an agent that reads it learns the rule instead of retrying. */
-function notYours(targetId: string, what: string, why: string): Record<string, unknown> {
+function notYours(
+  verdict: Extract<AgentFieldWriteVerdict, { allowed: false }>,
+  targetId: string,
+  what: string,
+  why: string,
+): Record<string, unknown> {
+  // A caller that is nobody cannot act on the ownership remedy — it names three identities it has no
+  // way to become. Tell it the thing it can actually fix: its id did not reach us.
+  if (verdict.reason === "no_caller_identity") {
+    return {
+      ok: false,
+      code: "no_caller_identity",
+      error:
+        `cannot ${what} agent ${targetId}: this request carries no caller identity, so ownership ` +
+        `cannot be established. This is a refusal about the CALLER, not about ${targetId} — the ` +
+        `bridge stamps callerAgentId server-side, so an empty one means the caller was never ` +
+        `identified rather than that it was denied.`,
+    };
+  }
+  // The same answer `findAgent` gives two lines below every call site. The gate merely got there
+  // first, and a mistyped id is not a permission problem.
+  if (verdict.reason === "unknown_target") {
+    return { ok: false, error: `unknown agent ${targetId}` };
+  }
   return {
     ok: false,
     code: "not_yours",
@@ -717,14 +810,20 @@ function notYours(targetId: string, what: string, why: string): Record<string, u
  *  builder produces both, so a name read here always resolves there. An unresolvable caller gets an
  *  EMPTY roster rather than the full one: this scope is the project boundary made readable, so
  *  failing open would turn a read into a cross-project enumeration oracle. */
-export type StateScope = "self" | "active" | "all" | "project";
+export type StateScope = "self" | "active" | "all" | "project" | "fleet";
 
 /** Coerce the caller-supplied `scope` to a known value, defaulting to the cheap one. Unknown or
  *  non-string input falls back to "active" rather than erroring: the MCP layer already rejects a
  *  bad enum, so anything odd arriving here is a misbehaving client, and quietly serving it the
  *  narrow (safe, cheap) roster beats failing a read op. */
 function resolveScope(raw: unknown): StateScope {
-  return raw === "self" || raw === "all" || raw === "active" || raw === "project" ? raw : "active";
+  return raw === "self" ||
+    raw === "all" ||
+    raw === "active" ||
+    raw === "project" ||
+    raw === "fleet"
+    ? raw
+    : "active";
 }
 
 /** Max ids reported in `omittedIds`. The field is a convenience for resolving a specific dropped
@@ -884,7 +983,7 @@ function goalAndStallFields(
             // with nothing to tell them apart, and the reader acts on the quote as a live claim.
             // That is not hypothetical — three of nine simultaneous escalations were false this
             // way, and the founder had to re-derive each one by hand.
-            ...(escalationQuotesStaleText(agent.goal) ? { escalationStale: true } : {}),
+            ...(goal.escalationStale ? { escalationStale: true } : {}),
             // GIT'S OWN ANSWER TO "IS THIS AGENT'S WORK ON ORIGIN MAIN", which the concierge has
             // never been able to see. It has been allowed to close any agent's goal for a while —
             // `handleSetGoalMet` exempts it — but the ancestry reading that would JUSTIFY doing so
@@ -993,6 +1092,54 @@ function handleGetState(req: ControlRequest): {
   const status = useRuntimeStore.getState().status;
   const ui = useUiStore.getState();
   const scope = resolveScope(req.payload.scope);
+
+  // ── SCOPE "fleet" — the CROSS-PROJECT ADDRESS BOOK (bead sparkle-179b2s) ──────────────────────
+  //
+  // Every other scope answers "which of MY siblings can I see"; this one answers "which APP-GLOBAL
+  // participants can I address" — the two ids that live outside any project: the concierge and each
+  // live Improve-Sparkle. It is a deliberately separate scope rather than extra rows on "project",
+  // because those rows are NOT project siblings and folding them into the project roster would blur
+  // the boundary the project scope exists to keep (a caller could no longer tell an in-project peer
+  // from an app-global one). It short-circuits here: it needs none of the roll-up/calm machinery the
+  // roster scopes build, only the liveness set and the caller's identity.
+  //
+  // These are exactly the ids `send_peer_message` resolves app-globally (`resolveSpecialAddressee`)
+  // and `inboxSend` treats as addressable, so a name read here always resolves at send time. The
+  // canonical Sparkle id is listed unconditionally — the headless pass drains it (see
+  // `build_improve_exec`) — and per-window Sparkle ids only while their pane is live.
+  if (scope === "fleet") {
+    const openIds = new Set(
+      mergeOpenAgentIds(useRuntimeStore.getState().openAgentIds, readPersistedOpenAgentIds()),
+    );
+    const liveSparkleIds = [
+      SPARKLE_AGENT_ID,
+      ...[...openIds].filter((id) => isSparkleAgentId(id) && id !== SPARKLE_AGENT_ID),
+    ];
+    const fleetAgents: unknown[] = [
+      { id: CONCIERGE_CALLER_AGENT_ID, name: CONCIERGE_SELF_NAME, kind: "concierge", appOwned: true },
+      ...liveSparkleIds.map((id) => ({
+        id,
+        name: SPARKLE_AGENT_DISPLAY_NAME,
+        kind: "build" as const,
+        appOwned: true as const,
+      })),
+    ];
+    return {
+      agents: fleetAgents,
+      self: selfIdentity(req),
+      scope,
+      // This scope's world IS the address book it returned, so — like scope "project" — it does not
+      // publish a headcount of anything it withheld (there is nothing withheld to count).
+      totalAgents: fleetAgents.length,
+      omitted: 0,
+      omittedIds: [],
+      theme: ui.themePref,
+      models: getModelCatalog().map((m) => m.id),
+      statusFilter: ui.statusFilter,
+      zoomByColumn: ui.zoomByColumn,
+    };
+  }
+
   // Liveness for scope "active" must NOT come from `status` alone. That map is window-local and
   // never persisted (runtimeStore: "live-only"), while control:request is broadcast to EVERY window
   // and whichever replies first answers — so a window has no status entries for agents mounted in
@@ -1119,6 +1266,14 @@ function handleGetState(req: ControlRequest): {
       liveness: livenessOf(a.id, status, openIds),
       parentId: a.parentId,
       activity: a.activity ?? null,
+      // AGE OF THE SELF-REPORT, so the machine reader (concierge / watcher) treats `activity` as a
+      // TIMESTAMPED QUOTE, not present-tense state (bead sparkle-s8y5t6). This roster is THE surface a
+      // watcher agent scans, and before this it saw a dead agent's hours-old "blocked on the outage"
+      // line as if current — exactly the "explained" misread the bead names. Compact and absent by
+      // default (this payload is the largest thing the control API puts in a context window): emitted
+      // only when there is a line, `null` when the line has no stamp (legacy/restored → unknown age,
+      // which the reader must treat as stale). Off the SAME `now` every other field here uses.
+      ...(a.activity ? { activityAgeMs: activityAgeMsOf(a.activityAt, now) } : {}),
       // THE SWEEP FIELDS. Without them, finding the agent that stopped mid-task means a human
       // noticing a gray row by eye — `status` cannot tell "idle and finished" from "idle and
       // stalled", and both render identically. With them, a concierge or an orchestrator can scan
@@ -1300,8 +1455,10 @@ function handleRename(req: ControlRequest): Record<string, unknown> {
   // roster is one call away, and the name is what the human reads as an agent's own account of
   // itself. Renaming a stalled agent to something reassuring is a lie told in the operator's own
   // trusted surface, which is the whole point of the roster.
-  if (!mayWriteAgentFieldFor(req, targetId)) {
+  const mayWrite = mayWriteAgentFieldFor(req, targetId);
+  if (!mayWrite.allowed) {
     return notYours(
+      mayWrite,
       targetId,
       "rename",
       "its name is that agent's own first-person report of what it is, and the human reads the roster as such",
@@ -1326,8 +1483,10 @@ function handleSetActivity(req: ControlRequest): Record<string, unknown> {
   // live "what I'm building now" the human scans to tell a working agent from a stuck one, and it is
   // also what the app reuses as a notification body — so an unowned write both misdescribes the
   // agent on the roster and can put attacker-chosen prose in front of the human out of band.
-  if (!mayWriteAgentFieldFor(req, targetId)) {
+  const mayWrite = mayWriteAgentFieldFor(req, targetId);
+  if (!mayWrite.allowed) {
     return notYours(
+      mayWrite,
       targetId,
       "narrate",
       "its activity line is that agent's own first-person report of what it is doing, and the human reads the roster as such",
@@ -1382,8 +1541,9 @@ function handleSetGoal(req: ControlRequest): Record<string, unknown> {
   // writes to their terminals by design. What is NOT legitimate is reaching a sibling or an unrelated
   // agent's fleet. So: yourself, your own worker subtree, or the concierge (whose reserved id the
   // bridge stamps server-side, and which is the human-driven surface).
-  if (!mayWriteAgentFieldFor(req, targetId)) {
-    return notYours(targetId, "set a goal on", "its text is replayed into that agent's terminal");
+  const mayWrite = mayWriteAgentFieldFor(req, targetId);
+  if (!mayWrite.allowed) {
+    return notYours(mayWrite, targetId, "set a goal on", "its text is replayed into that agent's terminal");
   }
   const goal = req.payload.goal;
   if (typeof goal !== "string") return { ok: false, error: "goal must be a string" };
@@ -1637,6 +1797,7 @@ function resumeReading(
     resolveStage(rt.branchStatus[id], rt.workflowStage[id]),
   );
   const runtime = agent.runtime === "cloud" ? "cloud" : "local";
+  const evidence = continuationEvidenceFor(agent);
   const decision = decideContinuation({
     goal: agent.goal,
     status: overlaid[agent.id] ?? "stopped",
@@ -1647,11 +1808,13 @@ function resumeReading(
     processAlive: processAliveFor(agent.id, raw, openIds),
     runtime,
     cloud: runtime === "cloud" ? cloudEvidenceFor(agent.id, now) : undefined,
-    mark: progressMark({
-      promptHistoryLength: agent.promptHistory.length,
-      activity: agent.activity,
-      aiTitle: agent.aiTitle,
-    }),
+    // ⚠️ THE SWEEP'S OWN BUILDER, NOT A SECOND COPY (roborev 65440). This function's whole value is
+    // that it predicts what the next sweep will decide, so the mark it compares and the gate it
+    // applies must be the ones the sweep uses. Hand-building the mark from the three self-report
+    // fields — which is what this did — made the two disagree for every agent carrying artifact
+    // evidence, and the disagreement read as PROGRESS: the streak arm could never fire here, so a
+    // cleared escalation answered `willResume: true` for an agent the next sweep would escalate.
+    ...evidence,
     quotaBlock: quotaBlockForAgent(agent.id, now),
   });
   if (decision.action === "continue") return { willResume: true };
@@ -2203,8 +2366,10 @@ function handleSetAgentModel(req: ControlRequest): Record<string, unknown> {
   // model decides what that agent can do and what each of its turns costs, it persists, and the
   // agent has no way to notice it was changed under it — its next turn simply runs weaker (or
   // dearer) with nothing in its own context saying why. Same closure, same three admitted callers.
-  if (!mayWriteAgentFieldFor(req, targetId)) {
+  const mayWrite = mayWriteAgentFieldFor(req, targetId);
+  if (!mayWrite.allowed) {
     return notYours(
+      mayWrite,
       targetId,
       "re-model",
       "the model decides what that agent can do and what its turns cost, and it has no way to see the change",
@@ -2348,9 +2513,17 @@ const PREVIEW_ROUTE = /^\/(?![/\\])[^\s\x00-\x1f\x7f]*$/;
  * or stopping the preview a colleague is being watched through. Anything the payload calls
  * `agentId`, `projectId`, `worktree` or `id` is ignored — read, deliberately, nowhere below.
  *
- * WHO MAY CALL IT is the tier gate's job (`CONTROL_OP_TIERS.preview` is `privileged`), so a worker
- * never reaches this function. The one caller that clears that gate and still cannot be served is
- * the concierge: it has no roster row, so `findAgent` cannot resolve it and there is no worktree.
+ * WHO MAY CALL IT is the tier gate's job, and the answer is now EVERY agent kind, workers included:
+ * `CONTROL_OP_TIERS.preview` is `free` (that entry carries the reasoning, and the founder rule it
+ * retired). A worker therefore REACHES this function and is served its own worktree like anyone
+ * else. That widens who may call, not what any caller can touch — the paragraph above is what bounds
+ * reach, and it is structural rather than tiered, which is exactly why the tier could be relaxed
+ * without a compensating check being added here.
+ *
+ * The one caller that clears every gate and still cannot be served is the CONCIERGE: a headless
+ * `claude -p` child with no roster row, so `findAgent` cannot resolve its reserved id and there is
+ * no checkout to serve. It is refused below with `preview_unknown_caller` — the HANDLER's refusal,
+ * not the tier's, which is why relaxing the tier leaves it exactly as it was.
  */
 async function handlePreview(req: ControlRequest): Promise<Record<string, unknown>> {
   const requested = req.payload.previewOp;
@@ -2510,8 +2683,13 @@ async function handlePreview(req: ControlRequest): Promise<Record<string, unknow
  * the human, not a consolation prize attached to a refusal.
  */
 function refusedCallerRemedy(domain: string, op: string): string {
+  // Read from `SCREENSHOT_OPS`, not from two op names spelled out here. A hand-listed pair is
+  // exactly the drift this whole function exists to prevent: a third screenshot op added to the
+  // domain would miss this branch silently and fall through to the generic sentence below — the
+  // false remedy, for the one domain where it was already measured to cost a pass. The lifecycle
+  // branch below has always read its list; this one now matches it.
   const wantsAPicture =
-    domain === "screenshot" || op === "capture_window" || op === "capture_agent";
+    domain === "screenshot" || (SCREENSHOT_OPS as readonly string[]).includes(op);
   if (wantsAPicture) {
     return (
       "No ordinary control op takes a picture, so there is nothing here to fall back to. The " +
@@ -3053,6 +3231,31 @@ const NO_SUCH_PEER =
   "no agent by that id or name is working in your project — read the roster with " +
   "get_state({ scope: 'project' }), which lists exactly the agents you may message";
 
+/** The two APP-GLOBAL addressees, resolved OUTSIDE the project boundary (bead sparkle-179b2s).
+ *
+ *  The project boundary is the right default — an agent messages its own siblings — but two ids are
+ *  not project rows at all and must be reachable from any project: the concierge (the app's
+ *  assistant, `CONCIERGE_CALLER_AGENT_ID`) and Improve Sparkle. The canonical Sparkle id is always
+ *  addressable because the hourly HEADLESS pass now drains its inbox (see `build_improve_exec`'s
+ *  `SPARKLE_INBOX_AGENT` export), so a message lands even with no pane open; a per-window Sparkle id
+ *  is addressable only while its pane is live (in `openIds`), since only then does something drain it.
+ *
+ *  Returns the wire identity to enqueue under, or `null` when `to` is not one of these — in which case
+ *  the caller falls through to the ordinary project-scoped resolution. This is the same directory
+ *  `get_state({ scope: "fleet" })` publishes, so a name read there always resolves here. */
+function resolveSpecialAddressee(
+  to: string,
+  openIds: Set<string>,
+): { id: string; name: string } | null {
+  if (to === CONCIERGE_CALLER_AGENT_ID) {
+    return { id: CONCIERGE_CALLER_AGENT_ID, name: CONCIERGE_SELF_NAME };
+  }
+  if (isSparkleAgentId(to) && (to === SPARKLE_AGENT_ID || openIds.has(to))) {
+    return { id: to, name: SPARKLE_AGENT_DISPLAY_NAME };
+  }
+  return null;
+}
+
 /**
  * Send one message to a sibling agent in the CALLER'S OWN project (bead `sparkle-0vl92`).
  *
@@ -3064,17 +3267,35 @@ const NO_SUCH_PEER =
  * payload, so `from` cannot be forged — which is what makes the project scoping meaningful.
  */
 async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string, unknown>> {
-  // FAILS CLOSED. An unresolvable caller has no project, and "no project" must never widen to "all
-  // projects" — so this refuses rather than searching everywhere. It also covers the concierge,
-  // whose reserved id matches no roster row: the concierge already reaches the inbox through its own
-  // tools and has no business borrowing an agent-to-agent channel.
-  const caller = findAgent(req.callerAgentId);
-  if (!caller) {
-    return peerRefusal(
-      "unknown_caller",
-      "send_peer_message could not resolve who is calling, so it cannot tell which project you are " +
-        "in — refusing rather than guessing",
-    );
+  // WHO IS SENDING, and from WHICH project. Two shapes resolve; everything else fails CLOSED.
+  //
+  // THE CONCIERGE IS A VALID SENDER (bead sparkle-179b2s). Its reserved id (`CONCIERGE_CALLER_AGENT_ID`)
+  // is deliberately not a roster row, so `findAgent` can never resolve it — and this op used to refuse
+  // it as an `unknown_caller`, which made the app's own assistant the one participant that could be
+  // addressed (Phase B) but could not address anyone back. It is special-cased BEFORE the findAgent
+  // guard and resolves its project exactly the way `selfIdentity` does: from the selected project. Its
+  // stamp is minted server-side on the concierge's own control socket (see CONCIERGE_CALLER_AGENT_ID),
+  // so seeing this id is proof of that socket — the label cannot be forged any more than an agent's can.
+  //
+  // AN UNRESOLVABLE CALLER still fails closed: it has no project, and "no project" must never widen to
+  // "all projects", so this refuses rather than searching everywhere.
+  let callerProjectId: string | null;
+  let callerLabel: string;
+  if (req.callerAgentId === CONCIERGE_CALLER_AGENT_ID) {
+    const { projects, selectedProjectId } = useProjectStore.getState();
+    callerProjectId = projects.find((p) => p.id === selectedProjectId)?.id ?? null;
+    callerLabel = CONCIERGE_SELF_NAME;
+  } else {
+    const caller = findAgent(req.callerAgentId);
+    if (!caller) {
+      return peerRefusal(
+        "unknown_caller",
+        "send_peer_message could not resolve who is calling, so it cannot tell which project you are " +
+          "in — refusing rather than guessing",
+      );
+    }
+    callerProjectId = caller.projectId;
+    callerLabel = peerLabel(agentDisplayName(caller.agent), req.callerAgentId);
   }
 
   const rawMessage = req.payload.message;
@@ -3099,30 +3320,50 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   // `not_in_project` means. Reusing it keeps the refusal vocabulary the frozen one.
   if (!to) return peerRefusal("not_in_project", NO_SUCH_PEER);
 
-  // RESOLUTION NEVER LEAVES THE CALLER'S PROJECT — the candidate list is built from it, rather than
-  // searching globally and rejecting afterwards. A global search that filters late is one early
-  // `return` away from leaking, and this way there is nothing to leak.
-  const siblings =
-    useProjectStore.getState().projects.find((p) => p.id === caller.projectId)?.agents ?? [];
+  // THE TWO APP-GLOBAL ADDRESSEES FIRST (bead sparkle-179b2s). The concierge and Improve Sparkle are
+  // not project rows, so the project-scoped resolution below can never find them; they resolve
+  // OUTSIDE the boundary. Doing it here rather than as a late filter keeps the project search itself
+  // leak-free — a special id short-circuits before the sibling list is even consulted.
+  const openIds = new Set(
+    mergeOpenAgentIds(useRuntimeStore.getState().openAgentIds, readPersistedOpenAgentIds()),
+  );
+  const special = resolveSpecialAddressee(to, openIds);
 
-  // Exact id first, then a UNIQUE display-name match — the same name the roster prints, so a name
-  // read from get_state({ scope: "project" }) always resolves here.
-  let target = siblings.find((a) => a.id === to);
-  if (!target) {
-    const byName = siblings.filter((a) => agentDisplayName(a) === to);
-    if (byName.length > 1) {
-      return peerRefusal(
-        "ambiguous_target",
-        `"${to}" matches ${byName.length} agents in your project (${byName
-          .map((a) => a.id)
-          .join(", ")}) — address one of those ids directly`,
-      );
+  // The resolved recipient's wire identity — an app-global special id, or a project sibling. Kept as
+  // plain {id,name} rather than an `AgentTab` because the special addressees have no roster row.
+  let targetId: string;
+  let targetName: string;
+  if (special) {
+    targetId = special.id;
+    targetName = special.name;
+  } else {
+    // RESOLUTION NEVER LEAVES THE CALLER'S PROJECT — the candidate list is built from it, rather than
+    // searching globally and rejecting afterwards. A global search that filters late is one early
+    // `return` away from leaking, and this way there is nothing to leak.
+    const siblings =
+      useProjectStore.getState().projects.find((p) => p.id === callerProjectId)?.agents ?? [];
+
+    // Exact id first, then a UNIQUE display-name match — the same name the roster prints, so a name
+    // read from get_state({ scope: "project" }) always resolves here.
+    let target = siblings.find((a) => a.id === to);
+    if (!target) {
+      const byName = siblings.filter((a) => agentDisplayName(a) === to);
+      if (byName.length > 1) {
+        return peerRefusal(
+          "ambiguous_target",
+          `"${to}" matches ${byName.length} agents in your project (${byName
+            .map((a) => a.id)
+            .join(", ")}) — address one of those ids directly`,
+        );
+      }
+      target = byName[0];
     }
-    target = byName[0];
+    if (!target) return peerRefusal("not_in_project", NO_SUCH_PEER);
+    targetId = target.id;
+    targetName = agentDisplayName(target);
   }
-  if (!target) return peerRefusal("not_in_project", NO_SUCH_PEER);
 
-  if (target.id === req.callerAgentId) {
+  if (targetId === req.callerAgentId) {
     return peerRefusal(
       "self_send",
       "that is you — a note to yourself belongs in your own notes, not in the inbox",
@@ -3131,7 +3372,7 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
 
   // Real clock, moved by fake timers in tests, so the shipping call site is the tested one.
   const now = Date.now();
-  const verdict = checkPeerRateLimit(req.callerAgentId, target.id, now);
+  const verdict = checkPeerRateLimit(req.callerAgentId, targetId, now);
   if (verdict !== "ok") {
     // The remedy is deliberately NOT "retry later". A rate limit here means a conversation is
     // looping or one agent is spraying the fleet, and both want a human, not a backoff.
@@ -3154,22 +3395,22 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
   // one turn, the ordinary shape when a model emits several `tool_use` blocks at once, would ALL read
   // the pre-send counts and ALL pass. These limits are the only bound on a reply loop and on one
   // agent spraying the fleet, and they are the stated reason this op can be `free` tier.
-  recordPeerSend(req.callerAgentId, target.id, now);
+  recordPeerSend(req.callerAgentId, targetId, now);
 
-  const label = peerLabel(agentDisplayName(caller.agent), req.callerAgentId);
+  // `callerLabel` was resolved up top — the concierge's own self name, or `Name [id]` for an agent.
   let messageId: string;
   try {
-    messageId = await sendPeerInboxMessage(target.id, message, label);
+    messageId = await sendPeerInboxMessage(targetId, message, callerLabel);
   } catch (e) {
     // Give the reservation back: nothing was delivered, so nothing should have been spent. Without
     // this, an agent whose peer is at its inbox cap burns its whole budget on sends that never landed.
-    releasePeerSend(req.callerAgentId, target.id, now);
+    releasePeerSend(req.callerAgentId, targetId, now);
     // The inbox refuses rather than evicting when an agent is at its cap, and that refusal names the
     // reason — pass it through rather than flattening it, because "they are not draining their
     // inbox" is actionable and "send failed" is not.
     return peerRefusal("send_failed", errMsg(e));
   }
-  return { ok: true, messageId, to: { id: target.id, name: agentDisplayName(target) } };
+  return { ok: true, messageId, to: { id: targetId, name: targetName } };
 }
 
 function reportControlOpSuccess(req: ControlRequest, result: unknown): void {

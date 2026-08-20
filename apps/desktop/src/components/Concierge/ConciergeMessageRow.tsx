@@ -20,7 +20,7 @@
 // re-render for a state change that concerns exactly one of them. It is a string rather than the
 // boolean it started as because a user message can carry SEVERAL pastes, and one of them being
 // expanded says nothing about its siblings.
-import { memo } from "react";
+import { memo, useMemo } from "react";
 import { FiAlertCircle, FiBell } from "react-icons/fi";
 // The sent card's INKS are not imported here on purpose — they arrive as `SENT_CARD_INK_VARS`
 // below, which is the whole mechanism: the card redefines the ink custom properties on its own
@@ -29,6 +29,10 @@ import { FiAlertCircle, FiBell } from "react-icons/fi";
 import { C, CHAT_USER_BUBBLE, CHAT_SENT_BUBBLE } from "../../theme/colors";
 import { RADIUS } from "../../theme/scale";
 import { Markdown } from "../Markdown";
+// Decides which of THIS message's bead cards render already-open. Wrapped around each answer's
+// `<Markdown>` rather than mounted once for the column, because the cap it applies is per-REPLY:
+// the founder lists eight or more beads in one message and the budget has to reset at the next one.
+import { BeadAutoExpandProvider } from "./BeadPill";
 import { bandColor } from "../../engine/statusBandLabels";
 import { CopyAnswerButton } from "./CopyAnswerButton";
 import { MessageStatusLive, type ConciergeMessageStatusText } from "./MessageStatus";
@@ -47,6 +51,13 @@ import { MentionPill } from "./MentionPill";
 // case-insensitive filesystem two modules differing only in case are the same path to the resolver
 // (tsc rejects the program outright). The suffix keeps the pair distinguishable everywhere.
 import { AnsweredMarker, ReplyAnchorStubs } from "./ReplyAnchorViews";
+import {
+  leadingQuoteSource,
+  quoteJumpLabel,
+  quoteJumpTarget,
+  barAnchorsFor,
+  stubAnchorsFor,
+} from "./replyQuoteCoverage";
 import { reportClaudeAuthFailed } from "../../services/claudeAuthSignal";
 import type {
   ConciergeDigestMessage,
@@ -76,6 +87,63 @@ const reauthButton: React.CSSProperties = {
 export const COLLAPSED_TEXT_TESTID = "concierge-collapsed-text";
 /** The placeholder standing in for a reply held back by a blocking lint finding. */
 export const HELD_REPLY_TESTID = "concierge-held-reply";
+
+/**
+ * THE GEOMETRY EVERY LEFT-ALIGNED PROSE ROW SHARES — the concierge's replies, its receipt lines and
+ * its unprompted pushes. Shared rather than repeated because the bug below is invisible in either
+ * copy on its own: it only shows up as a row whose text breaks in a place nothing explains.
+ *
+ * ══ WHY `width: "100%"` IS LOAD-BEARING (the founder's 2026-08-18 screenshot) ═══════════════════
+ * *"It says retired that, and then it says agent on the next line. You often do this. I don't know
+ * why you put something on the next line when there's plenty of space."* He was right that it is
+ * everywhere: it hit EVERY short line in the column, and the mechanism is not a narrow container.
+ *
+ * These rows are flex items in a column, so `alignSelf: flex-start` sizes them SHRINK-TO-FIT. Each
+ * also carries its copy affordance as a `float: left` — deliberately, so the prose flows around the
+ * glyph instead of being pushed down a line (see the two call sites). And the words themselves are a
+ * BLOCK: `<Markdown>` emits a `<p>`.
+ *
+ * THOSE THREE FACTS TOGETHER ARE THE DEFECT, and no two of them are enough. In intrinsic sizing a
+ * BLOCK child does not sit beside a float, so the row's shrink-to-fit width is the paragraph's
+ * max-content ALONE — the float contributes nothing to it. The float is then laid in, overlapping
+ * the block, and shortens its FIRST line box by the glyph's width. So the paragraph is given exactly
+ * the width its text needs and then has some of it taken away, and what falls off is always the same
+ * size: the last word.
+ *
+ * Measured in real Chrome by `scripts/visual/prose-row-wrap-probe.mjs`, at a 1400px column:
+ *
+ *     "Retired that agent."   row 156px (the paragraph's max-content; the float added nothing)
+ *                             line 1 usable 118px → "Retired that"
+ *                             line 2 usable 156px → "agent."
+ *
+ * THE INLINE VERSION DOES NOT REPRODUCE — that is the trap, and the probe encodes it as a control.
+ * Reduce this with the text in a `<span>` instead of a `<p>` and the float and the text DO sum
+ * (measured: row 176px, one line), so the bug vanishes and the fix looks unnecessary. The block is
+ * load-bearing.
+ *
+ * It is also invisible on LONG lines, which is why the founder's screenshot shows an informative
+ * receipt wrapping correctly directly above a bare one that does not, in this same component: a long
+ * paragraph's max-content exceeds the 92% cap, so the cap sizes the row and the float's width comes
+ * out of slack that was there anyway.
+ *
+ * `width: "100%"` takes the box off intrinsic sizing, so `maxWidth` alone decides the measure and
+ * every line — first or not — is laid out against the width the text was measured for. `maxWidth`
+ * still caps it at 92%, so nothing about the column's proportions changes.
+ *
+ * ══ NOT ASSERTABLE IN jsdom, SO ASSERT THE DECLARATION ══════════════════════════════════════════
+ * jsdom has no layout engine — it never resolves a percentage, never lays out a float, and reports 0
+ * from `getBoundingClientRect` — so no unit test in this suite can catch the break by measuring it
+ * (docs/jsdom-test-caveats.md). `ConciergeMessageRow.proseWidth.test.tsx` therefore pins the
+ * DECLARATION on the rendered rows, which is the honest thing a jsdom test can prove: it fails if
+ * the width is dropped or a third prose arm is added without it, and it does not pretend to have
+ * measured anything.
+ */
+const PROSE_ROW = {
+  maxWidth: "92%",
+  alignSelf: "flex-start",
+  // See the header: this is what stops the floated copy glyph from evicting the last word.
+  width: "100%",
+} as const;
 
 /**
  * A user bubble's words, with any agent it ADDRESSED drawn as a pill rather than as raw `@text`.
@@ -211,6 +279,46 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
   /** The blocks this reader has already asked to see as regular text. Rebuilt per render from a
    *  primitive prop — see this file's header for why it is not the thread's own Set. */
   const shown = shownBlockIds ? new Set(shownBlockIds.split(SHOWN_ID_SEP)) : null;
+  /**
+   * ══ ONE QUOTE, NOT TWO (founder screenshot, 2026-08-17, bead sparkle-y3ptuf) ══════════════════
+   *
+   * *"There's a bad UX here you're quoting. My question twice… I want it to be the blue bar that
+   * has the copy next to it."* The gray `ReplyAnchorStubs` line and the concierge's own opening
+   * markdown blockquote were both quoting him, neither aware of the other — see
+   * ./replyQuoteCoverage for the full account and for why the test is a CONTENT overlap rather than
+   * "does this reply start with a `>`" (it also quotes agent scrollback, and that must keep its
+   * stub).
+   *
+   * HELD REPLIES ARE EXCLUDED EXPLICITLY. A held bubble draws "Rewriting this reply…" instead of
+   * `m.text`, so there is no blue bar on screen to be duplicated by — suppressing the stub off a
+   * string that is not rendered would leave that row saying nothing about what it answers. The
+   * check is on `m.held` and not on the text, because the text is exactly what is being withheld.
+   *
+   * MEMOISED ON THE LEADING RUN, NOT ON THE TEXT, which is the whole point of `leadingQuoteSource`
+   * being a scan rather than a parse: `m.text` genuinely changes on every delta of a streaming
+   * reply, but the opening quote stops changing at the reply's first blank line. Keying the memo on
+   * the run means the markdown parse behind this runs a handful of times per reply instead of once
+   * per token beside the renderer's own. The scan itself bails on the first line for a reply that
+   * does not open with a quote, which is most of them.
+   */
+  const quoteSource =
+    m.kind === "sparkle" && !m.held ? leadingQuoteSource(m.text) : "";
+  const quoteAnchors = m.kind === "sparkle" ? m.answers : undefined;
+  // WHICH stubs survive, not merely whether any do. When the quote covers his WORDS but the burst
+  // also held an attachments-only send, that send keeps its stub: the blue bar's rendered text does
+  // not stand for it, so dropping it would leave it with no visible record at all.
+  const stubAnchors = useMemo(
+    () => stubAnchorsFor(quoteSource, quoteAnchors),
+    [quoteSource, quoteAnchors],
+  );
+  // …and the bar's jump/label come from the COMPLEMENT — the anchors it actually quotes. Deriving
+  // them from the full list instead pointed the bar at the message it does not show (see
+  // `barAnchorsFor`), which left his question reachable from nowhere on the row.
+  const barAnchors = useMemo(
+    () => barAnchorsFor(quoteSource, quoteAnchors),
+    [quoteSource, quoteAnchors],
+  );
+  const quoteJump = quoteJumpTarget(barAnchors);
   /**
    * The pills (or the expanded text) for a message's collapsed payloads.
    *
@@ -656,7 +764,7 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         data-quote-source="sparkle"
         data-highlighted={highlighted ? "yes" : "no"}
         data-stale={m.stale ? "true" : "false"}
-        style={{ maxWidth: "92%", alignSelf: "flex-start", opacity: m.stale ? 0.5 : 1, ...flash }}
+        style={{ ...PROSE_ROW, opacity: m.stale ? 0.5 : 1, ...flash }}
       >
         <div
           style={{
@@ -686,7 +794,9 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
         <span style={{ float: "left", marginRight: 6, marginLeft: -2, marginTop: -1 }}>
           <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
         </span>
-        <Markdown text={m.text} mergeQuotes />
+        <BeadAutoExpandProvider text={m.text}>
+          <Markdown text={m.text} mergeQuotes />
+        </BeadAutoExpandProvider>
         {collapsedPayload(m.collapsed ? [m.collapsed] : [])}
         {/* A push is still an ANSWER — the same words, arrived unasked — so it gets the same copy
             affordance. Copying its markdown source, like the branch below. */}
@@ -704,13 +814,24 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
       // answers he wants to reply to one claim inside.
       data-quote-source="sparkle"
       data-highlighted={highlighted ? "yes" : "no"}
-      style={{ maxWidth: "92%", alignSelf: "flex-start", minWidth: 0, ...flash }}
+      style={{ ...PROSE_ROW, minWidth: 0, ...flash }}
     >
       {/* WHAT THIS REPLY IS ANSWERING, above its own words — the iMessage idiom, and the reason this
           component exists (see ./replyAnchors). One quoted stub per message it covers, in the order
           they were sent, so a single reply to a burst of five is legible as five answers rather than
-          one paragraph nobody can aim at. */}
-      <ReplyAnchorStubs anchors={m.answers} onJump={onJump} />
+          one paragraph nobody can aim at.
+
+          …UNLESS THE REPLY ALREADY OPENS BY QUOTING HIM, in which case this line and the answer's
+          own blue blockquote were the same sentence twice — the founder's 2026-08-17 screenshot, see
+          `stubAnchorsFor` above. The stub is the FALLBACK now, not the primary: it draws whenever the
+          reply did not quote him (`reply-without-quote` is severity-configurable, so that stays
+          reachable) or quoted something else entirely, and the jump it carried moves onto the blue
+          bar rather than disappearing with it.
+
+          PER-ANCHOR, NOT PER-REPLY (see `stubAnchorsFor`). An attachments-only send in a mixed burst
+          keeps its stub even when the quote covers his words, because the blue bar's rendered text
+          never stood for it. */}
+      {stubAnchors.length > 0 && <ReplyAnchorStubs anchors={stubAnchors} onJump={onJump} />}
       {/* HELD BY A BLOCKING LINT FINDING — the words are withheld while a correction turn runs.
           The ROW stays (blanking in place is what keeps the reply in its original position; see
           `ConciergeSparkleMessage.held`), so something has to occupy it: an empty bubble reads as a
@@ -744,7 +865,19 @@ export const ConciergeMessageRow = memo(function ConciergeMessageRow({
           <span style={{ float: "left", marginRight: 6, marginLeft: -2, marginTop: -1 }}>
             <CopyAnswerButton text={m.text} onCopied={onAnswerCopied} />
           </span>
-          <Markdown text={m.text} mergeQuotes />
+          {/* THE OPENING QUOTE CARRIES THE JUMP the stub above used to (see `barAnchorsFor`). All three
+              props or none: `quoteJump` is undefined unless the quote demonstrably covers what this
+              reply answers AND that message is still in the thread, so a quote of agent scrollback —
+              or one whose target aged out on restore — renders exactly as inert as it always has. */}
+          <BeadAutoExpandProvider text={m.text}>
+            <Markdown
+              text={m.text}
+              mergeQuotes
+              quoteJumpId={quoteJump?.id}
+              quoteJumpLabel={quoteJump ? quoteJumpLabel(barAnchors) : undefined}
+              onQuoteJump={quoteJump ? onJump : undefined}
+            />
+          </BeadAutoExpandProvider>
         </>
       )}
       {/* AFTER the sentence, because it is what the sentence is about — a relayed brief the

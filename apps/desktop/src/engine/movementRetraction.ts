@@ -167,6 +167,23 @@ export interface MovementEvidence {
    * a compile error.
    */
   sessionId: string | null;
+  /**
+   * `HookFacts.toolsRecent` — how many tool events this agent's hook log holds inside the digest's
+   * window (15 minutes; `fleet.rs` DEFAULT_WINDOW_MS).
+   *
+   * NOT READ BY THIS MODULE. Retraction asks "did the agent act AFTER the red was raised", which is
+   * a question about an INSTANT, and a windowed count carries no instant — see header note 1 on why
+   * a freshness test is the wrong shape here. It rides along because
+   * `engine/goalContinuation.progressMark` asks a different question over the same stream ("did
+   * anything happen between two restarts"), and a count is the right shape for THAT one precisely
+   * because `lastEvent` is last-wins and reads `Stop` at the moment a continuation is decided
+   * (header note 3, in its other consequence).
+   *
+   * REQUIRED, like `sessionId` and for the identical reason: a projection that forgets it compiles
+   * fine and silently starves the escalation predicate back to the three self-report signals that
+   * produced the false-positive flood. `null` is a log this build could not count, never zero.
+   */
+  toolsRecent: number | null;
 }
 
 /**

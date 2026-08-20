@@ -18,6 +18,8 @@ import {
   cancelResearch,
   dispatchResearch,
   getResearch,
+  getResearchTail,
+  groupTasks,
   liveTasks,
   recentTasks,
   RECENT_RESEARCH_WINDOW_MS,
@@ -43,13 +45,16 @@ beforeEach(() => {
 });
 
 describe("the command surface", () => {
-  // These five strings are the contract with research.rs. An `invoke` typo has no compile-time
+  // These strings are the contract with research.rs. An `invoke` typo has no compile-time
   // signal, so the names are pinned here and the Rust side has one list to satisfy.
-  it("names exactly the five commands research.rs implements", () => {
+  it("names exactly the commands research.rs implements", () => {
     expect(RESEARCH_COMMANDS).toEqual({
       dispatch: "research_dispatch",
       list: "research_list",
       get: "research_get",
+      // The live-tail read — a running task's main-pane view polls this for the child's incremental
+      // output (bead sparkle-s7rfc).
+      tail: "research_tail",
       cancel: "research_cancel",
       markRead: "research_mark_read",
     });
@@ -94,7 +99,29 @@ describe("the Tauri seam — the argument names are the contract", () => {
       // The ROOT is what the runner needs; it refuses to guess a directory.
       projectRoot: "/tmp/p1",
       depth: "quick",
+      // An ABSENT model override is sent as an explicit `null`, not dropped. The Rust param is
+      // `Option<String>`, which reads a null and an absent key alike, so this is about the wire
+      // shape staying legible rather than about correctness — a reader diffing the two dispatch
+      // call sites sees the same set of keys either way. `resolve_research_model` treats it as
+      // "no override" and pins the depth's own model (bead `sparkle-revqiv`).
+      model: null,
     });
+  });
+
+  it("forwards a MODEL OVERRIDE when one is given", async () => {
+    // The second-model advisor pass is the only caller that sets this, and its whole premise is
+    // running on a model DIFFERENT from the planner's — so an override that were silently dropped
+    // here would turn second-model review back into self-review with nothing reporting it. Rust
+    // refuses an off-list id at dispatch; this pins that the id gets there at all.
+    await dispatchResearch({
+      question: "why",
+      projectId: "p1",
+      projectRoot: "/tmp/p1",
+      depth: "quick",
+      model: "claude-opus-5",
+    });
+    const [, args] = invokeMock.mock.calls[0]!;
+    expect((args as { model: unknown }).model).toBe("claude-opus-5");
   });
 
   it("forwards a null projectId rather than dropping the key", async () => {
@@ -115,6 +142,13 @@ describe("the Tauri seam — the argument names are the contract", () => {
     invokeMock.mockClear();
     await cancelResearch("t2");
     expect(invokeMock).toHaveBeenCalledWith("research_cancel", { taskId: "t2" });
+  });
+
+  it("getResearchTail sends taskId and returns the tail string", async () => {
+    invokeMock.mockResolvedValueOnce("→ Bash: git log\nreading the history");
+    const tail = await getResearchTail("t3");
+    expect(invokeMock).toHaveBeenCalledWith("research_tail", { taskId: "t3" });
+    expect(tail).toBe("→ Bash: git log\nreading the history");
   });
 
   it("markResearchRead sends taskIds and at", async () => {
@@ -391,5 +425,93 @@ describe("recentTasks — has the concierge been delegating at all", () => {
   // nothing to do with the concierge.
   it("looks back twelve hours, not a calendar day", () => {
     expect(RECENT_RESEARCH_WINDOW_MS).toBe(12 * 60 * 60_000);
+  });
+});
+
+// ══ groupTasks — WHAT THE EXPANDED GROUP RENDERS, AND WHY THE LABEL CAN NO LONGER LIE ═══════════
+//
+// THE BUG, exactly: the header's `· N recently` badge is `recentTasks` (which KEEPS retired tasks)
+// and the group rendered `visibleTasks` (which drops them). Replayed against the founder's records
+// at the moment of his screenshot: live 0, recent 15, rendered 0 — a row promising fifteen children
+// and opening onto nothing. Every test here is written against BOTH inputs, because the defect was
+// never in either selector; it was in the two of them being different answers to one question.
+describe("groupTasks — the live rows AND the recently-finished ones", () => {
+  const NOW = 1_800_000_000_000;
+  const HOUR = 60 * 60_000;
+  /** A task `agoMs` old. `readAt` non-null on a terminal status is what RETIRES it (isRetired). */
+  const at = (
+    id: string,
+    agoMs: number,
+    status: ResearchTask["status"] = "done",
+    readAt: number | null = null,
+  ): ResearchTask => ({ ...FIXTURE[0]!, id, status, createdAt: NOW - agoMs, readAt });
+
+  // THE FOUNDER'S CLICK, at the selector level. A store of nothing but retired tasks inside the
+  // window: `visibleTasks` is empty (the group had no rows to draw) and `groupTasks` is not. Seeding
+  // a live task here would make this pass against the very bug it exists to catch.
+  it("renders a store of ONLY retired tasks — the exact dead click", () => {
+    const retired = [at("a", HOUR, "done", NOW - HOUR), at("b", 2 * HOUR, "failed", NOW - HOUR)];
+    expect(visibleTasks(retired)).toHaveLength(0);
+    expect(recentTasks(retired, NOW)).toHaveLength(2);
+    expect(groupTasks(retired, NOW).map((t) => t.id)).toEqual(["a", "b"]);
+  });
+
+  // THE INVARIANT THE WHOLE CHANGE IS FOR, stated as a property rather than a count: whatever the
+  // badge counts, the click shows. Asserted over a mixed store so it is not satisfiable by "returns
+  // everything" — the out-of-window retired task below proves the set is genuinely bounded.
+  it("contains every task the `· N recently` badge counts", () => {
+    const tasks = [
+      at("live_recent", HOUR, "running"),
+      at("retired_recent", 2 * HOUR, "done", NOW - HOUR),
+      at("owed_recent", 3 * HOUR, "done"),
+      at("retired_old", 30 * HOUR, "cancelled", NOW - 29 * HOUR),
+    ];
+    const badge = recentTasks(tasks, NOW);
+    const group = groupTasks(tasks, NOW);
+    expect(badge.length).toBeGreaterThan(0);
+    for (const t of badge) expect(group.map((g) => g.id)).toContain(t.id);
+    // …and it is a BOUND, not "everything": the retired task outside the window is in neither.
+    expect(group.map((t) => t.id)).not.toContain("retired_old");
+  });
+
+  // THE OTHER HALF OF THE UNION, and the reason it is not simply `recentTasks`: a `deep` run started
+  // fourteen hours ago and still going is live work the founder must be able to reach. Bounding the
+  // group by the dispatch window alone would tear its row out from under him mid-run.
+  it("keeps a LIVE task that is older than the window, which `recentTasks` alone would drop", () => {
+    const tasks = [at("long_runner", 14 * HOUR, "running")];
+    expect(recentTasks(tasks, NOW)).toHaveLength(0);
+    expect(groupTasks(tasks, NOW).map((t) => t.id)).toEqual(["long_runner"]);
+  });
+
+  // A task inside the window that is NOT retired is in both input sets. One row, not two — a
+  // duplicate here is a duplicate React key as well as a duplicate row.
+  it("dedupes a task that both selectors return", () => {
+    const tasks = [at("both", HOUR, "running"), at("both_terminal", 2 * HOUR, "failed")];
+    expect(visibleTasks(tasks)).toHaveLength(2);
+    expect(recentTasks(tasks, NOW)).toHaveLength(2);
+    const group = groupTasks(tasks, NOW);
+    expect(group).toHaveLength(2);
+    expect(new Set(group.map((t) => t.id)).size).toBe(group.length);
+  });
+
+  it("is newest-first, through the store's one sort", () => {
+    const tasks = [
+      at("old_retired", 5 * HOUR, "done", NOW - HOUR),
+      at("mid_live", 3 * HOUR, "running"),
+      at("new_retired", HOUR, "cancelled", NOW - 10),
+    ];
+    expect(groupTasks(tasks, NOW).map((t) => t.id)).toEqual([
+      "new_retired",
+      "mid_live",
+      "old_retired",
+    ]);
+  });
+
+  // The window is the label's window. A second bound here is how the two would drift apart again,
+  // so the default is asserted to BE `RECENT_RESEARCH_WINDOW_MS` at its exact boundary.
+  it("bounds retired rows by the same 12h window the label uses", () => {
+    const inside = at("in", RECENT_RESEARCH_WINDOW_MS, "done", NOW - 1);
+    const outside = at("out", RECENT_RESEARCH_WINDOW_MS + 1, "done", NOW - 1);
+    expect(groupTasks([inside, outside], NOW).map((t) => t.id)).toEqual(["in"]);
   });
 });

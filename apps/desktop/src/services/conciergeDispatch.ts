@@ -286,6 +286,14 @@ export interface ConciergeDispatchOptions {
    * (`alternate-screen` or the `blocked-prompt` arms) — never for `unauthorized`, `trial-spent`,
    * `pty-gone`, or any refusal that has nothing to do with what's on screen right now.
    *
+   * ══ THIS FLAG IS NO LONGER THE GUARD — READ `mayHoldForScreenClear` ═══════════════════════════
+   * It used to be, and the paragraph below still explains WHY the scoping matters. What changed
+   * (roborev 64466): the human/machine half is now read from the validated AUTHORITY, so a
+   * machine-authored caller that sets this flag is refused anyway, and a `mount` authority holds
+   * WITHOUT it. The flag survives for the human authorities that are not `mount` — chiefly the
+   * mounted send that went through a COUNTDOWN and therefore arrives as `{kind: "countdown"}`.
+   * Treat the sentence below as the rationale, not as the enforcement.
+   *
    * SET BY EXACTLY ONE CALLER (bead sparkle-tbsvf, reopened): ConciergeHost's MOUNTED composer
    * send. That scoping is the whole safety argument, not an implementation detail. The three
    * screen refusals above exist because a write that lands wrong on `vim`/a credential field
@@ -474,6 +482,9 @@ const ANSWERS_AGENTS_PROMPT: Record<DispatchAuthorityKind, boolean> = {
   suggestion: false,
   "concierge-tool": false,
   "goal-continue": false,
+  // A message composed FOR the orchestrator ("resume this epic"), not an answer to anything on its
+  // screen. A stalled agent has no live picker by construction — that is what made it stalled.
+  "epic-restart": false,
 };
 
 /** Is this dispatch an approval GESTURE — the nudge card's Approve? See `ANSWERS_AGENTS_PROMPT`. */
@@ -645,12 +656,68 @@ function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatch
  * Returns null — "fall through to your own refusal" — when holding wasn't requested or this
  * agent's hold queue is already full of live entries.
  */
+/**
+ * MAY THIS SEND BE HELD RATHER THAN REFUSED? — the founder's refusal scope, made structural.
+ *
+ * ══ THE RULE, IN HIS WORDS (bead sparkle-tbsvf) ═════════════════════════════════════════════════
+ * *"The alt-screen refusal stays for PROGRAMMATIC senders (the concierge writing via MCP). It must
+ * NEVER apply to the human typing into a pane he deliberately mounted."*
+ *
+ * ══ WHY THIS IS NOT JUST `opts.holdForScreenClear` ══════════════════════════════════════════════
+ * That flag is a BOOLEAN THE CALLER PASSES, and its own doc already states the rule it cannot
+ * enforce: "neither [`send_to_agent_terminal`] nor an auto-resume may set this". Nothing stopped
+ * them. The options bag is plain data, so a tool call that set `holdForScreenClear: true` — by
+ * design, by a copied call site, or by an object rebuilt off the wire — bought itself the founder's
+ * treatment on a screen it cannot see. That is the same "each new caller arrives unguarded" failure
+ * this module's screen guard was hoisted here to end, and a convention in a docstring is not a
+ * guard.
+ *
+ * So the human/machine half is read from the AUTHORITY, which is validated at the top of
+ * `routeConciergeAnswer` and cannot be spoofed by a flag: `isHumanAuthored` is a `Record` over the
+ * union, so a NEW authority kind is a compile error there until someone decides which side of this
+ * line it sits on. `concierge-tool` and `goal-continue` are false, and they keep the outright
+ * refusal however they are called.
+ *
+ * ══ AND WHY THE FLAG IS STILL READ ══════════════════════════════════════════════════════════════
+ * Being human-authored is necessary, not sufficient. Most human authorities are a BUTTON PRESS at a
+ * live prompt (`approval`, `nudge-approve`, `suggestion`), and holding one of those would answer a
+ * dialog minutes later, after the screen it was read against is gone — the precise hazard
+ * `verifiedPickerPress` re-derives a fingerprint to prevent. Those keep the refusal, which loses
+ * the user nothing: the words are restored to the box either way.
+ *
+ * `mount` is exempt from needing the flag at all, because it IS the founder's case: he typed into a
+ * terminal he had patched a cable into and is watching.
+ *
+ * ══ THE EXEMPTION IS THE *AUTHORITY'S*, NOT EVERY MOUNTED SEND'S (roborev 64466, Medium) ═════════
+ * An earlier draft of this said "a mounted send is never bounced, whoever calls this". That claims
+ * more than the code does, and the gap is a SHIPPED path: a mounted send made while presence is AWAY
+ * — an explicit `setAway()`, an unfocused window, an idle voice session — does not dispatch
+ * immediately. It ARMS an intent and dispatches at expiry as `{kind: "countdown"}`, even though
+ * `mentionAim.via` is still `"mount"`. That send holds on the FLAG, which ConciergeHost passes from
+ * the very same `via === "mount"` test (see its `promptAgent` call).
+ *
+ * So, precisely: the `mount` AUTHORITY needs no flag; a mounted send that goes through the countdown
+ * still does. Do NOT read the exemption as making that argument redundant and drop it — that
+ * reintroduces the founder's original bug for the mounted-while-away case. Two rows guard it, at the
+ * two layers, and BOTH are needed: `conciergeDispatch.altScreen.test.ts` pins that this module
+ * honours the flag under a `countdown` authority, and `ConciergeHost.mounted.test.tsx` runs a
+ * mounted-while-AWAY send to expiry and pins that the call site still passes it. The second is the
+ * one that catches the realistic edit, which is not a deletion but a NARROWING to
+ * `authority.kind === "mount"` — every immediate mounted row stays green under that, because on
+ * that path the authority IS `mount` (roborev 64476).
+ */
+function mayHoldForScreenClear(opts: ConciergeDispatchOptions): boolean {
+  // The machine half, first and unconditionally: a programmatic sender never holds, flag or no flag.
+  if (!isHumanAuthored(opts.authority)) return false;
+  return opts.authority.kind === "mount" || opts.holdForScreenClear === true;
+}
+
 function holdForScreenClear(
   agentId: string,
   text: string,
   opts: ConciergeDispatchOptions,
 ): ConciergeDispatchResult | null {
-  if (!opts.holdForScreenClear) return null;
+  if (!mayHoldForScreenClear(opts)) return null;
   const display = opts.display ?? text;
   const queued = queueScreenHeldSend(
     {
@@ -953,6 +1020,31 @@ async function routeConciergeAnswer(
   if (isCloudAgent(agentId)) return deliverCloudPrompt(agentId, text, opts, options);
 
   if (options.length > 0) {
+    // ══ A LIVE PICKER IS A SCREEN REFUSAL TOO, SO IT OFFERS THE HOLD FIRST (bead sparkle-9gsjqm) ══
+    // THE FOUNDER'S BUG, reported more than once: text typed into a MOUNTED pane does not reach the
+    // agent. ConciergeHost declares a mounted send HOLDABLE and deliberately falls through to this
+    // function rather than bouncing it, with a comment promising "the actual hold happens a few
+    // lines down, inside dispatchConciergeAnswer via `holdForScreenClear`". The three refusal arms
+    // ABOVE keep that promise. The three arms in THIS block did not: they returned their refusal
+    // with no hold attempt at all, and `neverPickerAnswer` is TRUE for every mounted composer send
+    // (see ConciergeHost's `!!mentionAim && addressable`). So a mounted send made while a picker
+    // happened to be on screen took `addressed-at-picker` and BOUNCED — the one remaining way a
+    // send the host had already declared holdable still came back refused.
+    //
+    // THE HOLD IS ATTEMPTED, NOT ASSUMED, and the refusal below is unchanged for everyone else.
+    // `holdForScreenClear` returns null unless the caller may hold (see its own doc and
+    // `ConciergeDispatchOptions.holdForScreenClear` for why that is exactly one caller — the
+    // founder, mounted and looking at the pane), so a `concierge-tool` send or the goal auto-resume
+    // still takes the refusal verbatim. Calling the FUNCTION rather than re-reading
+    // `opts.holdForScreenClear` here is deliberate: the gate lives in one place, so a change to who
+    // may hold lands at every arm at once instead of at the three that remembered to ask.
+    //
+    // WHY HOLDING IS RIGHT FOR A PICKER AT ALL. A live picker owns the agent's stdin — that is why
+    // this block refuses rather than writing free text — but "owns stdin RIGHT NOW" is the same
+    // temporary fact `alternate-screen` and `blocked-prompt` describe, and the founder's rule for
+    // all three is identical: hold the words and deliver them the moment the screen clears, at THAT
+    // agent. The picker still is not answered by them — a held send is delivered later, through
+    // `flushScreenHeldSends`' `submitPrompt`, never collapsed into a keystroke.
     // ══ THE DECLARED DISPOSITION IS CHECKED FIRST, BEFORE THE MATCH ═════════════════════════════
     // `neverPickerAnswer` says this text may never become a keystroke "however well it matches an
     // option on the agent's screen" — so whether it happens to match is irrelevant to it, and
@@ -969,11 +1061,17 @@ async function routeConciergeAnswer(
     // message; open it and pick" — which under the old order they could reach only by matching,
     // i.e. by removing the file, which the copy never told them.
     if (opts.neverPickerAnswer) {
+      const held = holdForScreenClear(agentId, text, opts);
+      if (held) return held;
       return { ok: false, path: "addressed-at-picker", agentId, options };
     }
     const match = matchAnswerToOption(text, options);
     if (!match) {
       // A picker is on screen but the answer doesn't map to an option — do NOT guess a keystroke.
+      // A caller permitted to hold gets the hold instead of the refusal, exactly as the two arms
+      // around it do: the message is not an answer to this menu, so it waits for the menu to go.
+      const held = holdForScreenClear(agentId, text, opts);
+      if (held) return held;
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }
     // A USER-authored prompt that merely STARTS with a yes/no word is an instruction, not a picker
@@ -992,6 +1090,10 @@ async function routeConciergeAnswer(
     // just the option is either what the user already did or not what they were trying to do at
     // all. Sharing the line sent them round a loop with no stated exit.)
     if (opts.userPrompt && !isTerseAnswer(text, options)) {
+      // Same hold-before-refusing rule as the two arms above — a sentence is not a keystroke, so it
+      // waits for the picker rather than being thrown back at a caller that may hold.
+      const held = holdForScreenClear(agentId, text, opts);
+      if (held) return held;
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }
     const sent = frameSubmit(match.value);
@@ -1411,6 +1513,67 @@ export function sweepExpiredScreenHeldSends(agentId: string): void {
 }
 
 /**
+ * STOP THE HOLD CLOCK WHILE THERE IS NO SCREEN TO READ (bead sparkle-9gsjqm).
+ *
+ * Called by hooks/useScreenHoldDrain on the `no-viewport` tick — the agent's terminal simply is not
+ * mounted in this window (the founder unmounted, switched the cable to another pair, or the pane
+ * lives in a window that is not this one). That is NOT the same fact as "the screen is busy", and
+ * the drain used to treat the two identically: it swept, waited, and let the hold age out to
+ * `expired` after MAX_AGE_MS without ever having had a chance to deliver it. The hook's own header
+ * says the opposite — a hold "must still arrive; it does not become void because he looked away" —
+ * so the code contradicted the promise the founder was actually made.
+ *
+ * WHY THE FIX IS THE CLOCK AND NOT THE SWEEP. Merely skipping `sweepExpiredScreenHeldSends` here
+ * changes nothing anyone can observe: the entry stays in the queue, and the next flush classifies
+ * it `expired` by the same MAX_AGE_MS rule and hands it back undelivered. The 15-minute ceiling is
+ * a real policy (see screenHoldQueue's header for why it is not pendingSends' 2 minutes) and this
+ * does not raise it — it measures it against time the screen was actually WATCHABLE, which is the
+ * only kind of waiting the ceiling was ever reasoning about.
+ *
+ * SHIFTS BY ONE DELTA, NEVER RE-STAMPS EACH ENTRY TO `now`. Re-stamping would flatten every held
+ * entry onto the same instant, and `reinstateScreenHeldSends` sorts by `at` — so a message that
+ * arrived DURING the hidden stretch would sort ahead of the older ones it follows, the exact
+ * ordering inversion roborev 64289 was filed about. Anchoring the shift on the NEWEST entry moves
+ * the whole queue by one amount, so relative order (and relative age) survives untouched.
+ *
+ * IT PROTECTS THE LIVE ENTRIES, IT DOES NOT RESURRECT DEAD ONES. Anything already past MAX_AGE_MS
+ * when this runs aged out for some reason OTHER than the screen being unreadable — it was visible
+ * and blocked, or nothing polled at all (a sleeping machine fires no interval) — so it is swept and
+ * REPORTED first, exactly as the blocked branch would have. Un-expiring those would deliver a
+ * message typed an hour ago into a session that has moved on, which is the harm services/pendingSends'
+ * own header is about. Given the drain's 1500ms cadence, an entry can only reach this function
+ * already expired through one of those two routes; the ordinary hidden case never accrues the age.
+ *
+ * WHAT BOUNDS THIS. Not a second timer: the pane's own lifetime. `AgentPane` reports and clears
+ * both hold queues via `abandonScreenHeldSends` on unmount and on a spawn give-up, so a hold can
+ * only outlive the founder's attention for as long as the agent it is aimed at still exists — which
+ * is precisely the window the hook's header promises to cover. `MAX_PER_AGENT` still caps how many
+ * can wait, so a hidden pane refuses a sixth send with a truthful `queue-full` rather than
+ * accumulating an outbox.
+ */
+export function deferScreenHoldsWhileHidden(agentId: string): void {
+  // Reported and cleared through the SAME path the blocked branch uses, rather than a second copy
+  // of the emit — see the doc above for why an already-expired entry is not this function's to save.
+  sweepExpiredScreenHeldSends(agentId);
+  // Everything the sweep left is live against the real clock, so this take can use it: `due` is the
+  // whole remaining queue and `expired` is empty by construction.
+  const { due } = takeScreenHeldSends(agentId);
+  if (due.length === 0) return;
+  // Anchored on the NEWEST entry, so the whole queue moves by ONE amount — see this function's doc
+  // for why re-stamping each entry to `now` instead would invert the delivery order. Never negative:
+  // a queue whose newest entry is somehow ahead of the clock must not be aged by this.
+  const shift = Math.max(0, Date.now() - Math.max(...due.map((e) => e.at)));
+  // Copies, so nothing already handed to another holder is mutated underneath it.
+  const moved = due.map((e) => ({ ...e }));
+  for (const e of moved) e.at += shift;
+  // NO `onCrowdedOut`/`onPruned` here, unlike `flushScreenHeldSends`' re-queue, and that is not an
+  // omission: the take above emptied this agent's queue and nothing runs between the two calls (no
+  // await, one thread), so there is no incumbent for `moved` to crowd out and nothing to prune.
+  // Passing callbacks that cannot fire would read as a guarantee this function does not provide.
+  reinstateScreenHeldSends(agentId, moved);
+}
+
+/**
  * Void everything held for `agentId` WITH a reported outcome — called when the pane unmounts for
  * good or its spawn errors, i.e. the PTY this queue was waiting on will never come up. A held
  * prompt was promised ("I'll send that the moment it's ready"); discarding it silently would
@@ -1509,10 +1672,53 @@ export function recordPromptSideEffects(
   /** Did a PERSON compose this text? Forwarded to `appendPrompt`, which releases the agent's goal
    *  retry budget and escalation only for a human send. See dispatchAuthority.isHumanAuthored. */
   humanAuthored = true,
+  /**
+   * Set when the CALLER already wrote this prompt to the store (services/agentBrief `BriefRecord`).
+   *
+   * Then the four write-side effects below are already done, and re-running them is not a harmless
+   * repeat: `appendPrompt` has no dedupe, so one mission becomes two `promptHistory` rows — and
+   * since `markAgentPrompt` only ever ran against the second, the first one's "jump to this prompt"
+   * pointed at nothing. It also double-counted the naming ladder's `promptCount`, debited a
+   * free-trial prompt for a send the user never made, and taught the ghost-text corpus a generated
+   * epic brief, which its own doc forbids.
+   *
+   * What is STILL owed is the terminal marker — the one side-effect the attaching caller could not
+   * do, because no terminal existed yet when it wrote the row.
+   */
+  alreadyRecorded?: { promptId?: string },
 ): void {
+  // ── TWO DIFFERENT QUESTIONS, DELIBERATELY ON TWO DIFFERENT AXES ─────────────────────────────
+  //
+  // A RECORD AT ALL is the attaching caller DECLARING this prompt is not a person's send. That
+  // decides the AUTHORSHIP-flavoured effects below (`recordTrialSend`, the ghost-text corpus,
+  // auto-naming), because those are about WHO COMPOSED THE TEXT.
+  //
+  // It is a DECLARATION, not an inference — the record's absence proves nothing on its own, and
+  // reading it as proof is how this went wrong once already. Every attaching caller must therefore
+  // answer it deliberately: `sendToBuild.seedDraft` always records (it wrote the row itself);
+  // `buildAgentSpawn` records only for a `background` spawn — the timer-driven `/babysit-pr`
+  // dispatch nobody is watching — and deliberately does NOT for a foreground one, because
+  // `send_to_agent_terminal` already establishes that LLM prose dispatched on a person's behalf
+  // bills. A future caller that attaches a machine brief without a record silently re-opens the
+  // defect below, so give it a record.
+  //
+  // The record's promptId decides only WHETHER A ROW EXISTS, which is a different fact and governs
+  // only the append-vs-mark choice further down.
+  //
+  // Keying both on the id was a live defect: one and the same machine-authored epic brief then
+  // billed a free-trial prompt and taught the corpus a generated brief when the id happened to be
+  // absent, and did neither when it was present — a user-visible charge decided by a field that
+  // says nothing about who wrote the text. Keying both on the record's presence was the
+  // other one: an id-less record skipped the row entirely, leaving the agent briefless to
+  // `engine/newAgentAttention.isBriefless` with a jump-to-prompt resolving to nothing.
+  //
+  // NOT gated on `humanAuthored` instead, even though that reads like the natural axis: the
+  // concierge's `send_to_agent_terminal` deliberately dispatches LLM-composed prose as
+  // `userPrompt: true`, and it is meant to bill. Authorship alone would silently stop charging it.
+  const booked = alreadyRecorded !== undefined;
   // Debit one free-trial prompt on the server. Self-gates: a no-op for entitled users, and it
-  // never throws (see trialMeter).
-  void recordTrialSend();
+  // never throws (see trialMeter). Never for a booked brief — nobody made that send.
+  if (!booked) void recordTrialSend();
   // A DELIVERED USER PROMPT IS AN INTERACTION WITH THAT AGENT — recorded here, ABOVE the project
   // lookup below, because it is true of any agent the concierge can reach and not only of ones that
   // own a project tab.
@@ -1535,8 +1741,15 @@ export function recordPromptSideEffects(
   const basis = (renderings.namingBasis ?? text).trim();
   // The composer's fifth side-effect: teach the ghost-text suggestions from what the user actually
   // TYPED — never an attachment path, which would poison the corpus with unrepeatable temp names.
-  // Global (not per-agent), and it self-ignores empties/over-long prompts.
-  usePromptHistoryStore.getState().record(basis);
+  // Global (not per-agent), and it self-ignores empties/over-long prompts. Skipped for a booked
+  // brief: a generated epic brief is exactly the "unrepeatable" text this corpus excludes.
+  if (!booked) usePromptHistoryStore.getState().record(basis);
+  // THE ROW ALREADY EXISTS — so the only write still owed is the marker, against that row rather
+  // than a duplicate. Below this point is the append path, for a prompt nothing has recorded yet.
+  if (alreadyRecorded?.promptId) {
+    markAgentPrompt(agentId, alreadyRecorded.promptId);
+    return;
+  }
   const project = useProjectStore
     .getState()
     .projects.find((p) => p.agents.some((a) => a.id === agentId));
@@ -1550,6 +1763,6 @@ export function recordPromptSideEffects(
   // Fire-and-forget: no-ops if the name is pinned or no API key is configured. Gated on the
   // auto-rename AI feature, and skipped for an empty basis so the naming model is never asked to
   // summarize nothing — which is precisely the attachments-only send.
-  if (basis && aiFeatureNow("autoRename")) void maybeAutoName(project.id, agentId, basis);
+  if (!booked && basis && aiFeatureNow("autoRename")) void maybeAutoName(project.id, agentId, basis);
 }
 

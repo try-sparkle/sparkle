@@ -301,7 +301,7 @@ describe("setProjectConfig", () => {
   // Asserts the SIDE EFFECT — that the write actually reached `setProject` — rather than merely
   // that `ok` is true. An allowlist edit that let the call through but dropped the write would
   // satisfy a truthiness check and still leave the setting unmoved.
-  it.each(["preview.idle_grace_min", "preview.auto_open"])(
+  it.each(["preview.idle_grace_min", "preview.agent_eagerness"])(
     "ALLOWS %s at project scope — whether a project is worth previewing is a property of the project",
     async (key) => {
       setProject.mockClear();

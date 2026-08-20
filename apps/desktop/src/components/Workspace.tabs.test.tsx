@@ -342,15 +342,38 @@ describe("Workspace — closing a tab must not kill that project's agents", () =
 });
 
 describe("Workspace — depth layers + calm desaturation", () => {
-  it("hands calm to the VISIBLE pane while its agent is calm", async () => {
+  // BEAD sparkle-e7a3f3, THIRD FINDING — the mount-state flash, which survived BOTH earlier fixes
+  // and ran grey→white rather than white→grey.
+  //
+  // This test used to assert `calm === "true"` here, with the comment "No live status → the agent
+  // reads `stopped`, which is calm". That reading was correct and it was the defect: `runtimeStore`
+  // holds no status until a mounted `AgentPane` writes one, and the feed substitutes
+  // `DEFAULT_STATUS = "stopped"` for the gap — indistinguishable from a PTY that genuinely exited.
+  // So EVERY pane opened grey and snapped to full contrast the instant the engine said `working`.
+  // `terminalCalm` now requires `statusObservedLocally`, so the stand-in cannot read as calm.
+  it("does NOT hand calm to a freshly mounted pane whose status was never observed", async () => {
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
-    // No live status → the agent reads `stopped`, which is calm.
-    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("true");
-    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("true");
-    // The desaturation is the PANE's (its terminal theme), never a filter on the stage: that
-    // filter re-composited the WebGL canvas every frame and became a containing block for the
+    // No entry in runtimeStore.status at all — feed reports `stopped`, statusObservedLocally false.
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+    // …and it STAYS at full contrast when the engine's first reading arrives, so mount → working is
+    // not a boundary either. Both halves, because the first alone cannot tell "never calm" from
+    // "calm one beat later".
+    await act(async () => useRuntimeStore.setState({ status: { a1: "working" } } as never));
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+  });
+
+  it("puts the desaturation on the PANE, never a filter on the stage", async () => {
+    // Separated from the assertion above because they answer different questions and the first now
+    // asserts an absence: a filter check that rides a `calm === false` case proves nothing. Driven
+    // from an OBSERVED `stopped`, so calm is genuinely on while the filter is genuinely off.
+    // The filter re-composited the WebGL canvas every frame and became a containing block for the
     // fixed-position overlays inside it (roborev 46254-M2/M3).
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "stopped" } } as never));
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("true");
     expect(screen.getByTestId("terminal-stage").style.filter).toBe("");
   });
 
@@ -360,6 +383,62 @@ describe("Workspace — depth layers + calm desaturation", () => {
     await act(async () => useRuntimeStore.setState({ status: { a1: "waiting" } } as never));
     expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
     expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+  });
+
+  // BEAD sparkle-e7a3f3 — the founder's report, as a transition rather than as a state: "the text
+  // in the terminal renders white and then turns gray."
+  //
+  // This is the ONE ordering that produces it, and it is the most-watched moment in the app: an
+  // agent asks you something (`waiting` → not calm → near-white foreground), you answer, it starts
+  // running (`working`). While `working` was in the calm set, that second beat re-handed xterm a
+  // whole new theme object, and xterm re-resolves every cell carrying no explicit SGR colour — so
+  // text ALREADY on screen turned grey retroactively. A live PTY capture of Claude Code confirms
+  // most of what it writes is exactly that class of cell (`\e[39m`, default foreground).
+  //
+  // Asserted as BOTH beats, because either one alone is half the evidence: the first pins that we
+  // start non-calm (a treatment that never ran would pass the second beat trivially), the second
+  // that starting work does not flip it.
+  it("does NOT flip the pane to calm when the answered agent starts working", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "waiting" } } as never));
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "working" } } as never));
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+  });
+
+  // BEAD sparkle-e7a3f3, SECOND HALF — the flash the first fix RELOCATED rather than removed.
+  //
+  // `StatusEngine.settle()` runs on a `setTimeout(…, IDLE_MS = 2500)` and sets `idle` whenever the
+  // viewport is not awaiting input — i.e. ~2.5 seconds after every response finishes streaming.
+  // With `working` non-calm and `idle` still calm, the END of each turn became the theme swap, so
+  // the founder's reply repainted near-white → grey about two and a half seconds after it landed,
+  // then back to white on the next turn. Once per turn, forever, instead of once.
+  //
+  // This is the ordering that occurs at runtime, not the one that reads well: the settle is a timer,
+  // so `working` → `idle` arrives with the response already painted and being read.
+  it("does NOT flip the pane to calm when a finished turn settles to idle", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "working" } } as never));
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "idle" } } as never));
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+  });
+
+  // The paired POSITIVE, so the two absence assertions above cannot pass by the treatment simply
+  // being dead. `done` is emitted from exactly one place in statusEngine — `process-exit` — so it
+  // is a state a live session cannot churn back out of.
+  it("STILL desaturates once the agent's process has exited", async () => {
+    render(<Workspace />);
+    await screen.findByTestId("pane-a1");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "working" } } as never));
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
+    await act(async () => useRuntimeStore.setState({ status: { a1: "done" } } as never));
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("true");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("true");
   });
 
   // `unmerged` is the ONE status where the band and the calm predicate must disagree: it bands
@@ -372,8 +451,11 @@ describe("Workspace — depth layers + calm desaturation", () => {
     await screen.findByTestId("pane-a1");
     await act(async () =>
       useRuntimeStore.setState({
-        // idle + committed-but-unlanded → publishedStatusFor escalates the status to `unmerged`.
-        status: { a1: "idle" },
+        // `done` + committed-but-unlanded → publishedStatusFor escalates the status to `unmerged`.
+        // Was `idle` before bead sparkle-e7a3f3 narrowed calm to {done, stopped}; `idle` is no
+        // longer calm on its own, so keeping it here would have made this test — and its paired
+        // positive below — pass for a reason that has nothing to do with `unmerged`.
+        status: { a1: "done" },
         workflowStage: { a1: "building_saved" },
         branchStatus: {},
       } as never),
@@ -384,12 +466,13 @@ describe("Workspace — depth layers + calm desaturation", () => {
 
   it("DOES desaturate a genuinely landed agent, so the unmerged contrast is real", async () => {
     // Without this, the test above would pass trivially if the calm treatment broke entirely.
-    // `merged` is past the unlanded band, so the status stays plain `idle`.
+    // `merged` is past the unlanded band, so the status stays plain `done` — and `done` is one of
+    // the two the set still admits, which is exactly what makes the contrast above load-bearing.
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
     await act(async () =>
       useRuntimeStore.setState({
-        status: { a1: "idle" },
+        status: { a1: "done" },
         workflowStage: { a1: "merged" },
         branchStatus: {},
       } as never),
@@ -398,11 +481,16 @@ describe("Workspace — depth layers + calm desaturation", () => {
     expect(screen.getByTestId("pane-a1").dataset.calm).toBe("true");
   });
 
-  it("keeps a WORKING agent calm — the Running band changed sorting, not desaturation", async () => {
+  it("keeps a WORKING agent's terminal at full contrast — bead sparkle-e7a3f3", async () => {
+    // INVERTED from what it asserted before ("keeps a WORKING agent calm"). The Running band still
+    // only changed sorting and counts — but calm is a LEGIBILITY treatment and `terminalCalm` is
+    // only ever true for the visible, selected pane, so applying it to a running agent desaturates
+    // precisely the terminal whose output the founder is reading as it arrives.
     render(<Workspace />);
     await screen.findByTestId("pane-a1");
     await act(async () => useRuntimeStore.setState({ status: { a1: "working" } } as never));
-    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("true");
+    expect(screen.getByTestId("terminal-stage").dataset.calm).toBe("false");
+    expect(screen.getByTestId("pane-a1").dataset.calm).toBe("false");
   });
 
   it("keeps color while the Plan board is up — calm is a property of a VISIBLE agent pane", async () => {

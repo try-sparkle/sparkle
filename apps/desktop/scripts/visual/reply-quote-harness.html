@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Concierge reply quote — one bar, not two</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--c-concierge-surface, #212f4e);
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      A REAL-BROWSER PAGE for the founder's 2026-08-17 report: his question quoted back at him TWICE,
+      once as the app's gray reply-anchor stub and once as the concierge's own blue markdown
+      blockquote. *"I want it to be the blue bar that has the copy next to it."*
+
+      The colour claim is why this needs a browser: the bar is `var(--c-teal-ink)`, and jsdom loads
+      no stylesheet, so a custom property resolves to nothing there. See reply-quote-harness.jsx.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./reply-quote-harness.jsx"></script>
+  </body>
+</html>

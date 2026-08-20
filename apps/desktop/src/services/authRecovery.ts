@@ -69,6 +69,7 @@ import { getIdentities, listAccounts, type Account, type Identity } from "./acco
 import { isSafeToSwitch, moveAgent } from "./accountSwitch";
 import { paneAccountMap, restartPane } from "./paneControl";
 import { safeUnlisten } from "./safeUnlisten";
+import type { HumanBlockFlag } from "../engine/humanBlock";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import {
   AUTH_RECOVERED_EVENT,
@@ -207,6 +208,27 @@ export interface NudgeFlag {
    *  reader). This is what the AGENT says is stopping IT. Optional so a flag raised by a Rust build
    *  that predates the field still parses. */
   reply?: string | null;
+  /** The STAND-DOWN the ladder concluded — `"login-expired"`, `"blocked-on-quota"`,
+   *  `"blocked-on-human"`, `"no-task-assigned"`, `"out-of-context"`, … — or null when the ladder is
+   *  simply climbing.
+   *
+   *  A THIRD, DISTINCT fact from `reply` and `blockedBy`, and the only one of the three that
+   *  survives an agent being unable to SPEAK. A dead Claude session (`Login expired · Please run
+   *  /login`) leaves `reply` null by construction — answering costs the API call that is failing —
+   *  and `blockedBy` null too, because the gate had no objection, we simply chose not to write. By
+   *  those two fields' own contracts that row reads "quiet for a while, cause unknown", which is
+   *  exactly the silence a founder watched four consecutive nudges produce. This is where the cause
+   *  arrives. */
+  standdown?: string | null;
+  /** WHICH LOGIN a human has to fix, when that is the problem — a nickname plus its
+   *  `CLAUDE_CONFIG_DIR`, resolved on the Rust side from the PTY's spawn arguments.
+   *
+   *  Only populated for a `standdown === "login-expired"` row; null everywhere else. Do NOT read a
+   *  null as "the default account": the label deliberately conflates nothing, and a null here means
+   *  the account could not be identified at all (no PTY session, unreadable `accounts.json`, or a
+   *  Rust build predating the field). Sending someone to re-authenticate the wrong login is worse
+   *  than telling them it is unknown. */
+  account?: string | null;
 }
 
 /** What a recovery attempt did, per agent. Emitted on {@link AUTH_RECOVERY_RESULT_EVENT}. */
@@ -290,7 +312,15 @@ let deps: AuthRecoveryDeps = realDeps;
 export function __setAuthRecoveryDeps(next: Partial<AuthRecoveryDeps> | null): void {
   deps = next ? { ...realDeps, ...next } : realDeps;
   stuck.clear();
-  flags.clear();
+  // ⚠️ THROUGH THE HELPER, NOT A BARE `flags.clear()` (roborev 65432). `bumpFlagVersion` is the only
+  // writer of the snapshot, so a clear that skips it leaves `flagSnapshot` holding the PREVIOUS
+  // test's flags — and this seam's own docstring promises the opposite. It bit end to end: a suite
+  // that reset via `readNudgeFlags: () => []` then polled got `list.length === flags.size === 0`, so
+  // `tableChanged` answered false, no bump happened, and the snapshot kept a `blocked-on-human` flag
+  // for the rest of the file. `nudgeFlagFor(id)` then said undefined while the snapshot said
+  // founder/blocked-on-human — two readers of one table disagreeing in the same render, which is the
+  // failure class this whole branch exists to close.
+  clearNudgeFlagTable();
   lastIdentities = new Map();
   identitiesSeeded = false;
   // PENDING VERIFICATIONS TOO (roborev 58167). Without this they survive into the next test, and
@@ -449,8 +479,7 @@ async function resumeAll(
     // The deterministic layer's flag described this same stall; we have now acted on it. Leaving it
     // up would have the pusher chase an agent already handled, and a channel that reports resolved
     // problems stops being read.
-    if (flags.has(agentId)) {
-      flags.delete(agentId);
+    if (forgetNudgeFlagLocally(agentId)) {
       void deps.clearNudgeFlag(agentId).catch(() => {});
     }
     outcomes.push({ agentId, accountId, action, progressed: null, source });
@@ -644,16 +673,161 @@ export async function onAuthRecovered(payload: AuthRecoveredPayload): Promise<Re
 
 // ── NUDGER FLAGS — THE LISTENER THAT DID NOT EXIST ────────────────────────────────────────────
 
+/**
+ * Bumped whenever the flag table CHANGES, so React can re-render on a signal that lives in a plain
+ * module-level Map.
+ *
+ * ⚠️ WITHOUT THIS THE FLAG IS INVISIBLE TO THE UI, AND SILENTLY SO (roborev 65339, a Medium). The
+ * table is filled by a Tauri event listener and a 30s poll — neither of which is a store, so nothing
+ * a component selects on changes when a flag arrives. `engine/humanBlock` reads it during render to
+ * colour a row RED, and the sidebar's memo deps (`agentsById`, `calmStatus`, `branchStatus`,
+ * `workflowState`, `workflowStage`) do not move on a flag. The row would therefore flip only when
+ * some unrelated dep happened to change identity — and the targeted population is precisely agents
+ * that are SILENT, whose status and branch facts are static by definition. So the very rows this
+ * signal exists for are the ones least likely to repaint.
+ *
+ * `quotaBlockForAgent` gets away with the same shape because its updates coincide with a StatusEngine
+ * status write that re-renders anyway. This one has no such companion.
+ */
+let flagVersion = 0;
+const flagListeners = new Set<() => void>();
+
+/**
+ * An immutable view of the flag table, REPLACED (never mutated) on every change.
+ *
+ * ⚠️ THIS EXISTS SO A REACT DEP CANNOT BE DROPPED SILENTLY (roborev 65409). The version counter
+ * alone was not enough: nothing in a hook body READ it, so `react-hooks/exhaustive-deps` called it
+ * an "unnecessary dependency", and the remedy it suggests — delete it — silently restores the stale
+ * derivation. A `void` reference plus a comment did not fix that; it is dead at runtime, so deleting
+ * all of it changes no behaviour and no test fails. Handing the derivations a SNAPSHOT they actually
+ * read makes the dependency load-bearing: drop it and the code does not compile, and the lint rule
+ * demands it rather than objecting to it.
+ *
+ * A fresh `Map` per change is what makes `Object.is` a correct `useSyncExternalStore` comparison —
+ * the live `flags` map is a stable reference mutated in place, so it can never signal anything.
+ */
+let flagSnapshot: ReadonlyMap<string, HumanBlockFlag> = new Map();
+
+/**
+ * The current immutable flag table — the `getSnapshot` half of `useSyncExternalStore`.
+ *
+ * ⚠️ IT EXPOSES ONLY THE JUDGED FIELDS, AND THAT NARROWNESS IS A CORRECTNESS PROPERTY, not tidiness
+ * (roborev 65432). The poll rewrites every entry each tick but bumps only when {@link flagIdentity}
+ * moved — and that deliberately EXCLUDES `nudges`, `delivered`, `silentSecs` and `blockedBy`, so
+ * that a counter climbing every 30s cannot make this a heartbeat again. The consequence is that in
+ * the steady state the live `flags` map and this snapshot hold different objects for the same agent,
+ * indefinitely. Exposing the whole `NudgeFlag` here would make that a trap: the first consumer to
+ * render `silentSecs` ("silent for N minutes") or `blockedBy` would read a value frozen at the last
+ * identity change — 60s forever while the live table said four hours — and disagree with
+ * `nudgeFlagFor(id)` read on the same tick.
+ *
+ * Typing it as the fields that ARE change-detected makes a stale read impossible to write. Anything
+ * needing the counters must read the live table and accept that it is not a React signal.
+ */
+export function nudgeFlagsSnapshot(): ReadonlyMap<string, HumanBlockFlag> {
+  return flagSnapshot;
+}
+
+/** Subscribe to flag-table changes. Returns an unsubscribe, matching `useSyncExternalStore`. */
+export function subscribeNudgeFlags(cb: () => void): () => void {
+  flagListeners.add(cb);
+  return () => flagListeners.delete(cb);
+}
+
+/** The current flag-table version — the `getSnapshot` half of `useSyncExternalStore`. */
+export function nudgeFlagsVersion(): number {
+  return flagVersion;
+}
+
+function bumpFlagVersion(): void {
+  flagVersion++;
+  // Rebuilt here rather than at each mutation site, so no writer can forget it and every change
+  // produces exactly one new identity.
+  // Built from the judged fields only — see `nudgeFlagsSnapshot` for why exposing the counters here
+  // would be a stale-read trap rather than a convenience.
+  flagSnapshot = new Map(
+    [...flags].map(([id, f]) => [id, { target: f.target, reply: f.reply, raisedAtMs: f.raisedAtMs }]),
+  );
+  for (const cb of flagListeners) cb();
+}
+
+/**
+ * Empty the flag table, notifying subscribers.
+ *
+ * The single spelling of EMPTYING the table — `__setAuthRecoveryDeps` routes through it so a reset
+ * cannot leave `flagSnapshot` holding the previous test's flags (roborev 65432).
+ *
+ * ⚠️ NOT THE ONLY `flags.clear()` IN THE FILE, and the other one is fine: {@link pollNudgeFlags}
+ * clears as part of a REWRITE and bumps via `tableChanged`, so it is already covered. Stated so the
+ * next reader does not go hunting for a fourth site to route through here.
+ */
+export function clearNudgeFlagTable(): void {
+  if (flags.size === 0 && flagSnapshot.size === 0) return;
+  flags.clear();
+  bumpFlagVersion();
+}
+
+/**
+ * Drop this agent's flag from the LOCAL table, notifying subscribers. Returns whether there was one.
+ *
+ * ⚠️ THE BUMP HERE IS LOAD-BEARING AND ONLY BECAME SO WHEN THE POLL STOPPED BUMPING UNCONDITIONALLY
+ * (roborev 65405). This is a local mutation the poll can never observe as a change: the next read
+ * returns a list that already MATCHES the mutated map, so `tableChanged` answers false and no bump
+ * would ever happen for this clear. The row would keep its last-painted red until some unrelated dep
+ * moved — worst on `resumeAll`'s `cooldown` and `escape-failed` arms, which delete the flag WITHOUT
+ * restarting the pane, so nothing else moves either, on a population that is silent by definition.
+ * "A red that will not go away is how the colour stops meaning anything."
+ *
+ * Exported so a test drives the SAME function production does, rather than a re-implementation of
+ * it — the two-copies-of-one-rule failure this file has already taken twice.
+ */
+export function forgetNudgeFlagLocally(agentId: string): boolean {
+  if (!flags.has(agentId)) return false;
+  flags.delete(agentId);
+  bumpFlagVersion();
+  return true;
+}
+
 function recordFlag(flag: NudgeFlag): void {
   flags.set(flag.agentId, flag);
+  bumpFlagVersion();
+}
+
+/** The fields a reader of this table branches on. Compared to decide whether a poll CHANGED
+ *  anything — see {@link pollNudgeFlags}. */
+function flagIdentity(f: NudgeFlag): string {
+  return `${f.agentId}\u0000${f.target}\u0000${f.reply ?? ""}\u0000${f.raisedAtMs}`;
+}
+
+/** Did this poll actually change the table? */
+function tableChanged(list: readonly NudgeFlag[]): boolean {
+  if (list.length !== flags.size) return true;
+  for (const f of list) {
+    const current = flags.get(f.agentId);
+    if (current === undefined || flagIdentity(current) !== flagIdentity(f)) return true;
+  }
+  return false;
 }
 
 /** Pull the flag table. See {@link FLAG_POLL_MS} for why a pull exists alongside the event. */
 export async function pollNudgeFlags(): Promise<NudgeFlag[]> {
   try {
     const list = await deps.readNudgeFlags();
+    // ⚠️ BUMP ON A CHANGE, NOT ON EVERY POLL (roborev 65367). Bumping unconditionally turned the
+    // version into a 30-SECOND HEARTBEAT rather than a signal: every `useSyncExternalStore`
+    // subscriber re-rendered every 30s on a completely idle app, which recreates `stallReportOf`,
+    // recomputes the whole escalate → present → effective chain for every agent — the pass
+    // `AgentSidebar.escalationCost.test` exists to ratchet — and re-renders every `AgentRow` THROUGH
+    // its `memo` comparator, which a hook subscription bypasses. The cost landed hardest on the
+    // quiet fleet that previously did nothing between polls.
+    //
+    // The de-escalation requirement does not need the heartbeat: a CLEARED flag IS a change (the
+    // table shrinks), so change-detection still repaints a row back out of red — which is the arm
+    // the test now pins, rather than pinning the churn itself.
+    const changed = tableChanged(list);
     flags.clear();
-    for (const f of list) recordFlag(f);
+    for (const f of list) flags.set(f.agentId, f);
+    if (changed) bumpFlagVersion();
     return list;
   } catch (e) {
     deps.log("nudger_flags read failed", e);

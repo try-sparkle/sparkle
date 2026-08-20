@@ -103,7 +103,9 @@ describe("list_plans", () => {
     expect(r.data.map((p) => p.id)).toEqual(["e1", "e2"]);
     // Rolled up by the REAL planView.epicStatus: all children closed → done.
     expect(r.data.find((p) => p.id === "e1")?.status).toBe("done");
-    expect(r.data.find((p) => p.id === "e2")?.status).toBe("not_started");
+    // ...and e2's single child is still open, so it is PLANNING — a written plan nobody started,
+    // which the concierge must be able to tell apart from an epic with no children at all.
+    expect(r.data.find((p) => p.id === "e2")?.status).toBe("planning");
     expect(r.data.find((p) => p.id === "e1")?.childCount).toBe(2);
   });
 
@@ -119,6 +121,52 @@ describe("list_plans", () => {
     const r = await listPlans(ROOT, projectId);
     expect(r.ok && r.data.find((p) => p.id === "e1")?.orchestrator).toBe("Auth Work");
     expect(r.ok && r.data.find((p) => p.id === "e2")?.orchestrator).toBeNull();
+  });
+
+  // THE REGRESSION THIS CHANGE EXISTS FOR. Eight parents in the real store are typed
+  // feature/bug/task and carry 2 to 19 children apiece; keying epic-ness on `type` made every one
+  // of them invisible here while their children rendered as loose tasks. Asserting the SIDE EFFECT
+  // — the plan is listed, with its children counted and its status rolled up — not merely that some
+  // predicate returns true.
+  it("lists a parent bead that is NOT typed 'epic' as a plan, with its children", async () => {
+    const projectId = seedProject();
+    listBeads.mockResolvedValue([
+      bead("f1", { type: "feature" }), // a de-facto epic: never typed 'epic', but things point at it
+      child("f1c1", "f1", { status: "closed" }),
+      child("f1c2", "f1", { status: "in_progress" }),
+      bead("b1", { type: "bug" }), // a bug that is also a parent
+      child("b1c1", "b1"),
+      bead("solo", { type: "task" }), // parentless and childless — NOT a plan, and that is normal
+    ]);
+
+    const r = await listPlans(ROOT, projectId);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.map((p) => p.id).sort()).toEqual(["b1", "f1"]);
+    const f1 = r.data.find((p) => p.id === "f1");
+    expect(f1?.childCount).toBe(2);
+    // Rolled up by the REAL planView.epicStatus — a mix of closed and in_progress is in_progress.
+    expect(f1?.status).toBe("in_progress");
+  });
+
+  // The dotted id is bd's display form of the same edge, so it must confer plan-hood identically.
+  it("lists a parent whose children carry only dotted ids", async () => {
+    const projectId = seedProject();
+    listBeads.mockResolvedValue([bead("d1", { type: "chore" }), bead("d1.1"), bead("d1.2")]);
+
+    const r = await listPlans(ROOT, projectId);
+    expect(r.ok && r.data.map((p) => p.id)).toEqual(["d1"]);
+    expect(r.ok && r.data.find((p) => p.id === "d1")?.childCount).toBe(2);
+  });
+
+  // C, in the founder's words: "Every bead doesn't absolutely need to have an epic." A backlog of
+  // parentless tasks must produce NO plans rather than a board full of one-bead epics.
+  it("returns no plans at all when nothing has children and nothing is typed 'epic'", async () => {
+    const projectId = seedProject();
+    listBeads.mockResolvedValue([bead("t1"), bead("t2", { type: "bug" }), bead("t3", { type: "feature" })]);
+
+    const r = await listPlans(ROOT, projectId);
+    expect(r.ok && r.data).toEqual([]);
   });
 
   it("reports a project without beads as a supported state", async () => {
@@ -227,6 +275,11 @@ describe("promote_plan_to_build", () => {
       // This is the concierge's TOOL layer, so the seed is machine-authored (roborev 55721). It bites
       // on the reuse path, where the seed would otherwise release a resumed orchestrator's goal debt.
       humanAuthored: false,
+      // …and for the same reason it opts into being declined: an LLM promoting a plan must not pull
+      // the founder out of a terminal he is typing in (engine/attentionGuard). Pinned in the EXACT
+      // args rather than an objectContaining, so dropping the flag — which would silently restore
+      // the steal on the one path that can cause it — fails here.
+      attention: "auto",
     });
     expect(r.ok && r.data).toEqual({ agentId: "agent-new", epicId: "e1", reused: false });
   });

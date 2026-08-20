@@ -210,8 +210,12 @@ export interface ProjectState {
    *  job (services/agentModel.ts). */
   setAgentModel: (projectId: string, agentId: string, model: string | undefined) => void;
   /** Set the agent's live "what I'm building now" activity narration (sparkle-control MCP
-   *  set_agent_activity). Free-text; empty string clears the line. Persisted like the name. */
-  setAgentActivity: (projectId: string, agentId: string, activity: string) => void;
+   *  set_agent_activity). Free-text; empty string clears the line. Persisted like the name.
+   *
+   *  Stamps `activityAt` (default `Date.now()`, injectable for tests) so the string can be read as a
+   *  TIMESTAMPED QUOTE rather than as perpetually-current state — a stale self-report is how a dead
+   *  agent looked "explained" (bead sparkle-s8y5t6). Clearing the line clears the stamp. */
+  setAgentActivity: (projectId: string, agentId: string, activity: string, now?: number) => void;
   /**
    * Flip an agent's runtime IN PLACE — local→cloud promotion (services/agentPromotion,
    * spec 2026-07-31 §Decision 3). It changes `runtime` and NOTHING else, and that is the whole
@@ -1531,13 +1535,22 @@ export const useProjectStore = create<ProjectState>()(
           ),
         })),
 
-      setAgentActivity: (projectId, agentId, activity) =>
+      setAgentActivity: (projectId, agentId, activity, now = Date.now()) =>
         set((s) => ({
           projects: mapProject(s.projects, projectId, (p) =>
             // Trim so a whitespace-only report clears the line; store the string verbatim otherwise.
             // Unlike renameAgent this NEVER pins the name or touches auto-naming — activity is a
             // separate, always-live secondary field.
-            mapAgent(p, agentId, (a) => ({ ...a, activity: activity.trim() })),
+            //
+            // STAMP `activityAt` on every write so the line is a timestamped quote, not perpetual
+            // present tense (bead sparkle-s8y5t6). A cleared line carries NO stamp — an empty
+            // "as of now" would read as a fresh self-report of nothing, the opposite of the intent.
+            mapAgent(p, agentId, (a) => {
+              const text = activity.trim();
+              return text
+                ? { ...a, activity: text, activityAt: now }
+                : { ...a, activity: "", activityAt: undefined };
+            }),
           ),
         })),
 

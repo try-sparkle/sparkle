@@ -10,7 +10,13 @@
 // dispatcher — which reads the screen — not in this resolver, which cannot see one.
 import { describe, expect, it } from "vitest";
 
-import { decidePromptTarget, resolvePinnedProjectId, resolvePromptTarget } from "./shellResolve";
+import {
+  decidePromptTarget,
+  resolveMountedTarget,
+  resolvePinnedProjectId,
+  resolvePromptTarget,
+  type MountedAgentFacts,
+} from "./shellResolve";
 import type { AgentTab, Project, Runtime } from "../types";
 
 function mkAgent(runtime: Runtime, id = "a1"): AgentTab {
@@ -103,11 +109,119 @@ describe("decidePromptTarget", () => {
     expect(decidePromptTarget(null, "a1").refusal).toBeUndefined();
   });
 
+  // ══ THE `special` ARM HAD NO COVERAGE AT ALL, AND THAT IS PART OF WHY IT KEPT BITING ══════════
+  // It is the Improve-Sparkle pane's target, and it is the load-bearing half of the founder's
+  // reproduction B (bead sparkle-9gsjqm): it WINS over the roster path, so merely revealing that pane
+  // replaced the compose box's target — and, while the routing mount was derived from this value, the
+  // mount with it. Pinned here as data so the precedence is a stated rule rather than an accident of
+  // a `if (special)` sitting at the top of the function.
+  const SPARKLE_SPECIAL = { projectId: "", agentId: "__sparkle_self__", name: "Sparkle" };
+
+  it("takes the SPECIAL surface's target over the roster's, even with a live selection", () => {
+    const d = decidePromptTarget(mkProject([mkAgent("local")]), "a1", SPARKLE_SPECIAL);
+    expect(d.target).toEqual(SPARKLE_SPECIAL);
+    expect(d.refusal).toBeUndefined();
+  });
+
+  it("takes the SPECIAL surface's target with no project and no selection at all", () => {
+    // The state the Improve-Sparkle pane is actually in for a user with zero build agents — the case
+    // bead sparkle-0rf5 added the arm for. A roster lookup can never resolve this agent.
+    expect(decidePromptTarget(null, null, SPARKLE_SPECIAL).target).toEqual(SPARKLE_SPECIAL);
+  });
+
+  it("falls back to the roster the moment the special surface is gone", () => {
+    // `null`/`undefined` are the two shapes `Workspace`'s `sparkleTarget` memo produces when
+    // `activeSpecial !== "sparkle"`, and both must return the SELECTION rather than nothing —
+    // otherwise navigating away from that pane zeroes the compose box.
+    const p = mkProject([mkAgent("local")]);
+    expect(decidePromptTarget(p, "a1", null).target).toMatchObject({ agentId: "a1" });
+    expect(decidePromptTarget(p, "a1", undefined).target).toMatchObject({ agentId: "a1" });
+  });
+
   it("resolvePromptTarget is the same decision, target half only", () => {
     // A REFUSING case, so this pins "same decision" rather than "both happen to resolve": a
     // torn-apart pair would agree on a null target for a missing agent by coincidence.
     const p = mkProject([mkAgent("local")]);
     expect(resolvePromptTarget(p, "ghost")).toBe(decidePromptTarget(p, "ghost").target);
     expect(resolvePromptTarget(p, "a1")).toEqual(decidePromptTarget(p, "a1").target);
+  });
+});
+
+// ══ WHERE A MOUNTED SEND GOES ═══════════════════════════════════════════════════════════════════
+// The founder's recurring P0 (bead sparkle-9gsjqm): text typed into a mounted build-agent pane
+// silently became a concierge message. The routing mount used to be the DRAWING projection ANDed
+// with `decidePromptTarget`'s answer — three surface predicates and a liveness read between his
+// mounting gesture and where his words went. This function is what removes them: the mount is the
+// cable's own pin, and nothing else.
+describe("resolveMountedTarget", () => {
+  const SPARKLE_ID = "__sparkle_self__";
+  /** This window's two ways of naming a far end, exactly as ConciergeHost supplies them: the roster
+   *  row, and the app-owned agent that deliberately has none (services/knownAgents). */
+  const lookup = (id: string): MountedAgentFacts | undefined => {
+    if (id === "a1") return { name: "Blueprint UI/UX", projectId: "p1" };
+    if (id === SPARKLE_ID) return { name: "Sparkle", projectId: "" };
+    return undefined;
+  };
+
+  it("routes at the PINNED agent, whichever side the cable is patched into", () => {
+    expect(resolveMountedTarget({ wired: "left", agentId: "a1" }, lookup)).toEqual({
+      kind: "mounted",
+      target: { projectId: "p1", agentId: "a1", name: "Blueprint UI/UX" },
+    });
+    expect(resolveMountedTarget({ wired: "right", agentId: "a1" }, lookup)).toEqual({
+      kind: "mounted",
+      target: { projectId: "p1", agentId: "a1", name: "Blueprint UI/UX" },
+    });
+  });
+
+  it("resolves the app-owned Sparkle agent, which is never a roster row", () => {
+    // The mount `decidePromptTarget` can only reach through its `special` arm — and therefore only
+    // while that pane is the visible surface. Here it resolves from the PIN, so navigating the right
+    // column away cannot evaporate it (the founder's reproduction A).
+    expect(resolveMountedTarget({ wired: "right", agentId: SPARKLE_ID }, lookup)).toEqual({
+      kind: "mounted",
+      target: { projectId: "", agentId: SPARKLE_ID, name: "Sparkle" },
+    });
+  });
+
+  // ══ THE PRECEDENCE THAT FIXES REPRODUCTION B ══════════════════════════════════════════════════
+  // `decidePromptTarget`'s special arm wins over the roster — pinned three cases up — and while the
+  // mount was derived from THAT value, revealing the Improve-Sparkle pane re-aimed a mounted build
+  // agent at `__sparkle_self__`. This function cannot be told about a visible pane at all, which is
+  // the fix: the two resolvers are handed the SAME state below and disagree, deliberately.
+  it("a visible special surface cannot move a pinned cable", () => {
+    const cable = { wired: "right", agentId: "a1" } as const;
+    const shown = decidePromptTarget(mkProject([mkAgent("local", "a1")]), "a1", {
+      projectId: "",
+      agentId: SPARKLE_ID,
+      name: "Sparkle",
+    });
+    // What the compose box is aimed at while that pane is up…
+    expect(shown.target).toMatchObject({ agentId: SPARKLE_ID });
+    // …and where a MOUNTED send goes anyway. A pane becoming visible is not a mounting gesture.
+    expect(resolveMountedTarget(cable, lookup)).toEqual({
+      kind: "mounted",
+      target: { projectId: "p1", agentId: "a1", name: "Blueprint UI/UX" },
+    });
+  });
+
+  it("an unpatched cable is not a mount, whatever it still holds", () => {
+    expect(resolveMountedTarget({ wired: "off", agentId: null }, lookup)).toEqual({ kind: "none" });
+    // Both halves are tested, even though `unbindCable` clears them together: a caller can hand this
+    // a pair it built itself, and "off with a stale pin" must never route anywhere.
+    expect(resolveMountedTarget({ wired: "off", agentId: "a1" }, lookup)).toEqual({ kind: "none" });
+    // Patched with no pin at all — the dev visual fixtures drive the cable this way.
+    expect(resolveMountedTarget({ wired: "left", agentId: null }, lookup)).toEqual({ kind: "none" });
+  });
+
+  // ══ THE ARM THAT MUST NOT COLLAPSE INTO `none` ════════════════════════════════════════════════
+  // Flattening this to "nothing is mounted" is the defect: `classifyComposerRoute` would then answer
+  // `via: "default"` and the founder's words would become a concierge turn with no refusal and no
+  // notice. It is reported as its own kind so the caller has to decide what to say about it.
+  it("reports a pin this window cannot name as UNRESOLVABLE, never as unmounted", () => {
+    const r = resolveMountedTarget({ wired: "left", agentId: "ghost" }, lookup);
+    expect(r).toEqual({ kind: "unresolvable", agentId: "ghost" });
+    // Stated as an inequality too, because that is the substitution the bug actually made.
+    expect(r).not.toEqual({ kind: "none" });
   });
 });

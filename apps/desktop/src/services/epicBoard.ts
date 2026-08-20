@@ -1,0 +1,192 @@
+// The EPIC view of the Plan board — the founder's seven-stage ladder, bucketed from an already
+// bucketed Board. Pure data: no React, no stores, so the ladder is unit-testable without a GUI,
+// exactly like `planView` beside it.
+//
+// ── WHY THIS IS A SECOND BUCKETING AND NOT A WIDER `rollupEpicStatus` ─────────────────────────
+// `planView.rollupEpicStatus` answers a question the SWEEPER asks: is there a plan here, and has
+// anyone started it. `services/epicSweepRunner` and `engine/epicContinuation` both branch on its
+// four values, and widening that type would change what the live sweeper decides — a data change
+// made for a display reason. So the extra three stages the founder's ladder names (Blocked,
+// Shipped, Archived) are derived HERE, at the view layer, from the board bucket the epic bead
+// already sits in. The sweeper is untouched by anything in this file.
+import {
+  buildEpicIndex,
+  isEpicIndexed,
+  type Bead,
+  type Board,
+  type BoardColumn,
+  type EpicIndex,
+} from "./beads";
+import { rollupEpicStatus } from "./planView";
+
+/** A column of the epic ladder.
+ *
+ *  The keys deliberately REUSE the Board snapshot's vocabulary wherever one already exists —
+ *  `inProgress` renders as "Building", `delivered` as "Shipped" — so `BoardView`'s `Column`, its
+ *  `data-testid`s and its definable-stage wiring keep working with no widening. `planning` is the
+ *  one genuinely new key, because the board has never had a bucket for it. */
+export type EpicLadderKey = BoardColumn | "planning";
+
+/** The founder's ladder, in his reading order:
+ *  Backlog > Blocked > Planning > Building > Done > Shipped > Archived.
+ *
+ *  BLOCKED SITS SECOND for the same reason it does on the task board — you scan left to right
+ *  asking "what is next", and a blocked epic is one that WOULD be next except it cannot be.
+ *  PLANNING SITS THIRD, between "nobody has decided what this is" and "somebody is building it",
+ *  which is exactly the gap it names. */
+export const EPIC_LADDER_COLUMNS = [
+  { key: "backlog", label: "Backlog" },
+  { key: "blocked", label: "Blocked" },
+  { key: "planning", label: "Planning" },
+  { key: "inProgress", label: "Building" },
+  { key: "done", label: "Done" },
+  { key: "delivered", label: "Shipped" },
+  { key: "archived", label: "Archived" },
+] as const satisfies readonly { key: EpicLadderKey; label: string }[];
+
+/** The ladder's keys alone, DERIVED from the labelled list above rather than written out a second
+ *  time — two hand-maintained copies of one order is how a column ends up rendered in one place and
+ *  bucketed in another. */
+export const EPIC_LADDER: readonly EpicLadderKey[] = EPIC_LADDER_COLUMNS.map((c) => c.key);
+
+export type EpicBoard = Record<EpicLadderKey, Bead[]>;
+
+/** Every ladder column present and EMPTY.
+ *
+ *  Exported because it is now a state the board can actually be IN, not just the accumulator
+ *  `bucketEpics` fills: with two independent kind toggles the user can switch both off, and the
+ *  board has to render that as "nothing selected" rather than as a loading board or a crash. */
+export const emptyEpicBoard = (): EpicBoard => ({
+  backlog: [],
+  blocked: [],
+  planning: [],
+  inProgress: [],
+  done: [],
+  delivered: [],
+  archived: [],
+});
+
+// The membership index this file walks is `beads.buildEpicIndex`, deliberately NOT defined here:
+// it restates the parent-child edge, and that edge is stated in exactly ONE file. See its doc
+// comment there for why a *fast* copy of the rule is still a copy.
+/**
+ * Where an OPEN epic sits once its own bead tells us nothing more — the split that gives Planning
+ * its column. The epic bead is `open` either way; only its children distinguish "nobody has decided
+ * what this is" from "the plan is written and nobody picked it up".
+ *
+ * `done` is reachable from here and is not a mistake: an open epic whose children have ALL closed
+ * is finished work whose epic bead nobody closed. Filing it under Backlog would bury it; Done
+ * surfaces it as something to close.
+ */
+function openEpicStage(index: EpicIndex, epicId: string): EpicLadderKey {
+  switch (rollupEpicStatus(index.statusesByParent.get(epicId) ?? [])) {
+    case "planning":
+      return "planning";
+    case "in_progress":
+      return "inProgress";
+    case "done":
+      return "done";
+    default:
+      return "backlog"; // "unplanned" — a title with nothing under it
+  }
+}
+
+/**
+ * Re-bucket an ALREADY BUCKETED board into the epic ladder, keeping only epics.
+ *
+ * Takes the bucketed `Board` rather than a raw bead list on purpose: by the time BoardView calls
+ * this, the snapshot has had the agent filter, the label filter and the date/priority filter
+ * applied to it. Re-deriving the columns from `allBeads` here would quietly discard all three and
+ * show a board the user's own controls say should be narrower.
+ *
+ * `allBeads` is still needed and is a DIFFERENT set: epic-ness and the child roll-up are properties
+ * of the whole store (a bead cannot tell you whether anything points at it), so both must be asked
+ * against the unfiltered list or a filtered-out child would silently demote its parent's stage.
+ *
+ * THE EPIC'S OWN STATE WINS OVER ITS CHILD ROLL-UP, and the mechanism is DISJOINTNESS, not the
+ * order of the lines below — this was written as "order is load-bearing" first and that was wrong.
+ * `beads.columnFor` has already sent each bead to exactly one source column, so the roll-up split
+ * is only ever reached for a bead whose own state is plain `open`. Rearranging these statements
+ * changes nothing; a blocked epic cannot be re-filed by its children because it is never in
+ * `board.backlog` to begin with. Measured: routing `board.blocked` through the split as well reds
+ * exactly one test (the blocked case), while every other case stays green — which is what "the
+ * blocked pile is separate" looks like from the outside, and is the invariant to protect if this
+ * ever stops walking the source buckets one for one.
+ */
+export function bucketEpics(board: Board, allBeads: readonly Bead[]): EpicBoard {
+  const out = emptyEpicBoard();
+  const index = buildEpicIndex(allBeads); // ONE walk of the store, not one per bead — see EpicIndex
+  const keep = (b: Bead) => isEpicIndexed(index, b);
+  out.archived = board.archived.filter(keep);
+  out.delivered = board.delivered.filter(keep);
+  out.done = board.done.filter(keep);
+  out.blocked = board.blocked.filter(keep);
+  out.inProgress = board.inProgress.filter(keep);
+  // Only the open pile splits, and it is the split that gives Planning its column.
+  for (const b of board.backlog) {
+    if (!keep(b)) continue;
+    out[openEpicStage(index, b.id)].push(b);
+  }
+  return out;
+}
+
+/** Everything that is NOT an epic — the Tasks mode.
+ *
+ *  This and {@link bucketEpics} PARTITION the board: every bead the user can see in "both" is in
+ *  exactly one of them, so no mode can make work disappear. That property is asserted directly
+ *  rather than left implied, because the failure it guards against is silent — a bead dropped by
+ *  both halves is simply gone from the app, with a green suite and nothing on screen to notice. */
+export function tasksOnly(board: Board, allBeads: readonly Bead[]): Board {
+  const index = buildEpicIndex(allBeads);
+  return mapBoard(board, (b) => !isEpicIndexed(index, b));
+}
+
+/** A task-shaped `Board` widened to the ladder's shape with an EMPTY Planning pile, so the view
+ *  can index one type for every mode. Planning is empty by construction here and that is correct:
+ *  it is an EPIC-only stage (it is a statement about an epic's children), and the task modes never
+ *  render a Planning column to put anything in. */
+export function withPlanning(board: Board): EpicBoard {
+  return { ...board, planning: [] };
+}
+
+function mapBoard(board: Board, keep: (b: Bead) => boolean): Board {
+  return {
+    backlog: board.backlog.filter(keep),
+    blocked: board.blocked.filter(keep),
+    inProgress: board.inProgress.filter(keep),
+    done: board.done.filter(keep),
+    delivered: board.delivered.filter(keep),
+    archived: board.archived.filter(keep),
+  };
+}
+
+/** WHICH KINDS of work the Plan board is showing — two INDEPENDENT toggles, not one mode.
+ *
+ *  This replaces an exclusive `"both" | "tasks" | "epics"` switch, and the reason is not cosmetic:
+ *  "Both" is not a third kind of thing. Tasks and epics are the two kinds the board holds, and
+ *  "Both" named the ABSENCE of a filter — so the control had three buttons for two facts, and the
+ *  user had to work out that the way to see epics alongside tasks was a button whose label named
+ *  neither. Two checkboxes state the same thing with nothing to learn, and they compose: each one
+ *  answers exactly "is this kind on the board".
+ *
+ *  BOTH ON IS THE DEFAULT, and it is the board EXACTLY as it behaved before either control
+ *  existed. That matters more than it looks — a default that changed what the board shows would
+ *  make every existing expectation about the Plan board wrong for a reason nobody asked for.
+ *
+ *  BOTH OFF IS REACHABLE, and that is a decision rather than an oversight. The tempting guard is
+ *  to refuse the last un-toggle (or to silently re-enable the other kind), but that makes the
+ *  second click of an ordinary two-click gesture undo the first with no explanation, which is the
+ *  shape users read as a broken control. The board renders {@link emptyEpicBoard} and says why
+ *  instead, and the toggles are right there to undo it. */
+export type PlanKind = "tasks" | "epics";
+
+/** Which kinds are currently shown. Independent — any of the four combinations is legal. */
+export type PlanKindFilter = Readonly<Record<PlanKind, boolean>>;
+
+export const PLAN_KINDS = [
+  { kind: "tasks", label: "Tasks" },
+  { kind: "epics", label: "Epics" },
+] as const satisfies readonly { kind: PlanKind; label: string }[];
+
+/** The default: everything on, i.e. the pre-filter board. */
+export const PLAN_KINDS_ALL: PlanKindFilter = { tasks: true, epics: true };

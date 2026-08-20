@@ -21,7 +21,34 @@
 /// Sonnet 4.6 — the generic-chat model (brainstorm / AI-composer / ThinkPanel task-planning).
 /// Bare alias, no date suffix. Pinned rather than inherited: this runs on the user's own
 /// subscription, so a user configured on Opus would multiply their own cost for no gain.
-const CHAT_MODEL: &str = "claude-sonnet-4-6";
+///
+/// PUBLIC, and that is the point rather than an accident of visibility (bead `sparkle-revqiv`).
+/// The second-model advisor pass resolves its own model as "a model DIFFERENT from the planner's",
+/// and that rule is unimplementable while the planner's model is a private constant: the advisor
+/// would have to hardcode `"claude-sonnet-4-6"` a second time, which is exactly the drift this
+/// const exists to prevent — change the planner here and a hardcoded copy elsewhere would silently
+/// start permitting the advisor to run on the SAME model, i.e. self-review wearing a second name.
+/// `planner_chat_model` below is the one read path; nothing may re-declare the value.
+pub const CHAT_MODEL: &str = "claude-sonnet-4-6";
+
+/// The planner's effective model id, for a caller that must pick a DIFFERENT one.
+///
+/// A command rather than a duplicated string on the TypeScript side — see [`CHAT_MODEL`]. It reads
+/// a compile-time constant and touches nothing, so it is cheap enough to call per pass and cannot
+/// fail; `Result` is not used because there is no failure to report and a fallible signature would
+/// invite a caller to invent a default, which is the one thing that must not happen here (a wrong
+/// guess re-enables self-review).
+///
+/// ASYNC, like every command in this crate, and NOT added to `cmd_timing`'s `EXEMPT` list even
+/// though its body is a single `to_string()`. The guard's rule (bead `sparkle-rfhu5`) is about the
+/// SHAPE, not about this body's cost: a sync `#[tauri::command]` runs inline on the AppKit main
+/// thread, and exempting one because it is cheap today invites the next edit to add work to it with
+/// nothing to catch that. There is no blocking work here to hand to `spawn_blocking`, so `async`
+/// alone is the whole fix.
+#[tauri::command]
+pub async fn planner_chat_model() -> String {
+    CHAT_MODEL.to_string()
+}
 
 /// Default token budget when the caller passes 0, so a forgotten/zero `max_tokens` still yields a
 /// usable reply rather than the API rejecting a zero budget.

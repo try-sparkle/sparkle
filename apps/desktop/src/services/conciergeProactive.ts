@@ -27,6 +27,7 @@
 import { bandCountLabel } from "../engine/statusBandLabels";
 import { rosterLine } from "../engine/conciergeRosterLine";
 import { withResearchPreamble, type ResearchStaging } from "./research/drain";
+import { isTerminal, type ResearchTask } from "./research/types";
 import { withMemoryPreamble } from "../stores/conciergeMemoryStore";
 import type { ConciergeMessage } from "../components/Concierge/types";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
@@ -80,6 +81,16 @@ export interface ProactiveStats {
    * rising number here against a flat `fired` is the channel working as intended on a busy queue.
    */
   noticesRidden: number;
+  /**
+   * Turns bought by RESEARCH COMING BACK — see {@link ProactiveScheduler.observeResearch}.
+   *
+   * Counted separately from `fired` for the same reason `noticesRidden` is, and it is the number
+   * that makes the two-budget claim auditable rather than merely asserted: this rising while
+   * `fired` stays flat is research reaching the founder without having spent a fleet slot. If the
+   * two are ever seen moving together one-for-one, the tracks have been re-merged and §3.3's
+   * starvation objection is live again.
+   */
+  researchFired: number;
 }
 
 /** The edges: a clock, a timer, and the effect that actually spends money. */
@@ -93,11 +104,16 @@ export interface ProactiveDeps {
    * Returns the unread research findings to fold into this turn's prompt, and the ids they came
    * from. Optional: a scheduler wired without it behaves exactly as before.
    *
-   * IT IS ONLY EVER CALLED FOR A TURN THAT IS ALREADY HAPPENING. §3.3 is explicit that findings buy
-   * no interruption of their own — a push per finding would spend the shared six-an-hour ceiling on
-   * routine results and rate-limit out a genuine blocker at minute 40, which is the exact failure
-   * the channel exists to prevent. So this is consulted AFTER `fire` has decided there is something
-   * to say; a pending finding never makes that decision `true`.
+   * IT CAN NOW BE THE REASON A TURN HAPPENS — but only via {@link ProactiveScheduler.observeResearch},
+   * never via this method, and the distinction is the whole safety argument. This is still consulted
+   * strictly AFTER `fire` has decided there is something to say, so a peek can never be what decides
+   * it; the decision is taken from the store snapshot the host feeds in. What changed (bead
+   * sparkle-wo4c79) is that "an answer he is waiting on" joined the list of things worth saying, on
+   * a budget of its own — see `observeResearch` for why that answers §3.3 rather than overriding it.
+   *
+   * The old rule read "IT IS ONLY EVER CALLED FOR A TURN THAT IS ALREADY HAPPENING", and the cost of
+   * it was measured: research finished, nothing bought a turn, and the founder had to ask for an
+   * answer he had already commissioned.
    *
    * PEEKING CLAIMS NOTHING. The ids travel to {@link startTurn}, which stages them against the turn
    * id it gets back; the claim happens only once that turn delivers. See services/research/drain.
@@ -140,6 +156,35 @@ export interface ProactiveDeps {
 export interface ProactiveScheduler {
   /** Feed one roster observation in. Cheap: the common case is a string compare. */
   observe(feed: ConciergeFeed): void;
+  /**
+   * Feed the research store in. THE THIRD REASON TO SPEAK, and the one §3.3 originally declined.
+   *
+   * WHY THIS REVERSES §3.3, AND WHY THAT IS NOT A CLIMBDOWN. §3.3 chose "drain at turn start, no
+   * interrupt" and rejected a push per finding for ONE stated reason: it "would spend the SHARED
+   * 6/hour ceiling on routine results", rate-limiting out a genuine blocker at minute 40. That
+   * objection is about CONTENTION, not about interrupting — and it is answered here by removing the
+   * sharing rather than by overriding it. A turn bought by research spends neither
+   * {@link PROACTIVE_MAX_PER_HOUR} nor {@link PROACTIVE_MIN_INTERVAL_MS}; it cannot displace a
+   * blocker, and a noisy fleet cannot displace it. `claimNotices` already sets this precedent for
+   * the same reason ("the hourly cap bounds INTERRUPTIONS").
+   *
+   * The other half of §3.3 was a latency estimate that did not hold. It accepted the design because
+   * worst case became "until the founder next speaks — minutes — versus today's forever". The
+   * founder hit the forever branch: two runs finished, one of them FAILED with "the Claude CLI is
+   * not signed in", and he learned nothing until he thought to ask. "He speaks again soon" is not
+   * reliable when the thing he would speak about is the answer he is waiting on.
+   *
+   * A FINISHED ANSWER IS NOT AN INTERRUPTION. Everything the ceiling protects against is the app
+   * volunteering something unbidden; this is a reply to a question he asked. It is also incapable
+   * of the runaway the limiter exists to stop — the trigger is the roster republishing every 250ms
+   * (~14,400 turns/hour if ungated), whereas research completions are bounded by what he dispatched
+   * and each one costs minutes of a real `claude` run.
+   *
+   * CANCELLED TASKS DO NOT WAKE HIM. They are terminal and owed, and they still ride a turn bought
+   * by something else, but he cancelled them — a turn whose entire content is news he created is
+   * the spam this channel must not produce.
+   */
+  observeResearch(tasks: readonly ResearchTask[]): void;
   /**
    * Hand the concierge something the Pusher measured that no roster digest would ever show.
    *
@@ -546,6 +591,31 @@ export function buildProactivePrompt(feed: ConciergeFeed): string {
 }
 
 /**
+ * The body of a turn bought by RESEARCH COMING BACK rather than by the fleet moving.
+ *
+ * WHY THIS IS NOT {@link buildProactivePrompt}'s instruction. That one says "ONE or TWO short
+ * sentences, digest it" — right for fleet churn, where the founder needs to know something needs
+ * him and can go look. It is wrong here, and expensively so: he ASKED this question, the run has
+ * finished, and a two-line notice that an answer exists costs him a round-trip to get the answer he
+ * already commissioned. That round-trip IS the reported bug — he had to ask "what did you find out
+ * about Epic versus tasks?" for research that had already come back.
+ *
+ * So this instruction says the opposite thing about length: deliver the finding, and let the
+ * finding decide how long that is. The findings themselves arrive ahead of this, in the drain's own
+ * preamble (`withResearchPreamble`), exactly as they do on a user turn.
+ */
+export function buildResearchAnswerPrompt(): string {
+  return (
+    "The user has not asked you anything in this turn. This is you speaking first, unprompted, " +
+    "because research he commissioned has finished and he has NOT seen it. He is waiting on this — " +
+    "he asked the question, the run is done, so give him the ANSWER, not a notice that an answer " +
+    "exists. Lead with what he asked about and what came back. Length follows the finding: as long " +
+    "as the answer needs, no longer. If a run FAILED, say plainly that it failed, why, and what you " +
+    "recommend doing about it. No greeting, no preamble, no offer to help."
+  );
+}
+
+/**
  * Mark every proactive message whose state no longer holds.
  *
  * THE PROBLEM §2a NAMES: "Today's nudge list is recomputed from the feed every render, so it
@@ -659,6 +729,28 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
    *  is a floor on attempts rather than on deliveries: without it a standing refusal (the user
    *  holding the conversation) would retry once per coalescing window forever. */
   let lastAttemptAt: number | null = null;
+  /** ── THE RESEARCH TRACK ─────────────────────────────────────────────────────────────────────
+   *  A SECOND, INDEPENDENT CLOCK, deliberately not folded into the three variables above.
+   *
+   *  Sharing them was the whole of §3.3's objection (see `observeResearch`): one budget means a
+   *  noisy fleet starves an answer the founder is waiting for, and routine findings starve a
+   *  blocker. Two tracks means neither can happen — a research turn spends no fleet slot, and a
+   *  spent fleet ceiling does not hold a finished answer.
+   *
+   *  The LAST SNAPSHOT of the store, kept so `fire` can re-ask "is a wake still owed?" at the
+   *  moment it fires rather than trusting a decision taken up to a coalescing window earlier. The
+   *  store refreshes after every claim, so this self-updates — which is what makes the stand-down
+   *  below able to see a finding a USER turn delivered while this one was still pending. */
+  let researchTasks: readonly ResearchTask[] = [];
+  /** When the currently-owed research wake first appeared — this track's coalescing origin. Same
+   *  rule as `pendingSince`: opened by the FIRST terminal task, never reset by later ones, so five
+   *  runs finishing together are one turn rather than five. */
+  let researchSince: number | null = null;
+  /** This track's own floor on ATTEMPTS, mirroring `lastAttemptAt` and for the same reason: a push
+   *  declined because the user owns the conversation would otherwise be retried once per four
+   *  second window for as long as he keeps typing. It is a floor on RETRIES, never on the first
+   *  delivery — a finished answer still goes out on the coalescing window alone. */
+  let researchLastAttemptAt: number | null = null;
   /** A turn is out at the transport and has not reported back. Nothing else may fire until it
    *  does, or a slow bridge would let one change become several turns. */
   let inFlight = false;
@@ -667,6 +759,7 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
   const stats: ProactiveStats = {
     fired: 0,
     noticesRidden: 0,
+    researchFired: 0,
     skipped: {
       unchanged: 0,
       "same-surface": 0,
@@ -743,6 +836,39 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     firedAt = firedAt.filter((t) => t > now - HOUR_MS);
   };
 
+  /**
+   * Is there a finished research run the founder has not been told about, that is worth WAKING him
+   * for? Re-asked at fire time, never cached — see `researchTasks`.
+   *
+   * `readAt === null` is the drain's durable exactly-once claim (stamped in research.rs only once a
+   * turn actually delivers, first-claim-wins), so this answers "still owed" and not merely
+   * "finished". It is what makes the stand-down honest: if a USER turn carried the findings while
+   * this wake sat in its coalescing window, the claim is stamped and there is nothing left to say.
+   *
+   * CANCELLED IS TERMINAL AND OWED BUT NOT WAKE-WORTHY — see `observeResearch`. It is excluded here
+   * and nowhere else, so a cancelled task still RIDES a turn bought by something else, exactly as
+   * before. This predicate governs only whether research may BUY one.
+   */
+  const researchWakeOwed = () =>
+    researchTasks.some(
+      (t) => isTerminal(t.status) && t.readAt === null && t.status !== "cancelled",
+    );
+
+  /** The earliest moment an owed research answer may become a turn, or null if none is owed.
+   *
+   *  DELIBERATELY IGNORES `dueAt`'s two limiters. That is the entire point of the second track: the
+   *  fleet's floor and ceiling bound interruptions the founder did not ask for, and this is a reply
+   *  to one he did. It has its own retry floor and nothing else. */
+  const researchDueAt = (): number | null => {
+    if (researchSince === null) return null;
+    let at = researchSince + PROACTIVE_COALESCE_MS;
+    const last = researchLastAttemptAt;
+    if (last !== null && last + PROACTIVE_MIN_INTERVAL_MS > at) {
+      at = last + PROACTIVE_MIN_INTERVAL_MS;
+    }
+    return at;
+  };
+
   /** The earliest moment the pending change may become a turn, and what is holding it back. */
   const dueAt = (now: number): Due => {
     let due: Due = { at: (pendingSince ?? now) + PROACTIVE_COALESCE_MS, reason: "coalesce" };
@@ -773,31 +899,50 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
    * asks. A refusal that stays refused for an hour must cost one attempt per floor, not one per
    * four-second coalescing window.
    */
-  const fire = (now: number) => {
-    const feed = pendingFeed;
-    const digest = pendingDigest;
-    const surfaced = pendingSurfaced;
+  const fire = (now: number, mainReady: boolean, researchReady: boolean) => {
+    // NOTHING FROM THE MAIN TRACK IS READ WHEN IT IS NOT ITS TURN. A research wake can come due
+    // while a feed change is still held by the two-minute floor; taking the feed here anyway would
+    // let research smuggle the fleet past its own limiter, which is §3.3's objection with the
+    // players swapped.
+    const feed = mainReady ? pendingFeed : null;
+    const digest = mainReady ? pendingDigest : null;
+    const surfaced = mainReady ? pendingSurfaced : null;
     // Snapshotted BEFORE `dropPending`, and by value: `settle` runs after an await and must clear
     // exactly the notices this turn carried, never ones that arrived while it was in flight.
-    const notices = pendingNotices.slice();
+    const notices = mainReady ? pendingNotices.slice() : [];
     const hasFeedChange = feed !== null && digest !== null && surfaced !== null;
     // A NOTICE ALONE IS ENOUGH TO SPEAK. This is the point of the second input: the Pusher's
     // findings move no digest, so requiring a feed change here would mean they could only ever ride
     // along with an unrelated one — i.e. exactly the silence being fixed.
-    if (!hasFeedChange && notices.length === 0) return;
-    // ══ THE RESEARCH DRAIN RIDES A TURN; IT NEVER BUYS ONE ═══════════════════════════════════════
-    // BELOW the guard above, deliberately. §3.3 of the reporting-channel PRD rejected a push per
-    // finding, so an unread finding must never be the reason a proactive turn happens — it is
-    // folded into a turn that was already going to run, at the front of the prompt, exactly as the
-    // user-turn seam folds it ahead of the founder's message. Moving this line above the return
-    // would not merely widen the trigger: it would spend the six-an-hour ceiling on routine
-    // results and rate-limit out the blocker this channel exists to deliver.
+    const hasMain = hasFeedChange || notices.length > 0;
+    // ══ AND SO IS A FINISHED ANSWER ══════════════════════════════════════════════════════════════
+    // The third reason. This line used to sit BELOW a `return` that required one of the two above,
+    // on §3.3's reasoning that a finding must never buy a turn. That is reversed here, and
+    // `observeResearch` records why in full: the objection was contention on a SHARED ceiling, and
+    // the research track shares neither limiter, so the blocker at minute 40 is still safe. The
+    // failure it leaves behind — an answer sitting unspoken until the founder thinks to ask for it
+    // — is the one actually observed.
+    if (!hasMain && !researchReady) return;
     const research = deps.peekResearch?.() ?? EMPTY_RESEARCH;
+    // DO NOT REPORT WHAT HE HAS ALREADY BEEN TOLD. `researchWakeOwed` re-reads the durable
+    // `readAt` claim at THIS instant, so a finding a user turn happened to carry while this wake
+    // sat in its coalescing window stands the wake down instead of saying it twice. The preamble
+    // check is the same question asked of the drain, which is the component that actually knows.
+    const tellAnswer = researchReady && research.preamble !== "" && researchWakeOwed();
+    if (!hasMain && !tellAnswer) {
+      // Nothing owed after all: close this track's window rather than re-arming it, or a delivered
+      // finding would leave a timer running forever on a quiet fleet.
+      researchSince = null;
+      clearTimer();
+      return;
+    }
     const body = [
       hasFeedChange ? buildProactivePrompt(feed) : null,
       // EVERY OWED FINDING GOES IN — `buildNoticeSection` names all of them however many there are,
       // and changes shape rather than length past the readability threshold.
       notices.length > 0 ? buildNoticeSection(notices) : null,
+      // LAST, so a turn carrying both a blocker and an answer still leads with the blocker.
+      tellAnswer ? buildResearchAnswerPrompt() : null,
     ]
       .filter((part): part is string => part !== null)
       .join("\n\n");
@@ -806,8 +951,12 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     // the brain should already hold; research findings are what just came back).
     const memoryPreamble = deps.peekMemoryPreamble?.() ?? "";
     const prompt = withMemoryPreamble(memoryPreamble, withResearchPreamble(research.preamble, body));
-    lastAttemptAt = now;
-    dropPending();
+    // EACH TRACK CHARGES ITS OWN ATTEMPT, and only the track that actually spoke. A research-only
+    // turn that moved `lastAttemptAt` would put the fleet behind a two-minute floor it never
+    // earned — the starvation §3.3 predicted, arriving by the back door.
+    if (hasMain) lastAttemptAt = now;
+    if (tellAnswer) researchLastAttemptAt = now;
+    if (hasMain) dropPending();
 
     let settled = false;
     const settle = (delivered: boolean) => {
@@ -827,11 +976,25 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
         // with it (roborev 57705). `dropPending` keeps that flag alive while notices are owed, and
         // `fire` runs it BEFORE the transport reports back, so at that moment the flag is rightly
         // held; this is where it is released.
-        clearOwed(notices);
-        firedAt.push(now);
-        stats.fired++;
+        // GUARDED ON THE MAIN TRACK. `clearOwed` lowers the shared "something is owed" flag and
+        // kills the timer when nothing is left; running it for a research-only turn would tear down
+        // a main-track window this turn never carried.
+        if (hasMain) {
+          clearOwed(notices);
+          firedAt.push(now);
+          stats.fired++;
+        }
+        // THE ANSWER LANDED — close this track's window. Not `firedAt`: see `observeResearch`.
+        if (tellAnswer) {
+          researchSince = null;
+          stats.researchFired++;
+        }
       } else {
         stats.skipped.declined++;
+        // A DECLINED ANSWER STAYS OWED. `researchSince` is deliberately untouched, so `arm()` below
+        // re-arms it behind this track's own retry floor. In practice the user turn that caused the
+        // decline delivers the findings itself through the user-turn seam, after which the
+        // stand-down above closes the window silently.
         // The change is still OWED. Re-pend it — unless a newer observation already did, in which
         // case that one supersedes this and the baseline (deliberately not advanced) still differs
         // from it.
@@ -849,7 +1012,12 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
         }
         // Puts the re-armed attempt behind the min-interval floor. Notices left in `pendingNotices`
         // are re-armed by this too — they were never removed, so nothing has to be restored.
-        if (pendingSince === null) pendingSince = deps.now();
+        //
+        // GUARDED ON `hasMain`: a declined RESEARCH-only turn carried nothing from this track, and
+        // raising the flag for it would create the one state this file treats as impossible —
+        // owed-with-nothing-owed — whose real cost is that `observe`'s `pendingSince ??=` then keeps
+        // a stale origin and the next genuine feed change fires with no coalescing window at all.
+        if (hasMain && pendingSince === null) pendingSince = deps.now();
       }
       arm();
     };
@@ -877,22 +1045,31 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
 
   /** (Re)arm the timer for whenever the pending change may fire, counting any limiter that is
    *  holding it — once per pending change per reason. */
+  /** ONE TIMER, TWO TRACKS: arm for whichever comes due first. Keeping a second `setTimer` handle
+   *  was the obvious alternative and is worse — `dispose`, `dropPending` and `clearOwed` all reach
+   *  for exactly one handle today, and a sibling they did not know about would outlive them. */
   const arm = () => {
-    if (disposed || pendingSince === null) return;
+    if (disposed) return;
     const now = deps.now();
     prune(now);
-    const due = dueAt(now);
-    if (due.reason !== "coalesce" && !counted.has(due.reason)) {
-      counted.add(due.reason);
-      stats.skipped[due.reason]++;
+    const mainDue = pendingSince === null ? null : dueAt(now);
+    const researchDue = researchDueAt();
+    if (mainDue === null && researchDue === null) return;
+    // Counted for the MAIN track only, and only when that track is what is holding things up. The
+    // research track has no limiter worth a statistic: it is held by its coalescing window, which
+    // is not a skip.
+    if (mainDue !== null && mainDue.reason !== "coalesce" && !counted.has(mainDue.reason)) {
+      counted.add(mainDue.reason);
+      stats.skipped[mainDue.reason]++;
     }
+    const at = Math.min(mainDue?.at ?? Infinity, researchDue ?? Infinity);
     clearTimer();
-    timer = deps.setTimer(onTimer, Math.max(0, due.at - now));
+    timer = deps.setTimer(onTimer, Math.max(0, at - now));
   };
 
   function onTimer() {
     timer = null;
-    if (disposed || pendingSince === null) return;
+    if (disposed) return;
     // A turn is still out. Don't arm a replacement here — that would busy-loop on an already-due
     // change; `settle` re-arms once the transport reports back.
     if (inFlight) return;
@@ -900,11 +1077,14 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
     prune(now);
     // A limiter can have moved under us (another turn ran; the hour rolled differently than the
     // arithmetic at arm time predicted), so the decision is re-taken here rather than trusted.
-    if (dueAt(now).at > now) {
+    const mainReady = pendingSince !== null && dueAt(now).at <= now;
+    const researchDue = researchDueAt();
+    const researchReady = researchDue !== null && researchDue <= now;
+    if (!mainReady && !researchReady) {
       arm();
       return;
     }
-    fire(now);
+    fire(now, mainReady, researchReady);
   }
 
   return {
@@ -1009,6 +1189,26 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
       pendingSince ??= deps.now();
       arm();
     },
+    observeResearch(tasks) {
+      if (disposed) return;
+      // Kept even when nothing is wake-worthy, because `fire`'s stand-down re-reads this snapshot
+      // to decide whether an answer is still owed at the moment it would speak.
+      researchTasks = tasks;
+      if (!researchWakeOwed()) {
+        // Everything owed has been claimed — by this channel or by a user turn that carried it.
+        // Close the window rather than leaving a timer running on a quiet fleet.
+        if (researchSince !== null) {
+          researchSince = null;
+          clearTimer();
+          arm();
+        }
+        return;
+      }
+      // NOT reset by later arrivals — the same coalescing rule as `pendingSince`, and the reason
+      // five runs finishing inside four seconds are one turn instead of five.
+      researchSince ??= deps.now();
+      arm();
+    },
     /**
      * See the interface for WHY this seam exists. Two properties, both cheap and both load-bearing:
      * it claims nothing, and it arms nothing.
@@ -1040,11 +1240,16 @@ export function createProactiveScheduler(deps: ProactiveDeps): ProactiveSchedule
 
     dispose() {
       disposed = true;
+      // Both tracks. `dropPending` only knows about the main one, and a research window left open
+      // would keep `arm` willing to set a timer on a scheduler that will never build another prompt.
+      researchSince = null;
+      researchTasks = [];
       dropPending();
     },
     stats: () => ({
       fired: stats.fired,
       noticesRidden: stats.noticesRidden,
+      researchFired: stats.researchFired,
       skipped: { ...stats.skipped },
     }),
   };

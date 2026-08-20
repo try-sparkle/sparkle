@@ -149,13 +149,31 @@ export const MAX_CHROME_BELOW_FOOTER = 8;
  *  affordance drawn with a character, and it is not — these are bytes we RECOGNIZE, not bytes we
  *  render. Escapes also keep the codepoints legible.
  *
- *    status  \u26a0 ⚠  \u23f8 ⏸  \u25b6 ▶  \u25c6 ◆  \u25cf ●  \u2713 ✓  \u2717 ✗
+ *    status  \u26a0 ⚠  \u23f8 ⏸  \u23f5 ⏵  \u23f4 ⏴  \u25b6 ▶  \u25c6 ◆  \u25cf ●  \u2713 ✓  \u2717 ✗
  *            \u273b ✻  \u273d ✽  \u2722 ✢
  *    rules   \u2500 ─  \u2501 ━  \u2550 ═  \u2594 ▔  \u2581 ▁  and a run of underscores
  *    frame   \u2502 │  with a rule after it
- *    caret   \u276f ❯  \u203a ›  or a bare > — an EMPTY composer only, hence the `$` */
+ *    caret   \u276f ❯  \u203a ›  or a bare > — an EMPTY composer only, hence the `$`
+ *
+ *  \u23f5 IS THE VERSION-CURRENT PLAY GLYPH (roborev 64564, Medium). 2.1.220 drew the \u25b6
+ *  spelling of `bypass permissions on`; 2.1.231 draws the \u23f5 one, captured verbatim at
+ *  `capturedScreens.fixture.ts:271` and `:314`. This class is the ONLY thing
+ *  `nothingUnrecognizedBelowFooter` accepts besides blanks, one closing border and a rule — the
+ *  walk families E and F in `claudeCodeScreen` both depend on, neither of which is width-limited.
+ *  So a bar this class fails to recognise CAN end that walk, and the vocabulary should match what
+ *  Claude actually draws.
+ *
+ *  BE PRECISE ABOUT WHAT WAS MEASURED, rather than asserting the consequence (roborev 64577). With
+ *  the glyph removed from the shipped code, this predicate stops matching the bar — but
+ *  `nothingUnrecognizedBelowFooter` still returned `true` for `APPROVAL_2_1_220` and
+ *  `MODEL_PICKER_2_1_220`, and `isClaudeCodeScreen` stayed `true`: the appended bar is not the row
+ *  those two screens' walks stop on. No screen shape is known that flips, so no behavioural test
+ *  claims one — writing it against those fixtures would have been vacuous, and the first draft was.
+ *  See the note in `claudeCodeScreen.liveDialog.test.ts`. \u23f4 rides along
+ *  for symmetry with the narrow arm's `STATUS_GLYPHS`. Ported in the SAME change into
+ *  `nudge_gate.rs::is_ambient_chrome_line`, whose drift test now pins this class by needle. */
 export const AMBIENT_CHROME_LINE =
-  /^[ \t\u00a0]*(?:[\u26a0\u23f8\u25b6\u25c6\u25cf\u2713\u2717\u273b\u273d\u2722]|[\u2500\u2501\u2550\u2594\u2581_]{4,}[ \t\u00a0]*$|[\u2502|][ \t\u00a0]*[\u2500\u2501\u2550]{4,}[ \t\u00a0]*$|[\u2502|]?[ \t\u00a0]*[\u276f\u203a>][ \t\u00a0]*$)/u;
+  /^[ \t\u00a0]*(?:[\u26a0\u23f8\u23f5\u23f4\u25b6\u25c6\u25cf\u2713\u2717\u273b\u273d\u2722]|[\u2500\u2501\u2550\u2594\u2581_]{4,}[ \t\u00a0]*$|[\u2502|][ \t\u00a0]*[\u2500\u2501\u2550]{4,}[ \t\u00a0]*$|[\u2502|]?[ \t\u00a0]*[\u276f\u203a>][ \t\u00a0]*$)/u;
 
 /** How many rendered rows may separate the LAST option row from the picker's footer.
  *

@@ -2,7 +2,7 @@
 //
 // The layout the founder approved (PRD/sparkle/ui-directions/rev4.html) is an F1 cockpit:
 //
-//     TERM │ BUILD │ CONCIERGE │ BUILD │ TERM
+//     TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM
 //
 // Build is ALWAYS adjacent to the concierge; the terminals sit at the outer edges. A PAIR is a
 // build column plus its terminal and is never split — they are one project, which is why the

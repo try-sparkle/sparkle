@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import {
   GOAL_EXPIRY_PROMPT_MARKER,
   NUDGE_PROMPT_MARKER,
+  EPIC_RESUME_PROMPT_MARKER,
   RESUME_PROMPT_MARKER,
   TASK_NOTIFICATION_MARKER,
   isSystemAuthoredPrompt,
@@ -12,6 +13,7 @@ import {
 import type { AgentGoal } from "./agentGoal";
 import { continuePrompt } from "./goalContinuation";
 import { isHumanAuthored } from "../services/dispatchAuthority";
+import { resumeInstruction } from "../services/sendToBuild";
 
 const goal = (text: string): AgentGoal => ({
   text,
@@ -34,6 +36,45 @@ describe("the round trip — the sender and the recogniser cannot drift apart", 
   it("recognises it whatever the goal text is — the marker is the invariant prefix", () => {
     for (const text of ["a", "ship the thing", "GOAL: nested goal text", RESUME_PROMPT_MARKER]) {
       expect(isSystemAuthoredPrompt(continuePrompt(goal(text)))).toBe(true);
+    }
+  });
+
+  // Sparkle BUILDS this one too, so it gets the same anti-drift round trip as `continuePrompt`
+  // rather than a copied literal. It matters more here than almost anywhere: the epic sweep only
+  // ever writes this to an agent already suspected of being stuck, so if the detector went blind
+  // Sparkle's own prose would be counted as that agent's activity — progress it did not make, and,
+  // on a second restart, a `repeating-command` verdict earned entirely by Sparkle repeating itself.
+  it("recognises the REAL epic-sweep resume instruction, not an approximation of it", () => {
+    expect(
+      isSystemAuthoredPrompt(
+        resumeInstruction({ projectId: "p1", epicId: "sparkle-e1", prdPath: "PRD/plan.md" }),
+      ),
+    ).toBe(true);
+  });
+
+  it("recognises it for a PRD-less epic too — both wordings share the prefix", () => {
+    expect(
+      isSystemAuthoredPrompt(
+        resumeInstruction({ projectId: "p1", epicId: "sparkle-e1", prdPath: null }),
+      ),
+    ).toBe(true);
+  });
+
+  // ── THE NEGATIVE THAT MATTERS MOST ────────────────────────────────────────────────────────────
+  // The tests above only prove the marker matches OUR output. On its own that is satisfied by a
+  // marker so broad it also matches the founder's. This is the case that forbids it.
+  it("does NOT suppress a HUMAN who types the same instruction in their own words", () => {
+    // The notice and the audit note both name the epic id, so this is the natural reply to compose
+    // into that agent's box — which is exactly why a bare "Resume epic " prefix was unsafe. A false
+    // match SUPPRESSES a real turn from both tallies: it stops counting as progress (so a
+    // genuinely-worked agent reads as stalled and gets auto-restarted) and stops counting as a
+    // command in the thrash detector. That is the expensive direction of this module's trade.
+    for (const human of [
+      "Resume epic sparkle-e1",
+      "Resume epic sparkle-e1 — the PRD is at PRD/plan.md",
+      "resume epic sparkle-e1 please",
+    ]) {
+      expect(isSystemAuthoredPrompt(human)).toBe(false);
     }
   });
 
@@ -94,6 +135,7 @@ describe("the OTHER system-authored prompts — measured, not guessed", () => {
       GOAL_EXPIRY_PROMPT_MARKER,
       TASK_NOTIFICATION_MARKER,
       NUDGE_PROMPT_MARKER,
+      EPIC_RESUME_PROMPT_MARKER,
     ]) {
       expect(isSystemAuthoredPrompt(`\n  ${marker} …`)).toBe(true);
     }

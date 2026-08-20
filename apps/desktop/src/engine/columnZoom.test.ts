@@ -44,11 +44,19 @@ function nest(column: string, depth: number): Element {
 }
 
 describe("classifyZoomColumn", () => {
-  it("resolves each of the five cockpit columns from a deeply nested descendant", () => {
-    // The whole point of the feature: five regions, told apart from one another. Asserted for every
+  it("resolves each of the seven cockpit columns from a deeply nested descendant", () => {
+    // The whole point of the feature: seven regions, told apart from one another. Asserted for every
     // key rather than one representative, because the failure this guards is a LEFT press resolving
     // to the RIGHT column, which only shows up when both are checked.
-    for (const key of ["terminal-left", "build-left", "concierge", "build-right", "terminal-right"]) {
+    for (const key of [
+      "terminal-left",
+      "build-left",
+      "epics-left",
+      "concierge",
+      "epics-right",
+      "build-right",
+      "terminal-right",
+    ]) {
       expect(classifyZoomColumn(nest(key, 6))).toBe(key);
     }
   });
@@ -107,7 +115,7 @@ describe("zoomColumnFor", () => {
     expect(zoomColumnFor("terminal", "right")).toBe("terminal-right");
     expect(zoomColumnFor("build", "left")).toBe("build-left");
     expect(zoomColumnFor("build", "right")).toBe("build-right");
-    for (const kind of ["terminal", "build"] as const) {
+    for (const kind of ["terminal", "build", "epics"] as const) {
       for (const side of ["left", "right"] as const) {
         expect(ZOOM_COLUMNS).toContain(zoomColumnFor(kind, side));
       }
@@ -118,6 +126,13 @@ describe("zoomColumnFor", () => {
 describe("isZoomColumn", () => {
   it("accepts every declared column and rejects everything else", () => {
     for (const key of ZOOM_COLUMNS) expect(isZoomColumn(key)).toBe(true);
+    // NAMED POSITIVES, not just `ZOOM_COLUMNS` above — that loop is satisfied by whatever the union
+    // happens to contain, so it cannot notice a member going missing. These two are spelled out
+    // because the `satisfies readonly ColumnKey[]` bridge in the source breaks on a RENAME and NOT
+    // on a deletion-plus-addition, so dropping an epics column would compile and leave `Cmd +/-`
+    // silently inert inside it.
+    expect(isZoomColumn("epics-left")).toBe(true);
+    expect(isZoomColumn("epics-right")).toBe(true);
     for (const bad of ["rail-left", "rail-right", "", "TERMINAL-LEFT", null, undefined, 3, {}]) {
       expect(isZoomColumn(bad)).toBe(false);
     }

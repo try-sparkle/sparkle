@@ -2167,13 +2167,18 @@ fn describe_blocking_dirt(porcelain: &str) -> String {
 /// there is provably nothing to lose:
 ///   * the worktree exists and is a real worktree (`no-worktree` otherwise),
 ///   * the tree is clean — no uncommitted or unmerged files (`dirty`),
-///   * every commit this park could put beyond reach already exists on some `origin/*` ref
-///     (`unpushed`) — this is the valve that protects a run which committed but could not push
-///     (e.g. an unauthenticated `gh`). That set is the agent's own branch, plus HEAD only when HEAD
-///     is detached or on the agent branch: `checkout -B` moves one ref, so a commit any OTHER named
-///     branch holds stays reachable by name and was never at risk. See [`head_is_at_risk`] for why
-///     counting HEAD unconditionally made this decline PERMANENTLY on the recurring headless
-///     worktree. A draft on a topic branch is therefore kept by that branch's ref, not by this valve.
+///   * every commit this park could put beyond reach already exists on some `origin/*` ref OR in the
+///     fresh base it is about to reset onto (`unpushed`) — this is the valve that protects a run which
+///     committed but could not push (e.g. an unauthenticated `gh`). That set is the agent's own
+///     branch, plus HEAD only when HEAD is detached or on the agent branch: `checkout -B` moves one
+///     ref, so a commit any OTHER named branch holds stays reachable by name and was never at risk.
+///     See [`head_is_at_risk`] for why counting HEAD unconditionally made this decline PERMANENTLY on
+///     the recurring headless worktree. A draft on a topic branch is therefore kept by that branch's
+///     ref, not by this valve. The base is one of the negative refs because a commit already in
+///     `origin/<base>` is part of the very history this park resets onto — a fully-merged branch that
+///     is merely behind therefore SELF-HEALS (fast-forwards) instead of reading as unpushed, which is
+///     the recurring stuck-park this closes: `--remotes=origin` alone misses it whenever the branch's
+///     own remote ref was pruned after the merge, or the base resolves to a local branch.
 /// Only then does it `checkout -B` the agent branch onto the fresh base. A failed fetch is
 /// non-fatal: it falls through to the last-known `origin/<base>`, so an offline machine still gets
 /// parked (just not freshened) rather than erroring.
@@ -2283,9 +2288,32 @@ pub fn park_worktree_on_base_at(
         }
     };
 
+    // Resolve the fresh base UP FRONT: it anchors the containment proof below. A commit already
+    // reachable from the base we are about to `checkout -B` onto CANNOT be stranded by that reset —
+    // it is part of the base's own history — so it is not "unpushed" no matter what the
+    // remote-tracking refs happen to say. This is the whole self-heal: a branch that is fully merged
+    // into `origin/<base>` (0 commits divergent) proves safe here and fast-forwards, instead of being
+    // read as holding work that "exists nowhere else" and declining every hour forever. It matters
+    // because `--remotes=origin` is an INCOMPLETE view of "already safe" in two real ways this park
+    // hits: a branch whose own remote counterpart was PRUNED after the merge no longer contributes a
+    // negative ref, and `effective_base` legitimately resolves to a LOCAL branch when `origin/<base>`
+    // is absent — a local base that `--remotes=origin` cannot see at all. Both read a behind-but-
+    // merged worktree as unpushed. Anchoring on the base commit we actually reset to closes both.
+    //
+    // Resolved as an Option, WITHOUT declining, so the `unpushed` proof still runs and reports before
+    // `no-base` does — preserving the pre-existing precedence between those two declines (a genuinely
+    // unpushed tree names `unpushed`, the more actionable reason, even when the base also won't
+    // resolve). The `no-base` decline itself is unchanged; it just reads this value below.
+    let base = effective_base(root, &logical, false);
+    let base_rev = format!("{base}^{{commit}}");
+    let base_sha_opt = git(root, &["rev-parse", "--verify", "--quiet", &base_rev])
+        .ok()
+        .map(|s| s.trim().to_string());
+
     // Containment check: refuse if ANY commit this park would put beyond reach is missing from every
-    // origin ref. `--not --remotes=origin` is the whole safety story — a run that committed and
-    // failed to push is indistinguishable from a run that pushed, except right here.
+    // origin ref AND from the fresh base. `--not --remotes=origin <base>` is the whole safety story —
+    // a run that committed and failed to push is indistinguishable from a run that pushed (or whose
+    // work merged), except right here.
     let branch = format!("sparkle/agent-{agent_id}");
     let branch_ref = format!("refs/heads/{branch}");
     let head_branch =
@@ -2304,12 +2332,18 @@ pub fn park_worktree_on_base_at(
         tips.push(branch_ref.as_str());
     }
     // Counted here (the tree is still on the departing branch) but REPORTED only after the park
-    // actually happens — see the emit site at the end of this function.
+    // actually happens — see the emit site at the end of this function. Anchored on the base too, for
+    // the same reason the containment proof is: a commit the departing branch shares with the base we
+    // move onto was never "stepped over" — the base still records it — so counting it would inflate a
+    // diagnostic that means "work now reachable by that branch alone".
     let stepped_over: u32 = match head_branch_name.filter(|_| !head_is_at_risk(head_branch_name, &branch)) {
-        Some(_) => git(&wt_str, &["rev-list", "--count", "HEAD", "--not", "--remotes=origin"])
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .unwrap_or(0),
+        Some(_) => {
+            let mut so: Vec<&str> = vec!["rev-list", "--count", "HEAD", "--not", "--remotes=origin"];
+            if let Some(ref bs) = base_sha_opt {
+                so.push(bs.as_str());
+            }
+            git(&wt_str, &so).ok().and_then(|s| s.trim().parse::<u32>().ok()).unwrap_or(0)
+        }
         None => 0,
     };
 
@@ -2319,6 +2353,16 @@ pub fn park_worktree_on_base_at(
         let mut rev_list: Vec<&str> = vec!["rev-list", "--count"];
         rev_list.extend_from_slice(&tips);
         rev_list.extend_from_slice(&["--not", "--remotes=origin"]);
+        // ANCHOR ON THE FRESH BASE TOO. `--not` negates every ref that follows it, so appending the
+        // base sha excludes commits reachable from `origin/<base>` (or the local base) exactly as it
+        // excludes the remotes. This is what makes a merged, behind worktree prove safe (0) and
+        // self-heal through the `checkout -B <agent> <base>` below, rather than declining `unpushed`.
+        // Genuinely-unpushed commits — on no remote AND not in the base — still count, so the valve's
+        // real protection is intact. Absent when the base won't resolve; the `no-base` decline below
+        // then reports that, and until then this degrades to the prior `--remotes=origin`-only view.
+        if let Some(ref bs) = base_sha_opt {
+            rev_list.push(bs.as_str());
+        }
         // A failure here (no origin, unborn HEAD) must read as "can't prove it's safe" → decline.
         let unpushed: u32 = match git(&wt_str, &rev_list).ok().and_then(|s| s.trim().parse().ok()) {
             Some(n) => n,
@@ -2329,11 +2373,11 @@ pub fn park_worktree_on_base_at(
         }
     }
 
-    let base = effective_base(root, &logical, false);
-    let base_rev = format!("{base}^{{commit}}");
-    let base_sha = match git(root, &["rev-parse", "--verify", "--quiet", &base_rev]) {
-        Ok(sha) => sha.trim().to_string(),
-        Err(_) => return Ok(ParkOutcome::declined("no-base")),
+    // The base was resolved (as an Option) before the containment proof so it could anchor it; the
+    // `no-base` decline is unchanged, just deferred to here so `unpushed` keeps its precedence.
+    let base_sha = match base_sha_opt {
+        Some(sha) => sha,
+        None => return Ok(ParkOutcome::declined("no-base")),
     };
 
     // Already sitting on the fresh base with the right branch checked out → nothing to do. Checking
@@ -2648,6 +2692,20 @@ pub struct BranchStatus {
     /// The TRUE number of uncommitted paths, which may exceed `dirty_files.len()`. A "+N more"
     /// affordance must count from THIS; `dirty_files` is a preview, not an inventory.
     dirty_count: u32,
+    /// WHICH BRANCH every number above was measured on — the output of `resolve_agent_branch`, not
+    /// the minted `sparkle/agent-<id>` name the caller passed an id for.
+    ///
+    /// WHY IT IS ON THE WIRE (bead `sparkle-pgkbn4`). A release-cut agent that had tagged, built and
+    /// published v0.114.0 read as "Local: Nothing Yet", because the resolver measured a stale, empty
+    /// minted ref instead of the branch the work was on. Every number on the row was RIGHT ABOUT A
+    /// BRANCH NOBODY MEANT, and the row could not say so — so the only way to find out was to open a
+    /// terminal and re-derive the resolution by hand. A row that reports ahead/behind must be able to
+    /// name what it counted them against; a wrong branch is then one glance, not an investigation.
+    ///
+    /// Always non-empty on a successful read: even the two zeroed-status guards below (missing branch
+    /// ref, unresolvable base) fill it, because THOSE are exactly the readings whose zeroes need
+    /// explaining.
+    branch: String,
 }
 
 /// Status for an agent branch whose base ref can't be resolved: there's no base to diverge from,
@@ -2659,7 +2717,7 @@ fn ahead_only_status(root: &str, branch: &str, d: &DirtyReading, worktree_on_bra
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0);
-    BranchStatus { ahead, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count }
+    BranchStatus { ahead, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, branch: branch.to_string() }
 }
 
 /// The branch an agent's worktree is actually checked out on, or "" when the tree is missing, the
@@ -2700,14 +2758,38 @@ fn local_branch_exists(root: &str, branch: &str) -> bool {
 /// that was previously unanswerable, and leaves the parked-worktree contract (sparkle-rhgm) exactly
 /// as it was:
 ///   1. The tree is on the minted branch — the overwhelmingly common case. Unchanged.
-///   2. The minted ref EXISTS but the tree is elsewhere — the PARKED case. Keep reporting the
-///      minted branch with `worktree_on_branch: false`, so `dirty` stays attributable to whatever
-///      got checked out and every consumer's existing filtering still applies.
-///   3. The minted ref is GONE and the tree is on some other branch — the RENAME. Report on the
-///      branch the work is actually on. `worktree_on_branch` is true because it genuinely is.
+///   2. The minted ref EXISTS, CARRIES WORK OF ITS OWN, and the tree is elsewhere — the PARKED
+///      case. Keep reporting the minted branch with `worktree_on_branch: false`, so `dirty` stays
+///      attributable to whatever got checked out and every consumer's existing filtering applies.
+///   2b. The minted ref CARRIES work, the tree is on a branch evidenced as this agent's, and that
+///      branch already contains everything the minted ref holds and more — the RENAME-AFTER-COMMIT.
+///      The minted name is a strictly older view of one history, so report the head.
+///   3. The tree is on some other branch and the minted ref is either GONE or EMPTY — the RENAME.
+///      Report on the branch the work is actually on. `worktree_on_branch` is true because it is.
 ///   4. Anything else (fresh agent, no worktree, detached HEAD, parked on the base branch with its
 ///      own ref already deleted) — fall back to the minted name and let the existing
 ///      "branch doesn't exist" guards return the zeroed status, as before.
+///
+/// ⚠️ RUNG 3 WAS UNREACHABLE FOR THE CASE IT WAS WRITTEN FOR, AND THAT MISFILED SHIPPED WORK
+/// (bead `sparkle-pgkbn4`). Rung 2 used to test only `local_branch_exists(minted)`, and
+/// `git checkout -b <descriptive-name>` — which AGENTS.md actively encourages — does NOT delete the
+/// minted ref. So an agent that renamed its branch was measured on an empty ref FOREVER: nothing
+/// deletes that ref, so no later poll repairs it. Fed the empty branch, every gate downstream then
+/// closed correctly on its own terms — `branch_ever_committed` → `Some(false)` →
+/// `branch_carries_no_own_work` → `let shipped = !no_own_work && …` SUPPRESSES the release-tag
+/// check → `committedSeen` false → `building_unsaved` → `local_none`. The measured case: an agent
+/// that tagged, built and published v0.114.0, whose tip `git tag --contains` puts inside that very
+/// release, sat under "Local: Nothing Yet" — the same heading as an agent that had done nothing.
+/// The perverse shape is worth stating: the MORE disciplined an agent is about branch naming, the
+/// more likely its status was wrong.
+///
+/// The discriminator between rungs 2 and 3 is `branch_ever_committed(minted)`, and it must be
+/// `Some(false)` — a POSITIVE reading that the minted ref never authored anything. `None` (a repo
+/// with no reflog, `core.logAllRefUpdates=false`, a reflog gc'd away) keeps rung 2's behaviour:
+/// "we could not tell" must never be what moves an agent onto a different branch's history, which
+/// is the same one-directional caution `branch_carries_no_own_work` is built on. A genuinely parked
+/// worktree — minted branch holding real commits, tree checked out elsewhere — reads `Some(true)`
+/// and is unaffected, so the sparkle-rhgm contract survives verbatim.
 ///
 /// `base` is the integration base (`main`, `origin/main`, `develop`, …); an `origin/` prefix is
 /// stripped before comparing. Case 4's base check is what stops a tree parked on `main` from
@@ -2718,22 +2800,279 @@ fn local_branch_exists(root: &str, branch: &str) -> bool {
 /// `pub(crate)` so `promotion.rs` resolves a promoted agent's branch through THIS ladder rather
 /// than minting `sparkle/agent-<id>` at its own call site — a copy would drift, and the renamed
 /// case (rung 3) is exactly the one a promotion must not get wrong: it pushes and clones the ref.
-pub(crate) fn resolve_agent_branch(root: &str, head: &str, agent_id: &str, base: &str) -> (String, bool) {
+/// Whether the agent's WORKTREE HEAD branch is evidenced to belong to this agent, from
+/// `pr_owner`'s branch→agent table (see `pr_owner::observe_and_claim` for why that table and not
+/// git ancestry). Three-valued on purpose — "we did not ask" is not "not mine".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum HeadClaim {
+    /// The table resolves this branch to THIS agent. The only value that lets the ladder adopt it.
+    Mine,
+    /// A pre-existing, unambiguous row names a DIFFERENT agent. This is the ONLY refusal, and it is
+    /// deliberately narrow: it takes positive evidence that the branch is somebody else's.
+    NotMine,
+    /// No evidence either way — a first sighting, an `ambiguous` row, an unreadable store, or a
+    /// caller with no `app_data` at all (`promotion::preflight_at`). Adopts an adoptable head, which
+    /// is the pre-identity behaviour.
+    ///
+    /// ⚠️ THE TWO ERROR DIRECTIONS ARE NOT SYMMETRIC, which is why the no-evidence case adopts
+    /// rather than refuses. Adopting the wrong branch shows numbers that are wrong — but the row now
+    /// NAMES the branch they were measured on, so a human can see that at a glance. Refusing the
+    /// RIGHT branch shows "Local: Nothing Yet" on committed, shipped work, which is indistinguishable
+    /// from an agent that never started and is the exact failure this ladder exists to remove.
+    /// Prefer the diagnosable failure to the invisible one.
+    Unknown,
+}
+
+/// `HeadClaim::from_store` for callers outside this module (`promotion::preflight_at`).
+pub(crate) fn head_claim_from_store(
+    app_data: &Path,
+    project_id: &str,
+    branch: &str,
+    agent_id: &str,
+) -> HeadClaim {
+    HeadClaim::from_store(app_data, project_id, branch, agent_id)
+}
+
+impl HeadClaim {
+    /// Straight through from `pr_owner`, which decides the three-way split and documents why an
+    /// `ambiguous` row, an unreadable store and a first sighting are all `Unknown` rather than a
+    /// refusal. Nothing is re-derived here — a second opinion would just be a place to drift.
+    fn from_store(app_data: &Path, project_id: &str, branch: &str, agent_id: &str) -> Self {
+        match crate::pr_owner::claim_then_observe(app_data, project_id, branch, agent_id) {
+            crate::pr_owner::BranchClaim::Mine => HeadClaim::Mine,
+            crate::pr_owner::BranchClaim::Other => HeadClaim::NotMine,
+            crate::pr_owner::BranchClaim::Unknown => HeadClaim::Unknown,
+        }
+    }
+}
+
+pub(crate) fn resolve_agent_branch(
+    root: &str,
+    head: &str,
+    agent_id: &str,
+    base: &str,
+    head_claim: HeadClaim,
+    wt: Option<&Path>,
+) -> (String, bool) {
     let minted = format!("sparkle/agent-{agent_id}");
     if head == minted {
         return (minted, true);
-    }
-    if local_branch_exists(root, &minted) {
-        return (minted, false);
     }
     let base_name = base.strip_prefix("origin/").unwrap_or(base);
     // Never adopt ANOTHER agent's minted branch: a worktree parked on `sparkle/agent-<other>` would
     // otherwise report that agent's commits as this one's. Unknown beats wrong-but-confident.
     let is_other_agents = head.starts_with("sparkle/agent-") && head != minted;
-    if !head.is_empty() && head != base_name && !is_other_agents {
+    // Could we legitimately report on the head branch AT ALL? Pure string tests, and deliberately
+    // computed BEFORE the reflog read below: `branch_ever_committed` shells out, and a head that
+    // could never be adopted makes that fork pure waste on every poll of a parked worktree.
+    let head_is_a_candidate = !head.is_empty() && head != base_name && !is_other_agents;
+
+    if local_branch_exists(root, &minted) {
+        // PARKED or RENAMED? See the ladder note above: the ref existing is NOT the answer, because
+        // `git checkout -b` leaves it behind. Two things must BOTH hold before we adopt the head.
+        //
+        // `head_is_a_candidate` guards the `&&` deliberately, not just for tidiness: without it
+        // `branch_ever_committed` shells out on EVERY poll of EVERY parked worktree — including the
+        // base-branch parking it can never rescue — on what the surrounding code treats as a hot
+        // batch path (sparkle-zlic). Short-circuiting keeps the fork to the case that can change the
+        // answer.
+        let minted_is_empty =
+            head_is_a_candidate && branch_ever_committed(root, &minted) == Some(false);
+        // …and EMPTY IS NOT ENOUGH. `is_other_agents` only recognises the `sparkle/agent-` shape, and
+        // AGENTS.md pushes agents toward descriptive names — so "renamed away from an empty minted
+        // ref" and "never started, and something checked an unrelated branch out into this tree" are
+        // indistinguishable by emptiness alone. Adopting the second reports another branch's
+        // ahead/behind as this agent's AND sets `worktree_on_branch: true`, which un-gates `dirty` /
+        // `dirty_files` and attributes another branch's uncommitted files to this agent BY NAME —
+        // the failure `BranchStatus`'s own doc calls "a worse version of that mistake".
+        //
+        // ⚠️ GIT ANCESTRY CANNOT SUPPLY THAT EVIDENCE, and an earlier cut of this fix used it and was
+        // wrong in BOTH directions (roborev 65171):
+        //   * TOO WEAK — when the minted ref is empty it IS the base tip the agent was cut from, so
+        //     every sibling branch cut at or after that point contains it. "Does the head descend
+        //     from minted" therefore admits nearly every branch it was written to exclude.
+        //   * ACTIVELY WRONG — `park_worktree_on_base_at` runs `checkout -B sparkle/agent-<id>
+        //     <base>`, FORCE-ADVANCING the minted ref past a branch that was renamed earlier. After
+        //     one hourly park, ancestry refuses the genuine rename and the agent goes back under
+        //     "Local: Nothing Yet" — reintroducing the exact bug this ladder exists to fix, and
+        //     sending `promotion::preflight_at` to push and clone the empty ref.
+        //
+        // So the evidence is IDENTITY, not shape: `pr_owner`'s branch→agent table, which the status
+        // poll already writes on every tick and which latches `ambiguous` the moment a second agent
+        // is seen on one branch. See `HeadClaim`.
+        // `NotMine` is the ONLY refusal — the same rule rung 3 applies. Requiring a positive `Mine`
+        // here instead would refuse every FIRST sighting of a renamed branch, since the ownership
+        // row is written by this very poll and cannot pre-date it; the agent would read "Nothing
+        // Yet" until some later tick, which is the failure this ladder exists to remove.
+        if minted_is_empty && head_claim != HeadClaim::NotMine {
+            return (head.to_string(), true);
+        }
+        // RUNG 2b — THE SAME MISTAKE, ONE COMMIT LATER. Everything above turns on the minted ref
+        // being EMPTY, which only ever described an agent that renamed BEFORE its first commit. The
+        // ordinary shape is the other order: an agent commits, learns from the work what its branch
+        // should be called, and only then runs `git checkout -b`. Its minted ref then reads
+        // `Some(true)`, rung 2 keeps winning, and it is measured for the rest of its life on a ref
+        // frozen at that first commit. Measured on the founder's machine: a resolved minted ref
+        // **116 commits stale** whose tip had since landed and been released, so the row read
+        // "Remote: Shipped to Production" over work that had shipped in nothing — `sparkle-pgkbn4`
+        // inverted, and the worse direction for "which agents are safe to retire".
+        //
+        // TWO PIECES OF EVIDENCE, AND NEITHER IS SUFFICIENT ALONE.
+        //   * IDENTITY (`Mine`, positively) — ancestry cannot carry this rung any more than it could
+        //     carry rung 3. A minted ref that has LANDED is an ancestor of `main`, so every branch
+        //     cut from recent main contains it; "does the head descend from minted" therefore admits
+        //     nearly every branch it is meant to exclude, exactly as the note above warns. This is
+        //     `Mine` rather than rung 3's `!= NotMine` because here the alternative is a defensible
+        //     answer (the parked minted name), not "Nothing Yet" — so a first sighting parks and the
+        //     next poll adopts, instead of guessing on no evidence.
+        //   * SUPERSESSION — a minted ref holding a commit the head does NOT have is a FORK, and
+        //     moving off it would hide work that exists in exactly one place.
+        //   * CONTINUATION — and supersession is NOT the safety net an earlier cut of this claimed
+        //     (roborev 65348, finding 1). Once the minted ref has LANDED — which is the measured
+        //     motivating case, and this repo merges rather than squashes — its tip is an ancestor of
+        //     `main`, so EVERY branch cut from a recent `main` contains it and is ahead of it. Both
+        //     topology tests pass for free and the rung collapses onto `Mine` alone, which
+        //     `claim_then_observe` grants to whatever branch this worktree was first seen on: check
+        //     an unrelated branch out into a landed agent's tree and the next poll would adopt it,
+        //     un-gating `dirty`/`dirty_files` and attributing another branch's uncommitted files to
+        //     this agent BY NAME — the exact "worse version of that mistake" `BranchStatus`'s doc
+        //     names, and the parked contract's whole reason for existing.
+        //
+        //     `worktree_walked_from_minted` supplies what topology cannot: evidence from THIS
+        //     worktree's own HEAD reflog that the tree walked off the minted ref and AUTHORED work
+        //     on the way. A passive checkout of somebody else's branch produces the hop but no work,
+        //     so it is refused; the multi-hop rename an agent actually performs is not.
+        //
+        // Every shell-out sits behind the two cheap tests (a string test, then an enum compare), and
+        // the reflog read sits behind the topology ones, so a genuinely parked worktree — parked on
+        // the base, on another agent's minted ref, or on a branch evidenced as somebody else's —
+        // never pays for any of them. That keeps this inside the per-poll subprocess budget
+        // `sparkle-zlic` set for the batch path.
+        if head_is_a_candidate
+            && head_claim == HeadClaim::Mine
+            && minted_superseded_by_head(root, &minted, head)
+            && worktree_walked_from_minted(wt, &minted, head)
+        {
+            return (head.to_string(), true);
+        }
+        return (minted, false);
+    }
+
+    // Rung 3: the minted ref is GONE, so there is no "measure the other one" alternative and the
+    // only question is whether this head is adoptable at all. A POSITIVE `NotMine` still refuses —
+    // another agent's evidenced branch is not this agent's work just because our own ref vanished.
+    if head_is_a_candidate && head_claim != HeadClaim::NotMine {
         return (head.to_string(), true);
     }
     (minted, false)
+}
+
+/// Has the agent MOVED PAST its minted ref onto `head` — as opposed to forking away from it?
+///
+/// The distinction is the whole of rung 2b. "Superseded" means the head carries EVERYTHING the
+/// minted ref holds and has gone further: the minted name is then a strictly older view of one
+/// history, and reporting it can only ever under-report. "Forked" means the minted ref still holds
+/// at least one commit that exists nowhere else — and the right thing to do with work that exists
+/// in exactly one place is to keep pointing at it, which is the `sparkle-rhgm` parked contract.
+///
+/// Deliberately NOT a proxy for "is this the agent's branch" — `resolve_agent_branch` answers that
+/// from `pr_owner`'s identity table before it ever calls this. See rung 2b for why ancestry cannot
+/// answer it: a landed minted ref is an ancestor of `main`, so nearly every branch contains it.
+fn minted_superseded_by_head(root: &str, minted: &str, head: &str) -> bool {
+    let minted_tip = rev_parse_tip(root, minted);
+    if minted_tip.is_empty() {
+        return false;
+    }
+    if !ref_contains(root, head, &minted_tip) {
+        return false;
+    }
+    // Strictly ahead. Two refs at the same commit are the genuine park — nothing has moved on, so
+    // the minted name stays the one we report and `worktree_on_branch` stays false.
+    commits_beyond(root, minted, head) > 0
+}
+
+/// Did THIS worktree walk off the agent's minted ref onto `head`, AUTHORING work along the way?
+///
+/// The evidence topology cannot supply, and rung 2b's real guard. A landed minted ref is an
+/// ancestor of the default branch, so `minted_superseded_by_head` is satisfied by any branch cut
+/// from a recent `main` — including one a human checked out into this agent's tree. Adopting that
+/// would set `worktree_on_branch: true` and attribute a stranger's uncommitted files to this agent.
+///
+/// The worktree's OWN `HEAD` reflog (per-worktree, under `.git/worktrees/<id>/logs/HEAD`) records
+/// `checkout: moving from <a> to <b>` for every branch this tree moved between, which is exactly
+/// the scoped question: what did THIS tree do? So we replay it oldest-first, start the chain at the
+/// first hop OFF the minted ref, follow each subsequent hop that departs from where the chain
+/// currently is, and require both that the chain ends on `head` and that at least one commit was
+/// authored somewhere along it.
+///
+/// ⚠️ IT MUST BE A CHAIN, NOT A SINGLE HOP. Agents rename repeatedly — the measured case walked
+/// `sparkle/agent-<id>` → `ci/action-archive-cache` → `ci/action-cache-followup` →
+/// `ci/release-bump-rust-exemption` → `ci/scale-runner-pool`, committing at each step. A rule that
+/// asked "was the last checkout FROM the minted ref" would refuse the very agent this rung exists
+/// to rescue.
+///
+/// ⚠️ AND THE WORK REQUIREMENT IS THE DISCRIMINATOR, not decoration — but it is work on the branch
+/// being ADOPTED, not anywhere along the chain. Checking a stranger's branch out into a tree
+/// produces the identical hop; what it never produces is a commit authored on it AFTERWARDS. So
+/// `authored` resets at every hop, including a continuing one: an earlier hop's commits are
+/// evidence about that earlier branch and nothing else. (Carrying them forward is precisely how the
+/// first cut of this reopened the hole it was written to close — roborev 65402.)
+///
+/// The cost of that strictness is one poll of latency: a tree that has JUST moved onto a new name
+/// and not yet committed reads as parked, and adopts the moment it commits. That is the right
+/// direction to be wrong in — at that instant a renamed branch and a stranger's branch are
+/// genuinely indistinguishable.
+///
+/// `None` (no worktree, e.g. a caller with only a repo root) and any unreadable reflog are `false` —
+/// the same one-directional caution as `branch_ever_committed`: "we could not tell" must never be
+/// what moves an agent onto another branch's history.
+fn worktree_walked_from_minted(wt: Option<&Path>, minted: &str, head: &str) -> bool {
+    let Some(wt) = wt else {
+        return false;
+    };
+    if head.trim().is_empty() || !wt.exists() {
+        return false;
+    }
+    let Ok(log) = git(&wt.to_string_lossy(), &["reflog", "show", "--format=%gs", "HEAD"]) else {
+        return false;
+    };
+    // `git reflog` prints newest-first; the chain only reads forwards.
+    let mut on: Option<String> = None;
+    // Evidence is PER-BRANCH, not per-hop (roborev 65487, finding 1): the name a commit was made
+    // on is what that commit vouches for, and it keeps vouching for it however many times the tree
+    // later steps off that name and back. A single `authored` flag reset at each hop could not
+    // express that — it erased real evidence on an ordinary excursion-and-return (inspect another
+    // ref, or the app's own `park_worktree_on_base_at` plus a re-checkout), and since the flag only
+    // returns on the NEXT commit, a finished branch sitting in review never recovered it.
+    let mut authored_on: HashSet<String> = HashSet::new();
+    for msg in log.lines().map(str::trim).filter(|l| !l.is_empty()).rev() {
+        if let Some(rest) = msg.strip_prefix("checkout: moving from ") {
+            let Some((from, to)) = rest.split_once(" to ") else {
+                on = None;
+                authored_on.clear();
+                continue;
+            };
+            if on.as_deref() == Some(from) || from == minted {
+                // The chain continues onto the next name — or starts, at the first hop off the
+                // minted ref. The set is NOT cleared here: it is keyed by branch name, so work on
+                // hop N still cannot vouch for hop N+1 (roborev 65402, finding 1 — a stranger's
+                // branch checked out after a legitimate rename has nothing in the set), while a
+                // return to a name this tree really did author still resolves.
+                on = Some(to.to_string());
+            } else {
+                // The tree was moved from somewhere the chain is not. Whatever it is doing now, it
+                // is not a continuation of this agent's minted branch — start over, and drop the
+                // evidence with it: outside the chain we cannot vouch for any of those names.
+                on = None;
+                authored_on.clear();
+            }
+        } else if reflog_entry_is_work(msg) {
+            if let Some(cur) = on.as_deref() {
+                authored_on.insert(cur.to_string());
+            }
+        }
+    }
+    on.as_deref().is_some_and(|cur| cur == head && authored_on.contains(head))
 }
 
 /// Resolve the PARENT (orchestrator) branch a worker integrates into.
@@ -2758,17 +3097,34 @@ fn resolve_parent_branch(
     parent_branch: &str,
     base: &str,
 ) -> String {
-    if parent_branch.trim().is_empty() || local_branch_exists(root, parent_branch) {
+    if parent_branch.trim().is_empty() {
         return parent_branch.to_string();
     }
+    // THE CHEAP STRING TEST FIRST. Without the minted shape there is no parent id to recover, so the
+    // recovery below cannot run whatever the reflog says — and reading the reflog before finding
+    // that out is a `git reflog show` per worker per poll on the batch path, whose own comment
+    // budgets this function at 1-3 subprocesses (sparkle-zlic).
     let Some(parent_id) = parent_branch.strip_prefix("sparkle/agent-") else {
         return parent_branch.to_string();
     };
+    // EXISTENCE IS NOT ENOUGH HERE EITHER, and this short-circuit made the recovery below dead code
+    // for the exact case the doc comment says it exists for. `git checkout -b` leaves the minted
+    // `sparkle/agent-<parentId>` ref in place, so a renamed ORCHESTRATOR still resolved to its empty
+    // ref, `workflow_state_shared`'s `in_parent = ref_contains(root, parent_branch, tip)` read false
+    // against it, and every one of its workers was told its demonstrably-merged work had not landed.
+    // Same discriminator as `resolve_agent_branch`: only a parent ref that positively never authored
+    // anything falls through to recovery, so `None` (unknown reflog) keeps today's behaviour.
+    if local_branch_exists(root, parent_branch)
+        && branch_ever_committed(root, parent_branch) != Some(false)
+    {
+        return parent_branch.to_string();
+    }
     let Ok(wt) = worktree_path(app_data, project_id, parent_id) else {
         return parent_branch.to_string();
     };
     let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
-    resolve_agent_branch(root, &head, parent_id, base).0
+    let claim = HeadClaim::from_store(app_data, project_id, &head, parent_id);
+    resolve_agent_branch(root, &head, parent_id, base, claim, Some(wt.as_path())).0
 }
 
 /// RECORD which branch an agent is working on, whatever it is called.
@@ -2782,16 +3138,19 @@ fn resolve_parent_branch(
 /// Cheap by construction: `pr_owner::record_branch` writes only when the mapping actually changes,
 /// so a steady-state poll re-reads a small file and writes nothing. Best-effort — a failure costs a
 /// resolvable owner, never a status reading.
-fn observe_worktree_branch(app_data: &Path, project_id: &str, agent_id: &str, head_branch: &str) {
+fn observe_worktree_branch(
+    app_data: &Path,
+    project_id: &str,
+    agent_id: &str,
+    head_branch: &str,
+) -> HeadClaim {
     if head_branch.is_empty() {
-        return;
+        // A detached HEAD or a missing tree names no branch, so there is nothing to record and
+        // nothing to claim. `Unknown` is the honest value — we did not ask — and it changes nothing:
+        // `head_is_a_candidate` already refuses an empty head before the claim is ever consulted.
+        return HeadClaim::Unknown;
     }
-    if let Err(e) = crate::pr_owner::observe_branch(app_data, project_id, head_branch, agent_id) {
-        tracing::warn!(
-            %head_branch, %agent_id, error = %e,
-            "could not record branch → agent ownership (non-fatal)"
-        );
-    }
+    HeadClaim::from_store(app_data, project_id, head_branch, agent_id)
 }
 
 /// Core (AppHandle-free, testable): live ahead/behind + dirty + size of an agent branch vs its
@@ -2816,9 +3175,13 @@ pub fn agent_branch_status_at(
     // no `sparkle/agent-<id>` ref and used to read as a zeroed (⇒ "Unsaved") status. See
     // `resolve_agent_branch` for the full ordering and why the parked case is unaffected.
     let head_branch = worktree_head_branch(&wt_str, wt.exists());
+    // OBSERVE FIRST, THEN RESOLVE — the order is load-bearing now, not incidental. The observation
+    // is what puts this head in `pr_owner`'s branch table, and the resolve reads that table for its
+    // adoption evidence; resolving first would leave the very first poll after a rename with no
+    // record to consult. One call does both (see `pr_owner::observe_and_claim`).
+    let head_claim = observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
     let (branch, worktree_on_branch) =
-        resolve_agent_branch(root, &head_branch, agent_id, &base);
-    observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
+        resolve_agent_branch(root, &head_branch, agent_id, &base, head_claim, Some(wt.as_path()));
 
     // Dirtiness needs the actual worktree. When it's GONE (a landed/cleaned-up agent whose tab
     // stays open and keeps getting polled), a removed tree has no uncommitted changes — report
@@ -2849,7 +3212,7 @@ pub fn agent_branch_status_at(
     )
     .is_err()
     {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count });
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, branch: branch.clone() });
     }
 
     // The agent branch exists, but its RESOLVED base may not: `effective_base` documents an
@@ -2880,7 +3243,7 @@ pub fn agent_branch_status_at(
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
 
-    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count })
+    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count, branch })
 }
 
 /// Live ahead/behind + dirty + size of an agent branch vs its (no-fetch) effective base.
@@ -3860,6 +4223,201 @@ fn decode_open_prs(stdout: &str, limit: u32) -> Option<Vec<PrRow>> {
 /// — the one channel that survives a lost store or a fresh install. Resolving here (rather than in
 /// JS) also BACKFILLS the durable store in the same pass, so a legacy `sparkle/agent-<id>` PR keeps
 /// resolving once its branch is renamed or deleted.
+/// How many PRs the REST fallback reads check state for in one probe.
+///
+/// The GraphQL query returns every rollup in ONE round trip; REST needs two calls per PR, so the
+/// fallback is O(N) where the primary is O(1). This bounds the menu's cost during an outage.
+const REST_CHECK_BUDGET: usize = 20;
+
+/// One `gh api <path>` against `dir`'s repo. `{owner}/{repo}` is resolved by `gh` from the working
+/// directory, so no slug lookup is needed.
+fn gh_api(dir: &str, path: &str) -> Option<String> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.arg("api")
+        .arg(path)
+        .current_dir(dir)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// REST bodies → the same `PrRow`s the GraphQL path produces, PURE apart from the injected fetcher.
+///
+/// `me` reproduces the primary query's `--author @me` scoping, which REST's list endpoint has no
+/// parameter for — an empty `me` means "could not establish who I am", and rather than silently
+/// widening the menu to every contributor's PRs that case is refused by the caller.
+///
+/// MERGEABILITY IS REPORTED AS UNKNOWN, ALWAYS. REST's list endpoint does not carry `mergeable`
+/// or `mergeable_state` (GitHub computes them lazily, single-PR GET only). `"unknown"` is the
+/// value this codebase already means by "GitHub has not finished deciding", and the UI already
+/// treats it as a reason to WAIT rather than to offer a one-click merge — so an outage degrades
+/// the menu to "listed, not yet mergeable" instead of inventing a verdict. Reporting `"mergeable"`
+/// here would put a live Merge button under a PR nobody read.
+fn rest_rows_from_parts<F>(
+    pulls_body: &str,
+    me: &str,
+    budget: usize,
+    mut fetch_checks: F,
+) -> Option<Vec<PrRow>>
+where
+    F: FnMut(&str) -> Option<Vec<Value>>,
+{
+    let pulls = crate::gh_rest::decode_pulls(pulls_body)?;
+    let mine: Vec<_> = pulls.into_iter().filter(|p| p.author == me).collect();
+    let covered = mine.len().min(budget);
+    Some(
+        mine.iter()
+            .take(covered)
+            .map(|p| {
+                let rollup = fetch_checks(&p.head_oid);
+                // A rollup we could not read yields NO check word rather than "none": "none" is
+                // the positive observation that a PR has no checks at all, and the UI reads it as
+                // ready-to-merge. An unreadable rollup must never borrow that meaning.
+                let (checks, failing, pending) = match rollup {
+                    Some(r) => {
+                        let (f, pd) = collect_check_names(&r);
+                        (classify_checks(&r).to_string(), f, pd)
+                    }
+                    None => ("unknown".to_string(), Vec::new(), Vec::new()),
+                };
+                PrRow {
+                    number: p.number,
+                    updated_at: p.updated_at.clone(),
+                    title: p.title.clone(),
+                    head_ref_name: p.branch.clone(),
+                    url: p.url.clone(),
+                    checks,
+                    mergeable: "unknown".into(),
+                    merge_state_status: "unknown".into(),
+                    failing_checks: failing,
+                    pending_checks: pending,
+                    head_ref_oid: p.head_oid.clone(),
+                    list_saturated: covered < mine.len(),
+                    ..Default::default()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// The real REST fallback: who am I, my open PRs, then check state for a bounded prefix.
+fn rest_open_prs(root: &str) -> Option<Vec<PrRow>> {
+    let me = gh_api(root, "user")
+        .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+        .and_then(|v| v.get("login").and_then(Value::as_str).map(str::to_string))
+        .filter(|s| !s.is_empty())?;
+    let pulls = gh_api(root, "repos/{owner}/{repo}/pulls?state=open&per_page=100")?;
+    rest_rows_from_parts(&pulls, &me, REST_CHECK_BUDGET, |sha| {
+        let runs = gh_api(root, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100"))?;
+        let statuses = gh_api(root, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/status"))?;
+        crate::gh_rest::rollup_from_rest(&runs, &statuses)
+    })
+}
+
+#[cfg(test)]
+mod rest_pr_rows_tests {
+    use super::*;
+
+    const PULLS: &str = r#"[
+        {"number":2027,"title":"mine","draft":false,"html_url":"https://gh/2027",
+         "user":{"login":"me"},"updated_at":"2026-08-17T00:00:00Z",
+         "head":{"ref":"b","sha":"aaaa1111"},"base":{"sha":"bbbb2222"}},
+        {"number":2028,"title":"also mine","draft":false,"html_url":"https://gh/2028",
+         "user":{"login":"me"},"updated_at":"2026-08-17T00:00:00Z",
+         "head":{"ref":"c","sha":"cccc3333"},"base":{"sha":"bbbb2222"}},
+        {"number":9999,"title":"somebody else's","draft":false,"html_url":"https://gh/9999",
+         "user":{"login":"other"},"updated_at":"2026-08-17T00:00:00Z",
+         "head":{"ref":"d","sha":"dddd4444"},"base":{"sha":"bbbb2222"}}
+    ]"#;
+
+    /// A REAL GREEN REST PAYLOAD MUST READ AS PASSING, end to end — REST's lowercase bodies,
+    /// through `gh_rest`'s normalization, through this file's own `classify_checks`. This is the
+    /// whole fallback in one assertion: skip the normalization and `classify_checks` sees
+    /// `"completed"`/`"success"`, misses the uppercase literals, and reports a green PR as pending
+    /// or failing instead.
+    #[test]
+    fn a_green_rest_payload_reads_as_passing_end_to_end() {
+        let runs = r#"{"check_runs":[{"name":"CI","status":"completed","conclusion":"success"}]}"#;
+        let statuses = r#"{"statuses":[{"context":"Vercel","state":"success"}]}"#;
+        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| {
+            crate::gh_rest::rollup_from_rest(runs, statuses)
+        })
+        .unwrap();
+        assert_eq!(rows[0].checks, "passing");
+        assert!(rows[0].failing_checks.is_empty(), "and names nothing as failing");
+    }
+
+    /// THE CONFLATION THIS GUARDS. `"none"` is the positive observation that a PR has NO checks,
+    /// and the UI reads it as ready-to-merge. An UNREADABLE rollup must never borrow that meaning —
+    /// it gets its own word, so "we could not look" cannot present as "nothing needs to run".
+    #[test]
+    fn an_unreadable_rollup_is_unknown_not_none() {
+        let unread = rest_rows_from_parts(PULLS, "me", 10, |_| None).unwrap();
+        assert_eq!(unread[0].checks, "unknown");
+        assert_ne!(unread[0].checks, "none", "an unread PR must not read as one with no checks");
+
+        let empty = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        assert_eq!(empty[0].checks, "none", "but a genuinely empty rollup still reads none");
+    }
+
+    /// A red check still reads red — the fallback must not launder failures into green either.
+    #[test]
+    fn a_failing_rest_check_still_reads_failing() {
+        let runs = r#"{"check_runs":[{"name":"CI","status":"completed","conclusion":"failure"}]}"#;
+        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| {
+            crate::gh_rest::rollup_from_rest(runs, r#"{"statuses":[]}"#)
+        })
+        .unwrap();
+        assert_eq!(rows[0].checks, "failing");
+        assert_eq!(rows[0].failing_checks, vec!["CI".to_string()]);
+    }
+
+    /// MERGEABILITY IS NEVER CLAIMED. REST's list cannot supply it, and `"unknown"` is what the UI
+    /// already treats as a reason to wait. Reporting `"mergeable"` here would put a live Merge
+    /// button under a PR whose mergeability nobody read.
+    #[test]
+    fn a_rest_row_never_claims_mergeability() {
+        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        for r in &rows {
+            assert_eq!(r.mergeable, "unknown");
+            assert_eq!(r.merge_state_status, "unknown");
+        }
+    }
+
+    /// The primary query is `--author @me`-scoped; REST has no such parameter, so the filter moves
+    /// client-side. Without it an outage would silently widen the menu to every open PR in the repo.
+    #[test]
+    fn only_my_own_prs_survive_the_author_filter() {
+        let rows = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.number != 9999), "another author's PR is not mine");
+    }
+
+    /// A bounded read announces that it is bounded, so the menu can say it is not showing
+    /// everything rather than implying the missing PRs do not exist.
+    #[test]
+    fn a_budget_cutoff_marks_the_list_saturated() {
+        let full = rest_rows_from_parts(PULLS, "me", 10, |_| Some(vec![])).unwrap();
+        assert!(!full[0].list_saturated);
+
+        let cut = rest_rows_from_parts(PULLS, "me", 1, |_| Some(vec![])).unwrap();
+        assert_eq!(cut.len(), 1);
+        assert!(cut[0].list_saturated);
+    }
+
+    /// An unreadable body is no read at all — never an empty menu, which would read as "you have
+    /// no open PRs".
+    #[test]
+    fn an_unreadable_pulls_body_is_not_an_empty_menu() {
+        assert!(rest_rows_from_parts("503 Service Unavailable", "me", 10, |_| Some(vec![])).is_none());
+    }
+}
+
 fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<PrRow>> {
     let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
@@ -3878,11 +4436,31 @@ fn probe_open_prs(root: &str, project_id: &str, app_data: &Path) -> Option<Vec<P
         .env("GH_PROMPT_DISABLED", "1")
         .env("GH_NO_UPDATE_NOTIFIER", "1");
     apply_noninteractive(&mut cmd);
-    let output = output_with_timeout(cmd, NETWORK_TIMEOUT).ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let mut rows = decode_open_prs(&String::from_utf8_lossy(&output.stdout), OPEN_PR_LIST_LIMIT)?;
+    // GraphQL first, REST second. `gh pr list --json …statusCheckRollup` is a GraphQL query, and
+    // when that endpoint degrades it exits non-zero and this probe used to drop straight to `None`
+    // — taking the whole PR menu, `pr_checks_status`, and the merge button down with it. Measured
+    // 2026-08-17: the GraphQL call failed 4 of 6 consecutive attempts with HTTP 503 while REST
+    // answered normally throughout. The two fail independently, so one covers for the other.
+    //
+    // A SPAWN failure is NOT retried over REST: that path runs through the same `gh` binary, so it
+    // cannot succeed, and the attempt would only cost another timeout.
+    let mut rows = match output_with_timeout(cmd, NETWORK_TIMEOUT) {
+        Err(_) => return None,
+        Ok(output) if output.status.success() => {
+            decode_open_prs(&String::from_utf8_lossy(&output.stdout), OPEN_PR_LIST_LIMIT)?
+        }
+        Ok(_) => {
+            let rows = rest_open_prs(root)?;
+            tracing::warn!(
+                target: "worktree",
+                rows = rows.len(),
+                "the GraphQL PR probe failed; answered the open-PR list from REST instead. \
+                 Mergeability is reported as UNKNOWN on these rows because REST's list endpoint \
+                 cannot supply it — that is 'not yet known', NOT 'this PR cannot merge'"
+            );
+            rows
+        }
+    };
     // A TRUNCATED MENU IS A LOG LINE AS WELL AS A FLAG. The flag is what the UI discloses; this is
     // what a human debugging "why isn't my PR in the list" can grep for, and it is the only record
     // if the WebView is the thing that is broken.
@@ -4206,6 +4784,9 @@ pub async fn merge_pr(
 ) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || {
         // BEFORE the merge, and returning `Err` on refusal: the merge is the irreversible half.
+        // The policy backstop runs FIRST — a repo we will never merge in is a cheaper, more
+        // definitive refusal than a review-coverage question about a PR in it.
+        merge_policy_gate(&root, "merge_pr")?;
         crate::knightwatch::enforce(&root, number, knightwatch_override.as_deref())?;
         let mut cmd = Command::new(crate::preflight::gh_program());
         cmd.args(merge_argv(number, expected_head_oid.as_deref()))
@@ -4655,7 +5236,15 @@ pub fn agent_workflow_state_in(
     let branch = match ctx.and_then(|(app_data, pid)| worktree_path(app_data, pid, agent_id).ok()) {
         Some(wt) => {
             let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
-            resolve_agent_branch(root, &head, agent_id, &default_branch_for_resolve).0
+            // `ctx` is what carries `app_data`; without it there is no ownership table to read and
+            // the claim stays `Unknown` (see `HeadClaim::Unknown`).
+            let claim = match ctx {
+                Some((app_data, pid)) => {
+                    HeadClaim::from_store(app_data, pid, &head, agent_id)
+                }
+                None => HeadClaim::Unknown,
+            };
+            resolve_agent_branch(root, &head, agent_id, &default_branch_for_resolve, claim, Some(wt.as_path())).0
         }
         None => format!("sparkle/agent-{agent_id}"),
     };
@@ -4900,11 +5489,13 @@ fn branch_status_with_base(
     // sees — fixing only the single-agent path would leave the misreport live in the UI.
     // `rev-parse` doesn't touch the index, so it can't defeat the fingerprint skip above.
     let head_branch = worktree_head_branch(&wt_str, wt.exists());
-    let (branch, worktree_on_branch) =
-        resolve_agent_branch(root, &head_branch, agent_id, base_ref);
     // Only agents the fingerprint did NOT skip reach here — which is exactly right for ownership:
     // a skipped agent is unchanged by definition, so its branch mapping cannot have moved either.
-    observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
+    // Observe BEFORE resolving: the resolve reads the table this write populates (see the same
+    // note in `agent_branch_status_at`).
+    let head_claim = observe_worktree_branch(app_data, project_id, agent_id, &head_branch);
+    let (branch, worktree_on_branch) =
+        resolve_agent_branch(root, &head_branch, agent_id, base_ref, head_claim, Some(wt));
     let d = DirtyReading::read(&wt_str, wt.exists(), true)?;
     // A brand-new/non-git agent polled before its first commit has no `sparkle/agent-<id>` ref yet;
     // `rev-list <base>...<missing>` then hard-fails with "ambiguous argument ... unknown revision",
@@ -4913,7 +5504,7 @@ fn branch_status_with_base(
     // the batch refactor): return a zeroed status — still reflecting the worktree's dirty state — when
     // the branch ref doesn't exist, so there's nothing to count against a ref that isn't there.
     if git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_err() {
-        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count });
+        return Ok(BranchStatus { ahead: 0, behind: 0, dirty: d.dirty, files_changed: 0, insertions: 0, deletions: 0, worktree_on_branch, dirty_files: d.files.clone(), dirty_count: d.count, branch: branch.clone() });
     }
     // The branch exists, but the RESOLVED base may not (`effective_base`'s documented unborn/HEAD-less
     // fallback can return a name git can't resolve). `rev-list <unresolvable-base>...<branch>` then
@@ -4936,7 +5527,7 @@ fn branch_status_with_base(
         insertions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
         deletions += cols.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     }
-    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count })
+    Ok(BranchStatus { ahead, behind, dirty: d.dirty, files_changed, insertions, deletions, worktree_on_branch, dirty_files: d.files, dirty_count: d.count, branch })
 }
 
 /// The agent's workflow state given ALREADY-RESOLVED shared inputs (default branch, origin presence)
@@ -5139,22 +5730,46 @@ pub fn project_agents_status_at(
         // `workflow_state_shared` return the all-false default and `branch_status_with_base`
         // return ahead=0 — the pair that renders a fully-committed agent as "Unsaved".
         //
-        // COSTS NOTHING IN THE STEADY STATE, which matters because this runs BEFORE the
-        // fingerprint skip (the `tip` below is part of the fingerprint, so it cannot be deferred).
-        // `rev_parse_tip` on the minted name is the same call the batch already made; a non-empty
-        // answer means the minted branch exists, and `resolve_agent_branch` returns the minted name
-        // in that case regardless of the head. So the extra `git rev-parse` for the head is paid
-        // ONLY when the minted ref is missing — the renamed agent and the brand-new one, never the
-        // idle-and-unchanged majority the sparkle-zlic skip exists to keep cheap.
+        // ⚠️ THIS SHORT-CIRCUIT USED TO SKIP THE LADDER ENTIRELY FOR THE VERY CASE IT EXISTS FOR, and
+        // its own comment asserted the invariant that stopped being true: "a non-empty answer means
+        // the minted branch exists, and `resolve_agent_branch` returns the minted name in that case
+        // regardless of the head". Rung 2 now returns the HEAD when the minted ref exists but is
+        // EMPTY — which is exactly `git checkout -b`, which leaves the ref behind. So `minted_tip`
+        // was non-empty, the `else` arm took `(minted, minted_tip)`, and a renamed agent's
+        // `workflow_state_shared` was computed against a branch holding no work: `landed`, `merged`,
+        // `in_parent` and `shipped` all false, and `fp.tip` frozen at the creation-time base so no
+        // later merge could even invalidate the cache. The row NAMED the renamed branch (that half
+        // resolves correctly) while the stage beside it said "Nothing Yet" — this path runs ~35
+        // agents every 15s, so it is the one that decides what the founder actually sees
+        // (roborev 65183).
+        //
+        // THE COST, honestly. This runs BEFORE the fingerprint skip (the `tip` below is part of the
+        // fingerprint, so it cannot be deferred), and the old shape paid the head `rev-parse` only
+        // when the minted ref was missing. Deciding correctly needs the head, so that one fork is
+        // now unconditional. Everything expensive stays behind it: the ownership read, the reflog
+        // and the second `rev_parse_tip` are paid only when the tree is OFF its minted branch, which
+        // is the parked/renamed minority. `head == minted` — the idle-and-unchanged majority
+        // sparkle-zlic exists to keep cheap — still takes the tip the batch already had.
         let minted = format!("sparkle/agent-{}", a.agent_id);
         let minted_tip = rev_parse_tip(root, &minted);
-        let (branch, tip) = if minted_tip.is_empty() {
-            let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
-            let resolved = resolve_agent_branch(root, &head, &a.agent_id, &base_ref).0;
+        let head = worktree_head_branch(&wt.to_string_lossy(), wt.exists());
+        let (branch, tip) = if head == minted && !minted_tip.is_empty() {
+            (minted, minted_tip)
+        } else {
+            // `observe_worktree_branch`, NOT `HeadClaim::from_store` — it carries the empty-head
+            // short-circuit, and skipping it made this the WRONG population to charge for a store
+            // read. A gone worktree or a detached HEAD gives `worktree_head_branch` an empty string,
+            // which never equals `minted`, so every one of them landed in this arm and took the
+            // process-wide `store_lock()` plus a re-parse of `pr-owners.json` on every 15s tick —
+            // for a claim that is `Unknown` by construction and that `head_is_a_candidate` discards
+            // anyway. Gone-but-still-polled worktrees are exactly the population that ACCUMULATES,
+            // so that is not the parked/renamed minority the comment above budgets for, and it
+            // serialises the whole batch on one mutex (roborev 65189).
+            let claim = observe_worktree_branch(app_data, project_id, &a.agent_id, &head);
+            let resolved =
+                resolve_agent_branch(root, &head, &a.agent_id, &base_ref, claim, Some(wt.as_path())).0;
             let resolved_tip = rev_parse_tip(root, &resolved);
             (resolved, resolved_tip)
-        } else {
-            (minted, minted_tip)
         };
         let base_tip = base_tip_memo
             .entry(base_ref.clone())
@@ -5633,6 +6248,9 @@ pub async fn land_agent_branch(
     target_branch: String,
 ) -> Result<LandOutcome, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // BEFORE the merge: `land_agent_branch_at` writes to the target branch, which is the
+        // irreversible half. See `merge_policy_gate` for why only `deny` is enforced here.
+        merge_policy_gate(&root, "land_agent_branch")?;
         land_agent_branch_at(&root, &agent_id, &target_branch)
     })
     .await
@@ -7064,9 +7682,511 @@ pub fn merge_bypass_consent_settings(existing: Option<&str>) -> String {
     serde_json::to_string_pretty(&root).unwrap()
 }
 
+// ── MERGE POLICY: THE RUST BACKSTOP AND THE PER-WORKTREE WRITER ────────────────────────────────
+//
+// Two enforcement holes, one policy. Contract: `PRD/sparkle/per-project-tool-policy-contract.md`
+// §6 and §7 (bead `sparkle-gylxbo`).
+//
+//   §6 — `services/openPrs.ts` calls `invoke("merge_pr", …)` DIRECTLY, outside the concierge tool
+//        seam where `policy.ts` evaluates tiers. A TypeScript-only gate therefore does not cover
+//        the app's own merge buttons at all, so the hard refusal also lives here.
+//   §7 — `gh pr merge` typed by a build agent is in NEITHER layer today: not a concierge tool call,
+//        and deliberately not a static deny rule (see `MERGE_GUARD_DENY_RULE`). It becomes a
+//        PER-WORKTREE conditional, driven by the `.sparkle/merge-policy.json` this module writes.
+
+/// Slugs where Sparkle will NEVER merge on its own authority, whatever any config says.
+///
+/// A second copy of `apps/desktop/shared/merge-protected-repos.json`, exactly as
+/// [`SPARKLE_DENY_RULES`] is a second copy of `destructive-commands.json`, and pinned against that
+/// file the same way (`merge_protected_slugs_match_the_shared_fixture`). Lowercase: GitHub treats
+/// slugs case-insensitively and every comparison here lowercases first.
+const MERGE_PROTECTED_SLUGS: &[&str] = &["plow-pbc/tkmx-client", "plow-pbc/tkmx-server"];
+
+/// The deny rule that turns `gh pr merge` off for a Claude Code agent in ONE worktree.
+///
+/// Deliberately NOT a member of [`SPARKLE_DENY_RULES`]. That list is unconditional and has no
+/// approval path — a hard refusal a human cannot click through — and in `drodio/sparkle` merging a
+/// green PR is the *sanctioned* path (AGENTS.md, "Getting work to main"). Putting it there would
+/// break the owner's own workflow in order to protect repos he does not own, which is the exact
+/// trade this whole bead exists to stop making.
+const MERGE_GUARD_DENY_RULE: &str = "Bash(gh pr merge:*)";
+
+/// The remedy printed when a merge is refused. It is an INSTRUCTION the reader will follow
+/// (AGENTS.md, "User-facing copy is code"), so it names the only action that is safe under the
+/// conditions that triggered the refusal — a human decides — and it says do not retry, because
+/// nothing about a retry can change a pinned slug.
+const MERGE_POLICY_REMEDY: &str = "Hand the merge to a human. Do not retry.";
+
+/// `owner/repo`, lowercased, for a GitHub remote URL — or `None` rather than a guess.
+///
+/// DUPLICATES `crate::sparkle_agent::repo_slug_for_root` / `repo_slug_from_url`, which another
+/// worker is adding in the same feature. That duplication is deliberate and temporary: a
+/// cross-worker edit to `sparkle_agent.rs` collides, a 20-line helper does not. Collapse the two at
+/// merge time — theirs is the canonical name.
+pub(crate) fn merge_policy_slug_from_url(url: &str) -> Option<String> {
+    let url = url.trim();
+    let rest = if let Some(r) = url.strip_prefix("https://github.com/") {
+        r
+    } else if let Some(r) = url.strip_prefix("git@github.com:") {
+        r
+    } else if let Some(r) = url.strip_prefix("ssh://git@github.com/") {
+        r
+    } else {
+        return None; // another host, or a shape we cannot read — never a guess
+    };
+    let rest = rest.strip_suffix(".git").unwrap_or(rest);
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    let repo = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None; // deeper path — not a bare repo URL
+    }
+    Some(format!("{}/{}", owner.to_lowercase(), repo.to_lowercase()))
+}
+
+/// The slug for a repo or worktree root, read from `remote.origin.url`. `None` when there is no
+/// origin, git is unavailable, or the URL is not a GitHub `owner/repo`.
+///
+/// A linked worktree shares its repo's config, so this answers for a worktree as well as a root.
+///
+/// **NOT sufficient on its own to decide a merge** — see [`merge_policy_candidate_slugs`]. `gh`
+/// resolves the BASE repo for `gh pr merge`, which is not always origin.
+pub(crate) fn merge_policy_slug_for_root(root: &str) -> Option<String> {
+    let url = git(root, &["config", "--get", "remote.origin.url"]).ok()?;
+    merge_policy_slug_from_url(&url)
+}
+
+/// Lowercase and trim a repo reference that arrived as TEXT rather than as a remote URL, or
+/// `None`.
+///
+/// **IT MUST ACCEPT EVERY SHAPE `gh` ITSELF HONOURS, OR THE VALUE IS SILENTLY DROPPED AND THE GATE
+/// FAILS OPEN.** `$GH_REPO` is documented as `[HOST/]OWNER/REPO` and `gh` also takes a full URL
+/// there; `remote.<name>.gh-resolved` can likewise carry a host-qualified value. A stricter parser
+/// here does not refuse — it returns `None`, the value never joins the candidate set, the checkout
+/// reads as unpinned, and `gh` (which inherits that same environment, since `merge_argv` passes no
+/// `--repo`) merges in the pinned repo anyway.
+///
+/// A leading HOST segment is dropped rather than checked against `github.com`. That can only ever
+/// ADD a candidate, and an extra candidate is the fail-closed direction: at worst it over-refuses a
+/// merge a human can still perform by hand, where the alternative under-refuses one we promised
+/// never to make.
+fn normalize_slug(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    // A full URL is the URL parser's job, and it knows the `git@`/`ssh://` forms too.
+    if let Some(slug) = merge_policy_slug_from_url(raw) {
+        return Some(slug);
+    }
+    let s = raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_lowercase();
+    let mut parts: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    // `[HOST/]OWNER/REPO`: a leading segment carrying a `.` is a hostname, never an owner (GitHub
+    // account names cannot contain a dot).
+    if parts.len() == 3 && parts[0].contains('.') {
+        parts.remove(0);
+    }
+    if parts.len() != 2 {
+        return None;
+    }
+    Some(format!("{}/{}", parts[0], parts[1]))
+}
+
+/// PURE: EVERY GitHub repo this checkout could plausibly be acting on, most-authoritative first.
+///
+/// **ORIGIN IS NOT THE REPO `gh pr merge` ACTS ON, AND THE MISMATCH FAILS OPEN.** `gh` resolves the
+/// base repo from `$GH_REPO`, then its own `remote.<name>.gh-resolved` pin, then the remotes — so a
+/// FORK checkout (origin `drodio/tkmx-server`, upstream `plow-pbc/tkmx-server`) reads as an
+/// unpinned slug while the merge lands in the pinned upstream. `probe_viewer_permission` already
+/// documents this hazard and asks `gh` directly "so the two cannot disagree about which repo is
+/// meant"; a gate that consulted origin alone would reintroduce exactly that divergence, and its
+/// own refusal text promises "config cannot loosen a pin".
+///
+/// So the gate takes the STRICTEST answer over this whole set rather than one repo's. That is the
+/// fail-closed direction: over-refusing names a repo the human can merge in by hand, while
+/// under-refusing merges in a repo we promised never to touch. It stays local (git config reads,
+/// no `gh` spawn), which also means it is usable from `land_agent_branch`, where there is no `gh`
+/// notion of a base repo at all.
+pub(crate) fn merge_policy_candidates_from(
+    gh_repo: Option<&str>,
+    remote_urls: &str,
+    gh_resolved: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    fn push(out: &mut Vec<String>, slug: Option<String>) {
+        if let Some(s) = slug {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    // `$GH_REPO` overrides every remote, so it is the first thing gh would believe.
+    push(&mut out, gh_repo.and_then(normalize_slug));
+    // `remote.<name>.gh-resolved` is gh's own record of the base repo. It is either the literal
+    // `base` (meaning "that remote's URL is the base") or an explicit `owner/repo`.
+    for line in gh_resolved.lines() {
+        if let Some((_, value)) = line.split_once(' ') {
+            if value.contains('/') {
+                push(&mut out, normalize_slug(value));
+            }
+        }
+    }
+    // …then every remote, not just origin: `upstream` is the base of a fork checkout.
+    for line in remote_urls.lines() {
+        if let Some((key, url)) = line.split_once(' ') {
+            let slug = merge_policy_slug_from_url(url);
+            if key.starts_with("remote.origin.") {
+                push(&mut out, slug); // origin first among the remotes, for the file's `slug` field
+            }
+        }
+    }
+    for line in remote_urls.lines() {
+        if let Some((_, url)) = line.split_once(' ') {
+            push(&mut out, merge_policy_slug_from_url(url));
+        }
+    }
+    out
+}
+
+/// [`merge_policy_candidates_from`] against a real checkout.
+fn merge_policy_candidate_slugs(root: &str) -> Vec<String> {
+    let remote_urls = git(root, &["config", "--get-regexp", r"^remote\..*\.url$"]).unwrap_or_default();
+    let gh_resolved =
+        git(root, &["config", "--get-regexp", r"^remote\..*\.gh-resolved$"]).unwrap_or_default();
+    let gh_repo = std::env::var("GH_REPO").ok();
+    merge_policy_candidates_from(gh_repo.as_deref(), &remote_urls, &gh_resolved)
+}
+
+/// PURE: the FIRST candidate repo that refuses `tool`, or `None` when every one of them allows it.
+///
+/// The strictest-wins loop the gate runs, extracted so it is testable without a checkout — and so
+/// the loop itself, not merely `merge_policy_denies`, is what the tests exercise.
+pub(crate) fn first_denying_slug<'a, F>(slugs: &'a [String], tier_for: F) -> Option<&'a str>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    slugs
+        .iter()
+        .find(|s| merge_policy_denies(Some(s), tier_for(s).as_deref()))
+        .map(|s| s.as_str())
+}
+
+/// Is this slug on the shipped pin?
+pub(crate) fn is_pinned_merge_protected(slug: Option<&str>) -> bool {
+    match slug {
+        Some(s) => {
+            let s = s.trim().to_lowercase();
+            MERGE_PROTECTED_SLUGS.contains(&s.as_str())
+        }
+        None => false,
+    }
+}
+
+/// `<app_data>/config.toml` — the GLOBAL config, which is the only layer `[concierge]` is read
+/// from. A repo's own `.sparkle/config.toml` is deliberately never consulted here: a repo must not
+/// get a vote on its own permissions, which matters most for repos we do not own (contract §1.4).
+fn global_config_toml_path() -> Option<PathBuf> {
+    let base = if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support")
+    } else if cfg!(target_os = "windows") {
+        PathBuf::from(std::env::var_os("APPDATA")?)
+    } else {
+        match std::env::var_os("XDG_DATA_HOME") {
+            Some(x) => PathBuf::from(x),
+            None => PathBuf::from(std::env::var_os("HOME")?).join(".local/share"),
+        }
+    };
+    Some(crate::dev_identity::dev_suffixed_path(&base.join("ai.sparkle.desktop")).join("config.toml"))
+}
+
+/// PURE: the `[concierge.projects."<slug>".tools.<tool>"]` entry, lowercased, from config text.
+///
+/// Reads the raw TOML rather than `config::ConciergeConfig`, because the typed `projects` field is
+/// another worker's half of this feature and does not exist in this worktree yet. Same reasoning as
+/// [`merge_policy_slug_for_root`]: collapse at merge time, do not edit their file.
+///
+/// The slug key is TOML-quoted (`"plow-pbc/tkmx-server"`) since it contains a `/`; `toml` hands
+/// that back as an ordinary table key, so no quote handling is needed on this side.
+pub(crate) fn project_tool_tier_in(toml_text: &str, slug: &str, tool: &str) -> Option<String> {
+    let doc: toml::Value = toml::from_str(toml_text).ok()?;
+    let projects = doc.get("concierge")?.get("projects")?.as_table()?;
+    let want = slug.trim().to_lowercase();
+    let entry = projects
+        .iter()
+        .find(|(k, _)| k.trim().to_lowercase() == want)
+        .map(|(_, v)| v)?;
+    let tier = entry.get("tools")?.get(tool)?.as_str()?;
+    Some(tier.trim().to_lowercase())
+}
+
+/// The configured tier for `tool` in `slug`, read from the global config on disk.
+fn project_tool_tier(slug: &str, tool: &str) -> Option<String> {
+    let path = global_config_toml_path()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    project_tool_tier_in(&text, slug, tool)
+}
+
+/// PURE: does policy REFUSE this merge-class action outright?
+///
+/// **RUST ENFORCES `deny` ONLY — NEVER `ask`, AND THAT ASYMMETRY IS NOT A BUG.** There is no human
+/// on this path, so a Rust `ask` could only present as an unexplained failure; and keeping Rust to
+/// the hard refusal means there is no second copy of the strictness lattice here to drift from
+/// `policy.ts`'s. Two consequences follow, both deliberate:
+///
+///   * An UNRESOLVABLE slug does NOT deny. It cannot name a pinned repo, and the concierge layer
+///     still floors an unresolvable slug at `ask` for `mutates-main` tools, so the fail-closed
+///     behaviour lives there rather than being duplicated (and inevitably diverging) here. Note
+///     that [`merge_policy_for`] — the per-worktree FILE, which faces an unattended agent with no
+///     concierge layer above it — does the opposite and fails closed. Same fact, two audiences.
+///   * `foreign` (owner not in `[concierge].own_orgs`) is likewise absent: it floors at `ask`, and
+///     `ask` is not this layer's business.
+pub(crate) fn merge_policy_denies(slug: Option<&str>, project_tier: Option<&str>) -> bool {
+    is_pinned_merge_protected(slug) || project_tier.map(str::trim) == Some("deny")
+}
+
+/// The refusal text, naming the repo, the lever, and the remedy.
+pub(crate) fn merge_policy_refusal(slug: Option<&str>, tool: &str) -> String {
+    let repo = slug.unwrap_or("this repository");
+    let why = if is_pinned_merge_protected(slug) {
+        format!(
+            "{repo} is pinned merge-protected in the shipped \
+             apps/desktop/shared/merge-protected-repos.json, so Sparkle will never merge there on \
+             its own authority. Config cannot loosen a pin"
+        )
+    } else {
+        format!(
+            "the configured tool policy for {repo} sets {tool} = \"deny\" under \
+             [concierge.projects.\"{repo}\".tools]"
+        )
+    };
+    format!("Refusing {tool}: {why}. {MERGE_POLICY_REMEDY}")
+}
+
+/// **THE BACKSTOP.** Refuse a merge-class action the resolved policy DENIES.
+///
+/// Called as a statement with `?` at the TOP of [`merge_pr`] and [`land_agent_branch`], before
+/// anything irreversible — and pinned there by a body-scoped structural test
+/// (`merge_pr_actually_runs_the_merge_policy_gate`) so the call cannot be deleted or defanged into
+/// `let _ = …` without a test going red.
+///
+/// This is a BACKSTOP, not the policy engine. `policy.ts` owns the full allow/ask/deny lattice for
+/// concierge tool calls; this layer exists because `services/openPrs.ts` invokes `merge_pr`
+/// directly, outside that seam. See [`merge_policy_denies`] for why only `deny` is enforced here.
+pub fn merge_policy_gate(root: &str, tool: &str) -> Result<(), String> {
+    let candidates = merge_policy_candidate_slugs(root);
+    if let Some(slug) = first_denying_slug(&candidates, |s| project_tool_tier(s, tool)) {
+        return Err(merge_policy_refusal(Some(slug), tool));
+    }
+    Ok(())
+}
+
+/// The FROZEN wire shape of `<worktree>/.sparkle/merge-policy.json` (contract §7). Read by
+/// `worktree-guard.mjs` with native `JSON.parse`. Key names are normative — renaming one silently
+/// disarms the guard half, which is written in a separate worktree against this shape.
+///
+/// `slug` is a Rust `Option`, so it crosses as `null` and NEVER as an absent key (AGENTS.md); the
+/// guard must read `string | null`, not `string | undefined`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct MergePolicyFile {
+    pub version: u32,
+    pub slug: Option<String>,
+    pub merge_protected: bool,
+    pub reason: String,
+    pub remedy: String,
+}
+
+/// PURE: the policy file for a worktree whose slug and configured `merge_pr` tier are known.
+///
+/// **`mergeProtected` FAILS CLOSED on an unresolvable slug**, unlike [`merge_policy_denies`]. The
+/// audiences differ: the gate sits under a concierge layer that already floors an unknown slug at
+/// `ask`, while this file is the ONLY thing standing between an unattended agent's `gh pr merge`
+/// and a repo nobody can name. "We could not tell which repo this is" is not a licence to merge in
+/// it.
+pub fn merge_policy_for(slug: Option<&str>, project_tier: Option<&str>) -> MergePolicyFile {
+    let pinned = is_pinned_merge_protected(slug);
+    let denied = project_tier.map(str::trim) == Some("deny");
+    let unresolved = slug.is_none();
+    let merge_protected = pinned || denied || unresolved;
+    let reason = if pinned {
+        format!(
+            "{} is pinned merge-protected in apps/desktop/shared/merge-protected-repos.json, so \
+             Sparkle will never merge there on its own authority.",
+            slug.unwrap_or_default()
+        )
+    } else if denied {
+        format!(
+            "[concierge.projects.\"{}\".tools] sets merge_pr = \"deny\".",
+            slug.unwrap_or_default()
+        )
+    } else if unresolved {
+        "This worktree's GitHub repo could not be resolved from remote.origin.url. Sparkle fails \
+         closed rather than merging in a repo it cannot name."
+            .to_string()
+    } else {
+        format!(
+            "{} is not merge-protected: Sparkle may merge here under the usual checks.",
+            slug.unwrap_or_default()
+        )
+    };
+    // The remedy is the frozen string ONLY when it is true. An unprotected worktree that carried
+    // "hand the merge to a human" would be a user-facing instruction contradicting its own
+    // `mergeProtected: false` — and nothing reads the field unless the guard is blocking.
+    let remedy = if merge_protected {
+        MERGE_POLICY_REMEDY.to_string()
+    } else {
+        "None — merges are allowed here; the usual PR checks still apply.".to_string()
+    };
+    MergePolicyFile { version: 1, slug: slug.map(|s| s.to_string()), merge_protected, reason, remedy }
+}
+
+/// Resolve the policy for a real worktree on disk (slug from `remote.origin.url`, tier from the
+/// global config).
+pub fn merge_policy_for_worktree(worktree: &str) -> MergePolicyFile {
+    let candidates = merge_policy_candidate_slugs(worktree);
+    // STRICTEST over every repo this checkout could act on — same reasoning as the gate's, and for
+    // the same fork case. The protected candidate is the one named in the file, so the refusal the
+    // guard prints names the repo that is actually protected rather than origin.
+    for slug in &candidates {
+        let tier = project_tool_tier(slug, "merge_pr");
+        let policy = merge_policy_for(Some(slug), tier.as_deref());
+        if policy.merge_protected {
+            return policy;
+        }
+    }
+    // No candidate refused. `first()` is origin when there is one; an EMPTY set means we could not
+    // name this repo at all, which `merge_policy_for(None, ..)` fails closed on.
+    merge_policy_for(candidates.first().map(|s| s.as_str()), None)
+}
+
+/// What one pass has decided, handed from phase 1 to phase 2 of [`plan_merge_policy_at`].
+///
+/// `posture` is what the caller must do to `permissions.deny`; everything else is bookkeeping for
+/// [`commit_merge_policy`].
+pub struct MergePolicyPlan {
+    /// What this pass must do to the conditional deny rule.
+    pub posture: MergeRulePosture,
+    policy: MergePolicyFile,
+    worktree: PathBuf,
+    /// True when the policy file has NOT been written yet and phase 2 must write it.
+    deferred: bool,
+}
+
+impl MergePolicyPlan {
+    /// The verdict this pass resolved. `true` means the guard must block `gh pr merge` here.
+    pub fn merge_protected(&self) -> bool {
+        self.policy.merge_protected
+    }
+}
+
+/// PURE: the posture for this pass, and whether writing the policy file must WAIT for the caller's
+/// settings write to succeed.
+///
+/// **A RELAXATION IS DEFERRED BECAUSE THE FILE IS THE EVIDENCE THAT AUTHORISES IT.** Writing
+/// `mergeProtected: false` before the rule is actually gone destroys, one pass early, the only
+/// record that Sparkle owns that rule — and every subsequent pass then computes `Unknown` and
+/// leaves it alone. Since the settings write is fallible (and, in `install_worktree_guard`, three
+/// more fallible steps away), a failure anywhere in between would strand a deny rule that has NO
+/// approval path, permanently and silently: the "nothing ever removes the rule" hole in a narrower
+/// but unrecoverable form.
+///
+/// Deferring also restores the redundancy between the two installers. Whichever runs first does
+/// settings-then-policy; if it succeeded the rule is already gone and the second correctly reads
+/// `Unknown`, and if it FAILED the file still says `true`, so the second installer sees the same
+/// `Unprotected` and can finish the job.
+///
+/// Only a relaxation defers. Every other pass writes immediately, so the guard's absent-file rule
+/// stays safe for a brand-new worktree.
+pub(crate) fn merge_policy_write_is_deferred(posture: MergeRulePosture) -> bool {
+    posture == MergeRulePosture::Unprotected
+}
+
+/// Phase 1 — resolve this worktree's merge policy and say what to do about the deny rule.
+///
+/// **THE ONE ENTRY POINT BOTH SETTINGS INSTALLERS USE.** `AgentPane.prepare` calls
+/// `installWorktreeGuard` inside a `try/catch` that only warns, then calls `installAgentHooks`
+/// unconditionally — and the latter applies the FULL permission posture, bypass included, via
+/// `hooks::compose_agent_settings`. So a policy file written by only one of them leaves the exact
+/// hole §7 exists to close: on a worktree whose guard hook an earlier prepare already registered, a
+/// failed `install_worktree_guard` yields bypass ON, guard hook ACTIVE, and no policy file — which
+/// the guard reads as "not Sparkle-managed, no opinion". Both installers call this, mirroring the
+/// deliberate duplication of `merge_permission_posture` itself, so either alone is sufficient.
+///
+/// **EVERY CALLER MUST FOLLOW ITS SETTINGS WRITE WITH [`commit_merge_policy`]** — for a relaxation
+/// that is the call that writes the file at all.
+pub fn plan_merge_policy_at(worktree: &str) -> Result<MergePolicyPlan, String> {
+    let policy = merge_policy_for_worktree(worktree);
+    plan_merge_policy_for(Path::new(worktree), policy)
+}
+
+/// [`plan_merge_policy_at`] with the resolved policy supplied — the seam the tests drive, so a
+/// transition can be exercised without a checkout whose remotes say the right thing.
+fn plan_merge_policy_for(worktree: &Path, policy: MergePolicyFile) -> Result<MergePolicyPlan, String> {
+    // Read the PREVIOUS verdict: it is the only evidence that a `Bash(gh pr merge:*)` rule in this
+    // worktree is one Sparkle wrote rather than the human's.
+    let previous = read_merge_policy_at(worktree).map(|p| p.merge_protected);
+    let posture = merge_rule_posture_for(previous, policy.merge_protected);
+    let deferred = merge_policy_write_is_deferred(posture);
+    if !deferred {
+        write_merge_policy_at(worktree, &policy)?;
+    }
+    Ok(MergePolicyPlan { posture, policy, worktree: worktree.to_path_buf(), deferred })
+}
+
+/// Phase 2 — call ONLY after the settings write that applied `plan.posture` has succeeded.
+///
+/// A no-op unless this pass is a relaxation, in which case it is what writes the policy file. If it
+/// fails, the file keeps the previous `mergeProtected: true`: the guard goes on blocking (the
+/// fail-closed direction) and the next pass sees the same `Unprotected` and finishes the job.
+pub fn commit_merge_policy(plan: &MergePolicyPlan) -> Result<(), String> {
+    if !plan.deferred {
+        return Ok(());
+    }
+    write_merge_policy_at(&plan.worktree, &plan.policy)
+}
+
+/// Write `<worktree>/.sparkle/merge-policy.json`.
+///
+/// **UNCONDITIONAL, AND THAT IS LOAD-BEARING.** It is written for EVERY managed worktree, including
+/// unprotected ones (`mergeProtected: false`), because the guard's rule for an ABSENT file is "not
+/// a Sparkle-managed worktree, no opinion". That rule is only safe while the writer never skips.
+/// Write it conditionally and the guard has exactly two options, both wrong: block on absence,
+/// which breaks `gh pr merge` in every worktree predating this change — including the sanctioned
+/// path in the owner's own repo — or never block, which is the hole this closes.
+pub fn write_merge_policy_at(worktree: &Path, policy: &MergePolicyFile) -> Result<(), String> {
+    let dir = worktree.join(".sparkle");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .sparkle: {e}"))?;
+    let body = serde_json::to_string_pretty(policy)
+        .map_err(|e| format!("serialize merge-policy.json: {e}"))?;
+    std::fs::write(dir.join("merge-policy.json"), body)
+        .map_err(|e| format!("write merge-policy.json: {e}"))
+}
+
 /// Merge the PreToolUse guard hook into existing settings JSON (or a fresh object), preserving
 /// any keys the user already has.
 pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
+    // `Unknown`, not `Unprotected`: the two-argument form knows no worktree, so it cannot resolve a
+    // slug and must not guess one. It is the HEAL path (`hooks::heal_agent_hooks`), which re-points
+    // a stale guard command in a file that already exists — and since the rule writer is now
+    // SYMMETRIC, passing `Unprotected` here would strip the deny rule out of a merge-protected
+    // worktree on every heal. `Unknown` leaves it exactly as found.
+    merge_guard_settings_with_merge_policy(existing, guard_cmd, MergeRulePosture::Unknown)
+}
+
+/// [`merge_guard_settings`] plus the ONE conditional rule (contract §7): when this worktree's repo
+/// is merge-protected, `Bash(gh pr merge:*)` joins `permissions.deny`; when it is not, it must not.
+///
+/// Two layers, on purpose. This deny rule is a literal PREFIX match on the whole command, so it can
+/// only ever decide a simple invocation — `cd x && gh pr merge 5` sails straight past it. The
+/// compound case is `worktree-guard.mjs`'s job, reading the same verdict out of
+/// `.sparkle/merge-policy.json`. Neither layer is redundant and neither is sufficient.
+pub fn merge_guard_settings_with_merge_policy(
+    existing: Option<&str>,
+    guard_cmd: &str,
+    posture: MergeRulePosture,
+) -> String {
     let mut root: Value = existing
         .and_then(|s| serde_json::from_str(s).ok())
         .unwrap_or_else(|| json!({}));
@@ -7110,6 +8230,113 @@ pub fn merge_guard_settings(existing: Option<&str>, guard_cmd: &str) -> String {
     // Written by BOTH installers on purpose: `AgentPane.prepare` only warns when the guard install
     // fails, so a posture that rode solely on this path would go missing exactly when nobody looked.
     merge_permission_posture(&mut root);
+    apply_conditional_merge_deny(&mut root, posture);
+    serde_json::to_string_pretty(&root).unwrap()
+}
+
+/// What a caller knows about the worktree's repo when it rewrites `permissions.deny`.
+///
+/// Three states, not a `bool`, because "not protected" and "I have no idea" must do DIFFERENT
+/// things and a `bool` cannot hold the difference. The heal path
+/// (`hooks::heal_agent_hooks` → [`merge_guard_settings`]) re-points a stale guard command and knows
+/// no worktree, so it cannot resolve a slug; if it collapsed onto `Unprotected` it would silently
+/// STRIP the deny rule from a merge-protected worktree every time it ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeRulePosture {
+    /// The repo is merge-protected: the rule must be present.
+    Protected,
+    /// The repo is NOT merge-protected: the rule must be absent.
+    Unprotected,
+    /// This caller cannot tell. Leave whatever is there exactly alone.
+    Unknown,
+}
+
+/// PURE: which posture a rewrite should take, given what the worktree's policy file said BEFORE
+/// this pass and what it says now.
+///
+/// **`Unprotected` REQUIRES EVIDENCE THAT SPARKLE WROTE THE RULE.** The removal matches on the rule
+/// STRING, and nothing in a `settings.local.json` deny array records who put an entry there — a
+/// human, or Claude Code's own `/permissions` UI, writes the identical text. So an unconditional
+/// `Unprotected` would make every agent prepare on an ordinary repo (`drodio/sparkle` included)
+/// silently delete a human's explicit `gh pr merge` deny and hand the capability back: a fail-OPEN
+/// loosening, in a file whose other mergers are additive precisely so they can never do that.
+///
+/// A prior `mergeProtected: true` is that evidence, and it is evidence Sparkle wrote itself. With
+/// no prior protected file the rule cannot have come from us, so the posture is `Unknown` — leave
+/// it exactly alone.
+pub(crate) fn merge_rule_posture_for(
+    previous_protected: Option<bool>,
+    now_protected: bool,
+) -> MergeRulePosture {
+    if now_protected {
+        MergeRulePosture::Protected
+    } else if previous_protected == Some(true) {
+        // We wrote the rule on a previous pass and the repo is no longer protected: take it back
+        // off, or the sanctioned merge path stays dead with no approval path to revive it.
+        MergeRulePosture::Unprotected
+    } else {
+        MergeRulePosture::Unknown
+    }
+}
+
+/// The policy file this worktree already carries, if any. `None` covers absent, unreadable and
+/// unparseable alike — all three mean "no prior verdict of ours", which is the conservative read.
+fn read_merge_policy_at(worktree: &Path) -> Option<MergePolicyFile> {
+    let raw = std::fs::read_to_string(worktree.join(".sparkle").join("merge-policy.json")).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Bring `permissions.deny` into line with one worktree's merge policy, coercing a
+/// non-object/non-array on the way and de-duplicating by rule string, like
+/// [`merge_permission_posture`]. Idempotent.
+///
+/// **SYMMETRIC: it REMOVES the rule as well as adding it.** An additive-only writer is a one-way
+/// door, and this rule is precisely the kind that must not be one: a deny rule has no approval path
+/// (the property that keeps it out of [`SPARKLE_DENY_RULES`] in the first place), so a worktree
+/// installed while protected would keep refusing `gh pr merge` forever after the owner removed the
+/// project entry — with `.sparkle/merge-policy.json` beside it saying `mergeProtected: false`. The
+/// two layers would then disagree about one worktree, which is the thing this whole design is meant
+/// to make impossible.
+///
+/// Unlike the posture it does NOT wait for the guard hook to be installed: the reason the posture
+/// gates on the guard is that it turns the approval prompt OFF with nothing compound-aware in its
+/// place, and adjusting one brake has no such failure direction.
+fn apply_conditional_merge_deny(root: &mut Value, posture: MergeRulePosture) {
+    if posture == MergeRulePosture::Unknown {
+        return;
+    }
+    let obj = root.as_object_mut().unwrap();
+    let permissions = obj.entry("permissions").or_insert_with(|| json!({}));
+    if !permissions.is_object() {
+        *permissions = json!({});
+    }
+    let perms = permissions.as_object_mut().unwrap();
+    let deny = perms.entry("deny").or_insert_with(|| json!([]));
+    if !deny.is_array() {
+        *deny = json!([]);
+    }
+    let arr = deny.as_array_mut().unwrap();
+    // Retain-then-push in both directions, so the rule appears at most once whatever was there.
+    arr.retain(|e| e.as_str() != Some(MERGE_GUARD_DENY_RULE));
+    if posture == MergeRulePosture::Protected {
+        arr.push(json!(MERGE_GUARD_DENY_RULE));
+    }
+}
+
+/// Document-level form of [`apply_conditional_merge_deny`], for a caller that already holds a
+/// composed settings document as text — `hooks::install_agent_hooks_sync`, the SECOND installer,
+/// which applies the permission posture without going through [`merge_guard_settings`] at all.
+pub fn merge_conditional_merge_deny_settings(
+    existing: Option<&str>,
+    posture: MergeRulePosture,
+) -> String {
+    let mut root: Value = existing
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_else(|| json!({}));
+    if !root.is_object() {
+        root = json!({});
+    }
+    apply_conditional_merge_deny(&mut root, posture);
     serde_json::to_string_pretty(&root).unwrap()
 }
 
@@ -7130,12 +8357,27 @@ pub async fn install_worktree_guard(app: AppHandle, worktree: String) -> Result<
             shell_quote(&worktree)
         );
 
+        // The merge policy is resolved and WRITTEN FIRST, for every managed worktree, protected or
+        // not (see `write_merge_policy_at` for why the unconditional write is load-bearing). First
+        // because the ordering is the fail-closed one: if the write fails we return here, having
+        // left `settings.local.json` alone — so the bypass is not turned on, the agent merely
+        // prompts as it did before this posture existed, and no worktree ends up with the prompt
+        // off and no merge policy on disk.
+        let plan = plan_merge_policy_at(&worktree)?;
+
         let dir = Path::new(&worktree).join(".claude");
         std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir .claude: {e}"))?;
         let file = dir.join("settings.local.json");
         let existing = std::fs::read_to_string(&file).ok();
-        let merged = merge_guard_settings(existing.as_deref(), &guard_cmd);
-        std::fs::write(&file, merged).map_err(|e| format!("write settings.local.json: {e}"))
+        let merged = merge_guard_settings_with_merge_policy(
+            existing.as_deref(),
+            &guard_cmd,
+            plan.posture,
+        );
+        std::fs::write(&file, merged).map_err(|e| format!("write settings.local.json: {e}"))?;
+        // ONLY NOW may a relaxation be recorded: until the rule is actually gone from the settings
+        // file, the on-disk `mergeProtected: true` is the sole evidence authorising its removal.
+        commit_merge_policy(&plan)
     })
     .await
     .map_err(|e| format!("install_worktree_guard task failed: {e}"))?
@@ -9127,6 +10369,123 @@ mod tests {
         );
     }
 
+    /// Build a `main` that FULLY CONTAINS the agent branch's work but sits ahead of it, then delete
+    /// `origin/main` everywhere so the park's fetch cannot restore it and `effective_base` falls back
+    /// to the LOCAL `main`. Returns the sha the park must fast-forward the agent branch onto.
+    ///
+    /// This reproduces the exact incomplete-remote-view the self-heal closes: with `origin/main` gone
+    /// and the branch's own remote ref pruned, `--not --remotes=origin` sees no negative ref at all,
+    /// so it counts the branch's entire history as "unpushed" — even though every one of those commits
+    /// is part of the base the park is about to reset onto. `--remotes=origin` alone is blind to a
+    /// local base; anchoring the containment proof on the base commit is what sees it.
+    fn merge_agent_branch_into_local_base_then_drop_origin_main(r: &str, wt: &str) -> String {
+        // Work on the agent's OWN branch (the at-risk tip), then land it on `main`.
+        std::fs::write(format!("{wt}/agent-work.txt"), "work that later merged").unwrap();
+        git(wt, &["add", "."]).unwrap();
+        git(wt, &["commit", "-q", "-m", "agent work that merges"]).unwrap();
+        // `r` is checked out on `main`; merging the agent branch IN (a no-ff merge) leaves `main`
+        // strictly ahead of the agent branch, which is now fully contained but BEHIND.
+        git(r, &["merge", "--no-ff", "-q", "sparkle/agent-a1", "-m", "merge agent work"]).unwrap();
+        let base_sha = git(r, &["rev-parse", "refs/heads/main"]).unwrap().trim().to_string();
+        // The remote counterpart is gone: drop `main` from the bare origin so the park's fetch cannot
+        // bring it back, and drop the local tracking refs so `--remotes=origin` has nothing to offer.
+        let bare = git(r, &["remote", "get-url", "origin"]).unwrap().trim().to_string();
+        git(&bare, &["update-ref", "-d", "refs/heads/main"]).unwrap();
+        let _ = git(r, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let _ = git(r, &["update-ref", "-d", "refs/remotes/origin/HEAD"]);
+        base_sha
+    }
+
+    /// SELF-HEAL, the core fix: a worktree whose branch is FULLY MERGED into the integration base but
+    /// is behind it, whose remote counterpart was deleted, and which carries accumulated stashes, must
+    /// FAST-FORWARD onto the base — not decline `unpushed`. This is the stuck-park that stopped the
+    /// hourly pass for days: a lossless catch-up read as "commits that exist nowhere else", every hour
+    /// forever, because `--remotes=origin` could not see commits that live only in the (now local)
+    /// base. Asserts the SIDE EFFECTS: the branch moves onto the base, and the stashes survive.
+    #[test]
+    fn park_self_heals_a_fully_merged_branch_behind_the_base_with_stashes() {
+        let (r, wt, app_data) = init_repo_with_origin("park-selfheal-merged");
+        let base_sha = merge_agent_branch_into_local_base_then_drop_origin_main(&r, &wt);
+
+        // Accumulated stashes — separate refs, and the incident had a dozen. They must not wedge the
+        // park (a fast-forward does not touch them) and must still be there afterward.
+        for i in 0..3 {
+            std::fs::write(format!("{wt}/scratch.txt"), format!("dirty {i}")).unwrap();
+            git(&wt, &["add", "."]).unwrap();
+            git(&wt, &["stash", "push", "-q", "-m", &format!("wip {i}")]).unwrap();
+        }
+        let stashes_before = git(&wt, &["stash", "list"]).unwrap().lines().count();
+        assert_eq!(stashes_before, 3, "precondition: three stashes accumulated");
+        assert!(
+            git(&wt, &["status", "--porcelain"]).unwrap().trim().is_empty(),
+            "precondition: stashing leaves the tree clean, so `dirty` is not what is under test",
+        );
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
+
+        assert!(
+            out.parked,
+            "a fully-merged, behind branch with a pruned remote must self-heal, not decline: {out:?}",
+        );
+        assert_ne!(out.reason, "unpushed", "the lossless catch-up must not read as unpushed: {out:?}");
+        // THE SIDE EFFECT: the agent branch now sits ON the base commit...
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(),
+            base_sha,
+            "the worktree must have fast-forwarded onto the integration base",
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap().trim(),
+            "sparkle/agent-a1",
+            "and landed on the agent's own branch",
+        );
+        // ...AND the stashes are untouched — a fast-forward preserves them (they are separate refs).
+        assert_eq!(
+            git(&wt, &["stash", "list"]).unwrap().lines().count(),
+            stashes_before,
+            "every stash must survive the self-heal",
+        );
+    }
+
+    /// The PAIRED negative: the identical setup — origin/main dropped, base resolved to the local
+    /// integration branch — but with a commit the base does NOT contain. That commit exists on no
+    /// remote and is not in the base, so it is genuinely at risk and the park must STILL decline
+    /// `unpushed`. Proves the base anchor did not widen the valve into stepping over real work.
+    #[test]
+    fn park_still_declines_when_a_commit_is_absent_from_both_remote_and_base() {
+        let (r, wt, app_data) = init_repo_with_origin("park-selfheal-negative");
+        // Advance local `main` on its own, WITHOUT merging the agent branch, so the two diverge.
+        std::fs::write(format!("{r}/upstream.txt"), "unrelated base progress").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "base moves on without the agent work"]).unwrap();
+        // The agent branch commits work that never lands anywhere.
+        std::fs::write(format!("{wt}/unpushed.txt"), "committed, never pushed, never merged").unwrap();
+        git(&wt, &["add", "."]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "genuinely unpushed work"]).unwrap();
+        let agent_tip = git(&wt, &["rev-parse", "HEAD"]).unwrap().trim().to_string();
+        // Same incomplete-remote-view as the positive test: drop origin/main so the base is local.
+        let bare = git(&r, &["remote", "get-url", "origin"]).unwrap().trim().to_string();
+        git(&bare, &["update-ref", "-d", "refs/heads/main"]).unwrap();
+        let _ = git(&r, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        let _ = git(&r, &["update-ref", "-d", "refs/remotes/origin/HEAD"]);
+
+        let out =
+            park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
+
+        assert_eq!(
+            out,
+            ParkOutcome::declined("unpushed"),
+            "a commit on no remote and not in the base must still block the park: {out:?}",
+        );
+        assert_eq!(
+            git(&wt, &["rev-parse", "HEAD"]).unwrap().trim(),
+            agent_tip,
+            "the genuinely-unpushed commit must survive untouched",
+        );
+        assert!(Path::new(&wt).join("unpushed.txt").exists(), "its file must survive");
+    }
+
     #[test]
     fn head_is_at_risk_only_when_detached_or_on_the_agent_branch() {
         // Detached: nothing else names these commits.
@@ -9706,15 +11065,23 @@ mod tests {
         assert_eq!(out, ParkOutcome::declined("no-worktree"));
     }
 
-    // With no `origin` at all, "is this commit pushed?" is unanswerable — the conservative reading
-    // is "can't prove it's safe", so decline rather than reset against a local-only base.
+    // With no `origin` at all, a commit that is not in the local base either exists NOWHERE the park
+    // can prove safe — no remote holds it and the base it would reset onto does not contain it — so it
+    // must decline `unpushed` rather than step over it. (A commit that IS in the local base is a
+    // different case: resetting onto a base that already contains it is lossless, so that self-heals.
+    // See `park_self_heals_a_fully_merged_branch_behind_the_base_with_stashes`.)
     #[test]
     fn park_declines_when_containment_cannot_be_proven() {
         let r = init_repo("park-no-origin");
         let app_data = unique_root("park-no-origin-appdata");
-        create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        let info = create_worktree_at(&r, "p1", "a1", "main", &app_data).unwrap();
+        // A commit on the agent branch that no remote (there is none) and no base contains.
+        std::fs::write(format!("{}/loose.txt", info.path), "held by this branch alone").unwrap();
+        git(&info.path, &["add", "."]).unwrap();
+        git(&info.path, &["commit", "-q", "-m", "unpushed, uncontained work"]).unwrap();
         let out = park_worktree_on_base_at(&r, "p1", "a1", "main", &app_data, DirtyPolicy::Decline).unwrap();
         assert_eq!(out, ParkOutcome::declined("unpushed"));
+        assert!(Path::new(&info.path).join("loose.txt").exists(), "the commit's work must survive");
     }
 
     // Containment is a claim about origin AS IT IS NOW, so it has to be proven against a FRESHLY
@@ -13171,7 +14538,14 @@ mod tests {
         git(&root_str, &["branch", "-D", "sparkle/agent-mine"]).unwrap();
 
         let (branch, on_branch) =
-            resolve_agent_branch(&root_str, &worktree_head_branch(&info.path, true), "mine", "main");
+            resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "mine",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
         assert_eq!(
             branch, "sparkle/agent-mine",
             "must fall back to the minted name, never adopt another agent's branch"
@@ -13197,14 +14571,979 @@ mod tests {
         git(&root_str, &["branch", "-D", "sparkle/agent-parked"]).unwrap();
 
         let (branch, on_branch) =
-            resolve_agent_branch(&root_str, &worktree_head_branch(&info.path, true), "parked", "main");
+            resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "parked",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
         assert_eq!(branch, "sparkle/agent-parked", "must not adopt the base branch");
         assert!(!on_branch);
         // Same via the origin-prefixed base, which is what `effective_base` hands back when a
         // remote-tracking ref exists.
         let (branch2, _) =
-            resolve_agent_branch(&root_str, &worktree_head_branch(&info.path, true), "parked", "origin/main");
+            resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "parked",
+            "origin/main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
         assert_eq!(branch2, "sparkle/agent-parked", "the origin/ prefix must be stripped");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // ── The RENAMED agent (bead `sparkle-pgkbn4`) ────────────────────────────────────────────────
+    //
+    // `git checkout -b <descriptive-name>` does NOT delete the minted ref, so the old rung 2
+    // ("the minted ref exists ⇒ PARKED") swallowed every renamed agent and rung 3 could never run.
+    // The agent was then measured on an empty branch for the rest of its life, and nothing repaired
+    // it. These four tests pin the discriminator from both sides.
+
+    /// THE DEFECT. An agent that renamed its working branch — the shape AGENTS.md encourages — must
+    /// be measured on the branch its work is ON, even though the minted ref is still sitting there.
+    #[test]
+    fn the_branch_resolver_prefers_a_renamed_head_over_an_empty_minted_ref() {
+        let root = unique_root("resolve-renamed");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-renamed-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "renamed", "main", &app_data).unwrap();
+        // The rename, exactly as an agent performs it: a new descriptive branch, and the minted ref
+        // LEFT BEHIND — this is the half the old ladder could not see.
+        git(&info.path, &["checkout", "-b", "sparkle/ci-hosted-outage"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "the real work"]).unwrap();
+
+        assert!(
+            local_branch_exists(&root_str, "sparkle/agent-renamed"),
+            "fixture: the minted ref MUST still exist — that is what made rung 3 unreachable"
+        );
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-renamed"),
+            Some(false),
+            "fixture: and it must carry no work of its own"
+        );
+
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "renamed",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(
+            branch, "sparkle/ci-hosted-outage",
+            "an empty minted ref must not outrank the branch the work is actually on"
+        );
+        assert!(on_branch, "the tree genuinely IS on that branch");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The regression guard for the sparkle-rhgm parked contract, which the fix must NOT weaken: a
+    /// minted branch that carries real commits keeps winning, whatever the tree is checked out to.
+    #[test]
+    fn a_parked_worktree_whose_minted_branch_has_work_still_reports_the_minted_branch() {
+        let root = unique_root("resolve-parked-work");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-parked-work-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "busy", "main", &app_data).unwrap();
+        // Real work ON the minted branch first…
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        // …then the tree gets parked somewhere else entirely.
+        git(&root_str, &["branch", "somebody-elses-branch", "main"]).unwrap();
+        git(&info.path, &["checkout", "somebody-elses-branch"]).unwrap();
+
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-busy"),
+            Some(true),
+            "fixture: the minted branch carries its own commit"
+        );
+
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "busy",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(
+            branch, "sparkle/agent-busy",
+            "a minted branch holding real work is still this agent's branch"
+        );
+        assert!(!on_branch, "…and the tree is demonstrably not on it");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// UNKNOWN IS NOT "EMPTY". With no reflog to read, `branch_ever_committed` answers `None`, and
+    /// that must keep the old parked behaviour rather than move the agent onto another branch's
+    /// history — the same one-directional caution `branch_carries_no_own_work` is built on.
+    #[test]
+    fn an_unreadable_reflog_leaves_the_minted_branch_in_place() {
+        let root = unique_root("resolve-noreflog");
+        let root_str = root.to_string_lossy().to_string();
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        // A repo that keeps no reflogs at all (bare mirrors and `core.logAllRefUpdates=false` do
+        // this) — the branch is created with no record of how it got where it is.
+        git(&root_str, &["config", "core.logAllRefUpdates", "false"]).unwrap();
+        git(&root_str, &["branch", "sparkle/agent-quiet", "main"]).unwrap();
+
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-quiet"),
+            None,
+            "fixture: the reflog must be UNKNOWN, not empty-but-readable"
+        );
+
+        let (branch, on_branch) =
+            resolve_agent_branch(&root_str, "some-other-branch", "quiet", "main", HeadClaim::Mine, None);
+        assert_eq!(
+            branch, "sparkle/agent-quiet",
+            "an unknown reflog must not be what moves an agent onto another branch"
+        );
+        assert!(!on_branch);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE FOUNDER'S ACTUAL ROW, END TO END — the assertion with power. A release-cut agent renamed
+    /// its branch, committed, and the release tag covers that commit. It must read `shipped`.
+    ///
+    /// Asserting the resolver's return value alone would not have caught this: what broke was the
+    /// CHAIN — resolve → `branch_carries_no_own_work` → `let shipped = !no_own_work && …`, whose
+    /// guard SUPPRESSES the release-tag check for a branch with no work of its own. Measured on the
+    /// empty minted ref every link behaved correctly and the answer was still wrong.
+    #[test]
+    fn a_renamed_agent_whose_work_is_in_a_release_reads_as_shipped() {
+        let root = unique_root("renamed-shipped");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("renamed-shipped-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "relcut", "main", &app_data).unwrap();
+        git(&info.path, &["checkout", "-b", "sparkle/ci-hosted-outage"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "release work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "the work that shipped"]).unwrap();
+        let tip = rev_parse_tip(&root_str, "sparkle/ci-hosted-outage");
+        git(&root_str, &["tag", "v0.114.0", &tip]).unwrap();
+
+        let st = agent_workflow_state_in(
+            &root_str,
+            "relcut",
+            "",
+            false,
+            Some((app_data.as_path(), "p")),
+        )
+        .unwrap();
+        assert!(
+            st.shipped,
+            "the agent authored the commit the release was cut from — this is 'Shipped', not 'Nothing Yet'"
+        );
+        assert_eq!(st.ahead_of_base, 1, "and its own work is counted, not the empty minted ref's zero");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    // ── The agent that renamed AFTER it had already committed (the half `sparkle-pgkbn4` left) ───
+    //
+    // The pgkbn4 fix keys rung 3 on `branch_ever_committed(minted) == Some(false)`, so it rescues
+    // only an agent that renamed BEFORE it ever committed. Commit once on the minted ref and THEN
+    // `git checkout -b` — the ordinary shape, because an agent usually learns what its branch ought
+    // to be called by doing the work first — and the minted ref reads `Some(true)`, rung 2 keeps
+    // winning, and the agent is measured for the rest of its life on a ref that stopped moving at
+    // its first commit.
+    //
+    // MEASURED ON THE FOUNDER'S MACHINE: an agent resolved to a minted ref **116 commits stale**
+    // whose tip had since landed and been released, so the row read "Remote: Shipped to Production"
+    // while the work the agent was actually doing had shipped in NOTHING. That is the same lie as
+    // `sparkle-pgkbn4` pointing the other way, and it is the worse direction for the question the
+    // founder asks this ladder — "which agents are safe to retire" — because it says RETIRE about
+    // an agent holding a hundred-odd unlanded commits.
+    //
+    // THE PAIR IS THE POINT. Asserting only that `shipped` went false would pass just as well
+    // against a resolver that had stopped reporting `shipped` at all, so the second half re-tags the
+    // head tip and asserts the row DOES reach "Shipped" — the capability, not the absence.
+    #[test]
+    fn a_renamed_agent_that_committed_first_is_not_measured_on_the_superseded_minted_ref() {
+        let root = unique_root("resolve-superseded");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-superseded-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "moved", "main", &app_data).unwrap();
+
+        // 1. It commits ON the minted branch — this is what makes `branch_ever_committed` `Some(true)`
+        //    and puts this case outside the pgkbn4 fix.
+        std::fs::write(Path::new(&info.path).join("a.txt"), "first").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "first pass, before the branch had a name"]).unwrap();
+        // 2. That commit lands and a release is cut from it. The minted ref is now inside a release
+        //    tag FOREVER, which is the fact the stale reading goes on repeating.
+        let minted_tip = rev_parse_tip(&root_str, "sparkle/agent-moved");
+        git(&root_str, &["tag", "v1.0.0", &minted_tip]).unwrap();
+        // 3. …and only then does it rename and keep working. The new commits are in NO release.
+        git(&info.path, &["checkout", "-b", "ci/release-bump-exemption"]).unwrap();
+        for (f, m) in [("b.txt", "the real work"), ("c.txt", "more of it")] {
+            std::fs::write(Path::new(&info.path).join(f), m).unwrap();
+            git(&info.path, &["add", "-A"]).unwrap();
+            git(&info.path, &["commit", "-m", m]).unwrap();
+        }
+
+        assert_eq!(
+            branch_ever_committed(&root_str, "sparkle/agent-moved"),
+            Some(true),
+            "fixture: the minted ref DID author work — that is what the pgkbn4 discriminator sees"
+        );
+        assert!(
+            tip_in_release(&root_str, &minted_tip),
+            "fixture: and its stale tip really is inside a release"
+        );
+
+        // The ownership row is written BY the poll (`claim_then_observe` records what it just read),
+        // so a first sighting is `Unknown` by construction and adopting requires a positive `Mine`.
+        // One poll to record, the next to act on it — the same self-heal-next-tick shape the rest of
+        // this ladder uses, and worth pinning so nobody "fixes" the first call's parked answer.
+        let first = agent_workflow_state_in(
+            &root_str, "moved", "", false, Some((app_data.as_path(), "p")),
+        ).unwrap();
+        assert!(
+            first.shipped,
+            "fixture: the FIRST poll still reads the stale minted ref — this is the bug, observed"
+        );
+
+        let st = agent_workflow_state_in(
+            &root_str, "moved", "", false, Some((app_data.as_path(), "p")),
+        ).unwrap();
+        assert!(
+            !st.shipped,
+            "the branch this agent is working on is in no release — the minted ref it left behind \
+             being inside one must not make the row read 'Shipped to Production'"
+        );
+        assert_eq!(
+            st.ahead_of_base, 3,
+            "and all three of its commits are counted, not just the one the stale ref froze on"
+        );
+
+        // THE CAPABILITY, not just the absence: cut a release that DOES cover the work it is doing.
+        let head_tip = rev_parse_tip(&root_str, "ci/release-bump-exemption");
+        git(&root_str, &["tag", "v1.1.0", &head_tip]).unwrap();
+        let shipped = agent_workflow_state_in(
+            &root_str, "moved", "", false, Some((app_data.as_path(), "p")),
+        ).unwrap();
+        assert!(
+            shipped.shipped,
+            "…and once a release covers the branch it IS on, the row must reach 'Shipped'"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// A FORK IS NOT A SUPERSESSION, and the resolver must keep refusing to guess between them.
+    ///
+    /// If the head branch does NOT carry everything the minted ref has, then the minted ref holds
+    /// work that exists nowhere else, and moving the row off it would hide that work rather than
+    /// find it. Only a strict supersession — head contains the minted tip AND is ahead of it — is
+    /// evidence the agent moved on. Without this the rule degrades into "adopt any branch this
+    /// agent has been seen on", which is how the `sparkle-rhgm` parked contract gets lost.
+    #[test]
+    fn a_head_that_forked_away_from_the_minted_ref_stays_parked() {
+        let root = unique_root("resolve-forked");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-forked-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "forked", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("only-here.txt"), "unique").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "work that exists ONLY on the minted ref"]).unwrap();
+        // A second branch cut from `main`, NOT from the minted ref — so it can never contain it.
+        git(&info.path, &["checkout", "-b", "fix/somewhere-else", "main"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("d.txt"), "other work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "other work"]).unwrap();
+
+        // Two polls, so the ownership row is established and `Mine` is genuinely available — this
+        // test must fail for the ANCESTRY reason, not because identity was missing.
+        for _ in 0..2 {
+            let _ = agent_workflow_state_in(
+                &root_str, "forked", "", false, Some((app_data.as_path(), "p")),
+            );
+        }
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "forked",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(
+            branch, "sparkle/agent-forked",
+            "the minted ref holds a commit the head does not — that is a fork, and parking on it \
+             is what keeps that work visible"
+        );
+        assert!(!on_branch);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+
+    /// THE LANDED WORLD — the hole the fork test above could not see (roborev 65348, finding 2).
+    ///
+    /// That test keeps the minted commit UNLANDED and cuts the rival branch from a `main` that
+    /// predates it, so `ref_contains` fails on plain topology and the refusal is free. It therefore
+    /// proves nothing about the case that actually matters: once the minted ref has MERGED, its tip
+    /// is an ancestor of `main`, so a branch cut from the new `main` contains it AND is ahead of it
+    /// — both topology guards satisfied, leaving only `HeadClaim::Mine`, which this agent earns
+    /// simply by being polled twice on a tree somebody checked that branch out into.
+    ///
+    /// Adopting there would set `worktree_on_branch: true` and start attributing a stranger's
+    /// uncommitted files and ahead/behind to this agent by name. `worktree_walked_from_minted` is
+    /// what refuses it: the tree hopped off the minted ref but AUTHORED nothing afterwards.
+    #[test]
+    fn an_unrelated_branch_checked_out_after_the_minted_ref_landed_is_not_adopted() {
+        let root = unique_root("resolve-landed-rival");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-landed-rival-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "landed", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("a.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "agent work"]).unwrap();
+        // It LANDS. From here its tip is an ancestor of main, so containment proves nothing.
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-landed", "-m", "land"]).unwrap();
+        // Somebody else's branch, cut from the NEW main — so it contains the minted tip for free.
+        git(&root_str, &["branch", "feature/not-mine", "main"]).unwrap();
+        git(&root_str, &["checkout", "--detach"]).unwrap();
+        git(&info.path, &["checkout", "feature/not-mine"]).unwrap();
+
+        let minted_tip = rev_parse_tip(&root_str, "sparkle/agent-landed");
+        assert!(
+            ref_contains(&root_str, "feature/not-mine", &minted_tip),
+            "fixture: the rival MUST contain the landed minted tip — that is the whole trap"
+        );
+        assert!(
+            minted_superseded_by_head(&root_str, "sparkle/agent-landed", "feature/not-mine"),
+            "fixture: …so the topology guard is satisfied and cannot be what refuses this"
+        );
+
+        // Poll twice so the ownership row exists and the claim really is `Mine` — this must be
+        // refused for the CONTINUATION reason, not because identity happened to be missing.
+        for _ in 0..2 {
+            let _ = agent_branch_status_at(&root_str, "p", "landed", "main", &app_data);
+        }
+        assert_eq!(
+            HeadClaim::from_store(app_data.as_path(), "p", "feature/not-mine", "landed"),
+            HeadClaim::Mine,
+            "fixture: identity alone would adopt — so identity must not be the thing refusing"
+        );
+
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "landed",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(
+            branch, "sparkle/agent-landed",
+            "a branch this tree merely had checked out into it — authoring nothing after the hop — \
+             is not this agent's work, however completely it contains the landed minted ref"
+        );
+        assert!(
+            !on_branch,
+            "and `worktree_on_branch` must stay false, or a stranger's dirt is attributed by name"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The paired POSITIVE for the rule above, and the shape the founder's machine actually holds:
+    /// agents rename REPEATEDLY. The measured chain was `sparkle/agent-<id>` →
+    /// `ci/action-archive-cache` → `ci/action-cache-followup` → `ci/release-bump-rust-exemption` →
+    /// `ci/scale-runner-pool`, with commits at each hop. A single-hop rule would refuse the very
+    /// agent rung 2b exists to rescue, so the walk has to follow the whole chain.
+    #[test]
+    fn a_multi_hop_rename_chain_still_resolves_to_the_branch_the_work_is_on() {
+        let root = unique_root("resolve-chain");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-chain-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "chain", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("a.txt"), "first").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "first pass on the minted ref"]).unwrap();
+        for (b, f) in
+            [("ci/first-name", "b.txt"), ("ci/second-name", "c.txt"), ("ci/third-name", "d.txt")]
+        {
+            git(&info.path, &["checkout", "-b", b]).unwrap();
+            std::fs::write(Path::new(&info.path).join(f), b).unwrap();
+            git(&info.path, &["add", "-A"]).unwrap();
+            git(&info.path, &["commit", "-m", &format!("work on {b}")]).unwrap();
+        }
+
+        assert!(
+            worktree_walked_from_minted(
+                Some(Path::new(&info.path)),
+                "sparkle/agent-chain",
+                "ci/third-name"
+            ),
+            "three hops off the minted ref, committing at each — the chain must be followed through"
+        );
+
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "chain",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(branch, "ci/third-name", "the work is on the last name, not the first");
+        assert!(on_branch);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// THE PAIRED SURVIVAL CASE: an EXCURSION AND RETURN (roborev 65487, finding 1).
+    ///
+    /// Resetting `authored` on every continuing hop closes the carry-across hole above, but keyed to
+    /// "the last hop" it also discards evidence the tree genuinely earned on the branch it is STILL
+    /// ON. Inspecting `main` and coming back is an ordinary thing to do — as is the app's own
+    /// `park_worktree_on_base_at` followed by a re-checkout — and each writes a `checkout: moving
+    /// from` pair that blanks the flag.
+    ///
+    /// The consequence is not "one poll of latency": `authored` only comes back on the NEXT commit,
+    /// which may never come once the work is finished and sitting in review — precisely the window
+    /// in which the Build column's answer matters. The row would fall back to the frozen minted ref
+    /// and read "Shipped to Production" over it, the exact `sparkle-pgkbn4` failure this ladder
+    /// exists to remove.
+    ///
+    /// So the evidence has to be PER-BRANCH, not per-hop: work on `ci/foo` vouches for `ci/foo`
+    /// whenever the tree is on it, and never for anything else.
+    #[test]
+    fn an_excursion_and_return_keeps_the_evidence_earned_on_the_branch_returned_to() {
+        let root = unique_root("resolve-excursion");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-excursion-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "excursion", "main", &app_data).unwrap();
+        // A genuine rename with genuine work on it — this tree demonstrably authored `ci/foo`.
+        git(&info.path, &["checkout", "-b", "ci/foo"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("a.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "work on ci/foo"]).unwrap();
+        // The excursion: go look at something else, then come straight back. No new commit
+        // follows — the work is finished and in review, which is when this must still resolve.
+        // (`main` itself is held by the root worktree here, so the detour uses another ref; the
+        // reflog shape — a `moving from` pair that returns — is identical either way.)
+        git(&info.path, &["branch", "inspect/elsewhere"]).unwrap();
+        git(&info.path, &["checkout", "inspect/elsewhere"]).unwrap();
+        git(&info.path, &["checkout", "ci/foo"]).unwrap();
+
+        assert!(
+            worktree_walked_from_minted(
+                Some(Path::new(&info.path)),
+                "sparkle/agent-excursion",
+                "ci/foo"
+            ),
+            "the tree is back on a branch it really did author — a detour and back must not erase \
+             that, or the row falls back to the stale minted ref with no commit coming"
+        );
+
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "excursion",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(branch, "ci/foo", "the work is on the branch returned to, not the minted ref");
+        assert!(on_branch);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+
+    /// THE SAME TRAP WITH ONE LEGITIMATE RENAME IN FRONT OF IT (roborev 65402, finding 2).
+    ///
+    /// The zero-hop test above cannot see it: with the tree still sitting on the minted ref when the
+    /// rival is checked out, the chain starts at that hop and `authored` is necessarily false, so
+    /// the refusal is free. But rung 2b only ever fires on trees that DID rename, so the shape that
+    /// matters is: rename legitimately, commit, and only THEN have a stranger's branch checked out.
+    /// The first cut let the `ci/foo` commit go on standing as evidence across that next hop.
+    ///
+    /// This is the same critique the previous review made of the original fork test, so it is worth
+    /// stating why it keeps recurring: a refusal test is only as good as the reason it refuses, and
+    /// the cheap fixture always refuses for a reason that evaporates in the realistic case.
+    #[test]
+    fn a_stranger_branch_checked_out_after_a_legitimate_rename_is_not_adopted() {
+        let root = unique_root("resolve-hop-then-rival");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-hop-then-rival-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "hopped", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info.path).join("a.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "work on the minted ref"]).unwrap();
+        // A GENUINE rename, with a genuine commit on it — this is the evidence that must not carry.
+        git(&info.path, &["checkout", "-b", "ci/foo"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("b.txt"), "more").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "real work on ci/foo"]).unwrap();
+        // The minted ref lands, so topology is free for anything cut from the new main…
+        git(&root_str, &["merge", "--no-ff", "sparkle/agent-hopped", "-m", "land"]).unwrap();
+        git(&root_str, &["branch", "feature/not-mine", "main"]).unwrap();
+        // …and then a STRANGER's branch is checked out into the tree, with nothing committed on it.
+        git(&info.path, &["checkout", "feature/not-mine"]).unwrap();
+
+        let minted_tip = rev_parse_tip(&root_str, "sparkle/agent-hopped");
+        assert!(
+            minted_superseded_by_head(&root_str, "sparkle/agent-hopped", "feature/not-mine"),
+            "fixture: topology is satisfied, so it cannot be what refuses this"
+        );
+        assert!(!minted_tip.is_empty());
+        for _ in 0..2 {
+            let _ = agent_branch_status_at(&root_str, "p", "hopped", "main", &app_data);
+        }
+        assert_eq!(
+            HeadClaim::from_store(app_data.as_path(), "p", "feature/not-mine", "hopped"),
+            HeadClaim::Mine,
+            "fixture: identity is satisfied too — the walk is the only thing left to refuse"
+        );
+
+        let (branch, on_branch) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "hopped",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(
+            branch, "sparkle/agent-hopped",
+            "a commit on the PREVIOUS name is evidence about that name only — it must not vouch \
+             for whatever got checked out next"
+        );
+        assert!(!on_branch);
+
+        // And the paired POSITIVE, so this is not just "the walk stopped working": commit on the
+        // stranger's branch and it becomes, by the rule's own terms, work this tree authored there.
+        std::fs::write(Path::new(&info.path).join("c.txt"), "now mine").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "this tree really is working here now"]).unwrap();
+        let (branch2, on_branch2) = resolve_agent_branch(
+            &root_str,
+            &worktree_head_branch(&info.path, true),
+            "hopped",
+            "main",
+            HeadClaim::Mine,
+            Some(Path::new(&info.path)),
+        );
+        assert_eq!(branch2, "feature/not-mine", "…and once it authors there, it IS where the work is");
+        assert!(on_branch2);
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// THE WORKTREE-BACKED PROJECT ROOT — the founder's third hypothesis, pinned as a guard.
+    ///
+    /// `/Users/drodio/Projects/sparkle-desktop` is a LINKED WORKTREE of `…/Projects/sparkle`, so a
+    /// project registered at that path resolves branches, reflogs and tags through a `.git` FILE
+    /// pointing at another directory's object store rather than through a `.git` directory of its
+    /// own. If any step of the ladder walked the worktree's own git dir instead of the common one,
+    /// every agent under such a project would read "Local: Nothing Yet" no matter what it shipped —
+    /// the same symptom from a completely different cause.
+    ///
+    /// It does not today (refs, reflogs and tags all live in the common dir), and this test is what
+    /// keeps that true: it runs the whole shipped chain — worktree creation, branch resolution, the
+    /// release-tag read — with the project root ITSELF a linked worktree.
+    #[test]
+    fn shipped_resolves_when_the_project_root_is_itself_a_linked_worktree() {
+        let origin = unique_root("wt-backed-origin");
+        let origin_str = origin.to_string_lossy().to_string();
+        let app_data = unique_root("wt-backed-appdata");
+        ensure_project_repo_inner(origin_str.clone()).unwrap();
+        git(&origin_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&origin_str, &["checkout", "main"]).unwrap();
+
+        // The project root the app is pointed at is a LINKED WORKTREE, exactly like sparkle-desktop.
+        let linked = unique_root("wt-backed-linked");
+        let _ = std::fs::remove_dir_all(&linked);
+        let linked_str = linked.to_string_lossy().to_string();
+        git(&origin_str, &["worktree", "add", "-b", "desktop-checkout", &linked_str, "main"])
+            .unwrap();
+        assert!(
+            Path::new(&linked_str).join(".git").is_file(),
+            "fixture: a linked worktree's `.git` is a FILE pointing elsewhere — the whole hazard"
+        );
+
+        let info = create_worktree_at(&linked_str, "p", "wtagent", "main", &app_data).unwrap();
+        git(&info.path, &["checkout", "-b", "sparkle/shipped-from-a-worktree"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "released work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "the work that shipped"]).unwrap();
+        let tip = rev_parse_tip(&linked_str, "sparkle/shipped-from-a-worktree");
+        assert!(!tip.is_empty(), "the branch must resolve THROUGH the linked worktree");
+        git(&linked_str, &["tag", "v2.0.0", &tip]).unwrap();
+
+        let st = agent_workflow_state_in(
+            &linked_str, "wtagent", "", false, Some((app_data.as_path(), "p")),
+        ).unwrap();
+        assert!(
+            st.shipped,
+            "an agent whose work is in a published release reads 'Remote: Shipped to Production' \
+             even when the project root is a linked worktree"
+        );
+        assert_eq!(st.ahead_of_base, 1, "and its own commit is counted from the linked root");
+
+        let _ = std::fs::remove_dir_all(&origin);
+        let _ = std::fs::remove_dir_all(&linked);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// POSITIVE EVIDENCE THAT A BRANCH IS SOMEBODY ELSE'S — the one thing the ladder refuses on.
+    ///
+    /// Driven through `agent_branch_status_at`, NOT by handing the resolver a verdict. An earlier
+    /// cut of this test passed `HeadClaim::NotMine` in as a literal, which asserted the plumbing
+    /// GIVEN the verdict and never that the production path produces it (roborev 65176) — the
+    /// vacuous shape AGENTS.md warns about, and it would have stayed green while the real path
+    /// adopted the branch.
+    #[test]
+    fn a_branch_another_agent_is_recorded_on_is_not_adopted() {
+        let root = unique_root("resolve-unrelated");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("resolve-unrelated-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // An agent that really does own a descriptive branch, and is polled — which is what puts the
+        // mapping in the table. Without that prior observation there is no evidence to refuse on.
+        let owner = create_worktree_at(&root_str, "p", "owner", "main", &app_data).unwrap();
+        git(&owner.path, &["checkout", "-b", "sparkle/theirs"]).unwrap();
+        std::fs::write(Path::new(&owner.path).join("f.txt"), "their work").unwrap();
+        git(&owner.path, &["add", "-A"]).unwrap();
+        git(&owner.path, &["commit", "-m", "their work"]).unwrap();
+        let owned = agent_branch_status_at(&root_str, "p", "owner", "main", &app_data).unwrap();
+        assert_eq!(owned.branch, "sparkle/theirs", "precondition: the owner is recorded on it");
+
+        // A DIFFERENT agent that never started, whose tree is then checked out onto that branch.
+        // (git allows one worktree per branch, so the owner steps off; the RECORD is what carries.)
+        git(&owner.path, &["checkout", "--detach"]).unwrap();
+        let idle = create_worktree_at(&root_str, "p", "idle", "main", &app_data).unwrap();
+        git(&idle.path, &["checkout", "sparkle/theirs"]).unwrap();
+
+        let st = agent_branch_status_at(&root_str, "p", "idle", "main", &app_data).unwrap();
+        assert_eq!(
+            st.branch, "sparkle/agent-idle",
+            "a branch another agent is recorded on is not this agent's work"
+        );
+        assert_eq!(st.ahead, 0, "…so the other agent's commit is NOT counted here");
+        assert!(
+            !st.worktree_on_branch,
+            "…and adopting it would un-gate `dirty_files` onto another branch's files"
+        );
+
+        // POLL AGAIN — one poll cannot tell a durable guard from a one-shot, and this guard WAS a
+        // one-shot for a commit (roborev 65183): the same call that returned the refusal also
+        // latched the row `ambiguous`, and the next tick read that as "unknown" and adopted. Thirty
+        // seconds is all it took for the wrong branch to be reported as this agent's, permanently.
+        let again = agent_branch_status_at(&root_str, "p", "idle", "main", &app_data).unwrap();
+        assert_eq!(
+            again.branch, "sparkle/agent-idle",
+            "the refusal must SURVIVE the observation the first poll wrote"
+        );
+        assert!(!again.worktree_on_branch, "…on every tick, not just the first");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The PARENT half of the same defect (roborev 65164, finding 1). `resolve_parent_branch`
+    /// short-circuited on `local_branch_exists`, so its recovery was unreachable for the very case
+    /// its doc comment describes. The existing renamed-parent test uses `git branch -m`, which
+    /// DELETES the minted ref — that is the half that already worked. This is the `checkout -b`
+    /// half, which leaves the ref behind, and it left every worker of a renamed orchestrator being
+    /// told its merged work had not landed.
+    #[test]
+    fn a_worker_still_finds_its_parent_when_the_orchestrator_left_its_minted_ref_behind() {
+        let root = unique_root("renamed-parent-kept");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("renamed-parent-kept-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let boss = create_worktree_at(&root_str, "p", "boss", "main", &app_data).unwrap();
+        // The orchestrator renames the way an agent actually does — a NEW branch, minted ref kept.
+        git(&boss.path, &["checkout", "-b", "sparkle/cockpit-columns"]).unwrap();
+        let wk = create_worktree_at(&root_str, "p", "wk", "sparkle/cockpit-columns", &app_data)
+            .unwrap();
+        std::fs::write(Path::new(&wk.path).join("wk.txt"), "w\n").unwrap();
+        git(&wk.path, &["add", "-A"]).unwrap();
+        git(&wk.path, &["commit", "-m", "worker work"]).unwrap();
+        git(&boss.path, &["merge", "--no-ff", "-m", "integrate", "sparkle/agent-wk"]).unwrap();
+
+        assert!(
+            local_branch_exists(&root_str, "sparkle/agent-boss"),
+            "precondition: the orchestrator's minted ref is STILL THERE — that is the whole case"
+        );
+
+        // The frontend still mints the parent ref as `sparkle/agent-boss`; Rust must recover it.
+        let ws = agent_workflow_state_in(
+            &root_str,
+            "wk",
+            "sparkle/agent-boss",
+            false,
+            Some((app_data.as_path(), "p")),
+        )
+        .unwrap();
+        assert!(
+            ws.in_parent,
+            "the worker's work IS in the renamed parent — a leftover empty ref must not hide it"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// THE PATH THAT ACTUALLY RUNS. `project_agents_status_at` is the batch poll — ~35 agents every
+    /// 15s — and it short-circuited past the whole rename ladder, because `git checkout -b` leaves
+    /// the minted ref behind and the guard was `if minted_tip.is_empty()`. So the WORKFLOW state
+    /// (`shipped`/`landed`/`in_parent`) was computed against a branch holding no work while the
+    /// branch status beside it correctly named the renamed one — the row contradicted itself, and
+    /// the half that decides the stage was the wrong half (roborev 65183).
+    ///
+    /// This asserts through the batch entry point on purpose: every other test here goes through
+    /// `agent_branch_status_at`, which resolved correctly the whole time and so could never catch it.
+    ///
+    /// DISTINCT FROM `the_batch_poll_also_resolves_a_renamed_branch` below, and the difference is
+    /// the whole point: that one renames with `git branch -m`, which DELETES the minted ref, so
+    /// `minted_tip` came back empty and the short-circuit fell through to the ladder — the half that
+    /// already worked. This one renames with `checkout -b`, which LEAVES the ref, so `minted_tip` is
+    /// non-empty and the short-circuit fired. Same feature, opposite side of one `if`.
+    #[test]
+    fn the_batch_poll_computes_a_renamed_agents_workflow_on_the_renamed_branch() {
+        // NOTE the tag: `unique_root` is keyed by tag+pid and `remove_dir_all`s the path, so two
+        // tests sharing a tag delete each other's repo mid-run. `batch-renamed` is taken by
+        // `the_batch_poll_also_resolves_a_renamed_branch` below.
+        let root = unique_root("batch-renamed-kept-ref");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("batch-renamed-kept-ref-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "batchy", "main", &app_data).unwrap();
+        git(&info.path, &["checkout", "-b", "sparkle/renamed-work"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "the work"]).unwrap();
+        let tip = rev_parse_tip(&root_str, "sparkle/renamed-work");
+        git(&root_str, &["tag", "v9.9.9", &tip]).unwrap();
+
+        assert!(
+            !rev_parse_tip(&root_str, "sparkle/agent-batchy").is_empty(),
+            "fixture: the minted ref is still there — that is what made the short-circuit fire"
+        );
+
+        let out = project_agents_status_at(
+            &root_str,
+            "p",
+            &[AgentStatusInput {
+                agent_id: "batchy".into(),
+                base_branch: "main".into(),
+                parent_branch: String::new(),
+                kind: "build".into(),
+                force: true,
+            }],
+            false,
+            &app_data,
+        );
+        assert_eq!(out.len(), 1);
+        let branch = out[0].branch.as_ref().expect("a branch status");
+        let wf = out[0].workflow.as_ref().expect("a workflow state");
+        assert_eq!(branch.branch, "sparkle/renamed-work", "the row names the renamed branch…");
+        assert_eq!(branch.ahead, 1);
+        // …and THIS is the half that was wrong: the stage must be computed on the same branch the
+        // row names, not on the empty minted ref beside it.
+        assert!(
+            wf.shipped,
+            "the workflow state must be computed on the renamed branch, not the empty minted ref"
+        );
+        assert_eq!(wf.ahead_of_base, 1, "…and count the agent's own work");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// THE REGRESSION AN ANCESTRY GUARD CAUSED, pinned so it cannot come back (roborev 65171).
+    ///
+    /// `park_worktree_on_base_at` runs `checkout -B sparkle/agent-<id> <base>`, which FORCE-ADVANCES
+    /// the minted ref onto a newer base while leaving the agent's renamed branch where it was. An
+    /// adoption test phrased as "the head must descend from the minted ref" then refuses the genuine
+    /// rename after the very first hourly park, and the agent drops back to "Local: Nothing Yet" —
+    /// the bug this whole ladder exists to fix, reintroduced by its own guard. Identity evidence does
+    /// not move when a ref does.
+    #[test]
+    fn a_park_that_advances_the_minted_ref_does_not_un_rename_the_agent() {
+        let root = unique_root("park-advances-minted");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("park-advances-minted-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+        let info = create_worktree_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        git(&info.path, &["checkout", "-b", "sparkle/feature-work"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "the work"]).unwrap();
+
+        // One poll, which is what records the branch → agent mapping.
+        let before = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        assert_eq!(before.branch, "sparkle/feature-work", "precondition: the rename is picked up");
+
+        // main moves on, and the park resets the agent's MINTED ref onto it — one ref, forward,
+        // past the renamed branch. `branch -f` is a non-work reflog entry, so the minted ref stays
+        // "never committed" and nothing else rescues the reading.
+        std::fs::write(root.join("m.txt"), "main moves").unwrap();
+        git(&root_str, &["add", "-A"]).unwrap();
+        git(&root_str, &["commit", "-m", "main advances"]).unwrap();
+        git(&root_str, &["branch", "-f", "sparkle/agent-renamer", "main"]).unwrap();
+        assert!(
+            !ref_contains(&root_str, "sparkle/feature-work", &rev_parse_tip(&root_str, "sparkle/agent-renamer")),
+            "fixture: the minted ref is now AHEAD of the renamed branch — an ancestry test would refuse here"
+        );
+
+        let after = agent_branch_status_at(&root_str, "p", "renamer", "main", &app_data).unwrap();
+        assert_eq!(
+            after.branch, "sparkle/feature-work",
+            "a park moving the minted ref must not un-rename the agent"
+        );
+        assert_eq!(after.ahead, 1, "…and its own commit is still counted");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// AN AMBIGUOUS BRANCH IS "WE DO NOT KNOW", NOT "NOT YOURS" (roborev 65176).
+    ///
+    /// `BranchOwner::ambiguous` is a permanent latch with no repair path, designed for PR ownership
+    /// — where an unknown owner renders as a MISSING PILL. On the status path an unknown that
+    /// REFUSES renders as a confidently wrong stage: the agent falls back to the empty minted ref its
+    /// `checkout -b` left behind, and reads "Local: Nothing Yet" on committed, shipped work, forever.
+    /// So the latch must not be the terminal answer here. The agent that legitimately owns the branch
+    /// keeps its reading.
+    #[test]
+    fn an_ambiguous_branch_reads_as_unknown_rather_than_a_refusal() {
+        let root = unique_root("branch-ambiguous");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("branch-ambiguous-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        let a1 = create_worktree_at(&root_str, "p", "first", "main", &app_data).unwrap();
+        git(&a1.path, &["checkout", "-b", "sparkle/shared-name"]).unwrap();
+        std::fs::write(Path::new(&a1.path).join("f.txt"), "work").unwrap();
+        git(&a1.path, &["add", "-A"]).unwrap();
+        git(&a1.path, &["commit", "-m", "first agent's work"]).unwrap();
+        let solo = agent_branch_status_at(&root_str, "p", "first", "main", &app_data).unwrap();
+        assert_eq!(solo.branch, "sparkle/shared-name", "precondition: recorded and adopted");
+
+        // A second agent sits on it, which latches the row `ambiguous` — the mapping now names
+        // nobody. (That poll is also the one refused by `a_branch_another_agent_is_recorded_on…`.)
+        git(&a1.path, &["checkout", "--detach"]).unwrap();
+        let a2 = create_worktree_at(&root_str, "p", "second", "main", &app_data).unwrap();
+        git(&a2.path, &["checkout", "sparkle/shared-name"]).unwrap();
+        let _ = agent_branch_status_at(&root_str, "p", "second", "main", &app_data).unwrap();
+
+        // THE ASSERTION THAT MATTERS: the first agent, whose work this genuinely is, must not be
+        // demoted to its empty minted ref just because something else touched its branch once.
+        git(&a2.path, &["checkout", "--detach"]).unwrap();
+        git(&a1.path, &["checkout", "sparkle/shared-name"]).unwrap();
+        let after = agent_branch_status_at(&root_str, "p", "first", "main", &app_data).unwrap();
+        assert_eq!(
+            after.branch, "sparkle/shared-name",
+            "a permanent ambiguity latch must not strand a real agent at 'Nothing Yet'"
+        );
+        assert_eq!(after.ahead, 1, "…and its own commit is still counted");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    /// The row must be able to SAY which branch it counted. Without this the numbers above are
+    /// right about a branch nobody meant, and the only way to find that out is a terminal.
+    #[test]
+    fn branch_status_reports_the_branch_it_measured() {
+        let root = unique_root("status-branch-named");
+        let root_str = root.to_string_lossy().to_string();
+        let app_data = unique_root("status-branch-named-appdata");
+        ensure_project_repo_inner(root_str.clone()).unwrap();
+        git(&root_str, &["branch", "-f", "main", "HEAD"]).unwrap();
+        git(&root_str, &["checkout", "main"]).unwrap();
+
+        // RENAMED: the reading is about the descriptive branch, and says so.
+        let info = create_worktree_at(&root_str, "p", "named", "main", &app_data).unwrap();
+        git(&info.path, &["checkout", "-b", "sparkle/descriptive"]).unwrap();
+        std::fs::write(Path::new(&info.path).join("f.txt"), "work").unwrap();
+        git(&info.path, &["add", "-A"]).unwrap();
+        git(&info.path, &["commit", "-m", "work"]).unwrap();
+        let st = agent_branch_status_at(&root_str, "p", "named", "main", &app_data).unwrap();
+        assert_eq!(st.branch, "sparkle/descriptive", "name what the numbers were measured on");
+        assert_eq!(st.ahead, 1, "and they are the descriptive branch's numbers");
+
+        // PARKED: the reading is about the minted branch, and says THAT.
+        let info2 = create_worktree_at(&root_str, "p", "sitting", "main", &app_data).unwrap();
+        std::fs::write(Path::new(&info2.path).join("g.txt"), "work").unwrap();
+        git(&info2.path, &["add", "-A"]).unwrap();
+        git(&info2.path, &["commit", "-m", "work"]).unwrap();
+        git(&root_str, &["branch", "elsewhere", "main"]).unwrap();
+        git(&info2.path, &["checkout", "elsewhere"]).unwrap();
+        let st2 = agent_branch_status_at(&root_str, "p", "sitting", "main", &app_data).unwrap();
+        assert_eq!(st2.branch, "sparkle/agent-sitting", "a parked tree still reports its own branch");
+        assert!(!st2.worktree_on_branch, "…and flags that the tree is elsewhere");
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&app_data);
@@ -15190,6 +17529,61 @@ fn require_refs(cwd: &str, base: &str, head: &str) -> Result<(), String> {
     }
 }
 
+/// The base an agent's diff should actually be taken against — the remote-tracking ref when the
+/// LOCAL branch of that name is merely stale.
+///
+/// IN AN APP-MANAGED WORKTREE THE LOCAL `main` REF IS STALE BY CONSTRUCTION. Nothing ever checks
+/// `main` out there or fast-forwards it: the app fetches, cuts agent branches from `origin/main`,
+/// and leaves the local branch sitting wherever it was when the checkout was made. So the base the
+/// caller hands us is a branch name that can be hundreds of commits behind what the agent branched
+/// from.
+///
+/// The three-dot range does NOT save us from that, which is the part that makes this worth a
+/// function. `base...head` diffs from `merge-base(base, head)`, and when the agent branched off
+/// `origin/main` — which contains the stale local `main` whole — that merge base IS the stale local
+/// tip. Every commit the agent inherited from the base then reads as the agent's own work: a
+/// reported case came back as a 139 KB diff across dozens of unrelated files where the true change
+/// was five (bead `sparkle-049v4`, seen 2×). The wrong answer looks plausible enough to act on,
+/// which is the specific hazard this whole module exists to avoid.
+///
+/// SUBSTITUTES ONLY WHEN THE LOCAL REF IS STRICTLY BEHIND ITS REMOTE, so this can never be worse
+/// than the ref the caller named:
+/// - a base already naming a remote, or with no `origin/<base>` at all (the common case for a
+///   worker whose base is its parent's unpushed branch), is returned untouched;
+/// - a base with no LOCAL branch but a live `origin/<base>` uses the remote — that case used to be
+///   a flat `missing-base` refusal;
+/// - equal or diverged refs are returned untouched: with the local ref ahead, or forked, the remote
+///   is not a better answer and picking it would attribute the local-only commits to the agent.
+///
+/// When it does substitute, the returned name is what `DiffSummary.base` reports, so the caller can
+/// see which ref the numbers are against rather than having to assume.
+fn freshest_base(cwd: &str, base: &str) -> String {
+    let resolves =
+        |r: &str| git(cwd, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_ok();
+    // A base that already names a remote-tracking ref is as fresh as this checkout can be, and
+    // `origin/origin/main` is not a ref — bail before spending a subprocess on it. A tag or a raw
+    // sha needs no special case: `origin/<it>` does not resolve, so the next check returns it.
+    if base.starts_with("origin/") {
+        return base.to_string();
+    }
+    let remote = format!("origin/{base}");
+    if !resolves(&remote) {
+        return base.to_string();
+    }
+    let local = format!("refs/heads/{base}");
+    if !resolves(&local) {
+        return remote;
+    }
+    // `--is-ancestor` exits 0 for "yes" and 1 for "no", and a ref is its own ancestor — so testing
+    // BOTH directions is what separates "behind" (substitute) from "equal" and "diverged" (don't).
+    let ancestor = |a: &str, b: &str| git(cwd, &["merge-base", "--is-ancestor", a, b]).is_ok();
+    if ancestor(&local, &remote) && !ancestor(&remote, &local) {
+        remote
+    } else {
+        base.to_string()
+    }
+}
+
 fn missing_ref(cwd: &str, base: &str, head: &str) -> Option<&'static str> {
     let resolves = |r: &str| git(cwd, &["rev-parse", "--verify", "--quiet", &format!("{r}^{{commit}}")]).is_ok();
     if !resolves(head) {
@@ -15228,6 +17622,7 @@ pub async fn diff_files(
     validate_ref(&head)?;
     let cap = limit.unwrap_or(DIFF_MAX_FILES).min(DIFF_MAX_FILES).max(1);
     tauri::async_runtime::spawn_blocking(move || {
+        let base = freshest_base(&cwd, &base);
         require_refs(&cwd, &base, &head)?;
         let range = diff_range(&base, &head);
         // `--no-renames` so a rename reports as one add + one delete rather than a path pair the
@@ -15270,6 +17665,7 @@ pub async fn diff_file_text(
     }
     let cap = max_lines.unwrap_or(DIFF_MAX_LINES).min(DIFF_MAX_LINES).max(1);
     tauri::async_runtime::spawn_blocking(move || {
+        let base = freshest_base(&cwd, &base);
         require_refs(&cwd, &base, &head)?;
         let range = diff_range(&base, &head);
         let out = git_raw_paths(&cwd, &["diff", "--no-renames", &range, "--", &path])?;
@@ -15313,6 +17709,7 @@ pub async fn diff_commits(
     validate_ref(&head)?;
     let cap = limit.unwrap_or(50).min(200).max(1);
     tauri::async_runtime::spawn_blocking(move || {
+        let base = freshest_base(&cwd, &base);
         require_refs(&cwd, &base, &head)?;
         let range = format!("{base}..{head}");
         // %x1f (unit separator) rather than a printable delimiter: a commit subject can contain
@@ -15515,6 +17912,105 @@ mod diff_tests {
         assert_eq!(diff_range("main", "sparkle/agent-1"), "main...sparkle/agent-1");
     }
 
+    /// A repo shaped like an app-managed worktree: local `main` sits where the checkout left it,
+    /// `origin/main` has moved on, and the agent branched from the REMOTE — which is what the app
+    /// does. Returns (cwd, tempdir); the dir must outlive the cwd.
+    fn stale_local_main_repo() -> (String, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cwd = dir.path().to_string_lossy().to_string();
+        git(&cwd, &["init", "-q", "-b", "main"]).expect("init");
+        git(&cwd, &["config", "user.email", "t@example.com"]).expect("email");
+        git(&cwd, &["config", "user.name", "T"]).expect("name");
+        git(&cwd, &["commit", "-q", "--allow-empty", "-m", "root"]).expect("root");
+        // Leave local `main` at the root and advance only the remote-tracking ref — nothing in an
+        // app-managed worktree ever fast-forwards the local branch.
+        git(&cwd, &["checkout", "-q", "--detach"]).expect("detach");
+        git(&cwd, &["commit", "-q", "--allow-empty", "-m", "upstream 1"]).expect("upstream 1");
+        git(&cwd, &["commit", "-q", "--allow-empty", "-m", "upstream 2"]).expect("upstream 2");
+        git(&cwd, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("origin/main");
+        git(&cwd, &["checkout", "-q", "-b", "sparkle/agent-1"]).expect("agent branch");
+        git(&cwd, &["commit", "-q", "--allow-empty", "-m", "the agent's own work"]).expect("work");
+        (cwd, dir)
+    }
+
+    fn count(cwd: &str, range: &str) -> usize {
+        git(cwd, &["rev-list", "--count", range])
+            .expect("rev-list")
+            .trim()
+            .parse()
+            .expect("a number")
+    }
+
+    // THE BUG THIS EXISTS FOR. The caller names `main`, and in an app-managed worktree that ref is
+    // stale by construction — so the three-dot merge base lands on the stale local tip and every
+    // commit the agent INHERITED reads as its own (bead `sparkle-049v4`).
+    #[test]
+    fn a_stale_local_base_diffs_against_the_remote_so_inherited_commits_are_not_the_agents() {
+        let (cwd, _dir) = stale_local_main_repo();
+
+        // The decision…
+        assert_eq!(freshest_base(&cwd, "main"), "origin/main");
+
+        // …and the CONSEQUENCE, which is the whole point: the caller-supplied base attributes the
+        // two upstream commits to the agent; the resolved one reports the one commit it wrote.
+        let asked = diff_range("main", "sparkle/agent-1");
+        let used = diff_range(&freshest_base(&cwd, "main"), "sparkle/agent-1");
+        assert_eq!(count(&cwd, &asked), 3, "the stale base over-reports");
+        assert_eq!(count(&cwd, &used), 1, "the agent's own work, and only that");
+    }
+
+    // NEVER WORSE THAN THE REF THE CALLER NAMED. Substituting on anything but "strictly behind"
+    // would hand back a base that is missing the local-only commits — attributing THOSE to the
+    // agent instead, which is the same defect in the other direction.
+    #[test]
+    fn an_equal_ahead_or_diverged_local_base_is_left_alone() {
+        let (cwd, _dir) = stale_local_main_repo();
+
+        // EQUAL: nothing to gain, and a ref is its own ancestor — so the one-directional test would
+        // wrongly substitute here.
+        git(&cwd, &["update-ref", "refs/remotes/origin/main", "refs/heads/main"]).expect("equal");
+        assert_eq!(freshest_base(&cwd, "main"), "main");
+
+        // AHEAD: the local branch carries commits the remote lacks.
+        git(&cwd, &["branch", "-f", "main", "sparkle/agent-1"]).expect("advance local");
+        assert_eq!(freshest_base(&cwd, "main"), "main");
+
+        // DIVERGED: give the remote a commit the local branch cannot contain, so each side holds
+        // work the other lacks and neither is an ancestor of the other.
+        git(&cwd, &["checkout", "-q", "--detach", "main~3"]).expect("back to the root");
+        git(&cwd, &["commit", "-q", "--allow-empty", "-m", "remote only"]).expect("remote commit");
+        git(&cwd, &["update-ref", "refs/remotes/origin/main", "HEAD"]).expect("fork the remote");
+        git(&cwd, &["checkout", "-q", "sparkle/agent-1"]).expect("back to the agent");
+        assert!(git(&cwd, &["merge-base", "--is-ancestor", "refs/heads/main", "origin/main"]).is_err());
+        assert!(git(&cwd, &["merge-base", "--is-ancestor", "origin/main", "refs/heads/main"]).is_err());
+        assert_eq!(freshest_base(&cwd, "main"), "main");
+    }
+
+    // A base with no LOCAL branch used to be a flat `missing-base` refusal even with a live
+    // remote-tracking ref of that name sitting right there.
+    #[test]
+    fn a_base_with_no_local_branch_falls_back_to_its_remote() {
+        let (cwd, _dir) = stale_local_main_repo();
+        git(&cwd, &["update-ref", "refs/remotes/origin/release", "HEAD"]).expect("origin/release");
+
+        assert_eq!(freshest_base(&cwd, "release"), "origin/release");
+        assert!(require_refs(&cwd, "origin/release", "sparkle/agent-1").is_ok());
+    }
+
+    // The two arms that must never spend a substitution: a base already naming a remote (there is
+    // no `origin/origin/main`), and one with no remote counterpart at all — which is the ordinary
+    // case for a worker whose base is its parent's never-pushed branch.
+    #[test]
+    fn a_remote_base_and_a_remoteless_base_are_returned_untouched() {
+        let (cwd, _dir) = stale_local_main_repo();
+
+        assert_eq!(freshest_base(&cwd, "origin/main"), "origin/main");
+        assert_eq!(freshest_base(&cwd, "sparkle/agent-1"), "sparkle/agent-1");
+        // …and a ref that is not a branch at all resolves to itself rather than to a bogus remote.
+        let sha = git(&cwd, &["rev-parse", "HEAD"]).expect("sha").trim().to_string();
+        assert_eq!(freshest_base(&cwd, &sha), sha);
+    }
+
     // The refs reach a subprocess, so an option-shaped one must be refused rather than passed
     // through — the same guard the rest of this module applies to every ref it takes.
     #[test]
@@ -15522,5 +18018,750 @@ mod diff_tests {
         assert!(validate_ref("--upload-pack=touch /tmp/pwn").is_err());
         assert!(validate_ref("-x").is_err());
         assert!(validate_ref("main").is_ok());
+    }
+}
+
+// ── MERGE POLICY (contract §6 backstop + §7 per-worktree writer) ───────────────────────────────
+#[cfg(test)]
+mod merge_policy_tests {
+    use super::*;
+
+    /// Read the ONE shared pin both language halves are written against, exactly as
+    /// `deny_rules_match_the_shared_fixture` does for the destructive-command contract. A slug
+    /// added to the JSON and forgotten here fails a test instead of silently un-protecting a repo.
+    #[test]
+    fn merge_protected_slugs_match_the_shared_fixture() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("merge-protected-repos.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+        let expected: Vec<&str> = fixture["pinnedSlugs"]
+            .as_array()
+            .expect("pinnedSlugs array")
+            .iter()
+            .map(|e| e.as_str().expect("pinnedSlugs entries are strings"))
+            .collect();
+        assert_eq!(
+            MERGE_PROTECTED_SLUGS.to_vec(),
+            expected,
+            "MERGE_PROTECTED_SLUGS drifted from apps/desktop/shared/merge-protected-repos.json"
+        );
+    }
+
+    /// The gate is only worth anything if it actually RUNS. Body-scoped whole-line technique,
+    /// copied from `knightwatch::merge_pr_actually_runs_the_gate`: a substring test would pass for
+    /// `let _ = merge_policy_gate(…);` (which compiles and swallows every refusal — `unused_must_use`
+    /// is a warning here, not an error) and for a commented-out call.
+    #[test]
+    fn merge_pr_actually_runs_the_merge_policy_gate() {
+        const CALL: &str = "merge_policy_gate(&root, \"merge_pr\")?;";
+        let src = include_str!("worktree.rs");
+        // Slice from the signature, so the doc comment above it cannot satisfy the search.
+        let start = src.find("pub async fn merge_pr(").expect("merge_pr's signature");
+        let body = &src[start..];
+        // `merge_argv(number,` is the merge landmark — the pure builder that owns the `--merge`
+        // rules — so the assertion is "before the irreversible half", not "somewhere in the file".
+        let merge = body.find("merge_argv(number,").expect("the merge argv");
+        assert!(
+            body[..merge].lines().any(|l| l.trim() == CALL),
+            "merge_pr must call merge_policy_gate as a STATEMENT, with `?`, BEFORE `gh pr merge`"
+        );
+    }
+
+    /// The same pin for the OTHER merge-class command. `land_agent_branch_at` writes to the target
+    /// branch, so the gate has to precede it.
+    #[test]
+    fn land_agent_branch_actually_runs_the_merge_policy_gate() {
+        const CALL: &str = "merge_policy_gate(&root, \"land_agent_branch\")?;";
+        let src = include_str!("worktree.rs");
+        // `pub async fn` matches ONLY the command; the core is `pub fn land_agent_branch_at(`.
+        let start = src
+            .find("pub async fn land_agent_branch(")
+            .expect("land_agent_branch's signature");
+        let body = &src[start..];
+        // Terminate on the call that does the merging. `.expect` rather than `unwrap_or(len)`: a
+        // delimiter that silently widens the slice is how a guard against vacuity becomes vacuous.
+        let land = body
+            .find("land_agent_branch_at(&root, &agent_id, &target_branch)")
+            .expect("the local-merge call — re-scope this slice rather than widening it");
+        assert!(
+            body[..land].lines().any(|l| l.trim() == CALL),
+            "land_agent_branch must call merge_policy_gate as a STATEMENT, with `?`, BEFORE the merge"
+        );
+    }
+
+    /// **THE ACCEPTANCE CRITERION, IN ONE BODY** (contract §0/§9.1). One tier could not hold both
+    /// facts; this is the pair that proves it now can. `drodio/sparkle` merges on Sparkle's own
+    /// authority while `plow-pbc/tkmx-server` never does — at the same time, from the same config.
+    #[test]
+    fn sparkle_merges_and_a_pinned_repo_never_does_at_the_same_time() {
+        assert!(
+            !merge_policy_denies(Some("drodio/sparkle"), None),
+            "the owner's own repo must keep its sanctioned merge path"
+        );
+        assert!(
+            merge_policy_denies(Some("plow-pbc/tkmx-server"), None),
+            "a pinned repo is refused with no config entry at all"
+        );
+        assert!(merge_policy_denies(Some("plow-pbc/tkmx-client"), None));
+        // Case is not a way past the pin: GitHub slugs are case-insensitive.
+        assert!(merge_policy_denies(Some("PLOW-PBC/TKMX-Server"), None));
+    }
+
+    /// A pin is a FLOOR: config cannot loosen it. The inverse of the acceptance test — a project
+    /// entry saying `allow` on a pinned repo must change nothing.
+    #[test]
+    fn a_project_allow_entry_cannot_loosen_a_pin() {
+        assert!(merge_policy_denies(Some("plow-pbc/tkmx-server"), Some("allow")));
+        assert!(merge_policy_for(Some("plow-pbc/tkmx-server"), Some("allow")).merge_protected);
+    }
+
+    /// **RUST ENFORCES `deny` ONLY.** `ask` needs a human and there is none on this path, so it
+    /// must NOT refuse here — the concierge layer owns `ask`. If this ever goes red because someone
+    /// "fixed" the asymmetry, read `merge_policy_denies`' doc comment before changing it back.
+    #[test]
+    fn only_deny_refuses_here_never_ask() {
+        assert!(merge_policy_denies(Some("acme/widgets"), Some("deny")));
+        assert!(!merge_policy_denies(Some("acme/widgets"), Some("ask")));
+        assert!(!merge_policy_denies(Some("acme/widgets"), Some("allow")));
+        assert!(!merge_policy_denies(Some("acme/widgets"), None));
+        // An unreadable value is not `deny`, so it does not refuse here either.
+        assert!(!merge_policy_denies(Some("acme/widgets"), Some("maybe")));
+    }
+
+    /// The documented asymmetry, pinned so a later reader cannot quietly "fix" one half: an
+    /// unresolvable slug does NOT deny at the gate (the concierge layer floors it at `ask`), but it
+    /// DOES protect the worktree, because the agent facing that file has no concierge layer above
+    /// it. Both directions in one body — either alone reads like an inconsistency.
+    #[test]
+    fn an_unresolvable_slug_does_not_deny_at_the_gate_but_does_protect_the_worktree() {
+        assert!(!merge_policy_denies(None, None), "the gate cannot name a pinned repo from null");
+        let policy = merge_policy_for(None, None);
+        assert!(policy.merge_protected, "the worktree file fails closed on an unknown repo");
+        assert_eq!(policy.slug, None);
+        assert!(policy.reason.contains("could not be resolved"), "reason: {}", policy.reason);
+    }
+
+    /// The refusal is an instruction the reader will follow, so it must name the repo, the lever
+    /// and the only safe next action.
+    #[test]
+    fn the_refusal_names_the_repo_the_remedy_and_says_do_not_retry() {
+        let msg = merge_policy_refusal(Some("plow-pbc/tkmx-server"), "merge_pr");
+        assert!(msg.contains("plow-pbc/tkmx-server"), "{msg}");
+        assert!(msg.contains("merge_pr"), "{msg}");
+        assert!(msg.contains("Hand the merge to a human"), "{msg}");
+        assert!(msg.contains("Do not retry"), "{msg}");
+        // The config-driven refusal names the lever the reader can actually reach.
+        let cfg = merge_policy_refusal(Some("acme/widgets"), "merge_pr");
+        assert!(cfg.contains("[concierge.projects.\"acme/widgets\".tools]"), "{cfg}");
+        assert!(cfg.contains("Do not retry"), "{cfg}");
+    }
+
+    /// BOTH DIRECTIONS, SAME WRITER. Absence alone proves nothing (the rule could be unreachable
+    /// for an unrelated reason) and presence alone proves nothing (it could be unconditional).
+    fn deny_rules_of(doc: &str) -> Vec<String> {
+        let v: Value = serde_json::from_str(doc).expect("settings JSON");
+        v["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny")
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect()
+    }
+    fn denies_merge(doc: &str) -> bool {
+        deny_rules_of(doc).iter().any(|r| r == MERGE_GUARD_DENY_RULE)
+    }
+
+    #[test]
+    fn the_conditional_merge_deny_rule_is_written_only_for_a_protected_worktree() {
+        let cmd = "node /abs/worktree-guard.mjs /wt/a";
+        let protected =
+            merge_guard_settings_with_merge_policy(None, cmd, MergeRulePosture::Protected);
+        let open = merge_guard_settings_with_merge_policy(None, cmd, MergeRulePosture::Unprotected);
+        assert!(denies_merge(&protected), "a merge-protected worktree must deny `gh pr merge`");
+        assert!(!denies_merge(&open), "an unprotected worktree must keep the sanctioned merge path");
+        // …and the unconditional brakes are untouched in both, so this is an ADDITION, not a swap.
+        for doc in [&protected, &open] {
+            assert!(deny_rules_of(doc).iter().any(|r| r == "Bash(sudo:*)"), "static rules survive");
+        }
+    }
+
+    /// **THE RULE COMES BACK OFF.** The test above cannot see this: its unprotected case starts from
+    /// `None`, so the `Unprotected` branch is only ever exercised against a document that never held
+    /// the rule — delete the removal and it still passes. This one feeds the PROTECTED output back
+    /// in, which is the state the owner reaches by removing a project's `deny` entry.
+    ///
+    /// It matters because a deny rule has no approval path: left behind, it kills the sanctioned
+    /// merge path in that worktree permanently, while `.sparkle/merge-policy.json` beside it reads
+    /// `mergeProtected: false` — the two layers disagreeing about one worktree.
+    #[test]
+    fn the_rule_is_removed_when_a_worktree_stops_being_protected() {
+        let cmd = "node /abs/worktree-guard.mjs /wt/a";
+        let protected =
+            merge_guard_settings_with_merge_policy(None, cmd, MergeRulePosture::Protected);
+        assert!(denies_merge(&protected), "precondition: the rule is there to remove");
+        let relaxed = merge_guard_settings_with_merge_policy(
+            Some(&protected),
+            cmd,
+            MergeRulePosture::Unprotected,
+        );
+        assert!(!denies_merge(&relaxed), "the rule must come off when the repo stops being pinned");
+        // Nothing else was taken with it.
+        assert!(deny_rules_of(&relaxed).iter().any(|r| r == "Bash(sudo:*)"));
+        // Same through the document-level form the second installer uses.
+        let via_hooks = merge_conditional_merge_deny_settings(
+            Some(&protected),
+            MergeRulePosture::Unprotected,
+        );
+        assert!(!denies_merge(&via_hooks));
+    }
+
+    /// **A USER'S OWN DENY MUST SURVIVE.** The removal matches on the rule STRING, and nothing in a
+    /// deny array records who wrote an entry — a human, or Claude Code's `/permissions` UI, writes
+    /// the identical text. An unconditional `Unprotected` would therefore delete a human's explicit
+    /// `gh pr merge` deny on every agent prepare in an ordinary repo and hand the capability back:
+    /// a fail-OPEN loosening, from a writer that runs twice per prepare.
+    ///
+    /// A prior `mergeProtected: true` is the only evidence the rule is ours. All three arms in one
+    /// body — the removal arm alone would also be satisfied by a writer that never removes.
+    #[test]
+    fn the_removal_needs_evidence_that_sparkle_wrote_the_rule() {
+        // Never protected here → any such rule is the human's → leave it alone.
+        assert_eq!(merge_rule_posture_for(None, false), MergeRulePosture::Unknown);
+        assert_eq!(merge_rule_posture_for(Some(false), false), MergeRulePosture::Unknown);
+        // WE wrote it on a previous pass and the repo is no longer protected → take it back off.
+        assert_eq!(merge_rule_posture_for(Some(true), false), MergeRulePosture::Unprotected);
+        // Protected now, whatever came before.
+        assert_eq!(merge_rule_posture_for(None, true), MergeRulePosture::Protected);
+        assert_eq!(merge_rule_posture_for(Some(true), true), MergeRulePosture::Protected);
+
+        // …and end to end: a user file carrying the rule in a repo Sparkle never protected keeps it.
+        let user_file = r#"{"permissions":{"deny":["Bash(gh pr merge:*)","Bash(rm -rf /:*)"]}}"#;
+        let after = merge_guard_settings_with_merge_policy(
+            Some(user_file),
+            "node /abs/worktree-guard.mjs /wt/a",
+            merge_rule_posture_for(None, false),
+        );
+        assert!(denies_merge(&after), "a human's own deny must survive an unprotected pass");
+        assert!(deny_rules_of(&after).iter().any(|r| r == "Bash(rm -rf /:*)"));
+    }
+
+    /// The planner must READ the prior file, not assume there is none. Round-trips a real protected
+    /// file through `write` → `read` so the serde shape is exercised in both directions (a `read`
+    /// that silently failed to parse would look exactly like "no prior file", and would resurrect
+    /// the fail-open the test above pins).
+    #[test]
+    fn the_prior_verdict_round_trips_through_the_policy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write_merge_policy_at(dir.path(), &merge_policy_for(Some("plow-pbc/tkmx-server"), None))
+            .expect("write");
+        let previous = read_merge_policy_at(dir.path()).expect("the file we just wrote parses back");
+        assert!(previous.merge_protected);
+        assert_eq!(previous.slug.as_deref(), Some("plow-pbc/tkmx-server"));
+        assert_eq!(
+            merge_rule_posture_for(Some(previous.merge_protected), false),
+            MergeRulePosture::Unprotected,
+            "a worktree WE protected earlier is the case where removal is justified"
+        );
+        // An absent file is no prior verdict, which is the conservative read.
+        let empty = tempfile::tempdir().unwrap();
+        assert!(read_merge_policy_at(empty.path()).is_none());
+    }
+
+    /// **THE EVIDENCE MUST OUTLIVE THE PASS THAT FAILS.** A relaxation's `mergeProtected: false` is
+    /// written only AFTER the settings write that actually removes the rule. Writing it first
+    /// destroys, one pass early, the sole record that Sparkle owns that rule — and since the
+    /// settings write is fallible (and `AgentPane.prepare` only WARNS when `installWorktreeGuard`
+    /// throws), a failure in between would strand a deny rule with no approval path, permanently
+    /// and silently.
+    ///
+    /// Simulates exactly that: plan a relaxation, then DON'T write settings, then plan again. The
+    /// second pass must still say `Unprotected`. Both halves in one body — the deferral alone would
+    /// also be satisfied by a planner that never writes the file at all, so the committed case is
+    /// asserted beside it.
+    #[test]
+    fn a_failed_settings_write_does_not_strand_the_deny_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let protected = merge_policy_for(Some("plow-pbc/tkmx-server"), None);
+        let relaxed = merge_policy_for(Some("plow-pbc/tkmx-server"), Some("allow"));
+        // (the pin still protects that slug, so build the relaxed verdict directly)
+        let relaxed = MergePolicyFile { merge_protected: false, ..relaxed };
+        write_merge_policy_at(dir.path(), &protected).expect("seed the protected verdict");
+
+        // PASS 1: plan the relaxation, then the caller's settings write FAILS, so no commit.
+        let plan = plan_merge_policy_for(dir.path(), relaxed.clone()).expect("plan");
+        assert_eq!(plan.posture, MergeRulePosture::Unprotected);
+        assert!(
+            read_merge_policy_at(dir.path()).expect("still there").merge_protected,
+            "the on-disk verdict must NOT have been relaxed before the rule was actually removed"
+        );
+
+        // PASS 2: the next prepare (or the second installer, in the same one) must reach the same
+        // conclusion — otherwise the rule is stranded forever.
+        let again = plan_merge_policy_for(dir.path(), relaxed.clone()).expect("plan again");
+        assert_eq!(
+            again.posture,
+            MergeRulePosture::Unprotected,
+            "a failed settings write must leave the removal still authorised"
+        );
+
+        // …and once the settings write DOES succeed, phase 2 records it and the pass after that is
+        // a no-op rather than a repeated removal.
+        commit_merge_policy(&again).expect("commit");
+        assert!(!read_merge_policy_at(dir.path()).expect("written").merge_protected);
+        let settled = plan_merge_policy_for(dir.path(), relaxed).expect("plan once more");
+        assert_eq!(settled.posture, MergeRulePosture::Unknown, "nothing left to remove");
+    }
+
+    /// The non-relaxation passes must NOT defer: a brand-new worktree needs its policy file on disk
+    /// immediately, because the guard reads an absent file as "no opinion".
+    #[test]
+    fn a_new_worktree_gets_its_policy_file_without_waiting_for_phase_two() {
+        for policy in [
+            merge_policy_for(Some("drodio/sparkle"), None),
+            merge_policy_for(Some("plow-pbc/tkmx-server"), None),
+            merge_policy_for(None, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let expected = policy.merge_protected;
+            let plan = plan_merge_policy_for(dir.path(), policy).expect("plan");
+            assert!(!plan.deferred, "only a relaxation defers");
+            let on_disk = read_merge_policy_at(dir.path()).expect("written by phase 1");
+            assert_eq!(on_disk.merge_protected, expected);
+            // Phase 2 is then a no-op, so calling it is harmless and calling it twice changes
+            // nothing.
+            commit_merge_policy(&plan).expect("no-op commit");
+            assert_eq!(
+                read_merge_policy_at(dir.path()).expect("unchanged").merge_protected,
+                expected
+            );
+        }
+    }
+
+    /// **EVERY SHAPE `gh` HONOURS MUST RESOLVE, OR THE VALUE IS SILENTLY DROPPED AND THE GATE FAILS
+    /// OPEN.** `$GH_REPO` is `[HOST/]OWNER/REPO` and `gh` also accepts a full URL; `merge_pr` passes
+    /// no `--repo`, so `gh` honours whatever is in that environment while the gate would not see it.
+    #[test]
+    fn host_qualified_and_url_repo_references_still_resolve() {
+        let remotes = "remote.origin.url https://github.com/drodio/sparkle.git";
+        for value in [
+            "plow-pbc/tkmx-server",
+            "github.com/plow-pbc/tkmx-server",
+            "https://github.com/plow-pbc/tkmx-server",
+            "https://github.com/plow-pbc/tkmx-server.git",
+            "PLOW-PBC/TKMX-Server",
+            // The SSH forms are what make the URL parser load-bearing rather than a shortcut:
+            // splitting `git@github.com:plow-pbc/tkmx-server` on `/` yields TWO parts, so a
+            // text-only fallback produces the WRONG slug (`git@github.com:plow-pbc/tkmx-server`)
+            // rather than `None` — and a wrong slug silently protects the wrong repo.
+            "git@github.com:plow-pbc/tkmx-server.git",
+            "ssh://git@github.com/plow-pbc/tkmx-server",
+        ] {
+            let candidates = merge_policy_candidates_from(Some(value), remotes, "");
+            assert_eq!(
+                first_denying_slug(&candidates, |_| None),
+                Some("plow-pbc/tkmx-server"),
+                "GH_REPO={value} must reach the gate"
+            );
+        }
+        // A host-qualified `gh-resolved` value too.
+        let resolved = "remote.upstream.gh-resolved github.com/plow-pbc/tkmx-client";
+        let candidates = merge_policy_candidates_from(None, remotes, resolved);
+        assert_eq!(first_denying_slug(&candidates, |_| None), Some("plow-pbc/tkmx-client"));
+        // …and genuine nonsense is still None rather than a guess, so this widening did not turn
+        // the parser into one that accepts anything.
+        for junk in ["", "/", "owner", "a/b/c/d", "just some words"] {
+            let c = merge_policy_candidates_from(Some(junk), "", "");
+            assert!(c.is_empty(), "{junk:?} must not resolve: {c:?}");
+        }
+
+        // A NON-GitHub host in `$GH_REPO` resolves anyway, and that is deliberate rather than
+        // sloppy. Only `$GH_REPO` and `gh-resolved` reach this parser, and both are `gh`'s own
+        // fields — `gh` speaks to GitHub and GHE only, so a gitlab.com value there is not a real
+        // input. Accepting it can only ADD a candidate, which over-refuses at worst; rejecting the
+        // host-qualified form to exclude it would drop `github.com/owner/repo` too, which is the
+        // shape `gh` documents and the one that opens the hole. Remote URLs are unaffected: they go
+        // through `merge_policy_slug_from_url`, which still rejects every non-GitHub host.
+        let other_host = merge_policy_candidates_from(
+            Some("https://gitlab.com/plow-pbc/tkmx-server"),
+            "",
+            "",
+        );
+        assert_eq!(other_host, vec!["plow-pbc/tkmx-server".to_string()]);
+        assert_eq!(
+            merge_policy_candidates_from(
+                None,
+                "remote.origin.url https://gitlab.com/plow-pbc/tkmx-server.git",
+                "",
+            ),
+            Vec::<String>::new(),
+            "a REMOTE on another host is still not a candidate"
+        );
+    }
+
+    /// **`Unknown` IS NOT `Unprotected`, AND THE HEAL PATH IS WHY.** `hooks::heal_agent_hooks`
+    /// re-points a stale guard command and knows no worktree. If its posture collapsed onto
+    /// `Unprotected`, every heal would silently strip the deny rule out of a merge-protected
+    /// worktree — a hole opened by the routine maintenance pass, with nothing to see it happen.
+    #[test]
+    fn the_heal_path_leaves_the_rule_exactly_as_it_found_it() {
+        let cmd = "node /abs/worktree-guard.mjs /wt/a";
+        let protected =
+            merge_guard_settings_with_merge_policy(None, cmd, MergeRulePosture::Protected);
+        // Two-argument form == the heal path == `Unknown`.
+        let healed = merge_guard_settings(Some(&protected), "node /abs/worktree-guard.mjs /wt/b");
+        assert!(denies_merge(&healed), "a heal must not strip a protected worktree's rule");
+        // …and it does not invent one either.
+        let open = merge_guard_settings_with_merge_policy(None, cmd, MergeRulePosture::Unprotected);
+        let healed_open = merge_guard_settings(Some(&open), "node /abs/worktree-guard.mjs /wt/b");
+        assert!(!denies_merge(&healed_open), "a heal must not invent a rule it cannot justify");
+    }
+
+    /// The rule is idempotent and never clobbers what the user already denied.
+    #[test]
+    fn the_conditional_rule_is_idempotent_and_preserves_user_rules() {
+        let cmd = "node /abs/worktree-guard.mjs /wt/a";
+        let first = merge_guard_settings_with_merge_policy(
+            Some(r#"{"permissions":{"deny":["Bash(rm -rf /:*)"]}}"#),
+            cmd,
+            MergeRulePosture::Protected,
+        );
+        let twice =
+            merge_guard_settings_with_merge_policy(Some(&first), cmd, MergeRulePosture::Protected);
+        let doc: Value = serde_json::from_str(&twice).unwrap();
+        let rules: Vec<&str> = doc["permissions"]["deny"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            rules.iter().filter(|r| **r == MERGE_GUARD_DENY_RULE).count(),
+            1,
+            "written once, not once per install: {rules:?}"
+        );
+        assert!(rules.contains(&"Bash(rm -rf /:*)"), "the user's own rule survives: {rules:?}");
+    }
+
+    /// The conditional rule must stay OUT of the static list. `deny_rules_match_the_shared_fixture`
+    /// asserts byte-equality with `destructive-commands.json`, so this also keeps that pin green —
+    /// but the reason it is here is the design one: a static deny has no approval path, and in
+    /// `drodio/sparkle` merging is the sanctioned path.
+    #[test]
+    fn the_conditional_merge_rule_is_not_a_static_deny_rule() {
+        assert!(
+            !SPARKLE_DENY_RULES.contains(&MERGE_GUARD_DENY_RULE),
+            "`gh pr merge` is per-worktree conditional, never unconditional"
+        );
+    }
+
+    /// **THE UNCONDITIONAL WRITE.** Written for BOTH kinds of worktree — the guard's absent-file
+    /// rule ("not Sparkle-managed, no opinion") is only safe while this never skips.
+    #[test]
+    fn the_policy_file_is_written_for_both_kinds_of_worktree() {
+        let protected_dir = tempfile::tempdir().unwrap();
+        let open_dir = tempfile::tempdir().unwrap();
+        write_merge_policy_at(
+            protected_dir.path(),
+            &merge_policy_for(Some("plow-pbc/tkmx-server"), None),
+        )
+        .expect("write protected");
+        write_merge_policy_at(open_dir.path(), &merge_policy_for(Some("drodio/sparkle"), None))
+            .expect("write unprotected");
+
+        let read = |d: &Path| -> serde_json::Value {
+            let p = d.join(".sparkle").join("merge-policy.json");
+            assert!(p.exists(), "merge-policy.json must exist at {}", p.display());
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap()
+        };
+        let protected = read(protected_dir.path());
+        let open = read(open_dir.path());
+        assert_eq!(protected["mergeProtected"], serde_json::json!(true));
+        assert_eq!(open["mergeProtected"], serde_json::json!(false));
+        assert_eq!(protected["slug"], serde_json::json!("plow-pbc/tkmx-server"));
+        assert_eq!(open["slug"], serde_json::json!("drodio/sparkle"));
+        // Only the protected file carries the human-handoff remedy; the other would be a
+        // user-facing instruction contradicting its own `mergeProtected: false`.
+        assert_eq!(protected["remedy"], serde_json::json!(MERGE_POLICY_REMEDY));
+        assert_ne!(open["remedy"], serde_json::json!(MERGE_POLICY_REMEDY));
+    }
+
+    /// **THE WRITE IS UNCONDITIONAL, AND THE INSTALLER IS WHERE THAT HAS TO BE TRUE.**
+    /// `write_merge_policy_at` being unconditional is worth nothing if its one production caller
+    /// wraps it in an `if`. Body-scoped whole-line match, same technique as the gate pins: an
+    /// indented line would not match, so a call moved inside a conditional fails here.
+    #[test]
+    fn install_worktree_guard_always_writes_the_policy_file() {
+        const CALL: &str = "let plan = plan_merge_policy_at(&worktree)?;";
+        let src = include_str!("worktree.rs");
+        let start = src
+            .find("pub async fn install_worktree_guard(")
+            .expect("install_worktree_guard's signature");
+        let body = &src[start..];
+        // Terminate on the settings write — the policy must be resolved and written BEFORE it, so
+        // a failure there leaves the bypass unwritten rather than the policy missing.
+        let end = body
+            .find("write settings.local.json")
+            .expect("the settings write — re-scope this slice rather than widening it");
+        let before = &body[..end];
+        assert!(
+            before.lines().any(|l| l == format!("        {CALL}")),
+            "the policy file must be written unconditionally, at ONE indent level, before the \
+             settings write — the guard's absent-file rule is only safe while this never skips"
+        );
+        // …and the settings writer must be fed the SAME verdict that file carries, so the two
+        // enforcement layers cannot disagree about one worktree.
+        assert!(
+            before.contains("plan.posture,"),
+            "the deny rule must be driven by the plan just resolved, not re-derived"
+        );
+        // …and phase 2 must come AFTER the settings write, never before it.
+        assert!(
+            !before.contains("commit_merge_policy(&plan)"),
+            "commit_merge_policy must not run before the settings write — the on-disk verdict is \
+             the evidence authorising the removal that write performs"
+        );
+        // BOUND THE POSITIVE ASSERTION TO THE FUNCTION, exactly as `before` is bounded. Searching
+        // `body` (which runs to END OF FILE) made this vacuous: the literal appears in the
+        // assertion string three lines above, so the test's own source satisfied it and the
+        // production call could be deleted with the suite green. That is the failure mode the
+        // sibling test's comment names — and it was written here anyway, which is why the
+        // `.expect` below refuses to widen rather than falling back to the file's end.
+        let after = &body[end..];
+        let func_end = after
+            .find("\n/// Minimal POSIX single-quote escaping")
+            .expect("the item that follows install_worktree_guard — re-scope, never widen");
+        assert!(
+            after[..func_end].contains("commit_merge_policy(&plan)"),
+            "…but it must run, IN THIS FUNCTION: a relaxation is not recorded until phase 2, and \
+             an unrecorded one strands the deny rule permanently"
+        );
+    }
+
+    /// **THE FROZEN WIRE SHAPE** (contract §7). `worktree-guard.mjs` is being written against these
+    /// exact key names in a different worktree, by someone who cannot see this file. A renamed key
+    /// does not fail to compile — it silently disarms their half.
+    #[test]
+    fn the_merge_policy_wire_shape_is_frozen() {
+        let doc: serde_json::Value =
+            serde_json::to_value(merge_policy_for(None, None)).expect("serializes");
+        let obj = doc.as_object().expect("an object");
+        let mut keys: Vec<&str> = obj.keys().map(|s| s.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["mergeProtected", "reason", "remedy", "slug", "version"],
+            "the guard parses these names verbatim — renaming one disarms it silently"
+        );
+        assert_eq!(obj["version"], serde_json::json!(1));
+        // A Rust `Option` crosses as `null`, NEVER as an absent key (AGENTS.md). The guard must be
+        // able to read `slug` as `string | null`, so the key has to be PRESENT here.
+        assert!(obj.contains_key("slug"), "slug is null, not absent");
+        assert_eq!(obj["slug"], serde_json::Value::Null);
+        assert!(obj["mergeProtected"].is_boolean());
+        // Round-trips: the guard's shape and ours are the same shape.
+        let back: MergePolicyFile = serde_json::from_value(doc).expect("round-trips");
+        assert!(back.merge_protected);
+    }
+
+    /// The project tier is read out of a TOML-QUOTED slug key. Tested with a slug containing a DOT
+    /// as well as a slash: a parser that split naively on `.` would pass the slash-only case.
+    #[test]
+    fn the_project_tier_is_read_from_a_quoted_slug_key() {
+        let toml_text = r#"
+[concierge.tools]
+merge_pr = "allow"
+
+[concierge.projects."plow-pbc/tkmx-server".tools]
+merge_pr = "deny"
+
+[concierge.projects."acme/widgets.io".tools]
+merge_pr = "ask"
+"#;
+        assert_eq!(
+            project_tool_tier_in(toml_text, "plow-pbc/tkmx-server", "merge_pr").as_deref(),
+            Some("deny")
+        );
+        assert_eq!(
+            project_tool_tier_in(toml_text, "acme/widgets.io", "merge_pr").as_deref(),
+            Some("ask"),
+            "a slug containing a dot must resolve as ONE key"
+        );
+        // Case-insensitive on the slug, as GitHub is.
+        assert_eq!(
+            project_tool_tier_in(toml_text, "PLOW-PBC/TKMX-Server", "merge_pr").as_deref(),
+            Some("deny")
+        );
+        // Absent project, absent tool, and unparseable text all answer None rather than a guess.
+        assert_eq!(project_tool_tier_in(toml_text, "nobody/nothing", "merge_pr"), None);
+        assert_eq!(project_tool_tier_in(toml_text, "plow-pbc/tkmx-server", "land_agent_branch"), None);
+        assert_eq!(project_tool_tier_in("this is not = = toml", "a/b", "merge_pr"), None);
+        // The GLOBAL `[concierge.tools]` entry is not a project entry and must not be read as one.
+        assert_eq!(project_tool_tier_in(toml_text, "drodio/sparkle", "merge_pr"), None);
+    }
+
+    /// A project entry of `deny` protects a worktree even when the slug is not pinned — that is the
+    /// general mechanism the pin is a floor under.
+    #[test]
+    fn a_project_deny_entry_protects_an_unpinned_worktree() {
+        let policy = merge_policy_for(Some("acme/widgets"), Some("deny"));
+        assert!(policy.merge_protected);
+        assert!(policy.reason.contains("acme/widgets"), "reason: {}", policy.reason);
+        assert!(policy.reason.contains("merge_pr"), "reason: {}", policy.reason);
+        // …and `ask` does not, because Rust enforces `deny` only.
+        assert!(!merge_policy_for(Some("acme/widgets"), Some("ask")).merge_protected);
+    }
+
+    /// **THE FORK HOLE — origin is not the repo `gh pr merge` acts on.** A fork checkout's origin
+    /// is unpinned while its upstream is the pinned repo, so an origin-only gate returns `Ok` and
+    /// `gh` merges in the protected repo: the mismatch fails OPEN, which is the one direction the
+    /// refusal text ("config cannot loosen a pin") promises it cannot. Both directions in one body,
+    /// since "it refused" alone would also be satisfied by refusing everything.
+    #[test]
+    fn a_fork_whose_upstream_is_pinned_is_refused_even_though_origin_is_not() {
+        let remotes = "remote.origin.url https://github.com/drodio/tkmx-server.git\n\
+                       remote.upstream.url https://github.com/plow-pbc/tkmx-server.git";
+        let candidates = merge_policy_candidates_from(None, remotes, "");
+        assert!(
+            candidates.contains(&"drodio/tkmx-server".to_string())
+                && candidates.contains(&"plow-pbc/tkmx-server".to_string()),
+            "both sides of a fork are candidates: {candidates:?}"
+        );
+        assert_eq!(
+            first_denying_slug(&candidates, |_| None),
+            Some("plow-pbc/tkmx-server"),
+            "the pinned UPSTREAM must refuse, even though origin is unpinned"
+        );
+        // …and the worktree file takes the same strictest view, naming the protected repo.
+        let policy = merge_policy_for(Some("plow-pbc/tkmx-server"), None);
+        assert!(policy.merge_protected);
+
+        // The inverse: a checkout whose remotes are ALL unpinned is not refused. Without this the
+        // assertion above is satisfied by a gate that refuses everything.
+        let ordinary = merge_policy_candidates_from(
+            None,
+            "remote.origin.url https://github.com/drodio/sparkle.git",
+            "",
+        );
+        assert_eq!(first_denying_slug(&ordinary, |_| None), None);
+    }
+
+    /// `gh` resolves its base repo from `$GH_REPO` and its own `gh-resolved` pin before it looks at
+    /// remotes at all, so both are candidates. Origin still leads the list, because it is the slug
+    /// the policy FILE names when nothing is protected.
+    #[test]
+    fn gh_repo_and_gh_resolved_are_candidates_too() {
+        let remotes = "remote.origin.url https://github.com/drodio/sparkle.git";
+        let via_env = merge_policy_candidates_from(Some("PLOW-PBC/TKMX-Client"), remotes, "");
+        assert_eq!(via_env.first().map(String::as_str), Some("plow-pbc/tkmx-client"));
+        assert_eq!(first_denying_slug(&via_env, |_| None), Some("plow-pbc/tkmx-client"));
+
+        let resolved = "remote.upstream.gh-resolved plow-pbc/tkmx-server";
+        let via_cfg = merge_policy_candidates_from(None, remotes, resolved);
+        assert_eq!(first_denying_slug(&via_cfg, |_| None), Some("plow-pbc/tkmx-server"));
+        // The literal `base` is a pointer to that remote's URL, not a slug — it must not be parsed
+        // as one, and it must not stop origin from being a candidate.
+        let base_form = merge_policy_candidates_from(None, remotes, "remote.origin.gh-resolved base");
+        assert_eq!(base_form, vec!["drodio/sparkle".to_string()]);
+        // With no remotes at all there is nothing to name: the empty set is what fails closed.
+        assert!(merge_policy_candidates_from(None, "", "").is_empty());
+        assert!(merge_policy_for(None, None).merge_protected);
+    }
+
+    /// A project `deny` entry refuses through the SAME loop, so the tier lookup is not bypassed for
+    /// non-origin candidates.
+    #[test]
+    fn a_project_deny_refuses_whichever_candidate_carries_it() {
+        let candidates = merge_policy_candidates_from(
+            None,
+            "remote.origin.url https://github.com/drodio/sparkle.git\n\
+             remote.upstream.url https://github.com/acme/widgets.git",
+            "",
+        );
+        let tier = |s: &str| (s == "acme/widgets").then(|| "deny".to_string());
+        assert_eq!(first_denying_slug(&candidates, tier), Some("acme/widgets"));
+        // `ask` is not this layer's business, so the same setup with `ask` must NOT refuse.
+        let asks = |s: &str| (s == "acme/widgets").then(|| "ask".to_string());
+        assert_eq!(first_denying_slug(&candidates, asks), None);
+    }
+
+    /// **BOTH INSTALLERS LEAVE A POLICY FILE.** `AgentPane.prepare` only warns when
+    /// `installWorktreeGuard` fails and then calls `installAgentHooks` unconditionally — and that
+    /// second path applies the full posture, `bypassPermissions` included. A policy written by only
+    /// one of them leaves bypass ON with no policy file, which the guard reads as "no opinion".
+    /// Structural, because both callers are Tauri commands needing an `AppHandle`.
+    #[test]
+    fn both_settings_installers_ensure_a_merge_policy() {
+        let hooks = include_str!("hooks.rs");
+        let start = hooks
+            .find("pub fn install_agent_hooks_sync(")
+            .expect("install_agent_hooks_sync's signature");
+        let body = &hooks[start..];
+        // Terminate on the atomic write this posture has to be part of. `.expect`, never
+        // `unwrap_or(len)`: a delimiter whose absence widens the slice is how such a guard goes
+        // vacuous (it would then match this module's own source, included above).
+        let end = body
+            .find("atomic_write_settings(&file, &merged)?;")
+            .expect("the settings write — re-scope this slice rather than widening it");
+        let before = &body[..end];
+        assert!(
+            before.lines().any(|l| {
+                l.trim() == "let merge_plan = crate::worktree::plan_merge_policy_at(&worktree)?;"
+            }),
+            "install_agent_hooks_sync must ensure the merge policy as a STATEMENT with `?`, before \
+             it writes a settings file that turns the approval prompt off"
+        );
+        assert!(
+            before.contains("merge_conditional_merge_deny_settings("),
+            "…and apply the deny rule that pairs with it, in the same atomic write"
+        );
+        // Phase 2 runs after that write here too, and inside the same settings lock. Bounded to
+        // the function for the same reason as the sibling above: a positive assertion searching to
+        // end-of-file can be satisfied by something other than the call it means to pin.
+        assert!(
+            !before.contains("commit_merge_policy(&merge_plan)"),
+            "commit_merge_policy must follow the settings write, not precede it"
+        );
+        let after = &body[end..];
+        let func_end = after
+            .find("\n/// Resolve the config layer whose `[plugins]` applies to a worktree.")
+            .expect("the item that follows install_agent_hooks_sync — re-scope, never widen");
+        assert!(
+            after[..func_end].contains("commit_merge_policy(&merge_plan)?;"),
+            "…and it must run, IN THIS FUNCTION"
+        );
+    }
+
+    /// Every remote URL shape this machine actually produces, lowercased — or `None` rather than a
+    /// guess, because a wrong slug would protect (or fail to protect) the wrong repo.
+    #[test]
+    fn remote_urls_resolve_to_a_lowercased_slug_or_nothing() {
+        for url in [
+            "https://github.com/PLOW-PBC/TKMX-Server.git",
+            "git@github.com:plow-pbc/tkmx-server.git",
+            "ssh://git@github.com/plow-pbc/tkmx-server",
+            "  https://github.com/plow-pbc/tkmx-server  ",
+        ] {
+            assert_eq!(
+                merge_policy_slug_from_url(url).as_deref(),
+                Some("plow-pbc/tkmx-server"),
+                "{url}"
+            );
+        }
+        for url in [
+            "https://gitlab.com/plow-pbc/tkmx-server.git",
+            "https://github.com/plow-pbc",
+            "https://github.com/plow-pbc/tkmx-server/extra",
+            "",
+            "/local/path/to/repo",
+        ] {
+            assert_eq!(merge_policy_slug_from_url(url), None, "{url}");
+        }
+        // And the pin sees the lowercased answer, so an upper-case remote is still protected.
+        let slug = merge_policy_slug_from_url("https://github.com/PLOW-PBC/TKMX-Server.git");
+        assert!(is_pinned_merge_protected(slug.as_deref()));
     }
 }

@@ -96,8 +96,54 @@ export type BriefDeliveryOutcome =
    *  only one that leaves "briefless agent" on the table. Never upgraded into a success. */
   | { state: "unconfirmed" };
 
+/**
+ * What the ATTACHING caller already did to the store for this brief, so the delivery path does not
+ * do it a second time.
+ *
+ * ══ WHY THIS EXISTS: ONE MISSION, TWO WRITERS ═════════════════════════════════════════════════
+ *
+ * `AgentPane` runs `recordPromptSideEffects` after an argv brief launches, because a brief that
+ * bypasses `submitPrompt` would otherwise leave the pinned header, prompt history and auto-naming
+ * blind to it. That is exactly right for `buildAgentSpawn`, which attaches and writes NOTHING else.
+ *
+ * It is wrong for `sendToBuild.seedDraft`, which `appendPrompt`s the seed itself (that write is what
+ * puts the mission in the pinned header on the RESUME branch, where no argv launch ever happens).
+ * Once `seedDraft` also started attaching, the fresh branch got BOTH writes: two identical
+ * `promptHistory` rows for one mission — only one carrying a terminal marker, so the other's "jump
+ * to this prompt" is dead — a double-counted naming ladder, a free-trial prompt debited for every
+ * board Start, and a generated epic brief taught to the ghost-text corpus that documents it must
+ * hold only what a person actually TYPED.
+ *
+ * So the brief carries what was already recorded, and the delivery path completes only what is
+ * still owed.
+ */
+export interface BriefRecord {
+  /** The `promptHistory` id `appendPrompt` returned, so delivery can mark the terminal against the
+   *  EXISTING entry instead of appending a duplicate to mark. */
+  promptId?: string;
+  /**
+   * Did a PERSON compose this text? Carried rather than defaulted because the delivery path cannot
+   * see the authority the handoff was made under, and the flag governs
+   * `projectStore.releaseGoalDebt`.
+   *
+   * `AgentPane` used to default it to `true` and said why: the brief fires on an agent whose PTY has
+   * only just come up, so there is no goal and no debt for either answer to release. That reasoning
+   * ended with an explicit warning — "it stops being true the moment spawn seeds an agent that
+   * INHERITS a goal or a debt — a reused id, a restored session. If that ever lands, thread the real
+   * `isHumanAuthored(authority)` down from the spawn caller rather than reading this comment as a
+   * licence." `seedDraft` attaching briefs landed exactly that: `epicSweepRunner` and
+   * `conciergeTools/plans` pass `humanAuthored: false` precisely so a machine handoff onto a REUSED
+   * orchestrator cannot un-latch an escalation nothing spent, and a reused row whose session is gone
+   * spawns FRESH — so the argv path ran on an agent that did carry `goalDebt`/`escalatedAt`. This is
+   * the threading that comment asked for.
+   */
+  humanAuthored: boolean;
+}
+
 interface Held {
   text: string;
+  /** See {@link BriefRecord}. Absent when the attaching caller wrote nothing to the store. */
+  recorded?: BriefRecord;
   /**
    * A launch has READ this brief into its argv (`briefForLaunch` returned the text) but has not yet
    * reported an outcome. The difference between "we are waiting on a launch we can name" and "we are
@@ -114,9 +160,24 @@ interface Held {
 const held = new Map<string, Held>();
 
 /** Hold `text` as `agentId`'s opening brief, to be emitted as claude's positional prompt by the
- *  pane's next FRESH launch. Replaces any brief not yet delivered (a re-spawn supersedes it). */
-export function attachBrief(agentId: string, text: string): void {
-  held.set(agentId, { text, inFlight: false, waiters: [] });
+ *  pane's next FRESH launch. Replaces any brief not yet delivered (a re-spawn supersedes it).
+ *
+ *  Pass `recorded` when you have ALREADY written this prompt to the store — see {@link BriefRecord}
+ *  for the duplicate-record and goal-debt bugs that omitting it produced. */
+export function attachBrief(agentId: string, text: string, recorded?: BriefRecord): void {
+  held.set(agentId, { text, recorded, inFlight: false, waiters: [] });
+}
+
+/**
+ * What the attaching caller already recorded for this agent's held brief, or undefined when nothing
+ * is held or nothing was recorded.
+ *
+ * READ IT BEFORE `noteBriefLaunched`, which consumes the entry. Kept as a separate accessor rather
+ * than folded into that function's return so the many existing callers and tests asserting
+ * `noteBriefLaunched(...) === text` keep working unchanged.
+ */
+export function briefRecord(agentId: string): BriefRecord | undefined {
+  return held.get(agentId)?.recorded;
 }
 
 /**

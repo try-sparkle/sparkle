@@ -57,6 +57,7 @@ const SAMPLES: Record<DispatchAuthorityKind, DispatchAuthority> = {
   // engine/goalContinuation, not anything on the authority — so the gate simply has to DELIVER for
   // it, which is what this walk asserts.
   "goal-continue": { kind: "goal-continue", agentId: "a1" },
+  "epic-restart": { kind: "epic-restart", agentId: "a1", epicId: "sparkle-e1" },
 };
 
 afterEach(() => {

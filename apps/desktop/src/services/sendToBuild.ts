@@ -6,7 +6,23 @@
 import { useProjectStore } from "../stores/projectStore";
 import { beadsProtocol } from "./buildAgent";
 import { landInAgent } from "./landInAgent";
+import { attentionHold } from "../engine/attentionGuard";
 import { localAgentCapacity, atCapacitySentence } from "./agentCapacity";
+import {
+  mountAgent,
+  mounted,
+  mountAgentAwaited,
+  mountedAwaited,
+  type AwaitedMountResult,
+} from "./agentMount";
+import { labelBead, PROMOTED_LABEL } from "./beads";
+import { dispatchConciergeAnswer } from "./conciergeDispatch";
+import { useRuntimeStore } from "../stores/runtimeStore";
+import { log } from "../logger";
+import { EPIC_RESUME_PROMPT_MARKER } from "../engine/agentOriginated";
+import { processAliveFor } from "./goalContinuationRunner";
+import { attachBrief } from "./agentBrief";
+import { advisorBriefFor, advisorHandoffHook } from "./advisor";
 
 /** Thrown when the handoff would need a NEW build agent and the machine is at its ceiling. A named
  *  class so callers can map it to their own vocabulary — the concierge to a typed `at-capacity`
@@ -18,6 +34,43 @@ export class AtCapacityError extends Error {
     this.name = "AtCapacityError";
   }
 }
+
+/** Thrown when a machine-driven handoff could not RELAUNCH the agent.
+ *
+ *  A named class for the same reason {@link AtCapacityError} is one, and for a sharper one besides:
+ *  a caller that reports "I restarted it" on a relaunch that never happened is exactly the failure
+ *  several review rounds kept finding here. Throwing makes the silent-success shape unavailable —
+ *  `services/epicSweepRunner` catches it, records `spawn-failed`, and says nothing to the founder.
+ *
+ *  ── WHAT IT CARRIES, AND WHY THAT CHANGED ───────────────────────────────────────────────────
+ *  It used to mean one thing: "no `Project.agents` row names this id". That condition is
+ *  UNREACHABLE from this module and always was — {@link prepareHandoff} either finds an existing
+ *  row or calls `addAgent`, which inserts one, so by the time any mount runs the row is present by
+ *  construction. The check re-read the store and could only ever answer `true`, which made this
+ *  whole channel dead code dressed as a safety net: the sweep's `spawn-failed` branch, its test,
+ *  and the reasoning in three review rounds all rested on a throw that could not fire.
+ *
+ *  So the refusal is spent on the failures that ACTUALLY occur, which are the ones only waiting can
+ *  see: the pane gave up, Claude is missing, the re-spawn timed out, or nothing re-spawned at all.
+ *  `reason` carries which — see `AwaitedMountResult`. */
+export class MountRefusedError extends Error {
+  readonly mountRefused = true;
+  /** The `AwaitedMountResult` that refused, so a caller can log the cause rather than a string. */
+  readonly reason: string;
+  constructor(message: string, reason = "no-agent-row") {
+    super(message);
+    this.name = "MountRefusedError";
+    this.reason = reason;
+  }
+}
+
+// `agentRowPresent` USED TO LIVE HERE, and its removal is the point rather than tidying. It re-read
+// the store to ask whether a `Project.agents` row named the id — a question `prepareHandoff` has
+// just answered by either finding that row or calling `addAgent` to insert one. So it could only
+// ever return `true`, which is what made `MountRefusedError`'s original `no-agent-row` case
+// unreachable while three review rounds reasoned about it as a live guard. Both mount call sites now
+// pass `() => true` and say why. `services/resurrectionRunner` keeps its OWN, differently-shaped
+// `agentRowPresent`: that caller has no such guarantee, so there the question is real.
 
 /**
  * The refusal's first clause, matched to what was actually asked for.
@@ -71,6 +124,34 @@ export interface SendToBuildArgs {
    *  epic's child tasks out across workers; "task" tells it to build THIS ONE bead on a single
    *  isolated worker branch without fanning out. `epicId` still names the target bead in both. */
   mode?: "epic" | "task";
+  /**
+   * Should the handoff TAKE THE VIEW — leave the board, select the agent, open its pane and scroll
+   * its row into sight? Defaults to `true` because every board click wants exactly that.
+   *
+   * PASS `false` FOR A HANDOFF NOBODY CLICKED. `landInAgent`'s own header says to call it "ONLY for
+   * a hand-off the user actually asked for", and names `services/workerSpawn` — which passes
+   * `select: false` — as the precedent: an agent the user never asked for must not take their
+   * terminal. Calling it unconditionally was fine while every caller was a click, and stopped being
+   * fine the moment `services/epicSweepRunner` began handing epics over on a ten-minute timer: that
+   * yanks the founder off whatever board or agent he is reading, with no gesture behind it.
+   *
+   * It gates ONLY the reveal. The binding, the capacity check and the seeded prompt all still
+   * happen, because they are what the handoff IS — this decides whether he gets moved to watch it.
+   */
+  reveal?: boolean;
+  /**
+   * Did a PERSON press something to cause this? Defaults to `"user"`, which is NEVER declined.
+   *
+   * DISTINCT FROM `reveal`, and the two are not redundant. `reveal: false` means "this caller has
+   * not earned the view at all"; `attention` means "it has, unless taking it right now would pull
+   * the founder out of a terminal he is typing in" (engine/attentionGuard). A caller that passes
+   * neither behaves exactly as it always has.
+   *
+   * `"auto"` is opt-in for the same reason it is on SpawnBuildAgentOpts: three of this function's
+   * four callers are button handlers, and a declined click is the regression `landInAgent` exists
+   * to prevent. Today only `conciergeTools/plans` passes it.
+   */
+  attention?: "user" | "auto";
   /**
    * Did a PERSON trigger this handoff? Defaults to `true` because every board click is one.
    *
@@ -127,8 +208,46 @@ function buildSeedPrompt(args: SendToBuildArgs): string {
   ].join("\n");
 }
 
-/** Hand the epic off to the project's Build agent. Returns the build agent id. */
-export function sendToBuild(args: SendToBuildArgs): string {
+/**
+ * What a machine-driven handoff actually did.
+ *
+ * THE VERDICT TRAVELS, rather than being collapsed into the agent id. A caller that reports to a
+ * human needs to distinguish "I restarted your orchestrator" from "it was already running and I
+ * handed the epic back to it" — both are real handoffs, only one is a restart, and saying the wrong
+ * one is the same class of false claim this whole path exists to remove. Collapsing them is how the
+ * defect got RELOCATED from the mount layer to the reporting layer once the mount was fixed.
+ */
+export interface BuildHandoff {
+  agentId: string;
+  verdict: AwaitedMountResult;
+}
+
+/** Did this handoff actually RELAUNCH the agent, as opposed to finding it already up? The predicate
+ *  a caller needs before writing the word "restarted" into a notice or a durable record. */
+export function didRelaunch(h: BuildHandoff): boolean {
+  return h.verdict !== "already-live";
+}
+
+/** What the shared prologue settled, before either entry point decides how to mount. */
+interface PreparedHandoff {
+  agentId: string;
+  /** Was an EXISTING orchestrator reused (rather than a fresh one created)? The reuse path is the
+   *  only one where a resume can happen, and so the only one that needs the seed DELIVERED rather
+   *  than merely appended — see {@link sendToBuildAwaited}. */
+  reused: boolean;
+}
+
+/**
+ * Everything both entry points do identically: find the project, enforce the cap, get the
+ * orchestrator, bind the epic to it.
+ *
+ * ONE COPY, deliberately. This module's own header records what happened the last time a second
+ * handoff path re-derived half of a shared rule (`services/agentMount` exists because of it), and
+ * the prologue is where the load-bearing invariants live — one orchestrator per epic, the
+ * machine-wide capacity ceiling, and the two id bindings that make the board's Shipped column
+ * reachable. A second copy that drifts on any of those is a bug in a place nobody looks.
+ */
+function prepareHandoff(args: SendToBuildArgs): PreparedHandoff {
   const store = useProjectStore.getState();
   const project = store.projects.find((p) => p.id === args.projectId);
   if (!project) throw new Error(`unknown project ${args.projectId}`);
@@ -186,6 +305,176 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // `create` gate is satisfied, so no redundant `sparkle-auto` duplicate is minted for it either.
   store.setAgentBeadId(args.projectId, agentId, args.epicId);
 
+  // …and record the handoff ON THE BEAD, which is what puts the epic in the epic sweep's watch set
+  // and KEEPS it there. The two `store.set…` calls above are the same fact written to a tab, and a
+  // tab is closed, retired and relaunched all the time; this is the fact written to the work. See
+  // `beads.PROMOTED_LABEL` for the measurement that made this necessary — deriving the watch gate
+  // from the roster alone left the sweep unable to act on any epic, ever, since v0.114.0.
+  //
+  // FIRE AND FORGET, DELIBERATELY. `prepareHandoff` is synchronous and is on the click path for the
+  // board's Start button; blocking a handoff the user just asked for on a `bd` write — against a
+  // single-writer store another worktree may hold the lock on — would stall the UI for the length of
+  // that queue. A missed label costs one un-watched epic that the next handoff re-stamps; a stalled
+  // click costs the founder the interaction. `labelBead` is idempotent, so re-stamping is free.
+  //
+  // "task" mode is EXCLUDED: it hands over a single bead to build on one worker, not a plan to be
+  // driven to completion, and the sweep's whole premise is an epic with children that stopped
+  // moving. Stamping it would aim the sweep at ordinary tasks.
+  if ((args.mode ?? "epic") === "epic") {
+    void labelBead(project.rootPath, "add", args.epicId, PROMOTED_LABEL).catch((e: unknown) => {
+      log.warn("epics", "could not mark an epic as promoted to build", {
+        epic: args.epicId,
+        error: String(e),
+      });
+    });
+
+    // ── THE SECOND-MODEL ADVISOR PASS (bead `sparkle-revqiv`) ────────────────────────────────
+    //
+    // THIS is the choke point, which is the whole reason the hook sits here rather than in the four
+    // callers: every route by which an epic becomes a build orchestrator — the board's Start and
+    // Build It buttons, the concierge's `promote_plan_to_build`, and the epic sweep through
+    // `sendToBuildAwaited` — passes through `prepareHandoff`. A hook in one caller is not a hook.
+    //
+    // It is deliberately NOT attached to `epicDecompose`'s `decompose:requested` label instead: NO
+    // UI EVER SETS THAT LABEL (it is defined, read and removed only inside `epicDecompose.ts`, and
+    // applied by hand), so an advisor riding on it alone would essentially never run.
+    //
+    // FIRE AND FORGET, for exactly the reason the `labelBead` above is: this function is synchronous
+    // and on the click path, and the hook writes to the same single-writer `bd` store. It never
+    // throws, never rejects, and never blocks — the findings from a pass it dispatches reach the
+    // NEXT handoff of this epic, and the terminal verdict (`advisor:reviewed` | `advisor:skipped`)
+    // is recorded on the bead either way. `epicSweepRunner`'s "makes NO model call on any path"
+    // header stays true of the SWEEP: the only call here is gated on the live usage payload and
+    // refuses unless usage credits are disarmed.
+    void advisorHandoffHook({
+      projectPath: project.rootPath,
+      projectRoot: project.rootPath,
+      projectId: args.projectId,
+      epicId: args.epicId,
+      epicTitle: args.epicId,
+      planText: args.prdPath
+        ? `The plan for this epic is the PRD at ${args.prdPath} — read it.`
+        : `This epic has no PRD; run \`bd show ${args.epicId}\` and read its description as the plan.`,
+      // IDS, not titles — this store holds `epicId` and nothing richer. See `AdvisorPassArgs`.
+      siblingEpics: project.agents
+        .filter((a) => a.kind === "build" && a.epicId && a.epicId !== args.epicId)
+        .map((a) => a.epicId as string),
+      agentClaims: project.agents
+        .filter((a) => a.beadId && a.beadId !== args.epicId)
+        .map((a) => `${a.name ?? a.id}: ${a.beadId}`),
+    });
+  }
+
+  return { agentId, reused: Boolean(existing) };
+}
+
+/**
+ * Seed the orchestrator's opening mission — as a LAUNCH BRIEF, and as composer bookkeeping.
+ *
+ * ══ THE STORE WRITE ALONE DELIVERS NOTHING, AND ITS DOC USED TO CLAIM OTHERWISE ═══════════════
+ *
+ * This function used to call `appendPrompt` and stop, on the stated theory that "on a FRESH agent
+ * that is exactly right, because `briefForLaunch` picks the draft up and the spawn carries it into
+ * the session." **`briefForLaunch` has never read the draft.** It reads `agentBrief`'s module-level
+ * `held` map, which is populated by `attachBrief` and by nothing else — and `sendToBuild` /
+ * `sendToBuildAwaited` never called it. So `AgentPane`'s `briefForLaunch(agent.id, resume)` returned
+ * `undefined` on the fresh path too, `initialPrompt` was omitted from the assembled spawn, and claude
+ * was exec'd WITH NO PROMPT AT ALL.
+ *
+ * Measured cost before this line existed: twelve orchestrators created by `epicSweepRunner` sat with
+ * an empty prompt, each one's transcript holding exactly one user message — the nudger's automated
+ * ping, not its brief. Six epics spent their one-shot sweep-restart budget on an agent that was never
+ * told anything.
+ *
+ * The store write is KEPT, and it is not redundant: it is what puts the mission in the pinned header
+ * and the prompt history a human reads in the pane. But it is bookkeeping. `attachBrief` is delivery.
+ *
+ * ══ WHY ATTACHING UNCONDITIONALLY IS SAFE ON THE RESUME PATH ══════════════════════════════════
+ *
+ * `briefForLaunch(agentId, true)` returns `undefined` before it ever consults `held`, so a RESUMING
+ * agent cannot emit this text as argv no matter what is attached — which is what keeps this from
+ * double-delivering alongside the `resumeInstruction` that `sendToBuildAwaited` dispatches on that
+ * branch. The brief simply stays held (`attachBrief` replaces rather than accumulates, so repeated
+ * sweeps of one epic hold one entry, and `clearBrief` discards it when the row goes away).
+ *
+ * The one behaviour that follows from holding it: if that same agent LATER launches fresh — its
+ * session gone, "Start again" after a crash — it will carry this brief as its argv instead of coming
+ * up blank. That is the desirable direction, and it is the same retention rule `noteBriefFailed`
+ * already relies on for Retry.
+ *
+ * The known accepted cost is unchanged and documented at the delivery branch in
+ * {@link sendToBuildAwaited}: a bound-but-never-opened agent is `reused` yet spawns FRESH, so it now
+ * gets both the argv brief and the terse resume instruction. The two agree, and the alternative —
+ * misclassifying the far more common resume as fresh — delivers nothing at all.
+ */
+function seedDraft(args: SendToBuildArgs, agentId: string): void {
+  // THE ADVISOR FINDINGS RIDE THE ARGV PATH, and folding them in HERE is what makes that true.
+  //
+  // `attachBrief` below is the one channel a launch actually reads (`briefForLaunch` consults the
+  // held map and nothing else), so the findings have to be part of the STRING that goes into it —
+  // not appended afterwards, not written to the store, not dispatched. This module's own header
+  // records the cost of believing otherwise: twelve orchestrators created with an empty prompt.
+  //
+  // SYNCHRONOUS and never throws: it returns the prompt UNCHANGED when no verdict is held, which is
+  // the ordinary first-handoff case and every case where the pass could not run. An advisor that
+  // cannot run paints nothing.
+  //
+  // It folds BEFORE the `appendPrompt` below on purpose. The two consumers must receive the same
+  // string: the record's `promptId` rides the brief precisely so the pane completes the row we
+  // wrote rather than writing a second one, and a store row missing the findings the argv carries
+  // would make the jump-to-prompt show a mission the orchestrator never received.
+  const prompt = advisorBriefFor(args.epicId, buildSeedPrompt(args));
+  const humanAuthored = args.humanAuthored ?? true;
+  // BOOKKEEPING FIRST, so its `promptId` can ride the brief. Authorship is forwarded rather than
+  // defaulted — see `SendToBuildArgs.humanAuthored` for why it is load-bearing on the REUSE path.
+  const promptId = useProjectStore
+    .getState()
+    .appendPrompt(args.projectId, agentId, prompt, "composer", humanAuthored);
+  // DELIVERY. Emitted as claude's positional prompt by the pane's next fresh launch, which claude
+  // submits itself at startup — see `services/agentBrief` for why argv is the only channel that
+  // cannot lose the submit.
+  //
+  // THE RECORD IS NOT OPTIONAL HERE. The pane runs `recordPromptSideEffects` after an argv launch,
+  // which writes the prompt to the store again and releases goal debt as a HUMAN send. Handing it
+  // what we already wrote is what keeps one mission to one `promptHistory` row and keeps a machine
+  // handoff from un-latching an escalation — see `BriefRecord` for both bugs in full.
+  attachBrief(agentId, prompt, { promptId, humanAuthored });
+}
+
+/** Hand the epic off to the project's Build agent. Returns the build agent id.
+ *
+ *  THE CLICK PATH. Synchronous, because every caller is a button handler and a board click wants the
+ *  view to move now. For the machine-driven path — a timer, with a budget to spend and a human to
+ *  report to — use {@link sendToBuildAwaited}. */
+export function sendToBuild(args: SendToBuildArgs): string {
+  const { agentId } = prepareHandoff(args);
+
+  // No `requestComposeFocus`: the orchestrator arrives with a seeded prompt above, so there is
+  // nothing for the user to type and the caret is not ours to take.
+  //
+  // ── `reveal: false` DROPS THE VIEW STEPS AND STILL RELAUNCHES ───────────────────────────────
+  // A machine-driven handoff must not take the user's screen, but it MUST actually bring the agent
+  // back — otherwise it binds the epic, seeds a prompt, reports success and relaunches nothing.
+  // `runtimeStore.open` alone does NOT do that; `services/agentMount` owns the full rule and the
+  // argument for it.
+  //
+  // THE ROW IS PRESENT BY CONSTRUCTION HERE, so this reports what it dispatched and cannot refuse:
+  // `prepareHandoff` above either found an existing `Project.agents` row or called `addAgent`, which
+  // inserted one. Passing a predicate that re-reads the store would be asking a question whose
+  // answer this function just wrote — which is precisely how the old `MountRefusedError` branch
+  // became unreachable code that three review rounds nonetheless reasoned about as a live guard.
+  //
+  // A synchronous caller gets a DISPATCH RECEIPT and nothing better is available to it. That is
+  // acceptable here only because no click path reports "I restarted it" to anyone — the user is
+  // looking at the pane and can see for themselves. It is NOT acceptable for the sweep.
+  // Seed the orchestrator's first message with the epic + PRD + beads protocol, BEFORE the mount —
+  // for the same reason `sendToBuildAwaited` states at its own call: on any branch that spawns fresh,
+  // the brief is read DURING the mount (`AgentPane.prepare` → `briefForLaunch`), so attaching it
+  // afterwards races the launch that is supposed to carry it. Ordering it here makes "the brief is
+  // attached before anything can read it" true by construction rather than true because React
+  // happens not to render inside a synchronous function.
+  seedDraft(args, agentId);
+
   // LAND the user in it. "Start"/"Build It" are clicked FROM the Plan board, so `activeSpecial` is
   // "board" and the board owns the pane — this used to call `open()` alone, which mounts the pane
   // behind the board and changes nothing the user can see. On the reuse path it was worse still:
@@ -193,16 +482,248 @@ export function sendToBuild(args: SendToBuildArgs): string {
   // and the handoff was completely invisible. landInAgent does all four steps (leave the board,
   // select, open, reveal the row) — see its header for why they travel together.
   //
-  // No `requestComposeFocus`: the orchestrator arrives with a seeded prompt below, so there is
-  // nothing for the user to type and the caret is not ours to take.
-  landInAgent(args.projectId, agentId);
-
-  // Seed the orchestrator's first message with the epic + PRD + beads protocol. Authorship is
-  // forwarded rather than defaulted — see `SendToBuildArgs.humanAuthored` for why it is load-bearing
-  // on the REUSE path only.
-  useProjectStore
-    .getState()
-    .appendPrompt(args.projectId, agentId, buildSeedPrompt(args), "composer", args.humanAuthored ?? true);
+  // ── AND THE FOUNDER'S CARET IS THE THIRD WAY TO REACH THE `reveal: false` BRANCH ────────────
+  // `reveal: false` says "the CALLER did not earn the view"; a held attention says "the caller did,
+  // but right now taking it would yank the founder out of a terminal he is typing in". Both want
+  // the identical outcome — relaunch, don't move him — so they resolve to the identical branch
+  // rather than to a second, subtly-different quiet path. It has to be `mountAgent` and not
+  // `landInAgent`'s degraded `open`: this function REUSES an orchestrator that may be closed, and
+  // `runtimeStore.open` alone does not bring one back (see the paragraph above).
+  //
+  // NOTE THE ORDER, which the merge with the brief-before-mount change made load-bearing: the seed
+  // is attached ABOVE, unconditionally, so a held hand-off is quiet in the view and complete in
+  // every other respect. Holding must never gate the seeding.
+  //
+  // GATED ON `attention`, and this function is the reason that field exists rather than a bare DOM
+  // read. Three of its four callers are BUTTON HANDLERS (BoardView, and both paths in
+  // useBeadBuildActions); only conciergeTools/plans is machine-driven. Declining a click would
+  // reinstate the exact regression `landInAgent` was written to fix — "Build It" pressed, board
+  // still up, nothing visibly changed. `buildOne` makes it worse still: it `await`s `claimBead`
+  // first, a round trip against a single-writer store shared by every worktree, so the caret would
+  // be sampled at an arbitrary later instant than the gesture.
+  const held = args.attention === "auto" && args.reveal !== false && attentionHold() !== null;
+  if (args.reveal !== false && !held) {
+    landInAgent(args.projectId, agentId);
+  } else {
+    mounted(mountAgent(agentId, () => true));
+  }
 
   return agentId;
+}
+
+/**
+ * Hand the epic off, WAIT until the orchestrator is genuinely back, and DELIVER the instruction to
+ * its terminal. Returns the build agent id.
+ *
+ * THE MACHINE PATH — `services/epicSweepRunner`, on a ten-minute timer. It differs from
+ * {@link sendToBuild} in the only two ways that matter to a caller which spends a one-shot budget
+ * and then tells a human what it did. Both were live defects, in different layers, and neither is
+ * visible from the click path.
+ *
+ * ── 1. IT WAITS, SO WHAT IT REPORTS IS TRUE ──────────────────────────────────────────────────
+ * `restartPane` returns a DISPATCH RECEIPT. `paneControl` says so outright: "`true` here means
+ * DISPATCHED, not restarted … It is NOT fine for a caller that reports an outcome to a human."
+ * Measured on v0.107.0, three agents restarted through the concierge all acked `{ok:true}` and were
+ * all still `errored` on the next status read. This awaits the pane's own readiness verdict and
+ * THROWS {@link MountRefusedError} on every non-success, so "I restarted your epic" is only ever
+ * sent about a restart that happened.
+ *
+ * ── 2. IT DELIVERS THE SEED, WHICH THE RESUME PATH OTHERWISE SWALLOWS ────────────────────────
+ * This is the defect that made the whole feature inert, and it hides behind a successful restart.
+ * `restartPane` re-spawns a session that EXISTS, so the spawn resumes (`claude --resume`) — and on
+ * a resume `briefForLaunch` returns `undefined` by design, because "the resumed conversation
+ * already contains the mission". `appendPrompt` is store bookkeeping and writes nothing to a
+ * terminal. So the pre-existing code path restarted a dead orchestrator, told it NOTHING, and left
+ * the epic sitting exactly as it was — while reporting a successful handoff.
+ *
+ * The channel that actually reaches a terminal is the concierge dispatcher, which is what
+ * `goalContinuationRunner` and `fleetWatch` use for the same job. So the seed goes through
+ * `dispatchConciergeAnswer` under an `epic-restart` authority, and the RESULT of that dispatch is
+ * checked — a refused or queued send is not a delivery, and this reports it as a failure rather
+ * than assuming the send arrived.
+ *
+ * The seed is still written on the OTHER branch, because it is the right mechanism there: a freshly
+ * created orchestrator has no session to resume, so `briefForLaunch` returns the brief `seedDraft`
+ * ATTACHED and the spawn carries it into claude's argv. Both halves are needed; neither covers both
+ * cases. (Read `seedDraft`: it is the attached brief, never the composer draft, that a launch reads —
+ * believing otherwise is what made every fresh orchestrator start with an empty prompt.)
+ */
+export async function sendToBuildAwaited(
+  args: SendToBuildArgs,
+  opts: {
+    /** Returns `undefined` for UNOBSERVED, which is a third answer and not a synonym for dead — see
+     *  `mountAgentAwaited`. Typed to admit it so a caller cannot forget the case exists; the
+     *  production default (`processAliveFor`) returns it routinely. */
+    isLive?: (id: string) => boolean | undefined;
+    readyTimeoutMs?: number;
+    pollMs?: number;
+    deliver?: (agentId: string, text: string, epicId: string) => Promise<boolean>;
+  } = {},
+): Promise<BuildHandoff> {
+  const { agentId, reused } = prepareHandoff(args);
+
+  // The SAME predicate the sweep gated on when it decided this agent was dead — injected for the
+  // reason `agentMount` states: two copies could answer differently, and the pairing that matters
+  // in production would then be untested by construction.
+  const isLive =
+    opts.isLive ??
+    ((id: string) => {
+      const rt = useRuntimeStore.getState();
+      return processAliveFor(id, rt.status, new Set(rt.openAgentIds));
+    });
+
+  // ── THE GATE IS ONLY ASKED ABOUT A REUSED AGENT, AND THAT IS LOAD-BEARING ────────────────────
+  // A brand-new id has no `runtimeStore.status` entry — `addAgent` created it moments ago and no
+  // pane has ever mounted for it — so `processAliveFor` returns `undefined`, meaning UNOBSERVED.
+  // `mountAgentAwaited` correctly treats unobserved as alive (a wrong "dead" tears down a live PTY),
+  // and the two correct rules compose into a wrong one: the fresh agent reads `already-live`, so it
+  // is never admitted, never opened, never spawned — and `mountedAwaited("already-live")` is true,
+  // so the handoff is reported as a SUCCESS that started nothing at all.
+  //
+  // A freshly created agent is not alive; that is not an observation, it is a fact about having just
+  // minted the id. So the gate is skipped rather than answered. This must NOT be expressed by
+  // passing `() => false` from the test seam — that is precisely the reading production can never
+  // produce, and a test that injects it asserts against code the app never runs.
+  const liveGate = reused ? isLive : () => false;
+
+  // Seed FIRST, and UNCONDITIONALLY. It has to be attached before the mount, because on any branch
+  // that spawns fresh the brief is read during the mount (`AgentPane.prepare` → `briefForLaunch`) —
+  // write it after and it arrives too late to be picked up.
+  //
+  // DO NOT narrow this to `if (!reused)`, even though the delivery below is narrowed that way. The
+  // two conditions look like they should match and do not: `reused` means an agents ROW was bound
+  // to this epic, which is NOT the same as a Claude SESSION existing. A row created by an earlier
+  // handoff that the user never opened has no session, so mounting it spawns FRESH — and a fresh
+  // spawn is exactly the case that reads the draft. Skipping the write there would hand that
+  // orchestrator nothing at all, which is the same inert state this function exists to prevent.
+  //
+  // The cost of writing it on the resume path, where nothing reads it, is an unread draft sitting in
+  // that agent's composer and a held brief nothing consumes. Both are cosmetic; the alternative is a
+  // silent no-brief spawn. See `seedDraft` for why the held brief cannot double-deliver on a resume.
+  seedDraft(args, agentId);
+
+  const verdict = await mountAgentAwaited(agentId, () => true, liveGate, {
+    readyTimeoutMs: opts.readyTimeoutMs,
+    pollMs: opts.pollMs,
+  });
+  if (!mountedAwaited(verdict)) {
+    throw new MountRefusedError(`could not relaunch agent ${agentId}: ${verdict}`, verdict);
+  }
+
+  // ── DELIVERY ────────────────────────────────────────────────────────────────────────────────
+  // Only where the seed is otherwise swallowed. A brand-new orchestrator has no session to resume,
+  // so `briefForLaunch` carries the ATTACHED brief into its spawn's argv and dispatching on top would
+  // deliver the mission twice.
+  //
+  // `already-live` is included even though nothing was restarted — the agent is up and idle on a
+  // stalled epic, which is exactly the case where telling it to resume is the entire point.
+  //
+  // The known imprecision, stated rather than hidden: a bound-but-never-opened agent is `reused`
+  // yet spawns fresh, so it gets BOTH the drafted seed and this instruction. Harmless (the two
+  // agree, and the second is three lines), and the safe direction — the alternative misclassifies
+  // the far more common resume as fresh and delivers nothing at all. Distinguishing them would take
+  // a session-exists probe that no store here holds.
+  if (!reused) return { agentId, verdict };
+
+  const deliver = opts.deliver ?? defaultDeliver;
+  const delivered = await deliver(agentId, resumeInstruction(args), args.epicId);
+  if (!delivered) {
+    // NOT a silent success. The restart happened, so the agent is up — but the instruction did not
+    // reach it, which leaves exactly the inert state this function exists to prevent. Reported as a
+    // refusal so the sweep records a failure and does NOT tell the founder it handed the epic back.
+    throw new MountRefusedError(
+      `relaunched agent ${agentId} but could not deliver the epic instruction`,
+      "undelivered",
+    );
+  }
+  return { agentId, verdict };
+}
+
+/**
+ * What a RESUMED orchestrator is told.
+ *
+ * Terse on purpose, and that is a decision rather than an economy: the agent is resuming its own
+ * conversation, which already holds the epic, the PRD and the beads protocol from its first brief.
+ * Re-sending `buildSeedPrompt` would spend thousands of tokens restating what is already in context
+ * a few turns up. What it does NOT have is the one fact only the sweep knows — that time passed and
+ * nothing moved — so that is what this says.
+ */
+export function resumeInstruction(args: SendToBuildArgs): string {
+  const where = args.prdPath
+    ? `Its plan is at ${args.prdPath}.`
+    : `Run \`bd show ${args.epicId}\` for the plan.`;
+  // BUILT FROM THE MARKER, never a literal that happens to match it. `agentOriginated` recognises
+  // Sparkle's own sends by this opening; if the two drifted apart the detector would go silently
+  // blind and this prose would start counting as the agent's own activity.
+  return [
+    `${EPIC_RESUME_PROMPT_MARKER}Resume epic ${args.epicId}.`,
+    "",
+    `${where} Its plan was written and then nothing moved on it, so you were restarted`,
+    "automatically. Pick up the epic's ready child beads and continue the work — decompose them",
+    "across isolated worker agents and integrate each worker's branch sequentially, as before.",
+    "",
+    `If the epic is genuinely blocked rather than stalled, say so and stop: \`bd comment ${args.epicId}\``,
+    "with the reason is more useful than a retry.",
+  ].join("\n");
+}
+
+/**
+ * The production delivery seam: the concierge dispatcher, the same channel `goalContinuationRunner`
+ * and `fleetWatch` use to reach a terminal.
+ *
+ * Returns whether the text will reach the agent. `ok` alone is not that fact — the dispatcher has
+ * refusal paths that report `ok: false` and several that never deliver — so the accepting paths are
+ * named explicitly and EVERYTHING else counts as undelivered. Fails closed, like the rest of this
+ * seam.
+ *
+ * ── WHY `queued` COUNTS, when `goalContinuationRunner` treats it as undelivered ───────────────
+ * A deliberate divergence, not an oversight, and it turns on the difference between the two
+ * callers. `queued` means the agent's PTY is not up yet and the text is held until it reports ready.
+ *
+ * The auto-continue runner refuses it because it fires every ~45s against an agent that is supposed
+ * to be ALREADY RUNNING: a queued send there means something is wrong, and the runner gets another
+ * attempt in under a minute at no cost. Neither is true here. This caller has just RESTARTED the
+ * PTY, so "not up yet" is the expected state rather than a symptom. Rejecting `queued` would report
+ * such a restart as a failure even though it worked and the instruction is in the app's own
+ * hand-off queue for it.
+ *
+ * ⚠️ AND `queued` REQUIRES A PANE THAT EXISTS. An earlier version of this comment claimed the
+ * `opened` route made `queued` the only possible outcome; that was backwards, and the code was
+ * wrong with it. `conciergeDispatch` decides its hold on `paneState(id) === "starting"`, so a pane
+ * that has not registered at all — `"unmounted"`, which is exactly what route 2 leaves behind until
+ * `Workspace` renders — does not queue. It is refused as `pty-gone`, and the epic loses its one-shot
+ * budget to a delivery that was never attemptable. That is fixed in `mountAgentAwaited`, which now
+ * waits for the pane to register before reporting `opened`, so by the time this runs there is a
+ * pane for the queue to belong to.
+ *
+ * And the pessimistic direction is not free here: this caller spends a ONE-SHOT budget, so a false
+ * failure costs the epic its only automatic restart AND tells the founder nothing.
+ *
+ * The case `queued` gets wrong — the PTY never comes up and the send expires — is not silent
+ * either: no child bead moves, so the next sweep finds the epic still stalled with its budget spent
+ * and ESCALATES it into the Blocked lane in front of the founder. That is the designed backstop,
+ * one stall window later, which is strictly better than burning the restart now for nothing.
+ */
+async function defaultDeliver(agentId: string, text: string, epicId: string): Promise<boolean> {
+  const r = await dispatchConciergeAnswer(agentId, text, {
+    authority: { kind: "epic-restart", agentId, epicId },
+  });
+  // `picker-option` is not listed: a stalled orchestrator has no live picker by construction, and if
+  // one somehow matched, this text would have been swallowed as a menu keystroke rather than read as
+  // an instruction — which is a failure to deliver the instruction, whatever the dispatcher says.
+  const delivered = r.ok && (r.path === "free-text" || r.path === "queued");
+  if (!delivered) {
+    log.warn("epics", "epic restart instruction was not delivered", {
+      agent: agentId,
+      epic: epicId,
+      path: r.path,
+      ok: r.ok,
+    });
+  } else if (r.path === "queued") {
+    log.info("epics", "epic restart instruction queued for a PTY still coming up", {
+      agent: agentId,
+      epic: epicId,
+    });
+  }
+  return delivered;
 }

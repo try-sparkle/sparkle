@@ -57,7 +57,6 @@
 // re-derived here. That file is this codebase's single retune point for Claude Code TUI drift, and
 // a second copy of "what marks a picker" is the desync its own header forbids.
 import { pickerFooterSpan, nothingUnrecognizedBelowFooter } from "./screenClassifier";
-
 /** ══ FAMILY A — THE BUSY STATUS BAR ═════════════════════════════════════════════════════════════
  *  What Claude Code draws WHILE WORKING, which is the state this whole module is about.
  *
@@ -109,6 +108,45 @@ const CHROME_BAR: RegExp[] = [
   /\bpaste again to expand\b/i,
 ];
 
+/** `CHROME_BAR`, re-anchored to the START of a string, tolerating a leading status glyph.
+ *
+ *  ══ WHY THE NARROW ARM NEEDS ITS OWN ANCHORING (roborev 64487, Medium) ═════════════════════════
+ *  `CHROME_BAR`'s entries are UNANCHORED substring tests, so "the rejoined tail matches one" is a
+ *  weaker claim than "the tail IS Claude's status bar" — a document whose prose happens to quote
+ *  the phrase clears it. The previous cut bought that back by demanding the FIRST row below the box
+ *  open with `AMBIENT_CHROME_LINE`, and that gate is wrong at this width for the same reason family
+ *  C is: Ink wraps the bar, and several of Claude's real bars have a first row of PLAIN TEXT.
+ *  `capturedScreens.fixture.ts` holds two verbatim — `  paste again to expand` and `Claude is using
+ *  your computer · press Esc to stop` — whose first wrapped rows are `paste again` and `Claude is`.
+ *  Neither carries a glyph, a rule or a caret, so the arm could never fire on them, and the paste
+ *  hint is precisely the state `services/conciergeDispatch` creates when its own paste does not
+ *  submit — the founder's pane refused again, for the bug this arm exists to close.
+ *
+ *  Anchoring the JOIN instead keeps the strength and drops the false negative: the tail must OPEN
+ *  with one of Claude's own phrases (after optional whitespace and an optional status glyph), which
+ *  a document's tail — starting with its own text — does not. `press ? for / shortcuts to / see the
+ *  rest` still fails, because its join begins with `press`. */
+/** The status glyphs Claude Code opens its bar with, as ESCAPES rather than literals — the
+ *  glyph-icon ratchet reads a literal class as one more affordance drawn with a character, and these
+ *  are bytes we RECOGNIZE, not bytes we render (`sessionLimitScreen`'s own note).
+ *
+ *  `⏵`/`⏴` ARE THE VERSION-CURRENT SPELLING (roborev 64501, High). 2.1.220 drew
+ *  `▶▶ bypass permissions on`; 2.1.231 draws `⏵⏴`'s `⏵⏵` — captured
+ *  verbatim TWICE in `capturedScreens.fixture.ts`, from this app's own worktrees. Omitting it does
+ *  not merely demote the box: the anchored join fails, `narrowBoxTerminatesGrid` answers `no`, the
+ *  closing rule is rejected and family D is lost ENTIRELY, so the ordinary idle narrow pane on the
+ *  current Claude version is refused — the exact bug this arm exists to remove, one glyph later.
+ *
+ *  `sessionLimitScreen`'s `AMBIENT_CHROME_LINE` carried the same gap. It is CLOSED — in the same
+ *  change as its byte-for-byte `nudge_gate.rs` port, as that drift test requires (roborev 64564).
+ *  This note said "NOT fixed here" for one commit and was left standing after the fix, which is the
+ *  same stale-justification defect the reviews above charged this branch with (roborev 64577). */
+const STATUS_GLYPHS = "\\u26a0\\u23f8\\u23f5\\u23f4\\u25b6\\u25c6\\u25cf\\u2713\\u2717\\u273b\\u273d\\u2722";
+
+const CHROME_BAR_OPENS: readonly RegExp[] = CHROME_BAR.map(
+  (re) => new RegExp(`^[\\s${STATUS_GLYPHS}]*(?:${re.source})`, re.flags),
+);
+
 /** ══ FAMILY D — THE COMPOSER BOX ════════════════════════════════════════════════════════════════
  *  Claude Code's input line is a `❯ ` (or `>` ) prompt sandwiched between two full-width box rules —
  *  see IDLE_AFTER_TURN_2_1_220, where the three lines are consecutive.
@@ -120,7 +158,40 @@ const CHROME_BAR: RegExp[] = [
  *  accidentally, which is what makes the sandwich below structural rather than lexical. */
 //  `_` IS NOT IN THIS CLASS (roborev 57704): a run of 20+ underscores is a common ASCII separator in
 //  plain text files, so accepting it would let an ordinary document form the sandwich below.
-const RULE_LINE = /^\s*[─━═]{20,}\s*$/;
+const RULE_LINE = /^\s*([─━═]{8,})\s*$/;
+
+/** ── THE RULE IS DRAWN TO THE GRID, SO ITS LENGTH IS A CLAIM ABOUT THE PANE (bead sparkle-tbsvf) ──
+ *  THE DEFECT THIS CLOSES. This threshold was a flat 20, and 20 box characters is not a property of
+ *  Claude Code — it is a property of a terminal at least 20 columns wide. This app renders agent
+ *  terminals far narrower than that, by its own measurements in two separate places: a pane that
+ *  "fits to a tiny size (cols≈12)" (components/Terminal.tsx) and one given "a fit of cols=23 in a
+ *  box that holds ~43" (bead sparkle-l2xgf). Below 20 columns family D — this module's ONLY proof
+ *  of a live TUI — could not fire at all, so an ordinary idle Claude Code in a narrow pane scored
+ *  one family and `isClaudeCodeScreen` called it `vim`. The founder's message came back "has a
+ *  full-screen app open" from a pane he was looking straight at, and the answer to "why does THIS
+ *  pane fail while the others pass" is simply that this one is narrower than the constant.
+ *
+ *  The same narrow-pane class was already fixed one module over: `engine/rejoinWrapped` exists
+ *  because a picker footer "in a 13-column agent column landed on six rows" and defeated every
+ *  line-anchored matcher (bead sparkle-99o9a). The READER was taught about narrow panes there; this
+ *  predicate's own width assumption was left behind.
+ *
+ *  ══ WHY A SMALLER NUMBER ALONE WOULD BE THE WRONG FIX ═════════════════════════════════════════
+ *  At 20 the length was doing real work: a 12-character run of `─` in a document at a wide grid is
+ *  an ordinary ASCII separator, so lowering the floor outright would let a pager showing a QUOTED
+ *  composer box clear family D — precisely the impostor this module's header is written around, and
+ *  the one whose cost is a line pasted AND SUBMITTED into `less`.
+ *
+ *  So the wide case is left EXACTLY as it was, and the narrow case earns its standing the way
+ *  families E and F already do — by POSITION rather than by shape. See {@link boxQualifies}. */
+const WIDE_RULE_MIN = 20;
+
+/** How many box-drawing characters `line` is, as a rule — or 0 when it is not a rule at all.
+ *  A width rather than a boolean because the qualification below reasons about how wide the box is
+ *  and whether its two rules AGREE, neither of which a predicate can report. */
+function ruleWidth(line: string): number {
+  return RULE_LINE.exec(line)?.[1]?.length ?? 0;
+}
 /** The bare-rule form (2.1.220, `IDLE_AFTER_TURN_2_1_220`): the prompt sits on its own line. */
 //  The with-text arm requires `❯`/`›` and NOT a bare `>` (roborev 57704) — `> some text` is every
 //  markdown blockquote ever written, and this arm is the one that runs against arbitrary prose. The
@@ -141,8 +212,20 @@ const PROMPT_LINE = /^\s*[❯›>]\s*$|^\s*[❯›]\s+\S/;
  *  every other bordered TUI. `lazygit`'s panels are the same box characters, but their contents are
  *  filenames and branch names, never a lone `>`; requiring the prompt to be the only occupant is the
  *  whole discriminator. */
-const BOX_TOP = /^\s*[╭┌][─━═]{10,}[╮┐]\s*$/;
-const BOX_BOTTOM = /^\s*[╰└][─━═]{10,}[╯┘]\s*$/;
+//  The same width reasoning as the bare-rule arm above, and the same floor: a border's length is a
+//  claim about the pane, not about Claude Code. `WIDE_BOX_RULE_MIN` keeps the shipped behaviour for
+//  a pane wide enough to have satisfied the old constant; anything narrower goes through
+//  `boxQualifies` and has to terminate the grid.
+const BOX_TOP = /^\s*[╭┌]([─━═]{6,})[╮┐]\s*$/;
+const BOX_BOTTOM = /^\s*[╰└]([─━═]{6,})[╯┘]\s*$/;
+const WIDE_BOX_RULE_MIN = 10;
+
+function boxTopWidth(line: string): number {
+  return BOX_TOP.exec(line)?.[1]?.length ?? 0;
+}
+function boxBottomWidth(line: string): number {
+  return BOX_BOTTOM.exec(line)?.[1]?.length ?? 0;
+}
 const BOX_PROMPT = /^\s*[│|]\s*[❯›>]\s*[│|]?\s*$|^\s*[│|]\s*[❯›>]\s+\S.*[│|]\s*$/;
 
 /** ══ FAMILY E — A LIVE DIALOG, WHICH IS WHAT REPLACES THE COMPOSER BOX ══════════════════════════
@@ -337,43 +420,254 @@ function isBoxBodyRowFor(promptLine: string): (line: string) => boolean {
 }
 
 /**
- * Does a closing rule follow `promptIdx` within the body bound, with every intervening row a legal
- * body row? A row that is neither the closing rule nor legal body ENDS the search — the box is not
- * a window to hunt in, it is a contiguous structure.
+ * The INDEX of the closing rule that follows `promptIdx` within the body bound — or -1 when none
+ * does. Every intervening row must be a legal body row; a row that is neither the closing rule nor
+ * legal body ENDS the search, because the box is not a window to hunt in, it is a contiguous
+ * structure.
+ *
+ * AN INDEX RATHER THAN A BOOLEAN, because {@link boxQualifies} has to look at the closing rule
+ * itself — how wide it is, and what is drawn beneath it. A predicate cannot report either, and
+ * re-finding the line at the call site would be a second scan free to disagree with this one.
  */
-function closesWithinBody(
+function closingRuleIdx(
   lines: readonly string[],
   promptIdx: number,
-  isRule: (line: string) => boolean,
+  widthOf: (line: string) => number,
   isBody: (line: string) => boolean,
   maxBodyRows: number,
-): boolean {
+  /** Would a rule at this index and width actually CLOSE this box? See {@link boxQualifies}.
+   *
+   *  ── WHY THE QUALIFICATION HAPPENS INSIDE THE SCAN (roborev 64464, Medium) ──────────────────
+   *  It used to run at the call site, on whatever row the scan stopped at, and that silently
+   *  REGRESSED the wide case this fix promised to leave alone. Lowering `RULE_LINE` to `{8,}` means
+   *  an INDENTED run of 8-19 box characters — inside a composer holding a pasted message that
+   *  happens to contain one — now matches `widthOf(...) > 0`, so the scan returned IT as the closing
+   *  rule, the width check then failed it, and the box was abandoned before reaching the genuine
+   *  120-column rule below. Under the old `{20,}` that same row was not a rule at all: it matched
+   *  `CONTINUATION_ROW`, the scan carried on, and the box was found. A 120-column composer therefore
+   *  lost family D — the exact refusal this commit exists to remove, reintroduced on the wide path.
+   *
+   *  Asking here restores that: a rule that does not qualify is reconsidered AS A BODY ROW and the
+   *  scan continues, which is precisely what the single `{20,}` pattern used to do implicitly. */
+  qualifies: (closeIdx: number, closeWidth: number) => boolean,
+): number {
   const last = Math.min(promptIdx + 1 + maxBodyRows, lines.length - 1);
   for (let j = promptIdx + 1; j <= last; j += 1) {
     const line = lines[j] ?? "";
-    if (isRule(line)) return true;
-    if (!isBody(line)) return false;
+    const w = widthOf(line);
+    if (w > 0 && qualifies(j, w)) return j;
+    if (!isBody(line)) return -1;
   }
-  return false;
+  return -1;
 }
 
-function hasComposerBox(lines: readonly string[]): boolean {
+/** How many rows below the box may be Claude Code's own chrome. Mirrors `MAX_CHROME_BELOW_FOOTER`'s
+ *  role in the walk this narrow arm stands in for, with room for the WRAP: one status bar that fits
+ *  on a single row at 120 columns occupies several at 12, and there are two of them. */
+const MAX_NARROW_CHROME_ROWS = 12;
+
+/** HOW a narrow box terminated the grid, because the two ways are not equal evidence (roborev
+ *  64487, High).
+ *
+ *  `chrome` — Claude's own status bar, rejoined, sits below the box. That is TWO independent things
+ *  (the box, and the bar), which is what lets a narrow box stand alone in `isClaudeCodeScreen`.
+ *  `bare` — nothing below the box, or only rules. The box still terminates the grid, but the only
+ *  evidence on the screen is the box SHAPE, so it buys family D and nothing more.
+ *  `no` — something below that is neither. Not a live composer at all. */
+type NarrowTermination = "no" | "bare" | "chrome";
+
+/**
+ * Does this narrow box TERMINATE the grid — nothing below it but blanks and Claude's own chrome?
+ *
+ * ══ WHY NOT `nothingUnrecognizedBelowFooter`, WHICH IS WHAT FAMILIES E AND F USE ════════════════
+ * Because that walk is strictly line-anchored, and on a narrow grid Claude Code's chrome does not
+ * arrive on one line (roborev 64464, High). At 12 columns
+ *
+ *     "  ⏸ manual mode on · ? for shortcuts"
+ *
+ * is rendered as three rows, and only the FIRST carries the `⏸` that `AMBIENT_CHROME_LINE` matches.
+ * The continuation rows — "mode on · ?", "for shortcuts" — are not a rule, not a bare caret, and
+ * carry no status glyph, so the walk rejects them and the narrow arm could never fire on a real
+ * narrow pane. The first cut of this fix passed its own tests only because its fixture supplied a
+ * 36-column chrome row that a 12-column grid cannot render.
+ *
+ * `engine/rejoinWrapped` cannot help here and this file must not pretend otherwise: it rejoins rows
+ * the TERMINAL wrapped, and Ink does its own wrapping, "emitting a real newline of its own. There is
+ * no `isWrapped` to consult in that case, so the reader cannot help and the matcher has to"
+ * (`screenClassifier`, bead sparkle-99o9a). `pickerFooterSpan` already grew a two-line join for
+ * exactly this; this is the same accommodation, sized for a status bar rather than a footer.
+ *
+ * ══ WHAT KEEPS IT FROM ACCEPTING ANYTHING: THE ROWS ARE REJOINED AND THE *JOIN* MUST BE CHROME ══
+ * Two earlier cuts of this were too weak, and both failures are worth recording because they are
+ * the same mistake at different strengths.
+ *
+ * The first admitted a row whenever the row above it was "full". Wrong: Ink wraps at WORD
+ * boundaries, so a wrapped row is normally SHORTER than the grid, not flush with it.
+ *
+ * The second tested only the FIRST row below the box against `AMBIENT_CHROME_LINE` and admitted the
+ * rest behind a width bound — and that bound is VACUOUS in exactly the case this arm exists for
+ * (roborev 64475, High). `gridWidth` is the box's own rule width, and a terminal wraps every
+ * physical row at the PANE width, so on a pane as narrow as the rules NOTHING below can exceed it.
+ * `AMBIENT_CHROME_LINE` is cheap to satisfy from ordinary text — any line opening with `●`, `⚠`, a
+ * `─{4,}` divider or a lone `>` — so a pager running IN a narrow pane cleared the whole arm:
+ *
+ *     ────────────      ← the file's own separator, at a 12-column grid
+ *     ❯
+ *     ────────────
+ *     ● note text       ← passes, being the first content row
+ *     more prose        ← admitted unmatched
+ *     :                 ← less's status row, admitted unmatched
+ *
+ * The rows below the box are therefore REJOINED — Ink split one logical status bar across them and
+ * dropped the space at each break — and the JOIN has to OPEN with one of `CHROME_BAR`'s phrases,
+ * Claude Code's own catalogue of status lines. (A third cut kept a per-row `AMBIENT_CHROME_LINE`
+ * gate on the first row as well; that rejected Claude's own `paste again to expand` and `Claude is
+ * using your computer` bars, whose first wrapped row is plain text — roborev 64487, Medium. The
+ * anchoring moved onto the join, where the wrap cannot hide it: see `CHROME_BAR_OPENS`.) "The wrapped remainder of Claude's status bar" is then PROVEN rather
+ * than assumed, which is what the second cut got wrong: `  ⏸ manual` + `mode on · ?` +
+ * `for shortcuts` rejoins to a line `CHROME_BAR` recognises, while `● note text more prose :` and
+ * `notes.md 62%` match nothing in it.
+ *
+ * A box with NOTHING below it still terminates the grid, and so does one followed only by rules —
+ * neither is a document, and demanding a status bar there would reject a real screen. Those two are
+ * reported as `bare` rather than `chrome`, because NO status bar was read on them: see
+ * {@link NarrowTermination} and the standalone rule in `isClaudeCodeScreen`, which the distinction
+ * exists to keep honest.
+ *
+ * The width bound is KEPT but is no longer the argument: it still rejects the wide-pager case
+ * (trailing prose longer than the rules above it) cheaply, and it costs nothing when it cannot fire.
+ */
+function narrowBoxTerminatesGrid(
+  lines: readonly string[],
+  closeIdx: number,
+  gridWidth: number,
+): NarrowTermination {
+  const below: string[] = [];
+  for (let i = closeIdx + 1; i < lines.length; i++) {
+    const line = (lines[i] ?? "").trimEnd();
+    if (!line.trim()) continue;
+    // A row wider than the rules means the rules are not the grid, so this box is being QUOTED
+    // inside something wider. Cheap, and still right — just not sufficient on its own.
+    if (line.length > gridWidth) return "no";
+    if (below.length >= MAX_NARROW_CHROME_ROWS) return "no";
+    below.push(line.trim());
+  }
+  // NOTHING BELOW, OR ONLY RULES: the box still terminates the grid — neither is a document, and
+  // demanding a status bar here would reject a real screen. But it is termination WITHOUT PROOF of
+  // chrome, so it is reported as `bare` and does not buy the standalone privilege; see
+  // `isClaudeCodeScreen`.
+  if (below.length === 0) return "bare";
+  if (below.every((l) => RULE_LINE.test(l) || BOX_BOTTOM.test(l))) return "bare";
+  // THE JOIN IS ANCHORED, NOT MERELY MATCHED (roborev 64487, Medium). See `CHROME_BAR_OPENS`: a
+  // tail that only CONTAINS one of Claude's phrases inside prose is a document, while a tail that
+  // OPENS with one is the wrapped remainder of the bar itself.
+  //
+  // A DIVIDER BETWEEN THE BOX AND THE BAR IS SKIPPED FIRST (roborev 64501, High). A leading rule is
+  // already accepted as termination on its own (the `bare` branch above), so letting one push the
+  // bar out of the anchor's reach would answer `no` — losing family D entirely — on a screen that a
+  // rules-only tail would have kept.
+  const firstNonRule = below.findIndex((l) => !RULE_LINE.test(l) && !BOX_BOTTOM.test(l));
+  return matchesAny(CHROME_BAR_OPENS, below.slice(firstNonRule).join(" ")) ? "chrome" : "no";
+}
+
+/**
+ * Is this well-formed box ALSO good enough evidence of a LIVE TUI?
+ *
+ * ══ THE WIDE ARM IS THE SHIPPED BEHAVIOUR, UNCHANGED ════════════════════════════════════════════
+ * A box whose rules clear the old constant answers exactly as it did before this fix — including
+ * requiring the CLOSING rule to clear it too, which the single shared `{20,}` pattern used to
+ * enforce implicitly. Narrowing the floor must not quietly widen the wide case as a side effect.
+ *
+ * ══ THE NARROW ARM EARNS ITS STANDING BY POSITION, NOT BY SHAPE ═════════════════════════════════
+ * Below the old constant a rule is no longer self-evidently the full width of a grid, so the shape
+ * alone stops being proof — a document quoting a composer box draws the identical three rows. Two
+ * further things are demanded, and between them they are what a quoted box cannot supply:
+ *
+ *   • THE TWO RULES MUST BE THE SAME WIDTH. Claude Code draws both to one grid, so they match by
+ *     construction; an ASCII separator pair in prose has no reason to. Pinned on its own by the
+ *     mismatched-rule impostor in `claudeCodeScreen.narrowPane.test.ts` (roborev 64464, Medium):
+ *     without that case the termination rule below was rejecting every impostor single-handed and
+ *     this conjunct could have been deleted with the suite still green.
+ *   • THE BOX MUST TERMINATE THE GRID — nothing below it but blanks and Claude's own ambient
+ *     chrome. Same argument families E and F make, and for the same reason: a live composer is the
+ *     last thing Claude Code draws, while text ABOUT one has a document underneath it. A pager keeps
+ *     going below the quoted box, or draws its own status row (`less`'s `:`, a filename, a
+ *     percentage), and neither is Claude chrome. See {@link narrowBoxTerminatesGrid} for why this
+ *     arm cannot call `nothingUnrecognizedBelowFooter` itself.
+ *
+ * A false NEGATIVE here still costs one refusal, which is the behaviour that shipped for months; a
+ * false positive is a line pasted AND SUBMITTED into a pager. The asymmetry that governs every
+ * threshold in this file governs this one too.
+ */
+function boxQualifies(
+  lines: readonly string[],
+  topWidth: number,
+  closeIdx: number,
+  closeWidth: number,
+  wideMin: number,
+  /** How wide the GRID is if this box spans it — which is not `topWidth` for the rounded form,
+   *  whose match measures the run BETWEEN the two corner characters. Passing the inner width there
+   *  understates the grid by two cells and rejects a chrome row that fits the pane perfectly. */
+  gridWidth: number,
+): BoxProof {
+  if (topWidth >= wideMin) return closeWidth >= wideMin ? "wide" : "no";
+  if (closeWidth !== topWidth) return "no";
+  const how = narrowBoxTerminatesGrid(lines, closeIdx, gridWidth);
+  return how === "chrome" ? "narrow-chrome" : how === "bare" ? "narrow-bare" : "no";
+}
+
+/** Which arm recognised the composer box, because the two are not interchangeable evidence.
+ *
+ *  ══ WHY THE CALLER MUST KNOW (roborev 64482, High) ═════════════════════════════════════════════
+ *  The narrow arm proves itself with Claude's REJOINED STATUS BAR, and family C is a test for
+ *  Claude's status bar. Counting both would let ONE piece of evidence satisfy `>= 2` — precisely
+ *  the silent collapse `claudeCodeMarkerFamilies`' own doc says this module must never accept, and
+ *  a narrow box would have corroborated itself. See `isClaudeCodeScreen` for how the two arms are
+ *  scored instead. */
+type ComposerBoxKind = BoxProof;
+
+/** What a candidate box PROVED, not merely whether it qualified. `narrow-chrome` and `narrow-bare`
+ *  are both a recognised composer box (family D either way); only the first carries the status bar
+ *  that lets it stand alone. */
+type BoxProof = "no" | "wide" | "narrow-bare" | "narrow-chrome";
+
+function composerBoxKind(lines: readonly string[]): ComposerBoxKind {
+  // The STRONGEST narrow proof seen so far. A screen may draw more than one narrow box (a quoted one
+  // above the live one); the live one's chrome must not be lost to a bare sibling found later.
+  let narrow: "no" | "narrow-bare" | "narrow-chrome" = "no";
+  const record = (proof: BoxProof): boolean => {
+    if (proof === "narrow-chrome") narrow = "narrow-chrome";
+    else if (proof === "narrow-bare" && narrow === "no") narrow = "narrow-bare";
+    return proof !== "no";
+  };
   for (let i = 0; i + 2 < lines.length; i += 1) {
     const top = lines[i] ?? "";
     const mid = lines[i + 1] ?? "";
-    if (RULE_LINE.test(top) && PROMPT_LINE.test(mid)) {
-      const rule = (l: string) => RULE_LINE.test(l);
-      if (closesWithinBody(lines, i + 1, rule, isComposerBodyRow, MAX_COMPOSER_BODY_ROWS)) {
-        return true;
+    const topRule = ruleWidth(top);
+    if (topRule > 0 && PROMPT_LINE.test(mid)) {
+      const qualifies = (close: number, width: number): boolean =>
+        record(boxQualifies(lines, topRule, close, width, WIDE_RULE_MIN, topRule));
+      if (
+        closingRuleIdx(lines, i + 1, ruleWidth, isComposerBodyRow, MAX_COMPOSER_BODY_ROWS, qualifies) >= 0
+      ) {
+        if (topRule >= WIDE_RULE_MIN) return "wide";
       }
     }
-    if (BOX_TOP.test(top) && BOX_PROMPT.test(mid)) {
-      const bottom = (l: string) => BOX_BOTTOM.test(l);
+    const topBox = boxTopWidth(top);
+    if (topBox > 0 && BOX_PROMPT.test(mid)) {
       const isBody = isBoxBodyRowFor(mid);
-      if (closesWithinBody(lines, i + 1, bottom, isBody, MAX_BOX_BODY_ROWS)) return true;
+      const qualifies = (close: number, width: number): boolean =>
+        record(boxQualifies(lines, topBox, close, width, WIDE_BOX_RULE_MIN, topBox + 2));
+      if (closingRuleIdx(lines, i + 1, boxBottomWidth, isBody, MAX_BOX_BODY_ROWS, qualifies) >= 0) {
+        if (topBox >= WIDE_BOX_RULE_MIN) return "wide";
+      }
     }
   }
-  return false;
+  return narrow;
+}
+
+function hasComposerBox(lines: readonly string[]): boolean {
+  return composerBoxKind(lines) !== "no";
 }
 
 function matchesAny(patterns: readonly RegExp[], text: string): boolean {
@@ -392,6 +686,17 @@ export function claudeCodeMarkerFamilies(snapshot: string): number {
   let n = 0;
   if (matchesAny(BUSY_STATUS, snapshot)) n += 1;
   if (matchesAny(TOOL_GLYPH, snapshot)) n += 1;
+  // ── FAMILY C STAYS LINE-ANCHORED, AND THAT IS DELIBERATE (roborev 64482, High) ─────────────────
+  // It briefly also read the REJOINED tail, to stop it going blind on a narrow pane where Ink
+  // breaks "manual mode on · ? for shortcuts" across rows. That reads as an improvement and is a
+  // COLLAPSE: the narrow composer arm proves itself with that very same rejoined status bar, so one
+  // piece of evidence would have been counted twice and `>= 2` satisfied by a single marker — the
+  // exact weakening this function's own doc says must never pass quietly, and a narrow box would
+  // have corroborated itself.
+  //
+  // The narrow pane keeps its answer without the double count: see `isClaudeCodeScreen`, where a
+  // narrow box stands ALONE the way families E and F do, because its own proof already contains
+  // both the box and the status bar.
   if (matchesAny(CHROME_BAR, snapshot)) n += 1;
   if (hasComposerBox(lines)) n += 1;
   // Family E counts as its own family, not merely as a substitute precondition. Without that, a
@@ -454,10 +759,45 @@ export function isClaudeCodeScreen(snapshot: string): boolean {
   // on precisely the screen this family exists for.
   if (hasBackgroundTaskList(lines)) return true;
 
+  // ── A NARROW COMPOSER BOX STANDS ALONE, LIKE E AND F (roborev 64482, High) ────────────────────
+  // NOT a relaxation — it is what stops one piece of evidence being counted twice. The narrow arm
+  // only recognises a box when Claude's own STATUS BAR, rejoined, sits beneath it
+  // (`narrowBoxTerminatesGrid`), so a narrow box already carries the box AND the chrome. Scoring it
+  // as family D and then letting family C read that same status bar again would satisfy `>= 2` from
+  // a single marker — the collapse `claudeCodeMarkerFamilies` forbids — while a narrow pane is by
+  // construction too small to show a second, independent family anyway.
+  //
+  // The bar it clears is HIGHER than family E's, which stands alone on position alone: this demands
+  // a full-width pair of equal rules sandwiching a prompt, nothing below wider than the grid, and a
+  // rejoined tail that — past any divider drawn between the box and the bar — OPENS with one of
+  // `CHROME_BAR`'s phrases. (Two earlier wordings of this clause named guarantees the code did not
+  // give: a per-row first-line gate that had been deleted, and then a strict "opens with" that the
+  // divider skip had already relaxed — roborev 64487 and 64564, both Medium. The clause has to move
+  // with `narrowBoxTerminatesGrid`, since it is the safety argument the call site reads.)
+  // …and ONLY the chrome-proven form does (roborev 64487, High). `narrowBoxTerminatesGrid` also
+  // accepts a box with nothing below it, or with only rules below it, because neither is a document
+  // — but on those the two independent things above collapse back to ONE, the box shape, and a
+  // viewport carrying no Claude marker whatsoever would stand alone on its shape:
+  //
+  //     # notes on the composer     ← a document, and the only text on screen
+  //     ────────────
+  //     ❯
+  //     ────────────
+  //     ────────────                ← rules-only tail: terminates the grid, proves no chrome
+  //
+  // A `bare` box therefore falls through to the `>= 2` rule below, scoring family D like any other.
+  //
+  // READ THAT AS RULES-*ONLY* (roborev 64564, Medium). A rule FOLLOWED by chrome is still `chrome`:
+  // the anchor skips leading dividers, so the tail above demotes the box only because there is
+  // nothing after the rule. A divider under the box is not by itself a demotion, and the two
+  // statements have to be read together or this example teaches the opposite of what the code does.
+  const box = composerBoxKind(lines);
+  if (box === "narrow-chrome") return true;
+
   // ── OTHERWISE THE COMPOSER BOX IS MANDATORY, PLUS ONE CORROBORATING FAMILY ───────────────────
   // Unchanged, and still the rule for every screen without a live dialog: a pasted transcript in a
   // pager carries Claude's glyphs and its status bar — two families — without being Claude Code.
-  if (!hasComposerBox(lines)) return false;
+  if (box === "no") return false;
   return claudeCodeMarkerFamilies(snapshot) >= 2;
 }
 

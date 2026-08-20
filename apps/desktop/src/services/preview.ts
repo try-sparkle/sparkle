@@ -13,7 +13,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { safeUnlisten } from "./safeUnlisten";
-import { autoOpenPreviewIfWarranted } from "./previewOpenOutcomeFor";
 import {
   usePreviewStore,
   type PreviewCapability,
@@ -243,20 +242,16 @@ export function applyPreviewStatus(status: PreviewStatus): void {
     port: status.port ?? null,
     error: status.error ?? null,
   });
-  // THE AUTO-OPEN TRIGGER (design §10, bead sparkle-3475b.6).
+  // NO AUTO-OPEN TRIGGER ANY MORE, and nothing replaced it. It fired on the transition into
+  // `ready`/`serving` and asked `previewOpenOutcomeFor` whether to pop a preview PANE. That pane is
+  // gone (founder, 2026-08-19: a preview is a card in the concierge chat), and a card needs no
+  // permission to appear — it is a projection of this very store, so folding the status IS the
+  // surfacing. The whole five-condition conjunction of design §10 existed to decide whether taking
+  // the screen was warranted; a card takes no screen, so there is nothing left to decide.
   //
-  // Armed by the TRANSITION into `ready`/`serving` — a fresh `surfacedAt` stamp — and never by the
-  // state merely being one of those. The distinction is what keeps the whole thing bounded: a dev
-  // server re-emits `serving` on every hot reload, and an arm-on-state trigger would ask to open a
-  // pane on each of them, forever. `previewStore.setPreview` owns the stamping rule; this only
-  // notices that it moved.
-  //
-  // Everything about WHETHER to open lives in `previewOpenOutcomeFor`, which writes nothing —
-  // this line is the "when", not the "whether".
-  const after = usePreviewStore.getState().byAgent[status.agentId]?.surfacedAt ?? null;
-  if (after !== null && after !== before) {
-    autoOpenPreviewIfWarranted(status.projectId, status.agentId);
-  }
+  // `surfacedAt` is still stamped by `setPreview` and still read — `livePreviewCards` orders the
+  // cards by it, newest first. `before` is read above for that reason alone now.
+  void before;
 }
 
 /** Singleton guard, mirroring `aiServiceHealthListener`: StrictMode and HMR both double-mount, and

@@ -34,6 +34,13 @@ import {
   conciergeToolConfigPath,
   defaultDecisionFor,
   evaluateToolPolicy,
+  isForeignSlug,
+  isPinnedMergeProtectedSlug,
+  MERGE_PROTECTED_SLUGS,
+  ownerOfSlug,
+  POLICY_STRICTNESS,
+  projectPolicyContextFor,
+  strictestDecision,
   isConciergeToolName,
   perCallRiskFor,
   toToolPolicyOverrides,
@@ -954,5 +961,363 @@ describe("the type-level guarantee, exercised at runtime", () => {
     for (const name of named) {
       expect(CONCIERGE_TOOL_CATALOG.some((t) => t.name === name), name).toBe(true);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// PER-PROJECT POLICY — the strictness lattice (bead sparkle-gylxbo)
+// ---------------------------------------------------------------------------------------------
+
+describe("THE GOAL — one global tier, two different answers, in one test", () => {
+  it("merge_pr is allow in drodio/sparkle and deny in plow-pbc/tkmx-server at the same time", () => {
+    // One global rule. This is the whole point: today it has to be pinned to `ask` for everyone
+    // because one tier cannot hold both facts below.
+    const overrides = { merge_pr: "allow" } as const;
+    const ownOrgs = ["drodio"];
+
+    const own = evaluateToolPolicy("merge_pr", {
+      overrides,
+      project: projectPolicyContextFor("drodio/sparkle", ownOrgs, {}),
+    });
+    const theirs = evaluateToolPolicy("merge_pr", {
+      overrides,
+      project: projectPolicyContextFor("plow-pbc/tkmx-server", ownOrgs, {}),
+    });
+
+    expect(own.decision).toBe("allow");
+    expect(theirs.decision).toBe("deny");
+  });
+});
+
+describe("THE SECURITY PROPERTY — a project may only ever TIGHTEN", () => {
+  it("project allow + global deny is deny", () => {
+    // The inverse of the goal, and the reason the whole layer is safe to expose to a hand-edited
+    // file: there is no arrangement of project inputs that widens what the human granted globally.
+    // Written as its own named test rather than a row in the table below, because a table row that
+    // stops running is invisible and this is the one property nothing else re-checks.
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "deny" },
+      project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+        "drodio/sparkle": { merge_pr: "allow" },
+      }),
+    });
+    expect(evaluation.decision).toBe("deny");
+    // …and the ATTRIBUTION says the global rule decided it, not the project's — otherwise the pane
+    // would point the human at a project rule that changed nothing.
+    expect(evaluation.source).toBe("override");
+    expect(evaluation.project?.tightened).toBe(false);
+    expect(evaluation.project?.inheritedDecision).toBe("deny");
+  });
+
+  it("a project allow cannot lift a foreign repo's mutates-main floor", () => {
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor("someone-else/thing", ["drodio"], {
+        "someone-else/thing": { merge_pr: "allow" },
+      }),
+    });
+    expect(evaluation.decision).toBe("ask");
+    expect(evaluation.source).toBe("foreign-repo");
+  });
+
+  it("a project allow cannot lift a PINNED repo's deny", () => {
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      // Even with the org claimed as our own AND an explicit project allow, the shipped pin holds.
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor("plow-pbc/tkmx-client", ["plow-pbc", "drodio"], {
+        "plow-pbc/tkmx-client": { merge_pr: "allow" },
+      }),
+    });
+    expect(evaluation.decision).toBe("deny");
+    expect(evaluation.source).toBe("pinned-repo");
+  });
+});
+
+describe("ADDITIVE ONLY — no project context means today's answer, byte for byte", () => {
+  it("every tool in the catalog evaluates identically with and without an empty-ish project", () => {
+    // The claim is about the SHAPE too, not just the decision: a caller who passes no `project`
+    // must get an object with no `project` key at all, so nothing downstream can start depending
+    // on a field that is absent in the common case.
+    for (const entry of CONCIERGE_TOOL_CATALOG) {
+      const before = evaluateToolPolicy(entry.name, { overrides: {} });
+      expect(before, entry.name).not.toHaveProperty("project");
+      expect(Object.keys(before).sort(), entry.name).toEqual(
+        [
+          "decision",
+          "defaultDecision",
+          "domain",
+          "overridden",
+          "reason",
+          "requiresConfirmation",
+          "riskClass",
+          "source",
+          "tool",
+        ].sort(),
+      );
+    }
+  });
+
+  it("an OWN, unpinned repo with no project rules changes nothing", () => {
+    // The other half of "additive": supplying a project context for a repo we own, with no rules,
+    // must land on the identical decision/source/reason as supplying none. If this ever diverged,
+    // wiring the binding up would silently re-tier every tool in the founder's own repo.
+    for (const entry of CONCIERGE_TOOL_CATALOG) {
+      const bare = evaluateToolPolicy(entry.name, { overrides: {} });
+      const withProject = evaluateToolPolicy(entry.name, {
+        overrides: {},
+        project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {}),
+      });
+      expect(withProject.decision, entry.name).toBe(bare.decision);
+      expect(withProject.source, entry.name).toBe(bare.source);
+      expect(withProject.reason, entry.name).toBe(bare.reason);
+      expect(withProject.project?.tightened, entry.name).toBe(false);
+    }
+  });
+});
+
+describe("FAIL CLOSED — the direction every unknown resolves in", () => {
+  it("an unresolvable slug is foreign, and floors mutates-main at ask", () => {
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor(null, ["drodio"], {}),
+    });
+    expect(evaluation.decision).toBe("ask");
+    expect(evaluation.source).toBe("foreign-repo");
+    expect(evaluation.project?.foreign).toBe(true);
+    expect(evaluation.project?.slug).toBeNull();
+  });
+
+  it("a malformed slug is foreign too — a bare name has no owner to check", () => {
+    for (const bad of ["sparkle", "", "   ", "a/b/c", "/repo", "owner/"]) {
+      const ctx = projectPolicyContextFor(bad, ["drodio", "owner", "a"], {});
+      expect(ctx.slug, bad).toBeNull();
+      expect(ctx.foreign, bad).toBe(true);
+    }
+  });
+
+  it("a malformed project entry is ask-or-stricter, NEVER allow", () => {
+    // The value is the interesting axis: whatever the human typed, the answer must not be the
+    // global `allow` they set for every other project.
+    for (const junk of ["Allow", "yes", "ALLOW", "allow ", "1", "denyish"]) {
+      const evaluation = evaluateToolPolicy("spawn_build_agent", {
+        overrides: { spawn_build_agent: "allow" },
+        project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+          "drodio/sparkle": { spawn_build_agent: junk },
+        }),
+      });
+      expect(evaluation.decision, junk).toBe("ask");
+      expect(evaluation.source, junk).toBe("unreadable-project-override");
+      expect(evaluation.project?.projectEntry, junk).toBe(junk);
+    }
+  });
+
+  it("a non-string project entry contributes nothing rather than crashing", () => {
+    const evaluation = evaluateToolPolicy("spawn_build_agent", {
+      overrides: { spawn_build_agent: "allow" },
+      project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+        "drodio/sparkle": { spawn_build_agent: undefined },
+      }),
+    });
+    expect(evaluation.decision).toBe("allow");
+    expect(evaluation.project?.projectEntry).toBeNull();
+  });
+});
+
+describe("the lattice, over base x pinned x foreign x project", () => {
+  const rank = { allow: 0, ask: 1, deny: 2 } as const;
+  const decisions = ["allow", "ask", "deny"] as const;
+
+  it("POLICY_STRICTNESS orders the three and strictestDecision returns the maximum", () => {
+    expect(POLICY_STRICTNESS).toEqual(rank);
+    expect(strictestDecision()).toBe("allow");
+    expect(strictestDecision("allow", "ask")).toBe("ask");
+    expect(strictestDecision("deny", "allow")).toBe("deny");
+    expect(strictestDecision("ask", "deny", "allow")).toBe("deny");
+  });
+
+  it("merge_pr (mutates-main) resolves to the strictest contributor, for every combination", () => {
+    const cases = [
+      { slug: "drodio/sparkle", pinnedFloor: "allow", foreignFloor: "allow" },
+      { slug: "plow-pbc/tkmx-server", pinnedFloor: "deny", foreignFloor: "ask" },
+      { slug: "someone-else/thing", pinnedFloor: "allow", foreignFloor: "ask" },
+      { slug: null, pinnedFloor: "allow", foreignFloor: "ask" },
+    ] as const;
+    for (const c of cases) {
+      for (const base of decisions) {
+        for (const project of [...decisions, null]) {
+          const evaluation = evaluateToolPolicy("merge_pr", {
+            overrides: { merge_pr: base },
+            project: projectPolicyContextFor(
+              c.slug,
+              ["drodio"],
+              project === null || c.slug === null ? {} : { [c.slug]: { merge_pr: project } },
+            ),
+          });
+          const contributors = [
+            base,
+            c.pinnedFloor,
+            c.foreignFloor,
+            c.slug === null || project === null ? "allow" : project,
+          ] as const;
+          const expected = contributors.reduce((a, b) => (rank[b] > rank[a] ? b : a));
+          expect(evaluation.decision, `${c.slug}/${base}/${project}`).toBe(expected);
+        }
+      }
+    }
+  });
+
+  it("a read-only tool is untouched by the pin and the foreign floor", () => {
+    // The floors are scoped to `mutates-main` on purpose: a repo we do not own stays fully usable
+    // and only the class that pushes into its main is gated. Without this, adopting the feature
+    // would make every foreign project ask before it could so much as list its agents.
+    const evaluation = evaluateToolPolicy("list_projects", {
+      overrides: {},
+      project: projectPolicyContextFor("plow-pbc/tkmx-server", ["drodio"], {}),
+    });
+    expect(evaluation.decision).toBe("allow");
+    expect(evaluation.project?.tightened).toBe(false);
+  });
+});
+
+describe("ATTRIBUTION — the UI can only show what this returns", () => {
+  it("produces each of the four new sources from some real input", () => {
+    const produced = new Set<string>();
+    produced.add(
+      evaluateToolPolicy("merge_pr", {
+        overrides: { merge_pr: "allow" },
+        project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+          "drodio/sparkle": { merge_pr: "deny" },
+        }),
+      }).source,
+    );
+    produced.add(
+      evaluateToolPolicy("merge_pr", {
+        overrides: { merge_pr: "allow" },
+        project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+          "drodio/sparkle": { merge_pr: "sometimes" },
+        }),
+      }).source,
+    );
+    produced.add(
+      evaluateToolPolicy("merge_pr", {
+        overrides: { merge_pr: "allow" },
+        project: projectPolicyContextFor("someone-else/thing", ["drodio"], {}),
+      }).source,
+    );
+    produced.add(
+      evaluateToolPolicy("merge_pr", {
+        overrides: { merge_pr: "allow" },
+        project: projectPolicyContextFor("plow-pbc/tkmx-server", ["drodio"], {}),
+      }).source,
+    );
+    expect([...produced].sort()).toEqual([
+      "foreign-repo",
+      "pinned-repo",
+      "project-override",
+      "unreadable-project-override",
+    ]);
+  });
+
+  it("reports the INHERITED tier alongside the effective one", () => {
+    // Requirement 3 of the brief: the UI must show which tier is in force AND where it came from.
+    // "Denied for this repo, though you allowed it everywhere" needs both numbers in one object.
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+        "drodio/sparkle": { merge_pr: "ask" },
+      }),
+    });
+    expect(evaluation.decision).toBe("ask");
+    expect(evaluation.project).toEqual({
+      slug: "drodio/sparkle",
+      foreign: false,
+      pinned: false,
+      inheritedDecision: "allow",
+      inheritedSource: "override",
+      projectEntry: "ask",
+      tightened: true,
+    });
+  });
+
+  it("the reason strings name the lever the reader can actually pull", () => {
+    const foreign = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor("someone-else/thing", ["drodio"], {}),
+    });
+    expect(foreign.reason).toContain("someone-else/thing");
+    // The lever, named exactly as config.toml spells it — a remedy is an instruction people follow.
+    expect(foreign.reason).toContain("[concierge].own_orgs");
+
+    const pinned = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor("plow-pbc/tkmx-server", ["drodio"], {}),
+    });
+    expect(pinned.reason).toContain("plow-pbc/tkmx-server");
+    expect(pinned.reason).toContain("own authority");
+    expect(pinned.reason.toLowerCase()).toContain("human");
+    // …and it must NOT send them to config, because a pin is the one thing config cannot loosen.
+    expect(pinned.reason).not.toContain("own_orgs");
+    expect(pinned.reason.toLowerCase()).not.toContain("config.toml");
+
+    const project = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+        "drodio/sparkle": { merge_pr: "deny" },
+      }),
+    });
+    expect(project.reason).toContain("drodio/sparkle");
+    expect(project.reason).toContain("Never"); // the project tier
+    expect(project.reason).toContain("Allow"); // the inherited global tier
+    expect(project.reason.toLowerCase()).toContain("only tighten");
+  });
+
+  it("does not claim a project decided something the global rule already had", () => {
+    // `deny` globally and `deny` for the project: the answer is the same either way, so naming the
+    // project override would send the human to delete a rule and watch nothing change.
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "deny" },
+      project: projectPolicyContextFor("drodio/sparkle", ["drodio"], {
+        "drodio/sparkle": { merge_pr: "deny" },
+      }),
+    });
+    expect(evaluation.source).toBe("override");
+    expect(evaluation.project?.tightened).toBe(false);
+  });
+});
+
+describe("slug helpers", () => {
+  it("ownerOfSlug lowercases and rejects anything that is not owner/repo", () => {
+    expect(ownerOfSlug("DROdio/Sparkle")).toBe("drodio");
+    expect(ownerOfSlug("  drodio/sparkle  ")).toBe("drodio");
+    expect(ownerOfSlug("sparkle")).toBeNull();
+    expect(ownerOfSlug(null)).toBeNull();
+  });
+
+  it("isForeignSlug compares case-insensitively and treats null as foreign", () => {
+    expect(isForeignSlug("DROdio/sparkle", ["drodio"])).toBe(false);
+    expect(isForeignSlug("drodio/sparkle", ["DROdio"])).toBe(false);
+    expect(isForeignSlug("drodio/sparkle", [])).toBe(true);
+    expect(isForeignSlug(null, ["drodio"])).toBe(true);
+  });
+
+  it("isPinnedMergeProtectedSlug matches the shipped list case-insensitively", () => {
+    for (const slug of MERGE_PROTECTED_SLUGS) {
+      expect(isPinnedMergeProtectedSlug(slug.toUpperCase())).toBe(true);
+    }
+    expect(isPinnedMergeProtectedSlug("drodio/sparkle")).toBe(false);
+    expect(isPinnedMergeProtectedSlug(null)).toBe(false);
+  });
+
+  it("conciergeToolConfigPath keeps its one-argument behaviour and quotes the slug", () => {
+    expect(conciergeToolConfigPath("merge_pr")).toBe("concierge.tools.merge_pr");
+    expect(conciergeToolConfigPath("merge_pr", null)).toBe("concierge.tools.merge_pr");
+    // The quotes are load-bearing: the slug contains a `/`, which dotted-key syntax would
+    // otherwise read as two more table levels.
+    expect(conciergeToolConfigPath("merge_pr", "plow-pbc/tkmx-server")).toBe(
+      'concierge.projects."plow-pbc/tkmx-server".tools.merge_pr',
+    );
+    expect(conciergeToolConfigPath("merge_pr", "DROdio/Sparkle")).toBe(
+      'concierge.projects."drodio/sparkle".tools.merge_pr',
+    );
   });
 });

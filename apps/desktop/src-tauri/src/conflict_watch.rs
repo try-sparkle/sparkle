@@ -1215,6 +1215,281 @@ fn probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
     probe_from_stdout(&String::from_utf8_lossy(&output.stdout), PROBE_LIMIT).ok_or("gh-unreadable")
 }
 
+// ══ THE REST FALLBACK ═══════════════════════════════════════════════════════════════════════════
+
+/// Both APIs were tried and neither answered.
+///
+/// Deliberately distinct from [`probe_open_prs`]'s three reasons, on the same principle as
+/// [`SWEEP_BUDGET_REASON`]: `gh-failed` means ONE query exited non-zero, this means the GraphQL
+/// query failed AND the independent REST path could not cover for it. A human seeing this knows the
+/// outage is not one endpoint having a bad minute, and that there is no third path left to try.
+const BOTH_APIS_FAILED: &str = "gh-graphql-and-rest-failed";
+
+/// How many PRs the fallback will read check state for in one probe.
+///
+/// The GraphQL query returns every PR's rollup in ONE round trip; REST needs two calls per PR, so
+/// the fallback is O(N) where the primary is O(1). At 42 open PRs that is ~85 calls and well over a
+/// minute — past [`PROBE_TIMEOUT`] and most of [`SWEEP_BUDGET`], which covers every repo on the
+/// machine. So the fallback covers a bounded prefix and SAYS SO (see [`rest_probe_from_parts`])
+/// rather than running the sweep dry.
+const REST_CHECK_BUDGET: usize = 20;
+
+/// One `gh api <path>` against the repo `dir` belongs to, returning stdout.
+///
+/// `{owner}/{repo}` placeholders are resolved by `gh` from the working directory, so this needs no
+/// slug lookup of its own.
+fn gh_api(dir: &Path, path: &str) -> Result<String, &'static str> {
+    let mut cmd = Command::new(crate::preflight::gh_program());
+    cmd.arg("api")
+        .arg(path)
+        .current_dir(dir)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    apply_noninteractive(&mut cmd);
+    let output =
+        crate::worktree::output_with_timeout(cmd, PROBE_TIMEOUT).map_err(|_| "gh-unavailable")?;
+    if !output.status.success() {
+        return Err("gh-failed");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// REST's open-PR list plus per-PR check state → a read, PURE apart from the injected fetcher.
+///
+/// `fetch_checks(head_oid)` returns the two REST bodies for one commit; it is a parameter for the
+/// usual reason this file extracts things — [`probe_open_prs`] wraps a subprocess and no unit test
+/// can reach inside it, so the interesting behaviour lives here where one can.
+///
+/// TWO HONESTY CONSTRAINTS ARE ENCODED HERE, and neither is defensive padding:
+///
+/// 1. **Mergeability is not reported, because REST's list cannot supply it.** GitHub computes
+///    `mergeable`/`mergeable_state` lazily and exposes them only on the single-PR GET. Every row
+///    therefore carries [`MERGE_STATE_UNKNOWN`] — the state this module already means by "GitHub
+///    has not finished deciding" — so the last real verdict is carried forward by
+///    `carry_unknown_forward` instead of a `false` being invented here. `is_dirty: false` on these
+///    rows is a CONSEQUENCE of "unknown", not a claim that the PR merges cleanly.
+/// 2. **A budget cut-off marks the read SATURATED.** `saturated` already means "there may be more
+///    than you can see, do not treat this list as complete" and every caller already refuses to
+///    prune on it. Reusing it is what stops a bounded fallback from presenting as a full census —
+///    the failure mode that would let a PR we never reached read as one that no longer exists.
+fn rest_probe_from_parts<F>(pulls_body: &str, budget: usize, mut fetch_checks: F) -> Option<Probed>
+where
+    F: FnMut(&str) -> Option<Vec<Value>>,
+{
+    let pulls = crate::gh_rest::decode_pulls(pulls_body)?;
+    let covered = pulls.len().min(budget);
+    let prs = pulls
+        .iter()
+        .take(covered)
+        .map(|p| {
+            let rollup = fetch_checks(&p.head_oid);
+            PrFacts {
+                number: p.number,
+                project_id: String::new(),
+                title: p.title.clone(),
+                branch: p.branch.clone(),
+                head_oid: p.head_oid.clone(),
+                base_oid: p.base_oid.clone(),
+                merge_state: MERGE_STATE_UNKNOWN.into(),
+                is_draft: p.is_draft,
+                // Only a rollup we actually READ can say a PR has no checks. An unreadable one
+                // leaves this false the same way an unread PR is absent — which is why the read is
+                // marked saturated below rather than presented as complete.
+                is_dirty: false,
+                has_ci: rollup.is_some_and(|r| !r.is_empty()),
+                commits_behind: 0,
+                url: p.url.clone(),
+                carried_looks: 0,
+            }
+        })
+        .collect();
+    Some(Probed { prs, saturated: covered < pulls.len() })
+}
+
+/// The real REST fallback: one list call, then two calls per covered PR.
+fn rest_probe_open_prs(dir: &Path) -> Result<Probed, &'static str> {
+    let pulls = gh_api(dir, "repos/{owner}/{repo}/pulls?state=open&per_page=100")?;
+    rest_probe_from_parts(&pulls, REST_CHECK_BUDGET, |sha| {
+        let runs = gh_api(dir, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/check-runs?per_page=100")).ok()?;
+        let statuses = gh_api(dir, &format!("repos/{{owner}}/{{repo}}/commits/{sha}/status")).ok()?;
+        crate::gh_rest::rollup_from_rest(&runs, &statuses)
+    })
+    .ok_or("gh-unreadable")
+}
+
+/// Try the GraphQL probe; on an API-level failure, try the independent REST path.
+///
+/// WHY NOT ON EVERY ERROR. `gh-unavailable` means the binary could not be spawned or timed out —
+/// the REST path runs through the SAME binary, so retrying it cannot succeed, and collapsing that
+/// into [`BOTH_APIS_FAILED`] would bury the one reason on this list a human can act on directly
+/// (install `gh`, log in). Only a query that ANSWERED BADLY is worth a second opinion.
+///
+/// A fallback that silently degrades is worse than the bug it patches, so the total-failure arm
+/// returns a refusal rather than an empty or defaulted read: `Err` here travels to
+/// `ConflictFlag::blocked_by` and the ladder treats any refusal as untested, which is the module's
+/// standing fail-closed contract.
+fn probe_with_fallback<P, F>(
+    dir: &Path,
+    primary: P,
+    fallback: F,
+) -> Result<Probed, &'static str>
+where
+    P: FnOnce(&Path) -> Result<Probed, &'static str>,
+    F: FnOnce(&Path) -> Result<Probed, &'static str>,
+{
+    match primary(dir) {
+        Ok(read) => Ok(read),
+        Err("gh-unavailable") => Err("gh-unavailable"),
+        Err(primary_reason) => match fallback(dir) {
+            Ok(read) => {
+                tracing::warn!(
+                    target: "conflict_watch",
+                    primary_reason,
+                    prs = read.prs.len(),
+                    saturated = read.saturated,
+                    "the GraphQL PR probe failed; answered from REST instead"
+                );
+                Ok(read)
+            }
+            Err(fallback_reason) => {
+                tracing::warn!(
+                    target: "conflict_watch",
+                    primary_reason,
+                    fallback_reason,
+                    "both the GraphQL and REST PR probes failed; this repo is UNREADABLE, which is \
+                     NOT the same as its checks being red"
+                );
+                Err(BOTH_APIS_FAILED)
+            }
+        },
+    }
+}
+
+/// The probe the sweep actually runs: GraphQL first, REST second.
+fn probe_open_prs_resilient(dir: &Path) -> Result<Probed, &'static str> {
+    probe_with_fallback(dir, probe_open_prs, rest_probe_open_prs)
+}
+
+#[cfg(test)]
+mod rest_fallback_tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+
+    fn dir() -> &'static Path {
+        Path::new("/nonexistent")
+    }
+
+    fn one_pr() -> Probed {
+        Probed {
+            prs: vec![PrFacts { number: 7, has_ci: true, ..PrFacts::default() }],
+            saturated: false,
+        }
+    }
+
+    const PULLS: &str = r#"[
+        {"number":2027,"title":"t","draft":false,"html_url":"https://gh/2027",
+         "head":{"ref":"b","sha":"aaaa1111"},"base":{"sha":"bbbb2222"}},
+        {"number":2028,"title":"u","draft":false,"html_url":"https://gh/2028",
+         "head":{"ref":"c","sha":"cccc3333"},"base":{"sha":"bbbb2222"}}
+    ]"#;
+
+    /// THE HEADLINE REGRESSION TEST. A failed GraphQL probe — the shape a GitHub GraphQL 503
+    /// produces, measured 4-of-6 on 2026-08-17 — must still yield a READ, not a refusal. Delete
+    /// the fallback arm and this fails.
+    #[test]
+    fn a_failed_graphql_probe_is_answered_from_rest() {
+        let got = probe_with_fallback(dir(), |_| Err("gh-failed"), |_| Ok(one_pr()));
+        let read = got.expect("the REST fallback must produce a read");
+        assert_eq!(read.prs.len(), 1, "and it must carry the PR the fallback saw");
+        assert!(read.prs[0].has_ci, "with the check state it actually read");
+    }
+
+    /// AND WHEN BOTH FAIL, IT SAYS SO — rather than degrading to an empty or defaulted read.
+    /// The reason must be distinguishable from a single query failing, and it is emphatically not
+    /// a statement that any check is red.
+    #[test]
+    fn both_apis_failing_reports_a_distinct_unreadable_reason() {
+        let got = probe_with_fallback(dir(), |_| Err("gh-failed"), |_| Err("gh-unreadable"));
+        assert_eq!(got, Err(BOTH_APIS_FAILED));
+        assert_ne!(got, Err("gh-failed"), "a two-API outage is not one query exiting non-zero");
+    }
+
+    /// A MISSING BINARY IS NOT AN API OUTAGE. The REST path runs through the same `gh`, so trying
+    /// it cannot succeed — and folding it into the both-failed reason would bury the one cause on
+    /// this list a human can fix directly.
+    #[test]
+    fn gh_unavailable_short_circuits_without_a_second_attempt() {
+        let tried = Cell::new(false);
+        let got = probe_with_fallback(dir(), |_| Err("gh-unavailable"), |_| {
+            tried.set(true);
+            Ok(one_pr())
+        });
+        assert_eq!(got, Err("gh-unavailable"), "the actionable reason survives");
+        assert!(!tried.get(), "and the fallback is not even attempted");
+    }
+
+    /// The fallback costs O(N) network calls, so a healthy primary must never pay for it.
+    #[test]
+    fn a_healthy_primary_never_calls_the_fallback() {
+        let tried = Cell::new(false);
+        let got = probe_with_fallback(dir(), |_| Ok(one_pr()), |_| {
+            tried.set(true);
+            Err("gh-failed")
+        });
+        assert!(got.is_ok());
+        assert!(!tried.get());
+    }
+
+    /// A REST read must NOT claim mergeability it never fetched. REST's list endpoint cannot
+    /// supply `mergeable`/`mergeable_state`, so every row carries the "still deciding" state and
+    /// the last real verdict is carried forward — rather than a `false` being invented, which
+    /// would report an unread PR as merging cleanly.
+    #[test]
+    fn a_rest_read_never_claims_a_mergeability_it_did_not_fetch() {
+        let read = rest_probe_from_parts(PULLS, 10, |_| Some(vec![])).unwrap();
+        for f in &read.prs {
+            assert_eq!(f.merge_state, MERGE_STATE_UNKNOWN, "unknown, not clean");
+            assert!(!f.is_dirty, "and never a conflict we did not observe");
+        }
+    }
+
+    /// The bounded fallback must announce that it is bounded. `saturated` is the existing "this
+    /// list may be incomplete" signal every caller already refuses to prune on, so a PR the budget
+    /// never reached cannot read as a PR that no longer exists.
+    #[test]
+    fn a_budget_cutoff_marks_the_read_saturated() {
+        let full = rest_probe_from_parts(PULLS, 10, |_| Some(vec![])).unwrap();
+        assert_eq!(full.prs.len(), 2);
+        assert!(!full.saturated, "a read that covered everything is authoritative");
+
+        let cut = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
+        assert_eq!(cut.prs.len(), 1);
+        assert!(cut.saturated, "a read that ran out of budget is NOT a complete census");
+    }
+
+    /// Check presence comes from a rollup we actually read. A real empty rollup means "nothing has
+    /// run"; an UNREADABLE one must not be dressed up as the same observation.
+    #[test]
+    fn has_ci_reflects_the_rollup_that_was_read() {
+        let saw = rest_probe_from_parts(PULLS, 1, |_| Some(vec![json!({"name": "CI"})])).unwrap();
+        assert!(saw.prs[0].has_ci, "a non-empty rollup is a check that exists");
+
+        let empty = rest_probe_from_parts(PULLS, 1, |_| Some(vec![])).unwrap();
+        assert!(!empty.prs[0].has_ci, "a genuinely empty rollup is a real observation");
+
+        let unread = rest_probe_from_parts(PULLS, 1, |_| None).unwrap();
+        assert!(!unread.prs[0].has_ci, "and an unreadable one claims nothing either");
+    }
+
+    /// An unparsable pulls body is no read at all — never an empty list, which would read as
+    /// "this repo has no open PRs".
+    #[test]
+    fn an_unreadable_pulls_body_is_not_an_empty_repo() {
+        assert!(rest_probe_from_parts("503 Service Unavailable", 10, |_| Some(vec![])).is_none());
+    }
+}
+
 /// Force `gh`/`git` to fail fast rather than block on an interactive credential or host-key prompt.
 /// A hung child on a repeating timer is how a background thread stops being a background thread.
 fn apply_noninteractive(cmd: &mut Command) {
@@ -1536,7 +1811,7 @@ fn tick<R: Runtime>(app: &AppHandle<R>, watch: &mut Watch, now: u64) {
         &mut watch.probe_backoff,
         watch.sweep_cursor,
         SWEEP_BUDGET.as_millis() as u64,
-        probe_open_prs,
+        probe_open_prs_resilient,
         now_ms,
     );
     watch.sweep_cursor = swept.next_cursor;

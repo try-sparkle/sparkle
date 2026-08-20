@@ -270,6 +270,20 @@ fn run_bd(project_path: &str, args: &[&str]) -> Result<BdOutput, String> {
     run_cmd_bounded(&bd, project_path, args, beads_cmd::BD_TIMEOUT)
 }
 
+/// `run_bd` with extra environment for the child. Exists for `bd comment`, which falls back to
+/// `$EDITOR` when its `-m` is empty — and an editor opened from a Tauri command has no terminal
+/// attached, so it would hang until the bd timeout with nothing to show for it. Pinning
+/// `EDITOR=true` turns that into an immediate, readable "empty comment, aborting" instead.
+fn run_bd_env(
+    project_path: &str,
+    args: &[&str],
+    env: beads_cmd::ChildEnv<'_>,
+) -> Result<BdOutput, String> {
+    let bd = cached_bd_path()
+        .ok_or_else(|| "bd not found — install beads or add `bd` to your PATH".to_string())?;
+    run_cmd_bounded_env(&bd, project_path, args, beads_cmd::BD_TIMEOUT, env)
+}
+
 /// The delegation proper, with the program and the bound as parameters so BOTH are testable without
 /// a bd that hangs on demand — `run_cmd_timed` takes the program explicitly for the same reason.
 ///
@@ -285,8 +299,19 @@ fn run_cmd_bounded(
     args: &[&str],
     timeout: Duration,
 ) -> Result<BdOutput, String> {
+    run_cmd_bounded_env(program, project_path, args, timeout, beads_cmd::NO_EXTRA_ENV)
+}
+
+/// `run_cmd_bounded` with extra child environment. See [`run_bd_env`] for the one caller.
+fn run_cmd_bounded_env(
+    program: &str,
+    project_path: &str,
+    args: &[&str],
+    timeout: Duration,
+    env: beads_cmd::ChildEnv<'_>,
+) -> Result<BdOutput, String> {
     let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
-    beads_cmd::run_cmd_timed(program, project_path, &owned, timeout, beads_cmd::NO_EXTRA_ENV)
+    beads_cmd::run_cmd_timed(program, project_path, &owned, timeout, env)
         .map_err(|e| describe_bd_failure(&e, bd_subcommand_mutates(args)))
 }
 
@@ -879,6 +904,39 @@ pub async fn bead_label(
         .map_err(|e| format!("bd task failed: {e}"))?
 }
 
+/// Append a comment to a bead: `bd comment <id> -m <text>`.
+///
+/// The durable audit trail for machine-driven actions — the epic sweep's auto-restart records what
+/// it restarted and why here, because a console log dies with the app session and a label can only
+/// carry a timestamp. The store is shared by every worktree, so the note is readable from anywhere.
+///
+/// TWO GUARDS, both about the same failure. `bd comment`'s `-m` "opens editor if not provided", and
+/// because `-m` is a plain string flag an EMPTY value takes that path too — indistinguishable from
+/// unset. An editor spawned from a Tauri command has no terminal attached, so it would sit there
+/// until the bd timeout expires and report nothing useful:
+///   1. A blank message is refused HERE, before spawning, so the common case never reaches bd.
+///   2. `EDITOR=true` is pinned on the child, so any path that still reaches the fallback exits
+///      immediately with bd's own "empty comment, aborting" rather than blocking.
+/// The second is not redundant with the first: it also covers a future bd that decides some other
+/// input is editor-worthy.
+fn bead_comment_inner(project_path: String, id: String, text: String) -> Result<String, String> {
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
+    if text.trim().is_empty() {
+        return Err("refusing to write an empty bead comment".to_string());
+    }
+    let output = run_bd_env(&project_path, &["comment", &id, "-m", &text], &[("EDITOR", "true")])?;
+    select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
+}
+
+#[tauri::command]
+pub async fn bead_comment(project_path: String, id: String, text: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || bead_comment_inner(project_path, id, text))
+        .await
+        .map_err(|e| format!("bd task failed: {e}"))?
+}
+
 /// A bead id is safe to pass as a positional operand only if it can't be mistaken for a flag. Even
 /// though it's already an argv arg (not shell-interpolated), an id beginning with `-` would be parsed
 /// by `bd` as an OPTION, not an issue id. Restrict to bd's id charset and forbid a leading dash.
@@ -1315,6 +1373,34 @@ mod tests {
         assert_eq!(args[0], "create");
         assert_eq!(args[1], "'; rm -rf / #");
         assert!(args.contains(&"--json".to_string()));
+    }
+
+    #[test]
+    fn bead_comment_refuses_an_empty_message() {
+        // The whole reason this guard exists: `bd comment -m ""` is indistinguishable from a missing
+        // -m, which opens $EDITOR — and an editor spawned from a Tauri command hangs until the bd
+        // timeout with nothing to show. Refuse before spawning. Whitespace counts as empty.
+        for blank in ["", "   ", "\n\t "] {
+            let r = bead_comment_inner("/proj".into(), "sparkle-x".into(), blank.into());
+            assert!(r.is_err(), "must refuse blank comment {blank:?}");
+            assert!(
+                r.unwrap_err().contains("empty"),
+                "the error must name the reason so a caller can tell it from a bd failure"
+            );
+        }
+    }
+
+    #[test]
+    fn bead_comment_rejects_an_id_that_could_be_read_as_a_flag() {
+        let r = bead_comment_inner("/proj".into(), "--force".into(), "a real note".into());
+        assert!(r.is_err(), "a dash-leading id must be refused, not passed to bd as an option");
+    }
+
+    #[test]
+    fn bead_comment_is_classified_as_a_mutation() {
+        // `comment` is not in BD_READ_SUBCOMMANDS, so a failure must be described as a write that
+        // may have landed — which is what stops a caller blindly retrying it into a duplicate.
+        assert!(bd_subcommand_mutates(&["comment", "sparkle-x", "-m", "note"]));
     }
 
     #[test]
@@ -1939,18 +2025,32 @@ mod tests {
     /// own hole: a `run_bd` that grew an early-return path would have a second, unchecked call, and
     /// the guard would pass on the strength of the one that happened to come first.
     fn bd_bounds_passed_by_run_bd(src: &str) -> Result<Vec<String>, String> {
+        bd_bounds_passed_by(src, "run_bd", "run_cmd_bounded(")
+    }
+
+    /// The same extraction, parameterized over WHICH funnel and WHICH bounded runner.
+    ///
+    /// Generalized when `run_bd_env` was added for `bd comment` (which needs `EDITOR=true` on the
+    /// child so an empty `-m` cannot open an editor no terminal is attached to). A second funnel is
+    /// exactly the shape this guard exists to police — an unbounded or self-declared timeout hiding
+    /// beside the checked one — so it is covered by the same rule rather than exempted from it.
+    ///
+    /// The callee is passed WITH its open paren, which is what keeps `run_cmd_bounded(` from also
+    /// matching `run_cmd_bounded_env(`.
+    fn bd_bounds_passed_by(src: &str, fn_name: &str, callee: &str) -> Result<Vec<String>, String> {
         // Anchor on the SIGNATURE: `find` returns the first match, so a helper merely STARTING with
         // the name (`run_bd_json`) declared above the funnel would otherwise capture the slice.
         // A declaration at the very start of the input has no preceding newline, so match that case
         // too rather than requiring one. Anchoring on `\nfn` alone is a real limitation, not merely
         // a fixture quirk — it would silently report "no run_bd" for a file that opens with it.
-        let start = if src.starts_with("fn run_bd(") {
+        let sig = format!("fn {fn_name}(");
+        let start = if src.starts_with(&sig) {
             0
         } else {
-            src.find("\nfn run_bd(").ok_or("no `fn run_bd(` declaration")? + 1
+            src.find(&format!("\n{sig}")).ok_or("no matching fn declaration")? + 1
         };
         // Top-level fn bodies close on a column-0 brace (rustfmt guarantees it).
-        let len = src[start..].find("\n}").ok_or("run_bd has no closing brace")? + 1;
+        let len = src[start..].find("\n}").ok_or("the funnel has no closing brace")? + 1;
         // Strip whole-line comments: otherwise a `//` line quoting the call form is what gets read,
         // while the real call underneath passes something else.
         let body: String = src[start..start + len]
@@ -1966,8 +2066,8 @@ mod tests {
         // cheap; relying on the accident is how the last three rounds of holes got in.
         let mut calls = Vec::new();
         let mut rest = body.as_str();
-        while let Some(i) = rest.find("run_cmd_bounded(") {
-            let after = &rest[i + "run_cmd_bounded(".len()..];
+        while let Some(i) = rest.find(callee) {
+            let after = &rest[i + callee.len()..];
             let mut depth = 1usize;
             let mut end = None;
             for (j, c) in after.char_indices() {
@@ -1983,12 +2083,12 @@ mod tests {
                     _ => {}
                 }
             }
-            let end = end.ok_or("unterminated run_cmd_bounded( call")?;
+            let end = end.ok_or("unterminated bounded-runner call")?;
             calls.push(after[..end].to_string());
             rest = &after[end..];
         }
         if calls.is_empty() {
-            return Err("run_bd does not delegate to run_cmd_bounded at all".to_string());
+            return Err("the funnel does not delegate to the bounded runner at all".to_string());
         }
         Ok(calls)
     }
@@ -2058,6 +2158,23 @@ mod tests {
                 !call.contains("Duration::from_secs"),
                 "run_bd must not inline its own duration — an inlined literal is not a `const` \
                  declaration, so the check below would never catch it: args were `{call}`"
+            );
+        }
+
+        // ── THE SECOND FUNNEL IS HELD TO THE SAME RULE ──────────────────────────────────────
+        // `run_bd_env` exists so `bd comment` can pin `EDITOR=true` on the child. It is a second
+        // path to the same binary, which is precisely where an unbounded or hand-rolled timeout
+        // would hide — so it is checked here rather than trusted for being small.
+        let env_calls = bd_bounds_passed_by(src, "run_bd_env", "run_cmd_bounded_env(")
+            .expect("run_bd_env must delegate to the bounded runner");
+        for call in &env_calls {
+            assert!(
+                call.contains("beads_cmd::BD_TIMEOUT"),
+                "run_bd_env must PASS beads_cmd::BD_TIMEOUT: args were `{call}`"
+            );
+            assert!(
+                !call.contains("Duration::from_secs"),
+                "run_bd_env must not inline its own duration: args were `{call}`"
             );
         }
 

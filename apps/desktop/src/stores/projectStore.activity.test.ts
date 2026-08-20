@@ -66,4 +66,28 @@ describe("projectStore.setAgentActivity", () => {
     expect(agents.find((a) => a.id === "a1")!.activity).toBeUndefined();
     expect(agents.find((a) => a.id === "a2")!.activity).toBe("sibling work");
   });
+
+  // ── TIMESTAMPED QUOTE (bead sparkle-s8y5t6) ─────────────────────────────────────────────────
+  // A self-report with no age reads as perpetually current — the exact way a dead agent looked
+  // "explained". Every write must STAMP `activityAt` so consumers can read the line as a quote.
+  it("STAMPS activityAt on a write, using the injected clock", () => {
+    const T = 1_800_000_000_000;
+    useProjectStore.getState().setAgentActivity("p1", "a1", "Wiring the listener", T);
+    expect(agent().activityAt).toBe(T);
+  });
+
+  it("re-stamps activityAt to the NEW time on a later write", () => {
+    useProjectStore.getState().setAgentActivity("p1", "a1", "phase one", 1000);
+    useProjectStore.getState().setAgentActivity("p1", "a1", "phase two", 5000);
+    expect(agent().activity).toBe("phase two");
+    expect(agent().activityAt).toBe(5000);
+  });
+
+  it("CLEARS activityAt when the line is cleared — an empty 'as of now' would be a false fresh report", () => {
+    useProjectStore.getState().setAgentActivity("p1", "a1", "Building", 1000);
+    expect(agent().activityAt).toBe(1000);
+    useProjectStore.getState().setAgentActivity("p1", "a1", "   ", 2000);
+    expect(agent().activity).toBe("");
+    expect(agent().activityAt).toBeUndefined();
+  });
 });

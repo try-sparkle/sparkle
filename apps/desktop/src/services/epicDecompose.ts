@@ -15,7 +15,11 @@
 //      that spends nothing, so a crash must be reclaimable even while AI features are off.
 // Pure pickers up top (unit-tested), thin IO sweeps below. The beadsStore calls
 // `maybeRunDecomposeWatcher` after each poll; every guard lives here so the store stays dumb.
-import { childrenOf, labelBead, type Bead, type Board } from "./beads";
+// `isTypedEpic`, NOT `isEpic`, and the distinction is load-bearing here — see the note on
+// `pickEpicsToDecompose`. Decomposition looks for a bead DECLARED an epic that has no children yet;
+// asking the membership resolver would be self-contradictory, since a structural epic has children
+// by definition and so can never be a candidate.
+import { childrenOf, isTypedEpic, labelBead, type Bead, type Board } from "./beads";
 import {
   beadDepAdd,
   createBeadFull,
@@ -23,6 +27,7 @@ import {
   readPrd,
 } from "./tasks";
 import { structuredJson } from "./anthropic";
+import { advisorRevisionNote } from "./advisor";
 import { writePrd } from "./prd";
 import { aiFeatureMode, useSettingsStore } from "../stores/settingsStore";
 import { isAppWindowSearch } from "./windowIdentity";
@@ -54,7 +59,10 @@ function boardBeads(board: Board): Bead[] {
 
 /**
  * The epics the watcher may decompose this cycle. ALL of:
- *   - it is an epic that is not closed (finished work never triggers an AI call);
+ *   - it was DECLARED an epic (`issue_type = 'epic'`) and is not closed (finished work never
+ *     triggers an AI call). Declared, not resolved: a bead that is an epic only because things
+ *     point at it already HAS children, so it fails the last clause anyway — using the membership
+ *     resolver here would read as a widening while changing nothing;
  *   - it carries the EXPLICIT `decompose:requested` opt-in (the spend gate — absent ⇒ never picked);
  *   - it is not already in the pipeline (no `decomposing` / `decomposed` / `decompose-failed`);
  *   - it has ZERO children (in any column, any status).
@@ -64,7 +72,7 @@ export function pickEpicsToDecompose(board: Board): Bead[] {
   const beads = boardBeads(board);
   return beads.filter(
     (b) =>
-      b.type === "epic" &&
+      isTypedEpic(b) &&
       b.status !== "closed" &&
       b.labels.includes(DECOMPOSE_REQUESTED_LABEL) &&
       !b.labels.some((l) => PIPELINE_LABELS.includes(l)) &&
@@ -81,7 +89,7 @@ export function pickEpicsToDecompose(board: Board): Bead[] {
  */
 export function pickStuckDecomposing(board: Board): Bead[] {
   return boardBeads(board).filter(
-    (b) => b.type === "epic" && b.labels.includes(DECOMPOSING_LABEL),
+    (b) => isTypedEpic(b) && b.labels.includes(DECOMPOSING_LABEL),
   );
 }
 
@@ -258,7 +266,19 @@ export function runDecomposeWatcherForPoll(
       labelBead,
       decomposeEpic: ({ projectPath: p, epic }) =>
         decomposeEpic(
-          { structuredJson, createBeadFull, beadDepAdd, readPrd, writePrd },
+          {
+            structuredJson,
+            createBeadFull,
+            beadDepAdd,
+            readPrd,
+            writePrd,
+            // The ONE advisor revision round (bead `sparkle-revqiv`). Reads a verdict a pass
+            // dispatched EARLIER has already delivered — never a fresh call — so this adds no stall
+            // to a decompose and spends nothing here. `null` when no verdict is held or none of its
+            // findings are `high`, which is the ordinary case and leaves the plan exactly as the
+            // planner wrote it.
+            advisorRevisionNote,
+          },
           { projectPath: p, epic },
         ),
       aiEnabled: () => aiFeatureMode(useSettingsStore.getState()) !== "off",

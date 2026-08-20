@@ -670,7 +670,13 @@ function sameMovement(
     if (
       x.lastEvent !== y.lastEvent ||
       x.lastEventMs !== y.lastEventMs ||
-      x.sessionId !== y.sessionId
+      x.sessionId !== y.sessionId ||
+      // ⚠️ ADDING A FIELD TO MovementEvidence WITHOUT ADDING IT HERE MAKES IT UNREACHABLE. This
+      // predicate decides whether the new map is stored at all, so a tick where ONLY `toolsRecent`
+      // moved would be discarded as "the same reading" and `progressMark` would never see the tool
+      // count change — the escalation predicate's work signal, silently frozen at whatever the
+      // first poll happened to read, with every test still green.
+      x.toolsRecent !== y.toolsRecent
     )
       return false;
   }

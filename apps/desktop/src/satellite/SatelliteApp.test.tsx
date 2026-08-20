@@ -328,6 +328,65 @@ describe("SatelliteApp — the board covers the agent column", () => {
   });
 });
 
+describe("SatelliteApp — the board header's toggle placement", () => {
+  // THE SECOND HOST OF ONE ROW. BoardFilterBar.tsx's header records that this top row is rendered
+  // in TWO places — PlanBoardSlot in Workspace.tsx and here — and that a change made in only one
+  // DRIFTS. Until now nothing tested this half of it, so the warning was a comment rather than a
+  // guard; these assertions are deliberately the same ones the Workspace copy makes, against the
+  // same literal numbers, so a fix applied to one window alone fails here.
+  //
+  // The requirement, in the founder's words: "The build versus plan toggle should stay left
+  // justified when it's in plan mode. It should stay in the same spot that it is when it's in build
+  // mode … And then the filters can be to the right of the build and plan toggle, not to the left."
+  //
+  // Neither PlanBuildToggle nor BoardFilterBar is mocked in this file, so both testids below come
+  // from the real components — this is the row that actually ships, not a fixture of itself.
+  const renderBoard = () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "plan" } } as never);
+    useSettingsStore.setState({ beadsEnabled: true } as never);
+    render(<SatelliteApp projectId="p1" />);
+    // VIA THE TOGGLE'S PARENT, NOT THE ROW'S OWN TESTID. `plan-board-header` is introduced by this
+    // change, so looking the row up by it would make every assertion below fail on the old code
+    // merely because the attribute was absent — the order claim would never be evaluated against
+    // the layout it rejects. The toggle and its parent row both predate the change.
+    const mini = screen.getByTestId("plan-column").querySelector<HTMLElement>(
+      "[data-testid='plan-build-mini']",
+    );
+    expect(mini).toBeTruthy();
+    return mini!.parentElement as HTMLElement;
+  };
+
+  it("renders the toggle BEFORE the filter bar, so the filters sit to its right", () => {
+    const row = renderBoard();
+    const mini = row.querySelector<HTMLElement>("[data-testid='plan-build-mini']");
+    const filters = row.querySelector<HTMLElement>("[data-testid='board-filter-bar']");
+    // Presence first: an order assertion over an absent node passes for the wrong reason.
+    expect(mini).toBeTruthy();
+    expect(filters).toBeTruthy();
+    expect(row.dataset.testid).toBe("plan-board-header");
+
+    // FALSE on the pre-change row, which rendered the filter bar first and the toggle last.
+    expect(mini!.compareDocumentPosition(filters!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    // Stated again as sibling indices, so re-parenting cannot satisfy it by accident.
+    const kids = Array.from(row.children);
+    expect(kids.indexOf(mini!)).toBe(0);
+    expect(kids.indexOf(mini!)).toBeLessThan(kids.indexOf(filters!));
+  });
+
+  it("left-justifies the row on the Build header's own inset, so the toggle does not move", () => {
+    // jsdom does not lay out — getBoundingClientRect is all zeroes (docs/jsdom-test-caveats.md) —
+    // so the x is asserted as the declared inset rather than measured. `0 10px` + `minHeight: 34`
+    // is AgentSidebar's `.bhd` band, which is the top of the Build column this board covers, so
+    // matching it is what puts the toggle on the same pixel in both modes.
+    const row = renderBoard();
+    expect(row.style.justifyContent).toBe("flex-start");
+    expect(row.style.paddingLeft).toBe("10px");
+    expect(row.style.minHeight).toBe("34px");
+    // Explicitly NOT the corner it used to be pinned to.
+    expect(row.style.justifyContent).not.toBe("flex-end");
+  });
+});
+
 describe("SatelliteApp — persistence", () => {
   it("does not clobber main's sparkle-ui blob, given the freeze main.tsx installs", () => {
     // The pairing is the point, and it is split across two files: `main.tsx` calls

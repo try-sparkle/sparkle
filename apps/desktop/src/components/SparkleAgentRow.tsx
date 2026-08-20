@@ -45,6 +45,7 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
   dotLabel,
   workerCount,
   onSelect,
+  onMount,
   paneSide,
   jointOpen,
 }: {
@@ -60,7 +61,33 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
   /** Workers folded under this row. 0 today (the improvement pass runs a single agent), wired to
    *  the same rule build rows use so a future subtree gets the same badge for free. */
   workerCount: number;
+  /** Reveal this window's Improve Sparkle pane. The SELECT half of a build row's gesture — it
+   *  seats the pane and nothing else, and in particular it does NOT patch the cable. */
   onSelect: () => void;
+  /**
+   * PATCH THE CABLE ONTO THIS ROW. The MOUNT half, and the reason this prop exists at all.
+   *
+   * ══ THE ASYMMETRY THIS CLOSES (bead sparkle-gyvjyt) ═══════════════════════════════════════════
+   * The founder, on v0.114.0: *"I am able to double click to mount regular build agents and write
+   * to them so those are working OK. It's only the Improve-Sparkle one that's not working."*
+   *
+   * This row was a bare `<div data-hint="improve" onClick={onSelect}>` — no `role`, no `tabIndex`,
+   * no `onKeyDown`, no `onDoubleClick` — whose single callback revealed the pane and patched the
+   * cable together. So it was operable by POINTER ONLY: unreachable from the keyboard and from
+   * assistive tech, on the one row where that costs the entire feature, because `SparkleAgentPane`
+   * carries no composer and the cable is therefore this agent's only input surface. And the gesture
+   * the founder actually makes — the double press — raised no handler at all; it merely ran the
+   * single-click path twice, the second `patchCable` being an identity no-op.
+   *
+   * ══ AND THE ONE THING THIS SPLIT MUST NOT DO ════════════════════════════════════════════════════
+   * Splitting reveal from mount makes "seat but do not patch" REPRESENTABLE, and for this row that
+   * state is a silent misroute rather than a milder outcome — the row's `onClick` block has the
+   * reproduction. So every activation here calls BOTH halves, and the split exists for the caller's
+   * sake (`AgentSidebar` composes them) rather than to give any gesture only the first one. Do not
+   * "restore parity" by routing the click through `engine/cable.mountsOnRowActivation`: that was the
+   * first cut of this fix and review caught it re-opening the misroute.
+   */
+  onMount: () => void;
   /** Same two geometry inputs every build row takes — this row is the same anatomy, so it mirrors
    *  with the pair and opens its concierge end on the same cable. See engine/rowGeometry. */
   paneSide: PairSide;
@@ -82,7 +109,60 @@ export const SparkleAgentRow = memo(function SparkleAgentRow({
       // not a thing a test can read without asserting on colors. This mirrors the build rows'
       // `aria-selected` as a plain data hook so "which column claims the pane" is observable.
       data-active={active ? "1" : "0"}
-      onClick={onSelect}
+      // ══ THE SAME ACTIVATION VOCABULARY EVERY BUILD ROW HAS — see the `onMount` prop ═════════════
+      // `role` + `tabIndex` + a key handler is the trio AgentRow carries (roborev 59545/59322), and
+      // it is not decoration here either: without it this row is operable by pointer ONLY, so a
+      // keyboard or assistive-tech user has no gesture that reaches the agent at all — this pane has
+      // no composer of its own (SparkleAgentPane), which makes the cable the ONLY input surface.
+      role="button"
+      tabIndex={0}
+      onClick={() => {
+        // ══ EVERY ACTIVATION MOUNTS, AND THIS ROW IS DELIBERATELY *NOT* `mountsOnRowActivation` ═══
+        // The first cut of this fix DID route the click through that shared predicate, in the name of
+        // parity — and it re-opened the exact silent misroute this whole line of work exists to close
+        // (caught in review before it landed). The predicate's rule is "a plain single press SELECTS
+        // and does not patch", which is safe for a build row and is NOT safe here:
+        //
+        //   mount a build agent (cable pinned to it) → single-press this row → the pane on screen is
+        //   Improve Sparkle while the cable is still pinned to the build agent. `mountedAgentIdRef`
+        //   is the CABLE PIN and is independent of what pane is drawn (ConciergeHost's
+        //   `routableMountedAgentId`), so the founder's next unaddressed message is written into the
+        //   BUILD AGENT'S PTY, with no refusal and no notice. From a cold cable the same gesture
+        //   falls through to `via: "default"` — a silent concierge turn.
+        //
+        // A build row can afford "seat but do not patch" because its pane carries its own composer,
+        // so the seated-but-unmounted state still has an input surface that says where words go.
+        // SparkleAgentPane has NO composer, so for this row that state is not a milder outcome — it
+        // is a pane the founder is looking at while his typing goes somewhere else. Re-pinning on
+        // every activation makes it unrepresentable, which is what the row did before this change
+        // and what it must keep doing.
+        //
+        // What the parity work was actually FOR is below and is unaffected: the row had no `role`,
+        // no `tabIndex`, no `onKeyDown` and no `onDoubleClick`, so it was unreachable from the
+        // keyboard and from assistive tech entirely — on the one row where that costs the whole
+        // feature, since the cable is this agent's only input surface.
+        onSelect();
+        onMount();
+      }}
+      onDoubleClick={() => {
+        // IDEMPOTENT, not redundant. The browser delivers click, click, dblclick in that fixed order,
+        // so both clicks have already mounted and `patchCable` returns the identical state object for
+        // an unchanged side+agentId (engine/cable) — this writes nothing new. It is here because the
+        // founder's gesture IS the double press ("I am able to double click to mount regular build
+        // agents … it's only the Improve-Sparkle one that's not working"), and a row that happens to
+        // reach the right state without ever handling the event he makes is one refactor away from
+        // not reaching it. There are no chips on this row to bail over, which is why there is no
+        // `stopPropagation` dance here (contrast AgentRow, whose retire/notice/epic pills each need one).
+        onSelect();
+        onMount();
+      }}
+      onKeyDown={(e) => {
+        if (e.key !== "Enter" && e.key !== " ") return;
+        // Space scrolls the column otherwise, and Enter would bubble to whatever else listens.
+        e.preventDefault();
+        onSelect();
+        onMount();
+      }}
       title="Improve Sparkle — reviews your usage to propose improvements to the open-source app"
       style={{
         flex: "0 0 auto",

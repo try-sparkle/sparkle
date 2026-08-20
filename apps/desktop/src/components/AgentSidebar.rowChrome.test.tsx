@@ -218,6 +218,42 @@ describe("Build column — the row is the title and nothing else", () => {
     expect(card()!.textContent).toContain("Wiring the control listener");
   });
 
+  // TIMESTAMPED QUOTE (bead sparkle-s8y5t6). A self-report is what the agent SAID it was doing; the
+  // card must never present a stale one as current state. These drive the row's real clock via
+  // `activityAt` relative to Date.now(), so they assert the actual render, not the helper alone.
+  it("renders a FRESH self-report bare (no quote framing, no age)", () => {
+    const project = seed({}, { activity: "Wiring the control listener", activityAt: Date.now() - 5_000 });
+    render(<AgentSidebar project={project} />);
+    openAgentCard(rowFor("Alpha"));
+    const text = card()!.textContent ?? "";
+    expect(text).toContain("Wiring the control listener");
+    expect(text).not.toContain("said"); // a fresh line is current state, not a past quote
+  });
+
+  it("renders a STALE self-report as a past quote with its age", () => {
+    const project = seed(
+      {},
+      { activity: "Wiring the control listener", activityAt: Date.now() - 12 * 60_000 },
+    );
+    render(<AgentSidebar project={project} />);
+    openAgentCard(rowFor("Alpha"));
+    const text = card()!.textContent ?? "";
+    expect(text).toContain("Wiring the control listener");
+    expect(text).toContain("said"); // framed as a quote, not current state
+    expect(text).toContain("12m ago"); // and dated off the row's clock
+  });
+
+  it("renders an UNSTAMPED self-report as a quote of unknown age (never as current)", () => {
+    // No activityAt (a legacy/restored record) → unknown age → treated as stale, the distrust
+    // direction: it must not read as present-tense state just because its age can't be established.
+    const project = seed({}, { activity: "Wiring the control listener" });
+    render(<AgentSidebar project={project} />);
+    openAgentCard(rowFor("Alpha"));
+    const text = card()!.textContent ?? "";
+    expect(text).toContain("said");
+    expect(text).toContain("age unknown");
+  });
+
   // WorkflowLine renders role="img" with a "Workflow stage: …" label; that's the stable handle.
   it("drops the progress bar from the in-flow row", () => {
     const project = seed({}, {}, { a1: "building_saved" });

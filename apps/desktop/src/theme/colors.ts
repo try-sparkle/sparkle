@@ -200,6 +200,8 @@ export const THEME_HEX = {
     goldFill: BLUEPRINT.dark.primary, onGoldFill: BLUEPRINT.dark.onPrimary,
     successInk: "#34c759", dangerInk: "#f4968f", amberInk: "#ecb968",
     mixedInk: "#ecb968", violetInk: "#a185f5", questionsInk: "#7dd3fc",
+    // See the EPIC CARD block below `C` for why these three exist and how each value was derived.
+    epicCardFill: "#1d3362", epicPillFill: "#e0982f", onEpicPillFill: "#0a1a3f",
   },
   light: {
     inputSurface: BLUEPRINT.light.input,
@@ -226,6 +228,8 @@ export const THEME_HEX = {
     goldFill: BLUEPRINT.light.primary, onGoldFill: BLUEPRINT.light.onPrimary,
     successInk: "#0d5326", dangerInk: "#8f1d16", amberInk: "#664200",
     mixedInk: "#ab4e07", violetInk: "#5636b8", questionsInk: "#075985",
+    // LIGHT DIFFERENTIATES BY HUE, NOT BY LUMINANCE — see the EPIC CARD block below `C`.
+    epicCardFill: "#dce0ff", epicPillFill: "#664200", onEpicPillFill: "#ffffff",
   },
 } as const;
 
@@ -462,6 +466,37 @@ export const C = {
   // opaque brand color takes here. Held to the non-text CONTROL floor on all four planes in
   // theme/chromeContrast.test.ts.
   mixedInk: "var(--c-mixed-ink)",
+  // ── THE EPIC CARD ────────────────────────────────────────────────────────────────────────────
+  // The founder: "I want epic cards to have a different colored background than regular cards" —
+  // an epic must read as structurally different from a task AT A GLANCE, not only by its
+  // affordances. An ordinary card is `forest`; an epic card is this.
+  //
+  // THE TWO THEMES SOLVE DIFFERENT PROBLEMS, and that is why this is a themed token rather than one
+  // literal. Dark had room to go LIGHTER, which is what was asked for: `#1d3362` sits 1.62:1 off
+  // `forest` (above CHROME_MIN_CONTRAST, so the step is a guarantee and not a matter of taste)
+  // while keeping `cream` at 9.98 and `muted` at 4.80 — both above the AA ink floor.
+  //
+  // LIGHT HAD NO SUCH ROOM, and the naive "darken it a little" is the trap. `muted` on the ORDINARY
+  // light card already measures only 4.756:1 — barely over AA — so ANY darkening of the light card
+  // pushes every description preview and id on it UNDER the floor, and going lighter instead
+  // collapses it into the near-white column plane (`deepForest` #f2f6fd). So light differentiates
+  // by HUE AT MATCHED LIGHTNESS: `#dce0ff` is a periwinkle that measures ΔE 8.2 from the ordinary
+  // card and 14.4 from the column, while `muted` stays at 4.73 — i.e. the epic card costs the body
+  // text nothing. Contrast RATIO between the two light fills is ~1.05 by construction and that is
+  // the intended result, not a miss: ratio is a luminance metric and cannot see a hue difference.
+  epicCardFill: "var(--c-epic-card-fill)",
+  // THE `EPIC` PILL. The founder asked for a GOLD pill, and the reason it cannot read `goldFill` is
+  // the note on that token: Blueprint retired gold and the four `gold*` names now carry BLUE. A
+  // `goldFill` pill would be blue-on-blue against the epic card above — invisible, which is the one
+  // outcome the pill exists to prevent. The live warm family is `amber`, so that is what this is.
+  //
+  // THEMED AS A PAIR, for the same reason `goldFill`/`onGoldFill` are. BRAND.amber (#e0982f) is a
+  // FILL constant and works on dark (5.11:1 on the epic card, above CONTROL_MIN_CONTRAST), but on
+  // light's pale card it measures 1.5:1 and fails that floor outright — so light takes the deep
+  // ochre the `amberInk` tier already uses (6.89:1 on the light epic card). Each fill carries the
+  // ink it was measured with: near-navy on dark's amber (7.06:1), white on light's ochre (8.96:1).
+  epicPillFill: "var(--c-epic-pill-fill)",
+  onEpicPillFill: "var(--c-on-epic-pill-fill)",
 };
 
 // ── THE OVERLAY SCRIM AND THE MODAL SHADOW ────────────────────────────────────────────────────

@@ -396,16 +396,60 @@ fn latest_ai_title_in(path: &Path) -> Option<String> {
     scan_last_ai_title(&mut file, 0)
 }
 
+/// A session title together with the evidence a caller needs to decide whether adopting it as a
+/// NAME is honest.
+///
+/// ── WHY THE TITLE ALONE IS NOT ENOUGH (bead: nudge text becoming an agent's name) ─────────────
+/// Sparkle writes into an agent's PTY on its own initiative — the nudge ladder's automated ping
+/// above all — and those writes land in the transcript as ORDINARY USER TURNS, indistinguishable
+/// from the founder typing. For an agent that booted with no brief and sat silent, the ping is the
+/// ONLY user turn there is, so Claude Code summarizes it and the agent gets named after Sparkle
+/// talking to itself: "Sparkle-nudge automated ping", "Resume sparkle-nudge task", "Sparkle-nudge
+/// #8". The founder asked three times why orchestrators kept appearing with nudge names; measured,
+/// 112 transcripts on this machine carry a nudge-derived title.
+///
+/// So this hands back the title AND `first_prompt`, and the CALLER refuses tainted ones. The split
+/// is not incidental — `transcript.rs`'s header sets it out: **Rust does structure, TypeScript does
+/// semantics**, because `engine/agentOriginated.ts` owns the marker strings and has round-trip
+/// tests binding them to the code that GENERATES them. Duplicating those markers here would
+/// recreate the exact drift that module exists to prevent, so this file states no opinion about
+/// what the text means.
+///
+/// ── BOTH FIELDS COME FROM THE SAME FILE, AND THAT IS THE POINT ────────────────────────────────
+/// A worktree accrues one transcript per session. Resolving the path once and reading both from it
+/// is what makes `first_prompt` evidence ABOUT `title`; two independent lookups could judge one
+/// session's title by another session's opening turn.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTitle {
+    /// The freshest `ai-title` in the transcript. Never empty (see [`scan_last_ai_title`]).
+    pub title: String,
+    /// The first human-role turn in the SAME transcript — the title's basis, since Claude Code
+    /// derives the title on turn one and never re-derives it.
+    ///
+    /// `None` means NO EVIDENCE (unreadable file, or no human turn inside the sniff window), not
+    /// "the transcript is clean". Serde emits it as JSON `null`, never an absent key, so the
+    /// TypeScript side must type it `string | null` rather than `string | undefined`.
+    pub first_prompt: Option<String>,
+}
+
 /// Pure form of [`agent_session_title`]: the latest `ai-title` from the worktree's newest
-/// transcript, under the given config/home.
+/// transcript, under the given config/home, plus the first human turn of that same transcript.
 fn agent_session_title_in(
     config_dir: Option<&Path>,
     home: Option<&Path>,
     worktree_path: &str,
-) -> Option<String> {
+) -> Option<SessionTitle> {
     let root = claude_projects_root(config_dir, home)?;
     let file = latest_session_file(&claude_session_dir_for(&root, worktree_path))?;
-    latest_ai_title_in(&file)
+    let title = latest_ai_title_in(&file)?;
+    Some(SessionTitle {
+        title,
+        first_prompt: crate::transcript::first_human_prompt_in(
+            &file,
+            crate::transcript::FIRST_PROMPT_SNIFF_LINES,
+        ),
+    })
 }
 
 /// The agent's Claude Code session title (the `ai-title` it derived from the whole conversation),
@@ -413,7 +457,7 @@ fn agent_session_title_in(
 /// None until Claude Code has written a title (a few lines into the first turn) or for non-Claude
 /// agents. Best-effort — never errors; the caller leaves the current name as-is on None.
 /// Sync core of [`agent_session_title`]. `pub(crate)` for parity with the other session helpers.
-pub(crate) fn agent_session_title_sync(worktree_path: &str) -> Option<String> {
+pub(crate) fn agent_session_title_sync(worktree_path: &str) -> Option<SessionTitle> {
     let config_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from);
@@ -422,7 +466,7 @@ pub(crate) fn agent_session_title_sync(worktree_path: &str) -> Option<String> {
 }
 
 #[tauri::command]
-pub async fn agent_session_title(worktree_path: String) -> Option<String> {
+pub async fn agent_session_title(worktree_path: String) -> Option<SessionTitle> {
     // `async` + `spawn_blocking`: reading (and tail-scanning) a potentially multi-MB transcript is
     // filesystem I/O that must not stall the UI thread. Best-effort — a panicked task degrades to
     // None, exactly like the sync original's any-failure-yields-None contract.
@@ -877,7 +921,7 @@ mod tests {
 
         // End-to-end through the path resolver (single transcript present).
         assert_eq!(
-            agent_session_title_in(None, Some(&home), worktree),
+            agent_session_title_in(None, Some(&home), worktree).map(|t| t.title),
             Some("Debug Merged Agent On New Pop Open".to_string())
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -895,12 +939,128 @@ mod tests {
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
         )
         .unwrap();
-        assert_eq!(agent_session_title_in(None, Some(&home), worktree), None);
+        assert_eq!(agent_session_title_in(None, Some(&home), worktree).map(|t| t.title), None);
         // And a worktree with no session dir at all.
         assert_eq!(
-            agent_session_title_in(None, Some(&home), "/tmp/proj/.sparkle/worktrees/absent"),
+            agent_session_title_in(None, Some(&home), "/tmp/proj/.sparkle/worktrees/absent").map(|t| t.title),
             None
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The title's PROVENANCE reaches the caller — Rust's half of "don't name an agent after
+    /// Sparkle's own ping".
+    ///
+    /// This file deliberately states NO opinion about what the text means: `transcript.rs`'s header
+    /// fixes the split as **Rust does structure, TypeScript does semantics**, because
+    /// `engine/agentOriginated.ts` owns the marker strings and round-trip-tests them against the
+    /// code that generates them. So what is asserted here is that the ping SURVIVES to the caller
+    /// intact — if it were dropped or rewritten, the TypeScript predicate would be judging nothing
+    /// and `sessionTitle.test.ts` would still pass, which is the seam AGENTS.md warns about (both
+    /// suites green, the merge clean, the feature inert).
+    ///
+    /// The ping is built by calling the REAL `nudge_ladder::nudge_text`, never a retyped copy, so a
+    /// reword of the ladder's prose fails here instead of silently going out of step.
+    #[test]
+    fn the_title_carries_the_first_prompt_so_a_nudge_derived_name_can_be_refused() {
+        let home = unique_home("nudge-basis");
+        let worktree = "/tmp/proj/.sparkle/worktrees/nudge-basis";
+        let dir = claude_session_dir_for(&home_root(&home), worktree);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // The agent that booted with no brief: its ONLY user turn is Sparkle's automated ping, so
+        // the title Claude Code derived is a summary of Sparkle talking to itself.
+        let ping = crate::nudge_ladder::nudge_text(1, 245);
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "user",
+                "promptSource": "typed", // Sparkle types into the PTY — indistinguishable from a human
+                "message": {"role": "user", "content": ping},
+            }),
+            r#"{"type":"ai-title","aiTitle":"Sparkle-nudge automated ping","sessionId":"s"}"#,
+        );
+        std::fs::write(dir.join("s.jsonl"), body).unwrap();
+
+        let got = agent_session_title_in(None, Some(&home), worktree).expect("a title");
+        assert_eq!(got.title, "Sparkle-nudge automated ping");
+        assert_eq!(
+            got.first_prompt.as_deref(),
+            Some(ping.as_str()),
+            "the ping must reach the caller VERBATIM — a truncated or dropped basis silently \
+             blinds the TypeScript predicate that refuses the name"
+        );
+
+        // ── THE PAIRED CASE ──────────────────────────────────────────────────────────────────
+        // Same title, same everything, a human first turn. Without this the assertion above would
+        // pass just as well against a function that returned the first turn of every transcript as
+        // a nudge, and the refusal would swallow every honest name in the fleet.
+        let human = "Fix the nudge ladder so it stops pinging agents whose goal is met";
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "user",
+                "promptSource": "typed",
+                "message": {"role": "user", "content": human},
+            }),
+            r#"{"type":"ai-title","aiTitle":"Fix sparkle-nudge loop","sessionId":"s"}"#,
+        );
+        std::fs::write(dir.join("s.jsonl"), body).unwrap();
+
+        let got = agent_session_title_in(None, Some(&home), worktree).expect("a title");
+        assert_eq!(got.first_prompt.as_deref(), Some(human));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A tool_result-only turn is NOT the first prompt — the structural filter is reused, not
+    /// reimplemented. 816 of 869 real user records are tool results, so a naive "first record with
+    /// type:user" would return one of those for almost every session, and the basis would be noise.
+    #[test]
+    fn tool_results_and_meta_records_are_not_the_first_prompt() {
+        let home = unique_home("first-prompt-structure");
+        let worktree = "/tmp/proj/.sparkle/worktrees/first-prompt-structure";
+        let dir = claude_session_dir_for(&home_root(&home), worktree);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let body = concat!(
+            r#"{"type":"mode","sessionId":"s","mode":"default"}"#, "\n",
+            // A sidechain turn belongs to somebody else's conversation.
+            r#"{"type":"user","isSidechain":true,"message":{"role":"user","content":"SIDECHAIN"}}"#, "\n",
+            // An injected caveat.
+            r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"META"}}"#, "\n",
+            // A tool result.
+            r#"{"type":"user","toolUseResult":{"ok":true},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"TOOLRESULT"}]}}"#, "\n",
+            r#"{"type":"user","promptSource":"typed","message":{"role":"user","content":"the real first turn"}}"#, "\n",
+            r#"{"type":"ai-title","aiTitle":"Real Work","sessionId":"s"}"#, "\n",
+        );
+        std::fs::write(dir.join("s.jsonl"), body).unwrap();
+
+        let got = agent_session_title_in(None, Some(&home), worktree).expect("a title");
+        assert_eq!(got.first_prompt.as_deref(), Some("the real first turn"));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// No human turn in the transcript is NO EVIDENCE, and it must present as such. A `--continue`
+    /// transcript can hold only metadata and tool results while inheriting the prior session's
+    /// title; `None` lets the caller fail OPEN there rather than refusing on a guess.
+    #[test]
+    fn a_transcript_with_no_human_turn_reports_no_basis_rather_than_a_wrong_one() {
+        let home = unique_home("no-basis");
+        let worktree = "/tmp/proj/.sparkle/worktrees/no-basis";
+        let dir = claude_session_dir_for(&home_root(&home), worktree);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("s.jsonl"),
+            concat!(
+                r#"{"type":"ai-title","aiTitle":"Inherited Title","sessionId":"s"}"#, "\n",
+                r#"{"type":"assistant","message":{"role":"assistant","content":"working"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let got = agent_session_title_in(None, Some(&home), worktree).expect("a title");
+        assert_eq!(got.title, "Inherited Title");
+        assert_eq!(got.first_prompt, None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -918,7 +1078,7 @@ mod tests {
         );
         std::fs::write(dir.join("s.jsonl"), body).unwrap();
         assert_eq!(
-            agent_session_title_in(None, Some(&home), worktree),
+            agent_session_title_in(None, Some(&home), worktree).map(|t| t.title),
             Some("Good Title".to_string())
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -1002,7 +1162,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            agent_session_title_in(None, Some(&home), worktree),
+            agent_session_title_in(None, Some(&home), worktree).map(|t| t.title),
             Some("Current Title".to_string())
         );
         let _ = std::fs::remove_dir_all(&home);

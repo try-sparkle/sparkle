@@ -27,6 +27,7 @@
 // `{ path, width, height, bytes }`; the pixels never cross the tool envelope. See that module's
 // header for the cost math this avoids.
 import { invoke } from "@tauri-apps/api/core";
+import { notePreviewActivity } from "../../stores/previewStore";
 
 // ---------------------------------------------------------------------------------------------
 // The operation surface
@@ -145,6 +146,12 @@ export async function previewScreenshot(agentId: string): Promise<PreviewInspect
   if (!agentId?.trim()) {
     return refuse("screenshot", "bad-args", "Which agent's preview? Pass `agentId`.");
   }
+  // AN AGENT LOOKING AT A PREVIEW IS ACTIVITY, exactly as a human clicking its card is. The idle
+  // clock cannot learn this from the wire — `supervise()` in preview.rs goes silent once a server is
+  // `Ready` — so every sign of life has to be stamped by whoever observed it. Stamped BEFORE the
+  // capture, not on success, for the same reason the card does it: a capture that fails (no headless
+  // Chromium, the server mid-restart) is still someone asking for this preview.
+  notePreviewActivity(agentId);
   return attempt("screenshot", () => invoke<PreviewCapture>("preview_screenshot", { agentId }));
 }
 
@@ -165,6 +172,14 @@ export async function previewQueryDom(
   if (!selector?.trim()) {
     return refuse("query_dom", "bad-args", "Which elements? Pass a CSS `selector`.");
   }
+  // SAME STAMP AS `previewScreenshot`, and the asymmetry was a real bug (roborev 65689). Both ops
+  // read the same live server, so an agent that drives its preview purely with `query_dom` —
+  // polling for an element, asserting DOM state across a build loop — is using it just as hard.
+  // Without this its `lastActivityAt` never moves (supervise() emits nothing after `Ready`),
+  // `previewIdleGrace` stops the dev server out from under the loop, and the agent's next call
+  // refuses with `no-preview`. Stamped AFTER the arg guards and BEFORE the call, exactly as the
+  // screenshot path does: a query that finds nothing is still someone using the preview.
+  notePreviewActivity(agentId);
   return attempt("query_dom", () =>
     invoke<DomMatch[]>("preview_query_dom", { agentId, selector }),
   );

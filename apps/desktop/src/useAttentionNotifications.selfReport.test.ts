@@ -59,6 +59,28 @@ describe("selfReportBody — precedence gate for the notification body", () => {
     expect(selfReportBody("Wiring the relay", stamp, now, "waiting")).toBe("Wiring the relay");
   });
 
+  // ── DURABLE STAMP (activityAt) WINS OVER THE IN-WINDOW OBSERVATION STAMP (bead sparkle-s8y5t6) ──
+  // The in-memory stamp cannot survive a restart: a first sighting is `at = 0` (unknown age), so a
+  // genuinely-fresh narration written just before the window mounted is wrongly discarded. The
+  // durable `activityAt` fixes exactly that — and it also strictly distrusts a stale durable stamp.
+  it("uses a narration a FRESH durable stamp vouches for, even when the observation stamp is unknown-age", () => {
+    const unknown = { value: "Wiring the relay", at: 0 }; // restored/first-sighting → fallback would reject
+    // Without activityAt this returns null (at = 0). With a fresh durable stamp it is used.
+    expect(selfReportBody("Wiring the relay", unknown, now, "waiting")).toBeNull();
+    expect(selfReportBody("Wiring the relay", unknown, now, "waiting", now - 2_000)).toBe("Wiring the relay");
+  });
+
+  it("REJECTS a narration a STALE durable stamp reports, even when the observation stamp looks fresh", () => {
+    const looksFresh = { value: "Wiring the relay", at: now - 1_000 }; // fallback would accept
+    // The durable stamp is authoritative: stale by its clock → null, overriding the fresh observation.
+    expect(selfReportBody("Wiring the relay", looksFresh, now, "waiting", now - (ACTIVITY_FRESH_MS + 1))).toBeNull();
+  });
+
+  it("falls back to the observation stamp when there is NO durable stamp (legacy record)", () => {
+    const stamp = { value: "Wiring the relay", at: now - 2_000 };
+    expect(selfReportBody("Wiring the relay", stamp, now, "waiting", undefined)).toBe("Wiring the relay");
+  });
+
   it("does NOT substitute narration for an APPROVAL body — approval must describe the action, so it keeps Haiku", () => {
     const stamp = { value: "Wiring the relay", at: now - 2_000 }; // fresh, but wrong signal for an approval ask
     expect(selfReportBody("Wiring the relay", stamp, now, "approval")).toBeNull();

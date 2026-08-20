@@ -33,19 +33,49 @@ export function beadStage(
 }
 
 
-/** How an epic reads at a glance, rolled up from its child beads. */
-export type EpicStatus = "not_started" | "in_progress" | "done";
+/**
+ * How an epic reads at a glance, rolled up from its child beads.
+ *
+ * ── WHY `unplanned` AND `planning` ARE TWO WORDS AND NOT ONE ──────────────────────────────────
+ * These were a single `not_started` until this change, and collapsing them is what let a whole
+ * class of work die quietly. `not_started` was returned from TWO different lines below — "this
+ * epic has no children at all" and "this epic has a full plan and nobody has begun it" — which are
+ * opposite situations wearing the same word:
+ *
+ *   - an epic with no children is a TITLE. Nobody has decided what the work is. There is nothing
+ *     for anything to act on, and the correct response is to plan it.
+ *   - an epic whose children all sit `open` is a FINISHED PLAN THAT NOBODY PICKED UP. A build agent
+ *     decomposed it, wrote the tasks, and stopped. Everything needed to start exists.
+ *
+ * The second is the exact state the founder named: "the plan is done but the work has not yet
+ * started". While both said `not_started`, nothing could tell them apart, so nothing could act on
+ * the second — and an epic that had been fully planned was indistinguishable, to every reader in
+ * the app, from one nobody had thought about yet. `services/epicSweepRunner` is the first consumer
+ * that needs the distinction: it restarts an epic sitting in `planning` and must never spawn an
+ * agent against an epic with nothing planned, because there is nothing there to build.
+ *
+ * `planning` is the founder's own name for the stage (his ladder is
+ * Backlog > Blocked > Planning > Building > Done > Shipped > Archived), used verbatim so this state
+ * has ONE name from the roll-up through to whatever renders it, rather than an internal word and a
+ * display word that can drift apart.
+ */
+export type EpicStatus = "unplanned" | "planning" | "in_progress" | "done";
 
 /**
  * Roll a set of child-bead statuses up into the epic's status:
- *  - no children, or every child still `open`  → not_started
- *  - every child `closed`                      → done
+ *  - no children                → unplanned  (a title; nothing has been decided)
+ *  - every child still `open`   → planning   (the plan exists, nobody has started it)
+ *  - every child `closed`       → done
  *  - anything in between (any in_progress, or a mix of open/closed) → in_progress
+ *
+ * ORDER IS LOAD-BEARING between the first two: an epic with no children vacuously satisfies
+ * `every(open)`, so the empty case must be answered before it or `planning` would swallow it and
+ * the sweeper would spawn agents against epics that hold no plan.
  */
 export function rollupEpicStatus(childStatuses: Bead["status"][]): EpicStatus {
-  if (childStatuses.length === 0) return "not_started";
+  if (childStatuses.length === 0) return "unplanned";
   if (childStatuses.every((s) => s === "closed")) return "done";
-  if (childStatuses.every((s) => s === "open")) return "not_started";
+  if (childStatuses.every((s) => s === "open")) return "planning";
   return "in_progress";
 }
 

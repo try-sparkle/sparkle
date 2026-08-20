@@ -340,7 +340,16 @@ describe("the modal radius is the card's alone", () => {
 // positive. Raising the recorded count is the honest move; restyling a panel to dodge a heuristic
 // would make the UI wrong to keep a number down. The ratchet still does its job — it stops FIELD
 // sprawl, and the next migration lowers this.
-const MAX_BORROWED_FIELDS = 28;
+// 28 -> 30 (PR #2131). BOTH new entries are PANELS again, the same false positive the 26 -> 28
+// note below records: the per-project policy pane's scope bar (`ConciergeProjectPolicy.tsx`,
+// a toolbar holding the scope label and its controls) and its notice box (a bordered callout of
+// muted prose). Neither is a text field — there is no input in either — and both take
+// `forest` + `hairline` because that is the paint the pane they sit inside already uses:
+// `ConciergeToolsPane.tsx:689` and `:861` are on this list with the identical treatment, and the
+// two panes are meant to read as one. Restyling a correct panel to dodge a heuristic would make
+// the UI wrong to keep a number down, so raising the recorded count is the honest move here too.
+// The ratchet still stops FIELD sprawl, and the next migration lowers this.
+const MAX_BORROWED_FIELDS = 30;
 
 describe("fields borrowing the shell's tokens is a shrinking population", () => {
   /** A style object that looks like a text field: a `hairline` border over a `deepForest` fill. */

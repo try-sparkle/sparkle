@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "sparkle"
-version = "0.110.1"
+version = "0.119.0"
 dependencies = [
  "base64 0.22.1",
  "block2",
@@ -4477,6 +4477,7 @@ dependencies = [
  "tracing-subscriber",
  "tungstenite",
  "ureq",
+ "url",
  "vt100",
 ]
 

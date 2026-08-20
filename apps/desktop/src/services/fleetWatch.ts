@@ -416,6 +416,11 @@ export function movementFrom(agents: readonly FleetAgentFacts[]): Record<string,
       lastEvent: f.hooks.lastEvent,
       lastEventMs: f.hooks.lastEventMs,
       sessionId: f.hooks.sessionId,
+      // Carried for `engine/goalContinuation.progressMark`, not for retraction — see the field's
+      // note on MovementEvidence. This is the ONLY place the digest's tool count can cross into the
+      // store, so a projection that drops it takes the escalation predicate's only work signal with
+      // it (and, being a required field, cannot drop it silently).
+      toolsRecent: f.hooks.toolsRecent,
     };
   }
   return out;

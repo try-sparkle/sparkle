@@ -15,6 +15,7 @@
 // Every reader below therefore has three answers (`true` / `false` / `undefined`), and the third one
 // is a real answer.
 import {
+  escalationQuotesStaleText,
   goalRemainingMs,
   goalStateOf,
   hasUnmetGoal,
@@ -25,6 +26,7 @@ import { describeGoalVerify } from "@sparkle/core";
 import { stallReport, type StallReport } from "../engine/agentStall";
 import type { ExpiryProof } from "../engine/goalExpiry";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
+import { humanBlockFor } from "./humanBlockFor";
 import { thrashReportFor, type ThrashReport } from "../engine/agentThrash";
 import { unlandedWorkEvidence, type WorkflowStageId } from "../engine/workflowStage";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -52,6 +54,28 @@ export interface GoalReading {
   /** Present ONLY when `state === "escalated"`: why auto-continue gave up, for the human who now
    *  owns it. */
   escalationReason?: string;
+  /**
+   * `true` when {@link escalationReason} QUOTES A GOAL THIS AGENT NO LONGER HOLDS. Absent otherwise
+   * — the ordinary case pays nothing, and a reader can branch on presence.
+   *
+   * WHY IT HAS TO RIDE ALONGSIDE THE SENTENCE. `escalationReason` is frozen at the instant
+   * auto-continue gave up, and `chargeGoalDebt` deliberately carries it onto whatever the goal
+   * becomes next — an agent must not be able to launder an escalation away by rewording its
+   * objective. That is the right rule, and it has a consequence nobody reading the payload can see:
+   * the live `text` and the frozen sentence sit side by side with nothing to tell them apart, so a
+   * reader repeats a two-goals-old blocker as a live claim. The founder hit exactly this — a goal he
+   * had replaced was still being quoted back at him as the thing blocking the agent.
+   *
+   * ⚠️ IT IS STATED HERE RATHER THAN AT THE CALL SITE, and that is the point of moving it.
+   * `controlListener.handleGetState` computed this for the ROSTER and nothing computed it for
+   * `get_agent_status` — which is the CONCIERGE's per-agent read, i.e. the one surface whose output
+   * a human actually hears. One rule in two places is how the two came to disagree; every consumer
+   * of a {@link GoalReading} now gets the same answer.
+   *
+   * ABSENT IS "CANNOT TELL", NOT "FRESH" — see `AgentGoal.escalatedGoalText`, which every escalation
+   * persisted before that field carries no quote for. The comparison fails closed to not-stale.
+   */
+  escalationStale?: true;
   /** HOW this goal gets checked, rendered as one readable clause ("`pnpm test` exits 0", "a person
    *  decides"), and ABSENT when no check was stated.
    *
@@ -86,7 +110,12 @@ export function goalReading(goal: AgentGoal | undefined, now: number): GoalReadi
     // Only when it actually escalated: an escalation reason on a live goal would read as though the
     // fleet had already given up on it.
     ...(state === "escalated" && goal.escalationReason !== undefined
-      ? { escalationReason: goal.escalationReason }
+      ? {
+          escalationReason: goal.escalationReason,
+          // Only ever WITH the sentence it qualifies. A stale flag on a reading that carries no
+          // reason would be a warning about a string the caller cannot see.
+          ...(escalationQuotesStaleText(goal) ? { escalationStale: true as const } : {}),
+        }
       : {}),
     // Only when a check was actually stated — `describeGoalVerify(undefined)` returns the honest
     // "no check stated", but rendering that on every goal would put a string on the overwhelming
@@ -337,6 +366,7 @@ export function stallReadingFor(
   goal: AgentGoal | undefined,
   now: number,
 ): StallReport {
+  const humanBlock = humanBlockFor(agentId);
   return stallReport({
     status: correctedStatusFor(agentId, status, now),
     now,
@@ -346,6 +376,11 @@ export function stallReadingFor(
     // both publish this report, and a wall visible to one but not the other is the same
     // one-object-contradicts-itself bug the correction above exists to prevent.
     quotaBlock: quotaBlockForAgent(agentId, now),
+    // The agent's own `blocked-on-human` answer, supplied HERE for exactly the reason the quota wall
+    // and the corrected status are: this report is what `get_agent_status` and the roster publish, so
+    // a human block visible to the sidebar but not to them is the same one-object-contradicts-itself
+    // divergence the two comments above exist to prevent (roborev 65339).
+    ...(humanBlock ? { humanBlock } : {}),
     ...stallEvidenceFor(agentId),
   });
 }

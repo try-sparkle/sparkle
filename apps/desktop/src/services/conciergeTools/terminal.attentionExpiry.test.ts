@@ -116,6 +116,7 @@ function ledgerSeesWorkAfterTheAsk(raisedAtOffset: number, workedAtOffset: numbe
     lastEvent: "PostToolUse",
     lastEventMs: workedAt,
     sessionId: "session-1",
+    toolsRecent: null,
   };
   noteMovement(ledger, () => evidence, workedAt + 1); // adopts the session
   noteMovement(ledger, () => evidence, workedAt + 2); // …and only now counts as movement

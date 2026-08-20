@@ -1,5 +1,5 @@
 import { C } from "../theme/colors";
-import { FONT_UI, RADIUS } from "../theme/scale";
+import { FONT_MONO, FONT_UI, RADIUS } from "../theme/scale";
 import { DetailLine, PathReveal } from "./rowCardPrimitives";
 import type { BranchStatus } from "../services/branchStatus";
 
@@ -46,6 +46,24 @@ export function AgentDetailLines({
   // C.success (a CSS var can't take a hex-alpha suffix); the muted path is a var() and uses no tint.
   const pillInk = pillBehind ? C.muted : C.successInk;
   const baseLabel = baseBranch ?? "main";
+  // WHICH BRANCH the numbers above were measured on (bead `sparkle-pgkbn4`).
+  //
+  // Every other line in this card describes work; this one describes WHAT WAS MEASURED, and it is
+  // here because the two came apart. A release-cut agent that had tagged, built and published
+  // v0.114.0 filed itself under "Local: Nothing Yet" — Rust had resolved it onto a stale, empty
+  // `sparkle/agent-<id>` ref that the agent left behind when it renamed its branch. Every number on
+  // the row was CORRECT ABOUT A BRANCH NOBODY MEANT, and nothing on screen said which one, so the
+  // only way to find out was to open a terminal and re-derive the resolution by hand. Naming it
+  // turns that investigation into a glance.
+  //
+  // `undefined` means the Rust build predates the field — render NOTHING rather than a blank or a
+  // guessed `sparkle/agent-<id>`, since a guess here would re-create exactly the confusion above.
+  const measuredBranch = bs?.branch?.trim() || null;
+  // `worktreeOnBranch === false` is the one reading where the numbers deliberately are NOT about the
+  // tree you are looking at: something checked another branch out into this worktree, so the ref's
+  // history and the files on disk belong to different branches. Say so — the same three-valued
+  // caution the rest of this file applies to `dirty` (undefined is unknown, not "on branch").
+  const parked = !!bs && bs.worktreeOnBranch === false;
   // Shared pill geometry — squared off to roughly match the Land/old action pills (borderRadius 5),
   // not a fully-round chip. The behind/ahead variants layer color + action on top.
   const pillBase: React.CSSProperties = {
@@ -66,6 +84,30 @@ export function AgentDetailLines({
       <DetailLine label="Location">
         <PathReveal path={worktreePath ?? rootPath} />
       </DetailLine>
+      {measuredBranch && (
+        <DetailLine label="Branch">
+          <span
+            data-testid="measured-branch"
+            title={
+              parked
+                ? `Measured on ${measuredBranch} — the worktree is checked out to a different branch, so the files on disk are not this branch's.`
+                : `Every count on this row was measured on ${measuredBranch}.`
+            }
+            style={{
+              color: C.muted,
+              fontSize: 12,
+              fontFamily: FONT_MONO,
+              minWidth: 0,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {measuredBranch}
+            {parked && " — the worktree is checked out elsewhere"}
+          </span>
+        </DetailLine>
+      )}
       <DetailLine label="Status">
         {showPill ? (
           pillBehind ? (

@@ -22,6 +22,7 @@
 
 import { describe, it, expect } from "vitest";
 import { isClaudeCodeScreen, claudeCodeMarkerFamilies } from "./claudeCodeScreen";
+import { AMBIENT_CHROME_LINE } from "../services/sessionLimitScreen";
 import {
   APPROVAL_2_1_220,
   APPROVAL_OPTION_2_2_1_220,
@@ -52,6 +53,29 @@ describe("a live dialog is evidence of Claude Code, not of a full-screen app", (
   // The state the module was originally written for must not regress.
   it("still recognises the idle composer box", () => {
     expect(isClaudeCodeScreen(IDLE_AFTER_TURN_2_1_220)).toBe(true);
+  });
+
+  // ══ THE 2.1.231 BAR IS AMBIENT CHROME (roborev 64564, Medium — but see the correction) ════════
+  // `AMBIENT_CHROME_LINE`'s glyph class carried 2.1.220's ▶ and not the ⏵ that 2.1.231
+  // draws (`capturedScreens.fixture.ts:271`, `:314`), and this is the walk families E and F depend
+  // on — so the gap is real and is fixed alongside the narrow arm's own class, in the same change
+  // as its `nudge_gate.rs` port.
+  //
+  // THE REVIEW'S ASSERTED CONSEQUENCE DID NOT REPRODUCE, and that is recorded here rather than
+  // quietly dropped. The finding predicted that an approval dialog or /model picker under this bar
+  // would be REFUSED at 120 columns. Measured against the shipped code with the glyph removed:
+  // `AMBIENT_CHROME_LINE.test(bar)` flips to false, but `nothingUnrecognizedBelowFooter` still
+  // returns true for both fixtures and `isClaudeCodeScreen` stays true — the appended bar is not
+  // the row the walk stops on. So a dialog-level assertion here CANNOT fail on this defect: it
+  // would be exactly the vacuous test AGENTS.md calls the #1 fleet-wide finding. The fix is pinned
+  // where it can actually go red — on the predicate itself, below, and on the Rust port's own
+  // `the_2_1_231_ambient_bar_is_chrome_in_both_spellings`, both mutation-verified.
+  const CHROME_TAIL_2_1_231 = "  ⏵⏵ bypass permissions on (shift+tab to cycle)";
+  it.each([
+    ["the 2.1.231 spelling", CHROME_TAIL_2_1_231],
+    ["the 2.1.220 spelling", "  ▶▶ bypass permissions on (shift+tab to cycle)"],
+  ])("reads %s of the persistent bar as ambient chrome", (_label, bar) => {
+    expect(AMBIENT_CHROME_LINE.test(bar)).toBe(true);
   });
 
   // ══ THE IMPOSTORS ═════════════════════════════════════════════════════════════════════════════

@@ -115,6 +115,57 @@ const RESEARCH_MODEL: &str = "claude-opus-5";
 /// the ability to cancel.
 const RESEARCH_TIMEOUT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
+/// The ONLY model ids a caller may ask a research child to run on.
+///
+/// ══ WHY AN ALLOWLIST AND NOT A PASSTHROUGH ═════════════════════════════════════════════════════
+///
+/// `ai.rs` already clamps `max_tokens` because "an unclamped budget from a compromised renderer
+/// would be a costly-output amplifier". A free-form `--model` string is the SAME hazard class with
+/// a sharper edge: the prices differ by an order of magnitude (`spend.rs` lists Fable at $10/$50
+/// per Mtok against Opus 5's $5/$25), so a renderer that could name any string could point every
+/// research and advisor child at the dearest row in the table — or at a model id that does not
+/// exist, which the CLI reports as a task-level failure minutes later rather than as a rejected
+/// argument.
+///
+/// So the override is CLOSED, not validated-by-shape. An unknown id is refused at dispatch, before
+/// a task record is written, and the caller is told which ids exist. Mirrors the curated list in
+/// `services/models.ts` (the frontend's source of truth, since `model_catalog.rs` deliberately
+/// returns an empty vec) plus `claude-opus-5`, which this module already pins as its own default.
+pub const RESEARCH_MODEL_ALLOWLIST: &[&str] = &[
+    "claude-opus-5",
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "claude-sonnet-5",
+    "claude-haiku-4-5",
+];
+
+/// Resolve the model one child runs on: the caller's override when it is on the allowlist, else the
+/// depth's own pinned model. `None` and a blank string both mean "no override" — a blank is what an
+/// options object carrying an unset field serializes to, and treating it as an unknown id would
+/// refuse dispatches nobody asked to override.
+///
+/// Returns `Err` for a NON-BLANK id that is not allow-listed, rather than silently falling back to
+/// the default. A silent fallback is the failure this repo keeps paying for: the caller would get a
+/// task that ran, answered, and was attributed to a model it never used — and for the advisor pass
+/// specifically, "it ran on the model I asked for" is the whole premise (a fallback to the planner's
+/// own tier turns second-model review back into self-review with nothing reporting it).
+pub(crate) fn resolve_research_model(
+    depth: ResearchDepth,
+    model_override: Option<&str>,
+) -> Result<String, String> {
+    let requested = model_override.map(str::trim).filter(|m| !m.is_empty());
+    let Some(m) = requested else {
+        return Ok(depth.model().to_string());
+    };
+    if RESEARCH_MODEL_ALLOWLIST.contains(&m) {
+        return Ok(m.to_string());
+    }
+    Err(format!(
+        "research: {m} is not a model this app may dispatch. Allowed: {}",
+        RESEARCH_MODEL_ALLOWLIST.join(", ")
+    ))
+}
+
 impl ResearchDepth {
     /// Both depths run the same capable model now — see [`RESEARCH_MODEL`].
     pub fn model(self) -> &'static str {
@@ -181,6 +232,26 @@ pub fn research_dir(app_data: &Path) -> PathBuf {
 
 fn task_path(app_data: &Path, id: &str) -> PathBuf {
     research_dir(app_data).join(format!("{id}.json"))
+}
+
+/// The sidecar carrying the child's LIVE TAIL while it runs — a capped, human-readable log the
+/// running task's main-pane view polls (bead sparkle-s7rfc). Deliberately a SEPARATE file from the
+/// task JSON: the tail is rewritten continuously as events stream in, and routing that through the
+/// task record's write-then-rename-then-read-back contract would be both wasteful and a way to
+/// corrupt the record the whole feature depends on. `.tail` is not `.json`, so `list_tasks` (which
+/// filters to `.json`) never sees it.
+fn tail_path(app_data: &Path, id: &str) -> PathBuf {
+    research_dir(app_data).join(format!("{id}.tail"))
+}
+
+/// Read the live tail for a task, or an empty string when there is none (never dispatched by this
+/// install, already finished — `finish` removes the sidecar — or the id is malformed). Empty is the
+/// honest "nothing to show yet", which is exactly what the pane renders as an absence.
+pub fn read_tail(app_data: &Path, id: &str) -> String {
+    if valid_task_id(id).is_err() {
+        return String::new();
+    }
+    std::fs::read_to_string(tail_path(app_data, id)).unwrap_or_default()
 }
 
 /// Ids reach this module from the frontend (`research_get`, `research_cancel`, `research_mark_read`)
@@ -562,9 +633,20 @@ fn build_research_args(question: &str, model: &str, persona: &str) -> Vec<String
         // MUST be first — see the ordering constraint above.
         "-p".to_string(),
         question.to_string(),
-        // A single JSON object on stdout. Nothing here streams to a UI.
+        // NDJSON EVENTS ON STDOUT, ONE PER LINE, so the runner can surface a LIVE TAIL of the child's
+        // work while it runs (bead sparkle-s7rfc; founder 2026-08-17: "show me a bit of the research
+        // as it happens", not just a timer). The single-object `json` format buffered everything to
+        // the end and streamed nothing; `stream-json` emits `system`/`assistant`/`user`/`result`
+        // events incrementally. The FINAL `result` event carries the same top-level `is_error` /
+        // `result` fields the old single object did, so `classify_result` reads it UNCHANGED — see
+        // `CliSpawner::run`, which returns that final event's line as the outcome.
         "--output-format".to_string(),
-        "json".to_string(),
+        "stream-json".to_string(),
+        // REQUIRED by the CLI whenever `-p` is paired with `--output-format stream-json`: without it
+        // the CLI refuses to stream and errors out. It does not add token-level deltas on its own
+        // (that would be `--include-partial-messages`, deliberately NOT passed — message/tool-call
+        // granularity keeps the tail bounded and readable).
+        "--verbose".to_string(),
         // One capable model for both tiers — see RESEARCH_MODEL.
         "--model".to_string(),
         model.to_string(),
@@ -659,6 +741,117 @@ fn cli_failure_message(result_text: &str) -> String {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+// THE LIVE TAIL — turning stream-json events into a small, bounded, human-readable log
+// ═══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `stream-json` emits one JSON event per line as the child works. `CliSpawner::run` folds each event
+// into a rolling tail (last {TAIL_MAX_LINES} lines, hard-capped at {TAIL_MAX_CHARS} chars) that the
+// running task's main-pane view polls on the existing research cadence. Two caps and the poll are
+// the whole reason this cannot "become a big problem": the file never grows, and nobody reads it
+// faster than every few seconds. All three helpers below are PURE so they are unit-tested without a
+// real `claude` — the one thing this environment cannot spawn.
+
+/// Keep the tail short enough to read at a glance and small enough to reread every poll.
+const TAIL_MAX_LINES: usize = 40;
+/// One event's line, truncated so a single huge assistant block cannot dominate the window.
+const TAIL_LINE_MAX_CHARS: usize = 200;
+/// A hard ceiling on the rendered file regardless of line count — belt to the line cap's suspenders.
+const TAIL_MAX_CHARS: usize = 6_000;
+
+/// Is this the terminal `result` event — the one carrying the final `is_error` / `result` that
+/// `classify_result` consumes? `type == "result"` is the stream-json marker; the field-presence
+/// fallback keeps working if the CLI ever drops the `type` tag, and is the same shape the old
+/// single-object `json` format produced.
+fn is_result_event(v: &serde_json::Value) -> bool {
+    if v.get("type").and_then(serde_json::Value::as_str) == Some("result") {
+        return true;
+    }
+    v.get("is_error").is_some() || v.get("result").is_some()
+}
+
+/// One brief, human-readable representation of a tool call, for the tail — `→ Bash: git log` /
+/// `→ Read src/x.rs`. Never echoes a whole tool input (a `Bash` command or a file body can be long
+/// and can quote the question back), so it takes the single most identifying value and truncates.
+fn tool_use_line(name: &str, input: &serde_json::Value) -> String {
+    // The field that best identifies each research tool's target, in preference order.
+    let detail = ["command", "file_path", "path", "pattern", "query", "url", "prompt"]
+        .iter()
+        .find_map(|k| input.get(*k).and_then(serde_json::Value::as_str))
+        .unwrap_or("");
+    let detail = detail.trim();
+    if detail.is_empty() {
+        format!("→ {name}")
+    } else {
+        format!("→ {name}: {detail}")
+    }
+}
+
+/// The readable lines one stream-json event contributes to the tail — empty for events that carry
+/// nothing worth showing (`system`/`init`, tool RESULTS, the final `result`). Only ASSISTANT events
+/// speak: the model's own in-progress text and the tool calls it makes, which together are exactly
+/// "what the research agent is doing right now". A tool RESULT is deliberately skipped — it is where
+/// a whole file's contents (or the question, echoed back) would leak in unbounded.
+fn extract_tail_lines(v: &serde_json::Value) -> Vec<String> {
+    if v.get("type").and_then(serde_json::Value::as_str) != Some("assistant") {
+        return Vec::new();
+    }
+    let Some(content) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_array())
+    else {
+        return Vec::new();
+    };
+    let mut lines = Vec::new();
+    for block in content {
+        match block.get("type").and_then(serde_json::Value::as_str) {
+            Some("text") => {
+                if let Some(t) = block.get("text").and_then(serde_json::Value::as_str) {
+                    // Collapse to one line so a multi-paragraph block stays one tail entry (and one
+                    // truncation), rather than blowing the line budget by itself.
+                    let one = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    if !one.is_empty() {
+                        lines.push(one);
+                    }
+                }
+            }
+            Some("tool_use") => {
+                let name = block.get("name").and_then(serde_json::Value::as_str).unwrap_or("tool");
+                let empty = serde_json::Value::Null;
+                lines.push(tool_use_line(name, block.get("input").unwrap_or(&empty)));
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+/// Append one line to the rolling tail buffer: trimmed, char-safely truncated, empties dropped, and
+/// the oldest lines evicted once the buffer exceeds {TAIL_MAX_LINES}. `char`-based truncation (not
+/// byte slicing) so a multi-byte boundary can never panic.
+fn push_tail_line(buf: &mut std::collections::VecDeque<String>, line: &str) {
+    let line = line.trim();
+    if line.is_empty() {
+        return;
+    }
+    let truncated: String = line.chars().take(TAIL_LINE_MAX_CHARS).collect();
+    buf.push_back(truncated);
+    while buf.len() > TAIL_MAX_LINES {
+        buf.pop_front();
+    }
+}
+
+/// Render the buffer to the string written to the sidecar: newest-last (reading order), hard-capped
+/// at {TAIL_MAX_CHARS} by keeping the MOST RECENT characters — a tail shows the end, and the end is
+/// what the founder is watching for.
+fn render_tail(buf: &std::collections::VecDeque<String>) -> String {
+    let joined = buf.iter().cloned().collect::<Vec<_>>().join("\n");
+    let len = joined.chars().count();
+    if len <= TAIL_MAX_CHARS {
+        joined
+    } else {
+        joined.chars().skip(len - TAIL_MAX_CHARS).collect()
+    }
+}
+
 /// The message a task carries when it hit the wall-clock BACKSTOP (see [`RESEARCH_TIMEOUT`]) — a
 /// rare safety stop, not the old automatic wall. Rendered in the largest sensible unit so a
 /// multi-day ceiling does not read as an absurd minute count.
@@ -747,7 +940,18 @@ fn live_controls() -> &'static Mutex<std::collections::HashMap<String, Arc<Contr
 pub(crate) struct SpawnRequest {
     pub question: String,
     pub depth: ResearchDepth,
+    /// The model this child runs on, ALREADY RESOLVED and validated by
+    /// [`resolve_research_model`] — never a raw caller string. Carried here rather than derived
+    /// from `depth` at spawn time so the allowlist check happens once, at dispatch, before a task
+    /// record exists; a child cannot be started on an id that was never checked.
+    pub model: String,
     pub project_root: PathBuf,
+    /// Where to write the capped LIVE TAIL of the child's output as it runs, or `None` to write no
+    /// tail (every test spawner passes `None`). A sidecar `<id>.tail` beside the task JSON — NOT a
+    /// field on the task record, so the streaming write path never touches the carefully-guarded
+    /// `<id>.json` write-then-rename and the `ResearchTask` contract is unchanged. `research_tail`
+    /// reads it; `finish` removes it once the task is terminal.
+    pub tail_path: Option<PathBuf>,
 }
 
 /// THE SEAM. `run` blocks until the child ends, is cancelled, or the deadline passes, and returns
@@ -780,12 +984,12 @@ impl ResearchSpawner for CliSpawner {
     }
 
     fn run(&self, req: &SpawnRequest, ctl: &Control) -> Result<String, String> {
-        use std::io::Read;
+        use std::io::{BufRead, Read};
         use std::process::{Command, Stdio};
 
         let claude_path = crate::preflight::cached_claude_path()
             .ok_or_else(|| "No `claude` CLI was found on this machine.".to_string())?;
-        let args = build_research_args(&req.question, req.depth.model(), RESEARCH_PERSONA);
+        let args = build_research_args(&req.question, &req.model, RESEARCH_PERSONA);
 
         let mut cmd = Command::new(&claude_path);
         cmd.args(&args);
@@ -817,14 +1021,58 @@ impl ResearchSpawner for CliSpawner {
 
         // Drain both pipes concurrently. A child that fills a pipe buffer while we are not reading
         // deadlocks, and a research pass produces far more output than a judge does.
-        let mut out = child.stdout.take();
+        //
+        // STDOUT IS NOW READ LINE BY LINE, not slurped: with `--output-format stream-json` each line
+        // is one event, and folding it as it arrives is what makes the live tail live. The thread
+        // does three things per line — fold it into the rolling tail and write the capped sidecar,
+        // and remember the last line that IS the terminal `result` event. It returns that final
+        // line, which is the single JSON object the outcome pipeline below parses exactly as it
+        // parsed the old `json` format's whole stdout. If the child is killed (cancel/timeout) or
+        // dies before emitting a result, it returns `None`, and the `usable` fallback takes over.
+        let out = child.stdout.take();
         let mut err = child.stderr.take();
-        let out_thread = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(h) = out.as_mut() {
-                let _ = h.read_to_end(&mut buf);
+        let tail_path = req.tail_path.clone();
+        let out_thread = std::thread::spawn(move || -> Option<String> {
+            let Some(h) = out else { return None };
+            let mut reader = std::io::BufReader::new(h);
+            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            let mut final_line: Option<String> = None;
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break, // EOF: the pipe closed (child exited or was killed).
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+                    // A non-JSON line is not fatal — stream-json can interleave stray output; skip it
+                    // rather than aborting the whole read and losing the tail so far.
+                    continue;
+                };
+                if is_result_event(&event) {
+                    // The outcome, kept verbatim so `classify_result` sees the same object shape.
+                    final_line = Some(trimmed.to_string());
+                    continue; // The result event is not itself tail content.
+                }
+                let mut changed = false;
+                for l in extract_tail_lines(&event) {
+                    push_tail_line(&mut tail, &l);
+                    changed = true;
+                }
+                if changed {
+                    if let Some(tp) = tail_path.as_ref() {
+                        // Best-effort: a failed tail write must never affect the run. The file is
+                        // capped, so this rewrite is cheap even on a chatty stream.
+                        let _ = std::fs::write(tp, render_tail(&tail));
+                    }
+                }
             }
-            buf
+            final_line
         });
         let err_thread = std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -865,11 +1113,13 @@ impl ResearchSpawner for CliSpawner {
 
         // Release the handle so the pipes close and the drain threads can finish.
         ctl.release_child();
-        let stdout = out_thread.join().unwrap_or_default();
+        // The final `result` event's line — the one object the outcome pipeline parses. `None` when
+        // the child was killed or died before emitting one; the `usable` check then falls to stderr.
+        let final_line = out_thread.join().unwrap_or_default();
         let stderr = err_thread.join().unwrap_or_default();
         verdict?;
 
-        let stdout = String::from_utf8_lossy(&stdout).to_string();
+        let stdout = final_line.unwrap_or_default();
         // A RESULT OBJECT, not merely "some JSON" — a wrapper's error envelope or a truncated array
         // parses fine and then has no `is_error` and no `result`, which would read as "the CLI
         // answered with nothing". Falling back to stderr here keeps the real diagnosis.
@@ -947,11 +1197,15 @@ pub(crate) fn dispatch_with(
     project_id: Option<String>,
     project_root: PathBuf,
     depth: ResearchDepth,
+    model_override: Option<&str>,
 ) -> Result<ResearchTask, String> {
     let question = question.trim();
     if question.is_empty() {
         return Err("research: a research task needs a question".to_string());
     }
+    // BEFORE the task record is written, so a refused model leaves nothing behind to reconcile —
+    // the same ordering the empty-question guard above uses, and for the same reason.
+    let model = resolve_research_model(depth, model_override)?;
 
     let created_at = (runner.now)();
     let task = ResearchTask {
@@ -983,7 +1237,9 @@ pub(crate) fn dispatch_with(
     let req = SpawnRequest {
         question: task.question.clone(),
         depth,
+        model,
         project_root,
+        tail_path: Some(tail_path(&runner.app_data, &task.id)),
     };
     std::thread::spawn(move || {
         run_to_completion(&bg, &id, req, &ctl);
@@ -1104,6 +1360,12 @@ fn finish(
         // Nothing further to do — the record is the only channel, and it is unreachable.
         tracing::warn!(error = %e, "research: could not record a terminal state");
     }
+    // Drop the live-tail sidecar: a terminal task's pane shows its findings/error, not the tail, so
+    // the file has done its job and must not accumulate one-per-task forever. Best-effort — a task
+    // record with no sidecar reads as "no tail", which is correct for a finished task. It runs even
+    // when the write above yielded to a first-terminal-write-wins guard, because the sidecar is
+    // stale regardless of which terminal record won.
+    let _ = std::fs::remove_file(tail_path(&runner.app_data, id));
 }
 
 /// Reconcile records left non-terminal by a process exit. Call once at startup.
@@ -1281,10 +1543,23 @@ pub async fn research_dispatch(
     project_id: Option<String>,
     depth: ResearchDepth,
     project_root: Option<String>,
+    // OPTIONAL model override, checked against `RESEARCH_MODEL_ALLOWLIST`. Absent (the ordinary
+    // case, and every pre-existing caller) means the depth's pinned model. The second-model advisor
+    // pass is what needs it: its whole premise is running on a model DIFFERENT from the planner's,
+    // which it cannot do while every child is pinned to one id. A `///` here is a compile error —
+    // doc comments are not permitted on function parameters.
+    model: Option<String>,
 ) -> Result<ResearchTask, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     let runner = Arc::new(Runner::production(app_data));
-    dispatch_with(runner, &question, project_id, resolve_root(project_root)?, depth)
+    dispatch_with(
+        runner,
+        &question,
+        project_id,
+        resolve_root(project_root)?,
+        depth,
+        model.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -1300,6 +1575,16 @@ pub async fn research_get(
 ) -> Result<Option<ResearchTask>, String> {
     let app_data = crate::worktree::app_data_dir_pub(&app)?;
     Ok(read_task(&app_data, &task_id))
+}
+
+/// The LIVE TAIL for one running task — a capped, human-readable log of what the child is doing
+/// right now (bead sparkle-s7rfc). Empty string when there is nothing to show (never dispatched
+/// here, or already finished — `finish` removes the sidecar). Polled by the running task's main-pane
+/// view on the existing research cadence; never pushed, so it cannot outrun the reader.
+#[tauri::command]
+pub async fn research_tail(app: tauri::AppHandle, task_id: String) -> Result<String, String> {
+    let app_data = crate::worktree::app_data_dir_pub(&app)?;
+    Ok(read_tail(&app_data, &task_id))
 }
 
 #[tauri::command]
@@ -1554,6 +1839,7 @@ mod tests {
                 Some("proj_sparkle".to_string()),
                 PathBuf::from("/tmp"),
                 ResearchDepth::Deep,
+                None,
             );
             let _ = tx.send(out);
         });
@@ -1636,7 +1922,7 @@ mod tests {
             now: fixed_clock(7),
         });
 
-        dispatch_with(runner, "q", None, PathBuf::from("/tmp"), ResearchDepth::Quick)
+        dispatch_with(runner, "q", None, PathBuf::from("/tmp"), ResearchDepth::Quick, None)
             .expect_err("dispatch must fail when the store cannot read its own write");
         std::thread::sleep(Duration::from_millis(50));
         assert!(
@@ -1714,6 +2000,7 @@ mod tests {
             None,
             PathBuf::from("/tmp"),
             ResearchDepth::Quick,
+            None,
         )
         .unwrap();
         assert!(wait_until(|| entered.load(Ordering::Acquire)), "the child must be running");
@@ -2151,6 +2438,206 @@ mod tests {
         ] {
             assert!(args.iter().any(|a| a == flag), "{flag} must be present");
         }
+        // THE LIVE-TAIL CONTRACT: the child must STREAM its work, not buffer it to a single object.
+        // `--output-format stream-json` is what emits one event per line as it goes, and `--verbose`
+        // is what the CLI requires before it will stream under `-p`. A revert to the old buffered
+        // `json` (or dropping `--verbose`) silently kills the live tail — nothing else would notice —
+        // so it is pinned here as a VALUE, not just a flag presence.
+        let fmt = at("--output-format").expect("--output-format must be passed");
+        assert_eq!(fmt, "stream-json", "the runner must stream events for the live tail");
+        assert!(
+            args.iter().any(|a| a == "--verbose"),
+            "--verbose is REQUIRED by the CLI to stream under -p; without it the child refuses"
+        );
+    }
+
+    /// The terminal `result` event is recognised by its `type`, and by the field-presence fallback —
+    /// both must hold, because `CliSpawner::run` returns exactly that line for `classify_result`.
+    #[test]
+    fn is_result_event_matches_the_terminal_object_only() {
+        let result = serde_json::json!({"type":"result","is_error":false,"result":"done"});
+        let assistant = serde_json::json!({"type":"assistant","message":{"content":[]}});
+        let system = serde_json::json!({"type":"system","subtype":"init"});
+        // The old single-object `json` shape had no `type` — the fallback must still call it a result.
+        let legacy = serde_json::json!({"is_error":true,"result":"oops"});
+        assert!(is_result_event(&result));
+        assert!(is_result_event(&legacy));
+        assert!(!is_result_event(&assistant));
+        assert!(!is_result_event(&system));
+    }
+
+    /// An assistant event yields its text (collapsed to one line) and a brief line per tool call;
+    /// non-assistant events yield nothing, so a whole file's contents (a tool RESULT) never leaks in.
+    // ── THE MODEL OVERRIDE (bead `sparkle-revqiv`) ───────────────────────────────────────────────
+
+    /// An ABSENT override runs the depth's pinned model — the behaviour every pre-existing caller
+    /// has, asserted so adding the parameter cannot have moved the default.
+    #[test]
+    fn no_override_keeps_the_pinned_model() {
+        assert_eq!(
+            resolve_research_model(ResearchDepth::Quick, None).unwrap(),
+            RESEARCH_MODEL
+        );
+        assert_eq!(
+            resolve_research_model(ResearchDepth::Deep, None).unwrap(),
+            RESEARCH_MODEL
+        );
+        // A BLANK string is "no override", not an unknown id: an options object with an unset
+        // field serializes to exactly this, and refusing it would break dispatches nobody
+        // overrode.
+        assert_eq!(
+            resolve_research_model(ResearchDepth::Quick, Some("   ")).unwrap(),
+            RESEARCH_MODEL
+        );
+    }
+
+    /// An allow-listed override is HONOURED — and the id asserted is one that is NOT the default,
+    /// so this cannot pass against a resolver that ignores its argument entirely.
+    #[test]
+    fn an_allowlisted_override_is_honoured_and_differs_from_the_default() {
+        let picked = resolve_research_model(ResearchDepth::Quick, Some("claude-sonnet-5")).unwrap();
+        assert_eq!(picked, "claude-sonnet-5");
+        assert_ne!(
+            picked, RESEARCH_MODEL,
+            "the assertion is vacuous unless the override differs from the pinned default"
+        );
+    }
+
+    /// An UNKNOWN id is REFUSED, never silently downgraded to the default.
+    ///
+    /// The silent-fallback shape is what makes this worth a test: a caller would get a task that
+    /// ran and answered, attributed to a model it never used. For the advisor pass that is not
+    /// cosmetic — a fallback onto the planner's own tier turns second-model review back into
+    /// self-review, with nothing anywhere reporting that it had.
+    #[test]
+    fn an_unknown_model_is_refused_rather_than_defaulted() {
+        let err = resolve_research_model(ResearchDepth::Quick, Some("gpt-4o"))
+            .expect_err("an off-list id must not resolve");
+        assert!(err.contains("gpt-4o"), "the refusal must name what was asked for: {err}");
+        assert!(
+            err.contains("claude-opus-5"),
+            "and must name what IS allowed, so the caller can correct itself: {err}"
+        );
+        // The planner's own model is deliberately NOT on the list either — see ai.rs CHAT_MODEL.
+        assert!(
+            resolve_research_model(ResearchDepth::Quick, Some(crate::ai::CHAT_MODEL)).is_err(),
+            "the planner's chat model must not be dispatchable as a research/advisor child"
+        );
+    }
+
+    /// A refused model leaves NOTHING BEHIND — the check runs before the task record is written.
+    #[test]
+    fn a_refused_model_records_no_task() {
+        let _pool = pool_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let runner = Arc::new(Runner {
+            app_data: dir.path().to_path_buf(),
+            spawner: Arc::new(CliSpawner),
+            now: fixed_clock(0),
+        });
+        assert!(dispatch_with(
+            runner,
+            "a real question",
+            None,
+            PathBuf::from("/tmp"),
+            ResearchDepth::Quick,
+            Some("not-a-model"),
+        )
+        .is_err());
+        assert!(
+            list_tasks(dir.path()).is_empty(),
+            "a task must not exist for a dispatch that was refused"
+        );
+    }
+
+    /// THE SIDE EFFECT, not the resolver: the override must reach the CHILD'S ARGV.
+    ///
+    /// `resolve_research_model` returning the right string proves nothing about what is executed —
+    /// the value has to travel through `SpawnRequest.model` into `build_research_args`. This
+    /// asserts the pair, which is what a `req.depth.model()` regression at the spawn site would
+    /// break while every resolver test above stayed green.
+    #[test]
+    fn the_resolved_model_reaches_the_child_argv() {
+        let model = resolve_research_model(ResearchDepth::Quick, Some("claude-haiku-4-5")).unwrap();
+        let req = SpawnRequest {
+            question: "q".to_string(),
+            depth: ResearchDepth::Quick,
+            model: model.clone(),
+            project_root: PathBuf::from("/tmp"),
+            tail_path: None,
+        };
+        let args = build_research_args(&req.question, &req.model, RESEARCH_PERSONA);
+        let at = args.iter().position(|a| a == "--model").expect("--model must be passed");
+        assert_eq!(args[at + 1], "claude-haiku-4-5");
+        assert_ne!(
+            args[at + 1], RESEARCH_MODEL,
+            "vacuous unless the argv carries the OVERRIDE rather than the pinned default"
+        );
+    }
+
+    #[test]
+    fn extract_tail_lines_speaks_only_for_assistant_events() {
+        let ev = serde_json::json!({
+            "type": "assistant",
+            "message": { "content": [
+                { "type": "text", "text": "Looking at\nthe commit history" },
+                { "type": "tool_use", "name": "Bash", "input": { "command": "git log --oneline" } },
+                { "type": "tool_use", "name": "Read", "input": { "file_path": "src/x.rs" } },
+            ]},
+        });
+        let lines = extract_tail_lines(&ev);
+        assert_eq!(
+            lines,
+            vec![
+                "Looking at the commit history".to_string(),
+                "→ Bash: git log --oneline".to_string(),
+                "→ Read: src/x.rs".to_string(),
+            ]
+        );
+        // A tool RESULT (a `user` event) is where a file body / the echoed question would leak — it
+        // must contribute NOTHING to the tail.
+        let tool_result = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                { "type": "tool_result", "content": "the entire contents of a large file" }
+            ]},
+        });
+        assert!(extract_tail_lines(&tool_result).is_empty());
+    }
+
+    /// The rolling buffer keeps only the last TAIL_MAX_LINES, truncates a giant line, and renders
+    /// newest-last within the char ceiling — the two caps that keep the sidecar from ever growing.
+    #[test]
+    fn the_tail_is_bounded_in_lines_chars_and_line_length() {
+        let mut buf = std::collections::VecDeque::new();
+        for i in 0..(TAIL_MAX_LINES + 25) {
+            push_tail_line(&mut buf, &format!("line {i}"));
+        }
+        assert_eq!(buf.len(), TAIL_MAX_LINES, "the oldest lines must be evicted");
+        // Newest is retained, oldest is gone.
+        assert_eq!(buf.back().unwrap(), &format!("line {}", TAIL_MAX_LINES + 24));
+        assert_eq!(buf.front().unwrap(), &format!("line {}", 25));
+
+        // A single over-long line is truncated char-safely (no panic on a multi-byte boundary).
+        let mut one = std::collections::VecDeque::new();
+        push_tail_line(&mut one, &"é".repeat(TAIL_LINE_MAX_CHARS + 500));
+        assert_eq!(one.back().unwrap().chars().count(), TAIL_LINE_MAX_CHARS);
+
+        // Empty / whitespace lines are dropped, never stored.
+        let mut skip = std::collections::VecDeque::new();
+        push_tail_line(&mut skip, "   ");
+        assert!(skip.is_empty());
+
+        // render caps total chars by keeping the MOST RECENT ones. 40 lines × 200 chars ≈ 8k > 6k,
+        // so the render must clip — and it clips the FRONT, keeping the tail's end.
+        let mut big = std::collections::VecDeque::new();
+        for _ in 0..TAIL_MAX_LINES {
+            push_tail_line(&mut big, &"x".repeat(TAIL_LINE_MAX_CHARS));
+        }
+        push_tail_line(&mut big, "THE-NEWEST-LINE");
+        let rendered = render_tail(&big);
+        assert!(rendered.chars().count() <= TAIL_MAX_CHARS, "the render must obey the char ceiling");
+        assert!(rendered.ends_with("THE-NEWEST-LINE"), "the render keeps the most recent output");
     }
 
     /// ONE capable, unthrottled tier. The founder collapsed cheap/deep: both depths now run the same
@@ -2247,7 +2734,8 @@ mod tests {
             now: fixed_clock(8_000),
         });
         let task =
-            dispatch_with(runner, "q", None, PathBuf::from("/tmp"), ResearchDepth::Quick).unwrap();
+            dispatch_with(runner, "q", None, PathBuf::from("/tmp"), ResearchDepth::Quick, None)
+                .unwrap();
 
         assert!(
             wait_until(|| read_task(dir.path(), &task.id)
@@ -2305,7 +2793,7 @@ mod tests {
             spawner: Arc::new(CliSpawner),
             now: fixed_clock(0),
         });
-        assert!(dispatch_with(runner, "   ", None, PathBuf::from("/tmp"), ResearchDepth::Quick)
+        assert!(dispatch_with(runner, "   ", None, PathBuf::from("/tmp"), ResearchDepth::Quick, None)
             .is_err());
         assert!(list_tasks(dir.path()).is_empty(), "and nothing may be recorded");
     }

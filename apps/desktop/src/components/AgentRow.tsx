@@ -59,8 +59,11 @@ import {
 import { ActiveFillets, rowBoxFor } from "./rowAnatomy";
 import { HINT_JUMP_ATTR } from "../keyboardHints/hintTargets";
 import { isStalled, stallReport } from "../engine/agentStall";
+import { formatActivityAge, isActivityStale } from "../engine/activityFreshness";
 import { thrashReportFor } from "../engine/agentThrash";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
+import { humanBlockIn } from "../services/humanBlockFor";
+import { useNudgeFlagSnapshot } from "../useNudgeFlags";
 import { hasUnmetGoal } from "../engine/agentGoal";
 import { stageFraction } from "../engine/workflowStage";
 import {
@@ -287,15 +290,11 @@ export const AgentRow = memo(function AgentRow({
   // The preview affordances, read HERE for the same reason as `cloudOfferable` above: booleans
   // through a selector re-render the rows that changed, not the column.
   const previewOfferable = usePreviewStore((s) => s.capability[project.id]?.previewable === true);
-  const openPreviewPane = useUiStore((s) => s.openPreview);
   const setPreviewEntry = usePreviewStore((s) => s.setPreview);
   // The AMBIENT pill's two inputs. THIS agent's entry only — `byAgent[a.id]` is a stable reference
   // between writes (`setPreview` bails on an unchanged update), so subscribing to the entry rather
   // than to the map keeps a preview tick on one agent from re-rendering every other row.
   const previewEntry = usePreviewStore((s) => s.byAgent[a.id]);
-  const paneShowsThisPreview = useUiStore(
-    (s) => s.workModeBySide[paneSide] === "preview" && project.selectedAgentId === a.id,
-  );
   const openPromoteToCloud = useUiStore((s) => s.openPromoteToCloud);
   // The OTHER direction. Deliberately NOT gated on `cloudOfferable` (see the button below).
   const openDemoteToLocal = useUiStore((s) => s.openDemoteToLocal);
@@ -864,7 +863,11 @@ export const AgentRow = memo(function AgentRow({
     Math.max(lastPromptAt ?? 0, lastInteractionAt ?? 0) || undefined;
   // One clock for the row, shared by the collapsed timer AND the hover-overlay timer so the elapsed
   // count is identical in both and never jumps when the cursor moves on/off the row (see useRowClock).
-  const clockNow = useRowClock(lastTouchAt);
+  // `?? a.activityAt` so a NEVER-TOUCHED row that carries a self-report still subscribes to the clock
+  // — otherwise its open card could show a stale activity line as present-tense forever, since
+  // useRowClock registers no timer when `since == null` (the narrated-then-died case this guards). It
+  // only drives the tick; ElapsedTimer reads `lastTouchAt` directly, so its displayed value is unchanged.
+  const clockNow = useRowClock(lastTouchAt ?? a.activityAt);
 
   // ── THE NEVER-IDLE OVERLAY ──────────────────────────────────────────────────────────────────────
   // Idle-and-done, idle-and-stalled and thrashing all painted the SAME gray row, and that identity
@@ -886,6 +889,10 @@ export const AgentRow = memo(function AgentRow({
   // looked up". Passing a resolved stage would destroy exactly that distinction.
   const wfState = useRuntimeStore((s) => s.workflowState[a.id]);
   const stageOverride = useRuntimeStore((s) => s.workflowStage[a.id]);
+  // Subscribe so this row's OWN chip repaints when a flag lands — the dot is the sidebar's
+  // derivation, the chip is this one, and they must not disagree about the same agent (roborev
+  // 65339). Read as a SNAPSHOT rather than a counter so the dependency is real (roborev 65409).
+  const nudgeFlags = useNudgeFlagSnapshot();
   const stall = stallReport(
     // `calmSt`, NOT `st` — see the prop's docstring. Asking the stall question about an already-
     // escalated row returns `active` and no causes, so the row would go red with nothing to say.
@@ -895,6 +902,11 @@ export const AgentRow = memo(function AgentRow({
       a.goal,
       { bs, ws: wfState, stageOverride },
       quotaBlockForAgent(a.id, clockNow),
+      // THE SAME INPUT THE SIDEBAR'S REPORT GETS (roborev 65339, a High). This row builds its OWN
+      // stall report, so without the flag here the DOT went red from the sidebar's reading while the
+      // chip beside it never rendered "blocked on you" — a red row with no explanation attached,
+      // which is the inverse of the founder's complaint rather than a fix for it.
+      humanBlockIn(nudgeFlags, a.id),
     ),
   );
   // `isStalled` is the gate, not `verdict !== "finished"`: it is true ONLY for a confident stall, so
@@ -1424,13 +1436,15 @@ export const AgentRow = memo(function AgentRow({
   // twenty PILLS, which is a column that tells you where to look; the same twenty as panes is the
   // outcome §10 calls "strictly worse than no feature".
   //
-  // IT IS NOT ROUTED THROUGH `previewOpenOutcomeFor`, deliberately, and that is the thing most
-  // likely to be "simplified" later. The conjunction gates the PANE — the thing that can take the
-  // screen — while this steals nothing, so it shows under `auto_open = "never"`, on a pair sitting
-  // on Plan, and for a project the user has never previewed by hand. That last case is the point:
-  // the pill is how a first preview becomes discoverable, and gating it on having previewed before
-  // would make the feature visible only to people already using it.
-  // `AgentSidebar.previewPill.test.tsx` pins all three from the failing side.
+  // IT IS UNCONDITIONAL ON ANY POLICY, deliberately, and that is the thing most likely to be
+  // "simplified" later. There used to be a five-condition conjunction deciding whether a preview
+  // PANE could open unasked (`previewOpenOutcomeFor`, plus a `[preview].auto_open` key), and the
+  // pill was pointedly NOT routed through it: that conjunction gated the thing that could take the
+  // screen, while a pill steals nothing. Both the pane and the conjunction are gone (founder,
+  // 2026-08-19), so there is no policy left to be tempted by — but the property still matters and
+  // is still pinned: the pill shows for a project nobody has previewed by hand, which is how a
+  // first preview becomes discoverable at all. Gating it on prior use would make the feature
+  // visible only to people already using it. `AgentSidebar.previewPill.test.tsx` holds that line.
   //
   // TWO CONDITIONS, and they are both "is there something you are not looking at":
   //   • a LIVE server with a url — `listening`/`ready`/`serving`. Not `starting` (nothing to point
@@ -1442,8 +1456,10 @@ export const AgentRow = memo(function AgentRow({
   //     the port is bound before the first build finishes and the pane would fill with the
   //     framework's own compiling page. A pill saying ":5173" at `listening` is simply true, and
   //     costs the reader nothing if the page behind it is still building.
-  //   • the pane is NOT already showing it. Ambient means off-screen; beside a live preview pane
-  //     the pill would be a second, smaller rendering of the thing filling the column.
+  //   There USED to be a second condition — "the pane is not already showing it" — because a
+  //   preview pane could fill this pair. That pane is gone (founder, 2026-08-19: a preview is a card
+  //   in the concierge chat, not a peer column), so a live preview is ALWAYS off-screen from this
+  //   row's point of view and the pill is always the honest readout.
   //
   // A READOUT, NOT AN ACTION — no `onClick`. Every other pill in this strip is a jump (`epicPill`,
   // `feedbackPill`), and the temptation is to make this one open the pane. That is precisely the
@@ -1455,8 +1471,7 @@ export const AgentRow = memo(function AgentRow({
     previewEntry.url &&
     (previewEntry.status === "listening" ||
       previewEntry.status === "ready" ||
-      previewEntry.status === "serving") &&
-    !paneShowsThisPreview ? (
+      previewEntry.status === "serving") ? (
       <span
         data-testid="row-preview"
         title={`Preview ${previewEntry.status} — ${previewEntry.url}`}
@@ -2109,23 +2124,43 @@ export const AgentRow = memo(function AgentRow({
               was the same muted ink on every row so it carried no scannable signal — you had to
               read it to learn anything. It is genuinely useful when you have stopped ON an agent,
               which is exactly when the card is open. */}
-          {expanded && a.activity?.trim() && (
-            <div
-              title={a.activity}
-              style={{
-                color: C.muted,
-                fontSize: 12,
-                lineHeight: 1.3,
-                marginTop: 1,
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-                maxWidth: "100%",
-              }}
-            >
-              {a.activity}
-            </div>
-          )}
+          {/* TIMESTAMPED QUOTE, never present-tense state (bead sparkle-s8y5t6). `activity` is a
+              self-report; rendered bare it reads as what the agent is doing NOW, so a line left
+              behind by an agent that has since died or gone silent looks live for hours. We stamp
+              its age from `activityAt` and, once STALE, mark it explicitly as a past quote ("said …
+              · Nm ago") in italics — so a stale self-report can never masquerade as current, and
+              liveness is judged from the row's real status/tool activity instead of this prose. */}
+          {expanded &&
+            a.activity?.trim() &&
+            (() => {
+              // Read staleness off the ROW'S shared clock (clockNow), not a bare Date.now(): the
+              // row already subscribes to it (see useRowClock above), so the fresh→stale transition
+              // re-renders on its own, and a component test can drive it with a controlled `now`.
+              const stale = isActivityStale(a.activityAt, clockNow);
+              const age = formatActivityAge(a.activityAt, clockNow);
+              const label = stale
+                ? `said “${a.activity}”${age ? ` · ${age}` : " · age unknown"}`
+                : a.activity;
+              return (
+                <div
+                  title={stale ? `Self-reported${age ? ` ${age}` : " (age unknown)"}: ${a.activity}` : a.activity}
+                  style={{
+                    color: C.muted,
+                    fontSize: 12,
+                    lineHeight: 1.3,
+                    marginTop: 1,
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    whiteSpace: "nowrap",
+                    maxWidth: "100%",
+                    fontStyle: stale ? "italic" : undefined,
+                    opacity: stale ? 0.75 : undefined,
+                  }}
+                >
+                  {label}
+                </div>
+              );
+            })()}
           {/* The thin progress line under the title, with a status label to its right.
 
               CARD ONLY, for the same reason as the activity line above — and one more specific to
@@ -2279,8 +2314,10 @@ export const AgentRow = memo(function AgentRow({
           </button>
         </div>
       )}
-      {/* "PREVIEW" — open this agent's dev server in the pane (design §8: "the card is where a row's
-          actions live"), sibling of the two cloud items above and gated the same way.
+      {/* "PREVIEW" — start this agent's dev server (design §8: "the card is where a row's actions
+          live"), sibling of the two cloud items above and gated the same way. THE ONE PLACE A PERSON
+          STARTS A PREVIEW BY HAND, now that the toggle's Preview segment is gone; what it produces
+          is a card in the concierge chat, not a pane.
 
           TWO CONDITIONS, AND BOTH ARE "COULD THIS POSSIBLY WORK":
             • `previewOfferable` — `preview_capability` said yes for this project. ABSENT when it
@@ -2298,11 +2335,16 @@ export const AgentRow = memo(function AgentRow({
             data-testid="open-preview"
             onClick={(e) => {
               e.stopPropagation(); // the card's own onClick re-selects the agent
-              // OPEN THE PANE FIRST, and unconditionally. Starting a server takes seconds and the
-              // pane has honest states for every one of them ("starting…", then the failure with
-              // its stderr) — whereas waiting for the invoke before showing anything makes a click
-              // that appears to do nothing, which is the one outcome that reads as broken.
-              openPreviewPane(paneSide);
+              // NO PANE TO OPEN ANY MORE — this button starts a SERVER, and the surface that shows
+              // it is the concierge card (`Concierge/PreviewCards.tsx`), which appears on its own
+              // the moment the server reaches `ready`/`serving`. It used to also flip this column
+              // into Preview mode; that mode and its pane are gone (founder, 2026-08-19).
+              //
+              // THE FEEDBACK GAP THAT PAIRS WITH THAT is real and is covered elsewhere rather than
+              // ignored: a dev server takes seconds to come up, so between this click and the card
+              // appearing there is a silence. The row's own ambient preview pill fills it — it
+              // shows from `listening`, i.e. as soon as a port is bound, which is earlier than the
+              // card's `ready`/`serving` gate.
               void openPreviewServer({
                 agentId: a.id,
                 projectId: project.id,
@@ -2524,16 +2566,20 @@ export const AgentRow = memo(function AgentRow({
   // padding so its content lines up with the row it stands over.
   const cardBorder = mergeIntoTerminal ? 4 : 2;
   // NO FILTER GOES ON THIS ROW. Rows used to render `filter: grayscale(1) opacity(.72)` when their
-  // status banded "calm" (isCalmBand — everything not asking for you), lifted from the concierge
-  // prototype's `.arow.p2` so only P0/P1 carried color. `working` is deliberately inside that band,
-  // so a RUNNING agent's green dot came out desaturated — and sparkle-pulse (opacity 1 → .35)
-  // compounded it to about a quarter opacity. The column's job is to show what is live; that
-  // treatment erased exactly that. Removed outright rather than gated, because a conditional leaves
-  // the same trap one isCalmBand edit away. See AgentSidebar.liveStatusDots.test.tsx.
+  // status banded "calm" (isCalmBand, which THEN meant everything not asking for you), lifted from
+  // the concierge prototype's `.arow.p2` so only P0/P1 carried color. `working` was inside that band
+  // at the time, so a RUNNING agent's green dot came out desaturated — and sparkle-pulse
+  // (opacity 1 → .35) compounded it to about a quarter opacity. The column's job is to show what is
+  // live; that treatment erased exactly that. Removed outright rather than gated, because a
+  // conditional leaves the same trap one isCalmBand edit away.
+  // See AgentSidebar.liveStatusDots.test.tsx.
   //
-  // isCalmBand still exists and is still right for what it now governs — the TERMINAL's own xterm
-  // theme (Workspace.tsx), which desaturates a landed agent's text without touching the sidebar.
-  // Do not re-wire it to a row style.
+  // isCalmBand no longer includes `working` — it is `{done, stopped}` now, i.e. "this agent's
+  // process has exited" (bead sparkle-e7a3f3) — so the specific dot collision above cannot recur.
+  // THE REMOVAL WAS NEVER CONDITIONAL ON THAT and a row filter is still wrong: the column carries
+  // status by DOT COLOR, which any desaturation of the row fights whatever the predicate answers.
+  // isCalmBand governs the TERMINAL's own xterm theme (Workspace.tsx), which desaturates an EXITED
+  // agent's text without touching the sidebar. Do not re-wire it to a row style.
   // Show the slide-out only while hovering AND not renaming. Suppressing it during a rename means
   // the in-flow row is the SOLE owner of the rename <input> — the field never swaps mount points on
   // a hover change, so a trailing unmount-blur can't silently commit a half-typed name.

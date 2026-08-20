@@ -197,3 +197,113 @@ describe("clicking the Improve Sparkle row patches the cable", () => {
     }
   });
 });
+
+// ══ THE ROW'S ACTIVATIONS: REACHABLE FROM EVERYTHING, AND EVERY ONE OF THEM MOUNTS ══════════════
+// (bead sparkle-gyvjyt.) The founder, on v0.114.0: *"I am able to double click to mount regular
+// build agents and write to them so those are working OK. It's only the Improve-Sparkle one that's
+// not working."*
+//
+// The cases ABOVE all use `fireEvent.click`, which jsdom dispatches with `detail: 0`. That is the
+// assistive-tech / HintOverlay arm, so those cases could never see the two things actually wrong
+// with this row: it had no `role`, no `tabIndex`, no `onKeyDown` and no `onDoubleClick`, which made
+// it operable by POINTER ONLY — on the one row where that costs the whole feature, since
+// SparkleAgentPane has no composer and the cable is this agent's only input surface.
+//
+// ══ AND THE HALF THAT IS *NOT* PARITY, WHICH REVIEW CAUGHT BEFORE IT LANDED ══════════════════════
+// The first cut routed the click through the shared `mountsOnRowActivation` predicate, whose rule is
+// "a plain single press SELECTS and does not patch". That is safe for a build row and re-opens the
+// silent misroute here: the cable pin, not the visible pane, is what routing reads, so a pane-seated
+// single press would leave the founder looking at Improve Sparkle while his words went to whatever
+// the cable was still pinned to. `pins the cable to THIS row even when it was already patched
+// elsewhere` below is that exact scenario, and it is the case the old suite never had.
+describe("the Improve Sparkle row is reachable from every activation, and each one mounts", () => {
+  it("is OPERABLE — role, tab stop and all, which is what makes the keyboard cases below reachable", () => {
+    render(<AgentSidebar project={PROJECT} />);
+    expect(sparkleRow().getAttribute("role")).toBe("button");
+    expect(sparkleRow().getAttribute("tabindex")).toBe("0");
+  });
+
+  it("a plain SINGLE press seats the pane AND patches — this row does not do seat-without-patch", () => {
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      fireEvent.click(sparkleRow(), { detail: 1 });
+    });
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+    expect(useCableStore.getState().wired).toBe("right");
+    expect(useCableStore.getState().agentId).toBe(SPARKLE_ID);
+  });
+
+  // ══ THE CASE THAT CARRIES THE GUARANTEE ═════════════════════════════════════════════════════════
+  // Every other case here starts from `resetCable()`, so `agentId === SPARKLE_ID` is satisfied both
+  // by "the press re-pinned the cable" and — if the press ever stopped patching — by nothing at all
+  // having happened to a cable that was already off. Only a cable pinned to a DIFFERENT agent can
+  // tell those apart, and that is the state where the failure is a message in the wrong PTY rather
+  // than a cosmetic one.
+  it("pins the cable to THIS row even when it was already patched elsewhere", () => {
+    useCableStore.getState().patch("right", "a1");
+    expect(useCableStore.getState().agentId).toBe("a1"); // the precondition really took
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      fireEvent.click(sparkleRow(), { detail: 1 });
+    });
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+    // THE PANE ON SCREEN AND THE FAR END OF THE CABLE ARE THE SAME AGENT. Routing reads the pin, not
+    // the pane, so a stale pin here is the founder typing into a build agent while looking at Sparkle.
+    expect(useCableStore.getState().agentId).toBe(SPARKLE_ID);
+  });
+
+  it("a DOUBLE press mounts — the founder's actual gesture", () => {
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      // The real browser order, not a shortcut: click, click, dblclick.
+      fireEvent.click(sparkleRow(), { detail: 1 });
+      fireEvent.click(sparkleRow(), { detail: 2 });
+      fireEvent.doubleClick(sparkleRow());
+    });
+    expect(useUiStore.getState().activeSpecial).toBe("sparkle");
+    expect(useCableStore.getState().wired).toBe("right");
+    expect(useCableStore.getState().agentId).toBe(SPARKLE_ID);
+  });
+
+  it("a DOUBLE press re-pins a cable that was patched elsewhere, too", () => {
+    // The double press is the founder's gesture, so it gets the same non-reset precondition the
+    // single press does rather than inheriting its guarantee from the case above.
+    useCableStore.getState().patch("right", "a1");
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      fireEvent.click(sparkleRow(), { detail: 1 });
+      fireEvent.click(sparkleRow(), { detail: 2 });
+      fireEvent.doubleClick(sparkleRow());
+    });
+    expect(useCableStore.getState().agentId).toBe(SPARKLE_ID);
+  });
+
+  it("ENTER on the focused row mounts", () => {
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      fireEvent.keyDown(sparkleRow(), { key: "Enter" });
+    });
+    expect(useCableStore.getState().wired).toBe("right");
+    expect(useCableStore.getState().agentId).toBe(SPARKLE_ID);
+  });
+
+  it("SPACE on the focused row mounts", () => {
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      fireEvent.keyDown(sparkleRow(), { key: " " });
+    });
+    expect(useCableStore.getState().wired).toBe("right");
+    expect(useCableStore.getState().agentId).toBe(SPARKLE_ID);
+  });
+
+  it("an unrelated key does nothing at all", () => {
+    // The negative control for the two cases above: without it, a handler that patched on EVERY
+    // keydown would pass both of them.
+    render(<AgentSidebar project={PROJECT} />);
+    act(() => {
+      fireEvent.keyDown(sparkleRow(), { key: "a" });
+    });
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(useCableStore.getState().wired).toBe("off");
+  });
+});

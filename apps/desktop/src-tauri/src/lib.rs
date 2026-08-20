@@ -24,6 +24,7 @@ mod beads_cmd;
 mod drag_paths;
 /// Opt-in tokenmaxxing (Builder Index) reporting — default-off, consent-gated (bead sparkle-s3g2.6).
 mod builder_index;
+mod straude;
 // The orchestration bridge is built on a Unix-domain socket (std::os::unix::net), so the real
 // implementation is Unix-only. On Windows we compile a stub with the same public surface
 // (BridgeManager + the four tauri commands) that reports the feature as unavailable; porting the
@@ -55,6 +56,7 @@ mod dev_identity;
 mod dictation;
 mod display_span;
 mod fleet;
+mod gh_rest;
 mod folder_picker;
 mod frontmost;
 mod github;
@@ -94,6 +96,13 @@ mod proc;
 mod promotion;
 mod project_window;
 mod pty;
+/// The publish destination's MCP client — the outbound JSON-RPC calls and the HTTP-200
+/// `isError` decoder that keeps a failed publish from reading as a successful one.
+mod publish_client;
+/// The publish destination's bearer token, in the OS keychain (bead `sparkle-131ms.3`).
+mod publish_credential;
+/// Publish-destination URL validation — TLS required, loopback exempt, no userinfo.
+mod publish_url;
 mod redacting_writer;
 mod repo_freshness;
 /// The background research runner behind "Concierge Agents" (bead `sparkle-s7rfc`) — dispatches a
@@ -101,6 +110,7 @@ mod repo_freshness;
 mod research;
 mod retention;
 mod revival;
+mod pipeline_health;
 mod review_cmd;
 mod roborev_account;
 mod roborev_probe;
@@ -131,6 +141,7 @@ mod conflict_ladder;
 mod conflict_watch;
 mod concierge;
 mod concierge_guidelines;
+mod concierge_inbox;
 mod concierge_lint_log;
 mod webview_drop_gate;
 
@@ -642,6 +653,10 @@ pub fn run() {
             // its life asleep. Spawning it here (rather than on the toggle) means turning the
             // feature on doesn't need an app restart to take effect.
             builder_index::spawn_reporter(app.handle().clone());
+            // The second reporting destination. Independent of the Builder Index in every way —
+            // its own flag, sign-in and state file — and equally default-OFF: the loop re-reads
+            // `[tools].straude` every cycle and skips without a socket until the user opts in.
+            straude::spawn_reporter(app.handle().clone());
             // Show-on-ready backstop (bead sparkle-alrm.5, #10). The main window is created hidden
             // ("visible": false) so no blank frame flashes before React paints; the frontend calls
             // show() on first paint (see main.tsx) and then invokes `notify_frontend_shown`. This
@@ -721,11 +736,13 @@ pub fn run() {
             inbox::inbox_claim_for_idle,
             // "Concierge Agents" (bead sparkle-s7rfc). `research_dispatch` RETURNS BEFORE THE CHILD
             // FINISHES — that non-blocking property is the feature, and research.rs has a test
-            // pinning it. The five names are the contract with `RESEARCH_COMMANDS` in
-            // src/services/research/store.ts.
+            // pinning it. The names are the contract with `RESEARCH_COMMANDS` in
+            // src/services/research/store.ts. `research_tail` serves the running task's live-output
+            // tail to its main-pane view.
             research::research_dispatch,
             research::research_list,
             research::research_get,
+            research::research_tail,
             research::research_cancel,
             research::research_mark_read,
             folder_picker::pick_folder,
@@ -811,6 +828,7 @@ pub fn run() {
             concierge::concierge_turn,
             concierge::concierge_cancel,
             concierge::concierge_proactive_turn,
+            concierge_inbox::concierge_inbox_ack,
             claude::claude_has_session,
             claude::claude_latest_session_id,
             claude::claude_latest_session_path,
@@ -907,6 +925,7 @@ pub fn run() {
             worktree::scan_worker_manifests,
             roborev_probe::roborev_branch_probe,
             roborev_probe::roborev_job_review,
+            pipeline_health::pipeline_health_probe,
             pr_claims::pr_claim_set,
             pr_claims::pr_claim_release,
             pr_claims::pr_claims_list,
@@ -921,6 +940,10 @@ pub fn run() {
             sparkle_agent::ensure_sparkle_repo,
             sparkle_agent::reap_secondary_sparkle_worktrees,
             sparkle_agent::sparkle_submit_capability,
+            // Per-project concierge tool policy: the frontend's synchronous slug cache is filled
+            // from here. Without this registration `repoSlug.ts` resolves every root to null,
+            // which reads as FOREIGN and floors merge-class tools at `ask` everywhere.
+            sparkle_agent::commands::repo_slug_for_root,
             github::github_status,
             github::github_list_repos,
             github::github_clone_repo,
@@ -944,6 +967,13 @@ pub fn run() {
             chief::chief_pat_secure_get,
             chief::chief_pat_secure_set,
             chief::chief_pat_secure_clear,
+            // The publish destination's bearer token (bead `sparkle-131ms.3`). Same keychain
+            // pattern as the Chief PAT above. An UNREGISTERED #[tauri::command] produces zero
+            // compile errors and fails only at runtime, which is what
+            // scripts/lib/tauri-handler-guard.sh enforces in both directions.
+            publish_credential::publish_token_set,
+            publish_credential::publish_token_clear,
+            publish_credential::publish_token_present,
             bridge::start_orchestration_bridge,
             bridge::stop_orchestration_bridge,
             bridge::orchestration_respond,
@@ -965,6 +995,7 @@ pub fn run() {
             notes::create_bead_full,
             notes::bead_dep_add,
             notes::bead_label,
+            notes::bead_comment,
             notes::delete_bead,
             notes::concierge_memory_remember,
             notes::concierge_memory_recall,
@@ -980,6 +1011,9 @@ pub fn run() {
             beads_cmd::beads_close,
             beads_cmd::beads_comment,
             ai::anthropic_chat,
+            // The planner's model id, so the second-model advisor pass can resolve a DIFFERENT one
+            // rather than hardcoding a copy of it (bead `sparkle-revqiv`).
+            ai::planner_chat_model,
             judge::judge_turn_followup,
             // OUT OF BAND: called AFTER an auto-send has already gone, purely to record what Haiku
             // would have graded the utterance. It never gates a send — see auto_send_tuner's header
@@ -1002,6 +1036,12 @@ pub fn run() {
             builder_index::builder_index_set_identity,
             builder_index::builder_index_forget,
             builder_index::builder_index_report_now,
+            straude::straude_status,
+            straude::straude_login_begin,
+            straude::straude_login_poll,
+            straude::straude_consent,
+            straude::straude_forget,
+            straude::straude_report_now,
             auth::desktop_has_token,
             auth::desktop_bearer_token,
             auth::desktop_pair_code,

@@ -52,6 +52,12 @@ function setup(overrides: Partial<Props> = {}) {
     // No `@` half-written — the ordinary case every pre-existing row below assumes. The pause rows
     // opt in explicitly.
     composingMention: false,
+    // No screenshot crosshairs and no Finder panel on screen — the ordinary case every pre-existing
+    // row below assumes. The picker-pause rows opt in explicitly.
+    attachPickerOpen: false,
+    // Nothing has been pasted, dropped or uploaded — the ordinary case every pre-existing row below
+    // assumes. The reset rows bump it explicitly.
+    draftGrewSeq: 0,
     interim: "",
     targetName: "Concierge",
     onFire,
@@ -918,6 +924,214 @@ describe("typing an @-address PAUSES the countdown (sparkle-14dtu)", () => {
     // Everything above must be attributable to the pause and nothing else.
     const { onFire } = setup({ composingMention: false });
     speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("an OPEN ATTACH PICKER pauses the countdown", () => {
+  // The founder: "If I click the screenshot or the upload icons, I want you to pause the countdown
+  // while those are active … because it means that I'm taking an action, basically."
+  //
+  // The seam these rows own is that the host's `attachPickerOpen` report reaches the reducer's
+  // pause. That the CONTROLLER produces the report — true from the click, false again on a cancel —
+  // is proven in ../hooks/useConciergeAttachments.pickerOpen.test.tsx.
+  //
+  // EVERY ROW IS PAIRED. A lone "did not fire" is the classic vacuous assertion: it passes when the
+  // countdown was never armed, when the threshold moved, when `onFire` was wired to nothing. So
+  // each row that asserts a send was HELD is followed by the same setup proving the send DOES land
+  // once the picker closes — which can only be true if the clock was frozen rather than cancelled.
+
+  it("THE REPORT: a send due mid-pick does not go out while the picker is up", async () => {
+    // THE FAILING ROW. Before the fix this fires with the crosshairs on screen, and the message
+    // leaves carrying the words with no screenshot on them.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ attachPickerOpen: true });
+    await tick(HIGH * 5 + AUTO_SEND_TICK_MS);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("…and the SAME setup fires once the shot is taken — a pause, not a cancel", async () => {
+    // The pair to the row above. Without this, "did not fire" would also pass for a rail that had
+    // been disarmed outright, which would be a worse bug than the one being fixed.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ attachPickerOpen: true });
+    await tick(HIGH * 5);
+    expect(onFire).not.toHaveBeenCalled();
+    update({ attachPickerOpen: false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("A CANCELLED PICKER RESUMES TOO — an escaped crosshair never wedges the rail", async () => {
+    // Escape the crosshairs, or dismiss Finder without choosing a file. Nothing is staged, so
+    // `draftGrewSeq` never moves and this is the ONLY thing that can un-freeze the clock. A rail
+    // that stayed paused here is a countdown that never fires dressed up as one that does.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ attachPickerOpen: true });
+    await tick(HIGH * 3);
+    // Closed with nothing staged — note draftGrewSeq is untouched.
+    update({ attachPickerOpen: false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives back a WHOLE FRESH threshold, not the sliver that was left", async () => {
+    // The resume semantics `resumeCountdown` already documents, asserted through this new trigger:
+    // he has just added an attachment and is likely to keep talking, and a send landing the instant
+    // the panel closes is indistinguishable from the bug being fixed.
+    const { onFire, update } = setup();
+    speechEnds();
+    // Drain almost the whole threshold BEFORE opening the picker.
+    await tick(HIGH - AUTO_SEND_TICK_MS);
+    expect(onFire).not.toHaveBeenCalled();
+    update({ attachPickerOpen: true });
+    await tick(HIGH * 3);
+    update({ attachPickerOpen: false });
+    // Not on the closing frame, even though the original deadline is long gone.
+    await tick(HIGH / 2);
+    expect(onFire).not.toHaveBeenCalled();
+    // …but it does end on its own, one full threshold later.
+    await tick(HIGH / 2 + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("holds the fill still while the picker is up, rather than draining behind a frozen clock", async () => {
+    // What he SEES. A bar that kept draining to empty while the crosshairs were up would say the
+    // message had gone; the rail must visibly hold.
+    const { result, update } = setup({ composedText: PLAIN }); // normal → a longer, visible drain
+    speechEnds();
+    await tick(AUTO_SEND_TICK_MS * 2);
+    update({ attachPickerOpen: true });
+    const frozen = result.current.remainingFraction;
+    expect(frozen).toBeGreaterThan(0);
+    await tick(NORMAL);
+    expect(result.current.remainingFraction).toBe(frozen);
+    expect(result.current.phase).toBe("counting");
+  });
+
+  it("a picker open for a long time does not lose the countdown to STALENESS", async () => {
+    // AUTO_SEND_STALE_MS abandons a countdown nobody was present for. Someone hunting for a file in
+    // Finder is present — and this is the trigger most likely to run past 30s of all of them.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ attachPickerOpen: true });
+    await tick(40_000); // well past AUTO_SEND_STALE_MS
+    update({ attachPickerOpen: false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("STAYS PAUSED while an @-address is still open, when the picker closes first", async () => {
+    // The two pause terms are independent and can overlap. Whichever drops first, the clock must
+    // stay frozen until BOTH are false — an OR that resumed on either one going false would send
+    // the message mid-address, which is the bug the OTHER pause exists to fix.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @`, composingMention: true, attachPickerOpen: true });
+    await tick(HIGH * 2);
+    update({ attachPickerOpen: false }); // panel closed, name still half-typed
+    await tick(HIGH * 3);
+    expect(onFire).not.toHaveBeenCalled();
+    // …and one full threshold after the LAST of them clears, it goes.
+    update({ composedText: `@Kraken Auth ${DONE}`, composingMention: false });
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not disturb a countdown when no picker is open — the control row", async () => {
+    // Everything above must be attributable to the pause and nothing else.
+    const { onFire } = setup({ attachPickerOpen: false });
+    speechEnds();
+    await tick(HIGH + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("pasting / dropping / uploading RESTARTS the countdown (sparkle-3kqg2v)", () => {
+  // The founder, after confirming the @-pause above works: "So maybe we just need to reset the
+  // countdown if I paste something in or if I drop in an image or upload a file. Just reset the
+  // countdown back and then start the countdown again."
+  //
+  // The seam these rows own is that a BUMP of the host's gesture counter reaches the reducer's
+  // restart. The counter's two producers are proven elsewhere — ComposeBox's `onPasted` fires on a
+  // paste (./ComposeBox.pasteResets.test.tsx) and useConciergeAttachments bumps `stagedSeq` on a
+  // drop and on a picked file (../hooks/useConciergeAttachments.stagedSeq.test.tsx) — and the host
+  // sums them. What only this file can prove is that the sum, once it moves, moves the clock.
+
+  it("THE REPORT: a send about to go out is pushed a FULL threshold away", async () => {
+    // THE FAILING ROW. Before the fix `draftGrewSeq` did not exist and this fired mid-paste.
+    const { onFire, update } = setup();
+    speechEnds();
+    await tick(HIGH - AUTO_SEND_TICK_MS); // right up to the edge
+    expect(onFire).not.toHaveBeenCalled();
+    update({ draftGrewSeq: 1 }); // ⌘V
+    await tick(HIGH - AUTO_SEND_TICK_MS * 2);
+    expect(onFire).not.toHaveBeenCalled(); // the old deadline came and went
+    await tick(AUTO_SEND_TICK_MS * 3);
+    expect(onFire).toHaveBeenCalledTimes(1); // …and a fresh threshold later, it goes
+  });
+
+  it("the fill goes back to FULL, so the picture and the deadline agree", async () => {
+    const { result, update } = setup({ composedText: PLAIN }); // normal → a visible drain
+    speechEnds();
+    await tick(NORMAL / 2);
+    expect(result.current.remainingFraction).toBeLessThan(0.75);
+    update({ draftGrewSeq: 1 });
+    expect(result.current.remainingFraction).toBe(1);
+    expect(result.current.phase).toBe("counting"); // restarted, not stopped
+  });
+
+  it("EACH gesture gets its own threshold — three drops in a row each push it out", async () => {
+    // A boolean seam would collapse these into one and the send would land during the second drop.
+    const { onFire, update } = setup();
+    speechEnds();
+    for (const seq of [1, 2, 3]) {
+      update({ draftGrewSeq: seq });
+      await tick(HIGH - AUTO_SEND_TICK_MS * 2);
+      expect(onFire, `after gesture ${seq}`).not.toHaveBeenCalled();
+    }
+    await tick(HIGH);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("an unrelated re-render does NOT restart it — the guard is on the VALUE, not the commit", async () => {
+    // The failure this pins is a countdown that never fires: re-applying the restart on every commit
+    // (the transcript changing, the target name changing, a parent re-render) holds the deadline out
+    // forever while the rail still draws a live countdown. Paired with the row above deliberately —
+    // one shows it moves when it should, this shows it stays put when it should not.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ draftGrewSeq: 1 });
+    await tick(HIGH / 2);
+    update({ targetName: "Kraken Auth" }); // a commit that is not a gesture
+    update({ composedText: `${DONE} ` }); // and another
+    await tick(HIGH / 2 + AUTO_SEND_TICK_MS);
+    expect(onFire).toHaveBeenCalledTimes(1);
+  });
+
+  it("a gesture on an IDLE box starts nothing — it can only ever delay a send", async () => {
+    // No speech-end, so there is no clock. Pasting must not manufacture one, or a paste into a quiet
+    // composer would dispatch itself a few seconds later with nothing spoken at all.
+    const { onFire, update } = setup();
+    update({ draftGrewSeq: 1 });
+    await tick(VERYLOW * 2);
+    expect(onFire).not.toHaveBeenCalled();
+  });
+
+  it("a paste made mid-@-address does not un-pause it", async () => {
+    // The two signals compose rather than fight: he pastes a URL half-way through typing a name, so
+    // the address is still open and the clock stays frozen — then resumes on the finished mention.
+    const { onFire, update } = setup();
+    speechEnds();
+    update({ composedText: `${DONE} @Krak`, composingMention: true });
+    update({ draftGrewSeq: 1, composedText: `${DONE} @Krakhttps://x` });
+    await tick(HIGH * 4);
+    expect(onFire).not.toHaveBeenCalled();
+    update({ composedText: `@Kraken Auth ${DONE}`, composingMention: false });
     await tick(HIGH + AUTO_SEND_TICK_MS);
     expect(onFire).toHaveBeenCalledTimes(1);
   });

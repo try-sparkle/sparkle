@@ -13,7 +13,7 @@ import { FONT_UI, TYPE } from "../theme/scale";
 import { CHIP, COUNT, SECTION_LABEL } from "./labelTreatment";
 
 /** Only these two columns are definable; the map both gates the affordance and names the stage. */
-export function definableStageKey(columnKey: BoardColumn): StageKey | null {
+export function definableStageKey(columnKey: BoardColumn | "planning"): StageKey | null {
   if (columnKey === "done") return "done";
   if (columnKey === "delivered") return "delivered";
   return null;
@@ -35,7 +35,10 @@ export function StageColumnHeader({
   deliveryChip,
   onDefine,
 }: {
-  columnKey: BoardColumn;
+  // Widened for the Plan board's Epics mode, which renders one column the task board has no bucket
+  // for (`planning`). It reaches `definableStageKey`, which answers null for it — a Planning column
+  // is not a definable stage — so the header is inert for it exactly as Backlog and Blocked are.
+  columnKey: BoardColumn | "planning";
   label: string;
   count: number;
   /** Whether THIS column's stage is defined (drives the header status chip). */

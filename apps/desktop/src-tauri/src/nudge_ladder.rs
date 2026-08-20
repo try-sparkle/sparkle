@@ -302,6 +302,29 @@ pub enum Standdown {
     /// job (bead `sparkle-umtx1`). Writes stop and the concierge is flagged with a machine-readable
     /// `out-of-context` reason the layer above can act on — never the founder.
     OutOfContext,
+    /// THE AGENT'S CLAUDE SESSION IS DEAD — its screen carries `Login expired · Please run /login`.
+    ///
+    /// ── WHY THIS NEEDED ITS OWN VARIANT RATHER THAN A REPLY TOKEN ─────────────────────────────
+    /// It has NO entry in [`Reply`], and that absence is the whole point. Every other stand-down is
+    /// reached by the agent ANSWERING the nudge; an expired login is precisely the state in which
+    /// no answer can ever be produced, because the API call that would generate one dies at the
+    /// auth layer. So the reply path is unreachable here BY CONSTRUCTION — the same trap
+    /// `Standdown::Quota` fell into (bead `sparkle-mux4b`) and the same escape: read it off the
+    /// screen, where it is plainly written, and never ask.
+    ///
+    /// Observed live and screenshotted by the founder: nudges #5, #6, #7 and #8, four minutes
+    /// apart, each answered by nothing but `Login expired · Please run /login`. Each ping is a full
+    /// agent turn that dies at the API, emits the banner again, re-satisfies the no-output
+    /// condition, and reloops — and `LADDER_SECS` tops out at 600s and repeats forever, so nothing
+    /// in the module ended it.
+    ///
+    /// ── AND IT IS THE FOUNDER, NOT THE CONCIERGE ──────────────────────────────────────────────
+    /// `NoTask` and `OutOfContext` route to the concierge because a machine can act on them. This
+    /// one nobody but a person can clear: re-authenticating an OAuth session is a human at a
+    /// browser, and no layer of this app can do it on their behalf. It is the textbook
+    /// blocked-on-human, arriving without the agent being able to say so — a TRUE positive that,
+    /// before this variant, surfaced as nothing but a rising ping count.
+    LoginExpired,
 }
 
 impl Standdown {
@@ -330,12 +353,25 @@ impl Standdown {
             // marks both VISIBLE, so `effective_standdown`'s invisible-expiry (keyed on
             // `flag().is_none()`) leaves their rows standing until the concierge acts.
             Standdown::NoTask | Standdown::OutOfContext => Some(Escalation::Concierge),
+            // ONLY A PERSON CAN RE-AUTHENTICATE. No concierge action clears an expired OAuth
+            // session, so routing this anywhere but the founder would be routing it nowhere.
+            Standdown::LoginExpired => Some(Escalation::Founder),
         }
     }
 
     /// Does this stand-down forbid writing entirely?
     fn silences_writes(self) -> bool {
         !matches!(self, Standdown::External)
+    }
+
+    /// The stand-down's machine-readable token, for a consumer OUTSIDE this module.
+    ///
+    /// The same string `reason` puts in the log, exposed because the flag a human reads has to
+    /// carry it: a wall the agent cannot SPEAK about (a dead session, an account limit) leaves
+    /// `NudgeFlag::reply` null by construction, so without this the row says only "quiet for a
+    /// while" about an agent whose screen states the problem in plain English.
+    pub fn as_str(self) -> &'static str {
+        self.reason()
     }
 
     fn reason(self) -> &'static str {
@@ -346,6 +382,7 @@ impl Standdown {
             Standdown::External => "blocked-externally",
             Standdown::NoTask => "no-task-assigned",
             Standdown::OutOfContext => "out-of-context",
+            Standdown::LoginExpired => "login-expired",
         }
     }
 }
@@ -434,6 +471,30 @@ pub struct Observation {
     /// The agent's own one-line answer to the most recent nudge, per `parse_reply`. `None` when it
     /// has not answered, or when the screen cannot be read unambiguously.
     pub reply: Option<Reply>,
+    /// An account/quota wall is sitting on the agent's own screen, per
+    /// `nudge_gate::screen_shows_account_limit`.
+    ///
+    /// ── WHY THIS CANNOT BE DERIVED FROM `reply` ───────────────────────────────────────────────
+    /// `Standdown::Quota` used to be reachable ONLY through `Reply::Quota`, i.e. only by the agent
+    /// TYPING `blocked-on-quota` in answer to a nudge. But an agent behind a session limit cannot
+    /// answer anything — that is what the limit means — so the one stand-down written for its
+    /// situation was unreachable in precisely that situation (bead `sparkle-mux4b`). Observed live:
+    /// eight consecutive nudges at a constant base interval, each dying at the API with the inline
+    /// limit error and emitting nothing, which re-satisfies the no-output condition and reloops.
+    ///
+    /// Read off the SAME rendered grid the safety gate uses, so it needs neither the frontend nor a
+    /// model. An unreadable screen yields `false`, never a latch — same rule as `reply`.
+    pub quota_blocked: bool,
+    /// The agent's CLAUDE SESSION IS DEAD — its screen carries the expired-login banner, per
+    /// `nudge_gate::screen_shows_login_expired`.
+    ///
+    /// Same mechanism and same justification as `quota_blocked` above, for a wall that is worse:
+    /// a quota window reopens on its own, an expired OAuth session never does. The agent cannot
+    /// report it, because reporting it would cost the very API call that is failing — so this is
+    /// read off the rendered grid, and an unreadable screen yields `false` rather than a latch.
+    ///
+    /// See `Standdown::LoginExpired` for the founder's screenshot this closes.
+    pub login_expired: bool,
     /// The wall clock that has actually passed since the previous look at this agent, in seconds.
     ///
     /// BOTH CLOCKS IN THIS MODULE MEASURE TIME, so they must be GIVEN time rather than allowed to
@@ -835,6 +896,60 @@ fn step_inner(state: &mut AgentState, obs: &Observation) -> Decision {
                 state.standdown_at_foreign_write = obs.foreign_write_ms;
             }
         }
+    }
+
+    // ── THE WALL WE CAN SEE, WITH NO ANSWER ASKED FOR ─────────────────────────────────────────
+    // The block above is a CONVERSATION: it needs a nudge to have gone out and an answer to have
+    // come back. An account limit is the one condition where that can never complete — the agent
+    // cannot answer, because answering costs a turn it does not have. So the quota stand-down is
+    // reached here instead, from the screen alone (bead `sparkle-mux4b`).
+    //
+    // NOT gated on `attempts > 0`, deliberately, and it is the opposite of the staleness hazard
+    // that gates the reply: a reply is a claim about a moment, so an old one in scrollback is not
+    // consent to stay quiet NOW — whereas the banner is a claim about the ACCOUNT, and it is on the
+    // live grid or it is not. Nudging an agent before it has ever been nudged is no cheaper than
+    // nudging it a ninth time when a wall is up.
+    //
+    // SELF-RELEASING, which the reply-driven latch is not. Once the banner leaves the grid the wall
+    // is no longer evidenced, so the ordinary ladder resumes without waiting for a foreign write —
+    // otherwise a limit that expired on its own would leave the agent silently exempt until a human
+    // typed at it, which is the outcome this module's header forbids. An agent that TYPED
+    // `blocked-on-quota` keeps the latched semantics untouched: that answer is its own fact and it
+    // is released the way every other reply is.
+    if obs.quota_blocked {
+        if state.standdown != Some(Standdown::Quota) {
+            state.standdown = Some(Standdown::Quota);
+            state.standdown_at_foreign_write = obs.foreign_write_ms;
+        }
+    } else if state.standdown == Some(Standdown::Quota) && state.last_reply != Some(Reply::Quota) {
+        state.standdown = None;
+    }
+
+    // ── THE OTHER WALL WE CAN SEE, AND THE ONE NOBODY BUT A PERSON CAN CLEAR ──────────────────
+    // `Login expired · Please run /login`. Read off the screen for exactly the reason the quota
+    // banner above is: an agent whose OAuth session has lapsed cannot answer a nudge, because the
+    // answer costs the API call that is failing. The founder watched nudges #5-#8 land on such an
+    // agent four minutes apart, each producing nothing but this banner (see
+    // `Standdown::LoginExpired`).
+    //
+    // ORDERED AFTER THE QUOTA BLOCK DELIBERATELY, so a screen somehow carrying both resolves to
+    // this one: a quota wall reopens by itself and routes to the concierge, whereas an expired
+    // login is permanent until a human re-authenticates. Telling the founder about the recoverable
+    // half and staying silent about the permanent half is the wrong way to lose that race. Each
+    // block clears only its OWN latch, so when this one lifts while a quota wall is still up, the
+    // quota block re-latches on the next look rather than the agent falling through unwatched.
+    //
+    // SELF-RELEASING, like the quota banner and unlike a reply latch: there is no `Reply` token for
+    // this state (there cannot be — see the variant), so nothing else could ever release it, and an
+    // agent that a human has just re-authenticated must return to the ordinary ladder on the very
+    // next look rather than waiting for somebody to type at it.
+    if obs.login_expired {
+        if state.standdown != Some(Standdown::LoginExpired) {
+            state.standdown = Some(Standdown::LoginExpired);
+            state.standdown_at_foreign_write = obs.foreign_write_ms;
+        }
+    } else if state.standdown == Some(Standdown::LoginExpired) {
+        state.standdown = None;
     }
 
     // ANY change resets the SILENCE clock. This is still the entire detector.
@@ -1342,8 +1457,19 @@ fn raise(state: &mut AgentState, target: Option<Escalation>) -> Option<Escalatio
 /// "should not" is not a guarantee, and the failure is asymmetric: the wrong way round loses a
 /// human's row silently, this way round costs one visible flag that a human can dismiss.
 fn effective_standdown(state: &AgentState, obs: &Observation) -> Option<Standdown> {
-    if state.standdown == Some(Standdown::AwaitHuman) {
-        return Some(Standdown::AwaitHuman);
+    // ── AND A DEAD SESSION OUTRANKS IT TOO, FOR A SHARPER REASON ──────────────────────────────
+    // `Standdown::Done` reports NO flag, so letting a met goal win here would delete the row for an
+    // agent whose login has expired — the one state where the founder is the only party who can do
+    // anything at all. And a met goal co-occurring with a dead session is not exotic: `goalStateOf`
+    // answers "met" forever once `metAt` is set, so any agent that finished a task earlier and was
+    // later handed more work arrives here in exactly that pair. Silencing that row is how a TRUE
+    // positive disappears while the ping count climbs, which is the defect this variant exists to
+    // close.
+    if matches!(
+        state.standdown,
+        Some(Standdown::AwaitHuman) | Some(Standdown::LoginExpired)
+    ) {
+        return state.standdown;
     }
     // `goal_met_superseded` is the "unless new work arrives" clause for the GOAL, and it has to be
     // separate from the reply's because the two facts decay differently: a reply is a latch we own
@@ -1496,6 +1622,8 @@ mod tests {
             refusal: None,
             screen_readable: true,
             prompt_has_text: false,
+            quota_blocked: false,
+            login_expired: false,
             since_other_write_ms: u64::MAX,
             foreign_write_ms: 0,
             goal_met: false,
@@ -2271,6 +2399,220 @@ mod tests {
             "the backoff must exceed the ladder's own top rung, not merely reach it: {waits:?}"
         );
         assert!(QUOTA_BACKOFF_SECS > LADDER_SECS[LADDER_SECS.len() - 1]);
+    }
+
+    /// THE WALL AN AGENT CANNOT TELL US ABOUT (bead `sparkle-mux4b`).
+    ///
+    /// The test above hands the ladder a REPLY, which is why it could never catch this: an agent
+    /// behind a session limit cannot answer, so `Reply::Quota` — the sole producer of
+    /// `Standdown::Quota` before this — was unreachable in exactly the situation the stand-down was
+    /// written for. The observed consequence was eight consecutive nudges at the constant base
+    /// interval, each dying at the API and emitting nothing, which re-satisfies the no-output
+    /// condition and reloops.
+    ///
+    /// So this drives an observation with `reply: None` — asserted, not assumed — and asserts the
+    /// SIDE EFFECT: the next wait is the quota backoff, and no byte is ever typed.
+    #[test]
+    fn an_observed_quota_wall_backs_off_with_no_reply_at_all() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        let walled = Observation { hash: 0x0a11, quota_blocked: true, ..stalled() };
+        assert_eq!(walled.reply, None, "precondition — a walled agent answers NOTHING");
+
+        let d = run(&mut s, &walled, 10);
+        assert!(
+            d.iter().all(|x| x.action == Action::Observe),
+            "never type at an agent whose account is out of quota"
+        );
+        let waits: Vec<u64> = d[1..].iter().map(|x| x.next_look_secs).collect();
+        assert!(
+            waits.iter().all(|w| *w == QUOTA_BACKOFF_SECS),
+            "an OBSERVED wall must back off exactly as far as a REPORTED one: {waits:?}"
+        );
+        assert_eq!(s.standdown(), Some(Standdown::Quota));
+    }
+
+    /// THE PAIRED NEGATIVE, and it is what keeps the observed latch from being worse than the bug.
+    ///
+    /// A reply-driven stand-down is released only by a foreign write, because a reply is a claim
+    /// the agent made and only new work retracts it. An observed banner is not a claim — it is
+    /// evidence, and evidence that has left the grid no longer supports a stand-down. Without this
+    /// release, a limit that expired on its own would leave the agent exempt from the ladder until
+    /// a human typed at it: silent in both directions, which is the outcome this module forbids.
+    #[test]
+    fn the_observed_quota_standdown_releases_when_the_banner_leaves_the_screen() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 7);
+        run(&mut s, &Observation { hash: 0x0a11, quota_blocked: true, ..stalled() }, 3);
+        assert_eq!(s.standdown(), Some(Standdown::Quota), "precondition — stood down");
+
+        // Same silent, stalled agent — only the banner is gone. No foreign write, no reply.
+        let cleared = Observation { hash: 0x0a11, ..stalled() };
+        let d = run(&mut s, &cleared, 8);
+        assert_eq!(s.standdown(), None, "the wall is no longer evidenced, so the exemption ends");
+        assert!(
+            d.iter().any(|x| matches!(x.action, Action::Nudge { .. })),
+            "and the ordinary ladder resumes without waiting for a human"
+        );
+    }
+
+    // ══ THE DEAD SESSION ════════════════════════════════════════════════════════════════════════
+
+    /// THE FOUNDER'S SCREENSHOT, REPLAYED: nudges #5, #6, #7, #8, four minutes apart, each answered
+    /// by nothing but `Login expired · Please run /login`.
+    ///
+    /// The ladder is arithmetic, so the whole outage runs here in microseconds. This asserts the
+    /// SIDE EFFECT the founder watched fail — that the CLIMB STOPS — rather than the precondition
+    /// that the flag was set, and it is paired with a control below proving the same agent WITHOUT
+    /// the banner keeps being nudged. One direction alone would pass against a ladder that had
+    /// simply stopped nudging everything.
+    #[test]
+    fn a_dead_session_stops_the_climb_instead_of_taking_four_more_pings() {
+        let mut s = AgentState::default();
+        // Climb to the nudge rungs the ordinary way, exactly as the screenshotted agent did.
+        let before = run(&mut s, &stalled(), 8);
+        assert!(
+            before.iter().any(|d| matches!(d.action, Action::Nudge { .. })),
+            "precondition — this agent WAS being nudged before its login lapsed"
+        );
+        let nudges_so_far = s.attempts();
+
+        // …and now the session dies. Same silent screen; only the banner is new.
+        let dead = Observation { hash: 0x10_9111, login_expired: true, ..stalled() };
+        assert_eq!(dead.reply, None, "precondition — a dead session answers NOTHING, ever");
+
+        let after = run(&mut s, &dead, 12);
+        assert!(
+            after.iter().all(|d| d.action == Action::Observe),
+            "not one more byte may be typed at a session that cannot receive it: {:?}",
+            after.iter().map(|d| d.action.clone()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            s.attempts(),
+            nudges_so_far,
+            "and the ping COUNT stops climbing too — #5, #6, #7, #8 are what the founder watched"
+        );
+        assert!(
+            after.iter().all(|d| d.refusal == Some("login-expired")),
+            "every look says WHY it stood down, so the log answers the founder's question"
+        );
+        assert_eq!(s.standdown(), Some(Standdown::LoginExpired));
+    }
+
+    /// THE CONTROL FOR THE TEST ABOVE. Identical agent, identical looks, banner absent — it must
+    /// keep climbing. Without this the assertion "every action is Observe" would pass against a
+    /// ladder that had stopped nudging for any reason at all.
+    #[test]
+    fn the_same_agent_without_the_banner_keeps_being_nudged() {
+        let mut s = AgentState::default();
+        run(&mut s, &stalled(), 8);
+        let nudges_so_far = s.attempts();
+
+        let alive = Observation { hash: 0x10_9111, ..stalled() };
+        let after = run(&mut s, &alive, 12);
+        assert!(
+            after.iter().any(|d| matches!(d.action, Action::Nudge { .. })),
+            "the halt must be caused by the BANNER and by nothing else"
+        );
+        assert!(s.attempts() > nudges_so_far, "and the counter climbs when it should");
+    }
+
+    /// LOUDLY, AND AT ONCE — the second half of the founder's ask.
+    ///
+    /// Stopping the pings is only half a fix: an expired login is exactly the case where a person
+    /// genuinely must act, and before this it produced silence plus a rising ping count. So the
+    /// FOUNDER is flagged on the very FIRST look that sees the banner, with no nudges spent first —
+    /// not `ESCALATE_FOUNDER_AFTER` pings later, and never merely the concierge.
+    #[test]
+    fn a_dead_session_pages_the_founder_on_the_first_look_that_sees_it() {
+        let mut s = AgentState::default();
+        let dead = Observation { login_expired: true, ..stalled() };
+
+        let d = step(&mut s, &dead);
+        assert_eq!(d.escalate, Some(Escalation::Founder), "raised, on look one");
+        assert_eq!(d.flagged, Some(Escalation::Founder), "and the row EXISTS from look one");
+        assert_eq!(d.action, Action::Observe, "without typing at it even once");
+        assert_eq!(s.attempts(), 0, "no ping was spent buying that flag");
+
+        // …and it stays up. `flagged` is what keeps the row alive after the high-water mark stops
+        // rising, so a founder row must not evaporate on the second look.
+        let rest = run(&mut s, &dead, 10);
+        assert!(
+            rest.iter().all(|x| x.flagged == Some(Escalation::Founder)),
+            "the row a human owes is never hidden"
+        );
+    }
+
+    /// A MET GOAL MUST NOT BE ABLE TO DELETE THIS ROW.
+    ///
+    /// `Standdown::Done` reports NO flag, so if `goal_met` won inside `effective_standdown` an
+    /// agent with a dead session would be silent in both directions — the exact outcome this
+    /// module's header forbids, reached by the most ordinary flow there is: `goalStateOf` answers
+    /// "met" forever once `metAt` is set, so every agent that finished a task earlier and was
+    /// handed more work arrives here with both facts true at once.
+    #[test]
+    fn a_met_goal_cannot_hide_a_dead_session() {
+        let mut s = AgentState::default();
+        let dead_and_done =
+            Observation { login_expired: true, goal_met: true, ..stalled() };
+
+        let d = run(&mut s, &dead_and_done, 6);
+        assert!(
+            d.iter().all(|x| x.flagged == Some(Escalation::Founder)),
+            "an expired login outranks a met goal — the founder is the only one who can clear it"
+        );
+        assert!(
+            d.iter().all(|x| x.refusal == Some("login-expired")),
+            "and it is reported as the login problem it is, not as 'nothing to resume'"
+        );
+        assert_eq!(s.standdown(), Some(Standdown::LoginExpired));
+    }
+
+    /// AND IT OUTRANKS A QUOTA WALL, WHICH ROUTES TO A DIFFERENT HUMAN.
+    ///
+    /// A quota window reopens on its own and is the CONCIERGE's to handle; an expired OAuth session
+    /// never reopens and only the founder can clear it. A screen carrying both must therefore
+    /// resolve to the permanent one — reporting the recoverable half and staying quiet about the
+    /// permanent half sends the wrong person and leaves the real blocker unowned.
+    #[test]
+    fn an_expired_login_outranks_a_quota_wall_on_the_same_screen() {
+        let mut s = AgentState::default();
+        let both =
+            Observation { login_expired: true, quota_blocked: true, ..stalled() };
+
+        let d = run(&mut s, &both, 4);
+        assert_eq!(s.standdown(), Some(Standdown::LoginExpired));
+        assert!(
+            d.iter().all(|x| x.flagged == Some(Escalation::Founder)),
+            "the founder, not the concierge"
+        );
+        assert!(
+            d.iter().all(|x| x.next_look_secs != QUOTA_BACKOFF_SECS),
+            "and it must NOT inherit the half-hour quota backoff: a re-authenticated agent has to \
+             be seen recovering within a rung, not half an hour later"
+        );
+    }
+
+    /// THE PAIRED NEGATIVE — the release, for the same reason the observed quota wall has one.
+    ///
+    /// The banner is EVIDENCE, not a claim the agent made, so once it leaves the grid it no longer
+    /// supports a stand-down. Without this the founder re-authenticating would leave the agent
+    /// exempt from the ladder until somebody typed at it — silent in both directions, which is
+    /// exactly what this variant was added to stop.
+    #[test]
+    fn the_login_standdown_releases_when_the_banner_leaves_the_screen() {
+        let mut s = AgentState::default();
+        run(&mut s, &Observation { login_expired: true, ..stalled() }, 4);
+        assert_eq!(s.standdown(), Some(Standdown::LoginExpired), "precondition — stood down");
+
+        // The founder ran `/login`. Same silent agent, banner gone. No foreign write, no reply.
+        let revived = Observation { hash: 0x10_9222, ..stalled() };
+        let d = run(&mut s, &revived, 10);
+        assert_eq!(s.standdown(), None, "the dead session is no longer evidenced");
+        assert!(
+            d.iter().any(|x| matches!(x.action, Action::Nudge { .. })),
+            "and the ordinary ladder resumes without waiting for anyone to type at it"
+        );
     }
 
     /// A TASK-LESS AGENT IS A CONCIERGE MATTER, NOT A FOUNDER PAGE (bead `sparkle-dfy3d`).

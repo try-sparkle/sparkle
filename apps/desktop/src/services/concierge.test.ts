@@ -76,10 +76,16 @@ function turnArgs(n: number): {
   prompt: string;
   resumeSessionId: string | null;
   configDir: string | null;
+  fallbackConfigDirs: string[];
 } {
   const call = harness.invokes.filter((c) => c.cmd === "concierge_turn").at(n);
   if (!call) throw new Error(`expected a concierge_turn invoke #${n}`);
-  return call.args as { prompt: string; resumeSessionId: string | null; configDir: string | null };
+  return call.args as {
+    prompt: string;
+    resumeSessionId: string | null;
+    configDir: string | null;
+    fallbackConfigDirs: string[];
+  };
 }
 
 describe("concierge service", () => {
@@ -112,6 +118,8 @@ describe("concierge service", () => {
       prompt: "snapshot: all quiet",
       resumeSessionId: null,
       configDir: null,
+      // No accounts planted → no healthy alternative → an empty rotation list (the last-account guard).
+      fallbackConfigDirs: [],
     });
     // The event listeners were wired before the invoke, so no early event can be missed.
     expect(harness.handlers.has("concierge:delta")).toBe(true);
@@ -422,6 +430,16 @@ describe("concierge account binding", () => {
     // …and it is the same account the turn itself ran under. Asserting both together is the point:
     // a probe and a spawn that disagree is exactly the defect.
     expect(turnArgs(0).configDir).toBe("/data/accounts/work");
+  });
+
+  it("hands the turn the healthy alternative accounts as fallbackConfigDirs, so Rust can rotate off an auth-dead account in ONE turn", async () => {
+    // Parks on the default (lowest-usage tie, first listed); `work` is the healthy dedicated
+    // alternative. Without this list Rust has nothing to rotate TO and the turn dies at "sign in to
+    // Claude" — the founder's bug. Asserting the list on the payload, because the payload is the
+    // whole mechanism (exactly as the configDir tests above do).
+    await startConciergeTurn("hi");
+    expect(turnArgs(0).configDir).toBe("/home/.claude");
+    expect(turnArgs(0).fallbackConfigDirs).toEqual(["/data/accounts/work"]);
   });
 
   it("starts a FRESH conversation when the account changes, rather than a doomed --resume", async () => {

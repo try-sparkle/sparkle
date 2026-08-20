@@ -12,13 +12,17 @@ const h = vi.hoisted(() => ({
   agentIds: [] as string[],
   agentIdsArgs: [] as unknown[][],
   blocked: new Set<string>(),
+  /** Agents whose terminal is not mounted in THIS window — `getAgentViewport` returns null. */
+  hidden: new Set<string>(),
   flush: vi.fn(async (_agentId: string) => []),
   sweep: vi.fn((_agentId: string) => {}),
+  defer: vi.fn((_agentId: string) => {}),
 }));
 
 vi.mock("../services/conciergeDispatch", () => ({
   flushScreenHeldSends: h.flush,
   sweepExpiredScreenHeldSends: h.sweep,
+  deferScreenHoldsWhileHidden: h.defer,
 }));
 vi.mock("../services/screenHoldQueue", () => ({
   agentIdsWithScreenHolds: (...args: unknown[]) => {
@@ -27,13 +31,17 @@ vi.mock("../services/screenHoldQueue", () => ({
   },
 }));
 // One viewport per agent id, opaque to everything but the mocked predicate below — this hook
-// never inspects viewport shape itself, only what terminalWriteRefusal says about it.
+// never inspects viewport shape itself, only what terminalWriteRefusal says about it. NULL for a
+// hidden agent, which is the real registry's own answer for a terminal that isn't mounted here.
 vi.mock("../services/terminalViewport", () => ({
-  getAgentViewport: (id: string) => ({ id }),
+  getAgentViewport: (id: string) => (h.hidden.has(id) ? null : { id }),
 }));
+// Mirrors the real predicate's first two lines: a null viewport is `no-viewport`, an alternate
+// buffer is `alternate-screen`. Collapsing the two — which is what the hook itself used to do —
+// is the defect these rows exist to pin.
 vi.mock("../voice/dictationTerminalRoute", () => ({
   terminalWriteRefusal: (v: { id: string } | null) =>
-    v && h.blocked.has(v.id) ? "alternate-screen" : null,
+    v === null ? "no-viewport" : h.blocked.has(v.id) ? "alternate-screen" : null,
 }));
 
 import { SCREEN_HOLD_POLL_MS, useScreenHoldDrain } from "./useScreenHoldDrain";
@@ -43,8 +51,10 @@ beforeEach(() => {
   h.agentIds = [];
   h.agentIdsArgs = [];
   h.blocked.clear();
+  h.hidden.clear();
   h.flush.mockClear();
   h.sweep.mockClear();
+  h.defer.mockClear();
 });
 afterEach(() => {
   vi.useRealTimers();
@@ -64,6 +74,66 @@ describe("useScreenHoldDrain", () => {
     // The blocked agent is NEVER written to — only its expired entries (if any) get reported.
     expect(h.flush).not.toHaveBeenCalledWith("blocked");
     expect(h.sweep).toHaveBeenCalledWith("blocked");
+    // …and a screen that is right here and busy is NOT the hidden case: its clock keeps running.
+    expect(h.defer).not.toHaveBeenCalled();
+  });
+
+  // ══ "I CANNOT SEE THIS SCREEN" IS NOT "THIS SCREEN IS BUSY" (bead sparkle-9gsjqm) ══════════════
+  // THE FOUNDER'S CASE: he types into a busy mounted pane, is promised a delivery, then unmounts or
+  // switches the cable. `getAgentViewport` then returns null for that agent and the refusal is
+  // `no-viewport`. The branch used to test `!== null`, so a hidden pane fell in with `vim` and a
+  // credential prompt: never flushed, only ever swept, and dropped at the fifteen-minute mark. The
+  // header directly above this hook says a hold "does not become void because he looked away".
+  it("stops a hidden agent's hold clock instead of sweeping it toward expiry", () => {
+    h.agentIds = ["hidden"];
+    h.hidden.add("hidden");
+    renderHook(() => useScreenHoldDrain());
+    act(() => {
+      vi.advanceTimersByTime(SCREEN_HOLD_POLL_MS);
+    });
+    expect(h.defer).toHaveBeenCalledWith("hidden");
+    // NEITHER of the other two things: not swept (that is what ages it out), and certainly not
+    // flushed — this branch must never write into a PTY whose screen it cannot read.
+    expect(h.sweep).not.toHaveBeenCalled();
+    expect(h.flush).not.toHaveBeenCalled();
+  });
+
+  // THE OTHER HALF OF THE PROMISE: it is not enough to keep the words: they have to arrive. Once a
+  // viewport comes back and reads clear, the very next tick delivers.
+  it("delivers once the agent's viewport comes back and reads clear", () => {
+    h.agentIds = ["hidden"];
+    h.hidden.add("hidden");
+    renderHook(() => useScreenHoldDrain());
+    act(() => {
+      vi.advanceTimersByTime(SCREEN_HOLD_POLL_MS);
+    });
+    expect(h.flush).not.toHaveBeenCalled();
+
+    // He re-mounts the pane, and this time the screen is a clean prompt.
+    h.hidden.clear();
+    act(() => {
+      vi.advanceTimersByTime(SCREEN_HOLD_POLL_MS);
+    });
+    expect(h.flush).toHaveBeenCalledWith("hidden");
+  });
+
+  // A pane that comes back STILL BUSY is not a delivery — the two facts are independent, and the
+  // hidden branch must not have bought the write an exemption from the screen guard.
+  it("does not deliver when the viewport returns but the screen is still blocked", () => {
+    h.agentIds = ["hidden"];
+    h.hidden.add("hidden");
+    renderHook(() => useScreenHoldDrain());
+    act(() => {
+      vi.advanceTimersByTime(SCREEN_HOLD_POLL_MS);
+    });
+
+    h.hidden.clear();
+    h.blocked.add("hidden");
+    act(() => {
+      vi.advanceTimersByTime(SCREEN_HOLD_POLL_MS);
+    });
+    expect(h.flush).not.toHaveBeenCalled();
+    expect(h.sweep).toHaveBeenCalledWith("hidden");
   });
 
   // roborev 64238's High: enumerating only LIVE holds drops an agent whose entries have all

@@ -15,9 +15,14 @@ import { conciergeToolAuthority } from "../dispatchAuthority";
 import {
   appOpPolicy,
   configuredToolPolicy,
+  readProjectPolicyContext,
   readToolPolicyOverrides,
+  rootForToolArgs,
   toDispatchDecision,
 } from "./policyBinding";
+import { evaluateToolPolicy } from "./policy";
+import { __clearRepoSlugCache, __setRepoSlugForTest } from "./repoSlug";
+import { useProjectStore } from "../../stores/projectStore";
 
 
 // The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
@@ -527,5 +532,224 @@ describe("policy binding — the human's settings reach the dispatch gate", () =
     expect(toDispatchDecision("deny", "r")).toEqual({ tier: "deny", reason: "r" });
     // PURE. It has no way to reach the ledger, so it cannot produce an approval by accident.
     expect(toDispatchDecision("ask", "r")).toEqual({ tier: "ask", approvedByUser: false });
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// PER-PROJECT POLICY — the wiring, and the soundness property under it (bead sparkle-gylxbo)
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * THE SOUNDNESS PROPERTY: the policy must read the SAME repo root the action will act on.
+ *
+ * It is worth its own suite because the failure is invisible from either side. `policy.ts`'s own
+ * tests hand the lattice a slug directly, so they prove the decision is right FOR THAT SLUG and can
+ * say nothing about where the slug came from; `registry.test.ts` proves the dispatch reaches the
+ * right project and knows nothing about the policy. Between them sits the question that matters —
+ * could the model name repo A to the policy and merge repo B — and only a test that resolves the
+ * root exactly as the dispatch does can answer it.
+ */
+describe("per-project policy — the root the policy reads is the root the action acts on", () => {
+  const SPARKLE_ROOT = "/repos/sparkle";
+  const FOREIGN_ROOT = "/repos/tkmx-server";
+
+  function seedProjects() {
+    useProjectStore.setState({
+      projects: [
+        {
+          id: "p-own",
+          name: "sparkle",
+          rootPath: SPARKLE_ROOT,
+          defaultBranch: "main",
+          agents: [{ id: "a-own", name: "Own agent", baseBranch: "main" } as never],
+        } as never,
+        {
+          id: "p-foreign",
+          name: "tkmx-server",
+          rootPath: FOREIGN_ROOT,
+          defaultBranch: "main",
+          agents: [{ id: "a-foreign", name: "Foreign agent", baseBranch: "main" } as never],
+        } as never,
+      ],
+    } as never);
+    __setRepoSlugForTest(SPARKLE_ROOT, "drodio/sparkle");
+    __setRepoSlugForTest(FOREIGN_ROOT, "plow-pbc/tkmx-server");
+  }
+
+  beforeEach(() => {
+    openConciergeAiGate();
+    __clearRepoSlugCache();
+    seedProjects();
+    useSettingsStore.setState({
+      conciergeToolPolicy: { merge_pr: "allow" },
+      conciergeToolPolicyHydrated: true,
+      conciergeOwnOrgs: ["drodio"],
+      conciergeProjectPolicy: {},
+    });
+  });
+
+  it("resolves the root through the SAME lookup the registry's withProject does", () => {
+    // `registry.ts`'s merge_pr route is `withProject(ctx, a.projectId, p => mergePrTool({ root:
+    // p.rootPath, … }))`, and mergePrTool hands that root to `invoke("merge_pr", { root, number })`.
+    // So the policy's answer for `{ projectId }` has to be that same `rootPath`, not a second
+    // derivation of it.
+    for (const project of useProjectStore.getState().projects) {
+      expect(rootForToolArgs({ projectId: project.id, number: 1 })).toBe(project.rootPath);
+    }
+    // The agent-keyed ops (`land_agent_branch`, `push_agent_branch`) resolve through the agent's
+    // project, which is what `withAgentContext` does.
+    expect(rootForToolArgs({ agentId: "a-foreign" })).toBe(FOREIGN_ROOT);
+    // An explicit root — the control-op shape — is taken verbatim.
+    expect(rootForToolArgs({ root: SPARKLE_ROOT })).toBe(SPARKLE_ROOT);
+  });
+
+  // THE PRECEDENCE, PINNED — policy-checks-A-merges-B (roborev 65400, finding 2).
+  //
+  // Every assertion above passes ONE key at a time, so none of them can see the order. The order is
+  // the entire soundness argument: `merge_pr` dispatches through `withProject(ctx, a.projectId)` and
+  // never reads `args.root`, so if `root` won, a model could name its own repo to the policy and a
+  // pinned foreign one to the merge. Both keys arrive from the SAME untrusted object, so the test
+  // has to pass both at once — that is what makes it able to fail.
+  it("prefers projectId over a model-supplied root, because the dispatch does", () => {
+    expect(rootForToolArgs({ root: SPARKLE_ROOT, projectId: "p-foreign", number: 1 })).toBe(
+      FOREIGN_ROOT,
+    );
+    // ...and symmetrically, so this is not just "foreign always wins".
+    expect(rootForToolArgs({ root: FOREIGN_ROOT, projectId: "p-own", number: 1 })).toBe(
+      SPARKLE_ROOT,
+    );
+    // agentId likewise outranks a stray root, matching `withAgentContext`.
+    expect(rootForToolArgs({ root: SPARKLE_ROOT, agentId: "a-foreign" })).toBe(FOREIGN_ROOT);
+  });
+
+  // The end-to-end consequence, asserted on the DECISION rather than on the resolver, so it stays
+  // meaningful if the two are ever wired differently.
+  it("a stray root cannot buy an allow for a pinned repo", () => {
+    const evaluation = evaluateToolPolicy("merge_pr", {
+      overrides: { merge_pr: "allow" },
+      project: readProjectPolicyContext({ root: SPARKLE_ROOT, projectId: "p-foreign", number: 1 }),
+    });
+    expect(evaluation.decision).not.toBe("allow");
+  });
+
+  it("THE GOAL, through the binding: the same global rule allows one project and denies the other", () => {
+    const own = configuredToolPolicy({
+      domain: "workflow",
+      op: "merge_pr",
+      write: true,
+      toolCallId: "c-own",
+      args: { projectId: "p-own", number: 1 },
+    } as never);
+    const foreign = configuredToolPolicy({
+      domain: "workflow",
+      op: "merge_pr",
+      write: true,
+      toolCallId: "c-foreign",
+      args: { projectId: "p-foreign", number: 1 },
+    } as never);
+    expect(own.tier).toBe("allow");
+    expect(foreign.tier).toBe("deny");
+  });
+
+  it("a per-project rule reaches the dispatch gate and only ever tightens", () => {
+    useSettingsStore.setState({
+      conciergeProjectPolicy: { "drodio/sparkle": { spawn_build_agent: "deny" } },
+    });
+    const denied = configuredToolPolicy({
+      domain: "lifecycle",
+      op: "spawn_build_agent",
+      write: true,
+      toolCallId: "c1",
+      args: { projectId: "p-own" },
+    } as never);
+    expect(denied.tier).toBe("deny");
+    // The SAME tool, in a project with no rule, is untouched — otherwise the rule would be global
+    // by accident, which is the bug the per-project layer exists to fix.
+    useSettingsStore.setState({ conciergeToolPolicy: { spawn_build_agent: "allow" } });
+    const other = configuredToolPolicy({
+      domain: "lifecycle",
+      op: "spawn_build_agent",
+      write: true,
+      toolCallId: "c2",
+      args: { projectId: "p-foreign" },
+    } as never);
+    expect(other.tier).toBe("allow");
+  });
+
+  it("an UNRESOLVED root asks rather than allowing, and asks for the resolve", () => {
+    // The cold-cache case, and the fail-closed direction: we would rather raise one approval card
+    // than merge in a repo we could not name.
+    __clearRepoSlugCache();
+    const ctx = readProjectPolicyContext({ projectId: "p-own", number: 1 });
+    expect(ctx.slug).toBeNull();
+    expect(ctx.foreign).toBe(true);
+    const decision = configuredToolPolicy({
+      domain: "workflow",
+      op: "merge_pr",
+      write: true,
+      toolCallId: "c-cold",
+      args: { projectId: "p-own", number: 1 },
+    } as never);
+    expect(decision.tier).toBe("ask");
+  });
+
+  it("an unknown project id is foreign, not permissive", () => {
+    const ctx = readProjectPolicyContext({ projectId: "p-nope" });
+    expect(ctx.slug).toBeNull();
+    expect(ctx.foreign).toBe(true);
+    expect(rootForToolArgs({ projectId: "p-nope" })).toBeNull();
+    expect(rootForToolArgs(undefined)).toBeNull();
+    expect(rootForToolArgs({ projectId: 7 })).toBeNull();
+    expect(rootForToolArgs({ root: "   " })).toBeNull();
+  });
+
+  it("the control-op entry points get the project layer from the same seam", () => {
+    // `appOpPolicy` and `chiefOpPolicy` share `evaluateWithHydrationHold` with
+    // `configuredToolPolicy`, so wiring the layer there covers all three. Asserted rather than
+    // assumed: a second wiring is the one that gets forgotten when a fourth entry point appears.
+    // THE OP HAS TO BE ONE THAT REALLY CARRIES A ROOT (roborev 65400, finding 3). This assertion
+    // used to name `set_config`, whose control payload is `{ path, value }` and which writes the
+    // GLOBAL config file — it never carries `root`, `projectId` or `agentId`. So the project layer
+    // can never govern it in production, and passing `{ root }` here was a hand-built shape the app
+    // does not send: the test proved that `appOpPolicy` forwards `args`, not that any real control
+    // op gets the layer. `claim_pr` / `release_pr` are the app ops that genuinely carry a root
+    // (controlListener reads `req.payload.root` and requires it), so they can actually fail.
+    useSettingsStore.setState({
+      conciergeToolPolicy: { claim_pr: "allow", release_pr: "allow" },
+      conciergeProjectPolicy: {
+        "plow-pbc/tkmx-server": { claim_pr: "deny", release_pr: "deny" },
+      },
+    });
+    // The foreign/pinned repo's own rule governs...
+    expect(appOpPolicy("claim_pr", { requestId: "r1", args: { root: FOREIGN_ROOT } }).tier).toBe(
+      "deny",
+    );
+    expect(appOpPolicy("release_pr", { requestId: "r2", args: { root: FOREIGN_ROOT } }).tier).toBe(
+      "deny",
+    );
+    // ...and the own repo is untouched by it. Both halves, because one direction alone cannot tell
+    // "the project layer applied" from "everything is denied".
+    expect(appOpPolicy("claim_pr", { requestId: "r3", args: { root: SPARKLE_ROOT } }).tier).toBe(
+      "allow",
+    );
+  });
+});
+
+describe("per-project policy — the dispatch's root source, pinned against drift", () => {
+  it("registry.ts still hands merge_pr the project's OWN rootPath", async () => {
+    // A STRUCTURAL PIN, in the spirit of `merge_pr_actually_runs_the_gate` on the Rust side. The
+    // behavioural tests above resolve `{ projectId }` the way the registry does TODAY; if someone
+    // changes where the dispatch's root comes from, those tests keep passing against a policy that
+    // now reads a different repo than the merge acts on. This is the tripwire for that.
+    const { readFileSync } = await import("node:fs");
+    const { dirname, resolve } = await import("node:path");
+    const { fileURLToPath } = await import("node:url");
+    const source = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), "./registry.ts"),
+      "utf8",
+    );
+    const route = source.slice(source.indexOf("  merge_pr: route("));
+    expect(route.slice(0, 400)).toContain("withProject(ctx, a.projectId");
+    expect(route.slice(0, 400)).toContain("root: p.rootPath");
   });
 });

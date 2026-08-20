@@ -97,9 +97,18 @@ vi.mock("../services/conciergeDispatch", () => ({
   onDeferredSendOutcome: () => () => {},
 }));
 vi.mock("../services/conciergeRouter", () => ({ routeMessage: h.routeMessage }));
-// THE MOUNT, as one knob. `useEffectiveWired` is the host's only reader of the cable, and driving it
-// directly keeps this suite about ROUTING rather than about the cockpit's selection plumbing (whose
-// own rules are pinned in engine/cable.test.ts and hooks/useEffectiveWired's tests).
+// ══ `h.wired` NO LONGER MOUNTS ANYTHING, AND THAT IS THE FIX (bead sparkle-9gsjqm) ═══════════════
+// This mock used to BE the mount: `mountedAgentId` was `useEffectiveWired() !== "off" && promptTarget`,
+// so stubbing this hook and passing a `promptTarget` prop was enough. That is exactly what made this
+// suite blind to the founder's P0 — `useEffectiveWired` is a DRAWING projection ("USE THIS FOR VISUAL
+// TREATMENT ONLY", its own header) and the defect was that a drawing rule was serving as the routing
+// authority, so a suite that stubs it has replaced the collaborator under test with an oracle.
+//
+// The mount is now the CABLE's own pin, so `wireCableTo` below patches the REAL `cableStore` — the
+// same call `AgentRow`/`AgentSidebar` make — and `h.wired` is kept for the one thing it still names:
+// which side the shell DRAWS as connected. It is also what `wireCableTo` reads to decide which side
+// to patch, so the rows below read unchanged. `ConciergeHost.cableMount.test.tsx` is the suite that
+// mocks none of this at all.
 vi.mock("../hooks/useEffectiveWired", () => ({
   useEffectiveWired: () => h.wired(),
   usePairIsLive: () => false,
@@ -185,6 +194,7 @@ vi.mock("../stores/runtimeStore", () => ({
 }));
 
 import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
+import { mountRefusalTail } from "../engine/mountRefusal";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import {
   armedIntents,
@@ -203,6 +213,8 @@ import { useSettingsStore } from "../stores/settingsStore";
 // rather than a forced rejection, so it writes `me` instead of using the fully-funded helper.
 import { useAuthStore } from "../stores/authStore";
 import { useProjectStore } from "../stores/projectStore";
+// THE REAL CABLE — what actually mounts, as of bead sparkle-9gsjqm. See the `useEffectiveWired` mock.
+import { useCableStore, resetCable } from "../stores/cableStore";
 import { CONCIERGE_CHATTING_WITH_TESTID } from "./Concierge/ConciergeColumn";
 import { MOUNTED_THREAD_TESTID } from "./Concierge/MountedAgentThread";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
@@ -312,6 +324,9 @@ beforeEach(() => {
   // silently turn every later mounted row back into a countdown row — which they would still PASS,
   // because `elapse()` is a no-op when nothing is armed and most rows call it.
   usePresenceStore.getState().reset();
+  // The cable is a module singleton and now decides the mount, so a leaked patch would silently
+  // mount a later row that never asked for one — the mirror of the intent-registry leak below.
+  resetCable();
   seedMountedRow();
 });
 afterEach(() => {
@@ -345,6 +360,7 @@ afterEach(() => {
   // The store is a module singleton shared across cases — leaving rows behind would silently mount a
   // later suite's host against this one's fleet.
   useProjectStore.setState({ projects: [] });
+  resetCable();
   // Same reasoning, and it is PERSISTED: a rebind left behind would follow every later case (and
   // every later suite in this worker) into the notice copy they assert on.
   useKeybindingsStore.getState().resetBinding("unmountCable");
@@ -377,7 +393,20 @@ async function elapse() {
   });
 }
 
+/** THE MOUNTING GESTURE, spelled exactly as `AgentRow`/`AgentSidebar` spell it.
+ *
+ *  Reads `h.wired()` so every row in this file reads as it always did — set the knob, mount, assert
+ *  — while what actually happens underneath is a real `cableStore.patch`. `"off"` unbinds, which is
+ *  what those rows have always meant by it. */
+function wireCableTo(target: ConciergePromptTarget | null) {
+  const side = h.wired();
+  act(() => {
+    if (side === "off" || !target) useCableStore.getState().unbind();
+    else useCableStore.getState().patch(side, target.agentId);
+  });
+}
 function mount() {
+  wireCableTo(MOUNTED);
   return render(<ConciergeHost feed={FEED} promptTarget={MOUNTED} />);
 }
 
@@ -391,6 +420,10 @@ const SPARKLE_TARGET: ConciergePromptTarget = {
 };
 
 function selectSparkleRow() {
+  // The cable follows `h.wired` here too, which is what makes "FOCUS IS NOT A MOUNT" below a real
+  // statement rather than a fixture: those rows set `"off"`, so nothing is patched and the row is
+  // merely selected — the founder's exact state.
+  wireCableTo(SPARKLE_TARGET);
   return render(<ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} />);
 }
 
@@ -474,23 +507,25 @@ describe("ConciergeHost — a concierge-bound message is never screen-checked", 
 // content, which is wrong."* Whatever the mount was keyed on was not being invalidated when the
 // selected agent changed.
 //
-// The routing half and the display half are both derived from `promptTarget`, so a re-point should
-// be automatic — but "should be" is what this cluster has been wrong about five times, and NOTHING
-// in this suite moved the selection while mounted. These rows move it and assert both halves.
+// ══ AND THE RE-POINT TRAVELS ON THE CABLE, NOT ON `promptTarget` (bead sparkle-9gsjqm) ══════════
+// Both halves used to be derived from `promptTarget`, so these rows moved the PROP. That is not what
+// clicking a build row does: `AgentRow` calls `useCableStore.getState().patch(paneSide, a.id)`, and
+// the pin is deliberately what the far end follows — roborev 63145 finding 4 removed selection-
+// following precisely so that looking at a row cannot re-aim the concierge at it. So the rows now
+// move the cable, which is both the real mechanism and the one that keeps them honest: moving only
+// the prop must NOT move the mount, and `KRAKEN` below is reached by a real second patch.
 describe("ConciergeHost — the mount follows the selected agent", () => {
+  const KRAKEN: ConciergePromptTarget = { projectId: "p1", agentId: "ag2", name: "Kraken Auth" };
+
   it("routes to the NEWLY selected agent after the selection moves", async () => {
     const view = mount();
     await send("first, to the original mount");
     await elapse();
     expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe("ag1");
 
-    // The founder clicks a different build row. Same cable, different agent.
-    view.rerender(
-      <ConciergeHost
-        feed={FEED}
-        promptTarget={{ projectId: "p1", agentId: "ag2", name: "Kraken Auth" }}
-      />,
-    );
+    // The founder clicks a different build row. Same cable, different agent — the click patches it.
+    wireCableTo(KRAKEN);
+    view.rerender(<ConciergeHost feed={FEED} promptTarget={KRAKEN} />);
     await send("second, to the new one");
     await elapse();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(2);
@@ -508,12 +543,8 @@ describe("ConciergeHost — the mount follows the selected agent", () => {
     expect(screen.getByTestId(MOUNTED_THREAD_TESTID).getAttribute("aria-label")).toContain(
       "Blueprint UI/UX",
     );
-    view.rerender(
-      <ConciergeHost
-        feed={FEED}
-        promptTarget={{ projectId: "p1", agentId: "ag2", name: "Kraken Auth" }}
-      />,
-    );
+    wireCableTo(KRAKEN);
+    view.rerender(<ConciergeHost feed={FEED} promptTarget={KRAKEN} />);
     await waitFor(() =>
       expect(screen.getByTestId(MOUNTED_THREAD_TESTID).getAttribute("aria-label")).toContain(
         "Kraken Auth",
@@ -553,16 +584,37 @@ describe("ConciergeHost — the suite is actually in the mounted state", () => {
   //
   // Fixing it at `railTargetName` alone left THIS surface lying, which is why the row lives here and
   // not only in the rail suite.
-  it("REGRESSION: stays mounted, with the chip, when the agent has no projectStore row", () => {
-    useProjectStore.setState({
-      projects: [] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
-    });
+  //
+  // ══ THE FIX IS NOW STRUCTURAL, SO THE ASSERTION IS THE INVARIANT, NOT THE FALLBACK ═════════════
+  // The `?? target?.name` fallback this row used to pin is GONE (bead sparkle-9gsjqm): it was the
+  // SELECTION's name, so with the Improve-Sparkle pane visible over a mounted build agent it made the
+  // chip call that build agent "Sparkle" — the same lie, one identifier over. The name and the id now
+  // come from ONE resolution, so "the id resolves and the name does not" is unrepresentable.
+  //
+  // What roborev 59232 was actually protecting is the DIVERGENCE, and that is what this row asserts
+  // now: whatever the column says about this agent, the founder's words must not quietly go
+  // somewhere else. With no row to name it the column does not claim the mount — and the send does
+  // not become a concierge turn either. Both halves, because either alone is satisfiable by the bug.
+  it("REGRESSION: never draws one mount while routing at another, with no projectStore row", async () => {
     mount();
-    // The discriminator, as above: the concierge thread's ABSENCE is what proves the mount held.
-    expect(screen.queryByTestId("concierge-thread")).toBeNull();
-    expect(screen.getByTestId(MOUNTED_THREAD_TESTID)).toBeTruthy();
-    // And the chip still names him the agent — from `promptTarget.name`, the value the send aims at.
-    expect(screen.getByTestId(CONCIERGE_CHATTING_WITH_TESTID).textContent).toContain(MOUNTED.name);
+    // The roster goes away underneath a LIVE cable — a project closing, a cold reload. This is the
+    // order the app actually produces it in, and it is why the notice below can still name him the
+    // agent: the window knew it a moment ago (see `lastMountNameRef`).
+    act(() => {
+      useProjectStore.setState({
+        projects: [] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
+      });
+    });
+    // It does not claim a mount it cannot name…
+    expect(screen.queryByTestId(CONCIERGE_CHATTING_WITH_TESTID)).toBeNull();
+    expect(screen.queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
+    // …and — the half that matters — his words still do not become a concierge message.
+    await send("move the button 5px left");
+    await elapse();
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
+    // He is told why, on the row that survives a mount, and it NAMES the agent it was for.
+    expect(notice().textContent).toContain(MOUNTED.name);
   });
 });
 
@@ -1154,6 +1206,38 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
   // a classifier-gated build, which is exactly the vacuity roborev caught in the row this replaces —
   // the previous version used "run the deploy command", destructive solely because of the trailing
   // word "command". Routine text discriminates: only a presence gate holds it.
+  // ══ AND THE ARMED MOUNTED SEND STILL CARRIES THE HOLD FLAG AT EXPIRY (roborev 64476, Medium) ═══
+  // THE EDIT THIS EXISTS TO CATCH is not a deletion — deleting `mentionAim?.via === "mount"` from
+  // the `promptAgent` call reddens the three immediate rows above. It is the NARROWING that the
+  // `mount`-authority exemption practically invites: replacing that argument with
+  // `authority.kind === "mount"`, or gating it on `presenceCountingThisSubmit === "here"`. Every
+  // immediate row stays green under both, because on that path the authority IS `mount`.
+  //
+  // A mounted send made while AWAY is the one that breaks: it arms, and at expiry it dispatches as
+  // `{kind: "countdown"}` with `mentionAim.via` still "mount". Under a narrowed call site the flag
+  // goes false, `mayHoldForScreenClear` returns false, and the founder's message is refused outright
+  // — the original bug, restored, with the whole suite green. The dispatch-layer row cannot see
+  // this: it pins that the DISPATCHER honours the flag, not that this call site still passes it.
+  //
+  // So this row runs the countdown to EXPIRY and asserts the pair together: the countdown authority
+  // AND the flag. `authority.kind === "mount"` cannot satisfy it.
+  it("still asks for the hold when a mounted send dispatches after counting down while AWAY", async () => {
+    usePresenceStore.getState().setAway();
+    mount();
+    // Routine text, for the reason the block below gives: a destructive sample would be held by the
+    // precedence rule and never reach the dispatch this row is about.
+    h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
+    await send("move the button 5px left");
+    expect(armedIntents()).toHaveLength(1);
+
+    await elapse();
+    await waitFor(() => expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1));
+    expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
+      authority: { kind: "countdown", intentId: expect.any(String) },
+      holdForScreenClear: true,
+    });
+  });
+
   it("arms rather than dispatching while AWAY, even mounted", async () => {
     // `setAway()`, NOT `setState({mode:"away"})`. `mode` is DERIVED and re-resolved on every
     // keystroke via `noteInput`, so a seeded mode is wiped by the act of typing the message — the
@@ -1500,13 +1584,132 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
     expect(screen.queryByTestId(MOUNTED_NOTICE_TESTID)).toBeNull();
   });
 
-  it("names the agent that could not take the message", async () => {
+  // ══ AND IT NAMES WHICH GATE FIRED, NOT JUST THE AGENT (bead sparkle-gyvjyt) ═══════════════════
+  // This case used to assert the notice contained "can't take a message" — the single sentence this
+  // refusal gave for BOTH of its causes. True of each, diagnostic of neither, and that ambiguity is
+  // what made the founder's "I still can't send in the mounted pane" reports unactionable across
+  // several builds: nothing on screen said whether the mount had failed to register or the pane had
+  // simply not come up yet, and those have opposite remedies. `engine/mountRefusal` owns the split
+  // and pins the two sentences apart; this row pins that the HOST reaches it with the right cause.
+  it("names the agent AND the reason it could not take the message", async () => {
     mount();
+    // A live aim whose `agentCanAcceptPrompt` is false — the non-self `no-target` arm.
     h.agentCanAcceptInput.mockReturnValue(false);
     await send("move the button 5px left");
     await elapse();
     await waitFor(() => expect(notice().textContent).toContain("Blueprint UI/UX"));
-    expect(notice().textContent).toContain("can't take a message");
+    expect(notice().textContent).toContain(mountRefusalTail("no-target"));
+    // NEGATIVE HALF, and it is the half with the power: without it this passes against a host that
+    // hands every refusal the same string again, which is the regression being guarded. Paired with
+    // the sparkle-id row below — with only two causes, "not the other one" is evidence only when
+    // both arms are actually driven somewhere in the file.
+    expect(notice().textContent).not.toContain(mountRefusalTail("pane-not-open"));
+    // ══ THE FOUNDER'S P0, AND IT IS `startConciergeTurn` — NOT `dispatchConciergeAnswer` ═════════
+    // A mounted send must never become a SILENT CONCIERGE TURN. That is the whole of bead
+    // sparkle-9gsjqm, and `askSparkle` at the tail of `deliver` is what the `via === "mount"` arm
+    // exists to stop it reaching — so this is the assertion with the power.
+    //
+    // `dispatchConciergeAnswer` is NOT a substitute and was the vacuous shape this file shipped
+    // first (roborev 65179): every dispatch site in `deliver` is gated on a truthy `aim`, so on the
+    // `aim === null` route it cannot be called whatever the refusal branch does. It was already
+    // true before the branch existed — precisely the precondition-not-side-effect trap.
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+  });
+
+  // ══ AND THE APP-OWNED AGENT GETS ITS OWN CAUSE — THE PAIR, NOT ONE HALF (roborev 65163) ════════
+  // The row ABOVE uses a build agent, and on its own it proves nothing about the id this whole line
+  // of work is for: hardcoding `selfAgent: false` at the host's call site passed it, and passed the
+  // entire file. That is the review's finding — a suite that never drives the sparkle id cannot see
+  // a classifier that ignores it.
+  //
+  // The two rows are DELIBERATELY A PAIR and are asserted against each other's copy, because an
+  // "absence" assertion is otherwise satisfied by the arm simply never being reached. Together they
+  // pin that the host passes the discriminator through, not merely that the module can compute one.
+  it("gives the app-owned Sparkle agent the re-open remedy, not the build agent's", () => {
+    selectSparkleRow();
+    h.agentCanAcceptInput.mockReturnValue(false);
+    return (async () => {
+      await send("check in on the improvement pass");
+      await elapse();
+      await waitFor(() => expect(notice().textContent).toContain("Sparkle"));
+      expect(notice().textContent).toContain(mountRefusalTail("pane-not-open"));
+      // Not the OTHER sentence — `no-target`'s remedy points at mounting something else, which is
+      // wrong here: what clears THIS state is a click on the Improve Sparkle row, because that
+      // gesture calls `open(sparkleAgentId)` (see `mountRefusal`'s `pane-not-open`).
+      expect(notice().textContent).not.toContain(mountRefusalTail("no-target"));
+      // ══ THE FOUNDER'S P0, AND IT IS `startConciergeTurn` — NOT `dispatchConciergeAnswer` ═════════
+      // A mounted send must never become a SILENT CONCIERGE TURN. That is the whole of bead
+      // sparkle-9gsjqm, and `askSparkle` at the tail of `deliver` is what the `via === "mount"` arm
+      // exists to stop it reaching — so this is the assertion with the power.
+      //
+      // `dispatchConciergeAnswer` is NOT a substitute and was the vacuous shape this file shipped
+      // first (roborev 65179): every dispatch site in `deliver` is gated on a truthy `aim`, so on the
+      // `aim === null` route it cannot be called whatever the refusal branch does. It was already
+      // true before the branch existed — precisely the precondition-not-side-effect trap.
+      expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    })();
+  });
+
+  // ══ AND THE STATE PRODUCTION CAN ACTUALLY PRODUCE — `aim === null` (roborev 65174) ════════════
+  // Both rows above reach the refusal through `hasAim: true / canAcceptInput: false`, and this
+  // branch's own derivation proves that pair UNSATISFIABLE: `isPromptableTarget`'s roster arm and
+  // `agentCanAcceptPrompt` are nested lookups over one store, so a feed member is always a roster
+  // member. They only reach it here because the harness decouples the two — the `knownAgents` mock
+  // resolves the sparkle id unconditionally while `agentCanAcceptPrompt` is separately wired to
+  // `h.agentCanAcceptInput`.
+  //
+  // That does not change today's verdict, since `mountRefusalCause` no longer consults either — and
+  // THAT is exactly what makes the gap invisible. `mountRefusal.ts` invites a future arm to be added
+  // back "WITH a test that reaches it through the real predicates", and without this row there is no
+  // such test in the file to copy.
+  //
+  // The reachable route is `aim === null`: an agent this window can NAME (it has a `projectStore`
+  // row, so the cable resolves and the column can draw the mount) but which is NOT in the feed the
+  // host is holding — closed, deleted, or its project unloaded since the snapshot. `agentStillExists`
+  // reads the FEED; `mountedRow` reads the STORE; seeding one and not the other is the production
+  // state, not a contrivance.
+  it("refuses a mount whose agent has left the FEED, with agentCanAcceptPrompt left saying yes", async () => {
+    useProjectStore.setState({
+      projects: [
+        {
+          id: "p1",
+          name: "sparkle",
+          path: "/tmp/sparkle",
+          // `ag3` is in the STORE and deliberately absent from `FEED` above.
+          agents: [
+            { id: "ag1", name: "Blueprint UI/UX", worktreePath: "/tmp/wt/ag1" },
+            { id: "ag3", name: "Retired Agent", worktreePath: "/tmp/wt/ag3" },
+          ],
+        },
+      ] as unknown as ReturnType<typeof useProjectStore.getState>["projects"],
+    });
+    // LEFT SAYING YES, which is the point of the row: nothing but the missing aim can be producing
+    // the refusal, so this cannot pass by the same decoupled pair the two rows above rely on.
+    h.agentCanAcceptInput.mockReturnValue(true);
+    const target: ConciergePromptTarget = { projectId: "p1", agentId: "ag3", name: "Retired Agent" };
+    wireCableTo(target);
+    render(<ConciergeHost feed={FEED} promptTarget={target} />);
+    await send("pick the branch back up");
+    await elapse();
+    await waitFor(() => expect(notice().textContent).toContain("Retired Agent"));
+    expect(notice().textContent).toContain(mountRefusalTail("no-target"));
+    expect(notice().textContent).not.toContain(mountRefusalTail("pane-not-open"));
+    // AND THE WORDS COME BACK — the promise every arm of this copy makes. A refusal that says so
+    // while the draft is gone is the worse half of the bug it replaced.
+    expect(box().value).toContain("pick the branch back up");
+    // ══ THE FOUNDER'S P0, AND IT IS `startConciergeTurn` — NOT `dispatchConciergeAnswer` ═════════
+    // A mounted send must never become a SILENT CONCIERGE TURN. That is the whole of bead
+    // sparkle-9gsjqm, and `askSparkle` at the tail of `deliver` is what the `via === "mount"` arm
+    // exists to stop it reaching — so this is the assertion with the power.
+    //
+    // `dispatchConciergeAnswer` is NOT a substitute and was the vacuous shape this file shipped
+    // first (roborev 65179): every dispatch site in `deliver` is gated on a truthy `aim`, so on the
+    // `aim === null` route it cannot be called whatever the refusal branch does. It was already
+    // true before the branch existed — precisely the precondition-not-side-effect trap.
+    expect(h.startConciergeTurn).not.toHaveBeenCalled();
+    // Kept, but demoted to what it actually is: a check that nothing reached a terminal. It cannot
+    // fail on this route, so it is corroboration rather than the guard.
+    expect(h.dispatchConciergeAnswer).not.toHaveBeenCalled();
   });
 
   // A HOLD REPEATS. The founder retypes while the same full-screen app is still open, so the second
@@ -1541,6 +1744,9 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
     await elapse();
     await waitFor(() => expect(notice().textContent).toContain("busy"));
     h.wired.mockReturnValue("off");
+    // THE UNPLUG ITSELF — the real `unbind`, which is what Escape and click-away both call. Flipping
+    // the drawing stub alone no longer unmounts anything, which is the whole point of the fix.
+    wireCableTo(null);
     await act(async () => {
       view.rerender(<ConciergeHost feed={FEED} promptTarget={MOUNTED} />);
       await Promise.resolve();
@@ -1580,8 +1786,13 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
 // the founder's own stated remedy for an unresolvable route, and it is strictly better than the
 // silent redirect it replaces: a refusal you can read beats a delivery to the wrong recipient.
 describe("ConciergeHost — a plain mounted send goes to the mounted agent, always", () => {
-  const mountHidden = () =>
-    render(<ConciergeHost feed={FEED} promptTarget={MOUNTED} promptTargetShown={false} />);
+  const mountHidden = () => {
+    // MOUNTED for real (the cable), while the pane is NOT the shown surface (`promptTargetShown`).
+    // That combination is the whole subject of this block, and it is now spelled with the two
+    // independent facts rather than with one stub standing in for both.
+    wireCableTo(MOUNTED);
+    return render(<ConciergeHost feed={FEED} promptTarget={MOUNTED} promptTargetShown={false} />);
+  };
 
   it("routes to the mounted agent even when its pane is not the shown surface", async () => {
     mountHidden();
@@ -1668,6 +1879,7 @@ describe("ConciergeHost — a plain mounted send goes to the mounted agent, alwa
   // what someone mounted to an agent named "Sparkle" types. This also covers the `held === undefined`
   // fallback branch, which no other row exercises.
   it("does not say 'not Sparkle' when the mount IS the Sparkle agent", async () => {
+    wireCableTo(SPARKLE_TARGET);
     render(<ConciergeHost feed={FEED} promptTarget={SPARKLE_TARGET} promptTargetShown={false} />);
     await send("@Sparkle what is the status of the build?");
     await elapse();

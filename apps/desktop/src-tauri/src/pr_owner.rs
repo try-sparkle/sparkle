@@ -373,12 +373,87 @@ pub fn observe_branch(
     branch: &str,
     agent_id: &str,
 ) -> Result<(), String> {
-    let _g = store_lock().lock().map_err(|e| e.to_string())?;
-    let mut store = load_store(app_data);
-    if record_branch(&mut store, project_id, branch, agent_id, now_secs()) {
-        save_store(app_data, &store)?;
-    }
+    let _ = claim_then_observe(app_data, project_id, branch, agent_id);
     Ok(())
+}
+
+/// What the branch→agent table says about a branch, BEFORE this poll's own observation is folded
+/// in. Three-valued, and the middle value is the only one that is evidence of anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BranchClaim {
+    /// A pre-existing, unambiguous row naming THIS agent.
+    Mine,
+    /// A pre-existing, unambiguous row naming a DIFFERENT agent. The only positive evidence that a
+    /// branch is somebody else's, and the only thing a caller may refuse on.
+    Other,
+    /// No row at all, or the store could not be read. "We do not know" — never to be treated as
+    /// `Other`. An `ambiguous` row is NOT unknown: it still names its first owner. See
+    /// [`claim_then_observe`].
+    Unknown,
+}
+
+/// Answer "whose branch is this?" from what the table ALREADY held, then fold in this poll's own
+/// observation. The ORDER is the whole point.
+///
+/// WHY READ FIRST (bead `sparkle-pgkbn4`, roborev 65176). The obvious shape — record, then read
+/// back — is circular: `record_branch` inserts on a first sighting, so reading afterwards returns
+/// the row this very call just wrote and every unseen branch resolves to `Mine` on the first poll.
+/// That is not evidence, it is an echo. Reading first makes a first sighting honestly `Unknown`,
+/// and reserves a verdict for a mapping some EARLIER poll established.
+///
+/// WHY THE ROW'S NAME BEATS ITS `ambiguous` FLAG. The latch is permanent and has no repair path, and
+/// it was designed for PR ownership, where an unknown owner renders as a MISSING PILL. On the status
+/// path an unknown renders as a confidently wrong stage — an agent whose minted ref is the empty one
+/// left by a `checkout -b` rename goes straight back to `branch_ever_committed → Some(false)` →
+/// `building_unsaved` → "Local: Nothing Yet", on committed, shipped work. But treating the latch as
+/// `Unknown` is the opposite mistake, and it erases the only refusal this design has. `agent_id`
+/// SURVIVES the latch, so reading the NAME serves both sides: first owner `Mine`, everyone else
+/// `Other`.
+///
+/// `Unknown` is therefore only ever "there is no row at all" or "we could not read the store", and
+/// it ADOPTS, because the two error directions are not symmetric: adopting the wrong branch shows
+/// numbers that are wrong, but the row now NAMES the branch they were measured on, so a human can
+/// see it; refusing the right one shows "nothing here", which looks exactly like an agent that never
+/// started. Prefer the diagnosable failure.
+///
+/// The observation is best-effort: a persist failure costs a future resolvable owner, never this
+/// reading — the answer was already computed from the loaded store before any write was attempted.
+pub fn claim_then_observe(
+    app_data: &Path,
+    project_id: &str,
+    branch: &str,
+    agent_id: &str,
+) -> BranchClaim {
+    // A poisoned lock is a CAN'T-READ, so it answers `Unknown`. Mapping it to `Other` would turn a
+    // process-permanent lock failure into a fleet-wide "Nothing Yet" that has nothing to do with
+    // ownership.
+    let Ok(_g) = store_lock().lock() else {
+        tracing::warn!(%branch, %agent_id, "branch ownership lock poisoned; claim unknown");
+        return BranchClaim::Unknown;
+    };
+    let mut store = load_store(app_data);
+    // READ THE NAME, NOT THE LATCH. `record_branch` never rewrites `agent_id` once it sets
+    // `ambiguous`, so an ambiguous row still records WHO WAS THERE FIRST — and that one field
+    // answers both sides at once:
+    //   * the original owner keeps `Mine`, so a branch something else touched once does not strand
+    //     the agent whose work it is at "Local: Nothing Yet";
+    //   * the intruder keeps `Other`, DURABLY.
+    // Collapsing `ambiguous` to `Unknown` (as this did for one commit) made the single refusal
+    // SELF-ERASING: the very call that returned `Other` also latched the row, so the next poll read
+    // `Unknown`, adopted, and thirty seconds later a never-started agent was reporting another
+    // branch's ahead/behind and uncommitted files as its own — permanently, since the latch never
+    // clears (roborev 65183). A guard that works for exactly one tick is not a guard.
+    let claim = match store.branches.get(project_id).and_then(|m| m.get(branch)) {
+        Some(o) if o.agent_id == agent_id => BranchClaim::Mine,
+        Some(_) => BranchClaim::Other,
+        None => BranchClaim::Unknown,
+    };
+    if record_branch(&mut store, project_id, branch, agent_id, now_secs()) {
+        if let Err(e) = save_store(app_data, &store) {
+            tracing::warn!(%branch, %agent_id, error = %e, "could not persist branch ownership");
+        }
+    }
+    claim
 }
 
 /// Whether a resolution is a STABLE FACT worth freezing into the PR table, or a LIVE READING that

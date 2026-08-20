@@ -364,6 +364,49 @@ export interface DecomposeDeps {
   /** Wraps the Rust `read_prd` command; takes the BARE filename, returns the file content. */
   readPrd: (projectPath: string, filename: string) => Promise<string>;
   writePrd: GenerateDeps["writePrd"];
+  /**
+   * OPTIONAL — the second-model advisor's HIGH findings on this epic's plan (bead `sparkle-revqiv`).
+   *
+   * ══ WHY THE REVISION ROUND LIVES HERE, AND ONLY HERE ═══════════════════════════════════════════
+   *
+   * This is the one moment a plan can still be REVISED before any bead is written. Everywhere else
+   * the advisor is purely advisory — it comments, the orchestrator decides — because by then the
+   * work graph exists and rewriting it would put a second, unrecorded author on it.
+   *
+   * ══ EXACTLY ONE ROUND, BOUNDED DELIBERATELY ════════════════════════════════════════════════════
+   *
+   * Not "revise until the advisor is quiet". `.roborev.toml` measured that loop over 6,281 reviews
+   * and it DOES NOT CONVERGE: 61.6% fail on the first round, then 53.5, 46.2, 46.0 … and a plateau
+   * around 40-48% that holds through at least the fourteenth. Every revision is itself reviewable,
+   * so each round has a coin-flip chance of producing new findings indefinitely. A "keep going until
+   * it is clean" loop burns a whole session and is still not clean — that is a property of the loop,
+   * not a sign of being close. So: one round, then proceed.
+   *
+   * ══ ABSENT BY DEFAULT, AND THAT IS NOT AN OVERSIGHT ════════════════════════════════════════════
+   *
+   * With this dep unset `decomposeEpic` behaves EXACTLY as it did before the advisor existed — one
+   * `structuredJson` call, the same four arguments — so every pre-existing caller and test is
+   * untouched. It is a seam on the injected deps object rather than a value read inline at the call
+   * site, which is the shape AGENTS.md prescribes so a single test can drive the production path.
+   *
+   * Returns `null` when there is nothing to revise for: no verdict held, or none of its findings are
+   * `high`. It is NEVER awaited on a network call in production — the wiring reads a verdict already
+   * delivered by a pass dispatched earlier, so this adds no stall to a decompose.
+   *
+   * ══ THE ORDERING THIS REQUIRES, AND WHY IT IS RARE TODAY ═══════════════════════════════════════
+   *
+   * A verdict only exists for an epic that has ALREADY been handed off once and whose research child
+   * has since answered — `prepareHandoff` is the only dispatcher, and the child takes minutes. So on
+   * the ordinary Plan → decompose → Build order this returns `null` every time, because no pass has
+   * been dispatched for that epic yet. It becomes live on the RE-decompose paths: an epic sent to
+   * Build, then decomposed again after its pass answered.
+   *
+   * That is a real limit and it is stated here rather than implied by the tests. Making the round
+   * routine means dispatching at the decompose seam and WAITING for a verdict, which trades the
+   * "never blocks" property for it — a deliberate design decision, not a wiring fix, and out of
+   * scope for the branch that introduced this. Tracked on bead `sparkle-revqiv`.
+   */
+  advisorRevisionNote?: (epicId: string) => Promise<string | null>;
 }
 
 export interface DecomposeArgs {
@@ -406,19 +449,47 @@ export async function decomposeEpic(
   }
   const planInput = prdContent ?? `# ${epic.title}\n\n${epic.description}`;
 
-  const plan = await deps.structuredJson<TaskPlan>(
-    TASK_PLAN_SYSTEM,
-    planInput,
-    undefined,
-    {
-      purpose: `Breaking down the "${epic.title}" epic into tasks`,
-      project: projectNameForPath(projectPath),
-    },
-  );
+  const meta = {
+    purpose: `Breaking down the "${epic.title}" epic into tasks`,
+    project: projectNameForPath(projectPath),
+  };
+  let plan = await deps.structuredJson<TaskPlan>(TASK_PLAN_SYSTEM, planInput, undefined, meta);
   if (!plan || typeof plan !== "object") {
     throw new Error("Task plan was empty or malformed (need an epic and at least one task).");
   }
   validatePlanTasks(plan);
+
+  // ── THE ONE ADVISOR REVISION ROUND ────────────────────────────────────────────────────────────
+  // See `DecomposeDeps.advisorRevisionNote` for why it is exactly one and why it is optional. The
+  // note is appended to the SAME planning input and the planner is asked again with the SAME four
+  // arguments — the advisor never rewrites a plan itself, it only tells the planner what it found.
+  //
+  // BEST-EFFORT: a failure here (the note could not be read, the revised plan came back malformed)
+  // keeps the ORIGINAL plan rather than failing the decompose. A second opinion that cannot be
+  // obtained must not cost the founder a decomposition that already succeeded — the same failure
+  // contract the rest of the advisor follows.
+  if (deps.advisorRevisionNote) {
+    try {
+      const note = await deps.advisorRevisionNote(epic.id);
+      if (note?.trim()) {
+        const revised = await deps.structuredJson<TaskPlan>(
+          TASK_PLAN_SYSTEM,
+          `${planInput}
+
+${note.trim()}`,
+          undefined,
+          meta,
+        );
+        if (revised && typeof revised === "object") {
+          validatePlanTasks(revised);
+          plan = revised;
+        }
+      }
+    } catch {
+      // Keep the original plan. Deliberately swallowed rather than logged from here: this module is
+      // pure-ish and its caller (the decompose sweep) owns the failure reporting.
+    }
+  }
 
   const taskIds = await createChildTasks(deps, projectPath, epic.id, plan);
 

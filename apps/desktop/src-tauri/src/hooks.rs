@@ -1326,6 +1326,16 @@ pub fn install_agent_hooks_sync(
     // same worktree) cannot have its write silently reverted by ours. Scoped to a block so it is
     // released before the marketplace-install `spawn_blocking` below, which does not touch this
     // file and must not be serialized behind it. See `settings_write_lock`.
+    // THE SECOND INSTALLER MUST ALSO LEAVE A MERGE POLICY ON DISK. `AgentPane.prepare` wraps
+    // `installWorktreeGuard` in a `try/catch` that only warns, then calls `installAgentHooks`
+    // unconditionally — and the compose below applies the FULL posture, `bypassPermissions`
+    // included. Written by BOTH installers for exactly the reason `merge_permission_posture` is:
+    // otherwise a failed guard install on a worktree whose guard hook an earlier prepare already
+    // registered yields bypass ON, guard hook ACTIVE, and no `.sparkle/merge-policy.json` — which
+    // `worktree-guard.mjs` reads as "not Sparkle-managed, no opinion", reopening the §7 hole.
+    // Resolved BEFORE the lock: it shells out to git and must not hold the settings write lock.
+    let merge_plan = crate::worktree::plan_merge_policy_at(&worktree)?;
+
     let enabled = {
         let write_lock = settings_write_lock(&file);
         let _w = write_lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1333,9 +1343,17 @@ pub fn install_agent_hooks_sync(
         let cfg = plugins_layer_for(project_root.as_deref());
         let enabled = cfg.plugins.enabled();
         let merged = compose_agent_settings(existing.as_deref(), &emitter_cmd, &enabled);
+        // …and the deny rule that pairs with that policy file, in the same atomic write.
+        let merged = crate::worktree::merge_conditional_merge_deny_settings(
+            Some(&merged),
+            merge_plan.posture,
+        );
         // Atomic + JSON-validated: a concurrently-running Claude (this file drives its executable
         // hooks) must never read a truncated/partial write, and we refuse to clobber invalid JSON.
         atomic_write_settings(&file, &merged)?;
+        // ONLY NOW may a relaxation be recorded — see `commit_merge_policy`. Inside the lock, so a
+        // concurrent installer cannot read a policy file that disagrees with the settings on disk.
+        crate::worktree::commit_merge_policy(&merge_plan)?;
         enabled
     };
 

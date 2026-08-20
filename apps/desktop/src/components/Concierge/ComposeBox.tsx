@@ -144,6 +144,9 @@ import { classifyFocusOwner } from "../../voice/dictationFocus";
 import { log } from "../../logger";
 import {
   CONCIERGE_THREAD_TESTID,
+  COMPOSE_FONT_SIZE,
+  COMPOSE_LINE_HEIGHT,
+  COMPOSE_PAD_Y,
   composeDragH,
   composeDragReleasesManual,
   composeRenderH,
@@ -165,7 +168,10 @@ import {
   type MentionAgent,
 } from "./mentions";
 import { classifyComposerRoute } from "./composerRoute";
-import { TERM_BODY_BASE_SIZE, TERM_BODY_FONT } from "../terminalChrome";
+// The FAMILY only — the terminal-aimed face deliberately keeps the compose box's own font SIZE, so
+// the ten-line height cap means the same thing whichever way a draft is aimed. See
+// COMPOSE_TEXT_METRICS_TERMINAL.
+import { TERM_BODY_FONT } from "../terminalChrome";
 import { MentionMirror, MENTION_MIRROR_SKIP_ATTR } from "./MentionMirror";
 import { SendModeTray, type SendTrayModel } from "./SendModeTray";
 import {
@@ -230,8 +236,17 @@ export const CONCIERGE_TEXTAREA_TEXT_WIDTH = 360 - 24 - 63 - 8 - 26;
  *  out over the composer's neighbours instead. Belt and braces: the floor means it should never
  *  actually bite. */
 const PLACEHOLDER_INSET = { top: 11, left: 13, right: 13, bottom: 11 };
-/** Must match the textarea's own type ramp below, or the overlay won't sit on row one. */
-const PLACEHOLDER_TYPE = { fontFamily: "inherit", fontSize: 13, lineHeight: 1.4 };
+/** Must match the textarea's own type ramp below, or the overlay won't sit on row one.
+ *
+ *  TAKEN FROM THE HEIGHT ENGINE rather than written here, because the ten-line cap is computed from
+ *  these same two numbers. They were two independent copies — 13 × 1.4 here, a rounded `19` per line
+ *  there — which made the cap describe a box 0.4 lines taller than the one being drawn, and left a
+ *  retune of the type free to move the text without moving the cap. */
+const PLACEHOLDER_TYPE = {
+  fontFamily: "inherit",
+  fontSize: COMPOSE_FONT_SIZE,
+  lineHeight: COMPOSE_LINE_HEIGHT,
+};
 
 /**
  * The textarea's TEXT GEOMETRY, in one object because two elements have to agree on it exactly.
@@ -250,11 +265,11 @@ const PLACEHOLDER_TYPE = { fontFamily: "inherit", fontSize: 13, lineHeight: 1.4 
  *  component below — and because the layout effect must put it back to exactly this before reading
  *  `scrollHeight`, which counts padding. Exported so a test can model that measurement honestly
  *  rather than stubbing a constant height that no padding can move. */
-export const COMPOSE_TEXT_PAD_BOTTOM = 10;
+export const COMPOSE_TEXT_PAD_BOTTOM = COMPOSE_PAD_Y;
 
 const COMPOSE_TEXT_METRICS: CSSProperties = {
   fontFamily: "inherit",
-  fontSize: 13,
+  fontSize: COMPOSE_FONT_SIZE,
   lineHeight: PLACEHOLDER_TYPE.lineHeight,
   padding: `${COMPOSE_TEXT_PAD_BOTTOM}px 12px`,
   // The border is `transparent` rather than absent on purpose — see the textarea's own note below;
@@ -295,10 +310,17 @@ const COMPOSE_TEXT_METRICS: CSSProperties = {
  * but not the mirror would slide every fill off the word it belongs to — silently, because a
  * misaligned pill still renders.
  */
+// THE FAMILY SWAPS, THE SIZE DOES NOT — and the size is the half the height cap depends on.
+// `COMPOSE_CAP_H` is ten lines of `COMPOSE_FONT_SIZE × COMPOSE_LINE_HEIGHT`, so a face that set its
+// own size would give the founder ten lines while typing at Sparkle and some other number while
+// aimed at a terminal, which is precisely the "ten lines no matter what" promise this cap makes.
+// The two agree today (`TERM_BODY_BASE_SIZE` is also 13) — that agreement is exactly what would
+// break silently the day someone retunes the terminal ramp, so it is pinned rather than relied on.
+// Nothing about the swap's purpose is lost: the TYPEFACE is what says where the words are going.
 const COMPOSE_TEXT_METRICS_TERMINAL: CSSProperties = {
   ...COMPOSE_TEXT_METRICS,
   fontFamily: TERM_BODY_FONT,
-  fontSize: TERM_BODY_BASE_SIZE,
+  fontSize: COMPOSE_FONT_SIZE,
   fontWeight: 400,
 };
 
@@ -583,6 +605,7 @@ export function ComposeBox({
   sendChord = DEFAULT_SEND_CHORD,
   onComposedText,
   onMentionComposing,
+  onPasted,
   registerSubmit,
   quote = null,
   onRemoveQuote,
@@ -736,6 +759,22 @@ export function ComposeBox({
    * rule. Optional like every other seam here: a box mounted without the rail simply never asks.
    */
   onMentionComposing?: (composing: boolean) => void;
+  /**
+   * The user PASTED into the box — the auto-send countdown must start over from full
+   * (sparkle-3kqg2v). Fired once per paste gesture, with no argument: the fact is the gesture, not
+   * what it carried.
+   *
+   * ── EVERY PASTE, INCLUDING THE ONE THAT BECOMES A PILL ───────────────────────────────────────
+   * {@link onPaste} has two branches — a short paste falls through to the textarea's native insert
+   * and a long one is collapsed into a block — and only the first of them changes `text`. Reporting
+   * from the text would therefore miss exactly the pastes big enough to be worth reading before
+   * they go out, which is the wrong half to lose. So this fires ahead of the branch, on both.
+   *
+   * Deliberately NOT folded into {@link onComposedText}: a paste and an arriving dictation chunk
+   * are the same string change and must do opposite things to the clock (see useAutoSend's
+   * `draftGrewSeq`). Optional like every other seam here — a box mounted without the rail never asks.
+   */
+  onPasted?: () => void;
   /**
    * Hand the host this box's submit, so the auto-send rail can fire the SAME path the button does.
    *
@@ -1142,6 +1181,10 @@ export function ComposeBox({
   // undo stack included.
   const onPaste = (e: ReactClipboardEvent<HTMLTextAreaElement>) => {
     const pasted = e.clipboardData.getData("text/plain");
+    // AHEAD OF THE PILL BRANCH, so the countdown restarts for a long paste as well as a short one —
+    // see `onPasted`. Ahead of the empty check too: a paste that carries no text/plain is still the
+    // user reaching for the keyboard mid-countdown, and delaying a send is the safe direction.
+    onPasted?.();
     if (!shouldPasteAsPill(pasted)) return; // native paste
     e.preventDefault();
     setTextBlocks((prev) => [...prev, collapseText(nextId("blk"), pasted)]);
@@ -1465,6 +1508,15 @@ export function ComposeBox({
   }, [
     text,
     interim,
+    // THE COLUMN'S WIDTH — because `scrollHeight` is a WRAPPED height, and wrapping is what the
+    // width changes. This is the dependency that makes "ten lines no matter what the width is" true
+    // of the CONTENT as well as of the cap (see COMPOSE_CAP_H's note on why the cap itself is
+    // width-independent). Without it the box keeps the height it measured at the OLD width: narrow
+    // the concierge column and the same draft rewraps to more lines inside a box still sized for
+    // fewer, so it scrolls with room to spare — and it stays that way until the next keystroke
+    // happens to re-run this effect. The user resizing a column is not typing, so nothing else
+    // re-measures for them.
+    columnWidth,
     // The SPACER's own size. It is written by this effect and applied on the next render, so without
     // re-running here the pin above would scroll against the range the box had one phrase ago and
     // stop short of the newest words. Settles in two passes: the second finds the same measurement

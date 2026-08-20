@@ -1,6 +1,6 @@
 [package]
 name = "sparkle"
-version = "0.110.1"
+version = "0.119.0"
 edition = "2021"
 description = "Sparkle desktop (macOS)"
 license = "Apache-2.0"
@@ -80,6 +80,10 @@ subtle = "2"
 sherpa-onnx = "1.13.3"
 cpal = "0.15"
 ureq = "2"
+# Publish-destination URL validation (publish_url.rs). Already in the tree transitively via tauri;
+# declared here because `[publish]` validation must match on the parsed `Host` enum rather than on
+# `host_str()`, which returns an IPv6 literal WITH brackets and so cannot be string-compared.
+url = "2"
 # Best-effort secret redaction of the log tail we attach to support tickets (support.rs). Already
 # in the tree transitively; declared here so support.rs can use it directly.
 regex = "1"

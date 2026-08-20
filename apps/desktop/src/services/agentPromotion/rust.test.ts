@@ -132,13 +132,18 @@ describe("command wrappers", () => {
   it("invokes promotion_preflight with camelCase arg keys Tauri maps to snake_case params", () => {
     const { invoker, calls } = fakeInvoker({ promotion_preflight: { branch: "b", has_remote: true } });
     return promotionPreflight(
-      { root: "/r", agentId: "a1", worktree: "/wt", baseBranch: "main" },
+      { root: "/r", agentId: "a1", projectId: "p1", worktree: "/wt", baseBranch: "main" },
       invoker,
     ).then((p) => {
       expect(calls[0]!.cmd).toBe("promotion_preflight");
+      // `toEqual` on the WHOLE map, not a subset — a key Rust requires and TS omits is exactly how
+      // this broke (roborev 65189): `project_id` became a required non-`Option` param and only the
+      // dialog's preview call site was updated, so every real promotion failed at its first step.
+      // This test cannot see the Rust signature, so the map it pins must at least be exhaustive.
       expect(calls[0]!.args).toEqual({
         root: "/r",
         agentId: "a1",
+        projectId: "p1",
         worktree: "/wt",
         baseBranch: "main",
       });
@@ -251,7 +256,10 @@ describe("command wrappers", () => {
   it("propagates a Rust error rather than swallowing it", async () => {
     const invoker = vi.fn().mockRejectedValue("not a git repository") as unknown as Invoker;
     await expect(
-      promotionPreflight({ root: "/r", agentId: "a", worktree: "/wt", baseBranch: "main" }, invoker),
+      promotionPreflight(
+        { root: "/r", agentId: "a", projectId: "p1", worktree: "/wt", baseBranch: "main" },
+        invoker,
+      ),
     ).rejects.toBe("not a git repository");
   });
 });

@@ -54,6 +54,7 @@ import { suggestedRepliesFor } from "./services/suggestions/attentionReplies";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { withDismissedAlerts, alertControlKind } from "./engine/alertDismissal";
 import { isInMotion } from "./engine/inMotion";
+import { isActivityStale } from "./engine/activityFreshness";
 import {
   rollupDotAccessor,
   withWorkerRollupGreen,
@@ -65,6 +66,8 @@ import { withUnmergedWork } from "./engine/unmergedAttention";
 import { withNewAgentCalm } from "./engine/newAgentAttention";
 import { withDeadSessionCalm } from "./engine/deadSessionAttention";
 import { deathCauseForAgent } from "./services/deadSessionRegistry";
+import { isHumanBlockedIn, type NudgeFlagSnapshot } from "./services/humanBlockFor";
+import { nudgeFlagsSnapshot } from "./services/authRecovery";
 import type { DeathCause } from "./engine/deathTypes";
 import { useNewAgentCalm } from "./hooks/useNewAgentCalm";
 import { withBlockedPromptGrace, windowPromptGraceLedger } from "./engine/blockedPromptGrace";
@@ -153,6 +156,20 @@ export function publishedStatusFor(
    *  green-while-delegating without passing anything, while `composeRollup` itself stays pure.
    *  `false` from it means "no live background work", never "we did not look". See bead sparkle-262p7. */
   hasBackgroundTasksOf: (id: string) => boolean = hasLiveBackgroundTasksForAgent,
+  /** The nudger flag table — which agents have answered that a PERSON is blocking them.
+   *
+   *  ⚠️ A SNAPSHOT, NOT A PREDICATE, AND THE TYPE IS THE POINT (roborev 65465). Its neighbour
+   *  `hasBackgroundTasksOf` is `(id: string) => boolean` and so was this; the two were ADJACENT and
+   *  IDENTICALLY TYPED at the end of a 12-argument positional call, so a parameter inserted above or
+   *  a dropped placeholder would slide this into that slot and TYPECHECK CLEANLY — every
+   *  human-blocked agent silently read as "has live background work", and the exemption gone, on the
+   *  exact path it was added for. A `ReadonlyMap` cannot be mistaken for a function, so that
+   *  mis-wiring is now a compile error instead of a silent behaviour change.
+   *
+   *  Defaults to the live table at this OUTERMOST boundary, exactly as `deathCauseOf` and
+   *  `hasBackgroundTasksOf` do, so every production caller drives the real exemption without passing
+   *  anything while `composeRollup` itself stays pure. */
+  nudgeFlags: NudgeFlagSnapshot = nudgeFlagsSnapshot(),
 ): StatusMap {
   const { published, dotOf } = composeRollup(
     agents,
@@ -166,6 +183,7 @@ export function publishedStatusFor(
     isFinishedOf,
     deathCauseOf,
     hasBackgroundTasksOf,
+    nudgeFlags,
   );
   return withWorkerRollupGreen(agents, published, dotOf, promoted);
 }
@@ -207,6 +225,20 @@ export function rollupViewFor(
    *  reads the background-promoted map, so a column that skipped this would paint an idle-but-
    *  delegating head gray while every other surface had turned it green. */
   hasBackgroundTasksOf: (id: string) => boolean = hasLiveBackgroundTasksForAgent,
+  /** The nudger flag table — which agents have answered that a PERSON is blocking them.
+   *
+   *  ⚠️ A SNAPSHOT, NOT A PREDICATE, AND THE TYPE IS THE POINT (roborev 65465). Its neighbour
+   *  `hasBackgroundTasksOf` is `(id: string) => boolean` and so was this; the two were ADJACENT and
+   *  IDENTICALLY TYPED at the end of a 12-argument positional call, so a parameter inserted above or
+   *  a dropped placeholder would slide this into that slot and TYPECHECK CLEANLY — every
+   *  human-blocked agent silently read as "has live background work", and the exemption gone, on the
+   *  exact path it was added for. A `ReadonlyMap` cannot be mistaken for a function, so that
+   *  mis-wiring is now a compile error instead of a silent behaviour change.
+   *
+   *  Defaults to the live table at this OUTERMOST boundary, exactly as `deathCauseOf` and
+   *  `hasBackgroundTasksOf` do, so every production caller drives the real exemption without passing
+   *  anything while `composeRollup` itself stays pure. */
+  nudgeFlags: NudgeFlagSnapshot = nudgeFlagsSnapshot(),
 ): { own: StatusMap; dotOf: (id: string) => RollupDot } {
   const { own, dotOf } = composeRollup(
     agents,
@@ -220,6 +252,7 @@ export function rollupViewFor(
     isFinishedOf,
     deathCauseOf,
     hasBackgroundTasksOf,
+    nudgeFlags,
   );
   return { own, dotOf };
 }
@@ -267,6 +300,17 @@ function composeRollup(
    *  ("no background work"), which promotes nothing: exactly today's behaviour for a caller with no
    *  evidence to give. The real registry is wired in at the OUTERMOST boundaries above. */
   hasBackgroundTasksOf: (id: string) => boolean = () => false,
+  /** The nudger flag table. Injected for the same reason `deathCauseOf` and `hasBackgroundTasksOf`
+   *  are: this composition is consumed by `buildConciergeFeed`, which documents itself as PURE, and
+   *  the backing table is module state. Defaults to EMPTY, which exempts nothing — exactly today's
+   *  behaviour for a caller with no evidence to give. The real table is wired in at the two
+   *  OUTERMOST boundaries above.
+   *
+   *  ⚠️ THIS WAS AN IMPORT INSIDE THIS FUNCTION FOR ONE COMMIT (roborev 65408), which made the
+   *  composition impure — the test files driving it began depending on whatever flag state a prior
+   *  test had left behind — and left the production wiring reachable by no test at all. It is also a
+   *  MAP rather than a predicate on purpose; see the boundary parameters above (roborev 65465). */
+  nudgeFlags: NudgeFlagSnapshot = new Map(),
 ): { published: StatusMap; own: StatusMap; dotOf: (id: string) => RollupDot } {
   // (0): a spawned-but-never-briefed agent is `new`, not red. FIRST, on the RAW map, so the two
   // bubbles below never carry a briefless agent's false red up to its orchestrator — a bubbled red
@@ -342,6 +386,10 @@ function composeRollup(
       agents,
       withDismissedAlerts(agents, withUnmergedWork(agents, bubbled, stageOf)),
       thrashOf,
+      // ⚠️ THIS CALLER WAS MISSING IT (roborev 65373), and only making the parameter REQUIRED
+      // surfaced that. A stated human block must survive the nudge-loop demotion on the
+      // notification path too — otherwise the dot and the banner disagree about the same row.
+      (id) => isHumanBlockedIn(nudgeFlags, id),
     ),
     calm,
     isFinishedOf,
@@ -384,13 +432,16 @@ export const truncateDetail = (raw: string): string => {
 // into a needs-you (waiting/approval) state, it almost certainly describes the current ask — so we
 // use it as the notification body and SKIP the credit-metered summarize_attention screen-scrape.
 //
-// `activity` carries NO timestamp today (adding one would touch projectStore/types, outside this
-// file's ownership — see PRD/feat__claude-code-drives-.md), so we derive its age purely
-// from state visible HERE: this effect re-runs whenever the owned `agents` array changes, and
-// `setAgentActivity` produces a new array, so we can observe activity CHANGES across runs and stamp
-// when each one first appeared (stampActivity). First sighting of an id is stamped `at = 0` —
-// "unknown age" — so an activity restored from a previous session's persisted state is treated as
-// stale (conservative: we keep calling Haiku) until the agent actually re-narrates in this session.
+// `activity` now carries a DURABLE timestamp: `AgentTab.activityAt`, stamped by setAgentActivity
+// (bead sparkle-s8y5t6). When present it is authoritative — it is written at narration time and
+// survives a restart — so `selfReportBody` reads it directly. The in-memory `stampActivity` map
+// below is the FALLBACK for legacy/restored records that carry no `activityAt`: it derives age from
+// when THIS window first observed the string (this effect re-runs whenever the owned `agents` array
+// changes, and `setAgentActivity` produces a new array). First sighting of an id is stamped `at = 0`
+// — "unknown age" — so a stamp-less activity restored from a previous session is treated as stale
+// (conservative: we keep calling Haiku) until the agent re-narrates in this session. The durable
+// stamp fixes exactly the case this fallback cannot: a narration written just before the window
+// mounted reads as fresh from `activityAt` instead of being discarded as unknown-age.
 //
 // WHY 2 MINUTES AND NOT 10 SECONDS (roborev 53476, 2026-07-27). This window has to match the
 // narration cadence the persona actually asks for, and that cadence changed. The 10s original was
@@ -445,6 +496,7 @@ export function selfReportBody(
   stamp: ActivityStamp | undefined,
   now: number,
   status: AgentTabStatus | undefined,
+  activityAt?: number,
 ): string | null {
   // Only substitute the activity narration for a WAITING body, where "what I'm doing now" is a
   // reasonable proxy for the question. For APPROVAL we must NOT — the body has to describe the
@@ -454,6 +506,14 @@ export function selfReportBody(
   if (status !== "waiting") return null;
   const text = (activity ?? "").trim();
   if (!text) return null;
+  // DURABLE STAMP WINS. `activityAt` is written at narration time and survives a restart, so when it
+  // is present it is the authoritative age — use it and ignore the fragile in-window observation
+  // stamp entirely (bead sparkle-s8y5t6). A report is usable only while it is not stale by the
+  // notification window; `isActivityStale` also folds a missing/future stamp to stale for us.
+  if (activityAt !== undefined) {
+    return isActivityStale(activityAt, now, ACTIVITY_FRESH_MS) ? null : text;
+  }
+  // FALLBACK for a legacy/restored record with no durable stamp: the in-window observation stamp.
   if (!stamp || stamp.at <= 0) return null; // unknown age → treat as stale
   if (now - stamp.at > ACTIVITY_FRESH_MS) return null; // stale narration → Haiku fallback
   return text;
@@ -733,7 +793,13 @@ export function useAttentionNotifications(): void {
         // this needs-you transition), prefer that text as the body and skip the paid Haiku scrape.
         // Captured synchronously here — the ref reflects this tick's stamping above. Null for stale/
         // absent narration (and for non-ask statuses), which falls through to Haiku exactly as before.
-        const selfReported = selfReportBody(agent.activity, activitySeen.current[id], now, st);
+        const selfReported = selfReportBody(
+          agent.activity,
+          activitySeen.current[id],
+          now,
+          st,
+          agent.activityAt,
+        );
         void (async () => {
           // The agent's ask, summarized once and shared by phone + banner. A fresh self-report wins;
           // otherwise only the two "ask" statuses are summarized (cost control), and any miss/empty/

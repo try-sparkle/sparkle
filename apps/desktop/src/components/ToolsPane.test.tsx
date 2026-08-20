@@ -177,7 +177,7 @@ describe("ToolsPane", () => {
     expect(screen.getByText("Your tools")).toBeTruthy();
     expect(screen.getByText("Built into Sparkle")).toBeTruthy();
 
-    // Exactly the seventeen toggleable tools carry a switch. Superpowers is one of them: it used
+    // Exactly the eighteen toggleable tools carry a switch. Superpowers is one of them: it used
     // to be an info-only showcase row, and is a real [plugins] toggle since the plugin pre-enable
     // work — a stale showcase copy would claim Sparkle ships something the user can't turn off.
     // The seven "sparkle*" rows come from Sparkle's own published marketplace.
@@ -185,12 +185,16 @@ describe("ToolsPane", () => {
     // Hand-listed on purpose, unlike the derived counts further down: this is the one assertion
     // that says WHICH rows the pane offers, so a new plugin must be added here deliberately. A
     // count derived from the store's key set would accept any row set at all.
-    expect(screen.getAllByRole("switch")).toHaveLength(17);
+    expect(screen.getAllByRole("switch")).toHaveLength(18);
     for (const name of [
       "Deepgram voice",
       "Guardrails",
       "Roborev",
       "Builder Index",
+      // The SECOND reporting destination, and it sits beside the Builder Index deliberately —
+      // these are competing leaderboards and the pane is where a user chooses either, both, or
+      // neither.
+      "Straude",
       "Superpowers",
       "Frontend design",
       "Guardrails skill",
@@ -207,6 +211,16 @@ describe("ToolsPane", () => {
     ]) {
       expect(screen.getByRole("switch", { name })).toBeTruthy();
     }
+
+    // The two reporting destinations sit NEXT TO each other. The founder's stated test for this
+    // feature is being able to turn either on from one place, so ordering is behaviour here, not
+    // decoration.
+    const switches = screen.getAllByRole("switch");
+    const names = switches.map((s) => s.getAttribute("aria-label") ?? s.textContent ?? "");
+    const bi = names.findIndex((n) => n.includes("Builder Index"));
+    const st = names.findIndex((n) => n.includes("Straude"));
+    expect(bi).toBeGreaterThanOrEqual(0);
+    expect(st).toBe(bi + 1);
 
     // Showcase tools are info-only: present by name, badge shown, but NO switch.
     expect(screen.getByText("Claude Code")).toBeTruthy();

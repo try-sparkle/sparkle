@@ -382,7 +382,7 @@ describe("the seam is reachable in the five-column cockpit", () => {
   });
 
   it("still resizes once the LEFT pair has shipped", () => {
-    // `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`. The concierge is between two pairs now, and its
+    // `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`. The concierge is between two pairs now, and its
     // seam control is mounted on one side of it only — so this is the configuration the report came
     // from, not the single-pair one every other test renders.
     useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
@@ -1145,6 +1145,52 @@ describe("the visual surfaces ask for widths the capture viewport can paint", ()
         Number(width),
       );
       unmount();
+    }
+  });
+});
+
+describe("the concierge grip clears the pair's tab strip", () => {
+  // THE FOUNDER'S REPORT: "those 6 dots are placed in a different place vertically on the concierge
+  // and the build columns. They should be in the same spot vertically."
+  //
+  // The build rail is absolute INSIDE the build column, and that column starts below `.pairtabs`;
+  // this rail spans the whole row. Both used the same 34px offset from their own rail, so on screen
+  // the build grip sat lower by exactly the strip's height. The build grip cannot rise without
+  // overhanging the project tabs, so this one comes down to meet it.
+  //
+  // The strip is content-sized (`flex: 0 0 auto`), so its height is a layout outcome — hence a
+  // `calc()` against a published custom property rather than a constant. `ResizeObserver` never
+  // fires in jsdom, so the property is never set here and the fallback `0px` applies; the RESOLVED
+  // offset is a browser fact and is deliberately not claimed by this suite. What is assertable, and
+  // what actually distinguishes the fix, is that each rail reads the strip of the pair BESIDE it.
+  const zoneTop = (testId: string) =>
+    screen.getByTestId(`${testId}-zone`).style.top;
+
+  it("reads the RIGHT pair's strip on the right-hand rail", () => {
+    render(<Workspace />);
+    expect(zoneTop("concierge-pull-tab")).toBe("calc(var(--pairtabs-h-right, 0px) + 34px)");
+  });
+
+  it("reads each pair's OWN strip, with both rails mounted at once", () => {
+    // MOUNT BOTH, because that is the only state in which a swapped variable is visible: with one
+    // pair there is a single rail and either wiring looks identical. The left rail exists only in
+    // the two-pair cockpit.
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+    render(<Workspace />);
+    expect(screen.getByTestId("workspace-shell").getAttribute("data-pairs")).toBe("2");
+
+    expect(zoneTop("left-pair-pull-tab")).toBe("calc(var(--pairtabs-h-left, 0px) + 34px)");
+    expect(zoneTop("concierge-pull-tab")).toBe("calc(var(--pairtabs-h-right, 0px) + 34px)");
+    // ...and they are not the same property, which is the swap this pins.
+    expect(zoneTop("left-pair-pull-tab")).not.toBe(zoneTop("concierge-pull-tab"));
+  });
+
+  it("publishes a height property per side, not one shared between the pairs", () => {
+    // A single `--pairtabs-h` would be last-writer-wins between two pairs whose strips can differ.
+    useUiStore.setState({ pairAssignment: { p1: "left" }, leftProjectId: "p1" } as never);
+    render(<Workspace />);
+    for (const t of ["left-pair-pull-tab", "concierge-pull-tab"]) {
+      expect(zoneTop(t)).toMatch(/^calc\(var\(--pairtabs-h-(left|right), 0px\) \+ 34px\)$/);
     }
   });
 });

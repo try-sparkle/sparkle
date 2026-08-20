@@ -6,6 +6,7 @@
 // read site is what keeps a stale id from silently zeroing the concierge or aiming the compose box
 // at nothing.
 import { agentDisplayName } from "./agentDisplayName";
+import type { CableState } from "./cable";
 import type { AgentTab, Project } from "../types";
 
 /**
@@ -79,6 +80,78 @@ export function decidePromptTarget(
   // one (AGENTS.md: user-facing copy is code — a refusal string outlives the limit it described).
   return {
     target: { projectId: project.id, agentId: agent.id, name: agentDisplayName(agent) },
+  };
+}
+
+// ══ WHERE A MOUNTED SEND GOES — READ FROM THE CABLE, NOT FROM WHAT IS ON SCREEN ═════════════════
+//
+// THE DEFECT THIS EXISTS TO MAKE UNREPRESENTABLE (bead sparkle-9gsjqm, reported repeatedly). The
+// concierge's ROUTING mount used to be `wired !== "off" ? promptTarget?.agentId : null` — i.e. the
+// cable ANDed with `decidePromptTarget`'s answer — and three of the four predicates behind that
+// expression are about what the shell is DRAWING, not about what the founder mounted:
+//
+//   • `useEffectiveWired` is a DRAWING projection ("USE THIS FOR VISUAL TREATMENT ONLY", its own
+//     header) whose sparkle arm reads `activeSpecial === "sparkle"` — a surface predicate;
+//   • `isPromptableTarget` requires a resolvable LIVENESS, which is transient and routine;
+//   • `decidePromptTarget`'s `special` arm is non-null only while the Improve-Sparkle pane is the
+//     visible surface, and it WINS over the roster path.
+//
+// Two states fell out, and the founder hit both. Mount Improve Sparkle, then navigate the right
+// column anywhere else: the special target evaporates, the routing mount goes null — while the cable
+// stays patched forever, because `pinnedFarEndIsGone` deliberately exempts the app-owned agent — so
+// every subsequent message became a concierge turn with no refusal and no notice. Mount a BUILD
+// agent, then open the Improve-Sparkle pane: the special target WINS, and his words re-aim at
+// `__sparkle_self__` because a different pane became visible.
+//
+// So the routing mount is resolved from the CABLE'S OWN PIN and nothing else. The pin is written by
+// exactly the gesture that mounts (`cableStore.patch`) and cleared by exactly the gestures that
+// unmount (`unbindCable`, `setOverlay`), so there is no surface predicate and no liveness read
+// between the founder's click and where his words go. A pane becoming visible is not a mounting
+// gesture, and this function cannot be told that it is.
+export interface MountedAgentFacts {
+  /** What the column calls this agent — the same name the "Chatting with ● <Agent>" chip renders. */
+  name: string;
+  /** `""` for the app-owned Sparkle agent, which owns no project row (Workspace's `sparkleTarget`,
+   *  and `conciergeDispatch`'s "PTY id === agent id"). */
+  projectId: string;
+}
+
+/**
+ * WHERE A MOUNTED SEND GOES. Three arms, and the third is the point of the type.
+ *
+ * `unresolvable` is not a synonym for `none`, and collapsing the two is the bug: a pinned cable
+ * whose agent this window cannot name is still a MOUNT — the founder made the gesture, the shell is
+ * drawing the connection — so a send under it must be refused where he can see it, never quietly
+ * re-decided as a concierge turn. Flattening it to `null` is precisely what turned his words into a
+ * `via: "default"` route with nothing on screen to say so.
+ */
+export type MountResolution =
+  /** The cable is unpatched, or patched with no pin at all (the dev visual fixtures). */
+  | { kind: "none" }
+  /** Patched, pinned, and this window can name the far end. */
+  | { kind: "mounted"; target: PromptTarget }
+  /** Patched and pinned at an agent this window cannot name right now. */
+  | { kind: "unresolvable"; agentId: string };
+
+/**
+ * @param cable The RAW cable store value — never the `useEffectiveWired` projection, which is a
+ *              drawing rule and says "off" for states the cable is very much patched in.
+ * @param lookup This window's facts for a pinned id, or `undefined` when it has none. The app-owned
+ *               Sparkle agent is deliberately never a roster row (services/knownAgents), so the
+ *               caller resolves it through its own namespace rather than through `project.agents`.
+ */
+export function resolveMountedTarget(
+  cable: Pick<CableState, "wired" | "agentId">,
+  lookup: (agentId: string) => MountedAgentFacts | undefined,
+): MountResolution {
+  // BOTH halves, even though `patchCable`/`unbindCable` write them together: a caller can hand us a
+  // hand-built pair, and "wired but unpinned" is a real state the dev fixtures produce.
+  if (cable.wired === "off" || cable.agentId === null) return { kind: "none" };
+  const facts = lookup(cable.agentId);
+  if (!facts) return { kind: "unresolvable", agentId: cable.agentId };
+  return {
+    kind: "mounted",
+    target: { projectId: facts.projectId, agentId: cable.agentId, name: facts.name },
   };
 }
 

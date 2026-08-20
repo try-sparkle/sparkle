@@ -108,6 +108,8 @@ export const PLAN_COLUMN_Z = 26;
 // of geometry the whole selected-row treatment is built on.
 //
 //   BUILD_COLUMN_Z    the Build column (`AgentSidebar`'s docked root, `Workspace.tsx`'s ② slot).
+//   EPICS_COLUMN_Z    the Epics column, one step above it so its pull tab's overhang is not clipped
+//                     by the build column it overhangs into — see the constant's own note.
 //   TERMINAL_PANE_Z   an agent pane inside the terminal stage — what `paneVisibilityStyle` puts on
 //                     the VISIBLE pane to keep it above the inert hidden ones it overlaps.
 //
@@ -123,3 +125,24 @@ export const PLAN_COLUMN_Z = 26;
 // The ordering — not the values — is the contract, and `paneVisibility.test.ts` asserts it.
 export const TERMINAL_PANE_Z = 1;
 export const BUILD_COLUMN_Z = 2;
+/**
+ * The EPICS column — one step ABOVE the Build column, and the step is the whole reason it exists.
+ *
+ * This column's pull tab is an absolute child anchored at its BUILD-FACING edge, and the tab
+ * chiclet is centred on that 6px rail — so roughly a third of it overhangs the column's border box
+ * into the build column beside it. Both roots carry a z-index and so are stacking contexts; at
+ * EQUAL z-index the winner is tree order, and `Workspace` renders Epics BEFORE `AgentSidebar` on
+ * both pairs (`row-reverse` mirrors layout, not the tree). So with a shared value the build
+ * column's opaque `deepForest` paints over the overhang and the grip renders sliced flat at the
+ * boundary.
+ *
+ * `AgentSidebar`'s own tab has the same overhang and never shows it, but only because
+ * `BUILD_COLUMN_Z` already outranks `TERMINAL_PANE_Z` on the side it overhangs into. There is no
+ * equivalent margin here, so it has to be stated.
+ *
+ * NOT solvable from inside the column: `PULL_TAB_RAIL_Z` is local to this column's own stacking
+ * context and cannot lift anything past a sibling.
+ *
+ * As above, the ORDERING is the contract, not the values.
+ */
+export const EPICS_COLUMN_Z = 3;

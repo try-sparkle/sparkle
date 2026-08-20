@@ -16,11 +16,18 @@ vi.mock("./branchStatus", () => ({
   deleteAgentBranch: vi.fn(),
   deleteAgentBranchIfMerged: vi.fn(),
 }));
+// STRICT FACTORY — anything `sendToBuild` imports from `./beads` must appear here, or the call site
+// throws a TypeError that its own `.catch()` cannot intercept (the error is on the call, not in the
+// returned promise). `labelBead`/`PROMOTED_LABEL` are used by the epic-mode handoff to stamp the
+// sweep's watch marker; this file's cases happen to use `mode: "task"`, which skips that path, so
+// omitting them would leave a trap for whoever adds the first epic-mode case here.
 vi.mock("./beads", () => ({
   closeBead: vi.fn(),
   markBeadDelivered: vi.fn(),
   recordBeadMergeSha: vi.fn(),
   deleteBead: vi.fn(),
+  labelBead: vi.fn(() => Promise.resolve()),
+  PROMOTED_LABEL: "promoted-to-build",
 }));
 vi.mock("./worktree", () => ({ removeAgentWorkspace: vi.fn() }));
 

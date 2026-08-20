@@ -17,9 +17,12 @@ import {
   getPin,
   getPreferredAccountId,
   isAccountExhausted,
+  markExhausted,
+  isAccountLiveSpent,
   signedInAccountIds,
   signedInFilterApplies,
   loginSiblingIds,
+  clobberedDefaultIds,
   type Account,
   type Usage,
   type Identity,
@@ -29,6 +32,7 @@ import {
 import { getAccountUsageLive } from "./accountUsage";
 import { claudeSessionAccounts } from "../preflight";
 import type { Ceiling } from "./headroom";
+import type { ConciergeFailureKind } from "../engine/conciergeFailureNotice";
 import {
   recordSelection,
   shouldLogSelection,
@@ -290,6 +294,12 @@ export async function chooseAccountForAgent(
       worktreePath: string,
       configDirs: string[],
     ) => Promise<string[]>;
+    /** Treat a CLOBBERED default (shared `$HOME/.claude` now signed into a different account, or a dir
+     *  a different account took over recently) as unhealthy for auto-pick, so a dedicated account is
+     *  preferred and routing goes AWAY from the fragile default (see {@link clobberedDefaultIds} /
+     *  {@link PickOptions.clobberedIds}). Opt-in — only the concierge sets it — so other callers are
+     *  unchanged. `leastBad` still returns the clobbered default when it is genuinely the only account. */
+    avoidClobberedDefault?: boolean;
   } = {},
 ): Promise<{ chosen: Account | null; state: AccountState }> {
   const state = await loadAccountState(opts);
@@ -336,6 +346,13 @@ export async function chooseAccountForAgent(
     // is the SAME per-login judgement `exhaustionOutlook` (AC8) and `switchRecommendation` use, so the
     // spawn gate cannot land agents on a quota those two already call spent.
     siblingIds: loginSiblingIds(state.accounts, state.identities),
+    // Only the concierge asks to avoid a clobbered default (`avoidClobberedDefault`); every other
+    // caller passes undefined, so `partitionAccounts` sees an absent set and behaves exactly as before.
+    // A pin still overrides this — `pickAccount` honours a pinned account even when clobbered, because
+    // a human chose it on purpose (the same override that already covers exhausted/near-cap pins).
+    clobberedIds: opts.avoidClobberedDefault
+      ? clobberedDefaultIds(state.accounts, state.identities)
+      : undefined,
   };
   // A pin only counts if it still names a REAL account. Branching on the pin's mere presence let a
   // STALE pin — one left behind by a deleted account — bypass everything below it: `pickAccount`
@@ -528,8 +545,25 @@ async function accountsHoldingTranscript(
 
 /** The first holder we may actually launch under, or undefined when none is usable.
  *
- *  The SAME two gates the fleet preference passes through: an account nobody signed into strands the
- *  agent at a login prompt, and an exhausted one strands it at a wall. */
+ *  THREE gates, the same three AUTO-PICK applies, so transcript affinity cannot resume a spawn under
+ *  an account a fresh pick would have refused:
+ *   1. SIGNED IN — an account nobody signed into strands the agent at a login prompt;
+ *   2. NOT AT THE OBSERVED WALL — an `exhaustedUntil` in the future strands it at a rate limit;
+ *   3. NOT LIVE-SPENT — Anthropic's OWN utilization (`isAccountLiveSpent`, ≥ `LIVE_AVOID_PERCENT`)
+ *      is the proactive-avoid signal `partitionAccounts` already excludes on. Resuming under a holder
+ *      Anthropic reports at ≥95% lands the agent ~5% from a wall it will hit within the session, then
+ *      move accounts MID-TASK (a proactive move has no stale-resume retry, by design) — worse than
+ *      moving now. This is the SAME move-and-warn the exhausted-holder case already makes; live-spent
+ *      is FACT, not the retired learned-ceiling estimate, so aligning the two is a tightening, not a
+ *      new heuristic.
+ *
+ *  This does NOT match `usablePreferredAccount`, which stops at gates 1–2: a human who explicitly
+ *  activated an account is entitled to keep using it while it is busy, and transcript affinity is an
+ *  AUTOMATIC continuity preference with no such choice to respect.
+ *
+ *  SAFE against emptying the pool: returning undefined only falls through to `autoPick`, which still
+ *  returns an account. When the live-spent holder is the ONLY account, `autoPick`'s all-excluded
+ *  fallback (`leastBad`) returns it anyway, so continuity is preserved and no spawn is blocked. */
 function firstUsableHolder(
   holders: Account[],
   state: AccountState,
@@ -543,7 +577,8 @@ function firstUsableHolder(
   return holders.find(
     (a) =>
       (!applies || base.signedInIds!.includes(a.id)) &&
-      !isAccountExhausted(state.usage, a.id, now),
+      !isAccountExhausted(state.usage, a.id, now) &&
+      !isAccountLiveSpent(a.id, base.live, base.siblingIds),
   );
 }
 
@@ -808,6 +843,144 @@ export function resetStickyAccounts(): void {
   lastResolvedAccount.clear();
 }
 
+/** How long a reactively-detected-dead account is benched so a sticky consumer rotates OFF it.
+ *
+ *  SHORT on purpose — this is a reactive NUDGE to move the concierge NOW, not the authoritative
+ *  reset window:
+ *   - For a QUOTA wall, `limitSync` reads the REAL reset instant from the account's own transcript
+ *     within one poll (`LIMIT_POLL_MS`) and EXTENDS the bench to it (`pendingExhaustions` only ever
+ *     lengthens a bench, never shortens one), so a short reactive bench can never make an account
+ *     return to the pool before its true reset.
+ *   - For an AUTH expiry there is no reset instant at all — the account is dead until the human
+ *     re-signs in — and recorded state cannot see the expiry, so nothing else will ever bench it.
+ *     A short bench lets it back into the pool once the window passes; stickiness keeps the consumer
+ *     on the healthy account it moved to, so a still-dead account is only ever re-picked (and
+ *     re-benched on its next failure) if that healthy account also dies in the meantime.
+ *  Long enough to outlast the immediate re-resolve below, short enough not to strand a recovered
+ *  account. */
+export const REACTIVE_BENCH_MS = 5 * 60_000;
+
+/** Outcome of {@link rotateStickyConsumerOffFailedAccount}. `rotated` is the side effect a caller or
+ *  test asserts; the rest is provenance for the ledger/logs and for the paired negative tests. */
+export interface StickyRotationResult {
+  rotated: boolean;
+  /** The account the consumer was parked on when the failure arrived, if any. */
+  from?: string;
+  /** The account it moved TO, when it rotated. */
+  to?: string;
+  /** Why it did NOT rotate — for logging and to let a test distinguish the guards. */
+  reason?:
+    | "not-unusable"
+    | "pinned"
+    | "nothing-resolved"
+    | "backend-unreadable"
+    | "no-healthy-alternative";
+}
+
+/**
+ * Reactively rotate a STICKY consumer (the concierge, Improve Sparkle) OFF the account it just
+ * failed under, when the failure proves that account is unusable — an expired OAuth session or a
+ * quota/rate-limit wall (bead sparkle-08mq3t).
+ *
+ * ══ WHY THE STICKY EVICTION IS NOT ENOUGH ON ITS OWN ══════════════════════════════════════════
+ * {@link autoPick} already moves a sticky key when its account stops being eligible — but "eligible"
+ * is judged from RECORDED state, and an OAuth expiry leaves NO trace there: the account's
+ * `.claude.json` still carries an `oauthAccount`, so {@link signedInAccountIds} still lists it and
+ * {@link eligibleAccounts} still calls it healthy. The concierge therefore stays pinned to a dead
+ * account and every turn fails with "OAuth session expired" — exactly the founder's report, with
+ * three healthy accounts sitting right there and no way out but restarting the app. Recorded state
+ * cannot detect this; the turn FAILURE is the only signal, so rotation is driven reactively from it.
+ *
+ * ══ HOW — REUSING THE EXISTING PREDICATE, NOT A NEW ONE ═══════════════════════════════════════
+ * The failed account, and its whole LOGIN group (one dead OAuth session kills every registration of
+ * it, and one wall belongs to the login, not the config dir — the same fan-out `limitSync` does),
+ * is benched via {@link markExhausted}. That is the one mechanism {@link eligibleAccounts} and
+ * {@link pickAccount} already honour, so the next resolution evicts it through `autoPick`'s ordinary
+ * keep-vs-repick path and lands on the lowest-usage healthy account. The re-resolve here moves the
+ * sticky pointer too, so the consumer's NEXT turn is already stable on the new account.
+ *
+ * ══ SAFETY — every guard is a way this must fail safely ═══════════════════════════════════════
+ *  - Only on a genuine unusability signal (`auth`/`quota`), never `unknown`: a transient 529 must
+ *    not evict a healthy account.
+ *  - A human PIN wins (Manual Override). A pinned consumer is left exactly where the human put it.
+ *  - It benches ONLY when a healthy alternative exists. If every other account is unusable too, it
+ *    does nothing: the consumer stays put and its next turn fails into the EXISTING sign-in path,
+ *    which is the correct dead-end. It never benches the fleet down to nothing and never manufactures
+ *    a null account.
+ *  - Best-effort and never throws: a rotation that cannot be arranged leaves selection untouched.
+ *
+ * Fire-and-forget from the failure handler — the failing turn is already lost; this makes the NEXT
+ * one land on a live account instead of requiring an app restart.
+ */
+export async function rotateStickyConsumerOffFailedAccount(
+  key: string,
+  kind: ConciergeFailureKind,
+  opts: { now?: number } = {},
+): Promise<StickyRotationResult> {
+  try {
+    // A transient/unclassified failure is NOT evidence the account is dead — do not evict on it.
+    if (kind !== "auth" && kind !== "quota") return { rotated: false, reason: "not-unusable" };
+    // A human's explicit Manual Override outranks reactive rotation.
+    if (getPin(key)) return { rotated: false, reason: "pinned" };
+    // The account the consumer actually ran under is its sticky selection. With nothing resolved yet
+    // there is no failed account to move off of.
+    const from = stickySelections.get(key);
+    if (!from) return { rotated: false, reason: "nothing-resolved" };
+
+    const now = opts.now ?? Date.now();
+    const state = await loadAccountState({ force: true, now });
+    // Unreadable backend: every account looks absent, so we can neither identify a healthy
+    // alternative nor trust that `from` is really dead. Leave selection alone.
+    if (state.failed) return { rotated: false, reason: "backend-unreadable" };
+
+    // The dead LOGIN group, not just the one config dir — a dead OAuth session or a walled quota is
+    // a property of the login, and benching one registration while its twin reads healthy would just
+    // rotate the concierge straight onto the sibling and re-hit the identical failure.
+    const siblings = loginSiblingIds(state.accounts, state.identities);
+    const deadIds = new Set(siblings.get(from) ?? [from]);
+
+    // "Is there a healthy alternative" is asked with the SAME options the re-resolve will use, so the
+    // two cannot disagree about what "healthy" means.
+    const base = {
+      signedInIds: signedInAccountIds(state.identities),
+      now,
+      ceilings: state.ceilings,
+      live: liveUsageRows(),
+      siblingIds: siblings,
+    };
+    const hasAlternative = eligibleAccounts(state.accounts, state.usage, base).some(
+      (a) => !deadIds.has(a.id),
+    );
+    // SAFETY: never bench the fleet down to nothing. With no healthy alternative, leave the consumer
+    // on its (dead) account so its next turn fails into the existing sign-in dead-end rather than a
+    // null-account spawn — the behaviour the founder's flow already relies on when truly everything
+    // is out.
+    if (!hasAlternative) return { rotated: false, from, reason: "no-healthy-alternative" };
+
+    // Bench the dead login group so the existing eligibility predicate evicts it. Best-effort per id;
+    // a failed write simply leaves that id in the pool, which the next failure re-attempts.
+    const until = now + REACTIVE_BENCH_MS;
+    await Promise.all(
+      [...deadIds]
+        .filter((id) => state.accounts.some((a) => a.id === id))
+        .map((id) =>
+          markExhausted(id, until).catch((e) =>
+            console.warn("reactive rotation: markExhausted failed for", id, e),
+          ),
+        ),
+    );
+    // Fresh usage now reflects the bench; re-resolve so `autoPick` evicts `from` and the sticky
+    // pointer moves to the healthy account, making the consumer's next turn stable.
+    invalidateAccountState();
+    const { chosen } = await chooseAccountForAgent(key, { force: true, now });
+    const to = chosen?.id;
+    return { rotated: !!to && to !== from, from, to };
+  } catch (e) {
+    console.warn("reactive rotation failed; leaving account selection unchanged", e);
+    return { rotated: false, reason: "backend-unreadable" };
+  }
+}
+
 /** Failure is DISTINCT from "the default account", and conflating them cost the concierge its
  *  conversation. `null` is a real answer — no accounts configured, or the default account, whose
  *  `configDir` is the empty string precisely to mean "export no override" (accounts.rs). `undefined`
@@ -832,7 +1005,7 @@ export type ResolvedConfigDir = string | null | undefined;
  *  degrade the account choice, it would kill the turn outright. */
 export async function accountConfigDirFor(
   key: string,
-  opts: { force?: boolean; now?: number } = {},
+  opts: { force?: boolean; now?: number; avoidClobberedDefault?: boolean } = {},
 ): Promise<ResolvedConfigDir> {
   try {
     const { chosen, state } = await chooseAccountForAgent(key, opts);
@@ -847,5 +1020,72 @@ export async function accountConfigDirFor(
   } catch (e) {
     console.warn("accountSelection: could not resolve an account; inheriting the default:", e);
     return undefined;
+  }
+}
+
+/**
+ * The healthy DEDICATED accounts the concierge turn may rotate to when its pinned account's OAuth
+ * expires, as their `CLAUDE_CONFIG_DIR`s, ranked best-first — handed to the Rust `concierge_turn` as
+ * `fallbackConfigDirs`. When the turn fails with the auth-expiry signature, Rust retries on the first
+ * of these instead of re-running the dead account (see `concierge.rs::plan_retry`), so a SINGLE auth
+ * failure becomes a rotated retry rather than a "sign in to Claude" dead-end.
+ *
+ * Built from the SAME selection primitives `pickAccount`/`eligibleAccounts` use, so it cannot develop
+ * a second definition of "healthy". Three exclusions, each deliberate:
+ *  - the PRIMARY's whole login group — Rust is rotating OFF it, and a sibling shares its dead OAuth;
+ *  - CLOBBERED defaults — the shared `$HOME/.claude` fragility this whole change guards against;
+ *  - the DEFAULT itself (empty `configDir`) — the concierge rotates to a real dedicated account, never
+ *    back onto the shared default, which is exactly what "prefer a dedicated, non-default account"
+ *    means. (Rust also skips empty dirs, so this is belt-and-braces.)
+ *
+ * Ordered by repeatedly asking `pickAccount` for the best of the remaining pool and dropping its whole
+ * login group, so the rescued turn lands on the lowest-usage account and no login is offered twice.
+ * Returns `[]` on an unreadable backend or when nothing healthy remains — the last-account guard: with
+ * no alternative, Rust surfaces the sign-in rather than benching the only account.
+ */
+export async function conciergeFallbackConfigDirs(
+  opts: { force?: boolean; now?: number } = {},
+): Promise<string[]> {
+  try {
+    const { chosen, state } = await chooseAccountForAgent(CONCIERGE_ACCOUNT_KEY, {
+      ...opts,
+      avoidClobberedDefault: true,
+    });
+    if (state.failed) return [];
+    const now = opts.now ?? Date.now();
+    const siblings = loginSiblingIds(state.accounts, state.identities);
+    // The primary and everything sharing its login — the group Rust is rotating away from.
+    const excluded = new Set<string>(
+      chosen ? (siblings.get(chosen.id) ?? [chosen.id]) : [],
+    );
+    const base = {
+      signedInIds: signedInAccountIds(state.identities),
+      now,
+      ceilings: state.ceilings,
+      live: liveUsageRows(),
+      siblingIds: siblings,
+      clobberedIds: clobberedDefaultIds(state.accounts, state.identities),
+    };
+    // The healthy pool, minus the primary's group and the shared default (empty configDir).
+    let pool = eligibleAccounts(state.accounts, state.usage, base).filter(
+      (a) => !excluded.has(a.id) && a.configDir,
+    );
+    const ordered: string[] = [];
+    // `pickAccount` over a pool of only-healthy accounts returns the best of them; drop its login
+    // group and repeat, so the list is ranked and deduped by login. Bounded by `pool` shrinking each
+    // pass; the guard is defensive against a pick that somehow fails to shrink it.
+    while (pool.length > 0) {
+      const best = pickAccount(pool, state.usage, base);
+      if (!best) break;
+      ordered.push(best.configDir);
+      const group = new Set<string>(siblings.get(best.id) ?? [best.id]);
+      const before = pool.length;
+      pool = pool.filter((a) => !group.has(a.id));
+      if (pool.length === before) break;
+    }
+    return ordered;
+  } catch (e) {
+    console.warn("accountSelection: could not resolve concierge fallbacks; none offered:", e);
+    return [];
   }
 }

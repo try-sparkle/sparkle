@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveTerminalOverlay } from "./terminalOverlay";
+import { isPermanentSpawnRefusal, resolveTerminalOverlay } from "./terminalOverlay";
 
 describe("resolveTerminalOverlay", () => {
   it("shows the loading hint before any output (Starting / Resuming)", () => {
@@ -36,10 +36,9 @@ describe("resolveTerminalOverlay", () => {
       false,
       "pty_spawn: cwd is outside the managed worktrees directory",
     );
-    expect(o).toEqual({
-      kind: "fail",
+    expect(o.kind).toBe("fail");
+    expect(o).toMatchObject({
       canRetry: true,
-      message: "Couldn't start the agent.",
       detail: "pty_spawn: cwd is outside the managed worktrees directory",
     });
   });
@@ -51,6 +50,68 @@ describe("resolveTerminalOverlay", () => {
     expect(resolveTerminalOverlay("exited", false, false, undefined)).toEqual({
       kind: "fail", canRetry: true, message: "Agent exited.",
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// A DOOMED retry must not be presented as an ordinary one (the second half of
+// sparkle-mahbf / sparkle-bdbd9). Surfacing the reason text made the refusal
+// legible; it did not stop the pane from offering "Start again" — a button that,
+// for the worktree-scope guard, re-runs the same effect with the same fixed cwd
+// and re-derives the identical refusal, forever.
+// ---------------------------------------------------------------------------
+describe("resolveTerminalOverlay — a permanent refusal says so", () => {
+  const CONTAINMENT =
+    "pty_spawn: cwd is outside the managed worktrees directory: /a/accounts/x is not under /a/worktrees";
+
+  it("marks the worktree-scope refusal permanent and stops claiming a retry will help", () => {
+    const o = resolveTerminalOverlay("failed", false, false, CONTAINMENT);
+    expect(o).toEqual({
+      kind: "fail",
+      canRetry: true,
+      permanent: true,
+      message: "Couldn't start the agent — starting again won't help.",
+      detail: CONTAINMENT,
+    });
+  });
+
+  // The ESCAPE HATCH, asserted as a capability rather than as a label: whatever we say about the
+  // retry, the user is never locked out of taking it. This pane has no other control.
+  it("keeps the retry available on a permanent refusal", () => {
+    const o = resolveTerminalOverlay("failed", false, false, CONTAINMENT);
+    expect(o.kind === "fail" && o.canRetry).toBe(true);
+  });
+
+  // NARROW BY CONSTRUCTION. Each of these reaches the same branch and must come back retryable —
+  // a permanent verdict on a recoverable failure tells the user to give up for no reason.
+  it.each([
+    ["the sibling error from the same Rust function, which a later attempt can clear",
+     "pty_spawn: worktrees dir unavailable: No such file or directory (os error 2)"],
+    ["a missing binary", "No such file or directory (os error 2): claude"],
+    ["an unrecognized backend error", "something nobody has classified yet"],
+  ])("leaves %s retryable, with no permanent flag", (_why, reason) => {
+    const o = resolveTerminalOverlay("failed", false, false, reason);
+    expect(o).toEqual({
+      kind: "fail",
+      canRetry: true,
+      message: "Couldn't start the agent.",
+      detail: reason,
+    });
+    expect(o).not.toHaveProperty("permanent");
+  });
+
+  // "exited" is a PTY that ran and died, not a refused spawn. It can carry a reason string, but the
+  // containment guard cannot be the cause — the spawn it guards already succeeded.
+  it("never marks an exited PTY permanent, even if its reason text mentions the guard", () => {
+    const o = resolveTerminalOverlay("exited", false, false, CONTAINMENT);
+    expect(o).not.toHaveProperty("permanent");
+    expect(o.kind === "fail" && o.message).toBe("Agent exited.");
+  });
+
+  it("does not mark a blank reason permanent", () => {
+    expect(resolveTerminalOverlay("failed", false, false, "   ")).not.toHaveProperty("permanent");
+    expect(isPermanentSpawnRefusal(undefined)).toBe(false);
+    expect(isPermanentSpawnRefusal("")).toBe(false);
   });
 });
 

@@ -52,6 +52,7 @@ import { useShallow } from "zustand/react/shallow";
 import { C } from "../../theme/colors";
 import { MD_CODE_FACE } from "../mdCodeFace";
 import { MENTION_PILL_FILL } from "./MentionPill";
+import { linkifiableBeadIds } from "./remarkBeadRefs";
 import { sideOf } from "../../engine/pairs";
 import { BEADS_CROSS_PROJECT_REFRESH_MS, beadsPolledAt, useBeadsStore } from "../../stores/beadsStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -153,6 +154,122 @@ const EMPTY_BEADS: ReadonlyMap<string, ResolvedBead> = new Map();
 const EMPTY: BeadPillContextValue = { beads: EMPTY_BEADS };
 
 const BeadPillContext = createContext<BeadPillContextValue>(EMPTY);
+
+// ── WHICH CARDS OPEN WITHOUT A CLICK ────────────────────────────────────────────────────────────
+//
+// The founder's ask, verbatim: "I wanna try changing things such that you show these bead cards as
+// expanded by default and of me having to click on them to expand them… Let's give that a try."
+//
+// ══ WHY THE PILL CANNOT DECIDE THIS FOR ITSELF ══════════════════════════════════════════════════
+// A `useState(true)` in `BeadPill` would be the obvious change and it is the wrong one, for two
+// reasons that only show up in the founder's actual usage:
+//
+//   1. IT CANNOT COUNT ITS SIBLINGS. He routinely names eight or more beads in one reply, and each
+//      expanded card runs several hundred pixels — so whether card #9 should open is a question
+//      about the MESSAGE, which no individual pill can see. The cap has to live one level up.
+//   2. IT CANNOT TELL A BEAD FROM ENGLISH. `remarkBeadRefs` is loose BY DESIGN (see the header) and
+//      hands this component every id-SHAPED token — "auto-heal", "one-shot", "sweep-restarted" —
+//      most of which resolve to nothing and render as the prose they always were. A per-pill
+//      counter would spend the budget on those and collapse the one card he actually wanted.
+//
+// So the set is computed ONCE PER MESSAGE, from the message's own text and the live board, and
+// handed down. `ConciergeMessageRow` mounts the provider around each reply's `<Markdown>`.
+const EMPTY_ID_SET: ReadonlySet<string> = new Set();
+/** A stable empty candidate list, for the same identity reason as `EMPTY_ID_SET` — it is what a
+ *  disabled surface memoizes to, and a fresh `[]` each render would re-run the pick below. */
+const EMPTY_SPANS: readonly { id: string }[] = [];
+
+/** The bead ids in THIS message that render already-open. Empty outside a `BeadAutoExpandProvider`
+ *  — which is the correct default for every surface that is not a concierge reply (SupportModal, an
+ *  agent's own markdown, a test fixture): they keep the click-to-expand behaviour unchanged. */
+const BeadAutoExpandContext = createContext<ReadonlySet<string>>(EMPTY_ID_SET);
+
+/**
+ * Which of `text`'s bead ids open without a click.
+ *
+ * PURE, EXPORTED, AND TESTED DIRECTLY, because every interesting rule here is invisible in the
+ * rendered output: a collapsed card and an id that never resolved look identical on screen.
+ *
+ * Three rules, in the order they apply:
+ *
+ *   • ONLY IDS THAT RESOLVE. The budget is spent on real beads, never on the id-shaped English the
+ *     loose matcher also returns. This is the rule that makes a cap usable at all.
+ *   • DISTINCT IDS COUNT ONCE. Naming `sparkle-abc12` three times in one reply consumes one slot,
+ *     not three. (Every mention of an included id then expands — a repeated mention is a repeated
+ *     card, which is exactly what clicking each of those pills does today.)
+ *   • DOCUMENT ORDER. The first ids he wrote are the ones that open, so a cap truncates the tail of
+ *     his list rather than an arbitrary subset of it.
+ *
+ * `max <= 0` means NO CAP, which is the shipped default (`[ui].bead_cards_expanded_max = 0`).
+ *
+ * ══ IT COUNTS WHAT THE LINKIFIER WILL DRAW, NOT WHAT THE SOURCE CONTAINS ════════════════════════
+ * `linkifiableBeadIds` parses and walks the tree the SAME way `remarkBeadRefs` does, rather than
+ * scanning the raw markdown. That distinction is the whole of roborev 65335: a bare `findBeadIds`
+ * over the source also returns ids inside code spans, fences and links — none of which ever become
+ * pills — so each one silently spent a slot on a card that could not appear. At a cap of 1 a reply
+ * opening with `bd show sparkle-x` therefore expanded NOTHING, while the config plainly said the
+ * feature was on. The ids arrive here pre-filtered; this function's own job is only the three rules
+ * below.
+ */
+export function autoExpandedBeadIds(
+  text: string,
+  beads: ReadonlyMap<string, ResolvedBead>,
+  opts: { enabled: boolean; max: number },
+): ReadonlySet<string> {
+  if (!opts.enabled) return EMPTY_ID_SET;
+  return pickAutoExpanded(linkifiableBeadIds(text), beads, opts);
+}
+
+/** The budget itself, over ids the linkifier has already vouched for. Split from the parse above so
+ *  `BeadAutoExpandProvider` can memoize the two separately: the PARSE depends only on the message
+ *  text (which never changes once written), while the pick depends on the live board (which changes
+ *  on every poll). Folded together, every bead poll would re-parse the markdown of every message in
+ *  the thread. */
+function pickAutoExpanded(
+  ids: readonly { id: string }[],
+  beads: ReadonlyMap<string, ResolvedBead>,
+  opts: { enabled: boolean; max: number },
+): ReadonlySet<string> {
+  if (!opts.enabled) return EMPTY_ID_SET;
+  const out = new Set<string>();
+  for (const span of ids) {
+    if (!beads.has(span.id)) continue;
+    if (out.has(span.id)) continue;
+    out.add(span.id);
+    if (opts.max > 0 && out.size >= opts.max) break;
+  }
+  // A STABLE EMPTY, not a fresh `Set`, for the reason `EMPTY_BEADS` above exists: the overwhelming
+  // majority of concierge messages name no bead at all, and handing each of those a new identity
+  // would re-render every consumer under it on every poll for no change.
+  return out.size === 0 ? EMPTY_ID_SET : out;
+}
+
+/**
+ * Decides, for ONE message, which of its bead cards render open — and supplies that to the pills
+ * inside it.
+ *
+ * Mounted by `ConciergeMessageRow` around each reply's `<Markdown>`. It reads the live board from
+ * `BeadPillContext` rather than taking it as a prop, so it composes with the memo `<Markdown>`
+ * depends on: the text goes in as a prop (it is what the row already passes), and everything that
+ * can change underneath — a bead resolving on the next poll, the setting being flipped — arrives by
+ * context and repaints without re-parsing a token of markdown.
+ */
+export function BeadAutoExpandProvider({ text, children }: { text: string; children: ReactNode }) {
+  const { beads } = useContext(BeadPillContext);
+  const enabled = useSettingsStore((s) => s.beadCardsExpanded);
+  const max = useSettingsStore((s) => s.beadCardsExpandedMax);
+  // TWO MEMOS, NOT ONE, and the split is load-bearing rather than tidiness. The parse depends only
+  // on `text`, which never changes once a message is written; the pick depends on `beads`, whose
+  // identity changes on EVERY poll. Folded into one memo keyed on both, a thread of fifty messages
+  // would re-parse fifty markdown documents every few seconds for a board that usually came back
+  // unchanged.
+  const candidates = useMemo(() => (enabled ? linkifiableBeadIds(text) : EMPTY_SPANS), [text, enabled]);
+  const ids = useMemo(
+    () => pickAutoExpanded(candidates, beads, { enabled, max }),
+    [candidates, beads, enabled, max],
+  );
+  return <BeadAutoExpandContext.Provider value={ids}>{children}</BeadAutoExpandContext.Provider>;
+}
 
 /** Supplies the live board to every pill below it. The raw provider, mirroring `AgentPillProvider`
  *  — `BeadPillHost` below is what production mounts; this is what a test hands a fixture to. */
@@ -511,7 +628,23 @@ const noBoardSentence = (beadId: string) => `${beadId} is not on an open board.`
  */
 export function BeadPill({ beadId }: { beadId: string }) {
   const { beads, onViewOnBoard } = useContext(BeadPillContext);
-  const [open, setOpen] = useState(false);
+  // ── OPEN IS AN OVERRIDE OVER A RULE, NOT A FLAG ─────────────────────────────────────────────
+  //
+  // `null` means THE READER HAS NOT DECIDED, so the message-level rule (`BeadAutoExpandProvider`)
+  // answers. A click — on the pill, on the card's ×, or Escape — writes an explicit boolean that
+  // then wins for as long as this message is on screen. That is the founder's first requirement:
+  // "a card he collapses should stay collapsed".
+  //
+  // ══ WHY NOT `useState(autoOpen)` ════════════════════════════════════════════════════════════
+  // Because a `useState` initializer runs ONCE, at mount, and at mount the answer is routinely
+  // wrong. `beadsStore` polls, so a bead the concierge just filed resolves SECONDS after the
+  // message renders — the pill mounts while `beads.get(id)` is still undefined, seeds `false`, and
+  // then sits collapsed forever even though the card it should have opened is now available. The
+  // whole component is built on "re-read every render, hold no snapshot" (see below); a seeded
+  // initial state is exactly the snapshot that rule forbids, just spelled differently.
+  const [override, setOverride] = useState<boolean | null>(null);
+  const autoOpen = useContext(BeadAutoExpandContext).has(beadId);
+  const open = override ?? autoOpen;
   // Consecutive FAILED board opens. A COUNT rather than a boolean for the reason `AgentPill`
   // documents (roborev 55590): setting `true` on an already-`true` state is an identical-value
   // update, React bails out, and the reader's retry click paints and announces nothing.
@@ -541,6 +674,21 @@ export function BeadPill({ beadId }: { beadId: string }) {
   // card. Without `beadCardMenuIsOpen()` picking a priority would close the card underneath the
   // click, and Escape — whose listener this component registered FIRST, since the card opened
   // first — would close the card instead of peeling the menu.
+  //
+  // ══ A CARD THAT OPENED ITSELF DOES NOT CLOSE ON AN OUTSIDE CLICK ════════════════════════════
+  // The click-outside half is now gated on `override === true` — i.e. on a card THE READER OPENED
+  // — and that asymmetry is the founder's second requirement, not an accident.
+  //
+  // Click-outside is right for a popover you summoned: you pressed a thing, a layer appeared over
+  // your content, and pressing away is how you put it back. An auto-expanded card is not that. It
+  // is part of the message, the way a code block is, and the very next thing the founder does
+  // after reading a reply is CLICK HIS COMPOSER TO ANSWER IT. Under the ungated listener that one
+  // press collapses every card in the thread at once — the feature would appear to work for a few
+  // seconds and then delete itself, which reads as a bug rather than as a design.
+  //
+  // ESCAPE STILL CLOSES EITHER KIND, deliberately. Every card listens on `window`, so one press
+  // collapses them all — which makes Escape the "clear the decks" key, and leaves the reader a
+  // keyboard exit that does not depend on finding a particular pill that may have scrolled away.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -548,7 +696,7 @@ export function BeadPill({ beadId }: { beadId: string }) {
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (beadCardMenuIsOpen()) return; // the menu is the innermost layer; let it take this press
       e.preventDefault();
-      setOpen(false);
+      setOverride(false);
     };
     const onDown = (e: MouseEvent) => {
       const t = e.target as Node | null;
@@ -557,15 +705,17 @@ export function BeadPill({ beadId }: { beadId: string }) {
       const el = t instanceof Element ? t : t.parentElement;
       if (el?.closest(`[data-testid="${CARD_TESTID}"]`) != null) return;
       if (beadCardMenuIsOpen() && el?.closest("[data-bead-card-menu]") != null) return;
-      setOpen(false);
+      setOverride(false);
     };
     window.addEventListener("keydown", onKey);
-    window.addEventListener("mousedown", onDown, true);
+    // Registered only for a HAND-OPENED card. See the block comment above: an auto-expanded card
+    // must survive the founder clicking into his own composer.
+    if (override === true) window.addEventListener("mousedown", onDown, true);
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("mousedown", onDown, true);
     };
-  }, [open]);
+  }, [open, override]);
 
   // RE-READ EVERY RENDER — the bead's fourth requirement, and the whole of its implementation. There
   // is deliberately no `useState`/`useRef` holding a bead anywhere in this component: a bead cited
@@ -600,7 +750,12 @@ export function BeadPill({ beadId }: { beadId: string }) {
         aria-expanded={open}
         aria-controls={cardId}
         title={`${bead.id} · ${bead.title || "untitled"} — ${statusLabel(bead.status)}`}
-        onClick={() => setOpen((v) => !v)}
+        // Toggles against what is CURRENTLY SHOWN, not against the override — otherwise the first
+        // click on an auto-expanded card would write `true` (it reads `null` and negates it), and
+        // the founder's collapse gesture would leave the card open. `autoOpen` is captured from
+        // context, so the updater stays pure: it folds a value already decided this render, exactly
+        // as the `onViewOnBoard` note below requires.
+        onClick={() => setOverride((v) => !(v ?? autoOpen))}
         style={{
           ...base,
           border: "none",
@@ -634,7 +789,7 @@ export function BeadPill({ beadId }: { beadId: string }) {
         <ConciergeBeadCard
           id={cardId}
           resolved={resolved}
-          onClose={() => setOpen(false)}
+          onClose={() => setOverride(false)}
           notice={showMiss ? noBoardSentence(bead.id) : undefined}
           noticeKey={misses}
           // THE NAVIGATION RUNS IN THE HANDLER, NEVER INSIDE THE UPDATER.

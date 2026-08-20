@@ -86,6 +86,9 @@ export interface PromoteDeps {
   preflight(a: {
     root: string;
     agentId: string;
+    /** Required: Rust reads the branch→agent ownership table with it before resolving WHICH branch
+     *  the promotion pushes. A missing key fails the Tauri call outright. */
+    projectId: string;
     worktree: string;
     baseBranch: string;
   }): Promise<PromotionPreflight>;
@@ -216,6 +219,7 @@ export async function promoteAgentToCloud(
     pf = await deps.preflight({
       root: input.root,
       agentId: input.agentId,
+      projectId: input.projectId,
       worktree: input.worktree,
       baseBranch: input.baseBranch,
     });
@@ -409,6 +413,7 @@ export async function promoteAgentToCloud(
     post = await deps.preflight({
       root: input.root,
       agentId: input.agentId,
+      projectId: input.projectId,
       worktree: input.worktree,
       baseBranch: input.baseBranch,
     });

@@ -29,20 +29,24 @@ const SAMPLES: Record<DispatchAuthorityKind, DispatchAuthority> = {
   suggestion: { kind: "suggestion", agentId: "ag-3" },
   "concierge-tool": conciergeToolAuthority("call-1", { tier: "allow" })!,
   "goal-continue": { kind: "goal-continue", agentId: "ag-4" },
+  "epic-restart": { kind: "epic-restart", agentId: "ag-4", epicId: "sparkle-e1" },
 };
 
 describe("DISPATCH_AUTHORITY_KINDS", () => {
   it("lists every kind the union declares", () => {
     expect([...DISPATCH_AUTHORITY_KINDS].sort()).toEqual(Object.keys(SAMPLES).sort());
   });
-  it("covers the seven user gestures, plus the two machine arms", () => {
-    // `concierge-tool` (an AI tool call under a resolved policy) and `goal-continue` (the goal
-    // auto-continue runner) are the two writes NO human gesture authorizes. Each carries its own
-    // arm so the audit line names the real cause rather than borrowing another's.
+  it("covers the seven user gestures, plus the three machine arms", () => {
+    // `concierge-tool` (an AI tool call under a resolved policy), `goal-continue` (the goal
+    // auto-continue runner) and `epic-restart` (the epic sweep handing a stalled epic back) are the
+    // three writes NO human gesture authorizes. Each carries its OWN arm so the audit line names the
+    // real cause rather than borrowing another's — `epic-restart` could have minted a
+    // `goal-continue` and passed every gate, at the cost of answering a forwarding complaint by
+    // naming a goal that may not exist and a turn that never ended.
     //
     // `mount` is the seventh gesture: the user patched a cable into an agent and typed into it. It
     // exists so an IMMEDIATE mounted send need not claim a countdown that never ran.
-    expect(DISPATCH_AUTHORITY_KINDS).toHaveLength(9);
+    expect(DISPATCH_AUTHORITY_KINDS).toHaveLength(10);
   });
   // A mounted send is a HUMAN gesture, and its audit line must not describe it as a countdown —
   // that is the entire reason the arm was added rather than reusing `countdown`.
@@ -316,5 +320,38 @@ describe("the per-kind extra checks — total over the union, and not reachable 
   it("is not exported", () => {
     expect(dispatchAuthorityModule).not.toHaveProperty("AUTHORITY_EXTRA_CHECK");
     expect(dispatchAuthorityModule).not.toHaveProperty("AUTHORITY_REF_FIELD");
+  });
+});
+
+// The one arm besides `concierge-tool` whose legality rests on more than an id being present.
+describe("the epic-restart arm", () => {
+  it("REFUSES an authority carrying no epic id", () => {
+    // The epic id is the only thing that says WHICH epic's one-shot restart budget bought this
+    // write, so an authority without it cannot produce the audit line the arm exists for. A good
+    // agentId must not carry a blank epicId in on its coat-tails — the same failure shape
+    // `concierge-tool` refuses for `{policy:"ask"}`.
+    for (const bad of [undefined, "", "   "]) {
+      expect(isDispatchAuthority({ kind: "epic-restart", agentId: "ag-1", epicId: bad })).toBe(false);
+    }
+    expect(isDispatchAuthority({ kind: "epic-restart", agentId: "ag-1", epicId: "sparkle-e1" })).toBe(
+      true,
+    );
+  });
+
+  it("is MACHINE-authored, so it cannot release a reused orchestrator's goal debt", () => {
+    // Load-bearing rather than merely accurate: the sweep REUSES the orchestrator bound to the epic,
+    // and a human-authored send on that reuse path runs `releaseGoalDebt` — un-latching an
+    // escalation nothing spent. `sendToBuild` already passes `humanAuthored: false` for the draft it
+    // appends; the delivered instruction has to agree, or one handoff disagrees with itself.
+    expect(isHumanAuthored({ kind: "epic-restart", agentId: "ag-1", epicId: "sparkle-e1" })).toBe(
+      false,
+    );
+  });
+
+  it("names the EPIC when it describes itself", () => {
+    // "the epic sweep restarted something" is not an answer to a forwarding complaint.
+    expect(describeAuthority({ kind: "epic-restart", agentId: "ag-1", epicId: "sparkle-e1" })).toContain(
+      "sparkle-e1",
+    );
   });
 });

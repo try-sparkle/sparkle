@@ -21,13 +21,34 @@
  *  module exists to fix — with nothing failing. */
 export const CONCIERGE_THREAD_TESTID = "concierge-thread";
 
-/** One line of the compose textarea, in px: 13px font × ~1.45 line-height, rounded. Keep in step
- *  with ComposeBox's `fontSize` — the cap is expressed in LINES because that is how the ask was
- *  phrased ("about ten lines tall"), and lines only mean something against this. */
-export const COMPOSE_LINE_H = 19;
+/** The compose textarea's TYPE RAMP — the one source for both the glyphs and the height cap.
+ *
+ *  Exported and spread into ComposeBox's `COMPOSE_TEXT_METRICS` rather than written out a second
+ *  time there. The cap is expressed in LINES, and a line only means something against the metrics
+ *  the text is actually set in — so two hand-kept copies is not a tidiness problem, it is the cap
+ *  silently describing a box nobody renders. That is what it had become: the component set 13px ×
+ *  1.4 while this file rounded a line to `19`, so the "ten line" cap really resolved to 10.4 lines,
+ *  and retuning the type would have moved the text without moving the cap. */
+export const COMPOSE_FONT_SIZE = 13;
+export const COMPOSE_LINE_HEIGHT = 1.4;
+
+/** One RENDERED line of the compose textarea, in px.
+ *
+ *  FRACTIONAL, AND IT MUST STAY FRACTIONAL. 13 × 1.4 is 18.2 — rounding it here multiplies the
+ *  error by `COMPOSE_CAP_LINES`, which is exactly how a ten-line cap turns into a nine- or an
+ *  eleven-line one. The cap below rounds ONCE, after multiplying. */
+export const COMPOSE_LINE_PX = COMPOSE_FONT_SIZE * COMPOSE_LINE_HEIGHT;
+
+/** The resting one-line box's text height, rounded UP so a single line is never a hair short. */
+export const COMPOSE_LINE_H = Math.ceil(COMPOSE_LINE_PX);
+
+/** The textarea's vertical padding, per edge. Shared with ComposeBox for the reason the type ramp
+ *  is: `scrollHeight` counts this padding, so the chrome below has to be the padding that is
+ *  actually applied or every measurement is off by the difference. */
+export const COMPOSE_PAD_Y = 10;
 
 /** Vertical padding + borders around the text, in px (10px top + 10px bottom + 1px × 2 border). */
-export const COMPOSE_CHROME_H = 22;
+export const COMPOSE_CHROME_H = COMPOSE_PAD_Y * 2 + 2;
 
 /** Just the borders (1px × 2). What a `scrollHeight` reading is missing: it includes the padding
  *  and excludes the border, so anything measured that way is this much short of the box it needs. */
@@ -37,9 +58,34 @@ export const COMPOSE_BORDER_H = 2;
 export const COMPOSE_MIN_H = COMPOSE_LINE_H + COMPOSE_CHROME_H;
 
 /** Auto-grow stops here. Past ten lines the box would eat the conversation it belongs to, so it
- *  scrolls internally instead — and if you want more than this you drag, which is explicit. */
+ *  scrolls internally instead — and if you want more than this you drag, which is explicit.
+ *
+ *  ══ TEN WRAPPED LINES AT ANY COLUMN WIDTH, WHICH A PIXEL CAP GENUINELY DELIVERS ═══════════════
+ *  The founder's constraint on this was *"no matter what the width is … show the first 10 lines of
+ *  text"*, and the intuitive reading of it — that a pixel cap must therefore be wrong, because the
+ *  concierge column is resizable — is worth answering here, because it is the reading that sends
+ *  someone to re-derive this from a measured wrap count.
+ *
+ *  WRAPPING CHANGES HOW MANY LINES THE CONTENT OCCUPIES. IT DOES NOT CHANGE HOW TALL A LINE IS.
+ *  Narrow the column and the same paragraph wraps to more lines, each still `COMPOSE_LINE_PX`
+ *  tall — so `10 × COMPOSE_LINE_PX + chrome` is ten RENDERED lines at 200px wide and at 900px
+ *  wide alike. The box then fits ten of however many lines the text now wraps to, and scrolls the
+ *  rest, which is the ask.
+ *
+ *  A pixel cap only breaks that promise two ways, and both are closed above rather than by
+ *  measuring: an arbitrary number that was never derived from a line height (what `19` was), and a
+ *  type ramp that varies with width or mode while the cap does not (the terminal-aimed face swaps
+ *  the family, not the size — and it now takes `COMPOSE_FONT_SIZE` from here, so it cannot drift
+ *  into varying it without moving the cap too).
+ *
+ *  What DOES have to follow the width is the CONTENT measurement — `contentH` is a wrap-dependent
+ *  `scrollHeight`, so a column resize must re-measure it. That is ComposeBox's layout effect, and
+ *  `columnWidth` is one of its dependencies for exactly this reason. */
 export const COMPOSE_CAP_LINES = 10;
-export const COMPOSE_CAP_H = COMPOSE_LINE_H * COMPOSE_CAP_LINES + COMPOSE_CHROME_H;
+/** Rounded ONCE, after multiplying — see `COMPOSE_LINE_PX`. Ten lines of 18.2px is 182px, so the
+ *  cap is 204px and the eleventh line is fully out, rather than the 212px (10.4 lines) that
+ *  rounding per-line produced. */
+export const COMPOSE_CAP_H = Math.ceil(COMPOSE_LINE_PX * COMPOSE_CAP_LINES) + COMPOSE_CHROME_H;
 
 /** A dragged box still leaves this much of the thread visible. Without a ceiling the handle could
  *  swallow the entire column, leaving a compose box and no conversation — and no obvious way back,
@@ -139,17 +185,22 @@ export function composeMaxH(availableH: number): number {
  * - No drag yet → auto-grow to fit what the box DISPLAYS — the typed content, or the placeholder
  *   overlay when there is none — clamped to [MIN, CAP]. Past the cap the textarea scrolls its own
  *   overflow.
- * - Dragged → the user's height wins, clamped to [MIN, ceiling]. It may exceed the auto cap; that
- *   is the point of the handle. It does NOT shrink to fit less content, because a box that
- *   collapsed under you as you deleted a line would fight the size you just chose — and for the
- *   same reason an explicit drag outranks the placeholder floor below. Dragging back down to
- *   resting releases the box to auto-grow, which is where that floor reappears.
+ * - Dragged → the user's height is a FLOOR, clamped to [MIN, ceiling]. It may exceed the auto cap;
+ *   that is the point of the handle. It does NOT shrink to fit less content, because a box that
+ *   collapsed under you as you deleted a line would fight the size you just chose. But it no longer
+ *   BLOCKS growth either: content still grows a dragged box up to the same ten-line cap an undragged
+ *   one gets. It used to win outright, which made the cap permanently unreachable for anyone who had
+ *   touched the handle once — and since the height is persisted, for every session after. See the
+ *   branch body for the founder's measured 59px (two-line) box. Dragging back down to resting still
+ *   releases the box to auto-grow entirely.
  *
  * A live dictation preview is ADDED to whichever height wins — never compared against it, and only
  * the pixels the phrase adds PAST the textarea's own content. That distinction is not a nicety: as a
  * `Math.max(userH, …)` it made the typed draft outrank the drag for as long as anyone was speaking,
  * so the box jumped to fit the whole draft on every partial and snapped back on every settle
- * (roborev 57354). Do not restore that shape.
+ * (roborev 57354). It is still an increment, but the oscillation it caused is now gone at the
+ * source: the draft's height applies whether or not anyone is speaking, so there is no settle for
+ * such a box to snap back to.
  *
  * Why speech gets a lift at all, when nothing else does: everything a short box hides is still
  * reachable — you scroll the textarea, or the caret takes you there. Provisional speech is not in
@@ -182,35 +233,75 @@ export function composeRenderH({
   // The lift stops at the auto cap (or at the user's own height, when they dragged past it): a
   // dragged box may exceed the cap because the user said so, and a spoken sentence may not decide
   // that on their behalf. `max` still bounds everything, so the drag ceiling is never crossed.
-  if (userH != null) {
-    // THREE BOUNDS ON ONE NUMBER, each of which is a defect that actually happened.
-    //
-    //   Math.max(userH, needed)  GROW ONLY AS FAR AS NEEDED. `userH + speaking` unconditionally was
-    //                            wrong: a box with room to spare still grew on every partial and
-    //                            snapped back on every settle — an oscillation in the branch that is
-    //                            supposed to be the stable one. Nothing was ever clipped in a roomy
-    //                            box; the mirror is `inset: 0`, so it already filled it.
-    //   userH + allowed          NEVER BY MORE THAN THE SPOKEN LINES ADD. This is what stops a long
-    //                            typed draft riding in on the phrase and overriding the drag.
-    //   allowed ≤ CAP - MIN      NEVER MORE THAN A CAPFUL OF GROWTH — expressed as a bound on the
-    //                            GROWTH, not on the absolute height. `Math.max(userH, CAP)` as a
-    //                            ceiling looked equivalent and was not: for a box dragged ABOVE the
-    //                            cap it makes `userH` its own ceiling, which does not bound
-    //                            dictation growth, it disables it — re-erasing the phrase in exactly
-    //                            the boxes the user made roomiest.
-    const needed = (contentH == null ? COMPOSE_MIN_H : contentH + COMPOSE_BORDER_H) + speaking;
-    const allowed = Math.min(speaking, COMPOSE_CAP_H - COMPOSE_MIN_H);
-    return clamp(Math.min(Math.max(userH, needed), userH + allowed), COMPOSE_MIN_H, max);
-  }
   // `contentH` is the raw scrollHeight, which already includes the padding — but not the borders.
   const desired = (contentH == null ? COMPOSE_MIN_H : contentH + COMPOSE_BORDER_H) + speaking;
-  // The floor, not a separate branch: a box holding BOTH a draft and (transiently) an overlay
-  // takes whichever is taller, and neither can clip the other.
-  return clamp(
+  // What an UNDRAGGED box would be. Computed before the branch because a dragged box now takes it
+  // as a floor rather than ignoring it — see below.
+  //
+  // The placeholder overlay is a floor here, not a separate branch: a box holding BOTH a draft and
+  // (transiently) an overlay takes whichever is taller, and neither can clip the other.
+  const autoH = clamp(
     Math.max(desired, composePlaceholderFloorH(placeholderH)),
     COMPOSE_MIN_H,
     COMPOSE_CAP_H,
   );
+  if (userH != null) {
+    // ══ A DRAG IS A FLOOR, NOT A FREEZE ═══════════════════════════════════════════════════════
+    // It used to be a freeze: this branch returned `userH` and ignored `contentH` outright, so the
+    // ten-line cap was UNREACHABLE for anyone who had ever touched the handle. And because the
+    // height is persisted, one drag froze the box for every later session.
+    //
+    // That is not a hypothetical. The founder reported the box "scrolling after way less than ten
+    // lines" and then, more precisely, that he did not see it "changing height at all" — and his
+    // persisted `conciergeComposeH` read 59.13px, which is two lines. He had never once reached a
+    // cap that has said ten since the day it was written. The fractional value is the tell: it came
+    // off a pointer drag (`composeDragH`), and 59 is above the ≤ MIN release threshold, so it stuck.
+    //
+    // The half of the old rule that was right is KEPT, and it is the `Math.max`: the box still does
+    // not shrink as content is deleted, because a box collapsing under you would fight the size you
+    // just chose. What changes is the other direction — content may now grow the box PAST the
+    // dragged height, up to the same ten-line cap an undragged box gets. Dragging remains the way
+    // to exceed that cap, which is still the point of the handle.
+    //
+    // A NOTE ON WHAT THIS RETIRES. The old branch carried three bounds against a long typed draft
+    // riding in on a spoken phrase and overriding the drag (roborev 57354: a two-line box holding a
+    // fifteen-line draft jumped to the cap on the first partial and snapped back on every settle).
+    // The oscillation needed the draft's height to apply only WHILE speaking; now `autoH` applies
+    // whether or not anyone is talking, so such a box sits at the cap and stays there. The defect is
+    // removed by construction rather than guarded against — there is nothing left to snap back to.
+    //
+    // ── THE OLD DRAGGED RULE IS KEPT WHOLE, AND `autoH` IS ADDED UNDER IT AS A FLOOR ───────────
+    // `lifted` below is the previous branch verbatim, three bounds and all, and it must stay that
+    // way. Replacing it with a plain `userH + lift` looks equivalent and is not — it drops the
+    // "grow only as far as NEEDED" bound, so every dragged box with room to spare grows on each
+    // partial and snaps back on each settle. That is the roborev 57354 overshoot, re-entering
+    // through the door this change opens; the engine's own suite caught it on the first run.
+    //
+    //   Math.max(userH, needed)  GROW ONLY AS FAR AS NEEDED. Nothing is clipped in a roomy box —
+    //                            the mirror is `inset: 0`, so it already fills it.
+    //   userH + lift             NEVER BY MORE THAN THE SPOKEN LINES ADD.
+    //   lift ≤ CAP - MIN         NEVER MORE THAN A CAPFUL OF GROWTH — a bound on the GROWTH, not on
+    //                            the absolute height. As a `Math.max(userH, CAP)` ceiling it would
+    //                            make `userH` its own ceiling for a box dragged past the cap, which
+    //                            does not bound dictation growth, it disables it.
+    //
+    // The `Math.max` with `autoH` is the whole of the new behaviour: content may now raise a
+    // dragged box to the ten-line cap. Everything above still decides what the DRAG plus a live
+    // phrase is worth; this only refuses to go below what an undragged box would have been.
+    //
+    // ONE SIDE EFFECT WORTH NAMING, because it reverses a sentence this docstring used to carry.
+    // `autoH` includes `composePlaceholderFloorH`, so a dragged box now respects that floor too —
+    // an explicit drag used to outrank it. The direction is the safe one: the floor can only make
+    // the box TALLER, and the copy it exists for is the voice-error notice, the tallest in the slot
+    // and the only one carrying controls (Dismiss / Open System Settings). Under the old rule a box
+    // dragged short clipped those out of reach, stranding the user at a broken mic with the fix
+    // sitting just below the visible edge. That is no longer reachable.
+    const needed = desired;
+    const lift = Math.min(speaking, COMPOSE_CAP_H - COMPOSE_MIN_H);
+    const lifted = Math.min(Math.max(userH, needed), userH + lift);
+    return clamp(Math.max(lifted, autoH), COMPOSE_MIN_H, max);
+  }
+  return autoH;
 }
 
 /**

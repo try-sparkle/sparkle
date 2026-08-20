@@ -10,8 +10,11 @@ import {
   chooseAccountForAgent,
   invalidateAccountState,
   accountConfigDirFor,
+  conciergeFallbackConfigDirs,
   resetStickyAccounts,
   isStickyAccountKey,
+  rotateStickyConsumerOffFailedAccount,
+  refreshLiveUsage,
   ACCOUNT_CACHE_TTL_MS,
   CONCIERGE_ACCOUNT_KEY,
 } from "./accountSelection";
@@ -788,5 +791,343 @@ describe("transcript affinity", () => {
     const probe = vi.fn(async () => []);
     await chooseAccountForAgent("agent-1", { now: 1_000, worktreePath: WT, sessionAccounts: probe });
     expect(probe).toHaveBeenCalledWith(WT, ["/data/accounts/fresh", "/data/accounts/hist"]);
+  });
+
+  // ── LIVE-SPENT holder (sparkle-m1bjo1 in the override path) ─────────────────────────────────
+  //
+  // Auto-pick already excludes an account Anthropic reports at ≥ LIVE_AVOID_PERCENT (partitionAccounts
+  // `isLiveSpent`). Transcript affinity used to check ONLY the observed wall (`exhaustedUntil`), so it
+  // could resume a spawn under a holder at 99% of its real weekly limit — the exact account a fresh
+  // pick would refuse — landing the agent ~1% from a wall it would hit within the session and then
+  // move accounts mid-task (a proactive move has no stale-resume retry, by design). These tests pin
+  // that `firstUsableHolder` now applies the SAME live-spent gate, and — the load-bearing negative —
+  // that it never does so at the cost of breaking a spawn or over-skipping a usable holder.
+  //
+  // Live rows are seeded through the exported `refreshLiveUsage` with an injected `fetch`, because the
+  // production refresh is fire-and-forget and its rows land only for the NEXT pick. Seeding at the
+  // same `now` the pick uses keeps the row inside LIVE_USAGE_TTL_MS, so the load's own (rejected)
+  // background refresh no-ops instead of clobbering it.
+
+  /** Percentages by config dir → the shape `getAccountUsageLive` resolves. */
+  function seedLive(
+    accounts: typeof AFF_ACCOUNTS,
+    byDir: Record<string, { five: number | null; seven: number | null }>,
+    now: number,
+  ): Promise<void> {
+    return refreshLiveUsage(accounts, now, {
+      fetch: async (configDir: string) => {
+        const p = byDir[configDir];
+        if (!p) throw new Error(`no live row for ${configDir}`);
+        // `refreshLiveUsage` reads only the two percents; the rest of `AccountUsageLive` is filled to
+        // satisfy the type (the production seam returns the whole shape).
+        return {
+          fiveHourPercent: p.five,
+          sevenDayPercent: p.seven,
+          fiveHourResetsAt: null,
+          sevenDayResetsAt: null,
+          limits: [],
+        };
+      },
+    });
+  }
+
+  it("refuses to resume under a LIVE-SPENT holder when a healthy account exists, and says the context will be lost", async () => {
+    // The holder `hist` is at 99% of its REAL Anthropic weekly limit — not yet walled, so the old
+    // observed-wall-only gate would have parked the agent there. `fresh` is healthy. Non-vacuous:
+    // drop the `isAccountLiveSpent` clause from `firstUsableHolder` and `hist` is chosen, so this
+    // assertion goes red — the mutation is caught.
+    await seedLive(AFF_ACCOUNTS, {
+      "/data/accounts/hist": { five: 99, seven: null },
+      "/data/accounts/fresh": { five: 5, seven: 5 },
+    }, 1_000);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("fresh");
+    expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).toContain("FRESH session");
+    warn.mockRestore();
+  });
+
+  it("STILL resumes under a live-spent holder when it is the ONLY account — continuity kept, spawn never blocked", async () => {
+    // The paired safety negative. Skipping the holder must only ever fall THROUGH to auto-pick, whose
+    // all-excluded fallback (`leastBad`) returns the sole account anyway. So a single spent holder is
+    // still resumed under — no spawn is broken, and because the account it settled on IS the holder,
+    // there is no lost-context warning. Without this, a fail-closed reading of the gate above could
+    // strand the one account that exists.
+    const ONE = [
+      { id: "solo", nickname: "Solo", configDir: "/data/accounts/solo", isDefault: false, createdAt: 1 },
+    ];
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(ONE);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([{ id: "solo", tokens5h: 0, tokens7d: 0, exhaustedUntil: null }]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve([{ id: "solo", email: "s@x.com", organization: null, accountUuid: "u-solo" }]);
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
+      return Promise.reject(new Error(`unexpected command ${cmd}`));
+    });
+    await refreshLiveUsage(ONE, 1_000, {
+      fetch: async () => ({
+        fiveHourPercent: 99,
+        sevenDayPercent: null,
+        fiveHourResetsAt: null,
+        sevenDayResetsAt: null,
+        limits: [],
+      }),
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { chosen } = await chooseAccountForAgent("agent-solo", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/solo"],
+    });
+    expect(chosen?.id).toBe("solo");
+    expect(warn.mock.calls.map((c) => String(c[0])).join(" ")).not.toContain("FRESH session");
+    warn.mockRestore();
+  });
+
+  it("STILL resumes under the holder when its live usage is present but BELOW the avoid threshold", async () => {
+    // The other half of the pair: the new gate must not over-trigger. With live data present but the
+    // holder at a merely-busy 50%, affinity still wins — proving the change excludes on the ≥95%
+    // FACT, not on the presence of any live row. Non-vacuous against negating the clause: flip
+    // `!isAccountLiveSpent` and this usable holder is skipped, `fresh` is chosen, and this reds.
+    await seedLive(AFF_ACCOUNTS, {
+      "/data/accounts/hist": { five: 50, seven: 20 },
+      "/data/accounts/fresh": { five: 5, seven: 5 },
+    }, 1_000);
+    const { chosen } = await chooseAccountForAgent("agent-1", {
+      now: 1_000,
+      worktreePath: WT,
+      sessionAccounts: async () => ["/data/accounts/hist"],
+    });
+    expect(chosen?.id).toBe("hist");
+  });
+});
+
+// ── Reactive rotation off a dead account (bead sparkle-08mq3t) ──────────────────────────────────
+// The concierge is a STICKY consumer, and `autoPick`'s eviction is blind to an OAuth expiry: the
+// account keeps reading "signed in" in recorded state, so nothing moves the concierge off it and
+// every turn fails identically. `rotateStickyConsumerOffFailedAccount` drives the move from the
+// turn-failure signal instead. These assert the SIDE EFFECT — the dead account is benched and the
+// resolution lands on the healthy one — with paired negatives so a ranker that always returns `work`
+// cannot pass.
+describe("reactive rotation off a failed concierge account", () => {
+  // Two SIGNED-IN accounts, distinct logins (so neither is the other's sibling). `def` is the
+  // cheaper account, so a first resolve parks the concierge there.
+  const TWO = [
+    { id: "def", nickname: "Personal", configDir: "/home/.claude", isDefault: true, createdAt: 1 },
+    { id: "work", nickname: "Work", configDir: "/data/accounts/work", isDefault: false, createdAt: 2 },
+  ];
+
+  // Stateful backend: `accounts_mark_exhausted` records a bench (epoch SECONDS, Rust's unit) that
+  // `accounts_usage` then reflects, exactly as the real boundary does. Without this the re-resolve
+  // could not observe the bench the rotation just wrote — the test would be vacuous.
+  let exhausted: Record<string, number | null>;
+  function mockFleet(signedIn: string[] = ["def", "work"]) {
+    exhausted = {};
+    invoke.mockImplementation((cmd: string, args?: { id: string; untilEpoch: number }) => {
+      if (cmd === "accounts_list") return Promise.resolve(TWO);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([
+          { id: "def", tokens5h: 0, tokens7d: 10, exhaustedUntil: exhausted["def"] ?? null },
+          { id: "work", tokens5h: 0, tokens7d: 50, exhaustedUntil: exhausted["work"] ?? null },
+        ]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve(
+          signedIn.map((id) => ({ id, email: `${id}@example.com`, organization: null })),
+        );
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
+      if (cmd === "accounts_mark_exhausted") {
+        // markExhausted already converted ms → seconds; store it verbatim so accounts_usage → getUsage
+        // (× 1000) round-trips back to ~the same ms instant.
+        exhausted[args!.id] = args!.untilEpoch;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    invalidateAccountState();
+  }
+
+  function markExhaustedIds(): string[] {
+    return invoke.mock.calls
+      .filter((c) => c[0] === "accounts_mark_exhausted")
+      .map((c) => (c[1] as { id: string }).id);
+  }
+
+  beforeEach(() => {
+    invoke.mockReset();
+    invalidateAccountState();
+    resetStickyAccounts();
+    clearAllPins();
+  });
+
+  it("rotates the concierge to a HEALTHY account when its own account's auth fails", async () => {
+    mockFleet();
+    const t = 20_000_000;
+    // Parked on `def`.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    // THE TRAP, proven: `def`'s OAuth has died but recorded state cannot see it — it still reads
+    // signed-in and unexhausted — so a plain re-resolve STAYS on the dead account. This is the bug.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 1 })).toBe("/home/.claude");
+
+    // The failure signal drives the rotation.
+    const result = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "auth", {
+      now: t + 2,
+    });
+
+    // SIDE EFFECT 1: the dead account (and only it — `work` is a different login) was benched.
+    expect(markExhaustedIds()).toEqual(["def"]);
+    // SIDE EFFECT 2: resolution moved to the healthy account, and the sticky pointer with it.
+    expect(result.rotated).toBe(true);
+    expect(result.from).toBe("def");
+    expect(result.to).toBe("work");
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 3 })).toBe(
+      "/data/accounts/work",
+    );
+  });
+
+  it("does NOT rotate — or bench anything — for an unclassified (unknown) failure", async () => {
+    mockFleet();
+    const t = 21_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "unknown", {
+      now: t + 1,
+    });
+
+    expect(result).toEqual({ rotated: false, reason: "not-unusable" });
+    expect(markExhaustedIds()).toEqual([]);
+    // Still on `def`: a transient failure must not churn a healthy account.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe("/home/.claude");
+  });
+
+  it("does NOT rotate when every OTHER account is unusable — leaving the sign-in dead-end intact", async () => {
+    // Only `def` is signed in; `work` is a config dir nobody logged into, so it is not a healthy
+    // alternative. Benching `def` would strand the concierge with no account at all.
+    mockFleet(["def"]);
+    const t = 22_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "auth", {
+      now: t + 1,
+    });
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toBe("no-healthy-alternative");
+    // Critically: the last usable account was NOT benched — the next turn still resolves to it and
+    // fails into the existing sign-in path rather than a null-account spawn.
+    expect(markExhaustedIds()).toEqual([]);
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe("/home/.claude");
+  });
+
+  it("respects a human pin (Manual Override) and does not rotate", async () => {
+    mockFleet();
+    const t = 23_000_000;
+    setPin(CONCIERGE_ACCOUNT_KEY, "def");
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t })).toBe("/home/.claude");
+
+    const result = await rotateStickyConsumerOffFailedAccount(CONCIERGE_ACCOUNT_KEY, "auth", {
+      now: t + 1,
+    });
+
+    expect(result).toEqual({ rotated: false, reason: "pinned" });
+    expect(markExhaustedIds()).toEqual([]);
+    // The pin still wins on the next resolve.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t + 2 })).toBe("/home/.claude");
+  });
+});
+
+describe("concierge fallback config dirs (single-turn auth-failover candidates)", () => {
+  // A dedicated primary + a healthy dedicated alternative + a CLOBBERED default (terminal signed into
+  // a different account than Sparkle runs it as). The dedicated primary is cheapest so the concierge
+  // parks on it; the clobbered default reads "signed in / healthy" in recorded state.
+  const FLEET = [
+    { id: "primary", nickname: "Primary", configDir: "/data/accounts/primary", isDefault: false, createdAt: 1 },
+    { id: "alt", nickname: "Alt", configDir: "/data/accounts/alt", isDefault: false, createdAt: 2 },
+    { id: "home", nickname: "Home", configDir: "", isDefault: true, createdAt: 3 },
+  ];
+  // `alt` carries slightly MORE local usage than `primary`, so `primary` wins the initial park and
+  // `alt` is the (only) healthy fallback — a deterministic ranking the assertions can pin.
+  function mockFleet(over: { clobberHome?: boolean; signedIn?: string[] } = {}) {
+    const { clobberHome = true, signedIn = ["primary", "alt", "home"] } = over;
+    invoke.mockImplementation((cmd: string) => {
+      if (cmd === "accounts_list") return Promise.resolve(FLEET);
+      if (cmd === "accounts_usage")
+        return Promise.resolve([
+          { id: "primary", tokens5h: 0, tokens7d: 10, exhaustedUntil: null },
+          { id: "alt", tokens5h: 0, tokens7d: 20, exhaustedUntil: null },
+          // `home` carries the MOST usage, so it never wins the primary park — the concierge lands on a
+          // dedicated account whether or not `home` is clobbered, which keeps every assertion below
+          // about the FALLBACK list rather than about which account happened to be cheapest.
+          { id: "home", tokens5h: 0, tokens7d: 100, exhaustedUntil: null },
+        ]);
+      if (cmd === "accounts_identities")
+        return Promise.resolve(
+          signedIn.map((id) => ({
+            id,
+            email: `${id}@example.com`,
+            organization: null,
+            accountUuid: `uuid-${id}`,
+            // The default `home` is CLOBBERED: its terminal ~/.claude.json is a different account.
+            ...(id === "home" && clobberHome
+              ? { shellAccountUuid: "uuid-terminal", shellEmail: "terminal@example.com" }
+              : {}),
+          })),
+        );
+      if (cmd === "accounts_ceilings") return Promise.resolve([]);
+      if (cmd === "account_usage_live") return Promise.reject(new Error("no token in tests"));
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    invalidateAccountState();
+  }
+
+  beforeEach(() => {
+    invoke.mockReset();
+    invalidateAccountState();
+    resetStickyAccounts();
+    clearAllPins();
+  });
+
+  it("offers the healthy DEDICATED alternatives, excluding the primary and the clobbered default", async () => {
+    mockFleet();
+    const t = 30_000_000;
+    // Parks on the cheapest DEDICATED account — the clobbered default is routed away from even for the
+    // primary pick (avoidClobberedDefault), and `home`'s empty dir would never be a dedicated pick anyway.
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t, avoidClobberedDefault: true })).toBe(
+      "/data/accounts/primary",
+    );
+    // SIDE EFFECT: the fallback list is exactly the OTHER healthy dedicated account — not the primary
+    // (rotating off it), not the clobbered default, not the shared default's empty dir.
+    expect(await conciergeFallbackConfigDirs({ now: t })).toEqual(["/data/accounts/alt"]);
+  });
+
+  it("returns [] — the last-account guard — when the primary is the only healthy DEDICATED account", async () => {
+    // Only `primary` and the clobbered default `home` are signed in; `alt` is not. There is no healthy
+    // dedicated alternative, so the turn must fail into the sign-in dead-end rather than rotate.
+    mockFleet({ signedIn: ["primary", "home"] });
+    const t = 31_000_000;
+    expect(await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, { now: t, avoidClobberedDefault: true })).toBe(
+      "/data/accounts/primary",
+    );
+    expect(await conciergeFallbackConfigDirs({ now: t })).toEqual([]);
+  });
+
+  it("a HEALTHY (non-clobbered) default is still excluded from fallbacks — the concierge rotates to a dedicated account, never the shared default", async () => {
+    mockFleet({ clobberHome: false });
+    const t = 32_000_000;
+    // `home` is healthy now, but its config dir is the shared empty default; fallbacks stay dedicated-only.
+    expect(await conciergeFallbackConfigDirs({ now: t })).toEqual(["/data/accounts/alt"]);
+  });
+
+  it("returns [] when the accounts backend is unreadable (never rotates on a hiccup)", async () => {
+    invoke.mockImplementation(() => Promise.reject(new Error("backend down")));
+    invalidateAccountState();
+    expect(await conciergeFallbackConfigDirs({ now: 33_000_000 })).toEqual([]);
   });
 });

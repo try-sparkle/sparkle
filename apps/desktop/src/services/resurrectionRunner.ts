@@ -60,11 +60,9 @@ import type { QuotaBlock } from "../engine/quotaBlock";
 import { hasTurnEndAuthority, processAliveOf } from "../engine/turnEndAuthority";
 import { log } from "../logger";
 import { useProjectStore } from "../stores/projectStore";
-import { useRuntimeStore } from "../stores/runtimeStore";
 import { notifyAttention } from "./attention";
 import { notifyConcierge } from "./conciergeNotifier";
-import { restartPane } from "./paneControl";
-import { admitAgent } from "./resurrectionAdmission";
+import { mountAgent, type MountResult } from "./agentMount";
 import { ownsProjectInThisWindow, suppressContinuation } from "./goalContinuationRunner";
 import { isTornOut } from "./satelliteWindows";
 
@@ -127,7 +125,9 @@ export interface ResurrectionOutcome {
  *                      nothing and its mount loop (`for (const a of p.agents)`) iterates past it. The
  *                      admission set grows, `openAgentIds` grows, and nothing whatsoever mounts.
  */
-export type MountResult = "restarted" | "opened" | "no-agent-row";
+// Re-exported so this module's existing consumers keep importing it from here; the type (and
+// the logic behind it) now lives in `services/agentMount`.
+export type { MountResult } from "./agentMount";
 
 export interface ResurrectionSweepOptions {
   /** Injected clock, house style — so the ladder arithmetic needs no fake timers. */
@@ -354,20 +354,12 @@ function defaultProbationEvidence(
  * The roborev-60241 fix closed route 1 (`restartPane` already returned a boolean) and left route 2
  * claiming success unconditionally. This is route 2's boolean.
  */
+// THE BODY MOVED TO `services/agentMount`, unchanged, and this delegates. The two routes above are
+// not resurrection-specific: `services/sendToBuild` re-derived half of them for its machine-driven
+// handoff and shipped the identical no-op roborev 60241 had already paid to find here. One
+// implementation, so there cannot be a fourth derivation.
 function defaultMount(agentId: string, hasRow: (id: string) => boolean): MountResult {
-  // Route 1 first: a mounted pane is authoritative evidence that route 2's work is already done.
-  if (restartPane(agentId)) return "restarted";
-  // Route 2's precondition, checked BEFORE anything is written. Both writes below are effectively
-  // permanent for the session — the admission set is add-only by design, and nothing removes an id
-  // from `openAgentIds` on a PTY exit — so growing them for an id that can never mount is pure
-  // garbage, which the sweep would then report as a respawn.
-  if (!hasRow(agentId)) return "no-agent-row";
-  // Route 2. BOTH calls, doing different jobs: `admitAgent` unlocks the PROJECT's visited gate in
-  // Workspace's `live` memo, `open` is the app's ordinary, persisted, multi-window mount signal for
-  // the AGENT — and the one `runtimeStore.close()` undoes, which is what keeps the pane closable.
-  admitAgent(agentId);
-  useRuntimeStore.getState().open(agentId);
-  return "opened";
+  return mountAgent(agentId, hasRow);
 }
 
 /**

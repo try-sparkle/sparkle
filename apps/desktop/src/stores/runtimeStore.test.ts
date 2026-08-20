@@ -1253,3 +1253,39 @@ describe("workflowShippedAt — the date on the merge, not on the first latch", 
     expect(store.getState().workflowShippedAt["a4"]).toBeUndefined();
   });
 });
+
+describe("setAgentMovement — the equality gate must see every field it carries", () => {
+  // ⚠️ THIS IS THE SILENT-PLUMBING TEST. `setAgentMovement` compares the incoming map field by field
+  // and KEEPS the old reference when it decides nothing moved — a real optimisation, since
+  // `fleet_digest` hands back fresh objects every 30 seconds and a whole-map subscriber would
+  // re-render over facts that did not change. The cost is that a field added to `MovementEvidence`
+  // and to the projection, but NOT to the comparison, is unreachable: the store discards every tick
+  // that moved only that field, and the reader sees whatever the first poll happened to say, frozen,
+  // forever. Nothing else in the app can observe that — the field is present and correctly typed at
+  // both ends — so it has to be pinned here.
+  //
+  // `toolsRecent` is exactly such a field: `engine/goalContinuation.progressMark` reads it to tell a
+  // working agent from a stalled one, and freezing it restores the false-escalation flood it fixes.
+  it("stores a tick where ONLY the tool count moved", async () => {
+    const useRuntimeStore = await freshStore();
+    const base = { lastEvent: "Stop", lastEventMs: 1_000, sessionId: "s1" };
+
+    useRuntimeStore.getState().setAgentMovement({ a1: { ...base, toolsRecent: 4 } });
+    useRuntimeStore.getState().setAgentMovement({ a1: { ...base, toolsRecent: 41 } });
+
+    expect(useRuntimeStore.getState().agentMovement.a1!.toolsRecent).toBe(41);
+  });
+
+  it("still keeps the SAME reference when nothing moved at all", async () => {
+    // The pair. Without it the test above is satisfied by deleting the comparison entirely, which
+    // would re-render every subscriber on every poll — the cost this gate exists to avoid.
+    const useRuntimeStore = await freshStore();
+    const reading = { a1: { lastEvent: "Stop", lastEventMs: 1_000, sessionId: "s1", toolsRecent: 4 } };
+
+    useRuntimeStore.getState().setAgentMovement(reading);
+    const first = useRuntimeStore.getState().agentMovement;
+    useRuntimeStore.getState().setAgentMovement({ a1: { ...reading.a1 } });
+
+    expect(useRuntimeStore.getState().agentMovement).toBe(first);
+  });
+});

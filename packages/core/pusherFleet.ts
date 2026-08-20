@@ -750,11 +750,19 @@ export function overdueDuties(
  *     coming for them, and the zero-test called that healthy. A queue with an agent per message IS
  *     being served, and reporting it would spend the founder's attention on the healthy path.
  *
- *     Note this stays satisfiable even though `MAX_CONCURRENT_RESEARCH` is 2: a dispatched task is
- *     `queued` before it is `running` and BOTH count as live (services/research/types.ts `isLive`),
- *     so dispatching six lifts `liveAgents` to six immediately and the condition clears. It would
- *     NOT clear if the count were of running children only — that version of this rule can never be
- *     satisfied past a depth of two, and would report an abandoned queue forever.
+ *     Note this stays satisfiable at ANY depth, and does not depend on how wide the pool is. A
+ *     dispatched task is `queued` before it is `running` and BOTH count as live
+ *     (services/research/types.ts `isLive`), so dispatching six lifts `liveAgents` to six
+ *     immediately and the condition clears — even for a depth past the pool's
+ *     `MAX_CONCURRENT_RESEARCH` (see `researchPool.ts`), where the surplus sits in the runner's
+ *     bounded waiting room and is still live. It would NOT clear if the count were of RUNNING
+ *     children only: that version of this rule dies at the cap and reports an abandoned queue
+ *     forever.
+ *
+ *     THE CAP IS IMPORTED, NEVER RESTATED. This paragraph used to assert the number inline — *"even
+ *     though `MAX_CONCURRENT_RESEARCH` is 2"* — and went on saying 2 for six days after it became  guard-ok
+ *     16 (`bf597a494`, 2026-08-13). The value is an ARGUMENT here, so a stale value is a stale
+ *     argument; `researchPool.ts` gives it a home a test can check.
  *   • IT HAS BEEN THAT WAY A WHILE. See {@link QUEUE_UNFANNED_MIN_AGE_MS}. An unrecorded `oldestAt`
  *     fails this, because "we cannot establish the age" is not "it is old" — the same fail-closed
  *     reading `overdueDuties` gives an unseeded `lastRunAt`.

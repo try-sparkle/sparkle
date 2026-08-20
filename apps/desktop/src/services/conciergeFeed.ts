@@ -46,6 +46,7 @@ import {
   type PromptGraceLedger,
 } from "../engine/blockedPromptGrace";
 import { publishedStatusFor } from "../useAttentionNotifications";
+import type { NudgeFlagSnapshot } from "./humanBlockFor";
 import type { BranchStatus } from "./branchStatus";
 import type { Roster } from "./rosterTypes";
 // Used only by the column-one population selectors at the foot of this file.
@@ -62,6 +63,35 @@ export interface ConciergeAgent {
   projectName: string;
   kind: AgentKind;
   status: AgentTabStatus;
+  /** Did THIS WINDOW observe this agent's status, or is `status` a stand-in — or another window's
+   *  reading relayed through the tray roster?
+   *
+   *  THE NAME CARRIES THE RESTRICTION ON PURPOSE (roborev 65208). An earlier spelling was
+   *  `statusObserved`, whose first sentence promised the broader "was it observed anywhere", and the
+   *  two answers DIVERGE for a cross-window row in the direction the broad name does not suggest:
+   *  `trayStatusMap(input.roster)` can carry a perfectly genuine reading — the hosting window
+   *  published `working` — so `status` is emphatically not a stand-in, yet this is `false`. Harmless
+   *  today, because the only consumer governs a locally hosted pane; not harmless for the next
+   *  consumer that reads the field by its name and gets a silent wrong answer on every unhosted row.
+   *  That is the prose-vs-code divergence this whole series exists to remove, so it does not get to
+   *  live in the field's own header.
+   *
+   *  WHY IT EXISTS. `status` cannot answer the question and one caller must not guess: the feed
+   *  substitutes `DEFAULT_STATUS = "stopped"` for a missing entry, and `runtimeStore.status` is
+   *  live-only with a mounted `AgentPane` as its sole writer — so before the first `setStatus` an
+   *  agent reads `stopped`, indistinguishable from a PTY that genuinely exited.
+   *
+   *  WHY THE LOCAL MAP AND NOT THE MERGED ONE. The roster is not an independent witness: it
+   *  republishes our own `DEFAULT_STATUS` stand-in and hands it straight back, so a merged read
+   *  cannot tell an observation from an echo of our own guess (roborev 65188). See the assignment
+   *  for the full four-hop chain.
+   *
+   *  Harmless for the band, the dot and the label (an unobserved agent SHOULD read as not-running).
+   *  Not harmless for the terminal's calm theme, which means "this process has exited": a freshly
+   *  mounted pane painted grey and snapped to full contrast the instant the engine emitted
+   *  `working` — the mount-state flash, in the grey→white direction (bead sparkle-e7a3f3).
+   *  `Workspace.terminalCalm` requires this to be true. */
+  statusObservedLocally: boolean;
   statusColor: string;
   statusLabel: string;
   band: StatusBand;
@@ -247,6 +277,23 @@ export interface ConciergeFeedInput {
   lastObserved?: Record<string, LastObserved>;
   /** Agent id → epoch ms of last user touch (interactionStore.lastAt). */
   interaction?: Record<string, number>;
+  /** The nudger flag table — which agents have answered that a PERSON is blocking them.
+   *
+   *  ⚠️ THREADED IN FOR THE SAME REASON `interaction` IS — the "Pure" claim above (roborev 65448).
+   *
+   *  ⚠️ AND OMITTING IT DEMOTES, IT DOES NOT FALL BACK TO THE LIVE TABLE (roborev 65473). An earlier
+   *  version of this sentence said the opposite, which is the dangerous reading: this function
+   *  destructures a `new Map()` default and passes it UNCONDITIONALLY, so `publishedStatusFor`'s own
+   *  live-registry default can never apply on this path. A caller that leaves this out therefore
+   *  gets an EMPTY table — no agent exempt, every stated human block demoted back to amber across
+   *  the whole feed — rather than the correct-by-accident behaviour the old comment implied.
+   *
+   *  ⚠️ OPTIONAL, AND ITS DEFAULT IS THE DEMOTING ONE — stated plainly because the commit that added
+   *  it claimed the compiler holds this seam, and it does not (roborev 65465). With 54 call sites,
+   *  making it REQUIRED is churn rather than safety; what actually holds the production wiring in
+   *  place is `useConciergeFeed.test.tsx`'s after-mount test, which fails if the caller stops
+   *  passing this. Do not read the comment on the caller's dep array as a compiler guarantee. */
+  nudgeFlags?: NudgeFlagSnapshot;
   /** The merged cross-window fleet (getRoster/onRosterChanged). Fills statuses for agents
    *  another window runs — this window's own `status` map only covers agents it hosts, and an
    *  agent covered by NEITHER falls back to "stopped" (same default as buildRoster). Local status
@@ -325,24 +372,42 @@ export function conciergeBand(status: AgentTabStatus | undefined): StatusBand {
 
 /** Should this agent's TERMINAL desaturate — i.e. render in the calm xterm theme?
  *
+ *  THE ONE-LINE ANSWER: only once its PROCESS HAS EXITED. `{done, stopped}`, and nothing else.
+ *
  *  HISTORY, because this predicate used to mean something bigger and the old name still shows in
  *  places: it also drove a `grayscale(1) opacity(.72)` CSS filter over the agent's SIDEBAR ROW, so
  *  that only the rows asking for you carried color. That was removed on 2026-07-27 and must not
- *  come back. `working` is in the calm set (see below), so the filter desaturated the green dot of
+ *  come back. `working` WAS in the calm set at the time, so the filter desaturated the green dot of
  *  every agent that was actually running — erasing the one thing the Build column exists to show at
- *  a glance. The row treatment is gone entirely rather than gated; see
+ *  a glance. That membership is gone (bead sparkle-e7a3f3), but the removal still stands on its own:
+ *  the rows carry status by DOT COLOR now, and a filter over them would fight that whatever this
+ *  predicate answers. The row treatment is gone entirely rather than gated; see
  *  AgentSidebar.liveStatusDots.test.tsx, which fails if any row regains an inline filter.
  *
  *  What survives is the TERMINAL treatment (Workspace.tsx → AgentPane → Terminal → xtermTheme),
- *  which desaturates a landed agent's own text through the theme rather than a filter over the
+ *  which desaturates an EXITED agent's own text through the theme rather than a filter over the
  *  stage. That distinction has its own history — see the `calm is a terminal theme, not a filter
  *  over the pane` commits.
  *
- *  The SET is unchanged, and the reasoning below is why it is shaped the way it is.
+ *  THE SET CHANGED (bead sparkle-e7a3f3); the reasoning below is why it is shaped the way it is.
  *
  *  Deliberately NOT "is this row's band `done`", and deliberately NOT "is it anything but
- *  needs_you" alone. The set is {idle, done, stopped, working, no-status}: everything that is not
- *  asking for you, MINUS `unmerged`.
+ *  needs_you" alone. The set is exactly {done, stopped} — the two statuses whose PTY has exited.
+ *  `unmerged` is excluded for free by that shape, and its carve-out is documented below because the
+ *  reasoning still governs anyone tempted to widen this again.
+ *
+ *  `idle` IS EXCLUDED, and it is the second half of bead sparkle-e7a3f3. Dropping only `working`
+ *  did not remove the flash, it RELOCATED it — and made it recur. `StatusEngine.settle()` fires on
+ *  a `setTimeout(…, IDLE_MS = 2500)` and sets `idle` whenever the viewport is not awaiting input,
+ *  i.e. ~2.5s after every response finishes streaming. With `working` non-calm and `idle` calm, the
+ *  END of each turn became the theme swap: the founder's reply repainted from near-white to grey
+ *  about two and a half seconds after it landed — while he was reading it — and back to white on
+ *  the next turn. Once per turn, forever, instead of once. `working` and `idle` must therefore
+ *  answer this predicate IDENTICALLY; they are two halves of one live session, not two states.
+ *
+ *  `undefined` IS EXCLUDED TOO, for the same reason in the other direction: an agent the feed has
+ *  not seen yet is the MOUNT state, so admitting it painted a pane grey and flipped it to white on
+ *  first output. A flash is a flash whichever way it runs.
  *
  *  Those questions look identical to the band and are not: the band is an interruption budget,
  *  dimming is a legibility treatment, and `unmerged` needs opposite answers from them — no nudge
@@ -353,10 +418,27 @@ export function conciergeBand(status: AgentTabStatus | undefined): StatusBand {
  *  the calm band silently dimmed every "Needs merge" row, and the fix for that silently turned each
  *  one into a concierge nudge. Naming the predicate is what stops the next person rediscovering it.
  *
- *  Note `working` is in here even though it is its own band now: a running agent is not asking you
- *  for anything, and the terminal you are watching desaturating the moment it starts working would
- *  be a treatment nobody wants. The band split running from done for POSITION and COUNTS; it did not
- *  change what dims.
+ *  `working` IS EXCLUDED, and it is the whole of bead sparkle-e7a3f3. It used to be IN the calm set,
+ *  guarded by a comment and a test that both spelled out the requirement — "the terminal you are
+ *  watching desaturating the moment it starts working would be a treatment nobody wants" — while
+ *  the assertion beside it pinned `isCalmBand("working") === true`, i.e. exactly that treatment.
+ *  The prose stated the rule and the code did the opposite for as long as both existed.
+ *
+ *  What the founder actually saw, and why it reads as a FLASH rather than as a wrong colour: an
+ *  agent that is asking you something bands `needs_you`/`questions`, so its terminal carries the
+ *  normal foreground (dark-mode `#dce8fc`, a near-white). You answer it; it starts running; the
+ *  status flips to `working`; this predicate said calm; Workspace re-hands xterm a whole new theme
+ *  object, and xterm re-resolves EVERY cell that carries no explicit SGR colour — which is most of
+ *  a TUI's body text, Claude Code included: a live PTY capture of its own output paints the prompt
+ *  and the response with `\e[39m` (default foreground) and reserves truecolor for its chrome. So
+ *  the text ALREADY ON SCREEN turned from near-white to `#7d818e` grey, retroactively. White first,
+ *  then grey, on the one pane you are reading.
+ *
+ *  The band split running from done for POSITION and COUNTS. Dimming is a legibility treatment and
+ *  a running agent is the single worst thing to apply it to: `terminalCalm` (Workspace.tsx) is only
+ *  ever true for the VISIBLE, SELECTED pane, so calm never recedes anything you are not looking at.
+ *  Its counterpart — the sidebar row filter that made quiet rows recede so colored ones stood out —
+ *  was removed on 2026-07-27. What was left applied only to the terminal in front of you.
  *
  *  `questions` IS EXCLUDED TOO, for the plainest possible reason: an agent that has stopped to ask
  *  the founder something is not calm. Desaturating its terminal would be the mirror of the trap
@@ -364,8 +446,18 @@ export function conciergeBand(status: AgentTabStatus | undefined): StatusBand {
  *  it must be named explicitly, because the predicate is written as "not needs_you" and `questions`
  *  is its own band; the negative form is exactly what let a fourth band silently fall into "calm". */
 export function isCalmBand(status: AgentTabStatus | undefined): boolean {
-  const band = conciergeBand(status);
-  return band !== "needs_you" && band !== "questions" && status !== "unmerged";
+  // AN ALLOW-LIST OF TWO, AND NOTHING ELSE IN THE EXPRESSION. `done` and `stopped` are the only
+  // statuses whose PTY HAS EXITED — statusEngine emits `done` from exactly one place, the
+  // `process-exit` transition, and `stopped` is its explicit twin. Every other value is a state a
+  // LIVE session moves through, and any live state admitted here is a flip the founder can watch.
+  //
+  // The band guards that used to be conjoined here were DEAD, not defensive: `bandOfStatus`
+  // (engine/buildSections.ts) maps both `done` and `stopped` to the `done` band, so once the
+  // allow-list holds, `band !== "needs_you" && band !== "questions" && band !== "running"` is
+  // unconditionally true. Keeping them cost real verification — a mutation to any of the three
+  // could not turn a test red — while the comment above them claimed the expression was an
+  // allow-list and not a negation. It is one now.
+  return status === "done" || status === "stopped";
 }
 
 /** Is this agent's work WAITING ON THE USER — i.e. is it something he owes an action on?
@@ -533,6 +625,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     openAgentIds = [],
     lastObserved = {},
     interaction = {},
+    nudgeFlags = new Map(),
     shouldInterrupt = () => true,
   } = input;
   const pinnedProjectId = input.pinnedProjectId ?? null;
@@ -646,6 +739,16 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     // `status: "new"` ("not briefed") for the SAME agent — and made route 4 untestable here
     // except by mutating a module singleton. Also what keeps the "Pure" claim above true.
     interaction,
+    undefined, // `thrashOf` — the live registry default is correct here.
+    undefined, // `isFinishedOf` — this surface polls no git state of its own.
+    undefined, // `deathCauseOf` — live window-local registry default.
+    undefined, // `hasBackgroundTasksOf` — live registry default.
+    // Passed for the same purity reason as `interaction` directly above (roborev 65448), and always
+    // passed — so `publishedStatusFor`'s live-registry default is unreachable from here and the
+    // input's own `new Map()` default is what a caller omitting it actually gets: nobody exempt
+    // (roborev 65473). A MAP rather than a predicate so it cannot be transposed with the
+    // identically-typed `hasBackgroundTasksOf` beside it (65465).
+    nudgeFlags,
   );
 
   // Band + parent for EVERY agent in the fleet, so representation can be resolved across projects
@@ -713,6 +816,26 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
     );
     const agents = p.agents.map((a): ConciergeAgent => {
       const status = derived[a.id] ?? DEFAULT_STATUS;
+      // OBSERVEDNESS IS READ FROM THE LOCAL LIVE MAP, NOT FROM `derived`, and that is the whole of
+      // roborev 65188. `derived` descends from `observedStatus`, which merges `trayStatusMap(roster)`
+      // UNDER `input.status` — and the roster is not an independent witness: `buildRoster` publishes
+      // `calmNewAgent(status[a.id], …) ?? DEFAULT_STATUS`, `calmNewAgent(undefined, …)` returns
+      // `undefined`, and `get_roster` hands every window its OWN slice back. So an agent nobody has
+      // a reading for is published as `"stopped"` and returns as a first-class entry — the roster
+      // echoing our own stand-in. Reading `derived` therefore called that echo an observation, and
+      // `statusObserved` flipped true one publish + one `roster://changed` tick after mount, exactly
+      // restoring the grey→white mount flash it was added to remove.
+      //
+      // The local map is the right source rather than a narrower one: the only consumer is
+      // `Workspace.terminalCalm`, which governs the LOCALLY HOSTED visible pane, so a cross-window
+      // row never needs an answer to this question.
+      //
+      // INTENDED CONSEQUENCE, stated here rather than discovered later: an agent restored after a
+      // restart whose process genuinely DID exit reads unobserved, so its terminal stays at full
+      // contrast until something writes a status. That is the honest reading of "we did not look",
+      // and full contrast is the safe side of that uncertainty — a pane that is too legible costs
+      // nothing, a pane that greys the text you are reading is the bug.
+      const statusObservedLocally = input.status[a.id] !== undefined;
       const tok = AGENT_STATUS[status] ?? AGENT_STATUS[DEFAULT_STATUS];
       const band = conciergeBand(status);
       const muted = conciergeTopics(a.id, status).some((t) => !shouldInterrupt(t));
@@ -759,6 +882,7 @@ export function buildConciergeFeed(input: ConciergeFeedInput): ConciergeFeed {
         projectName: p.name,
         kind: a.kind,
         status,
+        statusObservedLocally,
         statusColor: tok.color,
         statusLabel: tok.label,
         band,

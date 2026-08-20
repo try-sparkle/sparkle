@@ -376,6 +376,7 @@ const TOOLS_CONFIG_PATH: Record<ToolKey, string> = {
   roborev: "tools.roborev",
   onepassword: "tools.onepassword",
   builderIndex: "tools.builder_index",
+  straude: "tools.straude",
 };
 
 /** Set (or clear) the 1Password vault backups are written to. A null id UNSETS the key rather
@@ -451,6 +452,25 @@ export async function setBuilderIndexEnabled(on: boolean): Promise<void> {
     return;
   }
   await setToolEnabled("builderIndex", false);
+}
+
+/**
+ * Toggle the straude.com reporter — the SECOND, independent reporting destination.
+ *
+ * Same asymmetry as `setBuilderIndexEnabled`, for the same reason: ON opens the consent modal and
+ * writes nothing, because that modal is where the user reads what leaves the machine and signs in;
+ * OFF writes immediately, because withdrawing consent must never need a dialog.
+ *
+ * Deliberately a SEPARATE function rather than a shared helper parameterised by key. These are
+ * competing leaderboards with different sign-ins, and the one bug worth engineering against is a
+ * change to one destination silently altering the other's consent state.
+ */
+export async function setStraudeEnabled(on: boolean): Promise<void> {
+  if (on) {
+    useSettingsStore.getState().setStraudeModalOpen(true);
+    return;
+  }
+  await setToolEnabled("straude", false);
 }
 
 /** Plugin key → its dotted config path under [plugins]. Note the snake_case leaf: the TOML key is

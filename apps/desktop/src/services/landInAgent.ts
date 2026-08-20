@@ -35,6 +35,33 @@ import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { sideOf } from "../engine/pairs";
+import { attentionHold, type AttentionHold } from "../engine/attentionGuard";
+
+/** Did a PERSON ask for this hand-off, or did the app decide to make it? */
+export type AttentionIntent =
+  /** A click, a keystroke, a menu item. NEVER declined — the user asked, so they get moved. */
+  | "user"
+  /** The app moved on its own (a concierge spawn, a board hand-off, a captured send). Declined
+   *  while the founder's attention is held — see engine/attentionGuard. */
+  | "auto";
+
+export interface LandInAgentOpts {
+  /** Defaults to `"user"`, so every existing call site keeps today's behaviour verbatim. */
+  attention?: AttentionIntent;
+  /** The hold the caller ALREADY read, when it made earlier decisions off the same answer. Omitted
+   *  means "read the live caret here". Passing it is how a multi-step caller avoids reading a moving
+   *  value twice in one decision (see engine/attentionGuard's note); `null` is a real value meaning
+   *  "I looked and nothing was held", and is not the same as omitting it. */
+  hold?: AttentionHold | null;
+}
+
+/** What the hand-off actually did, so a caller reads an outcome instead of inferring one. */
+export type LandOutcome =
+  /** All four steps ran — the user is looking at the agent. */
+  | "landed"
+  /** The attention move was declined; the agent was still OPENED, so its pane mounts and its PTY
+   *  launches. A held hand-off is quiet, never fictional. */
+  | "held";
 
 /**
  * Put `agentId` in front of the user: leave any special view, select it, open it, and scroll its
@@ -43,8 +70,26 @@ import { sideOf } from "../engine/pairs";
  * Callers pass an id they have already null-checked — every creator in this codebase can return
  * null (the project was closed in another window mid-action, roborev 46278), and revealing a
  * phantom id would scroll to a row that does not exist.
+ *
+ * ══ `attention: "auto"` MAY BE DECLINED ═════════════════════════════════════════════════════════
+ * The founder's rule: a jump the app started must not take him out of a terminal he is typing in.
+ * When it is declined, ONLY step 3 (`open`) runs — the one that mounts the pane and drives the PTY
+ * launch. Dropping that too would not make the hand-off quiet, it would make it FICTIONAL: the agent
+ * is created on paper, never starts, and every caller downstream reports success. That is the same
+ * split `SpawnBuildAgentOpts.background` already draws, and for the same reason.
  */
-export function landInAgent(projectId: string, agentId: string): void {
+export function landInAgent(
+  projectId: string,
+  agentId: string,
+  opts: LandInAgentOpts = {},
+): LandOutcome {
+  if (opts.attention === "auto") {
+    const hold = opts.hold !== undefined ? opts.hold : attentionHold();
+    if (hold !== null) {
+      useRuntimeStore.getState().open(agentId);
+      return "held";
+    }
+  }
   const ui = useUiStore.getState();
   ui.setActiveSpecial(null);
   // The agent lives in exactly one column; that is the only board this hand-off may close.
@@ -52,4 +97,5 @@ export function landInAgent(projectId: string, agentId: string): void {
   useProjectStore.getState().selectAgent(projectId, agentId);
   useRuntimeStore.getState().open(agentId);
   useUiStore.getState().requestRevealAgent(agentId);
+  return "landed";
 }

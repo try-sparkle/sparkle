@@ -422,7 +422,7 @@ export interface SidebarViewState {
    *  "board" USED to be reported here; it is not a window-global any more, because each column has
    *  its own Plan board. Read `workMode === "plan"` above for that — it is this column's answer,
    *  where the old field could only give the window's. */
-  activeSpecial: "sparkle" | null;
+  activeSpecial: "sparkle" | "research" | null;
   bands: BandVisibility;
   /** Per-band totals over the UNFILTERED top-level rows, so a band that is switched off still
    *  reports how many rows turning it back on would reveal — the same count the chips show. */
@@ -865,15 +865,11 @@ export function setWorkMode(mode: string): SidebarViewResult<WorkModeChange> {
     return refuse("set_work_mode", "no-op", `The column is already in ${mode} mode.`);
   }
   // EVERY branch goes through the store action that owns the mode-plus-yield pairing, so none can
-  // drift from the chevron the way this call site twice did. That is also why "preview" gets a
-  // branch here rather than a refusal: `openPreview` is the third member of that family, and a
-  // mode the type accepts but the dispatch cannot reach would refuse at the LAST step, after the
-  // no-op check has already reported the request as actionable.
-  //
-  // It opens the PANE and starts no server, exactly as the toggle segment does — the preview slot
-  // renders whatever state that agent's preview is in, including "none".
+  // drift from the chevron the way this call site twice did. The union is back to two members — a
+  // preview is a concierge card now, not a mode — so there are exactly two branches, and the
+  // message a bad `mode` gets is built from `WORK_MODES` rather than re-listed here, which is what
+  // stopped that message going stale the last time the union changed.
   if (mode === "plan") useUiStore.getState().openPlanBoard(side);
-  else if (mode === "preview") useUiStore.getState().openPreview(side);
   else useUiStore.getState().showBuildStage(side);
   return ok("set_work_mode", { priorWorkMode, workMode: mode });
 }
@@ -956,7 +952,7 @@ export interface SelectRowOutcome {
    *  nothing was selected in that project. */
   priorSelection: { projectId: string; agentId: string | null } | null;
   priorWorkMode: WorkMode;
-  priorActiveSpecial: "sparkle" | "board" | null;
+  priorActiveSpecial: "sparkle" | "research" | null;
   /** Present only when `ensureVisible` had to change the filter. Re-appliable. */
   priorBands: BandVisibility | null;
   /** Present only when `ensureVisible` had to open a subtree. Re-appliable. */

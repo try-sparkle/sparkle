@@ -34,7 +34,9 @@ const ev = (
   lastEvent: string | null,
   lastEventMs: number | null,
   sessionId: string | null = MAIN,
-): MovementEvidence => ({ lastEvent, lastEventMs, sessionId });
+  // `toolsRecent` is carried on the evidence for engine/goalContinuation, never read here — see
+  // the field's note on MovementEvidence.
+): MovementEvidence => ({ lastEvent, lastEventMs, sessionId, toolsRecent: null });
 
 const T = 1_000_000;
 

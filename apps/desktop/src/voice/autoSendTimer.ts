@@ -287,6 +287,50 @@ export function resumeCountdown(state: AutoSendState, now: number): AutoSendStat
 }
 
 /**
+ * The draft GREW by a gesture the user made — a paste, a dropped image, a picked file. Put the
+ * clock back to a FULL threshold and keep counting (bead sparkle-3kqg2v).
+ *
+ * ══ THE FOUNDER'S REPORT ════════════════════════════════════════════════════════════════════════
+ * *"So maybe we just need to reset the countdown if I paste something in or if I drop in an image
+ * or upload a file. Just reset the countdown back and then start the countdown again."* The
+ * `@`-address pause above already covers the case he checked first; this is the other half of the
+ * same complaint. A dictated sentence ends, the clock starts, and he reaches for the keyboard or
+ * the mouse to add the thing the message is ABOUT — and the send goes out carrying the words
+ * without the attachment, or with half a paste.
+ *
+ * ── RESET, NOT PAUSE, AND NOT CANCEL — THE THREE DIFFER AND ONLY ONE IS ASKED FOR ──────────────
+ * {@link pauseCountdown} freezes and waits for a matching resume, so a gesture with no "end" to it
+ * (a paste is over the instant it lands) would wedge the rail with nothing left to un-freeze it.
+ * {@link noteSpeechResumed} clears `silenceStartedAt` outright, so nothing but a fresh speech-end
+ * could ever count again and the finished sentence would sit in the box forever. He asked for
+ * neither: he asked for the clock to *start over*, which is exactly what {@link resumeCountdown}
+ * already does on its way out of a pause — this is that re-anchor, reachable on its own.
+ *
+ * ── AN INSTANT, NOT A STATE, SO IT IS NOT IDEMPOTENT ───────────────────────────────────────────
+ * The opposite of `pauseCountdown`'s rule, and deliberately: pasting twice is two gestures and each
+ * one is owed its own full threshold. The caller therefore signals it with a monotonic sequence
+ * number rather than a boolean (see useAutoSend), because two consecutive pastes must be two
+ * signals and an edge on a boolean would collapse them.
+ *
+ * ── ONLY WHILE A CLOCK IS ACTUALLY RUNNING ─────────────────────────────────────────────────────
+ * A no-op while `listening`, and that is the whole safety argument for wiring this to paste. There
+ * is no countdown to reset before a speech-end, so this can only ever DELAY a send — it can never
+ * start one. Pasting into an idle box does not arm anything.
+ *
+ * Anchored at {@link clockAt} rather than `now` so a reset landing DURING a pause (paste a URL
+ * mid-`@`-address) anchors at the frozen instant instead of handing back the wall-clock time the
+ * pause was holding off. The elapsed stays 0 either way, and `resumeCountdown` re-anchors again on
+ * the way out, so the two compose rather than fight.
+ *
+ * The drop-grace goes with it, for the reason `resumeCountdown` states: THRESHOLD_DROP_GRACE_MS
+ * buys one visible moment against an elapsed time that no longer exists.
+ */
+export function restartCountdown(state: AutoSendState, now: number): AutoSendState {
+  if (state.phase !== "counting" || state.silenceStartedAt === null) return state;
+  return { ...state, silenceStartedAt: clockAt(state, now), fireNoEarlierThan: null };
+}
+
+/**
  * How long until the send fires, floored at 0. `Infinity` when nothing is counting.
  *
  * A PURE function of `silenceStartedAt` and the CURRENT tier — which is exactly what "move the

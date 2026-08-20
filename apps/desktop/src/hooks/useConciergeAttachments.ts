@@ -49,6 +49,48 @@ import type { ConciergeAttachKind } from "../components/Concierge/types";
 export interface ConciergeAttachments {
   /** Staged files, oldest first. */
   attachments: Attachment[];
+  /**
+   * How many times the user has STAGED something here, counting up from 0. Bumped once per batch
+   * that actually landed, never decremented.
+   *
+   * The auto-send countdown's reset signal for two of its three cases (bead sparkle-3kqg2v):
+   * *"reset the countdown if I paste something in or if I drop in an image or upload a file."* The
+   * host feeds it to `useAutoSend` as `draftGrewSeq`; the paste is the box's own to report.
+   *
+   * ── A COUNTER, NOT `attachments.length`, AND THAT IS THE WHOLE POINT ─────────────────────────
+   * The length is a STATE and this is a count of EVENTS, and they disagree in both directions.
+   * Watching the length would fire on {@link restore} — a send that failed putting the user's files
+   * back, which is not a gesture they made and must not buy the draft a fresh countdown — and would
+   * miss a drop of two files replacing two just removed. It is bumped inside `add`, the one funnel
+   * all three producers reach (picker, drop, capture handoff) and the one `restore`, `remove` and
+   * `take` all bypass, so the distinction is structural rather than remembered at four call sites.
+   *
+   * A batch that staged NOTHING does not bump: a cancelled picker and a drop whose every file
+   * failed both resolve empty, and neither put anything in the box to read.
+   */
+  stagedSeq: number;
+  /**
+   * A native picker this hook opened is ON SCREEN right now — the screenshot crosshairs, or the
+   * Finder open panel. False the instant it closes, whether the user picked something or cancelled.
+   *
+   * The auto-send countdown's PAUSE signal (the founder: *"pause the countdown while those are
+   * active … because it means that I'm taking an action, basically"*). The host feeds it to
+   * `useAutoSend` beside `composingMention`, which is the same shape of fact: a condition that is
+   * true for a stretch of time rather than an instant.
+   *
+   * ── DISTINCT FROM `stagedSeq`, AND BOTH ARE NEEDED ───────────────────────────────────────────
+   * `stagedSeq` fires AFTER files land and restarts the clock from full. It cannot help here: it
+   * has nothing to say during the seconds the picker is open, which is the entire interval the send
+   * must not fire in — and it never fires at all for a cancelled picker, which must still not have
+   * had a message sent out from under it. This is the *while*; that is the *after*.
+   *
+   * ── A COUNTER UNDERNEATH, NOT A BOOLEAN ──────────────────────────────────────────────────────
+   * Two picks can overlap (click Upload, then Screenshot before the panel returns). With a boolean,
+   * whichever resolves first clears the flag while the other panel is still on screen, and the
+   * countdown resumes underneath it — the exact bug, one click later. The counter only reaches zero
+   * when the last one closes.
+   */
+  pickerOpen: boolean;
   /** A file drag is currently over the compose box. */
   dropActive: boolean;
   /** Set when an attach attempt lost files, cleared on the next attempt or by `dismissNotice`.
@@ -106,8 +148,32 @@ export function useConciergeAttachments(): ConciergeAttachments {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dropActive, setDropActive] = useState(false);
   const [attachNotice, setAttachNotice] = useState<string | null>(null);
+  const [stagedSeq, setStagedSeq] = useState(0);
   // Mirror of the list that is readable synchronously (see the header note on take()).
   const ref = useRef<Attachment[]>([]);
+
+  // ── HOW MANY NATIVE PICKERS ARE OPEN ────────────────────────────────────────────────────────
+  //
+  // The REF is the truth and the state is the render of it, rather than the other way round. Two
+  // clicks in one tick both read the same stale state under a functional-update-free boolean, and
+  // even `setOpen(n => n + 1)` cannot be READ back synchronously by the second `attach` call — so
+  // the count lives in a ref that is written immediately, and the state exists only so that a
+  // change re-renders the host and reaches `useAutoSend`. See `pickerOpen` for why a bare boolean
+  // is wrong regardless of how it is stored.
+  const openPickers = useRef(0);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const openPicker = useCallback(() => {
+    openPickers.current += 1;
+    setPickerOpen(true);
+  }, []);
+  const closePicker = useCallback(() => {
+    // Floored at zero so an unmatched close — a double-settle, a future caller that closes twice —
+    // cannot drive the count negative and leave the rail permanently paused with no picker on
+    // screen. Failing toward "the countdown runs" is the right direction for a bug in this
+    // bookkeeping: the worst case is the old behaviour, not a rail that never sends again.
+    openPickers.current = Math.max(0, openPickers.current - 1);
+    if (openPickers.current === 0) setPickerOpen(false);
+  }, []);
 
   const apply = useCallback((fn: (cur: Attachment[]) => Attachment[]) => {
     ref.current = fn(ref.current);
@@ -118,6 +184,9 @@ export function useConciergeAttachments(): ConciergeAttachments {
     (atts: Attachment[]) => {
       if (atts.length === 0) return;
       apply((cur) => [...cur, ...atts]);
+      // ONE bump per batch, not one per file: a three-file drop is one gesture, and the countdown
+      // it restarts is owed one fresh threshold rather than three. See `stagedSeq`.
+      setStagedSeq((n) => n + 1);
     },
     [apply],
   );
@@ -136,12 +205,28 @@ export function useConciergeAttachments(): ConciergeAttachments {
 
   const attach = useCallback(
     (kind: ConciergeAttachKind) => {
+      // THE FLAG GOES UP ON THE CLICK, NOT WHEN THE PANEL IS CONFIRMED VISIBLE.
+      //
+      // A native picker takes a few hundred ms to appear and the countdown's tick is 100ms, so a
+      // clock near its deadline fires in that gap — which is the founder's bug arriving slightly
+      // earlier rather than being fixed. There is no event for "the crosshairs are now on screen"
+      // and there does not need to be: `openPicker` is called synchronously in the click handler,
+      // before `pickAttachments` is even entered, so no tick can land between the gesture and the
+      // pause. Erring long is free here (the clock is frozen, not cancelled); erring short sends
+      // the message.
+      openPicker();
       // pickAttachments never rejects (a refused picker resolves an outcome carrying `error`), so
       // there is nothing to catch here — but a cancel resolves empty and must stay silent, which
       // is why the empty outcome produces no notice.
-      void pickAttachments(kind).then(settle);
+      //
+      // A CANCEL RESOLVES TOO, and that is what stops a dismissed panel wedging the rail. There is
+      // no rejection path to also close: every outcome — files, a cancel, an error — arrives as a
+      // resolved outcome, so one `closePicker` here covers all three. `finally` rather than a call
+      // inside `settle` so a throw in `settle` itself cannot leave the countdown paused forever;
+      // a wedged rail is a countdown that never fires dressed up as one that does.
+      void pickAttachments(kind).then(settle).finally(closePicker);
     },
-    [settle],
+    [settle, openPicker, closePicker],
   );
 
   const attachPaths = useCallback(
@@ -224,6 +309,8 @@ export function useConciergeAttachments(): ConciergeAttachments {
 
   return {
     attachments,
+    stagedSeq,
+    pickerOpen,
     dropActive,
     attachNotice,
     dismissNotice,

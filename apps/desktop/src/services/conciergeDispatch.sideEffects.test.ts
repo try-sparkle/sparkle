@@ -49,6 +49,7 @@ import {
   flushPendingSends,
   isTerseAnswer,
   onDeferredSendOutcome,
+  recordPromptSideEffects,
 } from "./conciergeDispatch";
 import { registerPromptMarker, resetPromptMarkers } from "./terminalMarkers";
 import { pendingSendCount, queuePendingSend, resetPendingSends, MAX_PER_AGENT } from "./pendingSends";
@@ -193,6 +194,157 @@ describe("dispatchConciergeAnswer — re-homed composer side-effects", () => {
     // …and the recorded history entry is trimmed too, so the pinned header and the naming basis
     // read the same string.
     expect(promptsOf("a1").at(-1)!.text).toBe("wire the webhook");
+  });
+});
+
+// ══ AN ARGV BRIEF WHOSE PROMPT IS ALREADY IN THE STORE ══════════════════════════════════════════
+//
+// THE REGRESSION THESE EXIST FOR. `sendToBuild.seedDraft` writes the seed with `appendPrompt` AND
+// attaches it as the launch brief. The pane then runs `recordPromptSideEffects` after the argv
+// launch — so for one mission the store got TWO identical `promptHistory` rows, only the second of
+// which carried a terminal marker (leaving the first's "jump to this prompt" dead), the naming
+// ladder's `promptCount` was double-counted, a free-trial prompt was debited for a send nobody made,
+// and a GENERATED epic brief was taught to the ghost-text corpus that documents it must hold only
+// what a person actually typed.
+//
+// Reachable on EVERY Plan-board Start click and every sweeper-created orchestrator, so these assert
+// the counts rather than mere presence — "a row exists" was true throughout the regression.
+describe("recordPromptSideEffects — the prompt is ALREADY recorded (argv brief)", () => {
+  it("does NOT append a second history row for one mission", async () => {
+    // Stand in for seedDraft's own write, then deliver as the pane does.
+    const promptId = useProjectStore
+      .getState()
+      .appendPrompt("p1", "a1", "run epic e1", "composer", false);
+    expect(promptsOf("a1")).toHaveLength(1);
+
+    recordPromptSideEffects("a1", "run epic e1", {}, false, { promptId });
+
+    expect(promptsOf("a1")).toHaveLength(1);
+    expect(promptsOf("a1")[0]!.id).toBe(promptId);
+  });
+
+  it("marks the terminal against the EXISTING row, so jump-to-prompt resolves", async () => {
+    // The one side-effect still genuinely owed: the attaching caller had no terminal to mark.
+    const mark = vi.fn();
+    registerPromptMarker("a1", mark);
+    const promptId = useProjectStore
+      .getState()
+      .appendPrompt("p1", "a1", "run epic e1", "composer", false);
+
+    recordPromptSideEffects("a1", "run epic e1", {}, false, { promptId });
+
+    expect(mark).toHaveBeenCalledWith(promptId);
+  });
+
+  it("does NOT debit a free-trial prompt, and does NOT poison the ghost-text corpus", async () => {
+    const promptId = useProjectStore
+      .getState()
+      .appendPrompt("p1", "a1", "run epic e1", "composer", false);
+
+    recordPromptSideEffects("a1", "run epic e1", {}, false, { promptId });
+
+    expect(recordTrialSend).not.toHaveBeenCalled();
+    // The corpus doc: "teach from what the user actually TYPED — never an attachment path". A
+    // generated epic brief is the same class of thing.
+    expect(usePromptHistoryStore.getState().history).toEqual([]);
+    expect(maybeAutoName).not.toHaveBeenCalled();
+  });
+
+  // ══ THE GOAL-DEBT HALF — the defect that had NO runtime test at all ═══════════════════════════
+  //
+  // Reviewed finding: the dedupe cases above assert row counts, markers, the meter and the corpus,
+  // but nothing asserted the outcome the HIGH-severity half is about. A refactor that kept the row
+  // count at 1 while re-releasing the debt would have passed every one of them. These assert the
+  // debt itself.
+  //
+  // `escalatedAt`/`continues`/`totalContinues` are what `releaseGoalDebt` clears, and clearing them
+  // refills a bound `MAX_CONCIERGE_REARMS` exists to meter — so a machine handoff must never do it.
+  const escalated = () => ({
+    ...mkAgent("a1"),
+    goal: {
+      text: "land the retry PR",
+      setAt: 1,
+      ttlMs: 10_000,
+      continues: 2,
+      totalContinues: 3,
+      escalatedAt: 999,
+    },
+  });
+  const goalOf = (id: string) =>
+    useProjectStore.getState().projects.flatMap((p) => p.agents).find((a) => a.id === id)?.goal;
+
+  describe("goal debt", () => {
+    beforeEach(() => {
+      useProjectStore.setState({
+        projects: [{ ...structuredClone(project), agents: [escalated()] }],
+        selectedProjectId: "p1",
+      } as never);
+    });
+
+    it("a MACHINE brief already in the store leaves the escalation latched", async () => {
+      recordPromptSideEffects("a1", "run epic e1", {}, false, { promptId: "seeded-1" });
+
+      expect(goalOf("a1")?.escalatedAt).toBe(999);
+      expect(goalOf("a1")?.continues).toBe(2);
+      expect(goalOf("a1")?.totalContinues).toBe(3);
+    });
+
+    it("a MACHINE brief with NO promptId records the row AND still leaves it latched", async () => {
+      // ── WHERE THE `humanAuthored` FLAG IS LOAD-BEARING, AND WHY THE TWO GATES ARE SPLIT ──────
+      // Two reviewed findings, in opposite directions, and this case is where they meet.
+      //
+      // Gating EVERYTHING on the record's mere PRESENCE made the threaded flag unreachable —
+      // discarded when a record existed, and `?? true` (the old default) when it did not — and it
+      // meant a record without an id skipped every write, leaving the agent with no history row and
+      // no marker: briefless to `newAgentAttention`, jump-to-prompt resolving to nothing, the very
+      // failure agentBrief exists to prevent. Gating EVERYTHING on the id was the other one: see
+      // the billing block below.
+      //
+      // So the ID gates only append-vs-mark, which is why this case takes the APPEND path carrying
+      // the real authorship: the row IS written, and the debt is NOT released. Flip the 4th
+      // argument to `true` and the second assertion fails.
+      recordPromptSideEffects("a1", "run epic e1", {}, false, {});
+
+      expect(promptsOf("a1")).toHaveLength(1); // recorded — not briefless
+      expect(goalOf("a1")?.escalatedAt).toBe(999); // and still latched
+      expect(goalOf("a1")?.totalContinues).toBe(3);
+      // ── AND IT MUST NOT DIVERGE FROM THE WITH-ID CASE ON BILLING ──────────────────────────
+      // Reviewed finding: keying the meter and the corpus on the ID meant the SAME machine brief
+      // billed a free-trial prompt and taught the corpus a generated brief whenever the id happened
+      // to be absent, and did neither when it was present — a user-visible charge decided by a
+      // field that says nothing about who wrote the text. Those effects are keyed on the record's
+      // PRESENCE now; the id decides only append-vs-mark.
+      expect(recordTrialSend).not.toHaveBeenCalled();
+      expect(usePromptHistoryStore.getState().history).toEqual([]);
+      expect(maybeAutoName).not.toHaveBeenCalled();
+    });
+
+    it("a HUMAN prompt with no record DOES release the debt — the paired positive", async () => {
+      // Without this the fix could refuse to release for everyone and every assertion above would
+      // still pass, while a person typing at an escalated agent stopped clearing it — the one lever
+      // documented as stronger than the concierge.
+      recordPromptSideEffects("a1", "carry on please");
+
+      expect(goalOf("a1")?.escalatedAt).toBeUndefined();
+      expect(goalOf("a1")?.continues).toBe(0);
+      expect(goalOf("a1")?.totalContinues).toBe(0);
+    });
+  });
+
+  it("STILL does all five when nothing was pre-recorded — buildAgentSpawn's path is unchanged", async () => {
+    // The paired positive. Without it the fix could early-return unconditionally and every one of
+    // the assertions above would still pass, while briefs that genuinely need recording lost it.
+    const mark = vi.fn();
+    registerPromptMarker("a1", mark);
+
+    recordPromptSideEffects("a1", "fix the parser");
+
+    expect(promptsOf("a1")).toHaveLength(1);
+    expect(promptsOf("a1")[0]!.text).toBe("fix the parser");
+    expect(mark).toHaveBeenCalledWith(promptsOf("a1")[0]!.id);
+    expect(recordTrialSend).toHaveBeenCalledTimes(1);
+    expect(usePromptHistoryStore.getState().history).toEqual(["fix the parser"]);
+    expect(maybeAutoName).toHaveBeenCalledWith("p1", "a1", "fix the parser");
   });
 });
 

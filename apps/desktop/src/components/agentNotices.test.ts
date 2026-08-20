@@ -98,6 +98,8 @@ describe("agentNotices", () => {
     // exercised, and could ship ranked above a red cause with the suite green. `satisfies` makes
     // omitting one a type error at this line instead of a silent gap.
     const ALL = Object.keys({
+      "blocked-on-human": 0,
+      "rearms-exhausted": 0,
       "human-verified-goal": 0,
       "abandoned-goal": 0,
       "unmet-goal": 0,
@@ -577,5 +579,42 @@ describe("every goal pill the producer can emit has an explainer", () => {
       // dead end from the reader's side.
       expect(explainer!.length).toBeGreaterThan(80);
     }
+  });
+});
+
+// ── THE PILL FOR A HUMAN BLOCK EXISTS AND CARRIES ITS EXPLAINER (roborev 65339, a High) ────────────
+//
+// The first cut threaded `humanBlock` into the SIDEBAR's stall report only, so the dot went red from
+// that reading while this surface — which builds its own — never emitted the notice. The result was
+// a red row with no explanation attached anywhere: the inverse of the founder's complaint rather
+// than a fix for it. These assert the notice is reachable, not merely that the engine ranks it.
+describe("blocked-on-human reaches the notice surface", () => {
+  it("emits a pill with the reader-addressed label", () => {
+    const ids = agentNotices({ stall: stallOf(["blocked-on-human"]) }).map((x) => x.id);
+    expect(ids).toContain("stall:blocked-on-human");
+    const pill = agentNotices({ stall: stallOf(["blocked-on-human"]) }).find(
+      (x) => x.id === "stall:blocked-on-human",
+    );
+    expect(pill?.label).toBe("blocked on you");
+  });
+
+  it("has an explainer, so clicking the pill recovers what it means", () => {
+    // bead sparkle-tyter: a mark the founder can click and NOT recover the meaning of is the defect
+    // NOTICE_EXPLAINER exists to prevent, and its key space is `Record<string, string>` — untyped, so
+    // a missing entry compiles silently. That is exactly how `goal:discharged` shipped without one.
+    const text = NOTICE_EXPLAINER["stall:blocked-on-human"] ?? "";
+    expect(text).not.toBe("");
+    // It may address the founder directly — one of only three causes where that is safe, because the
+    // agent ASSERTED it rather than the app inferring it.
+    expect(text).toMatch(/person|you/i);
+  });
+
+  it("leads the row when an amber cause sits beside it", () => {
+    // The ordering that matters in practice: `escalated-goal` coexists with this on the same row by
+    // construction (the nudger flags agents whose goals auto-continue handed back), so if the quiet
+    // member won, the row's single glyph would describe the wrong thing.
+    expect(
+      agentNotices({ stall: stallOf(["escalated-goal", "blocked-on-human"]) }).map((x) => x.id),
+    ).toEqual(["stall:blocked-on-human", "stall:escalated-goal"]);
   });
 });

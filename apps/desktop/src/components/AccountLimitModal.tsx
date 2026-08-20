@@ -42,7 +42,11 @@ const ACCOUNT_LIMIT_MODAL_Z = 130;
 /** Placeholder nickname for the row created before the login runs. It is replaced by the account's
  *  real email the moment the login confirms ({@link adoptionOutcome}); it is only ever visible if
  *  the user abandons the flow half-way, so it reads as an explanation rather than a name. */
-export const PENDING_NICKNAME = "Signing in…";
+// Defined in the React-free view module, where the staleness rule that reads it also lives
+// (`signInStalled`) — imported for use below AND re-exported so existing importers are unaffected.
+// A bare `export … from` would re-export without binding it locally, and line ~96 needs the value.
+import { PENDING_NICKNAME } from "./accountsView";
+export { PENDING_NICKNAME };
 
 /** When the limit resets, in the user's own locale. Mirrors `AccountsScreen`'s `exhaustedLabel`
  *  rather than inventing a second format — the same instant should read the same everywhere. */

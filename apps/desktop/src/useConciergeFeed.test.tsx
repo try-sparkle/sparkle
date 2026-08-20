@@ -10,6 +10,8 @@ import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useSparklePrefsStore } from "./stores/sparklePrefsStore";
 import { resetRetractionLedgerForTests } from "./engine/movementRetraction";
+import { __setAuthRecoveryDeps, pollNudgeFlags } from "./services/authRecovery";
+import { noteThrashEvent, resetThrashTracking, NUDGE_LOOP_LIMIT } from "./engine/agentThrash";
 import type { AgentTab, Project } from "./types";
 
 function agent(id: string, over: Partial<AgentTab> = {}): AgentTab {
@@ -103,7 +105,7 @@ describe("movement retraction is wired through the hook", () => {
   const moved = (atMs: number) =>
     act(() => {
       useRuntimeStore.getState().setAgentMovement({
-        a1: { lastEvent: "PostToolUse", lastEventMs: atMs, sessionId: null },
+        a1: { lastEvent: "PostToolUse", lastEventMs: atMs, sessionId: null, toolsRecent: null },
       });
     });
 
@@ -180,5 +182,64 @@ describe("movement retraction is wired through the hook", () => {
     vi.setSystemTime(T0 + 60_000);
     act(() => useRuntimeStore.setState({ status: { a1: "blocked", b1: "working" } }));
     expect(island.result.current.counts.needs_you).toBe(0);
+  });
+});
+
+// ── THE SUBSCRIPTION TO THE NUDGER FLAG TABLE (roborev 65448) ──────────────────────────────────────
+//
+// The feed reads the flag table through `publishedStatusFor`, and that table lives outside React. A
+// dep merely LISTED in this hook's memo is held in place by nothing — the memo carries an
+// `eslint-disable`, so the rule neither demands it nor reports it — which is why the snapshot is now
+// READ in the body and passed as `humanBlockedOf`. This is the test that fails if that read is
+// removed or the subscription is swapped for a plain call.
+//
+// It is also the founder's own case: a silent agent already on screen when the nudger flips its
+// reply to `blocked-on-human`. Nothing else about that row changes, so the subscription is the only
+// way the digest can ever learn.
+describe("a nudger flag arriving after mount reaches the feed", () => {
+  const founderFlag = (agentId: string, reply: string) => ({
+    agentId,
+    target: "founder",
+    raisedAtMs: 1,
+    nudges: 3,
+    delivered: 3,
+    blockedBy: null,
+    silentSecs: 300,
+    reply,
+  });
+
+  afterEach(async () => {
+    __setAuthRecoveryDeps(null);
+    resetThrashTracking();
+  });
+
+  it("flips the agent back into needs-you on the SAME mount", async () => {
+    // a1 is pinged into silence and `blocked`, so the nudge-loop rule demotes it to amber and it
+    // leaves the needs-you band — the correct behaviour when nobody has said a person is blocking.
+    useProjectStore.setState({ projects: [project("pA", [agent("a1")])] });
+    useRuntimeStore.setState({ status: { a1: "blocked" }, agentMovement: {} });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [] } as never);
+    await pollNudgeFlags();
+    for (let n = 1; n <= NUDGE_LOOP_LIMIT; n++) {
+      noteThrashEvent("a1", {
+        event: "UserPromptSubmit",
+        prompt: `[sparkle-nudge #${n} · no output for ${n * 5}m] Automated ping, not a new task.`,
+        ts: n * 1000,
+      });
+      noteThrashEvent("a1", { event: "Stop", ts: n * 1000 });
+    }
+
+    const { result } = renderHook(() => useConciergeFeed());
+    expect(result.current.scopedCounts.needs_you).toBe(0);
+
+    // …then the agent answers the ladder. No store write, no re-render forced by the test.
+    await act(async () => {
+      __setAuthRecoveryDeps({
+        readNudgeFlags: async () => [founderFlag("a1", "blocked-on-human")],
+      } as never);
+      await pollNudgeFlags();
+    });
+
+    expect(result.current.scopedCounts.needs_you).toBe(1);
   });
 });

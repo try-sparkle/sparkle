@@ -84,12 +84,16 @@ interface DictationState {
   enabled: boolean;
   /** passive = hearing but not typing; active = routing speech to the box. Persisted and synced
    *  across all windows (like `enabled`), so the active/paused status the user selects carries when
-   *  they focus a different project — reset to `passive` on a true cold start (see windowContext). */
+   *  they focus a different project — AND across a relaunch, on the same terms as `enabled`. Boot
+   *  used to force this back to `passive`, which restored half of a two-field setting and brought
+   *  the mic up armed and capturing with routing off: audio recorded, nothing transcribed, nothing
+   *  on screen saying why (bead sparkle-ysv1gj). See the note in windowContext.tsx. */
   phase: Phase;
   /** Transient: the "You are out of credits. Refill to activate voice." notice is showing. Set
    *  when the user tries to ARM the mic while out of credits (the arm is refused instead). Both mic
    *  surfaces (composer + top-left bar) subscribe to it, so the message shows in both at once. Runtime
-   *  only — never persisted (partialize keeps just `enabled`), so it can't survive a relaunch. */
+   *  only — never persisted (partialize keeps only `enabled` and `phase`), so it can't survive a
+   *  relaunch. */
   outOfCreditsNotice: boolean;
   /** The FAULT, tracked separately from the NOTICE that reports it: the frame-liveness watchdog has
    *  said audio stopped arriving and has not yet said it resumed.
@@ -361,8 +365,10 @@ export const useDictationStore = create<DictationState>()(
       // Persist the two user-facing mic settings so they carry across all windows (and relaunch):
       // `enabled` (on/off) and `phase` (paused vs. actively listening). Everything else (mic level,
       // status, download progress, the live insert callback) is per-session runtime that must not
-      // persist. NOTE: a persisted `phase: "active"` is reset to "passive" on a true cold start by
-      // the main window (see windowContext.tsx) so relaunching never resumes mid-dictation.
+      // persist. BOTH survive a relaunch, and that is load-bearing: boot used to restore `enabled`
+      // while forcing `phase` back to "passive", which brought the mic back armed and capturing
+      // with routing off — audio recorded, nothing transcribed (bead sparkle-ysv1gj). Restore the
+      // pair or neither; see the note in windowContext.tsx.
       partialize: (s) => ({ enabled: s.enabled, phase: s.phase }),
     },
   ),

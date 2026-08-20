@@ -20,6 +20,7 @@ import {
   _resetResearchStoreForTests,
   useResearchStore,
 } from "../../services/research/store";
+import { useUiStore } from "../../stores/uiStore";
 import type { ResearchTask } from "../../services/research/types";
 
 const ID = "rsh_1754700004000_0a1b2c3d4e5f6071";
@@ -50,7 +51,10 @@ function seed(t: ResearchTask | null) {
   });
 }
 
-beforeEach(() => _resetResearchStoreForTests());
+beforeEach(() => {
+  _resetResearchStoreForTests();
+  useUiStore.setState({ activeSpecial: null } as never);
+});
 afterEach(cleanup);
 
 const pill = () => screen.queryByTestId("concierge-research-pill");
@@ -68,15 +72,20 @@ describe("ResearchPill — a sparkle-research: reference becomes a clickable pil
     expect(el!.getAttribute("data-status")).toBe("running");
   });
 
-  it("opens the task on click — the SIDE EFFECT that reveals the row", () => {
+  it("opens the task in the MAIN pane on click — the SIDE EFFECT that reveals it", () => {
     seed(task());
     render(<Markdown text={`see [it](${researchRefHref(ID)})`} />);
     expect(useResearchStore.getState().openTaskId).toBeNull();
+    expect(useUiStore.getState().activeSpecial).toBeNull();
 
     fireEvent.click(pill()!);
-    // The whole of the click: the store's openTaskId now names this task, which is what
-    // ConciergeAgentsRow reads to expand its group and scroll the row into view.
+    // The whole of the click (founder 2026-08-17: a research agent works like any other worker, so
+    // its link shows it on the RIGHT): openTaskId names this task — which ConciergeAgentsRow reads to
+    // expand its group and scroll the row into view — AND activeSpecial flips to "research" so the
+    // main-pane view is the active surface. Both, not just the first: a click that set only
+    // openTaskId would expand the sidebar row but leave the pane closed, so the link would look dead.
     expect(useResearchStore.getState().openTaskId).toBe(ID);
+    expect(useUiStore.getState().activeSpecial).toBe("research");
   });
 
   it("repaints its status dot as the task moves — it re-reads live state", () => {

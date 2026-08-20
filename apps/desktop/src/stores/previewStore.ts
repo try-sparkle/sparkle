@@ -128,6 +128,34 @@ export interface PreviewEntry {
    * value's whole job is to withhold permission to open a pane unasked.
    */
   surfacedAt?: number | null;
+  /**
+   * When this preview last showed a SIGN OF LIFE — the clock `previewIdleGrace` measures against
+   * `[preview] idle_grace_min`. Null on a hand-built fixture that predates it.
+   *
+   * ══ A LAST-SEEN-AT, WHICH IS EXACTLY WHAT `surfacedAt` REFUSES TO BE ════════════════════════
+   * Its neighbour above is a TRANSITION stamp and says why at length: a last-seen-at there would
+   * hold the auto-open freshness TTL permanently open. This field wants the opposite, because it
+   * answers the opposite question — not "did something just become worth showing" but "has
+   * anything happened to this server lately". So it is written on EVERY `setPreview`, including
+   * the ones the unchanged-value bail throws away.
+   *
+   * ══ WRITTEN THROUGH THE BAIL, IN PLACE, AND THAT IS THE WHOLE TRICK ═════════════════════════
+   * "Record the activity" and "re-render the card" are two different things, and the bail exists
+   * only for the second. So the bail path MUTATES this one field on the entry it is about to
+   * return unchanged: `byAgent` keeps its identity, the entry keeps its identity, zustand's
+   * `Object.is` short-circuit fires, no subscriber wakes, and nothing re-renders — while the
+   * timestamp still moves. Nothing renders from this field, by construction; its only reader is
+   * the idle clock, which polls the store rather than subscribing to it.
+   *
+   * ══ WHAT COUNTS AS ACTIVITY IS BROADER THAN THE WIRE ════════════════════════════════════════
+   * `preview.rs`'s `supervise()` stops emitting once a server is `Ready` — it sleeps on a liveness
+   * check and transitions again only to `Crashed`/`Failed`. So a healthy preview produces NO
+   * further events at all, and a wire-only clock would be a max-lifetime cap wearing an idle
+   * clock's name. {@link notePreviewActivity} is the seam for the rest: the card's ⟳, a click
+   * through to the url, an agent's `preview_inspect`. Each of those is a human or an agent saying
+   * "this preview is still wanted", which is precisely what the grace window is asking about.
+   */
+  lastActivityAt?: number | null;
 }
 
 /** The states in which a preview is worth putting in front of the user: it has compiled and is
@@ -204,7 +232,15 @@ export const usePreviewStore = create<PreviewStoreState>((set) => ({
   setPreview: (agentId, next) =>
     set((s) => {
       const prev = s.byAgent[agentId];
-      if (prev && sameUpdate(prev, next)) return s;
+      if (prev && sameUpdate(prev, next)) {
+        // IN-PLACE, AND ONLY THIS FIELD. A repeat event is still a sign of life, so the idle clock
+        // must see it — but the projection is unchanged, so the card must not re-render. Mutating
+        // the entry rather than replacing it is what separates those two: `s` is returned by
+        // identity, zustand's `Object.is` check short-circuits, and no subscriber is woken. See
+        // `lastActivityAt`'s note on PreviewEntry.
+        prev.lastActivityAt = Date.now();
+        return s;
+      }
       const entry: PreviewEntry = {
         ...next,
         // Both carried forward. `startedAt` is when THIS preview appeared, not when the last event
@@ -220,6 +256,9 @@ export const usePreviewStore = create<PreviewStoreState>((set) => ({
           isSurfacingState(next.status) && prev?.status !== next.status
             ? Date.now()
             : (prev?.surfacedAt ?? null),
+        // A LAST-SEEN-AT, unlike its neighbour: every update is activity, including one that only
+        // moved the url. The bail above stamps the repeats this branch never sees.
+        lastActivityAt: Date.now(),
       };
       return { byAgent: { ...s.byAgent, [agentId]: entry } };
     }),
@@ -265,3 +304,27 @@ export const usePreviewStore = create<PreviewStoreState>((set) => ({
         : { openedProjects: { ...s.openedProjects, [projectId]: true } },
     ),
 }));
+
+/**
+ * Record that something still wants this agent's preview, WITHOUT changing what anything renders.
+ *
+ * The seam named in `lastActivityAt`'s note: `preview.rs` goes silent once a server is `Ready`, so
+ * every remaining sign of life is a human's or an agent's, and each one arrives through a caller
+ * that is not a wire event — the card's ⟳ refresh and its click-through (`PreviewCards.tsx`), an
+ * agent's `preview_inspect` capture. Call this from any of them and the idle-grace window restarts.
+ *
+ * WRITES NOTHING TO ZUSTAND. It mutates the one non-rendered field on the existing entry, exactly
+ * as `setPreview`'s bail does, so it can be called from a click handler or a render-adjacent effect
+ * without costing a re-render — and so it cannot loop by waking the subscription that called it.
+ * A no-op when there is no entry: activity on a preview that does not exist is not a fact worth
+ * inventing an entry for.
+ *
+ * @returns whether there was an entry to stamp — so a caller that cares can tell "recorded" from
+ *          "there is no preview here", rather than having to re-read the store to find out.
+ */
+export function notePreviewActivity(agentId: string, at: number = Date.now()): boolean {
+  const entry = usePreviewStore.getState().byAgent[agentId];
+  if (!entry) return false;
+  entry.lastActivityAt = at;
+  return true;
+}

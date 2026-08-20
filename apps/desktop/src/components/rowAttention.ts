@@ -33,6 +33,7 @@ import {
 } from "../engine/agentGoal";
 import type { StallCause, StallInput, StallReport } from "../engine/agentStall";
 import type { QuotaBlock } from "../engine/quotaBlock";
+import type { HumanBlock } from "../engine/humanBlock";
 import type { ThrashReport, ThrashVerdict } from "../engine/agentThrash";
 import type { AgentTabStatus } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
@@ -111,12 +112,17 @@ export function stallInputsFor(
   // It is a separate parameter rather than a member of `RowGitEvidence` because it is not git
   // evidence — it is an observation from the agent's own output stream.
   quotaBlock?: QuotaBlock,
+  // Same reasoning as `quotaBlock` above, from a different ledger: this is the Rust nudger's record
+  // of the agent's own answer about what is blocking it (`engine/humanBlock`). Not git evidence, so
+  // not a member of `RowGitEvidence`; passed in, so this stays pure.
+  humanBlock?: HumanBlock,
 ): StallInput {
   return {
     status,
     now,
     goal,
     ...(quotaBlock ? { quotaBlock } : {}),
+    ...(humanBlock ? { humanBlock } : {}),
     hasOpenPr: openPrEvidence(ev.ws),
     hasUnlandedWork: unlandedEvidence(ev),
     hasUncommittedChanges: uncommittedEvidence(ev.bs),
@@ -126,9 +132,16 @@ export function stallInputsFor(
 /** Each outstanding thing in three or four words, for a chip that has to fit in a sidebar column.
  *  The full sentence lives in `StallReport.detail` and rides along as the chip's tooltip. */
 export const STALL_CAUSE_LABEL: Record<StallCause, string> = {
+  // ADDRESSES THE READER, and says WHOSE claim it is. "blocked on you" rather than "blocked on
+  // human" on purpose: the wire token is machine vocabulary, and the row is read by the person it
+  // names. This is the label that finally matches the red dot the founder expected.
+  "blocked-on-human": "blocked on you",
   // THE ONLY LABEL THAT ADDRESSES THE READER. Every other phrase here names a state; this one names
   // an action, because it is the one cause where he is the only actor who can clear it.
   "human-verified-goal": "needs your sign-off",
+  // Names what RAN OUT rather than what happened, because "stuck again" is already carried by the
+  // goal badge beside it and the fact worth three words here is that nothing may retry it now.
+  "rearms-exhausted": "no re-arms left",
   // The second label that addresses the reader, and for the same reason: nothing else can clear it.
   // "abandoned" rather than "expired" deliberately — the clock is not the fact worth three words
   // here, the stranded branch is.
@@ -336,10 +349,35 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
       // The common case (never re-armed) keeps its exact original wording: this is a rarer row and
       // must not cost the ordinary one any clarity.
       const rearms = goal.conciergeRearms ?? 0;
-      const why = goal.escalationReason ? ` — ${goal.escalationReason}` : "";
+      // ⚠️ A STALE SENTENCE IS NOT RENDERED AS A LIVE CLAIM (founder, 2026-08-18). `escalationReason`
+      // is free prose frozen at the instant auto-continue gave up, and `chargeGoalDebt` deliberately
+      // carries it onto whatever the goal becomes next — so it outlives the work it describes and
+      // nothing regenerates it. Interpolated unconditionally, that let a row assert a blocker that no
+      // longer existed: the row he reported read "blocked on human" about a release run that had
+      // already terminally failed, in the app's own badge, beside a goal it no longer held.
+      //
+      // ⚠️ BE PRECISE ABOUT WHAT SURVIVES — this comment has now overstated it in BOTH directions
+      // (roborev 65339, then 65369/65370), so it is written as an enumeration rather than a claim.
+      // `staleQuote` carries `escalatedGoalText`, the GOAL TEXT the escalation was about, not the
+      // `escalationReason` SENTENCE. Who still carries that sentence for a stale escalation:
+      //   • DROPPED — this badge label, and `agentStall.stalledDetail` (the chip tooltip + pill).
+      //   • CARRIED, MARKED STALE — the MCP roster (`services/controlListener`) and the wake-up
+      //     brief (`services/agentGoalDisk`); both attach `escalationStale` beside it.
+      //   • CARRIED, MARKED STALE — `services/agentGoalReading.goalReading`, which reaches
+      //     `get_agent_status` and the `set_agent_goal` reply. It was the last UNFLAGGED reader and
+      //     handed a machine the frozen sentence as an unqualified live claim; it now sets
+      //     `escalationStale` too.
+      // The trade this line makes is only about the LABEL: an out-of-date sentence with no room to
+      // date it is worse than no sentence, and the reader still learns the escalation is stale and
+      // what it was about.
+      //
+      // This is also the founder's "stale can never be red" rule at the copy layer: no red tier reads
+      // this prose (see `stallEscalation.OUTSTANDING`), and now no live-sounding label does either.
+      const staleProse = escalationQuotesStaleText(goal);
+      const why = goal.escalationReason && !staleProse ? ` — ${goal.escalationReason}` : "";
       // Spread onto every escalated shape below, so a re-armed-and-stuck-again row cannot silently
       // lose the marker the common case gets.
-      const stale = escalationQuotesStaleText(goal) ? { staleQuote: goal.escalatedGoalText } : {};
+      const stale = staleProse ? { staleQuote: goal.escalatedGoalText } : {};
       if (rearms === 0) {
         return {
           state,
@@ -349,9 +387,13 @@ export function goalBadgeFor(goal: AgentGoal | undefined, now: number): GoalBadg
           ...stale,
         };
       }
-      // Amber either way. Escalated-goal was deliberately removed from the RED tier on 2026-08-06
-      // because rows were painted red that needed nothing, and a spent allowance is still a row the
-      // human reads at their own pace rather than an alarm.
+      // The BADGE stays amber either way — `escalated-goal` was deliberately removed from the RED
+      // tier on 2026-08-06 because rows were painted red that needed nothing, and that has not
+      // changed. What DID change is the CAUSE: a spent allowance now also raises the
+      // `rearms-exhausted` stall cause (engine/agentStall), which IS in the red tier, because at
+      // that point auto-continue can do nothing more and only a human can move the row. The two
+      // are not in conflict — the amber here is the goal badge's own wording, the red is the dot.
+      // Read them together: `!mayRearmGoal(goal)` is the exact predicate behind both.
       const spent = !mayRearmGoal(goal);
       const label = spent
         ? `re-armed ${rearms}× and stuck again — no re-arms left, this one is yours${why}`

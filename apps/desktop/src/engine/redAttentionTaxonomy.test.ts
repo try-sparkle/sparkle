@@ -7,7 +7,15 @@ import { bandOfStatus } from "./buildSections";
 import { isRedStatus } from "../services/windowStatus";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { stallReport, type StallCause, type StallInput, type StallReport } from "./agentStall";
-import { escalateGoal, markGoalMet, newGoal, type AgentGoal } from "./agentGoal";
+import {
+  escalateGoal,
+  escalationQuotesStaleText,
+  markGoalMet,
+  newGoal,
+  MAX_CONCIERGE_REARMS,
+  type AgentGoal,
+} from "./agentGoal";
+import { humanBlockOf } from "./humanBlock";
 import { agentClosableKind } from "@sparkle/core";
 import { mightNeedFollowup } from "../services/turnFollowup";
 import type { AgentTabStatus } from "../types";
@@ -287,6 +295,12 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
       expect(escalationFor(report(["human-verified-goal", c]))).toBe("blocked");
       // …and in the other input order, so it is the SET that decides and not the array head.
       expect(escalationFor(report([c, "human-verified-goal"]))).toBe("blocked");
+      // EVERY red cause outranks, not just the one this loop was written for. `blocked-on-human` is
+      // the case the founder actually hit — it coexists with `escalated-goal` on the same row by
+      // construction, since the nudger flags agents whose goals auto-continue has handed back — so if
+      // the ordering only held for `human-verified-goal` the fix would not reach his row at all.
+      expect(escalationFor(report(["blocked-on-human", c]))).toBe("blocked");
+      expect(escalationFor(report([c, "blocked-on-human"]))).toBe("blocked");
     }
   });
 
@@ -313,6 +327,13 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
     // founder is the only actor who can clear it — which is the decision this whole file exists to
     // force. The expected tier is written out per cause so the answer is reviewable as data.
     const EXPECTED = {
+      // RED, added 2026-08-18 on the founder's report of a row that READ blocked-on-human and DREW
+      // amber. It is the only cause on this list sourced from the agent's own answer rather than from
+      // git, a clock or the goal record — `nudge_ladder` asked it what was blocking it and it named a
+      // person — which is what makes it narrow enough to sit here without re-reddening the population
+      // the 2026-08-06 demotion cleared. Demotion trigger, stated so it is not rediscovered as a
+      // false red: the day a machine actor can answer a `blocked-on-human` row on his behalf.
+      "blocked-on-human": "blocked",
       "human-verified-goal": "blocked",
       // RED, and the argument is who can clear it: nobody but him. Sparkle has stopped (the re-arm
       // budget is spent and the goal is escalated, so nothing retries it), the agent will not restart
@@ -322,6 +343,11 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
       // cannot wear it. Demotion trigger, stated so it is not rediscovered as a false red: the day
       // the concierge auto-lands abandoned branches, this becomes "lapsed".
       "abandoned-goal": "blocked",
+      // RED, and strictly NARROWER than `escalated-goal` below, which stays amber: this fires only
+      // once the concierge has spent every re-arm it is allowed, so the machine actor that would
+      // otherwise clear the row has demonstrably run out rather than being assumed absent. The row's
+      // own copy already said "this one is yours" in this state while drawing amber.
+      "rearms-exhausted": "blocked",
       "unmet-goal": "lapsed",
       "open-pr": "lapsed",
       "unlanded-work": "lapsed",
@@ -539,5 +565,175 @@ describe("human-verified-goal — raised only when no other actor can close the 
     // asking a question cannot also be handed a second alarm by this cause.
     const goal = escalateGoal(newGoal("approve the copy", T0, undefined, { kind: "human" }), T0, "spent");
     expect(stallReport({ ...quiet(goal), status: "waiting" }).verdict).toBe("active");
+  });
+});
+
+// ── THE FOUNDER'S ROW: blocked on a human, drawn AMBER (2026-08-18) ────────────────────────────────
+//
+// *"I see that the Sparkle CI runner spot auto scaler has a blocked on human issue. By the way the
+// dot is amber or yellow and not red. It seems like this should be a red dot so that seems
+// problematic that it's not showing as red when it says it's blocked on human."*
+//
+// THE ROW, exactly as reported: `status: idle`, stall verdict `stalled`, causes `['escalated-goal']`,
+// `goal.state: 'escalated'`, `escalationStale: true`. It SAID blocked-on-human — in agent-authored
+// prose interpolated into its goal badge — while the colour system, which reads only structural
+// causes, saw an escalated goal and correctly rendered the amber `lapsed` tier.
+//
+// The fix is not to redden `escalated-goal` (that is the 2026-08-06 wall of false red, and this file
+// pins it amber above). It is to give the app a STRUCTURAL way to say "a person is the blocker" —
+// `engine/humanBlock`, relaying the answer `nudge_ladder.rs` already collects and that nothing read.
+describe("blocked-on-human — the agent's own answer reaches the dot", () => {
+  const T0 = 1_700_000_000_000;
+  /** The founder's row: idle, escalated goal, everything else clean. `humanBlock` is the ONE thing
+   *  that varies between the cases below, which is what makes the pair non-vacuous. */
+  const row = (humanBlock?: { raisedAtMs: number }): StallInput => ({
+    status: "idle",
+    now: T0 + 1,
+    goal: escalateGoal(newGoal("keep the CI runner autoscaler green", T0), T0, "budget spent"),
+    hasOpenPr: false,
+    hasUnlandedWork: false,
+    hasUncommittedChanges: false,
+    ...(humanBlock ? { humanBlock } : {}),
+  });
+
+  it("idle + escalated goal + the agent said a person is blocking it → RED", () => {
+    const report = stallReport(row({ raisedAtMs: T0 }));
+    expect(report.verdict).toBe("stalled");
+    expect(report.causes).toContain("blocked-on-human");
+    expect(escalationFor(report)).toBe("blocked");
+    expect(isRedStatus(escalationFor(report))).toBe(true);
+    expect(bandOfStatus("blocked")).toBe("needs_you");
+  });
+
+  it("…and the SAME row without that answer is still AMBER — the flag is what moves it", () => {
+    // THE PAIRED NEGATIVE, and the assertion that keeps the one above from being vacuous. Every
+    // other field is identical, so a green pair proves the human block is doing the work rather than
+    // the fixture happening to be red for some unrelated reason. It also pins the half of the
+    // founder's 2026-08-06 rule that must NOT regress: an escalated goal on its own stays amber.
+    const report = stallReport(row());
+    expect(report.causes).toEqual(["escalated-goal"]);
+    expect(escalationFor(report)).toBe("lapsed");
+    expect(isRedStatus(escalationFor(report))).toBe(false);
+    expect(needsAttention("lapsed")).toBe(false);
+  });
+
+  it("a STALE escalation does not redden the row on its own — prose is never a colour input", () => {
+    // The founder's second instruction the same day: a stale escalation must never be red. His row's
+    // escalation sentence quoted a release run that had already terminally failed, so the row
+    // asserted a blocker that no longer existed. Pin that the prose has no colour authority at all:
+    // a goal whose escalation quotes text it no longer holds is still merely `escalated-goal`.
+    const escalated = escalateGoal(newGoal("watch release run 123", T0), T0, "run 123 needs a human");
+    const stale = { ...escalated, text: "something else entirely" };
+    expect(escalationQuotesStaleText(stale)).toBe(true);
+    const report = stallReport({ ...row(), goal: stale });
+    expect(report.causes).not.toContain("blocked-on-human");
+    expect(escalationFor(report)).toBe("lapsed");
+  });
+
+  it("a FRESH answer still reddens a row whose escalation prose is stale — different evidence", () => {
+    // The fork the founder settled: staleness is a property of the frozen `escalationReason`
+    // SENTENCE, which `chargeGoalDebt` carries onto later goal text so it outlives what it describes.
+    // A nudger flag cannot acquire that property — `nudger.rs::apply_flags` clears it the first time
+    // the agent moves — so a live flag is current evidence and is not vetoed by stale prose.
+    const escalated = escalateGoal(newGoal("watch release run 123", T0), T0, "run 123 needs a human");
+    const stale = { ...escalated, text: "something else entirely" };
+    const report = stallReport({ ...row({ raisedAtMs: T0 }), goal: stale });
+    expect(escalationQuotesStaleText(stale)).toBe(true);
+    expect(escalationFor(report)).toBe("blocked");
+  });
+
+  it("only the FOUNDER-targeted `blocked-on-human` reply raises it", () => {
+    // `Standdown::flag()` routes several blocked-shaped replies to the CONCIERGE on purpose — a
+    // task-less agent (sparkle-dfy3d) and an out-of-context one (sparkle-umtx1) were both found
+    // raising founder-level rows no person could act on. Reading the reply without the target would
+    // re-open that class of false alarm in the module built to avoid it.
+    expect(humanBlockOf({ target: "founder", reply: "blocked-on-human", raisedAtMs: T0 })).toEqual({
+      raisedAtMs: T0,
+    });
+    for (const flag of [
+      { target: "concierge", reply: "blocked-on-human", raisedAtMs: T0 },
+      { target: "founder", reply: "blocked-on-ci", raisedAtMs: T0 },
+      { target: "founder", reply: "out-of-context", raisedAtMs: T0 },
+      { target: "founder", reply: "no-task-assigned", raisedAtMs: T0 },
+      { target: "founder", reply: "not-blocked", raisedAtMs: T0 },
+      { target: "founder", reply: null, raisedAtMs: T0 },
+      { target: "founder", raisedAtMs: T0 },
+    ]) {
+      expect(humanBlockOf(flag)).toBeUndefined();
+    }
+    expect(humanBlockOf(undefined)).toBeUndefined();
+  });
+});
+
+// ── THE OTHER HALF OF THE SAME COMPLAINT: copy that says "yours" while colouring "not yours" ───────
+describe("rearms-exhausted — the state whose label already addressed the founder", () => {
+  const T0 = 1_700_000_000_000;
+  const rowWith = (conciergeRearms: number): StallInput => ({
+    status: "idle",
+    now: T0 + 1,
+    goal: { ...escalateGoal(newGoal("land the retry PR", T0), T0, "budget spent"), conciergeRearms },
+    hasOpenPr: false,
+    hasUnlandedWork: false,
+    hasUncommittedChanges: false,
+  });
+
+  it("every re-arm spent → RED: no machine actor may restart it again", () => {
+    const report = stallReport(rowWith(MAX_CONCIERGE_REARMS));
+    expect(report.causes).toContain("rearms-exhausted");
+    expect(escalationFor(report)).toBe("blocked");
+  });
+
+  it("…with re-arms still LEFT it stays AMBER — the concierge is the actor, not him", () => {
+    // The paired negative again, and the boundary that keeps this from being "escalated-goal is red"
+    // wearing a new name: one re-arm short of the cap the row is still somebody else's to clear.
+    const report = stallReport(rowWith(MAX_CONCIERGE_REARMS - 1));
+    expect(report.causes).not.toContain("rearms-exhausted");
+    expect(escalationFor(report)).toBe("lapsed");
+  });
+
+  it("a never-re-armed escalated goal is untouched — the 2026-08-06 demotion still holds", () => {
+    const report = stallReport(rowWith(0));
+    expect(report.causes).toEqual(["escalated-goal"]);
+    expect(escalationFor(report)).toBe("lapsed");
+  });
+});
+
+// ── THE STATUS PRECONDITION ON `blocked-on-human`, PINNED IN BOTH DIRECTIONS (roborev 65339) ───────
+//
+// The cause sits below `agentStall`'s `isQuiet` gate, so it is reachable only from a resting status.
+// Every other test in this file seeds `idle`, which left the boundary unasserted in either
+// direction — and an unasserted boundary is where a later "obvious" hoist lands without anyone
+// noticing it changed the roster's verdict.
+describe("blocked-on-human is gated on a resting status", () => {
+  const T0 = 1_700_000_000_000;
+  const at = (status: StallInput["status"]): StallReport =>
+    stallReport({
+      status,
+      now: T0 + 1,
+      goal: undefined,
+      hasOpenPr: false,
+      hasUnlandedWork: false,
+      hasUncommittedChanges: false,
+      humanBlock: { raisedAtMs: T0 },
+    });
+
+  it("a RESTING flagged agent raises it and goes RED", () => {
+    for (const s of ["idle", "unmerged"] as const) {
+      expect(at(s).causes).toContain("blocked-on-human");
+      expect(escalationFor(at(s))).toBe("blocked");
+    }
+  });
+
+  it("a WORKING or unobserved flagged agent does NOT — the verdict is `active`, not a contradiction", () => {
+    // Deliberate, not an oversight. `ESCALATABLE` is idle/unmerged only, so hoisting the cause above
+    // the gate would change no dot; and the flag self-corrects (`nudger.rs::apply_flags` clears it
+    // the first time the agent moves, and a `working` status means it IS producing output). Reporting
+    // `stalled` about a row the app simultaneously calls `working` would put a contradiction into the
+    // roster and buy nothing. If this is ever hoisted, it must be a deliberate change with its own
+    // evidence — this test is what makes that a decision rather than an accident.
+    for (const s of ["working", "stopped"] as const) {
+      expect(at(s).verdict).toBe("active");
+      expect(at(s).causes).toEqual([]);
+    }
   });
 });

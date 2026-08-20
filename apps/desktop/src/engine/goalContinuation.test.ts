@@ -822,3 +822,178 @@ describe("the expiry outcomes reach this gate correctly", () => {
     expect(d.action).toBe("escalate");
   });
 });
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// WHAT THE PREDICATE MEASURES (founder report, 2026-08-18)
+//
+// The escalation count went 4 → 8 in one hour while the fleet worked normally, and nearly every one
+// was false: six agents paged as "no sign of progress" while holding OPEN pull requests against a
+// CI queue of 16 runs on 6 runners. Two independent defects produced that, and each half is pinned
+// below with its PAIR — the case that must still escalate — because a suppression test on its own
+// passes just as well against a predicate that never fires at all.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+/** A goal that has burned the whole consecutive streak against an unmoved mark — the exact state
+ *  that escalates today. Every test in this section starts here and changes ONE thing. */
+function stuckGoal(text = "land the retry PR") {
+  let goal = newGoal(text, T0);
+  for (let i = 0; i < MAX_CONTINUES_WITHOUT_PROGRESS; i++) goal = noteContinue(goal, "stuck");
+  return goal;
+}
+
+describe("an external gate is not absence of progress", () => {
+  it("PAIR — with no gate known, the streak still escalates", () => {
+    // THE TRUE POSITIVE. Without this the suppression test below is satisfied by a predicate that
+    // has simply stopped working, which is the failure mode the founder explicitly ruled out
+    // ("do NOT just raise the threshold").
+    const d = decideContinuation(ready({ goal: stuckGoal(), mark: "stuck" }));
+    expect(d.action).toBe("escalate");
+    if (d.action !== "escalate") throw new Error("unreachable");
+    expect(d.reason).toContain("no sign of progress");
+  });
+
+  it("an agent holding an OPEN PR is restarted, not paged as 'no sign of progress'", () => {
+    // THE FOUNDER'S VERIFIABLE GOAL. Identical state to the pair above plus the one fact that was
+    // never consulted: the work is out in front of a gate.
+    const d = decideContinuation(
+      ready({
+        goal: stuckGoal(),
+        mark: "stuck",
+        externalWait: { kind: "open-pr", prNumber: 2117 },
+      }),
+    );
+    expect(d.action).toBe("continue");
+  });
+
+  it("the gate suppresses the DIAGNOSIS, not the ceiling — it still ends at a human", () => {
+    // A hole, not a gate, is the way this change could be wrong: an agent parked forever on an open
+    // PR must still reach somebody. It does, through MAX_CONTINUES_TOTAL — whose sentence is about
+    // the SPEND rather than the false claim that restarting cannot fix it.
+    let goal = newGoal("land the retry PR", T0);
+    let escalated: string | null = null;
+    for (let round = 0; round < MAX_CONTINUES_TOTAL * 3; round++) {
+      const d = decideContinuation(
+        ready({
+          goal,
+          mark: "stuck",
+          now: T0 + IDLE_SETTLE_MS + round,
+          externalWait: { kind: "open-pr", prNumber: 2117 },
+        }),
+      );
+      if (d.action === "continue") {
+        goal = noteContinue(goal, "stuck");
+        continue;
+      }
+      expect(d.action).toBe("escalate");
+      if (d.action === "escalate") escalated = d.reason;
+      break;
+    }
+    expect(escalated).not.toBeNull();
+    expect(escalated).toContain("per-goal ceiling");
+    // …and specifically NOT the diagnosis this gate exists to withhold.
+    expect(escalated).not.toContain("no sign of progress");
+  });
+
+  it("the resume banner past the bound tells the agent the truth about the ceiling", () => {
+    // AGENTS.md: a fix that changes WHEN something happens must update every string describing the
+    // old timing. `attempt` is `consecutive + 1`, so a gated agent reaches resume 4 — and the
+    // ordinary copy would read "AUTO-RESUME 4 OF 3 … at 3 this stops and escalates to a human",
+    // which is arithmetically absurd AND promises an escalation the gate just cancelled.
+    const d = decideContinuation(
+      ready({
+        goal: stuckGoal(),
+        mark: "stuck",
+        externalWait: { kind: "open-pr", prNumber: 2117 },
+      }),
+    );
+    if (d.action !== "continue") throw new Error("expected a continue");
+    expect(d.attempt).toBe(MAX_CONTINUES_WITHOUT_PROGRESS + 1);
+    expect(d.prompt).toContain("PR #2117");
+    expect(d.prompt).not.toContain(`OF ${MAX_CONTINUES_WITHOUT_PROGRESS} on this goal`);
+    expect(d.prompt).toContain(String(MAX_CONTINUES_TOTAL));
+    // It must not tell an agent that is waiting on CI to invent work.
+    expect(d.prompt).toContain("do not invent work");
+  });
+
+  it("an ungated agent's banner is unchanged", () => {
+    // The common path keeps its exact copy — `engine/agentOriginated` recognises Sparkle's own send
+    // by this text, and two of the assertions above are negative, so a rewrite of the shared
+    // sentence would go unnoticed without this.
+    let goal = newGoal("g", T0);
+    goal = noteContinue(goal, "stuck");
+    const d = decideContinuation(ready({ goal, mark: "stuck" }));
+    if (d.action !== "continue") throw new Error("expected a continue");
+    expect(d.prompt).toContain(`THIS IS AUTO-RESUME 2 OF ${MAX_CONTINUES_WITHOUT_PROGRESS}`);
+    expect(d.prompt).toContain("escalates to a human");
+  });
+});
+
+describe("the mark measures WORK, not just self-reports", () => {
+  const selfReports = { promptHistoryLength: 1, activity: "wiring", aiTitle: "PR work" };
+
+  it("PAIR — an agent that moves nothing observable still escalates", () => {
+    // The whole point of widening the mark is that it must stay ABLE to read "nothing happened".
+    // An auto-continue deliberately does not grow `promptHistory` (`userPrompt: false`), and it is
+    // not a tool call, so a wedged agent's mark is byte-identical across restarts.
+    const before = progressMark({ ...selfReports, toolBursts: 12, commitsAhead: 3, prMark: "open#7" });
+    const after = progressMark({ ...selfReports, toolBursts: 12, commitsAhead: 3, prMark: "open#7" });
+    expect(after).toBe(before);
+    const goal = { ...stuckGoal(), mark: before };
+    expect(decideContinuation(ready({ goal, mark: after })).action).toBe("escalate");
+  });
+
+  it("running TOOLS is progress — the signal the six false pages could not see", () => {
+    // A BURST COUNTER, not the raw windowed sample — see `noteToolActivity`. The engine only ever
+    // sees the folded number; that the fold is monotone is the runner's test.
+    const before = progressMark({ ...selfReports, toolBursts: 3 });
+    const after = progressMark({ ...selfReports, toolBursts: 4 });
+    expect(after).not.toBe(before);
+    // …and that difference is what turns the escalation back into a restart.
+    const goal = { ...stuckGoal(), mark: before };
+    expect(decideContinuation(ready({ goal, mark: after })).action).toBe("continue");
+  });
+
+  it("COMMITTING is progress", () => {
+    const goal = { ...stuckGoal(), mark: progressMark({ ...selfReports, commitsAhead: 3 }) };
+    const after = progressMark({ ...selfReports, commitsAhead: 4 });
+    expect(decideContinuation(ready({ goal, mark: after })).action).toBe("continue");
+  });
+
+  it("OPENING a PR, and its state moving, are both progress", () => {
+    const none = progressMark({ ...selfReports, prMark: null });
+    const opened = progressMark({ ...selfReports, prMark: "open#2117" });
+    const merged = progressMark({ ...selfReports, prMark: "merged#2117" });
+    expect(opened).not.toBe(none);
+    expect(merged).not.toBe(opened);
+  });
+
+  it("'we did not look' and 'we looked and saw none' are DIFFERENT marks", () => {
+    // A window with no digest for an agent reads null; a digest whose log is quiet reads 0. Folding
+    // them together would let our own blind spot masquerade as a stable observation of no work —
+    // the `undefined`-is-not-`false` rule the goal-reading service is built on.
+    expect(progressMark({ promptHistoryLength: 1, toolBursts: null })).not.toBe(
+      progressMark({ promptHistoryLength: 1, toolBursts: 0 }),
+    );
+    expect(progressMark({ promptHistoryLength: 1, commitsAhead: null })).not.toBe(
+      progressMark({ promptHistoryLength: 1, commitsAhead: 0 }),
+    );
+  });
+
+  it("the three original self-report inputs still move it", () => {
+    // Widening must not have replaced them: a human typing, a narration and a re-derived title are
+    // all still progress, and an all-artifact mark would have lost every agent with no worktree.
+    const m = progressMark(selfReports);
+    expect(progressMark({ ...selfReports, promptHistoryLength: 2 })).not.toBe(m);
+    expect(progressMark({ ...selfReports, activity: "testing" })).not.toBe(m);
+    expect(progressMark({ ...selfReports, aiTitle: "other" })).not.toBe(m);
+  });
+
+  it("a caller that supplies no artifact evidence gets the ORIGINAL mark", () => {
+    // Back-compat, and it is load-bearing rather than tidy: `MAX_CONCIERGE_REARMS`' docs and several
+    // callers reason about the three-field mark, and an unwired caller must keep today's behaviour
+    // instead of silently reading every agent as having progressed.
+    expect(progressMark(selfReports)).toBe(
+      progressMark({ ...selfReports, toolBursts: null, commitsAhead: null, prMark: null }),
+    );
+  });
+});

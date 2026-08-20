@@ -26,6 +26,13 @@
 // being stale is the normal state, not an edge case (AGENTS.md is largely about that). Getting this
 // backwards would make the tool actively misleading rather than merely incomplete.
 //
+// …BUT THREE-DOT ONLY HELPS IF THE BASE REF ITSELF IS FRESH, which is why `targetFor` naming a
+// plain branch is not the end of it. In an app-managed worktree nothing ever fast-forwards the
+// local `main`, so a merge base computed against it lands on a months-old tip and the agent's
+// inherited commits come back as its own work. The Rust side resolves the base to `origin/<base>`
+// when — and only when — the local branch is strictly behind it (`freshest_base` in `worktree.rs`),
+// and reports the ref it actually used as `base` on the result.
+//
 // BUDGETS ARE THE MODULE'S, NOT THE CALLER'S. Everything here lands in an LLM context window. The
 // Rust side caps files-per-call, lines-per-file and chars-per-file; a caller may ask for LESS but
 // never for more, and a truncated result says so with amounts. Silent truncation is the specific

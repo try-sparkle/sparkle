@@ -22,6 +22,7 @@ import {
   beadShow,
   blockedBeadIds,
   childrenOf,
+  isEpic,
   isBeadsUnavailable,
   type Bead,
 } from "../beads";
@@ -112,11 +113,10 @@ async function attempt<T>(op: PlansOp, run: () => Promise<T>): Promise<PlansResu
   }
 }
 
-/** An epic is a bead whose type says so. bd's type field is tolerant/loosely-cased, which
- *  `normalizeBead` already lowercases into `type`. */
-function isEpic(b: Bead): boolean {
-  return (b.type ?? "").toLowerCase() === "epic";
-}
+// Epic-ness is NOT decided here. `services/beads.ts` owns the one resolver (see the "Epic
+// membership" section there); this module used to test the type field on its own, which is one
+// of the three competing conditions that made eight real parents — typed feature/bug/task, 2 to 19
+// children apiece — invisible to `list_plans`.
 
 // ---------------------------------------------------------------------------------------------
 // Views
@@ -127,7 +127,11 @@ export interface PlanSummary {
   id: string;
   title: string;
   description: string;
-  /** not_started | in_progress | done — rolled up from the children by planView. */
+  /** unplanned | planning | in_progress | done — rolled up from the children by planView.
+   *
+   *  `planning` is the one the concierge should react to: it means the plan is WRITTEN and nobody
+   *  has started it. `unplanned` means the epic has no children at all, so there is nothing to
+   *  promote yet — offering to build one would hand a build agent an empty brief. */
   status: ReturnType<typeof epicStatus>;
   childCount: number;
   /** The build agent bound to this epic, when one exists. Null means nobody is on it yet — which is
@@ -183,7 +187,7 @@ export async function listPlans(
   return attempt("list_plans", async () => {
     const beads = await listBeads(projectPath);
     const agents = agentsOf(projectId);
-    return beads.filter(isEpic).map((e) => summarize(e, beads, agents));
+    return beads.filter((b) => isEpic(beads, b)).map((e) => summarize(e, beads, agents));
   });
 }
 
@@ -209,7 +213,7 @@ export async function getPlan(
   if (!found.ok) return found;
   const { epic, beads, blocked } = found.data;
   if (!epic) return ok("get_plan", null);
-  if (!isEpic(epic)) {
+  if (!isEpic(beads, epic)) {
     return refuse(
       "get_plan",
       "not-a-plan",
@@ -275,20 +279,27 @@ export async function promotePlanToBuild(
   epicId: string,
   prdPath: string | null,
 ): Promise<PlansResult<{ agentId: string; epicId: string; reused: boolean }>> {
-  const found = await attempt("promote_plan_to_build", () => beadShow(projectPath, epicId));
+  // The bead AND the full list: epic-ness is a property of the SET (does anything point at this
+  // bead?), so a lone `beadShow` cannot answer it. Fetched together — a de-facto epic typed
+  // `feature` would otherwise be refused as `not-a-plan` here even though `list_plans` offered it,
+  // which is the same split-brain this change exists to remove.
+  const found = await attempt("promote_plan_to_build", async () => {
+    const [epic, beads] = await Promise.all([beadShow(projectPath, epicId), listBeads(projectPath)]);
+    return { epic, beads };
+  });
   if (!found.ok) return found;
-  if (!found.data) {
+  if (!found.data.epic) {
     return refuse(
       "promote_plan_to_build",
       "unknown-plan",
       `I couldn't find a plan with id ${epicId} in this project.`,
     );
   }
-  if (!isEpic(found.data)) {
+  if (!isEpic(found.data.beads, found.data.epic)) {
     return refuse(
       "promote_plan_to_build",
       "not-a-plan",
-      `${epicId} is a ${found.data.type ?? "task"}, not a plan. Promoting builds an epic's children ` +
+      `${epicId} is a ${found.data.epic.type ?? "task"}, not a plan. Promoting builds an epic's children ` +
         `across workers; for a single task, start a build agent and brief it with the task instead.`,
     );
   }
@@ -315,7 +326,18 @@ export async function promotePlanToBuild(
     // `set_agent_escalation`. An un-latch falling out of a PROMOTION is none of those: nothing is
     // spent, nothing is attributable, and the bound that makes the lever safe is bypassed entirely.
     // So this flag is not "the concierge may never re-arm"; it is "a re-arm is never a side effect".
-    const agentId = sendToBuild({ projectId, epicId, prdPath, mode: "epic", humanAuthored: false });
+    // `attention: "auto"` for the same reason as `humanAuthored: false` just above — this is the
+    // LLM promoting a plan, not a hand on the board's Start button. So if the founder's caret is in
+    // a terminal when it lands, the orchestrator is still bound, seeded and relaunched; it just
+    // does not take his screen (engine/attentionGuard). Every board click keeps the default.
+    const agentId = sendToBuild({
+      projectId,
+      epicId,
+      prdPath,
+      mode: "epic",
+      humanAuthored: false,
+      attention: "auto",
+    });
     return ok("promote_plan_to_build", { agentId, epicId, reused: Boolean(already) });
   } catch (e) {
     if (e instanceof AtCapacityError) {

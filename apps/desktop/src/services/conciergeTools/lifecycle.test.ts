@@ -77,12 +77,22 @@ vi.mock("../branchStatus", async (orig) => ({
 // The real spawn body runs by default (these tests assert the human path's exact sequence); a test
 // that needs the "project vanished mid-spawn" branch sets `spawnOverride`.
 let spawnOverride: (() => string | null) | null = null;
+/** Every `opts` this tool actually handed the spawn. The wrapper USED TO DROP THE SECOND ARGUMENT
+ *  entirely, which made the tool's whole opts payload — the brief, the name, the model, the mode,
+ *  and now `attention` — untestable BY CONSTRUCTION: any of them could be deleted from the call
+ *  site and every test here would stay green while the feature went dead in the app. */
+const spawnOpts: Array<Record<string, unknown> | undefined> = [];
 vi.mock("../buildAgentSpawn", async (orig) => {
   const real = await orig<typeof import("../buildAgentSpawn")>();
   return {
     ...real,
-    spawnBuildAgentInProject: (project: Parameters<typeof real.spawnBuildAgentInProject>[0]) =>
-      spawnOverride ? spawnOverride() : real.spawnBuildAgentInProject(project),
+    spawnBuildAgentInProject: (
+      project: Parameters<typeof real.spawnBuildAgentInProject>[0],
+      opts?: Parameters<typeof real.spawnBuildAgentInProject>[1],
+    ) => {
+      spawnOpts.push(opts as Record<string, unknown> | undefined);
+      return spawnOverride ? spawnOverride() : real.spawnBuildAgentInProject(project, opts);
+    },
   };
 });
 
@@ -203,6 +213,7 @@ beforeEach(() => {
   // otherwise inherit whatever a previous test marked.
   resetVisitedProjects();
   spawnOverride = null;
+  spawnOpts.length = 0;
   shipWorkMock.mockReset();
   shipWorkMock.mockResolvedValue(PR_OPENED);
   saveWorkMock.mockReset();
@@ -253,6 +264,25 @@ describe("LIFECYCLE_RISK", () => {
 
 // ── Spawn ───────────────────────────────────────────────────────────────────────────────────────
 describe("spawnBuildAgent", () => {
+  // ══ THE TOOL OPTS INTO BEING DECLINED ═════════════════════════════════════════════════════════
+  // This is the ONE spawn call site that may be refused the view, and asserting it HERE is the
+  // point: `SpawnBuildAgentOpts.attention` defaults to `"user"`, so dropping this one word from the
+  // call site turns the whole focus guard off for the only path that can trigger it — silently, with
+  // the guard's own unit tests still green, because they pass the flag themselves.
+  it('passes attention: "auto" — a concierge spawn must not take a terminal the founder is typing in', async () => {
+    // NO `prompt`: a briefed spawn makes this tool await brief delivery, which is a 45s wait with no
+    // pane mounted to confirm it. `name` rides the same opts argument and proves the forwarding just
+    // as well.
+    const pid = seedProject();
+    await spawnBuildAgent({ projectId: pid, name: "Fixer" });
+
+    expect(spawnOpts).toHaveLength(1);
+    expect(spawnOpts[0]).toMatchObject({ attention: "auto" });
+    // The rest of the payload rides the same argument, and it was invisible to this suite until the
+    // wrapper started forwarding it. Pinned together so the forwarding cannot quietly regress.
+    expect(spawnOpts[0]).toMatchObject({ name: "Fixer" });
+  });
+
   it("creates the agent and returns its id", async () => {
     const pid = seedProject();
     const r = await spawnBuildAgent({ projectId: pid });
@@ -1727,5 +1757,82 @@ describe("restart_agent / stop_agent", () => {
     claimPass();
     expect((await restartAgent(agentId)).ok).toBe(true);
     expect(restart).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── THE NAME MUST LEAVE WITH THE AGENT (roborev 65334, Medium) ─────────────────────────────────────
+//
+// The founder's 2026-08-18 screenshot was about a receipt reading "Retired that agent." This family
+// reaches the same empty sentence by a different route: `close_agent`, `discard_agent` and
+// `spin_down_worker` are each argued by ID ALONE, and each REMOVES the roster row it is reporting
+// on — so `conciergeReceiptClassifier`, which takes a receipt's subject from the call args, has no
+// name to use, and the renderer's id→name lookup is guaranteed to miss because the agent is gone.
+// The reply is the LAST place the name exists.
+//
+// ══ WHY THIS SUITE AND NOT THE CLASSIFIER'S ═════════════════════════════════════════════════════
+// Because the classifier's cases hand-build `data: { …, agentName: "Kraken Auth" }`. That proves the
+// CONSUMER reads a field its own fixture already contains, and is worth having — but it is blind to
+// the producer: delete the three `agentName: found.agent.name` lines below and every one of those
+// cases still passes while the founder's "Closed that agent." comes straight back. That is the
+// two-halves-both-green seam AGENTS.md warns about, and the missing half is this one — a test that
+// drives the REAL function and reads the name off what it actually returned.
+//
+// The name is captured from the store BEFORE the teardown, deliberately: reading it afterwards is
+// impossible (that is the whole defect), and hard-coding a literal would stop testing the linkage
+// between the row and the reply.
+describe("the close family carries the torn-down agent's name in its reply", () => {
+  /** The roster's own name for an agent, read while it still exists. */
+  const nameOf = (id: string): string =>
+    useProjectStore.getState().projects[0]!.agents.find((a) => a.id === id)!.name;
+
+  it("closeAgent returns the name it just tore down", async () => {
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: CLEAN, stage: "building_saved" });
+    const expected = nameOf(id);
+    const r = await closeAgent(id);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    // The row is gone, which is exactly why the reply has to carry this.
+    expect(useProjectStore.getState().projects[0]!.agents).toHaveLength(0);
+    expect(r.data.agentName).toBe(expected);
+  });
+
+  it("discardAgent returns the name it just destroyed", async () => {
+    const pid = seedProject();
+    const id = seedBuild(pid, { bs: AHEAD, beadId: "bd-x" });
+    const expected = nameOf(id);
+    const r = await discardAgent(id, { confirm: DISCARD_CONFIRM_TOKEN, agentId: id });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.agentName).toBe(expected);
+  });
+
+  it("spinDownWorkerAgent returns the name it just spun down", async () => {
+    const pid = seedProject();
+    const parent = seedBuild(pid, { bs: CLEAN });
+    const worker = seedWorker(pid, parent, undefined, CLEAN);
+    const expected = nameOf(worker);
+    const r = await spinDownWorkerAgent(worker);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.agentName).toBe(expected);
+  });
+
+  // THE NAME IS THE SUBJECT'S, NOT JUST ANY NAME. With one agent on the roster a reply that returned
+  // the wrong row's name — or a hard-coded constant — is indistinguishable from a correct one. Two
+  // agents make the linkage assertable: closing the second must not report the first.
+  it("names the agent that was torn down, not merely some agent on the roster", async () => {
+    const pid = seedProject();
+    const other = seedBuild(pid, { bs: CLEAN, stage: "building_saved" });
+    const target = seedBuild(pid, { bs: CLEAN, stage: "building_saved" });
+    const otherName = nameOf(other);
+    const targetName = nameOf(target);
+    expect(targetName).not.toBe(otherName);
+
+    const r = await closeAgent(target);
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.agentName).toBe(targetName);
+    expect(r.data.agentName).not.toBe(otherName);
   });
 });

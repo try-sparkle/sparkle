@@ -164,13 +164,18 @@ export function normalizeTranscript(raw: unknown): PromotionTranscript | null {
 
 /** Read the worktree's git state. Changes nothing. Rejects with the Rust error string. */
 export async function promotionPreflight(
-  args: { root: string; agentId: string; worktree: string; baseBranch: string },
+  args: { root: string; agentId: string; projectId: string; worktree: string; baseBranch: string },
   invoker: Invoker = defaultInvoke,
 ): Promise<PromotionPreflight> {
   return normalizePreflight(
     await invoker<unknown>("promotion_preflight", {
       root: args.root,
       agentId: args.agentId,
+      // REQUIRED, not optional — Rust takes `project_id: String`, and Tauri errors on a missing key
+      // for a non-`Option` param, so omitting it fails the promotion at its FIRST step rather than
+      // degrading. It is what lets Rust read the branch→agent ownership table before deciding which
+      // branch this promotion will push to origin (bead `sparkle-pgkbn4`).
+      projectId: args.projectId,
       worktree: args.worktree,
       baseBranch: args.baseBranch,
     }),

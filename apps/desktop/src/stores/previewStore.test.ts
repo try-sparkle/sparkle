@@ -4,8 +4,8 @@
 // to be a real thing that can be read back. "The store has no `persist` option" is a vacuous
 // assertion — it is true of the code as written and stays true if someone adds one badly — so the
 // test reads the storage the bug would actually land in.
-import { beforeEach, describe, expect, it } from "vitest";
-import { usePreviewStore, type PreviewUpdate } from "./previewStore";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { notePreviewActivity, usePreviewStore, type PreviewUpdate } from "./previewStore";
 
 const RUNNING: PreviewUpdate = {
   id: "srv-1",
@@ -45,6 +45,82 @@ describe("previewStore", () => {
 
     expect(usePreviewStore.getState().byAgent).toBe(mapBefore);
     expect(usePreviewStore.getState().byAgent.a1).toBe(entryBefore);
+  });
+
+  // ══ THE BAIL RECORDS ACTIVITY WITHOUT RE-RENDERING — TWO CLAIMS, ONE ROW ═════════════════════
+  // "Do not re-render the card" and "do not notice the event" are different things, and the bail
+  // used to conflate them: a repeat was thrown away whole, so `previewIdleGrace` had nothing to
+  // time a healthy preview off (bead `sparkle-9yck3i`). Both halves are asserted together on
+  // purpose — dropping the mutation passes the identity half, and replacing the bail with a fresh
+  // object passes the timestamp half, and each alone is the defect the other guards against.
+  it("MOVES lastActivityAt on a repeat while keeping the map and entry identical", () => {
+    vi.useFakeTimers();
+    try {
+      usePreviewStore.getState().setPreview("a1", RUNNING);
+      const mapBefore = usePreviewStore.getState().byAgent;
+      const entryBefore = mapBefore.a1!;
+      const stampBefore = entryBefore.lastActivityAt;
+      expect(stampBefore).toBe(Date.now());
+
+      vi.advanceTimersByTime(90_000);
+      usePreviewStore.getState().setPreview("a1", { ...RUNNING });
+
+      // Nothing woke: same map, same entry object. This is what keeps a redundant event free.
+      expect(usePreviewStore.getState().byAgent).toBe(mapBefore);
+      expect(usePreviewStore.getState().byAgent.a1).toBe(entryBefore);
+      // …and the clock nonetheless moved, by the full 90s.
+      expect(usePreviewStore.getState().byAgent.a1!.lastActivityAt).toBe(Date.now());
+      expect(usePreviewStore.getState().byAgent.a1!.lastActivityAt).toBe(stampBefore! + 90_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // A CHANGED UPDATE IS ACTIVITY TOO. The bail path is not the only writer, and a preview that just
+  // moved `listening` -> `ready` is emphatically not idle.
+  it("stamps lastActivityAt on an update that really changed", () => {
+    vi.useFakeTimers();
+    try {
+      usePreviewStore.getState().setPreview("a1", { ...RUNNING, status: "listening" });
+      vi.advanceTimersByTime(30_000);
+      usePreviewStore.getState().setPreview("a1", RUNNING);
+      expect(usePreviewStore.getState().byAgent.a1!.lastActivityAt).toBe(Date.now());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ══ THE SEAM FOR EVERYTHING THAT IS NOT A WIRE EVENT ═════════════════════════════════════════
+  // `supervise()` stops emitting once a server is Ready, so on a healthy preview the ONLY thing
+  // that can say "still wanted" is a human or an agent — the card's refresh, a click through to the
+  // url, a `preview_inspect` capture. Same in-place contract as the bail, for the same reason: this
+  // is called from click handlers, and waking the subscription that rendered them is a re-render
+  // nobody asked for.
+  it("notePreviewActivity moves the stamp without allocating a new map or entry", () => {
+    vi.useFakeTimers();
+    try {
+      usePreviewStore.getState().setPreview("a1", RUNNING);
+      const mapBefore = usePreviewStore.getState().byAgent;
+      const entryBefore = mapBefore.a1!;
+
+      vi.advanceTimersByTime(45_000);
+      expect(notePreviewActivity("a1")).toBe(true);
+
+      expect(usePreviewStore.getState().byAgent).toBe(mapBefore);
+      expect(usePreviewStore.getState().byAgent.a1).toBe(entryBefore);
+      expect(entryBefore.lastActivityAt).toBe(Date.now());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Activity on a preview that does not exist is not a fact worth inventing an entry for — the same
+  // rule `bumpReload` follows, and for the same reason: a half entry with no status is something
+  // every reader would then have to defend against.
+  it("notePreviewActivity on an agent with no preview does not invent one", () => {
+    expect(notePreviewActivity("ghost")).toBe(false);
+    expect(usePreviewStore.getState().byAgent.ghost).toBeUndefined();
+    expect("ghost" in usePreviewStore.getState().byAgent).toBe(false);
   });
 
   it("does allocate when a field really changed", () => {

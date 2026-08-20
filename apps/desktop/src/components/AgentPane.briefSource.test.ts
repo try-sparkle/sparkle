@@ -56,7 +56,35 @@ describe("AgentPane — the opening brief is delivered as launch argv", () => {
     // An argv brief never passes through `submitPrompt`, so nothing else moves `lastPrompt` /
     // `promptHistory`. Without this the row reads as briefless to `newAgentAttention.isBriefless`
     // while the agent is actively working on the brief.
-    expect(code).toMatch(/recordPromptSideEffects\(agent\.id,\s*delivered\)/);
+    expect(code).toMatch(/recordPromptSideEffects\(agent\.id,\s*delivered\b/);
+  });
+
+  it("THREADS the brief's authorship and record instead of defaulting them", () => {
+    // ── WHY THIS IS PINNED IN THE SOURCE ────────────────────────────────────────────────────
+    // Both defects here are invisible to a runtime test of this component, because they are about
+    // ARGUMENTS THAT WERE NOT PASSED — the call succeeds either way.
+    //
+    // 1. `humanAuthored` defaulted to true, so a machine handoff (`epicSweepRunner` /
+    //    `conciergeTools/plans` pass `humanAuthored: false`) re-recorded its mission as a HUMAN
+    //    send and ran `releaseGoalDebt` on a reused orchestrator carrying a real debt.
+    // 2. the record was not passed, so `recordPromptSideEffects` appended a SECOND identical
+    //    `promptHistory` row for a prompt `seedDraft` had already written.
+    //
+    // THIS PINS ONLY THE JOIN, and that limit is the point. A source regex cannot tell a
+    // load-bearing argument from an inert one — an earlier cut of this fix skipped on the record's
+    // mere PRESENCE, so `humanAuthored` was read on no path at all, and this same assertion passed
+    // against it while guarding nothing. The BEHAVIOUR is asserted in
+    // `conciergeDispatch.sideEffects.test.ts`'s "goal debt" suite (an escalated agent stays latched
+    // for a machine brief and is released for a human one) and in `sendToBuild.test.ts` (the flag
+    // riding the brief). Those are the guards; this only catches someone trimming the call back to
+    // two arguments.
+    expect(code).toMatch(/record\?\.humanAuthored\s*\?\?\s*true/);
+    // Read BEFORE `noteBriefLaunched`, which consumes the held entry — asking after always answers
+    // undefined, which would silently restore BOTH defaults with the call still looking threaded.
+    const readAt = code.indexOf("briefRecord(agent.id)");
+    const consumeAt = code.indexOf("noteBriefLaunched(agent.id)");
+    expect(readAt).toBeGreaterThan(-1);
+    expect(readAt).toBeLessThan(consumeAt);
   });
 
   it("tells the waiting caller when the pane will never launch it", () => {

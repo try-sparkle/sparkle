@@ -30,12 +30,14 @@ import {
   setRoborevEnabled,
   refreshPluginInstallState,
   setBuilderIndexEnabled,
+  setStraudeEnabled,
 } from "../services/configActions";
 import {
   BUILDER_INDEX_URL,
   builderIndexReportFailing,
   builderIndexStatus,
 } from "../services/builderIndex";
+import { STRAUDE_URL, straudeReportFailing, straudeStatus } from "../services/straude";
 import { matchesSearch } from "../engine/settingsSearch";
 import { FONT_UI, PILL } from "../theme/scale";
 import { CHIP, SECTION_LABEL } from "./labelTreatment";
@@ -111,6 +113,11 @@ export const TOOL_META = {
     name: "Claude Code",
     desc: "The agent engine behind every Sparkle agent.",
     keywords: "claude code agent engine cli",
+  },
+  straude: {
+    name: "Straude",
+    desc: "Publish your daily token totals to straude.com, a separate public leaderboard. Aggregates only, never your code or prompts.",
+    keywords: "straude leaderboard publish daily tokens totals spend rank public reporting",
   },
   builderIndex: {
     name: "Builder Index",
@@ -429,6 +436,12 @@ const PLUGIN_SCOPE_HINT = "Applies to agents created from now on.";
 const BUILDER_INDEX_FAILING_HINT =
   "Your last report didn't reach the leaderboard — open Builder Index settings for the details";
 
+/** The straude twin of the hint above, and separate on purpose: these are two independent
+ *  destinations, so a user whose Builder Index is healthy and whose straude reporter is stuck has
+ *  to be pointed at the one that is actually broken. */
+const STRAUDE_FAILING_HINT =
+  "Your last report didn't reach straude — open Straude settings for the details";
+
 /** What a plugin row's hint line should say, given the installer's current state for it. The
  *  install is the half of a toggle-on the user can't see — it shells out to `claude plugin install`
  *  and can take a while or fail (offline, no `claude`, marketplace outage) — so the row reports it
@@ -486,6 +499,9 @@ export function ToolsPane({ query = "" }: { query?: string }) {
   const roborevAuthWarning = useSettingsStore((s) => s.roborevAuthWarning);
   const builderIndexEnabled = useSettingsStore((s) => s.builderIndexEnabled);
   const openBuilderIndexModal = useSettingsStore((s) => s.setBuilderIndexModalOpen);
+  const openStraudeModal = useSettingsStore((s) => s.setStraudeModalOpen);
+  const straudeEnabled = useSettingsStore((s) => s.straudeEnabled);
+  const straudeModalOpen = useSettingsStore((s) => s.straudeModalOpen);
   const builderIndexModalOpen = useSettingsStore((s) => s.builderIndexModalOpen);
   const onepasswordEnabled = useSettingsStore((s) => s.onepasswordEnabled);
   const onepasswordVaultId = useSettingsStore((s) => s.onepasswordVaultId);
@@ -525,6 +541,30 @@ export function ToolsPane({ query = "" }: { query?: string }) {
     // Re-read when the dialog closes, so a "Report now" that fixed it clears the badge (and one
     // that failed raises it) without waiting for the next 2h cycle or an app restart.
   }, [builderIndexEnabled, builderIndexModalOpen]);
+
+  // The same read for straude. A SECOND poll rather than a shared one: the two reporters fail
+  // independently, and collapsing them would let one destination's outage hide or fake the other's.
+  // Same cheapness (a JSON file read in Rust, no scan and no socket) and the same enabled-only gate.
+  const [straudeFailing, setStraudeFailing] = useState(false);
+  useEffect(() => {
+    if (!straudeEnabled) {
+      setStraudeFailing(false);
+      return;
+    }
+    let live = true;
+    void straudeStatus()
+      .then((s) => {
+        if (live) setStraudeFailing(straudeReportFailing(s, Date.now() / 1000));
+      })
+      .catch((e) => {
+        console.warn("tools: straude status failed", e);
+        // An unreadable status is NOT a failed report — see the Builder Index twin above.
+        if (live) setStraudeFailing(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [straudeEnabled, straudeModalOpen]);
 
   const aiOff =
     aiFeatureMode({
@@ -588,6 +628,23 @@ export function ToolsPane({ query = "" }: { query?: string }) {
       onHintClick: builderIndexEnabled ? () => openBuilderIndexModal(true) : undefined,
       checked: builderIndexEnabled,
       onToggle: () => void setBuilderIndexEnabled(!builderIndexEnabled),
+    },
+    {
+      // Directly beside the Builder Index row on purpose: these are competing destinations, and the
+      // founder judges this feature by being able to switch either one on from one place.
+      ...TOOL_META.straude,
+      key: "straude",
+      Icon: FiTrendingUp,
+      url: STRAUDE_URL,
+      badge: straudeFailing ? { kind: "alert", text: "Not publishing" } : undefined,
+      hint: straudeFailing
+        ? STRAUDE_FAILING_HINT
+        : straudeEnabled
+          ? "Manage your Straude settings"
+          : undefined,
+      onHintClick: straudeEnabled ? () => openStraudeModal(true) : undefined,
+      checked: straudeEnabled,
+      onToggle: () => void setStraudeEnabled(!straudeEnabled),
     },
     {
       ...TOOL_META.superpowers,

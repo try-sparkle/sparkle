@@ -47,6 +47,15 @@ export interface BranchStatus {
   // The TRUE number of uncommitted paths, which may exceed `dirtyFiles.length`. A "+N more"
   // affordance must count from THIS; `dirtyFiles` is a preview, not an inventory.
   dirtyCount?: number;
+  // WHICH BRANCH every number above was measured on — Rust's `resolve_agent_branch` output, not the
+  // minted `sparkle/agent-<id>` name. See the Rust field for the case that put it on the wire
+  // (sparkle-pgkbn4): a release agent that had shipped v0.114.0 read as "Local: Nothing Yet" because
+  // the resolver measured a stale, empty minted ref, and the row had no way to say what it counted.
+  //
+  // Optional for the same back-compat reason as `worktreeOnBranch`/`dirtyFiles`: a Rust build that
+  // predates the field deserializes to `undefined`, which means "this build cannot tell you" and
+  // must render as NOTHING — never as a blank or guessed branch name.
+  branch?: string;
 }
 
 /** Land-to-green workflow signals for an agent branch (see Rust `agent_workflow_state`). All

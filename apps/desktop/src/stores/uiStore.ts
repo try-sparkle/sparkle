@@ -6,6 +6,7 @@ import { persist, createJSONStorage } from "zustand/middleware";
 // `type { Bead }`, which is erased), so this reaches neither theme/colors nor a component and
 // cannot close the cycle the notes below describe.
 import { NO_BOARD_FILTER, type BoardFilter } from "../services/boardFilters";
+import { PLAN_KINDS_ALL, type PlanKind, type PlanKindFilter } from "../services/epicBoard";
 import {
   migratePersistedUi,
   repairActiveSpecial,
@@ -72,11 +73,10 @@ export type CategoryId =
  *  uses this shape on the write side and `merge` deletes them on the read side; a key present in one
  *  place and missing from the other is how a transient flag comes back to life on the next launch. */
 const TRANSIENT_UI_KEYS = [
-  // AND IT MUST STAY HERE NOW THAT "preview" IS A MODE. A restored Plan mode was merely a surprise;
-  // a restored Preview mode is a pane pointing at a dev server that DIED with the last process —
-  // the preview registry is swept at startup, so there is nothing behind the frame and the column
-  // opens on a blank error with no memory of anyone asking for it. Transient is the only correct
-  // answer for a mode whose content is owned by a child process.
+  // A restored Plan mode is a surprise nobody asked for, which is reason enough on its own. (It was
+  // additionally load-bearing while "preview" was a mode, since a restored Preview pointed at a dev
+  // server that had died with the last process; that mode is gone, but the rule that put this key
+  // here never depended on it.)
   "workModeBySide",
   "buildAgentHover",
   "boardFocusBeadId",
@@ -90,6 +90,19 @@ const TRANSIENT_UI_KEYS = [
   // narrowed it is off screen and the user never touched it this session. Same reasoning as
   // boardAgentFilterBySide directly above.
   "boardFilterBySide",
+  // The Plan board's Tasks/Epics kind toggles. Transient for the SAME reason as the two filters
+  // above, and the reason is worth stating because this one looks more innocent than they do:
+  // clearing "Epics" HIDES every epic and clearing "Tasks" hides every task, so a restored pair is
+  // a board missing most of its work with nothing on screen saying why — and clearing BOTH is a
+  // board that would come back EMPTY. The toggles are visible, which is what makes them safe to
+  // use, but only while the user is the one who just pressed them. Their default (both on) is the
+  // board exactly as it behaved before these controls existed.
+  "planKindsBySide",
+  // The epics column's selection. Same reasoning as the two filters and the mode above, and one
+  // degree worse: the control that narrowed the build column is in a DIFFERENT column, so a
+  // restored selection is a build column missing most of its agents with the only explanation
+  // off to one side and never touched this session.
+  "epicFocusBySide",
   "settingsRequest",
   "composeFocusSeq",
   "revealAgentId",
@@ -296,16 +309,27 @@ interface UiState {
    *  `resetColumnZoom`, which is what Cmd+0 calls: with five independent levels, a user who has
    *  zoomed several columns and wants out needs one gesture that does not require visiting each. */
   resetAllZoom: () => void;
-  // Which special (non-project) view is in focus, if any. "sparkle" = the self-improvement agent
-  // pinned bottom-left. null = a normal project agent (or nothing) is active. Persisted so the
-  // active view survives relaunch. Selecting a normal agent clears this back to null.
+  // Which special (non-project) view is in focus, if any. null = a normal project agent (or nothing)
+  // is active. Persisted so the active view survives relaunch. Selecting a normal agent clears this
+  // back to null (via `showBuildStage`, below). Two special views today, both rendering into the
+  // primary pair's stage exactly as the worker terminal would:
+  //   • "sparkle"  = the self-improvement agent.
+  //   • "research" = a CONCIERGE research task's main-pane view (bead sparkle-s7rfc). WHICH task is
+  //     held in the research store's `openTaskId`, not here — mirroring how "sparkle" keys its pane
+  //     off `sparkleAgentId` rather than a field here. A research task is not an agent (no worktree,
+  //     branch, or PTY), so it deliberately stays out of `projectStore.selectedAgentId`, whose
+  //     ~5s roster reconcile would discard a non-agent id. Reusing `activeSpecial` is what buys the
+  //     mutual exclusion for free: every existing clear (`showBuildStage`/`openPlanBoard`, both of
+  //     which null it for the pane-owning side) hides the research pane the
+  //     instant the founder looks at a worker, a board, or Improve Sparkle. "research" is coerced to
+  //     null on rehydrate (composerPersist.repairActiveSpecial): `openTaskId` is not persisted, so a
+  //     restored "research" with no task would cover the stage with nothing.
   //
   // "board" USED TO LIVE HERE and no longer does. The Tasks Kanban is per-COLUMN state, and a
   // window-global field cannot express it: whichever column wrote "board" last owned the only
-  // board on screen. Read `workModeBySide[side] === "plan"` instead. What remains here is
-  // genuinely window-global — there is exactly one Improve-Sparkle pane, in the primary pair.
-  activeSpecial: "sparkle" | null;
-  setActiveSpecial: (v: "sparkle" | null) => void;
+  // board on screen. Read `workModeBySide[side] === "plan"` instead.
+  activeSpecial: "sparkle" | "research" | null;
+  setActiveSpecial: (v: "sparkle" | "research" | null) => void;
   // App theme preference. "auto" follows the OS appearance; "light"/"dark" force it.
   // Persisted in the same `sparkle-ui` blob; read synchronously at boot (see theme/theme.ts)
   // to set <html data-theme> before first paint and avoid a flash of the wrong theme.
@@ -350,10 +374,6 @@ interface UiState {
   /** The mirror: put a column into Build **and** make its stage actually visible. Same rule —
    *  anything meaning "show me the terminal/rows" uses this, not a bare `setWorkMode`. */
   showBuildStage: (side: PairSide) => void;
-  /** The THIRD member of that family: put a column into Preview **and** make its slot actually
-   *  visible. Same rule and the same reason — see `openPlanBoard`. Entering a mode is two writes
-   *  and exactly one place may know that. */
-  openPreview: (side: PairSide) => void;
   // One-shot "open this bead's detail when the board shows it" handoff (spec §8: clicking an
   // orchestrator's epic pill jumps to the Plan board with that epic's DetailOverlay open). Set by
   // the pill, consumed-then-cleared by BoardView once the bead is present. Transient — NOT persisted.
@@ -401,6 +421,33 @@ interface UiState {
   // failure `sparkle-qogah` names. The filter must always be something the user just did.
   boardFilterBySide: Record<PairSide, BoardFilter>;
   setBoardFilter: (side: PairSide, filter: BoardFilter) => void;
+  // WHICH KINDS the Plan board shows on each side — two independent booleans, `tasks` and `epics`,
+  // replacing the old exclusive "both"/"tasks"/"epics" mode (see `PlanKindFilter` for why "Both"
+  // was not a third kind of thing). Epics-only still swaps in the seven-stage epic ladder; every
+  // other combination keeps the task columns. Per side for the same reason the two filters above
+  // are: the pair shows two boards at once, and one toggle would silently reshape the one the user
+  // is not looking at. Transient — NOT persisted (see partialize).
+  planKindsBySide: Record<PairSide, PlanKindFilter>;
+  /** Flip ONE kind on the given side. Independent by construction: this never touches the other
+   *  kind, so turning the last one off is allowed and renders an explicitly empty board. */
+  togglePlanKind: (side: PairSide, kind: PlanKind) => void;
+  // WHICH EPIC THAT SIDE'S EPICS COLUMN HAS SELECTED, and therefore what its build column is
+  // narrowed to. `null` is "no epic selected", which is the default and is NOT a filter.
+  //
+  // This is the point of the epics column rather than a refinement of it — the founder: "a layer
+  // where I can be looking at EPICS and I can see all of the orchestrators that have to do with
+  // that epic."
+  //
+  // PER SIDE, like every other selection here: the two pairs are independent projects, and one
+  // shared value would silently narrow the build column the user is not looking at.
+  //
+  // TRANSIENT — NOT persisted (see partialize), and for exactly the reason `boardFilterBySide` and
+  // `planKindsBySide` above give. A narrowing restored at launch is a build column missing most of
+  // its agents with nothing on screen saying why — worse here than on the board, because the
+  // control that set it is in a DIFFERENT column from the one that looks empty. Being transient
+  // also keeps the persisted-key ratchet green with no migration.
+  epicFocusBySide: Record<PairSide, string | null>;
+  setEpicFocus: (side: PairSide, epicId: string | null) => void;
   // Whether ANY "+ New Build Agent" button is currently hovered. Shared so hovering the empty-state
   // start button on the Workspace also lights up the sidebar's button blue (and vice versa),
   // pointing the user at where that affordance normally lives. Transient — NOT persisted.
@@ -517,7 +564,7 @@ interface UiState {
   openProjectIds: string[] | null;
   setOpenProjectIds: (ids: string[]) => void;
   // WHICH PAIR EACH PROJECT LIVES IN (engine/pairs). The cockpit's full form is
-  // `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`; the app shipped the right half, and this is what
+  // `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`; the app shipped the right half, and this is what
   // makes the left half real. SPARSE and left-only: an absent entry means "right", so an existing
   // install with no map renders exactly the single-pair layout it had, and "empty map" and "no left
   // pair" are the same state — there is no way to persist a left pair with nothing in it.
@@ -754,20 +801,6 @@ export const useUiStore = create<UiState>()(
         get().setWorkMode(side, "build");
         if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
       },
-      // THE SAME PAIRING FOR PREVIEW, for the same reason and with the same scope. The preview slot
-      // covers the pair exactly as the board does, and the Improve-Sparkle pane renders into that
-      // pair's stage — so a caller that set the mode alone would get the half state this family
-      // exists to prevent: the chevron on Preview while the Sparkle terminal keeps the stage, with
-      // `reconcileWorkMode` answering null (a special is up) so nothing recovers it.
-      //
-      // NOTE what this does NOT do: it does not start a server. Opening the pane and opening a
-      // preview process are different acts with different owners — `services/preview.openPreview`
-      // is the one that talks to Rust — and conflating them here would make a mode flip spawn a
-      // node process. The slot renders the CURRENT state of that agent's preview, whatever it is.
-      openPreview: (side) => {
-        get().setWorkMode(side, "preview");
-        if (side === SPARKLE_PANE_SIDE) set({ activeSpecial: null });
-      },
       setWorkMode: (side, m) =>
         set((s) =>
           s.workModeBySide[side] === m ? {} : { workModeBySide: { ...s.workModeBySide, [side]: m } },
@@ -803,6 +836,32 @@ export const useUiStore = create<UiState>()(
             return {};
           }
           return { boardFilterBySide: { ...st.boardFilterBySide, [side]: filter } };
+        }),
+      planKindsBySide: { left: PLAN_KINDS_ALL, right: PLAN_KINDS_ALL },
+      // NO IDENTITY GUARD HERE, unlike the two setters above, and the difference is the point: a
+      // toggle has no no-op case. Those setters re-assert a value the segmented control already
+      // holds on every render, so they compare first to keep BoardView's narrowing memo from
+      // re-running for a click that changed nothing. A flip always changes the value it names, so
+      // the new record it hands back is the honest one — and the OTHER side's record is carried
+      // through by reference, so the board the user is not looking at still does not re-narrow.
+      togglePlanKind: (side, kind) =>
+        set((st) => ({
+          planKindsBySide: {
+            ...st.planKindsBySide,
+            [side]: { ...st.planKindsBySide[side], [kind]: !st.planKindsBySide[side][kind] },
+          },
+        })),
+      epicFocusBySide: { left: null, right: null },
+      // TOGGLES: clicking the selected epic again clears the narrowing. The column is the only
+      // control that sets this, so without a way to clear it from the same gesture the user has to
+      // hunt for one — and identity-stability on a no-op is not available as a substitute, because
+      // re-clicking the same row is a REQUEST TO CLEAR rather than a redundant re-assert. That is
+      // the one place this setter deliberately differs from the three above it.
+      setEpicFocus: (side, epicId) =>
+        set((st) => {
+          const next = st.epicFocusBySide[side] === epicId ? null : epicId;
+          if (st.epicFocusBySide[side] === next) return {};
+          return { epicFocusBySide: { ...st.epicFocusBySide, [side]: next } };
         }),
       buildAgentHover: false,
       setBuildAgentHover: (v) => set({ buildAgentHover: v }),

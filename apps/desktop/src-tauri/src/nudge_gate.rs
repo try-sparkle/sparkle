@@ -356,11 +356,25 @@ fn is_opening_border(line: &str) -> bool {
     line.chars().any(|c| matches!(c, '╭' | '╮' | '┌' | '┐' | '┏' | '┓'))
 }
 
+/// The status glyphs `is_ambient_chrome_line`'s FIRST alternative accepts — one of the four, not
+/// the whole predicate; the predicate's own contract is on the function below.
+///
+/// At MODULE scope so `ported_typescript_patterns_have_not_drifted` can DERIVE its needle from this
+/// array rather than restating it (roborev 64577): a hardcoded needle pinned the TS side only, so a
+/// deletion here stayed green and the ports diverged.
+///
+/// '\u{23f5}'/'\u{23f4}' are the VERSION-CURRENT play glyphs (roborev 64564): 2.1.220 drew
+/// '\u{25b6}\u{25b6} bypass permissions on', 2.1.231 draws the '\u{23f5}' spelling.
+const AMBIENT_STATUS_GLYPHS: &[char] = &[
+    '⚠', '⏸', '⏵', '⏴', '▶', '◆', '●', '✓', '✗', '✻', '✽', '✢',
+];
+
 /// TS `AMBIENT_CHROME_LINE`, ported shape-for-shape — the persistent chrome Claude Code paints
 /// below an open dialog. Kept in step by `ported_typescript_patterns_have_not_drifted`.
 ///
 /// Four alternatives, after optional leading space/tab/NBSP:
-///   1. a single status glyph (warning, pause, play, diamond, dot, check, cross, spinner frames),
+///   1. a single status glyph (warning, pause, play, diamond, dot, check, cross, spinner frames) —
+///      the set is {@link AMBIENT_STATUS_GLYPHS}, hoisted out so the drift test can read it,
 ///   2. a run of 4+ rule characters that IS THE WHOLE ROW,
 ///   3. a frame edge then 4+ rule characters, again ending the row,
 ///   4. an EMPTY composer: an optional frame edge, then a caret and nothing but whitespace after.
@@ -368,7 +382,6 @@ fn is_opening_border(line: &str) -> bool {
 /// Alternative 4 is why this is not simply "starts with a box glyph": the composer's caret row is
 /// chrome ONLY when empty. A caret with text after it is the user typing, which is content.
 fn is_ambient_chrome_line(line: &str) -> bool {
-    const STATUS: &[char] = &['⚠', '⏸', '▶', '◆', '●', '✓', '✗', '✻', '✽', '✢'];
     const RULE: &[char] = &['─', '━', '═', '▔', '▁', '_'];
     const HEAVY_RULE: &[char] = &['─', '━', '═'];
     const EDGE: &[char] = &['│', '|'];
@@ -383,7 +396,7 @@ fn is_ambient_chrome_line(line: &str) -> bool {
     };
 
     // 1. a lone status glyph.
-    if STATUS.contains(&first) {
+    if AMBIENT_STATUS_GLYPHS.contains(&first) {
         return true;
     }
     // 2. a run of rule characters, 4 or more, THAT IS THE WHOLE ROW.
@@ -585,6 +598,164 @@ const CREDENTIAL_TAIL_ROWS: usize = 3;
 /// suppressed by a spinner belonging to a different frame (roborev 54749).
 fn lines(text: &str) -> impl Iterator<Item = &str> {
     text.split(['\n', '\r'])
+}
+
+// ── THE PLAIN INLINE ACCOUNT-LIMIT BANNER ─────────────────────────────────────────────────────
+//
+// DISTINCT FROM `screen_is_session_limit_picker` ABOVE, and the distinction is the whole point of
+// this matcher existing (bead `sparkle-mux4b`). That one recognises the INTERACTIVE picker — a
+// dialog with options and a selection cursor, which a human must resolve. This one recognises the
+// far more common shape: Claude Code simply PRINTS the limit and the turn ends, with no dialog at
+// all:
+//
+//     You've hit your session limit · resets 4pm (America/Bogota) — /usage-credits to finish …
+//
+// An agent behind that banner cannot reply, so every signal the nudge ladder derives from a REPLY
+// is unreachable for it by construction — which is exactly how a session-limited agent was nudged
+// eight consecutive times at the base interval, each firing dying at the API and producing no
+// output, which trivially re-satisfies the no-output condition and reloops.
+//
+// PORTED FROM `engine/apiRecovery.ts`, NOT INVENTED HERE. The opener and the tail are that
+// module's two patterns, and the false-positive discipline comes with them: the line must START
+// with the opener (so prose about session limits — including this comment's own subject — never
+// matches) AND carry a separator-led `resets` / `raise it at` tail. `account_limit_ts_port_is_in_step`
+// pins the two against the TS source so a widening on either side cannot land alone.
+
+/// The opener, mirroring TS `ACCOUNT_LIMIT_OPENER`.
+fn account_limit_opener() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r"(?i)^you['’´`]?ve hit your\b[^\n]*\blimit\b")
+            .expect("account_limit_opener must compile")
+    })
+}
+
+/// The tail, mirroring TS `ACCOUNT_LIMIT_TAIL`. Allowed anywhere in the (possibly unwrapped) line
+/// rather than glued to `limit`, so "…your usage limit for Opus · resets 3pm" is caught too.
+fn account_limit_tail() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r"(?i)(?:·|•|\||—|-)\s*(?:resets\b|raise it at\b)")
+            .expect("account_limit_tail must compile")
+    })
+}
+
+/// Strip the TUI's leading chrome so the LINE-INITIAL opener can still anchor.
+///
+/// The banner is printed as an assistant message, so it arrives behind the `⏺` glyph, and inside a
+/// bordered frame it arrives behind a `│` as well. Without this the anchor — the very thing that
+/// keeps prose from matching — would instead keep the REAL banner from matching.
+fn strip_row_chrome(line: &str) -> &str {
+    line.trim_start_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '⏺' | '⎿' | '●' | '│' | '|' | '┃' | '>' | '*')
+    })
+}
+
+/// True when the rendered viewport shows the plain (non-interactive) account-limit banner.
+///
+/// ADJACENT ROWS ARE JOINED before testing, because xterm hard-wraps at the pane width and the real
+/// banner is long enough to wrap — the opener lands on one row and its "· resets …" tail on the
+/// next, so neither row matches alone. `apiRecovery.classifyFromScrollback` unwraps the same way
+/// for the same reason. Only the IMMEDIATELY following row is joined: reaching further would let an
+/// unrelated later line lend a tail to an innocent opener.
+pub fn screen_shows_account_limit(text: &str) -> bool {
+    let rows: Vec<&str> = lines(text).map(strip_row_chrome).collect();
+    rows.iter().enumerate().any(|(i, row)| {
+        if !account_limit_opener().is_match(row) {
+            return false;
+        }
+        if account_limit_tail().is_match(row) {
+            return true;
+        }
+        rows.get(i + 1)
+            .is_some_and(|next| account_limit_tail().is_match(&format!("{row} {next}")))
+    })
+}
+
+// ── THE LOGIN-EXPIRED / NOT-SIGNED-IN BANNER ──────────────────────────────────────────────────
+//
+// THE SAME SHAPE AS `screen_shows_account_limit` ABOVE, FOR A DIFFERENT WALL — and the reason it
+// needs its own matcher rather than a widened one is that the two route to different humans. A
+// quota wall is answered by waiting or by buying credits; an expired login is answered by a person
+// running `/login` in that pane. Conflating them sends the wrong person, so
+// `the_two_walls_are_disjoint_on_each_others_canonical_screens` pins them apart.
+//
+// WHY A SCREEN READ IS THE ONLY THING THAT CAN SEE IT. The nudge ladder stands down on a REPLY.
+// A Claude Code session whose credentials have expired cannot produce one: every turn dies before
+// the model, printing nothing but
+//
+//     Login expired · Please run /login
+//
+// which trivially re-satisfies the ladder's no-output condition, so the climb reloops for the life
+// of the process (`LADDER_SECS` tops out and then repeats forever). The founder watched exactly
+// this — nudges #5, #6, #7 and #8, four minutes apart, against a dead session. No reply-derived
+// signal can ever fire for a walled agent, so the screen is the only channel left.
+//
+// BOTH HALVES ARE REQUIRED, and that is the false-positive discipline this module lives by. An
+// OPENER anchored at the START of the row proves the banner is being PRINTED rather than discussed,
+// and a RE-LOGIN INSTRUCTION on that same (possibly unwrapped) row proves it is the banner rather
+// than an opener-shaped sentence. Neither alone may fire: a false positive here silently stops
+// nudging a HEALTHY agent, which is the one direction this file's asymmetric contract forbids.
+
+/// The opener, anchored line-initially by `screen_shows_login_expired`.
+///
+/// Every arm is a phrase Claude Code prints at the START of its own banner. The trailing `\b` keeps
+/// an arm from matching a longer word that merely begins with it.
+fn login_expired_opener() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(
+            r"(?i)^(?:login expired|not logged in|oauth session expired|oauth token (?:has )?expired|session expired|invalid api key)\b",
+        )
+        .expect("login_expired_opener must compile")
+    })
+}
+
+/// The re-login instruction, allowed ANYWHERE in the (possibly unwrapped) row — the banner puts it
+/// after a `·` separator, but the separator glyph varies by build and the row may have wrapped
+/// between the two halves, so gluing it to the opener would only re-create the wrap bug.
+fn relogin_instruction() -> &'static Regex {
+    static CELL: OnceLock<Regex> = OnceLock::new();
+    CELL.get_or_init(|| {
+        Regex::new(r"(?i)(?:/login\b|\bclaude login\b)").expect("relogin_instruction must compile")
+    })
+}
+
+/// Strip TUI decoration so the LINE-INITIAL opener can still anchor inside a bordered frame.
+///
+/// DELIBERATELY NARROWER THAN `strip_row_chrome`, which also eats `>`. Here `>`, `+`, `-` and `"`
+/// must all DEFEAT the anchor, because the screen most likely to carry an opener-shaped string is a
+/// diff of this very file — `+            "OAuth session expired · please run /login",` — scrolling
+/// past in the agent's own pane. Stripping those would make the matcher fire on its own source.
+fn strip_login_row_chrome(line: &str) -> &str {
+    line.trim_start_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '│' | '|' | '┃' | '❯' | '›' | '·' | '•' | '*' | '⎿' | '●' | '⏺'
+            )
+    })
+}
+
+/// True when the rendered viewport shows Claude Code's expired-login / not-signed-in banner.
+///
+/// ADJACENT ROWS ARE JOINED before the instruction is looked for, for the reason
+/// `screen_shows_account_limit` documents: xterm hard-wraps at the pane width, and the real banner
+/// is long enough to wrap, which puts `Login expired ·` on one row and `Please run /login` on the
+/// next so neither row carries both halves. Only the IMMEDIATELY following row is joined — reaching
+/// further would let an unrelated later line lend a `/login` to an innocent opener.
+pub fn screen_shows_login_expired(text: &str) -> bool {
+    let rows: Vec<&str> = lines(text).map(strip_login_row_chrome).collect();
+    rows.iter().enumerate().any(|(i, row)| {
+        if !login_expired_opener().is_match(row) {
+            return false;
+        }
+        if relogin_instruction().is_match(row) {
+            return true;
+        }
+        rows.get(i + 1)
+            .is_some_and(|next| relogin_instruction().is_match(&format!("{row} {next}")))
+    })
 }
 
 /// The last `rows` non-blank rendered rows, joined with a space.
@@ -1559,6 +1730,29 @@ mod tests {
         assert!(screen_is_session_limit_picker(&session_limit_screen("❯", "")));
     }
 
+    /// THE VERSION-CURRENT AMBIENT BAR MUST BE RECOGNISED HERE TOO (roborev 64564).
+    ///
+    /// The drift test pins the TS character class by needle, so a TS-side edit that this port
+    /// misses now fails — but the reverse did not hold: deleting '\u{23f5}' from `STATUS` left every
+    /// Rust test green (mutation-verified), because nothing here ever fed this port the bar
+    /// 2.1.231 actually draws. A silent divergence in THIS direction is the dangerous one: this
+    /// gate is the side that presses the key, so a tail it fails to recognise is a picker it stops
+    /// treating as a picker.
+    #[test]
+    fn the_2_1_231_ambient_bar_is_chrome_in_both_spellings() {
+        for bar in [
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle)",
+            "  ▶▶ bypass permissions on (shift+tab to cycle)",
+        ] {
+            assert!(is_ambient_chrome_line(bar), "not recognised as ambient chrome: {bar}");
+            // …and through the rule that consumes it, so this cannot pass on the helper alone.
+            assert!(
+                screen_is_session_limit_picker(&session_limit_screen("❯", bar)),
+                "picker lost its footer under: {bar}"
+            );
+        }
+    }
+
     /// THE CO-ASSERTION THAT KEEPS THE EXEMPTION NARROW: recognising the picker must NOT open
     /// `write_refusal`. Arbitrary text at a live picker is exactly what `Refusal::AwaitingInput`
     /// exists to prevent, and the nudger's own write is a bracketed paste followed by a carriage
@@ -2468,6 +2662,26 @@ mod tests {
             );
         }
 
+        // Placed here so the port and its pin read together; the behaviour tests are below.
+        // ── THE PLAIN INLINE ACCOUNT-LIMIT BANNER ───────────────────────────────────────────────
+        // Enrolled for the same reason as the picker matcher below: this port decides whether an
+        // agent is stood down for half an hour, and a TS-side change to either half of the rule
+        // that never reached here would leave the two disagreeing about what a limit even looks
+        // like. Both patterns are pinned — the opener is what keeps prose out, the tail is what
+        // makes `terminal` earn its verdict.
+        let api_recovery = ts("../src/engine/apiRecovery.ts");
+        for needle in [
+            r"/^you['’´`]?ve hit your\b[^\n]*\blimit\b/i",
+            r"/(?:·|•|\||—|-)\s*(?:resets\b|raise it at\b)/i",
+        ] {
+            assert!(
+                api_recovery.contains(needle),
+                "apiRecovery.ts changed a pattern nudge_gate.rs ported: {needle}\n\
+                 Port the change into `account_limit_opener` / `account_limit_tail` rather than \
+                 editing this expectation."
+            );
+        }
+
         // ── THE SESSION-LIMIT MATCHER ───────────────────────────────────────────────────────────
         // Enrolled here alongside `selection_cursor` / `footer_legacy` because the exemption it
         // grants — one `Esc` at a screen every other rule refuses — is only as safe as its
@@ -2501,6 +2715,21 @@ mod tests {
             format!("export const MIN_OPTIONS_PRESENT = {MIN_OPTIONS_PRESENT};"),
             format!("export const MAX_CHROME_BELOW_FOOTER = {MAX_CHROME_BELOW_FOOTER};"),
             format!("export const MAX_OPTION_FOOTER_GAP = {MAX_OPTION_FOOTER_GAP};"),
+            // THE AMBIENT-CHROME CLASS, DERIVED FROM THE RUST ARRAY (roborev 64577).
+            //
+            // It lived in the literal loop above first, and that pinned only ONE direction: the TS
+            // side could not drift, but deleting any of the other ten glyphs from
+            // `AMBIENT_STATUS_GLYPHS` left this test green and the ports divergent — 2 of 12 glyphs
+            // had behavioural cover. Exactly the failure this function documents for the thresholds
+            // ("a drift on the RUST side sailed through"), so it takes the same remedy: build the
+            // needle FROM the Rust array, so a deletion on either side fails.
+            format!(
+                "[{}]",
+                AMBIENT_STATUS_GLYPHS
+                    .iter()
+                    .map(|c| format!("\\u{:04x}", *c as u32))
+                    .collect::<String>()
+            ),
             r#"export const SESSION_LIMIT_REASON = "session-limit-picker";"#.to_string(),
         ] {
             assert!(
@@ -2535,5 +2764,226 @@ mod tests {
             arms, 5,
             "SHELL_PROMPTS gained or lost an arm; nudge_gate.rs ports all of them individually"
         );
+    }
+
+    // ══ THE PLAIN INLINE ACCOUNT-LIMIT BANNER (bead `sparkle-mux4b`) ════════════════════════════
+
+    /// The real shapes, each of which stands an agent down for half an hour — so each must match.
+    #[test]
+    fn the_account_limit_banner_is_recognised_in_the_shapes_it_actually_arrives_in() {
+        for (name, screen) in [
+            (
+                "bare",
+                "You've hit your session limit · resets 4pm (America/Bogota) — /usage-credits",
+            ),
+            (
+                "behind the assistant glyph",
+                "⏺ You've hit your session limit · resets 8:40am (America/Bogota)",
+            ),
+            (
+                // The banner is long enough to wrap at the pane width, which puts the opener and
+                // its tail on DIFFERENT rows — neither matches alone, and this is the shape that
+                // defeated the first version of the TS matcher too.
+                "hard-wrapped across two rows",
+                "⏺ You've hit your session limit ·\nresets 8:40am (America/Bogota)",
+            ),
+            (
+                "spend cap, no clock time",
+                "You've hit your usage limit for Opus · raise it at claude.ai/settings/usage",
+            ),
+            (
+                "inside a bordered frame, with live chrome below",
+                "│ You've hit your session limit · resets 4pm │\n│ >                              │",
+            ),
+        ] {
+            assert!(
+                screen_shows_account_limit(screen),
+                "{name}: a real account-limit banner must be seen"
+            );
+        }
+    }
+
+    /// The discipline that makes the verdict affordable. A false positive here does not merely
+    /// mis-paint a row: it silences the ladder for `QUOTA_BACKOFF_SECS` against an agent that is
+    /// merely stuck, which is the failure this whole module exists to prevent.
+    #[test]
+    fn prose_about_limits_never_stands_an_agent_down() {
+        for (name, screen) in [
+            // The opener without the tail — a genuinely truncated banner is NOT enough, because
+            // the tail is what distinguishes an account wall from narration.
+            ("opener alone", "You've hit your session limit"),
+            // Narration by the agent itself. Line-initial anchoring is what rejects these.
+            (
+                "mid-sentence narration",
+                "I think you've hit your session limit · resets soon, so I'll wait.",
+            ),
+            (
+                "a markdown bullet quoting the banner",
+                "- The banner reads: you've hit your session limit · resets 4pm",
+            ),
+            // The tail is on a row that is not adjacent to the opener, so joining must not reach it.
+            (
+                "opener and tail two rows apart",
+                "You've hit your session limit\nrunning tests…\n· resets 4pm",
+            ),
+            ("an empty screen", ""),
+        ] {
+            assert!(
+                !screen_shows_account_limit(screen),
+                "{name}: must NOT be read as an account limit"
+            );
+        }
+    }
+
+    // ══ THE LOGIN-EXPIRED / NOT-SIGNED-IN BANNER ════════════════════════════════════════════════
+
+    /// The shapes the wall actually arrives in. Each one is a DEAD session — it cannot reply, so
+    /// the ladder's reply-driven stand-down can never fire for it and only this read can see it.
+    #[test]
+    fn the_login_expired_banner_is_recognised_in_the_shapes_it_actually_arrives_in() {
+        for (name, screen) in [
+            // The founder's literal screen, watched four nudges running.
+            ("the founder's screen", "Login expired · Please run /login"),
+            ("not signed in at all", "Not logged in · Please run /login"),
+            (
+                // Lowercase `please`: the instruction half is matched case-insensitively and is
+                // not glued to the separator.
+                "oauth wording, lowercase instruction",
+                "OAuth session expired · please run /login",
+            ),
+            (
+                "oauth token wording",
+                "OAuth token has expired · Please run /login",
+            ),
+            ("a stale key", "Invalid API key · Please run /login"),
+            (
+                "plain session wording",
+                "Session expired · Please run /login",
+            ),
+            (
+                // The CLI form of the same remedy.
+                "shell remedy instead of the slash command",
+                "Login expired · Please run claude login",
+            ),
+            (
+                "behind the assistant glyph",
+                "⏺ Login expired · Please run /login",
+            ),
+            (
+                "inside a bordered frame",
+                "│ Login expired · Please run /login │",
+            ),
+            (
+                // The pane is narrower than the banner, so the opener and the instruction land on
+                // DIFFERENT rendered rows and neither matches alone.
+                "hard-wrapped across two rows",
+                "Login expired ·\nPlease run /login",
+            ),
+            (
+                "wrapped inside a frame, with live chrome below",
+                "│ Login expired ·             │\n│ Please run /login           │\n│ >          │",
+            ),
+        ] {
+            assert!(
+                screen_shows_login_expired(screen),
+                "{name}: a real login-expired banner must be seen"
+            );
+        }
+    }
+
+    /// The discipline that makes the verdict affordable. A false positive here does not merely
+    /// mis-paint a row: it stops nudging a HEALTHY agent, which is the direction this module's
+    /// asymmetric contract forbids outright.
+    #[test]
+    fn prose_and_source_about_expired_logins_never_stand_an_agent_down() {
+        for (name, screen) in [
+            (
+                // The opener is not line-initial, so the anchor rejects it.
+                "mid-sentence narration",
+                "The agent said its login expired earlier, so please run /login",
+            ),
+            (
+                // A diff of THIS VERY FILE scrolling past in the agent's own pane. `+` is not
+                // decoration, and neither is the quote after it.
+                "an added line in a diff of this file",
+                "+            \"OAuth session expired · please run /login\",",
+            ),
+            (
+                "a removed line in a diff of this file",
+                "-            \"Login expired · Please run /login\",",
+            ),
+            (
+                // Source without a diff marker: the string's own opening quote defeats the anchor.
+                "a source literal in nudge_ladder.rs",
+                "        \"Not logged in · Please run /login\",",
+            ),
+            (
+                // `>` is TUI decoration for `strip_row_chrome`, but NOT here — it is how a quoted
+                // line and a shell transcript both begin.
+                "a markdown blockquote of the banner",
+                "> Login expired · Please run /login",
+            ),
+            (
+                "the instruction with no opener",
+                "Please run /login to continue.",
+            ),
+            ("a bare mention of the command", "/login"),
+            ("the opener with no instruction anywhere", "Login expired"),
+            (
+                "the opener with the instruction two rows away",
+                "Login expired ·\nrunning tests…\nPlease run /login",
+            ),
+            ("an empty screen", ""),
+            (
+                "ordinary agent output",
+                "⏺ Read(src/main.rs)\n  ⎿ Read 42 lines\n\nI'll update the handler next.\n\n❯ ",
+            ),
+        ] {
+            assert!(
+                !screen_shows_login_expired(screen),
+                "{name}: must NOT be read as an expired login"
+            );
+        }
+    }
+
+    /// The two walls route to DIFFERENT humans — a quota wall is waited out or paid for, an expired
+    /// login needs a person at that pane typing `/login`. Conflating them pages the wrong one, so
+    /// neither matcher may claim the other's canonical screen.
+    #[test]
+    fn the_two_walls_are_disjoint_on_each_others_canonical_screens() {
+        for (name, screen) in [
+            (
+                "bare quota banner",
+                "You've hit your session limit · resets 4pm (America/Bogota) — /usage-credits",
+            ),
+            (
+                "spend-cap quota banner",
+                "You've hit your usage limit for Opus · raise it at claude.ai/settings/usage",
+            ),
+        ] {
+            assert!(
+                screen_shows_account_limit(screen),
+                "{name}: must still read as an account limit"
+            );
+            assert!(
+                !screen_shows_login_expired(screen),
+                "{name}: an account limit must NOT read as an expired login"
+            );
+        }
+
+        for (name, screen) in [
+            ("expired login", "Login expired · Please run /login"),
+            ("not signed in", "Not logged in · Please run /login"),
+            ("stale key", "Invalid API key · Please run /login"),
+        ] {
+            assert!(
+                screen_shows_login_expired(screen),
+                "{name}: must still read as an expired login"
+            );
+            assert!(
+                !screen_shows_account_limit(screen),
+                "{name}: an expired login must NOT read as an account limit"
+            );
+        }
     }
 }

@@ -3,11 +3,20 @@
 // The shared mic control (MicButton): the composer-left mic and the top waveform ring both consume
 // useMicToggle/micVisual, so this pins the ComposerMic's visibility gating and that its click runs
 // the identical tri-state cycle. The ring's own rendering is covered in LogoWaveform.render.test.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
-import { ComposerMic, MicMenu } from "./MicButton";
+import { ComposerMic, MicMenu, useMicToggle } from "./MicButton";
 import { useDictationStore } from "../stores/dictationStore";
+import { useAuthStore } from "../stores/authStore";
+import type { Me } from "../services/entitlement";
+
+const meWith = (balanceCents: number): Me => ({
+  clerkUserId: "u1",
+  entitled: true,
+  balanceCents,
+  tokenVersion: 1,
+});
 
 beforeEach(() => {
   // modelProgress must be reset too: it now drives the "preparing" state, so a case that leaves a
@@ -123,5 +132,69 @@ describe("ComposerMic — click drives the same tri-state cycle as the top ring"
     expect(useDictationStore.getState().enabled).toBe(false);
     rerender(<ComposerMic />);
     expect(screen.queryByRole("button")).toBeNull();
+  });
+});
+
+// bead sparkle-yvvu27 — the primary mic click used to cycle off → paused → off and could NEVER
+// reach the routing ("active") state, so a plain click gave a HOT-BUT-SILENT mic (enabled, phase
+// passive: capturing audio, routing/transcribing nothing) with no on-screen sign routing was off.
+// The click now arms AND routes. These drive the real shared hook (useMicToggle) directly because
+// the ComposerMic renders nothing while OFF, so the off→click transition can't be exercised through
+// the component. Both mic surfaces consume this same hook, so this pins the behavior for both.
+describe("useMicToggle — a plain click REACHES the routing (active) state", () => {
+  beforeEach(() => {
+    useAuthStore.setState({ me: meWith(500) }); // credits present: arming is allowed
+    useDictationStore.setState({ outOfCreditsNotice: false });
+  });
+  afterEach(() => {
+    useAuthStore.setState({ me: null });
+    useDictationStore.setState({ outOfCreditsNotice: false });
+  });
+
+  it("OFF → click → routes: phase becomes 'active', not the old hot-but-silent 'passive'", () => {
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive", modelProgress: null });
+    const { result } = renderHook(() => useMicToggle());
+    expect(result.current.state).toBe("off");
+    act(() => result.current.onClick());
+    // The SIDE EFFECT that matters is the routing intent, not merely that the mic armed. Before the
+    // fix `enabled` flipped true while `phase` stayed "passive" — exactly the hot-but-silent mic.
+    // Asserting phase === "active" (the routing flag), not just enabled, is what pins that the click
+    // reaches the ROUTING state rather than stopping at the paused intermediate.
+    expect(useDictationStore.getState().enabled).toBe(true);
+    expect(useDictationStore.getState().phase).toBe("active");
+  });
+
+  it("full cycle off → active → paused → off — every state reachable from a plain click", () => {
+    // status 'listening' so that, once armed with phase active, deriveMicState reports ACTIVE (the
+    // derived state, not just the raw store fields, is what the glyph and both surfaces render).
+    useDictationStore.setState({ enabled: false, status: "listening", phase: "passive", modelProgress: null });
+    const { result, rerender } = renderHook(() => useMicToggle());
+    expect(result.current.state).toBe("off");
+
+    act(() => result.current.onClick()); // off → active
+    rerender();
+    expect(result.current.state).toBe("active");
+
+    act(() => result.current.onClick()); // active → paused
+    rerender();
+    expect(useDictationStore.getState().phase).toBe("passive");
+    expect(result.current.state).toBe("paused");
+
+    act(() => result.current.onClick()); // paused → off
+    rerender();
+    expect(useDictationStore.getState().enabled).toBe(false);
+    expect(result.current.state).toBe("off");
+  });
+
+  it("OFF + OUT OF CREDITS → click is refused: mic never arms, never routes, notice shown", () => {
+    useAuthStore.setState({ me: meWith(0) }); // no credits
+    useDictationStore.setState({ enabled: false, status: "idle", phase: "passive", outOfCreditsNotice: false });
+    const { result } = renderHook(() => useMicToggle());
+    act(() => result.current.onClick());
+    // The credits guard must still short-circuit BEFORE arming or routing — the new setPhase("active")
+    // must sit behind it, not in front. So both enabled and phase are untouched, and the notice shows.
+    expect(useDictationStore.getState().enabled).toBe(false);
+    expect(useDictationStore.getState().phase).toBe("passive");
+    expect(useDictationStore.getState().outOfCreditsNotice).toBe(true);
   });
 });

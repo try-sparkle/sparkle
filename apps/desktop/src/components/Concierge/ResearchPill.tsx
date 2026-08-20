@@ -28,6 +28,7 @@ import { C } from "../../theme/colors";
 import { MENTION_PILL_FILL } from "./MentionPill";
 import { StatusDot } from "../StatusDot";
 import { useResearchStore } from "../../services/research/store";
+import { openResearchTaskInPane } from "../../services/research/selection";
 import { isRetired } from "../../services/research/types";
 import { agentStatusForResearch } from "../ConciergeAgentsRow";
 
@@ -96,10 +97,13 @@ export function ResearchPill({
       data-task-id={task.id}
       data-status={task.status}
       title={`${label} — research (${task.status})`}
-      // THE REVEAL. Sets the store's `openTaskId`; `ConciergeAgentsRow` expands its group and scrolls
-      // the child into view off the same field. A plain action, no navigation, so there is no
-      // updater-purity hazard of the kind `AgentPill`/`BeadPill` design around.
-      onClick={() => useResearchStore.getState().setOpenTask(task.id)}
+      // THE REVEAL. Opens the task in the MAIN pane (founder 2026-08-17: a research agent works like
+      // any other worker — its click shows it on the right, not inline). `openResearchTaskInPane`
+      // sets `openTaskId` (so `ConciergeAgentsRow` expands its group and scrolls the child into view,
+      // exactly as before) AND flips `activeSpecial` to "research" so the pane is the active surface.
+      // A plain action, no navigation, so there is no updater-purity hazard of the kind
+      // `AgentPill`/`BeadPill` design around.
+      onClick={() => openResearchTaskInPane(task.id)}
       style={{
         ...base,
         border: "none",

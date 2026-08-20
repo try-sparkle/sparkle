@@ -18,8 +18,28 @@ import {
   readAgentTranscript,
 } from "./fleet";
 import { defaultDecisionFor } from "./policy";
+import { useRuntimeStore } from "../../stores/runtimeStore";
+import { SPARKLE_AGENT_ID } from "../sparkleAgent";
 
-beforeEach(() => invoke.mockReset());
+// The concierge's reserved caller id. Mirrors `CONCIERGE_CALLER_AGENT_ID` in `../controlListener`
+// and `CONCIERGE_INBOX_ID` in `./fleet`; the literal is used here rather than imported so this test
+// does not drag the whole control listener (and its unmocked tauri event wiring) into a fleet unit
+// test. The bridge/controlListener copies are pinned by the Rust mirror test.
+const CONCIERGE_ID = "sparkle:concierge";
+
+beforeEach(() => {
+  invoke.mockReset();
+  // The deliver-or-fail directory (bead sparkle-179b2s) reads liveness from `openAgentIdSet`, i.e.
+  // the runtime store's `openAgentIds`. Reset it so no live agent leaks between tests; each test
+  // that expects a send to SUCCEED seeds the recipient here (driving the REAL seam, not a mock).
+  useRuntimeStore.setState({ openAgentIds: [] } as never);
+});
+
+/** Mark ids as live so `inboxSend`/`inboxBroadcast` will deliver to them — the same seam production
+ *  reads. Kept as a helper so a test states the addressable set in one line. */
+function markLive(...ids: string[]): void {
+  useRuntimeStore.setState({ openAgentIds: ids } as never);
+}
 
 /**
  * A backend that answers each command by name — needed because `inboxStatus` reads TWO commands
@@ -207,6 +227,7 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
    * — an absent field is exactly what let a caller assume the happy case.
    */
   it("does NOT report itself as delivered", async () => {
+    markLive("a1");
     invoke.mockResolvedValue("m1");
     const r = await inboxSend("a1", "rebase before you verify", "act");
     expect(r.ok).toBe(true);
@@ -227,6 +248,7 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
    * ready to paste, over exactly the id it just returned.
    */
   it("names the op that can confirm it, with the arguments already filled in", async () => {
+    markLive("a1");
     invoke.mockResolvedValue("m1");
     const r = await inboxSend("a1", "main has moved");
     expect(r.ok).toBe(true);
@@ -247,9 +269,95 @@ describe("inboxSend — a receipt for an ENQUEUE, not for a delivery", () => {
 
 });
 
+describe("deliver-or-fail: the recipient directory (C1, bead sparkle-179b2s)", () => {
+  /*
+   * THE HOLE THIS CLOSES. `inbox.rs::enqueue` writes into any well-formed id's file and reads it back,
+   * so it returns `ok` + a real messageId for a typo'd/closed id whose inbox nothing drains — an
+   * `ok:true` that means "written into a black hole", which is exactly the delivery-vs-enqueue lie the
+   * surrounding beads are about. `inboxSend` now resolves the recipient against the fleet directory
+   * BEFORE the Rust hop and refuses an unaddressable one, enqueuing nothing.
+   */
+  it("refuses an unaddressable recipient and enqueues NOTHING", async () => {
+    // No live agents, and `__typo__` is neither special id. Assert BOTH halves: the loud refusal
+    // naming the id, AND that the Rust command was never invoked. Deleting the guard makes this go
+    // `ok:true` (the mutation this test exists to catch), so it is not vacuous.
+    const r = await inboxSend("__typo__", "you will never read this");
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("undeliverable-recipient");
+    expect(r.message).toContain("__typo__");
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it("delivers to a LIVE agent — the guard gates typos, not real recipients", async () => {
+    // The paired positive. A guard that refused everything would also pass the case above; this pins
+    // that a genuinely addressable recipient still flows straight through to the normal queued receipt.
+    markLive("live-1");
+    invoke.mockResolvedValue("m9");
+    const r = await inboxSend("live-1", "rebase before you verify");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.messageId).toBe("m9");
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats the concierge as addressable even with no live agent panes", async () => {
+    // A special id: the concierge drains through its own channel, so it is addressable app-wide. This
+    // also pins fleet.ts's local concierge literal against the real reserved id — passing the real id
+    // and getting `ok` proves fleet.ts recognises it; a drift would refuse it here.
+    invoke.mockResolvedValue("m-concierge");
+    const r = await inboxSend(CONCIERGE_ID, "the founder asked for a status line");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats the canonical Improve Sparkle id as addressable even headless", async () => {
+    // The other special id: the hourly headless pass drains its inbox (Phase B3), so it is addressable
+    // with no pane open.
+    invoke.mockResolvedValue("m-sparkle");
+    const r = await inboxSend(SPARKLE_AGENT_ID, "unstick yourself");
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(invoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("in a broadcast, only addressable ids reach Rust; the rest become not-queued, never a fake id", async () => {
+    // The batch twin of the guard. `keep` is live; `gone` is not. Only `keep` crosses the wire, and
+    // `gone` comes back as a not-queued outcome that names WHY — it never receives a messageId.
+    markLive("keep");
+    invoke.mockResolvedValue([{ agentId: "keep", messageId: "m1", error: null }]);
+    const r = await inboxBroadcast(["keep", "gone"], "main has moved", "act");
+
+    // Rust saw ONLY the deliverable id — the undeliverable one never reached enqueue.
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("inbox_broadcast", {
+      agentIds: ["keep"],
+      text: "main has moved",
+      severity: "act",
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.data.queued).toBe(1);
+    expect(r.data.failedAgents).toContain("gone");
+    const goneRow = r.data.outcomes.find((o) => o.agentId === "gone")!;
+    expect(goneRow.messageId).toBeNull();
+    expect(goneRow.state).toBe("not-queued");
+    expect(String(goneRow.error)).toContain("not an addressable recipient");
+  });
+
+  it("skips Rust entirely when EVERY broadcast recipient is undeliverable", async () => {
+    // All-undeliverable: nothing crosses the wire, and the wrapper's `none-queued` refusal reports it.
+    const r = await inboxBroadcast(["ghost-1", "ghost-2"], "x");
+    expect(invoke).not.toHaveBeenCalled();
+    expect(r.ok).toBe(false);
+  });
+});
+
 describe("inboxBroadcast", () => {
   it("counts partial failure per recipient instead of failing the whole send", async () => {
     // One full inbox must not silently prevent the other deliveries.
+    markLive("a", "b", "c");
     invoke.mockResolvedValue([
       { agentId: "a", messageId: "m1", error: null },
       { agentId: "b", messageId: null, error: "inbox: b already has 50 undelivered messages" },
@@ -271,6 +379,7 @@ describe("inboxBroadcast", () => {
     // and the caller is a language model that has just been asked to instruct a fleet, for which
     // `ok: true` is exactly the evidence it uses to tell a human that it did. That is the same
     // positive-acknowledgement-for-nothing this bead pair is about, arriving through the batch path.
+    markLive("a", "b");
     invoke.mockResolvedValue([
       { agentId: "a", messageId: null, error: "inbox: wrote message m1 but could not read it back" },
       { agentId: "b", messageId: null, error: "inbox: b already has 50 undelivered messages" },
@@ -289,6 +398,7 @@ describe("inboxBroadcast", () => {
     // A message id is what a caller USES as proof of a send, so the failure count must be the count
     // of agents that have no id — never the count that happened to carry an error string. A backend
     // that returned `{messageId: null, error: null}` would otherwise read as a clean success.
+    markLive("a", "b");
     invoke.mockResolvedValue([
       { agentId: "a", messageId: "m1", error: null },
       { agentId: "b", messageId: null, error: null },
@@ -317,6 +427,7 @@ describe("inboxBroadcast", () => {
    * no `state` and no `delivered` on any of them.
    */
   it("gives every recipient the same honest queued-not-delivered shape", async () => {
+    markLive("a", "b");
     invoke.mockResolvedValue([
       { agentId: "a", messageId: "m1", error: null },
       { agentId: "b", messageId: null, error: "inbox: b already has 50 undelivered messages" },

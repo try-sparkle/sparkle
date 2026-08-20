@@ -28,23 +28,36 @@ import {
   noticeClusterCollapses,
 } from "./rowWidthThresholds";
 import { BUILD_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
-import { ColumnPullTab, publishColumnWidthVar } from "./ColumnPullTab";
+import {
+  ColumnPullTab,
+  publishColumnWidthVar,
+  HEADER_H,
+  TAB_TOP,
+} from "./ColumnPullTab";
 import { ZOOM_COLUMN_ATTR } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
+import { useBeadsStore } from "../stores/beadsStore";
+import { agentIdsInEpic } from "../engine/epicFocus";
 import { formatElapsed, useRowClock, ROLLUP_DOT_COLOR } from "./rowClock";
 import { useColumnZoom, useZoomColumnForSide } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
 import {
   BUILD_COLUMN_MIN_WIDTH,
   BUILD_WIDTH_EVENT,
+  OVERLAY_EDGE_RESERVE,
+  OVERLAY_MIN_WIDTH,
+  OVERLAY_WIDTH_BOOST,
   TERMINAL_MIN_WIDTH,
   buildColumnMax,
+  buildOverlayKey,
   buildWidthKey,
   buildWidthVar,
   readStoredBuildWidth,
+  readStoredOverlay,
 } from "../engine/columnResize";
 import type { Project, AgentTab, AgentTabStatus } from "../types";
 import { useProjectStore } from "../stores/projectStore";
+import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
 import { usePreviewStore } from "../stores/previewStore";
 import { refreshPreviewCapability } from "../services/preview";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -136,6 +149,10 @@ import { processAliveFor } from "../services/goalContinuationRunner";
 // and the wording; nothing here re-decides a verdict.
 import { stallReport } from "../engine/agentStall";
 import { quotaBlockForAgent } from "../engine/engineRegistry";
+// THE EDGE THAT DID NOT EXIST. `nudgeFlagFor` was exported and called by NOTHING, so the Rust
+// nudger's founder-level `blocked-on-human` answer never reached a colour. See engine/humanBlock.
+import { humanBlockIn, isHumanBlockedIn } from "../services/humanBlockFor";
+import { useNudgeFlagSnapshot } from "../useNudgeFlags";
 import {
   stallInputsFor,
 } from "./rowAttention";
@@ -402,6 +419,13 @@ export function AgentSidebar({
   // finishedHeadCalm` needs the SAME verdict — a head is only calmed where the app has positively
   // read it as `finished` — and the Build column's rollup needs it too, so it is named here and
   // passed to all three. Re-deriving it in two places is how this subsystem has drifted before.
+  // A FLAG ARRIVAL MUST REPAINT THE ROW. `nudgeFlagFor` reads a module-level Map with no store
+  // behind it, so without this subscription neither of the two derivations below re-runs when the
+  // nudger raises a founder-level flag — and a flagged agent is silent by definition, so no other
+  // dep moves either (roborev 65339). Threaded into BOTH dep lists: subscribing re-renders the
+  // component, but a `useMemo`/`useCallback` keyed on unchanged deps would still serve its stale
+  // value, which is the same invisibility one layer in.
+  const nudgeFlags = useNudgeFlagSnapshot();
   const stallReportOf = useCallback(
     (id: string) => {
       const agent = agentsById.get(id);
@@ -413,10 +437,11 @@ export function AgentSidebar({
           agent.goal,
           { bs: branchStatus[id], ws: workflowState[id], stageOverride: workflowStage[id] },
           quotaBlockForAgent(id, Date.now()),
+          humanBlockIn(nudgeFlags, id),
         ),
       );
     },
-    [agentsById, calmStatus, branchStatus, workflowState, workflowStage],
+    [agentsById, calmStatus, branchStatus, workflowState, workflowStage, nudgeFlags],
   );
   /** Positively read as FINISHED, or `undefined` when the git state was never read. `undefined` is a
    *  real answer and it demotes nothing — see engine/finishedHeadCalm. */
@@ -449,13 +474,27 @@ export function AgentSidebar({
             // computes its own reading that can never see a quota block, so the row goes red with no
             // reason attached and the "Rate limited" chip is unreachable.
             quotaBlockForAgent(id, Date.now()),
+            // The agent's own answer that a PERSON is blocking it. Without it this surface — the one
+            // the founder actually watches — cannot see the only structural "blocked on human" signal
+            // the app produces, so the row renders amber while its goal badge says otherwise.
+            humanBlockIn(nudgeFlags, id),
           ),
         );
       },
       (id) => processAliveFor(id, status, openIds),
     );
     return escalated;
-  }, [project, agentsById, calmStatus, status, branchStatus, workflowStage, workflowState, openIds]);
+  }, [
+    project,
+    agentsById,
+    calmStatus,
+    status,
+    branchStatus,
+    workflowStage,
+    workflowState,
+    openIds,
+    nudgeFlags,
+  ]);
   // The map the ROW PRESENTS: acknowledged escalations handed back to the band they came from.
   //
   // TWO MAPS, AND WHICH ONE EACH CONSUMER GETS IS THE WHOLE FIX (roborev 55423/55434). The episode
@@ -471,9 +510,8 @@ export function AgentSidebar({
         : escalatedStatus,
     [project, escalatedStatus, calmStatus],
   );
-  const effectiveStatus = useMemo(
-    () =>
-      project
+  const effectiveStatus = useMemo(() => {
+    return project
         ? // LAST IN THE CHAIN: a row Sparkle has been pinging into silence stops asking (bead
           // sparkle-hpbkw). This map is what the row COLOUR and the band FILTER read, so a nudge
           // loop that was only calmed inside `composeRollup` would still be counted by the needs-you
@@ -489,15 +527,21 @@ export function AgentSidebar({
               project.agents,
               withDismissedAlerts(project.agents, presentedStatus),
               (id) => thrashReportFor(id, Date.now(), {}),
+              // THE AGENT'S OWN ANSWER SURVIVES THIS DEMOTION (roborev 65357). `nudge-loop` and a
+              // `blocked-on-human` flag are the SAME population, not overlapping ones — the verdict
+              // counts nudge-opened turns that ran no tool, which is exactly what answering the
+              // ladder in prose looks like — so without this every row the new red was written for
+              // was demoted straight back to amber, reproducing the founder's original symptom one
+              // layer down.
+              (id) => isHumanBlockedIn(nudgeFlags, id),
             ),
             // `calmStatus` is the pre-bubble map — the row's OWN status. Handing this the bubbled or
             // presented map would make an inherited red read as the head's own and the rule a no-op.
             calmStatus,
             isFinishedOf,
           )
-        : status,
-    [project, presentedStatus, status, calmStatus, isFinishedOf],
-  );
+      : status;
+  }, [project, presentedStatus, status, calmStatus, isFinishedOf, nudgeFlags]);
   // Advance each agent's alert-episode record on every change to the overlaid (pre-dismissal) status
   // — the input the "Dismiss Alert" feature reads. Declared HERE, below `escalatedStatus`, because a
   // hook's dependency array is evaluated during render: referencing it from higher up the body would
@@ -589,11 +633,10 @@ export function AgentSidebar({
   const setWorkMode = useUiStore((s) => s.setWorkMode);
   const openPlanBoard = useUiStore((s) => s.openPlanBoard);
   const showBuildStage = useUiStore((s) => s.showBuildStage);
-  const openPreview = useUiStore((s) => s.openPreview);
-  // MAY THIS PROJECT BE PREVIEWED AT ALL? Narrowed to a boolean through the selector so a
-  // capability write for the OTHER project cannot re-render this column. `undefined` (not probed
-  // yet) reads as false, which is the honest answer — see the probe effect below.
-  const previewable = usePreviewStore((s) => s.capability[project?.id ?? ""]?.previewable === true);
+  // NO `openPreview` / `previewable` HERE ANY MORE. Both existed to gate and drive the toggle's
+  // Preview segment, which is gone (founder, 2026-08-19: a preview is a card in the concierge chat,
+  // not a third peer column). The capability PROBE below stays — `AgentRow`'s own Preview button
+  // still reads it to decide whether to offer starting a dev server at all.
   const setMode = useCallback((m: WorkMode) => setWorkMode(pairSide, m), [setWorkMode, pairSide]);
   // Which status bands the column currently shows (the filter chips above the ladder).
   const statusFilter = useUiStore((s) => s.statusFilter);
@@ -1017,9 +1060,27 @@ export function AgentSidebar({
   //
   // Persisted like the width, and for the same reason: it's a stated preference about the shape of
   // the app, not a transient view state, so it must survive a relaunch.
-  const OVERLAY_KEY = "sparkle-sidebar-overlay";
-  const [overlay, setOverlay] = useState<boolean>(
-    () => localStorage.getItem(OVERLAY_KEY) === "1",
+  // KEYED PER SIDE **AND PER WINDOW**, for the reason the WIDTH is keyed per side (see
+  // `buildWidthKey`) plus the one the ZOOM is keyed per window (see `ZoomColumnOverride`). This was
+  // one bare `sparkle-sidebar-overlay` shared by both build columns and by the satellite. Live that
+  // is harmless — each `AgentSidebar` owns its own `useState` and nothing listens for `storage` on
+  // this key — but every instance SEEDS from it, so overlaying one column silently floated the
+  // others on the next launch.
+  //
+  // THE SIDE ALONE IS NOT ENOUGH, which is the half the first split missed: the satellite forces
+  // `pairSide = "right"`, so a side-only key gives it the cockpit's right-builder string and the two
+  // windows go on sharing one value. `zoomColumn` is already the honest answer to "which window am I
+  // in" — it is `"satellite"` there and a per-side build column here — so the scope comes from it
+  // rather than from a second prop that could disagree with it.
+  //
+  // The legacy key is read as a fallback SEED so an existing preference is not silently dropped on
+  // upgrade, and is never written back. Reading never writes, so the scopes diverge from a common
+  // ancestor the first time any one of them is toggled. Both halves live in `engine/columnResize`
+  // beside the width's, so the key and its seed order cannot be respelled here.
+  const isSatelliteWindow = zoomColumn === "satellite";
+  const OVERLAY_KEY = buildOverlayKey(pairSide, isSatelliteWindow);
+  const [overlay, setOverlay] = useState<boolean>(() =>
+    readStoredOverlay(pairSide, isSatelliteWindow),
   );
   const toggleOverlay = () => {
     const next = !overlay;
@@ -1041,7 +1102,24 @@ export function AgentSidebar({
   // wrapper instead (it is already `position: relative`, so it is our containing block) tracks
   // every one of those shifts for free, and `max()/min()` do the clamping the same way, against
   // that wrapper's live width instead of a stored `window.innerWidth`.
-  const OVERLAY_WIDTH = "max(280px, min(480px, 100%))";
+  // A BOOST ON THE DOCKED WIDTH, NOT AN ABSOLUTE CAP — `overlaidColumnWidth` in `engine/columnResize`
+  // is the arithmetic form of this expression and carries the reasoning; the constants come from
+  // there so the two cannot drift. Built on `SPACER_WIDTH` because that is this column's docked
+  // width in the container's own terms, which is exactly what the boost has to be measured from.
+  //
+  // WHY THIS IS DIVIDED BY THE ZOOM and the old expression was not: the overlay replaces `width` on
+  // the SAME element that carries `zoom: columnZoom`, so an undivided expression is scaled by Z on
+  // the way to the screen. That was survivable while the width was a constant 480 — it just painted
+  // 576 at 1.2x — but it is not survivable now that the number means "the docked width plus 280",
+  // because the docked width is already divided (see `RENDERED_WIDTH`). Without the division the
+  // boost would silently become `280 * Z` and the two widths would be measured in different units.
+  // The docked width sits inside the `max()` beside the floor, mirroring `overlaidColumnWidth`
+  // exactly: without it the edge reserve pulls the overlay BELOW the dock once the column is
+  // dragged within 120px of the container, and the panel SHRINKS on click while its spacer holds
+  // the full slot (roborev 65324). The two spellings must stay identical — that is what the
+  // string test in `AgentSidebar.pullTabs.test.tsx` and the arithmetic tests in
+  // `columnResize.test.ts` jointly hold.
+  const OVERLAY_WIDTH = `calc(max(${OVERLAY_MIN_WIDTH}px, ${SPACER_WIDTH}, min(calc(${SPACER_WIDTH} + ${OVERLAY_WIDTH_BOOST}px), calc(100% - ${OVERLAY_EDGE_RESERVE}px))) / ${columnZoom})`;
 
   /**
    * PUT A BUILD AGENT IN FRONT OF THE USER, AND PLUG THE CABLE INTO IT.
@@ -1230,13 +1308,6 @@ export function AgentSidebar({
   // the section; clicking the SAME chevron AGAIN while already in Build spawns a fresh build agent
   // (same as the "+ New Build Agent" button). Plan stays a pure mode switch: it has no agent concept
   // and only opens the read-only Tasks board in the main pane.
-  // ENTER PREVIEW. A pure mode switch, exactly like `onPickPlan` and deliberately unlike
-  // `onPickBuild` (whose second press spawns an agent): pressing it twice must not start a second
-  // dev server, and starting one at all is the hover-card action's job, not a mode toggle's. The
-  // slot renders whatever state that agent's preview is in, including "none".
-  const onPickPreview = () => {
-    openPreview(pairSide);
-  };
   const onPickPlan = () => {
     // ONE WRITE FOR THE BOARD, to THIS column. It used to also set the window-global
     // `activeSpecial = "board"`, which is what made the board a singleton — that global was the
@@ -1312,20 +1383,35 @@ export function AgentSidebar({
   // `patchCable(pairSide)` and NOT `selectAndWire`: that helper calls `selectAgent(project.id, id)`,
   // and this id is not one of the project's agents. Same side, same reducer, same ONE LIVE CIRCUIT —
   // just without writing a foreign id into the project's selection.
-  const onSelectSparkle = useCallback(() => {
+  // ══ SPLIT IN TWO, BECAUSE A BUILD ROW'S GESTURE IS TWO THINGS (bead sparkle-gyvjyt) ════════════
+  // These were ONE callback that revealed the pane and patched the cable together, which is why the
+  // row could not run the shared `mountsOnRowActivation` predicate: that rule exists precisely to
+  // decide whether an activation is a SELECT or a MOUNT, and it has nothing to decide when the two
+  // are inseparable. `SparkleAgentRow.onMount`'s header has the founder's report and the full
+  // reasoning; do not restate it here.
+  //
+  // The pair mirrors `onSelect`/`onMount` for a build row, including the ORDERING guarantee: the
+  // mount half re-reveals rather than assuming the select half already ran, so a `dblclick` (which
+  // is preceded by two clicks) and an AT activation (which is not preceded by anything) both land
+  // the pane before the cable names it.
+  const revealSparklePane = useCallback(() => {
     handleImproveSparkleClick({
       activateLocal: () => {
         setActiveSpecial("sparkle");
         open(sparkleAgentId);
-        // PINNED TO THE SPARKLE AGENT, which is the one this gesture named (roborev 63145 #4).
-        // It is deliberately NOT `project.selectedAgentId`: this agent is never a roster member, so
-        // the selection here names some OTHER agent entirely — exactly the mismatch the pin exists
-        // to remove. Routing to the pane goes through `decidePromptTarget`'s special arm rather than
-        // this pin, so the value is truthful state rather than the thing that decides the send.
-        patchCable(pairSide, sparkleAgentId);
       },
     });
-  }, [setActiveSpecial, open, sparkleAgentId, patchCable, pairSide]);
+  }, [setActiveSpecial, open, sparkleAgentId]);
+  const onSelectSparkle = revealSparklePane;
+  const onMountSparkle = useCallback(() => {
+    revealSparklePane();
+    // PINNED TO THE SPARKLE AGENT, which is the one this gesture named (roborev 63145 #4).
+    // It is deliberately NOT `project.selectedAgentId`: this agent is never a roster member, so
+    // the selection here names some OTHER agent entirely — exactly the mismatch the pin exists
+    // to remove. Routing to the pane goes through `decidePromptTarget`'s special arm rather than
+    // this pin, so the value is truthful state rather than the thing that decides the send.
+    patchCable(pairSide, sparkleAgentId);
+  }, [revealSparklePane, patchCable, pairSide, sparkleAgentId]);
   // Land an agent's work into its integration target: a worker → its orchestrator's branch; a build
   // agent → the project's default branch. A local --no-ff merge (see Rust land_agent_branch); the
   // tracker then advances to On Main on the next poll. Best-effort feedback via console for now
@@ -2145,6 +2231,24 @@ export function AgentSidebar({
     return { topLevelAgents, childrenByParent };
   }, [project]);
 
+  // ── NARROWED TO THE EPICS COLUMN'S SELECTION ───────────────────────────────────────────────
+  //
+  // The point of the epics column, from this end: the founder picks an epic beside the concierge
+  // and this column narrows to the orchestrators working on it. The rule itself is
+  // `engine/epicFocus`, composed from `services/beads.childrenOf` — never re-derived here, because
+  // a second definition of epic membership is a CI failure (scripts/lib/epic-membership-guard.sh).
+  //
+  // `null` means NO EPIC SELECTED and renders everything. It is deliberately distinct from an empty
+  // set, which means "this epic has nothing" and renders nothing — nothing is selected on launch,
+  // so collapsing those two would empty this column for every user on every start.
+  const epicFocusId = useUiStore((s) => s.epicFocusBySide[pairSide]);
+  const epicBeads = useBeadsStore((s) => (project ? s.byProject[project.id]?.beads : undefined));
+  const epicAgentIds = useMemo(
+    () => agentIdsInEpic(project?.agents ?? [], epicBeads ?? [], epicFocusId),
+    [project?.agents, epicBeads, epicFocusId],
+  );
+
+
   // Which orchestrators have their worker subtree collapsed. Subscribed (not read via getState) so
   // a chevron click re-renders the list. A Set of the COLLAPSED ids, derived from the persisted
   // record, keeping uiStore's "absent → collapsed" default: an id is collapsed unless it is
@@ -2325,30 +2429,67 @@ export function AgentSidebar({
         // The column's disc must agree with every other surface about a finished head — otherwise
         // the row reads red here and calm in the digest (bead sparkle-hpbkw).
         isFinishedOf,
+        undefined,
+        undefined,
+        // ⚠️ PASSED EXPLICITLY, FROM THE SUBSCRIBED SNAPSHOT (roborev 65408). The default would read
+        // the live table and be CORRECT — but this memo would never re-run to ask, because a flagged
+        // agent is silent so none of its other deps ever move again. The result was the column disc
+        // holding `lapsed` while `effectiveStatus` (which does subscribe) had already painted the
+        // row `blocked`: the two disagreeing inside ONE component, which is exactly what the note
+        // below says this shared composition exists to prevent.
+        //
+        // The SNAPSHOT itself, not a predicate over it — the parameter's type changed so it cannot
+        // be transposed with the identically-typed `hasBackgroundTasksOf` beside it, and this call
+        // site is where that type change caught a real mis-wire (roborev 65465).
+        nudgeFlags,
       ),
     // `graceTick` is deliberate: this memo runs step (0) with an internally-sampled clock, and for a
     // held `errored` agent none of the other deps ever change again — so the row's disc and its
     // "Needs you" chip would stay gray `new` while `status` above had already gone red. The two
     // disagreeing inside one component is exactly what this shared tick exists to prevent
     // (roborev 54830).
+    // `nudgeFlags` for the same class of reason, one signal over: the flag table lives outside React
+    // and a flagged agent's other deps are static, so without it this memo could never learn that
+    // the agent said a person was blocking it (roborev 65408). The eslint-disable below means
+    // nothing will flag a missing dep here for you — it has to be kept by hand.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick, isFinishedOf],
+    [project?.agents, liveStatus, openAgentIds, lastObserved, branchStatus, workflowStage, graceTick, isFinishedOf, nudgeFlags],
   );
   const rowBandOf = useCallback((id: string) => bandOfRollup(rollupOf(id)), [rollupOf]);
 
   const sections = useMemo(
-    () =>
-      project
-        ? groupAgentsByStage(
-            topLevelOf(project.agents, mode),
+    () => {
+      if (!project) return [];
+      // NARROWED HERE, AT THE LADDER'S INPUT, and that placement is the whole of it. This is the
+      // list the column actually renders from — narrowing any of the other top-level derivations in
+      // this file would leave a filter that computes correctly and changes nothing on screen.
+      //
+      // WRITTEN AS A STATEMENT RATHER THAN A TERNARY so the narrowing occupies a LINE OF ITS OWN.
+      // That is not a style preference: `scripts/mutation-check.sh` proves a test can fail by
+      // mutating one line, and a filter buried inside a ternary argument cannot be mutated without
+      // breaking the file's syntax — so the guard on this behaviour would be unprovable. A rule
+      // worth writing is worth being able to show is load-bearing.
+      let ladderInput = topLevelOf(project.agents, mode);
+      if (epicAgentIds) ladderInput = ladderInput.filter((a) => epicAgentIds.has(a.id));
+      return groupAgentsByStage(
+            ladderInput,
             headStageOf,
             (id) => effectiveStatus[id] ?? "stopped",
             statusFilter,
             rowBandOf,
             headHoldsWorkOf,
-          )
-        : [],
-    [project, effectiveStatus, mode, headStageOf, statusFilter, rowBandOf, headHoldsWorkOf],
+          );
+    },
+    [
+      project,
+      effectiveStatus,
+      mode,
+      headStageOf,
+      statusFilter,
+      rowBandOf,
+      headHoldsWorkOf,
+      epicAgentIds,
+    ],
   );
   // The flat rendered order, used for the empty-state check and by anything that needs "the rows,
   // top to bottom" without caring about section boundaries.
@@ -2460,6 +2601,24 @@ export function AgentSidebar({
     () => recentTasks(Object.values(researchById), Date.now()),
     [researchById],
   );
+  // ── THE THIRD NUMBER: THE CONCIERGE'S OWN QUEUE (bead sparkle-zx9knz) ────────────────────────
+  //
+  // NOT a research number, and read from a different store on purpose. The two above are gauges
+  // over research tasks; this is how many of the founder's MESSAGES are still waiting behind the
+  // running concierge turn. Dispatching research dequeues nothing (only `turnFinished` advances
+  // that queue), so `conciergeLive` decays toward zero while the queue stays deep — which is
+  // exactly how `+0` came to mean both "nothing to do" and "sixteen of your messages are
+  // unanswered". See `ConciergeAgentsRow`'s header.
+  //
+  // AN EXISTING, TESTED CHANNEL — no second publisher. `ConciergeHost` already calls
+  // `publishConciergeQueue(owner, queueDepthOf(turnQueue))` every time the queue moves, and clears
+  // it on unmount; this is only the read side. `depth` is `undefined` for WE DID NOT LOOK (a window
+  // with no host mounted at all), and `?.waiting` propagates that rather than flattening it to 0 —
+  // the store's own rule, which the row's optional prop then honours.
+  //
+  // `.waiting` EXCLUDES the turn in flight, by definition. The row's wording is written against
+  // that, so do not swap in a "total outstanding" here without changing the copy with it.
+  const conciergeQueueDepth = useConciergeQueueStore((s) => s.depth);
   const conciergeStatus: AgentTabStatus = "stopped";
   const conciergeRollup = rollupDot(conciergeStatus, researchRollupStatuses(conciergeLive));
   const conciergeRollupOverrides =
@@ -2831,10 +2990,6 @@ export function AgentSidebar({
             beadsEnabled={beadsEnabled}
             onPickPlan={onPickPlan}
             onPickBuild={onPickBuild}
-            // ABSENT, NEVER GREYED (design §7 rule 5 / ColumnPullTab.tsx:130). A project with no
-            // dev server shows two segments, not three greyed ones.
-            previewEnabled={previewable}
-            onPickPreview={onPickPreview}
           />
           {/* Expand-all / collapse-all, where the `«` chevron used to sit. Hidden in Plan (no rows)
               and when NO head has workers — a control that would act on nothing is worse than none.
@@ -3243,6 +3398,17 @@ export function AgentSidebar({
           </div>
         )}
         {/* Empty hint: the dashed create rows above are the call to action. */}
+        {/* AN EMPTY COLUMN HAS TWO CAUSES NOW, and they need different copy. "No agents yet" told
+            the user to start one, which is wrong — and actively confusing — when the agents exist
+            and an epic selected in the NEXT COLUMN is hiding them. A filter whose explanation is
+            off-screen is the failure `uiStore`'s transient-key comments keep naming; here the
+            filter cannot be persisted, but it can still be set and forgotten within a session. */}
+        {project && mode === "build" && epicAgentIds && topLevelAgents.length > 0 && ordered.length === 0 && (
+          <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
+            No orchestrators for the epic selected in the Epics column. Press <strong>Clear</strong>
+            {" "}there to see them all again.
+          </div>
+        )}
         {project && mode === "build" && topLevelAgents.length === 0 && (
           <div style={{ color: C.muted, fontSize: 12, padding: "2px 10px 10px", lineHeight: 1.5 }}>
             No Build agents yet — use <strong>+ Local Agent</strong> or <strong>+ Cloud Agent</strong> above to start one.
@@ -3297,6 +3463,9 @@ export function AgentSidebar({
           }
           liveCount={conciergeLive.length}
           recentCount={conciergeRecent.length}
+          // `undefined` when no concierge is mounted in this window — WE DID NOT LOOK, which the
+          // row renders as no queue segment at all rather than as an empty queue.
+          queuedCount={conciergeQueueDepth?.waiting}
           hydrated={researchHydrated}
           paneSide={pairSide}
           jointOpen={jointOpen}
@@ -3317,6 +3486,7 @@ export function AgentSidebar({
           }
           workerCount={sparkleWorkerCount}
           onSelect={onSelectSparkle}
+          onMount={onMountSparkle}
           paneSide={pairSide}
           jointOpen={jointOpen}
         />
@@ -3497,6 +3667,16 @@ export function AgentSidebar({
           // (drag right to grow it), in the left pair it is right of it (drag left to grow it).
           grows={pairSide === "right" ? "left" : "right"}
           cssVar={buildWidthVar(pairSide)}
+          // ZOOM-CANCELLED, so this grip holds still against the concierge grip in the row.
+          //
+          // This rail is inside the element carrying `zoom: columnZoom`, and the concierge's rail is
+          // not — so the tab's painted offset here is `(topOffset + TAB_TOP) * Z` while the
+          // concierge's is a flat `HEADER_H + TAB_TOP`. At 1x they agree; at 1.2x they were 8px
+          // apart and separating, which is the half of the founder's misalignment report that no
+          // strip offset can fix. Solving `(t + TAB_TOP) * Z = HEADER_H + TAB_TOP` for `t` keeps the
+          // painted position at exactly the row's, whatever the text size. Same cancellation, and
+          // the same reason, as the `/ columnZoom` in RENDERED_WIDTH.
+          topOffset={(HEADER_H + TAB_TOP) / columnZoom - TAB_TOP}
           testId="sidebar-pull-tab"
         />
       </div>

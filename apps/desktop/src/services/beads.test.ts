@@ -11,8 +11,14 @@ import {
   ensureBeadsDb,
   beadShow,
   columnFor,
+  STALLED_LABEL,
+  SWEEP_RESTART_PREFIX,
+  sweepRestartedAt,
   bucketBeads,
   childrenOf,
+  isEpic,
+  buildEpicIndex,
+  isEpicIndexed,
   parseCreatedBeadId,
   mergeShaOf,
   severityOf,
@@ -193,6 +199,30 @@ describe("blockedBeadIdsOrNull vs blockedBeadIds", () => {
   });
 });
 
+describe("sweepRestartedAt", () => {
+  it("reads the epoch-ms out of the marker label", () => {
+    expect(sweepRestartedAt(bead({ id: "e", labels: [`${SWEEP_RESTART_PREFIX}1700000000000`] }))).toBe(
+      1700000000000,
+    );
+  });
+  it("is null when the epic carries no marker", () => {
+    // NULL MEANS "the sweep has never restarted this", which the engine reads as "still owed its
+    // one attempt". A 0 here would read as "restarted at the dawn of time" and escalate every
+    // stalled epic on sight instead of ever restarting one.
+    expect(sweepRestartedAt(bead({ id: "e", labels: ["stalled", "other"] }))).toBeNull();
+  });
+  it("takes the NEWEST when more than one survives", () => {
+    const b = bead({
+      id: "e",
+      labels: [`${SWEEP_RESTART_PREFIX}100`, `${SWEEP_RESTART_PREFIX}900`],
+    });
+    expect(sweepRestartedAt(b)).toBe(900);
+  });
+  it("ignores an unparseable value rather than treating it as 0", () => {
+    expect(sweepRestartedAt(bead({ id: "e", labels: [`${SWEEP_RESTART_PREFIX}garbage`] }))).toBeNull();
+  });
+});
+
 describe("columnFor", () => {
   it("open -> backlog", () => {
     expect(columnFor(bead({ id: "a", status: "open" }))).toBe("backlog");
@@ -237,6 +267,25 @@ describe("columnFor", () => {
   it("open and NOT in the set -> backlog, and no set at all means nothing is blocked", () => {
     expect(columnFor(bead({ id: "a", status: "open" }), new Set(["other"]))).toBe("backlog");
     expect(columnFor(bead({ id: "a", status: "open" }))).toBe("backlog");
+  });
+  // THE SECOND SOURCE OF BLOCKED. `bd blocked` answers "waiting on a dependency" and cannot be
+  // written to; the stalled label answers "this stopped moving and a restart did not help" and
+  // cannot be expressed as a dependency. They share a lane because they share a meaning to the
+  // reader, so both must reach it — and the label must not need the set to be present at all,
+  // which is the case the epic sweep actually produces.
+  it("open AND carrying the stalled label -> blocked, with no blocked set in play", () => {
+    expect(columnFor(bead({ id: "a", status: "open", labels: [STALLED_LABEL] }))).toBe("blocked");
+  });
+  it("the two blocked sources are independent — either one alone is enough", () => {
+    expect(columnFor(bead({ id: "a", status: "open", labels: [STALLED_LABEL] }), new Set())).toBe(
+      "blocked",
+    );
+    expect(columnFor(bead({ id: "a", status: "open", labels: [] }), new Set(["a"]))).toBe("blocked");
+  });
+  it("a CLOSED bead carrying the stalled label is still done, not blocked", () => {
+    // Same rule the archived label already follows: a finished bead cannot be waiting on anything,
+    // and a leftover mark must not drag it back into the lane the human scans for live problems.
+    expect(columnFor(bead({ id: "a", status: "closed", labels: [STALLED_LABEL] }))).toBe("done");
   });
   it("a bead being WORKED is not blocked, even if bd still lists it", () => {
     // Someone is on it; surfacing it as blocked would be telling the user to act on something
@@ -341,6 +390,44 @@ describe("childrenOf", () => {
   });
 });
 
+describe("isEpic", () => {
+  // THE POINT OF THE PREDICATE. Eight real parents in this repo's store are typed feature/bug/task
+  // and carry between 2 and 19 children apiece; keying epic-ness on `type` alone made every one of
+  // them invisible as a plan while their children rendered as loose tasks.
+  it("treats a bead with children as an epic whatever its issue_type says", () => {
+    const parent = bead({ id: "p1", type: "feature" });
+    const loose = bead({ id: "loose", type: "task" });
+    const beads = [parent, bead({ id: "c1", parent: "p1" }), loose];
+    expect(isEpic(beads, parent)).toBe(true);
+    expect(isEpic(beads, loose)).toBe(false);
+  });
+
+  // The dotted id is bd's DISPLAY form of the same parent edge, so it has to count the same way.
+  it("counts a dotted-id child as making its prefix an epic", () => {
+    const parent = bead({ id: "p2", type: "bug" });
+    expect(isEpic([parent, bead({ id: "p2.1" })], parent)).toBe(true);
+  });
+
+  // UNION, NOT REPLACEMENT. `create_plan` files a typed epic with no children yet and only then
+  // decomposes it; if children were REQUIRED, a fresh plan would fail isEpic the instant it was
+  // created — invisible to list_plans and refused by get_plan/promote_plan_to_build, dead-ending
+  // the create → decompose → promote workflow at its first step.
+  it("keeps a childless bead typed 'epic' an epic", () => {
+    const fresh = bead({ id: "fresh", type: "epic" });
+    expect(isEpic([fresh], fresh)).toBe(true);
+  });
+
+  it("is tolerant of bd's loose casing on the type field", () => {
+    expect(isEpic([bead({ id: "e", type: "Epic" })], bead({ id: "e", type: "Epic" }))).toBe(true);
+  });
+
+  // A parentless task is the NORMAL case, not a defect — most beads have no epic and must not be
+  // pushed toward one.
+  it("does not treat a bead with no children and no epic type as an epic", () => {
+    expect(isEpic([bead({ id: "solo" })], bead({ id: "solo" }))).toBe(false);
+  });
+});
+
 describe("mergeShaOf", () => {
   it("reads the SHA out of the merged-sha: label", () => {
     const sha = "deadbeef1234deadbeef1234deadbeef12341234";
@@ -385,5 +472,82 @@ describe("recordBeadMergeSha", () => {
     await recordBeadMergeSha("/proj", "bd-1", undefined);
     await recordBeadMergeSha("/proj", "bd-1", "  ");
     expect(invokeMock).not.toHaveBeenCalled();
+  });
+});
+
+
+const idxBead = (
+  id: string,
+  status: Bead["status"],
+  parent: string | null = null,
+  extra: Partial<Bead> = {},
+): Bead => ({ id, title: id, description: "", status, labels: [], parent, ...extra });
+
+// ══ THE INDEX MUST BE `childrenOf` / `isEpic`, EXACTLY ════════════════════════════════════════
+//
+// `buildEpicIndex` exists purely for speed: the per-bead `isEpic` it replaced was a full scan of
+// the store per bead, so both mode narrowings were O(N²) on the render path across every column,
+// including the ~1,800-bead archived pile. A faster predicate that answers even slightly
+// differently is worse than the slow one, and the difference would surface as an epic quietly
+// missing from a column rather than as anything that looks like a bug.
+//
+// So these do not restate the rules — they CROSS-CHECK the index against the real functions over a
+// fixture built to hit every branch of `childrenOf`'s two-clause match at once: a parent edge, a
+// dotted id, a GRANDCHILD (matched by two different prefixes), a bead whose parent edge and dotted
+// prefix name the same epic (the double-count case), a dotted id whose prefix is not a bead at all,
+// and a typed epic with nothing under it.
+describe("buildEpicIndex — agrees with childrenOf and isEpic on every bead", () => {
+  const fixture: Bead[] = [
+    idxBead("e", "open"),
+    idxBead("e.1", "open", "e"), //  parent edge AND dotted prefix name the same epic
+    idxBead("e.2", "in_progress"), //  dotted prefix only, no parent edge
+    idxBead("e.2.a", "closed"), //  GRANDCHILD — a child of BOTH "e" and "e.2"
+    idxBead("flat", "open", "e"), //  parent edge only, id shares no prefix
+    idxBead("typed", "open", null, { type: "epic" }), //  declared, childless
+    idxBead("orphan.7", "open"), //  dotted, but "orphan" is not a bead
+    idxBead("plain", "closed"), //  neither
+  ];
+
+  it("hasChildren matches isEpic's structural half for every bead in the fixture", () => {
+    const index = buildEpicIndex(fixture);
+    for (const b of fixture) {
+      expect({ id: b.id, epic: isEpicIndexed(index, b) }).toEqual({
+        id: b.id,
+        epic: isEpic(fixture, b),
+      });
+    }
+  });
+
+  it("statusesByParent matches childrenOf's statuses for every bead in the fixture", () => {
+    const index = buildEpicIndex(fixture);
+    for (const b of fixture) {
+      const expected = childrenOf(fixture, b.id).map((c) => c.status);
+      expect({ id: b.id, kids: index.statusesByParent.get(b.id) ?? [] }).toEqual({
+        id: b.id,
+        kids: expected,
+      });
+    }
+  });
+
+  // The grandchild is the case a "just index b.parent" implementation gets wrong, and it is stated
+  // on its own because the two loops above would still pass if `e` merely lost ONE of its three
+  // children — a roll-up is a summary, so a missing child can leave the verdict unchanged.
+  it("counts a grandchild under BOTH its prefixes, so a roll-up cannot miss in-flight work", () => {
+    const index = buildEpicIndex(fixture);
+    expect(index.statusesByParent.get("e.2")).toEqual(["closed"]);
+    // FOUR children, not three: "flat" reaches "e" by its parent edge while sharing no id prefix,
+    // which is the other half of childrenOf's match and easy to forget when reading ids alone.
+    expect(index.statusesByParent.get("e")?.slice().sort()).toEqual([
+      "closed",
+      "in_progress",
+      "open",
+      "open",
+    ]);
+  });
+
+  it("records a bead only once when its parent edge and its dotted prefix name the same epic", () => {
+    // "e.1" is reachable both ways. Counting it twice would make `e` look busier than it is.
+    const index = buildEpicIndex([idxBead("e", "open"), idxBead("e.1", "open", "e")]);
+    expect(index.statusesByParent.get("e")).toEqual(["open"]);
   });
 });

@@ -92,6 +92,10 @@ describe("control op: preview", () => {
   let buildId: string;
   let workerId: string;
   const WORKTREE = "/tmp/demo-worktrees/build-1";
+  // A DIFFERENT path from the build agent's, deliberately: the worker tests below assert WHICH
+  // checkout the supervisor was handed, and two agents sharing one string would make "served the
+  // caller's own worktree" and "served the other agent's" indistinguishable.
+  const WORKER_WORKTREE = "/tmp/demo-worktrees/worker-1";
 
   beforeEach(async () => {
     firedHandler = undefined;
@@ -110,7 +114,7 @@ describe("control op: preview", () => {
     useProjectStore.getState().setAgentWorktree(projectId, buildId, WORKTREE, "sparkle/demo");
     useProjectStore
       .getState()
-      .setAgentWorktree(projectId, workerId, "/tmp/demo-worktrees/worker-1", "sparkle/w");
+      .setAgentWorktree(projectId, workerId, WORKER_WORKTREE, "sparkle/w");
     cleanup = await startControlListener();
   });
   afterEach(() => {
@@ -156,12 +160,16 @@ describe("control op: preview", () => {
     );
   });
 
-  // THE FOUNDER'S RULE, ENFORCED RATHER THAN DOCUMENTED (docs/live-browser-preview.md, "Decisions —
-  // amended 2026-08-08": only interactive agents may open a preview; workers may not). The
-  // assertion that matters is the second one: a refusal that still spawned the server would be a
-  // dev server per worker — hundreds of MB of resident Node each, on a machine with 115 live
-  // worktrees — with a polite message on top.
-  it("open from a WORKER → refused, and no dev server is started", async () => {
+  // A WORKER MAY NOW CALL THIS OP (beads `sparkle-q3b4c6` / `sparkle-wnnye0`). This block replaces
+  // the two refusal tests that pinned the founder's 2026-08-08 interactive-only rule, which was a
+  // RESOURCE bound explicitly scoped "until `[preview] idle_grace_min` lands" — it landed, and
+  // `CONTROL_OP_TIERS.preview` is now `free`.
+  //
+  // WHAT IS ASSERTED IS THE SIDE EFFECT, not the reply: that the supervisor wrapper RAN, and ran
+  // against the WORKER'S OWN worktree. A reply-only assertion would pass against a handler that
+  // answered `ok` and started nothing, and against one that served the wrong checkout — which is
+  // the only thing that could actually go wrong here, the op having no target parameter at all.
+  it("open from a WORKER → starts the dev server in the WORKER's own worktree", async () => {
     fire({
       reqId: "p3",
       op: "preview",
@@ -169,23 +177,99 @@ describe("control op: preview", () => {
       payload: { previewOp: "open", path: "/x" },
     });
     await flush();
-    expect(openPreviewServerMock).not.toHaveBeenCalled();
-    const reply = lastReply();
-    expect(reply.ok).toBe(false);
-    expect(String(reply.error)).toMatch(/interactive \(non-worker\) agents/);
+    expect(openPreviewServerMock).toHaveBeenCalledTimes(1);
+    expect(openPreviewServerMock).toHaveBeenCalledWith({
+      agentId: workerId,
+      projectId,
+      worktree: WORKER_WORKTREE,
+      path: "/x",
+    });
+    expect(lastReply()).toMatchObject({ ok: true, preview: { id: "pv1" } });
   });
 
-  it("close/list from a WORKER → refused too, and nothing is stopped or read", async () => {
-    fire({ reqId: "p4", op: "preview", callerAgentId: workerId, payload: { previewOp: "close" } });
+  // The confused-deputy case for the kind that just gained access. Reaching the handler must not
+  // mean reaching ANOTHER agent's checkout: a worker is the caller most likely to know a sibling's
+  // id, and `open` spawns a real dev server in a real tree.
+  it("open from a WORKER naming another agent → still its OWN worktree, never the named one", async () => {
+    fire({
+      reqId: "p3b",
+      op: "preview",
+      callerAgentId: workerId,
+      payload: { previewOp: "open", agentId: buildId, worktree: WORKTREE, projectId: "elsewhere" },
+    });
     await flush();
-    expect(lastReply().ok).toBe(false);
+    expect(openPreviewServerMock).toHaveBeenCalledWith({
+      agentId: workerId,
+      projectId,
+      worktree: WORKER_WORKTREE,
+      path: null,
+    });
+  });
+
+  it("close/list from a WORKER → reach the supervisor, scoped to the worker itself", async () => {
+    fetchPreviewStatusMock.mockResolvedValueOnce({
+      agentId: workerId,
+      id: "pv-w",
+      state: "running",
+      url: "http://127.0.0.1:5200",
+      port: 5200,
+      error: null,
+    } as never);
     fire({ reqId: "p5", op: "preview", callerAgentId: workerId, payload: { previewOp: "list" } });
     await flush();
-    expect(lastReply().ok).toBe(false);
-    expect(stopPreviewForAgentMock).not.toHaveBeenCalled();
-    expect(stopPreviewMock).not.toHaveBeenCalled();
-    expect(fetchPreviewStatusMock).not.toHaveBeenCalled();
+    expect(fetchPreviewStatusMock).toHaveBeenCalledWith(workerId);
     expect(listPreviewsMock).not.toHaveBeenCalled();
+    expect(lastReply()).toMatchObject({
+      ok: true,
+      previews: [expect.objectContaining({ agentId: workerId, id: "pv-w" })],
+    });
+
+    fire({ reqId: "p4", op: "preview", callerAgentId: workerId, payload: { previewOp: "close" } });
+    await flush();
+    // BY AGENT, and by the CALLER's agent — `stopPreview(id)` is never reached, so "stop a
+    // sibling's server" stays unrepresentable rather than merely refused.
+    expect(stopPreviewForAgentMock).toHaveBeenCalledWith(workerId);
+    expect(stopPreviewMock).not.toHaveBeenCalled();
+    expect(lastReply()).toMatchObject({ ok: true, outcome: "stopped" });
+  });
+
+  // THE OTHER HALF OF THE EVIDENCE. Reachability alone would also be produced by deleting the tier
+  // gate outright, or by `callerMayAdminister` starting to admit workers — both of which would hand
+  // an unattended worker the human's global UI and machine-wide config. So the SAME worker id, in
+  // the SAME suite, must still be refused the ops that stayed `privileged`, and the assertion is
+  // again the side effect: the config write command is never issued, the selection never moves.
+  it("the same WORKER is still refused set_config — no config write is issued", async () => {
+    invokeMock.mockClear();
+    fire({
+      reqId: "p3c",
+      op: "set_config",
+      callerAgentId: workerId,
+      payload: { path: "preview.agent_eagerness", value: "always" },
+    });
+    await flush();
+    expect(lastReply().ok).toBe(false);
+    expect(String(lastReply().error)).toMatch(/interactive \(non-worker\) agents/);
+    const configWrites = invokeMock.mock.calls.filter(
+      ([cmd]) => cmd === "set_config_value" || cmd === "set_config_values",
+    );
+    expect(configWrites).toEqual([]);
+  });
+
+  it("the same WORKER is still refused navigate — the human's selection does not move", async () => {
+    const selectedBefore = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)?.selectedAgentId;
+    fire({
+      reqId: "p3d",
+      op: "navigate",
+      callerAgentId: workerId,
+      payload: { view: "agent", agentId: buildId },
+    });
+    await flush();
+    expect(lastReply().ok).toBe(false);
+    expect(
+      useProjectStore.getState().projects.find((p) => p.id === projectId)?.selectedAgentId,
+    ).toBe(selectedBefore);
   });
 
   // THE SCOPING DECISION, PINNED. `preview_list` (preview.rs) returns EVERY live preview across

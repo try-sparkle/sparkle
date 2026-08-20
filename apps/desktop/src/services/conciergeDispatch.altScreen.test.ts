@@ -44,6 +44,7 @@ import {
   queueScreenHeldSend,
   resetScreenHeldSends,
 } from "./screenHoldQueue";
+import { conciergeToolAuthority } from "./dispatchAuthority";
 
 const AGENT = "agent-1";
 /** A real gesture, so the authority gate (which runs first) is never what refuses here. */
@@ -590,6 +591,91 @@ describe("a mounted send holds instead of refusing, when asked to", () => {
     expect(r.ok).toBe(false);
     expect(r.path).toBe("alternate-screen");
     expectNothingWritten();
+  });
+
+  // ══ THE REFUSAL SCOPE IS THE AUTHORITY'S, NOT THE CALLER'S (bead sparkle-tbsvf) ═══════════════
+  // The founder's rule: the alternate-screen refusal stays for PROGRAMMATIC senders and must NEVER
+  // apply to him typing into a pane he deliberately mounted. Both halves are asserted here against
+  // ONE screen, so a change that relaxed the guard for everyone would fail the second row rather
+  // than quietly pass the first. See `mayHoldForScreenClear`.
+  describe("the human/programmatic split is read from the authority", () => {
+    it("holds a MOUNTED send even when the caller never set the hold flag", async () => {
+      onFullScreenApp();
+      // No `holdForScreenClear` at all — the guarantee must not depend on ConciergeHost remembering
+      // a boolean. Mutating `opts.authority.kind === "mount"` to `false` turns this row red.
+      const r = await dispatchConciergeAnswer(AGENT, "test", {
+        authority: { kind: "mount", agentId: AGENT },
+        userPrompt: true,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.path).toBe("queued");
+      expect(r.heldReason).toBe("screen");
+      expectNothingWritten();
+    });
+
+    // AND IT REACHES THE AGENT — a hold with nothing proving it drains is the "file a bead is my
+    // only channel" failure wearing a friendlier word. This is the founder's `test` landing.
+    it("delivers that mounted send once the screen clears", async () => {
+      onFullScreenApp();
+      await dispatchConciergeAnswer(AGENT, "test", {
+        authority: { kind: "mount", agentId: AGENT },
+        userPrompt: true,
+      });
+      expectNothingWritten();
+
+      atAPrompt();
+      const [flushed] = await flushScreenHeldSends(AGENT);
+      expect(flushed?.ok).toBe(true);
+      expect(submitPrompt).toHaveBeenCalledWith(AGENT, "test", expect.anything());
+    });
+
+    // THE HALF THAT MUST NOT MOVE. `send_to_agent_terminal` is the concierge writing via MCP, and
+    // the options bag is plain data — so the flag alone must not buy a machine-authored write the
+    // founder's treatment on a screen it cannot see.
+    it("refuses a concierge tool call even when it DOES set the hold flag", async () => {
+      onFullScreenApp();
+      const r = await dispatchConciergeAnswer(AGENT, "carry on", {
+        // Built the way production builds it, so this is a genuinely well-formed tool authority —
+        // an ill-formed one would be refused `unauthorized` by the gate above and would prove
+        // nothing about the screen guard.
+        authority: conciergeToolAuthority("call-1", { tier: "allow" })!,
+        userPrompt: true,
+        holdForScreenClear: true,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.path).toBe("alternate-screen");
+      expectNothingWritten();
+    });
+
+    // ══ THE MOUNTED SEND THAT WENT THROUGH A COUNTDOWN (roborev 64466, Medium) ══════════════════
+    // A mounted send made while presence is AWAY does not dispatch immediately — it arms an intent
+    // and fires at expiry as `{kind: "countdown"}`, with `mentionAim.via` still `"mount"`. So the
+    // `mount` exemption above does NOT cover it and the flag is what holds it. Without this row the
+    // armed mounted path is pinned by nothing at this layer, and the doc's claim that the exemption
+    // makes ConciergeHost's `via === "mount"` argument redundant would be acted on — reintroducing
+    // the founder's bug for exactly the case where he stepped away while it counted down.
+    it("holds a mounted send that arrives through the countdown, on the flag", async () => {
+      onFullScreenApp();
+      const r = await dispatchConciergeAnswer(AGENT, "test", {
+        authority: { kind: "countdown", intentId: "intent-1" },
+        userPrompt: true,
+        holdForScreenClear: true,
+      });
+      expect(r.ok).toBe(true);
+      expect(r.path).toBe("queued");
+      expectNothingWritten();
+    });
+
+    it("refuses a goal-continue auto-resume that sets the hold flag too", async () => {
+      onFullScreenApp();
+      const r = await dispatchConciergeAnswer(AGENT, "carry on", {
+        authority: { kind: "goal-continue", agentId: AGENT },
+        holdForScreenClear: true,
+      });
+      expect(r.ok).toBe(false);
+      expect(r.path).toBe("alternate-screen");
+      expectNothingWritten();
+    });
   });
 
   // roborev 64236's Medium: every outcome a screen hold produces carries `heldReason: "screen"`,

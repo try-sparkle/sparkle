@@ -1,0 +1,631 @@
+// A LIVE PREVIEW, AS A CARD IN THE CONCIERGE COLUMN — the founder's shape, verbatim:
+// *"[dot color] [build agent name] has a preview for you to review: [localhost preview card image
+// screenshot]"*, where *"clicking on the preview card would take me out to the actual localhost URL
+// and I could click on the builder agent name to go into that builder agent."*
+//
+// ══ WHAT WAS ACTUALLY BROKEN ════════════════════════════════════════════════════════════════════
+// Not the preview subsystem — that works. The url. It is printed once into a terminal that keeps
+// scrolling, so the one fact worth acting on ("there is something to LOOK at, right now") is gone
+// within seconds. This surface is the fix, and its whole job is to be the place that does not
+// scroll.
+//
+// ══ WHY THE COLUMN AND NOT A PANE ═══════════════════════════════════════════════════════════════
+// See `services/previewCards`' header for the full argument. In one line: a preview PANE during
+// planning is blocked three independent ways (mutually-exclusive work modes, a concierge with no
+// worktree, and `preview_open` needing a real dev server), and a concierge ROW is not a work mode,
+// so it sidesteps all three by only ever RENDERING a url another agent already owns.
+//
+// ══ RETIREMENT IS DERIVED, NOT SCHEDULED ════════════════════════════════════════════════════════
+// There is no dismiss, no timer and no dead-link sweep, because the cards are a projection of
+// `previewStore.byAgent` — the same store `preview:state` folds into. A preview that stops leaves
+// its surfacing state (or its entry entirely), the projection stops producing a card, and the card
+// is gone on the next render. A card can therefore never outlive the server it points at, which is
+// a property of the shape rather than a rule someone has to remember.
+//
+// ══ THIS COMPONENT READS ITS OWN STORES ═════════════════════════════════════════════════════════
+// `ConciergeColumn` is a pure renderer and must stay one, so this follows `MountedAgentNotices`
+// (a component that asks the stores itself) rather than growing the view model. The one thing it
+// does NOT own is the reveal: the agent name is an `AgentPill`, which resolves the live name, the
+// live status dot and the click-through from the `AgentPillProvider` the pinned strip already
+// wraps — so a renamed agent's card renames itself and there is no second roster to go stale.
+import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { FiRefreshCw } from "react-icons/fi";
+
+import { AgentPill } from "./AgentPill";
+// The SAME "time ago" the prompt-history dropdown uses. It takes `nowMs` as an argument rather than
+// reading the clock, which is what lets this card own WHEN the age is recomputed — see
+// `PREVIEW_CARD_AGE_TICK_MS`, because nothing else re-renders a card while a server sits quiet.
+import { formatAgo } from "../promptHistory";
+import { C } from "../../theme/colors";
+import { FONT_MONO, RADIUS, TYPE } from "../../theme/scale";
+import {
+  renderablePreviewCards,
+  renderablePreviewNotices,
+  previewCardShot,
+  type NamedPreviewNoticeModel,
+  type PreviewNoticeState,
+} from "../../services/previewCards";
+// `notePreviewActivity` is imported for the reason `previewStore` spells out at its definition:
+// `supervise()` in preview.rs goes SILENT once a server is `Ready` (it sleeps on a liveness check
+// and transitions again only to Crashed/Failed), so a healthy preview produces no further wire
+// events at all. That makes this card the ONLY place a "still wanted" signal can come from, and
+// without these two call sites the idle-grace clock degrades from an idle clock into a plain
+// max-lifetime cap — silently, with every unit test green, because the seam is perfectly testable
+// on its own. That is the `sparkle-lgbwf` shape, and it is why these calls are guarded by a test
+// that drives the HANDLERS rather than calling the seam.
+import { notePreviewActivity, usePreviewStore } from "../../stores/previewStore";
+import { useProjectStore } from "../../stores/projectStore";
+
+/** The strip. */
+export const PREVIEW_CARDS_TESTID = "concierge-preview-cards";
+/** The ONE element that caps how much vertical space the whole preview surface may take. Exported
+ *  so a test can assert there is exactly one such budget rather than one per zone — see
+ *  `PreviewCards` for why two independent caps put the composer off screen. */
+export const PREVIEW_ZONE_TESTID = "concierge-preview-zone";
+/** One card — carries `data-agent-id` and `data-preview-url` so a test/probe can read both facts. */
+export const PREVIEW_CARD_TESTID = "concierge-preview-card";
+/** The screenshot, once one has arrived. Absent until then, and absent forever if none can be
+ *  taken — see `previewCardShot` for why a missing picture must not cost the card. */
+export const PREVIEW_CARD_SHOT_TESTID = "concierge-preview-shot";
+/** The "captured Xm ago" caption. Present only when there is a picture to date. */
+export const PREVIEW_CARD_CAPTURED_TESTID = "concierge-preview-captured";
+/** The ⟳ control. Re-captures THIS card's snapshot; never opens the url. Present whenever the card
+ *  is — see the component for why it must NOT be gated on there already being a picture. */
+export const PREVIEW_CARD_REFRESH_TESTID = "concierge-preview-refresh";
+/** The "couldn't refresh" note. A capture that fails changes nothing else on screen, so without it
+ *  the only signal is silence — and silence reads as a dead button. */
+export const PREVIEW_CARD_REFRESH_FAILED_TESTID = "concierge-preview-refresh-failed";
+
+/** The NOTICE strip — the second, separate zone this component paints. See the block comment above
+ *  {@link PreviewNotices} for why it is a zone of its own rather than more cards. */
+export const PREVIEW_NOTICES_TESTID = "concierge-preview-notices";
+/** One notice. Carries `data-agent-id` and `data-preview-status` so a test/probe can read WHICH
+ *  agent and WHICH state without matching on prose. There is deliberately no `data-preview-url`:
+ *  a notice has no url to hand anyone. */
+export const PREVIEW_NOTICE_TESTID = "concierge-preview-notice";
+/** The stderr tail / failure text, when the state carries one. */
+export const PREVIEW_NOTICE_DETAIL_TESTID = "concierge-preview-notice-detail";
+/** The "started 4m" caption. Present on every notice — an install can legitimately take five
+ *  minutes, and "how long has this been going" is the whole question the reader is asking. */
+export const PREVIEW_NOTICE_AGE_TESTID = "concierge-preview-notice-age";
+
+/**
+ * What each non-openable state says, reading directly after the agent pill's `@Name`.
+ *
+ * A MAP RATHER THAN A TERNARY, so adding a state to `NOTICE_STATES` without giving it wording is a
+ * TYPE ERROR rather than a blank line in the column.
+ *
+ * ══ THE PUNCTUATION RULE, STATED ONCE FOR ALL SEVEN ENTRIES (roborev 65701) ═════════════════════
+ * A colon PROMISES a detail, and the detail span renders only when `detail` is non-null — which
+ * comes from `entry.error`, which `preview.rs` writes only on `failed`/`crashed`. So:
+ *
+ *   • end in a COLON only where `entry.error` is GUARANTEED non-null — today exactly `failed` and
+ *     `crashed`, the two outcomes;
+ *   • end in an ELLIPSIS for a stage still in progress — `installing`, `starting`, `listening`;
+ *   • end in a FULL STOP where there is no detail and never will be — `ready`/`serving`, which
+ *     reach this table only when the card cannot render the url (see `pendingPreviewNotices`).
+ *
+ * This is written here rather than beside the entries because the compile error a new state
+ * triggers demands WORDING and says nothing about which punctuation is legal — which is exactly how
+ * the colon got copied onto `ready`/`serving` and rendered a sentence stopping at a dangling colon.
+ */
+export const PREVIEW_NOTICE_LEAD: Record<PreviewNoticeState, string> = {
+  installing: "is installing dependencies for a preview…",
+  starting: "is starting a preview…",
+  listening: "is compiling a preview…",
+  failed: "could not start a preview:",
+  crashed: "had a preview crash:",
+  // REACHED ONLY WHEN THE CARD CANNOT RENDER THE PREVIEW — see `pendingPreviewNotices`. A running
+  // server whose url is null or is not loopback http gets no card, and used to get nothing at all.
+  // The wording says the preview is up and that the ADDRESS is the thing that cannot be offered,
+  // rather than implying a failure that has not happened.
+  // NO TRAILING COLON, unlike `failed`/`crashed` (roborev 65694). A colon promises a detail, and
+  // `detail` comes from `entry.error`, which the Rust side writes only on `failed`/`crashed` — so
+  // for exactly the case these two exist to cover it is null, the detail span is not rendered, and
+  // the sentence would stop mid-thought and read as truncated output. These leads are complete
+  // sentences instead, because they are all the reader is going to get.
+  ready: "has a preview running, but not at an address this can open.",
+  serving: "has a preview running, but not at an address this can open.",
+};
+
+/**
+ * How often a card re-reads the clock so its "captured …" caption ages.
+ *
+ * IT NEEDS ITS OWN TICK, and that is the whole reason this constant exists. The strip re-renders on
+ * `previewStore` writes, and a healthy dev server that nobody is touching produces NONE — so a
+ * caption computed once at capture time would read "just now" for an hour, which is precisely the
+ * lie the caption was added to prevent. 30s is under `formatAgo`'s first threshold (45s), so the
+ * label can never skip the moment it stops being "just now".
+ */
+export const PREVIEW_CARD_AGE_TICK_MS = 30_000;
+
+/** The sentence between the name and the picture. A CONSTANT because two tests and one probe read
+ *  it, and because it is the founder's own wording — not a string to improve in passing. */
+export const PREVIEW_CARD_LEAD = "has a preview for you to review:";
+
+/** Roughly two cards. Past that the strip scrolls INSIDE itself rather than growing, exactly as
+ *  `PinnedBlockers` does and for the same non-negotiable reason: nothing above the composer may
+ *  push the composer off screen. */
+const MAX_ZONE_HEIGHT = 260;
+
+const card = (): CSSProperties => ({
+  display: "flex",
+  flexDirection: "column",
+  gap: 6,
+  minWidth: 0,
+  padding: "7px 9px",
+  borderRadius: RADIUS.sm,
+  border: `1px solid ${C.hairline}`,
+  background: "transparent",
+  cursor: "pointer",
+  // CLIP RATHER THAN ESCAPE, the containment floor every narrow surface in this column shares: the
+  // concierge column is user-dragged and can be squeezed below what any of these children want.
+  overflow: "hidden",
+});
+
+const shot = (): CSSProperties => ({
+  display: "block",
+  width: "100%",
+  // The picture is a CUE, not the artefact. It exists so the reader can tell at a glance which of
+  // two previews is theirs; the real thing is one click away, full size, in a real browser.
+  maxHeight: 150,
+  objectFit: "cover",
+  objectPosition: "top",
+  borderRadius: RADIUS.sm,
+  border: `1px solid ${C.hairline}`,
+});
+
+/**
+ * One card. Split out from the strip so the screenshot effect is keyed by MOUNT rather than by an
+ * index into a list — a card that is retired unmounts, which cancels its own fetch, and a new
+ * agent's card cannot inherit the previous occupant's picture.
+ */
+function PreviewCard({
+  agentId,
+  url,
+  name,
+  surfacedAt,
+}: {
+  agentId: string;
+  url: string;
+  name: string;
+  surfacedAt: number;
+}) {
+  const [shotState, setShotState] = useState<{ dataUrl: string; capturedAt: number } | null>(null);
+  // ONE FETCH PER (agent, url, surfacing), and the guard is a ref rather than a dependency array
+  // because the point is to survive re-renders the dependency array cannot see — every unrelated
+  // store tick re-renders this strip, and a capture drives a real headless browser.
+  const fetchedRef = useRef<string | null>(null);
+  // ONE ALIVE FLAG FOR THE COMPONENT, not one per capture, because a capture can now be started by
+  // the ⟳ as well as by the effect — and a per-effect `live` local cannot cancel a manual one, which
+  // is how a click seconds before the card retires writes into an unmounted tree.
+  const aliveRef = useRef(true);
+  // AND A RUN COUNTER, so the LAST capture wins rather than the last to RESOLVE. A ⟳ pressed while
+  // an automatic re-capture is still in flight would otherwise let the older picture land on top of
+  // the newer one, with a timestamp saying it is fresh.
+  const runRef = useRef(0);
+  useEffect(
+    () => () => {
+      aliveRef.current = false;
+    },
+    [],
+  );
+
+  // IN FLIGHT — one capture at a time, and this is not cosmetic. Every press drives a REAL headless
+  // Chromium (`previewCardShot` → `preview_screenshot` → `launch_browser`), which takes seconds and
+  // is serialized nowhere on the Rust side either. A failed capture by design changes nothing on
+  // screen, so the natural response to "I clicked and nothing happened" is to click again — four
+  // presses in six seconds would launch four browsers and throw three of the results away.
+  const [busy, setBusy] = useState(false);
+  // …and a capture that failed says so. See the note above: silence is indistinguishable from a
+  // dead button, and this is the only thing on the card that moves when a re-capture loses.
+  const [failed, setFailed] = useState(false);
+
+  const capture = useCallback(() => {
+    // Same reasoning as `open`: asking for a fresh snapshot is a person saying this preview still
+    // matters. Stamped at the START of the capture rather than on success, because a capture that
+    // fails (no headless Chromium, server mid-restart) is still someone asking.
+    notePreviewActivity(agentId);
+    const run = ++runRef.current;
+    setBusy(true);
+    setFailed(false);
+    void previewCardShot(agentId).then((d) => {
+      // The alive check stops a late capture from writing into a card that has since been retired —
+      // React warns about it, but the real cost is a picture of a preview that is gone.
+      //
+      // A SUPERSEDED RUN RETURNS WITHOUT CLEARING `busy`, deliberately: the run that superseded it
+      // is still in flight and will clear it. Clearing here would re-enable the button while a
+      // browser is still running, which is the state this flag exists to prevent.
+      if (!aliveRef.current || run !== runRef.current) return;
+      setBusy(false);
+      // A FAILED RE-CAPTURE KEEPS THE OLD PICTURE, and that is deliberate: the alternative is a
+      // card that had a snapshot, was refreshed, and now shows none — strictly less than it had.
+      // The caption's timestamp is what stops that from being a lie, since it does not move.
+      if (d !== null) setShotState({ dataUrl: d, capturedAt: Date.now() });
+      else setFailed(true);
+    });
+  }, [agentId]);
+
+  useEffect(() => {
+    // KEYED ON `surfacedAt` AS WELL, so a preview that goes away and comes back — a restart, or a
+    // rebuild that dropped out of `serving` and returned — re-captures instead of showing the
+    // picture of a page that no longer exists. A same-state hot reload is invisible here by
+    // construction; `previewCardShot`'s header says why, and the ⟳ is the answer to it.
+    const key = `${agentId}|${url}|${surfacedAt}`;
+    if (fetchedRef.current === key) return;
+    fetchedRef.current = key;
+    capture();
+  }, [agentId, url, surfacedAt, capture]);
+
+  // THE CAPTION'S OWN CLOCK. See `PREVIEW_CARD_AGE_TICK_MS`: nothing else re-renders a card while a
+  // dev server sits quietly serving, so without this the age freezes at whatever it was when the
+  // picture landed. Armed only while there IS a picture — a card with none has nothing to date, and
+  // an interval running for it would be a wake-up with no possible visible effect.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    if (!shotState) return;
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), PREVIEW_CARD_AGE_TICK_MS);
+    return () => clearInterval(id);
+  }, [shotState]);
+
+  const open = () => {
+    // A human opening the preview is the strongest "still wanted" signal there is — stamped BEFORE
+    // the await, so a slow or failing `openUrl` cannot cost the signal. The click happened either
+    // way, which is the fact the grace clock is asking about.
+    notePreviewActivity(agentId);
+    void openUrl(url).catch((e) => console.warn("preview card: open url failed", url, e));
+  };
+
+  return (
+    <div
+      data-testid={PREVIEW_CARD_TESTID}
+      data-agent-id={agentId}
+      data-preview-url={url}
+      role="button"
+      tabIndex={0}
+      // THE URL IS IN THE ACCESSIBLE NAME. A card whose whole promise is "this opens somewhere
+      // outside the app" has to say where before it is activated, not after.
+      aria-label={`Open ${name}'s preview at ${url}`}
+      onClick={open}
+      onKeyDown={(e) => {
+        // ONLY THE CARD ITSELF — a keydown on the nested pill or the ⟳ bubbles here, and
+        // preventDefault would cancel their own Enter/Space activation. Same rule as
+        // `PinnedBlockers`/`NudgeCard`.
+        if (e.target !== e.currentTarget) return;
+        if (e.key !== "Enter" && e.key !== " ") return;
+        e.preventDefault();
+        open();
+      }}
+      style={card()}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}>
+        {/* A FENCE around the pill's own click, exactly as the pinned blocker row does it. Without
+            it, one click on the agent name would BOTH open the agent and launch the browser — two
+            destinations from one gesture, which is the worst kind of surprise this column can
+            produce. The fence sinks the bubble and nothing else; every other pixel of the card
+            still reaches the card's own handler. */}
+        <span
+          style={{ display: "inline-flex", minWidth: 0, overflow: "hidden" }}
+          onClick={(e) => e.stopPropagation()}
+          role="presentation"
+        >
+          <AgentPill agentId={agentId} fallbackName={name} />
+        </span>
+        <span style={{ color: C.conciergeMuted, fontSize: TYPE.small, minWidth: 0 }}>
+          {PREVIEW_CARD_LEAD}
+        </span>
+      </div>
+      {shotState ? (
+        <img
+          data-testid={PREVIEW_CARD_SHOT_TESTID}
+          src={shotState.dataUrl}
+          alt={`Preview of ${name}`}
+          style={shot()}
+        />
+      ) : (
+        // NO SPINNER, and no empty box holding a place. A capture needs a headless Chromium that
+        // may simply not be installed, so "no picture" is a steady state rather than a moment —
+        // and the url, which is the actionable half, is worth more on screen than a placeholder.
+        <span
+          style={{
+            color: C.conciergeMuted,
+            fontSize: TYPE.small,
+            // THE TOKEN, never a retyped stack — `fontTokens.test.ts` ratchets that at zero.
+            fontFamily: FONT_MONO,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {url}
+        </span>
+      )}
+      {/* THE FOOTER ROW — always present, and its two halves are gated DIFFERENTLY on purpose.
+          ══ THE CAPTION IS WHAT MAKES A SNAPSHOT HONEST, and it needs a picture to date. A still
+          picture of a live site is only trustworthy if it says how old it is: without this, a card
+          that has been on screen for an hour looks exactly like one captured a second ago. An age
+          caption over a card that never got a picture would be dating nothing, so it stays gated.
+          ══ THE ⟳ IS NOT GATED ON ONE, and that is the correction: gating it there put the retry
+          out of reach in exactly the case it was written for. `previewCardShot` lists `no-preview`
+          ("it stopped between the store read and the capture") and `preview-not-ready` as ORDINARY
+          TRANSIENT refusals — and a card whose automatic capture hits one has already burned its
+          fetch key, so the effect never re-fires either. Without a button there, one unlucky second
+          left the card picture-less for the whole life of that preview. */}
+      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+        {shotState && (
+          <span
+            data-testid={PREVIEW_CARD_CAPTURED_TESTID}
+            style={{ color: C.conciergeMuted, fontSize: TYPE.micro, minWidth: 0 }}
+          >
+            {`captured ${formatAgo(nowMs, shotState.capturedAt)}`}
+          </span>
+        )}
+        {failed && (
+          <span
+            data-testid={PREVIEW_CARD_REFRESH_FAILED_TESTID}
+            style={{ color: C.conciergeMuted, fontSize: TYPE.micro, minWidth: 0 }}
+          >
+            couldn&apos;t refresh
+          </span>
+        )}
+        {/* FENCED, like the pill: a click here must re-capture and NOT also launch a browser.
+            DISABLED WHILE ONE IS IN FLIGHT — see `busy`; a capture is a whole browser process.
+
+            THE FENCE IS ON THIS SPAN, NOT ONLY ON THE BUTTON, AND THAT IS THE WHOLE POINT OF IT.
+            A DISABLED button fires no React onClick at all, so the `stopPropagation` inside the
+            button's own handler does not run — while the DOM click still bubbles to the card, whose
+            handler opens the url. So the fence held in exactly the state nobody tests by hand
+            (idle) and failed in the state the button spends its busy window in: press ⟳, and
+            because a capture was already running you got a browser window instead. Wrapping the
+            control means the bubble is stopped whether or not the button itself is interactive. */}
+        <span onClick={(e) => e.stopPropagation()} style={{ display: "inline-flex" }}>
+        <button
+          type="button"
+          data-testid={PREVIEW_CARD_REFRESH_TESTID}
+          aria-label={`Refresh the preview snapshot for ${name}`}
+          title={busy ? "Capturing…" : "Refresh this snapshot"}
+          disabled={busy}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (busy) return;
+            capture();
+          }}
+          style={{
+            appearance: "none",
+            border: "none",
+            background: "transparent",
+            color: C.conciergeMuted,
+            cursor: busy ? "default" : "pointer",
+            opacity: busy ? 0.4 : 1,
+            padding: 0,
+            display: "inline-flex",
+            alignItems: "center",
+            flex: "0 0 auto",
+          }}
+        >
+          <FiRefreshCw size={10} />
+        </button>
+        </span>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * ONE PREVIEW THAT CANNOT BE OPENED, SAID OUT LOUD — the other half of this surface.
+ *
+ * ══ WHY IT IS NOT A CARD ════════════════════════════════════════════════════════════════════════
+ * "A dead link is worse than no card, because it costs the reader a click to learn it is dead" is
+ * the rule that kept `failed`/`installing` off screen entirely, and it is still right — about
+ * LINKS. It was never an argument for silence. So a notice keeps the rule and drops the link: it is
+ * a STATUS LINE, and the difference is structural rather than styled.
+ *
+ * NOTHING HERE IS CLICKABLE, and that is the assertion this component's shape has to survive: no
+ * `role="button"`, no `tabIndex`, no `onClick`, no `onKeyDown`, and `openUrl` is never reached from
+ * this subtree. A greyed-out card would have been the cosmetic version of the same idea and would
+ * have failed at exactly the moment that matters — an inert-LOOKING card still invites the click
+ * that teaches the reader it is dead. There is also no fence around the pill, because a fence
+ * exists to stop a click bubbling to a parent handler and there is no parent handler to stop.
+ *
+ * ══ THE TWO THINGS IT SAYS ══════════════════════════════════════════════════════════════════════
+ *   1. WHOSE, and WHAT STATE — the pill plus one sentence from `PREVIEW_NOTICE_LEAD`.
+ *   2. WHY, when the store has a why. `preview.rs` already writes a stderr tail into the `error`
+ *      field of every `failed`/`crashed` transition ("the dev server exited before it started
+ *      listening. Last output: …"); this is the first thing that renders it. MONOSPACE, because it
+ *      is program output and proportional type makes a stack trace unreadable, and CLAMPED by
+ *      `clampNoticeDetail`, with the full text on `title` so nothing is actually lost.
+ */
+function PreviewNotice({ notice, nowMs }: { notice: NamedPreviewNoticeModel; nowMs: number }) {
+  const { agentId, name, status, failed, detail, fullDetail, startedAt } = notice;
+  return (
+    <div
+      data-testid={PREVIEW_NOTICE_TESTID}
+      data-agent-id={agentId}
+      data-preview-status={status}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        minWidth: 0,
+        padding: "6px 9px",
+        borderRadius: RADIUS.sm,
+        border: `1px solid ${C.hairline}`,
+        background: "transparent",
+        // CLIP RATHER THAN ESCAPE — the containment floor every narrow surface in this column
+        // shares; the concierge column is user-dragged and can be squeezed below what this wants.
+        overflow: "hidden",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0, flexWrap: "wrap" }}>
+        <span style={{ display: "inline-flex", minWidth: 0, overflow: "hidden" }}>
+          <AgentPill agentId={agentId} fallbackName={name} />
+        </span>
+        <span
+          style={{
+            // THE ONLY COLOUR DIFFERENCE between a stage and an outcome. A failure earns the danger
+            // ink; "installing…" is ordinary progress and must not read as an alarm.
+            color: failed ? C.dangerInk : C.conciergeMuted,
+            fontSize: TYPE.small,
+            minWidth: 0,
+          }}
+        >
+          {PREVIEW_NOTICE_LEAD[status]}
+        </span>
+      </div>
+      {detail && (
+        <span
+          data-testid={PREVIEW_NOTICE_DETAIL_TESTID}
+          // THE UNCLAMPED TEXT, so the clamp costs nothing but width. A hover gives the whole tail.
+          title={fullDetail ?? undefined}
+          style={{
+            color: C.conciergeMuted,
+            fontSize: TYPE.micro,
+            // THE TOKEN, never a retyped stack — `fontTokens.test.ts` ratchets that at zero. Mono
+            // because this is program output, not prose.
+            fontFamily: FONT_MONO,
+            minWidth: 0,
+            // WRAPS rather than ellipsising to one line: a stderr tail's value is in the whole
+            // sentence, and the clamp above is what keeps the wrap from growing without bound.
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere",
+          }}
+        >
+          {detail}
+        </span>
+      )}
+      <span
+        data-testid={PREVIEW_NOTICE_AGE_TESTID}
+        style={{ color: C.conciergeMuted, fontSize: TYPE.micro, minWidth: 0 }}
+      >
+        {`started ${formatAgo(nowMs, startedAt)}`}
+      </span>
+    </div>
+  );
+}
+
+/**
+ * The strip of NON-openable previews. Separate from the card strip, and separate all the way down
+ * to `services/previewCards`' own projection — see that module's second header for why.
+ *
+ * ══ THE AGE CAPTION NEEDS ITS OWN CLOCK, exactly as the card's does ═════════════════════════════
+ * `preview.rs` waits up to `INSTALL_WAIT_TIMEOUT` (300s) for an install, and emits NOTHING while it
+ * waits. So the whole five minutes produces zero `previewStore` writes and therefore zero
+ * re-renders — a caption computed once would read "started just now" for the entire wait, which is
+ * the precise lie this caption exists to prevent. ONE interval for the strip rather than one per
+ * notice.
+ *
+ * ══ THE EMPTY CASE IS THE CALLER'S, NOT THIS COMPONENT'S ════════════════════════════════════════
+ * There is deliberately no `if (notices.length === 0) return null` here. {@link PreviewCards} only
+ * MOUNTS this when there is something to say, exactly as it does for the card strip — so an
+ * internal empty guard would be an inert line no test could ever turn red, which is precisely the
+ * shape `mutation-check` flags. Keeping the emptiness decision in one place also keeps the interval
+ * honest: this component never exists without a notice to age, so the timer never runs for nothing.
+ */
+function PreviewNotices({ notices }: { notices: NamedPreviewNoticeModel[] }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    setNowMs(Date.now());
+    const id = setInterval(() => setNowMs(Date.now()), PREVIEW_CARD_AGE_TICK_MS);
+    return () => clearInterval(id);
+  }, []);
+
+  return (
+    <div
+      data-testid={PREVIEW_NOTICES_TESTID}
+      // A LANDMARK, not a log — same reasoning as the card strip and the pinned blockers zone.
+      // `aria-live` would be wrong: this content persists rather than arriving, and the column
+      // already has exactly one live region.
+      role="region"
+      aria-label={`${notices.length} preview${notices.length === 1 ? "" : "s"} not yet openable`}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        padding: "0 12px 6px",
+        flex: "0 0 auto",
+      }}
+    >
+      {notices.map((n) => (
+        <PreviewNotice key={n.agentId} notice={n} nowMs={nowMs} />
+      ))}
+    </div>
+  );
+}
+
+/**
+ * The strip of live preview cards. Renders nothing when there are none, which is the ordinary
+ * state — so this costs an empty render and no layout at all until a preview actually surfaces.
+ */
+export function PreviewCards() {
+  const byAgent = usePreviewStore((s) => s.byAgent);
+  const projects = useProjectStore((s) => s.projects);
+  // BOTH GATES IN ONE PLACE — the store's (`ready`/`serving` on a loopback url) and the roster's
+  // (an agent that is not in the fleet has nothing to show). The roster half used to be inline
+  // here, which made this component's answer to "is this preview on screen?" differ from
+  // `previewIdleGrace`'s, and the disagreement leaked a dev server. See `renderablePreviewCards`.
+  const named = renderablePreviewCards(byAgent, projects);
+  // THE SECOND PROJECTION, kept separate all the way down. Broadening `renderablePreviewCards` to
+  // cover these states would have changed which dev servers `previewIdleGrace` reclaims — a
+  // lifecycle change wearing the costume of a UI change. See `services/previewCards`' second header.
+  const notices = renderablePreviewNotices(byAgent, projects);
+  if (named.length === 0 && notices.length === 0) return null;
+  // TWO REGIONS, NOT ONE, and the order is the column's usual rule: the thing that needs the reader
+  // (a dev server that just died) sits nearest the composer, under the invitations.
+  return (
+    // ONE SHARED HEIGHT BUDGET FOR BOTH ZONES (roborev 65681, Medium). `MAX_ZONE_HEIGHT` is the
+    // per-zone cap that keeps anything above the composer from pushing it off screen, and splitting
+    // the preview surface into TWO zones that each claimed it independently doubled the fixed
+    // budget: 132 (blockers) + 260 + 260 = 652 instead of 392. The concierge column is a plain
+    // flex column with no scroll of its own, so only `ConciergeThread` can give way — and with a
+    // mixed fleet (two live previews, two installing/failed) in a short window the thread collapses
+    // to nothing and the composer leaves the screen. `failed` notices make that durable rather than
+    // transient, because nothing sweeps them.
+    //
+    // So the cap lives on ONE wrapper and the two zones inside are uncapped: the preview surface
+    // costs exactly what it cost before notices existed, and the scroll is shared rather than one
+    // per zone — which is also better to read, since two independent scrollbars stacked in a 320px
+    // column is its own small horror.
+    <div
+      data-testid={PREVIEW_ZONE_TESTID}
+      style={{ maxHeight: MAX_ZONE_HEIGHT, overflowY: "auto", flex: "0 0 auto" }}
+    >
+      {named.length > 0 && <PreviewCardStrip named={named} />}
+      {notices.length > 0 && <PreviewNotices notices={notices} />}
+    </div>
+  );
+}
+
+/** The openable half, unchanged. Split out of {@link PreviewCards} only so the strip's own region —
+ *  whose `aria-label` counts LIVE previews — keeps meaning exactly what it meant before notices
+ *  existed. */
+function PreviewCardStrip({ named }: { named: ReturnType<typeof renderablePreviewCards> }) {
+  return (
+    <div
+      data-testid={PREVIEW_CARDS_TESTID}
+      // A LANDMARK, not a log — same reasoning as the pinned blockers zone. `aria-live` would be
+      // wrong: this content persists rather than arriving, and the column already has exactly one
+      // live region.
+      role="region"
+      aria-label={`${named.length} live preview${named.length === 1 ? "" : "s"}`}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        padding: "0 12px 6px",
+        flex: "0 0 auto",
+      }}
+    >
+      {named.map((c) => (
+        <PreviewCard
+          key={c.agentId}
+          agentId={c.agentId}
+          url={c.url}
+          name={c.name}
+          surfacedAt={c.surfacedAt}
+        />
+      ))}
+    </div>
+  );
+}

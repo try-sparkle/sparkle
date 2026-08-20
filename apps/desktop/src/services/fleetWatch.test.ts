@@ -849,7 +849,7 @@ describe("publishing artifact movement", () => {
     // worktree — including the human, in the very scenario this feature is written around — so it is
     // not attributable to the agent. See engine/movementRetraction's header.
     expect(spies.publishMovement).toHaveBeenCalledWith({
-      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "s1" },
+      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "s1", toolsRecent: 4 },
     });
   });
 
@@ -875,7 +875,7 @@ describe("publishing artifact movement", () => {
     const tick = await pollFleetOnce(deps);
     expect(tick.delivered).toEqual([]);
     expect(spies.publishMovement).toHaveBeenCalledWith({
-      a1: { lastEvent: "PreToolUse", lastEventMs: NOW - 2_000, sessionId: "s1" },
+      a1: { lastEvent: "PreToolUse", lastEventMs: NOW - 2_000, sessionId: "s1", toolsRecent: 4 },
     });
   });
 
@@ -897,7 +897,33 @@ describe("publishing artifact movement", () => {
     });
     await pollFleetOnce(deps);
     expect(spies.publishMovement).toHaveBeenCalledWith({
-      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "bg-oneshot" },
+      a1: { lastEvent: "PostToolUse", lastEventMs: NOW - 1_000, sessionId: "bg-oneshot", toolsRecent: 4 },
     });
+  });
+
+  // THE WINDOWED TOOL COUNT, and this is the ONLY place it can cross from the digest into the store.
+  // `engine/goalContinuation.progressMark` reads it to tell an agent that spent the last quarter
+  // hour running tools from one that has genuinely stopped — the distinction whose absence had six
+  // working agents paged as "no sign of progress" in one hour. A projection that dropped it would
+  // starve that predicate back to the three self-report signals with every other test still green,
+  // which is exactly the shape of the bug it fixes.
+  //
+  // NOT `lastEvent`, and the fixture says why: the name here is "Stop", because a digest reports the
+  // LAST event of any kind and a continuation is only ever decided on an agent whose turn has ended.
+  // A count survives that; a name does not.
+  it("publishes the windowed TOOL COUNT, which a last-wins event name cannot carry", async () => {
+    const { deps, spies } = fakeDeps({
+      agents: ["a1"],
+      digest: digestOf(
+        [facts("a1", { hooks: { lastEvent: "Stop", toolsRecent: 41 } })],
+        [verdict("a1")],
+      ),
+    });
+    await pollFleetOnce(deps);
+    const published = spies.publishMovement.mock.calls.at(-1)![0] as Record<
+      string,
+      { toolsRecent: number | null }
+    >;
+    expect(published.a1!.toolsRecent).toBe(41);
   });
 });

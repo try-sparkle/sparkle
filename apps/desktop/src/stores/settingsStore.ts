@@ -16,6 +16,10 @@ import type { ConcurrencyBound, EffectiveConfig } from "../services/config";
 // Type-only for the same reason as EffectiveConfig above: services/displaySpan imports
 // @tauri-apps, and this store must stay loadable under jsdom.
 import type { SpanMode } from "../services/displaySpan";
+// TYPE + CONSTANT ONLY. The union lives beside the persona fragment it governs
+// (`services/buildAgent`), so the values this store coerces to and the prose that switches on them
+// cannot drift; `DEFAULT_PREVIEW_EAGERNESS` is a plain const, so this pulls in no component code.
+import { DEFAULT_PREVIEW_EAGERNESS, type PreviewEagerness } from "../services/buildAgent";
 // Type-only for a SECOND reason on top of the Tauri one above: policy.ts imports the concierge tool
 // domains, and services/conciergeTools/lifecycle.ts imports THIS store. A value import would close
 // that loop; `import type` is erased, so it can't.
@@ -132,7 +136,8 @@ export type ToolKey =
   | "guardrails"
   | "roborev"
   | "onepassword"
-  | "builderIndex";
+  | "builderIndex"
+  | "straude";
 
 /** Map a tool key to its settings-store field name (the single source of that relationship). */
 export const TOOL_FIELD: Record<
@@ -144,6 +149,7 @@ export const TOOL_FIELD: Record<
   | "roborevEnabled"
   | "onepasswordEnabled"
   | "builderIndexEnabled"
+  | "straudeEnabled"
 > = {
   analytics: "analyticsEnabled",
   beads: "beadsEnabled",
@@ -152,6 +158,7 @@ export const TOOL_FIELD: Record<
   roborev: "roborevEnabled",
   onepassword: "onepasswordEnabled",
   builderIndex: "builderIndexEnabled",
+  straude: "straudeEnabled",
 };
 
 // --- Plugins (the [plugins] flags — Claude Code plugins pre-enabled for every agent) ----------
@@ -246,6 +253,48 @@ export function toConciergeToolPolicy(raw: unknown): ToolPolicyOverrides {
   const out: Record<string, string> = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
     if (typeof value === "string") out[key] = value;
+  }
+  return out;
+}
+
+/** Narrow `[concierge].own_orgs` into the store's mirror: strings only, trimmed and LOWERCASED,
+ *  blanks dropped, order preserved.
+ *
+ *  Lowercased HERE rather than at each comparison because GitHub treats owners case-insensitively
+ *  and the alternative is every reader remembering to. Dropping a non-string is safe in a way that
+ *  dropping a tool RULE is not: an org that is not in this list is FOREIGN, which is the stricter
+ *  answer, so a garbage entry costs an extra approval rather than a silent grant. */
+export function toConciergeOwnOrgs(raw: unknown): readonly string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const value of raw as unknown[]) {
+    if (typeof value !== "string") continue;
+    const org = value.trim().toLowerCase();
+    if (org.length > 0 && !out.includes(org)) out.push(org);
+  }
+  return out;
+}
+
+/** Narrow `[concierge.projects]` into the store's mirror: `slug -> { tool -> rule }`, slugs
+ *  lowercased, non-string RULE VALUES KEPT OUT but unrecognized ones kept VERBATIM.
+ *
+ *  Same discipline as `toConciergeToolPolicy` and for the same reason: `evaluateToolPolicy` reads
+ *  an unrecognized rule as `ask` — stricter than absent — so narrowing it away here would erase the
+ *  difference between "the user typo'd a project rule" and "the user set none", handing back the
+ *  looser global answer on exactly the repo they were tightening. */
+export function toConciergeProjectPolicy(
+  raw: unknown,
+): Readonly<Record<string, ToolPolicyOverrides>> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, ToolPolicyOverrides> = {};
+  for (const [slug, entry] of Object.entries(raw as Record<string, unknown>)) {
+    const key = slug.trim().toLowerCase();
+    if (key.length === 0) continue;
+    // `{ tools = { … } }` is the shape Rust sends; a project whose table exists but is empty (or
+    // whose `tools` is null, which is how a Rust Option arrives) is a real entry with no rules.
+    const tools =
+      entry && typeof entry === "object" ? (entry as { tools?: unknown }).tools : undefined;
+    out[key] = toConciergeToolPolicy(tools);
   }
   return out;
 }
@@ -446,27 +495,47 @@ export type SparkleImprovementConsent = "always" | "case_by_case" | "never";
 /** The default consent mode for a fresh install: review-and-approve each PR. */
 export const DEFAULT_SPARKLE_CONSENT: SparkleImprovementConsent = "case_by_case";
 
-/** `[preview] auto_open` — when a preview PANE may open unasked. See `previewAutoOpen` below and
- *  design doc §10; the row PILL is unconditional and is not governed by this. */
-export type PreviewAutoOpen = "returning" | "never" | "always";
-
-/** The founder's ratified default (design §10, "Decisions — settled by the founder, 2026-08-05"):
- *  the five-condition conjunction, not "never" and not "always". */
-export const DEFAULT_PREVIEW_AUTO_OPEN: PreviewAutoOpen = "returning";
 
 /**
- * Coerce the wire's bare `string` into the union, FAILING CLOSED to the default.
+ * Coerce `[preview] agent_eagerness` into the union, FAILING CLOSED to the shipped default.
  *
- * The wire can only carry the three (Rust validates and falls back), so in practice this only has
- * to absorb an absent `[preview]` section from a backend predating it. It is written as a
- * whitelist anyway because of what the alternative costs: the one value that must never be
- * *reached by accident* is `"always"`, which pops panes on its own, and a permissive cast would
- * hand it to any typo that happened to survive a future config path.
+ * The union itself lives in `services/buildAgent` beside the fragment it governs, so the prose and
+ * the values it switches on cannot drift apart. Fails closed TOWARDS `"visual"` rather than towards
+ * `"never"`: an unreadable value must not be able to silently switch the whole feature off, which is
+ * the failure — previews never happening, with nothing logged — that this knob exists to end.
  */
-export function asPreviewAutoOpen(value: unknown): PreviewAutoOpen {
-  return value === "never" || value === "always" || value === "returning"
+export function asPreviewEagerness(value: unknown): PreviewEagerness {
+  return value === "visual" || value === "always" || value === "never"
     ? value
-    : DEFAULT_PREVIEW_AUTO_OPEN;
+    : DEFAULT_PREVIEW_EAGERNESS;
+}
+
+/** Bead cards render OPEN by default (`[ui].bead_cards_expanded`). The founder's call — see
+ *  `beadCardsExpanded` below and `BeadPill.tsx`. Flipping this one constant, or the TOML key it
+ *  mirrors, is the entire revert. */
+export const DEFAULT_BEAD_CARDS_EXPANDED = true;
+
+/** No cap on how many cards one reply expands (`[ui].bead_cards_expanded_max`).
+ *
+ *  ZERO IS A DELIBERATE CHOICE, NOT AN UNSET SENTINEL WE NEVER GOT AROUND TO PICKING. A cap of 3
+ *  was offered and the founder chose uncapped: he would rather meet the ceiling in real use and
+ *  dial it down than have a number guessed for him. The cap machinery is built and tested so that
+ *  dialling down is one TOML key, not a code change. */
+export const DEFAULT_BEAD_CARDS_EXPANDED_MAX = 0;
+
+/**
+ * Coerce `[ui].bead_cards_expanded_max` into a usable cap: a non-negative integer, or the default
+ * when the key is absent.
+ *
+ * DEFENDS AGAINST A HAND-EDITED FILE, which is the only kind this key ever has. Rust forwards what
+ * TOML parsed rather than a corrected value, so a negative or fractional number reaches here — and
+ * an unguarded negative is the dangerous one: every `index < max` test is then false, so NO card
+ * expands and the symptom is indistinguishable from the feature having been turned off. Rounding
+ * DOWN (rather than to nearest) keeps `2.9` from quietly behaving as a cap of 3.
+ */
+export function normalizeBeadCardsExpandedMax(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return DEFAULT_BEAD_CARDS_EXPANDED_MAX;
+  return Math.max(0, Math.floor(value));
 }
 
 interface SettingsState {
@@ -577,6 +646,17 @@ interface SettingsState {
    *  is indistinguishable from one they never touched, so resolving through derived defaults would
    *  silently ignore their rule. Config-mirrored, NOT persisted — so it is false on every boot. */
   conciergeToolPolicyHydrated: boolean;
+  /** `[concierge].own_orgs` — the orgs whose repos count as OURS, lowercased. Every other repo is
+   *  FOREIGN, which floors anything touching its main branch at `ask`
+   *  (services/conciergeTools/policy.ts). An EMPTY list makes every repo foreign, which is exactly
+   *  today's global stopgap — so nobody gains anything on upgrade. Config-mirrored, NOT persisted;
+   *  covered by `conciergeToolPolicyHydrated` (one read, one flag). */
+  conciergeOwnOrgs: readonly string[];
+  /** `[concierge.projects."<slug>".tools]` — per-project rules, keyed by LOWERCASED `owner/repo`.
+   *  A project entry can only ever TIGHTEN the global tier above it. Kept RAW (values unnarrowed)
+   *  for the same reason `conciergeToolPolicy` is. Config-mirrored, NOT persisted; covered by
+   *  `conciergeToolPolicyHydrated`. */
+  conciergeProjectPolicy: Readonly<Record<string, ToolPolicyOverrides>>;
   /** Auto-apply desktop updates: when on (default), a found update downloads + installs silently
    *  and applies on the next restart, with a quiet "ready" affordance. When off, the user gets a
    *  "Restart to apply / Later" prompt instead and nothing is installed until they choose. Read by
@@ -648,19 +728,38 @@ interface SettingsState {
    *  [tools].analytics. Config-backed, NOT persisted — re-read from the file each launch. */
   analyticsEnabled: boolean;
   /**
-   * When a preview pane may open UNASKED. Mirrors `[preview] auto_open`; config-backed, NOT
+   * How eagerly a build agent is TOLD to open a preview of its own work. Mirrors
+   * `[preview] agent_eagerness`; config-backed, NOT persisted.
+   *
+   *   • `"visual"` (default) — the brief asks for a preview whenever the work changes something a
+   *     person would look at.
+   *   • `"always"` — ask on every task the project can preview at all.
+   *   • `"never"` — the brief says nothing about previews; the manual affordances are untouched.
+   *
+   * Read at persona-composition time (`components/AgentPane`), not at render time — a change takes
+   * effect for the next agent launched, not for one already running on the old brief.
+   */
+  previewEagerness: PreviewEagerness;
+  /**
+   * Render a bead card EXPANDED the moment the concierge names a bead, instead of as a pill the
+   * reader clicks open. Mirrors `[ui].bead_cards_expanded`; config-backed, NOT persisted.
+   *
+   * The founder's ask, verbatim: "I wanna try changing things such that you show these bead cards
+   * as expanded by default and of me having to click on them to expand them." `false` restores the
+   * pre-2026-08 behaviour exactly, and is the whole revert — see `BeadPill.tsx`.
+   */
+  beadCardsExpanded: boolean;
+  /**
+   * How many cards ONE concierge reply may expand before the rest fall back to pills. `0` = no cap,
+   * which is the shipped default. Mirrors `[ui].bead_cards_expanded_max`; config-backed, NOT
    * persisted.
    *
-   *   • `"returning"` (default) — the five-condition conjunction in design §10.
-   *   • `"never"` — no pane ever opens on its own. The row PILL still appears; it is passive.
-   *   • `"always"` — skip the "is this a returning previewer" clauses. Exists for the founder to try.
-   *
-   * A UNION rather than the wire's bare `string`, because this is what the predictor branches on
-   * and an unrecognized value must degrade to the default rather than to `"always"`. Rust already
-   * validates and falls back, so hydration only has to defend against a backend that predates the
-   * key — but a fail-open default here would auto-pop panes on a typo nobody can see.
+   * A COUNT rather than a boolean because the founder routinely lists eight or more beads in one
+   * message and each expanded card runs several hundred pixels — the cap is the dial he reaches for
+   * if the cards start pushing his own prose off screen. It counts only ids that RESOLVE; see
+   * `BeadPill.tsx` for why spending it on id-shaped English would defeat the feature.
    */
-  previewAutoOpen: PreviewAutoOpen;
+  beadCardsExpandedMax: number;
   /** The in-repo work graph behind the Plan board (Beads / `bd`). Off → the board is hidden and no
    *  `bd` shell-out runs. Mirrors [tools].beads. */
   beadsEnabled: boolean;
@@ -681,9 +780,12 @@ interface SettingsState {
    *  when on, the Rust reporter posts nothing until consent + a username + an API key are stored
    *  (see builder_index.rs). Config-backed, NOT persisted. */
   builderIndexEnabled: boolean;
+  /** `[tools].straude` — the SECOND reporting destination, independent of the Builder Index. */
+  straudeEnabled: boolean;
   /** Whether the Builder Index consent + settings modal is mounted. UI-only, never persisted:
    *  the modal is where consent is given, so it must never be restored as "already open". */
   builderIndexModalOpen: boolean;
+  straudeModalOpen: boolean;
   /** Which Claude Code plugins are pre-enabled in every agent worktree's
    *  .claude/settings.local.json. Mirrors the `[plugins]` TOML table. Config-backed, NOT persisted.
    *
@@ -828,6 +930,7 @@ interface SettingsState {
   setRoborevConsentOpen: (open: boolean) => void;
   /** Open/close the Builder Index consent + settings modal (UI-only). */
   setBuilderIndexModalOpen: (open: boolean) => void;
+  setStraudeModalOpen: (open: boolean) => void;
   /** Set (or clear, with null) the roborev auth self-test warning shown under the Roborev row. */
   setRoborevAuthWarning: (warning: string | null) => void;
   /** Set the Sparkle self-improvement consent mode (the banner's Always/Case by case/Never control). */
@@ -875,6 +978,10 @@ export const useSettingsStore = create<SettingsState>()(
       // default — so this is a complete starting policy, not an unguarded one.
       conciergeToolPolicy: {},
       conciergeToolPolicyHydrated: false,
+      // No orgs are ours until config says so. That makes every repo foreign, i.e. the strict
+      // reading — the fail-closed direction to boot in.
+      conciergeOwnOrgs: [],
+      conciergeProjectPolicy: {},
       resumeRule: DEFAULT_RESUME_RULE,
       conciergeAnswers: DEFAULT_CONCIERGE_ANSWERS,
       autoApplyUpdates: true,
@@ -897,13 +1004,16 @@ export const useSettingsStore = create<SettingsState>()(
       driftAheadNudge: 15,
       driftChangedLines: 1000,
       analyticsEnabled: true,
-      previewAutoOpen: DEFAULT_PREVIEW_AUTO_OPEN,
+      previewEagerness: DEFAULT_PREVIEW_EAGERNESS,
+      beadCardsExpanded: DEFAULT_BEAD_CARDS_EXPANDED,
+      beadCardsExpandedMax: DEFAULT_BEAD_CARDS_EXPANDED_MAX,
       beadsEnabled: true,
       githubEnabled: true,
       guardrailsEnabled: true,
       roborevEnabled: true,
       // Default OFF — nothing is published until the user opts in AND consents.
       builderIndexEnabled: false,
+      straudeEnabled: false,
       pluginsEnabled: { ...PLUGIN_DEFAULTS },
       onepasswordEnabled: false,
       onepasswordVaultId: null,
@@ -912,6 +1022,7 @@ export const useSettingsStore = create<SettingsState>()(
       roborevConsentPrompted: false,
       roborevConsentOpen: false,
       builderIndexModalOpen: false,
+      straudeModalOpen: false,
       roborevAuthWarning: null,
       pluginInstallState: {},
       configWarnings: [],
@@ -988,6 +1099,7 @@ export const useSettingsStore = create<SettingsState>()(
       setRoborevConsentPrompted: (prompted) => set({ roborevConsentPrompted: prompted }),
       setRoborevConsentOpen: (open) => set({ roborevConsentOpen: open }),
       setBuilderIndexModalOpen: (open) => set({ builderIndexModalOpen: open }),
+      setStraudeModalOpen: (open) => set({ straudeModalOpen: open }),
       setRoborevAuthWarning: (warning) => set({ roborevAuthWarning: warning }),
       setSparkleImprovementConsent: (mode) => set({ sparkleImprovementConsent: mode }),
       setImprovementLastRunAt: (at) => set({ improvementLastRunAt: at }),
@@ -1190,6 +1302,11 @@ export const useSettingsStore = create<SettingsState>()(
           // backend, or simply a user who has set no rules) is the empty map — which is a COMPLETE
           // policy, because every tool falls back to its derived default.
           conciergeToolPolicy: toConciergeToolPolicy(config.concierge?.tools),
+          // The per-project half of the same read, under the same flag: one config read settles
+          // all three, so there is no window where the global rules are loaded and the project
+          // ones are not — which would resolve every project to the looser global answer.
+          conciergeOwnOrgs: toConciergeOwnOrgs(config.concierge?.own_orgs),
+          conciergeProjectPolicy: toConciergeProjectPolicy(config.concierge?.projects),
           conciergeToolPolicyHydrated: true,
           // GLOBAL session-resume rule (sibling of approvals; own value domain). Coerced so an
           // absent/unknown value degrades to "ask".
@@ -1210,11 +1327,20 @@ export const useSettingsStore = create<SettingsState>()(
           // Tools flags. `?? true` treats an absent [tools] block (older backend) as the on-by-default
           // state, matching SparkleConfig::default() — a new install ships every tool on.
           analyticsEnabled: config.tools?.analytics ?? true,
-          // `[preview] auto_open`. An absent [preview] section — a backend predating it — reads as
-          // the shipped default, NOT as disabled: `config.ts` states that rule for the whole
-          // section ("callers that need a default fall back to the shipped ones"), and it is what
-          // `asPreviewAutoOpen(undefined)` returns.
-          previewAutoOpen: asPreviewAutoOpen(config.preview?.auto_open),
+          // Same rule for the same reason: an absent [preview] section reads as the SHIPPED
+          // default, never as "never" — a backend predating the key must not read as a user who
+          // turned previews off.
+          previewEagerness: asPreviewEagerness(config.preview?.agent_eagerness),
+          // `[ui]`. An absent section — a backend predating it — reads as the SHIPPED DEFAULTS,
+          // never as off: `config.ts` states that rule for the whole section, and reading it as
+          // "collapsed" would make a version skew look like the feature had been reverted.
+          //
+          // The cap is floored at 0 and rounded DOWN. A hand-edited TOML is untrusted input and
+          // Rust forwards what it parsed; a negative or fractional value reaching the comparison
+          // in `BeadPill` unguarded would silently expand nothing (`i < -1` is false for every i),
+          // which is indistinguishable from the feature being switched off.
+          beadCardsExpanded: config.ui?.bead_cards_expanded ?? DEFAULT_BEAD_CARDS_EXPANDED,
+          beadCardsExpandedMax: normalizeBeadCardsExpandedMax(config.ui?.bead_cards_expanded_max),
           beadsEnabled: config.tools?.beads ?? true,
           githubEnabled: config.tools?.github ?? true,
           guardrailsEnabled: config.tools?.guardrails ?? true,
@@ -1222,6 +1348,9 @@ export const useSettingsStore = create<SettingsState>()(
           // `?? false` here, unlike its on-by-default siblings: an absent [tools] block (older
           // backend) must read as "not opted in", never as "publishing".
           builderIndexEnabled: config.tools?.builder_index ?? false,
+          // `?? false` like its Builder Index sibling, and unlike the on-by-default tools: an
+          // absent key must never read as consent to publish.
+          straudeEnabled: config.tools?.straude ?? false,
           // Plugin flags. Same `?? true` back-compat rule as [tools]: an absent [plugins] block
           // (older backend) means the on-by-default state, matching SparkleConfig::default().
           // An absent [plugins] block (older backend) reads as the on-by-default state, matching

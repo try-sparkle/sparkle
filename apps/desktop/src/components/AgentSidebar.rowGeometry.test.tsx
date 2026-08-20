@@ -290,7 +290,7 @@ describe("Build column — the pane-side end is a mouth, not a corner", () => {
 
 // ── THE PAIR DECIDES WHICH END IS WHICH ────────────────────────────────────────────────────────
 //
-// `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`. In the LEFT pair the terminal is on the row's LEFT, so
+// `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`. In the LEFT pair the terminal is on the row's LEFT, so
 // every number above mirrors. The inline version this replaced was written when the app had one
 // pair, on the right, and hung the bleed on `marginRight`, the leading radius on the left corners
 // and both fillets at `right: 0` — so once the left pair shipped it drew that pair BACKWARDS: the

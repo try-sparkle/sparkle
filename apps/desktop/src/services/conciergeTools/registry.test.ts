@@ -406,6 +406,11 @@ describe("dispatchConciergeTool — argument validation", () => {
    * feeds its `verifyArgs` back through the registry VERBATIM.
    */
   it("carries inbox_status's messageIds filter through the schema to the per-message answer", async () => {
+    // `inbox_send` now resolves the recipient against the fleet directory before the Rust hop (bead
+    // sparkle-179b2s): an id nothing drains is refused as undeliverable. Mark `a1` live so the send
+    // is a real queued receipt whose `verifyArgs` this test then feeds back — the deliver-or-fail
+    // guard reads liveness from `openAgentIdSet`, i.e. this runtime seam.
+    useRuntimeStore.setState({ openAgentIds: ["a1"] } as never);
     invoke.mockImplementation((async (cmd: string) => {
       if (cmd === "inbox_send") return "m2";
       if (cmd === "inbox_status")

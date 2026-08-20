@@ -55,6 +55,7 @@ import {
   noteSpeechResumed,
   noteTranscript,
   pauseCountdown,
+  restartCountdown,
   remainingFraction,
   resumeCountdown,
   elapsedMs,
@@ -170,6 +171,56 @@ export interface UseAutoSendArgs {
    * in a refactor with nothing going red.
    */
   composingMention: boolean;
+  /**
+   * A native attach picker this composer opened is ON SCREEN — the screenshot crosshairs, or the
+   * Finder open panel. Freezes the clock for exactly as long as it is up.
+   *
+   * ── THE FOUNDER'S REPORT ─────────────────────────────────────────────────────────────────────
+   * *"If I click the screenshot or the upload icons, I want you to pause the countdown while those
+   * are active … because it means that I'm taking an action, basically."* A dictated sentence ends,
+   * the clock starts, and he reaches for the thing the message is ABOUT — and the send goes out
+   * carrying the words with no attachment on them.
+   *
+   * ── A SECOND PAUSE TERM, NOT A WIDER `composingMention` ──────────────────────────────────────
+   * The two are separate facts with separate causes, and merging them would mean a bug in either
+   * one silently changing the other. They compose through the reducer instead: `pauseCountdown` is
+   * idempotent, so an `@`-address typed and abandoned while a picker is open cannot un-pause it.
+   *
+   * ── WHY THIS AND `draftGrewSeq` ARE BOTH REQUIRED ────────────────────────────────────────────
+   * `draftGrewSeq` fires when files LAND and restarts the clock from full — it says nothing during
+   * the seconds the panel is open, and nothing at all when the panel is cancelled. This covers the
+   * *while*; that covers the *after*. Together: the countdown holds still while he is choosing, and
+   * starts over from full once something arrives.
+   *
+   * REQUIRED, not optional-defaulting-false, for the reason stated on `composingMention` directly
+   * above: an omitted prop makes a feature inert with a fully green suite, and there is exactly one
+   * caller.
+   */
+  attachPickerOpen: boolean;
+  /**
+   * Bumped once per gesture that PUT SOMETHING IN the composer — a paste, a dropped image, a file
+   * chosen from the picker. Each bump restarts the countdown from a full threshold (bead
+   * sparkle-3kqg2v, `restartCountdown`).
+   *
+   * ── A SEQUENCE NUMBER, BECAUSE THESE ARE INSTANTS AND NOT A STATE ────────────────────────────
+   * `composingMention` above is a condition that is true for a stretch of time, so a boolean is the
+   * honest shape for it and both edges mean something. A paste has no duration: it is over the
+   * moment it lands, and pasting twice is two gestures each owed its own full threshold. A boolean
+   * would collapse the second into the first, which is precisely the founder's complaint arriving
+   * one paste later.
+   *
+   * ── WHY IT CANNOT BE DERIVED FROM `composedText` ─────────────────────────────────────────────
+   * Two reasons, and the second is the one that matters. (1) A dropped image or an uploaded file
+   * changes no text at all — the draft grew, the string did not — so text is blind to two of the
+   * three cases outright. (2) For the paste that DOES change text, the arriving string is
+   * indistinguishable from a committed dictation chunk, and those must move the threshold WITHOUT
+   * touching the clock (`noteTranscript`, and the module header on why transcription lag must never
+   * push the deadline out). The gesture is the fact; the text is a consequence some gestures have.
+   *
+   * REQUIRED, not optional-defaulting-0, for the reason stated on `composingMention`: an omitted
+   * prop makes a feature inert with a fully green suite, and there is exactly one caller.
+   */
+  draftGrewSeq: number;
   /** Live uncommitted transcript; non-empty means the user is speaking into THIS box right now. */
   interim: string;
   /** Who this send would reach. The rail's only label, and the mis-route safety net. */
@@ -208,6 +259,8 @@ export function useAutoSend({
   micLive,
   composedText,
   composingMention,
+  attachPickerOpen,
+  draftGrewSeq,
   interim,
   targetName,
   onFire,
@@ -318,10 +371,21 @@ export function useAutoSend({
     apply(next);
   }, [composedText, apply]);
 
-  // ── (2b) AN ADDRESS IS BEING TYPED — freeze the clock ───────────────────────────────────────
+  // ── (2b) THE USER IS MID-ACTION — freeze the clock ──────────────────────────────────────────
   // The founder's report (sparkle-14dtu) in one effect: a dictated sentence has ended, the clock is
   // draining, and he reaches for the keyboard to say WHO it is for. Until that name is finished the
   // message is not finished, so nothing may go out.
+  //
+  // TWO TERMS NOW, ONE RULE. The second is an open attach picker — the screenshot crosshairs or the
+  // Finder panel — and it is the same principle stated about a different gesture: *"it means that
+  // I'm taking an action, basically."* The composer must not fire underneath a user who is mid-
+  // action, whether the action is typing an address or picking the file the message is about.
+  //
+  // OR'd rather than merged into one signal upstream, because they are independent facts that can
+  // overlap: clicking Upload does not end a half-typed `@`-address, and finishing the address does
+  // not close the panel. `pauseCountdown` is idempotent and `resumeCountdown` runs only on the way
+  // out, so whichever term drops first, the clock stays frozen until BOTH are false — and it is one
+  // full threshold on the way out either way, never two.
   //
   // DECLARED AFTER (1) AND (2), and `armed` is a dependency of it, both deliberately:
   //   • effects run in declaration order, so in a commit that arms the rail this re-establishes a
@@ -336,11 +400,32 @@ export function useAutoSend({
   useEffect(() => {
     const now = Date.now();
     apply(
-      composingMention
+      composingMention || attachPickerOpen
         ? pauseCountdown(stateRef.current, now)
         : resumeCountdown(stateRef.current, now),
     );
-  }, [composingMention, armed, apply]);
+  }, [composingMention, attachPickerOpen, armed, apply]);
+
+  // ── (2c) SOMETHING WAS PUT IN THE BOX — start the clock OVER ────────────────────────────────
+  // The other half of the founder's countdown complaint (sparkle-3kqg2v): *"reset the countdown if
+  // I paste something in or if I drop in an image or upload a file."* Three producers, one signal —
+  // ComposeBox's `onPasted` and useConciergeAttachments' `stagedSeq`, summed by the host.
+  //
+  // DECLARED AFTER (2b) so a reset and the pause state it lands inside settle in that order: a
+  // paste made mid-`@`-address anchors at the frozen instant rather than at wall-clock time, which
+  // is what `restartCountdown`'s `clockAt` is for.
+  //
+  // GUARDED ON THE PREVIOUS VALUE rather than run on every commit, because unlike (2b)'s two
+  // idempotent reducers this one is deliberately NOT idempotent — re-applying it on an unrelated
+  // re-render would hold the deadline out indefinitely, which is a countdown that never fires
+  // dressed up as one that does. The ref starts at the seq the hook mounted with, so a host that
+  // remounts mid-session does not read its existing count as a fresh gesture.
+  const draftGrewBefore = useRef(draftGrewSeq);
+  useEffect(() => {
+    if (draftGrewSeq === draftGrewBefore.current) return;
+    draftGrewBefore.current = draftGrewSeq;
+    apply(restartCountdown(stateRef.current, Date.now()));
+  }, [draftGrewSeq, apply]);
 
   // ── (3) SPEECH END — starts the clock, but only for OUR speech ──────────────────────────────
   // Keyed on the sequence number, not a boolean: two consecutive utterances must be two signals,

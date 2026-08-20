@@ -108,14 +108,58 @@ fn head_branch_and_detached(worktree: &str) -> (String, bool) {
 }
 
 /// Core (testable) of [`promotion_preflight`]. Reads only — no ref, index or file is written.
+/// `ctx` is `(app_data, project_id)` — what lets the branch resolver consult the branch→agent
+/// ownership table. IT MATTERS MORE HERE THAN ANYWHERE ELSE, and passing `None` used to be
+/// justified as "this entry point has no app_data" (roborev 65183 called that self-imposed, and it
+/// was right — this is a Tauri command and can take an `AppHandle` like every other one).
+///
+/// A promotion PUSHES the resolved branch to `origin` and clones it into a sandbox: an irreversible
+/// remote action. Since `HeadClaim::Unknown` adopts, a preflight with no ownership evidence reports
+/// whatever branch happens to be checked out into the tree — a colleague's, another agent's — and
+/// the promotion then publishes it. `None` remains valid for tests, where nothing is pushed; the
+/// rename keeps working either way, because only a POSITIVE `Other` refuses.
 pub fn preflight_at(
     root: &str,
     agent_id: &str,
     worktree: &str,
     base_branch: &str,
+    ctx: Option<(&std::path::Path, &str)>,
 ) -> Result<PromotionPreflight, String> {
     let (head, detached) = head_branch_and_detached(worktree);
-    let (branch, _on_branch) = crate::worktree::resolve_agent_branch(root, &head, agent_id, base_branch);
+    // TWO READS, DELIBERATELY — a promotion has no "next poll" (roborev 65348, finding 3).
+    // `head_claim_from_store` RECORDS what it just read, so a branch's FIRST sighting is `Unknown`
+    // by construction and only the second call can answer `Mine`. Every other caller is a 15s status
+    // poll, for which "parks now, adopts on the next tick" is a display delay; here the next thing
+    // that happens is `push_branch_at` publishing the resolved ref and the sandbox cloning it. A
+    // first sighting that fell back to the minted ref would push a branch frozen at the agent's
+    // first commit and silently drop every commit it made after renaming.
+    //
+    // ⚠️ BE HONEST ABOUT WHAT THIS SECOND READ IS: an ECHO, not evidence (roborev 65402, finding 3;
+    // `pr_owner::claim_then_observe` says the same of the shape in its own doc). It answers `Mine`
+    // because the line above just wrote that row, so on THIS path — the only one that takes an
+    // irreversible remote action — rung 2b's identity guard contributes nothing. What actually
+    // carries the decision here is the other evidence: `minted_superseded_by_head` and, load-bearing,
+    // `worktree_walked_from_minted`, which requires this very worktree to have authored work ON the
+    // branch being adopted. Keep that in mind before weakening either of them: they are the whole
+    // guard on the push path, not a belt beside identity's braces.
+    // A POSITIVE `NotMine` still refuses — `claim_then_observe` never rewrites the recorded owner,
+    // so the echo cannot launder somebody else's branch into `Mine`.
+    let claim = match ctx {
+        Some((app_data, project_id)) => {
+            let _recorded =
+                crate::worktree::head_claim_from_store(app_data, project_id, &head, agent_id);
+            crate::worktree::head_claim_from_store(app_data, project_id, &head, agent_id)
+        }
+        None => crate::worktree::HeadClaim::Unknown,
+    };
+    let (branch, _on_branch) = crate::worktree::resolve_agent_branch(
+        root,
+        &head,
+        agent_id,
+        base_branch,
+        claim,
+        Some(std::path::Path::new(worktree)),
+    );
 
     let branch_exists = !branch.trim().is_empty()
         && git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
@@ -181,13 +225,22 @@ pub async fn promotion_head_sha(worktree: String) -> Result<String, String> {
 /// Everything the promote dialog needs, read without mutating anything.
 #[tauri::command]
 pub async fn promotion_preflight(
+    app: tauri::AppHandle,
     root: String,
     agent_id: String,
+    project_id: String,
     worktree: String,
     base_branch: String,
 ) -> Result<PromotionPreflight, String> {
+    let app_data = crate::worktree::app_data_dir_pub(&app)?;
     tauri::async_runtime::spawn_blocking(move || {
-        preflight_at(&root, &agent_id, &worktree, &base_branch)
+        preflight_at(
+            &root,
+            &agent_id,
+            &worktree,
+            &base_branch,
+            Some((app_data.as_path(), &project_id)),
+        )
     })
     .await
     .map_err(|e| format!("promotion_preflight task failed: {e}"))?
@@ -470,7 +523,7 @@ mod tests {
         git(&wt, &["add", "-A"]).unwrap();
         git(&wt, &["commit", "-q", "-m", "work"]).unwrap();
 
-        let p = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let p = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         assert_eq!(p.branch, "sparkle/agent-a1");
         assert!(p.branch_exists);
         assert!(p.has_remote);
@@ -490,7 +543,7 @@ mod tests {
         std::fs::write(Path::new(&wt).join("new.txt"), "fresh\n").unwrap();
         let before = commit_count(&wt);
 
-        let p = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let p = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         assert_eq!(p.dirty_count, 2);
         let mut files = p.dirty_files.clone();
         files.sort();
@@ -508,7 +561,7 @@ mod tests {
         for i in 0..60 {
             std::fs::write(Path::new(&wt).join(format!("f{i:02}.txt")), "x\n").unwrap();
         }
-        let p = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let p = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         assert_eq!(p.dirty_files.len(), DIRTY_FILES_CAP, "the preview is bounded");
         assert_eq!(p.dirty_count, 60, "the count is the TRUTH, so the UI can say 'and 10 more'");
     }
@@ -517,7 +570,7 @@ mod tests {
     fn preflight_reports_no_remote_when_origin_is_absent() {
         let root = init_repo("no-remote");
         let wt = worktree_on_new_branch(&root, "no-remote", "sparkle/agent-a1");
-        let p = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let p = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         assert!(!p.has_remote, "a repo with no origin has nothing for a sandbox to clone");
         // With no origin refs at all, `--not --remotes=origin` subtracts nothing: the branch's whole
         // history is unpushed, which is the truth. Reporting 0 here would read as "already safe".
@@ -536,22 +589,34 @@ mod tests {
             "precondition: the minted ref must NOT exist"
         );
 
-        let p = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let p = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         assert_eq!(p.branch, "feature/whatever");
         assert_ne!(p.branch, "sparkle/agent-a1", "minting the name here is the bug this guards");
         assert!(p.branch_exists, "the resolved branch is a real ref");
     }
 
-    /// Rung 2 of the ladder: the minted ref EXISTS but the tree is parked elsewhere. Promotion still
-    /// reports the agent's own branch — parking is not a rename.
+    /// Rung 2 of the ladder: the minted ref EXISTS AND CARRIES WORK, but the tree is parked
+    /// elsewhere. Promotion still reports the agent's own branch — parking is not a rename.
+    ///
+    /// ⚠️ THE FIXTURE USED TO CONTRADICT THE NAME. It built the "park" with `checkout -b some/other`
+    /// on a minted ref holding NO commits — which is not a park at all, it is precisely the
+    /// `git checkout -b` RENAME that bead `sparkle-pgkbn4` exists to fix, and the test pinned the
+    /// defect as intended behaviour. A real park needs the minted branch to hold work of its own and
+    /// the tree to be on a branch that already existed.
     #[test]
     fn preflight_keeps_the_minted_branch_when_the_tree_is_parked() {
         let root = init_repo("parked");
         let wt = worktree_on_new_branch(&root, "parked", "sparkle/agent-a1");
-        git(&wt, &["checkout", "-q", "-b", "some/other"]).unwrap();
+        // Real work ON the minted branch — this is what makes it a park rather than a rename.
+        std::fs::write(std::path::Path::new(&wt).join("w.txt"), "work\n").unwrap();
+        git(&wt, &["add", "-A"]).unwrap();
+        git(&wt, &["commit", "-q", "-m", "agent work"]).unwrap();
+        // …and the tree is then moved onto a branch that already existed.
+        git(&root, &["branch", "some/other", "main"]).unwrap();
+        git(&wt, &["checkout", "-q", "some/other"]).unwrap();
 
-        let p = preflight_at(&root, "a1", &wt, "main").unwrap();
-        assert_eq!(p.branch, "sparkle/agent-a1", "the agent's own ref still exists");
+        let p = preflight_at(&root, "a1", &wt, "main", None).unwrap();
+        assert_eq!(p.branch, "sparkle/agent-a1", "the agent's own ref still holds its work");
     }
 
     #[test]
@@ -562,7 +627,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&wt);
         git(&root, &["worktree", "add", "-q", "--detach", &wt_str, "main"]).unwrap();
 
-        let p = preflight_at(&root, "a1", &wt_str, "main").unwrap();
+        let p = preflight_at(&root, "a1", &wt_str, "main", None).unwrap();
         assert!(p.detached, "a detached HEAD names no branch to push");
     }
 
@@ -629,7 +694,7 @@ mod tests {
         // moved after the push from one that didn't (roborev 57383).
         assert_eq!(outcome, format!("pushed:{}", remote_sha.trim()));
         // …and preflight now agrees there is nothing left to push.
-        assert_eq!(preflight_at(&root, "a1", &wt, "main").unwrap().unpushed, 0);
+        assert_eq!(preflight_at(&root, "a1", &wt, "main", None).unwrap().unpushed, 0);
     }
 
     // ── the cutover guard's two readings ────────────────────────────────────────────────────────
@@ -687,7 +752,7 @@ mod tests {
         let bare = add_origin(&root, "originurl");
         let wt = worktree_on_new_branch(&root, "originurl", "sparkle/agent-a1");
 
-        let pf = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let pf = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         assert_eq!(pf.origin_url.as_deref(), Some(bare.as_str()));
         assert!(pf.has_remote);
     }
@@ -697,7 +762,7 @@ mod tests {
         let root = init_repo("no-originurl");
         let wt = worktree_on_new_branch(&root, "no-originurl", "sparkle/agent-a1");
 
-        let pf = preflight_at(&root, "a1", &wt, "main").unwrap();
+        let pf = preflight_at(&root, "a1", &wt, "main", None).unwrap();
         // None, not "" — the plan treats UNKNOWN as a refusal, and an empty string would compare
         // equal to another empty string and read as a match.
         assert_eq!(pf.origin_url, None);
@@ -886,4 +951,83 @@ mod tests {
         let (paths, _) = parse_porcelain("?? a file with spaces.txt\n");
         assert_eq!(paths, vec!["a file with spaces.txt"]);
     }
+
+    /// A PROMOTION PUSHES WHAT THE PREFLIGHT RESOLVES, so the preflight must not adopt a branch the
+    /// ownership table positively attributes to someone else. `HeadClaim::Unknown` still adopts (the
+    /// rename must keep working), but a recorded `Other` refuses — and this is the one entry point
+    /// where getting it wrong takes an irreversible remote action (roborev 65183).
+    /// THE DOUBLE-READ IS LOAD-BEARING, AND NOTHING GUARDED IT (roborev 65402, finding 3a).
+    ///
+    /// The test below resolves through rung 2 — its worktree never commits, so the minted ref is
+    /// EMPTY and `!= NotMine` answers identically with one call or two. Deleting the extra
+    /// `head_claim_from_store` therefore left the whole suite green, which is the defaulted-seam
+    /// vacuity AGENTS.md warns about: the one line that supplies the real behaviour was covered by
+    /// nothing and would be tidied away by the next reader who noticed a duplicated call.
+    ///
+    /// This drives the rung-2b shape instead — a COMMITTED minted ref, a rename, work on the new
+    /// name — against a FRESH `app_data`, so the first sighting is genuinely unrecorded. One call
+    /// resolves `Unknown` and parks on the frozen minted ref; two resolve `Mine` and promote what
+    /// the agent is actually working on.
+    #[test]
+    fn preflight_resolves_a_renamed_branch_on_its_very_first_sighting() {
+        let root_str = init_repo("preflight-firstsight");
+        let app_data = unique_root("preflight-firstsight-appdata");
+        let wt = worktree_on_new_branch(&root_str, "preflight-firstsight", "sparkle/agent-mine");
+        // Work ON the minted ref, so this resolves through rung 2b rather than the empty-ref rung.
+        std::fs::write(std::path::Path::new(&wt).join("a.txt"), "work").unwrap();
+        git(&wt, &["add", "-A"]).unwrap();
+        git(&wt, &["commit", "-m", "work before the rename"]).unwrap();
+        // …then the rename, with a commit on the new name — the continuation evidence the walk wants.
+        git(&wt, &["checkout", "-b", "ci/renamed"]).unwrap();
+        std::fs::write(std::path::Path::new(&wt).join("b.txt"), "more").unwrap();
+        git(&wt, &["add", "-A"]).unwrap();
+        git(&wt, &["commit", "-m", "work after the rename"]).unwrap();
+
+        let pre = preflight_at(&root_str, "mine", &wt, "main", Some((app_data.as_path(), "p")))
+            .unwrap();
+        assert_eq!(
+            pre.branch, "ci/renamed",
+            "a promotion must publish the branch the work is ON, on the FIRST sighting — there is \
+             no later poll to repair it before the push happens"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_str);
+        let _ = std::fs::remove_dir_all(&app_data);
+    }
+
+    #[test]
+    fn preflight_refuses_a_branch_recorded_to_another_agent() {
+        let root_str = init_repo("preflight-owned");
+        let app_data = unique_root("preflight-owned-appdata");
+        // The agent's worktree on its minted branch, then the `checkout -b` rename that leaves that
+        // ref behind — the shape the whole ladder is about.
+        let wt = worktree_on_new_branch(&root_str, "preflight-owned", "sparkle/agent-mine");
+        git(&wt, &["checkout", "-b", "sparkle/not-mine"]).unwrap();
+
+        // Somebody ELSE is recorded on that branch.
+        crate::pr_owner::observe_branch(app_data.as_path(), "p", "sparkle/not-mine", "other")
+            .unwrap();
+
+        let with_ctx =
+            preflight_at(&root_str, "mine", &wt, "main", Some((app_data.as_path(), "p"))).unwrap();
+        assert_eq!(
+            with_ctx.branch, "sparkle/agent-mine",
+            "a promotion must not push a branch recorded to another agent"
+        );
+
+        // …and the rename still works when the table has no opinion, which is the case the
+        // adopt-on-unknown rule exists for.
+        let fresh = unique_root("preflight-owned-appdata2");
+        let no_opinion =
+            preflight_at(&root_str, "mine", &wt, "main", Some((fresh.as_path(), "p"))).unwrap();
+        assert_eq!(
+            no_opinion.branch, "sparkle/not-mine",
+            "with no recorded owner the rename is still adopted"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_str);
+        let _ = std::fs::remove_dir_all(&app_data);
+        let _ = std::fs::remove_dir_all(&fresh);
+    }
+
 }

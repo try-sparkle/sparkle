@@ -63,9 +63,48 @@ import type { AppToolName, TerminalToolName } from "./conciergeTools/policy";
  * terminal write lands in the PTY now, an inbox message sits queued and invisible until that agent's
  * next turn boundary. Making the pair unrepresentable is cheaper than a comment asking for it.
  */
-type ReceiptRule =
+type ReceiptRule = (
   | { kind: Exclude<ConciergeActionKind, "sent"> }
-  | { kind: "sent"; channel: ConciergeSendChannel };
+  | { kind: "sent"; channel: ConciergeSendChannel }
+) & {
+  /** THIS OP MINTS ITS OWN SUCCESS RECEIPT, so this spine must not mint a second one.
+   *
+   *  ══ THE DEFECT THIS NAMES (the founder's 2026-08-18 screenshot) ═══════════════════════════════
+   *  One retirement produced TWO lines in the thread, once per agent — he retired twelve and got
+   *  twelve pairs:
+   *
+   *      Retired Sparkle-nudge #1 — Nudge-ladder test fixture, not real work. Idle with no goal…
+   *      Retired that agent.
+   *
+   *  His words: *"just saying retired that agent doesn't really mean anything to me. It does make
+   *  sense if you're saying … retired Build 4, never named placeholder, idle, no goal, no activity
+   *  ever. Like, that makes sense."*
+   *
+   *  Both lines are `actionReceiptLine` output; they come from two different RECORDERS. The good one
+   *  is minted by hand in `conciergeTools/lifecycle`'s `noteReceipt`, which is standing next to the
+   *  agent it just tore down and so can pass `agentName` and the verbatim `reason`. This spine mints
+   *  the other from the CALL ARGS — and `retireAgentArgs` is `.strict()` with no `agentName` in it,
+   *  while `resolveAgent(agentId)` necessarily misses because the agent is gone by the time the
+   *  reply settles. So the subject degrades to `ANONYMOUS_SUBJECT` and the success path has no
+   *  `reason` at all: a contentless line, structurally, on every successful retirement.
+   *
+   *  ══ WHY A FLAG AND NOT `retire_agent: null` ══════════════════════════════════════════════════
+   *  Because the duplicate is only the SUCCESS half. `noteReceipt` runs after the teardown actually
+   *  happened, so it never fires on a refusal — and a refused retirement is exactly the case the
+   *  founder must still see ("I won't retire X, it has unlanded commits"). Nulling the op would take
+   *  that line with it and rebuild the silence `services/conciergeReceipts` exists to end: the whole
+   *  contract is that a missing receipt is EVIDENCE, so suppressing a refusal is the one thing this
+   *  file may not do. Suppression is therefore conditioned on `input.ok`, never on the op alone.
+   *
+   *  ══ AND WHY IT IS DATA RATHER THAN AN `if` ═══════════════════════════════════════════════════
+   *  It is a property of the OP — "somebody else already recorded this" — not of the retire verb,
+   *  and today `retire_agent` is the only op with a hand-written `recordConciergeActionReceipt` call
+   *  behind it. The next one to grow a richer receipt of its own inherits the same double-emit
+   *  silently, because nothing about it looks wrong at either end. Naming the property here is what
+   *  gives that op a place to declare itself; `conciergeReceiptClassifier.test.ts` pins the pairing
+   *  both ways so the flag cannot drift from the recorders that justify it. */
+  ownRecordOnSuccess?: true;
+};
 
 type OpRule = ReceiptRule | null;
 
@@ -97,7 +136,12 @@ const LIFECYCLE_RULES: Record<LifecycleOp, OpRule> = {
   // finished agent is done with. Reported as `closed` he would read "Closed Kraken Auth" in the
   // morning with no way to tell whether he had asked for it and forgotten, which is precisely the
   // did-it-really-happen ambiguity this module exists to end. The receipt is the only witness.
-  retire_agent: { kind: "retired" },
+  // `ownRecordOnSuccess` — `lifecycle.retireAgent`'s `noteReceipt` already minted the real one, with
+  // the agent's NAME and the verbatim judgement, from beside the agent it tore down. See the flag's
+  // header: this spine can supply neither (the args carry no name, and the row is gone by settle
+  // time), so its success line degrades to "Retired that agent." The REFUSAL line still comes from
+  // here, and must — `noteReceipt` only runs once the teardown succeeded.
+  retire_agent: { kind: "retired", ownRecordOnSuccess: true },
   ship_agent: null,
   save_agent: null,
   discard_agent: { kind: "closed" },
@@ -392,7 +436,29 @@ function subjectOf(
   // `targetAgentId` is the app domain's spelling (`set_agent_goal`); every registry op uses
   // `agentId`. A broadcast carries `agentIds` and no single subject, which is why it is not read
   // here: naming one of N recipients would be worse than naming none.
-  return { agentId: str(a.agentId) ?? str(a.targetAgentId), agentName: str(a.agentName) };
+  // ── THE NAME MAY COME FROM THE REPLY; THE SUBJECT MAY NOT ────────────────────────────────────
+  //
+  // The rule this file opens with — direction is keyed on the KIND, never on "whichever side has an
+  // agentId" — is about WHO the receipt is about, and it is untouched here: `agentId` is still read
+  // from the args alone, so a reply can never re-point the subject of an ordinary op. A NAME is a
+  // different kind of fact. It does not decide who the line is about; it only decides whether the
+  // reader sees that subject's name or the anonymous fallback, so taking it from the reply cannot
+  // produce the silent mis-subjecting that rule exists to prevent.
+  //
+  // AND FOR THE CLOSE FAMILY THE REPLY IS THE ONLY SOURCE THERE IS (the founder, 2026-08-18).
+  // `close_agent`, `discard_agent` and `spin_down_worker` are all argued by id alone, and each one
+  // REMOVES the roster row it is reporting on — so by the time the renderer tries to turn that id
+  // into a name, the lookup is guaranteed to miss and the line reads "Closed that agent." That is
+  // the same contentless sentence he objected to on retire ("just saying retired that agent doesn't
+  // really mean anything to me"), reached by the same route. Those ops now carry the name they were
+  // holding at teardown, and this is where it is picked up.
+  //
+  // ARGS STILL WIN when both are present: an argued name is what the CALLER asked for, and a reply
+  // that disagreed would be re-labelling the caller's own subject.
+  return {
+    agentId: str(a.agentId) ?? str(a.targetAgentId),
+    agentName: str(a.agentName) ?? str(record(data)?.agentName),
+  };
 }
 
 /** The bead a `filed` receipt points at. `createItem` returns `{ id }`; `beadId` is accepted too so
@@ -476,6 +542,18 @@ export function classifyConciergeActionReceipt(
   // RULE 2 — the op must map onto something a human can read.
   const rule = RULES_BY_DOMAIN[domain]?.[op];
   if (!rule) return null;
+
+  // RULE 2b — SOMEBODY ELSE ALREADY RECORDED THIS SUCCESS. Not a judgement that the action is
+  // unworthy of a receipt: the op mints its own, richer, from a place that can still see the subject
+  // (see `ownRecordOnSuccess`). Emitting here too is what put two lines in the founder's thread per
+  // retirement, the second one contentless.
+  //
+  // GATED ON `input.ok`, WHICH IS THE LOAD-BEARING HALF. The hand-written recorders run only after
+  // their teardown actually happened, so nothing but this spine reports a REFUSAL — and a refusal is
+  // the receipt the founder most needs ("I won't retire X, it has unlanded commits"). Dropping the
+  // op outright would delete it and make a missing receipt ambiguous, which is the one failure
+  // `services/conciergeReceipts` exists to prevent.
+  if (rule.ownRecordOnSuccess && input.ok) return null;
 
   const { kind } = rule;
   const { agentId, agentName } = subjectOf(kind, input.args, input.data);

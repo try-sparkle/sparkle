@@ -5,6 +5,8 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: (...a: unknown[]) => invoke(...
 
 import {
   pickAccount,
+  eligibleAccounts,
+  clobberedDefaultIds,
   getUsage,
   getIdentities,
   accountLabel,
@@ -1125,5 +1127,68 @@ describe("signedInFilterApplies — the shared 'is this reading usable' predicat
   it("is false for an absent or empty reading — 'could not tell' never empties the pool", () => {
     expect(signedInFilterApplies(accounts, undefined)).toBe(false);
     expect(signedInFilterApplies(accounts, [])).toBe(false);
+  });
+});
+
+describe("clobbered default guard (concierge shared-default fragility)", () => {
+  const NOW = 1_000_000;
+  function ident(id: string, over: Partial<Identity> = {}): Identity {
+    return { id, email: `${id}@x.com`, organization: null, accountUuid: `uuid-${id}`, ...over };
+  }
+
+  it("clobberedDefaultIds flags a default whose TERMINAL is signed into a different account (shellForked)", () => {
+    const def = acct("def", { isDefault: true, configDir: "" });
+    const dedicated = acct("ded");
+    const identities = [
+      // Default: Sparkle runs it as uuid-def, but the terminal ~/.claude.json is a DIFFERENT account.
+      ident("def", { shellAccountUuid: "uuid-terminal", shellEmail: "terminal@x.com" }),
+      ident("ded"),
+    ];
+    expect([...clobberedDefaultIds([def, dedicated], identities)]).toEqual(["def"]);
+  });
+
+  it("clobberedDefaultIds flags a default whose dir a different account took over recently (identityChanged), and NEVER a dedicated account", () => {
+    const def = acct("def", { isDefault: true, configDir: "" });
+    const dedicated = acct("ded", { isDefault: false });
+    // Both carry identityChanged, but only the DEFAULT is shared with the terminal, so only it counts.
+    const identities = [ident("def", { identityChanged: true }), ident("ded", { identityChanged: true })];
+    expect([...clobberedDefaultIds([def, dedicated], identities)]).toEqual(["def"]);
+  });
+
+  it("a healthy default is NOT flagged", () => {
+    const def = acct("def", { isDefault: true, configDir: "" });
+    expect([...clobberedDefaultIds([def], [ident("def")])]).toEqual([]);
+  });
+
+  it("eligibleAccounts drops a clobbered account — but leastBad still returns it when it is the ONLY one", () => {
+    const def = acct("def", { isDefault: true, configDir: "" });
+    const dedicated = acct("ded");
+    const u = [usage("def"), usage("ded")];
+    const clobberedIds = new Set(["def"]);
+    // SIDE EFFECT: with a healthy dedicated alternative, the clobbered default is neither eligible nor picked.
+    expect(eligibleAccounts([def, dedicated], u, { now: NOW, clobberedIds }).map((a) => a.id)).toEqual([
+      "ded",
+    ]);
+    expect(pickAccount([def, dedicated], u, { now: NOW, clobberedIds })?.id).toBe("ded");
+    // Without the option nothing changes — the clobbered default is eligible again (proves the exclusion
+    // is the clobberedIds set, not something else).
+    expect(eligibleAccounts([def, dedicated], u, { now: NOW }).map((a) => a.id).sort()).toEqual([
+      "ded",
+      "def",
+    ]);
+    // Last-account guard: when the clobbered default is all there is, it is STILL returned — a login
+    // prompt on the fragile default beats no account at all.
+    expect(eligibleAccounts([def], u, { now: NOW, clobberedIds })).toEqual([]);
+    expect(pickAccount([def], u, { now: NOW, clobberedIds })?.id).toBe("def");
+  });
+
+  it("a human PIN overrides the clobbered guard — a pinned account wins even when clobbered", () => {
+    const def = acct("def", { isDefault: true, configDir: "" });
+    const dedicated = acct("ded");
+    const u = [usage("def"), usage("ded")];
+    const clobberedIds = new Set(["def"]);
+    expect(pickAccount([def, dedicated], u, { now: NOW, clobberedIds, pinnedAccountId: "def" })?.id).toBe(
+      "def",
+    );
   });
 });

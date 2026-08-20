@@ -3,7 +3,9 @@ import { C, CHAT_USER_BUBBLE, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors
 import { createAgentWorktree, installWorktreeGuard, assertWorkspaceIntegrity } from "../services/worktree";
 import { checkClaude, claudeHasSession } from "../preflight";
 import { registerSparkleTranscript } from "../services/sparkleTranscript";
-import { buildClaudeExec } from "../services/claudeSpawn";
+import { buildClaudeExec, buildControlMcpConfig } from "../services/claudeSpawn";
+import { startControlBridge, controlMcpPaths } from "../services/orchestrationLaunch";
+import { sparkleControlProtocol } from "../services/buildAgent";
 import { cancelImprovementPass } from "../services/improvementPass";
 import {
   checkSubmitCapability,
@@ -205,20 +207,62 @@ export function SparkleAgentPane({ visible, agentId }: { visible: boolean; agent
       // session ends in a 403. A failed probe is "unknown": the normal submitting path stays.
       const submit = await checkSubmitCapability().catch(() => null);
       setSubmitNotice(submit ? submitBlockedReason(submit.verdict, submit.repo) : null);
+
+      // THE sparkle-control MCP — this agent's ONLY route to the rest of the app (bead
+      // sparkle-hdlhox). Without it Improve Sparkle has no `get_state({scope:"fleet"})` to read the
+      // app-global address book and no `send_peer_message` to reach the concierge at
+      // `sparkle:concierge`, so the cross-agent channel that already exists on main (bead
+      // sparkle-179b2s) is invisible to the one agent whose whole job is noticing systemic problems.
+      // It reported itself blind on that basis, having reached for the HARNESS's ListAgents — a
+      // different namespace that can never contain the concierge.
+      //
+      // Built exactly like AgentPane's generic branch, deliberately: one pattern, not two.
+      let control: { paths: { nodePath: string; serverPath: string }; socketPath: string; token: string } | null =
+        null;
+      try {
+        const [bridge, paths] = await Promise.all([startControlBridge(), controlMcpPaths()]);
+        control = { paths, socketPath: bridge.socketPath, token: bridge.token };
+      } catch (e) {
+        // DEGRADE, NEVER FAIL. A bridge that will not start costs this agent its cross-agent tools
+        // and nothing else — the pane still spawns with its persona, log dir and mission prompt.
+        // That is the brief's hard constraint: the channel must degrade safely when the other side
+        // is absent, and the absent side here is the app's own bridge.
+        console.warn("[control] sparkle-control MCP unavailable for Improve Sparkle; spawning without it", e);
+      }
+      const controlMcpConfig = control
+        ? buildControlMcpConfig({
+            nodePath: control.paths.nodePath,
+            serverPath: control.paths.serverPath,
+            socketPath: control.socketPath,
+            token: control.token,
+            agentId,
+          })
+        : undefined;
+      // Named rather than inlined into the ternary below so the gate is ONE testable predicate:
+      // the flag and the prose that advertises it are driven by the same value, and a mutation to
+      // this line flips both together the way a real regression would.
+      const controlUp = controlMcpConfig !== undefined;
+      const persona = sparklePersona(
+        ws.logDir,
+        wt.path,
+        consent,
+        submit?.verdict ?? "unknown",
+        // The pane IS the user sitting in the chat, so an auth failure is theirs to clear.
+        { attended: true },
+      );
       setSpawn({
         command: SHELL,
         args: [
           "-l",
           "-c",
           buildClaudeExec(claude.path, resume, {
-            appendSystemPrompt: sparklePersona(
-              ws.logDir,
-              wt.path,
-              consent,
-              submit?.verdict ?? "unknown",
-              // The pane IS the user sitting in the chat, so an auth failure is theirs to clear.
-              { attended: true },
-            ),
+            // The control-protocol prose rides ONLY when the server actually loaded. Advertising
+            // tools that are not there just yields confusing "tool not found" attempts — the same
+            // reason AgentPane gates it on the identical value.
+            appendSystemPrompt: controlUp ? `${persona}\n\n${sparkleControlProtocol()}` : persona,
+            // No `strictMcpConfig`: the user's own global MCP servers must still load alongside
+            // ours, matching AgentPane's generic branch.
+            mcpConfig: controlMcpConfig,
             // Ownership proof for the Stop hook's inbox drain (bead sparkle-ei7keg): the same
             // window id the hook-events log and the inbox would be keyed by.
             //

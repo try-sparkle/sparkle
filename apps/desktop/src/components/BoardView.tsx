@@ -1,20 +1,34 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, SCRIM } from "../theme/colors";
-import { RADIUS } from "../theme/scale";
+import { PILL, RADIUS } from "../theme/scale";
+import { TAG } from "./labelTreatment";
 import type { Project } from "../types";
 import {
   childrenOf,
-  claimBead,
+  isEpic,
+  epicDisplayTitle,
+  openChildCount,
+  parentEpicOf,
   labelBead,
+  STALLED_LABEL,
+  SWEEP_NO_AUTO_LABEL,
   mergeShaOf,
   severityOf,
   DELIVERED_LABEL,
   type Bead,
   type Board,
-  type BoardColumn,
 } from "../services/beads";
 import { DECOMPOSE_FAILED_LABEL, DECOMPOSING_LABEL } from "../services/epicDecompose";
-import { parsePrdRef } from "../services/tasks";
+import {
+  EPIC_LADDER_COLUMNS,
+  PLAN_KINDS,
+  bucketEpics,
+  emptyEpicBoard,
+  tasksOnly,
+  withPlanning,
+  type EpicBoard,
+  type EpicLadderKey,
+} from "../services/epicBoard";
 import { safeUnlisten } from "../services/safeUnlisten";
 import { useBeadsStore } from "../stores/beadsStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -22,7 +36,6 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import type { PairSide } from "../engine/cable";
 import { useUiStore } from "../stores/uiStore";
 import { useShallow } from "zustand/react/shallow";
-import { sendToBuild, sendToBuildBlockedReason } from "../services/sendToBuild";
 import {
   workersForBead,
   beadStage,
@@ -31,7 +44,7 @@ import {
   type EpicChildView,
 } from "../services/planView";
 import { WorkflowLine } from "./WorkflowLine";
-import { FiUsers } from "react-icons/fi";
+import { FiUsers, FiChevronRight, FiCheck, FiCircle } from "react-icons/fi";
 import { stageMeta, stageLineColor, type WorkflowStageId } from "../engine/workflowStage";
 import { agentDisplayName } from "../engine/agentDisplayName";
 import { boardFilterIsActive, matchesBoardFilter, NO_BOARD_FILTER } from "../services/boardFilters";
@@ -58,8 +71,13 @@ import { FONT_MONO, FONT_UI } from "../theme/scale";
 
 /** The next board stage a card in `columnKey` is progressing toward (whose criteria we evaluate):
  *  Backlog / In Progress → Done; Done → Delivered; Delivered is terminal (none). */
-function nextStageOf(columnKey: BoardColumn): StageKey | null {
-  if (columnKey === "backlog" || columnKey === "inProgress") return "done";
+// Takes the LADDER key rather than `BoardColumn` because the Epics mode renders one column the task
+// board has no bucket for (`planning`). Widening the parameter is the whole change: an epic sitting
+// in Planning is open and unstarted, so it wants the same "next stage" as Backlog — which is what
+// the existing `backlog` arm already answers.
+function nextStageOf(columnKey: EpicLadderKey): StageKey | null {
+  if (columnKey === "backlog" || columnKey === "planning" || columnKey === "inProgress")
+    return "done";
   if (columnKey === "done") return "delivered";
   return null;
 }
@@ -107,6 +125,12 @@ const DESC_PREVIEW = 120;
 // Stable empty fallback: a `?? []` literal inside a zustand selector returns a NEW reference every
 // render, which makes the store re-render in a loop. Reuse one frozen array instead.
 const NO_AGENTS: AgentTab[] = [];
+
+// Same reasoning as NO_AGENTS directly above, for the bead list. `snapshot?.beads ?? []` builds a
+// NEW empty array on every render whenever there is no snapshot yet, so every `useMemo` keyed on
+// `allBeads` re-ran each time and memoised nothing — the two that predate the Epics mode included.
+// One frozen array makes the identity stable, which is what the deps array is comparing.
+const NO_BEADS: Bead[] = [];
 
 /** The card list inside a column — the only element on this board that scrolls vertically, and the
  *  one `boardScrollDelta` asks whether it still has room. */
@@ -212,7 +236,7 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
   }, [project.id, project.rootPath]);
 
   const board = snapshot?.board;
-  const allBeads = snapshot?.beads ?? [];
+  const allBeads = snapshot?.beads ?? NO_BEADS;
 
   /**
    * The bead the open overlay is showing, read from the CURRENT poll rather than held.
@@ -383,6 +407,44 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
     };
   }, [agentOnlyBoard, boardFilter, filterActive]);
 
+  // ══ TASKS / EPICS — the Plan board's two independent kind toggles ════════════════════════════
+  const planKinds = useUiStore((s) => s.planKindsBySide[side]);
+  /**
+   * The columns to render and the beads in each, for the kinds currently switched on.
+   *
+   * EPICS-ONLY is the ONLY combination that changes the column SET: it swaps the task board's six
+   * columns for the founder's seven-stage ladder — Backlog > Blocked > Planning > Building > Done
+   * > Shipped > Archived — whose one addition is Planning, an EPIC-only derived stage. Every other
+   * combination keeps the familiar columns, because Planning is a statement about an epic's
+   * children and has nothing to put in it once tasks are on the board too.
+   *
+   * NEITHER KIND ON renders an explicitly EMPTY board rather than falling through to the unfiltered
+   * one. Falling through is the bug that shape invites: the user switches everything off and the
+   * board answers by showing them everything, which reads as the controls being ignored.
+   *
+   * IT NARROWS `displayBoard`, NOT `board` — so the mode COMPOSES with the agent filter and the
+   * priority/date filter rather than quietly discarding them. Narrowing the raw snapshot here would
+   * show a board wider than the user's own controls say it should be.
+   *
+   * `allBeads` is passed UNFILTERED on purpose, and it is a different set from the one being
+   * bucketed: epic-ness and the child roll-up are properties of the whole store (a bead cannot tell
+   * you whether anything points at it), so asking them against a filtered list would demote an epic
+   * whose children a filter happened to hide.
+   */
+  const { columns, viewBoard } = useMemo((): {
+    columns: readonly { key: EpicLadderKey; label: string }[];
+    viewBoard: EpicBoard | null;
+  } => {
+    if (!displayBoard) return { columns: COLUMNS, viewBoard: null };
+    if (!planKinds.tasks && !planKinds.epics)
+      return { columns: COLUMNS, viewBoard: emptyEpicBoard() };
+    if (!planKinds.tasks)
+      return { columns: EPIC_LADDER_COLUMNS, viewBoard: bucketEpics(displayBoard, allBeads) };
+    if (!planKinds.epics)
+      return { columns: COLUMNS, viewBoard: withPlanning(tasksOnly(displayBoard, allBeads)) };
+    return { columns: COLUMNS, viewBoard: withPlanning(displayBoard) };
+  }, [displayBoard, planKinds, allBeads]);
+
   /**
    * How many cards the PRIORITY/DATE filter removed — and only when it removed all of them.
    *
@@ -440,6 +502,11 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
 
   return (
     <div
+      // WHICH SIDE'S BOARD THIS IS. A pair mounts two of these at once and every per-side piece of
+      // state (the agent filter, the priority/date filter, the Tasks/Epics kind toggles) is supposed to
+      // move one of them without touching the other — a property that cannot be observed, or tested,
+      // unless the two are told apart in the tree.
+      data-board-side={side}
       style={{
         position: "absolute",
         inset: 0,
@@ -570,8 +637,149 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
         </div>
       )}
 
-      {/* No snapshot yet → loading. Otherwise the four columns. */}
-      {!displayBoard ? (
+      {/* ══ NEITHER KIND ON IS ALSO A FILTER THAT EMPTIES THE BOARD ═════════════════════════════
+          Same contract as the notice directly above, for the one state the old exclusive mode could
+          not reach: with two independent toggles the user can switch BOTH off, and the board then
+          has every column present and empty. `hiddenByFilter` cannot speak to this — it measures
+          the priority/date filter — so without this the board would silently report "nothing here"
+          while concealing all of it, the exact failure `sparkle-qogah` names.
+
+          The remedy is a real one, which is the property the sibling notice's own comment insists
+          on: "Show both" writes both kinds back on, so following it always refills the board. A
+          remedy that cannot work is worse than no remedy. */}
+      {displayBoard && !planKinds.tasks && !planKinds.epics && (
+        <div
+          data-testid="board-plan-kinds-empty-notice"
+          style={{
+            padding: "10px 16px",
+            borderBottom: `1px solid ${C.hairline}`,
+            background: C.deepForest,
+            color: C.cream,
+            fontSize: 12,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <span>Neither Tasks nor Epics is shown — the board is hiding everything.</span>
+          <button
+            type="button"
+            data-testid="board-plan-kinds-show-both"
+            onClick={() => {
+              // Re-read between the two flips. `togglePlanKind` is a flip, not a set, so acting on
+              // one snapshot for both kinds would turn a kind back OFF if anything changed it in
+              // between — a remedy that empties the board is the failure this notice exists to fix.
+              for (const kind of ["tasks", "epics"] as const) {
+                if (!useUiStore.getState().planKindsBySide[side][kind])
+                  useUiStore.getState().togglePlanKind(side, kind);
+              }
+            }}
+            style={{
+              background: "transparent",
+              border: "none",
+              padding: 0,
+              color: C.accentInk,
+              cursor: "pointer",
+              font: "inherit",
+              textDecoration: "underline",
+            }}
+          >
+            Show both
+          </button>
+        </div>
+      )}
+
+      {/* ══ TASKS / EPICS ══════════════════════════════════════════════════════════════════════
+          The founder could not SEE epics working: they were mixed into the task columns with
+          nothing marking them out, and the `planning` stage had no column at all. These are the
+          controls that separate them, and they are TWO INDEPENDENT TOGGLES — there is no "Both".
+          "Both" was never a third kind of thing; it named the absence of a filter, so the control
+          had three buttons for two facts and the way to see everything was the button whose label
+          named neither kind. Each toggle now answers exactly one question: is this kind on the
+          board.
+
+          Rendered UNCONDITIONALLY, above the columns, and that placement is the point — switching
+          either one off HIDES work, and a control that hides work has to be visible from the board
+          it narrowed.
+
+          `aria-pressed` (not `aria-checked`) with `role="group"`: these are two toggle BUTTONS
+          whose states are independent, not a radiogroup with one winner. That distinction is the
+          whole change, and it is the part a screen reader has to get right too. */}
+      <div
+        data-testid="board-plan-kinds"
+        role="group"
+        aria-label="Show tasks or epics"
+        style={{
+          display: "flex",
+          gap: 2,
+          padding: "6px 16px",
+          borderBottom: `1px solid ${C.hairline}`,
+          flexShrink: 0,
+        }}
+      >
+        {PLAN_KINDS.map(({ kind, label }) => {
+          const on = planKinds[kind];
+          return (
+            <button
+              key={kind}
+              type="button"
+              data-testid={`board-plan-kind-${kind}`}
+              aria-pressed={on}
+              onClick={() => useUiStore.getState().togglePlanKind(side, kind)}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "3px 10px",
+                borderRadius: PILL,
+                // ALWAYS 1px, never `none`, so the two states occupy the SAME box and the row does
+                // not reflow on a click. Only the colour changes: the selected pill's edge matches
+                // its own fill, so it reads as one solid shape rather than as an outlined one.
+                border: `1px solid ${on ? C.forest : C.hairline}`,
+                cursor: "pointer",
+                font: "inherit",
+                fontSize: 12,
+                fontWeight: on ? FONT_WEIGHT.semibold : FONT_WEIGHT.regular,
+                background: on ? C.forest : "transparent",
+                color: on ? C.cream : C.muted,
+              }}
+            >
+              {/* THE MARKER IS WHAT MAKES "SELECTED" A PROPERTY OF THIS PILL, not of the row.
+                  A filled-vs-empty pill alone is the language of a segmented control — one of N
+                  wins — which is exactly the wrong reading now that the two toggles are
+                  independent and can both be on. A per-pill mark says "this one is on" without
+                  reference to its neighbour.
+
+                  REACT-ICONS, NOT CHARACTERS. The first cut drew these as a check dingbat and a
+                  white-circle dingbat (U+2713 / U+25CB) and `glyphIcons.test` caught it, correctly:
+                  a dingbat resolves through whatever face the element inherits, so it changes
+                  weight, baseline and optical size across platforms, while a Feather icon is
+                  geometry on a fixed grid. `BoardView.tsx` is on that test's SWEPT list, so the
+                  surface is held at ZERO rather than merely under a ceiling — and the scanner reads
+                  comments too, so naming the codepoints is the way to describe them here without
+                  putting one back.
+
+                  BOTH STATES RENDER AN ICON of the same `size`, and the off state is a real ring
+                  rather than nothing: a marker that appears and disappears would shift the label
+                  sideways on every click, which is the cheapest possible way to make a good
+                  control feel broken. */}
+              <span
+                aria-hidden="true"
+                data-testid={`board-plan-kind-${kind}-marker`}
+                data-mark={on ? "on" : "off"}
+                style={{ display: "inline-flex", alignItems: "center", opacity: on ? 1 : 0.55 }}
+              >
+                {on ? <FiCheck size={11} /> : <FiCircle size={9} />}
+              </span>
+              {label}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* No snapshot yet → loading. Otherwise the current mode's columns. */}
+      {!viewBoard ? (
         <div style={{ padding: 24, color: C.muted, fontSize: 13 }}>Loading tasks…</div>
       ) : (
         <div
@@ -595,12 +803,12 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
             minHeight: 0,
           }}
         >
-          {COLUMNS.map(({ key, label }) => (
+          {columns.map(({ key, label }) => (
             <Column
               key={key}
               columnKey={key}
               label={label}
-              beads={displayBoard[key]}
+              beads={viewBoard[key]}
               allBeads={allBeads}
               agents={agents}
               project={project}
@@ -625,6 +833,7 @@ export function BoardView({ project, side }: { project: Project; side: PairSide 
           allBeads={allBeads}
           agents={agents}
           onClose={() => setSelectedId(null)}
+          onOpen={(b) => setSelectedId(b.id)}
         />
       )}
 
@@ -656,7 +865,9 @@ function Column({
   collapsible = false,
   renderCap,
 }: {
-  columnKey: BoardColumn;
+  // The LADDER key, not `BoardColumn`: the Epics mode renders a `planning` column the task board
+  // has no bucket for. Every consumer below already answers null/false for an unrecognised key.
+  columnKey: EpicLadderKey;
   label: string;
   beads: Bead[];
   allBeads: Bead[];
@@ -788,7 +999,6 @@ function Column({
               <Card
                 key={b.id}
                 bead={b}
-                columnKey={columnKey}
                 allBeads={allBeads}
                 agents={agents}
                 project={project}
@@ -835,9 +1045,124 @@ function Column({
   );
 }
 
+/**
+ * The gold EPIC pill. The founder asked for GOLD, and the reason this cannot read `C.goldFill` is
+ * that Blueprint retired gold: the four `gold*` tokens carry BLUE now, so a `goldFill` pill would
+ * be blue-on-blue against the epic card and invisible. `epicPillFill` is the themed warm pair —
+ * see the EPIC CARD block in theme/colors.ts for the measured contrast on both cards.
+ */
+function EpicPill() {
+  return (
+    <span
+      data-testid="epic-pill"
+      // `TAG`, not a hand-rolled box. It already carries every value this needs — uppercase, the
+      // spec's 0.1em tracking, mono at TYPE.micro, RADIUS.sm — and two tree-wide ratchets
+      // (theme/scale.test.ts on off-scale fontSize, labelTreatment.test.ts on hand-typed
+      // letterSpacing) exist precisely to stop a new badge re-deriving them by eye. Both caught
+      // this pill's first draft.
+      //
+      // FILLED rather than outlined, so `tag(ink)` is the wrong helper: this is a solid identity
+      // badge, and its fill/ink pair is themed and measured in theme/epicCardContrast.test.ts.
+      style={{
+        ...TAG,
+        alignSelf: "flex-start",
+        background: C.epicPillFill,
+        color: C.onEpicPillFill,
+      }}
+    >
+      EPIC
+    </span>
+  );
+}
+
+/** "Contains N tasks" — N is the count of OPEN children, i.e. remaining work, not total work. */
+function ContainsTasks({
+  count,
+  open,
+  onToggle,
+}: {
+  count: number;
+  open: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <button
+      data-testid="epic-contains-tasks"
+      onClick={onToggle}
+      aria-expanded={open}
+      style={{
+        alignSelf: "flex-start",
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 4,
+        background: "transparent",
+        border: "none",
+        padding: 0,
+        cursor: "pointer",
+        color: C.muted,
+        fontSize: 12,
+        fontFamily: FONT_UI,
+      }}
+    >
+      <FiChevronRight
+        size={11}
+        aria-hidden
+        style={{ transform: open ? "rotate(90deg)" : "none", transition: "transform 120ms" }}
+      />
+      Contains {count} {count === 1 ? "task" : "tasks"}
+    </button>
+  );
+}
+
+/**
+ * "Part of Epic: <name>" on a task card — the NAME, never the bead id. A raw `sparkle-131ms` tells
+ * the reader nothing at a glance; "Concierge chat surface" tells them what the work is for.
+ *
+ * TRUNCATED RATHER THAN WRAPPED. The card already carries title, description preview, id, priority
+ * chip, severity badge, workers line and the stage bar; a long epic name that wrapped to three
+ * lines would push all of that around and make the column ragged.
+ */
+function ParentEpicLine({ epic, onOpen }: { epic: Bead; onOpen: (b: Bead) => void }) {
+  return (
+    <button
+      data-testid="part-of-epic"
+      onClick={() => onOpen(epic)}
+      title={`Part of Epic: ${epicDisplayTitle(epic.title)}`}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 4,
+        maxWidth: "100%",
+        minWidth: 0,
+        background: "transparent",
+        border: "none",
+        padding: 0,
+        cursor: "pointer",
+        textAlign: "left",
+        color: C.muted,
+        fontSize: 12,
+        fontFamily: FONT_UI,
+      }}
+    >
+      <span style={{ flex: "0 0 auto" }}>Part of Epic:</span>
+      <span
+        style={{
+          flex: "0 1 auto",
+          minWidth: 0,
+          color: C.tealInk,
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        }}
+      >
+        {epicDisplayTitle(epic.title)}
+      </span>
+    </button>
+  );
+}
+
 function Card({
   bead,
-  columnKey,
   allBeads,
   agents,
   project,
@@ -847,7 +1172,10 @@ function Card({
   onOpen,
 }: {
   bead: Bead;
-  columnKey: BoardColumn;
+  // NO `columnKey`. The card used to take the ladder key for one reason only — gating its inline
+  // Build It on `backlog`/`planning` — and that gate moved into `useBeadBuildActions`, where it is
+  // asked of the BEAD's own status so the detail overlay and the concierge card (neither of which
+  // has a column) can answer it too. Leaving the prop here would invite the gate to grow back.
   allBeads: Bead[];
   agents: AgentTab[];
   project: Project;
@@ -875,13 +1203,32 @@ function Card({
     ),
   );
   const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
+
+  // ── EPIC vs TASK — ONE RESOLVER, BOTH DIRECTIONS ─────────────────────────────────────────────
+  // `isEpic` is the single predicate (typed `epic` OR has children); `parentEpicOf` is its inverse.
+  // Keying either off `type === "epic"` is the mistake this codebase already made three times: // epic-guard-ok — this line only NAMES the anti-pattern in prose; it is not a condition.
+  // several real parents are typed `feature`/`bug`/`task` and one of them has 19 children, so a
+  // type check would leave every one of those children unlabelled.
+  const beadIsEpic = isEpic(allBeads, bead);
+  // Only asked for a TASK. An epic that is itself nested would otherwise wear both the pill and a
+  // parent line, which is more chrome than the card can carry.
+  const parentEpic = beadIsEpic ? null : parentEpicOf(allBeads, bead);
+  // PER-CARD AND DELIBERATELY NOT PERSISTED — same contract as the Tasks/Epics kind toggles.
+  // Collapsed is the default because a board of auto-expanded epics is unreadable.
+  const [childrenOpen, setChildrenOpen] = useState(false);
+  const openKids = beadIsEpic ? openChildCount(allBeads, bead.id) : 0;
+  const hasKids = beadIsEpic && childrenOf(allBeads, bead.id).length > 0;
+
   return (
     // The card's visual shell is a div so the interactive Start button can live BESIDE the
     // clickable body (a <button> must not contain a nested <button>). The body button opens detail;
     // StartControls is a sibling, so a Start click never bubbles to the body.
     <div
+      data-testid={beadIsEpic ? "board-card-epic" : "board-card-task"}
+      // THE FOUNDER'S ASK: "I want epic cards to have a different colored background than regular
+      // cards." Themed, because the two modes need different answers — see `epicCardFill`.
       style={{
-        background: C.forest,
+        background: beadIsEpic ? C.epicCardFill : C.forest,
         border: `1px solid ${C.hairline}`,
         borderRadius: 6,
         padding: "10px 12px",
@@ -912,6 +1259,10 @@ function Card({
           fontFamily: FONT_UI,
         }}
       >
+        {/* TOP LEFT, on the same left edge the title starts on — the founder was explicit that this
+            is not a floated-right corner badge. It carries the literal word EPIC, so the epic/task
+            distinction is never colour-only (WCAG 1.4.1) even though the background carries it too. */}
+        {beadIsEpic && <EpicPill />}
         <div
           style={{
             color: C.cream,
@@ -924,7 +1275,8 @@ function Card({
             overflowWrap: "anywhere",
           }}
         >
-          {bead.title}
+          {/* Render-time only — the stored title is never rewritten. See `epicDisplayTitle`. */}
+          {beadIsEpic ? epicDisplayTitle(bead.title) : bead.title}
         </div>
         {preview && (
           <div style={{ color: C.muted, fontSize: 12, lineHeight: 1.4, overflowWrap: "anywhere" }}>
@@ -976,11 +1328,42 @@ function Card({
           </span>
         </div>
       </button>
-      {/* Backlog epic → Start controls (spec §7): claim + hand off to Build, with the
-          decompose-state affordances (disabled while decomposing/childless, retry on failure). */}
-      {columnKey === "backlog" && bead.type === "epic" && (
-        <StartControls bead={bead} allBeads={allBeads} project={project} />
+      {/* ── BELOW THE STATUS BAR ─────────────────────────────────────────────────────────────────
+          Both of these are SIBLINGS of the body button, not children of it: they are interactive,
+          and a <button> may not contain another one. That also keeps their clicks off the
+          open-detail handler, so expanding an epic does not open it. */}
+      {beadIsEpic &&
+        (hasKids ? (
+          <ContainsTasks
+            count={openKids}
+            open={childrenOpen}
+            onToggle={() => setChildrenOpen((v) => !v)}
+          />
+        ) : (
+          // "An epic with zero children should say so plainly rather than expanding into nothing."
+          <span style={{ color: C.muted, fontSize: 12 }}>Contains no tasks yet</span>
+        ))}
+      {beadIsEpic && childrenOpen && (
+        <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} onOpen={onOpen} />
       )}
+      {/* The mirror of the pill — from a child you can see the theme it serves, and click through to
+          it. Absent for an orphan task: those are normal, not an error state, and must not be
+          visually shamed. */}
+      {parentEpic && <ParentEpicLine epic={parentEpic} onOpen={onOpen} />}
+      {/* Build It: claim + hand off to Build, with the epic decompose-state affordances (disabled
+          while decomposing/childless, retry on failure).
+
+          ── NO COLUMN CHECK AND NO TYPE CHECK ON THIS LINE ANY MORE ──────────────────────────────
+          Both used to live here — `(columnKey === "backlog" || columnKey === "planning") &&
+          isEpic(allBeads, bead)` — and NEITHER was shared with the detail overlay or the concierge
+          card. That is the whole reason the two gates disagreed: this line hid Build It outside
+          Backlog/Planning and on every non-epic, while the overlay gated on TYPE alone and offered
+          it in any column, including on work already in progress. Two gates, two answers, one
+          question.
+
+          `StartControls` now asks `useBeadBuildActions` — the SAME hook the other two surfaces ask
+          — and renders nothing when it says no. The rule moved; it did not get deleted. */}
+      <StartControls bead={bead} allBeads={allBeads} project={project} />
       {/* Definable Done & Delivered (Unit 5): when the card's NEXT stage is defined, show its compact
           criteria progress + the confirm-first "Mark as …" control (only when every criterion is met).
           A sibling of the body button so its clicks never open the detail overlay. */}
@@ -999,13 +1382,25 @@ function Card({
 }
 
 /**
- * Backlog-epic Start controls (spec §7). Start claims the epic (→ in_progress) and hands it to the
- * Build orchestrator via sendToBuild — PRD path parsed from the epic body, or null for a PRD-less
- * epic (sendToBuild seeds off the epic bead itself). Disabled with a "decomposing…" tooltip while
- * the epic is still being decomposed (zero children) or carries the `decomposing` label; both the
- * `decomposing…` and `decompose failed` badges are click-to-clear (stuck-label recovery / retry —
- * clearing the label lets the next sweep re-decompose). All clicks stopPropagation so they never
- * open the card's detail overlay.
+ * The card's inline "Build It" (spec §7) — claim the bead (→ in_progress) and hand it to the Build
+ * orchestrator.
+ *
+ * ══ IT NO LONGER HAND-ROLLS THE HANDOFF, AND THAT IS THE POINT ═════════════════════════════════
+ * This used to call `sendToBuildBlockedReason` → `claimBead` → `sendToBuild` itself: a FOURTH copy
+ * of an ordering that had already been a review finding twice (roborev 55139, 55150). It also
+ * always took `sendToBuild`'s DEFAULT mode — "epic" — which was invisible while only epics could
+ * reach it and becomes wrong the moment a bug can: the epic seed prompt says "decompose them
+ * across isolated worker agents", which is not what a single bug wants to hear.
+ *
+ * Going through `useBeadBuildActions` fixes both at once and buys the thing the founder actually
+ * asked for: this card, the detail overlay and the concierge's `BeadPill` now offer Build It on
+ * exactly the same beads, because there is only one rule and none of them owns it.
+ *
+ * What stays here is the part that is genuinely the CARD's: the epic decompose-state affordances.
+ * Disabled with a "decomposing…" tooltip while an epic is still being decomposed (zero children)
+ * or carries the `decomposing` label; both the `decomposing…` and `decompose failed` badges are
+ * click-to-clear (stuck-label recovery / retry — clearing the label lets the next sweep
+ * re-decompose). All clicks stopPropagation so they never open the card's detail overlay.
  */
 function StartControls({
   bead,
@@ -1018,32 +1413,73 @@ function StartControls({
 }) {
   const [err, setErr] = useState("");
   const [busy, setBusy] = useState(false);
+  // THE SHARED GATE AND THE SHARED HANDOFF. `buildIt` is `buildEpic` for an epic and `buildTask`
+  // for everything else, already carrying the preflight-before-claim ordering and the right
+  // `mode` — and it is NULL once the bead has been started or closed, which is what makes this
+  // card agree with the overlay and the concierge without knowing their rules.
+  const { buildIt } = useBeadBuildActions({ bead, projectId: project.id, allBeads });
+  const beadIsEpic = isEpic(allBeads, bead);
   const isDecomposing = bead.labels.includes(DECOMPOSING_LABEL);
   const isFailed = bead.labels.includes(DECOMPOSE_FAILED_LABEL);
-  const noChildren = childrenOf(allBeads, bead.id).length === 0;
+  // AN EPIC-ONLY GATE, and it has to be — a childless EPIC has nothing to fan out to, so Build It
+  // waits for decompose. A bug, task or feature IS the unit of work and never has children, so
+  // asking it the same question would disable the button on every single non-epic bead: the exact
+  // bug this change exists to fix, re-created one line below the fix.
+  const noChildren = beadIsEpic && childrenOf(allBeads, bead.id).length === 0;
   const startDisabled = isDecomposing || noChildren || busy;
+  const isStalled = bead.labels.includes(STALLED_LABEL);
+
+  // ══ THE EARLY RETURN IS NARROW ON PURPOSE — A REFUSAL MUST NOT EAT THE REMEDY ════════════════
+  // This used to be `if (!buildIt) return null`, which took the recovery badges down with the
+  // button. That is at its worst for exactly the bead that needs them: the sweep writes
+  // STALLED_LABEL to mean "we spent this epic's restart and it bought nothing; wait for the human",
+  // `beads.ts` names being PICKED UP as one of only three ways back — and Build It is that pickup.
+  // So hiding the button hid the last in-app way out, leaving `bd label remove` at the CLI as the
+  // founder's only remedy, and a stalled epic that had ALSO failed to decompose lost its
+  // click-to-clear retry at the same time (roborev 65607).
+  //
+  // So: render nothing only when there is genuinely nothing to show. The button is conditional; the
+  // badges are not.
+  const showButton = buildIt !== null;
+  if (!showButton && !isDecomposing && !isFailed && !isStalled && !err) return null;
 
   async function handleStart(e: MouseEvent) {
-    e.stopPropagation(); // never let Start also open the detail overlay
-    if (startDisabled) return;
+    e.stopPropagation(); // never let Build It also open the detail overlay
+    if (startDisabled || !buildIt) return;
     setErr("");
     setBusy(true);
     try {
-      // PREFLIGHT BEFORE THE CLAIM. claimBead moves the bead to in_progress, which moves this card
-      // out of the `backlog` column that renders Start at all — so claiming and THEN failing would
-      // hide the button the user just pressed (roborev 55139).
-      const blocked = sendToBuildBlockedReason(project.id, bead.id);
-      if (blocked) {
-        setErr(blocked);
-        return;
-      }
-      await claimBead(project.rootPath, bead.id); // → in_progress
-      const prd = parsePrdRef(bead.description);
-      sendToBuild({ projectId: project.id, epicId: bead.id, prdPath: prd?.relPath ?? null });
+      // The preflight-before-claim ordering (roborev 55139) lives in the hook now: `claimBead`
+      // moves the bead to in_progress, which is a state this control does not render in at all —
+      // so claiming and THEN failing would hide the button the user just pressed.
+      await buildIt();
     } catch (e2) {
       setErr(e2 instanceof Error ? e2.message : String(e2));
     } finally {
       setBusy(false);
+    }
+  }
+
+  // ══ CLEARING "STALLED" MUST MIRROR THE SWEEP'S OWN CLEAR — BOTH LABELS ══════════════════════
+  // `epicSweepRunner` takes STALLED_LABEL and SWEEP_NO_AUTO_LABEL off together, with the invariant
+  // stated at its clear path: "BOTH labels come off, on a genuine clear and on a stand-in reset
+  // alike. Leaving the marker behind would reset the epic on every tick from here on."
+  //
+  // A board chip that removed only the first would orphan the marker, and the sweep cannot then
+  // reach it: the condition it keys on is `already-escalated`, which is exactly what clearing the
+  // stalled label erases. The orphan surfaces much later, as ONE EXTRA automatic restart handed to
+  // an epic whose contract is "wait for the human" (roborev 65617).
+  //
+  // The removals are sequential and the second is tolerant of the label being absent — the common
+  // case is a stalled epic with no marker at all, written while the restart half was enabled.
+  async function clearStalled(e: MouseEvent) {
+    e.stopPropagation();
+    setErr("");
+    try {
+      await labelBead(project.rootPath, "remove", bead.id, STALLED_LABEL);
+      await labelBead(project.rootPath, "remove", bead.id, SWEEP_NO_AUTO_LABEL);
+    } catch (e2) {
+      setErr(e2 instanceof Error ? e2.message : String(e2));
     }
   }
 
@@ -1059,13 +1495,20 @@ function StartControls({
 
   return (
     <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginTop: 2 }}>
+      {showButton && (
       <button
+        // Scoped per card, because "Build It" is no longer unique on the board: it now appears on
+        // every startable card, so `getByText("Build It")` is ambiguous by design rather than by
+        // accident. Distinct from the detail overlay's `board-bead-card-build-it`.
+        data-testid="board-card-build-it"
         onClick={handleStart}
         disabled={startDisabled}
         title={
           startDisabled
             ? "decomposing…"
-            : "Build It — claim this epic and hand it to the Build orchestrator"
+            : beadIsEpic
+              ? "Build It — claim this epic and hand it to the Build orchestrator"
+              : "Build It — claim this unit of work and hand it to the Build orchestrator"
         }
         style={{
           background: startDisabled ? C.deepForest : C.teal,
@@ -1081,6 +1524,29 @@ function StartControls({
       >
         Build It
       </button>
+      )}
+      {/* THE STALLED CHIP — the way back the refusal above owes the user. Clearing the label takes
+          the epic out of the Blocked lane, which makes `isStartable` true again and brings Build It
+          back on the very next poll. Same click-to-clear shape as its two neighbours. */}
+      {isStalled && (
+        <button
+          data-testid="board-card-clear-stalled"
+          onClick={(e) => clearStalled(e)}
+          title="Stalled — the sweep gave up and is waiting for you. Click to clear the label and hand it off again"
+          style={{
+            background: "transparent",
+            border: `1px solid ${C.sienna}`,
+            borderRadius: 4,
+            color: C.sienna,
+            cursor: "pointer",
+            padding: "2px 8px",
+            fontSize: 12,
+            fontFamily: FONT_UI,
+          }}
+        >
+          stalled
+        </button>
+      )}
       {isDecomposing && (
         <button
           onClick={(e) => clearLabel(e, DECOMPOSING_LABEL)}
@@ -1132,10 +1598,13 @@ function EpicLiveStatus({
   epicId,
   allBeads,
   agents,
+  onOpen,
 }: {
   epicId: string;
   allBeads: Bead[];
   agents: AgentTab[];
+  /** Open a child's own card. Optional so a read-only mount stays possible. */
+  onOpen?: (b: Bead) => void;
 }) {
   const rows = epicChildViews(allBeads, agents, epicId);
   if (rows.length === 0) return null;
@@ -1150,7 +1619,7 @@ function EpicLiveStatus({
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
         {rows.map((row) => (
-          <EpicChildRow key={row.bead.id} row={row} agents={agents} />
+          <EpicChildRow key={row.bead.id} row={row} agents={agents} onOpen={onOpen} />
         ))}
       </div>
     </div>
@@ -1159,7 +1628,15 @@ function EpicLiveStatus({
 
 /** One child-task row of the epic's live status view: title + live stage (from the child's
  *  worker(s), same subscription pattern as the board Card) + the workers on it. */
-function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] }) {
+function EpicChildRow({
+  row,
+  agents,
+  onOpen,
+}: {
+  row: EpicChildView;
+  agents: AgentTab[];
+  onOpen?: (b: Bead) => void;
+}) {
   const { bead, workers } = row;
   const workerIds = agents
     .filter((a) => a.kind === "worker" && a.beadId === bead.id)
@@ -1170,8 +1647,16 @@ function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] 
     ),
   );
   const stage = beadStage(bead.status, bead.labels.includes(DELIVERED_LABEL), workerStages);
+  // CLICKABLE WHEN A HANDLER IS GIVEN — "I basically want to be able to easily go between task cards
+  // and epic cards with clicks relating the two to each other." Rendered as a real <button> in that
+  // case rather than a div with onClick, so it is keyboard-reachable and announced as actionable;
+  // without a handler it stays the plain div it has always been.
+  const Tag = onOpen ? "button" : "div";
   return (
-    <div
+    <Tag
+      {...(onOpen
+        ? { onClick: () => onOpen(bead), type: "button" as const, "data-testid": "epic-child-row" }
+        : {})}
       style={{
         display: "flex",
         flexDirection: "column",
@@ -1179,6 +1664,12 @@ function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] 
         padding: "6px 8px",
         background: C.forest,
         borderRadius: 6,
+        // Only meaningful on the button arm; harmless on the div.
+        width: "100%",
+        textAlign: "left",
+        border: "none",
+        font: "inherit",
+        cursor: onOpen ? "pointer" : undefined,
       }}
     >
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1199,7 +1690,7 @@ function EpicChildRow({ row, agents }: { row: EpicChildView; agents: AgentTab[] 
       {workers.length > 0 && (
         <div style={{ color: C.tealInk, fontSize: 12, lineHeight: 1.4 }}>{workers.join(", ")}</div>
       )}
-    </div>
+    </Tag>
   );
 }
 
@@ -1209,14 +1700,17 @@ function DetailOverlay({
   allBeads,
   agents,
   onClose,
+  onOpen,
 }: {
   bead: Bead;
   projectId: string;
   allBeads: Bead[];
   agents: AgentTab[];
   onClose: () => void;
+  /** Swap the overlay to another bead — a child row, so the epic↔task walk works here too. */
+  onOpen: (b: Bead) => void;
 }) {
-  const isEpic = bead.type === "epic";
+  const beadIsEpic = isEpic(allBeads, bead);
   const workers = workersForBead(agents, bead.id);
   // The project's checkout root — every WRITE is addressed by PATH. Looked up here because the
   // overlay only receives a projectId.
@@ -1389,7 +1883,9 @@ function DetailOverlay({
             stage roll-up for an epic. It is a view of OTHER beads, not of this one, so it is not a
             field the concierge card is missing — it is a different surface that happens to live
             here. */}
-        {isEpic && <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} />}
+        {beadIsEpic && (
+          <EpicLiveStatus epicId={bead.id} allBeads={allBeads} agents={agents} onOpen={onOpen} />
+        )}
       </div>
     </div>
   );

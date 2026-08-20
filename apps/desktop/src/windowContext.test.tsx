@@ -56,31 +56,60 @@ afterEach(() => {
   setSearch("");
 });
 
-// The mic's active/paused status is shared + persisted across windows. On a true cold start the
-// main window is the only window, so it resets a stale "active" (left over from a previous session)
-// back to "passive" — relaunching never resumes mid-dictation. A non-main window must NOT reset, or
-// opening a second window mid-session would clobber the live shared status.
-describe("AppBoot — cold-start mic phase reset", () => {
-  it("main window resets a stale active phase to passive on cold start", () => {
+// THE MIC'S ROUTING STATE SURVIVES A RELAUNCH, exactly as its on/off state already does.
+//
+// `dictationStore` persists BOTH user-facing mic settings — `enabled` (on/off) and `phase` (paused
+// vs. actively listening). Boot used to restore only the first and force the second back to
+// "passive", which left the two halves inconsistent in the one way the user cannot see: the mic
+// came back ARMED AND CAPTURING with routing silently off, so every hold recorded audio and
+// transcribed nothing.
+//
+// That cost the founder a live session (bead sparkle-ysv1gj). Field logs across one 10-minute
+// stretch: 49 mic toggles, 0 cloud streams opened, 1 transcript — against 3 toggles / 24 opens on
+// the previous launch, with every file in the mic path byte-identical between the two. The reset
+// was the whole difference, and nothing on screen said so.
+//
+// It was not recoverable by the obvious gesture either, which is what made it a trap rather than an
+// annoyance: `useMicToggle` (the mic button) cycled off → paused → off and could not reach "active"
+// — the single `setPhase("active")` call site was the hover pill's Listening option, so a user who
+// did not know about the pill had no way back from the reset. That gesture is now fixed too (bead
+// sparkle-yvvu27): a plain mic click arms AND routes (off → active), reaching the routing state
+// directly (MicButton.tsx). Restoring the persisted phase still matters — it brings a relaunch back
+// to the user's stated intent without a click — which is what these tests pin.
+//
+// These tests therefore assert that boot LEAVES THE HYDRATED PHASE ALONE, in both directions.
+describe("AppBoot — the persisted mic phase survives a relaunch", () => {
+  it("keeps a persisted \"active\" phase, so a relaunch comes back listening", () => {
     useDictationStore.setState({ phase: "active" });
     setSearch(""); // no ?label= → the main window
+    render(<AppBoot>ok</AppBoot>);
+    expect(useDictationStore.getState().phase).toBe("active");
+  });
+
+  // THE PAIRED DIRECTION, and it is what stops this from being pinned by a flipped constant: a
+  // boot that wrote `setPhase("active")` unconditionally would satisfy the test above and fail
+  // here. Only "boot does not write the phase at all" satisfies both.
+  it("keeps a persisted \"passive\" phase — boot writes neither value", () => {
+    useDictationStore.setState({ phase: "passive" });
+    setSearch("");
     render(<AppBoot>ok</AppBoot>);
     expect(useDictationStore.getState().phase).toBe("passive");
   });
 
-  it("resets the mic phase regardless of URL params — one window, always \"main\"", () => {
+  it("leaves the phase alone regardless of URL params — one window, always \"main\"", () => {
     // CM-U7 part 2: there are no secondary windows; the boot hygiene always runs.
     useDictationStore.setState({ phase: "active" });
     setSearch("?label=win-1"); // a stale multi-window era URL must not change behavior
     render(<AppBoot>ok</AppBoot>);
-    expect(useDictationStore.getState().phase).toBe("passive");
+    expect(useDictationStore.getState().phase).toBe("active");
   });
 
-  it("main window defers the reset until hydration finishes when not yet hydrated", () => {
-    // Real localStorage hydrates synchronously in tests, so the sync (hasHydrated) branch is what
-    // the tests above exercise. Drive the async branch directly: stub the store as not-yet-hydrated
-    // and capture the onFinishHydration callback, then fire it. The reset must be deferred until the
-    // persisted value has landed — otherwise it would be overwritten by hydration.
+  it("does not clobber the phase when hydration settles AFTER mount", () => {
+    // Real localStorage hydrates synchronously in tests, so the tests above exercise the already-
+    // hydrated path. Drive the deferred path directly: stub the store as not-yet-hydrated, render,
+    // then settle hydration. The removed reset ran on exactly this callback, so this is the arm
+    // that would resurrect it — a re-added `onFinishHydration(() => setPhase("passive"))` passes
+    // every other test here and fails only this one.
     useDictationStore.setState({ phase: "active" });
     let finishHydration: (() => void) | undefined;
     const hasHydrated = vi.spyOn(useDictationStore.persist, "hasHydrated").mockReturnValue(false);
@@ -93,12 +122,11 @@ describe("AppBoot — cold-start mic phase reset", () => {
 
     setSearch(""); // the main window
     render(<AppBoot>ok</AppBoot>);
-    // Hydration still in flight → reset deferred, phase untouched so far.
     expect(useDictationStore.getState().phase).toBe("active");
 
-    // Hydration settles → the deferred reset fires.
+    // Hydration settles — and still nothing writes the phase.
     finishHydration?.();
-    expect(useDictationStore.getState().phase).toBe("passive");
+    expect(useDictationStore.getState().phase).toBe("active");
 
     hasHydrated.mockRestore();
     onFinish.mockRestore();

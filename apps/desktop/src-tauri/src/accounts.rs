@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::identity_log::{self, IdentityLog};
 
@@ -644,10 +644,20 @@ fn dir_to_remove_on_remove(acct: &Account) -> Option<PathBuf> {
 /// dir of a default account (see [`dir_to_remove_on_remove`]).
 fn remove_account_at(accounts_path: &Path, id: &str) -> Result<(), String> {
     let mut accounts = read_accounts_at(accounts_path)?;
-    let pos = accounts
-        .iter()
-        .position(|a| a.id == id)
-        .ok_or_else(|| format!("account not found: {id}"))?;
+    // IDEMPOTENT ON PURPOSE — removing an account that is already gone is SUCCESS, not an error.
+    //
+    // The founder deleted an account, saw the row still on screen (the UI waited on this call
+    // before dropping it), clicked again, and got `account not found: <id>` in an error box — a
+    // failure notice for an operation that had in fact done exactly what he asked, twice. The
+    // caller's own retry, a double-click, and two panes racing the same delete all produce that
+    // shape, and in every one of them the END STATE the caller wanted is already true.
+    //
+    // Contrast `set_nickname_at` / `mark_exhausted_at` above, which keep the not-found error: those
+    // ask to MUTATE a record, so a missing one means the write went nowhere and the caller must
+    // hear about it. A delete is the one operation whose goal is the record's absence.
+    let Some(pos) = accounts.iter().position(|a| a.id == id) else {
+        return Ok(());
+    };
     let acct = accounts.remove(pos);
     if let Some(dir) = dir_to_remove_on_remove(&acct) {
         let _ = std::fs::remove_dir_all(&dir); // best-effort; metadata removal is the source of truth
@@ -861,6 +871,59 @@ fn mark_exhausted_at(
         }
     }
     write_accounts_at(accounts_path, &accounts)
+}
+
+/// The id of the account registered under `config_dir`, or `None`. Pure so the mapping — the one
+/// piece of new logic on the concierge's rotation-bench path — is unit-testable without an
+/// `AppHandle` or a filesystem.
+///
+/// An EMPTY `config_dir` never matches: the shared `$HOME/.claude` default records `config_dir: ""`
+/// (meaning "export no override"), and benching the default by a blank string would be ambiguous —
+/// the concierge steers AWAY from a clobbered default rather than benching it by id (see
+/// `bench_config_dir_auth_dead`). A blank query against a stored blank must therefore be a miss, not
+/// a match on whichever default happens to be first.
+pub(crate) fn account_id_for_config_dir(accounts: &[Account], config_dir: &str) -> Option<String> {
+    if config_dir.is_empty() {
+        return None;
+    }
+    accounts
+        .iter()
+        .find(|a| a.config_dir == config_dir)
+        .map(|a| a.id.clone())
+}
+
+/// Bench the account registered under `config_dir` as auth-dead for `secs` seconds, so every consumer
+/// that reads `exhausted_until` — the concierge's next resolution, the roborev shim, build agents —
+/// routes around it. Reuses [`mark_exhausted_at`] (the SAME write `accounts_mark_exhausted` makes,
+/// with the same identity-owner bookkeeping and sibling fan-out on read) and republishes the roborev
+/// candidate list, so one bench converges the whole fleet.
+///
+/// Returns `Ok(false)` — never an error — when nothing matches or `config_dir` is empty (the default
+/// account): a rotation whose dead account cannot be identified still succeeds at its real job, which
+/// is running the retry on the healthy account. The [`AccountsLock`] is taken for the read-modify-write,
+/// exactly as `accounts_mark_exhausted` does, so a concurrent writer cannot interleave.
+pub(crate) fn bench_config_dir_auth_dead(
+    app: &AppHandle,
+    config_dir: &str,
+    secs: i64,
+) -> Result<bool, String> {
+    if config_dir.is_empty() {
+        return Ok(false);
+    }
+    let lock = app.state::<AccountsLock>();
+    let _guard = lock.guard();
+    let app_data = crate::worktree::app_data_dir_pub(app)?;
+    let path = accounts_json_path(&app_data);
+    let accounts = read_accounts_at(&path)?;
+    let Some(id) = account_id_for_config_dir(&accounts, config_dir) else {
+        return Ok(false);
+    };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    mark_exhausted_at(&path, &id, now_secs() + secs, home.as_deref())?;
+    if let Some(h) = home.as_deref() {
+        republish_roborev_candidates(&app_data, h);
+    }
+    Ok(true)
 }
 
 // ---- usage tally (pure) -------------------------------------------------------
@@ -1875,6 +1938,249 @@ fn latest_limit_event_at(
     reads
 }
 
+// ---- OAuth-expiry ("auth-dead") detection for the roborev shim -----------------
+//
+// The AUTH analogue of a rate-limit event. An account whose OAuth session can no longer be refreshed
+// is still signed in — its keychain credential reads fine, so `has_readable_credential` keeps it in
+// the roborev candidate pool — but every `claude` under it fails at auth time. Worse, an
+// unauthenticated account has consumed zero tokens, so it scores as the account with the MOST
+// headroom and roborev routes EVERY review to the one login guaranteed to fail.
+//
+// We detect it the same way we detect a quota wall: by scanning the account's OWN transcripts (by
+// FILE, so attribution is free) for the structured API-error record Claude Code writes when auth
+// fails, and matching it against `roborev_account::is_auth_expired`. The result feeds
+// `publish_candidates_excluding_auth_dead`, which drops the dead login from the next shim's list.
+// Unlike a rate-limit event this has no reset instant, so it is NOT surfaced to the limit modal — it
+// is roborev-scoped.
+//
+// RECOVERY: we compare the account's newest auth-error timestamp against its newest
+// AFFIRMATIVE-SUCCESS turn (an assistant turn carrying `message.usage`, never a bare `user` line, a
+// quota record, or a differently-worded error — see `is_successful_turn`), and mark it dead only when
+// the error is the newer of the two. Two things clear a bench, and NEITHER is a bare `claude login`
+// (which writes no session turn): (1) a COMPLETED run under the account writes a newer usage turn —
+// which happens when the interactive fleet shares the account; (2) the auth error AGES OUT of the
+// `AUTH_EXPIRY_LOOKBACK` window (its transcript mtime falls before the floor), after which roborev
+// retries the account and re-benches only if it fails again. This matters because an auth-dead
+// account is DROPPED from the candidate list, so roborev never execs `claude` under it — a
+// roborev-ONLY account therefore cannot write its own clearing turn and heals solely via (2), the
+// bounded lookback expiry. The scan is also FLOORED at the identity takeover (the same floor the
+// rate-limit
+// path uses), so a config dir that was re-logged into a DIFFERENT account never inherits the
+// previous login's death.
+//
+// LIMITATION (bead sparkle-2kg6re): this depends on Claude Code persisting the auth failure as a
+// transcript record. A failure that aborts BEFORE any session JSONL is written would leave nothing to
+// scan, making this path inert for that shape. BUG 1's straight-exec fix is independent of this and
+// already resolves the live outage; the robust future source is roborev's own `~/.roborev/reviews.db`
+// job outcomes. What is committed here is correct WHEN a record exists, and cannot false-positive on
+// prose (see `record_is_auth_expiry`'s discriminator).
+
+/// How far back to look for an auth-expiry record. Same lookback as a limit event — and it doubles as
+/// the bench-EXPIRY for a roborev-only account (case (2) in the recovery note): once the error is
+/// older than this, it is no longer read, so the account is retried.
+const AUTH_EXPIRY_LOOKBACK: i64 = LIMIT_EVENT_LOOKBACK;
+
+/// Is this transcript record Claude Code's own API-ERROR turn AND does its text carry the OAuth
+/// refresh-failure signature? The `isApiErrorMessage`/top-level-`error` gate is the discriminator —
+/// the same discipline the rate-limit scanner uses — so an assistant merely QUOTING "please run
+/// /login" in ordinary prose can never bench a healthy account.
+fn record_is_auth_expiry(v: &serde_json::Value) -> bool {
+    let is_api_error = v.get("isApiErrorMessage").and_then(serde_json::Value::as_bool) == Some(true);
+    let top_error = v.get("error").and_then(serde_json::Value::as_str);
+    if !is_api_error && top_error.is_none() {
+        return false;
+    }
+    if let Some(t) = limit_event_text(v) {
+        if crate::roborev_account::is_auth_expired(&t) {
+            return true;
+        }
+    }
+    if top_error.is_some_and(crate::roborev_account::is_auth_expired) {
+        return true;
+    }
+    v.get("result")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(crate::roborev_account::is_auth_expired)
+}
+
+/// An AFFIRMATIVE success turn — the only thing that counts as "recovered". A signed-in `claude -p`
+/// writes an assistant turn carrying `message.usage`; a bare `user` turn (Claude Code appends the
+/// user half BEFORE the request is even made), a quota record, or a differently-worded API error are
+/// all NON-successes and must NOT clear a bench. Mirrors the discriminator discipline
+/// [`record_is_auth_expiry`] applies to the error side, so one unmatched error line can never
+/// un-bench an account the scan already proved dead.
+fn is_successful_turn(v: &serde_json::Value) -> bool {
+    let is_error = v.get("isApiErrorMessage").and_then(serde_json::Value::as_bool) == Some(true)
+        || v.get("error").is_some();
+    !is_error
+        && v.get("type").and_then(serde_json::Value::as_str) == Some("assistant")
+        && v.get("message").and_then(|m| m.get("usage")).is_some()
+}
+
+/// The error-side cheap-reject predicate: does this ALREADY-LOWERCASED transcript line carry any auth
+/// marker? Its own function so the coupling test
+/// (`every_auth_phrase_survives_the_scan_prefilter`) exercises the REAL predicate rather than a
+/// copy — editing these tokens reds that test.
+fn line_carries_auth_marker(lower: &str) -> bool {
+    lower.contains("oauth") || lower.contains("login") || lower.contains("refreshed")
+}
+
+/// Fold one transcript's in-window records into the newest AUTH-ERROR and newest AFFIRMATIVE-SUCCESS
+/// timestamps, so the caller can tell "failed and never recovered" from "failed, then succeeded".
+/// Defensive throughout: an unreadable file or an unparseable line is skipped, never fatal.
+///
+/// A CHEAP REJECT runs before any JSON parse — the sibling rate-limit scanner spends one, and this
+/// path runs synchronously under `AccountsLock` from `accounts_mark_exhausted`, so a full parse of
+/// every transcript line (each carrying whole tool results) would block the accounts lock. A line can
+/// only matter if it carries an auth marker (error side: [`line_carries_auth_marker`]'s
+/// `oauth`/`login`/`refreshed`, a maintained SUPERSET of
+/// [`crate::roborev_account::AUTH_EXPIRY_PHRASES`] — NOT immune to drift, so
+/// `every_auth_phrase_survives_the_scan_prefilter` reds the suite if a phrase is added that these
+/// tokens don't cover) or `"usage"` (success side); everything else — the bulk of the corpus — is
+/// skipped.
+fn fold_auth_signals(path: &Path, floor: i64, newest_error: &mut Option<i64>, newest_ok: &mut Option<i64>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        let maybe_error = line_carries_auth_marker(&lower);
+        let maybe_ok = line.contains("\"usage\"");
+        if !maybe_error && !maybe_ok {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(ts) = v
+            .get("timestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(parse_iso8601_to_epoch)
+        else {
+            continue;
+        };
+        if ts < floor {
+            continue;
+        }
+        if maybe_error && record_is_auth_expiry(&v) {
+            if newest_error.is_none_or(|e| ts > e) {
+                *newest_error = Some(ts);
+            }
+        } else if maybe_ok && is_successful_turn(&v) && newest_ok.is_none_or(|o| ts > o) {
+            *newest_ok = Some(ts);
+        }
+    }
+}
+
+/// Recursively fold every in-window transcript under `root` into the newest-error / newest-ok pair.
+/// Mirrors [`latest_limit_event_at`]'s traversal (symlink-cycle guard, mtime pre-filter, listing
+/// cache). No short-circuit: recovery is a CROSS-file comparison, so a later clean file must be seen
+/// even after an earlier file's error record.
+fn fold_auth_signals_at(
+    root: &Path,
+    floor: i64,
+    newest_error: &mut Option<i64>,
+    newest_ok: &mut Option<i64>,
+    now: SystemTime,
+) {
+    let Some((dirs, files, _did_read)) = list_transcript_dir(root, now) else {
+        return;
+    };
+    for name in files.iter() {
+        let path = root.join(name);
+        if let Some(modified) = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok()) {
+            if let Ok(dur) = modified.duration_since(UNIX_EPOCH) {
+                if (dur.as_secs() as i64) < floor {
+                    continue;
+                }
+            }
+        }
+        fold_auth_signals(&path, floor, newest_error, newest_ok);
+    }
+    for name in dirs.iter() {
+        fold_auth_signals_at(&root.join(name), floor, newest_error, newest_ok, now);
+    }
+}
+
+/// True when the newest auth-relevant signal under `root` (at/after `floor`) is an auth-error with no
+/// later successful turn — i.e. the login failed auth and has not recovered. Extracted from
+/// [`account_shows_auth_expiry`] so the recovery logic is unit-testable against a temp transcript
+/// tree without going through account/identity resolution.
+fn root_is_auth_dead(root: &Path, floor: i64, now: SystemTime) -> bool {
+    let mut newest_error = None;
+    let mut newest_ok = None;
+    fold_auth_signals_at(root, floor, &mut newest_error, &mut newest_ok, now);
+    match newest_error {
+        // Dead iff nothing succeeded at or after the failure. `>=` (not `>`) so a same-timestamp
+        // ordinary turn does not out-vote the error it accompanies.
+        Some(err) => newest_ok.is_none_or(|ok| err >= ok),
+        None => false,
+    }
+}
+
+/// True if this account's transcripts show an unrecovered OAuth-expiry — its login is signed in but
+/// auth-dead and roborev must route around it. Floored at the identity takeover (same as
+/// [`limit_event_for_account`]) so a previous login's death in the same tree can't bench the current
+/// one.
+fn account_shows_auth_expiry(acct: &Account, now: i64, home: Option<&Path>, log: &IdentityLog) -> bool {
+    let Some(root) = projects_root_for_account_at(acct, home) else {
+        return false;
+    };
+    let floor = identity_key_for(acct, home)
+        .and_then(|k| identity_log::takeover_at(log, &acct.config_dir, &k))
+        .map_or(now - AUTH_EXPIRY_LOOKBACK, |t| t.max(now - AUTH_EXPIRY_LOOKBACK));
+    let dead = root_is_auth_dead(&root, floor, SystemTime::now());
+    evict_dir_cache();
+    dead
+}
+
+/// Given the directly-observed dead config dirs and each account's `(config_dir, identity_key)`,
+/// expand the dead set so a dead login's SIBLING registrations (a second account row pointing at the
+/// same underlying login) are excluded too — the identity-aware benching the interactive fleet
+/// already applies to quota walls. Pure, so the expansion is unit-testable without `.claude.json` IO.
+fn expand_auth_dead_across_identity(
+    directly_dead: &HashSet<String>,
+    account_identities: &[(String, Option<String>)],
+) -> HashSet<String> {
+    let dead_identities: HashSet<String> = account_identities
+        .iter()
+        .filter(|(dir, _)| directly_dead.contains(dir))
+        .filter_map(|(_, key)| key.clone())
+        .collect();
+    let mut out = directly_dead.clone();
+    if dead_identities.is_empty() {
+        return out;
+    }
+    for (dir, key) in account_identities {
+        if key.as_ref().is_some_and(|k| dead_identities.contains(k)) {
+            out.insert(dir.clone());
+        }
+    }
+    out
+}
+
+/// The set of config dirs roborev must EXCLUDE for OAuth-expiry, expanded across identity.
+fn roborev_auth_dead_dirs(
+    accounts: &[Account],
+    home: Option<&Path>,
+    log: &IdentityLog,
+    now: i64,
+) -> HashSet<String> {
+    let directly_dead: HashSet<String> = accounts
+        .iter()
+        .filter(|a| account_shows_auth_expiry(a, now, home, log))
+        .map(|a| a.config_dir.clone())
+        .collect();
+    if directly_dead.is_empty() {
+        return directly_dead;
+    }
+    let identities: Vec<(String, Option<String>)> = accounts
+        .iter()
+        .map(|a| (a.config_dir.clone(), identity_key_for(a, home)))
+        .collect();
+    expand_auth_dead_across_identity(&directly_dead, &identities)
+}
+
 /// The transcript root for one account, resolved the SAME way session detection does.
 ///
 /// Passing `$HOME` matters: the default account stores an EMPTY `config_dir` (see
@@ -2334,13 +2640,88 @@ fn effective_exhaustion(acct: &Account, current: Option<&OauthIdentity>, now: i6
     }
 }
 
+/// The later of two optional walls, treating `None` as "no wall". Used to fold a sibling's
+/// exhaustion into an account's own: the identity stays benched until the LAST of its walls clears,
+/// which is the fail-safe direction — never route work into a quota pool a sibling reports walled.
+fn later_wall(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// Identity-aware effective exhaustion: `target`'s own [`effective_exhaustion`] rolled together with
+/// every SIBLING registration that resolves to the SAME identity.
+///
+/// [`effective_exhaustion`] is strictly per-CONFIG-DIR: it answers only "is THIS registration's own
+/// bench still owned by the login in it". But a rate limit is a fact about an ANTHROPIC ACCOUNT, and
+/// the ~10 registered dirs collapse to ~4 distinct logins (multiple dirs per account — "DROdio
+/// Storytell" and "DROdio Gmail" both resolve to one `accountUuid`; see
+/// [`AccountIdentity::account_uuid`]). So when one dir of a login hits its wall, its sibling dirs
+/// still read `exhausted_until: null` and the headroom ranker sees "healthy" accounts that are really
+/// walled quota pools — which is the root cause of rotation repeatedly landing the fleet on walls.
+///
+/// Two dirs are SIBLINGS iff their live identities resolve to the SAME [`identity_key`] — the
+/// `accountUuid` when present, its email form otherwise. Email STRING matching is deliberately NOT
+/// used: two dirs can hold logins to one account under one email, which is the whole reason
+/// `accountUuid` is the discriminator. An identity reads as exhausted if ANY sibling is currently
+/// walled, and the epoch returned is the LATEST such wall (see [`later_wall`]) so the identity stays
+/// benched until the last sibling clears.
+///
+/// UNKNOWN identity NEVER merges. A dir whose `.claude.json` does not resolve to an identity is
+/// treated on its OWN — "can't resolve" is not "the same account as another unresolvable dir", the
+/// same fail-safe [`effective_exhaustion`] applies to an unreadable owner. Merging two unknowns would
+/// invent a sibling relationship on no evidence and could bench a genuinely healthy account.
+///
+/// `identities` is parallel to `accounts`; each entry is that account's live identity (`None` =
+/// unresolvable). Kept as an injected slice rather than read here so the contagion logic is
+/// unit-testable without the filesystem — [`resolve_identities`] is the file-reading half.
+fn effective_exhaustion_across_identity_with(
+    accounts: &[Account],
+    identities: &[Option<OauthIdentity>],
+    target_idx: usize,
+    now: i64,
+) -> Option<i64> {
+    let target = &accounts[target_idx];
+    let target_identity = identities[target_idx].as_ref();
+    let mut wall = effective_exhaustion(target, target_identity, now);
+    // Unknown identity: never merge with anyone. Treat this dir strictly on its own.
+    let Some(target_key) = target_identity.map(identity_key) else {
+        return wall;
+    };
+    for (i, sib) in accounts.iter().enumerate() {
+        if i == target_idx {
+            continue;
+        }
+        // A sibling with an unresolvable identity is never merged — unknown != same.
+        let Some(sib_key) = identities[i].as_ref().map(identity_key) else {
+            continue;
+        };
+        if sib_key != target_key {
+            continue;
+        }
+        // The sibling's OWN effective exhaustion (ownership-checked against ITS current login), so a
+        // sibling whose bench belongs to a since-switched login does not contaminate this one.
+        wall = later_wall(wall, effective_exhaustion(sib, identities[i].as_ref(), now));
+    }
+    wall
+}
+
+/// Resolve every account's live identity in one pass — the file-reading half that
+/// [`effective_exhaustion_across_identity_with`] is factored out from, so the contagion logic stays
+/// unit-testable without touching the filesystem.
+fn resolve_identities(accounts: &[Account], home: Option<&Path>) -> Vec<Option<OauthIdentity>> {
+    accounts.iter().map(|a| identity_for_account(a, home)).collect()
+}
+
 /// Usage for EVERY account in one pass: one generation across all of them, eviction once at the
 /// end. Extracted from the command body so the invariant is testable — inlined there, reverting to
 /// a generation per account left every test green while restoring the memo thrash.
 fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
     let pass = UsagePass::start();
     let mut touched = 0usize;
-    let usage: Vec<AccountUsage> = accounts
+    let mut usage: Vec<AccountUsage> = accounts
         .iter()
         .map(|a| {
             let (u, n) = usage_for_account(a, now, pass.id());
@@ -2349,6 +2730,16 @@ fn usage_for_accounts(accounts: &[Account], now: i64) -> Vec<AccountUsage> {
         })
         .collect();
     finish_usage_pass(pass, touched > 0);
+    // Identity-level contagion. `usage_for_account` set each `exhausted_until` from that dir's OWN
+    // bench alone, but a login's multiple config dirs share one Anthropic quota pool: a wall on ANY
+    // sibling dir of the same identity walls this one too. Resolve identities once and fold siblings
+    // in — without this the headroom ranker (and roborev, downstream) reads a walled login's other
+    // dirs as healthy and rotation lands the fleet straight back onto the wall (sparkle-xsr6o).
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let identities = resolve_identities(accounts, home.as_deref());
+    for (i, u) in usage.iter_mut().enumerate() {
+        u.exhausted_until = effective_exhaustion_across_identity_with(accounts, &identities, i, now);
+    }
     usage
 }
 
@@ -2895,12 +3286,46 @@ pub(crate) fn republish_roborev_candidates(app_data: &Path, home: &Path) {
     let accounts = if signed_in.is_empty() { all } else { signed_in };
 
     let now = now_secs();
-    let tallies: Vec<(String, u64)> = usage_for_accounts(&accounts, now)
-        .into_iter()
-        .map(|u| (u.id, u.tokens_5h))
-        .collect();
+    let usages = usage_for_accounts(&accounts, now);
+    let tallies: Vec<(String, u64)> = usages.iter().map(|u| (u.id.clone(), u.tokens_5h)).collect();
     let headroom = crate::roborev_account::headroom_from_tokens(&tallies);
-    let _ = crate::roborev_account::publish_candidates(home, &accounts, &headroom, now);
+    // TWO corrections compose here, both feeding the same publish:
+    //
+    // (1) IDENTITY-AWARE QUOTA EXHAUSTION (sparkle-xsr6o): `usage_for_accounts` computes exhaustion
+    // per IDENTITY, so carry it onto the accounts roborev ranks — its ranker reads the raw
+    // `exhausted_until` field (a deliberately pure, no-filesystem module), so the correction is
+    // written back onto that field rather than duplicating the identity plumbing into it. Without it
+    // a review routes to a sibling dir of a walled login and re-hits the same quota pool immediately.
+    let corrected: Vec<Account> = accounts
+        .iter()
+        .map(|a| {
+            let mut a = a.clone();
+            a.exhausted_until = usages
+                .iter()
+                .find(|u| u.id == a.id)
+                .and_then(|u| u.exhausted_until);
+            a
+        })
+        .collect();
+
+    // (2) REACTIVE OAUTH-EXPIRY BENCHING (sparkle-2kg6re): an account that is signed in but auth-dead
+    // reads healthy to every OTHER signal (readable credential, zero usage ⇒ most headroom), so
+    // without this it wins the ranking and every review dies at auth. Detected by scanning each
+    // account's own transcripts for Claude Code's auth-error record, expanded across identity, and
+    // dropped from the list — with the last-healthy guard inside the ranker, so this never strands
+    // roborev. The scan reads config dirs / transcripts / identity, NOT `exhausted_until`, so it runs
+    // on `accounts` (pre-correction) and composes with (1) rather than depending on it. Use the
+    // caller's own `home` (it is `$HOME`; threading it the whole way through the usage path above is a
+    // separate change) so the default account's roots resolve from a home a test can inject.
+    let log = identity_log::read_log_at(&identity_log::identity_log_path(app_data));
+    let auth_dead = roborev_auth_dead_dirs(&accounts, Some(home), &log, now);
+
+    // Publish once: identity-CORRECTED accounts (so ranking/`is_healthy` is identity-aware) AND the
+    // auth-dead exclusion. Both features hold — an auth-dead identity is excluded, and a walled
+    // login's siblings are benched by the corrected exhaustion.
+    let _ = crate::roborev_account::publish_candidates_excluding_auth_dead(
+        home, &corrected, &headroom, &auth_dead, now,
+    );
 }
 
 /// Per-account token tallies (5h / 7d) plus any in-effect exhausted-until epoch.
@@ -3553,6 +3978,26 @@ mod tests {
             exhausted_until: None,
         exhausted_identity: None,
         }
+    }
+
+    /// The one piece of NEW logic on the concierge's rotation-bench path: map the failed
+    /// `config_dir` back to the account id `mark_exhausted_at` benches. Asserts the SIDE EFFECT — the
+    /// id that gets benched — for each shape, including the two that must NOT bench a wrong account:
+    /// an empty query (the shared default) and a non-matching dir.
+    #[test]
+    fn account_id_for_config_dir_maps_only_a_real_dedicated_dir() {
+        let accounts = vec![
+            sample("default", true, ""),
+            sample("acct-b", false, "/accounts/acct-b"),
+            sample("acct-c", false, "/accounts/acct-c"),
+        ];
+        assert_eq!(account_id_for_config_dir(&accounts, "/accounts/acct-b").as_deref(), Some("acct-b"));
+        assert_eq!(account_id_for_config_dir(&accounts, "/accounts/acct-c").as_deref(), Some("acct-c"));
+        // An empty query must NOT match the default's empty `config_dir` — benching the default by a
+        // blank string is exactly the ambiguity this guard prevents.
+        assert_eq!(account_id_for_config_dir(&accounts, ""), None);
+        // A dir no account is registered under benches nothing rather than the wrong account.
+        assert_eq!(account_id_for_config_dir(&accounts, "/accounts/gone"), None);
     }
 
     #[test]
@@ -4550,6 +4995,180 @@ mod tests {
     }
 
     #[test]
+    fn a_wall_on_one_dir_benches_its_same_identity_sibling() {
+        // THE ROOT FIX (sparkle-xsr6o). effective_exhaustion is strictly per-config-dir, so a login's
+        // OTHER dirs read exhausted_until:null while one is walled — the headroom ranker then sees
+        // "healthy" accounts that are really one walled quota pool. Two dirs, SAME login: A walled, B
+        // not → B must read as walled too.
+        let now = 1_700_000_000;
+        let mut a = sample("a", false, "/dirs/a");
+        a.exhausted_until = Some(now + 3_600);
+        a.exhausted_identity = Some("uuid-shared".to_string());
+        let b = sample("b", false, "/dirs/b"); // no bench of its own
+        let accounts = vec![a, b];
+        let ids = vec![
+            Some(oauth(Some("uuid-shared"), "shared@x.com")),
+            Some(oauth(Some("uuid-shared"), "shared@x.com")),
+        ];
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 1, now),
+            Some(now + 3_600),
+            "a healthy dir of a walled login must read as walled (contagion)"
+        );
+        // A itself is still walled.
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 0, now),
+            Some(now + 3_600)
+        );
+
+        // PAIRED negative: with NO wall anywhere on the identity, B stays healthy — proving the wall
+        // CAUSED the contagion, not a function that always returns Some.
+        let mut healthy = accounts.clone();
+        healthy[0].exhausted_until = None;
+        healthy[0].exhausted_identity = None;
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&healthy, &ids, 1, now),
+            None,
+            "no wall on the identity → no false bench"
+        );
+    }
+
+    #[test]
+    fn a_wall_takes_the_latest_sibling_epoch() {
+        // The identity stays benched until the LAST of its dirs clears — the fail-safe direction, so
+        // work is never routed into a pool a sibling still reports walled.
+        let now = 1_700_000_000;
+        let mut a = sample("a", false, "/dirs/a");
+        a.exhausted_until = Some(now + 1_000);
+        a.exhausted_identity = Some("uuid-shared".to_string());
+        let mut b = sample("b", false, "/dirs/b");
+        b.exhausted_until = Some(now + 9_000); // the later wall
+        b.exhausted_identity = Some("uuid-shared".to_string());
+        let accounts = vec![a, b];
+        let ids = vec![
+            Some(oauth(Some("uuid-shared"), "shared@x.com")),
+            Some(oauth(Some("uuid-shared"), "shared@x.com")),
+        ];
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 0, now),
+            Some(now + 9_000),
+            "the identity is benched until its latest sibling wall clears"
+        );
+    }
+
+    #[test]
+    fn a_wall_does_not_bench_a_different_identity() {
+        // PAIRED with the contagion test: DIFFERENT logins must not cross-contaminate, or the fix
+        // would bench genuinely healthy accounts and make rotation worse, not better.
+        let now = 1_700_000_000;
+        let mut a = sample("a", false, "/dirs/a");
+        a.exhausted_until = Some(now + 3_600);
+        a.exhausted_identity = Some("uuid-a".to_string());
+        let b = sample("b", false, "/dirs/b");
+        let accounts = vec![a, b];
+        let ids = vec![
+            Some(oauth(Some("uuid-a"), "a@x.com")),
+            Some(oauth(Some("uuid-b"), "b@x.com")), // a DIFFERENT login
+        ];
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 1, now),
+            None,
+            "a wall on a different account must not bench this one"
+        );
+        // A stays walled on its own.
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 0, now),
+            Some(now + 3_600)
+        );
+    }
+
+    #[test]
+    fn an_unknown_identity_dir_is_never_merged() {
+        // "Can't resolve" is not "the same account as another unresolvable dir". Merging two unknowns
+        // would invent a sibling relationship on no evidence and bench a genuinely healthy account.
+        let now = 1_700_000_000;
+        let mut a = sample("a", false, "/dirs/a");
+        a.exhausted_until = Some(now + 3_600);
+        a.exhausted_identity = None; // legacy/unowned bench — honoured for A itself
+        let b = sample("b", false, "/dirs/b");
+        let accounts = vec![a, b];
+        let ids: Vec<Option<OauthIdentity>> = vec![None, None]; // BOTH unresolvable
+
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 1, now),
+            None,
+            "an unknown-identity dir must not inherit another unknown dir's wall"
+        );
+        // A still honours its OWN bench (can't-tell owner is not somebody-else).
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts, &ids, 0, now),
+            Some(now + 3_600)
+        );
+
+        // And a KNOWN walled login must not leak into an unresolvable sibling dir either.
+        let mut accounts2 = accounts.clone();
+        accounts2[0].exhausted_identity = Some("uuid-a".to_string());
+        let ids_mixed = vec![Some(oauth(Some("uuid-a"), "a@x.com")), None];
+        assert_eq!(
+            effective_exhaustion_across_identity_with(&accounts2, &ids_mixed, 1, now),
+            None,
+            "a known login's wall must not bench an unresolvable dir"
+        );
+    }
+
+    #[test]
+    fn usage_for_accounts_applies_identity_level_contagion() {
+        // THE WIRING, through the real production entry point. Deleting the contagion post-pass in
+        // `usage_for_accounts` leaves the healthy same-login sibling reading as healthy — the whole
+        // bug — while every pure-core test above stays green. This is the test that catches that.
+        let base = unique_dir("identity-contagion-wiring");
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        // Both dirs resolve to the SAME accountUuid — the real "two dirs, one login" shape.
+        write_claude_json(
+            &dir_a,
+            r#"{"oauthAccount":{"emailAddress":"shared@x.com","accountUuid":"uuid-shared"}}"#,
+        );
+        write_claude_json(
+            &dir_b,
+            r#"{"oauthAccount":{"emailAddress":"shared@x.com","accountUuid":"uuid-shared"}}"#,
+        );
+
+        let now = now_secs();
+        let until = now + 3_600;
+        let mut a = sample("a", false, dir_a.to_str().unwrap());
+        a.exhausted_until = Some(until);
+        a.exhausted_identity = Some("uuid-shared".to_string());
+        let b = sample("b", false, dir_b.to_str().unwrap()); // no bench of its own
+
+        let usage = usage_for_accounts(&[a, b], now);
+        let wall_for = |id: &str| usage.iter().find(|u| u.id == id).unwrap().exhausted_until;
+        assert_eq!(wall_for("a"), Some(until), "the walled dir stays walled");
+        assert_eq!(
+            wall_for("b"),
+            Some(until),
+            "its healthy same-login sibling must now read as walled too"
+        );
+
+        // PAIRED negative through the SAME entry point: a DIFFERENT login on dir B stays healthy.
+        write_claude_json(
+            &dir_b,
+            r#"{"oauthAccount":{"emailAddress":"other@x.com","accountUuid":"uuid-other"}}"#,
+        );
+        let mut a2 = sample("a", false, dir_a.to_str().unwrap());
+        a2.exhausted_until = Some(until);
+        a2.exhausted_identity = Some("uuid-shared".to_string());
+        let b2 = sample("b", false, dir_b.to_str().unwrap());
+        let usage2 = usage_for_accounts(&[a2, b2], now);
+        assert_eq!(
+            usage2.iter().find(|u| u.id == "b").unwrap().exhausted_until,
+            None,
+            "a different login must not be benched by the wall on dir A"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn remove_refuses_to_delete_a_default_dir() {
         let base = unique_dir("remove");
         let path = accounts_json_path(&base);
@@ -4576,6 +5195,47 @@ mod tests {
         remove_account_at(&path, "added1").unwrap();
         assert!(!added_dir.exists(), "non-default config dir is deleted");
         assert!(read_accounts_at(&path).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Deleting an account that is ALREADY gone is success, not `account not found`.
+    ///
+    /// This is the second click. The founder removed an account, the row stayed on screen while the
+    /// call was in flight, he clicked again, and the second call reported failure for a delete that
+    /// had already succeeded. The assertion is on the SECOND call's result and on the store being
+    /// untouched by it — not merely on the first, which passed before this change too.
+    #[test]
+    fn remove_is_idempotent_when_the_account_is_already_gone() {
+        let base = std::env::temp_dir().join(format!("sparkle-remove-idem-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&base);
+        let path = base.join("accounts.json");
+        let keep_dir = base.join("keep");
+        let gone_dir = base.join("gone");
+        let _ = std::fs::create_dir_all(&keep_dir);
+        let _ = std::fs::create_dir_all(&gone_dir);
+        write_accounts_at(
+            &path,
+            &vec![
+                sample("keep", false, keep_dir.to_str().unwrap()),
+                sample("gone", false, gone_dir.to_str().unwrap()),
+            ],
+        )
+        .unwrap();
+
+        remove_account_at(&path, "gone").unwrap();
+        assert_eq!(read_accounts_at(&path).unwrap().len(), 1);
+
+        // THE SECOND CLICK: same id, now absent. Ok, and the surviving account is left alone.
+        remove_account_at(&path, "gone").expect("removing an absent account must be Ok");
+        let left = read_accounts_at(&path).unwrap();
+        assert_eq!(left.len(), 1, "a no-op remove must not disturb the store");
+        assert_eq!(left[0].id, "keep");
+        assert!(keep_dir.exists(), "a no-op remove must not delete another account's dir");
+
+        // An id that NEVER existed is the same no-op — nothing to find, nothing to report.
+        remove_account_at(&path, "never-existed").expect("unknown id must be Ok");
+        assert_eq!(read_accounts_at(&path).unwrap().len(), 1);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -6399,6 +7059,356 @@ mod tests {
         )
         .unwrap();
         assert_eq!(latest_limit_event_in_file(&f, 0), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---- OAuth-expiry ("auth-dead") detection ----------------------------------
+
+    /// An API-error transcript turn as Claude Code writes it when auth fails: `isApiErrorMessage`
+    /// true, with the error text in the single content block.
+    fn auth_line(ts: &str, text: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","isApiErrorMessage":true,"timestamp":"{ts}","message":{{"model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":"{text}"}}]}}}}"#
+        )
+    }
+
+    /// An ordinary (successful) assistant turn — the "recovery" signal.
+    fn ok_line(ts: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","message":{{"role":"assistant","content":[{{"type":"text","text":"reviewing the diff"}}],"usage":{{"input_tokens":5}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn record_is_auth_expiry_matches_all_error_carriers_and_no_prose() {
+        // content-text carrier (isApiErrorMessage true).
+        let v: serde_json::Value = serde_json::from_str(&auth_line(
+            "2026-07-26T15:00:00.000Z",
+            "OAuth session expired \\u00b7 please run /login",
+        ))
+        .unwrap();
+        assert!(record_is_auth_expiry(&v));
+        // top-level `error` string carrier.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"type":"result","error":"OAuth token has expired and could not be refreshed","timestamp":"2026-07-26T15:00:00.000Z"}"#,
+        )
+        .unwrap();
+        assert!(record_is_auth_expiry(&v), "top-level error branch missed");
+        // `result` string carrier (with the isApiErrorMessage gate set).
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"type":"result","isApiErrorMessage":true,"result":"Please run `claude login`","timestamp":"2026-07-26T15:00:00.000Z"}"#,
+        )
+        .unwrap();
+        assert!(record_is_auth_expiry(&v), "result branch missed");
+
+        // NEGATIVES — the discriminator holds: prose (no error flag) and a quota record are not auth.
+        let prose: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","timestamp":"t","message":{"content":[{"type":"text","text":"please run /login to fix an OAuth session that could not be refreshed"}]}}"#,
+        )
+        .unwrap();
+        assert!(!record_is_auth_expiry(&prose), "prose was read as auth-death");
+        let quota: serde_json::Value =
+            serde_json::from_str(&limit_line("t", "You've hit your session limit")).unwrap();
+        assert!(!record_is_auth_expiry(&quota), "a quota record was read as auth-death");
+    }
+
+    #[test]
+    fn an_unrecovered_oauth_expiry_marks_the_account_dead() {
+        // Uppercase form AND the backtick `claude login` form — both must survive the pre-filter
+        // (the regression the reviewer flagged: a case-sensitive pre-filter narrower than the matcher).
+        for text in [
+            "OAUTH SESSION EXPIRED",
+            "Please run `claude login` to continue",
+            "your session could not be refreshed",
+        ] {
+            let base = unique_dir("auth-dead");
+            let f = base.join("t.jsonl");
+            let ts = "2026-07-26T15:00:00.000Z";
+            std::fs::write(&f, format!("{}\n{}\n", ok_line("2026-07-26T14:00:00.000Z"), auth_line(ts, text)))
+                .unwrap();
+            assert!(root_is_auth_dead(&base, 0, SystemTime::now()), "not marked dead for: {text}");
+
+            // Paired: floor AFTER the error (the identity-takeover / lookback floor) drops it — a
+            // previous login's death cannot bench the current one.
+            let after = parse_iso8601_to_epoch(ts).unwrap() + 10;
+            assert!(!root_is_auth_dead(&base, after, SystemTime::now()), "floored error still benched: {text}");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn a_later_successful_turn_clears_the_bench() {
+        // THE self-healing guard: an auth error FOLLOWED by a successful turn (a re-login) must NOT
+        // leave the account benched. This is the behavior the doc claims and the reviewer said the
+        // short-circuiting scanner did not implement.
+        let recovered = unique_dir("auth-recovered");
+        std::fs::write(
+            recovered.join("t.jsonl"),
+            format!(
+                "{}\n{}\n",
+                auth_line("2026-07-26T15:00:00.000Z", "OAuth session expired"),
+                ok_line("2026-07-26T15:30:00.000Z"), // later success
+            ),
+        )
+        .unwrap();
+        assert!(!root_is_auth_dead(&recovered, 0, SystemTime::now()), "recovered account still benched");
+
+        // PAIRED: success THEN error, nothing newer -> IS dead, so the test can't pass by never
+        // marking anything dead. Separate dir so the two cases can't cross-contaminate.
+        let still_dead = unique_dir("auth-still-dead");
+        std::fs::write(
+            still_dead.join("t.jsonl"),
+            format!(
+                "{}\n{}\n",
+                ok_line("2026-07-26T15:00:00.000Z"),
+                auth_line("2026-07-26T15:30:00.000Z", "OAuth session expired"),
+            ),
+        )
+        .unwrap();
+        assert!(root_is_auth_dead(&still_dead, 0, SystemTime::now()), "error-latest account not benched");
+        let _ = std::fs::remove_dir_all(&recovered);
+        let _ = std::fs::remove_dir_all(&still_dead);
+    }
+
+    /// COUPLING: the cheap reject in `fold_auth_signals` is a second correctness gate — a line it
+    /// drops is never parsed — so its token set MUST subsume every phrase the matcher accepts, or the
+    /// detector goes silently inert for a new phrase. Assert every `AUTH_EXPIRY_PHRASES` entry trips
+    /// the prefilter predicate, so adding a phrase that these tokens miss reds the suite instead.
+    #[test]
+    fn every_auth_phrase_survives_the_scan_prefilter() {
+        for p in crate::roborev_account::AUTH_EXPIRY_PHRASES {
+            // is_auth_expired lowercases the INPUT and tests the phrase verbatim, so an uppercase
+            // phrase can NEVER match — permanently inert. Enforce the "keep it lowercase" invariant
+            // here, WITHOUT laundering the case (comparing p to its own lowercase, not lowercasing
+            // before the prefilter check below).
+            assert_eq!(*p, p.to_ascii_lowercase(), "phrase '{p}' must be lowercase or is_auth_expired can't match it");
+            // Call the REAL prefilter predicate (not a re-declared copy): a phrase it drops is never
+            // parsed, so narrowing the tokens in `line_carries_auth_marker` reds this test.
+            assert!(line_carries_auth_marker(p), "phrase '{p}' is dropped by the fold_auth_signals prefilter");
+        }
+    }
+
+    #[test]
+    fn is_successful_turn_requires_an_affirmative_usage_bearing_assistant_turn() {
+        let ok: serde_json::Value = serde_json::from_str(&ok_line("t")).unwrap();
+        assert!(is_successful_turn(&ok), "a usage-bearing assistant turn is a success");
+        // A user turn is NOT a success even if it carries a usage field (Claude Code writes the user
+        // half before the request), so it can never clear a bench.
+        let user: serde_json::Value = serde_json::from_str(
+            r#"{"type":"user","timestamp":"t","usage":{"input_tokens":1},"message":{"role":"user","content":[]}}"#,
+        )
+        .unwrap();
+        assert!(!is_successful_turn(&user), "a user turn must not count as success");
+        // An assistant turn flagged as an API error is not a success.
+        let err: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","isApiErrorMessage":true,"timestamp":"t","message":{"usage":{"input_tokens":1}}}"#,
+        )
+        .unwrap();
+        assert!(!is_successful_turn(&err), "an API-error turn must not count as success");
+        // An assistant turn with no usage is not an affirmative success.
+        let no_usage: serde_json::Value = serde_json::from_str(
+            r#"{"type":"assistant","timestamp":"t","message":{"content":[]}}"#,
+        )
+        .unwrap();
+        assert!(!is_successful_turn(&no_usage), "an assistant turn without usage is not affirmative");
+    }
+
+    #[test]
+    fn a_non_success_record_after_an_auth_error_does_not_clear_the_bench() {
+        // THE finding-A guard: only an AFFIRMATIVE success un-benches. A bare `user` turn (written
+        // BEFORE the request), a quota record, and a differently-worded API error are each strictly
+        // NEWER than the auth error yet must leave the account DEAD — one unmatched line cannot
+        // un-bench a login the scan already proved dead.
+        let auth_ts = "2026-07-26T15:00:00.000Z";
+        let later_ts = "2026-07-26T15:30:00.000Z";
+        let cases = [
+            ("user turn carrying usage", format!(r#"{{"type":"user","timestamp":"{later_ts}","usage":{{"input_tokens":1}},"message":{{"role":"user","content":[]}}}}"#)),
+            ("quota record", limit_line(later_ts, "You've hit your session limit")),
+            ("different API error", format!(r#"{{"type":"assistant","isApiErrorMessage":true,"timestamp":"{later_ts}","message":{{"usage":{{"output_tokens":1}},"content":[{{"type":"text","text":"API Error: 500"}}]}}}}"#)),
+        ];
+        for (label, later) in cases {
+            let base = unique_dir("auth-nonsuccess");
+            std::fs::write(
+                base.join("t.jsonl"),
+                format!("{}\n{}\n", auth_line(auth_ts, "OAuth session expired"), later),
+            )
+            .unwrap();
+            assert!(root_is_auth_dead(&base, 0, SystemTime::now()), "{label} wrongly cleared the bench");
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[test]
+    fn a_quota_record_does_not_mark_auth_dead() {
+        // The two failure families stay DISJOINT: a rate-limit record is owned by the exhausted_until
+        // path. (It also counts as ordinary activity, never as an auth error.)
+        let base = unique_dir("auth-quota");
+        let f = base.join("t.jsonl");
+        std::fs::write(
+            &f,
+            format!("{}\n", limit_line("2026-07-26T15:00:00.000Z", "You've hit your session limit")),
+        )
+        .unwrap();
+        assert!(!root_is_auth_dead(&base, 0, SystemTime::now()), "a quota wall was misread as auth-death");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn expand_auth_dead_across_identity_covers_sibling_registrations() {
+        // Two registrations for ONE login (same identity key), only one directly observed dead: the
+        // sibling must be excluded too. A third account on a DIFFERENT identity stays alive.
+        let directly_dead: HashSet<String> = ["/dir/a".to_string()].into_iter().collect();
+        let identities = vec![
+            ("/dir/a".to_string(), Some("login-1".to_string())),
+            ("/dir/b".to_string(), Some("login-1".to_string())), // sibling of A
+            ("/dir/c".to_string(), Some("login-2".to_string())), // different login
+        ];
+        let out = expand_auth_dead_across_identity(&directly_dead, &identities);
+        assert!(out.contains("/dir/a") && out.contains("/dir/b"), "sibling not expanded: {out:?}");
+        assert!(!out.contains("/dir/c"), "unrelated login wrongly benched: {out:?}");
+
+        // A dead dir with NO resolvable identity must not drag anyone else down (and must not panic).
+        let directly_dead: HashSet<String> = ["/dir/x".to_string()].into_iter().collect();
+        let identities = vec![
+            ("/dir/x".to_string(), None),
+            ("/dir/y".to_string(), Some("login-9".to_string())),
+        ];
+        let out = expand_auth_dead_across_identity(&directly_dead, &identities);
+        assert_eq!(out, ["/dir/x".to_string()].into_iter().collect::<HashSet<_>>(), "identity-less dead over-expanded: {out:?}");
+    }
+
+    /// END-TO-END wiring: detection -> identity expansion -> the returned dead set. Proves the
+    /// production `roborev_auth_dead_dirs` actually benches a dead login's SIBLING registration
+    /// (only one has the error transcript) and leaves an unrelated login alone. Deleting the
+    /// expansion call would fail this, which the pure-helper test alone could not catch.
+    #[test]
+    fn roborev_auth_dead_dirs_benches_sibling_registrations_of_a_dead_login() {
+        let home = unique_dir("auth-e2e");
+        let dir_a = home.join("acct-a");
+        let dir_b = home.join("acct-b");
+        let dir_c = home.join("acct-c");
+        // A and B are two registrations of ONE login; C is a different login.
+        write_claude_json(&dir_a, r#"{"oauthAccount":{"emailAddress":"dead@x.com"}}"#);
+        write_claude_json(&dir_b, r#"{"oauthAccount":{"emailAddress":"dead@x.com"}}"#);
+        write_claude_json(&dir_c, r#"{"oauthAccount":{"emailAddress":"live@x.com"}}"#);
+        // An in-window auth-error transcript ONLY under A.
+        let ts = "2026-07-26T15:00:00.000Z";
+        let proj_a = dir_a.join("projects").join("p");
+        std::fs::create_dir_all(&proj_a).unwrap();
+        std::fs::write(proj_a.join("x.jsonl"), format!("{}\n", auth_line(ts, "OAuth session expired"))).unwrap();
+
+        let now = parse_iso8601_to_epoch(ts).unwrap() + 100;
+        let accounts = vec![
+            sample("a", false, dir_a.to_str().unwrap()),
+            sample("b", false, dir_b.to_str().unwrap()),
+            sample("c", false, dir_c.to_str().unwrap()),
+        ];
+        let dead = roborev_auth_dead_dirs(&accounts, Some(&home), &no_log(), now);
+        assert!(dead.contains(dir_a.to_str().unwrap()), "A (directly dead) missing: {dead:?}");
+        assert!(dead.contains(dir_b.to_str().unwrap()), "B (sibling of A's login) not benched: {dead:?}");
+        assert!(!dead.contains(dir_c.to_str().unwrap()), "C (different login) wrongly benched: {dead:?}");
+
+        // PAIRED NEGATIVE: give B a DIFFERENT login — now only A comes back, so the test can't pass
+        // by returning everything.
+        write_claude_json(&dir_b, r#"{"oauthAccount":{"emailAddress":"other@x.com"}}"#);
+        let dead = roborev_auth_dead_dirs(&accounts, Some(&home), &no_log(), now);
+        assert!(
+            dead.contains(dir_a.to_str().unwrap()) && !dead.contains(dir_b.to_str().unwrap()),
+            "with distinct logins only A is dead: {dead:?}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The `home` argument is LOAD-BEARING at THIS function's boundary, not inert: for the DEFAULT
+    /// account (empty `config_dir`) the transcript root is `<home>/.claude/projects`, so the scan can
+    /// only find its auth-error via the injected home, and passing `None` misses it. NOTE this pins
+    /// `roborev_auth_dead_dirs` genuinely consulting `home`; it does NOT observe
+    /// `republish_roborev_candidates`'s choice of `home` vs a fresh env read at the call site — that
+    /// choice is unobserved by any test and is behaviorally identical while both callers pass `$HOME`.
+    #[test]
+    fn roborev_auth_dead_dirs_consults_home_for_the_default_account() {
+        let home = unique_dir("auth-default-home");
+        let proj = home.join(".claude").join("projects").join("p");
+        std::fs::create_dir_all(&proj).unwrap();
+        let ts = "2026-07-26T15:00:00.000Z";
+        std::fs::write(proj.join("x.jsonl"), format!("{}\n", auth_line(ts, "OAuth session expired"))).unwrap();
+        let now = parse_iso8601_to_epoch(ts).unwrap() + 100;
+        let accounts = vec![sample("d", true, "")]; // default account: empty config_dir
+
+        let dead = roborev_auth_dead_dirs(&accounts, Some(&home), &no_log(), now);
+        assert!(dead.contains(""), "default account not detected via injected home: {dead:?}");
+
+        // PAIRED: without a home the default account's transcript root is unresolvable
+        // (`claude_projects_root(Some(""), None)` → `None`), so it is missed — this shows the
+        // `Some(&home)` arm above passed BECAUSE of the home, not vacuously. It pins that THIS
+        // function consults `home`, not that any caller threads it (see the doc block above).
+        let dead_none = roborev_auth_dead_dirs(&accounts, None, &no_log(), now);
+        assert!(!dead_none.contains(""), "default account resolved without home: {dead_none:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// THE MERGE-COMPOSITION GUARD (#2026 × #2043). `republish_roborev_candidates` is the ONLY place
+    /// #2026's identity-aware exhaustion and #2043's auth-dead exclusion compose, and a clean git
+    /// resolution of that hunk could silently drop either. Drive the real function end-to-end and
+    /// assert BOTH exclusions hold in the WRITTEN candidate file: reverting `&corrected`→`&accounts`
+    /// re-admits the quota-sibling (its own dir carries no bench, only the identity path sees it),
+    /// and dropping the `auth_dead` argument re-admits the auth-dead account.
+    #[test]
+    fn republish_composes_identity_aware_exhaustion_and_auth_dead_exclusion() {
+        let base = unique_dir("republish-compose");
+        let app_data = base.join("app_data");
+        std::fs::create_dir_all(&app_data).unwrap();
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+
+        let dir_a = base.join("a"); // quota-walled (own bench), identity uuid-shared
+        let dir_b = base.join("b"); // sibling of A (uuid-shared), NO own bench — only the identity path excludes
+        let dir_c = base.join("c"); // auth-dead (auth-error transcript), identity uuid-c
+        let dir_d = base.join("d"); // healthy
+        let dir_e = base.join("e"); // healthy (keeps ≥ MIN_HEALTHY_TO_RUN after exclusions)
+        write_claude_json(&dir_a, r#"{"oauthAccount":{"emailAddress":"shared@x.com","accountUuid":"uuid-shared"}}"#);
+        write_claude_json(&dir_b, r#"{"oauthAccount":{"emailAddress":"shared@x.com","accountUuid":"uuid-shared"}}"#);
+        write_claude_json(&dir_c, r#"{"oauthAccount":{"emailAddress":"c@x.com","accountUuid":"uuid-c"}}"#);
+        write_claude_json(&dir_d, r#"{"oauthAccount":{"emailAddress":"d@x.com","accountUuid":"uuid-d"}}"#);
+        write_claude_json(&dir_e, r#"{"oauthAccount":{"emailAddress":"e@x.com","accountUuid":"uuid-e"}}"#);
+
+        // C's auth-error transcript. A far-future timestamp keeps it in-window regardless of the real
+        // `now_secs()` republish reads internally (the scan floors below, not above, the window).
+        let proj_c = dir_c.join("projects").join("p");
+        std::fs::create_dir_all(&proj_c).unwrap();
+        std::fs::write(
+            proj_c.join("x.jsonl"),
+            format!("{}\n", auth_line("2099-01-01T00:00:00.000Z", "OAuth session expired")),
+        )
+        .unwrap();
+
+        // A carries its own quota wall + identity; usage_for_accounts propagates it to sibling B.
+        let now = now_secs();
+        let mut a = sample("a", false, dir_a.to_str().unwrap());
+        a.exhausted_until = Some(now + 3_600);
+        a.exhausted_identity = Some("uuid-shared".to_string());
+        let accounts = vec![
+            a,
+            sample("b", false, dir_b.to_str().unwrap()),
+            sample("c", false, dir_c.to_str().unwrap()),
+            sample("d", false, dir_d.to_str().unwrap()),
+            sample("e", false, dir_e.to_str().unwrap()),
+        ];
+        write_accounts_at(&accounts_json_path(&app_data), &accounts).unwrap();
+
+        republish_roborev_candidates(&app_data, &home);
+
+        let published = std::fs::read_to_string(crate::roborev_account::candidates_path(&home))
+            .expect("candidate file written");
+        // #2026 path: A (own wall) AND B (identity-contagion via `corrected`) are both excluded.
+        assert!(!published.contains(dir_a.to_str().unwrap()), "quota-walled A published: {published}");
+        assert!(!published.contains(dir_b.to_str().unwrap()), "identity-sibling B published — `corrected` dropped? {published}");
+        // #2043 path: C (auth-dead) is excluded.
+        assert!(!published.contains(dir_c.to_str().unwrap()), "auth-dead C published — `auth_dead` dropped? {published}");
+        // Paired: the healthy pair IS published, so the assertion can't pass via an empty/STANDDOWN list.
+        assert!(!published.contains(crate::roborev_account::STANDDOWN), "unexpected stand-down: {published}");
+        assert!(published.contains(dir_d.to_str().unwrap()), "healthy D missing: {published}");
+        assert!(published.contains(dir_e.to_str().unwrap()), "healthy E missing: {published}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

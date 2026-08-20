@@ -9,7 +9,7 @@
 //   to tell me if you're not gonna execute, explain it to me in some place, or let me do something
 //   about it."*
 // So the assertions below are about the EXPLANATION being reachable, not about a pill existing.
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
@@ -21,6 +21,7 @@ import {
   NOTICE_OWN_WORDS_TESTID,
 } from "./MountedAgentNotices";
 import { NOTICE_EXPLAINER } from "../agentNotices";
+import { __setAuthRecoveryDeps, pollNudgeFlags } from "../../services/authRecovery";
 import { C, DANGER } from "../../theme/colors";
 
 import { useProjectStore } from "../../stores/projectStore";
@@ -602,5 +603,107 @@ describe("MountedAgentNotices", () => {
     } as never);
     render(<MountedAgentNotices agentId="a1" side="left" />);
     expect(useUiStore.getState().focusedNoticeBySide.left).toBe("thrash:repeating-command");
+  });
+});
+
+// ── THE MOUNT TEST THE REVIEW ASKED FOR (roborev 65339, a High) ────────────────────────────────────
+//
+// The first cut of the blocked-on-human fix threaded the nudger flag into the SIDEBAR's stall report
+// only. Every other surface computes its own, so the dot went red while this one — the composer's
+// pill row, the surface that carries the WORDS — never emitted the notice at all. A red row with no
+// explanation attached anywhere is the inverse of the founder's complaint rather than a fix for it.
+//
+// A unit test over `agentNotices` cannot catch that: it is handed a report that already contains the
+// cause, so it stays green no matter what the component forgets to pass. This mounts the real
+// component with a real raised flag and asserts the pill EXISTS — the only shape that fails when the
+// wiring is removed.
+describe("a founder-level nudger flag reaches the mounted pill row", () => {
+  const founderFlag = (reply: string) => ({
+    agentId: "a1",
+    target: "founder",
+    raisedAtMs: Date.now(),
+    nudges: 2,
+    delivered: 2,
+    blockedBy: null,
+    silentSecs: 300,
+    reply,
+  });
+
+  afterEach(async () => {
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [] } as never);
+    await pollNudgeFlags();
+    // `__setAuthRecoveryDeps(null)` now clears the table THROUGH the bump, so the snapshot cannot
+    // survive into the next test (roborev 65432). It used to do a bare `flags.clear()`, which left
+    // `flagSnapshot` holding this file's flag for every test that followed.
+    __setAuthRecoveryDeps(null);
+  });
+
+  it("a flag ARRIVING AFTER MOUNT repaints the row — the subscription, not the first read", async () => {
+    // ⚠️ THE ONLY TEST THAT EXERCISES THE SUBSCRIPTION (roborev 65432). Both mount tests above poll
+    // BEFORE `render`, so the flag is already in the table at first read and `useSyncExternalStore`
+    // is never asked to do anything — swapping the hook for a plain `nudgeFlagsSnapshot()` call
+    // keeps them all green while a flag arriving after mount repaints nothing.
+    //
+    // And that is the founder's actual case: a silent agent whose row is already on screen when the
+    // nudger flips `reply` to `blocked-on-human`. Nothing else about that row changes, so the
+    // subscription is the entire mechanism by which the dot can ever go red.
+    seed({
+      status: { a1: "idle" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: OPEN_PR_WS },
+    });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [] } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    // Mounted with a real notice row and NO human block.
+    expect(pills().length).toBeGreaterThan(0);
+    expect(pills().some((p) => (p.textContent ?? "").includes("blocked on you"))).toBe(false);
+
+    await act(async () => {
+      __setAuthRecoveryDeps({
+        readNudgeFlags: async () => [founderFlag("blocked-on-human")],
+      } as never);
+      await pollNudgeFlags();
+    });
+
+    // Same mount, no re-render forced by the test — the pill can only be here via the subscription.
+    expect(pills().some((p) => (p.textContent ?? "").includes("blocked on you"))).toBe(true);
+  });
+
+  it("renders the 'blocked on you' pill for an idle agent whose flag says blocked-on-human", async () => {
+    seed({ status: { a1: "idle" }, branchStatus: { a1: CLEAN_BS }, workflowState: { a1: BARE_WS } });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [founderFlag("blocked-on-human")] } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const labels = pills().map((p) => p.textContent ?? "");
+    expect(labels.some((t) => t.includes("blocked on you"))).toBe(true);
+  });
+
+  it("…and does NOT for the same agent when the reply names a different blocker", async () => {
+    // THE PAIRED NEGATIVE. Identical mount, identical status, identical flag SHAPE — only the reply
+    // differs. `blocked-on-ci` routes to `Standdown::External`, not to the founder, so it must not
+    // produce a pill that tells him a person is needed.
+    //
+    // ⚠️ IT IS SEEDED WITH AN OPEN PR ON PURPOSE, AND THE FIRST CUT WAS VACUOUS WITHOUT IT (roborev
+    // 65367). With `BARE_WS` and no goal this row has NO notices at all, so the component takes its
+    // `notices.length === 0` early return and `pills()` queries an EMPTY DOM — the assertion then
+    // passes whether or not the rule works, and would pass with `humanBlockOf` deleted outright.
+    // That is verbatim the trap AGENTS.md names: absence asserted against a target that was never
+    // MOUNTED, and the trap this file already recorded once at the `cleanup()` note above.
+    //
+    // `OPEN_PR_WS` gives the row a real `stall:open-pr` pill, so the tree is populated and the
+    // absence of "blocked on you" is attributable to the rule rejecting `blocked-on-ci`.
+    seed({
+      status: { a1: "idle" },
+      branchStatus: { a1: CLEAN_BS },
+      workflowState: { a1: OPEN_PR_WS },
+    });
+    __setAuthRecoveryDeps({ readNudgeFlags: async () => [founderFlag("blocked-on-ci")] } as never);
+    await pollNudgeFlags();
+    render(<MountedAgentNotices agentId="a1" side="left" />);
+    const labels = pills().map((p) => p.textContent ?? "");
+    // The row DID render pills — without this the assertion below is about an empty document.
+    expect(labels.length).toBeGreaterThan(0);
+    expect(labels.some((t) => t.includes("blocked on you"))).toBe(false);
   });
 });

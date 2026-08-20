@@ -3878,7 +3878,12 @@ describe("the cable reaches the concierge column", () => {
     expect(screen.queryByTestId(MOUNTED_THREAD_TESTID)).toBeNull();
     expect(screen.getByTestId(CONCIERGE_THREAD_TESTID)).toBeTruthy();
 
-    act(() => useCableStore.getState().patch("right", null));
+    // PATCHED AT `ag1`, NOT AT `null`. The pin is what mounts, as of bead sparkle-9gsjqm — the mount
+    // no longer crosses the drawing projection with `promptTarget`, so a cable with no far end
+    // recorded is not a mount at all (`cableStore.patch`'s own doc: pass `null` only where there is
+    // genuinely no agent, i.e. the dev visual fixtures). The rows below this one assert `data-wired`,
+    // which is the projection and is unaffected, so they keep their `null`.
+    act(() => useCableStore.getState().patch("right", "ag1"));
 
     // Patched: THAT agent's thread, and the concierge thread is gone rather than merely hidden.
     // Asserted by the accessible name too, because "a thread is present" would be true either way —

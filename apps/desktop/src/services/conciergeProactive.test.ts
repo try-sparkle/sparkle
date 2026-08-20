@@ -30,6 +30,7 @@ import {
 } from "./conciergeNotifier";
 import type { ConciergeAgent, ConciergeFeed } from "./conciergeFeed";
 import type { ConciergeMessage } from "../components/Concierge/types";
+import type { ResearchTask } from "./research/types";
 
 const agent = (over: Partial<ConciergeAgent> & { id: string }): ConciergeAgent =>
   ({
@@ -982,9 +983,11 @@ describe("research findings ride a proactive turn", () => {
     expect(h.fired[0]!.prompt).toContain("quota-walled");
   });
 
-  it("NEVER buys a turn of its own — a finding with nothing else to say spends nothing", () => {
-    // The rejected alternative, pinned. If this ever fires, routine research is eating the hourly
-    // ceiling and the blocker at minute 40 is the thing that gets dropped.
+  it("buys NOTHING until it is told — a scheduler never handed the store speaks about nothing", () => {
+    // WHAT THIS PINS CHANGED WITH `observeResearch` (bead sparkle-wo4c79), so read it carefully:
+    // research CAN now buy a turn, but only once the store has actually been fed in. What stays
+    // true, and is what this case guards, is that the drain is never polled speculatively — no
+    // `peekResearch` on a quiet fleet, so a peek still cannot be the thing that decides to speak.
     let peeks = 0;
     const h = harness({
       peekResearch: () => {
@@ -1035,6 +1038,249 @@ describe("research findings ride a proactive turn", () => {
     // line, on the overwhelmingly common turn.
     expect(withDrain.fired[0]!.prompt).toBe(without.fired[0]!.prompt);
     expect(withDrain.fired[0]!.researchTaskIds).toEqual([]);
+  });
+});
+
+// ══ RESEARCH COMING BACK WAKES HIM ══════════════════════════════════════════════════════════════
+//
+// The reported bug (bead sparkle-wo4c79): the founder commissioned research, it FINISHED, and he
+// had to ask "what did you find out about Epic versus tasks?" to hear the answer — because a
+// finished finding could only ride a turn bought by something else, and on a quiet fleet nothing
+// ever bought one. Two more runs died that day with "the Claude CLI is not signed in" and he was
+// never told at all.
+//
+// Every case below is still about SPENDING, in the same terms as the rest of this file — the point
+// is not merely that research speaks, but that it speaks WITHOUT touching the fleet's budget, so
+// §3.3's starvation objection stays answered rather than traded away.
+describe("research coming back wakes the concierge", () => {
+  const task = (over: Partial<ResearchTask> & { id: string }): ResearchTask =>
+    ({
+      question: "epic vs tasks",
+      depth: "quick",
+      projectId: "p1",
+      projectRoot: "/p1",
+      status: "done",
+      createdAt: 1,
+      startedAt: 2,
+      finishedAt: 3,
+      findings: "Epics are containers; tasks are the unit of work.",
+      error: null,
+      readAt: null,
+      ...over,
+    }) as ResearchTask;
+
+  /** A drain stubbed to report exactly what the (mutable) task list still owes, so a test can stamp
+   *  `readAt` and have the peek agree — the real drain's behaviour, and what the stand-down reads. */
+  const drainOver = (tasks: () => ResearchTask[]): Partial<ProactiveDeps> => ({
+    peekResearch: () => {
+      const owed = tasks().filter((t) => t.readAt === null);
+      return {
+        preamble: owed.length === 0 ? "" : owed.map((t) => t.findings ?? t.error ?? "").join("\n"),
+        taskIds: owed.map((t) => t.id),
+      };
+    },
+  });
+
+  /** A fleet that is up and running: nothing needs him, so nothing else can buy the turn. */
+  const quiet = () => feed([agent({ id: "a", status: "working", band: "running" })]);
+
+  it("a FINISHED run buys a turn on a quiet fleet, and carries the answer", () => {
+    // THE REGRESSION TEST. Before `observeResearch` this fired nothing, forever, which is exactly
+    // what made the founder ask for an answer he had already commissioned.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Epics are containers");
+    expect(h.fired[0]!.researchTaskIds).toEqual(["r1"]);
+    // It is framed as speaking first, and told to deliver the ANSWER rather than a two-line digest
+    // — the fleet instruction's "ONE or TWO short sentences" is what made the old channel useless
+    // for a question he was waiting on.
+    expect(h.fired[0]!.prompt).toContain("speaking first, unprompted");
+    expect(h.fired[0]!.prompt).toContain("give him the ANSWER");
+  });
+
+  it("a FAILED run wakes him exactly like a successful one", () => {
+    // Requirement 1, and the half that actually bit: two runs died with this precise message and
+    // the founder learned nothing until someone happened to speak.
+    const tasks = [
+      task({
+        id: "r1",
+        status: "failed",
+        findings: null,
+        error: "The research run could not start — the Claude CLI is not signed in.",
+      }),
+    ];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("not signed in");
+    expect(h.fired[0]!.prompt).toContain("say plainly that it failed");
+  });
+
+  it("a CANCELLED run buys nothing — he stopped it, so it is not news", () => {
+    const tasks = [task({ id: "r1", status: "cancelled", findings: null, error: null })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(60 * 60_000);
+
+    expect(h.fired).toEqual([]);
+  });
+
+  it("several runs finishing together COALESCE into one turn", () => {
+    // Requirement 3. The window opens at the first and does not reset, so the later two ride it.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(1_000);
+    tasks.push(task({ id: "r2", findings: "second answer" }));
+    s.observeResearch(tasks);
+    h.advance(1_000);
+    tasks.push(task({ id: "r3", findings: "third answer" }));
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.researchTaskIds).toEqual(["r1", "r2", "r3"]);
+    expect(h.fired[0]!.prompt).toContain("second answer");
+    expect(h.fired[0]!.prompt).toContain("third answer");
+  });
+
+  it("does NOT report again what a user turn already delivered", () => {
+    // Requirement 2, at the one instant it is hard: the wake is already armed and sitting in its
+    // coalescing window when the founder types, and HIS turn carries the findings. The claim is
+    // stamped, so the wake must stand down rather than tell him a second time.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    // A user turn delivers it mid-window: the drain stamps the durable claim.
+    tasks[0]!.readAt = 12_345;
+    h.advance(60 * 60_000);
+
+    expect(h.fired).toEqual([]);
+    // ...and the window is closed rather than left armed, so nothing is still ticking on a quiet
+    // fleet an hour later.
+    expect(h.pending()).toBe(0);
+  });
+
+  it("tells him ONCE — a delivered answer does not come back on the next tick", () => {
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    // The turn delivered, so the drain stamps the claim and the store re-reports.
+    tasks[0]!.readAt = 99_999;
+    s.observeResearch(tasks);
+    h.advance(60 * 60_000);
+    expect(h.fired).toHaveLength(1);
+  });
+
+  it("is NOT held by a fleet hourly ceiling that is already spent", () => {
+    // §3.3's objection, answered rather than overridden. Six fleet pushes exhaust the hour; an
+    // answer he is waiting on must still arrive, because it spends a different budget.
+    const tasks: ResearchTask[] = [];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    for (let i = 0; i < PROACTIVE_MAX_PER_HOUR; i++) {
+      s.observe(feed([agent({ id: `x${i}`, status: "approval", band: "needs_you" })]));
+      h.advance(PROACTIVE_COALESCE_MS + PROACTIVE_MIN_INTERVAL_MS);
+    }
+    expect(s.stats().fired).toBe(PROACTIVE_MAX_PER_HOUR);
+
+    tasks.push(task({ id: "r1" }));
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(PROACTIVE_MAX_PER_HOUR + 1);
+    expect(h.fired.at(-1)!.prompt).toContain("Epics are containers");
+    // And it did not take a fleet slot on the way through.
+    expect(s.stats().fired).toBe(PROACTIVE_MAX_PER_HOUR);
+    expect(s.stats().researchFired).toBe(1);
+  });
+
+  it("spends no fleet slot, so a real blocker right after it is NOT rate-limited out", () => {
+    // The mirror of the case above, and the one §3.3 actually cared about. If a research turn
+    // charged `lastAttemptAt`, the blocker below would be held two minutes behind routine results.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+
+    tasks[0]!.readAt = 1;
+    s.observeResearch(tasks);
+    // A blocker appears immediately afterwards — well inside the two-minute floor.
+    s.observe(feed([agent({ id: "b", status: "blocked", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.prompt).toContain("Approve?");
+  });
+
+  it("a DECLINED wake keeps the answer owed and retries behind its own floor", () => {
+    // The push stands down because the founder owns the conversation. Nothing may be lost, and
+    // nothing may busy-loop: without this track's own retry floor it would re-ask every four
+    // seconds for as long as he keeps typing.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    h.decline();
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    h.advance(PROACTIVE_COALESCE_MS);
+    expect(h.fired).toHaveLength(1);
+    expect(s.stats().skipped.declined).toBe(1);
+    expect(s.stats().researchFired).toBe(0);
+
+    // It did not retry once per coalescing window while it was refused.
+    h.advance(PROACTIVE_MIN_INTERVAL_MS - PROACTIVE_COALESCE_MS - 1);
+    expect(h.fired).toHaveLength(1);
+
+    h.acceptAgain();
+    h.advance(PROACTIVE_MIN_INTERVAL_MS);
+    expect(h.fired).toHaveLength(2);
+    expect(h.fired[1]!.researchTaskIds).toEqual(["r1"]);
+    expect(s.stats().researchFired).toBe(1);
+  });
+
+  it("rides an ALREADY-BOUGHT fleet turn instead of buying a second one", () => {
+    // The pre-existing ride-along, still true and now load-bearing for spend: when both tracks come
+    // due together they produce ONE turn carrying both, not a fleet turn plus a research turn. Both
+    // counters move because both things genuinely happened; what must never rise is the turn count.
+    const tasks = [task({ id: "r1" })];
+    const h = harness(drainOver(() => tasks));
+    const s = createProactiveScheduler(h.deps);
+    s.observe(quiet());
+    s.observeResearch(tasks);
+    s.observe(feed([agent({ id: "a", status: "approval", band: "needs_you" })]));
+    h.advance(PROACTIVE_COALESCE_MS);
+
+    expect(h.fired).toHaveLength(1);
+    expect(h.fired[0]!.prompt).toContain("Epics are containers");
+    expect(h.fired[0]!.prompt).toContain("Approve?");
+    expect(s.stats().fired).toBe(1);
+    expect(s.stats().researchFired).toBe(1);
   });
 });
 

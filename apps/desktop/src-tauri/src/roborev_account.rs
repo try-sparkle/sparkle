@@ -48,7 +48,7 @@
 //! correct when Sparkle is closed and the candidate list is stale.
 
 use crate::accounts::Account;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Marker line meaning "do not run a review at all" — written when fewer than two accounts are
@@ -76,9 +76,56 @@ pub struct Candidate {
 ///
 /// Mirrors `accounts::effective_exhaustion`'s `e > now` future-filter, so an expired exhaustion
 /// clears on its own rather than benching an account forever.
+///
+/// This reads the raw `exhausted_until` field by design — this module stays pure and does no
+/// filesystem/identity resolution (the shim it serves must work when Sparkle is closed). The
+/// IDENTITY-AWARE correction — benching every sibling dir of a walled login, not just the dir that
+/// hit the wall — is applied UPSTREAM in `accounts::republish_roborev_candidates`, which writes the
+/// identity-aware epoch onto `exhausted_until` before calling [`publish_candidates`]. So a caller who
+/// hands `rank_candidates` accounts straight off disk gets per-dir behaviour; the production path
+/// gets identity-aware behaviour (sparkle-xsr6o). Do not reintroduce a per-dir read here on the
+/// assumption the field is already identity-corrected — verify the caller corrected it.
 fn is_healthy(a: &Account, now: i64) -> bool {
     !a.exhausted_until.is_some_and(|e| e > now)
 }
+
+/// Does this roborev job's output show that the account's OAuth session is DEAD — signed in, but its
+/// stored token can no longer be refreshed, so every `claude` invocation under it fails at auth time?
+///
+/// This is the AUTH analogue of a quota wall. A quota wall is recorded as `exhausted_until` (from a
+/// structured `error: "rate_limit"` transcript record) and [`is_healthy`] already routes around it.
+/// An auth-expired account has NO rate-limit record and a perfectly readable keychain credential, so
+/// nothing benched it — and because an unauthenticated account has consumed zero tokens it scores as
+/// the account with the MOST headroom, so roborev kept picking the one account guaranteed to fail.
+///
+/// Kept deliberately NARROW and DISJOINT from the quota family: matching quota text here would
+/// double-handle a wall the exhausted_until path already owns, and matching an arbitrary error would
+/// bench the whole pool on a failure that is identical on every account (a bad flag, a crash) rather
+/// than specific to this login. Only the OAuth refresh-failure / re-login signatures.
+///
+/// Matches by lowercasing the INPUT and testing each [`AUTH_EXPIRY_PHRASES`] entry verbatim, so those
+/// phrases MUST be lowercase (enforced by `every_auth_phrase_survives_the_scan_prefilter`).
+pub fn is_auth_expired(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    AUTH_EXPIRY_PHRASES.iter().any(|p| t.contains(p))
+}
+
+/// The OAuth refresh-failure phrases [`is_auth_expired`] matches, all lowercase. Exposed as a shared
+/// const so the accounts.rs scan prefilter can be TESTED to cover every one: the prefilter is a
+/// second correctness gate (a line it drops is never parsed), so a phrase here that carries none of
+/// the prefilter's tokens would silently disable detection for that shape. The coupling test reds the
+/// suite instead. If you add a phrase, keep it lowercase (the matcher can't match an uppercase entry)
+/// and make sure the prefilter tokens (`oauth`/`login`/`refreshed`) still subsume it.
+pub const AUTH_EXPIRY_PHRASES: &[&str] = &[
+    "oauth session expired",
+    "oauth token has expired",
+    "oauth token expired",
+    "could not be refreshed",
+    "session could not be refreshed",
+    "please run /login",
+    "please run `claude login`",
+    "please run claude login",
+];
 
 /// Rank the accounts roborev may use, best headroom first.
 ///
@@ -92,9 +139,51 @@ fn is_healthy(a: &Account, now: i64) -> bool {
 ///
 /// Pure — `now` is injected, so this is unit-testable without a clock.
 pub fn rank_candidates(accounts: &[Account], headroom: &HashMap<String, f64>, now: i64) -> Vec<Candidate> {
+    rank_candidates_excluding_auth_dead(accounts, headroom, &HashSet::new(), now)
+}
+
+/// [`rank_candidates`], additionally dropping accounts whose config dir is in `auth_dead` — the
+/// OAuth-expired accounts observed by [`is_auth_expired`] on a prior job's output.
+///
+/// SAFETY — the founder's last-account rule, mirrored for auth. An auth-dead account is NOT a usable
+/// reserve, so excluding it composes with the [`MIN_HEALTHY_TO_RUN`] stand-down rather than
+/// bypassing it: if dropping the auth-dead accounts leaves fewer than [`MIN_HEALTHY_TO_RUN`] USABLE
+/// accounts, roborev stands down exactly as it would on quota — running on the one remaining login IS
+/// taking the founder's last usable one. The ONE exception is fail-open: if EVERY healthy account is
+/// auth-dead the detector might be wrong (a false positive would otherwise strand ALL reviews), so
+/// the un-pruned ranking is kept and the shim is left to try. The exclusion EXPIRES rather than being
+/// permanent: the scan only reads auth errors within `AUTH_EXPIRY_LOOKBACK`, so once the error ages
+/// past that window the account is retried (and re-benched if it fails again). A shared account also
+/// clears immediately if the interactive fleet completes a run under it (a newer usage-bearing turn).
+/// A bare `claude login` writes NO session turn, and a roborev-only account is not exec'd while
+/// excluded, so for THAT account the lookback expiry is the healing path — see
+/// [`crate::accounts::republish_roborev_candidates`].
+pub fn rank_candidates_excluding_auth_dead(
+    accounts: &[Account],
+    headroom: &HashMap<String, f64>,
+    auth_dead: &HashSet<String>,
+    now: i64,
+) -> Vec<Candidate> {
     let mut healthy: Vec<&Account> = accounts.iter().filter(|a| is_healthy(a, now)).collect();
     if healthy.len() < MIN_HEALTHY_TO_RUN {
         return Vec::new();
+    }
+    if !auth_dead.is_empty() {
+        let alive: Vec<&Account> = healthy
+            .iter()
+            .copied()
+            .filter(|a| !auth_dead.contains(&a.config_dir))
+            .collect();
+        if alive.is_empty() {
+            // Every healthy account is auth-dead: fail open, keep the un-pruned list (the detector
+            // could be wrong, and a hard stop of all reviews is the worse error).
+        } else if alive.len() < MIN_HEALTHY_TO_RUN {
+            // Exclusion drops us below the run threshold: stand down, same as the quota case — one
+            // usable login left means using it takes the founder's last usable account.
+            return Vec::new();
+        } else {
+            healthy = alive;
+        }
     }
     // Most headroom first = least consumed first. Tie-break by id so the order is deterministic:
     // an unstable ranking would make the shim pick a different account run to run for no reason.
@@ -264,7 +353,21 @@ pub fn publish_candidates(
     headroom: &HashMap<String, f64>,
     now: i64,
 ) -> Result<(), String> {
-    let ranked = rank_candidates(accounts, headroom, now);
+    publish_candidates_excluding_auth_dead(home, accounts, headroom, &HashSet::new(), now)
+}
+
+/// [`publish_candidates`], additionally excluding the OAuth-expired accounts in `auth_dead` from the
+/// ranking. This is the write half of the reactive auth-benching loop: an observed OAuth-expiry
+/// failure (detected by [`is_auth_expired`] over an account's transcripts) lands here as an excluded
+/// config dir, so the NEXT review job's shim reads a candidate list the dead login is absent from.
+pub fn publish_candidates_excluding_auth_dead(
+    home: &Path,
+    accounts: &[Account],
+    headroom: &HashMap<String, f64>,
+    auth_dead: &HashSet<String>,
+    now: i64,
+) -> Result<(), String> {
+    let ranked = rank_candidates_excluding_auth_dead(accounts, headroom, auth_dead, now);
     write_atomic(&candidates_path(home), &render_candidates(&ranked), 0o600)
 }
 
@@ -461,6 +564,141 @@ mod tests {
         // Via PATH it would re-enter itself: the shim IS named `claude`.
         assert!(s.contains("REAL_CLAUDE='/abs/claude'"));
         assert!(s.contains(r#"exec "$REAL_CLAUDE" "$@""#));
+    }
+
+    // ── BUG 2: auth-expiry detection + reactive exclusion ────────────────────────────────────────
+
+    /// THE AUTH ROTATION ASSERTION: an OAuth-expired account is not offered, and a healthy sibling
+    /// is. Paired with "the same account NOT flagged is offered" so the exclusion is proven to be
+    /// CAUSED by the auth-dead flag, not by a ranker that would have dropped it anyway.
+    #[test]
+    fn an_auth_dead_account_is_dropped_and_a_healthy_sibling_is_offered() {
+        // All three quota-healthy (no exhausted_until), so the only reason A could vanish is the
+        // auth-dead flag — this is the case the old ranker got wrong: A scores BEST (zero usage,
+        // most headroom) yet is the dead login.
+        let accounts = vec![
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+            acct("c", "/dir/c", None),
+        ];
+        let auth_dead: HashSet<String> = ["/dir/a".to_string()].into_iter().collect();
+        let dirs: Vec<String> =
+            rank_candidates_excluding_auth_dead(&accounts, &HashMap::new(), &auth_dead, NOW)
+                .into_iter()
+                .map(|c| c.dir)
+                .collect();
+        assert!(!dirs.contains(&"/dir/a".to_string()), "auth-dead account offered: {dirs:?}");
+        assert!(dirs.contains(&"/dir/b".to_string()), "healthy sibling missing: {dirs:?}");
+
+        // Paired: with NOTHING flagged, A IS offered. Proves the drop is caused by the flag.
+        let dirs: Vec<String> =
+            rank_candidates_excluding_auth_dead(&accounts, &HashMap::new(), &HashSet::new(), NOW)
+                .into_iter()
+                .map(|c| c.dir)
+                .collect();
+        assert!(dirs.contains(&"/dir/a".to_string()), "unflagged A must be offered: {dirs:?}");
+    }
+
+    /// PAIRED NEGATIVE — a QUOTA wall still benches (the auth path must not regress the quota path).
+    /// The auth-dead set is empty here; A is excluded purely by its future `exhausted_until`.
+    #[test]
+    fn a_quota_wall_still_benches_even_with_auth_exclusion_in_play() {
+        let accounts = vec![
+            acct("a", "/dir/a", Some(NOW + 5_000)),
+            acct("b", "/dir/b", None),
+            acct("c", "/dir/c", None),
+        ];
+        let dirs: Vec<String> =
+            rank_candidates_excluding_auth_dead(&accounts, &HashMap::new(), &HashSet::new(), NOW)
+                .into_iter()
+                .map(|c| c.dir)
+                .collect();
+        assert!(!dirs.contains(&"/dir/a".to_string()), "quota wall no longer benches: {dirs:?}");
+        assert!(dirs.contains(&"/dir/b".to_string()));
+    }
+
+    /// SAFETY fail-open — when EVERY healthy account is auth-dead, exclusion would empty the list; the
+    /// guard keeps the un-pruned ranking instead of hard-stopping all reviews (the detector could be
+    /// wrong, and the exclusion self-heals on the next re-login/republish).
+    #[test]
+    fn auth_exclusion_fails_open_when_every_account_is_auth_dead() {
+        let accounts = vec![
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+            acct("c", "/dir/c", None),
+        ];
+        let all_dead: HashSet<String> =
+            ["/dir/a".to_string(), "/dir/b".to_string(), "/dir/c".to_string()].into_iter().collect();
+        let dirs: Vec<String> =
+            rank_candidates_excluding_auth_dead(&accounts, &HashMap::new(), &all_dead, NOW)
+                .into_iter()
+                .map(|c| c.dir)
+                .collect();
+        assert_eq!(dirs.len(), 3, "must not strand roborev when all are auth-dead: {dirs:?}");
+    }
+
+    /// THE STAND-DOWN COMPOSITION (reviewer's case): with TWO quota-healthy accounts, one auth-dead,
+    /// only ONE login is usable — so roborev must STAND DOWN, not publish a one-candidate list that
+    /// takes the founder's last usable account. Paired with a 3-account case where a real alternative
+    /// remains, which DOES publish the survivors — so the test can't pass by always standing down.
+    #[test]
+    fn auth_exclusion_stands_down_when_it_leaves_only_one_usable_login() {
+        // 2 quota-healthy, 1 auth-dead -> 1 usable -> STAND DOWN.
+        let two = vec![acct("a", "/dir/a", None), acct("b", "/dir/b", None)];
+        let a_dead: HashSet<String> = ["/dir/a".to_string()].into_iter().collect();
+        assert!(
+            rank_candidates_excluding_auth_dead(&two, &HashMap::new(), &a_dead, NOW).is_empty(),
+            "one usable login left must stand down, not publish a single candidate"
+        );
+
+        // 3 quota-healthy, 1 auth-dead -> 2 usable -> publish the two survivors.
+        let three = vec![
+            acct("a", "/dir/a", None),
+            acct("b", "/dir/b", None),
+            acct("c", "/dir/c", None),
+        ];
+        let dirs: Vec<String> =
+            rank_candidates_excluding_auth_dead(&three, &HashMap::new(), &a_dead, NOW)
+                .into_iter()
+                .map(|c| c.dir)
+                .collect();
+        assert_eq!(dirs, vec!["/dir/b".to_string(), "/dir/c".to_string()], "survivors must publish: {dirs:?}");
+    }
+
+    /// The stand-down rule is unchanged by auth exclusion: at one quota-healthy account roborev still
+    /// stands down BEFORE the auth filter can even run.
+    #[test]
+    fn auth_exclusion_does_not_bypass_the_standdown_guard() {
+        let accounts = vec![
+            acct("a", "/dir/a", Some(NOW + 5_000)),
+            acct("b", "/dir/b", None),
+        ];
+        let dead: HashSet<String> = ["/dir/c".to_string()].into_iter().collect();
+        assert!(
+            rank_candidates_excluding_auth_dead(&accounts, &HashMap::new(), &dead, NOW).is_empty(),
+            "must still stand down at one healthy account"
+        );
+    }
+
+    /// The detector fires on the OAuth refresh-failure family and NOTHING else — the paired negatives
+    /// are the point: a quota wall (owned by the exhausted_until path) and an ordinary error (a bad
+    /// flag, a crash — identical on every account) must NOT be read as auth-death, or the whole pool
+    /// would be benched on a failure re-login cannot fix.
+    #[test]
+    fn is_auth_expired_matches_only_the_oauth_refresh_family() {
+        assert!(is_auth_expired("Error: OAuth session expired · please run /login"));
+        assert!(is_auth_expired("Your OAuth token has expired and could not be refreshed"));
+        assert!(is_auth_expired("credential could not be refreshed"));
+        assert!(is_auth_expired("Please run `claude login` to continue")); // backtick form
+        // Case-insensitive.
+        assert!(is_auth_expired("OAUTH SESSION EXPIRED"));
+
+        // Paired negatives — the quota family and generic errors are NOT auth-death.
+        assert!(!is_auth_expired("You've hit your session limit · resets 2am"));
+        assert!(!is_auth_expired("Credit balance is too low"));
+        assert!(!is_auth_expired("error: unknown flag --nope"));
+        assert!(!is_auth_expired("Connection reset by peer"));
+        assert!(!is_auth_expired(""));
     }
 
     #[test]

@@ -29,11 +29,27 @@ const worker = (
 ): Pick<AgentTab, "name" | "kind" | "beadId"> => ({ name, kind, beadId });
 
 describe("rollupEpicStatus", () => {
-  it("is not_started with no children", () => {
-    expect(rollupEpicStatus([])).toBe("not_started");
+  // THE SPLIT IS THE POINT OF THESE TWO CASES. Both returned "not_started" until this change, and
+  // the pair is asserted together deliberately: a test that only checked one of them would stay
+  // green if the two words were ever collapsed back into one, which is the regression that matters.
+  // "no plan at all" and "a finished plan nobody started" must never be the same word again.
+  it("is unplanned with no children — a title, nothing decided", () => {
+    expect(rollupEpicStatus([])).toBe("unplanned");
   });
-  it("is not_started when every child is open", () => {
-    expect(rollupEpicStatus(["open", "open"])).toBe("not_started");
+  it("is planning when every child is open — the plan exists and nobody picked it up", () => {
+    expect(rollupEpicStatus(["open", "open"])).toBe("planning");
+  });
+  it("distinguishes no-plan from planned-not-started", () => {
+    expect(rollupEpicStatus([])).not.toBe(rollupEpicStatus(["open"]));
+  });
+  // An empty array satisfies `every(open)` VACUOUSLY, so the childless case has to be answered
+  // first. Written as its own assertion because reordering those two lines is a silent change: the
+  // suite would still pass every other case here while the sweeper started spawning agents at
+  // epics that hold no plan to build.
+  it("does not let a childless epic fall through to planning", () => {
+    expect(["open"].every((s) => s === "open")).toBe(true); // the trap, stated
+    expect([].every((s) => s === "open")).toBe(true); // ...and it is vacuously true when empty
+    expect(rollupEpicStatus([])).toBe("unplanned"); // ...so order, not the predicate, decides
   });
   it("is done when every child is closed", () => {
     expect(rollupEpicStatus(["closed", "closed"])).toBe("done");
@@ -60,8 +76,12 @@ describe("epicStatus", () => {
     const beads = [bead("e2", "open"), bead("e2.1", "closed", "e2"), bead("e2.2", "closed", "e2")];
     expect(epicStatus(beads, "e2")).toBe("done");
   });
-  it("is not_started for an epic with no children", () => {
-    expect(epicStatus([bead("e3", "open")], "e3")).toBe("not_started");
+  it("is unplanned for an epic with no children", () => {
+    expect(epicStatus([bead("e3", "open")], "e3")).toBe("unplanned");
+  });
+  it("is planning for an epic whose children are all still open", () => {
+    const beads = [bead("e4", "open"), bead("e4.1", "open", "e4"), bead("e4.2", "open", "e4")];
+    expect(epicStatus(beads, "e4")).toBe("planning");
   });
 });
 

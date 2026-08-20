@@ -28,8 +28,30 @@ export type TerminalOverlay =
   | { kind: "none" }
   | { kind: "loading"; message: string }
   | { kind: "stopped"; message: string; canRetry: true }
-  /** `detail` is the underlying error, when we have one — see `reason` on resolveTerminalOverlay. */
-  | { kind: "fail"; message: string; canRetry: true; detail?: string };
+  /** `detail` is the underlying error, when we have one — see `reason` on resolveTerminalOverlay.
+   *  `permanent` marks a refusal that cannot change on retry — see `isPermanentSpawnRefusal`. */
+  | { kind: "fail"; message: string; canRetry: true; detail?: string; permanent?: true };
+
+/** The leading phrase of pty.rs `validate_spawn_inner`'s containment refusal. Rust may only ever
+ *  APPEND to that message (its own comment says so, naming this module), so a substring match on
+ *  the phrase is stable while the appended paths vary per install. */
+const CWD_CONTAINMENT_REFUSAL = "cwd is outside the managed worktrees directory";
+
+/** Is this spawn error a refusal that a retry CANNOT clear?
+ *
+ *  Only one signature qualifies today, and it qualifies for a specific structural reason: the
+ *  worktree-scope guard compares the `cwd` prop against the managed worktrees base, and that prop is
+ *  fixed for the Terminal's life. "Start again" re-runs the same effect with the same cwd, so it
+ *  re-derives the identical refusal — the retry is doomed before it is clicked, every time.
+ *
+ *  Deliberately NOT matched: `pty_spawn: worktrees dir unavailable`, the sibling error from the same
+ *  function. That one fires when the base directory cannot be canonicalized (it does not exist yet),
+ *  which a later attempt genuinely can clear — calling it permanent would tell the user to give up
+ *  on a case that fixes itself. Narrow by construction: anything unrecognized stays retryable, so a
+ *  new backend error can never be mislabelled as hopeless. */
+export function isPermanentSpawnRefusal(reason: string | undefined): boolean {
+  return !!reason && reason.includes(CWD_CONTAINMENT_REFUSAL);
+}
 
 /**
  * `stopped` closes the hole this whole module was supposed to cover (bead sparkle-l2xgf).
@@ -64,11 +86,22 @@ export function resolveTerminalOverlay(
   // Failure takes precedence over the loading affordance even if output never set firstOutput.
   if (spawnFail) {
     const detail = reason?.trim();
+    // A PERMANENT refusal is still offered a retry — `canRetry` stays true and the button stays
+    // rendered. Removing it would take away the only control on a pane that has nothing else, and
+    // "this cannot succeed" is a judgement about one signature, not a reason to strip the escape
+    // hatch. What `permanent` changes is the CLAIM: the surface stops presenting a doomed retry as
+    // an ordinary one, which is the half of sparkle-mahbf that surfacing the reason text left open.
+    const permanent = spawnFail === "failed" && isPermanentSpawnRefusal(detail);
     return {
       kind: "fail",
       canRetry: true,
-      message: spawnFail === "failed" ? "Couldn't start the agent." : "Agent exited.",
+      message: permanent
+        ? "Couldn't start the agent — starting again won't help."
+        : spawnFail === "failed"
+          ? "Couldn't start the agent."
+          : "Agent exited.",
       ...(detail ? { detail } : {}),
+      ...(permanent ? { permanent: true as const } : {}),
     };
   }
   // Before the loading hint: a PTY that stopped is stopped whether or not its first byte arrived,

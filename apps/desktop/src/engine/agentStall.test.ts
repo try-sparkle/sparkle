@@ -215,3 +215,33 @@ describe("which statuses the question even applies to", () => {
     ).toBe("active");
   });
 });
+
+// ── THE STALL DETAIL DROPS A STALE ESCALATION SENTENCE TOO (roborev 65339, a Medium) ───────────────
+//
+// The first cut gated only the goal BADGE's one-line label. This string is the stall chip's tooltip
+// and the composer pill's `detail`, and it interpolated the same frozen prose unconditionally — so
+// the identical dead sentence still rendered as a live claim, on the same row, about the same
+// escalation. Half a fix reads as a whole one precisely because the surface that still lies is the
+// one nobody re-checked.
+describe("a stale escalation sentence is not repeated as a live claim", () => {
+  /** Escalate on one goal text, then move the goal on — the real carry path `chargeGoalDebt` takes,
+   *  which is what makes the frozen sentence outlive the work it describes. */
+  const staleGoal = () => ({
+    ...escalateGoal(newGoal("watch release run 123", T0), T0, "run 123 needs a human decision"),
+    text: "something else entirely",
+  });
+
+  it("omits it from the detail when the quote is stale", () => {
+    const detail = stallReport(finished({ goal: staleGoal() })).detail;
+    expect(detail).toContain("auto-continue gave up on its goal");
+    expect(detail).not.toContain("run 123 needs a human decision");
+  });
+
+  it("…but KEEPS it when the escalation still describes the goal the agent holds", () => {
+    // THE PAIRED NEGATIVE. Without it, a change that drops `escalationReason` from EVERY detail
+    // satisfies the assertion above while deleting the one sentence explaining why auto-continue
+    // stopped from the common row — strictly worse than the bug being fixed.
+    const fresh = escalateGoal(newGoal("watch release run 123", T0), T0, "the build never went green");
+    expect(stallReport(finished({ goal: fresh })).detail).toContain("the build never went green");
+  });
+});

@@ -155,11 +155,46 @@ export const NUDGE_PROMPT_MARKER = "[sparkle-nudge #";
  *   • `isMeta` / `isSidechain` — record FIELDS, not prompt text. This predicate takes a string and
  *     structurally cannot see them; they are the transcript reader's to honour.
  */
+/**
+ * The opening of the EPIC SWEEP's resume instruction (`services/sendToBuild.resumeInstruction`),
+ * delivered to a stalled orchestrator's terminal when the sweep hands its epic back.
+ *
+ * SPARKLE AUTHORS THIS ONE, like the resume marker and unlike the goal-expiry banner — so it is
+ * pinned by a ROUND TRIP in the suite (build a real instruction, assert this matches it) rather than
+ * by a copied literal, and rewording the prose without touching this constant fails that test
+ * instead of going silently blind.
+ *
+ * ⚠️ WHY IT HAS TO BE HERE. The sweep restarts a STALLED agent — one that is, by definition, already
+ * being judged for lack of progress. Its instruction arrives on the hook stream as an ordinary user
+ * turn with the authority long since stripped, so without this marker Sparkle's own prose would be
+ * counted as agent activity in both tallies: it would read as progress the agent did not make, and,
+ * on a repeat restart, as a `repeating-command` verdict about the agent earned entirely by Sparkle
+ * saying the same thing twice. That is the exact failure the nudge marker was added for after it
+ * cost a fleet-wide loss of trust in the red dot (bead sparkle-hpbkw) — and this path is MORE
+ * exposed, because the sweep only ever writes it to an agent already suspected of being stuck.
+ *
+ * ⚠️ IT CARRIES AN OWNED TAG, and the tag is the whole point. An earlier cut used a bare
+ * `"Resume epic "` — twelve characters of ordinary English that a human can type verbatim, and this
+ * path positively INVITES him to: the concierge notice and the audit note both name the epic id, so
+ * "Resume epic sparkle-e1" is the natural reply to compose into that agent's box. Matching it would
+ * suppress a REAL human turn from both tallies — it would stop counting as progress in
+ * `goalContinuation` (so a genuinely-worked agent reads as stalled and gets auto-restarted) and stop
+ * counting as a command in `agentThrash`.
+ *
+ * That is the failure direction this module's header calls the expensive one: a false match here
+ * SUPPRESSES a real signal rather than merely failing to catch ours. So this marker follows the
+ * discipline the other three do — be unmistakable — via a bracketed tag no human types, exactly like
+ * `NUDGE_PROMPT_MARKER`. `resumeInstruction` BUILDS from this constant, so the round trip in the
+ * suite pins the two together and a reworded instruction fails a test rather than going blind.
+ */
+export const EPIC_RESUME_PROMPT_MARKER = "[sparkle-epic-resume] ";
+
 const SYSTEM_AUTHORED_MARKERS: readonly string[] = [
   RESUME_PROMPT_MARKER,
   GOAL_EXPIRY_PROMPT_MARKER,
   TASK_NOTIFICATION_MARKER,
   NUDGE_PROMPT_MARKER,
+  EPIC_RESUME_PROMPT_MARKER,
 ];
 
 /**

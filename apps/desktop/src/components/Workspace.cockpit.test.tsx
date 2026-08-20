@@ -5,7 +5,7 @@
 //
 // The user sits centred on the concierge like an F1 driver:
 //
-//     TERM │ BUILD │ CONCIERGE │ BUILD │ TERM
+//     TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM
 //
 // Four things these pin, each of which the shell got wrong or lacked before:
 //
@@ -289,15 +289,30 @@ describe("the pair", () => {
     expect(pair.contains(screen.getByTestId("concierge"))).toBe(false);
   });
 
-  it("holds build and terminal as one unsplit unit, build first", () => {
+  it("holds build and terminal as one unsplit unit, in that order, with nothing between them", () => {
     render(<Workspace />);
     const cols = screen.getByTestId("pair-cols-right");
     expect(cols.contains(screen.getByTestId("sidebar"))).toBe(true);
     expect(cols.contains(screen.getByTestId("terminal-stage"))).toBe(true);
+
+    // ADJACENCY, NOT POSITION — and the change from `firstElementChild` is the point rather than a
+    // relaxation. The founder's constraint is that build and terminal are ONE THING with no seam
+    // between them; "build is the first child" was only ever a proxy for it, true while the pair
+    // held exactly two columns. It no longer does: the epics column mounts ahead of both, so a
+    // first-child assertion would now fail for a row that satisfies the actual invariant perfectly.
+    //
+    // The proxy was already known to be lossy — `AgentSidebar` renders TWO siblings in overlay mode
+    // with an aria-hidden spacer FIRST — which is why index.css stopped selecting `.paircols >
+    // :first-child` and names `[data-testid="agent-sidebar-column"]` instead (roborev 54699). So
+    // nothing in the stylesheet depends on position any more, and this stops depending on it too.
+    //
     // [build, terminal] in DOM order on BOTH sides — the mirror reverses the flow, not the markup,
-    // so reading order and tab order are identical left and right. index.css's
-    // `.paircols > :first-child` selector depends on exactly this.
-    expect(cols.firstElementChild).toBe(screen.getByTestId("sidebar"));
+    // so reading order and tab order are identical left and right.
+    const kids = Array.from(cols.children);
+    const build = kids.indexOf(screen.getByTestId("sidebar"));
+    const terminal = kids.indexOf(screen.getByTestId("terminal-stage"));
+    expect(build).toBeGreaterThanOrEqual(0);
+    expect(terminal).toBe(build + 1);
   });
 
   it("mirrors: build stays adjacent to the concierge on both sides", () => {
@@ -775,7 +790,7 @@ describe("wiring and the overlay cannot both be true", () => {
 
 // ── 5. THE SECOND PAIR ────────────────────────────────────────────────────────────────────────
 //
-// The left half of `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`. The interesting assertions here are
+// The left half of `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`. The interesting assertions here are
 // not "does a second column appear" — they are about OWNERSHIP: a project's panes must be mounted
 // in exactly one stage. Zero means dead terminals under a live tab; two means two xterms on one
 // PTY, which is what `pty_spawn`'s `sessions.insert` orphans a child process over.

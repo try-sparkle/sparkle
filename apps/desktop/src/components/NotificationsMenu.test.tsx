@@ -38,10 +38,27 @@ describe("NotificationsMenu", () => {
     expect(screen.getByRole("checkbox", { name }).getAttribute("aria-checked")).toBe("false");
   });
 
-  it("does not offer the noisy/low-signal statuses (working/blocked/stopped)", () => {
+  it("does not offer the noisy/low-signal statuses (working/stopped)", () => {
     render(<NotificationsMenu />);
     expect(screen.queryByRole("checkbox", { name: /working/i })).toBeNull();
-    expect(screen.queryByRole("checkbox", { name: /stalled|blocked/i })).toBeNull();
     expect(screen.queryByRole("checkbox", { name: /stopped/i })).toBeNull();
+  });
+
+  it("DOES offer `blocked` — but leaves it OFF, so listing it cannot start a storm", () => {
+    // ⚠️ REVERSES THE ASSERTION ABOVE FOR ONE STATUS (founder, 2026-08-18). `blocked` was hidden as
+    // "passive", which described statusEngine's quiet-settle timer and stopped being true when
+    // `stallEscalation.OUTSTANDING` narrowed to "the founder is the only actor who can clear it" —
+    // its members now include `blocked-on-human`, an agent that was ASKED and said a person is
+    // blocking it. Hiding the toggle for that is the same text/colour mismatch he reported on the
+    // dot, one layer up.
+    render(<NotificationsMenu />);
+    const box = screen.getByRole("checkbox", { name: /blocked/i });
+    // BOTH HALVES MATTER, and the second is the one that keeps this safe: the notification pipeline
+    // keys on STATUS, not on stall cause, so this single toggle covers the whole red tier. Shipping
+    // it ON would page for every OUTSTANDING cause — the storm `attention.ATTENTION` exists to
+    // avoid. Discoverable, not default.
+    expect(box).not.toBeNull();
+    expect(box.getAttribute("aria-checked")).toBe("false");
+    expect(useSettingsStore.getState().notifyStatuses.blocked).toBe(false);
   });
 });

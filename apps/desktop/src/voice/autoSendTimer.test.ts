@@ -8,6 +8,7 @@ import {
   noteCountdownHeld,
   noteManualSend,
   pauseCountdown,
+  restartCountdown,
   resumeCountdown,
   elapsedMs,
   remainingMs,
@@ -571,5 +572,89 @@ describe("PAUSED while an @-address is being typed (sparkle-14dtu)", () => {
   it("DISARMING clears the pause — an armed-later rail is never born frozen", () => {
     const s = setArmed(pauseCountdown(counting("ship it now", 0), 100), false);
     expect(s.pausedAt).toBeNull();
+  });
+});
+
+describe("RESTARTED when something is put in the box — paste / drop / upload (sparkle-3kqg2v)", () => {
+  // THE FOUNDER'S REPORT: *"reset the countdown if I paste something in or if I drop in an image or
+  // upload a file. Just reset the countdown back and then start the countdown again."* The `@`-pause
+  // above is the half he confirmed already works; this is the half that was missing.
+  //
+  // Every row asserts the SIDE EFFECT — what `evaluate` decides, or what the deadline becomes —
+  // rather than that `silenceStartedAt` holds some number. The field is the mechanism; the send
+  // going out early is the bug.
+
+  it("THE WHOLE REPORT IN ONE ROW: a send that was about to fire is pushed a FULL threshold out", () => {
+    // 100ms left on the clock — the exact moment he reaches for ⌘V. Before the fix this fired.
+    const about = counting("ship it now", 0);
+    expect(evaluate(about, NORMAL).action).toBe("fire");
+    const reset = restartCountdown(about, NORMAL - 100);
+    // Still nothing at the old deadline…
+    expect(evaluate(reset, NORMAL).action).toBe("wait");
+    // …and not until a whole fresh threshold has passed since the paste.
+    expect(evaluate(reset, NORMAL - 100 + NORMAL - 1).action).toBe("wait");
+    expect(evaluate(reset, NORMAL - 100 + NORMAL).action).toBe("fire");
+  });
+
+  it("resets to FULL, not to what was left — the elapsed clock goes back to zero", () => {
+    const reset = restartCountdown(counting("ship it now", 0), 900);
+    expect(elapsedMs(reset, 900)).toBe(0);
+    expect(remainingMs(reset, 900)).toBe(NORMAL);
+    expect(remainingFraction(reset, 900)).toBe(1);
+  });
+
+  it("KEEPS COUNTING — it is not a pause and not a cancel", () => {
+    // The two neighbouring reducers both stop the clock, and either would be a plausible-looking
+    // implementation. `pauseCountdown` would leave the rail frozen with no gesture left to un-freeze
+    // it (a paste has no end); `noteSpeechResumed` would drop back to `listening`, so only a fresh
+    // speech-end could ever count again and his finished sentence would sit there forever.
+    const reset = restartCountdown(counting("ship it now", 0), 500);
+    expect(reset.phase).toBe("counting");
+    expect(reset.pausedAt).toBeNull();
+    expect(reset.silenceStartedAt).not.toBeNull();
+    expect(evaluate(reset, 500 + NORMAL).action).toBe("fire"); // it still fires, just later
+  });
+
+  it("EACH gesture is owed its own threshold — two pastes are not one", () => {
+    // Deliberately NOT idempotent, the opposite of `pauseCountdown`'s rule. A boolean-edge signal
+    // would collapse these two, which is the same complaint arriving one paste later.
+    let s = restartCountdown(counting("ship it now", 0), 500);
+    s = restartCountdown(s, 1_000);
+    expect(evaluate(s, 1_000 + NORMAL - 1).action).toBe("wait");
+    expect(evaluate(s, 1_000 + NORMAL).action).toBe("fire");
+  });
+
+  it("CANNOT START a countdown — pasting into an idle box arms nothing", () => {
+    // The whole safety argument for wiring this to a paste: it can only ever DELAY a send. An
+    // armed-but-listening rail has no clock, and a paste must not give it one before speech ends.
+    const listening = setArmed(initialState(), true);
+    expect(restartCountdown(listening, 5_000)).toBe(listening);
+    const disarmed = initialState();
+    expect(restartCountdown(disarmed, 5_000)).toBe(disarmed);
+  });
+
+  it("clears a drop-grace window granted against an elapsed time that no longer exists", () => {
+    // Same reasoning `resumeCountdown` states. Without this the grace deadline outlives the reset
+    // and can only push the send out further — harmless here, but it means the rail is drawing one
+    // deadline and honouring another.
+    let s = counting("hold the deploy because", 0); // verylow — a long threshold to accumulate under
+    expect(s.tier).toBe("verylow");
+    s = noteTranscript(s, "hold the deploy because it is flaky.", 4_000); // -> high, already blown past
+    expect(s.fireNoEarlierThan).not.toBeNull();
+    expect(restartCountdown(s, 4_000).fireNoEarlierThan).toBeNull();
+  });
+
+  it("a reset DURING an @-pause anchors at the frozen instant, not at wall-clock time", () => {
+    // He pastes a URL half-way through typing `@Kraken`. The clock is frozen, so the seconds spent
+    // inside the pause are not his — handing them back would shorten the countdown the pause exists
+    // to protect. Composes with `resumeCountdown`, which re-anchors again on the way out.
+    const paused = pauseCountdown(counting("ship it now", 0), 500);
+    const reset = restartCountdown(paused, 90_000); // long pause, wall clock miles ahead
+    expect(reset.pausedAt).toBe(500); // still frozen — a paste does not finish the address
+    expect(elapsedMs(reset, 90_000)).toBe(0);
+    expect(evaluate(reset, 90_000).action).toBe("wait");
+    const resumed = resumeCountdown(reset, 90_000);
+    expect(evaluate(resumed, 90_000 + NORMAL - 1).action).toBe("wait");
+    expect(evaluate(resumed, 90_000 + NORMAL).action).toBe("fire");
   });
 });

@@ -615,6 +615,53 @@ fn parse_records(text: &str, first_index: usize) -> Vec<RawRecord> {
 /// hurts: a type missing from one copy reads as conversation there and metadata here.
 pub(crate) const CONVERSATION_TYPES: &[&str] = &["user", "assistant"];
 
+/// How many lines from the START of a transcript we sniff for the first human turn.
+///
+/// Set from the same measurement that set [`crate::claude`]'s `SNIFF_LINES`: across 400 sampled
+/// real transcripts the first `user`/`assistant` record was at line 12 at the WORST, median 8. 64
+/// is >5x that worst case and bounds the read so this never walks a multi-MB file.
+pub(crate) const FIRST_PROMPT_SNIFF_LINES: usize = 64;
+
+/// The text of the FIRST human-role turn in the transcript at `path`, or None.
+///
+/// STRUCTURE ONLY — this deliberately does not look at what the text SAYS. It reuses [`classify`],
+/// so a sidechain, an `isMeta` injection, a tool_result-only turn, an `sdk`/`system` prompt source
+/// and a `<local-command-*>` wrapper are all dropped by the same rule the renderer uses, and cannot
+/// drift from it. Judging the text is the caller's job and, per this module's header, TypeScript's:
+/// `engine/agentOriginated.ts` owns the marker strings.
+///
+/// ── WHY THE *FIRST* TURN, AND WHY ANYONE WANTS IT ────────────────────────────────────────────
+/// Claude Code derives a session's `ai-title` on the first turn and then re-emits that same value
+/// verbatim forever (measured 58/58 in [`crate::claude::latest_ai_title_in`]'s notes). So the first
+/// human turn is the title's BASIS: if Sparkle's own automated ping is what opened the transcript,
+/// every title that session will ever report was summarized from Sparkle talking to itself, and the
+/// staleness is permanent — a human typing later does not retitle it. Callers that adopt a title as
+/// a NAME need that provenance, which is why this is read alongside the title rather than inferred
+/// from the title's wording (the wording varies: "Sparkle-nudge #8", "Resume sparkle-nudge task",
+/// and — for 39 measured sessions — nothing recognisable at all).
+///
+/// Best-effort: an unreadable file, a malformed line, or no human turn inside the sniff window all
+/// yield None. None means "no evidence", NOT "the transcript is clean" — see the caller for which
+/// direction that has to fail in.
+pub(crate) fn first_human_prompt_in(path: &Path, max_lines: usize) -> Option<String> {
+    use std::io::BufRead;
+    let file = File::open(path).ok()?;
+    for line in std::io::BufReader::new(file).lines().take(max_lines) {
+        let Ok(line) = line else { return None }; // a read error is no evidence, not a clean file
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue; // half-flushed line: skip it, keep looking
+        };
+        if let RecordKind::Human { text, .. } = classify(&v) {
+            return Some(text);
+        }
+    }
+    None
+}
+
 /// The structural filter. An ALLOWLIST on `type` (see [`CONVERSATION_TYPES`]), then per-role
 /// structural drops.
 fn classify(v: &Value) -> RecordKind {

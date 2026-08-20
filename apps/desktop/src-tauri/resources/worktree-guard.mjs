@@ -12,7 +12,7 @@
 // tool, which can write anywhere the user can. True isolation comes from the per-agent worktree+branch
 // model; this hook just stops a well-behaved agent from accidentally editing outside its lane.
 //
-// It ALSO carries two narrow Bash guards:
+// It ALSO carries three narrow Bash guards:
 //   - (sparkle-0ezz) it blocks a `security`-CLI invocation against the app's `ai.sparkle.desktop`
 //     keychain item. Workers auto-approve their own shell commands, so an agent shelling out to
 //     `security find-generic-password -s ai.sparkle.desktop` would pop a scary "security wants to use
@@ -25,8 +25,13 @@
 //     guard ships with Sparkle and covers EVERY project a user points it at. (A repo-local
 //     `pre-commit` hook is not an option: `core.hooksPath` is commonly set globally, which makes any
 //     repo-local hook structurally unable to run. The PreToolUse hook is the layer that actually fires.)
+//   - MERGE POLICY (contract §7): it blocks `gh pr merge` in a worktree whose
+//     `.sparkle/merge-policy.json` says the repo is merge-protected. This one is deliberately
+//     CONDITIONAL rather than a global deny rule: in the owner's OWN repo merging IS the sanctioned
+//     path, so a static rule would rebuild the wall this posture exists to tear down. See the
+//     MERGE-POLICY GUARD section for the three file states and why an ABSENT file must not block.
 import { relative, sep, isAbsolute, dirname, join } from "node:path";
-import { lstatSync, readlinkSync, statSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { execFileSync } from "node:child_process";
 
@@ -1764,6 +1769,594 @@ function destructiveCommandMessage(verdict) {
   );
 }
 
+// ──────────────────────────────────────────────────────────────────────────────────────────────
+// MERGE-POLICY GUARD  (contract: PRD/sparkle/per-project-tool-policy-contract.md §7)
+//
+// `gh pr merge` was in NEITHER agent enforcement layer, so a build agent could merge a PR into a
+// repo the machine's owner does not own, with nothing in the way.
+//
+// It must NOT join `SPARKLE_DENY_RULES` / the destructive-command corpus. A deny rule is a hard
+// refusal with no approval path, and in `drodio/sparkle` merging is the SANCTIONED path — the
+// orchestrator merges agent branches that way. A global rule would rebuild the exact wall this
+// posture exists to tear down. So this is a PER-WORKTREE CONDITIONAL rule: the verdict is resolved
+// in Rust (which owns the strictness lattice, the config and the repo slug) and written to
+// `<worktree>/.sparkle/merge-policy.json`; the guard only reads it. Native `JSON.parse`, no new
+// dependency, and deliberately no TOML parser — keeping the guard dependency-free is the whole
+// reason the verdict is pre-resolved into JSON.
+//
+// THREE FILE STATES, and getting them backwards is the expensive mistake:
+//
+//   ABSENT      -> DO NOT BLOCK. Absence means "not a Sparkle-managed worktree; the guard has no
+//                  opinion". This is only safe because the Rust writer emits the file
+//                  UNCONDITIONALLY for every managed worktree, including unprotected ones
+//                  (`mergeProtected: false`). Blocking on absence would break `gh pr merge` in
+//                  every worktree that predates this change — including the sanctioned merge path
+//                  in the owner's OWN repo, and the orchestrator's own PR merges.
+//   UNREADABLE  -> BLOCK. Unparseable, wrong `version`, or no boolean `mergeProtected`. A policy
+//                  file can only EXIST in a managed worktree, so a corrupted one is the tamper
+//                  case and it fails closed.
+//   PROTECTED   -> BLOCK.
+//
+// The check is cwd-anchored and walks UP for the policy file, because an agent's `cwd` is very
+// often a subdirectory of its worktree rather than the root. It also resolves any `cd` target on
+// the same command line: `cd ../other-repo && gh pr merge` is precisely the shape a prefix-matched
+// deny rule cannot see, and it is why the lexer layer exists at all.
+
+/** The one wire version this guard understands. A file claiming any other version is treated as
+ *  unreadable (block) rather than ignored: a newer writer ships with a newer guard, so a version
+ *  mismatch in the field means something rewrote the file. */
+const MERGE_POLICY_VERSION = 1;
+/** Ancestor directories to search for the policy file. A cap, not a policy — an unbounded walk on
+ *  attacker-shaped input is how a guard that must never hang starts hanging. */
+const MERGE_POLICY_MAX_ASCENT = 64;
+/** Cap on policy-supplied prose echoed into the refusal, so a rewritten file cannot bury the
+ *  guard's own fixed instructions under a wall of text. */
+const MERGE_POLICY_TEXT_CAP = 400;
+
+/** Read one candidate policy path. Distinguishes "not here, keep walking" from "here and
+ *  unreadable" — the first is the ABSENT state (allow) and the second is the tamper state (block),
+ *  and collapsing them is exactly the mistake this whole section is written around.
+ *
+ *  THE TAMPER STATE REQUIRES PROOF THAT THE FILE IS THERE, which is why this stats first. The walk
+ *  climbs from `cwd` to `/`, so a read error says nothing about the policy unless the file exists:
+ *  one mode-700 ancestor, an SMB mount answering `EIO`, or macOS TCC denying `~/Documents` yields
+ *  `EACCES` for a path that holds no policy at all. Reading that as "PRESENT but unusable" ends the
+ *  ascent, so the REAL policy higher up is never reached — and the refusal then names a file that
+ *  does not exist and tells the agent not to delete it. Permanent, and unexplainable from the copy.
+ *  So: `lstat` fails → missing, keep walking. `lstat` succeeds and the read fails → the file is
+ *  demonstrably there and unreadable, which is the tamper case. */
+function readMergePolicyFile(file) {
+  try {
+    lstatSync(file);
+  } catch {
+    return { ok: false, missing: true };
+  }
+  try {
+    return { ok: true, text: readFileSync(file, "utf8") };
+  } catch (e) {
+    const code = e && typeof e === "object" ? e.code : undefined;
+    // The one exception: a race in which the file is unlinked between the stat and the read is an
+    // ABSENT file, not a corrupted one.
+    if (code === "ENOENT" || code === "ENOTDIR") return { ok: false, missing: true };
+    return { ok: false, missing: false, error: typeof code === "string" ? code : "unreadable" };
+  }
+}
+
+/** The nearest `.sparkle/merge-policy.json` at or above `dir`, or null when there is none.
+ *  Returns `{ file, text }` when it was read, `{ file, text: null, error }` when a file IS there
+ *  and could not be read. */
+function findMergePolicy(dir) {
+  let cur = isAbsolute(dir) ? dir : join(process.cwd(), dir);
+  for (let i = 0; i < MERGE_POLICY_MAX_ASCENT; i++) {
+    const file = join(cur, ".sparkle", "merge-policy.json");
+    const r = readMergePolicyFile(file);
+    if (r.ok) return { file, text: r.text };
+    if (!r.missing) return { file, text: null, error: r.error };
+    const parent = dirname(cur);
+    if (parent === cur) break;
+    cur = parent;
+  }
+  return null;
+}
+
+/** Decide one found policy file. `{ kind: "ok", slug }` = this worktree permits the merge (and this
+ *  is the repo it speaks for); otherwise a blocking verdict. It returns the slug even on the allow
+ *  path because "may this worktree merge" and "is the command merging THIS repo" are two different
+ *  questions, and only the caller can ask the second. */
+function judgeMergePolicy(found) {
+  const file = found.file;
+  const unreadable = (why, slug = null) => ({ kind: "unreadable", file, slug, why, remedy: null });
+  if (found.text === null) return unreadable(`it could not be read (${found.error})`);
+  let policy;
+  try {
+    policy = JSON.parse(found.text);
+  } catch {
+    return unreadable("it is not valid JSON");
+  }
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+    return unreadable("its contents are not a JSON object");
+  }
+  const slug = typeof policy.slug === "string" && policy.slug.length > 0 ? policy.slug : null;
+  if (policy.version !== MERGE_POLICY_VERSION) {
+    return unreadable(
+      `its \`version\` is ${JSON.stringify(policy.version) ?? "absent"}, not ${MERGE_POLICY_VERSION}`,
+      slug,
+    );
+  }
+  // Deliberately `!== "boolean"` and not a truthiness test: a missing field, `null`, or the STRING
+  // "false" must all fail closed. A truthy read would turn `"mergeProtected": "false"` into a block
+  // (right answer, wrong reason) and a missing field into an ALLOW (the wrong answer entirely).
+  if (typeof policy.mergeProtected !== "boolean") {
+    return unreadable("it has no boolean `mergeProtected` field", slug);
+  }
+  found.slugOf = slug;
+  if (policy.mergeProtected === false) return { kind: "ok", slug };
+  return {
+    kind: "protected",
+    file,
+    slug,
+    why: typeof policy.reason === "string" ? policy.reason : null,
+    remedy: typeof policy.remedy === "string" ? policy.remedy : null,
+  };
+}
+
+/** gh's repo override, in every spelling it accepts. This is not decoration: `gh` does NOT take its
+ *  target repo from the worktree when the caller names one, so an override is the cheap version of
+ *  the `cd` laundering the walk above already covers. */
+/** gh's own value-taking flags on the merge path, whose VALUE is prose the agent typed and must
+ *  never be read as a repo name. Split by spelling because a SHORTHAND is a letter inside a
+ *  cluster, not a whole token. Deliberately narrow: this only has to cover the flags a
+ *  `gh pr merge` line actually carries. */
+const GH_LONG_VALUE_FLAGS = new Set([
+  "--subject", "--body", "--body-file", "--match-head-commit", "--author-email",
+]);
+const GH_SHORT_VALUE_FLAGS = new Set(["t", "b", "F", "A"]);
+
+/** Every repo override the segment names, walking shorthand CLUSTERS letter by letter.
+ *
+ *  Collecting all of them rather than picking one is the load-bearing half: any precedence is a
+ *  bypass, because a benign override placed where the picker looks first shadows the hostile one
+ *  that actually takes effect. The judge refuses if ANY named target is foreign, which is the only
+ *  reading that cannot be reordered into a hole.
+ *
+ *  THE CLUSTER WALK IS THE OTHER HALF, and it is the third time this file has had to learn it (see
+ *  `envParse`'s letter-by-letter comment). pflag — which gh uses — bundles shorthands, so matching
+ *  `-R` only as a whole token or only as the FIRST letter fails in both directions at once:
+ *  `gh pr merge 41 -mR <foreign>` and `-sR<foreign>` named a repo the guard never saw, while
+ *  `-st '-Rebase before merging'` had its commit SUBJECT read as a repo name and was refused —
+ *  prose, with no approval path. Walking the cluster answers both with one rule. */
+function ghRepoOverrides(assignments, args) {
+  const out = [];
+  for (const t of assignments) {
+    const m = /^GH_REPO=(.*)$/.exec(t);
+    if (m && m[1].length > 0) out.push(m[1]);
+  }
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith("-") || a === "-" || a === "--") continue;
+    if (a.startsWith("--")) {
+      if (a === "--repo") {
+        if (args[i + 1] !== undefined) out.push(args[i + 1]);
+        i++; // consume the value so it is not re-read as a flag
+        continue;
+      }
+      const eq = /^--repo=(.*)$/.exec(a);
+      if (eq) {
+        if (eq[1].length > 0) out.push(eq[1]);
+        continue;
+      }
+      if (GH_LONG_VALUE_FLAGS.has(a)) i++; // skip THIS flag's value, which is prose
+      continue;
+    }
+    // A shorthand cluster: booleans may precede the letter that takes a value, and that letter
+    // swallows the REST of the word (or, if nothing is left, the next word).
+    const cluster = a.slice(1);
+    for (let k = 0; k < cluster.length; k++) {
+      const c = cluster[k];
+      if (c === "R") {
+        const attached = cluster.slice(k + 1).replace(/^=/, "");
+        if (attached.length > 0) out.push(attached);
+        else if (args[i + 1] !== undefined) {
+          out.push(args[i + 1]);
+          i++;
+        }
+        break;
+      }
+      if (GH_SHORT_VALUE_FLAGS.has(c)) {
+        if (cluster.length === k + 1 && args[i + 1] !== undefined) i++; // its value is the next word
+        break; // either way it consumed the rest of this word
+      }
+    }
+  }
+  return out;
+}
+
+/** `{ targetRepos }` iff one lexed segment invokes `gh pr merge` in COMMAND POSITION, else null.
+ *  Command-position anchored — the difference between a guard and a substring search:
+ *  `echo "gh pr merge is blocked here"` lexes to a single quoted token behind `echo` and is a
+ *  MENTION, not an invocation.
+ *
+ *  IT MATCHES ADJACENT TOKENS, NOT `operandsOf` POSITIONS, and that is the whole subtlety.
+ *  `operandsOf` drops an option WORD but keeps the VALUE it consumes, so
+ *  `gh -R plow-pbc/tkmx-server pr merge 41` yields operands `["plow-pbc/tkmx-server","pr","merge",…]`
+ *  — the slug lands at index 0, a positional pair test fails, and the merge sails through a fully
+ *  protected worktree. That is the same option-takes-a-value bug this file already fixed twice (see
+ *  `GIT_GLOBAL_VALUE_OPTS` and `WRAPPER_VALUE_FLAGS`), and only the equals spelling was unaffected,
+ *  which made the hole look randomly present. Requiring `pr` to be IMMEDIATELY followed by `merge`
+ *  needs no flag table at all, so it cannot rot as gh grows options — and it still leaves
+ *  `gh pr list --search merge` alone, which a "next non-option word" rule would refuse. */
+function mergeSegment(tokens, assignments) {
+  const seg = segmentCommand(tokens);
+  if (!seg || seg.bin !== "gh") return null;
+  const { args } = seg;
+  const merges = args.some((a, i) => a === "pr" && args[i + 1] === "merge" && inCommandPosition(args, i));
+  if (!merges) return null;
+  return { targetRepos: ghRepoOverrides(assignments, args) };
+}
+
+/** True iff `args[i]` is where gh's SUBCOMMAND sits — i.e. everything before it is an option word
+ *  or the value one consumed. Adjacency alone is not enough: `pr merge` also appears inside another
+ *  subcommand's positional arguments, and those are read-only commands this must not touch —
+ *  `gh search issues pr merge` is a full-text search for the words "pr merge", and `gh alias set pr
+ *  merge` defines an alias. A refusal has no approval path, so an agent that believed the copy
+ *  would escalate a `gh search` to a human. This asks the question without a flag table, so it
+ *  cannot rot as gh grows options: `gh -R owner/repo pr merge` still qualifies (the slug follows
+ *  `-R`), while a bare word not preceded by an option disqualifies everything after it. */
+function inCommandPosition(args, i) {
+  for (let j = 0; j < i; j++) {
+    if (args[j].startsWith("-")) continue; // an option word
+    if (j > 0 && args[j - 1].startsWith("-") && !args[j - 1].includes("=")) continue; // its value
+    return false; // a bare operand — this is some other subcommand's argument list
+  }
+  return true;
+}
+
+/** The `NAME=value` words `env` itself owns for one arity reading — the operands before the command
+ *  word — appended to what was already inherited. The boundary comes from `envRunTokenLists`'s own
+ *  reading (`toks` starts AT the command word), so this cannot disagree with the parser it rides on
+ *  the way a hand-rolled scan of `args` did. */
+function envOwn(args, toks, inherited) {
+  const start = Math.max(0, args.length - toks.length);
+  return [...inherited, ...args.slice(0, start).filter((a) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(a))];
+}
+
+/** The leading `VAR=value` words of a segment: what `segmentCommand` skips to find the binary. */
+function leadingAssignments(tokens) {
+  const out = [];
+  for (const t of tokens) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(t)) break;
+    out.push(t);
+  }
+  return out;
+}
+
+/** Walk a command string collecting (a) whether it merges a PR anywhere, and (b) every directory it
+ *  `cd`s into. Follows the same nesting shapes as the destructive guard, because otherwise the
+ *  claim that laundering does not work is false: a shell's `-c` argument is ONE token the top-level
+ *  lexer never re-lexes, and `xargs`/`env`/`nohup` carry their command as plain operands. */
+function scanMergeCommand(command, depth, acc, inherited = []) {
+  if (typeof command !== "string" || command.length === 0) return;
+  if (depth > MAX_NESTING) return;
+  for (const tokens of lexCommand(stripHeredocBodies(command))) {
+    scanMergeTokens(tokens, depth, acc, inherited);
+  }
+}
+
+/** `inherited` carries the `VAR=value` assignments in force for whatever this segment runs, because
+ *  an environment override survives every wrapper the walk unwraps: `env GH_REPO=… gh pr merge` and
+ *  `nohup env GH_REPO=… gh pr merge` set it for the `gh` underneath, but `envParse` drops those
+ *  words as env's own before handing on the tail, so reading them off the gh segment alone misses
+ *  every wrapped spelling. */
+function scanMergeTokens(tokens, depth, acc, inherited = []) {
+  if (depth > MAX_NESTING) return;
+  const seg = segmentCommand(tokens);
+  if (!seg) return;
+  const { bin, args } = seg;
+  const assignments = [...inherited, ...leadingAssignments(tokens)];
+  if (changesDirectory(tokens)) {
+    const dir = operandsOf(args)[0];
+    if (typeof dir === "string" && dir.length > 0) acc.dirs.push(dir);
+    return;
+  }
+  const merge = mergeSegment(tokens, assignments);
+  if (merge) {
+    acc.merges = true;
+    for (const t of merge.targetRepos) {
+      if (typeof t === "string" && t.length > 0) acc.targets.push(t);
+    }
+    return;
+  }
+  if (SHELL_BINARIES.has(bin)) {
+    // `-c` may be BUNDLED (`bash -lc "…"`), exactly as in judgeSegment — an exact `indexOf("-c")`
+    // misses the idiom this repo's own tooling uses.
+    const at = args.findIndex((a) => a.startsWith("-") && !a.startsWith("--") && a.includes("c"));
+    if (at !== -1 && args[at + 1] !== undefined) {
+      scanMergeCommand(args[at + 1], depth + 1, acc, assignments);
+    }
+  } else if (bin === "env") {
+    // `env` gets the REAL option grammar rather than `commandTailFrom`'s flag set, for the same
+    // reason judgeSegment does: `-S` carries a whole COMMAND LINE, and treating it as an ordinary
+    // value-flag skips straight past it — `env -S 'gh pr merge 41'` would have an empty tail and
+    // read as no merge at all. `envRunTokenLists` covers the other half, where GNU and BSD disagree
+    // about whether an option takes a value and each reading names a different command word.
+    // env's OWN operand assignments are in force for whatever it runs, and `envParse` skips them —
+    // so collect them here or `env GH_REPO=… gh pr merge` launders the override past the rule with
+    // one word. `env -S 'GH_REPO=… gh …'` needs no help: the assignment leads its re-lexed segment.
+    //
+    // ONLY the words env owns, which are the operands BEFORE the command word. Filtering all of
+    // `args` for `NAME=value` reads the NESTED command's arguments as environment too, and that is
+    // wrong in both directions: it refused `env gh pr merge --subject 'GH_REPO=…'` (a commit
+    // subject, with no approval path) and, paired with a real `-R`, it let a foreign merge through.
+    // `envParse` already computes that boundary per arity reading; `envOwn` reuses it.
+    const parsed = envParse(args);
+    if (parsed.kind === "split") {
+      // The SPLIT reading needs env's own assignments just as much as the tail reading does, and it
+      // cannot borrow `envOwn`'s arithmetic because the split command is not a suffix of `args`:
+      // `env GH_REPO=<foreign> -S 'gh pr merge 41'` exports the variable and merges the foreign
+      // repo, while the guard collected nothing. The words env owns here are everything before the
+      // trailing operands, minus the `-S` string itself — which is excluded explicitly because a
+      // string that STARTS with an assignment (`-S 'GH_REPO=… gh …'`) is assignment-shaped as a
+      // token, and swallowing it would read the whole command line as one bogus repo name.
+      const rest = parsed.rest ?? [];
+      // EXCLUDING the `-S` value is load-bearing: a split string that STARTS with an assignment is
+      // assignment-shaped as a token, so reading it as one turns the whole command line into a
+      // bogus repo name and refuses a legitimate merge.
+      //
+      // It is excluded BY VALUE rather than by re-deriving its position, and that is deliberate.
+      // Re-scanning `args` for a literal `-S`/`--split-string` is a NARROWER grammar than the one
+      // `envParse` used to produce `parsed.str`: it also reaches the split reading through a bundled
+      // cluster (`env -iS '…'`) and a long-option abbreviation (`env --split '…'`), and for those a
+      // position re-scan finds nothing, excludes nothing, and over-blocks exactly the merge this is
+      // meant to protect. Value identity covers every spelling `envParse` accepts, by construction.
+      //
+      // The case value identity cannot distinguish — a caller repeating the split string verbatim as
+      // an assignment, so both are dropped — is reached anyway by the operand composition below,
+      // which re-lexes the string and finds the assignment leading its own segment. Verified by
+      // mutation: swapping the two forms changes no verdict for that shape.
+      const splitOwned = [
+        ...assignments,
+        ...args
+          .slice(0, Math.max(0, args.length - rest.length))
+          .filter((a) => a !== parsed.str && /^[A-Za-z_][A-Za-z0-9_]*=/.test(a)),
+      ];
+      // `env -S` APPENDS the trailing operands to the split command line — `envRunTokenLists` says
+      // so in as many words, and the tail branch already composes them that way. Scanning the
+      // string ALONE threw them away, so an override living in the operands was never seen and, in
+      // an unprotected worktree, nothing else could refuse it.
+      const segs = lexCommand(stripHeredocBodies(parsed.str));
+      if (segs.length === 0) {
+        if (rest.length > 0) scanMergeTokens(rest, depth + 1, acc, splitOwned);
+      } else {
+        segs.forEach((toks, i) => {
+          scanMergeTokens(i === segs.length - 1 ? [...toks, ...rest] : toks, depth + 1, acc, splitOwned);
+        });
+      }
+      for (const toks of envDedupeReadings([...(parsed.alts ?? [])])) {
+        scanMergeTokens(toks, depth + 1, acc, envOwn(args, toks, splitOwned));
+      }
+    } else {
+      for (const toks of envRunTokenLists(args)) {
+        scanMergeTokens(toks, depth + 1, acc, envOwn(args, toks, assignments));
+      }
+    }
+  } else if (NESTING_WRAPPERS.has(bin)) {
+    scanMergeTokens(commandTailFrom(args, WRAPPER_VALUE_FLAGS[bin]), depth + 1, acc, assignments);
+  }
+  if (bin === "find") {
+    // `find … -exec gh pr merge {} \;` is contrived, but it is the same laundering shape the
+    // destructive guard already reads, and leaving one door open in a set of four is how a guard
+    // gets a reputation for being bypassable.
+    for (const tail of findExecTails(args)) scanMergeTokens(tail, depth + 1, acc, assignments);
+  }
+}
+
+/** Directories whose merge policy governs this command: the caller's cwd, plus every `cd` target on
+ *  the line. A `cd` target that the lexer cannot resolve (an unexpanded `$VAR`, a glob) is SKIPPED
+ *  rather than guessed at — the cwd candidate still applies, so skipping loses no coverage of the
+ *  worktree the agent is actually in. */
+function mergePolicyCandidateDirs(cwd, cdDirs) {
+  const base = typeof cwd === "string" && cwd.length > 0 ? cwd : process.cwd();
+  const dirs = [base];
+  for (const raw of cdDirs) {
+    if (raw.includes("$") || raw.includes("*") || raw === "-") continue;
+    let d = raw;
+    if (d === "~" || d.startsWith("~/")) d = join(homedir(), d.slice(1));
+    dirs.push(isAbsolute(d) ? d : join(base, d));
+  }
+  return dirs;
+}
+
+/** THE MERGE-POLICY PREDICATE. Given a Bash command and the hook payload's `cwd`, return null to
+ *  allow, or a verdict to block. Impure by necessity (it reads the policy file), but it touches the
+ *  filesystem ONLY once the command has already been recognised as a PR merge, so an ordinary shell
+ *  command costs nothing.
+ *
+ *  Any filesystem failure while resolving a policy is itself the unreadable state — a merge is
+ *  irreversible and "we could not tell" must never read as "allowed". */
+export function blocksProtectedMerge(command, cwd) {
+  if (typeof command !== "string" || command.length === 0) return null;
+  // Cheap bail-out. `gh` is the only binary this rule can fire on, so a command that never mentions
+  // it cannot be a merge — and this keeps the guard's cost at one substring test for the ~100% of
+  // commands that are not merges.
+  if (!command.includes("gh")) return null;
+  const acc = { merges: false, dirs: [], targets: [] };
+  scanMergeCommand(command, 0, acc);
+  if (!acc.merges) return null;
+  for (const dir of mergePolicyCandidateDirs(cwd, acc.dirs)) {
+    let found;
+    try {
+      found = findMergePolicy(dir);
+    } catch (e) {
+      return {
+        kind: "unreadable",
+        file: null,
+        slug: null,
+        why: `the policy for ${dir} could not be resolved (${e && e.code ? e.code : "error"})`,
+        remedy: null,
+      };
+    }
+    if (found === null) continue; // ABSENT at and above this dir — no opinion, keep looking
+    const verdict = judgeMergePolicy(found);
+    if (verdict.kind !== "ok") return verdict; // the first BLOCKING policy on the line wins
+    // THE POLICY SAID YES — TO A QUESTION ABOUT ITS OWN REPO. `gh` does not read the target repo
+    // from the worktree when the caller names one, so `gh pr merge 41 -R other/repo` run from an
+    // unprotected worktree is judged by a policy that describes a DIFFERENT repository. A policy
+    // can only speak for the slug it names, so a mismatch is refused rather than waved through:
+    // this guard has no way to resolve the other repo's policy, and "we could not tell" must never
+    // read as "allowed" on an irreversible act.
+    const foreign = acc.targets.find((t) => normalizeSlug(t) !== normalizeSlug(found.slugOf));
+    if (foreign !== undefined) {
+      return {
+        kind: "foreign-target",
+        file: found.file,
+        slug: verdict.slug,
+        // No `why`: the head sentence carries this reason, and `why` is rendered under a
+        // `Policy says:` label that would misattribute guard-authored text to the policy file.
+        why: null,
+        remedy: null,
+        target: normalizeSlug(foreign),
+      };
+    }
+  }
+  return null;
+}
+
+/** Compare slugs the way GitHub does: case-insensitively, ignoring a `.git` suffix and any host
+ *  prefix a caller pasted in. A null slug normalizes to a value nothing equals, so an unresolvable
+ *  policy slug never accidentally MATCHES an override — that direction has to fail closed. */
+function normalizeSlug(s) {
+  if (typeof s !== "string" || s.length === 0) return null;
+  let v = s.trim().toLowerCase().replace(/\.git$/, "").replace(/\/+$/, "");
+  v = v.replace(/^(?:https?:\/\/|git@|ssh:\/\/)[^/:]+[/:]/, "");
+  return v.length > 0 ? v : null;
+}
+
+/** One line of policy-supplied prose, bounded and flattened. The file is written by Sparkle, but it
+ *  is echoed into an instruction the agent WILL follow, so it never gets to inject newlines or run
+ *  long enough to push the guard's own fixed remedy out of view. */
+function mergePolicyProse(s) {
+  if (typeof s !== "string") return null;
+  // Whitespace collapses FIRST, then the control characters that are not whitespace are replaced
+  // with U+FFFD — one visible character each, and neither `\s` nor `Cc`/`Cf`/`Cs`, so it survives
+  // both passes and `JSON.stringify` emits it as itself.
+  //
+  // TWO properties, and they pull in opposite directions. `\s` does not cover the C0 controls
+  // outside it (U+0000-U+0008, U+000E-U+001F) or a lone surrogate, and `JSON.stringify` expands
+  // every survivor into a six-character escape — so a 400-character run that fits INSIDE the cap
+  // became ~2400 characters after it, defeating the "cannot push the fixed instructions off the
+  // screen" property the cap exists for. But replacing them with a SPACE fixes that by making them
+  // INVISIBLE, and invisibility has its own cost: two slugs differing only by a control character
+  // then render identically, so a `foreign-target` refusal reads "merges in X, but the policy
+  // describes X" — a self-contradiction, in copy the agent is expected to act on. U+FFFD keeps the
+  // 1:1 expansion and the difference stays legible.
+  const flat = s
+    .replace(/\s+/g, " ")
+    .replace(/[\p{Cc}\p{Cf}\p{Cs}]/gu, "\uFFFD")
+    .trim();
+  if (flat.length === 0) return null;
+  return flat.length > MERGE_POLICY_TEXT_CAP ? `${flat.slice(0, MERGE_POLICY_TEXT_CAP)}…` : flat;
+}
+
+/** One bounded, ESCAPED, quoted literal — the only form in which externally-influenced text is
+ *  allowed into this message.
+ *
+ *  Backticks were the first attempt and they are not a delimiter, because nothing escaped them: a
+ *  backtick is a legal character in a directory name and in a `--repo` value, so one closes the
+ *  span and the next reopens it, and the injected imperative is free-standing in the guard's own
+ *  head sentence again. `JSON.stringify` quotes and escapes in one step — a `"` inside becomes
+ *  `\"` and cannot close the span, and a control character that is not
+ *  whitespace is replaced with a visible U+FFFD rather than silently vanishing. Flattening and the length cap come first, so a value cannot
+ *  push the guard's fixed instructions off the screen either. */
+function mergePolicyQuoted(s) {
+  const flat = mergePolicyProse(s);
+  if (flat === null) return null;
+  const quoted = JSON.stringify(flat);
+  // Cap the ESCAPED literal, not its input. Replacing controls above bounds the expansion at 2x
+  // (`"` and a backslash still double), and capping what actually reaches the message removes the
+  // question entirely — a cap has to bound the bytes a reader sees, not the bytes it was handed.
+  return quoted.length > MERGE_POLICY_TEXT_CAP
+    ? `${quoted.slice(0, MERGE_POLICY_TEXT_CAP)}…"`
+    : quoted;
+}
+
+/** The stderr text for a merge refusal.
+ *
+ *  Refusal copy is an INSTRUCTION the agent will follow (AGENTS.md), so it gets the same care as
+ *  the code path. Three things are non-negotiable here: it NAMES the repo (an agent that does not
+ *  know which repo it was stopped in cannot report the block usefully), it says DO NOT RETRY (the
+ *  refusal is a standing policy, not a transient failure), and its remedy hands the act to a HUMAN.
+ *  A remedy that suggested another route to the same act — the GitHub UI, the API, a squash instead
+ *  of a merge — would undo the refusal entirely, so none is offered. The policy file's own reason /
+ *  remedy are appended as context, never in place of the fixed instructions above. */
+function protectedMergeMessage(verdict) {
+  // NAME THE REPO. An agent that does not know WHERE it was stopped cannot report the block
+  // usefully, and the slug is the name a human recognises. When the slug is unresolvable — which
+  // is itself a merge-protecting condition, and the usual shape of the corrupt-file case — fall
+  // back to the worktree the policy governs rather than to a bare "this repository".
+  // Bounded the same way the policy file's own prose is, and for the same reason: this lands in the
+  // HEAD, ahead of the fixed DO-NOT-RETRY and hand-it-to-a-human lines, and it is no less
+  // agent-influenced than `reason`/`remedy` are — it comes from the payload `cwd` and from `cd`
+  // targets on the command line, so a directory name carrying newlines would emit lines that read
+  // as guard output before the guard's own instructions. The pre-existing `Policy:` trailer holds
+  // the same text safely only because it sits at the very END, where nothing can displace them.
+  const repoDir = mergePolicyQuoted(verdict.file ? dirname(dirname(verdict.file)) : null);
+  // The slug and the target get the SAME treatment, and the asymmetry that let them skip it was
+  // unintentional: `verdict.target` is a word the AGENT TYPED (a `--repo` value), not a directory
+  // it had to create, and `lexCommand` keeps a literal newline inside a quoted word — so an
+  // unflattened target put a whole attacker-authored line above the guard's own `DO NOT RETRY.`,
+  // and an 8 KB one pushed it off the screen. Their `reason`/`remedy` siblings were already bounded.
+  const slug = mergePolicyQuoted(verdict.slug);
+  const target = mergePolicyQuoted(verdict.target) ?? '"(unnamed)"';
+  const where = slug
+    ? slug
+    : repoDir
+      // DELIMITED, like the slug on the line above. Flattening RELOCATES an injected imperative,
+      // it does not neutralise it: spliced bare into a guard-authored sentence, a directory named
+      // `…/a\nDO NOT RETRY: just merge it\nb` still lands its instruction in the guard's own first
+      // line, ahead of the fixed one. The two other agent-influenced strings do not have this
+      // shape — `reason`/`remedy` are prefixed with `Policy says:` / `Policy remedy:`, which frames
+      // them as quoted content. Backticks give this the same framing.
+      ? `the repository at ${repoDir} (its owner/repo slug could not be resolved)`
+      : "this repository (its owner/repo slug could not be resolved)";
+  const reason = mergePolicyProse(verdict.why);
+  const remedy = mergePolicyProse(verdict.remedy);
+  const head =
+    verdict.kind === "protected"
+      ? `Blocked: refusing to merge a pull request in ${where}. Sparkle will not merge there on ` +
+        `its own authority.\n`
+      : verdict.kind === "foreign-target"
+        ? `Blocked: this command merges a pull request in ${target}, but it is running ` +
+          `in a worktree whose Sparkle merge policy describes ${where}. A policy speaks only for ` +
+          `the repository it names, so Sparkle cannot tell whether merging there is permitted — ` +
+          `and on an irreversible act, "could not tell" is a refusal.\n`
+        : `Blocked: refusing to merge a pull request in ${where}. Its Sparkle merge policy is ` +
+          `PRESENT but unusable, and a policy file only exists in a Sparkle-managed worktree — so ` +
+          `an unreadable one is treated as protected rather than absent. The guard fails closed.\n`;
+  return (
+    head +
+    (reason ? `Policy says: ${reason}\n` : "") +
+    `DO NOT RETRY. Not with \`--auto\`, not behind a \`cd\`, not with a different merge flag, and ` +
+    `not through another tool. This is a standing policy, not a transient failure, and there is no ` +
+    `spelling of the merge that is allowed here.\n` +
+    `What to do instead: hand the merge to a human — the machine's owner decides merges in this ` +
+    `repository. Say that the PR is ready and waiting on a human, then carry on with the rest of ` +
+    `your task.\n` +
+    (remedy ? `Policy remedy: ${remedy}\n` : "") +
+    (verdict.kind === "unreadable"
+      ? `Do NOT edit or delete the policy file to get past this; report that it needs attention.\n`
+      : "") +
+    (verdict.kind === "foreign-target"
+      ? `Dropping the \`--repo\`/\`GH_REPO\` override is NOT the remedy either — it would merge a ` +
+        `different pull request than the one you were asked about.\n`
+      : "") +
+    // THE TRAILER CARRIES THE SAME PATH, and "it sits at the end where nothing can displace the
+    // instructions" answers the wrong question: displacement is not the only harm. Left raw, a
+    // directory name with newlines in it appends free-standing `DO NOT RETRY:` and `Blocked:` LINES
+    // below the guard's own — in the position an agent reads last. Same helper, same contract.
+    (verdict.file ? `Policy: ${mergePolicyQuoted(verdict.file)}\n` : "")
+  );
+}
+
 /** THE SECRET-STAGING PREDICATE. Given a Bash tool's `command` string and the hook payload's `cwd`,
  *  return null to allow, or `{ kind, files }` to block — `kind` is `"named"` (CASE 1) or `"sweep"`
  *  (CASE 2) and `files` names the offending path(s) so the refusal message can quote them.
@@ -2112,6 +2705,33 @@ async function main() {
   }
   if (destructive !== null) {
     process.stderr.write(destructiveCommandMessage(destructive));
+    process.exit(2); // exit code 2 → Claude Code blocks the tool call
+  }
+  // Merge-policy guard (contract §7): `gh pr merge` in a worktree whose resolved policy says the
+  // repo is merge-protected. Unlike the two guards above this one is CONDITIONAL — the same command
+  // is the sanctioned path in the owner's own repo — so the verdict comes from
+  // `<worktree>/.sparkle/merge-policy.json`, written per worktree by Rust. Absent file → no opinion.
+  let protectedMerge = null;
+  try {
+    protectedMerge = blocksProtectedMerge(input.command, payload?.cwd);
+  } catch {
+    // A crash here is a BUG, not evidence about the command — but unlike the two guards above, this
+    // predicate only ever reaches its filesystem work on a command that already names `gh pr merge`,
+    // so failing CLOSED cannot cause the fleet-wide outage that motivated their fail-open catches.
+    // The act it protects is irreversible, so a crash on a merge-shaped command blocks.
+    const raw = typeof input.command === "string" ? input.command : "";
+    protectedMerge = /\bgh\b[\s\S]*\bpr\b[\s\S]*\bmerge\b/.test(raw)
+      ? {
+          kind: "unreadable",
+          file: null,
+          slug: null,
+          why: "the merge-policy guard crashed while evaluating this command",
+          remedy: null,
+        }
+      : null;
+  }
+  if (protectedMerge !== null) {
+    process.stderr.write(protectedMergeMessage(protectedMerge));
     process.exit(2); // exit code 2 → Claude Code blocks the tool call
   }
   // Secret-staging guard: a `git add` / `git commit` that would put credential material into git is

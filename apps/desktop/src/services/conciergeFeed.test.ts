@@ -96,19 +96,96 @@ describe("isCalmBand is NOT the band", () => {
     expect(isCalmBand("unmerged")).toBe(false);
   });
 
-  it("keeps `working` calm even though it is now its own band", () => {
-    // The running/done split is about POSITION and COUNTS. A terminal that desaturates the moment
-    // its agent starts working would be a treatment nobody asked for.
+  it("`working` bands `running` and is NOT calm — bead sparkle-e7a3f3", () => {
+    // THIS ASSERTION WAS INVERTED, and the comment sitting on it stated the correct rule the whole
+    // time: "a terminal that desaturates the moment its agent starts working would be a treatment
+    // nobody asked for." It then pinned `true`, which IS that treatment — the shape AGENTS.md calls
+    // a test that pins the defect (mutation-check passes it cleanly, because the grip is perfect).
+    //
+    // The founder's report is the user-visible half: text renders white, then turns grey. Answering
+    // an agent moves it off `needs_you`/`questions` (normal near-white foreground) onto `working`;
+    // calm re-hands xterm a whole new theme; xterm re-resolves every default-foreground cell, so
+    // text ALREADY PAINTED goes grey retroactively.
+    //
+    // The band split stays about POSITION and COUNTS — that half of the old comment was right.
     expect(conciergeBand("working")).toBe("running");
-    expect(isCalmBand("working")).toBe(true);
+    expect(isCalmBand("working")).toBe(false);
   });
 
-  it("is exactly {idle, done, stopped, working, no-status}", () => {
-    for (const s of ["idle", "done", "stopped", "working"] as const) {
+  // ── THE TRANSITION GUARD (bead sparkle-e7a3f3) ────────────────────────────────────────────────
+  //
+  // WHY A TABLE AND NOT MORE CASES. The founder reported one symptom — terminal text renders white
+  // then turns grey — and it took THREE rounds to remove, because each fix RELOCATED it:
+  //
+  //   1. `working` was calm, so answering an agent flipped grey the moment it started running.
+  //   2. Dropping `working` left `idle` calm, and `settle()` sets `idle` ~2.5s after every turn on a
+  //      timer — so the flash moved to the END of each turn and began recurring once per turn.
+  //   3. Narrowing to {done, stopped} left the feed's `DEFAULT_STATUS = "stopped"` stand-in calm, so
+  //      every pane opened GREY and snapped to full contrast on the first real reading.
+  //
+  // Every round passed its own state-by-state tests and its own mutation check, because a test that
+  // names one status can only ever see that status. The defect is not in any state — it is in the
+  // BOUNDARY between two, and it reappears wherever the partition happens to cut. So the guard is
+  // the invariant itself, swept over every ordered pair: no transition a LIVE session can make may
+  // change whether the terminal is calm.
+  //
+  // WHAT IT DOES AND DOES NOT REACH, verified by hand-mutating this predicate rather than assumed:
+  // re-admitting `working` fails the sweep, and so does re-admitting `idle` — rounds 1 and 2. It
+  // CANNOT see round 3, and saying so is the point: that defect never touched this predicate at all.
+  // `{done, stopped}` was already correct; the feed handed `terminalCalm` a DEFAULTED `stopped` for
+  // an agent it had no reading for. A pure predicate test is structurally blind to its caller's
+  // input, so round 3's guard has to live where the input is — see Workspace.tabs.test.tsx, "does
+  // NOT hand calm to a freshly mounted pane whose status was never observed". Two guards, because
+  // there are two failure surfaces: which statuses are calm, and whether the status is real.
+  const EXITED: readonly AgentTabStatus[] = ["done", "stopped"];
+  // `errored` is deliberately LIVE here even though the process has crashed: it is RED, it is asking
+  // the founder for something, and a red pane's text must stay at full contrast. "Calm" is about
+  // legibility, not about process bookkeeping.
+  const LIVE: readonly AgentTabStatus[] = [
+    "working", "idle", "new", "questions", "waiting",
+    "approval", "blocked", "errored", "lapsed", "unmerged",
+  ];
+
+  it("partitions EVERY AgentTabStatus, so a new one cannot silently fall into calm", () => {
+    // Enumerated from AGENT_STATUS rather than hand-listed: `AgentTabStatus` is `keyof typeof
+    // AGENT_STATUS`, so this is the real union and a 13th status fails here until someone decides
+    // which side it belongs on. Asserting the two lists against each other instead would be a
+    // tautology — the trap in "a guard enumerated by value goes stale".
+    const all = Object.keys(AGENT_STATUS) as AgentTabStatus[];
+    expect([...LIVE, ...EXITED].sort()).toEqual([...all].sort());
+    expect(new Set([...LIVE, ...EXITED]).size).toBe(all.length);
+  });
+
+  it("NO transition between two live statuses changes whether the terminal is calm", () => {
+    // The whole table, both directions, including each status against itself. 10 live statuses = 100
+    // ordered pairs, and any single live status leaking into the calm set breaks 18 of them at once.
+    // This is the assertion rounds 1 and 2 would have failed (both confirmed by mutation).
+    for (const from of LIVE) {
+      for (const to of LIVE) {
+        expect(
+          isCalmBand(from),
+          `${from} -> ${to} must not change the terminal's calm state`,
+        ).toBe(isCalmBand(to));
+      }
+    }
+    // …and the pairs are all equal to FALSE, not merely equal to each other: without this the loop
+    // above is satisfied by the treatment being on for everything, which is the same vacuity as it
+    // being off for everything.
+    for (const s of LIVE) expect(isCalmBand(s)).toBe(false);
+    // The paired positive, so "no transition changes it" is not just "nothing is ever calm".
+    for (const s of EXITED) expect(isCalmBand(s)).toBe(true);
+  });
+
+  it("is exactly {done, stopped} — the two statuses whose PTY has exited", () => {
+    for (const s of ["done", "stopped"] as const) {
       expect(isCalmBand(s)).toBe(true);
     }
-    expect(isCalmBand(undefined)).toBe(true);
-    for (const s of ["waiting", "approval", "errored", "blocked", "unmerged"] as const) {
+    // EVERY live-session state is out, and `idle` is the one that matters most: settle() sets it
+    // ~2.5s after each response stops streaming, so admitting it makes the theme swap fire once per
+    // TURN — the founder's reply going grey while he reads it. `undefined` is the mount state and
+    // would flash the other way (grey pane, white on first output).
+    expect(isCalmBand(undefined)).toBe(false);
+    for (const s of ["idle", "working", "waiting", "approval", "errored", "blocked", "unmerged"] as const) {
       expect(isCalmBand(s)).toBe(false);
     }
   });
@@ -165,6 +242,87 @@ describe("buildConciergeFeed — status banding + status tokens", () => {
     expect(flat(feed)[0]).toMatchObject({
       status: "stopped", band: "done", statusColor: GRAY, statusLabel: "Stopped",
     });
+  });
+
+  // ── `statusObservedLocally`: THE ROSTER IS NOT AN INDEPENDENT WITNESS (roborev 65188) ───────
+  //
+  // This is the shape that fires in the shipped app and that no jsdom test can reach, which is why
+  // it lives here as a pure feed test. `buildRoster` publishes `calmNewAgent(status[a.id], …) ??
+  // DEFAULT_STATUS`, `calmNewAgent(undefined, …)` returns `undefined`, and `get_roster` hands every
+  // window its OWN slice back — so an agent nobody has a reading for goes out as `"stopped"` and
+  // comes back as a first-class roster entry. Computing it from the merged map called
+  // that echo an observation, so the flag flipped true one publish + one `roster://changed` tick
+  // after mount and `terminalCalm` painted a freshly opened pane grey again.
+  //
+  // In jsdom `getRoster()` resolves `null` (useConciergeFeed), so the Workspace test exercises the
+  // roster-LESS path and passes for a reason production does not reproduce. Hence both tests.
+  it("statusObservedLocally stays FALSE when the only 'reading' is the roster echoing our own default", () => {
+    const echo: Roster = {
+      projects: [
+        {
+          id: "p1",
+          name: "Proj p1",
+          agents: [
+            // Exactly what buildRoster publishes for an agent this window has no status for.
+            { id: "a1", name: "a1", kind: "build", status: "stopped",
+              status_color: GRAY, status_label: "Stopped", parent_id: null },
+          ],
+        },
+      ],
+    };
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("a1")])],
+      status: {}, // nothing observed locally — the mount state
+      roster: echo,
+    });
+    const a = flat(feed)[0]!;
+    // The STATUS still reads `stopped`, and that is correct for the band, the dot and the label.
+    expect(a.status).toBe("stopped");
+    // …but we never looked, so the terminal must not treat it as an exited process.
+    expect(a.statusObservedLocally).toBe(false);
+    expect(isCalmBand(a.status) && a.statusObservedLocally).toBe(false);
+  });
+
+  it("is LOCAL-only: a genuine cross-window reading is not a stand-in, yet still reads false", () => {
+    // THE DIVERGENCE THE NAME NOW ADVERTISES (roborev 65208). The echo test above only exercises the
+    // `"stopped"` default, where "not a real reading" and "not OUR reading" happen to coincide. Here
+    // they come apart: the hosting window published a genuine `working`, so `status` is emphatically
+    // NOT the DEFAULT_STATUS stand-in — and the flag is still false, because WE did not observe it.
+    //
+    // Pinned rather than left implicit, because that is the shape a future cross-window consumer
+    // would read wrongly, and the whole of bead sparkle-e7a3f3 is prose promising more than the code
+    // delivers. The narrowing is correct for the one consumer there is: `Workspace.terminalCalm`
+    // governs a pane THIS window hosts, so another window's reading is not evidence about it.
+    const hosted: Roster = {
+      projects: [
+        {
+          id: "p1",
+          name: "Proj p1",
+          agents: [
+            { id: "a1", name: "a1", kind: "build", status: "working",
+              status_color: GREEN, status_label: "Working", parent_id: null },
+          ],
+        },
+      ],
+    };
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("a1")])],
+      status: {}, // this window hosts nothing for a1
+      roster: hosted,
+    });
+    const a = flat(feed)[0]!;
+    expect(a.status).toBe("working"); // a real reading, relayed
+    expect(a.statusObservedLocally).toBe(false); // …but not ours
+  });
+
+  it("statusObservedLocally is TRUE for a genuine local reading, so the check above is not vacuous", () => {
+    const feed = buildConciergeFeed({
+      projects: [project("p1", [agent("a1")])],
+      status: { a1: "stopped" },
+    });
+    const a = flat(feed)[0]!;
+    expect(a.statusObservedLocally).toBe(true);
+    expect(isCalmBand(a.status) && a.statusObservedLocally).toBe(true);
   });
 
   it("prefers the Claude title, then the auto-name, then the raw name (displayName chain)", () => {

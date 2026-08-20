@@ -151,6 +151,51 @@ export type ContinuationDecision =
   | { action: "none"; reason: NoContinueReason };
 
 /**
+ * AN EXTERNAL GATE THE AGENT'S WORK IS SITTING BEHIND — something neither a restart nor the human
+ * being paged can hurry.
+ *
+ * WHAT IT IS FOR. `MAX_CONTINUES_WITHOUT_PROGRESS` escalates with the sentence "Something is
+ * blocking it that restarting cannot fix", which is a claim about the AGENT. When the thing not
+ * moving is a CI queue, that sentence is false in the way that matters: nothing is wrong with the
+ * agent, and the human it pages can do nothing about it either. On the night this was measured, six
+ * agents were paged that way in one hour while holding open PRs against a queue of 16 runs on 6
+ * runners. Waiting on CI is not absence of progress, and a "needs you" list that is mostly this
+ * trains its reader to stop opening it — which is the actual damage.
+ *
+ * IT SUPPRESSES THE ESCALATION, NOT THE RESTART. A gated agent keeps being auto-continued (polling
+ * the gate and then landing the work is exactly what it should be doing), and {@link
+ * MAX_CONTINUES_TOTAL} still bounds the whole goal — so a genuinely dead agent parked on an open PR
+ * still reaches a human, via the ceiling arm, whose sentence is about the SPEND rather than a
+ * diagnosis it cannot support.
+ *
+ * ⚠️ OPTIONAL, AND ABSENCE MEANS "NO GATE KNOWN" — which is the direction that PRESERVES the true
+ * positives. Every other evidence field on {@link ContinuationInput} is required-but-nullable
+ * because forgetting it would fail OPEN; this one fails open by being present, so a caller that
+ * never wires it gets today's behaviour unchanged rather than a fleet that never escalates. The
+ * same reasoning as `quotaBlock?` beside it.
+ *
+ * ⚠️ `prState: "open"` IS THE ONLY READING THAT CARRIES INFORMATION, and the caller must not
+ * manufacture the negative. Rust reports `prState: null` both for "probed, there is no PR" and for
+ * a poll that never probed GitHub (`probePrState` is gated), and those are indistinguishable at the
+ * store boundary — the same ambiguity `WorkflowState.hasRemote` documents for its own `false`. So
+ * absence here is "we did not find an open PR", never "there is no PR".
+ *
+ * NOT CHECKS-QUEUED, AND SAYING SO IS THE POINT. The founder's question is "is it waiting on CI",
+ * and the honest answer is that this window cannot ask cheaply: check state comes from a `gh` probe
+ * (`prChecksStatusTool`), and this decision runs for every agent on the roster every 15 seconds, so
+ * a network call per agent would cost more than the stalls it resolves — the same rule
+ * `services/agentGoalReading` is built on. An OPEN PR is the already-polled proxy: the work is out
+ * of the agent's hands and in front of a gate. A red or conflicted PR is inside that proxy too, and
+ * that is a deliberate trade — being wrong there costs a LATE page at the ceiling; being wrong the
+ * other way is the false page this exists to remove.
+ */
+export type ExternalWait = {
+  kind: "open-pr";
+  /** For the log line and the resume banner; null when the state was read without a number. */
+  prNumber: number | null;
+};
+
+/**
  * What this window knows about a CLOUD agent's sandbox. Required whenever `runtime` is `"cloud"`.
  *
  * WHY A CLOUD AGENT NEEDS ITS OWN EVIDENCE BUNDLE AT ALL. Every other field on
@@ -292,6 +337,11 @@ export interface ContinuationInput {
    * fix" — true, but arrived having spent the whole retry budget and told them nothing about WHEN.
    */
   quotaBlock?: QuotaBlock;
+  /**
+   * An external gate this agent's work is parked behind — see {@link ExternalWait} for the whole
+   * argument. Absent means no gate is known, which escalates exactly as before.
+   */
+  externalWait?: ExternalWait;
 }
 
 /**
@@ -395,7 +445,14 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // fresh one (mirroring agentGoal.noteContinue, which applies the same rule when recording).
   const progressed = live.mark !== undefined && live.mark !== mark;
   const consecutive = progressed ? 0 : live.continues;
-  if (consecutive >= MAX_CONTINUES_WITHOUT_PROGRESS) {
+  // THE STREAK BOUND IS A DIAGNOSIS, SO IT MUST NOT FIRE WHERE THE DIAGNOSIS IS FALSE. It says
+  // "something is blocking it that restarting cannot fix", which is a statement about the agent —
+  // and for an agent parked behind an open PR the thing not moving is a CI queue, which the human
+  // this pages can do nothing about either. See {@link ExternalWait}: the gate suppresses the
+  // ESCALATION only, so the agent keeps being restarted (polling the gate and landing the work is
+  // its job) and `MAX_CONTINUES_TOTAL` below still ends the goal at a human — with a sentence about
+  // the spend, which is the one claim the evidence supports.
+  if (consecutive >= MAX_CONTINUES_WITHOUT_PROGRESS && input.externalWait === undefined) {
     return {
       action: "escalate",
       reason:
@@ -425,7 +482,17 @@ export function decideContinuation(input: ContinuationInput): ContinuationDecisi
   // not receive it, which is how the agent came to be the only party in the loop that could not
   // tell its second resume from its first. Computing it twice would let them drift.
   const attempt = consecutive + 1;
-  return { action: "continue", prompt: continuePrompt(live, attempt), attempt };
+  // THE BANNER HAS TO STAY TRUE PAST THE SUPPRESSED BOUND. `attempt` is `consecutive + 1`, so a
+  // gated agent goes on to resume 4, 5, 6 — and the ordinary copy says "AUTO-RESUME 4 OF 3 … at 3
+  // this stops and escalates to a human", which is both arithmetically absurd and a promise the
+  // gate has just cancelled. AGENTS.md's rule that a fix which changes WHEN something happens must
+  // update every string describing the old timing applies directly: the wait travels with the
+  // attempt number so the agent is told the ceiling it is ACTUALLY heading for.
+  return {
+    action: "continue",
+    prompt: continuePrompt(live, attempt, input.externalWait),
+    attempt,
+  };
 }
 
 /** The resting statuses an auto-continue may act on. See the note at the `not-idle` gate for why
@@ -542,12 +609,16 @@ function cloudRefusal(cloud: CloudEvidence | undefined): NoContinueReason | null
  * the alternative is the detector going silently blind, which is how agent 0bf08c64 came to be
  * badged "It is looping, not working" through 46 minutes of real work.
  */
-export function continuePrompt(goal: AgentGoal, attempt = 1): string {
+export function continuePrompt(
+  goal: AgentGoal,
+  attempt = 1,
+  externalWait?: ExternalWait,
+): string {
   return (
     `${RESUME_PROMPT_MARKER} automatically. ` +
     `Do not stop to acknowledge this — pick up exactly where you left off and keep working.\n\n` +
     `GOAL: ${goal.text}\n\n` +
-    repeatedResumeLine(attempt) +
+    repeatedResumeLine(attempt, externalWait) +
     // NAME THE OP THAT EXISTS. This said `set_agent_goal with met: true`, which cannot work:
     // `set_agent_goal`'s schema is `{ targetAgentId?, goal, ttlMs? }` — there is no `met`, and
     // `goal` is required. An agent that obeyed either failed zod validation or, if it invented a
@@ -582,8 +653,27 @@ export function continuePrompt(goal: AgentGoal, attempt = 1): string {
  * not a guess. It is scoped to what Sparkle can SEE — an agent may well have been thinking — which
  * is why the line says so instead of accusing the agent of idling.
  */
-function repeatedResumeLine(attempt: number): string {
+function repeatedResumeLine(attempt: number, externalWait?: ExternalWait): string {
   if (attempt < 2) return "";
+  // ── THE GATED VARIANT ────────────────────────────────────────────────────────────────────────
+  // Past the suppressed streak bound the ordinary sentence below is false twice over: the count has
+  // gone past the ceiling it quotes, and the escalation it promises at that ceiling is exactly what
+  // the gate cancelled. Two of its claims are also wrong for this agent specifically — "nothing
+  // Sparkle can observe has changed" is not the reason it is being resumed, and telling an agent
+  // that is waiting on CI to "take the next concrete step" invites it to invent work. So the gated
+  // agent is told the truth: what we think it is waiting for, that the wait is not held against it,
+  // and the ceiling that DOES still apply.
+  if (externalWait !== undefined) {
+    const pr = externalWait.prNumber === null ? "an open pull request" : `PR #${externalWait.prNumber}`;
+    return (
+      `THIS IS AUTO-RESUME ${attempt} on this goal. Sparkle can see ${pr} on your branch, so it is ` +
+      `NOT counting this as a stall — waiting on review or CI is not something you are doing ` +
+      `wrong, and you will not be escalated to a human for it. An identical message arriving twice ` +
+      `is this timer, not the human repeating themselves. If the gate has moved, land the work; if ` +
+      `it is still pending, say so and stop — do not invent work to look busy. Resumes on one goal ` +
+      `stop at ${MAX_CONTINUES_TOTAL}.\n\n`
+    );
+  }
   return (
     `THIS IS AUTO-RESUME ${attempt} OF ${MAX_CONTINUES_WITHOUT_PROGRESS} on this goal. Nothing ` +
     `Sparkle can observe has changed since resume ${attempt - 1}. An identical message arriving ` +
@@ -615,21 +705,115 @@ function repeatedResumeLine(attempt: number): string {
  *   • `aiTitle`             — Claude Code re-derived the session title from the whole
  *                             conversation, which tracks the work actually shifting.
  *
+ * ── WORK EVIDENCE: WHY THE THREE ABOVE WERE NOT ENOUGH ──────────────────────────────────────────
+ *
+ * THE MEASURED DEFECT (founder, 2026-08-18). The escalation count went 4 → 8 in one hour while the
+ * fleet worked normally, and nearly every one was false: six agents were paged as "no sign of
+ * progress" while holding OPEN pull requests and waiting on a saturated CI queue, several having
+ * just answered a design question. Read against the three inputs above, that is not a mystery —
+ * it is the arithmetic working exactly as written. An agent that commits, pushes, opens a PR and
+ * polls CI moves NONE of them: `promptHistory` only grows when a HUMAN types, and `aiTitle` only
+ * when Claude Code re-derives a session title. That leaves `activity`, a narration the agent must
+ * choose to emit — and the orchestrator prompt tells agents to narrate a handful of times per
+ * session and to SKIP it rather than spend a turn on it. So the one signal an ordinary working
+ * agent could move is the one it is instructed not to move, and the predicate was measuring
+ * auto-continues rather than work.
+ *
+ * The three added inputs are artifacts of the agent ACTING, and all three are already in the store:
+ *
+ *   • `toolBursts`   — how many times this agent's windowed tool count has been seen to GO UP
+ *                      (`HookFacts.toolsRecent` off the `fleet_digest` poll `services/fleetWatch`
+ *                      already runs, folded by `goalContinuationRunner.noteToolActivity`).
+ *                      A COUNT, NOT `lastEvent`: `fleet.rs` assigns `last_event` LAST-WINS over
+ *                      every kind, so by the time a turn has ended — the only moment this is
+ *                      consulted — the last event is the `Stop` that ended it, and a name-keyed
+ *                      read would be null on essentially every sample (`movementRetraction`'s
+ *                      header note 3, in its other consequence).
+ *                      ⚠️ AND MONOTONE, NOT THE RAW SAMPLE (roborev 65440). `toolsRecent` is
+ *                      counted over a SLIDING 15-minute window, so it also falls on its OWN as
+ *                      events age out: an agent that genuinely stopped decays 41 → 30 → … → 0, and
+ *                      fed in raw, every decrement moved the mark and reset the streak — silence
+ *                      reading as work, which is the opposite of what this measures. Only an
+ *                      INCREASE counts. The folding lives in the runner because it needs per-agent
+ *                      state a pure function cannot hold.
+ *                      Deliberately NOT `turnsRecent`/`lastTurnEndMs`: an auto-continue IS a turn,
+ *                      so either would move on every attempt and make the bound vacuous — the same
+ *                      trap `userPrompt: false` exists to keep out of `promptHistoryLength`. Tools
+ *                      run INSIDE a resumed turn do still count, which is weaker than that rule;
+ *                      the runner's ledger states why that is a judgement rather than an oversight.
+ *   • `commitsAhead` — commits the agent's branch carries (`BranchStatus.ahead`). Committing is
+ *                      work by any reading, and it is branch-scoped, so it is attributable in a way
+ *                      a worktree file write is not.
+ *   • `prMark`       — the branch's PR state and number. Opening one, or its state moving, is the
+ *                      single most legible thing an agent does between restarts.
+ *
  * NONE of these is a perfect proxy for progress, and the design does not pretend otherwise — an
- * agent can work hard and move none of them. That is exactly why {@link MAX_CONTINUES_TOTAL}
- * exists as a bound this function cannot influence: the consecutive counter is an OPTIMISATION
- * that keeps restarting an obviously-progressing agent, never the only thing standing between the
- * fleet and an unbounded loop.
+ * agent can work hard and move none of them. (A failed digest poll republishes `{}`, which used to
+ * be a second hazard here — a reading dropping to null and back read as one movement that was
+ * really a gap in our own observation. `noteToolActivity` treats a null as SILENCE and leaves the
+ * counter alone, so that particular gap is closed.) None of it changes why
+ * {@link MAX_CONTINUES_TOTAL} exists as a bound this function cannot influence: the consecutive
+ * counter is an OPTIMISATION that keeps restarting an obviously-progressing agent, never the only
+ * thing standing between the fleet and an unbounded loop.
  */
+/** Where {@link progressMark} writes each field. Named so the two functions cannot drift — a reader
+ *  that hard-coded an index would silently read the wrong column the day a field is inserted. */
+const MARK_FIELDS = ["promptHistoryLength", "activity", "aiTitle", "toolBursts", "commitsAhead", "prMark"] as const;
+
+/**
+ * The `toolBursts` count a RECORDED mark carries, or `null` when there is none to read.
+ *
+ * ⚠️ THE MARK IS OPAQUE TO EVERYONE ELSE, AND THIS IS THE ONE EXCEPTION. It exists because the
+ * burst counter is the only field of the mark whose producer holds MODULE-LOCAL state
+ * (`goalContinuationRunner.toolActivity`) while the mark itself is PERSISTED on the goal. After a
+ * reload — or in a second window that has never swept this agent — that producer starts cold, and a
+ * cold baseline of 0 compared against a stored `4` reads as progress and silently clears the
+ * no-progress streak (roborev 65483). Recovering the number from the mark is what makes the two
+ * sides agree; every other field is re-read from live state and needs no such recovery.
+ *
+ * Fails CLOSED to `null` — an absent mark, a short one from an older build, or a non-numeric token
+ * all mean "we cannot tell", which `progressMark` renders as the same empty token an unseeded
+ * ledger produces. Never 0: that is a real, different value.
+ */
+export function burstsOf(mark: string | undefined): number | null {
+  if (mark === undefined) return null;
+  const token = mark.split("\u0000")[MARK_FIELDS.indexOf("toolBursts")];
+  if (token === undefined || token === "") return null;
+  const n = Number(token);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function progressMark(input: {
   promptHistoryLength: number;
   activity?: string;
   aiTitle?: string | null;
+  /** A MONOTONE count of how many times this agent's windowed tool count has been seen to GO UP
+   *  (`goalContinuationRunner.noteToolActivity`) — NEVER the raw `HookFacts.toolsRecent` sample,
+   *  which falls on its own as events age out of the window. See the WORK EVIDENCE note above. */
+  toolBursts?: number | null;
+  /** `BranchStatus.ahead` — commits the agent's own branch carries that its base does not. */
+  commitsAhead?: number | null;
+  /** The agent branch's pull request as one opaque token (`"open#2117"`), or null when this window
+   *  has no reading. Built by the caller so this module never has to know GitHub's vocabulary. */
+  prMark?: string | null;
 }): string {
   // Joined on NUL, written as the ESCAPE and not a raw byte: a raw NUL makes git treat the whole
   // file as binary (no diffs, no review), which `services/sourceIsText.test.ts` guards against —
   // it caught exactly that here. The runtime string is identical. NUL rather than a space because
   // the fields are free text: an activity line containing the separator could otherwise make two
   // different states produce the same mark, which would read as "no progress" and burn a retry.
-  return [input.promptHistoryLength, input.activity ?? "", input.aiTitle ?? ""].join("\u0000");
+  // ⚠️ THE ORDER IS THE WIRE FORMAT, and {@link burstsOf} reads a column out of it by name via
+  // MARK_FIELDS. Inserting or reordering a field here without updating that list makes the reader
+  // return a neighbouring column's value — silently, since every token is a bare string.
+  return [
+    input.promptHistoryLength,
+    input.activity ?? "",
+    input.aiTitle ?? "",
+    // `?? ""` rather than `?? 0`: a count of 0 ("we looked and the log is quiet") and a null ("we
+    // have no digest for this agent") must not collapse onto the same token, or a window that
+    // cannot read the fleet would be indistinguishable from a fleet that is not working.
+    input.toolBursts ?? "",
+    input.commitsAhead ?? "",
+    input.prMark ?? "",
+  ].join("\u0000");
 }

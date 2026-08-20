@@ -16,7 +16,11 @@
 // looked away. `agentIdsWithScreenHolds` keeps this cheap: it is only ever the handful of agents
 // that actually have something held, bounded by MAX_PER_AGENT on each — never a scan of the fleet.
 import { useEffect } from "react";
-import { flushScreenHeldSends, sweepExpiredScreenHeldSends } from "../services/conciergeDispatch";
+import {
+  deferScreenHoldsWhileHidden,
+  flushScreenHeldSends,
+  sweepExpiredScreenHeldSends,
+} from "../services/conciergeDispatch";
 import { agentIdsWithScreenHolds } from "../services/screenHoldQueue";
 import { getAgentViewport } from "../services/terminalViewport";
 import { terminalWriteRefusal } from "../voice/dictationTerminalRoute";
@@ -31,17 +35,36 @@ export function useScreenHoldDrain(): void {
   useEffect(() => {
     const id = setInterval(() => {
       // `includeExpired: true` — see agentIdsWithScreenHolds' own doc (roborev 64238's High). A
-      // live-only view drops an agent whose screen never clears (or whose viewport unregisters,
-      // e.g. on unmount) once its entries have all aged out but before anything has SWEPT them —
-      // and a live-only poll never visits that agent again to do the sweeping.
+      // live-only view drops an agent whose screen never clears once its entries have all aged out
+      // but before anything has SWEPT them — and a live-only poll never visits that agent again to
+      // do the sweeping. (An UNREGISTERED viewport used to reach expiry the same way; it no longer
+      // ages at all — see the `no-viewport` branch below — but a hold that aged out before the
+      // pane went unreadable still has to be visited, so this stays `true` either way.)
       for (const agentId of agentIdsWithScreenHolds(undefined, { includeExpired: true })) {
         // The SAME predicate `holdForScreenClear`'s callers used to decide this needed holding in
         // the first place — reusing it here, rather than re-deriving "is it safe now" a second
         // way, is what keeps the hold and the drain from ever disagreeing about what the screen
         // shows.
-        if (terminalWriteRefusal(getAgentViewport(agentId)) !== null) {
-          // Still blocked: nothing may be DELIVERED, but anything that aged out while waiting
-          // still has to be reported and cleared rather than left to rot in the queue.
+        const refusal = terminalWriteRefusal(getAgentViewport(agentId));
+        // ══ "I CANNOT SEE THIS SCREEN" IS NOT "THIS SCREEN IS BUSY" (bead sparkle-9gsjqm) ═══════
+        // `no-viewport` is what this reads for a pane that simply is not mounted in THIS window —
+        // the founder unmounted, switched the cable, or the pane is in another window. Lumping it
+        // in with the two refusals below (the branch used to test only `!== null`) meant a held
+        // send for a hidden pane could never be flushed and could only ever age out to `expired`
+        // after MAX_AGE_MS, at which point the sweep dropped it. That is the exact outcome the
+        // header above promises does NOT happen: a hold "does not become void because he looked
+        // away". So the unreadable stretch stops the hold's clock instead of consuming it, and
+        // delivery still waits for a viewport that comes back and READS CLEAR — this branch never
+        // writes into a PTY it cannot see.
+        if (refusal === "no-viewport") {
+          deferScreenHoldsWhileHidden(agentId);
+          continue;
+        }
+        if (refusal !== null) {
+          // Still blocked — `alternate-screen` or `awaiting-input`, both of which mean the screen
+          // is right here and is a screen no write belongs on: nothing may be DELIVERED, but
+          // anything that aged out while waiting still has to be reported and cleared rather than
+          // left to rot in the queue.
           sweepExpiredScreenHeldSends(agentId);
           continue;
         }

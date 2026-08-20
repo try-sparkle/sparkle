@@ -30,6 +30,10 @@
 //      screenshot; the wide board on one side must leave the other side's two columns alone.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { assertPinnedNeedle } from "../testing/pinnedNeedle";
+import { buildWidthVar } from "../engine/columnResize";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -237,18 +241,123 @@ describe("the Plan board takes over the whole pair", () => {
     expect(overlay.querySelector("[data-testid='plan-build-mini']")).toBeTruthy();
   });
 
-  // Top right on BOTH sides. This used to align to the pair's inboard edge — right for the left
-  // pair, left for the right pair — which the founder overruled ("just have it be top right").
-  it("puts the toggle at the top right of either pair", () => {
+  // ── WHERE THE TOGGLE SITS, AND WHY DOM ORDER IS THE ASSERTION ───────────────────────────────
+  // The founder overruled the earlier "just have it be top right": "The build versus plan toggle
+  // should stay left justified when it's in plan mode. It should stay in the same spot that it is
+  // when it's in build mode, so it shouldn't be going to the right side. And then the filters can
+  // be to the right of the build and plan toggle, not to the left. So don't move build and plan to
+  // the right. Keep it where it is so I can switch between them easily."
+  //
+  // This REPLACES an assertion that pinned `justifyContent: "flex-end"` — i.e. a test guarding the
+  // behaviour that was just reversed. Its successor has to be able to fail on the old row, and
+  // "the toggle renders" could not: BOTH children were already there before this change, which is
+  // the vacuous shape this repo keeps paying for. So the claims are ORDER and ALIGNMENT, and the
+  // old row satisfied neither — it put the filter bar first and pinned the toggle to the right.
+  //
+  // jsdom does not lay out (getBoundingClientRect is all zeroes — docs/jsdom-test-caveats.md), so
+  // "to the left of" is asserted as DOM order within a `flex-start` row, which is the thing that
+  // actually decides it, rather than as a pixel.
+  it("puts the toggle FIRST and left-justified, with the filters to its right, on both sides", () => {
     render(<Workspace />);
     for (const side of ["left", "right"] as const) {
       planOn(side);
-      const mini = planColumn(side).querySelector("[data-testid='plan-build-mini']");
+      const overlay = planColumn(side);
+      // THE ROW IS FOUND VIA THE TOGGLE'S PARENT, NOT VIA ITS OWN TESTID — deliberately. Keying the
+      // lookup on `plan-board-header` (which this change introduces) would make every assertion
+      // below fail on the OLD code for the boring reason that the testid did not exist yet, so the
+      // order claim would never actually be evaluated against the layout it exists to reject. The
+      // toggle and its parent row both predate the change, so what fails there is the ORDER.
+      const mini = overlay.querySelector<HTMLElement>("[data-testid='plan-build-mini']");
       expect(mini).toBeTruthy();
-      // The flex row that positions it is the toggle's parent.
       const row = mini!.parentElement as HTMLElement;
-      expect(row.style.justifyContent).toBe("flex-end");
+      const filters = row.querySelector<HTMLElement>("[data-testid='board-filter-bar']");
+      // Both are really in this row. An order assertion over a node that is absent passes for the
+      // wrong reason, so establish presence before comparing positions.
+      expect(filters).toBeTruthy();
+
+      // THE ORDER. DOCUMENT_POSITION_FOLLOWING reads "the filter bar comes AFTER the toggle".
+      // FALSE on the pre-change row, which rendered the bar first.
+      expect(mini!.compareDocumentPosition(filters!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      // …and again as sibling indices, so a re-parenting that preserved document order while
+      // nesting the bar elsewhere cannot satisfy it: they are siblings, and the toggle is first.
+      const kids = Array.from(row.children);
+      expect(kids.indexOf(mini!)).toBe(0);
+      expect(kids.indexOf(mini!)).toBeLessThan(kids.indexOf(filters!));
+
+      // THE ALIGNMENT. flex-start rather than flex-end, and on the Build header's own inset, so
+      // the toggle lands on the x it already occupies in Build mode instead of moving when used.
+      expect(row.style.justifyContent).toBe("flex-start");
+      expect(row.style.minHeight).toBe("34px");
+
+      // ── WHICH PHYSICAL EDGE `flex-start` RESOLVES TO ────────────────────────────────────────
+      // The assertions above are identical for both sides and therefore CANNOT see the one thing
+      // that differs between them. `.paircols` is `row-reverse` on the left pair and `row` on the
+      // right, while its children are `[build, terminal]` in DOM order on both — so the Build
+      // column paints on the RIGHT of a left pair. This overlay is `inset: 0` over that box and
+      // `inset` ignores `row-reverse`, so an UNMIRRORED row anchors to the physical left on both
+      // sides: correct on the right pair, and a full-terminal-width jump on the left one.
+      //
+      // Asserting a literal per side would just restate the source. Asserting that the header
+      // AGREES WITH ITS OWN PAIR is the claim that survives someone re-mirroring the shell, and it
+      // is false on the unmirrored row — which is what makes it worth having. Both directions are
+      // exercised because the loop runs both sides.
+      const cols = screen.getByTestId(`pair-cols-${side}`);
+      expect(cols.style.flexDirection).toBe(side === "left" ? "row-reverse" : "row");
+      // The ROW itself is never mirrored: mirroring it would put the filters to the toggle's LEFT
+      // on the left pair, which is the one thing the founder named explicitly.
+      expect(row.style.flexDirection).toBe("row");
+      // ...so the alignment is carried entirely by the inline-start inset, and THAT is the claim
+      // worth pinning. On the unmirrored pair the Build column starts at the pair's own left edge,
+      // so the inset is AgentSidebar's bare `.bhd` 10px. On the mirrored pair the Build column
+      // starts a full column-width in from the right, so the inset must be DERIVED FROM the
+      // published build-width var — the property that makes the toggle land on the Build header's
+      // x rather than merely on the correct half of the screen.
+      if (side === "right") {
+        expect(row.style.paddingLeft).toBe("10px");
+      } else {
+        expect(row.style.paddingLeft).toContain(buildWidthVar("left"));
+        expect(row.style.paddingLeft).toContain("100%");
+      }
+      // The row is addressable in its own right too, for the satellite test's twin of this.
+      expect(row.dataset.testid).toBe("plan-board-header");
     }
+  });
+
+  // THE ALIGNMENT'S OTHER HALF, which no render can see. The numbers asserted above are only
+  // meaningful while they still match what AgentSidebar's Build header uses — and that constant is
+  // module-private, deliberately: 17 test files replace that module with a mock factory, so an
+  // exported `BUILD_HEADER_H` would read as `undefined` in every one of them and silently un-pin
+  // the alignment the export was for. So pin the source of truth directly. If someone re-tunes
+  // `.bhd`, this fails and says which two plan hosts have to follow it.
+  //
+  // SCOPED TO THE HEADER BLOCK, not grepped over the whole file: `padding: "0 10px"` is a common
+  // enough declaration that a file-wide match would be satisfied by some unrelated element, which
+  // is the vacuous shape a source pin fails into.
+  it("keeps the Build header's own geometry as the number the plan header matches", () => {
+    const path = resolve(process.cwd(), "src/components/AgentSidebar.tsx");
+    // Fail-closed: a wrong cwd must fail loudly, never pass by finding nothing to contradict it.
+    expect(existsSync(path)).toBe(true);
+    const src = readFileSync(path, "utf8");
+
+    // assertPinnedNeedle, not toMatch/toContain: a bare text search is satisfied by the needle
+    // sitting on a COMMENT line, so deleting the declaration and leaving `// const BUILD_HEADER_H
+    // = 34;` behind would keep this green. mutation-check proved that exact hole — all three pins
+    // here survived being commented out until this helper replaced the regexes.
+    assertPinnedNeedle(src, "const BUILD_HEADER_H = 34;", "AgentSidebar.tsx");
+
+    // Bound the slice by the header's OWN style object — `style={{` … the `}}` at its indent —
+    // rather than by a character count. A count either truncates before the values (it did) or
+    // over-reaches into a sibling element, and the over-reach is the silent half.
+    const at = src.indexOf('data-testid="build-column-header"');
+    expect(at).toBeGreaterThan(-1);
+    const styleAt = src.indexOf("style={{", at);
+    expect(styleAt).toBeGreaterThan(at);
+    const styleEnd = src.indexOf("\n          }}", styleAt);
+    expect(styleEnd).toBeGreaterThan(styleAt);
+    const band = src.slice(styleAt, styleEnd);
+    // The band's height and its horizontal inset — the two values the plan header copies.
+    assertPinnedNeedle(band, "minHeight: BUILD_HEADER_H,", "AgentSidebar.tsx build header");
+    assertPinnedNeedle(band, 'padding: "0 10px",', "AgentSidebar.tsx build header");
   });
 
   // ── 3 ── THE LAYOUT IS NOT SPENT. This is the "do not lose his layout" requirement, and the
@@ -284,13 +393,20 @@ describe("the Plan board takes over the whole pair", () => {
     const inFlow = () =>
       Array.from(cols.children).filter((c) => (c as HTMLElement).style.position !== "absolute");
 
-    expect(inFlow()).toHaveLength(2); // the Build column and the terminal stage
+    // NAMED, NOT COUNTED — the count alone went stale the moment the row gained the epics column,
+    // and a bare number cannot tell "a column was added" from "a column was lost and another
+    // added". The claim under test is that turning the board ON changes NOTHING here, so the census
+    // is taken before and compared after rather than re-asserted as a literal.
+    const census = () => inFlow().map((c) => (c as HTMLElement).dataset.testid);
+    expect(census()).toEqual(["epics-column", "sidebar-left", "terminal-stage-left"]);
 
     planOn("left");
     // The board arrived...
     expect(cols.querySelector("[data-testid='plan-column']")).toBeTruthy();
-    // ...and the flex row it landed on is untouched — still exactly those two columns.
-    expect(inFlow()).toHaveLength(2);
+    // ...and the flex row it landed on is untouched — the SAME columns, in the same order. That is
+    // what "it covers, it does not re-flow" means: an absolute child takes no part in this flex row,
+    // so no column is unmounted, resized, or asked to give its width up.
+    expect(census()).toEqual(["epics-column", "sidebar-left", "terminal-stage-left"]);
   });
 
   // ── 3b ── COVERED IS NOT THE SAME AS GONE, and the gap between them is a real defect

@@ -283,14 +283,22 @@ afterEach(() => {
   resetCable();
 });
 
-// ══ PREVIEW — the column is showing a dev-server slot, and the rows are still there ═════════════
-describe("a row gesture reveals the agent's terminal from PREVIEW mode", () => {
-  beforeEach(() => seed({ mode: "preview" }));
+// ══ AN OVERLAY COVERS THE PAIR, AND THE ROWS ARE STILL THERE ════════════════════════════════════
+// This block used to seed `mode: "preview"`, because a preview slot was the one surface that hid the
+// terminal while keeping the row list (Plan short-circuits the list). That mode is gone (founder,
+// 2026-08-19: a preview is a card in the concierge chat, not a peer column), so the state is now
+// reached by the Improve-Sparkle overlay — `activeSpecial`, which covers the pair's stage and leaves
+// the sidebar's rows exactly where they were.
+//
+// THE PREMISE TEST BELOW IS WHAT KEEPS THIS HONEST after the swap: if the new seed did NOT hide the
+// terminal, every case here would pass on a lucky default and prove nothing about the gesture.
+describe("a row gesture reveals the agent's terminal from behind a covering overlay", () => {
+  beforeEach(() => seed({ mode: "build", special: "sparkle" }));
 
   // THE PREMISE, asserted so the two cases below are genuine transitions rather than lucky defaults.
-  // Both halves matter: the row must be clickable (Preview keeps the list, unlike Plan), and the
+  // Both halves matter: the row must be clickable (an overlay keeps the list, unlike Plan), and the
   // terminal must start OFF SCREEN — otherwise "it is visible afterwards" proves nothing.
-  it("starts with the row on screen and the terminal hidden behind the preview slot", async () => {
+  it("starts with the row on screen and the terminal hidden behind the overlay", async () => {
     await mount();
     expect(rowFor(MOUNTED)).toBeTruthy();
     // THE POSITIVE CONTROL FOR THE PLAN GUARD at the bottom of this file, which asserts this exact
@@ -482,12 +490,13 @@ describe("Improve Sparkle still reveals the SPARKLE pane, even from a Plan board
 // The menu item is the SAME production entry point — `AgentSidebar.rowContextMenu.test.tsx` pins it
 // as "the same outcome as the × on it", both landing in `requestClose` — and it needs no geometry.
 describe("closing the MOUNTED agent leaves the surviving agent's terminal on screen", () => {
-  // PREVIEW, not the default Build. Under `seed()`'s defaults (`mode: "build"`, `selectedAgentId:
-  // "a1"`) a1's terminal is ALREADY painted before any gesture, so the premise below held identically
-  // with the double-click deleted — vacuous, and its comment claimed the opposite. Preview starts the
-  // terminal hidden behind the dev-server slot, so the mount is a genuine transition.
+  // A COVERING OVERLAY, not the default Build. Under `seed()`'s defaults (`mode: "build"`,
+  // `selectedAgentId: "a1"`) a1's terminal is ALREADY painted before any gesture, so the premise
+  // below held identically with the double-click deleted — vacuous, and its comment claimed the
+  // opposite. An overlay starts the terminal hidden, so the mount is a genuine transition. (This
+  // used to seed `mode: "preview"` for the same reason; that mode was removed on 2026-08-19.)
   beforeEach(() => {
-    seed({ mode: "preview" });
+    seed({ mode: "build", special: "sparkle" });
     // A CLEAN, POLLED BRANCH STATUS FOR BOTH ROWS — required for the close to be silent, and the
     // requirement is real production logic rather than test scaffolding. `closeDecision` answers
     // `work-at-risk-prompt` when `branchStatus` is UNDEFINED (engine/closeAgent.ts:110 — "we can't

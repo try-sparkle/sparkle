@@ -120,11 +120,18 @@ describe("unmerged: no interruption, but not dimmed either", () => {
   });
 
   it("the genuinely calm statuses still dim, and no red one does", () => {
-    // `working` is its own BAND now (Running) and still calm: the band split changed where a row
-    // sorts and what it counts toward, not what desaturates.
-    for (const s of ["idle", "done", "stopped", "working"] as const) {
+    // `working` is NOT here any more (bead sparkle-e7a3f3). It is its own BAND (Running) and the
+    // band split still only changed where a row sorts and what it counts toward — but a RUNNING
+    // agent's terminal is the one surface calm must never touch, because it is the pane the founder
+    // is reading while the output arrives. See conciergeFeed.isCalmBand for the full note.
+    for (const s of ["done", "stopped"] as const) {
       expect(isCalmBand(s)).toBe(true);
     }
+    // `working` and `idle` answer IDENTICALLY: they are two halves of one live session (settle()
+    // flips working -> idle ~2.5s after each turn), so a set containing one and not the other is a
+    // per-turn theme swap rather than a treatment.
+    expect(isCalmBand("working")).toBe(false);
+    expect(isCalmBand("idle")).toBe(false);
     for (const s of ["waiting", "approval", "errored", "blocked"] as const) {
       expect(isCalmBand(s)).toBe(false);
     }

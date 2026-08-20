@@ -111,6 +111,40 @@ describe("applyPreviewStatus", () => {
     expect(usePreviewStore.getState().byAgent.a1?.status).toBe("failed");
     expect(usePreviewStore.getState().byAgent.a1?.error).toContain("Cannot find module");
   });
+
+  // ══ THE WIRE PATH IS WHAT FEEDS THE IDLE CLOCK ═══════════════════════════════════════════════
+  // `previewIdleGrace` times a preview off `lastActivityAt`, and the honest entry point for that is
+  // this function — the one every `preview:state` event and every `listPreviews()` reconciliation
+  // goes through. Asserted HERE rather than only on the store because a repeat status is precisely
+  // what `listPreviews()` produces after a window reload, and the setter's unchanged-value bail
+  // used to discard it whole. Both halves again: the timestamp moves AND the entry is not
+  // reallocated, since a re-render on every redundant event is what the bail exists to prevent.
+  it("moves lastActivityAt on a REPEAT status without reallocating the entry", () => {
+    const STATUS = {
+      id: "srv-1",
+      agentId: "a1",
+      projectId: "p1",
+      url: "http://127.0.0.1:5199/",
+      port: 5199,
+      state: "serving",
+      error: null,
+    } as const;
+
+    vi.useFakeTimers();
+    try {
+      applyPreviewStatus({ ...STATUS });
+      const entryBefore = usePreviewStore.getState().byAgent.a1!;
+      expect(entryBefore.lastActivityAt).toBe(Date.now());
+
+      vi.advanceTimersByTime(120_000);
+      applyPreviewStatus({ ...STATUS }); // a freshly-deserialized twin, as the wire always sends
+
+      expect(usePreviewStore.getState().byAgent.a1).toBe(entryBefore);
+      expect(usePreviewStore.getState().byAgent.a1!.lastActivityAt).toBe(Date.now());
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("openPreviewServer — the wire shape preview_open ACTUALLY returns", () => {

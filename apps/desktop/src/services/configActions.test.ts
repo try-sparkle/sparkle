@@ -58,6 +58,7 @@ import {
   setImprovementConsent,
   backfillImprovementConsentMirror,
   setBuilderIndexEnabled,
+  setStraudeEnabled,
   setOnePasswordAccount,
   setOnePasswordVault,
   setOnePasswordSeedWorktrees,
@@ -845,6 +846,54 @@ describe("setBuilderIndexEnabled", () => {
     expect(setConfigValue).toHaveBeenCalledWith("tools.builder_index", false);
     expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
     expect(useSettingsStore.getState().builderIndexModalOpen).toBe(false);
+  });
+});
+
+describe("setStraudeEnabled", () => {
+  beforeEach(() => {
+    useSettingsStore.setState({
+      straudeEnabled: false,
+      straudeModalOpen: false,
+      builderIndexEnabled: false,
+      builderIndexModalOpen: false,
+    });
+  });
+
+  it("turning it ON opens the consent modal and writes NOTHING", async () => {
+    // Same contract as the Builder Index: a click on the switch must not be able to start
+    // publishing to a third party. Only the modal's explicit confirmation writes tools.straude.
+    await setStraudeEnabled(true);
+    expect(useSettingsStore.getState().straudeModalOpen).toBe(true);
+    expect(useSettingsStore.getState().straudeEnabled).toBe(false);
+    expect(setConfigValue).not.toHaveBeenCalled();
+  });
+
+  it("turning it OFF writes immediately, with no dialog in the way", async () => {
+    useSettingsStore.setState({ straudeEnabled: true });
+    await setStraudeEnabled(false);
+    expect(setConfigValue).toHaveBeenCalledWith("tools.straude", false);
+    expect(useSettingsStore.getState().straudeEnabled).toBe(false);
+    expect(useSettingsStore.getState().straudeModalOpen).toBe(false);
+  });
+
+  // THE INDEPENDENCE PROPERTY, in the layer that could most easily break it. These are competing
+  // leaderboards, so one destination's toggle touching the other's flag or modal would be a silent
+  // third-party egress the user never answered a consent screen for.
+  it("neither destination's toggle disturbs the other", async () => {
+    await setStraudeEnabled(true);
+    expect(useSettingsStore.getState().builderIndexModalOpen).toBe(false);
+    expect(useSettingsStore.getState().builderIndexEnabled).toBe(false);
+
+    useSettingsStore.setState({ straudeModalOpen: false });
+    await setBuilderIndexEnabled(true);
+    expect(useSettingsStore.getState().straudeModalOpen).toBe(false);
+    expect(useSettingsStore.getState().straudeEnabled).toBe(false);
+
+    useSettingsStore.setState({ straudeEnabled: true, builderIndexEnabled: true });
+    await setStraudeEnabled(false);
+    expect(setConfigValue).toHaveBeenCalledWith("tools.straude", false);
+    expect(setConfigValue).not.toHaveBeenCalledWith("tools.builder_index", false);
+    expect(useSettingsStore.getState().builderIndexEnabled).toBe(true);
   });
 });
 

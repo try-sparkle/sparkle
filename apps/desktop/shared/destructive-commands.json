@@ -16,6 +16,20 @@
     "(`cd /tmp && rm -rf ~`). There is no third list: a rule lives in `denyRules`, in the guard, or",
     "in both — never in a key that does not exist here.",
     "",
+    "`mergePolicy` IS A DIFFERENT KIND OF RULE, which is why it is its own key and not more",
+    "`mustBlock` entries. Everything above is UNCONDITIONAL: the same command is refused in every",
+    "worktree, and `mustBlock` is driven against `blocksDestructiveCommand`, a PURE predicate that",
+    "reads no filesystem. `gh pr merge` cannot be judged that way. It is the SANCTIONED path in the",
+    "owner's own repo (the orchestrator merges agent branches with it) and forbidden in a repo he",
+    "merely has commit access to, so the verdict depends on WHICH worktree the command runs in. Rust",
+    "resolves it per worktree and writes `<worktree>/.sparkle/merge-policy.json`; the guard reads that",
+    "file with native JSON.parse and owns the compound case a prefix rule cannot see. `gh pr merge`",
+    "must therefore NEVER join `denyRules` — a deny rule has no approval path, and blanket-refusing",
+    "the merge would rebuild the wall this posture exists to tear down, with no way through it at all.",
+    "Each `mergePolicy` case carries the worktree STATE it is judged against (`policy`, `policyRaw`,",
+    "or neither for an absent file), because a command alone cannot express the rule.",
+    "Contract: PRD/sparkle/per-project-tool-policy-contract.md §7.",
+    "",
     "MEASURED, not assumed (claude 2.1.229, A/B against the real CLI):",
     "  bypassPermissions, no deny      -> `rm -f <marker>` RAN (marker deleted). Bypass is real;",
     "                                     headless auto-deny is NOT the explanation.",
@@ -243,10 +257,16 @@
     { "command": "find / -name '[a-z[:]*' -delete", "why": "REGRESSION, HIGH: an UNTERMINATED sub-expression is not a sub-expression — fnmatch rewinds and reads the `[` as an ordinary member. Refusing from inside the class returned the same -1 the glob path reads as `literal [`, so the strip re-scanned, took a SHORTER class, and left `[a-z` behind as literal text. This is `'[a-z]*'` re-opened by adding two characters." },
     { "command": "find / -name '[a[:alpha]*' -delete", "why": "the same malformed sub-expression with a member before it, and a class NAME that merely lacks its `:]`" },
     { "command": "find / -name '[a-z[.]*' -delete", "why": "the `[.coll.]` spelling of the same unterminated sub-expression" },
-    { "command": "find / -name '[a-z[=]*' -delete", "why": "and the `[=equiv=]` spelling" }
+    { "command": "find / -name '[a-z[=]*' -delete", "why": "and the `[=equiv=]` spelling" },
+    { "command": "find / -regex '[a-z' -delete", "why": "THE SENTINEL'S ONE SURVIVING PRODUCER, regex half. `bracketClassEnd` still returns a bare -1 when a class never closes at all, and the two callers read that -1 in OPPOSITE directions — refuse here, `literal [` on the glob path (its mustAllow twin below pins the same text as ALLOWED). Both readings are correct for their own dialect, which is exactly why nothing flags a third condition that starts returning -1 and silently inherits the permissive one. This pair is the tripwire: unify the readings, or add a producer, and one of the two flips." },
+    { "command": "find / -iregex '[a-z' -delete", "why": "the case-insensitive spelling, so the pin does not rest on one dispatch arm" }
   ],
 
   "mustAllow": [
+    { "command": "gh pr merge 2109 --merge", "why": "THE PIN THAT KEEPS THE MERGE RULE CONDITIONAL: `gh pr merge` must never become an unconditional refusal. In `drodio/sparkle` merging a green PR is the sanctioned path and a deny rule has no approval path, so a global block would leave no way to land anything. Whether THIS worktree may merge is decided by `mergePolicy` below, from the per-worktree policy file — never here." },
+    { "command": "cd apps/desktop && gh pr merge 2109 --auto --merge", "why": "the same, in the compound form the merge guard does judge — the global layer must stay silent about it either way" },
+    { "command": "gh pr view 2109 --json state,mergeable", "why": "a read-only PR query is not a merge; over-blocking `gh` would refuse the diagnostics an agent needs to decide anything" },
+    { "command": "gh pr list --state open --limit 50", "why": "same — the merge rule is anchored on the `pr merge` subcommand pair, not on the `gh` binary" },
     {
       "command": "cd \"/Users/x/Library/Application Support/ai.sparkle.desktop/worktrees/a b/c\" && git status",
       "why": "REGRESSION: a space in Sparkle's own worktree path tripped 'Contains backslash-escaped whitespace'"
@@ -349,6 +369,7 @@
     { "command": "find ~ \\( -name .DS_Store -o -name Thumbs.db \\) -delete", "why": "the canonical two-name cleanup, rooted at ~ — bounded by both branches naming a literal file" },
     { "command": "find / -name '*.log' ! -newer stamp -delete", "why": "a negated FILTER beside a real name: the set is still bounded by -name, so the negation only subtracts from it" },
     { "command": "find / -name 'log[0-9]' -delete", "why": "a class BESIDE a literal still narrows — stripping classes must not strip the pattern" },
+    { "command": "find / -name '[a-z' -delete", "why": "THE SENTINEL'S ONE SURVIVING PRODUCER, glob half — the SAME pattern text its mustBlock twin pins as BLOCKED on `-regex`. POSIX fnmatch reads a `[` that never closes as an ordinary literal, so this names the single path `[a-z` and is a bounded delete; refusing it would be a strict regression against real usage. Read the two entries together: they are what makes the divergence visible rather than a comment nobody re-reads." },
     { "command": "find / -name '*.log' -exec grep -o pat {} + -delete", "why": "an `-o` inside the -exec TAIL is grep's flag, not find's OR. Rooted at / WITH -delete, so the narrowing check really runs — splitting on that `-o` invents an unnarrowed branch out of grep's operands and refuses a bounded cleanup." },
     { "command": "xargs -n 1 grep -l TODO", "why": "the wrapper value-skip must not turn a benign nested command into a block" },
     { "command": "bash -lc 'pnpm -r test'", "why": "bundled -c carrying an ordinary command" },
@@ -376,5 +397,819 @@
       "command": "echo 'a\n<<EOF\nb'\nrm -rf ~",
       "why": "the same, single-quoted"
     }
-  ]
+  ],
+
+  "mergePolicy": {
+    "$comment": [
+      "The merge-policy corpus (contract §7). Each case names the worktree STATE it is judged in:",
+      "  `policy`    — the object written to <worktree>/.sparkle/merge-policy.json",
+      "  `policyRaw` — verbatim bytes, for the corrupt-file cases JSON cannot express",
+      "  neither     — no policy file at all (the ABSENT state)",
+      "  `cwdSubdir` — run the command from this subdirectory of the worktree, not its root",
+      "Driven by apps/desktop/src/guard/mergePolicyGuard.test.ts against blocksProtectedMerge(),",
+      "which is impure by necessity — the verdict lives in a file, not in the command string.",
+      "EVERY case has its opposite here on purpose: a `mustBlock` list alone is satisfied by a guard",
+      "that refuses `gh pr merge` everywhere, which is precisely the over-block this design forbids."
+    ],
+    "mustBlock": [
+      {
+        "command": "gh pr merge 41",
+        "why": "the bare merge in a merge-protected worktree — the hole this rule closes",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr merge 41 --auto --merge",
+        "why": "`--auto` is not a different act; it is the same merge with a delay",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "cd apps/desktop && gh pr merge 41 --merge",
+        "why": "THE COMPOUND: a prefix-matched deny rule sees `cd`, not `gh`. This is the entire reason the lexer layer exists.",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        },
+        "cwdSubdir": "apps/desktop"
+      },
+      {
+        "command": "gh -R plow-pbc/tkmx-server pr merge 41",
+        "why": "REGRESSION, HIGH: `operandsOf` drops an option WORD but keeps the VALUE it consumes, so the slug landed at operand 0, the `pr`/`merge` pair test failed, and the merge sailed through a fully protected worktree. Only the `--repo=` spelling was unaffected, which made the hole look randomly present.",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh --repo plow-pbc/tkmx-server pr merge 41",
+        "why": "the long spelling of the same operand shift",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr merge 41 -R plow-pbc/tkmx-server",
+        "why": "REGRESSION, the OTHER half: `gh` does not read its target repo from the worktree when the caller names one, so an UNPROTECTED worktree's policy was permitting a merge in a protected repo. A policy speaks only for the slug it names.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -iS 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
+        "why": "the BUNDLED spelling of -S. envParse walks the cluster letter by letter, so it reaches the split reading here too \u2014 a rule that re-scans for a literal `-S` token does not.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env --split 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
+        "why": "the long-option ABBREVIATION spelling, which envParse also accepts",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -iS 'gh pr merge 41' -R plow-pbc/tkmx-server",
+        "why": "the bundled spelling with the override in the operands",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -S 'gh pr merge 41' -R plow-pbc/tkmx-server",
+        "why": "REGRESSION: `env -S` APPENDS its trailing operands to the split command line \u2014 the tail branch already composed them that way and the split branch threw them away, so an override living in the operands was never seen. In an unprotected worktree nothing else could refuse it.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -S 'gh pr merge 41' --repo plow-pbc/tkmx-server",
+        "why": "the long spelling of the same operand override",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env --split-string='gh pr merge 41' -R plow-pbc/tkmx-server",
+        "why": "and the attached long-flag spelling of -S",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=plow-pbc/tkmx-server -S 'GH_REPO=plow-pbc/tkmx-server' gh pr merge 41",
+        "why": "excluding the -S value by STRING EQUALITY dropped the real assignment when the split string repeated it; the exclusion is positional now",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -mR plow-pbc/tkmx-server",
+        "why": "REGRESSION, HIGH: pflag BUNDLES shorthands, so matching -R only as a whole token or only as the first letter of a word missed a real repo override entirely \u2014 the third time this file has had to learn to walk a cluster letter by letter",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -sRplow-pbc/tkmx-server",
+        "why": "the bundled-with-attached-value spelling of the same",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=plow-pbc/tkmx-server -S 'gh pr merge 41'",
+        "why": "REGRESSION: narrowing env's assignments to the ones it OWNS gave the -S branch none at all \u2014 the split command is not a suffix of args, so the tail branch's arithmetic could not serve it and the assignment was simply dropped. env exports it and gh merges the foreign repo.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=plow-pbc/tkmx-server -S 'bash -lc \"gh pr merge 41\"'",
+        "why": "the same hole one wrapper deeper",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -t '-Rebase' -R plow-pbc/tkmx-server",
+        "why": "skipping a value-taking flag's VALUE must not cost the real override beside it",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=drodio/sparkle bash -lc 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
+        "why": "REGRESSION: a BENIGN override placed OUTSIDE shadowed the hostile one that actually runs, because the lookup returned the first match in an outermost-first list. Any precedence is a bypass; every named target is collected instead, and the judge refuses if ANY is foreign.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=drodio/sparkle gh pr merge 41 -R plow-pbc/tkmx-server",
+        "why": "the same shadowing across MECHANISMS: an assignment won over gh's own --repo, which in gh actually outranks it \u2014 so the shipped -R rule was laundered by one prepended word",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env gh pr merge 41 --subject 'GH_REPO=drodio/sparkle' -R plow-pbc/tkmx-server",
+        "why": "a NAME=value word inside the NESTED command's arguments was read as an environment assignment, shadowing a real foreign --repo beside it",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -R drodio/sparkle --repo plow-pbc/tkmx-server",
+        "why": "two flags on one line: the second is the one gh honours, and picking either by position is a coin flip \u2014 collecting both is not",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=plow-pbc/tkmx-server gh pr merge 41",
+        "why": "REGRESSION: ONE WORD defeated the GH_REPO rule. `envParse` skips NAME=value operands as env's own before handing on the tail, so the assignment never reached the gh segment and the merge was judged by the local worktree's policy. An environment override survives every wrapper the walk unwraps, so the walk inherits it.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "nohup env GH_REPO=plow-pbc/tkmx-server gh pr merge 41",
+        "why": "the same, one wrapper deeper",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "bash -lc 'GH_REPO=plow-pbc/tkmx-server gh pr merge 41'",
+        "why": "and through a shell's -c string, where the assignment leads its own re-lexed segment",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "GH_REPO=plow-pbc/tkmx-server gh pr merge 41",
+        "why": "the env spelling of the override \u2014 `segmentCommand` SKIPS leading VAR=value assignments to find the binary, so it is invisible unless the raw tokens are read",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 --repo=plow-pbc/tkmx-server",
+        "why": "the equals spelling of the override",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -Rplow-pbc/tkmx-server",
+        "why": "cobra's attached-shorthand spelling",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr checks 41 && gh pr merge 41 --squash",
+        "why": "a read-only probe in front of the merge does not launder it",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "bash -lc 'gh pr merge 41 --merge'",
+        "why": "a shell's -c argument is ONE token the top-level lexer never re-lexes",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "env -S 'gh pr merge 41 --merge'",
+        "why": "`env -S` carries a whole COMMAND LINE; treating it as an ordinary value-flag skips straight past it and the merge reads as no merge at all",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "xargs -I{} gh pr merge {} --merge",
+        "why": "a nesting wrapper carries its command as plain operands, so the segment's command word is `xargs` and the merge behind it is invisible without the walk",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "find . -name PR -exec gh pr merge 41 \\;",
+        "why": "the fourth laundering door \u2014 contrived, but leaving one of four open is how a guard gets a reputation for being bypassable",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "/opt/homebrew/bin/gh pr merge 41",
+        "why": "a path-prefixed binary is the same command",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr merge 41",
+        "why": "PRESENT but not valid JSON — a policy file only exists in a managed worktree, so a corrupted one is the tamper case and fails closed",
+        "policyRaw": "{ \"version\": 1, \"mergeProtected\": tru"
+      },
+      {
+        "command": "gh pr merge 41",
+        "why": "PRESENT with an unknown `version` — something rewrote the file; a newer writer ships with a newer guard",
+        "policy": {
+          "version": 99,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": false
+        }
+      },
+      {
+        "command": "gh pr merge 41",
+        "why": "PRESENT with no `mergeProtected` key at all — the missing field must never read as permission",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server"
+        }
+      },
+      {
+        "command": "gh pr merge 41",
+        "why": "PRESENT with `mergeProtected` as the STRING \"false\" — a truthiness read would get this right by accident and a missing field wrong; the type check is what makes both fail closed",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": "false"
+        }
+      },
+      {
+        "command": "gh pr merge 41",
+        "why": "PRESENT with a null slug (the repo could not be resolved) — Rust fails closed on an unresolvable slug and the guard must honour it",
+        "policy": {
+          "version": 1,
+          "slug": null,
+          "mergeProtected": true,
+          "reason": "The repo slug could not be resolved.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      }
+    ],
+    "mustAllow": [
+      {
+        "command": "gh pr merge 41 --merge",
+        "why": "AN UNPROTECTED managed worktree: the same command, permitted. Without this case every block above is satisfied by a guard that refuses `gh pr merge` everywhere.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "cd apps/desktop && gh pr merge 41 --merge",
+        "why": "the compound form, unprotected — the compound rule must be conditional too, not a second unconditional deny",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        },
+        "cwdSubdir": "apps/desktop"
+      },
+      {
+        "command": "gh pr merge 41",
+        "why": "NO policy file at all: absence means 'not a Sparkle-managed worktree, no opinion'. Blocking here would break every worktree predating this change, including the sanctioned merge path in the owner's own repo."
+      },
+      {
+        "command": "env -S 'gh pr merge 41 --merge'",
+        "why": "the env -S laundering shape in an UNPROTECTED worktree: reading the nested command line must not become a second unconditional deny",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "xargs -I{} gh pr merge {} --merge",
+        "why": "same for the wrapper walk",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -S 'gh pr view 41 --json mergeable'",
+        "why": "and the nested read-only query stays allowed even in a PROTECTED worktree \u2014 the walk must judge WHAT it runs, not merely that it nested",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr view 41 --json mergeable",
+        "why": "a read-only query in a PROTECTED worktree — over-blocking is a real failure here, not a safe default",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr merge 41 -R drodio/sparkle",
+        "why": "an override naming the repo the policy DOES describe is ordinary work \u2014 the override rule must not collapse into 'any --repo blocks'",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 --repo DRODIO/Sparkle.git",
+        "why": "slugs compare the way GitHub compares them: case-insensitively and ignoring a .git suffix, or the rule refuses correct commands",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -iS 'GH_REPO=drodio/sparkle gh pr merge 41'",
+        "why": "REGRESSION, the direction that matters: re-deriving the -S value's POSITION used a narrower grammar than envParse's, so the bundled spelling excluded nothing, inherited the split string itself as a bogus GH_REPO assignment, and refused a legitimate own-repo merge with a garbage slug in the refusal head \u2014 no approval path. Value identity covers every spelling.",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -vS 'GH_REPO=drodio/sparkle gh pr merge 41'",
+        "why": "another boolean in the same cluster",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env --split 'GH_REPO=drodio/sparkle gh pr merge 41'",
+        "why": "the abbreviation spelling of the same over-block",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env --spl 'GH_REPO=drodio/sparkle gh pr merge 41'",
+        "why": "a shorter abbreviation, still unambiguous to envParse",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -S 'gh pr merge 41' -R drodio/sparkle",
+        "why": "the paired direction for the split operands: an override naming the policy's own repo is ordinary work",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -mR drodio/sparkle",
+        "why": "the paired direction for the bundled shorthand",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -st '-Rebase before merging'",
+        "why": "OVER-BLOCK the cluster walk also removes: an exact-token flag test could not see the `t` inside `-st`, so a commit SUBJECT beginning with -R was read as a repo name and refused with no approval path",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 -A '-Rebase@example.com'",
+        "why": "-A is --author-email's shorthand and was missing from the set",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=drodio/sparkle -S 'gh pr merge 41'",
+        "why": "the paired direction for the -S inheritance: an owned assignment naming the policy's own repo is ordinary work",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env -S 'GH_REPO=drodio/sparkle gh pr merge 41'",
+        "why": "the assignment INSIDE the split string leads its own re-lexed segment; excluding the -S string token from env's own assignments must not turn it into a bogus repo name",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "GH_REPO=drodio/sparkle gh pr merge 41 -t '-Rebase before merging'",
+        "why": "OVER-BLOCK: collect-all removed the shield first-match gave, and the attached-shorthand pattern matches any word merely BEGINNING with -R \u2014 so a commit subject was refused as a foreign repo, with no approval path",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh pr merge 41 --repo drodio/sparkle -b '-R is the short flag'",
+        "why": "the same on --body, alongside a legitimate override",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env gh pr merge 41 --subject 'GH_REPO=plow-pbc/tkmx-server'",
+        "why": "the OVER-BLOCK half of the same defect: a commit subject that happens to be NAME=value shaped is not an environment assignment, and a refusal here has no approval path",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=drodio/sparkle bash -lc 'GH_REPO=drodio/sparkle gh pr merge 41'",
+        "why": "inner and outer BOTH benign \u2014 so the ordering cannot be 'fixed' by flipping which end wins",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "env GH_REPO=drodio/sparkle gh pr merge 41",
+        "why": "the paired direction: an inherited override naming the repo the policy DOES describe is ordinary work",
+        "policy": {
+          "version": 1,
+          "slug": "drodio/sparkle",
+          "mergeProtected": false,
+          "reason": "drodio is in [concierge].own_orgs and this repo is not pinned.",
+          "remedy": ""
+        }
+      },
+      {
+        "command": "gh search issues pr merge",
+        "why": "REGRESSION: adjacency alone is not command position. This is a full-text search for the words \"pr merge\" and it was refused with 'DO NOT RETRY / hand it to a human' copy \u2014 an agent following that escalates a `gh search` to a person, and a refusal here has no approval path.",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh search prs pr merge",
+        "why": "the same shape on the other search subcommand",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh alias set pr merge",
+        "why": "defining an alias is not running one",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr list --search merge",
+        "why": "a `merge` that is a FLAG VALUE, not the subcommand \u2014 a 'next non-option word after pr' rule would refuse this; token ADJACENCY is what keeps it allowed",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr view 41 -R plow-pbc/tkmx-server",
+        "why": "the override rule is scoped to the MERGE segment: a read-only query naming another repo is not a merge",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr list --state open",
+        "why": "same",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr checks 41 --watch",
+        "why": "same — anchoring on the `pr merge` pair is what keeps the rest of `gh` usable",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "echo 'do not run: gh pr merge 41'",
+        "why": "a MENTION is not an invocation; this guard is command-position anchored like the rest of the file",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "grep -rn 'gh pr merge' AGENTS.md",
+        "why": "reading the docs that describe the rule must not trip the rule",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "git merge origin/main",
+        "why": "a git merge is not a PR merge; AGENTS.md tells a stale branch to do exactly this",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      },
+      {
+        "command": "gh pr create --fill",
+        "why": "opening a PR is the act the refusal REDIRECTS toward, so it must stay allowed",
+        "policy": {
+          "version": 1,
+          "slug": "plow-pbc/tkmx-server",
+          "mergeProtected": true,
+          "reason": "plow-pbc is not in [concierge].own_orgs, so Sparkle will not merge here.",
+          "remedy": "Hand the merge to a human. Do not retry."
+        }
+      }
+    ]
+  }
 }

@@ -1,6 +1,6 @@
 // "Which pair does this project live in?" — the pure rules behind the SECOND pair.
 //
-// The cockpit's full form is `TERM │ BUILD │ CONCIERGE │ BUILD │ TERM`. The app shipped the right
+// The cockpit's full form is `TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM`. The app shipped the right
 // half of it; this module is what makes the left half real. `Workspace` renders the geometry and
 // `ProjectTabsBar` renders the tabs, but every rule about ownership lives here, pure, so it can be
 // tested without a DOM — the same split `engine/cable.ts` uses for `data-wired`.

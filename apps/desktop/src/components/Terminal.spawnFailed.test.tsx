@@ -285,8 +285,15 @@ describe("Terminal — a rejected spawn reports OUT, not just to its own overlay
     expect(detail).not.toBeNull();
     expect(detail!.textContent).toContain(reason);
     // The retry stays reachable alongside it — the detail must ADD to the affordance, not replace it.
-    expect(container.textContent).toContain("Couldn't start the agent.");
-    expect(container.textContent).toContain("Start again");
+    // Asserted as the CAPABILITY (a clickable button is rendered), not as its label: this reason is
+    // the worktree-scope refusal, which the resolver marks permanent, so the button reads "Start
+    // again anyway". Pinning the exact string here would make the honest-copy change look like a
+    // regression while the escape hatch it protects is untouched.
+    expect(container.textContent).toContain("Couldn't start the agent");
+    const retryBtn = [...container.querySelectorAll("button")].find((b) =>
+      (b.textContent ?? "").includes("Start again"),
+    );
+    expect(retryBtn).toBeDefined();
 
     // …and the detail is BOUNDED, so a long error cannot push the button out of the pane. jsdom has
     // no layout engine, so this pins the declaration (which it can see) rather than a measured

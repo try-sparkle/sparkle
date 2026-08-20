@@ -370,7 +370,12 @@ function isApprovalKey(path: string): boolean {
 const PREVIEW_MERGED_KEYS: readonly string[] = [
   "preview.enabled",
   "preview.idle_grace_min",
-  "preview.auto_open",
+  // `auto_open` was here until 2026-08-19. It governed when a preview PANE opened unasked, and the
+  // pane was removed in favour of a card in the concierge chat — a card surfaces itself, so there
+  // was nothing left for it to decide. Listing a key the merged config no longer carries would make
+  // this tool report a setting that reads back as undefined, which is the stale-allowlist failure
+  // the note above is about, pointed the other way.
+  "preview.agent_eagerness",
 ];
 
 /** `[preview]` detection overrides — read off the project file directly by `preview.rs`, never
@@ -914,6 +919,14 @@ export const UNMAPPED_SETTINGS: readonly UnmappedSetting[] = [
     op: null,
     omittedBecause:
       "Turning it on opens the consent modal by design — that modal is where the user reads what gets published publicly. A consent flag set by an agent is not consent. Turning it OFF is the plain `tools.builder_index` config key and is already reachable.",
+  },
+  {
+    pane: "tools",
+    control: "Straude (publish daily token totals)",
+    where: "command",
+    op: null,
+    omittedBecause:
+      "Same reasoning as the Builder Index row above, and it needs a browser sign-in the agent cannot perform. A consent flag set by an agent is not consent. Turning it OFF is the plain `tools.straude` config key and is already reachable.",
   },
   {
     pane: "ai",

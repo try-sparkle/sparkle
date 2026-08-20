@@ -704,33 +704,44 @@ describe("setWorkMode", () => {
 
   // ── EVERY MODE THE UNION HAS IS REACHABLE FROM HERE ──────────────────────────────────────────
   // The guard used to be a hand-written `mode !== "plan" && mode !== "build"` beside a type that
-  // already had three members, so the concierge refused `"preview"` with the message `the chevrons
-  // are "plan" and "build"` — telling the user a real mode does not exist (roborev 60625). Both
-  // halves are asserted: the mode is ACCEPTED, and it lands through the store's paired write.
-  it("switches the column to Preview", () => {
-    const v = value(setWorkMode("preview"));
-    expect(v.priorWorkMode).toBe("build");
-    expect(v.workMode).toBe("preview");
-    expect(useUiStore.getState().workModeBySide.right).toBe("preview");
+  // had grown a third member, so the concierge refused a mode that really existed and told the user
+  // it did not (roborev 60625). The union is back to two — a preview is a concierge card now, not a
+  // mode — but the shape that caused that bug is the same one that would cause the next: a guard
+  // and a message that re-list the members by hand instead of reading `WORK_MODES`.
+  //
+  // `"preview"` IS NOW REFUSED, AND THAT IS THE CONTRACT, not a gap: there is no such mode, so
+  // accepting it would put a column into a state nothing renders. Asserted beside a mode that IS
+  // accepted, so this cannot be satisfied by an op that refuses everything.
+  it("refuses preview — it is not a mode any more — while still accepting plan", () => {
+    const bad = setWorkMode("preview");
+    expect(bad.ok).toBe(false);
+    expect(useUiStore.getState().workModeBySide.right).toBe("build");
+
+    const good = value(setWorkMode("plan"));
+    expect(good.workMode).toBe("plan");
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
   });
 
-  // `openPreview`, not a bare `setWorkMode` — the third member of the mode-plus-yield family. The
-  // Improve-Sparkle pane covers whichever surface the column is showing, so entering Preview while
-  // it is up has to make it yield or the op reports success over an unchanged stage.
-  it("drops a covering Improve-Sparkle pane when it enters Preview", () => {
+  // `openPlanBoard`, not a bare `setWorkMode` — the mode-plus-yield family. The Improve-Sparkle
+  // pane covers whichever surface the column is showing, so entering another mode while it is up
+  // has to make it yield or the op reports success over an unchanged stage.
+  it("drops a covering Improve-Sparkle pane when it enters Plan", () => {
     useUiStore.setState({ activeSpecial: "sparkle" } as never);
-    value(setWorkMode("preview"));
-    expect(useUiStore.getState().workModeBySide.right).toBe("preview");
+    value(setWorkMode("plan"));
+    expect(useUiStore.getState().workModeBySide.right).toBe("plan");
     expect(useUiStore.getState().activeSpecial).toBeNull();
   });
 
   // THE REFUSAL MESSAGE IS BUILT FROM THE LIST, which is the half a widened guard alone would leave
-  // standing: the mode would be accepted while the help text still named two of three.
+  // standing: the mode would be accepted while the help text still named the wrong set.
   it("names every mode when it refuses an unknown one", () => {
     const bad = setWorkMode("kanban");
     expect(bad.ok).toBe(false);
     if (!bad.ok) {
-      for (const m of ["plan", "build", "preview"]) expect(bad.message).toContain(m);
+      for (const m of ["plan", "build"]) expect(bad.message).toContain(m);
+      // …and it must NOT name a mode that no longer exists, which is the same failure in reverse:
+      // a help text offering "preview" would send the caller straight back to the refusal above.
+      expect(bad.message).not.toContain("preview");
     }
   });
 });

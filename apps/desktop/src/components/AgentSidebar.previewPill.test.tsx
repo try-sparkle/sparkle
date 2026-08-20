@@ -31,7 +31,6 @@ import { AgentSidebar } from "./AgentSidebar";
 import { usePreviewStore, type PreviewEntry, type PreviewState } from "../stores/previewStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
-import { useSettingsStore } from "../stores/settingsStore";
 import { useUiStore } from "../stores/uiStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
@@ -94,7 +93,6 @@ beforeEach(() => {
     workModeBySide: { left: "build", right: "build" },
     statusFilter: allBandsVisible(),
   } as never);
-  useSettingsStore.setState({ previewAutoOpen: "returning" } as never);
   useHelperPrefs.setState({ enabled: true } as never);
 });
 afterEach(() => {
@@ -139,60 +137,44 @@ describe("the row PREVIEW pill", () => {
     },
   );
 
-  it("is hidden when the pane is ALREADY showing this agent's preview", () => {
-    // Ambient means "there is something you are not looking at". With the preview on screen the
-    // pill would be a second rendering of a fact the pane is already making unmissable.
-    useUiStore.setState({ workModeBySide: { left: "build", right: "preview" } } as never);
+  // ── THE PANE GATE IS GONE, AND SO ARE THE TWO ROWS THAT PINNED IT ────────────────────────────
+  //
+  // The pill used to hide while the pair's preview PANE showed this same agent: ambient means "there
+  // is something you are not looking at", and beside a live pane the pill was a second rendering of
+  // an unmissable fact. That pane no longer exists (founder, 2026-08-19: a preview is a card in the
+  // concierge chat), so a live preview is ALWAYS off-screen from a sidebar row's point of view and
+  // the pill is always the honest readout. The two rows that asserted the gate — hidden when the
+  // pane showed this agent, shown when it showed a different one — were deleted rather than
+  // rewritten, because neither state is reachable any more.
+  //
+  // WHAT REPLACES THEM is the row below: the pill's presence no longer depends on any work mode at
+  // all, which is the property that could regress if someone re-introduced a visibility gate keyed
+  // to something the sidebar cannot see.
+  // THIS IS THE EXACT STATE THE OLD GATE SUPPRESSED — this agent SELECTED in its own pair — so the
+  // row goes red if a visibility gate keyed to the selection is ever reintroduced. `"plan"` is not
+  // worth a second iteration here: it short-circuits the row list entirely, so there would be no
+  // row to carry a pill and the assertion could not distinguish the gate from the empty list.
+  it("shows the pill even when this agent is the SELECTED one in its pair", () => {
+    useUiStore.setState({ workModeBySide: { left: "build", right: "build" } } as never);
     const project = seed(entry());
     useProjectStore.setState({
       projects: [{ ...project, selectedAgentId: "a1" }],
     } as never);
     render(<AgentSidebar project={{ ...project, selectedAgentId: "a1" }} />);
-    expect(pillOf("Alpha")).toBeNull();
-  });
-
-  it("still appears while that pair previews a DIFFERENT agent", () => {
-    useUiStore.setState({ workModeBySide: { left: "build", right: "preview" } } as never);
-    const project: Project = {
-      id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
-      createdAt: new Date(0).toISOString(), selectedAgentId: "a2",
-      agents: [mkAgent("a1", "Alpha"), mkAgent("a2", "Beta")],
-    };
-    useProjectStore.setState({ projects: [project] } as never);
-    useRuntimeStore.setState({
-      branchStatus: {}, workflowStage: { a1: "building_saved", a2: "building_saved" }, status: {},
-      openAgentIds: ["a1", "a2"],
-      open: vi.fn(),
-      pollBranchStatus: vi.fn(() => Promise.resolve()),
-    } as never);
-    usePreviewStore.setState({
-      byAgent: { a1: entry() },
-      capability: {},
-      openedProjects: {},
-    } as never);
-    render(<AgentSidebar project={project} />);
-    // The pane is showing Beta; Alpha's server is live and off screen, which is exactly what an
-    // ambient indicator is for.
     expect(pillOf("Alpha")).toBeTruthy();
   });
 
   // ══ THE SEPARATION FROM THE PANE GATE ══════════════════════════════════════════════════════
   //
-  // Both rows below hold states in which `previewOpenOutcomeFor` declines. If the pill were ever
-  // routed through that predictor — the obvious-looking simplification — each of these goes red.
+  // The row below used to be one of three, each holding a state in which the retired auto-open
+  // predictor declined — the guard against routing the pill through that predictor. The predictor
+  // and its `auto_open` key are gone (founder, 2026-08-19: no pane, so nothing to decide), so the
+  // two rows keyed to its specific declines went with them. THIS one survives because it does not
+  // depend on the predictor at all: it is about the pill having no window of its own.
 
-  it('shows under auto_open = "never", which governs the PANE and not the pill', () => {
-    useSettingsStore.setState({ previewAutoOpen: "never" } as never);
-    render(<AgentSidebar project={seed(entry())} />);
-    expect(pillOf("Alpha")).toBeTruthy();
-  });
-
-  it("shows for a server whose surfacing moment is long past the auto-open TTL", () => {
-    // `previewOpenOutcomeFor` answers `declined-stale` here — the pane's 5s window has closed. The
-    // pill has no window: the server is still up, so there is still something to see, and history
-    // is exactly what an ambient row indicator is for. (Deliberately NOT tested via `workMode:
-    // "plan"`, which is the other conjunction decline: the sidebar swaps itself for the board in
-    // that mode, so there is no agent row to carry a pill and the test would prove nothing.)
+  it("shows for a server whose surfacing moment is long in the past", () => {
+    // The server is still up, so there is still something to see. An ambient row indicator that
+    // expired would be worse than none: the reader would learn that its absence means nothing.
     render(<AgentSidebar project={seed(entry({ surfacedAt: Date.now() - 10 * 60_000 }))} />);
     expect(pillOf("Alpha")).toBeTruthy();
   });

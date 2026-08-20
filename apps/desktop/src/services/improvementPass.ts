@@ -31,6 +31,9 @@ import { registerSparkleTranscript } from "./sparkleTranscript";
 import { noteAgentSessionId } from "./agentTranscriptRegistry";
 import { claimPass, releasePass } from "./improvementPassLatch";
 import { accountConfigDirFor } from "./accountSelection";
+import { buildControlMcpConfig } from "./claudeSpawn";
+import { startControlBridge, controlMcpPaths } from "./orchestrationLaunch";
+import { sparkleControlProtocol } from "./buildAgent";
 import {
   assertWorkspaceIntegrity,
   createAgentWorktree,
@@ -584,6 +587,21 @@ let retryDueAt: number | null = null;
  *  tick for the whole hour instead of once. */
 let retryUsed = false;
 
+/** Consecutive hourly passes that must refuse to run for the SAME reason before the row escalates
+ *  from the SILENT `blocked` pill to the NOTIFYING `errored` one. One refusal is routine — a killed
+ *  pass left work behind and the next hour clears it — but the SAME refusal several hours running is a
+ *  loop nothing here can break (a stash cannot save a commit, and next hour's park makes the identical
+ *  decision), and staying silently red is exactly how the hourly loop went dark for days without
+ *  anyone being pinged. `errored` is in the notify set (settingsStore DEFAULT_NOTIFY_STATUSES) where
+ *  `blocked` deliberately is not, so crossing this threshold fires the banner/badge `blocked` holds
+ *  back. Three: the second refusal could still be the tail of a transient hiccup; the third is a loop. */
+export const PARK_DECLINE_ESCALATE_AFTER = 3;
+/** The reason the last hourly park DECLINED, and how many hourly passes in a row it has declined for
+ *  THAT reason. Module-level for the same reason as the retry latch above: it is this webview's running
+ *  tally, and a reload should start it over. Cleared by any park that succeeds (or is already-fresh). */
+let parkDeclineReason: string | null = null;
+let parkDeclineStreak = 0;
+
 /** Epoch ms of the armed connectivity re-attempt, or null (read by the scheduler's gate). */
 export function passRetryDueAt(): number | null {
   return retryDueAt;
@@ -621,6 +639,39 @@ export function resetPaneBusyForTests(): void {
 export function resetPassRetryForTests(): void {
   retryDueAt = null;
   retryUsed = false;
+}
+
+/** Fold one park DECLINE into the running same-reason tally and decide how loudly to surface it. It
+ *  advances the module tally — a NEW reason restarts it at 1, the SAME reason extends it — and once it
+ *  reaches PARK_DECLINE_ESCALATE_AFTER the status rises from the silent `blocked` pill to the notifying
+ *  `errored` one, so a stuck loop stops hiding in a red row nobody watches. Returns the status to set
+ *  and the current streak length (for the escalation log and attention screen). */
+function noteParkDeclineStatus(reason: string): { status: AgentTabStatus; streak: number } {
+  if (reason === parkDeclineReason) {
+    parkDeclineStreak += 1;
+  } else {
+    parkDeclineReason = reason;
+    parkDeclineStreak = 1;
+  }
+  const escalate = parkDeclineStreak >= PARK_DECLINE_ESCALATE_AFTER;
+  return { status: escalate ? "errored" : "blocked", streak: parkDeclineStreak };
+}
+
+/** Clear the consecutive-decline tally — any park that SUCCEEDS (parked or already-fresh) breaks the
+ *  streak, so the next first refusal starts a fresh count rather than escalating on the wrong hour. */
+function clearParkDeclineStreak(): void {
+  parkDeclineReason = null;
+  parkDeclineStreak = 0;
+}
+
+/** Read the consecutive same-reason decline tally without disturbing it. */
+export function parkDeclineStreakAt(): number {
+  return parkDeclineStreak;
+}
+
+/** Test seam: forget the consecutive-decline tally, as a fresh webview would. */
+export function resetParkDeclineStreakForTests(): void {
+  clearParkDeclineStreak();
 }
 
 /** Arm the one connectivity re-attempt this slot is allowed, when the failure looks like a
@@ -663,6 +714,39 @@ export async function cancelImprovementPass(): Promise<void> {
  * `freshSlot` says this run is the hourly one coming due, not the connectivity re-attempt —
  * the scheduler knows which, and only a fresh slot re-earns the one retry.
  */
+/**
+ * The `--mcp-config` JSON for one hourly pass, or `undefined` when the control bridge is not
+ * available (bead sparkle-hdlhox).
+ *
+ * WHY THE HEADLESS PASS GETS THIS AT ALL. The pass already DRAINS its inbox — `build_improve_exec`
+ * exports `SPARKLE_INBOX_AGENT` — so it can be told things and, without the control MCP, could not
+ * answer. That asymmetry is the original problem relocated rather than solved: the concierge's whole
+ * job on this channel is to reply "that contradicts what I can observe", and a correction the
+ * corrected party cannot respond to ends the exchange instead of starting one. This pass is also the
+ * body that HAS the cross-agent findings — it does the log-mining and the bead triage — while the
+ * interactive pane is mostly the user chatting.
+ *
+ * NEVER THROWS, and that is the load-bearing property. An hourly pass that dies because a socket
+ * was slow would be a far worse regression than a pass with no cross-agent tools: `undefined` here
+ * emits no flag at all (not an empty one, which `claude` would reject), so the pass runs exactly as
+ * it did before this change.
+ */
+export async function buildPassControlMcp(): Promise<string | undefined> {
+  try {
+    const [bridge, paths] = await Promise.all([startControlBridge(), controlMcpPaths()]);
+    return buildControlMcpConfig({
+      nodePath: paths.nodePath,
+      serverPath: paths.serverPath,
+      socketPath: bridge.socketPath,
+      token: bridge.token,
+      agentId: SPARKLE_AGENT_ID,
+    });
+  } catch (e) {
+    console.warn("improvement pass: sparkle-control MCP unavailable; running without it", e);
+    return undefined;
+  }
+}
+
 export async function runImprovementPass(
   consent: SparkleImprovementConsent,
   freshSlot = false,
@@ -683,6 +767,28 @@ export async function runImprovementPass(
   try {
     const claude = await checkClaude();
     if (!claude.installed || !claude.path) return; // not set up yet — skip quietly
+    // GREEN FROM THE FIRST STEP OF ACTUAL WORK, not from the last one.
+    //
+    // The headless pass has no PTY and no StatusEngine (see the module header + the `sparkle_improve:*`
+    // listeners below), so unlike a build agent — whose row goes green the instant its terminal spawns
+    // (statusEngine.ts, `spawn -> working`) — nothing here reports "working" from the stream. The row
+    // is driven only by these explicit `setStatus` calls. This one used to sit just before the
+    // `sparkle_improve_run` invoke, AFTER the whole networked preamble: the OSS clone
+    // (`ensureSparkleRepo`, minutes on a cold start), the worktree cut, and the fresh-base
+    // `parkWorktreeOnBase` (which fetches). For that entire window the pass is actively working while
+    // the row shows the PREVIOUS pass's resting `idle`/`stopped` — a GRAY dot on a plainly working
+    // agent, which is exactly the "falls to gray while its work is still live" symptom the trustworthy
+    // -status-dot work chased on the interactive side. Claim `working` HERE instead, as soon as Claude
+    // is confirmed present, so setup is covered too.
+    //
+    // NOT EARLIER — this is below the `!claude.installed` return on purpose. A machine with no Claude
+    // never runs, and marking it green would be a false-green with no turn behind it. Everything below
+    // this line, by contrast, either runs the pass or resolves to a TERMINAL status that overrides
+    // this: a declined/thrown park → `blocked`/`errored` (the park gate below), any setup throw → the
+    // outer `catch` → `blocked`, a completed run → `idle`/`approval`, a handoff → `idle`. So no path
+    // leaves a stale `working`; the only change is that the truthful green now starts at the top of the
+    // work rather than at the end of the setup.
+    setStatus(SPARKLE_AGENT_ID, "working");
     const ws = await ensureSparkleRepo();
     const wt = await createAgentWorktree(
       ws.repoPath,
@@ -741,11 +847,40 @@ export async function runImprovementPass(
       // told only "blocked" has no way to learn that a leftover branch in an app-owned worktree they
       // have never seen is what stopped it.
       const detail = refusalDetail(park.reason);
-      console.warn("improvement pass: refusing to run from an unknown base —", park.reason, "—", detail);
-      useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, detail);
-      setStatus(SPARKLE_AGENT_ID, "blocked");
+      // ESCALATE A STUCK LOOP. A single refusal stays on the silent `blocked` pill (it may clear next
+      // hour); the SAME refusal PARK_DECLINE_ESCALATE_AFTER hours running is a loop nothing here can
+      // break, so it must stop being invisible. Crossing the threshold raises the row to `errored` —
+      // which IS in the notify set that `blocked` is deliberately kept out of — so it fires the
+      // banner/badge, and the attention screen (tier (b) of readAgentTerminal, relayed to the phone
+      // and returned to the concierge) says how long it has been stuck. This is the founder-requested
+      // prevention: the hourly log-mining + beads-drain loop stopped for days behind a red row nobody
+      // was pinged about, because the park declined every hour and the only signal was a silent pill.
+      const { status, streak } = noteParkDeclineStatus(park.reason);
+      const escalated = status === "errored";
+      const screen = escalated
+        ? `Improve Sparkle has been unable to start ${streak} hourly passes in a row for the same reason, ` +
+          `and it won't recover on its own. ${detail}`
+        : detail;
+      if (escalated) {
+        console.error(
+          "improvement pass: STUCK — refused to start",
+          streak,
+          "hourly passes in a row —",
+          park.reason,
+          "—",
+          detail,
+        );
+      } else {
+        console.warn("improvement pass: refusing to run from an unknown base —", park.reason, "—", detail);
+      }
+      useRuntimeStore.getState().setAttentionScreen(SPARKLE_AGENT_ID, screen);
+      setStatus(SPARKLE_AGENT_ID, status);
       return; // `finally` still clears the passRunning latch.
     }
+    // The park cleared (a fresh base, or one already fresh) — the consecutive-decline streak the hourly
+    // loop may have been accumulating is broken. Reset it so a later first refusal starts a new count
+    // rather than inheriting this run's and escalating on the wrong hour.
+    clearParkDeclineStreak();
     // READABLE WITHOUT A PANE. This pass has no PTY, so the concierge's live tiers are all empty for
     // it — registering the worktree is the only thing that makes "what is Improve Sparkle doing?"
     // answerable while an hourly pass is mid-flight. It is the WORKTREE and not a resolved file
@@ -798,7 +933,8 @@ export async function runImprovementPass(
     // `undefined` here now means only "no account has ever resolved for this key".
     const configDir = (await accountConfigDirFor(SPARKLE_AGENT_ID)) ?? null;
 
-    setStatus(SPARKLE_AGENT_ID, "working");
+    // `working` was already claimed at the top of the work (right after the Claude-installed check),
+    // so the row has been green through the clone/worktree/park/probe preamble — see that call.
     const outcome = await new Promise<PassOutcome>((resolve, reject) => {
       const unlisteners: Array<() => void> = [];
       // One guarded teardown shared by every exit path (first caller wins; the rest no-op),
@@ -904,17 +1040,29 @@ export async function runImprovementPass(
           // Same settlement discipline as track: if the pass already settled (e.g. the
           // accepted stale-event race delivered first), don't spawn a run nobody is watching.
           if (settled) return;
-          invoke("sparkle_improve_run", {
-            cwd: wt.path,
-            claudePath: claude.path,
-            // Headless: nobody is here to run `gh auth login`, whatever the consent mode says.
-            persona: sparklePersona(ws.logDir, wt.path, consent, submit?.verdict ?? "unknown", {
-              attended: false,
-            }),
-            prompt: hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
-            logDir: ws.logDir,
-            configDir,
-          }).catch(fail);
+          // Headless: nobody is here to run `gh auth login`, whatever the consent mode says.
+          const headlessPersona = sparklePersona(
+            ws.logDir,
+            wt.path,
+            consent,
+            submit?.verdict ?? "unknown",
+            { attended: false },
+          );
+          void buildPassControlMcp().then((mcpConfig) => {
+            if (settled) return;
+            const controlUp = mcpConfig !== undefined;
+            invoke("sparkle_improve_run", {
+              cwd: wt.path,
+              claudePath: claude.path,
+              persona: controlUp
+                ? `${headlessPersona}\n\n${sparkleControlProtocol()}`
+                : headlessPersona,
+              prompt: hourlyMissionPrompt(consent, submit?.verdict ?? "unknown"),
+              logDir: ws.logDir,
+              mcpConfig,
+              configDir,
+            }).catch(fail);
+          }, fail);
         },
         fail,
       );

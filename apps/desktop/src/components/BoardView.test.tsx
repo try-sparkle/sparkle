@@ -2,6 +2,8 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bead, Board } from "../services/beads";
+import { C } from "../theme/colors";
+import { TAG } from "./labelTreatment";
 import type { AgentTab, Project } from "../types";
 
 // Mock the beads store so no real `bd`/Tauri invoke happens. startPolling/stopPolling are spies;
@@ -133,7 +135,7 @@ vi.mock("../services/beadsCommands", async (importOriginal) => {
 
 import { BoardView, boardScrollDelta } from "./BoardView";
 import { sendToBuild } from "../services/sendToBuild";
-import { claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
+import { bucketBeads, claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
 import { useCriteriaStore } from "../services/criteriaStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useUiStore } from "../stores/uiStore";
@@ -820,6 +822,15 @@ describe("BoardView — Build It (epic handoff)", () => {
   });
 });
 
+/** The card node for a title, ignoring the "part of epic" back-links that repeat a parent's name. */
+function titleNodeGlobal(title: string): HTMLElement | null {
+  return (
+    screen
+      .queryAllByText(title)
+      .find((n) => n.closest('[data-testid="part-of-epic"]') === null) ?? null
+  );
+}
+
 describe("BoardView — Start button + decompose badges (spec §7)", () => {
   afterEach(() => {
     vi.mocked(claimBead).mockClear();
@@ -835,7 +846,18 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
       description: over.description ?? "Body.\n\nPRD file: PRD/2026-07-01-epic.md",
       labels: over.labels ?? [],
     });
-    const child = bead({ id: "p1-e1.1", title: "Child task", type: "task", parent: "p1-e1" });
+    // `status: "in_progress"` MATTERS now and did not before. `beads.columnFor` derives the column
+    // FROM the status, so a bead in `inProgress` with status `open` is a snapshot real data cannot
+    // produce — and Build It, which is now offered on every not-yet-started bead, would correctly
+    // appear on it and make "Build It" ambiguous in every test below. The fixture was lying; it
+    // isn't any more.
+    const child = bead({
+      id: "p1-e1.1",
+      title: "Child task",
+      type: "task",
+      parent: "p1-e1",
+      status: "in_progress",
+    });
     const beads = over.withChild === false ? [epic] : [epic, child];
     snapshot = {
       beads,
@@ -857,7 +879,7 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
     blockedReasonMock.mockReturnValue("This machine has 8 of its 8 agent slots taken.");
     startSnapshot({});
     render(<BoardView project={project} side="right" />);
-    fireEvent.click(screen.getByText("Build It"));
+    fireEvent.click(screen.getByTestId("board-card-build-it"));
 
     await waitFor(() => expect(screen.getByText(/8 of its 8 agent slots/)).toBeTruthy());
     expect(sendToBuild).not.toHaveBeenCalled();
@@ -869,13 +891,17 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("claims the epic then hands off to Build with the parsed PRD path", async () => {
     startSnapshot({});
     render(<BoardView project={project} side="right" />);
-    fireEvent.click(screen.getByText("Build It"));
+    fireEvent.click(screen.getByTestId("board-card-build-it"));
     await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
     expect(claimBead).toHaveBeenCalledWith("/tmp/demo", "p1-e1");
+    // `mode: "epic"` is EXPLICIT now. `StartControls` used to take `sendToBuild`'s default, which
+    // was silently correct while only epics could reach it and would have seeded a bug with "fan
+    // out across worker agents" the moment one could.
     expect(sendToBuild).toHaveBeenCalledWith({
       projectId: "p1",
       epicId: "p1-e1",
       prdPath: "PRD/2026-07-01-epic.md",
+      mode: "epic",
     });
     // Start must not ALSO open the detail overlay (stopPropagation).
     expect(screen.queryByLabelText("Close")).toBeNull();
@@ -884,15 +910,20 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
   it("passes prdPath null for a PRD-less epic instead of blocking", async () => {
     startSnapshot({ description: "no prd reference" });
     render(<BoardView project={project} side="right" />);
-    fireEvent.click(screen.getByText("Build It"));
+    fireEvent.click(screen.getByTestId("board-card-build-it"));
     await waitFor(() => expect(sendToBuild).toHaveBeenCalled());
-    expect(sendToBuild).toHaveBeenCalledWith({ projectId: "p1", epicId: "p1-e1", prdPath: null });
+    expect(sendToBuild).toHaveBeenCalledWith({
+      projectId: "p1",
+      epicId: "p1-e1",
+      prdPath: null,
+      mode: "epic",
+    });
   });
 
   it("disables Start (tooltip decomposing…) while the epic has zero children", () => {
     startSnapshot({ withChild: false });
     render(<BoardView project={project} side="right" />);
-    const start = screen.getByText("Build It") as HTMLButtonElement;
+    const start = screen.getByTestId("board-card-build-it") as HTMLButtonElement;
     expect(start.disabled).toBe(true);
     expect(start.title).toContain("decomposing…");
     fireEvent.click(start);
@@ -900,10 +931,54 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
     expect(sendToBuild).not.toHaveBeenCalled();
   });
 
+  // ══ A REFUSAL MUST NOT EAT THE REMEDY ═══════════════════════════════════════════════════════
+  // The sweep writes `stalled` to mean "we spent this epic's restart and it bought nothing; wait
+  // for the human", and `beads.ts` names being PICKED UP as one of only three ways back — Build It
+  // being that pickup. So excluding stalled beads from Build It removed the last in-app way out,
+  // and the `if (!buildIt) return null` that did it took the decompose-failed retry badge down with
+  // it (roborev 65607). Both halves are asserted here.
+  it("keeps the click-to-clear way out on a STALLED bead whose Build It is withheld", async () => {
+    startSnapshot({ labels: ["stalled", "decompose-failed"] });
+    render(<BoardView project={project} side="right" />);
+    // The refusal itself: a stalled bead is not handed to an agent.
+    expect(screen.queryByTestId("board-card-build-it")).toBeNull();
+    // ...but the way back survives it — both badges, not just the one for the label under test.
+    expect(screen.getByTestId("board-card-clear-stalled")).toBeTruthy();
+    expect(screen.getByText("decompose failed")).toBeTruthy();
+    // And following it actually clears the label, which is what brings Build It back next poll.
+    fireEvent.click(screen.getByTestId("board-card-clear-stalled"));
+    await waitFor(() =>
+      expect(labelBead).toHaveBeenCalledWith("/tmp/demo", "remove", "p1-e1", "stalled"),
+    );
+  });
+
+  // ══ THE CHIP MUST MIRROR THE SWEEP'S CLEAR, NOT HALF OF IT ══════════════════════════════════
+  // `epicSweepRunner` takes STALLED_LABEL and SWEEP_NO_AUTO_LABEL off TOGETHER, and says why:
+  // "leaving the marker behind would reset the epic on every tick from here on". A chip that
+  // removed only the first orphans the marker where the sweep can no longer reach it — the
+  // condition it keys on (`already-escalated`) is exactly what clearing the stalled label erases —
+  // and the orphan resurfaces much later as ONE EXTRA automatic restart on an epic whose contract
+  // is "wait for the human" (roborev 65617).
+  it("clears the sweep's no-auto marker alongside the stalled label, never orphaning it", async () => {
+    startSnapshot({ labels: ["stalled", "stalled-no-auto-restart"] });
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-card-clear-stalled"));
+    await waitFor(() =>
+      expect(labelBead).toHaveBeenCalledWith(
+        "/tmp/demo",
+        "remove",
+        "p1-e1",
+        "stalled-no-auto-restart",
+      ),
+    );
+    // BOTH, not either — asserting only the marker would pass a handler that dropped the label.
+    expect(labelBead).toHaveBeenCalledWith("/tmp/demo", "remove", "p1-e1", "stalled");
+  });
+
   it("disables Start and shows a click-to-clear badge while labeled decomposing", async () => {
     startSnapshot({ labels: ["decomposing"] });
     render(<BoardView project={project} side="right" />);
-    expect((screen.getByText("Build It") as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByTestId("board-card-build-it") as HTMLButtonElement).disabled).toBe(true);
     // The badge itself clears the label (the user's way out of a stuck decompose).
     fireEvent.click(screen.getByText("decomposing…"));
     await waitFor(() =>
@@ -920,21 +995,87 @@ describe("BoardView — Start button + decompose badges (spec §7)", () => {
     );
   });
 
-  it("shows Build It only on backlog epic cards (not tasks, not other columns)", () => {
+  // ══ WHICH CARDS OFFER BUILD IT — THE FOUNDER-FACING CONTRACT ════════════════════════════════
+  // This replaces "shows Build It only on backlog epic cards (not tasks, not other columns)",
+  // which pinned the behaviour he filed as broken: on his live store that rule left 1,753 of 2,074
+  // open beads — every one of 1,652 bugs — with no way to start work from the board.
+  //
+  // EVERY CANDIDATE IS MOUNTED AT ONCE, which is the only shape with power here. A test that
+  // renders one card and checks the button is present proves nothing about a gate keyed to the
+  // wrong side of the question; a test that renders none and checks it is absent proves less. The
+  // assertion that bites names all of them and says what each one gets.
+  it("offers Build It on every NOT-YET-STARTED card of any type, and on no started one", () => {
+    const startable = [
+      bead({ id: "p1-t1", title: "Plain task", type: "task" }),
+      bead({ id: "p1-b1", title: "A bug", type: "bug" }),
+      bead({ id: "p1-f1", title: "A feature", type: "feature" }),
+      bead({ id: "p1-c1", title: "A chore", type: "chore" }),
+    ];
+    const running = bead({
+      id: "p1-r1",
+      title: "Running task",
+      type: "task",
+      status: "in_progress",
+    });
+    const finished = bead({ id: "p1-d1", title: "Finished task", type: "task", status: "closed" });
+    // ── THE THREE OPEN-BUT-UNSTARTABLE LANES ────────────────────────────────────────────────────
+    // All three are `status: "open"`, so a gate that read only the status would offer Build It on
+    // every one of them. They are mounted HERE, on the board, and not only in the hook's own suite,
+    // because that is the surface the founder presses and the one where the old column gate used to
+    // exclude them by accident.
+    const depBlocked = bead({ id: "p1-x1", title: "Blocked task", type: "task" });
+    const stalled = bead({ id: "p1-x2", title: "Stalled task", type: "task", labels: ["stalled"] });
+    const doneEpic = bead({ id: "p1-x3", title: "Rolled-up epic", type: "epic" });
+    const doneKid = bead({
+      id: "p1-x3.1",
+      title: "Its only child",
+      type: "task",
+      parent: "p1-x3",
+      status: "closed",
+    });
     snapshot = {
-      beads: [],
+      beads: [...startable, running, finished, depBlocked, stalled, doneEpic, doneKid],
       board: {
-        backlog: [bead({ id: "p1-t1", title: "Plain task", type: "task" })],
-        blocked: [],
-        inProgress: [bead({ id: "p1-e2", title: "Running epic", type: "epic" })],
-        done: [],
+        backlog: [...startable, stalled, doneEpic],
+        blocked: [depBlocked],
+        inProgress: [running],
+        done: [finished, doneKid],
         delivered: [],
         archived: [],
       },
       loadedAt: Date.now(),
     };
     render(<BoardView project={project} side="right" />);
-    expect(screen.queryByText("Build It")).toBeNull();
+
+    // SCOPED TO THE CARD, NOT THE COLUMN — the first draft of this test used the column, and all
+    // four type assertions silently read the SAME first card's button while reporting four passes.
+    const buildItIn = (title: string) => {
+      const card = titleNodeGlobal(title)?.closest(
+        "[data-testid=\"board-card-epic\"],[data-testid=\"board-card-task\"]",
+      ) as HTMLElement | null;
+      return card ? within(card).queryAllByTestId("board-card-build-it") : [];
+    };
+
+    for (const b of startable) {
+      const [btn] = buildItIn(b.title);
+      expect(btn, `${b.type} should offer Build It`).toBeTruthy();
+      // ENABLED, not merely present. The epic-only "no children yet → decomposing…" guard must not
+      // reach a bug or a task: those ARE the unit of work and never have children, so applying it
+      // would render a button on all 1,652 bugs that can never be pressed — the same defect wearing
+      // a different disguise.
+      expect((btn as HTMLButtonElement).disabled, `${b.type} should be pressable`).toBe(false);
+    }
+    // ...and the other half of the pair: work that is not startable is not offered a handoff.
+    // Started or finished —
+    expect(buildItIn("Running task")).toHaveLength(0);
+    expect(buildItIn("Finished task")).toHaveLength(0);
+    // — and open, but not "not started yet". Each of these was offered-and-pressable in the first
+    // draft of this change and was caught by review; pressing them would have handed an agent a
+    // bead with unmet prerequisites, re-handed off work the sweep had given up on, and claimed a
+    // finished epic to in_progress respectively.
+    expect(buildItIn("Blocked task")).toHaveLength(0);
+    expect(buildItIn("Stalled task")).toHaveLength(0);
+    expect(buildItIn("Rolled-up epic")).toHaveLength(0);
   });
 });
 
@@ -1616,5 +1757,462 @@ describe("the archived column", () => {
     expect(screen.queryByText("Archived 59")).toBeNull();
     // The unrendered remainder is a count (60 - 50 = 10), never DOM nodes.
     expect(screen.getByTestId("board-column-overflow-archived").textContent).toContain("10");
+  });
+});
+
+// ══ TASKS / EPICS — the Plan board's two independent kind toggles (sparkle-xelans.6) ═══════════
+//
+// WHAT THESE HAVE TO PROVE, and why the obvious test would not. The pure bucketing is already
+// covered in `services/epicBoard.test.ts`; what is NOT covered by that, and what actually broke the
+// founder's ability to see epics, is the WIRING — that the toggle reaches the store, that the store
+// reaches the memo, and that the memo reaches the column render. A test that rendered the board and
+// asserted an epic is on it would pass against the code as it was BEFORE any of this existed,
+// because epics were always on the board; they were just mixed into the task columns.
+//
+// So every case below mounts an epic AND a plain task AND the epic's own child in one snapshot, and
+// asserts the full row: which column each one landed in, and that the others are absent. Absence
+// alone is the trap (AGENTS.md, the "N targets" case) — a card missing from Planning proves nothing
+// if nothing was ever going to be there.
+describe("BoardView — Tasks / Epics kind toggles", () => {
+  /** One snapshot holding all three kinds at once: an epic whose children are all open (so it rolls
+   *  up to `planning`), that epic's child, and an unrelated plain task in the same Backlog pile. */
+  function seedEpicSnapshot() {
+    const beads: Bead[] = [
+      // NOT "The epic": a trailing bare word `epic` is now scrubbed from the DISPLAYED title
+      // (epicDisplayTitle), and these tests locate cards BY their rendered text. The title is
+      // incidental here — what is under test is bucketing by epic-ness, which comes from having a
+      // child, not from the name. The scrub itself is pinned in services/beads.epicTitle.test.ts.
+      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
+      bead({ id: "p1-task", title: "Plain task" }),
+    ];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+  }
+
+  /** The CARD TITLE node bearing this text, ignoring the "Part of Epic: <name>" back-link that a
+   *  child card now also carries. Without this scoping a bare `getByText` matches twice and throws
+   *  "Found multiple elements" — the queries below are about which column a CARD sits in, and the
+   *  back-link is not a card. `scope` narrows to one board in the two-sided test. */
+  const titleNode = (title: string, scope?: HTMLElement): HTMLElement | null =>
+    (scope ? within(scope) : screen)
+      .queryAllByText(title)
+      .find((n) => n.closest('[data-testid="part-of-epic"]') === null) ?? null;
+
+  const columnOf = (title: string): string | null => {
+    const card = titleNode(title);
+    return card ? (card.closest("[data-board-column]")?.getAttribute("data-board-column") ?? null) : null;
+  };
+
+  const ALL_KINDS = { left: { tasks: true, epics: true }, right: { tasks: true, epics: true } };
+
+  beforeEach(() => {
+    seedEpicSnapshot();
+    useUiStore.setState({ planKindsBySide: { ...ALL_KINDS } });
+  });
+  afterEach(() => {
+    useUiStore.setState({ planKindsBySide: { ...ALL_KINDS } });
+  });
+
+  it("defaults to BOTH KINDS ON — the board is exactly what it was before these controls existed", () => {
+    const { container } = render(<BoardView project={project} side="right" />);
+    expect(screen.getByTestId("board-plan-kind-tasks").getAttribute("aria-pressed")).toBe("true");
+    expect(screen.getByTestId("board-plan-kind-epics").getAttribute("aria-pressed")).toBe("true");
+    // All three visible, all in the task columns, and NO Planning column anywhere.
+    expect(columnOf("Parent rollup")).toBe("backlog");
+    expect(columnOf("Epic child")).toBe("backlog");
+    expect(columnOf("Plain task")).toBe("backlog");
+    expect(container.querySelector('[data-board-column="planning"]')).toBeNull();
+  });
+
+  // ══ THERE IS NO "BOTH" ═══════════════════════════════════════════════════════════════════════
+  // The founder's actual instruction, and the one thing a rename of the old control would leave
+  // untouched — so it is asserted directly rather than inferred from the two toggles existing.
+  // Both halves matter: the control is GONE (no third button, no element bearing its label), and
+  // the group holds exactly two toggles, so a "Both" reintroduced under any name also fails.
+  it("offers exactly two toggles and NO Both control", () => {
+    render(<BoardView project={project} side="right" />);
+    const group = screen.getByTestId("board-plan-kinds");
+    expect(within(group).queryByText(/^both$/i)).toBeNull();
+    expect(screen.queryByTestId("board-epic-view-both")).toBeNull();
+    const toggles = within(group).getAllByRole("button");
+    // The marker is an <svg>, so it contributes no textContent — this reads the labels alone. It is
+    // deliberately NOT stripping characters any more: an earlier cut used `✓`/`○` glyphs and had to
+    // strip them here, which quietly coupled "is there a Both button" to the marker's appearance.
+    expect(toggles.map((b) => b.textContent)).toEqual(["Tasks", "Epics"]);
+  });
+
+  // ══ SELECTED AND UNSELECTED MUST LOOK DIFFERENT, PER PILL ════════════════════════════════════
+  // The founder asked for "either selected or unselected" — a state you can read off the control
+  // itself, not inferred from which sibling is highlighted. A filled-vs-empty pill ALONE is the
+  // language of a segmented control (one of N wins), which is the wrong reading now that both can
+  // be on at once, so each pill carries its own marker.
+  //
+  // THE ASSERTION NEEDS ONE OF EACH ON SCREEN AT THE SAME TIME. Reading only the selected pill
+  // would pass against a control that renders the same mark unconditionally — absence has to be
+  // observed on a mounted sibling, not on a state the test never rendered. So: turn one off, then
+  // read BOTH.
+  it("marks each pill selected or unselected on its own, with one of each mounted", () => {
+    render(<BoardView project={project} side="right" />);
+    const marker = (kind: "tasks" | "epics") =>
+      screen.getByTestId(`board-plan-kind-${kind}-marker`);
+
+    // Both on: both marked selected.
+    expect(marker("tasks").getAttribute("data-mark")).toBe("on");
+    expect(marker("epics").getAttribute("data-mark")).toBe("on");
+
+    fireEvent.click(screen.getByTestId("board-plan-kind-epics"));
+
+    // One of each, side by side — the shape that can actually fail.
+    expect(marker("tasks").getAttribute("data-mark")).toBe("on");
+    expect(marker("epics").getAttribute("data-mark")).toBe("off");
+    // AN ICON, NOT A CHARACTER — the founder's standing rule, enforced repo-wide by
+    // glyphIcons.test.ts, which holds BoardView.tsx at zero on its SWEPT list. Asserting an <svg>
+    // in BOTH states is what stops a future edit quietly swapping either one back to a dingbat:
+    // `data-mark` alone would still read "off" for a `○`.
+    expect(marker("tasks").querySelector("svg")).not.toBeNull();
+    expect(marker("epics").querySelector("svg")).not.toBeNull();
+    expect(marker("epics").textContent).toBe("");
+    // ...and the difference is not carried by the marker alone: the selected pill is filled and
+    // the unselected one is not. Asserting they DIFFER (rather than pinning literal colours, which
+    // are theme tokens and would make this a palette test) is what survives a re-theme.
+    const tasksBg = screen.getByTestId("board-plan-kind-tasks").style.background;
+    const epicsBg = screen.getByTestId("board-plan-kind-epics").style.background;
+    expect(tasksBg).not.toBe(epicsBg);
+    expect(epicsBg).toBe("transparent");
+
+    // The marker is decoration — the accessible state is aria-pressed, and a screen reader must not
+    // hear "✓" as part of the name.
+    expect(marker("epics").getAttribute("aria-hidden")).toBe("true");
+  });
+
+  // The click target must not move when the mark changes. A control whose label jumps sideways on
+  // every press reads as broken however correct it is, and the fixed-width spacer that prevents it
+  // is invisible in review — so it is pinned here rather than trusted.
+  it("keeps the pill geometry identical across the two states", () => {
+    render(<BoardView project={project} side="right" />);
+    const epics = () => screen.getByTestId("board-plan-kind-epics");
+    const on = { border: epics().style.border, padding: epics().style.padding };
+
+    fireEvent.click(epics());
+
+    // Same box: a 1px border in BOTH states (never `none`, which would shrink the box by 2px), and
+    // the marker still occupies its slot rather than vanishing.
+    expect(epics().style.padding).toBe(on.padding);
+    // jsdom does NOT expand the `border` shorthand, so `style.borderWidth` reads empty here even
+    // though the property is set — assert the shorthand both states actually carry instead.
+    expect(epics().style.border).toContain("1px");
+    expect(on.border).toContain("1px");
+    // The marker still occupies its slot rather than vanishing: an icon in BOTH states, so the
+    // label cannot slide left when the check turns into a ring.
+    expect(
+      screen.getByTestId("board-plan-kind-epics-marker").querySelector("svg"),
+    ).not.toBeNull();
+  });
+
+  it("clearing Tasks leaves EPICS only — the epic moves to a PLANNING column and the tasks go", () => {
+    const { container } = render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-plan-kind-tasks"));
+
+    // The column exists now — it never did with tasks on the board, in any combination.
+    expect(container.querySelector('[data-board-column="planning"]')).not.toBeNull();
+    expect(screen.getByTestId("lane-label-planning").textContent).toContain("Planning");
+    // The epic is IN it, and specifically not left behind in Backlog.
+    expect(columnOf("Parent rollup")).toBe("planning");
+    // ...and both non-epics are gone from the whole board, not merely from Planning.
+    expect(titleNode("Epic child")).toBeNull();
+    expect(screen.queryByText("Plain task")).toBeNull();
+  });
+
+  it("clearing Epics is the exact complement — the epic goes, its child and the plain task stay", () => {
+    const { container } = render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-plan-kind-epics"));
+
+    expect(titleNode("Parent rollup")).toBeNull();
+    expect(columnOf("Epic child")).toBe("backlog");
+    expect(columnOf("Plain task")).toBe("backlog");
+    // The ladder is an epics-only column set; keeping tasks keeps the familiar six.
+    expect(container.querySelector('[data-board-column="planning"]')).toBeNull();
+  });
+
+  // ══ THE TOGGLES ARE INDEPENDENT — the property the old exclusive mode could not have ══════════
+  // With a tri-state switch, pressing one button always cleared the other; asserting the board
+  // narrowed would pass either way. What has power here is that the UNTOUCHED toggle keeps its
+  // state across a press of the other, in both directions — mount both, press one, read both.
+  it("toggles each kind INDEPENDENTLY — pressing one never moves the other", () => {
+    render(<BoardView project={project} side="right" />);
+    const tasks = () => screen.getByTestId("board-plan-kind-tasks");
+    const epics = () => screen.getByTestId("board-plan-kind-epics");
+
+    fireEvent.click(epics());
+    expect(epics().getAttribute("aria-pressed")).toBe("false");
+    expect(tasks().getAttribute("aria-pressed")).toBe("true"); // untouched by the other press
+
+    fireEvent.click(epics()); // and it is a TOGGLE, not a one-way set
+    expect(epics().getAttribute("aria-pressed")).toBe("true");
+    expect(tasks().getAttribute("aria-pressed")).toBe("true");
+
+    fireEvent.click(tasks());
+    expect(tasks().getAttribute("aria-pressed")).toBe("false");
+    expect(epics().getAttribute("aria-pressed")).toBe("true");
+  });
+
+  // Both off is reachable BY DESIGN (the second click of a two-click gesture must not silently undo
+  // the first), so the board owes the user an explanation and a remedy that actually works. The
+  // remedy is asserted by FOLLOWING it: press it and the cards come back.
+  it("says so when NEITHER kind is shown, and Show both refills the board", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByTestId("board-plan-kind-tasks"));
+    fireEvent.click(screen.getByTestId("board-plan-kind-epics"));
+
+    // Every card is gone — not just the epic, not just the tasks.
+    expect(titleNode("Parent rollup")).toBeNull();
+    expect(titleNode("Epic child")).toBeNull();
+    expect(screen.queryByText("Plain task")).toBeNull();
+    // ...and the board says why rather than reading as a project with no work.
+    expect(screen.getByTestId("board-plan-kinds-empty-notice")).toBeTruthy();
+
+    fireEvent.click(screen.getByTestId("board-plan-kinds-show-both"));
+    expect(screen.queryByTestId("board-plan-kinds-empty-notice")).toBeNull();
+    expect(columnOf("Parent rollup")).toBe("backlog");
+    expect(columnOf("Epic child")).toBe("backlog");
+    expect(columnOf("Plain task")).toBe("backlog");
+  });
+
+  // The affordance that keeps the Epics column from being read-only. An epic sitting in Planning is
+  // the most startable thing on the board — a written plan nobody picked up — so the Start controls
+  // have to reach it. Gated on `backlog` alone they would not, and nothing else would have said so.
+  it("offers the Start controls on a PLANNING epic, not just a Backlog one", () => {
+    render(<BoardView project={project} side="right" />);
+    // SCOPED TO THE EPIC'S OWN CARD, not counted across the board. A board-wide count used to work
+    // because the epic was the only thing that could carry Build It; now every startable card does,
+    // so the two views legitimately hold different totals and an equality on them would fail for a
+    // reason that has nothing to do with the epic surviving its move.
+    const epicBuildIt = () => {
+      const card = titleNode("Parent rollup")?.closest(
+        "[data-testid=\"board-card-epic\"],[data-testid=\"board-card-task\"]",
+      ) as HTMLElement | null;
+      return card ? within(card).queryByTestId("board-card-build-it") : null;
+    };
+    expect(epicBuildIt(), "backlog epic").toBeTruthy();
+    fireEvent.click(screen.getByTestId("board-plan-kind-tasks")); // → epics only; it moves to Planning
+    expect(columnOf("Parent rollup")).toBe("planning"); // the move actually happened
+    expect(epicBuildIt(), "planning epic").toBeTruthy(); // ...and the control came with it
+  });
+
+  // ══ BOTH BOARDS MOUNTED AT ONCE — the only shape that can catch this ═══════════════════════
+  //
+  // The first version of this test asserted only the STORE, which is true by construction of the
+  // action and therefore proved nothing about the board. Worse, every other test in this file
+  // renders `side="right"`, so the read (`planKindsBySide[side]`) and the write
+  // (`togglePlanKind(side, …)`) were only ever exercised with the same literal side — replacing
+  // BOTH with a hardcoded "right", i.e. deleting the per-side wiring entirely, left all the tests
+  // green. That is exactly the "N targets, only one mounted" trap AGENTS.md names, and roborev
+  // 65269 caught it.
+  //
+  // The assertion with power needs both targets in the tree at once and reads the RENDERED result
+  // on each: the clicked board gains a Planning column and loses the tasks, and the other board is
+  // still showing all three beads in its six task columns.
+  it("keeps the kinds per side — switching one board does not reshape the other", () => {
+    const { container } = render(
+      <>
+        <BoardView project={project} side="left" />
+        <BoardView project={project} side="right" />
+      </>,
+    );
+    const boards = container.querySelectorAll("[data-board-side]");
+    const left = boards[0] as HTMLElement;
+    const right = boards[1] as HTMLElement;
+    expect(left.getAttribute("data-board-side")).toBe("left");
+    expect(right.getAttribute("data-board-side")).toBe("right");
+
+    // Precondition: both boards start identical, so a difference below is caused by the click.
+    expect(left.querySelector('[data-board-column="planning"]')).toBeNull();
+    expect(right.querySelector('[data-board-column="planning"]')).toBeNull();
+
+    fireEvent.click(within(right).getByTestId("board-plan-kind-tasks"));
+
+    // The clicked board reshaped...
+    expect(right.querySelector('[data-board-column="planning"]')).not.toBeNull();
+    expect(within(right).queryByText("Plain task")).toBeNull();
+    expect(titleNode("Parent rollup", right)).toBeTruthy();
+    // ...and the other one did NOT — still six task columns, still holding all three beads, and its
+    // own Tasks toggle still reads pressed.
+    expect(within(left).getByTestId("board-plan-kind-tasks").getAttribute("aria-pressed")).toBe("true");
+    expect(left.querySelector('[data-board-column="planning"]')).toBeNull();
+    expect(within(left).getByText("Plain task")).toBeTruthy();
+    expect(titleNode("Parent rollup", left)).toBeTruthy();
+    expect(titleNode("Epic child", left)).toBeTruthy();
+  });
+});
+
+// ── EPIC CARDS READ DIFFERENTLY FROM TASK CARDS, IN BOTH DIRECTIONS ─────────────────────────────
+// The founder: "I want epic cards to have a different colored background than regular cards", plus
+// a gold EPIC pill, a "Contains N tasks" expander, and — the mirror of the pill — a "Part of Epic"
+// link on the child so the relationship is legible from BOTH ends.
+//
+// EVERY ASSERTION HERE IS ABOUT A DIFFERENCE, not about presence. "The card rendered" and "a title
+// is on screen" were already true before this change and would prove nothing; each test below
+// contrasts an epic against a task in the SAME render, which is the shape that can actually fail.
+describe("BoardView — epic vs task card treatment", () => {
+  // One board holding both kinds at once. Mounting BOTH matters: an assertion that something is
+  // absent from a card that was never rendered passes for the wrong reason.
+  function seedEpicBoard() {
+    const epic = bead({ id: "p1-e1", title: "Concierge chat surface (epic)", type: "epic" });
+    const kidOpen = bead({ id: "p1-e1.1", title: "Child one", parent: "p1-e1" });
+    const kidDoing = bead({
+      id: "p1-e1.2",
+      title: "Child two",
+      parent: "p1-e1",
+      status: "in_progress",
+    });
+    const kidClosed = bead({
+      id: "p1-e1.3",
+      title: "Child three",
+      parent: "p1-e1",
+      status: "closed",
+    });
+    const orphan = bead({ id: "p1-solo", title: "Orphan task" });
+    snapshot = {
+      beads: [epic, kidOpen, kidDoing, kidClosed, orphan],
+      board: {
+        backlog: [epic, kidOpen, orphan],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+    return { epic, kidOpen, orphan };
+  }
+
+  const epicCard = () => screen.getAllByTestId("board-card-epic")[0]!;
+
+  it("gives an epic card a DIFFERENT background from a task card", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    const epicBg = epicCard().style.background;
+    const taskBg = screen.getAllByTestId("board-card-task")[0]!.style.background;
+    // The contract is that they DIFFER — pinning the literal would just restate colors.ts.
+    expect(epicBg).not.toBe("");
+    expect(epicBg).not.toBe(taskBg);
+  });
+
+  it("puts the EPIC pill on the epic card and on no task card", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    const pill = within(epicCard()).getByTestId("epic-pill");
+    expect(pill.textContent).toBe("EPIC");
+    // ── THE PILL'S APPEARANCE, NOT JUST ITS TEXT (roborev 65326) ────────────────────────────────
+    // `textContent === "EPIC"` was the only rendered assertion, and it survives deleting the fill,
+    // the ink, and the `...TAG` spread — i.e. the whole point of the control. The token PAIR is
+    // measured in theme/epicCardContrast.test.ts without ever rendering this component, and the
+    // two ratchets that pushed the pill onto `TAG` are `<=` counters over hand-typed literals, so
+    // they stay green whether or not this component spreads it. Nothing tied the two together.
+    //
+    // These four do. The first two are what makes it GOLD rather than inheriting the card's ink;
+    // the last two are what makes "built from TAG, not re-derived by eye" a fact a future edit has
+    // to keep true instead of a comment — the card button sets `fontFamily: FONT_UI`, so a dropped
+    // spread would silently inherit that.
+    expect(pill.style.background).toBe(C.epicPillFill);
+    expect(pill.style.color).toBe(C.onEpicPillFill);
+    expect(pill.style.fontFamily).toBe(TAG.fontFamily);
+    expect(pill.style.letterSpacing).toBe(TAG.letterSpacing);
+    for (const task of screen.getAllByTestId("board-card-task")) {
+      expect(within(task).queryByTestId("epic-pill")).toBeNull();
+    }
+  });
+
+  it("scrubs a trailing '(epic)' from the DISPLAYED title only", () => {
+    const { epic } = seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    expect(within(epicCard()).getByText("Concierge chat surface")).toBeTruthy();
+    expect(screen.queryByText("Concierge chat surface (epic)")).toBeNull();
+    // The STORED title is untouched — the founder ruled a bulk bd rewrite out explicitly.
+    expect(epic.title).toBe("Concierge chat surface (epic)");
+  });
+
+  it("counts only OPEN children in 'Contains N tasks'", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    // Three children exist; one is closed. A total-children count would read 3 and is what this
+    // rules out.
+    expect(within(epicCard()).getByTestId("epic-contains-tasks").textContent).toContain(
+      "Contains 2 tasks",
+    );
+  });
+
+  it("is COLLAPSED by default and expands in place on click", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    const card = epicCard();
+    // Collapsed: the child rows are not in the tree at all.
+    expect(within(card).queryAllByTestId("epic-child-row")).toHaveLength(0);
+    expect(
+      within(card).getByTestId("epic-contains-tasks").getAttribute("aria-expanded"),
+    ).toBe("false");
+    fireEvent.click(within(card).getByTestId("epic-contains-tasks"));
+    expect(within(epicCard()).queryAllByTestId("epic-child-row").length).toBeGreaterThan(0);
+    // ...and collapses again, so the toggle is a toggle and not a one-way door.
+    fireEvent.click(within(epicCard()).getByTestId("epic-contains-tasks"));
+    expect(within(epicCard()).queryAllByTestId("epic-child-row")).toHaveLength(0);
+  });
+
+  it("says so plainly for an epic with no children, with no expander", () => {
+    const childless = bead({ id: "p1-e9", title: "Fresh plan", type: "epic" });
+    snapshot = {
+      beads: [childless],
+      board: {
+        backlog: [childless],
+        blocked: [],
+        inProgress: [],
+        done: [],
+        delivered: [],
+        archived: [],
+      },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    expect(screen.getByText("Contains no tasks yet")).toBeTruthy();
+    expect(screen.queryByTestId("epic-contains-tasks")).toBeNull();
+  });
+
+  it("opens the CHILD's own card when an expanded child row is clicked", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(within(epicCard()).getByTestId("epic-contains-tasks"));
+    const rows = within(epicCard()).getAllByTestId("epic-child-row");
+    // "Child two" is in_progress and is NOT rendered as a board card in this fixture, so finding it
+    // in a dialog can only be the overlay the click opened.
+    const row = rows.find((r) => r.textContent?.includes("Child two"))!;
+    fireEvent.click(row);
+    expect(within(screen.getByRole("dialog")).getByText("Child two")).toBeTruthy();
+  });
+
+  it("shows the parent epic's NAME on a child card, and nothing on an orphan", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    const cards = screen.getAllByTestId("board-card-task");
+    const child = cards.find((c) => c.textContent?.includes("Child one"))!;
+    const orphan = cards.find((c) => c.textContent?.includes("Orphan task"))!;
+    const link = within(child).getByTestId("part-of-epic");
+    // The NAME, scrubbed — "a raw id like sparkle-131ms tells him nothing at a glance".
+    expect(link.textContent).toContain("Part of Epic:");
+    expect(link.textContent).toContain("Concierge chat surface");
+    expect(link.textContent).not.toContain("p1-e1");
+    // Orphans are normal, not an error state, and must not be visually shamed.
+    expect(within(orphan).queryByTestId("part-of-epic")).toBeNull();
+  });
+
+  it("opens the EPIC's card when the parent link is clicked", () => {
+    seedEpicBoard();
+    render(<BoardView project={project} side="right" />);
+    const child = screen
+      .getAllByTestId("board-card-task")
+      .find((c) => c.textContent?.includes("Child one"))!;
+    fireEvent.click(within(child).getByTestId("part-of-epic"));
+    const dialog = screen.getByRole("dialog");
+    expect(within(dialog).getByText("p1-e1")).toBeTruthy();
   });
 });

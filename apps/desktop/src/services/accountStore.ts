@@ -353,6 +353,32 @@ export function identityChanged(identity: Identity | undefined): boolean {
   return identity?.identityChanged ?? false;
 }
 
+/** Ids of DEFAULT accounts that are CLOBBERED — the shared `$HOME/.claude` folder whose on-disk login
+ *  is now a different Anthropic account than the one Sparkle runs it as ({@link accountDisplay}'s
+ *  `shellForked`), or one whose dir a different account signed into recently ({@link identityChanged}).
+ *
+ *  This is the exact fragility the founder hits: the default is shared with the terminal `claude` CLI,
+ *  so a terminal login clobbers the OAuth Sparkle expects, yet recorded state still reads the account
+ *  as signed-in and healthy. Feed this set to {@link PickOptions.clobberedIds} so auto-pick prefers a
+ *  dedicated account and routes AWAY from a clobbered default — while `leastBad` still falls back to it
+ *  when it is genuinely the only account (see PickOptions.clobberedIds).
+ *
+ *  Scoped to `isDefault` deliberately: `shellForked` is a default-only signal, and a named dedicated
+ *  account is not shared with the terminal, so it cannot be clobbered this way. */
+export function clobberedDefaultIds(
+  accounts: Account[],
+  identities: Identity[] | undefined,
+): Set<string> {
+  const byId = new Map((identities ?? []).map((i) => [i.id, i]));
+  const out = new Set<string>();
+  for (const a of accounts) {
+    if (!a.isDefault) continue;
+    const identity = byId.get(a.id);
+    if (accountDisplay(a, identity).shellForked || identityChanged(identity)) out.add(a.id);
+  }
+  return out;
+}
+
 /** The one-sentence fork warning, or null when there is no fork to report.
  *
  *  The founder's literal complaint: his terminal reads `~/.claude.json` (gmail) while Sparkle's
@@ -762,6 +788,18 @@ export interface PickOptions {
    *  and this matches the same per-login judgement `exhaustionOutlook` / `switchRecommendation` use,
    *  so the spawn gate cannot disagree with them. Omit for plain per-dir behaviour. */
   siblingIds?: ReadonlyMap<string, readonly string[]>;
+  /** Ids of accounts to treat as unhealthy for AUTO-PICK because they are CLOBBERED — the shared
+   *  `$HOME/.claude` default whose on-disk login is now a DIFFERENT Anthropic account than the one
+   *  Sparkle runs it as, or a config dir a different account signed into recently (see
+   *  {@link clobberedDefaultIds}). Recorded state still reads such an account as "signed in / healthy",
+   *  so nothing else excludes it, yet routing to it authenticates as the wrong account or dies on an
+   *  OAuth mismatch — the concierge's shared-default fragility.
+   *
+   *  Excluded from `candidates` exactly like an exhausted account, so a healthy DEDICATED account is
+   *  preferred. It is NEVER removed from `eligible`, so when a clobbered account is the ONLY option
+   *  `leastBad` still returns it: a login prompt on the fragile default beats no account at all. Opt-in
+   *  per caller — omit it and behaviour is unchanged, which is why only the concierge passes it today. */
+  clobberedIds?: ReadonlySet<string>;
   /** Current time (epoch ms), injectable for tests. Defaults to `Date.now()`. */
   now?: number;
 }
@@ -928,15 +966,15 @@ function partitionAccounts(
   // Judged PER LOGIN when `siblingIds` is supplied (max real utilization across the login group), so
   // a duplicate of a spent login whose own fetch failed is still excluded and this gate agrees with
   // `exhaustionOutlook` / `switchRecommendation`. Absent it, this is plain per-dir.
-  const liveById = new Map((opts.live ?? []).map((l) => [l.id, l]));
-  const isLiveSpent = (a: Account) => {
-    const p = loginLiveWorstPercent(a.id, liveById, opts.siblingIds);
-    return p != null && p >= LIVE_AVOID_PERCENT;
-  };
+  const isLiveSpent = (a: Account) => isAccountLiveSpent(a.id, opts.live, opts.siblingIds);
+  // A clobbered account (see PickOptions.clobberedIds) is unhealthy for auto-pick but stays in
+  // `eligible`, so `leastBad` can still return it when it is the only account (a login prompt on the
+  // fragile default beats a dead agent). Absent the option this set is empty and nothing changes.
+  const isClobbered = (a: Account) => opts.clobberedIds?.has(a.id) ?? false;
 
   const candidates = eligible.filter((a) => {
     const u = usageFor(a);
-    return !isExhausted(u) && !isNearStaticCap(u) && !isLiveSpent(a);
+    return !isExhausted(u) && !isNearStaticCap(u) && !isLiveSpent(a) && !isClobbered(a);
   });
   return { eligible, candidates };
 }
@@ -1317,6 +1355,36 @@ export function isAccountExhausted(
     usage.find((x) => x.id === accountId),
     now,
   );
+}
+
+/** Is this account at or above Anthropic's OWN proactive-avoidance utilization
+ *  ({@link LIVE_AVOID_PERCENT})? Judged PER LOGIN when `siblingIds` is supplied (max real
+ *  utilization across the login group), so a duplicate of a spent login whose own live fetch failed
+ *  is still counted spent via its twin — the same per-login judgement `exhaustionOutlook` /
+ *  `switchRecommendation` use.
+ *
+ *  THE ONE definition of "live-spent", shared by {@link partitionAccounts} (auto-pick) and the
+ *  override-path usability gates in `accountSelection` (transcript affinity). Extracted so the
+ *  spawn's proactive-avoid rule cannot mean one thing for a fresh auto-pick and another for a
+ *  transcript-holder it decides to resume under — the exact kind of "two definitions, drifted"
+ *  split that {@link partitionAccounts}/{@link isAccountExhausted} were factored apart to prevent.
+ *
+ *  FACT, never estimate — this is Anthropic's own number, distinct from the RETIRED learned-ceiling
+ *  gate. And a missing live row (background cache cold, offline, 401, keychain declined) is NOT an
+ *  exclusion: {@link loginLiveWorstPercent} returns null there and null reads as "not spent", so an
+ *  unreadable figure never looks like a full one — exactly as it must never look like an empty one.
+ *
+ *  Deliberately NOT applied to `usablePreferredAccount`: a human who explicitly activated an account
+ *  is entitled to keep using it while it is busy; transcript affinity is an AUTOMATIC continuity
+ *  preference with no human choice to respect, so it is aligned with auto-pick instead. */
+export function isAccountLiveSpent(
+  accountId: string,
+  live: readonly LiveUsage[] | undefined,
+  siblingIds?: ReadonlyMap<string, readonly string[]>,
+): boolean {
+  const liveById = new Map((live ?? []).map((l) => [l.id, l]));
+  const p = loginLiveWorstPercent(accountId, liveById, siblingIds);
+  return p != null && p >= LIVE_AVOID_PERCENT;
 }
 
 /** What a just-completed login into a fresh config dir turned out to be.

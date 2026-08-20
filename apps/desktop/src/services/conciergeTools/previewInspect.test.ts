@@ -26,6 +26,7 @@ import {
   type DomMatch,
 } from "./previewInspect";
 import { evaluateToolPolicy, NO_TOOL_POLICY_OVERRIDES } from "./policy";
+import { usePreviewStore } from "../../stores/previewStore";
 
 const invokeMock = vi.mocked(invoke);
 
@@ -123,5 +124,89 @@ describe("previewQueryDom", () => {
     const r = await previewQueryDom("agent-1", ":::bad");
     expect(r.ok).toBe(false);
     expect(!r.ok && r.reason).toBe("capture-failed");
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// BOTH OPS STAMP ACTIVITY — roborev 65689, and this suite could not see it
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+//
+// `previewIdleGrace` stops a dev server that has shown no sign of life for `idle_grace_min`, and
+// `supervise()` in preview.rs emits nothing once a server is `Ready` — so an agent driving its own
+// preview through this domain is INVISIBLE to that clock unless these ops say so. Without these
+// rows the stamp could be deleted from either op and every test here stays green (this file mocks
+// only `invoke` and never touches the store), which is exactly the seam-goes-dead shape the
+// surrounding work exists to prevent — and how the asymmetry between the two ops got in.
+describe("preview_inspect stamps activity, so an agent's own loop is not reaped under it", () => {
+  const AGENT = "agent-activity";
+
+  function seedLivePreview() {
+    usePreviewStore.setState({
+      byAgent: {
+        [AGENT]: {
+          id: "srv-1",
+          agentId: AGENT,
+          projectId: "p1",
+          url: "http://127.0.0.1:5173",
+          port: 5173,
+          status: "serving",
+          error: null,
+          startedAt: 1_000,
+          surfacedAt: 1_000,
+          lastActivityAt: 1_000,
+          reloadNonce: 0,
+        } as never,
+      },
+      capability: {},
+      openedProjects: {},
+    });
+  }
+
+  it("screenshot stamps BEFORE the capture, so a FAILED capture still counts", async () => {
+    // The ordering claim the comment makes, asserted rather than asserted-in-prose. A rejected
+    // invoke is the ordinary case (no headless Chromium is a perfectly normal machine), and someone
+    // asking for a picture they did not get is still someone using the preview.
+    seedLivePreview();
+    vi.mocked(invoke).mockRejectedValueOnce(new Error("headless browser not installed"));
+    const at = 999_000;
+    const spy = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      const r = await previewScreenshot(AGENT);
+      expect(r.ok).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(usePreviewStore.getState().byAgent[AGENT]?.lastActivityAt).toBe(at);
+  });
+
+  it("query_dom stamps too — the op an inspect LOOP actually uses", async () => {
+    // The asymmetry that was the bug: an agent polling for an element with query_dom produced no
+    // stamp at all, so the clock reaped the server out from under it and its next call refused
+    // with `no-preview`.
+    seedLivePreview();
+    vi.mocked(invoke).mockResolvedValueOnce([]);
+    const at = 1_234_000;
+    const spy = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      await previewQueryDom(AGENT, "#root");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(usePreviewStore.getState().byAgent[AGENT]?.lastActivityAt).toBe(at);
+  });
+
+  it("a REFUSED call stamps nothing — a bad-args typo is not use", async () => {
+    // The paired negative. Without it both rows above are satisfied by stamping unconditionally at
+    // the top of the function, which would let a malformed call keep a dead preview alive.
+    seedLivePreview();
+    const at = 5_555_000;
+    const spy = vi.spyOn(Date, "now").mockReturnValue(at);
+    try {
+      expect((await previewScreenshot("   ")).ok).toBe(false);
+      expect((await previewQueryDom(AGENT, "  ")).ok).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+    expect(usePreviewStore.getState().byAgent[AGENT]?.lastActivityAt).toBe(1_000);
   });
 });

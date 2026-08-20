@@ -139,6 +139,27 @@ export function dispatchBuild(payload: CaptureSendPayload): void {
   }
   // Leave the special view, select, open — and (new) scroll the row on screen, which this path was
   // missing: a capture can land on an agent well below the fold of a long column.
+  //
+  // ══ DELIBERATELY *NOT* GATED ON THE ATTENTION HOLD ══════════════════════════════════════════
+  // It was, for one review round, and that was a defect rather than a conservative choice. The
+  // select on this line is a LOAD-BEARING PRECONDITION of the handoff published three lines below,
+  // not merely a courtesy: `ConciergeHost`'s handoff effect drains `composeHandoffStore` on the
+  // next render and inserts the text into the composer's LIVE aim, and its own wrong-agent guard
+  // states the invariant explicitly — *"dispatchBuild selects that agent synchronously before
+  // queueing the draft, so by the time this effect runs the box's live aim should already BE that
+  // agent"*. Suppressing the select does not defer the landing; it publishes the capture into a
+  // composer still aimed at whatever agent the founder was typing in, so his next Enter sends it
+  // to the wrong PTY. A silent wrong-agent send is a strictly worse outcome than a moved view.
+  //
+  // It is also the wrong surface for the rule on its own terms. A capture send is the founder's own
+  // gesture — he pressed send in the capture window — and the guard declines only jumps the app
+  // starts.
+  //
+  // AND THE COST WOULD BE THE OPPOSITE OF SMALL, which is worth stating because an earlier version
+  // of this note claimed the reverse. `attentionHold()` deliberately does NOT consult
+  // `document.hasFocus()` (see its header), so a gate here would read the MAIN window's live
+  // `activeElement` — which in a terminal-first shell is a terminal essentially always. It would
+  // therefore decline nearly every capture, permanently, on top of breaking the precondition above.
   landInAgent(payload.projectId, agentId);
   useComposeHandoffStore.getState().set({
     origin: "capture-build",

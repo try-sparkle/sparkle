@@ -1,6 +1,6 @@
 #!/bin/sh
-# Sparkle roborev claude shim — selects a healthy Claude ACCOUNT per review job, and FAILS OVER to
-# the next account when the one it picked turns out to be walled.
+# Sparkle roborev claude shim — selects a healthy Claude ACCOUNT per review job, then EXECS the real
+# claude, handing it the process untouched.
 #
 # THIS FILE IS THE SHIM. Rust (`roborev_account.rs`) reads it with include_str! and substitutes the
 # two @PLACEHOLDER@ tokens at install time; the shell suite
@@ -11,18 +11,21 @@
 # CLAUDE_CODE_SIMPLE: that was the retired ~/.roborev-shim mechanism, which forced strict API-key
 # auth against an unfunded key and made every review die on "Credit balance is too low".
 #
-# WHY IT RETRIES RATHER THAN JUST PICKING. The candidate list is built from Sparkle's recorded
-# `exhaustedUntil`, which is a LAGGING indicator: Sparkle learns an account is walled by scanning
-# its transcripts afterwards, so an account walled sixty seconds ago still reads as healthy.
-# Measured live while building this — the shim correctly routed away from a walled account and the
-# very next account was walled too, unrecorded. Selecting alone is therefore not enough to keep
-# reviews running; the shim has to notice the wall itself and move on.
+# WHY IT EXECS RATHER THAN RUNS-AND-RETRIES. roborev pipes the review prompt to `claude --print` on
+# STDIN. `exec` replaces this shell with claude, so claude inherits STDIN, STDOUT, STDERR, the
+# signals and the exit status directly — the prompt reaches it byte-for-byte and its
+# --output-format stream-json is written straight to roborev with nothing in the middle.
 #
-# That is why this does NOT exec until the final attempt: it must stay alive to observe the exit.
-# Output is captured per attempt and replayed verbatim, so roborev's --output-format stream-json
-# parser sees exactly what claude wrote.
+# An earlier version RAN claude for the first candidate and failed over to the next on a wall. That
+# was fatal: the first run consumed STDIN, so the failover `exec` handed claude an empty pipe and
+# every review died with "Input must be provided either through stdin or as a prompt argument when
+# using --print". A wrapper cannot replay a streamed prompt to a second process, so it must not run
+# claude more than once. Routing away from a dead account is handled REACTIVELY instead: Sparkle
+# observes the failure, benches the account (quota wall via `exhausted_until`, OAuth-expiry via the
+# auth-dead bench in roborev_account.rs), and republishes this candidate list so the NEXT job's shim
+# picks a different account — the same model the interactive fleet and the concierge use.
 #
-# Fails OPEN: if anything about the candidate list is wrong, run the real claude untouched — which
+# Fails OPEN: if anything about the candidate list is wrong, exec the real claude untouched — which
 # is exactly the pre-shim behavior. A broken shim must never be worse than no shim.
 REAL_CLAUDE='@REAL_CLAUDE@'
 CANDIDATES='@CANDIDATES@'
@@ -30,25 +33,13 @@ CANDIDATES='@CANDIDATES@'
 now=`date +%s 2>/dev/null` || now=0
 case "$now" in ''|*[!0-9]*) now=0 ;; esac
 
-# Does this output show a Claude ACCOUNT wall (as opposed to a real error)? Kept deliberately
-# narrow: these are the exact families recorded in ~/.roborev/reviews.db. A non-wall failure must
-# NOT burn through every account — it is the same failure everywhere, so retrying only multiplies it.
-is_wall() { # file
-  # `.*` rather than `[^\n]*`: grep matches line by line, so `.` can never cross a newline anyway,
-  # and a backslash before an ordinary character is undefined in a POSIX ERE (caught by
-  # scripts/tests/grep-ere-portability.test.sh — it failed CI on Linux while passing on macOS).
-  grep -qiE "hit your (session|weekly|monthly|usage).*limit|hit your monthly spend limit|credit balance is too low|not logged in" "$1" 2>/dev/null
-}
-
-TMPD=`mktemp -d 2>/dev/null` || TMPD="${TMPDIR:-/tmp}/roborev-shim.$$"
-mkdir -p "$TMPD" 2>/dev/null
-OUT="$TMPD/out"; ERR="$TMPD/err"
-cleanup() { rm -rf "$TMPD" 2>/dev/null; }
-trap cleanup EXIT INT TERM
-
-# ── Collect the usable candidates, in order ──────────────────────────────────────────────────────
+# ── Select the best usable candidate (the list is ranked best-first) ─────────────────────────────
+# NOTHING in this loop reads or consumes STDIN — no `read` from the prompt pipe, no `cat`, no
+# `$(...)` that inherits STDIN — so the prompt is still intact when we exec. `read` here draws from
+# the CANDIDATES file via the `< "$CANDIDATES"` redirection on the loop, not from the process STDIN.
 standdown=0
-n=0
+selected=''
+have=0
 if [ -r "$CANDIDATES" ]; then
   while IFS='	' read -r until dir; do
     case "$until" in
@@ -56,11 +47,14 @@ if [ -r "$CANDIDATES" ]; then
       ''|'#'*) continue ;;
       *[!0-9]*) continue ;;
     esac
+    # A future exhaustion means this account is walled: skip it.
     [ "$until" -le "$now" ] || continue
-    # An EMPTY dir is the default-account sentinel: a real value meaning "export nothing".
+    # An EMPTY dir is the default-account sentinel: a real value meaning "export nothing". A
+    # non-empty dir that no longer exists (a removed account) is skipped for the next candidate.
     if [ -n "$dir" ] && [ ! -d "$dir" ]; then continue; fi
-    n=$((n + 1))
-    eval "cand_$n=\$dir"
+    selected=$dir
+    have=1
+    break
   done < "$CANDIDATES"
 fi
 
@@ -69,44 +63,12 @@ if [ "$standdown" -eq 1 ]; then
   exit 78
 fi
 
-# Fail open: nothing usable in the list -> behave exactly as if the shim were not installed.
-if [ "$n" -eq 0 ]; then
-  cleanup
-  exec "$REAL_CLAUDE" "$@"
+# ── Hand off to the real claude, STDIN and all ───────────────────────────────────────────────────
+if [ "$have" -eq 1 ] && [ -n "$selected" ]; then
+  CLAUDE_CONFIG_DIR="$selected" export CLAUDE_CONFIG_DIR
+else
+  # Fail open (nothing usable) OR the default-account sentinel (empty dir): export nothing.
+  unset CLAUDE_CONFIG_DIR
 fi
 
-# ── Try each candidate; move on ONLY when the failure is an account wall ─────────────────────────
-i=1
-while [ "$i" -le "$n" ]; do
-  eval "dir=\$cand_$i"
-  if [ -n "$dir" ]; then
-    CLAUDE_CONFIG_DIR="$dir" export CLAUDE_CONFIG_DIR
-  else
-    unset CLAUDE_CONFIG_DIR
-  fi
-
-  # The LAST candidate execs: nothing is left to fail over to, so hand the process to claude and let
-  # it own the terminal, the signals and the exit status directly.
-  if [ "$i" -eq "$n" ]; then
-    cleanup
-    exec "$REAL_CLAUDE" "$@"
-  fi
-
-  "$REAL_CLAUDE" "$@" >"$OUT" 2>"$ERR"
-  rc=$?
-
-  if [ "$rc" -eq 0 ]; then
-    cat "$OUT"; cat "$ERR" >&2
-    exit 0
-  fi
-
-  if is_wall "$ERR" || is_wall "$OUT"; then
-    echo "sparkle roborev shim: account walled, failing over to the next account" >&2
-    i=$((i + 1))
-    continue
-  fi
-
-  # A genuine error (bad flags, crash, network): identical on every account. Report it as-is.
-  cat "$OUT"; cat "$ERR" >&2
-  exit "$rc"
-done
+exec "$REAL_CLAUDE" "$@"

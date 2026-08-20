@@ -653,6 +653,43 @@ pub fn enqueue(
     Ok(id)
 }
 
+/// Enqueue ONLY when `agent_id` is a known, addressable recipient — the defence-in-depth sink for
+/// the "queued into a file nothing reads" hole (bead sparkle-179b2s).
+///
+/// `enqueue` accepts any well-formed id (it only guards against path traversal) and checks no
+/// registry, so a send to a typo'd, closed, or otherwise undrained id writes a message no process
+/// will ever read and hands back an id that reads exactly like a successful delivery. The frontend
+/// wrapper (`inboxSend` in `conciergeTools/fleet.ts`) is the live gate today: it resolves every
+/// recipient against the fleet directory before it invokes the Rust command, so the shipped path is
+/// covered. This function is the SINK guard for that same rule — validating at the wrapper is a
+/// guarantee one deleted line wide, and any future non-frontend caller (a background job, a new
+/// command) would reopen the hole with the whole suite still green. Such a caller passes the set of
+/// ids it knows to be addressable and gets a loud refusal instead of a silent black-hole write.
+///
+/// `known_ids` is the caller's addressability directory (open agents plus the app's special ids).
+/// An id absent from it is refused BEFORE any file is touched, so nothing is written for a recipient
+/// nobody drains. When the id IS present this is exactly `enqueue`, so the read-back honesty above is
+/// unchanged.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn enqueue_addressable(
+    app_data: &Path,
+    agent_id: &str,
+    text: &str,
+    severity: Severity,
+    from: &str,
+    now: i64,
+    id: String,
+    known_ids: &[String],
+) -> Result<String, String> {
+    if !known_ids.iter().any(|k| k == agent_id) {
+        return Err(format!(
+            "inbox: {agent_id} is not an addressable recipient — refusing to queue a message into an \
+             inbox no live agent drains. Resolve the recipient against the fleet directory first."
+        ));
+    }
+    enqueue(app_data, agent_id, text, severity, from, now, id)
+}
+
 /// Delivery/ack counts for one agent.
 ///
 /// Fails CLOSED on an id that would escape the inbox dir — see [`refuse_escape`]. The loud refusal
@@ -1075,6 +1112,61 @@ mod tests {
 
         // The label survives verbatim: the recipient needs both the name to reply with and the id.
         assert_eq!(only_from(&base, "a1"), "Relay Builder [abc-123]");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn enqueue_addressable_refuses_an_unknown_recipient_and_writes_nothing() {
+        // bead sparkle-179b2s, Phase C2. The sink guard: a recipient not in the known-addressable set
+        // is refused BEFORE any file is touched, so a future non-frontend caller cannot re-open the
+        // "queued into a file nobody drains" hole. Assert BOTH halves — the loud error AND the absence
+        // of any written record — so the test is not satisfied by the refusal alone.
+        let base = tmp("addressable-unknown");
+        let known = vec!["a1".to_string(), "__sparkle_self__".to_string()];
+
+        let err = enqueue_addressable(
+            &base,
+            "__typo__",
+            "hello",
+            Severity::Fyi,
+            "concierge",
+            1_000,
+            "m1".to_string(),
+            &known,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("__typo__") && err.contains("not an addressable recipient"),
+            "expected an undeliverable-recipient refusal naming the id, got: {err:?}"
+        );
+        // The SIDE EFFECT that matters: nothing was queued for the bad id.
+        assert!(
+            pending(&base, "__typo__", 1_000).is_empty(),
+            "a refused send must not leave a message on disk"
+        );
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn enqueue_addressable_queues_a_known_recipient_exactly_like_enqueue() {
+        // The paired positive: an id that IS in the set flows straight through to `enqueue`, so the
+        // guard adds a gate without changing delivery for a real recipient. Without this, a guard that
+        // refused everything would also pass the test above — the pair is what pins the cause.
+        let base = tmp("addressable-known");
+        let known = vec!["a1".to_string()];
+        let id = enqueue_addressable(
+            &base,
+            "a1",
+            "hello",
+            Severity::Fyi,
+            "concierge",
+            1_000,
+            "m1".to_string(),
+            &known,
+        )
+        .expect("a known recipient must be queued");
+        assert_eq!(id, "m1");
+        assert_eq!(pending(&base, "a1", 1_000).len(), 1, "the known recipient's message must be queued");
         std::fs::remove_dir_all(&base).ok();
     }
 

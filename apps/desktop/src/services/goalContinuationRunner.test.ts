@@ -8,7 +8,7 @@
 // evidence and acts on it exactly once.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { progressMark } from "../engine/goalContinuation";
+import { burstsOf, progressMark } from "../engine/goalContinuation";
 import { MAX_CONCIERGE_REARMS } from "../engine/agentGoal";
 import {
   noteHooksLive,
@@ -74,6 +74,10 @@ import {
   sweepGoalContinuations,
   trackIdleSince,
   undeliveredStreakFor,
+  continuationEvidenceFor,
+  externalWaitOf,
+  noteToolActivity,
+  prMarkOf,
 } from "./goalContinuationRunner";
 
 const sendMock = vi.mocked(dispatchConciergeAnswer);
@@ -140,6 +144,10 @@ beforeEach(() => {
     openAgentIds: [],
     branchStatus: {},
     workflowStage: {},
+    // Both are read by the progress mark and the external-gate evidence. Leaving them out of the
+    // reset would let one test's PR or tool count decide another's escalation.
+    workflowState: {},
+    agentMovement: {},
   } as never);
   resetTurnEndAuthority();
   _resetGoalContinuationRunnerForTests();
@@ -814,5 +822,368 @@ describe("the concierge's re-arm actually puts the agent back to work", () => {
 
     expect(sendMock).not.toHaveBeenCalled();
     expect(goalOf(projectId, agentId)!.escalatedBy).toBe("concierge");
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+// THE FALSE-POSITIVE FLOOD (founder report, 2026-08-18)
+//
+// Six agents were paged "Auto-continued 3 times with no sign of progress" in one hour while holding
+// OPEN pull requests against a saturated CI queue. These are the SIDE-EFFECT tests for that: what
+// reached the terminal and whether the human's "needs you" list got a line, not what the decision
+// object said. Each suppression is paired with the case that must still page somebody.
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+
+describe("evidence the sweep must actually gather", () => {
+  /**
+   * Spend the consecutive-retry budget without moving the mark.
+   *
+   * ⚠️ `at` MUST BE THE MARK THE RUNNER WILL COMPUTE ON THE NEXT SWEEP, not `FRESH_MARK`. Burning
+   * against a stale mark makes the sweep read "the mark moved" and reset the streak, so the test
+   * would pass without the gate ever being consulted — the state under test is specifically
+   * "nothing observable moved AND the streak is spent", which is the shape that pages the human.
+   */
+  function burn(projectId: string, agentId: string, times: number, at = FRESH_MARK): void {
+    for (let i = 0; i < times; i++) {
+      useProjectStore.getState().noteAgentGoalContinue(projectId, agentId, at);
+    }
+  }
+
+  /** Merge extra runtime evidence in WITHOUT clobbering what `seed` wrote. */
+  function evidence(patch: Record<string, unknown>): void {
+    useRuntimeStore.setState(patch as never);
+  }
+
+  async function settleThenSweep(): Promise<void> {
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+  }
+
+  // ⚠️ RESTORE THE DISPATCH STUB, DO NOT INHERIT IT. The `never REACHES the terminal` describe above
+  // calls `sendMock.mockReset()` in its own `afterEach`, and in vitest 2 that leaves the mock with
+  // NO implementation for whatever runs next — so `dispatchConciergeAnswer` resolves `undefined`,
+  // the runner records the send as `threw`, and nothing is written to the goal. That failure is
+  // silent in exactly the wrong way: `toHaveBeenCalledTimes(1)` still passes (the call happened) and
+  // `notifyMock` still passes (no escalation), so a delivery assertion looks green while the sweep's
+  // whole side effect was thrown away. Restoring here rather than reaching into the describe above
+  // keeps this block independent of file order.
+  beforeEach(() => {
+    sendMock.mockImplementation(
+      async (agentId: string, text: string, opts?: { userPrompt?: boolean }) => {
+        // The `userPrompt` contract is honoured for the same reason the module factory honours it:
+        // `promptHistory.length` is part of the progress mark, so a stub that appended
+        // unconditionally would make every mark assertion here test the stub.
+        if (opts?.userPrompt) {
+          const store = useProjectStore.getState();
+          const project = store.projects.find((p) => p.agents.some((a) => a.id === agentId));
+          if (project) store.appendPrompt(project.id, agentId, text);
+        }
+        return { ok: true, path: "free-text" as const, agentId, sent: text, display: text };
+      },
+    );
+  });
+  afterEach(() => {
+    sendMock.mockReset();
+  });
+
+  it("PAIR — with no PR reading, the streak still pages the human", async () => {
+    // THE TRUE POSITIVE, restated here rather than borrowed from the `escalation` block above, so
+    // the suppression test below cannot be satisfied by a predicate that stopped firing entirely.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    burn(projectId, agentId, 3);
+
+    await settleThenSweep();
+
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(notifyMock.mock.calls[0]![0].body).toContain("no sign of progress");
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+  });
+
+  it("an agent with an OPEN PR is restarted instead — nothing reaches the 'needs you' list", async () => {
+    // THE FOUNDER'S VERIFIABLE GOAL, end to end. Identical to the pair above except that the store
+    // holds the one fact the predicate never consulted.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    evidence({
+      workflowState: { [agentId]: { prState: "open", prNumber: 2117 } },
+    });
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, prMark: "open#2117" }));
+
+    await settleThenSweep();
+
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeUndefined();
+    // Restarted, not merely left alone: "never continued AND never escalated" is the
+    // silent-forever state this whole module exists to abolish.
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    expect(sendMock.mock.calls[0]![1]).toContain("PR #2117");
+  });
+
+  it("a MERGED PR is not a gate — the agent escalates normally", async () => {
+    // The gate is "the work is waiting on an answer", not "this branch has ever had a PR". Once the
+    // PR is answered there is nothing to wait for, and `prState` never returns to null — so a gate
+    // keyed on presence rather than on `open` would be a permanent hole.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    evidence({ workflowState: { [agentId]: { prState: "merged", prNumber: 2117 } } });
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, prMark: "merged#2117" }));
+
+    await settleThenSweep();
+
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+  });
+
+  /** Publish one digest reading of the windowed tool count for `agentId`. */
+  function tools(agentId: string, toolsRecent: number | null): void {
+    evidence({
+      agentMovement: {
+        [agentId]: { lastEvent: "Stop", lastEventMs: T0, sessionId: "s1", toolsRecent },
+      },
+    });
+  }
+
+  it("TOOL activity read off the fleet digest resets the streak", async () => {
+    // The signal the six false pages could not see. `promptHistory` grows only when a HUMAN types
+    // and `activity` only when the agent narrates — which the orchestrator prompt tells it to skip —
+    // so an agent that spent the hour running tools moved nothing the old mark could read.
+    //
+    // Two sweeps, because the ledger's FIRST sighting is a baseline: one reading is a level, and it
+    // takes two to see a RISE. Burned at burst 0, which is what the first sweep records.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, toolBursts: 0 }));
+    tools(agentId, 5);
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    tools(agentId, 41); // the agent ran tools
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+    // The mark the runner RECORDED carries the evidence, so the next sweep compares against a live
+    // reading rather than the stale one the streak was burned at.
+    expect(goalOf(projectId, agentId)!.mark).not.toBe(FRESH_MARK);
+    expect(goalOf(projectId, agentId)!.continues).toBe(1);
+  });
+
+  it("WINDOW DECAY is not progress — a falling tool count escalates (roborev 65440)", async () => {
+    // THE PAIR, and the defect it pins. `HookFacts.toolsRecent` counts over a SLIDING 15-minute
+    // window, so an agent that genuinely STOPPED still produces a changing number: 41 → 30 → … → 0
+    // as its old events age out. Fed in raw, every one of those decrements moved the mark, reset the
+    // consecutive streak and pushed the escalation further away — silence reading as work, which is
+    // the exact inverse of what this measures and would have made the 3-strike bound unreachable for
+    // any agent that had ever been busy.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, toolBursts: 0 }));
+    tools(agentId, 41);
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    tools(agentId, 30); // nothing happened; the window simply moved
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(notifyMock.mock.calls[0]![0].body).toContain("no sign of progress");
+  });
+
+  it("a POLL GAP is silence, not movement", async () => {
+    // `fleetWatch` republishes `{}` after a failed digest, so a reading can vanish and come back.
+    // Treating the disappearance as a value would make our own blind spot look like work — and then
+    // the return look like more of it. `noteToolActivity` holds the ledger still across a null.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, toolBursts: 0 }));
+    tools(agentId, 41);
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    evidence({ agentMovement: {} }); // the poll failed
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a RECREATED agent id starts from a baseline, not its predecessor's count", async () => {
+    // The ledger is pruned against the live roster in the same loop as `undelivered` and
+    // `loggedExpiryRefusal`, for the reasons those two document — plus it grows with every agent id
+    // ever swept since app start rather than with the roster.
+    //
+    // ⚠️ THE FIRST VERSION OF THIS TEST DID NOT DISCRIMINATE, and its mutant survived: the
+    // predecessor's LEVEL is overwritten by the very next reading (`lastSeen` is assigned
+    // unconditionally), so a lost level costs at most one observation and no assertion could see it.
+    // What actually survives a teardown is the COUNT, so the fixture drives a real RISE first —
+    // without the prune the recreated id resumes at 1 instead of starting at 0.
+    const busy = seed({ goal: "first tenant" });
+    tools(busy.agentId, 5);
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    tools(busy.agentId, 41); // a genuine rise: bursts -> 1
+    await sweepGoalContinuations({ now: SETTLED, ownsProject: ownsEverything });
+    expect(noteToolActivity(busy.agentId, 41)).toBe(1);
+
+    // The row goes away — the sweep's composite no longer carries it, which is the prune's trigger.
+    useProjectStore.setState({ projects: [] } as never);
+    useRuntimeStore.setState({ status: {}, openAgentIds: [], agentMovement: {} } as never);
+    await sweepGoalContinuations({ now: SETTLED + 46_000, ownsProject: ownsEverything });
+
+    // A fresh agent under the SAME id inherits nothing.
+    expect(noteToolActivity(busy.agentId, 5)).toBe(0);
+    expect(noteToolActivity(busy.agentId, 9)).toBe(1);
+  });
+
+  it("a COLD ledger reproduces the burst count the persisted mark already carries", async () => {
+    // ⚠️ THE LEDGER IS WEBVIEW-LOCAL; THE MARK IS PERSISTED ON THE GOAL (roborev 65483). After a
+    // reload the ledger is empty, so an unseeded baseline of 0 is compared against a stored `…␀4␀…`
+    // — the two differ, that reads as progress, and `continues` is rewritten to 1. Every app restart
+    // would silently clear the no-progress streak, and a machine that restarts more often than an
+    // agent accumulates three settled strikes could never reach the 3-strike escalation at all.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    const persisted = progressMark({ promptHistoryLength: 0, toolBursts: 4 });
+    burn(projectId, agentId, 3, persisted);
+    tools(agentId, 7); // a fresh reading, from a ledger that knows nothing about this agent
+
+    await settleThenSweep();
+
+    // The streak survived the cold start: no free "progressed", so the bound still fires.
+    expect(sendMock).not.toHaveBeenCalled();
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(notifyMock.mock.calls[0]![0].body).toContain("no sign of progress");
+  });
+
+  it("continuationEvidenceFor reproduces the persisted count with a COLD ledger", async () => {
+    // ⚠️ THE READER'S FALLBACK NEEDS ITS OWN TEST, and its mutant survived without one: inside a
+    // SWEEP the fold has already seeded the ledger by the time the reader runs, so removing the
+    // reader's `?? burstsOf(...)` changes nothing there. The path it actually guards is a read
+    // taken with no fold ahead of it — `controlListener.resumeReading` in a window that has never
+    // swept this agent, which is exactly the cross-window drift this whole commit is about.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    useProjectStore.getState().noteAgentGoalContinue(
+      projectId,
+      agentId,
+      progressMark({ promptHistoryLength: 0, toolBursts: 4 }),
+    );
+    const agent = useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.id === agentId)!;
+
+    // No sweep has run, so nothing has folded anything for this agent.
+    expect(continuationEvidenceFor(agent).mark).toBe(
+      progressMark({ promptHistoryLength: 0, toolBursts: 4 }),
+    );
+  });
+
+  it("burstsOf reads the count back out of a mark, and fails closed", () => {
+    expect(burstsOf(progressMark({ promptHistoryLength: 0, toolBursts: 4 }))).toBe(4);
+    expect(burstsOf(progressMark({ promptHistoryLength: 0, toolBursts: 0 }))).toBe(0);
+    // "we did not look" must not come back as a real 0 — that is a different, meaningful value.
+    expect(burstsOf(progressMark({ promptHistoryLength: 0 }))).toBeNull();
+    expect(burstsOf(undefined)).toBeNull();
+    // An older build's shorter mark, or a non-numeric token, is also "cannot tell".
+    expect(burstsOf("0\u0000\u0000")).toBeNull();
+    expect(burstsOf("0\u0000\u0000\u0000x\u0000\u0000")).toBeNull();
+  });
+
+  it("noteToolActivity: only a RISE advances the counter", async () => {
+    // The rule as arithmetic, so the three end-to-end tests above cannot all pass on a fold that is
+    // merely different rather than monotone.
+    expect(noteToolActivity("x", 5)).toBe(0); // first sighting is a baseline, never a burst
+    expect(noteToolActivity("x", 5)).toBe(0); // flat
+    expect(noteToolActivity("x", 3)).toBe(0); // decay
+    expect(noteToolActivity("x", 9)).toBe(1); // a rise
+    expect(noteToolActivity("x", null)).toBe(1); // a gap holds, it does not move
+    expect(noteToolActivity("x", 2)).toBe(1); // …and the held level is still 9, so this is decay
+    expect(noteToolActivity("x", 10)).toBe(2);
+  });
+
+  it("`lastEvent` alone would have been useless — the digest reads Stop when a turn has ended", () => {
+    // Why the mark keys on a COUNT and not the event NAME. `fleet.rs` assigns `last_event`
+    // last-wins, and a continuation is only ever decided on an agent whose turn has ENDED, so the
+    // name at that instant is `Stop` essentially every time. Both fixtures below carry the same
+    // useless name and are still told apart, which is the property under test.
+    const quiet = progressMark({ promptHistoryLength: 0, toolBursts: 0 });
+    const busy = progressMark({ promptHistoryLength: 0, toolBursts: 1 });
+    expect(busy).not.toBe(quiet);
+  });
+
+  it("COMMITS on the agent's branch reset the streak", async () => {
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    // Burned at the OLD commit count, then a commit lands — which is the movement under test.
+    burn(projectId, agentId, 3, progressMark({ promptHistoryLength: 0, commitsAhead: 3 }));
+    evidence({ branchStatus: { [agentId]: { ahead: 4, behind: 0, dirty: false } } });
+
+    await settleThenSweep();
+
+    expect(notifyMock).not.toHaveBeenCalled();
+    expect(sendMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("an agent this window has never polled reads as NO evidence, and still escalates", async () => {
+    // The fail-safe direction. Every new input is `?? null`, so a window with no digest and no pane
+    // poll must behave exactly as it did before this change — a manufactured zero would read as a
+    // real, unchanging observation of "no work" built out of our own silence, and a manufactured
+    // gate would silence the fleet.
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    burn(projectId, agentId, 3);
+    evidence({ workflowState: {}, agentMovement: {}, branchStatus: {} });
+
+    await settleThenSweep();
+
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    expect(goalOf(projectId, agentId)!.escalatedAt).toBeDefined();
+  });
+});
+
+describe("the unreachable-terminal escalation is untouched", () => {
+  // THE ONE THE FOUNDER WANTS LOUDER, NOT QUIETER: "Auto-resume could not reach this agent" is the
+  // case where a human genuinely must open a pane. It is raised by `noteUndelivered`, an entirely
+  // separate path from the streak bound — but "separate by construction" is what every silently
+  // broken guard was too, so it is pinned against the exact state that now suppresses the other one.
+  afterEach(() => {
+    sendMock.mockReset();
+  });
+
+  it("still fires for an agent that ALSO has an open PR", async () => {
+    sendMock.mockImplementation(async (agentId: string) => ({
+      ok: false as const,
+      path: "alternate-screen" as never,
+      agentId,
+    }));
+    const { projectId, agentId } = seed({ goal: "land the PR" });
+    useRuntimeStore.setState({
+      workflowState: { [agentId]: { prState: "open", prNumber: 2117 } },
+    } as never);
+
+    await sweepGoalContinuations({ now: T0, ownsProject: ownsEverything });
+    for (let i = 0; i < MAX_UNDELIVERED_CONTINUES; i++) {
+      await sweepGoalContinuations({ now: SETTLED + i * 46_000, ownsProject: ownsEverything });
+    }
+
+    expect(notifyMock).toHaveBeenCalledTimes(1);
+    const reason = goalOf(projectId, agentId)!.escalationReason!;
+    expect(reason).toContain("full-screen mode");
+    // And it is NOT the diagnosis the gate suppresses — the two must stay distinguishable.
+    expect(reason).not.toContain("no sign of progress");
+  });
+});
+
+describe("reading the store's PR state honestly", () => {
+  it("only `open` is a gate", () => {
+    expect(externalWaitOf({ prState: "open", prNumber: 7 } as never)).toEqual({
+      kind: "open-pr",
+      prNumber: 7,
+    });
+    expect(externalWaitOf({ prState: "merged", prNumber: 7 } as never)).toBeUndefined();
+    expect(externalWaitOf({ prState: "closed", prNumber: 7 } as never)).toBeUndefined();
+  });
+
+  it("`prState: null` yields NO gate and NO mark — it is ambiguous, not a negative finding", () => {
+    // Rust sends null both for "probed, found nothing" and for a poll that never probed
+    // (`probePrState` is gated), and those are indistinguishable here. Turning it into either a gate
+    // or a stable "there is no PR" token would be inventing an answer.
+    expect(externalWaitOf({ prState: null, prNumber: null } as never)).toBeUndefined();
+    expect(prMarkOf({ prState: null, prNumber: null } as never)).toBeNull();
+    expect(externalWaitOf(undefined)).toBeUndefined();
+    expect(prMarkOf(undefined)).toBeNull();
+  });
+
+  it("the mark token moves when the PR appears and when its state changes", () => {
+    const opened = prMarkOf({ prState: "open", prNumber: 2117 } as never);
+    const merged = prMarkOf({ prState: "merged", prNumber: 2117 } as never);
+    expect(opened).not.toBeNull();
+    expect(merged).not.toBe(opened);
   });
 });

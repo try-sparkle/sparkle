@@ -29,6 +29,49 @@ import type {
   FleetVerdict,
 } from "../../engine/fleetVerdict";
 import { verdictsFor } from "../../engine/fleetVerdict";
+import { openAgentIdSet } from "../knownAgents";
+import { SPARKLE_AGENT_ID } from "../sparkleAgent";
+
+/** The concierge's reserved caller id. Mirrors `CONCIERGE_CALLER_AGENT_ID` in `../controlListener`,
+ *  kept LOCAL here to avoid a controlListener → conciergeTools/registry → fleet import cycle (fleet
+ *  is a leaf of that chain). The two literals must stay in step; `fleet.test.ts` pins that
+ *  behaviorally — it passes the REAL `CONCIERGE_CALLER_AGENT_ID` to `inboxSend` and asserts it is
+ *  addressable, so a drift here would refuse the concierge and red the test. */
+const CONCIERGE_INBOX_ID = "sparkle:concierge";
+
+/** The ids `inboxSend`/`inboxBroadcast` will actually DELIVER to — the deliver-or-fail directory
+ *  (bead sparkle-179b2s), the same address book `get_state({ scope: "fleet" })` publishes.
+ *
+ *  THE HOLE THIS CLOSES. `inbox.rs::enqueue` accepts any well-formed id and checks no registry, so a
+ *  send to a typo'd, closed, or otherwise undrained id writes a message into a file nothing reads and
+ *  hands back an id that looks exactly like a delivery — the `ok:true` silent lie this whole change
+ *  exists to kill. Resolving the recipient here, BEFORE the Rust hop, is what makes an undeliverable
+ *  send a loud refusal instead.
+ *
+ *  MEMBERSHIP: every live agent (open in any window — the same `openAgentIdSet` liveness the roster
+ *  uses) plus the two app-global special ids. The canonical Improve Sparkle id is always included —
+ *  the hourly HEADLESS pass drains it (`sparkle_improve.rs::build_improve_exec` exports
+ *  `SPARKLE_INBOX_AGENT`) — so a message lands even with no pane open; a per-window Sparkle id rides
+ *  in via `openAgentIdSet` only while its pane is live. */
+function inboxAddressableIds(): Set<string> {
+  const ids = openAgentIdSet();
+  ids.add(CONCIERGE_INBOX_ID);
+  ids.add(SPARKLE_AGENT_ID);
+  return ids;
+}
+
+/** The refusal returned for a recipient nothing drains — named so the caller can report WHICH id it
+ *  failed to reach, never a flat "send failed". */
+function undeliverableRecipient(op: FleetOp, agentId: string): FleetRefusal {
+  return refuse(
+    op,
+    "undeliverable-recipient",
+    `"${agentId}" is not an addressable recipient: no live agent has that id, and it is neither the ` +
+      `concierge nor Improve Sparkle. Nothing drains that inbox, so a queued message would never be ` +
+      `read — refusing rather than returning an id for a message no one will see. Resolve the ` +
+      `recipient against get_state({ scope: "fleet" }) or the project roster first.`,
+  );
+}
 
 // ---------------------------------------------------------------------------------------------
 // Ops and risk
@@ -389,6 +432,13 @@ export async function inboxSend(
   text: string,
   severity: InboxSeverity = "fyi",
 ): Promise<FleetResult<EnqueueReceipt>> {
+  // DELIVER-OR-FAIL (bead sparkle-179b2s). Resolve the recipient against the fleet directory BEFORE
+  // the Rust hop: `enqueue` writes into any well-formed id's file whether or not anything drains it,
+  // so a typo'd/closed id would otherwise come back `ok:true` with a real messageId for a message no
+  // one will ever read. Refuse loudly, naming the id, and enqueue NOTHING.
+  if (!inboxAddressableIds().has(agentId)) {
+    return undeliverableRecipient("inbox_send", agentId);
+  }
   try {
     const messageId = await invoke<string>("inbox_send", { agentId, text, severity });
     return ok("inbox_send", {
@@ -443,21 +493,46 @@ export async function inboxBroadcast(
   if (agentIds.length === 0) {
     return refuse("inbox_broadcast", "no-recipients", "Name at least one agentId to broadcast to.");
   }
-  try {
-    const raw = await invoke<BroadcastOutcome[]>("inbox_broadcast", {
-      agentIds,
-      text,
-      severity,
-    });
-    // EVERY RECIPIENT'S ROW CARRIES THE SAME HONEST VOCABULARY `inboxSend` returns. A fan-out is the
-    // single-send bug N times over, and it is the WORSE half: a caller that reads one `messageId` as
-    // proof of delivery reads forty of them as proof of a fleet-wide delivery.
-    const outcomes: BroadcastReceipt[] = raw.map((o) => ({
-      ...o,
-      state: o.messageId !== null ? "queued" : "not-queued",
+  // DELIVER-OR-FAIL, PER RECIPIENT (bead sparkle-179b2s). Partition against the fleet directory BEFORE
+  // the Rust hop. This is the single-send hole N times over and the worse half — a caller reads forty
+  // ids as proof of a fleet-wide delivery — so an id nothing drains must never reach `enqueue` and
+  // must never receive a messageId. It becomes a `not-queued` outcome that names WHY, sitting beside
+  // the real ones, so the counts and the `none-queued` refusal below stay honest.
+  const addressable = inboxAddressableIds();
+  const deliverable = agentIds.filter((id) => addressable.has(id));
+  const undeliverableOutcomes: BroadcastReceipt[] = agentIds
+    .filter((id) => !addressable.has(id))
+    .map((agentId) => ({
+      agentId,
+      messageId: null,
+      error: undeliverableRecipient("inbox_broadcast", agentId).message,
+      state: "not-queued",
       delivered: false,
       verifyWith: "fleet.inbox_status",
     }));
+  try {
+    // Only addressable ids cross the wire; an all-undeliverable broadcast skips Rust entirely.
+    const raw = deliverable.length
+      ? await invoke<BroadcastOutcome[]>("inbox_broadcast", {
+          agentIds: deliverable,
+          text,
+          severity,
+        })
+      : [];
+    // EVERY RECIPIENT'S ROW CARRIES THE SAME HONEST VOCABULARY `inboxSend` returns. A fan-out is the
+    // single-send bug N times over, and it is the WORSE half: a caller that reads one `messageId` as
+    // proof of delivery reads forty of them as proof of a fleet-wide delivery.
+    const outcomes: BroadcastReceipt[] = [
+      ...raw.map(
+        (o): BroadcastReceipt => ({
+          ...o,
+          state: o.messageId !== null ? "queued" : "not-queued",
+          delivered: false,
+          verifyWith: "fleet.inbox_status",
+        }),
+      ),
+      ...undeliverableOutcomes,
+    ];
     const queued = outcomes.filter((o) => o.messageId !== null).length;
     const failedOutcomes = outcomes.filter((o) => o.messageId === null);
     if (queued === 0) {

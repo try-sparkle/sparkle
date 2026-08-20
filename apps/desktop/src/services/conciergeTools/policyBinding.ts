@@ -48,6 +48,7 @@ import {
   recentlyRan,
   requestApproval,
 } from "../../stores/conciergeApprovals";
+import { useProjectStore } from "../../stores/projectStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { aiEnhancementsEnabled, aiFeatureNow } from "../aiGate";
 import { useAuthStore } from "../../stores/authStore";
@@ -62,10 +63,13 @@ import {
   conciergeToolConfigPath,
   evaluateToolPolicy,
   NO_TOOL_POLICY_OVERRIDES,
+  projectPolicyContextFor,
   type ConciergeToolEntry,
   type ToolPolicyEvaluation,
   type ToolPolicyOverrides,
+  type ToolPolicyProjectContext,
 } from "./policy";
+import { primeRepoSlug, slugForRoot } from "./repoSlug";
 import type { ConciergeToolPolicy, ToolPolicyQuery } from "./registry";
 import type { ChiefOp } from "./chief";
 
@@ -258,6 +262,90 @@ function resolveAskTier(c: AskContext): ToolPolicyDecision {
  * rather than falling through to allow.
  */
 /**
+ * WHICH REPO ROOT this call will act on — resolved EXACTLY as the dispatch resolves it.
+ *
+ * THIS IS THE SOUNDNESS PROPERTY OF THE WHOLE PER-PROJECT LAYER, and it is easy to get subtly
+ * wrong in a way no test notices. The concierge's `merge_pr` does NOT carry a `root`: the model
+ * sends a `projectId`, and `registry.ts`'s route turns it into `p.rootPath` before calling
+ * `invoke("merge_pr", { root, number })`. So a policy that only looked for `args.root` would
+ * evaluate EVERY merge against an unresolvable slug — fail-closed, but permanently `ask`, which is
+ * the exact stopgap this feature exists to remove. And a policy that resolved the root by some
+ * OTHER route than the dispatch does would be worse than useless: it would let the model name repo
+ * A to the policy and merge repo B. `policyBinding.test.ts` pins this resolution against the
+ * registry's, so the two cannot drift.
+ *
+ * The three keys, in the order the dispatch itself prefers them:
+ *   • `root`      — a control op that already carries one.
+ *   • `projectId` — what `withProject` looks up (`merge_pr`, `open_agent_pr`, …).
+ *   • `agentId`   — what `withAgentContext` looks up (`land_agent_branch`, `push_agent_branch`, …).
+ *
+ * Every read is defensive: `args` arrives RAW and UNVALIDATED from a model turn (the policy runs
+ * before the registry's zod), so anything that is not a string is `null`, and `null` is foreign,
+ * which asks.
+ */
+export function rootForToolArgs(args: unknown): string | null {
+  if (!args || typeof args !== "object") return null;
+  const a = args as Record<string, unknown>;
+  // PRECEDENCE IS `projectId` -> `agentId` -> `root`, AND THE ORDER IS THE WHOLE SOUNDNESS ARGUMENT
+  // (roborev 65400, finding 2). This function must name the repo the DISPATCH will act on, not the
+  // one the model would prefer to be judged against. `merge_pr` and its siblings resolve through
+  // `withProject(ctx, a.projectId, ...)` in registry.ts — they never read `args.root` at all — so
+  // reading `root` first meant a turn of
+  //     { root: "/repos/my-own-repo", projectId: "<a pinned foreign repo>", number: 1 }
+  // was judged against the repo named in `root` (`allow`) and then merged in the repo named by
+  // `projectId`. That is precisely the policy-checks-A-merges-B hole this seam exists to close, and
+  // a model supplies both keys.
+  //
+  // `mergePrArgs` being `.strict()` does reject the stray key — but only AFTER the policy has
+  // already returned its verdict and spent or short-circuited the approval, and that is an
+  // invariant living in another file which nothing here asserts. Order it correctly at the source.
+  //
+  // `root` stays LAST rather than being dropped: the control ops that genuinely carry it
+  // (`claim_pr`, `release_pr`) carry nothing else, so they still resolve.
+  try {
+    const projects = useProjectStore.getState().projects;
+    if (typeof a.projectId === "string") {
+      const project = projects.find((p) => p.id === a.projectId);
+      if (project?.rootPath) return project.rootPath;
+    }
+    if (typeof a.agentId === "string") {
+      for (const project of projects) {
+        if (project.agents.some((agent) => agent.id === a.agentId)) {
+          return project.rootPath ?? null;
+        }
+      }
+    }
+  } catch {
+    // An unreadable project store is "we don't know which repo", which is foreign, which asks.
+    return null;
+  }
+  if (typeof a.root === "string" && a.root.trim().length > 0) return a.root;
+  return null;
+}
+
+/**
+ * The per-project context for one call, off the live stores. Never throws — this runs on every tool
+ * call, underneath the dispatch gate.
+ *
+ * A cache MISS on the slug returns `null` (foreign → `ask` for anything that mutates main) AND
+ * kicks off the resolve, so the next call for that root has the answer. Fail-closed first, correct
+ * shortly after: the worst a cold cache costs is one approval card, and it can never widen
+ * anything.
+ */
+export function readProjectPolicyContext(args: unknown): ToolPolicyProjectContext {
+  const root = rootForToolArgs(args);
+  const slug = slugForRoot(root);
+  if (root !== null && slug === null) primeRepoSlug(root);
+  try {
+    const s = useSettingsStore.getState();
+    return projectPolicyContextFor(slug, s.conciergeOwnOrgs ?? [], s.conciergeProjectPolicy ?? {});
+  } catch {
+    // No store to read: no org is ours, no project rule exists. Both are the strict reading.
+    return projectPolicyContextFor(slug, [], {});
+  }
+}
+
+/**
  * Evaluate one op, reporting separately whether the verdict is being HELD because we have not read
  * the human's rules yet (roborev 54247, finding 3).
  *
@@ -296,6 +384,10 @@ function evaluateWithHydrationHold(
     overrides,
     aiEnabled: conciergeToolsEnabled(),
     args,
+    // The PER-PROJECT layer, supplied HERE and only here so `configuredToolPolicy`, `appOpPolicy`
+    // and `chiefOpPolicy` all get it from one place — a second wiring is the one that gets
+    // forgotten when a fourth entry point appears.
+    project: readProjectPolicyContext(args),
   });
   const held =
     !hydrated && evaluation.decision === "allow" && evaluation.riskClass !== "read-only";

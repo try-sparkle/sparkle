@@ -14,6 +14,30 @@ declare module "*/worktree-guard.mjs" {
   export function blocksDestructiveCommand(
     command: unknown,
   ): { rule: string; why: string } | null;
+  // Merge-policy guard predicate (contract §7): non-null iff a Bash command invokes `gh pr merge`
+  // in a worktree whose `<worktree>/.sparkle/merge-policy.json` refuses it. Deliberately NOT a
+  // global rule — in the owner's own repo merging is the sanctioned path — so the verdict is
+  // per-worktree and resolved in Rust. Three file states: ABSENT -> null (not a Sparkle-managed
+  // worktree, no opinion); PRESENT but unparseable / wrong `version` / no boolean `mergeProtected`
+  // -> `kind: "unreadable"` (the tamper case, fails closed); `mergeProtected: true` ->
+  // `kind: "protected"`. A fourth verdict, `kind: "foreign-target"`, covers the case the
+  // worktree-anchored design cannot otherwise see: `gh` takes its target repo from an explicit
+  // `-R`/`--repo`/`GH_REPO` override rather than from the worktree, so a policy that permits the
+  // merge is answering about a DIFFERENT repository — `target` names the one actually being merged.
+  // Reads the file only after the command is recognised as a merge, and sees inside a compound
+  // (`cd other && gh pr merge`) — which is the whole reason the lexer layer exists, since a
+  // prefix-matched deny rule cannot.
+  export function blocksProtectedMerge(
+    command: unknown,
+    cwd: unknown,
+  ): {
+    kind: "protected" | "unreadable" | "foreign-target";
+    file: string | null;
+    slug: string | null;
+    why: string | null;
+    remedy: string | null;
+    target?: string | null;
+  } | null;
   // Secret-staging guard predicate: non-null iff a Bash command would put credential material into
   // git. `kind: "named"` = the command line explicitly names a secret-shaped path (pure string
   // matching, fails CLOSED); `kind: "sweep"` = the command stages whatever is lying around and the

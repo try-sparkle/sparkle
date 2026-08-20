@@ -704,6 +704,12 @@ export async function spawnBuildAgent(
     name: input.name,
     model: input.model,
     mode: input.mode,
+    // THE ONE CALLER THAT OPTS INTO BEING DECLINED. A spawn from here is the machine acting on the
+    // founder's behalf, not his own hand on a control — so if his caret is in a terminal when this
+    // lands, the new agent appears and starts but does not take his screen (engine/attentionGuard).
+    // Every direct gesture (the sidebar row, the empty-state button, a file drop) keeps the default
+    // `"user"` and still jumps; see SpawnBuildAgentOpts.attention.
+    attention: "auto",
   });
   if (!agentId) {
     // TWO CAUSES REACH THIS LINE NOW, AND THEY READ DIFFERENTLY TO A HUMAN. Capacity and torn-out
@@ -1410,6 +1416,21 @@ export interface ClosedAgents {
   projectId: string;
   /** Which outcome actually ran. */
   outcome: "close" | "ship" | "save" | "spin-down" | "retire";
+  /** THE NAME OF THE AGENT THIS TORE DOWN, because after this reply nothing else can supply it.
+   *
+   *  `conciergeReceiptClassifier` takes a receipt's subject from the CALL ARGS, and every op in this
+   *  family is argued by id alone; the renderer then tries the live roster to turn that id into a
+   *  name and necessarily MISSES, because the op it is reporting has just removed the row. Without
+   *  this the receipt degrades to its anonymous fallback and reads "Closed that agent." — the
+   *  founder's 2026-08-18 complaint, which he raised about the retire wording and which this family
+   *  reaches by the same route.
+   *
+   *  DECLARED HERE RATHER THAN LEFT TO INFERENCE (roborev 65334, Medium). It previously survived
+   *  only because `ok()` infers through generics and a non-fresh object literal gets no
+   *  excess-property check — so nothing in the type system asserted the reply carried it, and a
+   *  refactor that built this from a typed value would have dropped it silently while every test
+   *  stayed green. Optional, because the ship/save outcomes share this shape and do not set it. */
+  agentName?: string;
 }
 
 /**
@@ -1479,7 +1500,14 @@ export async function closeAgent(
   // the refusal is relayed rather than worked around.
   const closed = await closeBuildAgent(agentId, false);
   if (!closed.ok) return refuse("close_agent", closed.reason, closed.message);
-  return ok("close_agent", { agentIds: ids, projectId: found.project.id, outcome: "close" });
+  // `agentName` — see the note on `spinDownWorkerAgent`'s reply. The roster row is gone by the time
+  // the receipt renders, so without this the line reads "Closed that agent."
+  return ok("close_agent", {
+    agentIds: ids,
+    projectId: found.project.id,
+    outcome: "close",
+    agentName: found.agent.name,
+  });
 }
 
 // ── Retire: the unattended close ────────────────────────────────────────────────────────────────
@@ -1976,6 +2004,10 @@ export function isDiscardIntent(v: unknown): v is DiscardIntent {
 export interface DiscardOutcome {
   /** What was destroyed — the same preview shape, captured immediately before the delete. */
   destroyed: DiscardPreview;
+  /** The name of the agent this destroyed. See {@link ClosedAgents.agentName} — same reason, same
+   *  defect: `destroyed` describes WHAT went, not WHO, so without this the receipt for a discard
+   *  reads "Closed that agent." Declared rather than inferred (roborev 65334, Medium). */
+  agentName?: string;
 }
 
 /**
@@ -2031,7 +2063,9 @@ export async function discardAgent(
     beadIds: destroyed.beadIds,
   });
   useProjectStore.getState().removeAgent(project.id, agentId);
-  return ok("discard_agent", { destroyed });
+  // `agentName` — see the note on `spinDownWorkerAgent`'s reply. `destroyed` describes what was
+  // torn down, not who; without the name the receipt reads "Closed that agent."
+  return ok("discard_agent", { destroyed, agentName: found.agent.name });
 }
 
 // ── Workers ─────────────────────────────────────────────────────────────────────────────────────
@@ -2105,6 +2139,16 @@ export async function spinDownWorkerAgent(
     agentIds: [workerId],
     projectId: found.project.id,
     outcome: "spin-down",
+    // ── THE NAME, BECAUSE BY THE TIME THE RECEIPT RENDERS THERE IS NOWHERE ELSE TO GET IT ────────
+    // The founder's 2026-08-18 complaint about "Retired that agent." was one instance of a defect
+    // this whole family shares. `conciergeReceiptClassifier` takes a receipt's subject from the CALL
+    // ARGS, and every close-family op is argued by id alone; the renderer then tries the live roster
+    // to turn that id into a name — and necessarily misses, because the op it is reporting has just
+    // removed the row. So the line degrades to the anonymous fallback and reads "Closed that agent."
+    //
+    // This function is the LAST place the name exists. It is spread into `close_agent` and
+    // `retire_agent` as well, so one field here fixes the sentence for all three.
+    agentName: found.agent.name,
   });
 }
 

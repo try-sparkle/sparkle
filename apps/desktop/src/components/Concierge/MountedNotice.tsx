@@ -48,19 +48,30 @@ export interface MountedNoticeModel {
   seq: number;
 }
 
+// Shared layout for BOTH tones: the row's flow, spacing, and type size. Neither the box nor the
+// colour lives here, because the two tones no longer share them (see below).
 const rowStyle: CSSProperties = {
   display: "flex",
   alignItems: "baseline",
   gap: 6,
-  padding: "5px 8px",
   margin: "0 0 6px",
-  borderRadius: 4,
   // `TYPE.small` is a NUMBER (the scale's px value), not a style object — theme/scale's ratchet holds
   // the off-scale `fontSize` count at zero, so this must read from the scale rather than say 12.
   fontSize: TYPE.small,
-  // Structure is DRAWN, not filled — the direction's rule, and the same treatment the unmount hint
-  // beside this row uses. A filled banner here would read as a modal interruption over a column that
-  // has just flooded to the terminal plane.
+};
+
+// The INFO box only. An outcome that merely happened elsewhere keeps the drawn-not-filled frame —
+// the same treatment the unmount hint beside this row uses; a filled banner would read as a modal
+// interruption over a column that has just flooded to the terminal plane.
+//
+// A REFUSAL is deliberately NOT boxed. The founder asked for the error variant to read as inline red
+// text, not as a bordered container wider than the composer: nothing was sent, and a frame around
+// that sentence made it look like a filled modal over the very box the words just reappeared in. So
+// the box (padding + radius + border) is reserved for `info`, and `warn` inherits only the shared
+// layout above.
+const infoBoxStyle: CSSProperties = {
+  padding: "5px 8px",
+  borderRadius: 4,
   border: `1px solid color-mix(in srgb, currentColor 30%, transparent)`,
   background: "transparent",
 };
@@ -78,6 +89,7 @@ const rowStyle: CSSProperties = {
  */
 export function MountedNotice({ notice }: { notice: MountedNoticeModel | null }) {
   if (!notice) return null;
+  const isWarn = notice.tone === "warn";
   return (
     <div
       key={notice.seq}
@@ -85,17 +97,22 @@ export function MountedNotice({ notice }: { notice: MountedNoticeModel | null })
       role="status"
       style={{
         ...rowStyle,
-        // A refusal reads at the column's OWN ink because it is the one the founder must not miss;
-        // an outcome that merely happened elsewhere sits in the muted register the unmount hint
-        // beside it uses. `inherit` rather than a named token: the column flips its ink wholesale
-        // when the cable is patched (it takes the terminal's material), and a concrete colour here
-        // would be the one line that did not follow it.
-        color: notice.tone === "warn" ? "inherit" : C.conciergeMuted,
+        // Only the INFO tone is boxed (see `infoBoxStyle`); a refusal is bare inline text.
+        ...(isWarn ? null : infoBoxStyle),
+        // A refusal reads in ALARM RED — `dangerInk`, the themed alarm-red-as-text token that
+        // clears AA on every plane in both themes (see theme/colors) — because it is the one the
+        // founder must not miss and must read as an error at a glance. An outcome that merely
+        // happened elsewhere sits in the muted register the unmount hint beside it uses.
+        color: isWarn ? C.dangerInk : C.conciergeMuted,
       }}
     >
-      {/* The terminal register's prompt mark, matching the activity line directly below this row —
-          it says "this is about the terminal you are patched into" without a word of chrome. */}
-      <span aria-hidden style={{ opacity: 0.6 }}>{">_"}</span>
+      {/* The terminal register's prompt mark, on the INFO tone only. A refusal is stripped of chrome
+          — no `>_`, no frame — so it reads as a plain red sentence rather than terminal output. */}
+      {!isWarn && (
+        <span aria-hidden style={{ opacity: 0.6 }}>
+          {">_"}
+        </span>
+      )}
       <span>{notice.text}</span>
     </div>
   );

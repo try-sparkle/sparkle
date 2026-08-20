@@ -168,6 +168,22 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
   // THE ONE RED STALL CAUSE. Its explainer may say what the tier-agnostic ones below must not: that
   // this row is addressed to HIM. It is the only cause where that sentence is safe, because both
   // halves of the condition are checked before it is raised (engine/agentStall).
+  // THE SECOND RED STALL CAUSE, and like the sign-off below it may say the row is addressed to HIM —
+  // for the strongest reason on this table: the agent said so when asked. It names the MECHANISM
+  // because "says who" is the reader's first question, and because the phrase used to arrive as
+  // unbacked prose in an escalation sentence (bead filed 2026-08-18).
+  "stall:blocked-on-human":
+    "Sparkle asked this agent what is blocking it — it can answer CI, another agent, a quota wall, " +
+    "or nothing at all — and it answered that a PERSON is. That is why this row is red rather than " +
+    "amber: no retry, no other agent and no machine is going to clear it. Open the agent to see " +
+    "what it needs from you.",
+  // TIER-SAFE TO ADDRESS HIM for the same reason `abandoned-goal` is: both halves are checked before
+  // it is raised, and the second half is that the one machine actor allowed to overrule the
+  // escalation has demonstrably run out of attempts.
+  "stall:rearms-exhausted":
+    "Auto-continue gave up on this agent's goal, and the concierge has already used every re-arm it " +
+    "is allowed — so nothing may restart it again. The row's own label has said 'this one is yours' " +
+    "in this state for a while; it now carries the colour to match.",
   "stall:human-verified-goal":
     "This agent's goal can only be closed by a person — the check on it is a sign-off or a command, " +
     "neither of which any agent may mark met itself — and nothing is coming to retry it. That makes " +
@@ -272,26 +288,36 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
  *  and that gap is what roborev 59949 caught. Both are fixed; keep them in step. */
 const STALL_CAUSE_RANK: Record<StallCause, number> = {
   // RED — `stallEscalation.OUTSTANDING`: the founder is the only actor who can clear it.
-  "human-verified-goal": 0,
-  // Also RED. Second because it is the less immediate of the two: a sign-off is a question already
-  // put to him, while an abandoned branch is a disposition he can take at his leisure. Everything
-  // below shifted down one to make room rather than being re-ranked — their relative order is a
-  // genuine actionability ordering and this change has no opinion about it.
-  "abandoned-goal": 1,
+  //
+  // FIRST OF ALL, ahead of the sign-off below, and the tie-break is provenance: every other cause on
+  // this list is something the app INFERRED about the agent, while this is the agent's own answer to
+  // a direct question about what is blocking it. An assertion beats an inference, so it leads.
+  "blocked-on-human": 0,
+  "human-verified-goal": 1,
+  // Also RED. Below the sign-off because it is the less immediate of the two: a sign-off is a
+  // question already put to him, while an abandoned branch is a disposition he can take at his
+  // leisure. Everything below shifted down to make room rather than being re-ranked — their relative
+  // order is a genuine actionability ordering and this change has no opinion about it.
+  "abandoned-goal": 2,
+  // RED, and LAST of the red group: it says only that nothing may retry the goal again, which is a
+  // weaker call to action than a stated question or a stranded branch. It rides alongside
+  // `escalated-goal` (which stays amber and stays at the bottom), so without a rank of its own the
+  // row's single glyph would have led with the quiet member of the pair.
+  "rearms-exhausted": 3,
   // NEVER RED. The four below are `stallEscalation.LIFECYCLE` → the amber `lapsed` status; they were
   // in the RED group until 2026-08-07 and moved together (see OUTSTANDING for who clears each). Their
   // relative order is unchanged — it is a genuine actionability ordering among things somebody else
   // will do, and `uncommitted-changes` stays last of them for the same reason it always did.
-  "unmet-goal": 2,
-  "open-pr": 3,
-  "unlanded-work": 4,
-  "uncommitted-changes": 5,
+  "unmet-goal": 4,
+  "open-pr": 5,
+  "unlanded-work": 6,
+  "uncommitted-changes": 7,
   // `escalated-goal` is LIFECYCLE too, and sorts BELOW the work causes: it says our retry budget ran
   // out, which is the quietest thing on this list. `expired-goal` is in NEITHER engine set → calm
   // gray. Do not "keep them in step" by adding expiry to LIFECYCLE; that module's own ⚠️ block
   // explains at length why it must stay out.
-  "escalated-goal": 6,
-  "expired-goal": 7,
+  "escalated-goal": 8,
+  "expired-goal": 9,
 };
 
 // NO THRASH RANK HERE, deliberately (roborev 58710/58721). A `ThrashReport` carries exactly ONE

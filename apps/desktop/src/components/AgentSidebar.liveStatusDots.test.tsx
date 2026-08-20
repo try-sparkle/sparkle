@@ -8,7 +8,7 @@
 // (PRD/sparkle/concierge-mode/prototype.html `.arow.p2`). The intent was that only the P0/P1 rows
 // carry color so the eye lands on what needs you.
 //
-// The cost was larger than the benefit. `isCalmBand` deliberately includes `working` (a running
+// The cost was larger than the benefit. `isCalmBand` INCLUDED `working` at the time (a running
 // agent is not asking you for anything), so a genuinely-working agent's GREEN dot rendered fully
 // desaturated — and `sparkle-pulse` (opacity 1 → .35) compounded it to roughly a quarter opacity.
 // On a fleet with live workers, that meant the one signal the column exists to carry, "what is
@@ -18,10 +18,14 @@
 // So this file is the inverse pin. If a future change re-adds a filter over the rows, these fail
 // and this comment says why they were written. `isCalmBand` itself still exists and is still
 // correct for what it now governs — the TERMINAL's own xterm theme (Workspace.tsx), which
-// desaturates a landed agent's text without ever touching the sidebar. Do not re-wire it here.
-import { cleanup, render, screen } from "@testing-library/react";
+// desaturates an EXITED agent's text without ever touching the sidebar. It no longer includes
+// `working` at all (bead sparkle-e7a3f3), so the specific collision above cannot recur — but the
+// removal was never conditional on that, and re-adding a row filter is still wrong. Do not
+// re-wire it here.
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AGENT_STATUS } from "@sparkle/ui";
+import { __setAuthRecoveryDeps, pollNudgeFlags } from "../services/authRecovery";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
   openUrl: vi.fn(() => Promise.resolve()),
@@ -41,7 +45,7 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { WorkflowStageId } from "../engine/workflowStage";
-import { expectedDotColor, filterOn } from "./statusDotTestUtils";
+import { dotInk, expectedDotColor, filterOn } from "./statusDotTestUtils";
 
 function mkAgent(id: string, name: string): AgentTab {
   return {
@@ -122,5 +126,108 @@ describe("AgentSidebar — no filter may sit over a row's status dot", () => {
     // …and it is not the gray every other status in this seed resolves to.
     expect(dot.style.background).not.toBe(expectedDotColor("done"));
     expect(filterOn(dot)).toBe("");
+  });
+});
+
+// ── THE DOT MUST REPAINT WHEN A NUDGER FLAG ARRIVES AFTER MOUNT (roborev 65461) ────────────────────
+//
+// The founder's report is about the DOT, and the dot comes from `AgentSidebar`'s `stallReportOf` /
+// `escalatedStatus` memos and `AgentRow`'s own `stallReport` — not from the composer pill, which is
+// the only surface the previous round's subscription test covered.
+//
+// The flag table lives outside React, so a silent agent's row can be on screen when `nudge_ladder`
+// flips its reply to `blocked-on-human` with nothing else about that row changing. The subscription
+// is then the ENTIRE mechanism by which the dot can go red — and none of it was pinned: swapping
+// `useNudgeFlagSnapshot()` for a plain call, or dropping `nudgeFlags` from either hand-maintained
+// dep array (one of which sits under an `eslint-disable` that suppresses the rule in both
+// directions), left the whole suite green.
+describe("a blocked-on-human flag arriving after mount turns the dot RED", () => {
+  const founderFlag = (agentId: string, reply: string) => ({
+    agentId,
+    target: "founder",
+    raisedAtMs: 1,
+    nudges: 3,
+    delivered: 3,
+    blockedBy: null,
+    silentSecs: 300,
+    reply,
+  });
+
+  const raise = async (flags: ReturnType<typeof founderFlag>[]) => {
+    await act(async () => {
+      __setAuthRecoveryDeps({ readNudgeFlags: async () => flags } as never);
+      await pollNudgeFlags();
+    });
+  };
+
+  afterEach(async () => {
+    await raise([]);
+    __setAuthRecoveryDeps(null);
+  });
+
+  /** THE ROW'S DOT — the element, found the way this file's sibling `AgentSidebar.redWorker.test`
+   *  finds it, then read through `dotInk`.
+   *
+   *  ⚠️ THE FIRST CUT HAND-ROLLED BOTH HALVES AND WAS WRONG THREE WAYS (roborev 65470), each of
+   *  which `statusDotTestUtils` already existed to prevent — its charter names THIS FILE:
+   *    • It scanned every descendant's `style` for the colour, so the `askPill`'s red BORDER (same
+   *      prop, same hex) satisfied a test headed "turns the dot RED". A change stripping the disc's
+   *      ink but leaving the pill would have stayed green.
+   *    • It compared against `background` only, so the RING variant — a head standing in for a
+   *      worker paints an inset `box-shadow` over a transparent background — reads as not-red. That
+   *      is verbatim the trap `dotInk`'s docblock records ("adding the ring turned three green
+   *      rollup guards red"), and an orchestrator case is the obvious next test here.
+   *    • It re-implemented hex→rgb a third time, in the one file `asRgb`'s charter calls out.
+   *  So: the shared helpers, not local copies. */
+  const dotOfRow = (name: string) => rowFor(name).querySelector<HTMLElement>("span[title]");
+
+  /** ONE plain resting agent, seeded here rather than reusing this file's shared `seed()`.
+   *
+   *  ⚠️ THE ROW HAS TO BE ESCALATABLE, which is why the shared fixture is wrong for this: its rows
+   *  carry `building_saved`/`merged` stages, and `stallEscalation.ESCALATABLE` is `idle`/`unmerged`
+   *  only — a `done` row is deliberately never repainted "needs you to unstick it". Reaching for the
+   *  convenient fixture is what made the first two drafts of this test fail. */
+  function seedResting(): Project {
+    const project: Project = {
+      id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
+      createdAt: new Date(0).toISOString(), selectedAgentId: null,
+      agents: [mkAgent("a1", "Quiet")],
+    };
+    useProjectStore.setState({ projects: [project] } as never);
+    useRuntimeStore.setState({
+      branchStatus: {},
+      workflowStage: {},
+      status: { a1: "idle" } as Record<string, AgentTabStatus>,
+      openAgentIds: ["a1"],
+      open: vi.fn(),
+      pollBranchStatus: vi.fn(() => Promise.resolve()),
+    } as never);
+    return project;
+  }
+
+  it("repaints on the SAME mount, with no store write and no forced re-render", async () => {
+    const project = seedResting();
+    await raise([]);
+    render(<AgentSidebar project={project} />);
+    // Nothing on screen is claiming a person is blocked.
+    expect(dotInk(dotOfRow("Quiet")!)).not.toBe(expectedDotColor("blocked"));
+
+    // The agent answers the ladder. No store write; nothing else about the row moves.
+    await raise([founderFlag("a1", "blocked-on-human")]);
+
+    expect(dotInk(dotOfRow("Quiet")!)).toBe(expectedDotColor("blocked"));
+    // …and the row says WHY, so the colour does not arrive unexplained. The founder's row had the
+    // words without the colour; the inverse would be just as wrong.
+    expect(screen.getByTitle(/blocked on you/)).toBeTruthy();
+  });
+
+  it("a reply naming a DIFFERENT blocker leaves the dot alone", async () => {
+    // THE PAIRED NEGATIVE. Identical mount, identical flag shape — only the reply differs, so a
+    // change that reddened every flagged row (or every row) fails here.
+    const project = seedResting();
+    await raise([]);
+    render(<AgentSidebar project={project} />);
+    await raise([founderFlag("a1", "blocked-on-ci")]);
+    expect(dotInk(dotOfRow("Quiet")!)).not.toBe(expectedDotColor("blocked"));
   });
 });

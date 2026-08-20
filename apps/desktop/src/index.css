@@ -77,6 +77,9 @@
   --c-mixed-ink: #ecb968;
   --c-violet-ink: #a185f5;
   --c-questions-ink: #7dd3fc;
+  --c-epic-card-fill: #1d3362;
+  --c-epic-pill-fill: #e0982f;
+  --c-on-epic-pill-fill: #0a1a3f;
 }
 :root[data-theme="light"] {
   --c-input-surface: #ffffff;
@@ -115,6 +118,9 @@
   --c-mixed-ink: #ab4e07;
   --c-violet-ink: #5636b8;
   --c-questions-ink: #075985;
+  --c-epic-card-fill: #dce0ff;
+  --c-epic-pill-fill: #664200;
+  --c-on-epic-pill-fill: #ffffff;
 }
 
 * {
@@ -331,7 +337,7 @@ body {
 
    Structure (PRD/sparkle/ui-directions/rev4.html):
 
-       TERM │ BUILD │ CONCIERGE │ BUILD │ TERM
+       TERM │ BUILD │ EPICS │ CONCIERGE │ EPICS │ BUILD │ TERM
 
    Build is ALWAYS adjacent to the concierge; the terminals sit at the outer edges. A PAIR is build
    plus its terminal and is never split — one project, which is why the project tabs belong to the

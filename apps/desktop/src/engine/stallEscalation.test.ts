@@ -3,6 +3,10 @@ import type { AgentTabStatus } from "@sparkle/ui";
 import { AGENT_STATUS } from "@sparkle/ui";
 import { newGoal } from "./agentGoal";
 import { stallReport, type StallInput } from "./agentStall";
+import type { StatusMap } from "./attention";
+import { withNudgeLoopCalm } from "./nudgeLoopCalm";
+import { withFinishedHeadCalm } from "./finishedHeadCalm";
+import type { ThrashReport } from "./agentThrash";
 import {
   mustLeaveCalm,
   withDismissedStallAttention,
@@ -11,6 +15,7 @@ import {
 import {
   advanceAlertRecord,
   alertControlKind,
+  withDismissedAlerts,
   dismissedRecord,
   reenabledRecord,
   type AgentAlertRecord,
@@ -580,5 +585,150 @@ describe("an AMBER `lapsed` row is dismissible exactly like the red one", () => 
   it("re-raises the amber after the human re-enables it", () => {
     const rec = advanceAlertRecord(undefined, pipeline().recorded.a ?? "stopped");
     expect(pipeline(reenabledRecord(dismissedRecord(rec))).presented.a).toBe("lapsed");
+  });
+});
+
+// ── AN ORCHESTRATOR CAN BE BLOCKED ON A PERSON WHILE ITS WORKERS RUN (2026-08-18) ──────────────────
+//
+// `withStallAttention` refuses to escalate a head whose worker subtree is in motion (roborev
+// 55423/55434), and that refusal is right for every cause it was written about: those are INFERENCES
+// from a resting status, and delegation is work the parent is not doing itself.
+//
+// `blocked-on-human` is not an inference — `nudge_ladder` asked the agent what was blocking it and it
+// answered that a person is. A busy subtree does not discharge that. Without the exemption the fix
+// would be silently unreachable for orchestrators, which on this fleet are the heads MOST likely to
+// be waiting on the founder.
+describe("blocked-on-human outranks the in-motion refusal", () => {
+  /** A head with a worker beneath it — the shape `isInMotion` is about.
+   *
+   *  ⚠️ THE CHILD'S `kind` MUST BE `"worker"`. `isInMotion` matches on
+   *  `a.kind === "worker" && a.parentId === agentId`, so a child written as `"build"` makes the veto
+   *  never fire — and then BOTH tests below pass without exercising the thing they name. The first
+   *  cut of this fixture did exactly that and the paired negative caught it, which is the whole
+   *  reason that test exists. */
+  const HEAD_AND_WORKER = [
+    { id: "a", kind: "build" as const, parentId: null },
+    { id: "w", kind: "worker" as const, parentId: "a" },
+  ];
+  const withHumanBlock = (over: Partial<StallInput> = {}): StallInput =>
+    resting({ humanBlock: { raisedAtMs: T0 }, ...over });
+
+  it("the head goes RED even though its worker is working", () => {
+    const out = withStallAttention(
+      HEAD_AND_WORKER,
+      { a: "idle", w: "working" },
+      (id) => (id === "a" ? stallReport(withHumanBlock()) : undefined),
+      allAlive,
+    );
+    expect(out.a).toBe("blocked");
+    expect(AGENT_STATUS[out.a as AgentTabStatus].color).toBe(AGENT_STATUS.waiting.color);
+  });
+
+  it("…while the SAME moving subtree still suppresses an inferred cause — the refusal is intact", () => {
+    // THE PAIRED NEGATIVE, and the one that keeps the exemption narrow. Identical agents, identical
+    // statuses; only the CAUSE differs. If this went red too, the change would have deleted roborev
+    // 55423/55434's protection wholesale rather than carving one cause out of it.
+    const out = withStallAttention(
+      HEAD_AND_WORKER,
+      { a: "idle", w: "working" },
+      (id) => (id === "a" ? stallReport(founderOnly()) : undefined),
+      allAlive,
+    );
+    expect(out.a).toBe("idle");
+  });
+
+  it("a head with NO worker in motion is unaffected either way", () => {
+    // Guards against the exemption being what makes the first case pass for the wrong reason: with
+    // a quiet subtree the veto never fires, so both causes escalate exactly as they did before.
+    // Typed rather than a bare literal: without it TS widens the values to `string` and the call
+    // does not compile. vitest does not typecheck, so only `tsc --noEmit` catches this.
+    const quiet: StatusMap = { a: "idle", w: "idle" };
+    expect(
+      withStallAttention(HEAD_AND_WORKER, quiet, (id) => (id === "a" ? stallReport(withHumanBlock()) : undefined), allAlive).a,
+    ).toBe("blocked");
+    expect(
+      withStallAttention(HEAD_AND_WORKER, quiet, (id) => (id === "a" ? stallReport(founderOnly()) : undefined), allAlive).a,
+    ).toBe("blocked");
+  });
+});
+
+// ── THE COMPOSED CHAIN, NOT THE FIRST OVERLAY (roborev 65357, the second Medium) ───────────────────
+//
+// The in-motion tests above call `withStallAttention` directly, which proves only that the FIRST
+// overlay emits `blocked`. Production runs three more passes over that map, and one of them —
+// `withNudgeLoopCalm` — demoted the result straight back to amber for exactly the rows this red was
+// written for. The unit tests stayed green throughout, because the thing they assert is not the
+// thing the founder looks at.
+//
+// THE POPULATIONS ARE THE SAME, NOT MERELY OVERLAPPING, which is what makes this the whole feature
+// rather than an edge: `agentThrash` raises `nudge-loop` after three nudge-opened turns that ran no
+// tool, and answering the ladder's question in prose IS a nudge-opened turn that ran no tool. So the
+// flag is produced by the same nudging that produces the verdict.
+describe("blocked-on-human survives the whole sidebar chain", () => {
+  /** TWO agents, so `humanBlockedOf` is checked for PER-ROW selectivity (roborev 65373). With one
+   *  agent a predicate that ignores its `id` — or reads the wrong one — passes every case, and the
+   *  sibling `thrashOf` already has a two-agent test for exactly this reason. */
+  const AGENTS2 = [
+    { id: "said", kind: "build" as const, parentId: null },
+    { id: "inferred", kind: "build" as const, parentId: null },
+  ];
+  const CALM2: StatusMap = { said: "idle", inferred: "idle" };
+  const humanBlocked = (): StallInput => resting({ humanBlock: { raisedAtMs: T0 } });
+  /** The verdict every flagged agent also carries — see the block comment above. */
+  const nudgeLoop = { verdict: "nudge-loop" } as ThrashReport;
+
+  /**
+   * ALL FOUR PASSES, in the sidebar's real order (roborev 65373).
+   *
+   * ⚠️ THE PREVIOUS CUT RAN ONLY TWO and still called itself "the whole chain" — which is the very
+   * defect the round before it was about, repeated one layer out: a claim about the PAINTED status
+   * asserted against a prefix of the chain. `withFinishedHeadCalm` runs AFTER `withNudgeLoopCalm`
+   * in production and can also demote to `lapsed`, so leaving it out left the final word untested.
+   */
+  const painted = (inputOf: (id: string) => StallInput, humanBlockedOf: (id: string) => boolean) => {
+    const reportOf = (id: string) => stallReport(inputOf(id));
+    const escalated = withStallAttention(AGENTS2, CALM2, reportOf, allAlive);
+    return withFinishedHeadCalm(
+      AGENTS2,
+      withNudgeLoopCalm(AGENTS2, withDismissedAlerts(AGENTS2, escalated), () => nudgeLoop, humanBlockedOf),
+      CALM2,
+      (id) => reportOf(id).verdict === "finished",
+    );
+  };
+
+  it("the stated row stays RED while an inferred one beside it is demoted — same call", () => {
+    // Both halves in ONE composition, which is what makes this about the PREDICATE rather than about
+    // two independent runs: `said` answered, `inferred` did not, and the same pass must treat them
+    // differently. A `humanBlockedOf` that ignored its `id` would fail one side or the other.
+    const out = painted(
+      (id) => (id === "said" ? humanBlocked() : founderOnly()),
+      (id) => id === "said",
+    );
+    expect(out.said).toBe("blocked");
+    expect(out.inferred).toBe("lapsed");
+  });
+
+  it("…and with NOBODY blocked, both are demoted — the module still does its job", () => {
+    // `nudgeLoopCalm` exists because the founder was shown red rows that were Sparkle's own pings
+    // looping (bead sparkle-hpbkw). Exempting a stated block must not become exempting everything.
+    const out = painted(() => founderOnly(), () => false);
+    expect(out.said).toBe("lapsed");
+    expect(out.inferred).toBe("lapsed");
+  });
+
+  it("the exemption is keyed on the ANSWER, not on the status being blocked", () => {
+    // Guards the shape of the carve-out: were it keyed on `blocked` itself, the cases above would
+    // pass while the module was disabled outright. Both rows present `blocked` before the demotion;
+    // only the flag separates them.
+    expect(painted(() => founderOnly(), () => true).said).toBe("blocked");
+    expect(painted(() => humanBlocked(), () => false).said).toBe("lapsed");
+  });
+
+  it("survives the LAST pass too — a human-blocked row is never `finished`", () => {
+    // `withFinishedHeadCalm` is the pass the previous cut omitted. It happens not to demote here
+    // because a `humanBlock` cause forces `verdict: "stalled"`, so `isFinished` is false — but that
+    // coupling was unpinned, and a change to `stallInputsFor` could break it invisibly.
+    expect(stallReport(humanBlocked()).verdict).toBe("stalled");
+    expect(painted(() => humanBlocked(), () => true).said).toBe("blocked");
   });
 });

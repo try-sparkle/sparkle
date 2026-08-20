@@ -19,6 +19,13 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => undefined) })
 import {
   __flushVerifications,
   __setAuthRecoveryDeps,
+  subscribeNudgeFlags,
+  nudgeFlagsVersion,
+  nudgeFlagFor,
+  pollNudgeFlags,
+  forgetNudgeFlagLocally,
+  nudgeFlagsSnapshot,
+  type NudgeFlag,
   correlateStuckAgents,
   identitiesMatch,
   identityRecoveries,
@@ -482,3 +489,250 @@ describe("pollIdentities", () => {
 // Keep the import used — `setPin` runs inside `moveAgent` on the primary path, so this test file
 // exercises it transitively and a broken account store would surface here rather than in the app.
 expect(typeof setPin).toBe("function");
+
+// ── THE FLAG TABLE MUST BE A SIGNAL, NOT JUST A MAP (roborev 65339, a Medium) ──────────────────────
+//
+// `engine/humanBlock` reads this table DURING RENDER to decide whether a row's dot is RED. The table
+// is filled by a Tauri event listener and a 30s poll — neither a store — so without a version bump
+// nothing a component selects on changes when a flag arrives, and the row repaints only if some
+// unrelated dep happens to move. The targeted population is agents that have gone SILENT, whose
+// status and branch facts are static by definition, so the rows this signal exists for are precisely
+// the ones least likely to repaint by coincidence.
+describe("nudge flag table notifies subscribers", () => {
+  it("bumps the version and calls listeners when a poll brings a flag in", async () => {
+    install({
+      readNudgeFlags: async () => [
+        {
+          agentId: "a",
+          target: "founder",
+          raisedAtMs: 5,
+          nudges: 1,
+          delivered: 1,
+          blockedBy: null,
+          silentSecs: 60,
+          reply: "blocked-on-human",
+        },
+      ],
+    });
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    const before = nudgeFlagsVersion();
+    await pollNudgeFlags();
+    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(calls).toBe(1);
+    // …and the flag is actually readable, so the version is not moving for nothing.
+    expect(nudgeFlagFor("a")?.reply).toBe("blocked-on-human");
+    unsub();
+  });
+
+  it("a poll that CLEARS a raised flag bumps — the row must repaint back OUT of red", async () => {
+    // THE ARM THAT IS EASY TO MISS. When the agent starts moving again `nudger.rs::apply_flags`
+    // drops its row, and the table shrinking is what has to reach the UI: de-escalation matters as
+    // much as escalation, because a red that will not go away is how the colour stops meaning
+    // anything. Driven as a real transition — raised, then gone — rather than as a no-change poll.
+    let raised = true;
+    install({
+      readNudgeFlags: async () =>
+        raised
+          ? [
+              {
+                agentId: "a",
+                target: "founder",
+                raisedAtMs: 5,
+                nudges: 1,
+                delivered: 1,
+                blockedBy: null,
+                silentSecs: 60,
+                reply: "blocked-on-human",
+              },
+            ]
+          : [],
+    });
+    await pollNudgeFlags();
+    expect(nudgeFlagFor("a")).toBeDefined();
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    const before = nudgeFlagsVersion();
+    raised = false;
+    await pollNudgeFlags();
+    expect(nudgeFlagFor("a")).toBeUndefined();
+    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(calls).toBe(1);
+    unsub();
+  });
+
+  it("a poll that changes NOTHING does not bump — the version is a signal, not a heartbeat", async () => {
+    // ⚠️ THIS REPLACES AN ASSERTION THAT PINNED THE BUG (roborev 65367). The first cut bumped on
+    // every successful read, so an idle app re-rendered every subscriber every 30s — recreating
+    // `stallReportOf`, recomputing the whole escalate → present → effective chain for every agent,
+    // and re-rendering every `AgentRow` through the `memo` comparator a hook subscription bypasses.
+    // The old test asserted a bump on a no-change poll, which meant the churn was protected by a
+    // test rather than caught by one.
+    install({ readNudgeFlags: async () => [] });
+    await pollNudgeFlags();
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    const before = nudgeFlagsVersion();
+    await pollNudgeFlags();
+    await pollNudgeFlags();
+    expect(nudgeFlagsVersion()).toBe(before);
+    expect(calls).toBe(0);
+    unsub();
+  });
+
+  it("stops calling a listener that unsubscribed", async () => {
+    install({ readNudgeFlags: async () => [] });
+    let calls = 0;
+    subscribeNudgeFlags(() => calls++)();
+    await pollNudgeFlags();
+    expect(calls).toBe(0);
+  });
+});
+
+// ── THE TWO ARMS THE SIZE CHECK CANNOT SEE (roborev 65405/65407) ───────────────────────────────────
+describe("nudge flag change-detection covers the field comparison, not just the size", () => {
+  const flag = (over: Partial<NudgeFlag> = {}): NudgeFlag => ({
+    agentId: "a",
+    target: "founder",
+    raisedAtMs: 5,
+    nudges: 1,
+    delivered: 1,
+    blockedBy: null,
+    silentSecs: 60,
+    reply: "blocked-on-human",
+    ...over,
+  });
+
+  it("a SAME-SIZE poll whose reply flips to blocked-on-human bumps — the founder's exact transition", async () => {
+    // ⚠️ THE ONLY ARM THAT DISTINGUISHES `flagIdentity` FROM THE SIZE CHECK, and it is the branch's
+    // headline case rather than an edge one. `nudger.rs::build_flag` rebuilds an existing row IN
+    // PLACE on every flagging look — carrying `raised_at_ms` forward while re-deriving `reply` from
+    // `state.last_reply()` — so the transition that turns the dot RED keeps the same agentId, the
+    // same raisedAtMs and the same table size. Every other test here moves the size, so a mutant
+    // reducing `tableChanged` to a size comparison passed the whole suite while the founder's row
+    // silently never went red.
+    let reply: string | null = null;
+    install({ readNudgeFlags: async () => [flag({ reply })] });
+    await pollNudgeFlags();
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    const before = nudgeFlagsVersion();
+    reply = "blocked-on-human";
+    await pollNudgeFlags();
+    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(calls).toBe(1);
+    expect(nudgeFlagFor("a")?.reply).toBe("blocked-on-human");
+    unsub();
+  });
+
+  it("a target flip concierge→founder bumps too — same size, same reply", async () => {
+    let target = "concierge";
+    install({ readNudgeFlags: async () => [flag({ target })] });
+    await pollNudgeFlags();
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    target = "founder";
+    await pollNudgeFlags();
+    expect(calls).toBe(1);
+    unsub();
+  });
+
+  it("a poll whose COUNTERS moved does NOT bump — excluding them is deliberate", async () => {
+    // `silentSecs` and `nudges` climb on every look, so including them in `flagIdentity` would make
+    // this a heartbeat again by the back door — the exact regression roborev 65367 was about.
+    // Recorded as an assertion so the exclusion reads as a decision rather than an oversight.
+    let n = 1;
+    install({ readNudgeFlags: async () => [flag({ nudges: n, silentSecs: n * 60 })] });
+    await pollNudgeFlags();
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    const before = nudgeFlagsVersion();
+    n = 7;
+    await pollNudgeFlags();
+    expect(nudgeFlagsVersion()).toBe(before);
+    expect(calls).toBe(0);
+    unsub();
+  });
+
+  it("the RECOVERY path's local delete notifies — the poll can never see it", async () => {
+    // roborev 65405. `resumeAll` deletes straight out of the map; the next poll then reads a list
+    // that already matches it, so change-detection finds nothing and the row keeps its stale red.
+    install({ readNudgeFlags: async () => [flag()] });
+    await pollNudgeFlags();
+    let calls = 0;
+    const unsub = subscribeNudgeFlags(() => calls++);
+    const before = nudgeFlagsVersion();
+    forgetNudgeFlagLocally("a");
+    expect(nudgeFlagFor("a")).toBeUndefined();
+    expect(nudgeFlagsVersion()).toBeGreaterThan(before);
+    expect(calls).toBe(1);
+    unsub();
+  });
+});
+
+// ── THE TEST SEAM MUST RESET THE SNAPSHOT, NOT JUST THE MAP (roborev 65432) ────────────────────────
+describe("__setAuthRecoveryDeps leaves no flag state behind", () => {
+  it("empties the SNAPSHOT too, so no test inherits another's flags", async () => {
+    // ⚠️ THE BUG THIS PINS IS CROSS-TEST POLLUTION, which is invisible in the file that causes it.
+    // `bumpFlagVersion` is the only writer of the snapshot, so a bare `flags.clear()` in the seam
+    // left it holding the previous test's flags — and the obvious reset (`readNudgeFlags: () => []`
+    // then poll) could not fix it either, because `list.length === flags.size === 0` means
+    // `tableChanged` answers false and no bump happens. A component reading the snapshot then
+    // rendered a phantom "blocked on you" for an agent whose live table said nothing, order-
+    // dependent and green until someone appended a test.
+    install({
+      readNudgeFlags: async () => [
+        {
+          agentId: "a",
+          target: "founder",
+          raisedAtMs: 5,
+          nudges: 1,
+          delivered: 1,
+          blockedBy: null,
+          silentSecs: 60,
+          reply: "blocked-on-human",
+        },
+      ],
+    });
+    await pollNudgeFlags();
+    expect(nudgeFlagsSnapshot().get("a")?.reply).toBe("blocked-on-human");
+
+    __setAuthRecoveryDeps(null);
+
+    // BOTH readers, asserted together — the defect was them disagreeing, so checking one proves
+    // nothing about the pair.
+    expect(nudgeFlagFor("a")).toBeUndefined();
+    expect(nudgeFlagsSnapshot().get("a")).toBeUndefined();
+    expect(nudgeFlagsSnapshot().size).toBe(0);
+  });
+
+  it("the snapshot carries the judged fields for a raised flag, and no counters", async () => {
+    // The narrowing is a correctness property, not tidiness: the poll deliberately does NOT
+    // change-detect `nudges`/`silentSecs`/`blockedBy` (doing so restores the 30s heartbeat roborev
+    // 65367 removed), so a snapshot exposing them would hand out values frozen at the last identity
+    // change while the live table moved on. Asserted on the VALUE rather than the type, so it fails
+    // if someone widens the snapshot back to the whole `NudgeFlag`.
+    install({
+      readNudgeFlags: async () => [
+        {
+          agentId: "a",
+          target: "founder",
+          raisedAtMs: 5,
+          nudges: 9,
+          delivered: 9,
+          blockedBy: "awaiting-input",
+          silentSecs: 4321,
+          reply: "blocked-on-human",
+        },
+      ],
+    });
+    await pollNudgeFlags();
+    expect(nudgeFlagsSnapshot().get("a")).toEqual({
+      target: "founder",
+      reply: "blocked-on-human",
+      raisedAtMs: 5,
+    });
+    // …while the LIVE table still has everything, for readers that accept it is not a React signal.
+    expect(nudgeFlagFor("a")?.silentSecs).toBe(4321);
+  });
+});

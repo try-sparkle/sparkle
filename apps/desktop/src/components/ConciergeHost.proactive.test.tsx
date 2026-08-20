@@ -70,6 +70,8 @@ vi.mock("../services/sparkleApi", async (orig) => ({
 import { ConciergeHost } from "./ConciergeHost";
 import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
 import { PROACTIVE_COALESCE_MS } from "../services/conciergeProactive";
+import { useResearchStore } from "../services/research/store";
+import type { ResearchTask } from "../services/research/types";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import type { StatusBand } from "../engine/buildSections";
 
@@ -238,5 +240,110 @@ describe("a push that never ran is not treated as delivered", () => {
     await settle(3 * 60_000);
     expect(h.pushes.length).toBeGreaterThan(1);
     expect(h.pushes.at(-1)).toContain("Kraken Auth");
+  });
+});
+
+// ══ RESEARCH COMING BACK REACHES THE SCHEDULER ══════════════════════════════════════════════════
+//
+// THE WIRING HALF of bead sparkle-wo4c79, and the half that can silently not exist. The scheduler's
+// own suite proves that `observeResearch` buys a turn, but it calls that method directly — so it
+// would pass unchanged if the host never subscribed the scheduler to the research store at all,
+// which is precisely the "defaulted seam" vacuity shape AGENTS.md warns about. What is checked here
+// is the edge: a task going terminal in the STORE, with nobody touching the scheduler by hand,
+// produces a push.
+describe("a finished research run wakes the concierge through the host", () => {
+  const task = (over: Partial<ResearchTask> & { id: string }): ResearchTask =>
+    ({
+      question: "epic vs tasks",
+      depth: "quick",
+      projectId: "p1",
+      projectRoot: "/p1",
+      status: "done",
+      createdAt: 1,
+      startedAt: 2,
+      finishedAt: 3,
+      findings: "Epics are containers; tasks are the unit of work.",
+      error: null,
+      readAt: null,
+      ...over,
+    }) as ResearchTask;
+
+  /** Put tasks into the real store, which is what the host's subscription is listening to. */
+  const store = (...tasks: ResearchTask[]) =>
+    act(() => {
+      useResearchStore.setState({
+        byId: Object.fromEntries(tasks.map((t) => [t.id, t])),
+        hydrated: true,
+      } as never);
+    });
+
+  afterEach(() => {
+    useResearchStore.setState({ byId: {}, hydrated: false } as never);
+  });
+
+  it("pushes the ANSWER on a calm fleet, with nothing else buying the turn", async () => {
+    // The founder's exact case: the fleet is quiet, so under the old rule no turn was ever bought
+    // and the answer sat until he thought to ask for it.
+    render(<ConciergeHost feed={calm()} />);
+    await settle(PROACTIVE_COALESCE_MS * 2);
+    expect(h.pushes, "nothing before the run finishes").toEqual([]);
+
+    await store(task({ id: "r1" }));
+    await settle();
+
+    expect(h.pushes).toHaveLength(1);
+    expect(h.pushes[0]).toContain("Epics are containers");
+    expect(h.pushes[0]).toContain("speaking first, unprompted");
+    // It is not the fleet's message: no roster line rode in on it.
+    expect(h.pushes[0]).not.toContain("Kraken Auth");
+  });
+
+  it("pushes for a FAILED run too — the case the founder was never told about", async () => {
+    render(<ConciergeHost feed={calm()} />);
+    await settle(PROACTIVE_COALESCE_MS * 2);
+
+    await store(
+      task({
+        id: "r1",
+        status: "failed",
+        findings: null,
+        error: "The research run could not start — the Claude CLI is not signed in.",
+      }),
+    );
+    await settle();
+
+    expect(h.pushes).toHaveLength(1);
+    expect(h.pushes[0]).toContain("not signed in");
+  });
+
+  it("says nothing for a run the founder CANCELLED himself", async () => {
+    render(<ConciergeHost feed={calm()} />);
+    await settle(PROACTIVE_COALESCE_MS * 2);
+
+    await store(task({ id: "r1", status: "cancelled", findings: null, error: null }));
+    await settle(PROACTIVE_COALESCE_MS * 4);
+
+    expect(h.pushes).toEqual([]);
+  });
+
+  it("says nothing for a run that is still going", async () => {
+    // The guard against waking on every poll: only a TERMINAL task is news.
+    render(<ConciergeHost feed={calm()} />);
+    await settle(PROACTIVE_COALESCE_MS * 2);
+
+    await store(task({ id: "r1", status: "running", findings: null, finishedAt: null }));
+    await settle(PROACTIVE_COALESCE_MS * 4);
+
+    expect(h.pushes).toEqual([]);
+  });
+
+  it("says nothing for a finding already delivered — `readAt` is the authority", async () => {
+    render(<ConciergeHost feed={calm()} />);
+    await settle(PROACTIVE_COALESCE_MS * 2);
+
+    await store(task({ id: "r1", readAt: 12_345 }));
+    await settle(PROACTIVE_COALESCE_MS * 4);
+
+    expect(h.pushes).toEqual([]);
   });
 });

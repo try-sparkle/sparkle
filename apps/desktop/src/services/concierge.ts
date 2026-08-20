@@ -18,10 +18,12 @@
 // the concierge column always has something to render.
 import { invoke } from "@tauri-apps/api/core";
 import { conciergeAiEnabled } from "./conciergeTools/policyBinding";
+import { drainConciergeInbox } from "./conciergeInbox";
 import { listen } from "@tauri-apps/api/event";
 import { conciergeSessionInfo, type ClaudeSessionInfo } from "../preflight";
 import {
   accountConfigDirFor,
+  conciergeFallbackConfigDirs,
   CONCIERGE_ACCOUNT_KEY,
   type ResolvedConfigDir,
 } from "./accountSelection";
@@ -809,7 +811,13 @@ export async function startConciergeTurn(
     // Then wiring + restore together, and the restore resolves the same account internally — same
     // cache, same sticky selection, so the tree it probes cannot disagree with the tree this turn
     // spawns into.
-    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+    // `avoidClobberedDefault`: the concierge default (`$HOME/.claude`) is shared with the terminal
+    // `claude` CLI, so a terminal login clobbers the OAuth Sparkle expects. Prefer a dedicated account
+    // and route away from a clobbered default — recorded state still reads it healthy, so nothing else
+    // would (see accountSelection `clobberedDefaultIds`).
+    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, {
+      avoidClobberedDefault: true,
+    });
     // `effectiveConfigDir`, not `resolved`: an unreadable accounts backend must not silently move
     // the turn to the DEFAULT account while the session pointer still names another one.
     rebindSessionToAccount(resolved);
@@ -830,13 +838,29 @@ export async function startConciergeTurn(
     // resume target.
     const startedAt = sessionEpoch;
     const resume = resumeSessionId ?? currentSessionId ?? undefined;
+    // RECIPIENT-HALF INBOX DRAIN (bead sparkle-179b2s, Phase A2). The concierge is not a worktree
+    // agent, so neither the hook nor the PTY delivery path reaches it — its inbox is drained HERE, at
+    // turn assembly. Read the pending messages, frame them into the prompt as data (never as
+    // instruction), and ack them so the next turn does not re-inject them. Never throws and returns
+    // "" on any failure, so a broken inbox cannot stop a turn; see `services/conciergeInbox.ts`.
+    const inboxText = await drainConciergeInbox();
+    const turnPrompt = inboxText ? `${prompt}\n\n${inboxText}` : prompt;
+    // The healthy DEDICATED accounts Rust may rotate to if THIS account's OAuth has expired — ranked
+    // best-first, excluding this account's login group and any clobbered default. When the turn fails
+    // with the auth-expiry signature, `concierge_turn` retries on the first of these instead of
+    // re-running the dead account, so a single auth failure becomes a rotated retry rather than a
+    // "sign in to Claude" dead-end (see accountSelection `conciergeFallbackConfigDirs` and
+    // `concierge.rs::plan_retry`). Empty (one healthy account, or an unreadable backend) = sign-in as
+    // before, which is the last-account guard: never bench the only account.
+    const fallbackConfigDirs = await conciergeFallbackConfigDirs();
     // `configDir` binds this turn to an account. Before it existed the concierge always ran as
     // `$HOME/.claude`, so an exhausted default account failed every turn with no way for the human
     // to move it — see PRD/sparkle/account-rotation.md §2.
     const id = await invoke<string>("concierge_turn", {
-      prompt,
+      prompt: turnPrompt,
       resumeSessionId: resume ?? null,
       configDir,
+      fallbackConfigDirs,
     });
     // Only advance the session id once the turn was ACCEPTED — a rejected invoke must not leave a
     // resume target (esp. an explicit override) for a turn that never ran — and only while the
@@ -892,7 +916,13 @@ export async function startProactiveConciergeTurn(prompt: string): Promise<strin
     // Same order, same reason, as `startConciergeTurn` — and it matters MORE here, not less: a push
     // has no stale-resume retry by design (see `concierge_proactive_turn`), so a resume aimed at the
     // wrong account's tree is never self-healed; the push just dies silently.
-    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY);
+    // `avoidClobberedDefault`: the concierge default (`$HOME/.claude`) is shared with the terminal
+    // `claude` CLI, so a terminal login clobbers the OAuth Sparkle expects. Prefer a dedicated account
+    // and route away from a clobbered default — recorded state still reads it healthy, so nothing else
+    // would (see accountSelection `clobberedDefaultIds`).
+    const resolved = await accountConfigDirFor(CONCIERGE_ACCOUNT_KEY, {
+      avoidClobberedDefault: true,
+    });
     // `effectiveConfigDir`, not `resolved`: an unreadable accounts backend must not silently move
     // the turn to the DEFAULT account while the session pointer still names another one.
     rebindSessionToAccount(resolved);

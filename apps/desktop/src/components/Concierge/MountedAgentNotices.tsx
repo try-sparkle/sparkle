@@ -81,6 +81,8 @@ import { thrashReportFor } from "../../engine/agentThrash";
 import { quotaBlockForAgent } from "../../engine/engineRegistry";
 import { hasUnmetGoal } from "../../engine/agentGoal";
 import { goalBadgeFor, stallInputsFor } from "../rowAttention";
+import { humanBlockIn } from "../../services/humanBlockFor";
+import { useNudgeFlagSnapshot } from "../../useNudgeFlags";
 import { pendingCount, useAgentInbox } from "../../stores/inboxStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
@@ -163,6 +165,10 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
   // pure waste, and it is measurable: it is what pushed ConciergeHost.liveness's 50-send row over
   // its timeout once this component was mounted in the column. The memo is keyed on every input,
   // so it cannot serve a stale verdict — including `now`, which is what makes a verdict APPEAR.
+  // Read as a SNAPSHOT so the memo's dependency on the flag table is one the linter can see and
+  // the compiler enforces — a counter nothing read was reported as an "unnecessary dependency"
+  // whose suggested removal silently restores the stale reading (roborev 65409).
+  const nudgeFlags = useNudgeFlagSnapshot();
   const notices = useMemo(() => {
     const quota = quotaBlockForAgent(agentId, now);
     const thrash = thrashReportFor(agentId, now, {
@@ -179,7 +185,17 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
   // to `stopped` like every other reader, so an unobserved agent still makes no claim.
     const calmStatus = calmStatusOf(status, resolveStage(bs, stageOverride));
     const stall = stallReport(
-      stallInputsFor(calmStatus, now, goal, { bs, ws, stageOverride }, quota),
+      // `humanBlock` for the same reason `quota` is here: this surface computes its OWN report, so
+      // omitting it left the composer's pill row unable to emit `stall:blocked-on-human` — making the
+      // explainer copy for it unreachable while the row's dot was red (roborev 65339).
+      stallInputsFor(
+        calmStatus,
+        now,
+        goal,
+        { bs, ws, stageOverride },
+        quota,
+        humanBlockIn(nudgeFlags, agentId),
+      ),
     );
     return agentNotices({
       thrash,
@@ -193,7 +209,7 @@ export function MountedAgentNotices({ agentId, side }: { agentId: string; side: 
       // the pill that says what it means, and the pill has to exist for that click to land on.
       goal: goalBadgeFor(goal, now),
     });
-  }, [agentId, now, goal, status, bs, ws, stageOverride, pending, entries]);
+  }, [agentId, now, goal, status, bs, ws, stageOverride, pending, entries, nudgeFlags]);
 
   // ── WHICH PILL IS OPEN ───────────────────────────────────────────────────────────────────────
   // One at a time: two open explainers push the composer down twice as far, and the pill row sits

@@ -24,7 +24,7 @@ import { recordTrialSend } from "../services/trialMeter";
 import { checkClaude, claudeSessionInfo } from "../preflight";
 import { buildClaudeExec, buildControlMcpConfig, SHELL } from "../services/claudeSpawn";
 import { shouldResetReusedSlotIdentity } from "../services/slotIdentity";
-import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona, sparkleControlProtocol } from "../services/buildAgent";
+import { workerPersona, workerMission, WORKER_RESULT_RELPATH, parseWorkerResult, orchestrationPersona, genericAgentProtocol } from "../services/buildAgent";
 import {
   startOrchestrationBridge,
   orchestratorMcpPaths,
@@ -73,6 +73,7 @@ import {
 } from "../services/conciergeDispatch";
 import {
   briefForLaunch,
+  briefRecord,
   noteBriefFailed,
   noteBriefLaunchAbandoned,
   noteBriefLaunched,
@@ -858,6 +859,12 @@ function AgentPaneInner({
             parentBranch,
             resultPath,
             guardrails: useSettingsStore.getState().guardrailsEnabled,
+            // `[preview].agent_eagerness`, read HERE rather than inside the persona for the same
+            // reason the orchestrator branch below does it — `buildAgent` stays a pure string
+            // module with no store import. A worker may call `preview` (its tier is `free`), so it
+            // is briefed on it and the human's knob governs the ask; without this line the worker
+            // brief would ignore a project that set `"never"`.
+            previewEagerness: useSettingsStore.getState().previewEagerness,
           }),
           initialPrompt: workerMission(agent.task ?? "", agent.id),
           configDir,
@@ -928,6 +935,11 @@ function AgentPaneInner({
             // it a bigger number just makes it spawn into a queue and wait (sparkle-01xv).
             maxConcurrentWorkers: enforcedWorkerCap(useSettingsStore.getState()),
             guardrails: useSettingsStore.getState().guardrailsEnabled,
+            // `[preview].agent_eagerness` (bead sparkle-3475b.8). Read HERE rather than inside the
+            // persona so `buildAgent` stays a pure string module with no store import — the same
+            // split `guardrails` above uses. Read at COMPOSE time: changing the knob briefs the
+            // next agent launched, not one already running on the old prompt.
+            previewEagerness: useSettingsStore.getState().previewEagerness,
           });
           // Read the held brief for THIS launch (undefined when resuming, or when the agent was
           // spawned empty). Remembered in a ref so the readiness effect below reports the
@@ -998,7 +1010,15 @@ function AgentPaneInner({
           // every relaunch.
           permissionMode: agent.permissionMode,
           mcpConfig: controlMcpConfig,
-          appendSystemPrompt: controlMcpConfig ? sparkleControlProtocol() : undefined,
+          // The control preamble AND the preview protocol, as one value — see
+          // `genericAgentProtocol`. Both are gated on the same `controlMcpConfig` fact because the
+          // `preview` tool lives on that MCP server: telling an agent to call a tool it was not
+          // given is the unactionable-instruction failure the fragment's own header forbids.
+          appendSystemPrompt: controlMcpConfig
+            ? genericAgentProtocol({
+                previewEagerness: useSettingsStore.getState().previewEagerness,
+              })
+            : undefined,
         });
       }
       setSpawn({
@@ -1226,22 +1246,35 @@ function AgentPaneInner({
     // paste and no Enter left to lose. Note it is deliberately NOT enough to say a brief PASTED
     // here had submitted — that is precisely the claim the old code made and lost five times out of
     // five, because at this instant claude's TUI is not reading stdin yet.
+    // READ THE RECORD FIRST — `noteBriefLaunched` consumes the held entry, so asking afterwards
+    // always answers undefined.
+    const record = launchBriefRef.current ? briefRecord(agent.id) : undefined;
     const delivered = launchBriefRef.current ? noteBriefLaunched(agent.id) : undefined;
     launchBriefRef.current = undefined;
     // An argv brief bypasses `submitPrompt`, so record the prompt side-effects it would have done:
     // pinned header, prompt history, ghost-text corpus and auto-naming basis. Without this the row
     // reads as briefless (engine/newAgentAttention) even though the agent is working on the brief.
     //
-    // `humanAuthored` is LEFT AT ITS DEFAULT, and the honest reason is that it cannot matter here —
-    // not that a brief is always typed by a person. It is NOT: `spawn_build_agent` takes a `prompt`
-    // the concierge's own model may have composed. What the flag governs is
-    // `projectStore.releaseGoalDebt`, and this fires on an agent whose PTY has only just come up —
-    // no goal, no `goalDebt`, so there is no debt for either answer to release. (This reasoning
-    // moved here from the `queuePendingSend` call it replaced; it stops being true the moment spawn
-    // seeds an agent that INHERITS a goal or a debt — a reused id, a restored session. If that ever
-    // lands, thread the real `isHumanAuthored(authority)` down from the spawn caller rather than
-    // reading this comment as a licence.)
-    if (delivered) recordPromptSideEffects(agent.id, delivered);
+    // ── AUTHORSHIP IS NOW CARRIED, NOT DEFAULTED, AND THIS IS THE WARNING ABOVE COMING TRUE ─────
+    // This used to pass no `humanAuthored`, on the reasoning that it "cannot matter here" because a
+    // just-spawned PTY has no goal and no `goalDebt` for `releaseGoalDebt` to release — and it ended
+    // by naming its own expiry: "it stops being true the moment spawn seeds an agent that INHERITS a
+    // goal or a debt — a reused id, a restored session. If that ever lands, thread the real
+    // `isHumanAuthored(authority)` down from the spawn caller rather than reading this comment as a
+    // licence."
+    //
+    // `sendToBuild.seedDraft` attaching briefs landed exactly that. `epicSweepRunner` and
+    // `conciergeTools/plans` pass `humanAuthored: false` so a machine handoff cannot un-latch an
+    // escalation nothing spent, and a REUSED orchestrator row whose session is gone spawns FRESH —
+    // so this fires on an agent that really does carry `goalDebt`/`escalatedAt`. The brief now
+    // carries the flag (services/agentBrief `BriefRecord`); `true` remains the default only for a
+    // brief attached without one, which is the brand-new row `buildAgentSpawn` creates.
+    //
+    // The record also says the prompt is ALREADY in the store, so this completes the terminal marker
+    // instead of appending a second identical `promptHistory` row.
+    if (delivered) {
+      recordPromptSideEffects(agent.id, delivered, {}, record?.humanAuthored ?? true, record);
+    }
     void flushPendingSends(agent.id).catch((e) =>
       console.warn("flushPendingSends failed", e),
     );

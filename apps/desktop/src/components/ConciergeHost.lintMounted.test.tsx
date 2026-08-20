@@ -123,6 +123,9 @@ vi.mock("../stores/runtimeStore", () => ({
 import { ConciergeHost, type ConciergePromptTarget } from "./ConciergeHost";
 import type { ConciergeFeed } from "../useConciergeFeed";
 import { useProjectStore } from "../stores/projectStore";
+// THE REAL CABLE — what actually mounts, as of bead sparkle-9gsjqm. `h.wired` below stubs only the
+// DRAWING projection, which no longer decides anything; `wireCableTo` is the gesture.
+import { useCableStore, resetCable } from "../stores/cableStore";
 import { useConciergeThreadStore } from "../stores/conciergeThreadStore";
 import { enableAiEnhancementsForTests } from "../testing/aiEnhancements";
 import { MOUNTED_NOTICE_TESTID } from "./Concierge/MountedNotice";
@@ -184,12 +187,14 @@ beforeEach(() => {
   useConciergeThreadStore.setState({ chat: [] });
   enableAiEnhancementsForTests();
   seedMountedRow();
+  resetCable();
   h.wired.mockReturnValue("left");
   h.runReplyLint.mockImplementation((input) => ({ text: input.text, violations: [], blocked: false }));
 });
 
 afterEach(() => {
   cleanup();
+  resetCable();
   vi.resetAllMocks();
 });
 
@@ -208,6 +213,13 @@ async function turn(violations: string[]) {
     violations: violations.map((check) => ({ check, severity: "warn", detail: "offered to act", span: 9, action: "warned" })),
     blocked: false,
   }));
+  // THE MOUNTING GESTURE, off the same knob the rows already set: `AgentRow`'s own
+  // `useCableStore.getState().patch(side, id)`. `"off"` unbinds, which is what those rows mean.
+  act(() => {
+    const side = h.wired();
+    if (side === "off") useCableStore.getState().unbind();
+    else useCableStore.getState().patch(side, MOUNTED.agentId);
+  });
   render(<ConciergeHost feed={FEED} promptTarget={MOUNTED} />);
   await flush();
   fireEvent.change(screen.getByLabelText("Message"), { target: { value: "spawn a worker" } });

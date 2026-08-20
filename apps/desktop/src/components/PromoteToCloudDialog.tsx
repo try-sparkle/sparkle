@@ -137,6 +137,11 @@ export function promoteDialogDeps(args: {
           ? invoke<Preflight>("promotion_preflight", {
               root: project.rootPath,
               agentId: agent.id,
+              // `projectId` is what lets Rust read the branch→agent ownership table before deciding
+              // WHICH branch this promotion will push to origin. Without it the preflight adopts
+              // whatever happens to be checked out into the worktree — a colleague's branch, another
+              // agent's — and the promotion publishes it (bead `sparkle-pgkbn4`).
+              projectId: project.id,
               worktree: agent.worktreePath,
               baseBranch,
             }).catch(() => null)

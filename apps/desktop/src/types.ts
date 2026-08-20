@@ -85,6 +85,15 @@ export interface AgentTab {
   // under the agent name (see AgentSidebar / FittedAgentName). Optional so legacy records need no
   // migration; undefined/empty renders nothing.
   activity?: string;
+  // Epoch ms the CURRENT `activity` line was last written (stamped by setAgentActivity). The whole
+  // point: `activity` is a SELF-REPORT, and a self-report with no timestamp is read as if it were
+  // perpetually current — an agent that narrated "blocked on the outage" and then died leaves that
+  // line looking live for hours, which is exactly how a dead agent looked "explained" (bead
+  // sparkle-s8y5t6). With this stamp every consumer can treat the string as a TIMESTAMPED QUOTE —
+  // "what it SAID it was doing, N ago" — and judge liveness from real tool activity instead. Cleared
+  // (undefined) whenever the line is cleared. Optional, so legacy/restored records read as "unknown
+  // age", which callers must treat as stale — never as fresh (see engine/activityFreshness).
+  activityAt?: number;
   // What this agent is trying to ACHIEVE, and whether it has (engine/agentGoal.AgentGoal).
   //
   // Distinct from `activity` in the way that matters: `activity` is what the agent is doing right

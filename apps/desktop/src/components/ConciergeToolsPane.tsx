@@ -1,4 +1,4 @@
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useMemo, useState, type CSSProperties } from "react";
 import { FiAlertTriangle, FiSlash } from "react-icons/fi";
 import { C, FONT_WEIGHT, ON_BRAND_FILL } from "../theme/colors";
 import { useSettingsStore } from "../stores/settingsStore";
@@ -32,6 +32,13 @@ import {
 
 import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../theme/scale";
 import { SECTION_LABEL, tag } from "./labelTreatment";
+import {
+  ConciergePolicyScopeBar,
+  ConciergeProjectPolicyPane,
+  policyScopeSlugs,
+  useConciergeProjectPolicy,
+  type PolicyScope,
+} from "./ConciergeProjectPolicy";
 // The ⋯ Settings → "Concierge tools" pane: every tool the concierge can invoke, grouped by domain,
 // each with an allow / ask first / never control.
 //
@@ -114,104 +121,124 @@ export function ConciergeToolsPane() {
   // How many rules the human has actually set — what "Reset all" would discard, and whether there
   // is anything for it to do at all.
   const ruleCount = Object.keys(overrides).length;
+  // WHICH PROJECT THIS PANE IS ABOUT. `null` — every project — is the default and renders exactly
+  // what this pane has always rendered: the scope switcher is the only thing added to the global
+  // screen, because a permission surface that grew more confusing in its ordinary state would have
+  // cost more than the per-project view gained.
+  const [scope, setScope] = useState<PolicyScope>(null);
+  const { ownOrgs, projectPolicy } = useConciergeProjectPolicy();
+  const scopeSlugs = useMemo(() => policyScopeSlugs(Object.keys(projectPolicy)), [projectPolicy]);
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
+      <ConciergePolicyScopeBar scope={scope} slugs={scopeSlugs} onScope={setScope} />
       {gated && <AiEnhancementsGate remedy={access.remedy} />}
-      {/* WHAT IT DID, above what it MAY do — the same question in two tenses, and this is the tense
-          people arrive on this pane asking about ("why didn't it merge the PR?"). Ungated on
-          purpose: the record of what already happened does not stop being true when enhancements
-          go off, and it renders its own empty state when there is nothing to show. */}
-      <ConciergeAuditPane />
-      {/* ABOVE the tool rows, and outside the gated block on purpose. Everything below this asks
-          "what may the concierge do on its own"; this asks "what does MY selection do", which is
-          true whether or not the paid half is running. */}
-      <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-        <h3 style={groupHeading}>Copying</h3>
-        <SettingCheckbox
-          label="Copy on selection"
-          checked={copyOnSelection}
-          onToggle={() => setCopyOnSelection(!copyOnSelection)}
+      {scope !== null ? (
+        <ConciergeProjectPolicyPane
+          slug={scope}
+          overrides={overrides}
+          ownOrgs={ownOrgs}
+          projectPolicy={projectPolicy}
+          gated={gated}
         />
-        <p style={settingBlurb}>
-          Highlight anything Sparkle said and it goes straight to your clipboard. The copy button
-          beside each answer works either way — and copies the original markdown, so tables and code
-          blocks paste intact.
-        </p>
-      </section>
-      {/* THE TUNER'S ONLY SWITCH. Without a row here the default-off flag is not "opt-in", it is
-          unreachable — and an unreachable flag retires the whole §4e path (the classify command,
-          its timeout, the argv/env hardening, the comparison log) into code that can never run and
-          a tuning corpus that can never gain a row. Outside the gated block for the same reason as
-          Copying above: it spends the user's OWN Claude subscription, not Sparkle credits, so it
-          does not depend on the paid half being on. */}
-      <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-        <h3 style={groupHeading}>Dictation tuning</h3>
-        <SettingCheckbox
-          label="Help tune auto-send"
-          checked={autoSendTuner}
-          onToggle={() => setAutoSendTuner(!autoSendTuner)}
-        />
-        <p style={settingBlurb}>
-          After each auto-send, grade the sentence with a background Haiku call and record it beside
-          what the built-in heuristic guessed — the only way to find out when auto-send fired too
-          early. It runs on your own Claude subscription rather than Sparkle credits, one call at a
-          time, well after the message has gone. Off by default; auto-send itself works either way.
-        </p>
-      </section>
-      {/* THE TAXONOMY, AND IT HAS FOUR AXES RATHER THAN THREE. "Irreversible, outward-facing, or
-          metered" was the whole of it until the screenshot domain arrived, and every one of those
-          three words is FALSE about a screen capture: it destroys nothing, publishes nothing and
-          bills nothing — and it still asks, because of what it can SEE. A blurb that lists only the
-          first three mis-describes the very default `privacy-sensitive` was minted to create, which
-          is the one thing this box exists to get right. */}
-      <div style={noticeBox}>
-        Each tool is set on its own. Anything left on its default is decided by how risky it is —
-        reading Sparkle’s own data and other reversible work happens silently, while anything
-        irreversible, outward-facing, or metered
-        {screenReadingClause(PRIVACY_TOOLS.length, "or that reads your screen")} stops to ask you
-        first. Nothing defaults to “Never”.
-      </div>
-      <BulkBar
-        gated={gated}
-        ruleCount={ruleCount}
-        onAllowAll={() => setPending("allow-all")}
-        onResetAll={() => setPending("reset-all")}
-      />
-      {/* The gate check lives HERE and only here, unlike the rows — and the difference is real
-          rather than an inconsistency. A row's buttons persist across the flip, so they need a
-          `disabled` and a defensive re-read inside their handler. This dialog does not persist:
-          the effect above drops `pending` and this guard unmounts it, so there is no rendered
-          confirm button left holding a stale closure to defend. A `disabled={gated}` inside
-          BulkConfirm would read as a second, independent guard while being statically dead — it
-          could only ever see the same `gated === false` this line already tested. */}
-      {pending && !gated && (
-        <BulkConfirm
-          action={pending}
-          ruleCount={ruleCount}
-          onCancel={() => setPending(null)}
-          onConfirm={() => {
-            void (pending === "allow-all" ? allowAllConciergeTools() : resetAllConciergeTools());
-            setPending(null);
-          }}
-        />
-      )}
-      {CONCIERGE_TOOL_GROUPS.map((group) => (
-        <section
-          key={group.domain}
-          style={{ display: "flex", flexDirection: "column", gap: 12, opacity: gated ? 0.55 : 1 }}
-        >
-          <h3 style={groupHeading}>{group.label}</h3>
-          {group.tools.map((tool) => (
-            <ToolRow
-              key={tool.name}
-              tool={tool}
-              evaluation={evaluateToolPolicy(tool.name, { overrides })}
-              gated={gated}
-            />
-          ))}
+      ) : (
+        <>
+        {/* WHAT IT DID, above what it MAY do — the same question in two tenses, and this is the tense
+            people arrive on this pane asking about ("why didn't it merge the PR?"). Ungated on
+            purpose: the record of what already happened does not stop being true when enhancements
+            go off, and it renders its own empty state when there is nothing to show. */}
+        <ConciergeAuditPane />
+        {/* ABOVE the tool rows, and outside the gated block on purpose. Everything below this asks
+            "what may the concierge do on its own"; this asks "what does MY selection do", which is
+            true whether or not the paid half is running. */}
+        <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <h3 style={groupHeading}>Copying</h3>
+          <SettingCheckbox
+            label="Copy on selection"
+            checked={copyOnSelection}
+            onToggle={() => setCopyOnSelection(!copyOnSelection)}
+          />
+          <p style={settingBlurb}>
+            Highlight anything Sparkle said and it goes straight to your clipboard. The copy button
+            beside each answer works either way — and copies the original markdown, so tables and code
+            blocks paste intact.
+          </p>
         </section>
-      ))}
+        {/* THE TUNER'S ONLY SWITCH. Without a row here the default-off flag is not "opt-in", it is
+            unreachable — and an unreachable flag retires the whole §4e path (the classify command,
+            its timeout, the argv/env hardening, the comparison log) into code that can never run and
+            a tuning corpus that can never gain a row. Outside the gated block for the same reason as
+            Copying above: it spends the user's OWN Claude subscription, not Sparkle credits, so it
+            does not depend on the paid half being on. */}
+        <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <h3 style={groupHeading}>Dictation tuning</h3>
+          <SettingCheckbox
+            label="Help tune auto-send"
+            checked={autoSendTuner}
+            onToggle={() => setAutoSendTuner(!autoSendTuner)}
+          />
+          <p style={settingBlurb}>
+            After each auto-send, grade the sentence with a background Haiku call and record it beside
+            what the built-in heuristic guessed — the only way to find out when auto-send fired too
+            early. It runs on your own Claude subscription rather than Sparkle credits, one call at a
+            time, well after the message has gone. Off by default; auto-send itself works either way.
+          </p>
+        </section>
+        {/* THE TAXONOMY, AND IT HAS FOUR AXES RATHER THAN THREE. "Irreversible, outward-facing, or
+            metered" was the whole of it until the screenshot domain arrived, and every one of those
+            three words is FALSE about a screen capture: it destroys nothing, publishes nothing and
+            bills nothing — and it still asks, because of what it can SEE. A blurb that lists only the
+            first three mis-describes the very default `privacy-sensitive` was minted to create, which
+            is the one thing this box exists to get right. */}
+        <div style={noticeBox}>
+          Each tool is set on its own. Anything left on its default is decided by how risky it is —
+          reading Sparkle’s own data and other reversible work happens silently, while anything
+          irreversible, outward-facing, or metered
+          {screenReadingClause(PRIVACY_TOOLS.length, "or that reads your screen")} stops to ask you
+          first. Nothing defaults to “Never”.
+        </div>
+        <BulkBar
+          gated={gated}
+          ruleCount={ruleCount}
+          onAllowAll={() => setPending("allow-all")}
+          onResetAll={() => setPending("reset-all")}
+        />
+        {/* The gate check lives HERE and only here, unlike the rows — and the difference is real
+            rather than an inconsistency. A row's buttons persist across the flip, so they need a
+            `disabled` and a defensive re-read inside their handler. This dialog does not persist:
+            the effect above drops `pending` and this guard unmounts it, so there is no rendered
+            confirm button left holding a stale closure to defend. A `disabled={gated}` inside
+            BulkConfirm would read as a second, independent guard while being statically dead — it
+            could only ever see the same `gated === false` this line already tested. */}
+        {pending && !gated && (
+          <BulkConfirm
+            action={pending}
+            ruleCount={ruleCount}
+            onCancel={() => setPending(null)}
+            onConfirm={() => {
+              void (pending === "allow-all" ? allowAllConciergeTools() : resetAllConciergeTools());
+              setPending(null);
+            }}
+          />
+        )}
+        {CONCIERGE_TOOL_GROUPS.map((group) => (
+          <section
+            key={group.domain}
+            style={{ display: "flex", flexDirection: "column", gap: 12, opacity: gated ? 0.55 : 1 }}
+          >
+            <h3 style={groupHeading}>{group.label}</h3>
+            {group.tools.map((tool) => (
+              <ToolRow
+                key={tool.name}
+                tool={tool}
+                evaluation={evaluateToolPolicy(tool.name, { overrides })}
+                gated={gated}
+              />
+            ))}
+          </section>
+        ))}
+        </>
+      )}
     </div>
   );
 }

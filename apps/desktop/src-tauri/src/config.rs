@@ -19,6 +19,7 @@
 //! singleton and live-reloaded by a file watcher (wired in lib.rs). The per-project layer is
 //! read on demand via `for_project` — cheap, and avoids watching arbitrary repo paths.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
@@ -253,6 +254,15 @@ pub struct ToolsConfig {
     /// (see builder_index.rs, which also gates on a stored username + API key). Aggregates only —
     /// never file paths, prompts, code, or keys.
     pub builder_index: bool,
+    /// Publish your DAILY TOKEN TOTALS to straude.com, a SEPARATE public leaderboard that competes
+    /// with the Builder Index. Independent of `builder_index` in every way — its own flag, its own
+    /// sign-in, its own reporter — so a user can run either, both, or neither. Ships OFF for the
+    /// same reason: it sends something about you to a third party, so it takes a deliberate opt-in
+    /// plus a one-time consent confirmation (see straude.rs, which also gates on a stored sign-in
+    /// token). Aggregates only — never file paths, prompts, code, project names, or keys. Note it
+    /// receives strictly LESS than `builder_index` does: straude's wire format has no field for
+    /// machine specs, installed plugins, or session-activity counters.
+    pub straude: bool,
     /// Back your `.env*` files up to a 1Password vault, and restore them into fresh agent
     /// worktrees. Like `builder_index`, defaults OFF: every other flag toggles behavior Sparkle
     /// can deliver on its own, but this one needs an external account, the `op` CLI, and a chosen
@@ -297,10 +307,128 @@ pub struct ConciergeConfig {
     /// The deterministic reply linter's policy (`[concierge.checks]`). Unlike `tools`, this ships
     /// NON-empty: the checks ARE the policy, so a fresh install lints from the first turn.
     pub checks: ConciergeChecksConfig,
+    /// GitHub org/user names the human considers HIS OWN (`[concierge].own_orgs`), lowercased and
+    /// trimmed on read. Everything else is FOREIGN, and a foreign repo floors every `mutates-main`
+    /// tool at `ask` in the policy layer.
+    ///
+    /// EMPTY BY DEFAULT, which makes every repo foreign. That is deliberate and it is not a
+    /// regression: it reproduces exactly the global stopgap this design replaces (`merge_pr` pinned
+    /// to `ask` for everything), so nobody gains authority by upgrading. Adding your org here is
+    /// the ONLY way to lift that floor — there is no per-project entry that can, because a project
+    /// entry can only tighten.
+    pub own_orgs: Vec<String>,
+    /// Per-repo tightenings (`[concierge.projects."<owner>/<repo>".tools]`), keyed by LOWERCASED
+    /// slug. GitHub is case-insensitive about owner and repo, so a differently-cased key must not
+    /// be able to miss its own rule.
+    ///
+    /// A project entry can only TIGHTEN: the policy layer takes the strictest of the global answer,
+    /// the shipped pin, the foreign floor and this. `[concierge.tools].merge_pr = "deny"` plus a
+    /// project `"allow"` is still `deny`. That asymmetry is the whole security property — otherwise
+    /// this table would be a way to hand back authority the global layer withheld.
+    ///
+    /// Global-only, like the rest of `[concierge]`: a repo's own `.sparkle/config.toml` never
+    /// reaches here, which matters MOST for repos the user does not own (see `apply_project`).
+    pub projects: std::collections::BTreeMap<String, ConciergeProjectPolicy>,
+}
+
+/// One repo's entry in `[concierge.projects]`.
+///
+/// A struct with a single field rather than a bare map, because the wire shape is frozen as
+/// `{ tools }` and the section is expected to grow siblings (a per-project note, a reason string).
+/// An entry with no `tools` table is legal and contributes no tightening.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConciergeProjectPolicy {
+    /// Tool name → `"allow"` | `"ask"` | `"deny"`, VERBATIM — unrecognized values included, for the
+    /// same reason as [`ConciergeConfig::tools`]: the frontend reads an unreadable rule as `ask`,
+    /// and narrowing here would hand back the authority the user was trying to remove.
+    pub tools: std::collections::BTreeMap<String, String>,
+}
+
+/// Repos where Sparkle will NEVER merge on its own authority, whatever any config says.
+///
+/// A FLOOR compiled into the build, not a default: config can tighten past it and can never loosen
+/// it. That is what makes the owner's standing rule ("no PR merges without a human in a repo I do
+/// not own") survive a reset, a hand-edit, or a future change to the shipped defaults.
+///
+/// Pinned byte-for-byte against `apps/desktop/shared/merge-protected-repos.json` by
+/// `merge_protected_slugs_match_the_shared_fixture`, exactly as `SPARKLE_DENY_RULES` is pinned
+/// against `destructive-commands.json` — `policy.ts` declares its own copy of the same list and
+/// pins it against the same file, so a slug added on one side and forgotten on the other fails a
+/// test instead of drifting.
+pub const MERGE_PROTECTED_SLUGS: [&str; 2] = ["plow-pbc/tkmx-client", "plow-pbc/tkmx-server"];
+
+/// Is this `owner/repo` on the shipped merge-protected pin list?
+///
+/// Case- and whitespace-insensitive: GitHub treats `Plow-PBC/TKMX-Server` and
+/// `plow-pbc/tkmx-server` as one repo, and a pin that a differently-cased remote could slip past
+/// would not be a floor at all.
+///
+/// NOT WIRED YET — say so rather than implying a guarantee that does not exist. The Rust backstop
+/// in `worktree.rs` (§6 of the contract) WILL call this from `merge_pr` / `land_agent_branch`,
+/// because `services/openPrs.ts` invokes `merge_pr` outside the concierge policy seam. Until that
+/// gate lands, the only enforcement of this pin is in TypeScript, and nothing here will surface
+/// that: both items are `pub` in a lib crate, so `dead_code` never fires. The gate's own PR owns
+/// the structural test (the pattern is `knightwatch.rs`'s `merge_pr_actually_runs_the_gate`) that
+/// keeps the wiring from being absent — or deleted later — silently.
+///
+/// When it is wired it enforces `deny` ONLY, never `ask` — there is no human on that path to answer
+/// a question — so an unresolvable slug does not refuse there even though the concierge layer floors
+/// it at `ask`. That asymmetry is deliberate, not a gap.
+pub fn is_merge_protected_slug(slug: &str) -> bool {
+    let slug = slug.trim().to_lowercase();
+    MERGE_PROTECTED_SLUGS.contains(&slug.as_str())
 }
 
 /// The three values a `[concierge.tools]` entry may take. Mirrors PolicyDecision in policy.ts.
 const CONCIERGE_TOOL_DECISIONS: [&str; 3] = ["allow", "ask", "deny"];
+
+/// Does this already-trimmed, already-lowercased key look like a GitHub `owner/repo` slug?
+///
+/// SHAPE ONLY — it cannot know whether the repo exists, and it deliberately does not try. What it
+/// catches is the class of hand-edit that fails OPEN: a key that can never match a resolved
+/// `remote.origin.url` contributes no tightening at all, and without this the user gets no warning
+/// on the one line he wrote to restrict a repo. The plausible misses are all shape errors —
+/// `"tkmx-server"` (owner omitted), `"https://github.com/plow-pbc/tkmx-server"` (a pasted URL),
+/// `"plow-pbc/tkmx-server.git"`, a stray inner space. Every OTHER mistake in this section already
+/// warns, so silence here reads as acceptance.
+///
+/// Permissive about the character set on purpose (GitHub is stricter about owners than about
+/// repos): the point is to catch "this is not an owner/repo at all", not to re-implement GitHub's
+/// naming rules and reject a name a future GitHub allows.
+fn looks_like_repo_slug(slug: &str) -> bool {
+    let mut parts = slug.split('/');
+    let (Some(owner), Some(repo), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    // A `.git` SUFFIX IS REJECTED EXPLICITLY, even though `.` is otherwise a legal character
+    // (roborev 65417). `repo_slug_from_url` strips `.git` before lowercasing, so a resolved slug
+    // NEVER carries the suffix — which makes `"plow-pbc/tkmx-server.git"` a key that cannot match
+    // anything and therefore contributes no tightening at all. That is the fail-open case this
+    // whole check exists to report, and it is the single most likely one: the `.git` form is what
+    // you get by copying the tail of a clone URL. Both the doc comment above and the user-facing
+    // remedy text already name it, so letting it pass silently was a promise nothing kept.
+    if repo.strip_suffix(".git").is_some() {
+        return false;
+    }
+    let ok = |s: &str| {
+        !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    ok(owner) && ok(repo)
+}
+
+/// Does this already-trimmed, already-lowercased entry look like a bare GitHub org or username?
+///
+/// The mirror-image failure of [`looks_like_repo_slug`], and the more expensive one:
+/// `own_orgs = ["drodio/sparkle"]` — a repo slug where an ORG goes — matches nothing, so every repo
+/// stays foreign and Sparkle keeps asking, while the user believes he has lifted the floor. Silence
+/// there is the difference between "I turned this off" and "I thought I turned this off".
+fn looks_like_repo_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
 
 /// The three values a `[concierge.checks.<id>].severity` may take, described as they BEHAVE in this
 /// build rather than as designed — the two differ, and saying otherwise here is the same unkept
@@ -783,6 +911,61 @@ impl Default for PushersConfig {
     }
 }
 
+/// The SECOND-MODEL ADVISOR PASS (`[advisor]`) — bead `sparkle-revqiv`.
+///
+/// At the moment an epic becomes a build orchestrator, a model DIFFERENT from the one that wrote the
+/// plan reviews it through three lenses (scope one agent can hold, checkable completion criterion,
+/// collision with work in flight) and comments. It never rewrites a plan and it never blocks a
+/// handoff.
+///
+/// FLAT AND SCALAR ONLY, and GLOBAL ONLY, for the same two reasons `[pushers]` above records: every
+/// field is a bool/string so the whole section stays editable through the existing dotted setters,
+/// and which model this machine spends its owner's quota on is a property of the human sitting at
+/// it, not of a repo that happens to be cloned onto it.
+///
+/// ══ WHY `enabled` SHIPS TRUE, WHEN `[pushers]` HAD TO ARGUE FOR IT ═════════════════════════════
+///
+/// Because the flag is NOT what bounds spend here — the ZERO-SPEND GATE is. Before every pass the
+/// advisor reads the LIVE usage payload and dispatches only while `extra_usage.is_enabled` is FALSE,
+/// i.e. only while the usage-credit meter is DISARMED and no call CAN bill outside the Claude Max
+/// subscription. Armed credits, a reached spend limit, an unreadable payload and an absent field all
+/// REFUSE (`services/advisor/spendGate.ts`). So the worst case of shipping this on is a pass that
+/// declines to run, which is why the switch can default to the useful direction.
+///
+/// The switch still exists, and its job is the one the gate cannot do: turning the feature off for
+/// reasons that have nothing to do with money — noise, a bad model, an investigation.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct AdvisorConfig {
+    /// Master switch. Ships TRUE — see the section doc for why that is defensible here and had to
+    /// be argued for in `[pushers]`.
+    pub enabled: bool,
+    /// Which model reviews the plan. Ships `claude-opus-5`.
+    ///
+    /// A CONFIG LINE, NEVER A HARDCODED TIER, and the default is a considered choice rather than a
+    /// reach for the biggest number: Opus 5 is a different FAMILY from the Sonnet planner (which is
+    /// the entire premise — a model reviewing its own plan shares its own blind spots) at half
+    /// Fable's price (`spend.rs` prices Fable at $10/$50 per Mtok, the most expensive row in the
+    /// table; Opus 5 is $5/$25). Fable is one edit to this line away.
+    ///
+    /// RESOLVED, not obeyed blindly. `services/advisor/model.ts` takes this id only if it is in the
+    /// model catalog AND is not the planner's own model; otherwise it falls to the first catalog
+    /// entry that is not the planner's, and failing that SKIPS the pass with a reason. An id absent
+    /// from the catalog is ignored rather than dispatched — `research.rs` would refuse it anyway
+    /// (`RESEARCH_MODEL_ALLOWLIST`), and one typo in a hand-edited TOML must cost exactly that knob.
+    ///
+    /// A blank string means "unset", which is the same thing as absent: the catalog rule decides.
+    pub model: String,
+}
+
+impl Default for AdvisorConfig {
+    /// The shipped envelope. Stated here and mirrored by the `[advisor]` block in
+    /// `DEFAULT_TEMPLATE` (asserted by `advisor_template_matches_the_default`).
+    fn default() -> Self {
+        Self { enabled: true, model: "claude-opus-5".to_string() }
+    }
+}
+
 /// 1Password env-backup state that isn't a simple on/off toggle. Machine-wide (like [tools]): a
 /// per-project value is ignored with a warning, because the vault is a property of the user's
 /// 1Password account, not of any one repo.
@@ -805,6 +988,49 @@ pub struct OnePasswordConfig {
     /// agent starts without its project's secrets. Off by default: it writes files into a fresh
     /// worktree, which the user should ask for rather than discover.
     pub seed_worktrees: bool,
+}
+
+/// One place Sparkle can publish a post to ([publish.destinations.<id>]). Bead `sparkle-131ms.3`.
+///
+/// v1 validates exactly ONE destination (drodio.com), but this is modeled as a keyed table with an
+/// `active` pointer anyway. That is the cheap half of the founder's "drodio.com now, but design for
+/// X + LinkedIn next" decision — a second destination is then an added row, whereas promoting a
+/// flat `url`/`name` pair into a table later is a config migration on every user's machine.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PublishDestination {
+    /// What the user sees in the configure pane and on the approval card ("drodio.com").
+    pub name: String,
+    /// The destination's MCP endpoint. Stored as the user typed it and sent verbatim — the
+    /// endpoint answers both the bare and trailing-slash forms with no redirect (verified
+    /// 2026-08-17), so there is nothing to gain from normalizing and a normalized value would not
+    /// match what the user reads back out of their own file. Validated by
+    /// `publish_url::validate_destination_url`, at parse time AND again at call time.
+    pub url: String,
+    /// A credential REFERENCE, never the secret: the keychain account key is derived from the
+    /// destination's id (`publish_credential::account_key`). Nothing in this struct is a token, so
+    /// a serialized `config.toml` can be pasted into a bug report without leaking one — which is
+    /// pinned by a test rather than left to review.
+    pub has_credential_in_keychain: bool,
+}
+
+/// Where Sparkle may publish ([publish]).
+///
+/// MACHINE-WIDE, like [concierge] and [pushers], and for the same kind of reason: a destination is
+/// a network egress target that Sparkle sends a bearer token to. A repo that could set this would
+/// grant itself one merely by being cloned with a block in its checked-in config, on a machine
+/// whose owner never chose it. `build_effective` therefore ignores `[publish]` in a per-project
+/// `.sparkle/config.toml` and warns.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct PublishConfig {
+    /// The destination id publish ops act on. `None` until one is configured — the concierge's
+    /// publish tools then refuse with "no destination configured" rather than guessing, which is
+    /// the right failure when there is more than one row and no stated choice.
+    pub active: Option<String>,
+    /// Configured destinations, keyed by id. Empty on a fresh install; Sparkle can publish nowhere
+    /// until the user configures one, which is the correct default for an outward-facing action.
+    pub destinations: BTreeMap<String, PublishDestination>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1304,23 +1530,86 @@ pub struct WorktreePoolConfig {
 pub struct PreviewConfig {
     /// Master switch. false = never detect, never spawn a preview server.
     pub enabled: bool,
-    /// How long a preview keeps serving after its pane is covered, before it is stopped. A grace
-    /// period, not a cap: stopping the instant a pane is covered would make flipping to Plan and
-    /// back pay a full cold compile (10–30s for Next).
+    /// How long a preview keeps serving after the last SIGN OF LIFE, before it is stopped.
+    ///
+    /// THIS MEASURES IDLENESS, NOT INVISIBILITY. It used to be written as "after its pane is
+    /// covered": a preview lived in a pane that flipping the pair to Plan would cover, so "nobody
+    /// is looking" was a fact the frontend could read off the layout. The pane was removed on
+    /// 2026-08-19 (a preview is a card in the concierge chat, not a peer column) and a CARD CANNOT
+    /// BE COVERED — so the covered-ness this key was phrased around became permanently false for
+    /// every healthy preview, and the timer that enforced it stopped bounding anything at all. A
+    /// dev server ran until worktree teardown or app exit while this doc went on naming
+    /// `idle_grace_min` as one of the three things that stop a server (bead `sparkle-9yck3i`).
+    ///
+    /// What restarts the window, per `services/previewIdleGrace.ts`, which owns the timer:
+    ///   • any `preview:state` update for that preview — including a repeat that changes nothing;
+    ///   • a human or an agent touching it: the card's refresh, a click through to the url, a
+    ///     `preview_inspect` capture.
+    /// Note that `supervise()` in `preview.rs` goes quiet once a server is `Ready` (it transitions
+    /// again only to `Crashed`/`Failed`), so on a preview nobody touches the second bullet is the
+    /// only thing that can move this clock — which is exactly the case the window is here to end.
+    ///
+    /// STILL A GRACE PERIOD, NOT A CAP. Anything that wants the preview restarts the whole window,
+    /// so an actively-used server is never reclaimed on a schedule; and the window is generous
+    /// because a cold restart is not free (10–30s of compile for Next).
     pub idle_grace_min: u32,
-    /// When a preview pane may open WITHOUT being asked for: `"returning"` (the five-condition
-    /// conjunction in §10 — the default), `"never"`, or `"always"`. Anything else is rejected in
-    /// `validate` and falls back to `"returning"`.
-    pub auto_open: String,
+    /// How eagerly an AGENT is told to OPEN a preview of its own work, in the brief it is given.
+    ///
+    /// THE ONLY REMAINING QUESTION ABOUT WHEN, now that `auto_open` is gone. That key decided when a
+    /// preview PANE could reveal itself unasked; the pane was removed on 2026-08-19 (the founder:
+    /// a preview is a card in the concierge chat, not a peer column beside Build and Plan), and a
+    /// card needs no permission to appear — it is a projection of the live preview state, so
+    /// surfacing is automatic. What is left to govern is whether a preview is opened AT ALL.
+    ///
+    /// Values, and every one of them is a real position rather than a slider:
+    ///   • `"visual"` (default) — the brief tells the agent to open a preview whenever the work
+    ///     changes something a person would LOOK at. Silent on the rest, so a pure refactor or a
+    ///     config edit costs nothing.
+    ///   • `"always"` — open one whenever the project can be previewed at all, whatever the change.
+    ///   • `"never"`  — the brief says nothing about previews. The manual affordances are untouched;
+    ///     this only stops Sparkle from asking on your behalf.
+    ///
+    /// Anything else is rejected in `validate` and falls back to `"visual"`.
+    pub agent_eagerness: String,
 }
 
-/// The accepted values of `[preview].auto_open`.
-const PREVIEW_AUTO_OPEN_MODES: &[&str] = &["returning", "never", "always"];
+/// The accepted values of `[preview].agent_eagerness`.
+const PREVIEW_AGENT_EAGERNESS_MODES: &[&str] = &["visual", "always", "never"];
 
-/// Ceiling for `[preview].idle_grace_min`. Two hours is far past any "flip to Plan and back"
-/// round trip the grace exists to absorb, and short enough that a forgotten preview cannot
-/// outlive a working session. See the note at its check in `validate`.
+/// Ceiling for `[preview].idle_grace_min`. Two hours is far past any pause in the work the grace
+/// exists to absorb (a long build, a meeting, reading the diff), and short enough that a forgotten
+/// preview cannot outlive a working session. See the note at its check in `validate`.
 const PREVIEW_IDLE_GRACE_MAX_MIN: u32 = 120;
+
+/// Display preferences for surfaces the founder READS rather than configures — today, just the
+/// shape a bead card draws in when the concierge names a bead. Machine-wide (like
+/// [capture]/[voice]): how a card renders is a property of the person reading the column, not of
+/// any repo, so a per-project value is ignored with a warning.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UiConfig {
+    /// Render a bead card EXPANDED the moment the concierge names it, instead of as a pill the
+    /// reader has to click open. The founder's ask, verbatim: "I wanna try changing things such
+    /// that you show these bead cards as expanded by default and of me having to click on them to
+    /// expand them." Default true.
+    ///
+    /// SET IT `false` AND THE BEHAVIOUR IS EXACTLY WHAT SHIPPED BEFORE — every card starts
+    /// collapsed and opens on a click. That is the whole revert, and it is deliberately ONE key:
+    /// "let's give that a try" is an experiment, and an experiment needs an off switch that does
+    /// not require finding every place a default leaked to.
+    pub bead_cards_expanded: bool,
+    /// How many cards ONE REPLY may expand before the rest fall back to pills. `0` = NO CAP, and
+    /// that is the shipped default: the founder chose to find the ceiling by feel rather than have
+    /// one guessed for him. A reply routinely names eight or more beads and each expanded card runs
+    /// several hundred pixels, so this is the knob to reach for if the transcript starts swamping
+    /// the prose between the cards.
+    ///
+    /// THE CAP COUNTS ONLY IDS THAT RESOLVE to a real bead, which is not a detail. The linkifier
+    /// upstream is loose BY DESIGN and hands the renderer every id-SHAPED token in the message —
+    /// ordinary hyphenated English like "auto-heal" and "one-shot" included — so a cap spent on
+    /// prose would collapse the one card the reader actually wanted. See `BeadPill.tsx`.
+    pub bead_cards_expanded_max: u32,
+}
 
 /// Menu-bar capture flow. Machine-wide (like [workers]/[ai]): the OS registers ONE global
 /// hotkey per machine, so a per-project value is meaningless and ignored with a warning.
@@ -1414,6 +1703,9 @@ pub struct SparkleConfig {
     /// 1Password env-backup state (chosen vault + worktree seeding). Its own section for the same
     /// reason as [roborev]: it is machine-wide state, not a per-repo preference.
     pub onepassword: OnePasswordConfig,
+    /// Where Sparkle may publish a post. Machine-wide for the same reason as [concierge]: a
+    /// destination is a network egress target Sparkle sends a bearer token to.
+    pub publish: PublishConfig,
     pub freshness: FreshnessConfig,
     /// Which PR-scoped reviewer watches this repo, or `none`. Per-project overridable; the shell
     /// merge gate reads the same key out of `.sparkle/config.toml`.
@@ -1422,6 +1714,8 @@ pub struct SparkleConfig {
     /// Live in-app browser preview (repo-scoped + per-project overridable).
     pub preview: PreviewConfig,
     pub capture: CaptureConfig,
+    /// Reader-facing display preferences (bead-card expansion). Machine-wide (see UiConfig).
+    pub ui: UiConfig,
     pub voice: VoiceConfig,
     /// Per-category Sparkle Auto-Approve rules (repo-scoped overridable, like [workflow]/[freshness]).
     pub approvals: ApprovalsConfig,
@@ -1434,6 +1728,10 @@ pub struct SparkleConfig {
     /// the same reason as [pushers]: a repo does not get to decide how much of this machine's
     /// Claude quota is spent answering review probes.
     pub babysit: BabysitConfig,
+    /// The second-model advisor pass at the epic planning→execution boundary. Machine-wide for the
+    /// same reason as [pushers]/[babysit] — which model this machine spends its owner's quota on is
+    /// a property of the human at it. See AdvisorConfig.
+    pub advisor: AdvisorConfig,
     /// Per-project "Done" stage definition (see the Definable Done & Delivered feature).
     pub done: DoneConfig,
     /// Per-project "Delivered" stage definition + detected production-ship signal.
@@ -1490,6 +1788,12 @@ impl Default for SparkleConfig {
                 // DEFAULT_TEMPLATE describes (asserted by
                 // `concierge_checks_template_matches_the_default`).
                 checks: ConciergeChecksConfig::defaults(),
+                // EMPTY for the reason on the field: every repo is foreign until the human names
+                // his org, which reproduces today's global `ask` stopgap rather than loosening it.
+                own_orgs: Vec::new(),
+                // Empty like `tools`, and for the same reason: a project entry is a TIGHTENING the
+                // human wrote, never something Sparkle infers.
+                projects: std::collections::BTreeMap::new(),
             },
             // Ships ENABLED — the founder's decision over the fail-safe default; see
             // `PushersConfig::enabled`. Stated once in `PushersConfig::default()` so this line, the
@@ -1502,10 +1806,12 @@ impl Default for SparkleConfig {
                 beads: true,
                 github: true,
                 guardrails: true,
-                // The lone default-OFF tool: nothing about this machine reaches the public
-                // leaderboard until the user turns this on AND answers the consent modal.
+                // The default-OFF reporting tools: nothing about this machine reaches EITHER public
+                // leaderboard until the user turns one on AND answers its consent modal. They are
+                // independent destinations — turning one on says nothing about the other.
                 roborev: true,
                 builder_index: false,
+                straude: false,
                 onepassword: false,
             },
             // Defaults come from the KNOWN_PLUGINS rows themselves, so there is one place to state
@@ -1524,6 +1830,10 @@ impl Default for SparkleConfig {
                 recovery_cooldown_minutes: 5,
                 max_dispatches_per_hour: 4,
             },
+            // Ships ENABLED, and unlike [pushers] that needs no argument: the ZERO-SPEND GATE bounds
+            // this, not the flag. Stated once in `AdvisorConfig::default()` so this line, the struct
+            // and DEFAULT_TEMPLATE cannot drift apart.
+            advisor: AdvisorConfig::default(),
             // No vault and no account until the user picks them, and no worktree seeding until they
             // ask for it. An unset account_id means "let `op` decide", which is right whenever
             // exactly one account is signed in.
@@ -1532,6 +1842,10 @@ impl Default for SparkleConfig {
                 account_id: None,
                 seed_worktrees: false,
             },
+            // Sparkle can publish nowhere until the user configures a destination. For an
+            // outward-facing action that is the only defensible default: a shipped default
+            // destination would be a network egress target nobody chose.
+            publish: PublishConfig { active: None, destinations: BTreeMap::new() },
             freshness: FreshnessConfig {
                 // Keep these in sync with the bash fallback in scripts/lib/sparkle-config.sh.
                 staleness_warn_commits: 25,
@@ -1552,9 +1866,18 @@ impl Default for SparkleConfig {
             preview: PreviewConfig {
                 enabled: true,
                 idle_grace_min: 10,
-                auto_open: "returning".into(),
+                // VISUAL BY DEFAULT — a product default, not a preference. Sparkle's users judge a
+                // change by looking at it, and a URL that scrolled past in a terminal is a change
+                // nobody looked at. "visual" is the honest middle: it asks for a preview exactly
+                // where one would have been worth having, and stays quiet for work that has
+                // nothing to see.
+                agent_eagerness: "visual".into(),
             },
             capture: CaptureConfig { popover_shortcut: "ctrl+shift+r".into() },
+            // Expanded, uncapped. Both halves are the founder's explicit choice (see UiConfig):
+            // cards open on sight, and NO cap — he would rather meet the ceiling and dial it down
+            // than have a number picked for him. `bead_cards_expanded = false` is the whole revert.
+            ui: UiConfig { bead_cards_expanded: true, bead_cards_expanded_max: 0 },
             voice: VoiceConfig { input_device_uid: None, allow_virtual_input: false },
             // Undefined by default: every project starts with no Done/Delivered definition until
             // the user defines one (see the Definable Done & Delivered feature).
@@ -1731,6 +2054,15 @@ struct PartialConcierge {
     /// the whole global layer. `apply_concierge` requires a table before reading it as
     /// [`PartialConciergeChecks`], whose own fields cannot then fail.
     checks: Option<toml::Value>,
+    /// A bare `Value` for the reason on `tools`: `own_orgs = "drodio"` (the singular form, an easy
+    /// thing to reach for) would otherwise fail the WHOLE-FILE parse and revert every unrelated
+    /// setting. It costs that one line instead.
+    own_orgs: Option<toml::Value>,
+    /// A bare `Value` for the reason on `tools`, and it matters more here than anywhere else in
+    /// this struct: these keys are repo slugs, so they carry `/` and `.` and MUST be quoted. A
+    /// missing quote is the single most likely hand-edit mistake in this section, and it must cost
+    /// the reader that one rule rather than the whole global layer.
+    projects: Option<toml::Value>,
 }
 
 /// `[concierge.checks]` as read from TOML.
@@ -1789,6 +2121,23 @@ struct PartialPushers {
     rest: std::collections::BTreeMap<String, toml::Value>,
 }
 
+/// `[advisor]` as read from TOML.
+///
+/// EVERY value is `toml::Value` for the reason `PartialPushers` above records: with strong types,
+/// ONE hand-edit (`enabled = "yes"`, `model = 3`) fails `toml::from_str::<PartialConfig>` for the
+/// WHOLE FILE, discarding every unrelated setting the user wrote. One typo in one advisor knob must
+/// cost exactly that knob, and `apply_advisor` drops it with a warning instead.
+///
+/// `#[serde(flatten)]` collects unknown keys into `rest` so a misspelling is REPORTED — the field
+/// set is authoritative right here, so `modle` is a typo and not a setting from the future.
+#[derive(Debug, Default, Deserialize)]
+struct PartialAdvisor {
+    enabled: Option<toml::Value>,
+    model: Option<toml::Value>,
+    #[serde(flatten)]
+    rest: std::collections::BTreeMap<String, toml::Value>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct PartialTools {
     analytics: Option<bool>,
@@ -1797,6 +2146,7 @@ struct PartialTools {
     guardrails: Option<bool>,
     roborev: Option<bool>,
     builder_index: Option<bool>,
+    straude: Option<bool>,
     onepassword: Option<bool>,
 }
 
@@ -1831,6 +2181,18 @@ struct PartialOnePassword {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialPublish {
+    active: Option<String>,
+    destinations: Option<BTreeMap<String, PartialPublishDestination>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialPublishDestination {
+    name: Option<String>,
+    url: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialFreshness {
     staleness_warn_commits: Option<u32>,
     stale_build_block_commits: Option<u32>,
@@ -1853,7 +2215,7 @@ struct PartialWorktreePool {
 struct PartialPreview {
     enabled: Option<bool>,
     idle_grace_min: Option<u32>,
-    auto_open: Option<String>,
+    agent_eagerness: Option<String>,
     // NOTE: `command`/`args`/`path` are NOT declared here on purpose — see `PreviewConfig`. Serde
     // ignores unknown keys, so a project file carrying them still parses.
 }
@@ -1861,6 +2223,12 @@ struct PartialPreview {
 #[derive(Debug, Default, Deserialize)]
 struct PartialCapture {
     popover_shortcut: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct PartialUi {
+    bead_cards_expanded: Option<bool>,
+    bead_cards_expanded_max: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1921,15 +2289,18 @@ struct PartialConfig {
     improvement: Option<PartialImprovement>,
     babysit: Option<PartialBabysit>,
     onepassword: Option<PartialOnePassword>,
+    publish: Option<PartialPublish>,
     freshness: Option<PartialFreshness>,
     review: Option<PartialReview>,
     worktree_pool: Option<PartialWorktreePool>,
     preview: Option<PartialPreview>,
     capture: Option<PartialCapture>,
+    ui: Option<PartialUi>,
     voice: Option<PartialVoice>,
     approvals: Option<PartialApprovals>,
     concierge: Option<PartialConcierge>,
     pushers: Option<PartialPushers>,
+    advisor: Option<PartialAdvisor>,
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
     builder_index: Option<PartialBuilderIndex>,
@@ -2106,14 +2477,29 @@ fn apply_preview(
     if let Some(v) = p.idle_grace_min {
         into.idle_grace_min = v;
     }
-    if let Some(v) = p.auto_open {
-        into.auto_open = v;
+    // Fully project-overridable, for the reason stated on `enabled` above: whether THIS project's
+    // work is worth looking at is a property of the project, and asking an agent to open a preview
+    // is not authority over the machine — `enabled` still gates whether any server may spawn.
+    if let Some(v) = p.agent_eagerness {
+        into.agent_eagerness = v;
     }
 }
 
 fn apply_capture(into: &mut CaptureConfig, p: Option<PartialCapture>) {
     if let Some(PartialCapture { popover_shortcut: Some(v) }) = p {
         into.popover_shortcut = v;
+    }
+}
+
+/// Per-KEY, not per-section: a file that sets only `bead_cards_expanded` must leave the cap at its
+/// default rather than resetting it, which is what a whole-struct overwrite would do.
+fn apply_ui(into: &mut UiConfig, p: Option<PartialUi>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.bead_cards_expanded {
+        into.bead_cards_expanded = v;
+    }
+    if let Some(v) = p.bead_cards_expanded_max {
+        into.bead_cards_expanded_max = v;
     }
 }
 
@@ -2219,6 +2605,147 @@ fn apply_concierge(into: &mut ConciergeConfig, p: Option<PartialConcierge>) -> V
                  effect; the master switch is `enabled` INSIDE that section",
                 checks.type_str()
             ));
+        }
+    }
+    // `[concierge].own_orgs` — the ONLY lever that lifts the foreign-repo floor. Assigned rather
+    // than merged because it is a LIST, not a table of independent rules, and because `[concierge]`
+    // is global-only so there is never a second layer to overlay onto.
+    if let Some(orgs) = p.own_orgs {
+        match orgs.as_array() {
+            Some(entries) => {
+                let mut collected: Vec<String> = Vec::new();
+                for entry in entries {
+                    // A non-string is DROPPED with a user-facing warning, never coerced. Silence
+                    // here would leave the user believing he had named his org while every repo
+                    // stayed foreign — i.e. the interruption he wrote the line to stop.
+                    let Some(name) = entry.as_str() else {
+                        warnings.push(format!(
+                            "[concierge].own_orgs contains a {}, not a name in quotes, so that \
+                             entry is ignored; repos under it stay foreign and Sparkle will keep \
+                             asking before it touches your main branch there",
+                            entry.type_str()
+                        ));
+                        continue;
+                    };
+                    // Trimmed and lowercased on read: GitHub is case-insensitive about owners, and
+                    // a stray space is invisible in the file but would silently match nothing.
+                    let name = name.trim().to_lowercase();
+                    if name.is_empty() {
+                        warnings.push(
+                            "[concierge].own_orgs contains an empty name, which matches no repo; \
+                             that entry is ignored"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    // KEPT, not dropped — the same discipline as an unrecognized decision value:
+                    // rewriting or discarding what the user wrote would hide the mistake instead of
+                    // reporting it. But an entry that cannot match any owner must SAY so, or the
+                    // user believes he lifted the foreign-repo floor and Sparkle silently keeps
+                    // asking. `own_orgs = ["drodio/sparkle"]` (a repo slug where an org goes) is the
+                    // shape that does this.
+                    if !looks_like_repo_owner(&name) {
+                        warnings.push(format!(
+                            "[concierge].own_orgs contains \"{name}\", which is not a bare GitHub \
+                             org or username, so it matches no repo; write just the owner \
+                             (\"drodio\"), not a repo slug or a URL"
+                        ));
+                    }
+                    collected.push(name);
+                }
+                into.own_orgs = collected;
+            }
+            None => warnings.push(format!(
+                "[concierge].own_orgs is a {}, not a list like own_orgs = [\"your-org\"], so it \
+                 has no effect; every repo stays foreign",
+                orgs.type_str()
+            )),
+        }
+    }
+    // `[concierge.projects."<owner>/<repo>".tools]` — per-repo TIGHTENINGS.
+    if let Some(projects) = p.projects {
+        match projects.as_table() {
+            Some(projects) => {
+                for (slug, entry) in projects.clone() {
+                    let Some(entry) = entry.as_table() else {
+                        warnings.push(format!(
+                            "[concierge.projects.\"{slug}\"] is a {}, not a section like \
+                             [concierge.projects.\"{slug}\".tools], so it has no effect",
+                            entry.type_str()
+                        ));
+                        continue;
+                    };
+                    // Lowercased for the same reason as `own_orgs`: the slug is compared against a
+                    // resolved `remote.origin.url`, and GitHub treats `Owner/Repo` and `owner/repo`
+                    // as ONE repo. A differently-cased key would silently match nothing — which
+                    // fails OPEN on a line the user wrote to tighten.
+                    let slug_key = slug.trim().to_lowercase();
+                    if slug_key.is_empty() {
+                        warnings.push(
+                            "[concierge.projects] has an entry with an empty name, which matches \
+                             no repo; it is ignored"
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    // KEPT and still applied, but REPORTED. A key that is not an `owner/repo` slug
+                    // can never equal a resolved `remote.origin.url`, so the rule contributes no
+                    // tightening — it fails OPEN on the one line the user wrote to restrict a repo,
+                    // and nothing downstream can recover it (the frontend keys by the same string,
+                    // where a miss is indistinguishable from "no rule set"). Case is only one of the
+                    // ways a key misses; these are the rest.
+                    if !looks_like_repo_slug(&slug_key) {
+                        warnings.push(format!(
+                            "[concierge.projects.\"{slug}\"] is not an \"owner/repo\" slug, so it \
+                             matches no repo and none of its rules apply; use the two-part form \
+                             (\"plow-pbc/tkmx-server\"), not a bare repo name, a URL, or a .git \
+                             suffix"
+                        ));
+                    }
+                    let Some(tools) = entry.get("tools") else {
+                        // Not a warning: an entry reserving a slug with no rules yet is legal and
+                        // contributes no tightening. It still gets a (possibly empty) row so the
+                        // settings pane can show that the user has written something about it.
+                        into.projects.entry(slug_key).or_default();
+                        continue;
+                    };
+                    let Some(tools) = tools.as_table() else {
+                        warnings.push(format!(
+                            "[concierge.projects.\"{slug}\"].tools is a {}, not a section like \
+                             [concierge.projects.\"{slug}\".tools], so no rule for that repo \
+                             applies",
+                            tools.type_str()
+                        ));
+                        into.projects.entry(slug_key).or_default();
+                        continue;
+                    };
+                    // PER KEY, never wholesale: two `[concierge.projects."x".tools]` rules written
+                    // in different places in the file must both survive, exactly as
+                    // `[concierge.tools]` entries do.
+                    let into_project = into.projects.entry(slug_key).or_default();
+                    for (name, decision) in tools.clone() {
+                        match decision.as_str() {
+                            // VERBATIM, unnarrowed — see the identical note under [concierge.tools]
+                            // below. The TS layer reads an unrecognized value as `ask`, stricter
+                            // than the derived default, and narrowing here would erase the
+                            // difference between "the user typo'd a rule" and "the user set none".
+                            Some(v) => {
+                                into_project.tools.insert(name, v.to_string());
+                            }
+                            None => warnings.push(format!(
+                                "[concierge.projects.\"{slug}\".tools].{name} is a {}, not \
+                                 \"allow\", \"ask\", or \"deny\", so that rule is ignored",
+                                decision.type_str()
+                            )),
+                        }
+                    }
+                }
+            }
+            None => warnings.push(format!(
+                "[concierge.projects] is a {}, not a section like \
+                 [concierge.projects.\"owner/repo\".tools], so no per-repo rule applies",
+                projects.type_str()
+            )),
         }
     }
     if let Some(tools) = p.tools {
@@ -2494,6 +3021,62 @@ fn apply_pushers(into: &mut PushersConfig, p: Option<PartialPushers>) -> Vec<Str
     warnings
 }
 
+/// Overlay a partial `[advisor]` section onto the shipped envelope.
+fn apply_advisor(into: &mut AdvisorConfig, p: Option<PartialAdvisor>) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let Some(p) = p else { return warnings };
+
+    // THE SAME OFF-SPELLING RULE AS `[pushers].enabled`, and for the same reason: `enabled` is the
+    // only control a user has over a feature that ships ON, and dropping `enabled = "false"` with a
+    // warning would leave the advisor RUNNING while the person who just hand-edited the TOML
+    // believes they stopped it. Recognising the spellings that unambiguously mean OFF moves in the
+    // safe direction; anything without a defensible off-reading still warns and still has no effect,
+    // so the default is never flipped by a typo.
+    if let Some(v) = p.enabled {
+        let off = match &v {
+            toml::Value::Boolean(false) => true,
+            toml::Value::Integer(0) => true,
+            toml::Value::String(s) => {
+                matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "off" | "no" | "0")
+            }
+            _ => false,
+        };
+        if off {
+            into.enabled = false;
+        } else {
+            match v.as_bool() {
+                Some(b) => into.enabled = b,
+                None => warnings.push(format!(
+                    "[advisor].enabled is a {}, not true or false, so it has no effect — the \
+                     advisor pass is still running. Use `enabled = false` to stop it.",
+                    v.type_str()
+                )),
+            }
+        }
+    }
+
+    // KEPT VERBATIM when it reads, exactly like the Pusher integers: whether the id is DISPATCHABLE
+    // is not this function's question. `services/advisor/model.ts` resolves it against the catalog
+    // and `research.rs` refuses an off-list id at dispatch, so an unknown model here costs a skipped
+    // pass with a stated reason — never a rewritten config file, and never a silent substitution.
+    if let Some(v) = p.model {
+        match v.as_str() {
+            Some(m) => into.model = m.trim().to_string(),
+            None => warnings.push(format!(
+                "[advisor].model is a {}, not a string, so it has no effect",
+                v.type_str()
+            )),
+        }
+    }
+
+    for (field, _) in p.rest {
+        warnings.push(format!(
+            "[advisor].{field} is not an advisor setting (enabled, model), so it has no effect"
+        ));
+    }
+    warnings
+}
+
 fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
     let Some(p) = p else { return };
     if let Some(v) = p.analytics {
@@ -2513,6 +3096,9 @@ fn apply_tools(into: &mut ToolsConfig, p: Option<PartialTools>) {
     }
     if let Some(v) = p.builder_index {
         into.builder_index = v;
+    }
+    if let Some(v) = p.straude {
+        into.straude = v;
     }
     if let Some(v) = p.onepassword {
         into.onepassword = v;
@@ -2586,6 +3172,100 @@ fn apply_onepassword(into: &mut OnePasswordConfig, p: Option<PartialOnePassword>
     if let Some(v) = p.seed_worktrees {
         into.seed_worktrees = v;
     }
+}
+
+/// Apply `[publish]`, returning a warning per rejected row.
+///
+/// Every rejection is WARNED ABOUT rather than silently dropped. A destination that vanishes with
+/// no explanation reads to the user as "Sparkle lost my config", and they re-add the same broken
+/// row; the warning names the id and the rule so the next edit is the fixed one. This preserves
+/// the module's "unknown/missing never errors" contract — a bad row is skipped, never fatal.
+fn apply_publish(into: &mut PublishConfig, p: Option<PartialPublish>) -> Vec<String> {
+    let Some(p) = p else { return Vec::new() };
+    let mut warnings = Vec::new();
+
+    if let Some(rows) = p.destinations {
+        for (id, row) in rows {
+            if !crate::publish_credential::destination_id_is_valid(&id) {
+                warnings.push(format!(
+                    "[publish.destinations.{id}] was ignored — a destination id may only contain \
+                     lowercase letters, digits and dashes (it names a keychain item)"
+                ));
+                continue;
+            }
+            let Some(url) = row.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+                warnings.push(format!(
+                    "[publish.destinations.{id}] was ignored — it has no `url`"
+                ));
+                continue;
+            };
+            // Validated HERE, at parse time, so a bad URL is reported when the user edits the file
+            // rather than at the moment they try to publish. The client re-validates at call time
+            // too: this layer is a courtesy, not the security boundary.
+            if let Err(e) = crate::publish_url::validate_destination_url(url) {
+                warnings.push(format!(
+                    "[publish.destinations.{id}] was ignored — {e}"
+                ));
+                continue;
+            }
+            let name = row
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .unwrap_or(&id)
+                .to_string();
+            into.destinations.insert(
+                id.clone(),
+                PublishDestination {
+                    name,
+                    url: url.to_string(),
+                    // Whether a token is actually stored is a keychain question, answered live by
+                    // `publish_credential::publish_token_present`. It is NOT read from the file:
+                    // a config that could assert "I have a credential" would let a repo fake a
+                    // configured destination, and the value would go stale the moment the user
+                    // disconnects.
+                    has_credential_in_keychain: false,
+                },
+            );
+        }
+    }
+
+    match p.active.as_deref().map(str::trim) {
+        Some("") | None => {
+            // `active` omitted (or blanked). Configuring exactly one destination and nothing else
+            // is what a first-time user writes, and leaving publishing OFF for it would be the
+            // silently-inert-feature shape: everything looks configured, nothing works, and no
+            // message says why. With exactly one destination there is no ambiguity to resolve, so
+            // it IS the active one.
+            if into.destinations.len() == 1 {
+                into.active = into.destinations.keys().next().cloned();
+            } else if into.destinations.len() > 1 && into.active.is_none() {
+                // With several, Sparkle must not guess which one posts under the user's name.
+                warnings.push(format!(
+                    "[publish] has {} destinations but no `active` — publishing stays off until \
+                     you set active to one of [{}]",
+                    into.destinations.len(),
+                    into.destinations.keys().cloned().collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        Some(active) if into.destinations.contains_key(active) => {
+            into.active = Some(active.to_string());
+        }
+        Some(active) => {
+            // Pointing `active` at a destination that does not exist is the shape that would
+            // otherwise fail at publish time with "unknown destination", long after the edit.
+            warnings.push(format!(
+                "[publish] active = \"{active}\" names no configured destination — publishing \
+                 stays off until it names one of [{}]",
+                into.destinations.keys().cloned().collect::<Vec<_>>().join(", ")
+            ));
+            into.active = None;
+        }
+    }
+
+    warnings
 }
 
 /// Materialize partial criteria into effective ones. A missing `text`/`kind` degrades to an empty
@@ -2861,6 +3541,54 @@ fn cpu_core_count() -> Option<u32> {
 /// `ram_derived_concurrency` is: zero would deadlock the orchestrator rather than degrade it.
 fn cpu_derived_concurrency(cores: u32) -> u32 {
     cores.saturating_mul(AGENTS_PER_CORE).max(1)
+}
+
+/// The per-run vitest worker cap the shared pool config (`vitest.pool.mjs`) picks when NOTHING
+/// overrides it. Mirrored here as the ceiling for what we inject, so an agent PTY never RAISES a
+/// run above the number an uncoordinated local run would already use. If you change one, change the
+/// other — `agent_test_worker_cap_survives_the_default` pins them together.
+const AGENT_TEST_WORKER_DEFAULT: u32 = 6;
+
+/// How many vitest workers ONE agent may fan out to, handed to its PTY as `SPARKLE_TEST_MAX_WORKERS`.
+///
+/// THE AMPLIFICATION THIS BOUNDS. `AGENTS_PER_CORE` prices an agent as a mostly-idle process blocked
+/// on model round-trips — true until it runs `pnpm test`, at which point one agent becomes a vitest
+/// pool of `min(AGENT_TEST_WORKER_DEFAULT, cores)` CPU-pinned workers. That pool is sized PER RUN and
+/// knows nothing of the other agents, so N agents each verifying at once is N × 6 workers on the same
+/// cores — the process/CPU storm behind the 2026 swap-thrash incident (438 → 1600+ processes, load
+/// 15 → 55), which the memory-only admission gate cannot see because reclaimable file cache reads as
+/// "available". The concurrency CEILING and the per-agent HEAP are both bounded; the per-agent
+/// PROCESS FAN-OUT was not, and a small cap times an unbounded count is still unbounded.
+///
+/// So divide the machine-wide worker budget (≈ one per core) among the agents that could be admitted
+/// at once. At the ceiling every agent gets `cores / ceiling`, so even the worst case — all of them
+/// verifying simultaneously — sums to about `cores`, not `ceiling × 6`. On the measured 18-core host
+/// with an 81-agent ceiling that is 1 worker each; on a machine whose ceiling is at or below its core
+/// count it stays at the default and nothing changes. Floored at 1 (a run needs at least one worker),
+/// and `effective_max_concurrent` is the divisor because it is the number actually admitted — a user
+/// who pins the ceiling to 4 lets each of those 4 keep `cores/4` workers.
+pub fn agent_test_worker_cap(cores: u32, effective_max_concurrent: u32) -> u32 {
+    let cores = cores.max(1);
+    let ceiling = effective_max_concurrent.max(1);
+    (cores / ceiling).max(1)
+}
+
+/// The value to inject into an agent PTY, or `None` to leave the pool's own CPU-count default in
+/// charge. `None` in two cases, both meaning "do not narrow": we can't read the core count, or the
+/// division lands at or above the default the pool would pick anyway — injecting then could only
+/// RAISE a run, which is never the direction this exists to move.
+pub fn agent_test_worker_cap_to_inject(cores: u32, effective_max_concurrent: u32) -> Option<u32> {
+    let cap = agent_test_worker_cap(cores, effective_max_concurrent);
+    (cap < AGENT_TEST_WORKER_DEFAULT).then_some(cap)
+}
+
+/// The live value to inject, reading this machine's cores and the effective ceiling. `None` when the
+/// core count is unknown (unsupported platform) — the pool then keeps its own default, exactly as it
+/// did before this existed.
+pub fn agent_test_worker_cap_env() -> Option<u32> {
+    let cores = cpu_core_count()?;
+    let effective = current_effective().effective_max_concurrent;
+    agent_test_worker_cap_to_inject(cores, effective)
 }
 
 /// Which measured dimension held the automatic limit down. Returned BY the derivation rather than
@@ -3227,17 +3955,16 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
         ));
         cfg.preview.idle_grace_min = PREVIEW_IDLE_GRACE_MAX_MIN;
     }
-    // An unrecognized auto_open mode is REPLACED with the default, not left in place: unlike a
-    // [concierge.tools] value (which the frontend reads as the stricter "ask"), nothing downstream
-    // has a safe reading for an unknown preview mode — an unmatched string would silently behave
-    // like "never" and look like the feature is broken rather than misconfigured.
-    if !PREVIEW_AUTO_OPEN_MODES.contains(&cfg.preview.auto_open.as_str()) {
+    // Same rule, same reason, for the eagerness knob: an unmatched string would read downstream as
+    // "no instruction", i.e. exactly `"never"` — the one value a typo must not be able to reach,
+    // because its symptom is a feature that silently stops happening rather than an error.
+    if !PREVIEW_AGENT_EAGERNESS_MODES.contains(&cfg.preview.agent_eagerness.as_str()) {
         warnings.push(format!(
-            "[preview].auto_open is \"{}\", which is not returning, never, or always; using \
-             \"returning\"",
-            cfg.preview.auto_open
+            "[preview].agent_eagerness is \"{}\", which is not visual, always, or never; using \
+             \"visual\"",
+            cfg.preview.agent_eagerness
         ));
-        cfg.preview.auto_open = "returning".to_string();
+        cfg.preview.agent_eagerness = "visual".to_string();
     }
     // A [concierge.tools] value that isn't allow/ask/deny is surfaced but NOT dropped. The frontend
     // policy layer reads an unrecognized rule as "ask" — deliberately stricter than the derived
@@ -3250,6 +3977,21 @@ fn validate(cfg: &mut SparkleConfig, warnings: &mut Vec<String>) {
                 "[concierge.tools].{tool} is \"{decision}\", which is not allow, ask, or deny; \
                  Sparkle will ask you before that tool runs until it is fixed"
             ));
+        }
+    }
+    // Same rule, same reason, for the per-repo tightenings. Surfaced and NOT rewritten: an
+    // unreadable per-project rule resolves to `ask`, which is stricter than the tier it would
+    // otherwise inherit, so dropping it here would restore the more permissive answer on exactly
+    // the line the user wrote to tighten one repo.
+    for (slug, project) in &cfg.concierge.projects {
+        for (tool, decision) in &project.tools {
+            if !CONCIERGE_TOOL_DECISIONS.contains(&decision.as_str()) {
+                warnings.push(format!(
+                    "[concierge.projects.\"{slug}\".tools].{tool} is \"{decision}\", which is not \
+                     allow, ask, or deny; Sparkle will ask you before that tool runs in that repo \
+                     until it is fixed"
+                ));
+            }
         }
     }
     // A `[concierge.checks.<id>].severity` that isn't block/warn/off is surfaced but NOT rewritten,
@@ -3388,11 +4130,15 @@ fn build_effective(
                 apply_roborev(&mut cfg.roborev, p.roborev);
                 apply_improvement(&mut cfg.improvement, p.improvement);
                 apply_onepassword(&mut cfg.onepassword, p.onepassword);
+                // Extended immediately rather than collected: [publish] is global-only, so there is
+                // no second layer whose warnings could interleave (same reasoning as [concierge]).
+                warnings.extend(apply_publish(&mut cfg.publish, p.publish));
                 apply_freshness(&mut cfg.freshness, p.freshness);
                 apply_review(&mut cfg.review, p.review);
                 apply_worktree_pool(&mut cfg.worktree_pool, p.worktree_pool);
                 apply_preview(&mut cfg.preview, p.preview, Layer::Global, &mut warnings);
                 apply_capture(&mut cfg.capture, p.capture);
+                apply_ui(&mut cfg.ui, p.ui);
                 apply_voice(&mut cfg.voice, p.voice);
                 apply_approvals(&mut cfg.approvals, p.approvals);
                 // Extended immediately rather than collected like `rejected_plugins`: `[concierge]`
@@ -3401,6 +4147,8 @@ fn build_effective(
                 // Extended immediately for the same reason as [concierge]: [pushers] is global-only,
                 // so there is no second layer whose warnings could interleave with these.
                 warnings.extend(apply_pushers(&mut cfg.pushers, p.pushers));
+                // Global-only like [pushers], so its warnings cannot interleave with a repo layer's.
+                warnings.extend(apply_advisor(&mut cfg.advisor, p.advisor));
                 // Global-only like [pushers], so its warnings cannot interleave with a repo layer's.
                 warnings.extend(apply_babysit(&mut cfg.babysit, p.babysit));
                 // Global-only like [babysit]/[pushers], so its warnings cannot interleave with a
@@ -3489,6 +4237,27 @@ fn build_effective(
                         "[capture] in a per-project .sparkle/config.toml is ignored — the \
                          global shortcut is a machine-wide setting; set it in the global \
                          config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.ui.is_some() {
+                    warnings.push(
+                        "[ui] in a per-project .sparkle/config.toml is ignored — how a bead card \
+                         renders belongs to the person reading the concierge column, not to one \
+                         repo; set it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                // A SECURITY boundary, the same one [concierge] draws. A publish destination is a
+                // network egress target Sparkle sends a bearer token to; a repo that could set one
+                // would point the user's publishing at a host of its choosing merely by being
+                // cloned with a block in its checked-in config. The token itself never leaves the
+                // keychain, but the URL it is sent TO is exactly the thing worth stealing.
+                if p.publish.is_some() {
+                    warnings.push(
+                        "[publish] in a per-project .sparkle/config.toml is ignored — where \
+                         Sparkle may post on YOUR behalf, and which host it sends your token to, \
+                         are not something a repo gets to set; set them in the global config.toml"
                             .to_string(),
                     );
                 }
@@ -3866,7 +4635,7 @@ pub const DEFAULT_TEMPLATE: &str = r#"# ========================================
 # Which one-time config migrations have already been applied to this file. Sparkle uses it to
 # know it has already upgraded you, so it never re-applies a migration and never overrides a
 # value you set yourself afterwards. Lowering or deleting this can re-run past migrations.
-config_version = 3
+config_version = 4
 
 # --- How agents land their work -------------------------------------------------------
 [workflow]
@@ -4012,6 +4781,29 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # fetch  = "never"     # or turn any other category back to ask-each-time
 # resume = "summary"   # auto-resume from summary on every restart (or "full", or "ask")
 # concierge_answers = false   # never route an unclassified prompt to the concierge — always ask me
+
+# --- Which GitHub orgs are YOURS (per-machine; ignored in a project file) ----------------
+# Repos under an org listed here are treated as your own. Everywhere else, Sparkle asks you
+# first before it does anything to the MAIN branch — merging a PR, landing a branch —
+# however permissive [concierge.tools] below is. Empty (the shipped value) means every repo
+# gets that treatment, which is the safe default and exactly what you want until you say
+# otherwise.
+#
+# This list is the ONLY way to lift that floor. A per-repo entry under
+# [concierge.projects."owner/repo".tools] can only make a repo STRICTER, never looser — so
+# there is no way for a repo you cloned to talk its way into more authority.
+[concierge]
+own_orgs = []          # e.g. ["your-github-org", "your-github-username"]
+
+# --- Per-repo TIGHTENINGS (per-machine; ignored in a project file) -----------------------
+# Same three values as [concierge.tools], scoped to one GitHub repo. The key is the repo's
+# "owner/repo" slug IN QUOTES — it contains a slash, so the quotes are required.
+#
+# ONLY TIGHTENS. Sparkle takes the strictest of: your global [concierge.tools] rule, this
+# rule, and the floors above. A global "deny" plus a per-repo "allow" is still deny.
+#
+# [concierge.projects."plow-pbc/tkmx-server".tools]
+# merge_pr = "deny"    # never merge a PR in that repo, even though the global rule allows it
 
 # --- Concierge autonomy, PER TOOL (per-machine; ignored in a project file) ---------------
 # How much the concierge may do on its own, tool by tool. Three values:
@@ -4197,6 +4989,19 @@ observe_interval_ms = 300000  # ms between observation cycles for one partner (5
 messages_per_hour   = 4       # challenges per partner per rolling hour. Ceiling only — lower it, never raise
 inbox_yield_pct     = 80      # if the partner's inbox is this % full or more, the Pusher stays quiet
 
+# --- Second-model advisor pass (per-machine; ignored in a project file) ------------------
+# When an epic is handed to a build orchestrator, a model DIFFERENT from the one that wrote the plan
+# reviews it — scope one agent can hold, is the completion criterion checkable, does it collide with
+# work already in flight — and leaves a comment on the bead. It NEVER rewrites a plan and NEVER
+# blocks a handoff; findings are advisory.
+# SPEND: bounded by a gate, not by this flag. Before every pass Sparkle reads your LIVE usage payload
+# and runs only while usage credits are DISARMED (extra_usage.is_enabled = false), so no call can
+# bill outside your Claude subscription. Armed credits, a reached spend limit, or a payload it cannot
+# read all REFUSE and record why on the bead.
+[advisor]
+enabled = true              # master switch — false stops the pass entirely
+model   = "claude-opus-5"   # must differ from the planner's model, and be one Sparkle can dispatch
+
 # --- Opinionated tools (per-machine; ignored in a project file) -------------------------
 # The non-AI tools Sparkle leans on, surfaced in ⋯ Settings → "Tools". Each defaults on for a
 # new install; setting one false means that tool is used NOWHERE in Sparkle. (Deepgram voice is an
@@ -4214,6 +5019,16 @@ roborev    = true   # per-commit AI code review of your BUILD-agent commits (use
 # tokenmaxxing username + API key and a one-time consent confirmation; nothing is sent until all
 # three are in place, so flipping this to true by hand alone does NOT start reporting.
 builder_index = false
+# The other reporting destination, and the other default-OFF publisher. straude.com is a SEPARATE
+# leaderboard that competes with the Builder Index — this flag is independent of the one above, so
+# you can run either, both, or neither. On, Sparkle posts your DAILY TOKEN TOTALS (per day, per
+# model, plus an estimated cost — never file paths, prompts, code, project names, or keys). It sends
+# strictly LESS than builder_index does: straude has no field for your machine specs, your installed
+# plugins, or session-activity counters. Turning it on in ⋯ Settings → "Tools" opens a browser
+# sign-in and a one-time consent confirmation; nothing is sent until both are done, so flipping this
+# to true by hand alone does NOT start reporting. Note each day you report becomes a PUBLIC POST on
+# straude.com showing your models and dollar spend.
+straude = false
 onepassword = false # back your .env* files up to a 1Password vault. Also ships OFF:
                     # it needs a 1Password account, the `op` CLI, and a chosen vault, so you opt in
                     # from ⋯ Settings → "Tools" once those exist.
@@ -4258,6 +5073,31 @@ onepassword = false # back your .env* files up to a 1Password vault. Also ships 
                        # refuses every call with "multiple accounts found". Pick it in ⋯ Settings;
                        # unset means "let `op` decide", which is right for a single account.
 seed_worktrees = false # restore backed-up env files into each newly created agent worktree
+
+# --- Where Sparkle may publish (per-machine; ignored in a project file) ------------------
+# Destinations Sparkle can post to. EMPTY BY DEFAULT — Sparkle publishes nowhere until you add
+# one here, which is the only defensible default for something that posts under your name.
+#
+# IGNORED IN A PROJECT FILE, and that is a security boundary rather than tidiness: a destination
+# is a network egress target Sparkle sends your bearer token to, so a repo you cloned must not be
+# able to name one (or repoint an existing one) merely by shipping a .sparkle/config.toml.
+#
+# The TOKEN IS NOT WRITTEN HERE. It lives in your OS keychain (macOS Keychain / Windows Credential
+# Manager) under `publish-<id>-token`; this file holds only the destination's id and URL, so it can
+# be pasted into a bug report without leaking a credential. Set the token in ⋯ Settings.
+#
+# `url` must be https (plain http is allowed only for localhost, so you can develop a destination),
+# and must carry no username/password. A row that breaks either rule is skipped with a warning
+# naming it, rather than silently dropped.
+#
+# The table is keyed by id — lowercase letters, digits and dashes — so adding a second destination
+# later is one more block, not a migration. v1 talks to exactly one at a time: `active`.
+# [publish]
+# active = "drodio"
+#
+# [publish.destinations.drodio]
+# name = "drodio.com"                    # what you see on the approval card
+# url  = "https://drodio.com/api/mcp"    # the destination's MCP endpoint, sent exactly as written
 
 # --- Claude Code plugins pre-enabled for every agent (repo-scoped; overridable per project) --
 # Sparkle turns these Claude Code marketplace plugins ON for every agent it spawns: it installs
@@ -4320,6 +5160,20 @@ consent_prompted = false   # set true once the one-time "review your commits?" p
 # here — the app writes this key when you pick a mode.
 # [improvement]
 # consent = "case_by_case"   # "always" | "case_by_case" | "never"
+
+# --- Reading preferences (per-machine; ignored in a project file) -----------------------
+# How a BEAD CARD draws when the concierge names a bead id in its reply.
+[ui]
+# true  = the card renders already open — title, id, status, priority, type, progress and
+#         "Build It" all visible with no click.
+# false = the pre-2026-08 behaviour: every bead renders as a small pill you click to expand.
+# Either way the collapse control still works: clicking the pill (or the card's x) collapses that
+# one card, and it stays collapsed for as long as that message is on screen.
+bead_cards_expanded = true
+# How many cards ONE reply may expand before the rest fall back to pills. 0 = no cap.
+# A reply can name a dozen beads and each card runs several hundred pixels tall, so lower this
+# (3 is a good first try) if expanded cards start pushing the reply's own text off screen.
+bead_cards_expanded_max = 0
 
 # --- Menu-bar capture (per-machine; ignored in a project file) --------------------------
 [capture]
@@ -4416,12 +5270,13 @@ enabled        = true
 # Capped at 120: with no max_servers and no runaway-kill path, this is one of only three things
 # that ever stops a server, so an unbounded value is a dev server that never exits.
 idle_grace_min = 10
-# When a preview pane may open WITHOUT you asking:
-#   "returning" = only if you've opened a preview for this project before, that agent is already
-#                 selected in its pair, that pair is in Build mode, and nothing is already shown
-#   "never"     = only ever open a preview by hand
-#   "always"    = open one as soon as a server is up
-auto_open      = "returning"
+# How eagerly a Sparkle agent is TOLD to open a preview of its own work. What a preview LOOKS like
+# is settled: a card in the concierge chat, showing a snapshot of the running site, which opens the
+# real localhost url when clicked. This decides how often one gets opened at all.
+#   "visual" = open one whenever the work changes something a person would look at (the default)
+#   "always" = open one whenever the project can be previewed at all
+#   "never"  = say nothing about previews in the brief; open them by hand
+agent_eagerness = "visual"
 # A PROJECT's .sparkle/config.toml may also set command / args / path / port here to override
 # previewability detection outright, e.g.:
 #   command = "pnpm"
@@ -4436,8 +5291,8 @@ auto_open      = "returning"
 # HAND-WRITTEN ONLY. Sparkle's own settings tool refuses to set command/args/path/port and will
 # tell you to edit the file directly. They are not merged into the effective config — the
 # detector reads them from the project file — so a tool that wrote one would have to report it
-# back as unset. The three keys above (enabled / idle_grace_min / auto_open) ARE merged and can
-# be set through the app.
+# back as unset. The three keys above (enabled / idle_grace_min / agent_eagerness) ARE merged and
+# can be set through the app.
 
 # --- What "Done" and "Delivered" mean for THIS project (repo-scoped) --------------------
 # These two sections let each project define its own Plan/Tasks board semantics. They are
@@ -4488,21 +5343,104 @@ fn json_to_toml_value(v: &serde_json::Value) -> Result<toml_edit::Value, String>
     }
 }
 
-/// Surgically set a dotted `path` (e.g. `workers.max_concurrent`) in a TOML document,
-/// creating intermediate tables as needed, WITHOUT disturbing surrounding comments/formatting.
-fn set_dotted(doc: &mut toml_edit::DocumentMut, path: &str, value: toml_edit::Value) -> Result<(), String> {
-    let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
+/// Split a dotted config path into key SEGMENTS, honouring TOML's quoted-key form.
+///
+/// A plain `split('.')` was correct for as long as every config key was a bare TOML key. It stopped
+/// being correct with `[concierge.projects."<owner>/<repo>".tools]`: a repo slug contains a `/`,
+/// which TOML cannot express as a bare key, so the quoting is LOAD-BEARING — and a slug may also
+/// contain a `.` (`plow-pbc/tkmx.server`), which the naive splitter tears in half. The damage is
+/// silent: the write lands under an invented nesting of tables nobody reads, so the rule the user
+/// just set does nothing and the file still parses.
+///
+/// Both TOML quoted-key spellings are accepted: `"basic"` (with `\"` / `\\` escapes) and
+/// `'literal'` (no escapes). An unterminated quote is an ERROR rather than a best guess — writing
+/// to a mis-parsed path is exactly the silent failure above.
+fn split_dotted_path(path: &str) -> Result<Vec<String>, String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut chars = path.chars().peekable();
+    loop {
+        // Skip separators; empty segments stay filtered out, as they always were.
+        while chars.peek() == Some(&'.') {
+            chars.next();
+        }
+        let Some(&c) = chars.peek() else { break };
+        if c == '"' || c == '\'' {
+            let quote = c;
+            chars.next();
+            let mut seg = String::new();
+            let mut closed = false;
+            while let Some(ch) = chars.next() {
+                if ch == '\\' && quote == '"' {
+                    // Basic strings honour escapes; the two that can appear in a key we write are
+                    // the quote itself and the backslash. Anything else is passed through verbatim
+                    // rather than being rejected — this is a config path, not a TOML parser.
+                    match chars.next() {
+                        Some(esc @ ('"' | '\\')) => seg.push(esc),
+                        Some(other) => {
+                            seg.push('\\');
+                            seg.push(other);
+                        }
+                        None => break,
+                    }
+                    continue;
+                }
+                if ch == quote {
+                    closed = true;
+                    break;
+                }
+                seg.push(ch);
+            }
+            if !closed {
+                return Err(format!("config path '{path}' has an unterminated quoted key"));
+            }
+            // A quoted segment is kept even when EMPTY (`""` is a legal TOML key), unlike the bare
+            // form where an empty segment is just a doubled dot.
+            parts.push(seg);
+            // What follows a closing quote must be a separator or the end of the path.
+            match chars.peek() {
+                None | Some('.') => {}
+                Some(other) => {
+                    return Err(format!(
+                        "config path '{path}' has '{other}' after a quoted key; expected '.'"
+                    ));
+                }
+            }
+        } else {
+            let mut seg = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch == '.' {
+                    break;
+                }
+                seg.push(ch);
+                chars.next();
+            }
+            if !seg.is_empty() {
+                parts.push(seg);
+            }
+        }
+    }
     if parts.is_empty() {
         return Err("empty config path".to_string());
     }
+    Ok(parts)
+}
+
+/// Surgically set a dotted `path` (e.g. `workers.max_concurrent`) in a TOML document,
+/// creating intermediate tables as needed, WITHOUT disturbing surrounding comments/formatting.
+///
+/// Quoted segments are one key: `concierge.projects."owner/repo.x".tools.merge_pr` addresses four
+/// levels, not six. See [`split_dotted_path`].
+fn set_dotted(doc: &mut toml_edit::DocumentMut, path: &str, value: toml_edit::Value) -> Result<(), String> {
+    let parts = split_dotted_path(path)?;
     let mut item: &mut toml_edit::Item = doc.as_item_mut();
     for part in &parts[..parts.len() - 1] {
+        let part = part.as_str();
         match item.get(part) {
             // Implicit tables keep the file tidy (only `[workflow.drift]` appears, not `[workflow]`).
             None => {
                 let mut t = toml_edit::Table::new();
                 t.set_implicit(true);
-                item[*part] = toml_edit::Item::Table(t);
+                item[part] = toml_edit::Item::Table(t);
             }
             // A malformed path that tries to descend through a scalar (e.g. `workflow.require_pr.x`)
             // would otherwise panic in toml_edit's IndexMut — return an error instead.
@@ -4511,9 +5449,9 @@ fn set_dotted(doc: &mut toml_edit::DocumentMut, path: &str, value: toml_edit::Va
             }
             Some(_) => {}
         }
-        item = &mut item[*part];
+        item = &mut item[part];
     }
-    let last = parts[parts.len() - 1];
+    let last = parts[parts.len() - 1].as_str();
     item[last] = toml_edit::Item::Value(value);
     Ok(())
 }
@@ -4522,12 +5460,13 @@ fn set_dotted(doc: &mut toml_edit::DocumentMut, path: &str, value: toml_edit::Va
 /// A missing key (or a missing intermediate table) is a no-op — removing an unset rule is harmless.
 /// A path that tries to descend through a non-table scalar is an error (matches set_dotted).
 fn unset_dotted(doc: &mut toml_edit::DocumentMut, path: &str) -> Result<(), String> {
-    let parts: Vec<&str> = path.split('.').filter(|s| !s.is_empty()).collect();
-    if parts.is_empty() {
-        return Err("empty config path".to_string());
-    }
+    // Quoted segments parsed the same way `set_dotted` parses them — a path that can be SET must be
+    // removable by the same string, or the ⋯ editor and the settings pane disagree about what a
+    // per-repo rule is called.
+    let parts = split_dotted_path(path)?;
     let mut item: &mut toml_edit::Item = doc.as_item_mut();
     for part in &parts[..parts.len() - 1] {
+        let part = part.as_str();
         match item.get(part) {
             None => return Ok(()), // intermediate table absent → nothing to remove
             Some(existing) if !existing.is_table() => {
@@ -4535,9 +5474,9 @@ fn unset_dotted(doc: &mut toml_edit::DocumentMut, path: &str) -> Result<(), Stri
             }
             Some(_) => {}
         }
-        item = &mut item[*part];
+        item = &mut item[part];
     }
-    let last = parts[parts.len() - 1];
+    let last = parts[parts.len() - 1].as_str();
     if let Some(table) = item.as_table_mut() {
         table.remove(last);
     } else if let Some(inline) = item.as_inline_table_mut() {
@@ -4547,7 +5486,7 @@ fn unset_dotted(doc: &mut toml_edit::DocumentMut, path: &str) -> Result<(), Stri
 }
 
 /// Schema revision of the on-disk global config. Bump when adding a one-time migration below.
-const CONFIG_MIGRATION_VERSION: i64 = 3;
+const CONFIG_MIGRATION_VERSION: i64 = 4;
 
 /// Apply one-time migrations to the global config FILE, recording the revision reached in
 /// `[meta].config_version`.
@@ -4692,6 +5631,51 @@ pub fn migrate_global(app_data: &Path) -> Result<(), String> {
             doc.remove("pushers");
         }
         tracing::debug!("config migration v3: removing the retired [pushers].model key");
+    }
+
+    // v4 — introduce `[concierge].own_orgs`, EMPTY, and NOTHING ELSE.
+    //
+    // A migration that CHANGES a tier would be the one thing this whole design must never do:
+    // nobody may silently gain — or lose — authority by upgrading. So this writes a key whose value
+    // is identical to the built-in default, purely so the lever is DISCOVERABLE in the file the
+    // user hand-edits. An empty list means every repo is foreign, which floors main-touching tools
+    // at `ask` — exactly the global stopgap this release replaces. Behaviour is preserved by
+    // construction, and a tier the human tightened by hand is not readable from here, let alone
+    // writable.
+    //
+    // Gated on `applied < 4` specifically, never on the aggregate — see the rule above. Skipped
+    // outright when the key already exists: a user who set his org before upgrading keeps it.
+    let concierge_is_new = doc.get("concierge").is_none();
+    let add_own_orgs = applied < 4
+        && doc
+            .get("concierge")
+            .map_or(true, |c| c.get("own_orgs").is_none());
+    if add_own_orgs {
+        if concierge_is_new {
+            let mut table = toml_edit::Table::new();
+            table.decor_mut().set_prefix(
+                "\n# --- Which GitHub orgs are YOURS (per-machine) ---------------------------------\n\
+                 # Repos under an org listed here are treated as your own. Everywhere else, Sparkle\n\
+                 # asks you first before it does anything to the main branch — merging a PR, landing\n\
+                 # a branch — however permissive [concierge.tools] is. Empty (the shipped value)\n\
+                 # means every repo gets that treatment.\n\
+                 #   own_orgs = [\"your-github-org\", \"your-github-username\"]\n\
+                 # This list is the ONLY way to lift that. A per-repo entry under\n\
+                 # [concierge.projects.\"owner/repo\".tools] can only make a repo STRICTER.\n",
+            );
+            doc.insert("concierge", toml_edit::Item::Table(table));
+        }
+        // `as_table_like_mut` covers both `[concierge]` and a hand-written inline
+        // `concierge = { … }`, exactly as the `workers`/`pushers` blocks above do. A shape neither
+        // one accepts DEFERS rather than falling through — stamping the version on a file we failed
+        // to edit would mark the migration applied when it wasn't.
+        let Some(t) = doc.get_mut("concierge").and_then(|c| c.as_table_like_mut()) else {
+            return Err(
+                "[concierge] is not a table; migration deferred until config.toml is fixed".into(),
+            );
+        };
+        t.insert("own_orgs", toml_edit::value(toml_edit::Array::new()));
+        tracing::debug!("config migration v4: adding the empty [concierge].own_orgs lever");
     }
 
     // Written table-shape-agnostically for the same reason as `workers` above: `set_dotted` demands
@@ -5830,6 +6814,41 @@ quit_app = 42
         assert!(warns.iter().any(|w| w.contains("[tools]")));
     }
 
+    #[test]
+    fn straude_defaults_off_and_is_independent_of_builder_index() {
+        // The second publishing destination, and the second one that must be opted INTO. Same
+        // outermost-gate reasoning as builder_index: the reporter also gates on consent + a stored
+        // sign-in, but the toggle has to hold on its own.
+        let (cfg, _, _) = effective(None, None);
+        assert!(!cfg.tools.straude);
+
+        // INDEPENDENCE, both directions. These are competing leaderboards, so consenting to one
+        // must never be read as consenting to the other — that would be a silent enablement of a
+        // third-party data egress the user never answered a modal for.
+        let (cfg, warns, hard) = effective(Some("[tools]\nbuilder_index = true\n"), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(cfg.tools.builder_index);
+        assert!(!cfg.tools.straude, "opting into the Builder Index must not opt into straude");
+
+        let (cfg, warns, hard) = effective(Some("[tools]\nstraude = true\n"), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(cfg.tools.straude);
+        assert!(!cfg.tools.builder_index, "opting into straude must not opt into the Builder Index");
+        assert!(cfg.tools.roborev, "untouched tool keeps its default");
+    }
+
+    #[test]
+    fn project_cannot_opt_a_machine_into_straude() {
+        // Same rule as builder_index: [tools] is machine-wide, so a cloned repo shipping
+        // `straude = true` must NOT be able to start publishing this machine's usage.
+        let p = "[tools]\nstraude = true\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(!cfg.tools.straude);
+        assert!(warns.iter().any(|w| w.contains("[tools]")));
+    }
+
     // ── [builder_index] — what the reporter publishes ────────────────────────────────────
 
     #[test]
@@ -6364,6 +7383,48 @@ quit_app = 42
         assert_eq!(ram_derived_concurrency(8 * GIB, 6 * GIB, 3072), 1);
         assert_eq!(ram_derived_concurrency(4 * GIB, 6 * GIB, 3072), 1);
         assert_eq!(ram_derived_concurrency(0, 6 * GIB, 3072), 1);
+    }
+
+    #[test]
+    fn agent_test_worker_cap_shrinks_as_the_agent_ceiling_rises() {
+        // The measured incident machine: 18 cores, 81-agent ceiling. Every agent that verifies
+        // gets ONE worker, so even all 81 verifying at once is ~81 workers, not 81 × 6 = 486.
+        assert_eq!(agent_test_worker_cap(18, 81), 1);
+        // A user-pinned ceiling of 4 on the same box: each of the 4 keeps cores/4 = 4 workers
+        // (4 × 4 = 16 ≤ 18), so a lightly loaded machine is not needlessly throttled.
+        assert_eq!(agent_test_worker_cap(18, 4), 4);
+        // Ceiling equal to cores → exactly one worker each, the point where the sum meets the budget.
+        assert_eq!(agent_test_worker_cap(18, 18), 1);
+        // Ceiling below cores → the division exceeds one and each agent gets a real pool.
+        assert_eq!(agent_test_worker_cap(36, 6), 6);
+    }
+
+    #[test]
+    fn agent_test_worker_cap_floors_at_one_and_tolerates_zero_inputs() {
+        // A run needs at least one worker; a ceiling far above the core count must not yield zero.
+        assert_eq!(agent_test_worker_cap(2, 100), 1);
+        // Zero cores (unmeasurable, defensively) and zero ceiling both floor to 1 rather than
+        // panicking on a divide-by-zero.
+        assert_eq!(agent_test_worker_cap(0, 5), 1);
+        assert_eq!(agent_test_worker_cap(18, 0), 18);
+    }
+
+    #[test]
+    fn agent_test_worker_cap_only_injects_when_it_lowers_the_default() {
+        // Below the pool's own default → inject the narrowed number.
+        assert_eq!(agent_test_worker_cap_to_inject(18, 81), Some(1));
+        assert_eq!(agent_test_worker_cap_to_inject(18, 4), Some(4));
+        // At or above the default → inject NOTHING, so the pool keeps its own value and a run is
+        // never RAISED above what an uncoordinated local run would already pick.
+        assert_eq!(agent_test_worker_cap_to_inject(36, 6), None); // == default
+        assert_eq!(agent_test_worker_cap_to_inject(64, 4), None); // 16 > default
+    }
+
+    #[test]
+    fn agent_test_worker_cap_survives_the_default() {
+        // Pins the Rust ceiling to the JS pool default (vitest.pool.mjs DEFAULT_MAX_WORKERS). If
+        // this fails the two have drifted and an agent PTY could raise a run above the local default.
+        assert_eq!(AGENT_TEST_WORKER_DEFAULT, 6);
     }
 
     #[test]
@@ -7231,11 +8292,68 @@ quit_app = 42
 
         // And the two knobs that ARE project properties are untouched by the asymmetry.
         let (cfg, _, _) = effective(
-            Some("[preview]\nidle_grace_min = 30\nauto_open = \"never\"\n"),
-            Some("[preview]\nidle_grace_min = 2\nauto_open = \"always\"\n"),
+            Some("[preview]\nidle_grace_min = 30\n"),
+            Some("[preview]\nidle_grace_min = 2\n"),
         );
         assert_eq!(cfg.preview.idle_grace_min, 2);
-        assert_eq!(cfg.preview.auto_open, "always");
+    }
+
+    /// `agent_eagerness` decides whether a preview is ever OPENED. (It had a sibling, `auto_open`,
+    /// which decided whether an existing one revealed itself in a pane; that pane and that key were
+    /// removed on 2026-08-19 — a card surfaces itself, so there is nothing left to decide.)
+    #[test]
+    fn agent_eagerness_defaults_to_visual_and_is_project_overridable() {
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(
+            cfg.preview.agent_eagerness, "visual",
+            "the shipped default asks for a preview when the work is visual"
+        );
+
+        // A project may set its own eagerness — whether THIS repo's work is worth looking at is a
+        // property of the repo. Unlike `enabled`, it confers no authority over the machine.
+        let (cfg, warns, _) = effective(
+            Some("[preview]\nagent_eagerness = \"never\"\n"),
+            Some("[preview]\nagent_eagerness = \"always\"\n"),
+        );
+        assert_eq!(cfg.preview.agent_eagerness, "always");
+        assert!(warns.is_empty(), "a legal project override must be silent; got {warns:?}");
+
+    }
+
+    /// An unmatched string reads downstream as "no instruction", which is exactly `"never"` — the
+    /// one value a typo must not be able to reach, because its symptom is a feature that quietly
+    /// stops happening. Asserts the SIDE EFFECT (the struct value was replaced), not the warning.
+    #[test]
+    fn an_unknown_agent_eagerness_falls_back_to_visual() {
+        let g = "[preview]\nagent_eagerness = \"eagerly\"\n";
+        let (cfg, warns, _) = effective(Some(g), None);
+        assert_eq!(
+            cfg.preview.agent_eagerness, "visual",
+            "an unrecognized mode must be REPLACED with the default, not left in place"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[preview].agent_eagerness")),
+            "the fallback must say so by name; warnings were {warns:?}"
+        );
+    }
+
+    /// DEFAULT_TEMPLATE is not documentation — `load_document_for_write` writes it to disk on first
+    /// run, so a template whose values disagree with `SparkleConfig::default()` ships a fresh
+    /// install a different behaviour from an upgraded one, silently. Same guard
+    /// `ui_template_matches_the_default` puts on `[ui]`.
+    #[test]
+    fn preview_template_matches_the_default() {
+        let (cfg, warns, hard) = effective(Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "DEFAULT_TEMPLATE must parse");
+        assert!(warns.is_empty(), "DEFAULT_TEMPLATE warnings: {warns:?}");
+        let d = SparkleConfig::default();
+        assert_eq!(cfg.preview.enabled, d.preview.enabled);
+        assert_eq!(cfg.preview.idle_grace_min, d.preview.idle_grace_min);
+        assert_eq!(
+            cfg.preview.agent_eagerness, d.preview.agent_eagerness,
+            "the template's agent_eagerness must be the built-in default, or a fresh install \
+             briefs its agents differently from an upgraded one"
+        );
     }
 
     /// The grace period is one of only three things that ever stops a preview server (there is no
@@ -7271,19 +8389,17 @@ quit_app = 42
     }
 
     #[test]
-    fn preview_defaults_overrides_and_auto_open_validation() {
+    fn preview_defaults_and_overrides() {
         // Absent [preview] → the built-in defaults.
         let (cfg, _, _) = effective(None, None);
         assert!(cfg.preview.enabled);
         assert_eq!(cfg.preview.idle_grace_min, 10);
-        assert_eq!(cfg.preview.auto_open, "returning");
 
         // Global override, field by field.
-        let g = "[preview]\nenabled = false\nidle_grace_min = 30\nauto_open = \"always\"\n";
+        let g = "[preview]\nenabled = false\nidle_grace_min = 30\n";
         let (cfg, warns, _) = effective(Some(g), None);
         assert!(!cfg.preview.enabled);
         assert_eq!(cfg.preview.idle_grace_min, 30);
-        assert_eq!(cfg.preview.auto_open, "always");
         assert!(warns.is_empty());
 
         // Per-project overridable (like [freshness]/[worktree_pool]); no "ignored" warning.
@@ -7291,29 +8407,18 @@ quit_app = 42
         let (cfg, warns, _) = effective(None, Some(p));
         assert_eq!(cfg.preview.idle_grace_min, 2);
         assert!(cfg.preview.enabled, "untouched field keeps its default");
-        assert_eq!(cfg.preview.auto_open, "returning");
         assert!(warns.is_empty());
 
-        // "never" is a real mode, not a typo — it must survive validation untouched.
-        let g = "[preview]\nauto_open = \"never\"\n";
-        let (cfg, warns, _) = effective(Some(g), None);
-        assert_eq!(cfg.preview.auto_open, "never");
-        assert!(!warns.iter().any(|w| w.contains("auto_open")));
-
-        // An unrecognized mode is REPLACED (not merely warned about), because nothing downstream
-        // has a safe reading for it. Assert the replacement, which is the side effect.
-        for bogus in ["Always", "sometimes", "", "returning "] {
-            let g = format!("[preview]\nauto_open = \"{bogus}\"\n");
-            let (cfg, warns, _) = effective(Some(&g), None);
-            assert_eq!(
-                cfg.preview.auto_open, "returning",
-                "auto_open = {bogus:?} must fall back to the default, not be left in place"
-            );
-            assert!(
-                warns.iter().any(|w| w.contains("[preview].auto_open")),
-                "auto_open = {bogus:?} must say so out loud"
-            );
-        }
+        // `auto_open` IS GONE, and a config file that still carries it must stay INERT rather than
+        // failing the layer. It is not declared in PartialPreview any more, and serde ignores an
+        // unknown key — so an upgrading user whose file still names it loads cleanly and keeps
+        // every sibling key in the same section. This is the whole migration story for that
+        // removal, which is why it is asserted rather than assumed.
+        let g = "[preview]\nauto_open = \"always\"\nidle_grace_min = 9\n";
+        let (cfg, warns, hard_error) = effective(Some(g), None);
+        assert!(!hard_error, "a leftover auto_open must not fail the layer");
+        assert_eq!(cfg.preview.idle_grace_min, 9, "its siblings still apply");
+        assert!(warns.is_empty(), "an ignored unknown key is silent; got {warns:?}");
 
         // A project file may carry the detection-override keys (command/args/path). They are not
         // declared in PartialPreview, so this asserts they are INERT — the file still loads and the
@@ -7337,6 +8442,61 @@ quit_app = 42
         assert!(!hard);
         assert!(warns.is_empty());
         assert_eq!(cfg.capture.popover_shortcut, "alt+f9");
+    }
+
+    #[test]
+    fn ui_bead_card_expansion_defaults_and_overrides() {
+        // ABSENT [ui] → the founder's chosen default: cards render OPEN, with no cap on how many
+        // one reply may expand. Both halves asserted, because "expanded" and "uncapped" are two
+        // separate decisions and a merge that silently reset either one is the bug this catches.
+        let (cfg, _, _) = effective(None, None);
+        assert!(cfg.ui.bead_cards_expanded);
+        assert_eq!(cfg.ui.bead_cards_expanded_max, 0);
+
+        // THE REVERT PATH, and the reason this section exists at all: one key restores the
+        // pre-2026-08 click-to-expand behaviour without touching code.
+        let g = "[ui]\nbead_cards_expanded = false\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert!(!cfg.ui.bead_cards_expanded);
+        // …and it leaves the SIBLING key alone. `apply_ui` merges per-key; a whole-struct
+        // overwrite would silently reset the cap here and nothing else would notice.
+        assert_eq!(cfg.ui.bead_cards_expanded_max, 0);
+
+        // The cap on its own, likewise leaving `bead_cards_expanded` at its default. This is the
+        // dial the founder reaches for if eight expanded cards start swamping his own text.
+        let g = "[ui]\nbead_cards_expanded_max = 3\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty());
+        assert_eq!(cfg.ui.bead_cards_expanded_max, 3);
+        assert!(cfg.ui.bead_cards_expanded);
+    }
+
+    #[test]
+    fn project_ui_is_ignored_with_warning() {
+        // How a bead card renders belongs to the person reading the concierge column, not to a
+        // repo — the column is cross-project by construction, so a per-project value could not
+        // even be resolved coherently when one reply names beads from three different projects.
+        let p = "[ui]\nbead_cards_expanded = false\nbead_cards_expanded_max = 1\n";
+        let (cfg, warns, _) = effective(None, Some(p));
+        assert!(cfg.ui.bead_cards_expanded);
+        assert_eq!(cfg.ui.bead_cards_expanded_max, 0);
+        assert!(warns.iter().any(|w| w.contains("[ui]")));
+    }
+
+    #[test]
+    fn ui_template_matches_the_default() {
+        // DEFAULT_TEMPLATE is not documentation — `load_document_for_write` writes it to disk on
+        // first run, so a template whose values disagree with `SparkleConfig::default()` ships a
+        // fresh install a different behaviour from an upgraded one, silently.
+        let (cfg, warns, hard) = effective(Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "DEFAULT_TEMPLATE must parse");
+        assert!(warns.is_empty(), "DEFAULT_TEMPLATE warnings: {warns:?}");
+        let d = SparkleConfig::default();
+        assert_eq!(cfg.ui.bead_cards_expanded, d.ui.bead_cards_expanded);
+        assert_eq!(cfg.ui.bead_cards_expanded_max, d.ui.bead_cards_expanded_max);
     }
 
     #[test]
@@ -7672,6 +8832,199 @@ quit_app = 42
         assert!(
             warns.iter().any(|w| w.contains("[concierge]")),
             "the user must be told their project rule was ignored: {warns:?}"
+        );
+    }
+
+    // ── [publish] — bead `sparkle-131ms.3` ───────────────────────────────────────────────────
+
+    const DEST: &str = "[publish]\nactive = \"drodio\"\n\n\
+                        [publish.destinations.drodio]\nname = \"drodio.com\"\n\
+                        url = \"https://drodio.com/api/mcp\"\n";
+
+    /// The positive case, and the PAIR to the global-only test below. Without it, that test is
+    /// ambiguous: a `[publish]` section that never worked in ANY layer would also pass it.
+    #[test]
+    fn publish_in_the_global_file_configures_a_destination() {
+        let (cfg, warns, hard) = effective(Some(DEST), None);
+        assert!(!hard, "a valid [publish] block is not an error: {warns:?}");
+        assert_eq!(cfg.publish.active.as_deref(), Some("drodio"));
+        let d = cfg
+            .publish
+            .destinations
+            .get("drodio")
+            .expect("the destination is configured");
+        assert_eq!(d.name, "drodio.com");
+        // Sent exactly as configured — the endpoint answers both the bare and trailing-slash forms
+        // with no redirect, so normalizing would only make the file disagree with what is used.
+        assert_eq!(d.url, "https://drodio.com/api/mcp");
+    }
+
+    /// The security boundary. A repo must not be able to point the user's publishing — and the
+    /// bearer token that goes with it — at a host of its choosing merely by being cloned.
+    #[test]
+    fn publish_is_ignored_in_a_project_file_with_a_warning() {
+        let (cfg, warns, hard) = effective(None, Some(DEST));
+        assert!(!hard);
+        assert!(
+            cfg.publish.destinations.is_empty() && cfg.publish.active.is_none(),
+            "a per-project publish destination must not take effect: {:?}",
+            cfg.publish
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[publish]")),
+            "the user must be told their project block was ignored: {warns:?}"
+        );
+    }
+
+    /// …and it must not take effect even when a GLOBAL destination already exists — the shape that
+    /// matters, since a repo overriding the real destination's url is the actual attack, not a repo
+    /// adding one to an empty config.
+    #[test]
+    fn a_project_file_cannot_override_a_globally_configured_destination() {
+        let evil = "[publish.destinations.drodio]\nurl = \"https://evil.example.com/api/mcp\"\n";
+        let (cfg, _warns, _) = effective(Some(DEST), Some(evil));
+        assert_eq!(
+            cfg.publish.destinations["drodio"].url, "https://drodio.com/api/mcp",
+            "a project file must not repoint a configured destination"
+        );
+    }
+
+    /// The credential never rides in the config. Asserted on the SERIALIZED form, because that is
+    /// the artifact that ends up in a backup, a screen share, or a pasted bug report.
+    #[test]
+    fn a_token_is_never_serialized_into_the_config() {
+        let with_token = "[publish.destinations.drodio]\n\
+                          url = \"https://drodio.com/api/mcp\"\n\
+                          token = \"sk-super-secret-value\"\n";
+        let (cfg, _warns, _) = effective(Some(with_token), None);
+        let json = serde_json::to_string(&cfg).expect("config serializes");
+        assert!(
+            !json.contains("sk-super-secret-value"),
+            "an unknown `token` key must not survive into the effective config"
+        );
+        // And the struct offers no field that could hold one: the only credential-shaped value is
+        // a boolean presence flag, answered live by the keychain.
+        assert!(!cfg.publish.destinations["drodio"].has_credential_in_keychain);
+    }
+
+    /// A non-https destination is refused by the config layer, not merely at call time — so the
+    /// user learns at edit time. The row is DROPPED, and the warning names the id.
+    #[test]
+    fn a_non_https_destination_is_rejected_with_a_warning_naming_it() {
+        let p = "[publish.destinations.drodio]\nurl = \"http://drodio.com/api/mcp\"\n";
+        let (cfg, warns, hard) = effective(Some(p), None);
+        assert!(!hard, "a bad row is skipped, never fatal");
+        assert!(
+            cfg.publish.destinations.is_empty(),
+            "an http destination must not be configured: {:?}",
+            cfg.publish.destinations
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("drodio") && w.contains("https")),
+            "the warning names the destination and the rule: {warns:?}"
+        );
+    }
+
+    /// A localhost destination over plain http IS allowed — the converse of the rule above, and the
+    /// thing that makes developing a destination possible. Without this the cheap wrong
+    /// implementation ("reject anything not https") passes every other test here.
+    #[test]
+    fn a_loopback_destination_over_http_is_allowed() {
+        let p = "[publish.destinations.dev]\nurl = \"http://localhost:3000/api/mcp\"\n";
+        let (cfg, _warns, _) = effective(Some(p), None);
+        assert!(
+            cfg.publish.destinations.contains_key("dev"),
+            "a loopback dev destination must be configurable over http"
+        );
+    }
+
+    /// `active` pointing at nothing is the shape that would otherwise fail at publish time with an
+    /// opaque "unknown destination", long after the edit that caused it.
+    #[test]
+    fn an_active_pointer_naming_no_destination_is_cleared_with_a_warning() {
+        let p = "[publish]\nactive = \"nope\"\n\n\
+                 [publish.destinations.drodio]\nurl = \"https://drodio.com/api/mcp\"\n";
+        let (cfg, warns, _) = effective(Some(p), None);
+        assert_eq!(cfg.publish.active, None, "publishing stays off");
+        assert!(
+            warns.iter().any(|w| w.contains("nope")),
+            "the warning names the dangling pointer: {warns:?}"
+        );
+    }
+
+    /// A lone destination with no `active` is what a first-time user writes. Leaving publishing off
+    /// for it is the silently-inert-feature shape — everything looks configured and nothing works.
+    #[test]
+    fn a_single_destination_is_active_without_having_to_say_so() {
+        let p = "[publish.destinations.drodio]\nurl = \"https://drodio.com/api/mcp\"\n";
+        let (cfg, warns, _) = effective(Some(p), None);
+        assert_eq!(
+            cfg.publish.active.as_deref(),
+            Some("drodio"),
+            "one destination and no ambiguity means publishing is on: {warns:?}"
+        );
+    }
+
+    /// …but with more than one, Sparkle must not guess which one posts under the user's name — and
+    /// must SAY that publishing is off, rather than leaving it silently inert.
+    #[test]
+    fn several_destinations_with_no_active_stays_off_and_says_so() {
+        let p = "[publish.destinations.drodio]\nurl = \"https://drodio.com/api/mcp\"\n\n\
+                 [publish.destinations.other]\nurl = \"https://example.com/api/mcp\"\n";
+        let (cfg, warns, _) = effective(Some(p), None);
+        assert_eq!(cfg.publish.active, None, "no guessing between two destinations");
+        assert!(
+            warns.iter().any(|w| w.contains("active")),
+            "the user must be told publishing is off and why: {warns:?}"
+        );
+    }
+
+    /// An explicit `active` still wins over the single-destination default — otherwise the default
+    /// would be indistinguishable from the explicit case and this feature would be untestable.
+    #[test]
+    fn an_explicit_active_is_honored_over_the_single_destination_default() {
+        let p = "[publish]\nactive = \"drodio\"\n\n\
+                 [publish.destinations.drodio]\nurl = \"https://drodio.com/api/mcp\"\n\n\
+                 [publish.destinations.other]\nurl = \"https://example.com/api/mcp\"\n";
+        let (cfg, _warns, _) = effective(Some(p), None);
+        assert_eq!(cfg.publish.active.as_deref(), Some("drodio"));
+    }
+
+    /// A destination id names a keychain item, so a permissive id rule is what would let a config
+    /// file reach across to another item's slot.
+    #[test]
+    fn a_destination_id_that_could_not_name_a_keychain_item_is_rejected() {
+        let p = "[publish.destinations.\"../chief\"]\nurl = \"https://drodio.com/api/mcp\"\n";
+        let (cfg, warns, hard) = effective(Some(p), None);
+        assert!(!hard);
+        assert!(cfg.publish.destinations.is_empty(), "{:?}", cfg.publish.destinations);
+        assert!(!warns.is_empty(), "the rejection is explained");
+    }
+
+    /// A fresh install can publish nowhere. For an outward-facing action that is the only
+    /// defensible default.
+    #[test]
+    fn publishing_is_off_by_default() {
+        let (cfg, _warns, _) = effective(None, None);
+        assert!(cfg.publish.active.is_none() && cfg.publish.destinations.is_empty());
+    }
+
+    /// The shipped template must EXPLAIN the section without configuring one — an uncommented
+    /// example would be a real egress target the user never chose. Same contract as [concierge].
+    #[test]
+    fn publish_template_documents_the_section_and_stays_commented_out() {
+        assert!(DEFAULT_TEMPLATE.contains("[publish.destinations."));
+        assert!(
+            DEFAULT_TEMPLATE.contains("# [publish]"),
+            "must ship commented out"
+        );
+        let (cfg, warns, hard) =
+            build_effective(SparkleConfig::default(), Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert!(
+            cfg.publish.destinations.is_empty() && cfg.publish.active.is_none(),
+            "the template must not configure a destination: {:?}",
+            cfg.publish
         );
     }
 
@@ -8119,6 +9472,95 @@ tools = "allow"
         assert!(DEFAULT_TEMPLATE.contains("\n[pushers]\n"), "the block must ship uncommented");
     }
 
+    /// The `[advisor]` block in DEFAULT_TEMPLATE must reproduce `AdvisorConfig::default()` exactly.
+    ///
+    /// Same trap avoided the same way as `pushers_template_matches_the_default`: overlaying the
+    /// template onto `SparkleConfig::default()` would pass with the block MISSING, because the base
+    /// already holds the values. So WIPE the section to something no default could be first.
+    #[test]
+    fn advisor_template_matches_the_default() {
+        let mut base = SparkleConfig::default();
+        base.advisor = AdvisorConfig { enabled: false, model: "not-a-model".to_string() };
+        let (cfg, warns, hard) = build_effective(base, Some(DEFAULT_TEMPLATE), None);
+        assert!(!hard, "the shipped template must parse: {warns:?}");
+        assert_eq!(
+            cfg.advisor,
+            SparkleConfig::default().advisor,
+            "DEFAULT_TEMPLATE's [advisor] disagrees with SparkleConfig::default()"
+        );
+        assert!(DEFAULT_TEMPLATE.contains("\n[advisor]\n"), "the block must ship uncommented");
+        // The shipped default must be DISPATCHABLE, or the advisor is inert out of the box: an id
+        // absent from research.rs's allowlist is refused at dispatch, and one absent from the
+        // frontend catalog never resolves. Both lists are elsewhere, which is exactly why this is
+        // asserted here rather than assumed.
+        assert!(
+            crate::research::RESEARCH_MODEL_ALLOWLIST
+                .contains(&SparkleConfig::default().advisor.model.as_str()),
+            "the shipped [advisor].model must be one research.rs may dispatch"
+        );
+        // …and it must not BE the planner's model, which would make the pass self-review.
+        assert_ne!(
+            SparkleConfig::default().advisor.model,
+            crate::ai::CHAT_MODEL,
+            "the advisor must never default to the planner's own model"
+        );
+    }
+
+    /// The kill switch reads unambiguous off-spellings, like `[pushers].enabled` — and a wrong-typed
+    /// value leaves the shipped default ALONE rather than flipping it.
+    #[test]
+    fn advisor_enabled_reads_off_spellings_and_refuses_nonsense() {
+        for spelling in ["false", "\"false\"", "\"off\"", "\"no\"", "0"] {
+            let toml = format!("[advisor]\nenabled = {spelling}\n");
+            let (cfg, _w, hard) = build_effective(SparkleConfig::default(), Some(&toml), None);
+            assert!(!hard, "{spelling} must not be a hard error");
+            assert!(!cfg.advisor.enabled, "`enabled = {spelling}` must stop the advisor");
+        }
+        // A value with no defensible off-reading warns and changes nothing — the default is only
+        // ever flipped by an intent, never by a typo.
+        let (cfg, warns, _h) =
+            build_effective(SparkleConfig::default(), Some("[advisor]\nenabled = \"maybe\"\n"), None);
+        assert!(cfg.advisor.enabled, "an unreadable value must leave the shipped default alone");
+        assert!(
+            warns.iter().any(|w| w.contains("[advisor].enabled")),
+            "and it must SAY the edit did nothing: {warns:?}"
+        );
+    }
+
+    /// A configured model is taken VERBATIM, a wrong-typed one warns and is dropped, and an unknown
+    /// key is REPORTED rather than silently accepted.
+    #[test]
+    fn advisor_model_is_kept_verbatim_and_unknown_keys_are_reported() {
+        let (cfg, _w, _h) = build_effective(
+            SparkleConfig::default(),
+            Some("[advisor]\nmodel = \"claude-fable-5\"\n"),
+            None,
+        );
+        assert_eq!(cfg.advisor.model, "claude-fable-5");
+        assert_ne!(
+            cfg.advisor.model,
+            AdvisorConfig::default().model,
+            "vacuous unless the configured id differs from the shipped one"
+        );
+
+        let (cfg, warns, _h) =
+            build_effective(SparkleConfig::default(), Some("[advisor]\nmodel = 3\n"), None);
+        assert_eq!(
+            cfg.advisor.model,
+            AdvisorConfig::default().model,
+            "a wrong-typed model must be dropped, not coerced"
+        );
+        assert!(warns.iter().any(|w| w.contains("[advisor].model")), "{warns:?}");
+
+        let (_cfg, warns, hard) =
+            build_effective(SparkleConfig::default(), Some("[advisor]\nmodle = \"x\"\n"), None);
+        assert!(!hard, "one misspelled key must not discard the whole layer");
+        assert!(
+            warns.iter().any(|w| w.contains("[advisor].modle")),
+            "a misspelling must be reported, not silently ignored: {warns:?}"
+        );
+    }
+
     #[test]
     fn a_pushers_edit_lands_and_leaves_its_siblings_alone() {
         // The one-line edit the section exists for — "this is too noisy" — must not silently reset
@@ -8156,7 +9598,10 @@ tools = "allow"
         // warning it exists to silence.
         assert!(after.contains("messages_per_hour = 2"), "a real choice survives: {after}");
         assert!(after.contains("require_pr = false"), "an unrelated section survives: {after}");
-        assert!(after.contains("config_version = 3"), "the revision is stamped: {after}");
+        assert!(
+            after.contains(&format!("config_version = {CONFIG_MIGRATION_VERSION}")),
+            "the revision is stamped: {after}"
+        );
     }
 
     #[test]
@@ -8506,6 +9951,405 @@ mesages_per_hour = 9
         let (cfg, _, hard) = effective(Some(&doc.to_string()), None);
         assert!(!hard);
         assert_eq!(cfg.workflow.drift.behind_nudge, 7);
+    }
+
+    // ---- per-project concierge tool policy (bead sparkle-gylxbo) -----------------
+
+    #[test]
+    fn set_dotted_round_trips_a_quoted_slug_containing_a_dot() {
+        // THE regression this splitter exists for. A repo slug carries a `/`, so TOML requires the
+        // quotes; the naive `split('.')` then tore `"a/b.c"` into `"a/b` and `c"` and wrote the rule
+        // under an invented nesting nobody reads — silently, because the resulting file still
+        // parses. A slug with only a slash would pass a BROKEN parser (there is no dot to split on),
+        // so the dot is the part that has power here.
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        set_dotted(
+            &mut doc,
+            "concierge.projects.\"a/b.c\".tools.merge_pr",
+            "deny".into(),
+        )
+        .unwrap();
+        let text = doc.to_string();
+
+        // The document itself addresses ONE key named `a/b.c`, four levels down — not six.
+        let entry = doc
+            .get("concierge")
+            .and_then(|c| c.get("projects"))
+            .and_then(|p| p.get("a/b.c"))
+            .and_then(|e| e.get("tools"))
+            .and_then(|t| t.get("merge_pr"))
+            .and_then(|v| v.as_str());
+        assert_eq!(entry, Some("deny"), "the rule lands under the whole slug: {text}");
+
+        // And the SIDE EFFECT that matters: the file we wrote loads back as a rule for that repo.
+        let (cfg, warns, hard) = effective(Some(&text), None);
+        assert!(!hard, "the written file must parse: {text}");
+        assert!(warns.is_empty(), "a valid rule warns about nothing: {warns:?}");
+        assert_eq!(
+            cfg.concierge.projects["a/b.c"].tools["merge_pr"],
+            "deny",
+            "round-trips into the loaded config: {text}"
+        );
+    }
+
+    #[test]
+    fn unset_dotted_removes_a_quoted_slug_key() {
+        // A path that can be SET must be removable by the same string, or the settings pane can
+        // write a per-repo rule it can never clear.
+        let src = "[concierge.projects.\"a/b.c\".tools]\nmerge_pr = \"deny\"\nland_agent_branch = \"ask\"\n";
+        let mut doc = src.parse::<toml_edit::DocumentMut>().unwrap();
+        unset_dotted(&mut doc, "concierge.projects.\"a/b.c\".tools.merge_pr").unwrap();
+        let text = doc.to_string();
+        let (cfg, _, hard) = effective(Some(&text), None);
+        assert!(!hard);
+        let tools = &cfg.concierge.projects["a/b.c"].tools;
+        assert!(!tools.contains_key("merge_pr"), "the named rule goes: {text}");
+        assert_eq!(tools["land_agent_branch"], "ask", "its sibling stays: {text}");
+    }
+
+    #[test]
+    fn a_dotted_path_with_an_unterminated_quote_is_an_error_not_a_guess() {
+        // Writing to a mis-parsed path is the silent failure this whole splitter exists to stop, so
+        // an unreadable path must refuse rather than invent a nesting.
+        let mut doc = "".parse::<toml_edit::DocumentMut>().unwrap();
+        let err = set_dotted(&mut doc, "concierge.projects.\"a/b.tools", 1i64.into())
+            .expect_err("an unterminated quote must not be guessed at");
+        assert!(err.contains("unterminated"), "the reason is diagnosable: {err}");
+        assert_eq!(doc.to_string(), "", "and nothing was written");
+        // Bare paths are unaffected — every existing caller passes one.
+        assert_eq!(
+            split_dotted_path("workers.max_concurrent").unwrap(),
+            vec!["workers".to_string(), "max_concurrent".to_string()]
+        );
+    }
+
+    #[test]
+    fn own_orgs_and_per_repo_rules_are_read_trimmed_and_lowercased() {
+        let g = r#"
+[concierge]
+own_orgs = ["  DRodio ", "Try-Sparkle"]
+
+[concierge.tools]
+merge_pr = "allow"
+
+[concierge.projects."Plow-PBC/TKMX-Server".tools]
+merge_pr = "deny"
+"#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert!(warns.is_empty(), "a valid section warns about nothing: {warns:?}");
+        // Lowercased and trimmed: the answer is compared against a resolved remote URL, and GitHub
+        // treats owner/repo case-insensitively. A verbatim key would silently match nothing —
+        // failing OPEN on a line written to tighten one repo.
+        assert_eq!(cfg.concierge.own_orgs, vec!["drodio", "try-sparkle"]);
+        assert_eq!(
+            cfg.concierge.projects["plow-pbc/tkmx-server"].tools["merge_pr"],
+            "deny"
+        );
+        // The global tier is untouched by the per-repo rule — the strictest-of lattice lives in
+        // TypeScript, and this layer must hand it BOTH numbers rather than pre-resolving one.
+        assert_eq!(cfg.concierge.tools["merge_pr"], "allow");
+    }
+
+    #[test]
+    fn a_second_per_repo_block_merges_per_key_instead_of_replacing_the_first() {
+        // PER KEY, never wholesale — the same contract `[concierge.tools]` holds. A user who writes
+        // two rules for one repo in two places must keep both.
+        let g = r#"
+[concierge.projects."owner/repo".tools]
+merge_pr = "deny"
+push_agent_branch = "ask"
+"#;
+        let (cfg, _, hard) = effective(Some(g), None);
+        assert!(!hard);
+        let tools = &cfg.concierge.projects["owner/repo"].tools;
+        assert_eq!(tools["merge_pr"], "deny");
+        assert_eq!(tools["push_agent_branch"], "ask");
+        assert_eq!(tools.len(), 2);
+    }
+
+    #[test]
+    fn an_unrecognized_per_repo_decision_is_kept_verbatim_and_warned_about() {
+        // Kept, NOT narrowed. The frontend reads an unreadable rule as `ask`, which is stricter
+        // than the tier the repo would inherit; rewriting it here to a value this build recognizes
+        // would hand back exactly the authority the user was writing that line to remove.
+        let g = "[concierge.projects.\"owner/repo\".tools]\nmerge_pr = \"nope\"\n";
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        assert_eq!(
+            cfg.concierge.projects["owner/repo"].tools["merge_pr"],
+            "nope",
+            "the raw string survives so the frontend can read it as `ask`"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge.projects.\"owner/repo\".tools].merge_pr")),
+            "and the user is told: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn a_wrong_typed_entry_in_the_new_sections_costs_only_itself() {
+        // roborev 54240's lesson, applied to the two new keys: with strong types any ONE of these
+        // lines fails the WHOLE-FILE parse and every unrelated setting silently reverts.
+        let g = r#"
+[workflow]
+require_pr = false
+
+[concierge]
+own_orgs = ["good", 42]
+
+[concierge.projects]
+"owner/scalar" = "deny"
+
+[concierge.projects."owner/repo".tools]
+merge_pr = true
+land_agent_branch = "deny"
+"#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard, "a typo in one rule must never be a hard error: {warns:?}");
+        assert!(!cfg.workflow.require_pr, "an unrelated section still applies");
+        assert_eq!(cfg.concierge.own_orgs, vec!["good"], "the good entry survives");
+        let tools = &cfg.concierge.projects["owner/repo"].tools;
+        assert!(!tools.contains_key("merge_pr"), "the non-string rule is dropped, not coerced");
+        assert_eq!(tools["land_agent_branch"], "deny", "its good sibling in the same table applies");
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("[concierge].own_orgs contains a integer"), "list entry: {warns:?}");
+        assert!(said("[concierge.projects.\"owner/scalar\"] is a string"), "scalar entry: {warns:?}");
+        assert!(said("[concierge.projects.\"owner/repo\".tools].merge_pr is a boolean"), "rule: {warns:?}");
+    }
+
+    #[test]
+    fn own_orgs_as_a_bare_string_is_reported_rather_than_silently_ignored() {
+        // The likely reach — the singular form. Left silent, the user believes he has named his org
+        // while every repo stays foreign and Sparkle keeps interrupting him.
+        let (cfg, warns, hard) = effective(Some("[concierge]\nown_orgs = \"drodio\"\n"), None);
+        assert!(!hard);
+        assert!(cfg.concierge.own_orgs.is_empty(), "nothing is inferred from a wrong shape");
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge].own_orgs is a string")),
+            "the user is told: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn the_new_concierge_keys_are_still_ignored_in_a_project_config() {
+        // THE SECURITY BOUNDARY, and it matters MOST for a repo the user does not own. If a cloned
+        // repo could write `[concierge].own_orgs = ["its-own-org"]` into its checked-in
+        // .sparkle/config.toml it would declare ITSELF owned, lifting the very floor that exists to
+        // protect it — and a per-repo `merge_pr = "allow"` would be the same move from the other
+        // side. Both must be inert with a warning.
+        let p = r#"
+[concierge]
+own_orgs = ["plow-pbc"]
+
+[concierge.projects."plow-pbc/tkmx-server".tools]
+merge_pr = "allow"
+"#;
+        let (cfg, warns, hard) = effective(None, Some(p));
+        assert!(!hard);
+        assert!(
+            cfg.concierge.own_orgs.is_empty(),
+            "a repo must never be able to declare itself owned"
+        );
+        assert!(
+            cfg.concierge.projects.is_empty(),
+            "nor to write itself a rule; per-repo policy is global-only"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[concierge] in a per-project")),
+            "and the reader is told why it did nothing: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn migration_v4_adds_own_orgs_and_changes_no_tier() {
+        // The whole promise of this migration: NOBODY silently gains — or loses — authority by
+        // upgrading. So the assertion that has power is not "the file still parses", it is that a
+        // tier the human tightened BY HAND reads back byte-identical afterwards.
+        let dir = app_data_with(
+            "[concierge.tools]\nmerge_pr = \"allow\"\ndiscard_agent = \"deny\"\n\
+             \n[meta]\nconfig_version = 3\n",
+        );
+        migrate_global(dir.path()).expect("migration must not fail");
+        let text = global_text(&dir);
+        let (cfg, warns, hard) = effective(Some(&text), None);
+        assert!(!hard, "the migrated file must load: {text}");
+
+        assert_eq!(cfg.concierge.tools["merge_pr"], "allow", "a hand-set tier is UNCHANGED: {text}");
+        assert_eq!(cfg.concierge.tools["discard_agent"], "deny", "and so is this one: {text}");
+        assert!(cfg.concierge.own_orgs.is_empty(), "the lever ships EMPTY — every repo foreign");
+        assert!(text.contains("own_orgs = []"), "the lever is written so it is discoverable: {text}");
+        assert!(
+            !text.contains("[concierge.projects"),
+            "and NOTHING else is added: {text}"
+        );
+        assert!(warns.is_empty(), "the migrated file warns about nothing: {warns:?}");
+        let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert_eq!(
+            doc.get("meta").and_then(|m| m.get("config_version")).and_then(|v| v.as_integer()),
+            Some(4),
+            "stamped, so it runs once: {text}"
+        );
+    }
+
+    #[test]
+    fn migration_v4_writes_own_orgs_onto_concierge_not_onto_a_subtable() {
+        // The reachable way to get this wrong: `[concierge]` already exists only as the PARENT of
+        // `[concierge.checks]`, and a value appended after a subtable would render inside it —
+        // making `own_orgs` a lint knob and leaving the real lever absent. Every real install has a
+        // `[concierge.checks]` block (it ships in the template), so this is the common path.
+        let dir = app_data_with("[concierge.checks]\nenabled = true\n");
+        migrate_global(dir.path()).expect("migration must not fail");
+        let text = global_text(&dir);
+        let (cfg, warns, hard) = effective(Some(&text), None);
+        assert!(!hard, "the migrated file must load: {text}");
+        assert!(cfg.concierge.own_orgs.is_empty());
+        assert!(
+            cfg.concierge.checks.enabled,
+            "the existing lint policy is untouched: {text}"
+        );
+        assert!(
+            !warns.iter().any(|w| w.contains("own_orgs")),
+            "own_orgs landed on [concierge], not inside [concierge.checks]: {warns:?} / {text}"
+        );
+        let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
+        assert!(
+            doc.get("concierge").and_then(|c| c.get("own_orgs")).is_some(),
+            "on the parent table: {text}"
+        );
+        assert!(
+            doc.get("concierge")
+                .and_then(|c| c.get("checks"))
+                .and_then(|c| c.get("own_orgs"))
+                .is_none(),
+            "and NOT on the checks subtable: {text}"
+        );
+    }
+
+    #[test]
+    fn migration_v4_keeps_an_org_the_user_already_named() {
+        // The upgrade path for someone who edited the file before this build shipped, or who is
+        // re-migrated after a version bump. A migration that overwrote this would be exactly the
+        // "silently changes a value the human chose" failure roborev 53140 was about.
+        let dir = app_data_with(
+            "[concierge]\nown_orgs = [\"drodio\"]\n\n[meta]\nconfig_version = 1\n",
+        );
+        migrate_global(dir.path()).expect("migration must not fail");
+        let (cfg, _, hard) = effective(Some(&global_text(&dir)), None);
+        assert!(!hard);
+        assert_eq!(cfg.concierge.own_orgs, vec!["drodio"], "the user's choice survives");
+    }
+
+    #[test]
+    fn a_project_key_that_can_never_match_a_repo_is_reported_rather_than_silently_inert() {
+        // FAILS OPEN otherwise, which is the direction that matters: a key that is not an
+        // `owner/repo` slug can never equal a resolved remote URL, so the rule contributes no
+        // tightening — on the one line the user wrote to restrict a repo. Every other mistake in
+        // this section warns, so silence here reads as acceptance.
+        let g = r#"
+[concierge.projects."tkmx-server".tools]
+merge_pr = "deny"
+
+[concierge.projects."https://github.com/plow-pbc/tkmx-server".tools]
+merge_pr = "deny"
+
+[concierge.projects."plow-pbc/tkmx server".tools]
+merge_pr = "deny"
+
+[concierge.projects."plow-pbc/tkmx-server.git".tools]
+merge_pr = "deny"
+
+[concierge.projects."plow-pbc/tkmx-server".tools]
+merge_pr = "deny"
+"#;
+        let (cfg, warns, hard) = effective(Some(g), None);
+        assert!(!hard);
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("[concierge.projects.\"tkmx-server\"] is not an \"owner/repo\" slug"), "bare repo name: {warns:?}");
+        assert!(
+            said("[concierge.projects.\"https://github.com/plow-pbc/tkmx-server\"] is not an"),
+            "pasted URL: {warns:?}"
+        );
+        // THE `.git` SUFFIX — the likeliest miss of the four, because it is what you get by copying
+        // the tail of a clone URL, and the one that used to pass silently (roborev 65417). `.` is a
+        // legal slug character, so the character-set check alone waves it through; but
+        // `repo_slug_from_url` strips `.git`, so a resolved slug can never carry it and this key
+        // tightens nothing. Both the doc comment and the remedy string name it, so it has to warn.
+        assert!(
+            said("[concierge.projects.\"plow-pbc/tkmx-server.git\"] is not an"),
+            ".git suffix: {warns:?}"
+        );
+        assert!(said("[concierge.projects.\"plow-pbc/tkmx server\"] is not an"), "inner space: {warns:?}");
+        // The rule is KEPT, not dropped — reporting the mistake, not rewriting what the user wrote.
+        assert_eq!(cfg.concierge.projects["tkmx-server"].tools["merge_pr"], "deny");
+        // And the WELL-FORMED sibling in the same file draws no warning at all, so the check cannot
+        // be satisfied by warning about everything.
+        assert!(
+            !warns.iter().any(|w| w.contains("\"plow-pbc/tkmx-server\"] is not an")),
+            "a real slug must stay quiet: {warns:?}"
+        );
+        assert_eq!(cfg.concierge.projects["plow-pbc/tkmx-server"].tools["merge_pr"], "deny");
+    }
+
+    #[test]
+    fn an_own_orgs_entry_that_can_never_match_an_owner_is_reported() {
+        // The mirror-image failure, and the more expensive one: a repo slug where an ORG goes
+        // matches nothing, so every repo stays foreign and Sparkle keeps asking — while the user
+        // believes he lifted the floor.
+        let (cfg, warns, hard) = effective(
+            Some("[concierge]\nown_orgs = [\"drodio/sparkle\", \"https://github.com/drodio\", \"drodio\"]\n"),
+            None,
+        );
+        assert!(!hard);
+        let said = |needle: &str| warns.iter().any(|w| w.contains(needle));
+        assert!(said("own_orgs contains \"drodio/sparkle\", which is not a bare GitHub org"), "slug: {warns:?}");
+        assert!(said("own_orgs contains \"https://github.com/drodio\""), "URL: {warns:?}");
+        // Kept, not dropped, and the good entry is silent — so the warning is about SHAPE, not
+        // about there being more than one entry.
+        assert_eq!(cfg.concierge.own_orgs, vec!["drodio/sparkle", "https://github.com/drodio", "drodio"]);
+        assert!(
+            !warns.iter().any(|w| w.contains("own_orgs contains \"drodio\",")),
+            "a real org must stay quiet: {warns:?}"
+        );
+    }
+
+    /// Read the ONE shared file both language halves declare their pin list against. `policy.ts`
+    /// pins its own copy against this same file, so a slug added on one side and forgotten on the
+    /// other fails a test here instead of drifting into a repo Sparkle would then merge in.
+    #[test]
+    fn merge_protected_slugs_match_the_shared_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("shared")
+            .join("merge-protected-repos.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture is valid JSON");
+        assert_eq!(fixture["version"].as_i64(), Some(1), "wire version is frozen at 1");
+        let expected: Vec<&str> = fixture["pinnedSlugs"]
+            .as_array()
+            .expect("pinnedSlugs array")
+            .iter()
+            .map(|e| e.as_str().expect("pinnedSlugs entries are strings"))
+            .collect();
+        assert_eq!(
+            MERGE_PROTECTED_SLUGS.to_vec(),
+            expected,
+            "MERGE_PROTECTED_SLUGS drifted from apps/desktop/shared/merge-protected-repos.json"
+        );
+    }
+
+    #[test]
+    fn the_merge_protected_pin_is_case_insensitive_and_narrow() {
+        // A resolved `remote.origin.url` can carry any casing, and GitHub treats owner/repo
+        // case-insensitively — a pin a differently-cased remote could slip past would not be a
+        // floor at all.
+        assert!(is_merge_protected_slug("plow-pbc/tkmx-server"));
+        assert!(is_merge_protected_slug("  Plow-PBC/TKMX-Server  "));
+        // And it must not spread to repos nobody pinned.
+        assert!(!is_merge_protected_slug("drodio/sparkle"));
+        assert!(!is_merge_protected_slug("plow-pbc/something-else"));
+        assert!(!is_merge_protected_slug(""));
     }
 
     #[test]

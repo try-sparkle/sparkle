@@ -22,7 +22,7 @@
 // rendered text, roles, DOM order, or an inline style the component itself writes.
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -83,6 +83,8 @@ import {
   ConciergeAgentsRow,
   CONCIERGE_AGENTS_HINT,
   CONCIERGE_AGENTS_TITLE,
+  livenessOfResearch,
+  researchRollupStatuses,
 } from "./ConciergeAgentsRow";
 import { asRgb } from "./statusDotTestUtils";
 import { useProjectStore } from "../stores/projectStore";
@@ -90,13 +92,16 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { useInteractionStore } from "../stores/interactionStore";
+import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
 import { useHelperPrefs } from "../helper/helperPrefs";
 import { allBandsVisible } from "../engine/buildSections";
 import {
   _resetResearchStoreForTests,
+  groupTasks,
   RESEARCH_POLL_INTERVAL_MS,
   useResearchStore,
 } from "../services/research/store";
+import { openResearchTaskInPane } from "../services/research/selection";
 import type { ResearchTask } from "../services/research/types";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 
@@ -172,6 +177,10 @@ beforeEach(() => {
   backend.refresh.mockClear();
   backend.cancel.mockReset();
   _resetResearchStoreForTests();
+  // Back to NOBODY HAS LOOKED. A depth published by one test would otherwise be the standing
+  // reading for every test after it — the exact "last reading stands forever" failure the store's
+  // own header describes for a host that is torn down without clearing.
+  useConciergeQueueStore.getState()._resetForTests();
   useUiStore.setState({
     collapsedOrchestrators: {},
     activeSpecial: null,
@@ -319,39 +328,40 @@ describe("Concierge Agents — click the row, then click an agent", () => {
     expect(inset(child) - inset(header)).toBe(32);
   });
 
-  it("opens a detail with the question and the full findings", () => {
+  // ══ THE FOUNDER'S ASK: A CHILD CLICK ROUTES TO THE MAIN PANE, NOTHING OPENS INLINE ═════════════
+  //
+  // Founder 2026-08-17: a research agent should work "exactly like any other worker" — click its
+  // name and the RIGHT pane shows it, with nothing expanding in the builder column. So a child click
+  // is a SELECTION (openTaskId + activeSpecial="research"), and the old inline detail panel is gone.
+  // The pane content itself is asserted in ConciergeResearchPane.test.tsx (AgentSidebar does not
+  // render the pane); here we prove the ROUTING and, as the paired negative, the ABSENCE of any
+  // inline detail in the sidebar.
+  it("selects the task into the main pane and renders NO inline detail in the sidebar", () => {
     seedResearch(FIXTURE);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
-    expect(screen.queryByTestId("concierge-agent-detail")).toBeNull();
+    // PAIRED NEGATIVE, before: nothing selected, no research surface active.
+    expect(useResearchStore.getState().openTaskId).toBeNull();
+    expect(useUiStore.getState().activeSpecial).toBeNull();
 
     const target = childRows().find(
       (r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id,
     )!;
     fireEvent.click(target);
 
-    const detail = screen.getByTestId("concierge-agent-detail");
-    expect(detail.textContent).toContain(DONE_WITH_FINDINGS.question);
-    // IN FULL, not clipped — types.ts records the same rule on the write side.
-    expect(screen.getByTestId("concierge-agent-findings").textContent).toBe(
-      DONE_WITH_FINDINGS.findings,
-    );
-    // Status and elapsed: 1754700120000 − 1754700004000 = 116_000ms, which formatElapsed spells
-    // "1.9m". Asserted as a value rather than as "some digits" so a broken span reads red.
-    expect(detail.textContent).toContain("Done");
-    expect(detail.textContent).toContain("1.9m");
+    // The routing: this task is now the main-pane selection.
+    expect(useResearchStore.getState().openTaskId).toBe(DONE_WITH_FINDINGS.id);
+    expect(useUiStore.getState().activeSpecial).toBe("research");
+    // …and the selected child reflects it.
+    expect(target.getAttribute("aria-pressed")).toBe("true");
+    // THE OLD INLINE PANEL IS GONE — the whole point. Neither the panel nor its findings/error/tier
+    // render anywhere in the sidebar column.
+    expect(screen.queryByTestId("concierge-agent-detail")).toBeNull();
+    expect(screen.queryByTestId("concierge-agent-findings")).toBeNull();
+    expect(screen.queryByTestId("concierge-agent-error")).toBeNull();
   });
 
-  it("shows a failed task's error in its detail", () => {
-    const failed = FIXTURE.find((t) => t.status === "failed")!;
-    seedResearch(FIXTURE);
-    render(<AgentSidebar project={seed()} />);
-    fireEvent.click(row());
-    fireEvent.click(childRows().find((r) => r.getAttribute("data-task-id") === failed.id)!);
-    expect(screen.getByTestId("concierge-agent-error").textContent).toBe(failed.error);
-  });
-
-  it("closes the detail when the open agent is clicked again", () => {
+  it("clicking the selected child again clears the main-pane selection", () => {
     seedResearch(FIXTURE);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
@@ -359,20 +369,25 @@ describe("Concierge Agents — click the row, then click an agent", () => {
       (r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id,
     )!;
     fireEvent.click(target);
+    expect(useUiStore.getState().activeSpecial).toBe("research");
+
+    // Click-again puts it away — same gesture a selected build head uses to fold.
     fireEvent.click(target);
-    expect(screen.queryByTestId("concierge-agent-detail")).toBeNull();
+    expect(useResearchStore.getState().openTaskId).toBeNull();
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+    expect(target.getAttribute("aria-pressed")).toBe("false");
   });
 });
 
-// ── 3b. THE CHAT LINK OPENS THE ROW ──────────────────────────────────────────────────────────────
+// ── 3b. THE CHAT LINK OPENS THE ROW AND THE MAIN PANE ────────────────────────────────────────────
 //
-// The concierge names a dispatched task as a `sparkle-research:` pill; clicking it sets the store's
-// `openTaskId` and nothing else (see `ResearchPill`). This is the row's half of that gesture: an
-// `openTaskId` pointing at a task this group renders must EXPAND the collapsed group, open that
-// task's detail, and scroll the row to the founder — otherwise the link sets a field a collapsed
-// group never reveals and reads as dead.
-describe("Concierge Agents — a chat-link click reveals the task's row", () => {
-  it("expands the collapsed group and opens the detail when openTaskId is set", () => {
+// The concierge names a dispatched task as a `sparkle-research:` pill; clicking it calls
+// `openResearchTaskInPane` (see `ResearchPill`), which sets `openTaskId` AND activeSpecial="research"
+// so the task shows in the MAIN pane. This is the row's half of that gesture: it must EXPAND the
+// collapsed group, mark that task's child selected, and scroll the row to the founder — otherwise
+// the link would leave the child unreachable and read as dead.
+describe("Concierge Agents — a chat-link click reveals the task's row and selects it", () => {
+  it("expands the collapsed group and selects the task's child when the pane is opened", () => {
     seedResearch(FIXTURE);
     render(<AgentSidebar project={seed()} />);
     // Collapsed, nothing clicked — the founder has not touched the header.
@@ -380,14 +395,18 @@ describe("Concierge Agents — a chat-link click reveals the task's row", () => 
     expect(childRows()).toHaveLength(0);
     expect(screen.queryByTestId("concierge-agent-detail")).toBeNull();
 
-    // The pill's whole effect: name a task as open. No header click.
-    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+    // The pill's whole effect: open the task in the main pane. No header click.
+    act(() => openResearchTaskInPane(DONE_WITH_FINDINGS.id));
 
     expect(row().getAttribute("aria-expanded")).toBe("true");
     expect(childRows()).toHaveLength(VISIBLE_IN_FIXTURE);
-    // …and it is THAT task's detail that opened, not merely the group.
-    const detail = screen.getByTestId("concierge-agent-detail");
-    expect(detail.textContent).toContain(DONE_WITH_FINDINGS.question);
+    // …and it is THAT task's child that is selected, not merely the group that opened. Still no
+    // inline detail — the content is in the main pane now.
+    const selected = childRows().find(
+      (r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id,
+    )!;
+    expect(selected.getAttribute("aria-pressed")).toBe("true");
+    expect(screen.queryByTestId("concierge-agent-detail")).toBeNull();
   });
 
   it("scrolls the opened row into view", () => {
@@ -399,7 +418,7 @@ describe("Concierge Agents — a chat-link click reveals the task's row", () => 
     try {
       seedResearch(FIXTURE);
       render(<AgentSidebar project={seed()} />);
-      act(() => useResearchStore.getState().setOpenTask(RUNNING.id));
+      act(() => openResearchTaskInPane(RUNNING.id));
       const opened = childRows().find((r) => r.getAttribute("data-task-id") === RUNNING.id)!;
       // The spy fires with the opened row as `this`; asserting the instance is what ties the scroll
       // to the RIGHT task rather than to any row that happened to mount.
@@ -439,18 +458,19 @@ describe("Concierge Agents — a chat-link click reveals the task's row", () => 
   it("re-opens the group when the SAME pill is clicked again after a manual collapse", () => {
     seedResearch(FIXTURE);
     render(<AgentSidebar project={seed()} />);
-    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+    act(() => openResearchTaskInPane(DONE_WITH_FINDINGS.id));
     expect(row().getAttribute("aria-expanded")).toBe("true");
 
     fireEvent.click(row());
     expect(row().getAttribute("aria-expanded")).toBe("false");
 
     // Same id again — a repeat pill click. `openTaskId` does not change, but the gesture does.
-    act(() => useResearchStore.getState().setOpenTask(DONE_WITH_FINDINGS.id));
+    act(() => openResearchTaskInPane(DONE_WITH_FINDINGS.id));
     expect(row().getAttribute("aria-expanded")).toBe("true");
-    expect(screen.getByTestId("concierge-agent-detail").textContent).toContain(
-      DONE_WITH_FINDINGS.question,
-    );
+    const reselected = childRows().find(
+      (r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id,
+    )!;
+    expect(reselected.getAttribute("aria-pressed")).toBe("true");
   });
 
   // A stale id — a task since retired, or one this window never listed — must NOT force the group
@@ -465,57 +485,10 @@ describe("Concierge Agents — a chat-link click reveals the task's row", () => 
   });
 });
 
-// ── 3c. THE DETAIL NAMES THE TIER ────────────────────────────────────────────────────────────────
-//
-// The founder asked each row to show "the model". The task carries no model id (the runner derives
-// it from `depth`, which this lane does not touch), so the detail names the TIER — the stable proxy.
-describe("Concierge Agents — the detail names the research tier", () => {
-  it("shows the quick/deep tier from the task's depth", () => {
-    seedResearch(FIXTURE);
-    render(<AgentSidebar project={seed()} />);
-    fireEvent.click(row());
-    // UNREAD_DONE is a `quick` task; RUNNING is `deep`. Assert each maps to its own label, so a
-    // hardcoded string cannot satisfy both.
-    fireEvent.click(childRows().find((r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id)!);
-    expect(screen.getByTestId("concierge-agent-tier").textContent).toBe("Quick research");
-
-    fireEvent.click(childRows().find((r) => r.getAttribute("data-task-id") === RUNNING.id)!);
-    expect(screen.getByTestId("concierge-agent-tier").textContent).toBe("Deep research");
-  });
-});
-
-// ── 4. THE KILL ────────────────────────────────────────────────────────────────────────────────
-//
-// The founder chose NO CAP on concurrent research, so "visible and killable" is the entire guardrail
-// and this is the killable half. A detail that offered no way to stop a running task would leave the
-// row as a viewer rather than a control.
-describe("Concierge Agents — cancel", () => {
-  it("cancels a running task and reflects the new state", async () => {
-    const cancelled: ResearchTask = { ...RUNNING, status: "cancelled", finishedAt: 1754700099000 };
-    backend.cancel.mockResolvedValue(cancelled);
-    seedResearch(FIXTURE);
-    render(<AgentSidebar project={seed()} />);
-    fireEvent.click(row());
-    fireEvent.click(childRows().find((r) => r.getAttribute("data-task-id") === RUNNING.id)!);
-
-    fireEvent.click(screen.getByText("Cancel"));
-    expect(backend.cancel).toHaveBeenCalledWith(RUNNING.id);
-    // THE SIDE EFFECT, not the call: the returned task lands in the store, so the row's own count
-    // drops and the detail stops offering a kill.
-    await waitFor(() => expect(screen.queryByText("Cancel")).toBeNull());
-    expect(row().textContent).toContain(`+${LIVE_IN_FIXTURE - 1}`);
-  });
-
-  it("offers no Cancel on a task that has already finished", () => {
-    seedResearch(FIXTURE);
-    render(<AgentSidebar project={seed()} />);
-    fireEvent.click(row());
-    fireEvent.click(
-      childRows().find((r) => r.getAttribute("data-task-id") === DONE_WITH_FINDINGS.id)!,
-    );
-    expect(screen.queryByText("Cancel")).toBeNull();
-  });
-});
+// THE TIER, THE FINDINGS, THE ERROR, AND CANCEL all moved to the MAIN pane
+// (ConciergeResearchPane.test.tsx) — they no longer render in the sidebar. The row's job is now to
+// SELECT; the pane's job is to SHOW. Keeping the display assertions here would test a surface that
+// no longer draws them.
 
 // ── 5. POSITION ────────────────────────────────────────────────────────────────────────────────
 describe("Concierge Agents — pinned directly above Improve Sparkle", () => {
@@ -756,5 +729,526 @@ describe("Concierge Agents — a recent count, so +0 is readable", () => {
     render(<AgentSidebar project={seed()} />);
     expect(row().textContent).not.toContain("recently");
     expect(row().textContent).not.toContain("+");
+  });
+});
+
+// ══ THE THIRD NUMBER: A DEEP QUEUE AND AN EMPTY ONE MUST NOT LOOK ALIKE ═════════════════════════
+//
+// Bead `sparkle-zx9knz`. The founder had SIXTEEN messages queued to the concierge while this row
+// read `+2`, and asked why ten agents were not spun up. `+[n]` is a live gauge with no denominator
+// — it decays toward zero as passes finish, while the turn queue stays deep because dispatching
+// research dequeues nothing — so `+0` meant BOTH "nothing to do" and "sixteen of your messages are
+// unanswered and nobody is working on any of them".
+//
+// ⚠️ WHY EVERY TEST BELOW RENDERS BOTH SIDES. The bug is a COLLISION between two states, so an
+// assertion about one of them is half the evidence: `expect(text).toContain("16 queued")` passes
+// against a component that printed the queue unconditionally, which re-creates the same
+// indistinguishability in the opposite direction — exactly how `· N recently` overshot the first
+// time this row was fixed. Each test therefore renders the pair and asserts they DIFFER, and what
+// each one says.
+describe("Concierge Agents — a queue depth, so +0 is not two different facts", () => {
+  const baseProps = {
+    status: "stopped" as AgentTabStatus,
+    liveCount: 0,
+    recentCount: 12,
+    hydrated: true,
+    paneSide: "left" as const,
+    jointOpen: false,
+  };
+  /** The badge span — the one span in the header row whose text starts with the `+` gauge. */
+  const badge = () =>
+    Array.from(row().querySelectorAll("span")).find((s) =>
+      s.textContent?.startsWith("+"),
+    ) as HTMLElement;
+
+  // ── THE COLLISION ITSELF ─────────────────────────────────────────────────────────────────────
+  it("renders a deep queue differently from an empty one, and says which is which", () => {
+    const { rerender } = render(<ConciergeAgentsRow {...baseProps} queuedCount={16} />);
+    const deep = badge().textContent;
+    rerender(<ConciergeAgentsRow {...baseProps} queuedCount={0} />);
+    const empty = badge().textContent;
+
+    // The whole complaint, in one line: these two are not the same row any more.
+    expect(deep).not.toBe(empty);
+    // …and each says the right thing, so "different" cannot be satisfied by noise.
+    expect(deep).toContain("16 queued");
+    expect(empty).not.toContain("queued");
+    // Neither number the row already had is disturbed by the new one.
+    expect(deep).toContain("+0");
+    expect(empty).toContain("+0");
+    expect(deep).toContain("12 recently");
+    expect(empty).toContain("12 recently");
+  });
+
+  // The founder's ACTUAL reading, which was not `+0` but `+2`. A fix keyed on `liveCount === 0`
+  // would pass every test above and still leave him looking at the row he complained about.
+  it("distinguishes the two at a NON-zero live count too", () => {
+    const { rerender } = render(<ConciergeAgentsRow {...baseProps} liveCount={2} queuedCount={16} />);
+    const deep = badge().textContent;
+    rerender(<ConciergeAgentsRow {...baseProps} liveCount={2} queuedCount={0} />);
+    expect(deep).not.toBe(badge().textContent);
+    expect(deep).toContain("+2");
+    expect(deep).toContain("16 queued");
+  });
+
+  // ── `undefined` IS NOT `0`, AND THEY RENDER THE SAME ANYWAY ──────────────────────────────────
+  //
+  // ⚠️ READ THIS BEFORE "FIXING" THE ASSERTION. The two are DIFFERENT FACTS and IDENTICAL OUTPUT,
+  // deliberately. `undefined` is WE DID NOT LOOK — a window with no `ConciergeHost` mounted — and
+  // `stores/conciergeQueueStore` states the rule for itself: conflating it with an empty queue puts
+  // the fail-open answer at the front of a display built to end a silence. `0` is a measured empty
+  // queue, and it is suppressed for the reason `· 0 recently` is: it is the ordinary state of every
+  // single send. So the equality below is the SPEC, not a shortcut — but the suppressions stay
+  // separate in the code, because the day one of them grows a treatment the other must not get it.
+  it("renders `undefined` exactly as it rendered before this prop existed", () => {
+    const { rerender } = render(<ConciergeAgentsRow {...baseProps} queuedCount={undefined} />);
+    const notLooked = {
+      text: badge().textContent,
+      title: badge().getAttribute("title"),
+      aria: badge().getAttribute("aria-label"),
+    };
+    // The pre-change rendering, spelled out rather than compared to itself.
+    expect(notLooked.text).toBe("+0 · 12 recently");
+    expect(notLooked.title).toBe("0 research agents running · 12 dispatched in the last 12 hours");
+    expect(notLooked.aria).toBe("0 running, 12 recently");
+
+    rerender(<ConciergeAgentsRow {...baseProps} queuedCount={0} />);
+    expect(badge().textContent).toBe(notLooked.text);
+    expect(badge().getAttribute("title")).toBe(notLooked.title);
+    expect(badge().getAttribute("aria-label")).toBe(notLooked.aria);
+  });
+
+  // ── THE COPY, IN STEP WITH THE VISIBLE TEXT ──────────────────────────────────────────────────
+  //
+  // The repo treats user-facing copy as code: a tooltip that still describes the old behaviour is
+  // the specific failure it names. Both strings are pinned in the same pair of states as the text.
+  it("tells the same story in the tooltip and the accessible description", () => {
+    const { rerender } = render(<ConciergeAgentsRow {...baseProps} queuedCount={16} />);
+    // Worded against `ConciergeQueueDepth.waiting`, which EXCLUDES the turn in flight — so
+    // "waiting behind the concierge's current turn", never "16 messages outstanding".
+    expect(badge().getAttribute("title")).toBe(
+      "0 research agents running · 16 messages waiting behind the concierge's current turn · 12 dispatched in the last 12 hours",
+    );
+    expect(badge().getAttribute("aria-label")).toBe("0 running, 16 queued, 12 recently");
+
+    rerender(<ConciergeAgentsRow {...baseProps} queuedCount={0} />);
+    expect(badge().getAttribute("title")).not.toContain("waiting");
+    expect(badge().getAttribute("aria-label")).not.toContain("queued");
+  });
+
+  it("says `message` when exactly one is waiting", () => {
+    render(<ConciergeAgentsRow {...baseProps} queuedCount={1} />);
+    expect(badge().textContent).toContain("1 queued");
+    expect(badge().getAttribute("title")).toContain("1 message waiting");
+    expect(badge().getAttribute("title")).not.toContain("1 messages");
+  });
+
+  // ── (D) NO FOURTH GRAMMAR FOR "ALL DISPATCHED, ALL FINISHED, STILL QUEUED" ───────────────────
+  //
+  // The state named in the bead — `queuedCount > 0`, `liveCount === 0`, `recentCount > 0` — is
+  // reported by the same three segments as every other state, and this pins that DECISION rather
+  // than an oversight. The row could word it as "waiting on the concierge", and deliberately does
+  // not: that would additionally claim the queue has STOPPED MOVING, which a count cannot support
+  // (a 16-deep queue draining one turn at a time is healthy and looks identical from here). The
+  // store says where that evidence lives — `oldestAt`, which this row is not given.
+  //
+  // The exact-string form is the point: it fails if a dialect word appears, if a segment goes
+  // missing, and if the order changes.
+  it("reports the bead's state in three numbers and invents no fourth word for it", () => {
+    render(<ConciergeAgentsRow {...baseProps} liveCount={0} recentCount={12} queuedCount={16} />);
+    expect(badge().textContent).toBe("+0 · 16 queued · 12 recently");
+  });
+
+  // NOW, then WAITING, then ALREADY BEEN THROUGH. Pinned because the segments are only a sentence
+  // in that order, and nothing else would catch a reordering.
+  it("orders the segments live · queued · recently", () => {
+    render(<ConciergeAgentsRow {...baseProps} liveCount={3} recentCount={7} queuedCount={5} />);
+    const t = badge().textContent!;
+    expect(t.indexOf("+3")).toBeLessThan(t.indexOf("5 queued"));
+    expect(t.indexOf("5 queued")).toBeLessThan(t.indexOf("7 recently"));
+  });
+
+  // The queue segment lives INSIDE the `hydrated` gate, which is a choice: one badge, one grammar,
+  // rather than a bare `· 16 queued` with no gauge in front of it. The state is a sub-second
+  // transient (the row hydrates on mount), so it does not earn a second layout.
+  it("says nothing about the queue before the first research listing lands", () => {
+    render(<ConciergeAgentsRow {...baseProps} hydrated={false} queuedCount={16} />);
+    expect(row().textContent).not.toContain("queued");
+    expect(row().textContent).not.toContain("+");
+  });
+
+  // ── THE WIRING: THE SIDEBAR READS THE PUBLISHED STORE, NOT A SECOND COUNTER ──────────────────
+  //
+  // Asserted through `AgentSidebar` rather than the row, because the prop threading is the half a
+  // component test cannot see. `ConciergeHost` is the real publisher; this seeds the store the same
+  // way it does. Both directions again: an unpublished store must leave the row exactly as it was.
+  it("takes the depth from the published store, and shows nothing when nobody published", () => {
+    seedResearch([]);
+    const owner = {};
+    act(() => {
+      useConciergeQueueStore.getState().publish(owner, { waiting: 16, running: true, oldestAt: 1 });
+    });
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).toContain("16 queued");
+
+    // …and the reading is not sticky: a window whose host has gone reads WE DID NOT LOOK.
+    act(() => useConciergeQueueStore.getState().clearFor(owner));
+    expect(row().textContent).not.toContain("queued");
+    expect(row().textContent).toContain("+0");
+  });
+});
+
+// ══ THE DEAD CLICK: THE LABEL PROMISED FIFTEEN ROWS AND THE GROUP DREW NONE ══════════════════════
+//
+// Founder, 2026-08-18, on `Concierge Agents +0 · 15 recently`: *"I'm trying to click on agents, but
+// it's not doing anything. … But I wanna be able to see the recent ones as well as the active ones."*
+//
+// The click was never broken. `· N recently` counts `recentTasks`, which KEEPS retired tasks on
+// purpose; the group rendered `visibleTasks`, which drops them. Replayed against his records: live 0,
+// recent 15, rendered 0. So the header opened an empty group and read as a dead row.
+//
+// EVERY TEST BELOW IS WRITTEN SO THE OLD CODE FAILS IT. In particular the first one seeds NOTHING
+// but retired tasks — a fixture containing a live task would render a non-empty group under the bug
+// as well, and prove nothing at all.
+describe("Concierge Agents — the recent ones as well as the active ones", () => {
+  const HOUR = 60 * 60_000;
+  /** A RETIRED task: terminal AND claimed (`readAt` stamped), dispatched `agoMs` ago. */
+  const retired = (id: string, agoMs: number, status: ResearchTask["status"] = "done"): ResearchTask => ({
+    ...DONE_WITH_FINDINGS,
+    id,
+    status,
+    question: `Retired ${id}`,
+    createdAt: Date.now() - agoMs,
+    readAt: Date.now() - agoMs + 1_000,
+  });
+  /** A LIVE task, dispatched `agoMs` ago. Never retired — `readAt` is meaningless while running. */
+  const live = (id: string, agoMs: number): ResearchTask => ({
+    ...RUNNING,
+    id,
+    question: `Live ${id}`,
+    createdAt: Date.now() - agoMs,
+    readAt: null,
+  });
+  /**
+   * THE THIRD POPULATION, and the whole reason it has a fixture: TERMINAL but UNCLAIMED.
+   *
+   * `readAt: null` on a stopped task — the run is over, but the concierge has not been told, so its
+   * findings are still owed to the prompt preamble. `isRetired` says LIVE here and `isTerminal` says
+   * RETIRED, which is the ONLY input on which the two disagree. Without it in the tree every fixture
+   * is one the two predicates answer identically, and `livenessOfResearch` could be rewritten to the
+   * wrong one with the whole suite green.
+   */
+  const unclaimed = (id: string, agoMs: number, status: ResearchTask["status"] = "done"): ResearchTask => ({
+    ...DONE_WITH_FINDINGS,
+    id,
+    status,
+    question: `Unclaimed ${id}`,
+    createdAt: Date.now() - agoMs,
+    readAt: null,
+  });
+
+  /** The one status disc inside a row — the only span the component gives a 50% radius. */
+  const discIn = (r: HTMLElement) =>
+    Array.from(r.querySelectorAll("span")).find(
+      (s) => (s as HTMLElement).style.borderRadius === "50%",
+    ) as HTMLElement;
+  /** A row's TITLE span, found by its exact text so the elapsed timer beside it cannot be mistaken
+   *  for it. */
+  const titleIn = (r: HTMLElement, text: string) =>
+    Array.from(r.querySelectorAll("span")).find((s) => s.textContent === text) as HTMLElement;
+  const rowFor = (id: string) => childRows().find((r) => r.getAttribute("data-task-id") === id)!;
+
+  // ── THE BUG ITSELF ───────────────────────────────────────────────────────────────────────────
+  it("opens onto a NON-empty group when every task in the window is retired", () => {
+    seedResearch([retired("r1", HOUR), retired("r2", 2 * HOUR, "failed"), retired("r3", 3 * HOUR, "cancelled")]);
+    render(<AgentSidebar project={seed()} />);
+
+    // The header the founder was reading: nothing live, three dispatched recently.
+    expect(row().textContent).toContain("+0");
+    expect(row().textContent).toContain("3 recently");
+    expect(childRows()).toHaveLength(0);
+
+    fireEvent.click(row());
+
+    // The fix: what the label counted is what the click shows. Under the old `visibleTasks` group
+    // this is 0 — the group did not even render, because it was gated on `tasks.length > 0`.
+    expect(row().getAttribute("aria-expanded")).toBe("true");
+    expect(childRows()).toHaveLength(3);
+    expect(screen.getAllByText("Retired r1").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Retired r2").length).toBeGreaterThan(0);
+  });
+
+  // THE INVARIANT, asserted on the two rendered numbers rather than on the selector: whatever
+  // `· N recently` says, that many rows (at least) are behind the click. Stated over a MIXED store
+  // so it cannot be satisfied by a group that renders everything the store has ever held.
+  it("shows at least as many rows as the badge promises", () => {
+    seedResearch([live("l1", 60_000), retired("r1", HOUR), retired("r2", 2 * HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).toContain("3 recently");
+    fireEvent.click(row());
+    expect(childRows().length).toBeGreaterThanOrEqual(3);
+  });
+
+  // ── THE TREATMENT: BOTH CANDIDATES MOUNTED AT ONCE ───────────────────────────────────────────
+  //
+  // AGENTS.md's rule for a change that picks one of N treatments — "render the state where all N
+  // targets exist, then assert the chosen one is PAINTED and each other one is NOT". Asserting only
+  // the retired side passes a `dotVariantFor` that ignores its argument and rings EVERY row, which
+  // is the regression that would make the live rows unreadable.
+  it("draws the retired row hollow-and-muted and the live row filled-and-cream, side by side", () => {
+    seedResearch([live("l1", 60_000), retired("r1", HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+
+    const liveRow = rowFor("l1");
+    const retiredRow = rowFor("r1");
+    expect(liveRow).toBeTruthy();
+    expect(retiredRow).toBeTruthy();
+
+    // FILL vs HOLLOW. The live disc paints its status colour as a background and casts no ring;
+    // the retired one is transparent with an INSET ring in the colour its own status resolves to.
+    expect(discIn(liveRow).style.background).toBe(asRgb(AGENT_STATUS.working.color));
+    expect(discIn(liveRow).style.boxShadow).toBe("");
+    expect(discIn(retiredRow).style.background).toBe("transparent");
+    expect(discIn(retiredRow).style.boxShadow).toContain("inset");
+
+    // HUE IS UNTOUCHED — the retired ring is the row's OWN status ink, not a new grey. This is the
+    // half that keeps a run which DIED distinguishable from one that ANSWERED.
+    expect(discIn(retiredRow).style.boxShadow).toContain(AGENT_STATUS.done.color);
+
+    // …and the titles, the other channel of the treatment.
+    expect(titleIn(liveRow, "Live l1").style.color).toBe("var(--c-cream)");
+    expect(titleIn(retiredRow, "Retired r1").style.color).toBe("var(--c-muted)");
+    expect(titleIn(liveRow, "Live l1").style.color).not.toBe(
+      titleIn(retiredRow, "Retired r1").style.color,
+    );
+  });
+
+  // A FAILED retired run must not flatten into the same ink as a DONE one — the second reason the
+  // treatment travels on FILL rather than on hue. Both mounted, both hollow, different colours.
+  it("keeps the outcome readable across two retired rows", () => {
+    seedResearch([retired("ok", HOUR, "done"), retired("bad", 2 * HOUR, "failed")]);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+    const ok = discIn(rowFor("ok"));
+    const bad = discIn(rowFor("bad"));
+    expect(ok.style.background).toBe("transparent");
+    expect(bad.style.background).toBe("transparent");
+    expect(ok.style.boxShadow).not.toBe(bad.style.boxShadow);
+    expect(bad.style.boxShadow).toContain(AGENT_STATUS.errored.color);
+  });
+
+  // ── THE BOUND IS REAL ────────────────────────────────────────────────────────────────────────
+  //
+  // The window is the label's 12h window and nothing else. The PAIRED positive is what stops this
+  // passing against a group that renders no retired rows at all.
+  it("does not render a retired task from outside the 12h window", () => {
+    seedResearch([retired("recent", HOUR), retired("ancient", 40 * HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+    expect(childRows().map((r) => r.getAttribute("data-task-id"))).toEqual(["recent"]);
+    expect(screen.queryByText("Retired ancient")).toBeNull();
+  });
+
+  // The other half of the union: a long `deep` run older than the window is still LIVE work, and
+  // tearing its row out mid-run would be a worse bug than the one being fixed.
+  it("still renders a LIVE task older than the window", () => {
+    seedResearch([live("long", 14 * HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    // Outside the dispatch window, so the badge does not count it…
+    expect(row().textContent).not.toContain("recently");
+    fireEvent.click(row());
+    // …and it is on screen anyway, because it has not finished.
+    expect(childRows().map((r) => r.getAttribute("data-task-id"))).toEqual(["long"]);
+  });
+
+  // ── RULE 2: A RETIRED ROW FEEDS NO ROLLUP ────────────────────────────────────────────────────
+  //
+  // A REGRESSION GUARD, and named as one: it passed before this change too, because retired tasks
+  // were not rendered at all. It has grip on what comes NEXT — a retired `failed` task reaching
+  // `researchRollupStatuses` paints the header red forever for work nobody can act on, which is the
+  // "red that can never be cleared" the row's own header argues against. Asserted by holding the
+  // live population FIXED and adding retired tasks around it: the badge and the disc must not move.
+  it("leaves +N and the header disc untouched when retired tasks appear", () => {
+    seedResearch([live("l1", 60_000)]);
+    const { rerender } = render(<AgentSidebar project={seed()} />);
+    const headerDisc = () => row().querySelector<HTMLElement>("span[title]")!;
+    const badgeBefore = row().textContent;
+    const discBefore = headerDisc().style.background;
+    const labelBefore = headerDisc().getAttribute("title");
+    expect(badgeBefore).toContain("+1");
+
+    act(() =>
+      seedResearch([
+        live("l1", 60_000),
+        retired("r1", HOUR, "failed"),
+        retired("r2", 2 * HOUR, "cancelled"),
+        retired("r3", 3 * HOUR, "done"),
+      ]),
+    );
+    rerender(<AgentSidebar project={seed()} />);
+
+    // Four rows behind the click…
+    fireEvent.click(row());
+    expect(childRows()).toHaveLength(4);
+    // …and the header still reports one live agent, in the same ink, with the same tooltip. A
+    // retired `failed` task feeding the rollup would turn this disc red.
+    expect(row().textContent).toContain("+1");
+    expect(row().textContent).not.toContain("+4");
+    expect(headerDisc().style.background).toBe(discBefore);
+    expect(headerDisc().getAttribute("title")).toBe(labelBefore);
+  });
+
+  // …AND THE SAME RULE AT THE FUNCTION, because the test above cannot reach it. `AgentSidebar`
+  // hands `researchRollupStatuses` an already-live-filtered list (`liveTasks`), so the filter INSIDE
+  // that function is unreachable from a render and deleting it leaves the rendered assertion green —
+  // measured, as a surviving mutant. This one drives the function directly with the very population
+  // the expanded group now renders: a live task and a RETIRED FAILED one, together.
+  it("keeps a retired FAILED task out of the rollup even when handed one", () => {
+    const tasks = [live("l1", 60_000), retired("bad", HOUR, "failed")];
+    // Both are rows the founder can see…
+    expect(groupTasks(tasks, Date.now()).map((t) => t.id).sort()).toEqual(["bad", "l1"]);
+    // …and only the live one reaches the disc. `errored` here is the red that can never be cleared:
+    // nobody can act on a research run that already finished and was already reported.
+    expect(researchRollupStatuses(tasks)).toEqual(["working"]);
+    expect(researchRollupStatuses(tasks)).not.toContain("errored");
+  });
+
+  // ── RULE 4: A RETIRED ROW LEADS SOMEWHERE ────────────────────────────────────────────────────
+  //
+  // The whole request is to READ a finished run — its question and its findings. A retired row that
+  // is inert text is a failed fix, so the routing is asserted on the retired row specifically.
+  it("routes a click on a RETIRED row into the main pane", () => {
+    seedResearch([live("l1", 60_000), retired("r1", HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+    expect(useResearchStore.getState().openTaskId).toBeNull();
+    expect(useUiStore.getState().activeSpecial).toBeNull();
+
+    const target = rowFor("r1");
+    fireEvent.click(target);
+
+    expect(useResearchStore.getState().openTaskId).toBe("r1");
+    expect(useUiStore.getState().activeSpecial).toBe("research");
+    expect(target.getAttribute("aria-pressed")).toBe("true");
+  });
+
+  // The chat-link reveal's membership guard reads the SAME widened list, so a pill naming a task
+  // that has since been claimed now opens onto its row instead of silently doing nothing. The
+  // guard is still a guard — the stale-id test above proves an unknown id opens nothing.
+  it("expands the group for a pill naming a retired task", () => {
+    seedResearch([retired("r1", HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().getAttribute("aria-expanded")).toBe("false");
+
+    act(() => openResearchTaskInPane("r1"));
+
+    expect(row().getAttribute("aria-expanded")).toBe("true");
+    expect(rowFor("r1").getAttribute("aria-pressed")).toBe("true");
+  });
+
+  // ══ BOTH HALVES OF THE ROLLUP CONJUNCTION, NOT JUST THE ONE THAT HAPPENS TO FIRE ═════════════
+  //
+  // `researchRollupStatuses` filters on `isLive(t) && countsTowardRollup(livenessOfResearch(t))`.
+  // Once a terminal-but-unclaimed task maps to "live" — which the tests below now pin — the SECOND
+  // half returns true for it, so only `isLive` keeps it out of the header disc. Every other rollup
+  // test seeds a running task or a retired one, i.e. inputs on which the two halves agree, so
+  // deleting `isLive` left all 44 tests green while letting an unclaimed FAILED run paint the
+  // collapsed header red — the "red nobody can clear until the concierge is told" outcome that
+  // function's own header argues against. Verified by mutation; raised as a Medium by roborev 65382.
+  //
+  // Stated as the DIFFERENCE between the two facts, because that is the whole content of the bug:
+  // the row treats this task as live, and the rollup must still not count it.
+  it("keeps a terminal-but-unclaimed task out of the rollup, though the row treats it as live", () => {
+    const owedFailed = unclaimed("u_failed", HOUR, "failed");
+    const owedDone = unclaimed("u_done", HOUR, "done");
+
+    // The row-treatment half: these are LIVE, so they draw filled and cream.
+    expect(livenessOfResearch(owedFailed)).toBe("live");
+    expect(livenessOfResearch(owedDone)).toBe("live");
+
+    // …and the rollup half: they are nevertheless absent from it, which is the half `isLive` alone
+    // is holding up. A `failed` one is the case that matters — it is the only status that could
+    // turn the header red.
+    expect(researchRollupStatuses([owedFailed])).toEqual([]);
+    expect(researchRollupStatuses([owedDone])).toEqual([]);
+    expect(researchRollupStatuses([owedFailed])).not.toContain("errored");
+
+    // The control: a genuinely live task in the same call IS counted, so the assertions above are
+    // about this population rather than about a filter that rejects everything.
+    expect(researchRollupStatuses([live("l1", 60_000), owedFailed])).toEqual(["working"]);
+  });
+
+  // ══ FINISHED IS NOT THE SAME AS HEARD — THE ONE INPUT THE TWO PREDICATES DISAGREE ON ══════════
+  //
+  // `livenessOfResearch` maps `isRetired` (terminal AND claimed) and DELIBERATELY not `isTerminal`.
+  // Everything above seeds either a running task or a terminal-and-claimed one, and on both of those
+  // the two predicates return the SAME answer — so rewriting the body to `isTerminal` left all 83
+  // tests green while dimming the one row that still has findings to deliver. Verified by mutation,
+  // and raised as a Medium finding on this commit by two independent reviews.
+  //
+  // The direct unit test is the cheap half and kills that mutant outright; the render test below is
+  // the half that proves the treatment actually reaches the DOM for this population.
+  it("calls a terminal-but-unclaimed task LIVE, and only a claimed one retired", () => {
+    // EVERY terminal status on BOTH sides of the claim, not just one — `cancelled` is a state the
+    // founder put the run in and it retires exactly like the other two, so a mapping that special-
+    // cased any single status would still have to answer all six of these.
+    expect(livenessOfResearch(live("l", 60_000))).toBe("live");
+    expect(livenessOfResearch(unclaimed("u_done", HOUR, "done"))).toBe("live");
+    expect(livenessOfResearch(unclaimed("u_failed", HOUR, "failed"))).toBe("live");
+    expect(livenessOfResearch(unclaimed("u_cancelled", HOUR, "cancelled"))).toBe("live");
+    expect(livenessOfResearch(retired("r", HOUR, "done"))).toBe("retired");
+    expect(livenessOfResearch(retired("rf", HOUR, "failed"))).toBe("retired");
+    // THE SIXTH, and the one that was missing while the comment above claimed six. `readAt` is
+    // stamped for EVERY terminal status and `cancelled` is terminal, so claimed-and-cancelled is a
+    // real production shape. Without it, a mapping reading `isRetired(task) && status !== "cancelled"`
+    // passes the whole suite and leaves a run the founder himself cancelled drawn as work in flight.
+    expect(livenessOfResearch(retired("rc", HOUR, "cancelled"))).toBe("retired");
+
+    // THE DISCRIMINATOR, stated as a difference rather than as two absolutes: a `done` task is
+    // terminal either way, so what separates the two rows is ONLY whether it has been claimed.
+    expect(livenessOfResearch(unclaimed("u2", HOUR, "done"))).not.toBe(
+      livenessOfResearch(retired("r2", HOUR, "done")),
+    );
+  });
+
+  // ALL THREE CANDIDATES MOUNTED AT ONCE — AGENTS.md's rule, applied to the population the earlier
+  // side-by-side test was missing. A `done`-with-findings-owed row must render exactly like a live
+  // one: filled disc, cream title. If it dims, the founder loses the visual cue on the single row
+  // that still owes him something.
+  it("draws a terminal-but-unclaimed row filled-and-cream, beside a live one and a retired one", () => {
+    seedResearch([live("l1", 60_000), unclaimed("u1", HOUR), retired("r1", 2 * HOUR)]);
+    render(<AgentSidebar project={seed()} />);
+    fireEvent.click(row());
+
+    const liveRow = rowFor("l1");
+    const unclaimedRow = rowFor("u1");
+    const retiredRow = rowFor("r1");
+    expect(liveRow).toBeTruthy();
+    expect(unclaimedRow).toBeTruthy();
+    expect(retiredRow).toBeTruthy();
+
+    // The unclaimed row is FILLED, like the live one — not hollow like the retired one.
+    expect(discIn(unclaimedRow).style.background).toBe(asRgb(AGENT_STATUS.done.color));
+    expect(discIn(unclaimedRow).style.boxShadow).toBe("");
+    expect(titleIn(unclaimedRow, "Unclaimed u1").style.color).toBe("var(--c-cream)");
+    // Stated against the LIVE row as well as against the literal token: what this row must match is
+    // whatever a row still in flight looks like, so a change to the live ink drags this with it
+    // instead of leaving a hardcoded token behind that quietly stops meaning "same as live".
+    expect(titleIn(unclaimedRow, "Unclaimed u1").style.color).toBe(
+      titleIn(liveRow, "Live l1").style.color,
+    );
+
+    // …and the retired one, seeded with the SAME `done` status, is drawn the other way. Same status,
+    // different treatment: the difference is claimed-ness alone, which is the point.
+    expect(discIn(retiredRow).style.background).toBe("transparent");
+    expect(discIn(retiredRow).style.boxShadow).toContain("inset");
+    expect(titleIn(retiredRow, "Retired r1").style.color).toBe("var(--c-muted)");
+
+    // Stated as a difference so a treatment that ignored liveness entirely cannot satisfy it.
+    expect(discIn(unclaimedRow).style.boxShadow).not.toBe(discIn(retiredRow).style.boxShadow);
+    expect(titleIn(unclaimedRow, "Unclaimed u1").style.color).not.toBe(
+      titleIn(retiredRow, "Retired r1").style.color,
+    );
   });
 });

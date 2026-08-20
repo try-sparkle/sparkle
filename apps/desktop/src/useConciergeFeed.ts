@@ -16,6 +16,7 @@ import { windowPromptGraceLedger } from "./engine/blockedPromptGrace";
 import { getRoster, onRosterChanged } from "./services/attention";
 import { safeUnlisten } from "./services/safeUnlisten";
 import { buildConciergeFeed, type ConciergeFeed } from "./services/conciergeFeed";
+import { useNudgeFlagSnapshot } from "./useNudgeFlags";
 import { useProjectStore } from "./stores/projectStore";
 import { useRuntimeStore } from "./stores/runtimeStore";
 import { useInteractionStore } from "./stores/interactionStore";
@@ -56,6 +57,12 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
   // hashes a prompt's identity from and measures its 30s ceiling against. Subscribed as a PAIR
   // because the store writes them as one (runtimeStore.attentionScreenAt), and a feed holding one
   // without the other would measure a hold from the wrong instant.
+  // The nudger flag table, subscribed. It lives outside React (a module-level Map in
+  // `services/authRecovery`), and `publishedStatusFor` reads it to decide whether a stated human
+  // block survives the nudge-loop demotion. Without this the digest could never learn about a flag:
+  // a flagged agent is SILENT, so none of the store maps below ever move again, and the feed would
+  // keep reporting `lapsed` for a row the sidebar had already painted red (roborev 65408).
+  const nudgeFlags = useNudgeFlagSnapshot();
   const attentionScreen = useRuntimeStore((s) => s.attentionScreen);
   const attentionScreenAt = useRuntimeStore((s) => s.attentionScreenAt);
   const interaction = useInteractionStore((s) => s.lastAt);
@@ -148,6 +155,15 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
         promptGrace,
         attentionScreen,
         attentionScreenAt,
+        // The subscribed snapshot, READ here rather than merely listed in the deps below — a
+        // listed-not-read token is enforced by nothing, since the eslint-disable suppresses the rule
+        // in both directions (roborev 65448).
+        //
+        // ⚠️ BUT NOT COMPILER-ENFORCED, and the earlier claim that it was is wrong (roborev 65465):
+        // `nudgeFlags` is OPTIONAL on `ConciergeFeedInput` (54 call sites make required pure churn)
+        // and its default is the DEMOTING `new Map()`. What holds this line in place is the
+        // after-mount test in `useConciergeFeed.test.tsx`, which goes red if it is deleted.
+        nudgeFlags,
       }),
     // `graceTick` / `promptTick` are not referenced in the body BY DESIGN — they are the only inputs
     // that change when a grace window closes with nothing else happening in the app, which is the
@@ -169,6 +185,9 @@ export function useConciergeFeed(opts?: UseConciergeFeedOpts): ConciergeFeed {
       pinnedProjectId,
       graceTick,
       promptTick,
+      // READ in the body (passed to `buildConciergeFeed`), unlike the two ticks above. Held by the
+      // after-mount test rather than by the compiler — see the note at the call site (roborev 65465).
+      nudgeFlags,
     ],
   );
 }

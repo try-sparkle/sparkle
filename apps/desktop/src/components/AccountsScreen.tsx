@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type CSSProperties } from "react";
 import { FiAlertTriangle, FiRotateCw, FiSlash, FiUserPlus } from "react-icons/fi";
 import { C, ON_BRAND_FILL } from "../theme/colors";
-import { FONT_UI, TYPE } from "../theme/scale";
+import { FONT_UI, PILL, TYPE } from "../theme/scale";
 import { tag } from "./labelTreatment";
 import { AccountSpawnLog } from "./AccountSpawnLog";
 import { MODAL_PADDING } from "./ModalShell";
@@ -15,6 +15,8 @@ import {
   setNickname,
   removeAccount,
   accountDisplay,
+  forkNotice,
+  identityChanged,
   duplicateAccountGroups,
   loginSiblingIds,
   identityKey,
@@ -47,7 +49,22 @@ import {
   leadName,
   type Ceiling,
 } from "../services/headroom";
-import { getAccountUsageLive, type AccountUsageLive } from "../services/accountUsage";
+import {
+  getAccountUsageLive,
+  type AccountUsageLive,
+} from "../services/accountUsage";
+import { checkSpendGateForAccounts } from "../services/advisor/spendGate";
+import {
+  orderBySpace,
+  usageColor,
+  USAGE_COLOR_HEX,
+  formatResetCaption,
+  collapsedRunningAgents,
+  signInStalled,
+  PENDING_NICKNAME,
+  STALLED_SIGN_IN_TITLE,
+  SIGN_IN_STALL_SECONDS,
+} from "./accountsView";
 import { joinList } from "../engine/joinList";
 
 // Accounts settings screen for multi Claude Max account support (design spec
@@ -163,21 +180,41 @@ const primaryBtn: CSSProperties = {
   color: ON_BRAND_FILL,
 };
 
+/** A borderless inline text link (e.g. the "+ N more" / "Collapse" toggles in the running-agents
+ *  list). Reads as a link, not a button, and inherits the surrounding font size. */
+const linkBtn: CSSProperties = {
+  background: "transparent",
+  border: "none",
+  padding: 0,
+  margin: 0,
+  // tealInk, not teal: `C.teal` is a FILL token (for painting a surface behind on-brand text), and
+  // underlined link TEXT has to sit on a verifiable ink tier to stay legible on the page ground.
+  color: C.tealInk,
+  font: "inherit",
+  cursor: "pointer",
+  textDecoration: "underline",
+};
+
+/** One option inside the ⋮ kebab dropdown — full-width, left-aligned, borderless. */
+const menuItem: CSSProperties = {
+  display: "block",
+  width: "100%",
+  textAlign: "left",
+  background: "transparent",
+  border: "none",
+  color: C.cream,
+  fontFamily: fontStack,
+  fontSize: 12,
+  padding: "8px 12px",
+  cursor: "pointer",
+};
+
 const tagStyle: CSSProperties = { ...tag(C.accentInk), borderColor: C.teal };
 
-/** The PRIMARY badge — the account the user activated for the fleet.
- *
- *  DELIBERATELY A FILLED PILL while `default` stays an outline tag, and that contrast is the point
- *  rather than decoration. In the founder's screenshot an EXHAUSTED account was still badged
- *  `default`, because "default" means "the config dir Sparkle registers as `~/.claude`" and has
- *  nothing to do with where agents run. Two outline tags of the same weight would read as two
- *  spellings of one idea; a solid one reads as the answer to "which account are my agents on". */
-const primaryTagStyle: CSSProperties = {
-  ...tag(ON_BRAND_FILL),
-  background: C.teal,
-  borderColor: C.teal,
-  color: ON_BRAND_FILL,
-};
+// The "PRIMARY" badge was REMOVED (founder's overhaul): the list now reads as a flat, equal rotation
+// with no crowned account. The activation MECHANISM stays — the per-card "Manual Override" button and
+// the subtle inline "Active — new agents run here" indicator below it — but the badge/terminology is
+// gone. `default` keeps its own outline tag (a different idea the founder did not ask to remove).
 
 /** The screen's title bar, PINNED. "+ Add account" is the remedy every banner on this screen
  *  recommends, and it used to scroll with the page: the spawn ledger at the bottom grew unbounded,
@@ -255,62 +292,73 @@ function clockTime(epochMs: number): string {
   return new Date(epochMs).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
-/** "resets Aug 17, 10:59 AM" for an ISO-8601 reset instant, or null when the string is absent or
- *  unparseable. A 7-day reset can be days out, so — unlike {@link clockTime} — this carries the date
- *  too. Defensive: Anthropic sends `resets_at: null` for a scoped/inactive window, and a bad string
- *  yields `NaN`, both of which must read as "no reset to show" rather than "Invalid Date". */
-function resetLabel(iso: string | null): string | null {
-  if (!iso) return null;
-  const ms = Date.parse(iso);
-  if (Number.isNaN(ms)) return null;
-  const when = new Date(ms).toLocaleString([], {
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  });
-  return `resets ${when}`;
-}
+/** Fixed width of the metric-label column so the Session and Weekly bars line up vertically. */
+const USAGE_LABEL_WIDTH = 84;
+/** Bar thickness — 2× the original 6px (overhaul item 8). */
+const USAGE_BAR_HEIGHT = 12;
 
-/** A REAL usage bar filled by Anthropic's actual utilization percent (0–100), with an optional reset
- *  caption. `percent: null` (a window the server didn't report) renders "—" and an empty bar, never
- *  a fabricated 0%. Unlike the removed relative cross-account bar, this one
- *  is the account's honest standing against its own real limit. */
+/** A REAL usage bar filled by Anthropic's actual utilization percent (0–100). Overhaul items 8/9/12/
+ *  15: one ROW — label │ bar (flex) │ % — with the bar 2× thick and COLOUR-CODED by its own used
+ *  percent, and a right-aligned reset caption on its own line beneath. `percent: null` (a window the
+ *  server didn't report) renders "—" and an empty muted bar, never a fabricated 0%. `now` is passed
+ *  in (never read from the clock here) so the caption is deterministic/testable. */
 function LiveUsageBar({
   label,
   percent,
   resetsAt,
+  now,
 }: {
   label: string;
   percent: number | null;
   resetsAt: string | null;
+  now: number;
 }) {
-  const pct = percent != null ? Math.max(0, Math.min(100, percent)) : 0;
-  const reset = resetLabel(resetsAt);
+  const known = percent != null;
+  const pct = known ? Math.max(0, Math.min(100, percent)) : 0;
+  const resetMs = resetsAt ? Date.parse(resetsAt) : NaN;
+  // The reset caption is independent of the percent: each window's percent and reset instant are
+  // separately nullable on the wire (accountUsage.ts), so a payload can carry "when do I get capacity
+  // back" without a utilization figure. Gate the caption on the RESET parsing, not on `known`, so that
+  // "when it resets" signal isn't dropped just because the percent for that window was omitted.
+  const caption = !Number.isNaN(resetMs) ? formatResetCaption(now, resetMs) : null;
+  // Colour by the account's OWN used percent (item 9); an unknown window stays muted.
+  const barColor = known ? USAGE_COLOR_HEX[usageColor(pct)] : C.muted;
   return (
-    <div style={{ marginTop: 6 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted }}>
-        <span>{label}</span>
-        <span>{percent != null ? `${Math.round(percent)}%` : "—"}</span>
+    <div style={{ marginTop: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 12, color: C.muted, width: USAGE_LABEL_WIDTH, flexShrink: 0 }}>
+          {label}
+        </span>
+        <div
+          role="progressbar"
+          aria-label={`${label} real usage`}
+          aria-valuenow={Math.round(pct)}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          style={{
+            flex: 1,
+            minWidth: 0,
+            height: USAGE_BAR_HEIGHT,
+            // PILL, not `USAGE_BAR_HEIGHT / 2`: a capsule is the shape intended, and the scale
+            // ratchet reads every numeric literal in the expression — the `2` counts as an
+            // off-scale radius even though the value it computes (6) is on the scale.
+            borderRadius: PILL,
+            background: C.deepForest,
+            border: `1px solid ${C.muted}`,
+            overflow: "hidden",
+          }}
+        >
+          <div style={{ width: `${pct}%`, height: "100%", background: barColor }} />
+        </div>
+        <span style={{ fontSize: 12, color: C.muted, width: 40, textAlign: "right", flexShrink: 0 }}>
+          {known ? `${Math.round(percent)}%` : "—"}
+        </span>
       </div>
-      <div
-        role="progressbar"
-        aria-label={`${label} real usage`}
-        aria-valuenow={Math.round(pct)}
-        aria-valuemin={0}
-        aria-valuemax={100}
-        style={{
-          height: 6,
-          borderRadius: 3,
-          background: C.deepForest,
-          border: `1px solid ${C.muted}`,
-          marginTop: 2,
-          overflow: "hidden",
-        }}
-      >
-        <div style={{ width: `${pct}%`, height: "100%", background: C.teal }} />
-      </div>
-      {reset && <div style={{ fontSize: TYPE.micro, color: C.muted, marginTop: 2 }}>{reset}</div>}
+      {caption && (
+        <div style={{ fontSize: TYPE.micro, color: C.muted, marginTop: 2, textAlign: "right" }}>
+          {caption}
+        </div>
+      )}
     </div>
   );
 }
@@ -320,7 +368,13 @@ function LiveUsageBar({
  *   - `"error"` (no token / offline / 401 / keychain declined) → "Real usage unavailable", and the
  *     relative token-tally bars below remain the fallback;
  *   - data → the two real percent bars. */
-function LiveUsageSection({ live }: { live: AccountUsageLive | "error" | undefined }) {
+function LiveUsageSection({
+  live,
+  now,
+}: {
+  live: AccountUsageLive | "error" | undefined;
+  now: number;
+}) {
   if (live === undefined) {
     return (
       <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>Loading real usage…</div>
@@ -328,28 +382,169 @@ function LiveUsageSection({ live }: { live: AccountUsageLive | "error" | undefin
   }
   if (live === "error") {
     return (
-      <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>
-        Real usage unavailable — showing local estimate below.
-      </div>
+      <div style={{ marginTop: 6, fontSize: 12, color: C.muted }}>Real usage unavailable.</div>
     );
   }
+  // The "REAL USAGE (ANTHROPIC)" section label was removed (overhaul item 5) — the two labelled bars
+  // speak for themselves. The bars themselves stay.
   return (
     <div style={{ marginTop: 6 }}>
-      <div style={{ fontSize: TYPE.micro, color: C.muted, textTransform: "uppercase", letterSpacing: 0.4 }}>
-        Real usage (Anthropic)
-      </div>
       <LiveUsageBar
         label="Session (5h)"
         percent={live.fiveHourPercent}
         resetsAt={live.fiveHourResetsAt}
+        now={now}
       />
       <LiveUsageBar
         label="Weekly (7d)"
         percent={live.sevenDayPercent}
         resetsAt={live.sevenDayResetsAt}
+        now={now}
       />
+      <MeterLine live={live} />
     </div>
   );
+}
+
+/** THE FLEET ANSWER: will an advisor pass run at all, right now?
+ *
+ *  `MeterLine` below states one ACCOUNT's meter. This states the thing a human actually wants to
+ *  know, and the two are not the same question — which is the trap this component exists to close.
+ *
+ *  Production asks `checkSpendGateForAccounts`, which folds EVERY registered account and requires
+ *  UNANIMITY: the first account that cannot prove its credits are disarmed refuses for the whole
+ *  fleet. So a card reading "usage credits disarmed" proves nothing on its own, and two reachable
+ *  states were being reported as though it did — a sibling with credits ARMED, and a sibling whose
+ *  usage read FAILED (which renders "Real usage unavailable" and mounts no meter line at all, so
+ *  nothing anywhere on the screen said the advisor was off).
+ *
+ *  It calls the SAME function production calls rather than re-deriving the rule. A second copy of a
+ *  unanimity fold is exactly the drift that would put a reassuring sentence on screen while every
+ *  pass silently refuses — the failure this whole surface exists to prevent.
+ *
+ *  An account still loading contributes nothing; one that ERRORED contributes `null`, which the
+ *  gate reads as unreadable and refuses on, matching production, where a rejected read is a refusal
+ *  rather than an abstention. */
+function AdvisorGateLine({
+  liveByAccount,
+}: {
+  liveByAccount: readonly (AccountUsageLive | "error" | undefined)[];
+}) {
+  const payloads = liveByAccount
+    .filter((l) => l !== undefined)
+    .map((l) => (l === "error" ? null : l));
+  if (payloads.length === 0) return null;
+  const verdict = checkSpendGateForAccounts(payloads);
+  const why =
+    verdict.allowed === true
+      ? null
+      : verdict.reason === "credits-armed"
+        ? "an account has usage credits armed, so a pass could bill outside the subscription"
+        : verdict.reason === "spend-limit-reached"
+          ? "an account reports its credit spend limit reached"
+          : verdict.reason === "usage-unreadable"
+            ? "an account's usage could not be read, and an unreadable meter is not permission"
+            : "an account did not report its usage-credits meter";
+  return (
+    <div
+      data-testid="advisor-gate-line"
+      style={{
+        ...card,
+        fontSize: 12,
+        color: why ? C.dangerInk : C.muted,
+        marginBottom: 8,
+      }}
+    >
+      {why ? `Advisor passes are SKIPPING — ${why}.` : "Advisor passes can run — all accounts have usage credits disarmed."}
+    </div>
+  );
+}
+
+/** WHICH BILLING METER this account is spending against, in one plain line under the bars.
+ *
+ *  The two bars above are the SUBSCRIPTION windows, and for a long time they were the whole story
+ *  the screen could tell — the usage-credits meter was fetched and thrown away by the parser. So an
+ *  account spending pay-as-you-go credits looked identical to one on subscription alone, and the
+ *  first anyone learned of a spend limit was a fleet of agents stalling against it. The point of
+ *  this line is that a human sees it BEFORE that, not after.
+ *
+ *  Driven off the RAW TRI-STATE, not `summarizeMeter`, and IN THE GATE'S OWN ORDER. The summary
+ *  folds absent / `null` / `isEnabled: false` together as "subscription", which is right for a
+ *  status pill and wrong here: `services/advisor/spendGate.ts` treats those as opposite outcomes.
+ *
+ *  The order is the subtle half, and getting it wrong is what a first cut of this line did. The
+ *  gate checks `spendLimitReached` BEFORE the `isEnabled` gate, so a DISARMED meter at its spend
+ *  limit still refuses — yet reading the warning off the summary while the label read the
+ *  tri-state rendered that case as a plain, unqualified "subscription", which under this line's own
+ *  contract is the one reading that means a pass is permitted. Most reassuring in a refusing state
+ *  is precisely the failure this exists to prevent, so the whole line derives from one verdict that
+ *  mirrors the gate rather than from two independent reads.
+ *
+ *  It also distinguishes NO METER BLOCK from a block that did not say whether it is armed. Both
+ *  refuse, but only the first can honestly be called "not reported" — a payload carrying
+ *  `spendLimitReached: true` with a null `isEnabled` plainly did report a meter, and saying
+ *  otherwise one line above a definite statement about that meter's ceiling contradicts itself. */
+function MeterLine({ live }: { live: AccountUsageLive }) {
+  const extra = live.extraUsage ?? null;
+  const armed = extra?.isEnabled;
+  const limitReached = extra?.spendLimitReached === true;
+  const credits = extra?.usedCredits ?? null;
+  const monthly = extra?.monthlyLimit ?? null;
+
+  // ONE derivation, in `spendGate.ts`'s order: spend limit, then armed, then disarmed (the only
+  // permitting state), then unreadable.
+  //
+  // Worded as a fact about THIS ACCOUNT, never as a verdict about whether advisor passes run. That
+  // distinction is not pedantry: production asks `checkSpendGateForAccounts`, which requires
+  // UNANIMITY across every registered account, so one disarmed account proves nothing on its own —
+  // a sibling with credits armed, or one whose usage read failed, refuses for the whole fleet. An
+  // earlier cut said "Advisor passes skip here — …" and rendered NOTHING on a permitting card,
+  // which made silence a fleet-wide permission claim this line cannot support. The fleet answer is
+  // `AdvisorGateLine`, rendered once above the cards from the same fold production uses.
+  const accountNote =
+    limitReached
+      ? "credit spend limit reported reached"
+      : armed === true
+        ? "usage credits armed"
+        : armed === false
+          ? "usage credits disarmed"
+          : extra == null
+            ? "no credits meter reported"
+            : "credits meter did not say whether it is armed";
+
+  // Credit figures belong ONLY beside the credits label. The Rust type makes every field its own
+  // `Option`, so a meter disabled part-way through a month arrives as `isEnabled: false` with
+  // `usedCredits` still populated — and rendering that as "subscription · 47.50 of 200 used"
+  // asserts one meter while displaying the other's spend, the exact confusion this removes.
+  const usedText =
+    armed !== true || credits == null
+      ? null
+      : monthly == null
+        ? `${formatCredits(credits)} in credits used this month`
+        : `${formatCredits(credits)} of ${formatCredits(monthly)} credits used this month`;
+
+  return (
+    <div style={{ marginTop: 6, fontSize: TYPE.small, color: C.muted }}>
+      <span>
+        Billing: {armed === true ? "usage credits" : "subscription"}
+        {usedText ? ` · ${usedText}` : ""}
+      </span>
+      {limitReached && (
+        <div style={{ color: C.dangerInk, marginTop: 2 }}>
+          Credit spend limit reached — usage credits will not cover new agents.
+        </div>
+      )}
+      <div style={{ color: limitReached ? C.dangerInk : C.muted, marginTop: 2 }}>
+        This account: {accountNote}.
+      </div>
+    </div>
+  );
+}
+
+/** Credits as a plain figure: whole numbers stay whole, fractions keep two places. Never a
+ *  fabricated value — the caller has already established the figure is non-null. */
+function formatCredits(n: number): string {
+  return Number.isInteger(n) ? String(n) : n.toFixed(2);
 }
 
 function exhaustedLabel(usage: Usage | undefined, now: number): string | null {
@@ -538,6 +733,19 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // Bumped after every completed `onLogin` (handleAdd / handleLogin) to re-drive the live-usage
   // effect — the trigger a login provides that the account SET does not (see the effect below).
   const [liveNonce, setLiveNonce] = useState(0);
+  // ── Per-card "Check usage levels" (item 14): a cache-bypassing re-read of ONE account's real
+  // Anthropic levels, surfaced from that card's ⋮ kebab. `checkingUsage[id]` drives the in-flight
+  // line; `usageError[id]` is that card's inline failure. Both are keyed by account id and kept
+  // separate from the per-account `liveUsage` map so a check never blanks the row while it runs —
+  // the row keeps its last figures and updates in place when the forced fetch returns. Replaces the
+  // old global "Refresh usage" button — each card checks its own account independently.
+  const [checkingUsage, setCheckingUsage] = useState<Record<string, boolean>>({});
+  const [usageError, setUsageError] = useState<Record<string, string | null>>({});
+  // Which card's ⋮ kebab menu is open (item 11); only one at a time, null = none.
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  // PER-CARD expand state for the "Running agents" one-line collapse (item 13): the set of account
+  // ids whose running-agents list is currently expanded to the full comma list.
+  const [expandedRunning, setExpandedRunning] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
@@ -547,6 +755,28 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   // the resulting blur runs, which lets handleRename short-circuit a double-commit
   // (Enter) or a cancelled-edit save (Escape).
   const editingIdRef = useRef<string | null>(null);
+  // ── THE CLOCK BEHIND "Trouble signing in" ───────────────────────────────────────────────────
+  //
+  // Whether a pending row has stalled is a function of TIME, not of any state this screen holds, so
+  // without a tick the title would only flip when something unrelated happened to re-render — which
+  // on a screen the user is staring at may be never. The interval runs ONLY while a row is actually
+  // pending (that is the `pendingCount` dependency), so a fleet of settled accounts costs nothing.
+  const [signInNow, setSignInNow] = useState(() => Date.now());
+  // Signed-in rows are excluded: a RECOVERED account keeps the placeholder as its stored nickname
+  // until `handleLogin`'s best-effort rename lands, and counting it here would keep this interval
+  // running forever on a healthy row for a title that is no longer derived from it.
+  const pendingCount = accounts.filter(
+    (a) => a.nickname === PENDING_NICKNAME && !isSignedIn(identities.find((i) => i.id === a.id)),
+  ).length;
+  useEffect(() => {
+    if (pendingCount === 0) return;
+    // A quarter of the stall window: fine enough that the flip lands close to the deadline, coarse
+    // enough to be a handful of renders rather than a per-second re-layout of every card.
+    const every = Math.max(1000, (SIGN_IN_STALL_SECONDS * 1000) / 4);
+    const t = setInterval(() => setSignInNow(Date.now()), every);
+    return () => clearInterval(t);
+  }, [pendingCount]);
+
   const [confirmRemove, setConfirmRemove] = useState<string | null>(null);
   // Two-step confirm for re-logging in the DEFAULT account, whose config dir is the user's real
   // ~/.claude — see the button below.
@@ -564,6 +794,25 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
   const getIdentitiesFn = deps?.getIdentities ?? DEPS.getIdentities;
   const listCeilingsFn = deps?.listCeilings ?? DEPS.listCeilings;
   const getUsageLiveFn = deps?.getUsageLive ?? DEPS.getUsageLive;
+  // ── REMOVED IDS, SO A STALE RE-READ CANNOT RESURRECT A ROW ──────────────────────────────────
+  //
+  // `refresh()` writes `setAccounts(a)` unconditionally, and six things call it (the mount effect,
+  // rename, add, login ×2, remove). Any of them already in flight when a remove is confirmed
+  // resolves afterwards with a list that STILL contains the removed id and puts the card back —
+  // then it vanishes again when this remove's own refresh lands. That flicker is the same "did my
+  // click do anything?" shape the optimistic drop exists to remove, and the window is a
+  // `listAccounts` + `getIdentities` round trip (a per-account `.claude.json` read).
+  //
+  // Same idea as `liveGenRef` below, keyed by id rather than by generation because what must be
+  // suppressed is one ROW, not one batch.
+  //
+  // An id is NOT cleared on success, deliberately. It is a tombstone: the account is gone from the
+  // backend, so nothing legitimate can reintroduce it, and holding the id is what keeps a read that
+  // STARTED before the delete from resurrecting it when it lands afterwards. Ids are random, so a
+  // future account cannot collide with one. It IS cleared when the delete fails, because then the
+  // account genuinely still exists and must be allowed back.
+  const removingRef = useRef<Set<string>>(new Set());
+
   const refresh = useCallback(async () => {
     setError(null);
     try {
@@ -576,7 +825,7 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         // screen that shows no accounts at all. Degrade to "unknown" per account instead.
         listCeilingsFn().catch(() => [] as Ceiling[]),
       ]);
-      setAccounts(a);
+      setAccounts(a.filter((x) => !removingRef.current.has(x.id)));
       setIdentities(ids);
       setCeilings(cs);
       // ══ THE LOCAL TALLY IS NO LONGER AWAITED — THIS IS THE TEN-SECOND LOAD ═══════════════════
@@ -643,6 +892,55 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
     // doesn't re-fire); `liveNonce` re-fires after any login. `accounts`/`getUsageLiveFn` read inside.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accountsKey, liveNonce, getUsageLiveFn]);
+
+  // ── "Check usage levels" — per-card, on-demand true-up of ONE account's REAL usage (item 14) ─────
+  // The founder's ask, now surfaced from each card's ⋮ menu instead of a global button. Force-fetches
+  // that account's live usage with `force=true`, so the read bypasses the cached OAuth token and
+  // re-reads the account's keychain — the macOS prompt that may raise is the acknowledged, wanted
+  // signal of a real re-check, not an error.
+  //
+  // HONEST SCOPE: the cache holds only the TOKEN, never the usage numbers (`account_usage_live` hits
+  // Anthropic on every call), so `force` guarantees a fresh keychain-backed token read rather than
+  // adding data freshness. Shares the live effect's `liveGenRef` guard so a login that re-fires the
+  // effect mid-check discards this late write; the in-flight flag is always cleared so it can't wedge.
+  async function checkUsageLevels(a: Account) {
+    setOpenMenuId(null);
+    if (checkingUsage[a.id]) return;
+    setCheckingUsage((m) => ({ ...m, [a.id]: true }));
+    setUsageError((m) => ({ ...m, [a.id]: null }));
+    const gen = ++liveGenRef.current;
+    try {
+      const r = await getUsageLiveFn(a.configDir, true);
+      if (liveGenRef.current === gen) setLiveUsage((prev) => ({ ...prev, [a.id]: r }));
+    } catch {
+      if (liveGenRef.current === gen) {
+        setLiveUsage((prev) => ({ ...prev, [a.id]: "error" }));
+        setUsageError((m) => ({
+          ...m,
+          [a.id]: "Couldn't refresh usage. Check your connection or sign in again.",
+        }));
+      }
+    } finally {
+      setCheckingUsage((m) => ({ ...m, [a.id]: false }));
+    }
+  }
+
+  // Close the open ⋮ kebab menu on an outside click or Escape (item 11). Only bound while a menu is
+  // open. The menu button and dropdown stopPropagation their own clicks, so an in-menu click never
+  // reaches this document handler.
+  useEffect(() => {
+    if (openMenuId === null) return;
+    const onDown = () => setOpenMenuId(null);
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpenMenuId(null);
+    };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [openMenuId]);
 
   // ── Where work actually runs ────────────────────────────────────────────────────────────────
   // Same "pull the individual functions" discipline as `refresh` above: an integrator passing an
@@ -969,6 +1267,21 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         return;
       }
 
+      // A row still carrying the sign-in PLACEHOLDER has just been recovered by this login, so give
+      // it its real name. `AccountLimitModal.onSignedIn` is the only other place that renames, and
+      // it is bound to that modal's own `pending` state — so an account rescued from THIS card's
+      // "Finish sign-in" button would otherwise keep "Signing in…" as its stored nickname forever.
+      // Best-effort on purpose: a failed rename must not fail a login that actually succeeded, and
+      // the card's own display rule already refuses to show a stale placeholder on a signed-in row.
+      if (a.nickname === PENDING_NICKNAME && newIdentity?.email) {
+        try {
+          await io.setNickname(a.id, newIdentity.email);
+          await refresh();
+        } catch {
+          /* display rule covers it; nothing to tell the user about a cosmetic rename */
+        }
+      }
+
       // Case 1 — SAME identity as before. The legit "my token expired, re-auth" case: nothing to
       // warn about. (A slot that had NO prior identity falls through to the change handling below,
       // where the "account lost" branch is suppressed because there was no X to lose.)
@@ -1069,18 +1382,97 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
 
   async function handleRemove(id: string) {
     setConfirmRemove(null);
+    // ── OPTIMISTIC: THE ROW LEAVES NOW, NOT WHEN THE BACKEND ANSWERS ────────────────────────────
+    //
+    // `removeAccount` deletes a config DIRECTORY (`remove_dir_all` over a tree that can hold
+    // thousands of transcript files) and then rewrites `accounts.json`, so the round trip is
+    // visibly slow. Awaiting it before dropping the row left the card on screen looking untouched:
+    // the founder read that as "the click did nothing", clicked Remove a second time, and the
+    // second call landed on an id the first had already deleted — surfacing `account not found:
+    // a7a45c3f2396de7b` in an error box, for a delete that had actually succeeded.
+    //
+    // Removing it from local state first makes the click feel instantaneous AND removes the second
+    // click entirely, because there is no longer a row to click. `remove_account_at` is idempotent
+    // as well (accounts.rs), so the two fixes are independent: this one stops the double click
+    // happening, that one stops it mattering if it ever does.
+    // Captured BEFORE the filter, so the row can be put back even if the re-read below cannot
+    // supply it (see the catch).
+    const removed = accounts.find((a) => a.id === id);
+    removingRef.current.add(id);
+    setAccounts((prev) => prev.filter((a) => a.id !== id));
     try {
       await io.removeAccount(id);
-      await refresh();
     } catch (e) {
+      // A GENUINE failure — the account is still there, so the row must come BACK.
+      //
+      // Clear the tombstone FIRST: while the id is in that set, `refresh()` filters it out, so a
+      // re-read done before this line could not restore the row it is being asked to restore.
+      removingRef.current.delete(id);
+      // Prefer the backend's own answer — it is the source of truth and also picks up whatever else
+      // changed while the call was in flight. ORDER MATTERS: `refresh()` opens with
+      // `setError(null)`, so the message has to be set after it or it is wiped and the failure is
+      // silent.
+      await refresh();
+      // …but `refresh()` CANNOT REPORT ITS OWN FAILURE: it swallows the error into `setError` and
+      // returns without touching `accounts`, leaving the optimistic filter standing. The rejections
+      // that bring us here are exactly the ones that also reject `listAccounts` — IPC unavailable,
+      // the accounts lock held, an unparseable accounts.json — so relying on the re-read alone
+      // would delete the card from the screen while the account still exists on disk, which is the
+      // silent-loss outcome the optimistic drop must never be able to cause. Restore explicitly,
+      // and only if the re-read did not already do it.
+      if (removed) {
+        setAccounts((prev) => (prev.some((a) => a.id === id) ? prev : [...prev, removed]));
+      }
       setError(errText(e, "Failed to remove"));
+      return;
     }
+    await refresh();
   }
+
+  // Render the rows "most space first" (item 1): accounts with the most REAL Anthropic headroom on
+  // top, unknown-usage below them, signed-out last. Only the RENDER order changes — every other
+  // derivation above (readiness, duplicates, headroom) still reads the unordered `accounts`, which
+  // are order-independent. The projection reads live usage + sign-in exactly as the row render does.
+  const freshOrder = orderBySpace(accounts, (a) => {
+    const live = liveUsage[a.id];
+    const hasData = live !== undefined && live !== "error";
+    return {
+      id: a.id,
+      alias: displayFor(a).nickname || displayFor(a).primary || a.id,
+      usable: isSignedIn(identityFor(a.id)),
+      sessionUsedPct: hasData ? live.fiveHourPercent : null,
+      weeklyUsedPct: hasData ? live.sevenDayPercent : null,
+    };
+  });
+  // FREEZE the order while a rename is in progress. The sort key depends on liveUsage/identities
+  // that arrive asynchronously, one account at a time — so a SIBLING account's fetch landing while
+  // the user is mid-rename would re-sort the list, and because rows are keyed by `a.id` React
+  // re-parents the moved row, which blurs the focused rename `<input>`; its `onBlur` then commits
+  // the half-typed draft with no user action. Holding the last settled order stable while
+  // `editingId` is set removes that race without freezing the list the rest of the time. New rows
+  // (added mid-edit) fall to the end in their fresh relative order rather than being dropped.
+  const lastOrderRef = useRef<string[]>([]);
+  let orderedAccounts = freshOrder;
+  if (editingId !== null && lastOrderRef.current.length > 0) {
+    const rank = new Map(lastOrderRef.current.map((id, i) => [id, i] as const));
+    const freshIndex = new Map(freshOrder.map((a, i) => [a.id, i] as const));
+    orderedAccounts = [...accounts].sort((x, y) => {
+      const rx = rank.has(x.id) ? rank.get(x.id)! : Number.POSITIVE_INFINITY;
+      const ry = rank.has(y.id) ? rank.get(y.id)! : Number.POSITIVE_INFINITY;
+      if (rx !== ry) return rx - ry;
+      return (freshIndex.get(x.id) ?? 0) - (freshIndex.get(y.id) ?? 0);
+    });
+  }
+  // Record the order actually rendered, but only when NOT frozen, so the frozen snapshot stays the
+  // pre-edit order and cannot drift under the open input.
+  if (editingId === null) lastOrderRef.current = orderedAccounts.map((a) => a.id);
 
   return (
     <div style={{ fontFamily: fontStack, color: C.cream }}>
       <div data-testid="accounts-header" style={stickyHeader}>
         <div style={{ fontSize: 13, fontWeight: 600 }}>Claude accounts</div>
+        {/* The global "Refresh usage" button was replaced by a per-card "Check usage levels" item in
+            each card's ⋮ kebab menu (overhaul item 14). */}
         {!adding && (
           <button type="button" style={primaryBtn} onClick={() => setAdding(true)}>
             + Add account
@@ -1215,18 +1607,15 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
         <div style={{ ...card, color: C.muted, fontSize: 13 }}>No accounts yet. Add one to get started.</div>
       )}
 
-      {/* BE HONEST ABOUT COVERAGE. `paneAccountMap` holds only MOUNTED panes, so an agent in a
-          satellite window or a closed tab is running somewhere and appears in no list below. Saying
-          so in one line is cheaper than a reader concluding the lists are exhaustive and that an
-          account is idle when it is not. */}
-      {accounts.length > 0 && (
-        <div data-testid="routing-coverage-note" style={{ fontSize: 12, color: C.muted, margin: "0 0 8px" }}>
-          The lists below cover agents with an open tab in this window; agents in other windows or
-          closed tabs aren&rsquo;t shown.
-        </div>
-      )}
+      {/* The "lists below cover agents with an open tab in this window…" coverage caption was
+          removed (overhaul item 7) at the founder's instruction. */}
 
-      {accounts.map((a) => {
+      {/* One fleet-level statement, above the cards, because the gate is a fleet-level fact — see
+          `AdvisorGateLine`. Rendered before the per-account meters so a human reads "are passes
+          running" before "what is this one account's meter", which is the order they care about. */}
+      <AdvisorGateLine liveByAccount={orderedAccounts.map((a) => liveUsage[a.id])} />
+
+      {orderedAccounts.map((a) => {
         const u = usageFor(a.id);
         const identity = identityFor(a.id);
         const exhausted = exhaustedLabel(u, now);
@@ -1251,136 +1640,252 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
           : signedIn
             ? SIGNED_IN_NO_EMAIL
             : display.primary;
-        const alias = primary !== display.nickname ? display.nickname : null;
+        // Overhaul items 3 & 4: the NICKNAME is the bold card title; the verified email (or the
+        // honest sign-in status for a uuid-only / not-signed-in account) is the secondary line
+        // beneath. When the account has no nickname, the title falls back to the identity string and
+        // there is no separate secondary line. The organization sub-line was removed entirely.
+        // A sign-in that never finished stops claiming to be in progress. `signInStalled` reads
+        // the row's own `createdAt`, so nothing extra is persisted; `signInTick` below is what makes
+        // the flip happen on its own rather than waiting for the next unrelated re-render.
+        // Gated on NOT being signed in. `signInStalled` reads only the placeholder nickname and
+        // `createdAt`, and neither changes when a login is RECOVERED: `handleLogin` (the card's own
+        // "Finish sign-in" button) never renames the row — the only rename lives in
+        // `AccountLimitModal.onSignedIn`, bound to that modal's own pending state. So without this
+        // guard a recovered account would show a verified email on its secondary line under a title
+        // reading "Trouble signing in", forever — a card contradicting itself, which is the very
+        // defect class this screen was just cleaned of (roborev 65218).
+        const stalledSignIn = !signedIn && signInStalled(a.nickname, a.createdAt, signInNow);
+        // A RECOVERED sign-in must stop showing the placeholder too, not merely stop calling it a
+        // failure. Gating `stalledSignIn` alone would leave a signed-in account titled "Signing in…"
+        // above its own verified email — the same self-contradiction, one word milder. The row keeps
+        // the placeholder as its stored nickname until something renames it (handleLogin now does,
+        // best-effort), so this display rule is what guarantees the card is right either way.
+        const pendingPlaceholder = a.nickname === PENDING_NICKNAME;
+        const titleText = stalledSignIn
+          ? STALLED_SIGN_IN_TITLE
+          : pendingPlaceholder && signedIn
+            ? primary
+            : display.nickname || primary;
+        const secondaryText = titleText === primary ? null : primary;
         return (
           <div key={a.id} data-testid={`account-row-${a.id}`} style={card}>
-            {/* ══ CONTROLS ROW — ON TOP, AND THE TEXT BELOW IT ═══════════════════════════════════
-                The buttons and the identity text used to share ONE flex row, with the text at
-                `flex: 1` beside them. At any width where the buttons did not fit on their own line,
-                the name and email wrapped AROUND them and the two collided — which is what the
-                founder screenshotted.
-
-                Splitting them into two stacked blocks removes the failure mode rather than tuning
-                it: the controls take a full-width wrapping row of their own, so they reflow among
-                THEMSELVES at a narrow width, and the text block below is full-width with no
-                floated sibling to wrap around. No breakpoint to pick, and nothing to re-tune the
-                next time a button is added to this card. */}
-            <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
-              {/* PRIMARY before `default`, and filled rather than outlined. They answer different
-                  questions and the founder's screenshot is why that has to be legible at a glance:
-                  an EXHAUSTED account was badged `default` there, which reads as "this is the one
-                  in use" when it means nothing of the kind. */}
-              {routing.preferredId === a.id && (
-                <span data-testid={`account-primary-badge-${a.id}`} style={primaryTagStyle}>
-                  primary
-                </span>
-              )}
-              {a.isDefault && <span style={tagStyle}>default</span>}
-              {/* Log in / re-point this config dir at a different Claude account. Without this an
-                  account could only ever be logged in at the moment it was CREATED, so an account
-                  that was never signed into — or two that turned out to hold the SAME login — had no
-                  route to a fix but delete-and-recreate. Highlighted for a duplicate, since
-                  re-logging one of the pair into a different account is exactly the remedy. */}
-              {/* SIGNED-IN accounts only. An account with no login gets its one affordance from the
-                  loud block below instead — rendering "Finish sign-in" twice in one card would be
-                  noise, and an ambiguous target for a test. */}
+            {/* ══ HEADER ROW: `default` badge (LEFT) │ Manual Override + ⋮ kebab (RIGHT) ═══════════
+                Rename / Switch login / Remove moved INTO the ⋮ kebab (item 11); the activate toggle
+                and the kebab form the top-right cluster (item 11 layout refinement). */}
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+                {a.isDefault && <span style={tagStyle}>default</span>}
+              </div>
+              {/* Manual Override = the activate/deactivate toggle. Hidden while renaming. */}
               {!isEditing &&
-                signedIn &&
-                // The DEFAULT account's config dir is the user's real `~/.claude` (registered by
-                // reference, never copied — which is also why the Rust side refuses to delete it).
-                // Re-logging it in therefore replaces the login used by `claude` EVERYWHERE on this
-                // machine, not just inside Sparkle. That is not a one-click action, so it takes the
-                // same confirm step as Remove.
-                (a.isDefault && confirmLogin !== a.id ? (
+                (routing.preferredId === a.id ? (
                   <button
                     type="button"
-                    style={
-                      duplicateIds.has(a.id)
-                        ? { ...smallBtn, borderColor: C.amber, color: C.amber }
-                        : smallBtn
-                    }
-                    onClick={() => setConfirmLogin(a.id)}
-                    // Scope named, not overstated — see AccountLoginModal (knightwatch probe 3).
-                    title={`Changes the Claude login Sparkle uses for the default account (${a.configDir || "~/.claude.json"}).`}
+                    style={smallBtn}
+                    onClick={handleClearPreferred}
+                    title="Stop sending new agents here. Agents already running stay where they are."
                   >
-                    Switch login
+                    Back to automatic
                   </button>
-                ) : a.isDefault ? (
-                  <>
-                    <button
-                      type="button"
-                      style={{ ...smallBtn, borderColor: C.amber, color: C.amber }}
-                      onClick={() => {
-                        setConfirmLogin(null);
-                        void handleLogin(a);
-                      }}
-                      title={`Replaces the login Sparkle uses for the default account (${a.configDir || "~/.claude.json"})`}
-                    >
-                      Change default account login
-                    </button>
-                    <button type="button" style={smallBtn} onClick={() => setConfirmLogin(null)}>
-                      Cancel
-                    </button>
-                  </>
                 ) : (
                   <button
                     type="button"
-                    style={
-                      duplicateIds.has(a.id)
-                        ? { ...smallBtn, borderColor: C.amber, color: C.amber }
-                        : smallBtn
+                    style={canBePrimary ? primaryBtn : { ...smallBtn, opacity: 0.5 }}
+                    disabled={!canBePrimary}
+                    onClick={() => handleActivate(a.id)}
+                    title={
+                      canBePrimary
+                        ? "Manually override rotation to run agents on this account. New agents start here; ones already running move as each finishes its turn."
+                        : "Sign in to this account first — it cannot receive agents yet."
                     }
-                    onClick={() => void handleLogin(a)}
-                    title={`Currently ${identity?.email ?? "signed in"}. Logging in again lets you point this account at a different Claude login.`}
                   >
-                    Switch login
+                    Manual Override
                   </button>
                 ))}
+              {/* ⋮ kebab: Rename / Remove / Switch login / Check usage levels. Its own click and its
+                  menu's clicks stopPropagation so they neither select the card nor trip the
+                  outside-click close. Positioned right-aligned so the dropdown can't clip the edge. */}
               {!isEditing && (
+                <div style={{ position: "relative" }} onMouseDown={(e) => e.stopPropagation()}>
+                  <button
+                    type="button"
+                    aria-label="Account actions"
+                    aria-haspopup="menu"
+                    aria-expanded={openMenuId === a.id}
+                    data-testid={`account-menu-button-${a.id}`}
+                    style={{ ...smallBtn, padding: "4px 9px", lineHeight: 1 }}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setOpenMenuId((cur) => (cur === a.id ? null : a.id));
+                    }}
+                  >
+                    ⋮
+                  </button>
+                  {openMenuId === a.id && (
+                    <div
+                      role="menu"
+                      data-testid={`account-menu-${a.id}`}
+                      style={{
+                        position: "absolute",
+                        right: 0,
+                        top: "calc(100% + 4px)",
+                        zIndex: 5,
+                        minWidth: 168,
+                        background: C.dialogSurface,
+                        border: `1px solid ${C.muted}`,
+                        borderRadius: 6,
+                        overflow: "hidden",
+                        boxShadow: "0 6px 18px rgba(0,0,0,0.45)",
+                      }}
+                    >
+                      <button
+                        role="menuitem"
+                        type="button"
+                        style={menuItem}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setOpenMenuId(null);
+                          startRename(a);
+                        }}
+                      >
+                        Rename
+                      </button>
+                      {!a.isDefault && (
+                        <button
+                          role="menuitem"
+                          type="button"
+                          style={menuItem}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setOpenMenuId(null);
+                            setConfirmRemove(a.id);
+                          }}
+                        >
+                          Remove
+                        </button>
+                      )}
+                      {signedIn && (
+                        <button
+                          role="menuitem"
+                          type="button"
+                          style={duplicateIds.has(a.id) ? { ...menuItem, color: C.amber } : menuItem}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setOpenMenuId(null);
+                            // The DEFAULT account's dir is the user's real ~/.claude, so re-logging it
+                            // changes the login `claude` uses EVERYWHERE — that takes a confirm step.
+                            if (a.isDefault) setConfirmLogin(a.id);
+                            else void handleLogin(a);
+                          }}
+                        >
+                          Switch login
+                        </button>
+                      )}
+                      {signedIn && (
+                        <button
+                          role="menuitem"
+                          type="button"
+                          style={menuItem}
+                          disabled={checkingUsage[a.id]}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            void checkUsageLevels(a);
+                          }}
+                        >
+                          {checkingUsage[a.id] ? "Checking usage…" : "Check usage levels"}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* ══ THE DEFAULT ACCOUNT'S DIRECTORY WAS RE-LOGGED-IN UNDERNEATH US ═══════════════════
+                The default account is imported BY REFERENCE — `config_dir: ""`, the documented
+                sentinel for "export no CLAUDE_CONFIG_DIR" — so it IS the user's real ~/.claude, and
+                its identity is whatever that directory currently holds. Run `claude` in a terminal
+                and log into a different account and this card silently becomes that other account:
+                the founder found his "FC Superadmin" card reporting drodio@storytell.ai, with both
+                cards showing identical usage because they had genuinely become one login.
+
+                TWO DIFFERENT SIGNALS, AND THEY ARE NEARLY DISJOINT — do not conflate them
+                (roborev 65222 caught me doing exactly that):
+
+                  * `forkNotice` / `shellForked` compares this account's OWN config dir against the
+                    shell's. For the normalized default — `config_dir: ""` — those are two reads of
+                    the SAME file ($HOME/.claude.json), so they are identical by construction and
+                    this can never fire. It covers the older TWO-FILE case: a legacy $HOME/.claude
+                    default holding a login (which `default_config_dir_needs_normalizing` refuses to
+                    normalize), or a CLAUDE_CONFIG_DIR exported in .zprofile after the record was
+                    made. Real, but NOT the founder's symptom.
+
+                  * `identityChanged` is the temporal one and IS the founder's symptom: the Rust
+                    side records every observed identity per config dir and flips this when that dir
+                    has hosted a DIFFERENT account uuid recently (`identity_log::takeover_at`). A
+                    terminal `claude` login into another account is precisely that — one file, one
+                    identity at a time, no divergence to compare, only a CHANGE over time.
+
+                Sparkle cannot PREVENT a terminal login to the user's own config; making it visible
+                where it is looked for is the achievable fix. */}
+            {identityChanged(identity) && (
+              <div
+                data-testid={`account-identity-changed-${a.id}`}
+                style={{ marginTop: 8, fontSize: 12, color: C.amber }}
+              >
+                <strong>This account&rsquo;s folder was signed into a different Claude account
+                recently.</strong>{" "}
+                {a.isDefault
+                  ? "The default account is your real ~/.claude, shared with your terminal — a `claude` login there changes who this account is."
+                  : "Its usage figures may have been measured against the previous login."}
+              </div>
+            )}
+            {forkNotice(display) && (
+              <div
+                data-testid={`account-fork-notice-${a.id}`}
+                style={{ marginTop: 8, fontSize: 12, color: C.amber }}
+              >
+                {forkNotice(display)}
+              </div>
+            )}
+
+            {/* In-app confirms (never a native dialog): Remove, and re-logging the DEFAULT account,
+                each take a confirm step surfaced here after the kebab item is chosen. */}
+            {!a.isDefault && confirmRemove === a.id && (
+              <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", fontSize: 12 }}>
+                <span style={{ color: C.amber }}>Remove this account?</span>
                 <button
                   type="button"
-                  style={smallBtn}
-                  onClick={() => startRename(a)}
+                  style={{ ...smallBtn, borderColor: C.amber, color: C.amber }}
+                  onClick={() => void handleRemove(a.id)}
                 >
-                  Rename
+                  Confirm remove
                 </button>
-              )}
-              {/* The default account has no Remove control. NOTE: this is a UI-only rule —
-                  `accounts_remove` does NOT reject a default, so do not rely on the backend for it.
-                  What the backend does guarantee is that the DIRECTORY survives
-                  (`dir_to_remove_on_remove` returns None for a default). */}
-              {!a.isDefault &&
-                (confirmRemove === a.id ? (
-                  <>
-                    <button
-                      type="button"
-                      style={{ ...smallBtn, borderColor: C.amber, color: C.amber }}
-                      onClick={() => void handleRemove(a.id)}
-                    >
-                      Confirm remove
-                    </button>
-                    <button type="button" style={smallBtn} onClick={() => setConfirmRemove(null)}>
-                      Cancel
-                    </button>
-                  </>
-                ) : (
-                  <button type="button" style={smallBtn} onClick={() => setConfirmRemove(a.id)}>
-                    Remove
-                  </button>
-                ))}
-
-              {/* The duplicate "Switch all agents here" control that used to render here was REMOVED
-                  when this branch merged, along with the `manualAccountSwitch` request channel it
-                  published on. It and "Activate this account" below were built in parallel for the
-                  same ask, and shipping both put two buttons with overlapping meaning on one card —
-                  one of which promised, in its own tooltip, to "move every agent and the concierge",
-                  which is the exact opposite of what the sticky section two blocks down tells the
-                  user. The channel went with it rather than being left wired: nothing published on
-                  it once the button was gone, and a module whose comment says it is live while no
-                  caller exists is worse than no module. `activateAccount` is now the ONE entry point
-                  — it records the preference with or without a mounted host, and hands the migration
-                  to the same `switchTo` this screen's button reaches. */}
-            </div>
+                <button type="button" style={smallBtn} onClick={() => setConfirmRemove(null)}>
+                  Cancel
+                </button>
+              </div>
+            )}
+            {a.isDefault && confirmLogin === a.id && (
+              <div style={{ marginTop: 8, display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center", fontSize: 12 }}>
+                <span style={{ color: C.amber }}>
+                  This changes the Claude login used everywhere on this machine.
+                </span>
+                <button
+                  type="button"
+                  style={{ ...smallBtn, borderColor: C.amber, color: C.amber }}
+                  onClick={() => {
+                    setConfirmLogin(null);
+                    void handleLogin(a);
+                  }}
+                >
+                  Change default account login
+                </button>
+                <button type="button" style={smallBtn} onClick={() => setConfirmLogin(null)}>
+                  Cancel
+                </button>
+              </div>
+            )}
 
             {/* IDENTITY TEXT — full width, BELOW the controls. `minWidth: 0` still matters: it is
                 what lets the ellipsis rule inside actually clip a long email rather than forcing
@@ -1401,6 +1906,8 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 />
               ) : (
                 <>
+                  {/* TITLE = the nickname (bold), on its own — no "alias:" prefix. Falls back to the
+                      identity string when the account has no nickname. */}
                   <span
                     data-testid={`account-identity-${a.id}`}
                     style={{
@@ -1410,29 +1917,33 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                       overflow: "hidden",
                       textOverflow: "ellipsis",
                       whiteSpace: "nowrap",
-                      ...(signedIn ? {} : { color: C.amber }),
                     }}
-                    title={
-                      signedIn
-                        ? undefined
-                        : "This config folder holds no Claude login. Log in to give it a real identity."
-                    }
                   >
-                    {primary}
+                    {titleText}
                   </span>
-                  {alias && (
-                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>alias: {alias}</span>
+                  {/* SECONDARY = the verified email, or the honest sign-in status for a uuid-only /
+                      not-signed-in account (amber, so a not-signed-in card still reads as a problem —
+                      the loud blocked banner below also stays). The organization line was removed. */}
+                  {secondaryText && (
+                    <span
+                      data-testid={`account-identity-sub-${a.id}`}
+                      style={{
+                        fontSize: 12,
+                        display: "block",
+                        overflow: "hidden",
+                        textOverflow: "ellipsis",
+                        whiteSpace: "nowrap",
+                        color: signedIn ? C.muted : C.amber,
+                      }}
+                      title={
+                        signedIn
+                          ? undefined
+                          : "This config folder holds no Claude login. Log in to give it a real identity."
+                      }
+                    >
+                      {secondaryText}
+                    </span>
                   )}
-                  {identity?.organization && (
-                    <span style={{ fontSize: 12, color: C.muted, display: "block" }}>{identity.organization}</span>
-                  )}
-                  {/* The separate amber "Not signed in" badge is gone: the identity slot above now
-                      says it literally, and rendering the same words twice in one card was both
-                      noise and an ambiguous target for tests. `isSignedIn` (uuid OR email) still
-                      drives the Log in / Switch login affordance above — it is deliberately WIDER
-                      than the identity slot's rule (email only), so an account holding an
-                      `oauthAccount` with no readable `emailAddress` offers "Switch login" while its
-                      identity slot honestly reports it has no email to show. */}
                 </>
               )}
             </div>
@@ -1489,6 +2000,9 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
               const here = consumersOn(a.id);
               return (
                 <div data-testid={`account-routing-${a.id}`} style={{ marginTop: 10 }}>
+                  {/* The activate/deactivate TOGGLE moved to the card's top-right header (item 11
+                      layout). This block keeps only the subtle active-state indicator and the list of
+                      what is running here. */}
                   <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                     <span
                       data-testid={`account-active-state-${a.id}`}
@@ -1498,53 +2012,88 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                         color: isPrimary ? C.successInk : C.muted,
                       }}
                     >
-                      {isPrimary ? "Active — new agents run here" : "Inactive"}
+                      {/* NOT "Inactive". This line states a ROUTING fact — where the NEXT agent
+                          will be started — and says nothing about what is running now. The founder
+                          screenshotted a card reading "Inactive" directly above "Running agents:
+                          Concierge" and reasonably read it as a bug in the state. The state was
+                          right; the word was wrong, and it sits one line above the very list that
+                          contradicts it.
+
+                          THREE states, not two, and the third is the DEFAULT one. With no manual
+                          override anywhere, `preferredId` is unset, so NO card is primary and a
+                          two-way label would tell every card it takes no new agents — while
+                          `chooseAccountForAgent` is in fact auto-picking one of them by lowest
+                          usage. On a single-account fleet that is the card receiving 100% of spawns
+                          declaring it receives none: a definitely false claim, which is worse than
+                          the vague word it replaced (roborev 65216). Only when some OTHER card
+                          holds the override is "not taking new agents" actually true — and even
+                          then a per-agent pin can outrank it, which "may" leaves room for.
+
+                          `!signedIn` comes FIRST because a signed-out card cannot receive agents at
+                          all: `chooseAccountForAgent` filters both `eligibleAccounts` and `autoPick`
+                          on `signedInIds`, and this same card renders "Not signed in — this account
+                          cannot receive agents" a few lines below. Claiming "automatic — may run
+                          here" above that banner would rebuild the founder's original complaint
+                          inside a single card (roborev 65221).
+
+                          The PRIMARY arm needs the same gate, and for the same reason (roborev
+                          65223): nothing clears a stored preference when an account's login later
+                          goes away — `handleActivate` checks `canBePrimary` at CLICK time only —
+                          so a preference can outlive its identity. `usablePreferredAccount` drops a
+                          preference that is not in `signedInIds`, so routing sides with the banner
+                          there too, and an unqualified "Active" is the loudest possible way to be
+                          wrong about it. */}
+                      {isPrimary && signedIn
+                        ? "Active — new agents run here"
+                        : !signedIn || routing.preferredId
+                          ? "Not taking new agents"
+                          : "Automatic — new agents may run here"}
                     </span>
-                    {isPrimary ? (
-                      <button
-                        type="button"
-                        style={smallBtn}
-                        onClick={handleClearPreferred}
-                        // Says what it does NOT do, because the opposite is the natural assumption:
-                        // nothing already running is dragged back off this account.
-                        title="Stop sending new agents here. Agents already running stay where they are."
-                      >
-                        Back to automatic
-                      </button>
-                    ) : (
-                      <button
-                        type="button"
-                        style={canBePrimary ? primaryBtn : { ...smallBtn, opacity: 0.5 }}
-                        // An account the selection gate would reject cannot receive agents, so
-                        // offering the button would be a control that reports success and changes
-                        // nothing — the card would flip to "Active — new agents run here" and the
-                        // very next spawn would discard the preference, recording a bland "auto".
-                        //
-                        // Gated on `display.signedIn` (EMAIL-ONLY) rather than the wider `signedIn`
-                        // (uuid OR email) precisely so this button and `usablePreferredAccount`
-                        // cannot disagree: that gate tests `signedInAccountIds`, which keys on
-                        // email. The wider predicate is right for Log in / Switch login beside it —
-                        // a uuid-only login IS real — but promising primacy this screen cannot
-                        // deliver is the failure mode here.
-                        disabled={!canBePrimary}
-                        onClick={() => handleActivate(a.id)}
-                        title={
-                          canBePrimary
-                            ? "Run agents on this account. New agents start here; ones already running move as each finishes its turn."
-                            : "Sign in to this account first — it cannot receive agents yet."
-                        }
-                      >
-                        Activate this account
-                      </button>
-                    )}
                   </div>
                   <div style={{ fontSize: 12, color: C.muted, marginTop: 4 }}>
                     {here.length === 0 ? (
                       "Nothing is running on this account right now."
-                    ) : (
+                    ) : expandedRunning[a.id] ? (
+                      // EXPANDED: the full comma list + a Collapse link back to one line.
                       <>
-                        Running here: <span style={{ color: C.cream }}>{here.join(", ")}</span>
+                        Running agents: <span style={{ color: C.cream }}>{here.join(", ")}</span>{" "}
+                        <button
+                          type="button"
+                          style={linkBtn}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setExpandedRunning((m) => ({ ...m, [a.id]: false }));
+                          }}
+                        >
+                          Collapse
+                        </button>
                       </>
+                    ) : (
+                      // COLLAPSED (one line): first 2 names + "+ N more" (or all, when <= 3).
+                      (() => {
+                        const { shown, moreCount } = collapsedRunningAgents(here);
+                        return (
+                          <>
+                            Running agents:{" "}
+                            <span style={{ color: C.cream }}>{shown.join(", ")}</span>
+                            {moreCount > 0 && (
+                              <>
+                                {" "}
+                                <button
+                                  type="button"
+                                  style={linkBtn}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setExpandedRunning((m) => ({ ...m, [a.id]: true }));
+                                  }}
+                                >
+                                  + {moreCount} more
+                                </button>
+                              </>
+                            )}
+                          </>
+                        );
+                      })()
                     )}
                   </div>
                 </div>
@@ -1568,7 +2117,28 @@ export function AccountsScreen({ onLogin, deps, currentAccountId }: AccountsScre
                 a number that confidently contradicts the real one beside it is a liability, not a
                 fallback. (The same inversion was steering the ROUTER; that is fixed separately, in
                 `accountStore.pickAccount`.) */}
-            <LiveUsageSection live={liveUsage[a.id]} />
+            <LiveUsageSection live={liveUsage[a.id]} now={now} />
+            {/* Per-card "Check usage levels" status (item 14): a brief in-flight line, then an inline
+                error if the forced fetch failed — never a browser dialog. */}
+            {checkingUsage[a.id] ? (
+              <div
+                data-testid={`account-usage-checking-${a.id}`}
+                role="status"
+                style={{ marginTop: 6, fontSize: 12, color: C.muted }}
+              >
+                Checking usage…
+              </div>
+            ) : (
+              usageError[a.id] && (
+                <div
+                  data-testid={`account-usage-error-${a.id}`}
+                  role="alert"
+                  style={{ marginTop: 6, fontSize: 12, color: C.amber }}
+                >
+                  {usageError[a.id]}
+                </div>
+              )
+            )}
           </div>
         );
       })}

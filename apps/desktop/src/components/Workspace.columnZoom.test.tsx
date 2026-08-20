@@ -179,15 +179,28 @@ describe("Cmd +/- sizes the column that has focus", () => {
     useUiStore.getState().resetAllZoom();
   });
 
-  it("renders all FIVE zoomable regions in the two-pair cockpit", () => {
+  it("renders all SEVEN zoomable regions in the two-pair cockpit", () => {
     // The precondition for everything below, asserted once so a case that silently lost a region
     // cannot pass by resolving to null and taking the do-nothing branch.
+    //
+    // SEVEN SINCE THE EPICS COLUMN. This exact-set assertion is the ONLY thing that catches a new
+    // `ZoomColumn` member that never got a render site — the `satisfies readonly ColumnKey[]`
+    // bridge in `engine/columnZoom` breaks on a rename and not on an addition, so a column can be
+    // declared zoomable, compile perfectly, and have `Cmd +/-` do nothing inside it forever.
     render(<Workspace />);
     const marked = Array.from(document.querySelectorAll("[data-zoom-column]")).map((el) =>
       el.getAttribute("data-zoom-column"),
     );
     expect(new Set(marked)).toEqual(
-      new Set(["terminal-left", "build-left", "concierge", "build-right", "terminal-right"]),
+      new Set([
+        "terminal-left",
+        "build-left",
+        "epics-left",
+        "concierge",
+        "epics-right",
+        "build-right",
+        "terminal-right",
+      ]),
     );
   });
 

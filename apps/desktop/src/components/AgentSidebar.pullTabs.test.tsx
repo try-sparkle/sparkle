@@ -22,7 +22,7 @@
 // (position:fixed pinned to the slot) and really does hand its slot to a spacer; the keyboard
 // resize path clamps and persists. The layout half was verified by hand in the running app; see
 // PRD/feat/sidebar-pull-tabs.md for what was observed and what was not.
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/plugin-opener", () => ({
@@ -35,11 +35,15 @@ vi.mock("./HistorySearch", () => ({ HistorySearch: () => null }));
 import {
   BUILD_COLUMN_MIN_WIDTH,
   BUILD_COLUMN_ROW_RESERVE,
+  OVERLAY_EDGE_RESERVE,
+  OVERLAY_WIDTH_BOOST,
   TERMINAL_MIN_WIDTH,
   buildColumnMax,
+  buildWidthVar,
 } from "../engine/columnResize";
 import { AgentSidebar } from "./AgentSidebar";
 import { PLAN_COLUMN_Z, SIDEBAR_OVERLAY_Z } from "./layers";
+import { ZoomColumnOverride } from "../hooks/useZoomColumn";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, Project } from "../types";
@@ -47,7 +51,9 @@ import type { AgentTab, Project } from "../types";
 // Per SIDE now: two mounted sidebars must not race on one value. The default fixture is the
 // right pair.
 const WIDTH_KEY = "sparkle-sidebar-width:right";
-const OVERLAY_KEY = "sparkle-sidebar-overlay";
+// Per side, mirroring `buildWidthKey` — these tests render the RIGHT pair (see `WIDTH_KEY`).
+const OVERLAY_KEY = "sparkle-sidebar-overlay:right";
+const LEGACY_OVERLAY_KEY = "sparkle-sidebar-overlay";
 
 function mkAgent(id = "a1"): AgentTab {
   return {
@@ -681,14 +687,33 @@ describe("AgentSidebar — overlay mode", () => {
     expect(slot.getAttribute("aria-hidden")).toBe("true");
   });
 
-  it("sizes the panel by CSS clamp, not by a stored rect that can go stale", () => {
-    // The hover card's shape — grow right, cap, floor — but resolved by the engine against the
-    // wrapper's LIVE width. jsdom has no layout, so what is assertable here is the expression
-    // itself; that it resolves to 480 in a real 1440px window was measured in the browser.
-    localStorage.setItem(WIDTH_KEY, "200");
+  it("sizes the panel as a BOOST on the docked width, not an absolute cap", () => {
+    // WHAT THIS REPLACES, and why the replacement is not cosmetic. The assertion here used to be
+    // `toBe("max(280px, min(480px, 100%))")` — the expression itself, a constant. It was green
+    // whether the column was docked at 200px or 900px, so it could not see that a column already
+    // wider than 480 popped out at the SAME width or narrower, in the same place, with its spacer
+    // holding the full docked slot so nothing beside it moved either. That is the bug the founder
+    // reported as "the arrow does nothing", and six overlay tests could not fail on it.
+    //
+    // jsdom still has no layout (it cannot resolve `min()`/`calc()`), so the resolved pixel width
+    // is not assertable here — the ARITHMETIC is pinned numerically by `overlaidColumnWidth` in
+    // engine/columnResize.test.ts. What IS assertable, and what actually distinguishes the fix, is
+    // that the expression is DERIVED FROM THE DOCKED WIDTH rather than being a constant.
+    localStorage.setItem(WIDTH_KEY, "700");
     render(<AgentSidebar project={mkProject()} />);
     fireEvent.click(overlayTab());
-    expect(column().style.width).toBe("max(280px, min(480px, 100%))");
+    const w = column().style.width;
+
+    // It reads this column's own stored width — the old constant referenced no variable at all.
+    expect(w).toContain(buildWidthVar("right"));
+    expect(w).toContain("700px");
+    // ...and adds the boost to it, rather than clamping down onto a fixed ceiling.
+    expect(w).toContain(`+ ${OVERLAY_WIDTH_BOOST}px`);
+    // ...while still leaving the pane underneath peeking out.
+    expect(w).toContain(`100% - ${OVERLAY_EDGE_RESERVE}px`);
+    // The exact string this test used to demand, stated as a negative so the regression cannot
+    // quietly return.
+    expect(w).not.toBe("max(280px, min(480px, 100%))");
   });
 
   it("cannot trap the user: the dismiss tab survives, and it is the same tab", () => {
@@ -709,6 +734,91 @@ describe("AgentSidebar — overlay mode", () => {
     expect(screen.queryByTestId("agent-sidebar-slot")).toBeNull();
     // Docked again, the dots are a separator that reports the width they move.
     expect(resizeTab().getAttribute("role")).toBe("separator");
+  });
+
+  it("keys the overlay PER SIDE, so floating one build column does not float the other", () => {
+    // THE REGRESSION. This was one bare `sparkle-sidebar-overlay` shared by both build columns and
+    // by the satellite window. Live it looked fine — each instance owns its own `useState` — so the
+    // damage only appeared on the NEXT LAUNCH, when every instance seeded from the one key.
+    //
+    // BOTH SIDES ARE MOUNTED, and that is the whole point: from ONE side a shared key and a
+    // per-side key are indistinguishable, so a single-column render cannot fail on the bug. And
+    // because the coupling is latent, the assertion that carries the weight is the REMOUNT below —
+    // asserting only on the live left column would pass against the shared key too.
+    const right = render(<AgentSidebar project={mkProject()} forcePairSide="right" />);
+    const left = render(<AgentSidebar project={mkProject()} forcePairSide="left" />);
+    const col = (r: { container: HTMLElement }) =>
+      within(r.container).getByTestId("agent-sidebar-column");
+    const chevron = (r: { container: HTMLElement }) =>
+      within(r.container).getByTestId("sidebar-pull-tab-chevron");
+
+    expect(col(left).style.position).toBe("relative");
+    fireEvent.click(chevron(right));
+
+    expect(col(right).style.position).toBe("absolute");
+    expect(col(left).style.position).toBe("relative");
+    expect(chevron(left).getAttribute("aria-pressed")).toBe("false");
+    expect(localStorage.getItem("sparkle-sidebar-overlay:right")).toBe("1");
+    // The other side is untouched, and so is the legacy key — reading never writes.
+    expect(localStorage.getItem("sparkle-sidebar-overlay:left")).toBeNull();
+    expect(localStorage.getItem(LEGACY_OVERLAY_KEY)).toBeNull();
+
+    // THE RELAUNCH — where the shared key did its damage. The left column seeds from its own key,
+    // which nothing has written, so it comes back DOCKED while the right one comes back floating.
+    cleanup();
+    const relaunchedLeft = render(<AgentSidebar project={mkProject()} forcePairSide="left" />);
+    const relaunchedRight = render(<AgentSidebar project={mkProject()} forcePairSide="right" />);
+    expect(col(relaunchedLeft).style.position).toBe("relative");
+    expect(col(relaunchedRight).style.position).toBe("absolute");
+  });
+
+  it("gives the SATELLITE its own key, though it forces the right side", () => {
+    // The half a side-only split misses: `SATELLITE_PAIR_SIDE` is "right", so a key built from the
+    // side alone hands the satellite the cockpit's right-builder string — one origin, one
+    // localStorage, the same latent coupling one window further out. `ZoomColumnOverride` is how
+    // this window already says it is not the cockpit, so the storage scope is read from it.
+    const satellite = render(
+      <ZoomColumnOverride.Provider value="satellite">
+        <AgentSidebar project={mkProject()} forcePairSide="right" />
+      </ZoomColumnOverride.Provider>,
+    );
+    fireEvent.click(within(satellite.container).getByTestId("sidebar-pull-tab-chevron"));
+
+    expect(localStorage.getItem("sparkle-sidebar-overlay:satellite")).toBe("1");
+    // The cockpit's right builder is NOT dragged along — the bug was that it was.
+    expect(localStorage.getItem("sparkle-sidebar-overlay:right")).toBeNull();
+
+    // And the reverse direction, which is the one a shared key also fails: the cockpit floating its
+    // right column must not float the satellite on ITS next launch.
+    cleanup();
+    localStorage.clear();
+    localStorage.setItem("sparkle-sidebar-overlay:right", "1");
+    const relaunched = render(
+      <ZoomColumnOverride.Provider value="satellite">
+        <AgentSidebar project={mkProject()} forcePairSide="right" />
+      </ZoomColumnOverride.Provider>,
+    );
+    expect(within(relaunched.container).getByTestId("agent-sidebar-column").style.position).toBe(
+      "relative",
+    );
+  });
+
+  it("seeds from the pre-per-side key once, so an existing preference is not dropped", () => {
+    // Upgrade path: someone who had the column floating before the split still finds it floating.
+    localStorage.setItem(LEGACY_OVERLAY_KEY, "1");
+    render(<AgentSidebar project={mkProject()} />);
+    expect(column().style.position).toBe("absolute");
+    expect(overlayTab().getAttribute("aria-pressed")).toBe("true");
+  });
+
+  it("prefers its OWN key over the legacy one, so the sides can diverge", () => {
+    // Once a side has an opinion the shared ancestor stops mattering — otherwise the two sides
+    // could never disagree, which is the whole reason for the split.
+    localStorage.setItem(LEGACY_OVERLAY_KEY, "1");
+    localStorage.setItem("sparkle-sidebar-overlay:right", "0");
+    render(<AgentSidebar project={mkProject()} />);
+    expect(column().style.position).toBe("relative");
+    expect(overlayTab().getAttribute("aria-pressed")).toBe("false");
   });
 
   it("persists the choice, like the width does, so it survives a relaunch", () => {
@@ -817,5 +927,46 @@ describe("the build column tells the row how wide it is", () => {
       fireEvent.pointerUp(window, { pointerId: 1, clientX: 560 });
     });
     expect(seen.at(-1)?.width).toBe(280); // 220 + 60
+  });
+});
+
+describe("AgentSidebar — the grip lines up with the concierge's", () => {
+  // THE FOUNDER'S REPORT: "those 6 dots are placed in a different place vertically on the concierge
+  // and the build columns. They should be in the same spot vertically." Two independent causes, and
+  // only one of them is fixable from this file.
+  //
+  // (1) THE TAB STRIP. This rail is absolute inside the build column, which starts BELOW
+  //     `.pairtabs`; the concierge's rail spans the whole row. Fixed on the concierge side, by
+  //     `rowGripTop` in Workspace — the build grip cannot rise without overhanging the tabs.
+  // (2) THE ZOOM, which is this file's half and is asserted here. This rail sits inside the element
+  //     carrying `zoom: columnZoom`, so a flat `top` paints at `top * Z` while the concierge's
+  //     paints unscaled. At 1x they agreed, which is exactly why it went unnoticed.
+  const zone = () => screen.getByTestId("sidebar-pull-tab-zone");
+  const HEADER_H = 34;
+  const TAB_TOP = 6;
+  /** Where the TAB lands once the browser has applied the column's zoom. */
+  const paintedTabTop = (z: number) => (parseFloat(zone().style.top) + TAB_TOP) * z;
+
+  it("puts the tab at the row's own offset when the column is not zoomed", () => {
+    render(<AgentSidebar project={mkProject()} />);
+    expect(paintedTabTop(1)).toBeCloseTo(HEADER_H + TAB_TOP, 6);
+  });
+
+  it("holds that painted offset across every zoom level, rather than drifting with it", () => {
+    // The assertion that has power: the SAME painted number at each zoom. A test at one zoom level
+    // cannot distinguish a cancelled offset from an uncancelled one — at 1x they are identical.
+    for (const z of [0.7, 1, 1.2, 1.5, 1.8]) {
+      const { unmount } = render(<AgentSidebar project={mkProject()} />);
+      act(() => useUiStore.getState().setColumnZoom("build-right", z));
+      expect(paintedTabTop(z)).toBeCloseTo(HEADER_H + TAB_TOP, 6);
+      unmount();
+    }
+  });
+
+  it("would DRIFT under an uncancelled offset — the regression, stated", () => {
+    // What the code did before: a flat `top: HEADER_H`, painted at `(34 + 6) * Z`.
+    const uncancelled = (z: number) => (HEADER_H + TAB_TOP) * z;
+    expect(uncancelled(1)).toBe(HEADER_H + TAB_TOP); // agrees at 1x — why nobody saw it
+    expect(uncancelled(1.5)).toBeGreaterThan(HEADER_H + TAB_TOP + 15); // 60 vs 40
   });
 });

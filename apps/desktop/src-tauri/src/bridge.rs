@@ -865,9 +865,12 @@ const CONTROL_OPS: &[&str] = &[
     //
     // Scoping is NOT enforced at this layer. Every preview op targets the `callerAgentId` this
     // bridge stamps from the socket — a payload-named agent must never start a dev server in
-    // someone else's worktree — and the founder's "interactive agents only, not workers" rule is
-    // the frontend tier gate (`CONTROL_OP_TIERS.preview`). This entry is only the coarse existence
-    // gate, without which every preview call dies at "unknown op".
+    // someone else's worktree — and that stamping is the WHOLE of the op's access control now:
+    // `CONTROL_OP_TIERS.preview` is `free`, so every agent kind including `worker` reaches the
+    // handler and is served its own checkout (beads `sparkle-q3b4c6` / `sparkle-wnnye0` retired the
+    // founder's earlier "interactive agents only" tier; the reasoning lives at that tier entry).
+    // This entry is only the coarse existence gate, without which every preview call dies at
+    // "unknown op".
     "preview",
 ];
 

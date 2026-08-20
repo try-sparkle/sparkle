@@ -13,6 +13,8 @@ import { healAgentHooks } from "./services/worktree";
 import { importDefault } from "./services/accountStore";
 import { startRelayHost, stopRelayHost } from "./services/relayClient";
 import { useSettingsStore } from "./stores/settingsStore";
+import { primeRepoSlugs } from "./services/conciergeTools/repoSlug";
+import { useProjectStore } from "./stores/projectStore";
 import { getConfig, onConfigChanged } from "./services/config";
 import { refreshRoborevAuth, backfillImprovementConsentMirror } from "./services/configActions";
 import { pollMemoryAdmission } from "./services/agentCapacity";
@@ -41,15 +43,18 @@ import { AccountSwitchHost } from "./components/AccountSwitchHost";
 import { HintOverlay } from "./components/HintOverlay";
 import { RoborevConsentModal } from "./components/RoborevConsentModal";
 import { BuilderIndexConsentModal } from "./components/BuilderIndexConsentModal";
+import { StraudeConsentModal } from "./components/StraudeConsentModal";
 import { AccountLimitModal } from "./components/AccountLimitModal";
 import { startUpdater } from "./services/updaterService";
 import { startStaleBuildWatch } from "./services/staleBuildService";
 import { startAgentGoalDiskMirror } from "./services/agentGoalDisk";
 import { startGoalContinuationRunner } from "./services/goalContinuationRunner";
+import { startEpicSweepRunner } from "./services/epicSweepRunner";
 import { startResurrectionRunner } from "./services/resurrectionRunner";
 import { startAutoApproveWatch } from "./services/suggestions/autoApproveWatch";
 import { startFleetWatch } from "./services/fleetWatch";
 import { startInboxWatch } from "./stores/inboxStore";
+import { startPipelineHealthWatch } from "./stores/pipelineHealthStore";
 import { startPusher } from "./services/pusherMount";
 import { startAuthRecovery } from "./services/authRecovery";
 import { startSocialSync } from "./services/socialSync";
@@ -145,6 +150,25 @@ function InboxWatch() {
   return null;
 }
 
+// The deployment-pipeline health poll behind the header's PipelineHealthChip (bead sparkle-m6jov5).
+// Paints no UI.
+//
+// MAIN WINDOW ONLY, like FleetWatch and for the same reason (cost, not correctness): a tick shells
+// out to `roborev status` and one `gh api` runner read, and the answer is repo-wide, so N windows
+// each probing would be N times the subprocess/network work for one identical result. The chip in a
+// non-main window still renders from the shared store the main window populates.
+//
+// Not deferred to onIdle: the poll returns immediately until a project root is set, so there is no
+// boot-burst cost to defer, and deferring would delay the first health reading the founder can see.
+function PipelineHealthWatch() {
+  const isMain = useIsMainWindow();
+  useEffect(() => {
+    if (!isMain) return;
+    return startPipelineHealthWatch();
+  }, [isMain]);
+  return null;
+}
+
 // ⌘, → Settings, from ANY focus context (window-level, capture-phase; see useSettingsShortcut).
 //
 // Mounted INSIDE THE <Suspense> THAT WRAPS Workspace, deliberately — that boundary, not <AuthGate>,
@@ -207,6 +231,16 @@ function AutoApproveWatch() {
 // UI.
 function GoalContinuation() {
   useEffect(() => startGoalContinuationRunner(), []);
+  return null;
+}
+
+// THE SAME SHAPE, ONE LEVEL UP: goal continuation watches an AGENT that stopped, this watches an
+// EPIC that stopped. They are disjoint by construction — the epic sweep fires only when NO
+// orchestrator is alive on the epic, which is exactly when there is no agent left for the other
+// three sweeps to recover. Mounted app-level and elected per project for the identical reason: the
+// side effect is a HANDOFF, so a per-pane timer would multiply the agents, not just the work.
+function EpicSweep() {
+  useEffect(() => startEpicSweepRunner(), []);
   return null;
 }
 
@@ -502,6 +536,19 @@ export function App() {
         // refreshRoborevAuth: the toggle defaults ON, so this launch path is the only thing that
         // checks a fresh install or a restart. Fire-and-forget: it must never delay first paint.
         void refreshRoborevAuth();
+        // PRIME THE REPO-SLUG CACHE for every known project (roborev 65400, finding 1).
+        //
+        // Per-project tool policy is keyed by `owner/repo`, and `slugForRoot` is SYNCHRONOUS
+        // because the whole policy path is. A cache miss therefore resolves to `null`, which is
+        // treated as FOREIGN — the fail-closed answer — which floors `mutates-main` tools at `ask`.
+        // Correct, but without this line the FIRST `merge_pr` of every session is a guaranteed
+        // approval card even in a repo the human explicitly set to `allow`, which is exactly the
+        // interruption this feature exists to remove. Lazy priming on miss fixes the second call;
+        // this fixes the first.
+        //
+        // Fire-and-forget, after hydrate, and never awaited: it must not delay first paint, and a
+        // failure only leaves the cache cold, which is the state we already handle safely.
+        primeRepoSlugs(useProjectStore.getState().projects.map((p) => p.rootPath));
       })
       .catch((e) => {
         console.warn("getConfig failed", e);
@@ -575,9 +622,11 @@ export function App() {
       <RosterPublisher />
       <FleetWatch />
       <InboxWatch />
+      <PipelineHealthWatch />
       <LimitSync />
       <AutoApproveWatch />
       <GoalContinuation />
+      <EpicSweep />
       <GoalDiskMirror />
       <FleetResurrection />
       <Pusher />
@@ -614,6 +663,7 @@ export function App() {
             settingsStore.roborevConsentOpen (flipped at the first reviewable commit). */}
         <RoborevConsentModal />
         <BuilderIndexConsentModal />
+        <StraudeConsentModal />
         {/* Raised by <LimitSync/> when a REAL account limit lands. Self-gated on
             accountLimitStore.current, so it costs nothing until an account is actually blocked —
             and it is the one place the user can log into another account without a terminal. */}
