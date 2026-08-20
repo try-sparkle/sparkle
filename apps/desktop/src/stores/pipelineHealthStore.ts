@@ -17,6 +17,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import { log } from "../logger";
+import { runPipelineEscalation } from "../services/pipelineHealthEscalation";
 
 /**
  * Poll cadence. ONE MINUTE.
@@ -136,7 +137,14 @@ export async function refreshPipelineHealth(): Promise<void> {
   pollInFlight = true;
   try {
     const health = await probe(root);
+    // Capture the PRIOR snapshot BEFORE publishing the new one — the real-time escalation is
+    // edge-triggered off prev→next, and the store's whole point is that it keeps the prior reading.
+    const prev = usePipelineHealthStore.getState().health;
     usePipelineHealthStore.setState({ health, error: null });
+    // Escalate any worse transition (green→warning/blocking, warning→blocking) or recovery. Fire-
+    // and-forget and self-contained (never rejects): a delivery failure must not fail the poll, and
+    // the durable pipeline-health bead is filed by the hourly scan regardless.
+    void runPipelineEscalation(prev, health, root);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     // WARN, not error, and the previous snapshot survives: the honest state after a failed read is

@@ -4,7 +4,7 @@
 // matter most are: a failed poll must NOT clear a known-bad reading (the icon must not blink to
 // "all clear" on a dropped IPC), and a wedged/blocking component must surface as amber/red rather
 // than vanish. Both are asserted here as side effects on the published store.
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   type PipelineHealth,
@@ -15,9 +15,19 @@ import {
   toneForState,
   usePipelineHealthStore,
 } from "./pipelineHealthStore";
+import {
+  __resetPipelineEscalationForTests,
+  __setPipelineEscalationDepsForTests,
+  type EscalationDeps,
+} from "../services/pipelineHealthEscalation";
+
+vi.mock("../logger", () => ({
+  log: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
+}));
 
 afterEach(() => {
   __resetPipelineHealthForTests();
+  __resetPipelineEscalationForTests();
 });
 
 /** Let an in-flight poll (including the eager one setPipelineRoot fires) settle: drain the probe's
@@ -103,5 +113,92 @@ describe("refreshPipelineHealth", () => {
     setPipelineRoot("/other"); // changed → eager poll #2
     await flush();
     expect(probe).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("refreshPipelineHealth → real-time escalation (driven through the real store transition)", () => {
+  let woke: string[];
+  let told: string[];
+
+  beforeEach(() => {
+    woke = [];
+    told = [];
+    const deps: EscalationDeps = {
+      now: () => Date.now(),
+      notifyConcierge: (t) => {
+        told.push(t);
+        return true;
+      },
+      wakeImprove: async (t) => {
+        woke.push(t);
+        return true;
+      },
+      fileDurableBead: async () => {},
+    };
+    __setPipelineEscalationDepsForTests(deps);
+  });
+
+  it("a green→blocking transition across two REAL polls escalates once, naming the component+remediation", async () => {
+    __setPipelineProbeForTests(async () => HEALTHY);
+    setPipelineRoot("/repo"); // eager poll #1 = HEALTHY (baseline, no alert)
+    await flush();
+    expect(woke).toHaveLength(0);
+    expect(told).toHaveLength(0);
+
+    // The next real poll finds roborev BLOCKING — the store publishes it AND escalates the edge.
+    const BLOCKED: PipelineHealth = {
+      overall: "blocking",
+      components: [
+        { id: "roborev", name: "Code review (roborev)", state: "blocking", detail: "daemon down" },
+      ],
+    };
+    __setPipelineProbeForTests(async () => BLOCKED);
+    await refreshPipelineHealth();
+    await flush(); // let the fire-and-forget escalation settle
+
+    expect(usePipelineHealthStore.getState().health?.overall).toBe("blocking");
+    expect(woke).toHaveLength(1);
+    expect(told).toHaveLength(1);
+    expect(woke[0]).toContain("Code review (roborev)");
+    expect(woke[0]).toContain("BLOCKING");
+    expect(woke[0]).toContain("scripts/roborev-maintenance.sh --watchdog");
+  });
+
+  it("a steady blocking state across polls does NOT re-escalate", async () => {
+    const BLOCKED: PipelineHealth = {
+      overall: "blocking",
+      components: [
+        { id: "roborev", name: "Code review (roborev)", state: "blocking", detail: "down" },
+      ],
+    };
+    __setPipelineProbeForTests(async () => BLOCKED);
+    setPipelineRoot("/repo"); // baseline poll (blocking, but first reading → no alert)
+    await flush();
+    expect(woke).toHaveLength(0);
+
+    await refreshPipelineHealth(); // still blocking — steady state, no edge
+    await flush();
+    expect(woke).toHaveLength(0);
+  });
+
+  it("a failed poll does not escalate (the prior reading survives, no transition is observed)", async () => {
+    const WARN: PipelineHealth = {
+      overall: "warning",
+      components: [
+        { id: "roborev", name: "Code review (roborev)", state: "warning", detail: "wedged" },
+      ],
+    };
+    __setPipelineProbeForTests(async () => WARN);
+    setPipelineRoot("/repo"); // baseline warning (first reading → no alert)
+    await flush();
+
+    __setPipelineProbeForTests(async () => {
+      throw new Error("ipc dropped");
+    });
+    await refreshPipelineHealth();
+    await flush();
+    // The catch path never reaches escalation, so nothing was pushed on a dropped poll.
+    expect(woke).toHaveLength(0);
+    expect(told).toHaveLength(0);
   });
 });
