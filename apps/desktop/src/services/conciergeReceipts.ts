@@ -117,6 +117,18 @@ export interface ConciergeActionReceipt {
   beadId?: string;
   /** For `merged`: the PR number. */
   prNumber?: number;
+  /** For `merged`: the pull request's URL, as the tool itself reported it.
+   *
+   *  WHAT IT BUYS IS THE REPOSITORY, not a link. `Concierge/prRefs` needs `owner/repo` to turn a
+   *  number into something clickable, and there are only two ways to get one: read it off the tool's
+   *  own answer, or infer it from whichever project happens to be selected when the line is read.
+   *  `mergePrTool` returns the url it merged, so the app never has to infer — and a receipt about
+   *  one repository cannot open another repository's PR of the same number.
+   *
+   *  ABSENT ON A REFUSAL, and that is the normal case rather than a gap: a refused merge carries no
+   *  reply data at all, so the number survives (from the ARGUMENT) and the url does not. The line
+   *  still gets a pill; it is just resolved live instead of stated. */
+  prUrl?: string;
   /** The refusal, when `ok` is false — the tool's own words, already human-fit at the registry.
    *
    *  STORED VERBATIM, ALWAYS. A refusal aimed at the concierge (a review gate, running checks, no

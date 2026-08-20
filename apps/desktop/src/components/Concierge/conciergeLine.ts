@@ -34,6 +34,7 @@
 // the app used to produce, so what a screen-reader user hears is unchanged by this feature.
 import { AGENT_REF_SCHEME, agentRefHref } from "./agentRefs";
 import { beadRefHref, isWellFormedBeadId } from "./beadRefs";
+import { parsePrRefHref, prRefHref, prRefLabel, slugFromPrUrl } from "./prRefs";
 
 /** The minimum an agent must be to be referenced: an id to open, a name to read. Structural so a
  *  feed agent, a roster agent and a test fixture all satisfy it without a shared nominal type. */
@@ -196,6 +197,53 @@ export function bead(target: { id: string; title?: string }): Slot {
     // The id LAST when there is a title, so a listener hears the meaning before the handle and can
     // stop attending once they have it.
     spoken: title === undefined || title === "" ? id : `${title} (${id})`,
+  };
+}
+
+/**
+ * Reference a PULL REQUEST — the third kind of referent this module can name, after an agent and a
+ * unit of work.
+ *
+ * ══ WHY IT EXISTS ══════════════════════════════════════════════════════════════════════════════
+ * Rule 3 of `actionReceiptLine` — NAME THE SUBJECT AS A PILL WHENEVER THERE IS AN ID — held for
+ * agents and beads while `Merged PR #2164.` went out through {@link plain}, the explicitly
+ * NON-clickable slot. That is the founder's recorded complaint ("You said it's up. But I can't
+ * actually click on it") reproduced by the very module whose header quotes it.
+ *
+ * ══ `url` IS THE REPOSITORY, AND IT IS WORTH PASSING ═══════════════════════════════════════════
+ * `mergePrTool` returns the exact url it merged, so the app can say WHICH repository rather than
+ * leave it to be inferred. Pass it and the reference is QUALIFIED (`sparkle-pr:owner/repo#2164`) and
+ * can never open the wrong repo's PR. Omit it — a refusal carries no reply data at all — and the
+ * reference is UNQUALIFIED, which `PrPill` resolves against the reader's selected project. Both are
+ * clickable; only the first is unambiguous, so pass the url whenever there is one.
+ *
+ * A number that cannot be written degrades to plain text, exactly as `ref` and `bead` do: the reader
+ * loses a click, never the number.
+ */
+export function pr(target: { number: number; url?: string | null }): Slot {
+  const n = target.number;
+  if (!Number.isInteger(n) || n <= 0) return { kind: PLAIN_SLOT, text: prRefLabel(n) };
+  const slug = target.url ? slugFromPrUrl(target.url) : null;
+  const href = prRefHref({ number: n, slug });
+  // THE WRITER ASKS THE PARSER, rather than trusting its own construction — the discipline
+  // `isWritableBeadId` establishes above. A reference the renderer would reject must never be
+  // written, or the clipboard carries a dead link; `prRefHref` already drops an unusable slug, so
+  // this only ever catches a number outside the parser's bounded class.
+  if (parsePrRefHref(href) === null) return { kind: PLAIN_SLOT, text: prRefLabel(n) };
+  return {
+    kind: AGENT_SLOT,
+    md: `[${escapeLabel(prRefLabel(n))}](${href})`,
+    // THE BARE NUMBER — no words, and NO `#`.
+    //
+    // No words because every call site writes "PR" itself (`Merged PR ${pr(...)}`), so speaking them
+    // here would read "Merged PR PR 2164". No `#` for the reason {@link ref} drops the `@` sigil: it
+    // is a mark for the EYE, and a live region reads it aloud as "hash".
+    //
+    // This is the ONE place a `.spoken` differs from the sentence the app produced before pills.
+    // `Merged PR #${plain(String(n))}.` carried the `#` as static text, so the announcement was
+    // "Merged PR hash 1175"; it is now "Merged PR 1175". That is the sigil rule being applied where
+    // it was previously missed, not a rendering being lost — `actionReceiptLine`'s tests pin it.
+    spoken: String(n),
   };
 }
 

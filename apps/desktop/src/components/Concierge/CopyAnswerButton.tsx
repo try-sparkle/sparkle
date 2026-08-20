@@ -45,6 +45,7 @@ import { copyToClipboard } from "../../clipboard";
 import { stripAgentRefs } from "./agentRefs";
 import { stripBeadRefs } from "./beadRefs";
 import { stripResearchRefs } from "./researchRefs";
+import { stripPrRefs } from "./prRefs";
 import { COPY_TOAST_MS } from "./useCopyOnSelection";
 
 /** Resting opacity — present, findable, and quiet enough not to compete with the answer. */
@@ -155,7 +156,7 @@ export function CopyAnswerButton({
           // answer that named a dispatched task carries `[the question](sparkle-research:rsh_…)` in
           // its source, and pasting that internal id as a dead link is not what "copy this answer"
           // means; the pill reads the question, so the source is made to agree.
-          void copyToClipboard(stripResearchRefs(stripBeadRefs(stripAgentRefs(text)))).then((ok) => {
+          void copyToClipboard(stripPrRefs(stripResearchRefs(stripBeadRefs(stripAgentRefs(text))))).then((ok) => {
             // Never claim a copy that didn't happen — no check mark, no announcement.
             if (!ok || !alive.current) return;
             setCopied(true);

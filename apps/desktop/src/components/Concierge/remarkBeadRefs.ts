@@ -29,19 +29,8 @@
 
 import { fromMarkdown } from "mdast-util-from-markdown";
 
-import { findBeadIds, type BeadIdSpan } from "./beadRefs";
-import { beadRefHref } from "./beadRefs";
-
-/** The subset of mdast this plugin touches. Structural, matching `beadRefs.ts`'s choice not to take
- *  a type dependency on the renderer's stack. */
-interface Node {
-  type: string;
-  value?: string;
-  url?: string;
-  children?: Node[];
-  /** Present on parsed nodes; deliberately NOT set on the nodes this plugin creates — see below. */
-  position?: unknown;
-}
+import { beadRefHref, findBeadIds, type BeadIdSpan } from "./beadRefs";
+import { splitOnSpans, walkTextNodes, type MdastWalkNode as Node } from "./mdastTextWalk";
 
 /**
  * Split every bead id out of the text nodes of `tree` into `sparkle-bead:` links.
@@ -54,7 +43,7 @@ interface Node {
  */
 export function remarkBeadRefs() {
   return (tree: Node): void => {
-    walk(tree, false, (value) => split(value));
+    walkTextNodes(tree, false, (value) => split(value));
   };
 }
 
@@ -86,63 +75,19 @@ export function remarkBeadRefs() {
  */
 export function linkifiableBeadIds(text: string): BeadIdSpan[] {
   const out: BeadIdSpan[] = [];
-  walk(fromMarkdown(text) as Node, false, (value) => {
+  walkTextNodes(fromMarkdown(text) as Node, false, (value) => {
     out.push(...findBeadIds(value));
     return null; // collect only — nothing is rewritten
   });
   return out;
 }
 
-/**
- * THE ONE TRAVERSAL, shared by the linkifier and by `linkifiableBeadIds` above.
- *
- * `onText` is called for every text node the linkifier would split, in document order. Returning
- * nodes replaces that node (what the plugin does); returning `null` leaves it alone (what the
- * collector does). Two callers, one statement of "which nodes are eligible" — see the note on
- * `linkifiableBeadIds` for the drift this shape exists to prevent.
- */
-function walk(node: Node, inLink: boolean, onText: (value: string) => Node[] | null): void {
-  const children = node.children;
-  if (children === undefined) return;
-  // A link's SUBTREE is off limits, not merely its immediate children: `[**sparkle-17hm1**](…)`
-  // puts the text one level down inside a `strong`, and emphasis inside a link is ordinary markdown
-  // a model emits unprompted (the reasoning `Markdown.tsx`'s `linkText` had to learn the hard way).
-  const nested = inLink || node.type === "link" || node.type === "linkReference";
-  const out: Node[] = [];
-  let changed = false;
-  for (const child of children) {
-    if (child.type !== "text" || nested || typeof child.value !== "string") {
-      walk(child, nested, onText);
-      out.push(child);
-      continue;
-    }
-    const replacement = onText(child.value);
-    if (replacement === null) {
-      out.push(child);
-      continue;
-    }
-    changed = true;
-    out.push(...replacement);
-  }
-  if (changed) node.children = out;
-}
-
 /** The nodes `value` becomes, or null when it holds no ids and the original should be kept (which
  *  keeps its `position` intact for every node this plugin does not touch). */
 function split(value: string): Node[] | null {
-  const spans = findBeadIds(value);
-  if (spans.length === 0) return null;
-  const out: Node[] = [];
-  let cursor = 0;
-  for (const span of spans) {
-    if (span.start > cursor) out.push({ type: "text", value: value.slice(cursor, span.start) });
-    out.push({
-      type: "link",
-      url: beadRefHref(span.id),
-      children: [{ type: "text", value: span.id }],
-    });
-    cursor = span.end;
-  }
-  if (cursor < value.length) out.push({ type: "text", value: value.slice(cursor) });
-  return out;
+  return splitOnSpans(value, findBeadIds(value), (_span, text) => ({
+    type: "link",
+    url: beadRefHref(text),
+    children: [{ type: "text", value: text }],
+  }));
 }

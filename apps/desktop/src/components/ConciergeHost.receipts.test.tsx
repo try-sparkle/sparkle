@@ -227,8 +227,20 @@ describe("ConciergeHost — action receipts reach the thread", () => {
     render(<ConciergeHost feed={feed()} />);
     await flush();
 
+    // READ THE THREAD'S `textContent`, NOT `getByText`. A PR number written by the app is now a
+    // REFERENCE — `actionReceiptLine` composes this line with `pr()`, so the renderer hands the
+    // number to `PrPill` and it lands in its own element (a chiclet when the number resolves to a
+    // repository, a `display: contents` wrapper when it does not). `getByText`'s default matcher
+    // reads only an element's DIRECT text-node children, so the paragraph now measures as
+    // "Merged PR ." and matches nothing — the sentence the reader sees is unchanged, and the
+    // assertion silently stopped being able to see it.
+    //
+    // This is the wiring test, so what it has to pin is that the SENTENCE reached the thread, and
+    // `textContent` is the reading that survives the number being a pill, plain prose, or anything
+    // between. The number stays in the assertion: a line that posted without it would be the
+    // "Merged." fallback, which is a different receipt.
     await waitFor(() => {
-      expect(within(thread()).getByText(/Merged PR #1184/)).toBeTruthy();
+      expect(thread().textContent).toContain("Merged PR #1184.");
     });
   });
 

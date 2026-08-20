@@ -177,9 +177,59 @@ describe("actionReceiptLine", () => {
       expect(l?.spoken).toBe("Filed a task.");
     });
     it("merged, with the PR number", () => {
+      // The `#` moved out of the STATIC text and into the pill's label, so the announcement drops
+      // it — the same sigil rule that makes `ref()` speak "Left Pair" for a pill drawing "@Left
+      // Pair". A live region read the old form aloud as "Merged PR hash 1175".
       expect(
         actionReceiptLine(receipt({ kind: "merged", prNumber: 1175 }), resolve)?.spoken,
-      ).toBe("Merged PR #1175.");
+      ).toBe("Merged PR 1175.");
+    });
+
+    // ══ THE NUMBER IS A PILL — bead `sparkle-e9ziie` ════════════════════════════════════════════
+    // "You said it's up. But I can't actually click on it." This module's own header quotes that
+    // complaint and its rule 3 answers it for agents and beads; the merge line went out through
+    // `plain()`, the explicitly NON-clickable slot, so it kept reproducing it.
+
+    it("renders the PR number as a REFERENCE, not as plain text", () => {
+      const l = actionReceiptLine(receipt({ kind: "merged", prNumber: 1175 }), resolve);
+      expect(l?.md).toContain("[#1175](sparkle-pr:1175)");
+    });
+
+    it("QUALIFIES the reference with the repo the tool actually merged", () => {
+      // The url comes from `mergePrTool`'s own reply. Without it the pill would resolve against
+      // whichever project is selected when the line is READ, which for a cross-project thread is a
+      // chance to open a different repository's PR of the same number.
+      const l = actionReceiptLine(
+        receipt({
+          kind: "merged",
+          prNumber: 1175,
+          prUrl: "https://github.com/drodio/sparkle/pull/1175",
+        }),
+        resolve,
+      );
+      expect(l?.md).toContain("[#1175](sparkle-pr:drodio/sparkle#1175)");
+      // The sentence a listener hears is unaffected by which form the eye gets.
+      expect(l?.spoken).toBe("Merged PR 1175.");
+    });
+
+    it("degrades to the plain sentence when a url names no repository we recognise", () => {
+      // An unusable slug costs the QUALIFICATION, never the pill — `prRefHref` drops it and the
+      // reference falls back to the unqualified form rather than to dead text.
+      const l = actionReceiptLine(
+        receipt({
+          kind: "merged",
+          prNumber: 1175,
+          prUrl: "https://gitlab.example.com/o/r/merge_requests/1175",
+        }),
+        resolve,
+      );
+      expect(l?.md).toContain("[#1175](sparkle-pr:1175)");
+    });
+
+    it("still says plain 'Merged.' when there is no number to name", () => {
+      const l = actionReceiptLine(receipt({ kind: "merged" }), resolve);
+      expect(l?.spoken).toBe("Merged.");
+      expect(l?.md).not.toContain("sparkle-pr:");
     });
   });
 
@@ -210,7 +260,7 @@ describe("actionReceiptLine", () => {
         resolve,
       );
       expect(l?.spoken).toBe(
-        "Didn't merge — you do not have permission to merge in this repository",
+        "Didn't merge PR 753 — you do not have permission to merge in this repository",
       );
       expect(l?.spoken).not.toMatch(/^Merged/);
     });
@@ -284,6 +334,19 @@ describe("actionReceiptLine", () => {
       );
       expect(l?.spoken).toMatch(/^Didn't merge/);
       expect(l?.spoken).not.toMatch(/^Merged/);
+    });
+
+    it("a refused merge NAMES the PR, and names it as a reference", () => {
+      // `prNumberOf` falls back to the ARGUMENT precisely for this arm, whose own comment says
+      // "'Couldn't merge the PR' is a poorer answer than naming it" — and the line said exactly
+      // that poorer thing, discarding the number the classifier preserved. A refusal is the receipt
+      // the founder most needs to act on, and "which PR" is its first question.
+      const l = actionReceiptLine(
+        receipt({ kind: "merged", ok: false, prNumber: 753, reason: "GraphQL: unauthorized" }),
+        resolve,
+      );
+      expect(l?.spoken).toBe("Didn't merge PR 753 — GraphQL: unauthorized");
+      expect(l?.md).toContain("[#753](sparkle-pr:753)");
     });
 
     it("STILL posts one the founder alone can clear — this is not a mute button", () => {

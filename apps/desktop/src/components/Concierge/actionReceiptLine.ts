@@ -34,12 +34,18 @@
 //    click on it" is a recorded complaint about this exact gap. `ref()` degrades to plain words on
 //    its own when the id is unusable, so this module never has to guess — and never invents a
 //    reference, because a pill carrying a wrong id opens the wrong agent and the reader cannot tell.
+//
+//    A PR NUMBER IS AN ID TOO, and for a long time this rule quietly did not cover it: the merge
+//    arms wrote `#${plain(String(n))}`, i.e. the explicitly NON-clickable slot, so the module that
+//    quotes that complaint in its own header was still producing it (bead `sparkle-e9ziie`). Both
+//    arms now go through `pr()`, which degrades the same way `ref()` does.
 
 import {
   ANONYMOUS_SUBJECT,
   bead,
   line,
   plain,
+  pr,
   ref,
   type Line,
 } from "./conciergeLine";
@@ -261,8 +267,21 @@ export function actionReceiptLine(
         return line`Couldn't set a goal on ${subject}${tail}`;
       case "filed":
         return line`Couldn't file that${tail}`;
-      case "merged":
-        return line`Didn't merge${tail}`;
+      case "merged": {
+        // NAMING IT IS THE WHOLE POINT OF KEEPING THE NUMBER. `prNumberOf` falls back to the
+        // ARGUMENT specifically for this arm — its own comment says "a refusal carries no `data` at
+        // all, and 'Couldn't merge the PR' is a poorer answer than naming it" — and yet this line
+        // said exactly that poorer thing, discarding the number the classifier had gone out of its
+        // way to preserve. A refusal is the receipt the founder most needs to act on, and "which PR
+        // didn't merge" is the first question it has to answer.
+        //
+        // No `url`: a refusal carries no reply data, so the reference is UNQUALIFIED and `PrPill`
+        // resolves the repo live. Clickable either way.
+        const n = receipt.prNumber;
+        return n !== undefined && Number.isFinite(n)
+          ? line`Didn't merge PR ${pr({ number: n })}${tail}`
+          : line`Didn't merge${tail}`;
+      }
       default:
         return null;
     }
@@ -372,9 +391,17 @@ export function actionReceiptLine(
     }
 
     case "merged": {
+      // `pr()`, NOT `plain()`. This is the line the founder was looking at when he said "You said
+      // it's up. But I can't actually click on it" — `plain()` is documented as the slot for text
+      // that is deliberately NOT a reference, and a PR number is the opposite of that.
+      //
+      // The url comes from `mergePrTool`'s own reply, so this reference names the repository it
+      // actually merged rather than inferring one from whichever project is selected when the line
+      // is eventually read. "PR" stays prose and only the number is the pill, so the sentence reads
+      // as it always did and the live region hears the identical words.
       const n = receipt.prNumber;
-      return Number.isFinite(n)
-        ? line`Merged PR #${plain(String(n))}.`
+      return n !== undefined && Number.isFinite(n)
+        ? line`Merged PR ${pr({ number: n, url: receipt.prUrl })}.`
         : line`Merged.`;
     }
 

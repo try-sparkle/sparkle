@@ -479,6 +479,15 @@ function prNumberOf(args: unknown, data: unknown): number | undefined {
   return a ? num(a.number) : undefined;
 }
 
+/** The PR's URL off a merge reply. REPLY ONLY, deliberately: the argument never carries one, and a
+ *  url is the thing that says WHICH REPOSITORY was merged — a value worth having only when it comes
+ *  from the tool that actually did it. A refusal therefore has none, and the line falls back to
+ *  resolving the repo live. */
+function prUrlOf(data: unknown): string | undefined {
+  const d = record(data);
+  return d ? str(d.url) : undefined;
+}
+
 /** The dispatch `path` off a terminal-send reply, when it reads as a string. */
 function pathOf(data: unknown): string | undefined {
   if (!data || typeof data !== "object") return undefined;
@@ -585,6 +594,7 @@ export function classifyConciergeActionReceipt(
   const isBroadcast = domain === "fleet" && op === "inbox_broadcast";
   const counts = isBroadcast ? countsOf(input.data) : undefined;
   const prNumber = kind === "merged" ? prNumberOf(input.args, input.data) : undefined;
+  const prUrl = kind === "merged" ? prUrlOf(input.data) : undefined;
 
   return {
     id: input.id,
@@ -610,6 +620,7 @@ export function classifyConciergeActionReceipt(
       : {}),
     ...(beadId ? { beadId } : {}),
     ...(prNumber !== undefined ? { prNumber } : {}),
+    ...(prUrl !== undefined ? { prUrl } : {}),
     ...(isBroadcast ? { fanout: true as const } : {}),
     ...(counts ?? {}),
     // Only when it FAILED. A reason on a success would be a caveat the reader has no use for, and

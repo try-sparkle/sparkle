@@ -32,6 +32,9 @@ import { parseBeadRefHref } from "./Concierge/beadRefs";
 import { parseResearchRefHref } from "./Concierge/researchRefs";
 import { ResearchPill } from "./Concierge/ResearchPill";
 import { remarkBeadRefs } from "./Concierge/remarkBeadRefs";
+import { remarkPrRefs } from "./Concierge/remarkPrRefs";
+import { PrPill } from "./Concierge/PrPill";
+import { parsePrRefHref } from "./Concierge/prRefs";
 import { remarkMergeQuotes } from "./Concierge/remarkMergeQuotes";
 import { LEADING_QUOTE_ATTR, remarkLeadingQuote } from "./Concierge/remarkLeadingQuote";
 import { BeadPill } from "./Concierge/BeadPill";
@@ -156,7 +159,7 @@ function CodeBlock({ children }: { children?: ReactNode }) {
 // are already `link` nodes when the bead linkifier walks the tree, and their text is therefore
 // protected by the same in-a-link guard as a hand-written link's. See remarkBeadRefs' header.
 //
-const REMARK_PLUGINS = [remarkGfm, remarkBeadRefs];
+const REMARK_PLUGINS = [remarkGfm, remarkBeadRefs, remarkPrRefs];
 
 // ── THE QUOTE MERGE IS OPT-IN, AND THAT IS A REAL BOUNDARY, NOT CAUTION ─────────────────────────
 //
@@ -180,7 +183,7 @@ const REMARK_PLUGINS = [remarkGfm, remarkBeadRefs];
 // and never looks inside them, while the linkifiers only ever rewrite inline `text`. It is placed
 // last so the merge runs on the final block structure, which is the reading that stays correct if a
 // future plugin ever introduces or splits a quote.
-const REMARK_PLUGINS_MERGED_QUOTES = [remarkGfm, remarkBeadRefs, remarkMergeQuotes];
+const REMARK_PLUGINS_MERGED_QUOTES = [remarkGfm, remarkBeadRefs, remarkPrRefs, remarkMergeQuotes];
 
 // ── …AND THE TWO THAT ALSO MARK THE OPENING QUOTE ──────────────────────────────────────────────
 //
@@ -196,10 +199,11 @@ const REMARK_PLUGINS_MERGED_QUOTES = [remarkGfm, remarkBeadRefs, remarkMergeQuot
 // Four constants rather than a computed array, for the reason the two above give: a fresh literal
 // per render defeats react-markdown's memoisation of the parse, which in a streaming column is the
 // difference between one parse per token and two.
-const REMARK_PLUGINS_LEADING_QUOTE = [remarkGfm, remarkBeadRefs, remarkLeadingQuote];
+const REMARK_PLUGINS_LEADING_QUOTE = [remarkGfm, remarkBeadRefs, remarkPrRefs, remarkLeadingQuote];
 const REMARK_PLUGINS_MERGED_QUOTES_LEADING = [
   remarkGfm,
   remarkBeadRefs,
+  remarkPrRefs,
   remarkMergeQuotes,
   remarkLeadingQuote,
 ];
@@ -259,6 +263,13 @@ function urlTransform(url: string): string {
   // `href` ever reaches the DOM. Without this line the sanitizer would blank the reference before
   // `ExternalLink` ever saw it.
   if (parseResearchRefHref(url) !== null) return url;
+  // `sparkle-pr:` is the FOURTH exception, on identical terms: gated on `parsePrRefHref`'s
+  // conservative number/slug classes, and `ExternalLink` returns a `<button>` (or inert text) for it
+  // so no `href` ever reaches the DOM. It has to be here even though MOST pr references are
+  // synthesized by `remarkPrRefs` rather than written — `urlTransform` runs on every link the
+  // renderer sees, whatever produced it, so without this line the linkifier's own output would be
+  // blanked and every PR number in the thread would go back to being prose.
+  if (parsePrRefHref(url) !== null) return url;
   return defaultUrlTransform(url);
 }
 
@@ -392,6 +403,19 @@ function ExternalLink({ href, children }: { href?: string; children?: ReactNode 
   const researchTaskId = parseResearchRefHref(href);
   if (researchTaskId !== null) {
     return <NestedUi><ResearchPill taskId={researchTaskId} fallbackLabel={linkText(children)} /></NestedUi>;
+  }
+  // A pull-request reference is not a link either — it is a chiclet. Checked BEFORE the scheme
+  // allowlist for the same reason as the three above: `sparkle-pr:` is deliberately not on it, so
+  // outside the app (an agent's own reply, a support modal) it falls through to the inert-text path
+  // below and reads as `#2164` — exactly the label the pill would have shown.
+  //
+  // NO `fallbackName` COUNTERPART, for `BeadPill`'s reason rather than `AgentPill`'s: a pull
+  // request's readable handle is its NUMBER, which is already in the href. The written label is
+  // discarded so a model that wrote `[the retry work](sparkle-pr:2164)` still draws `#2164` — the
+  // pill must never be able to say something the href does not.
+  const prRef = parsePrRefHref(href);
+  if (prRef !== null) {
+    return <NestedUi><PrPill number={prRef.number} slug={prRef.slug} /></NestedUi>;
   }
   const safe = isSafeLinkHref(href);
   return (

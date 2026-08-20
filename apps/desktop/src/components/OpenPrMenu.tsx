@@ -61,6 +61,7 @@ import { C, FONT_WEIGHT } from "../theme/colors";
 import { TYPE } from "../theme/scale";
 import { ModalLayer } from "./ModalLayer";
 import { pillStyle } from "./Concierge/pillStyle";
+import { rowButtonStyle } from "./OpenPrMenu.rowButtonStyle";
 import {
   fetchOpenPrs,
   formatPrBadge,
@@ -2275,17 +2276,12 @@ export function OpenPrMenu({
                                 setOpen(false);
                                 onOpenAgent(agent);
                               }}
-                              style={{
-                                flex: "0 0 auto",
-                                background: "transparent",
-                                color: C.accentInk,
-                                border: `1px solid ${C.accentMid}`,
-                                borderRadius: 6,
-                                padding: "3px 8px",
-                                fontSize: 12,
-                                cursor: "pointer",
-                                whiteSpace: "nowrap",
-                              }}
+                              // Ink vs stroke: `accentInk` for the words the user READS,
+                              // `accentMid` for the box they sit in.
+                              style={rowButtonStyle({
+                                edge: C.accentMid,
+                                ink: C.accentInk,
+                              })}
                             >
                               Open agent
                             </button>
@@ -2296,19 +2292,18 @@ export function OpenPrMenu({
                             title="View this PR on GitHub"
                             onClick={() => openGithub(pr.url)}
                             disabled={!pr.url}
-                            style={{
-                              flex: "0 0 auto",
-                              background: "transparent",
-                              // Ink vs stroke, as on the chip above: violetInk for the label the user
-                              // READS, the brand literal for the box it sits in.
-                              color: pr.url ? C.violetInk : C.muted,
-                              border: `1px solid ${pr.url ? C.violet : C.muted}`,
-                              borderRadius: 6,
-                              padding: "3px 8px",
-                              fontSize: 12,
-                              cursor: pr.url ? "pointer" : "default",
-                              whiteSpace: "nowrap",
-                            }}
+                            // THE ROW'S BOX, from the cluster's one helper — not the concierge
+                            // header's chiclet. Its peers are the controls beside it, and a 19px
+                            // squared chip between ~24px rounded siblings is drift, not parity
+                            // (roborev 65621; the reasoning is in `OpenPrMenu.rowButtonStyle.ts`).
+                            // Ink vs stroke: violetInk for the glyph, the brand literal for the box.
+                            // No-url is a TONE (muted edge, muted ink, resting cursor) plus the DOM
+                            // `disabled` above — the geometry does not move with it.
+                            style={rowButtonStyle({
+                              edge: pr.url ? C.violet : C.muted,
+                              ink: pr.url ? C.violetInk : C.muted,
+                              interactive: !!pr.url,
+                            })}
                           >
                             <FiExternalLink size={12} aria-hidden />
                           </button>
@@ -2332,17 +2327,11 @@ export function OpenPrMenu({
                             onClick={() =>
                               void runDismiss(group.scope, group.key, pr)
                             }
-                            style={{
-                              flex: "0 0 auto",
-                              background: "transparent",
-                              color: C.muted,
-                              border: `1px solid ${C.hairline}`,
-                              borderRadius: 6,
-                              padding: "3px 8px",
-                              fontSize: 12,
-                              cursor: "pointer",
-                              whiteSpace: "nowrap",
-                            }}
+                            // The quietest control on the row: a hairline box, muted glyph.
+                            style={rowButtonStyle({
+                              edge: C.hairline,
+                              ink: C.muted,
+                            })}
                           >
                             <FiEyeOff size={12} aria-hidden />
                           </button>
@@ -2402,24 +2391,24 @@ export function OpenPrMenu({
                                   reason,
                                 });
                               }}
-                              style={{
-                                flex: "0 0 auto",
-                                background: "transparent",
-                                color:
+                              // ARMED-AND-WRITABLE goes sienna, on both the stroke and the words;
+                              // everything else stays muted. `action` because this is the merge
+                              // family — the one control on the row that touches `main`.
+                              style={rowButtonStyle({
+                                emphasis: "action",
+                                edge:
                                   armed && reasonIssue === null
                                     ? C.sienna
                                     : C.muted,
-                                border: `1px solid ${armed && reasonIssue === null ? C.sienna : C.muted}`,
-                                borderRadius: 6,
-                                padding: "3px 10px",
-                                fontSize: 12,
-                                fontWeight: FONT_WEIGHT.semibold,
-                                cursor:
-                                  busy || (armed && reasonIssue !== null)
-                                    ? "default"
-                                    : "pointer",
-                                whiteSpace: "nowrap",
-                              }}
+                                ink:
+                                  armed && reasonIssue === null
+                                    ? C.sienna
+                                    : C.muted,
+                                interactive: !(
+                                  busy ||
+                                  (armed && reasonIssue !== null)
+                                ),
+                              })}
                             >
                               {busy
                                 ? "Merging…"
@@ -2440,25 +2429,17 @@ export function OpenPrMenu({
                               onClick={() =>
                                 void runMerge(group.scope, [pr.number])
                               }
-                              style={{
-                                flex: "0 0 auto",
-                                background:
-                                  ready.canMerge && !busy
-                                    ? C.teal
-                                    : "transparent",
-                                color:
-                                  ready.canMerge && !busy ? "#fff" : C.muted,
-                                border: `1px solid ${ready.canMerge && !busy ? C.teal : C.muted}`,
-                                borderRadius: 6,
-                                padding: "3px 10px",
-                                fontSize: 12,
-                                fontWeight: FONT_WEIGHT.semibold,
-                                cursor:
-                                  ready.canMerge && !busy
-                                    ? "pointer"
-                                    : "default",
-                                whiteSpace: "nowrap",
-                              }}
+                              // THE ONE FILLED BOX in the cluster. Ready-and-idle is the only state
+                              // in this panel that paints a solid button, and that is the point:
+                              // the row's primary action is the only one that reads as filled.
+                              style={rowButtonStyle({
+                                emphasis: "action",
+                                fill:
+                                  ready.canMerge && !busy ? C.teal : undefined,
+                                edge: ready.canMerge && !busy ? C.teal : C.muted,
+                                ink: ready.canMerge && !busy ? "#fff" : C.muted,
+                                interactive: ready.canMerge && !busy,
+                              })}
                             >
                               {busy ? "Merging…" : "Merge"}
                             </button>
@@ -2479,18 +2460,14 @@ export function OpenPrMenu({
                                 setOverrideArmed(null);
                                 void runMerge(group.scope, [pr.number]);
                               }}
-                              style={{
-                                flex: "0 0 auto",
-                                background: "transparent",
-                                color: armed ? C.sienna : C.muted,
-                                border: `1px solid ${armed ? C.sienna : C.muted}`,
-                                borderRadius: 6,
-                                padding: "3px 10px",
-                                fontSize: 12,
-                                fontWeight: FONT_WEIGHT.semibold,
-                                cursor: busy ? "default" : "pointer",
-                                whiteSpace: "nowrap",
-                              }}
+                              // Same armed grammar as the probe override beside it — sienna once the
+                              // first click has relabelled it with the consequence.
+                              style={rowButtonStyle({
+                                emphasis: "action",
+                                edge: armed ? C.sienna : C.muted,
+                                ink: armed ? C.sienna : C.muted,
+                                interactive: !busy,
+                              })}
                             >
                               {busy
                                 ? "Merging…"
