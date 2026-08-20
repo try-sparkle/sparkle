@@ -438,14 +438,24 @@ describe("previewIdleGrace — a stop in flight is not re-stopped", () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
-// A SETTLE FROM A TORN-DOWN WORLD IS INERT, IN BOTH ARMS — roborev 65694 + 65701
+// A SETTLE FROM A TORN-DOWN WORLD IS INERT, IN BOTH ARMS — roborev 65694 + 65701 + 65711 + 65766
 // ══════════════════════════════════════════════════════════════════════════════════════════════
 //
 // A stop's promise outlives teardown. Its settle then lands in a module whose maps have been
 // cleared and possibly repopulated, and the first version of this guard checked only the `.catch`
 // arm — so a stale `.then` could delete a LIVE stop's entry and reopen the double-stop it was
-// added to prevent. Both arms compare a per-stop token now, and both directions are pinned here:
-// asymmetric guards are exactly what decays.
+// added to prevent. Both arms compare a per-stop token now.
+//
+// THREE ROWS, because a token check has three ways to be wrong and each needs its OWN mutant.
+// This comment claimed coverage twice before it actually had it (roborev 65711, then 65766), so
+// the rows are named against the mutant each one kills:
+//   • the `.catch` arm re-arming into a torn-down world      -> "does not arm a timer …"
+//   • the `.then` arm deleting when the token does NOT match -> "does not clear a LIVE stop's …"
+//   • the `.then` arm NOT deleting when it DOES match        -> "DOES clear the entry …"
+//
+// The last is the one that hides: a leaked `stopping` entry makes the reconcile pass skip that
+// agent FOREVER, which presents as "the timer simply never armed" rather than as a guard fault —
+// i.e. as `sparkle-9yck3i`, the immortal server this module exists to prevent.
 describe("previewIdleGrace — a stop that settles after teardown changes nothing", () => {
   it("does not arm a timer in a watcher that was torn down", () => {
     let reject!: (e: unknown) => void;
@@ -496,7 +506,12 @@ describe("previewIdleGrace — a stop that settles after teardown changes nothin
     vi.mocked(stopPreviewForAgent)
       .mockReset()
       .mockReturnValueOnce(first as never)
-      .mockReturnValueOnce(second as never);
+      .mockReturnValueOnce(second as never)
+      // FALLBACK so the MUTANT fails on the assertion rather than on an exhausted mock: with the
+      // guard removed a THIRD stop is issued, and without this that call returns `undefined` and
+      // dies with "Cannot read properties of undefined (reading 'catch')" — a crash that does not
+      // name the defect. With it, the mutant reports `expected 3 to be 2`.
+      .mockResolvedValue(null);
 
     seed("ag1");
     reconcilePreviewIdleGrace();
@@ -520,6 +535,47 @@ describe("previewIdleGrace — a stop that settles after teardown changes nothin
       .then(() => {
         reconcilePreviewIdleGrace();
         vi.advanceTimersByTime(0);
+        expect(stopPreviewForAgent).toHaveBeenCalledTimes(2);
+      });
+  });
+
+  it("DOES clear the entry when the SAME world's stop resolves, so the agent stays timable", () => {
+    // THE POSITIVE HALF — and without it the guard is still half-pinned (roborev 65766).
+    //
+    // The row above only proves the `.then` does NOT delete when the token does not match. Replace
+    // the whole body with a no-op — `.then(() => {})`, i.e. a successful stop never clears
+    // `stopping` — and all rows above stay green, because each one ends before its resolve is
+    // observable and `beforeEach` wipes the leaked entry before anything could notice.
+    //
+    // The un-pinned branch is NOT cosmetic. A `stopping` entry that is never removed makes
+    // `reconcilePreviewIdleGrace`'s `if (stopping.has(agentId)) continue;` skip that agent
+    // FOREVER, so the next preview it starts arms no idle timer at all — `sparkle-9yck3i`, the
+    // immortal server this module exists to prevent, reintroduced through the back door.
+    let resolveOnly!: (v: unknown) => void;
+    const only = new Promise((res) => {
+      resolveOnly = res;
+    });
+    vi.mocked(stopPreviewForAgent)
+      .mockReset()
+      .mockReturnValueOnce(only as never)
+      .mockResolvedValue(null);
+
+    seed("ag1");
+    reconcilePreviewIdleGrace();
+    vi.advanceTimersByTime(GRACE);
+    expect(stopPreviewForAgent).toHaveBeenCalledTimes(1);
+
+    // No teardown this time: the stop settles into the world that issued it, so the token matches
+    // and the entry must be released.
+    resolveOnly(null);
+    return Promise.resolve()
+      .then(() => Promise.resolve())
+      .then(() => {
+        // Touch it, then let a full window pass with no activity. A released agent is timable
+        // again; a leaked `stopping` entry means the reconcile pass never arms anything for it.
+        seed("ag1");
+        reconcilePreviewIdleGrace();
+        vi.advanceTimersByTime(GRACE);
         expect(stopPreviewForAgent).toHaveBeenCalledTimes(2);
       });
   });
