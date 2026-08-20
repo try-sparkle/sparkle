@@ -72,6 +72,33 @@ export interface WorkflowState {
   // downstream so a no-op branch (also trivially adds nothing) can't claim it landed. Optional in the
   // type so a Rust build that predates the field deserializes to falsy.
   landed?: boolean;
+  // Did the arm that proved `landed` prove it against ORIGIN — i.e. is the work on the REMOTE
+  // integration branch? Three of Rust's four `branch_landed` arms are origin-scoped (ancestry in
+  // origin/<default>, a merge-tree no-op against it, and `cherry_empty`, which is checked against
+  // origin ONLY); collapsing them into `landed` alone left this boundary unable to tell "landed on
+  // this laptop" from "landed on the remote", so deriveLiveStage settled EVERY patch-equivalent
+  // landing at the cautious `merged_local` (bead `sparkle-e3lxt7`).
+  //
+  // That mattered because patch-equivalence is the NORMAL path to shipped in this repo, not an edge
+  // case — work re-lands under a different sha via squash/rebase constantly. In that shape
+  // inLocalMain AND inOriginMain are both false, so `merged_local` — documented in buildSections.ts
+  // as "seen on LOCAL main, not yet seen on ORIGIN main" — was false in both halves.
+  //
+  // Strictly narrower than `landed`: never true when `landed` is false, and false for a local-scoped
+  // proof. The two groups of Rust arms are ranked on DIFFERENT principles — ANCESTRY prefers local
+  // (harmless, because `inLocalMain`/`inOriginMain` carry reachability separately and this boundary
+  // ORs them), while TREE/PATCH EQUIVALENCE prefers ORIGIN. The second is load-bearing: when an
+  // equivalence arm fires the tip is an ancestor of nothing, so `inLocalMain` is false and NOTHING
+  // else carries either fact. Had local equivalence been asked first, a squash re-land would report
+  // local the moment local main caught up to origin, and the row would settle back at
+  // `merged_local` — the original bug, reproduced whenever local main is current.
+  //
+  // Gate it behind the same `committedSeen` no-op-branch guard as `landed` — on its own it is not
+  // evidence a branch did any work.
+  //
+  // Optional ONLY for the back-compat reason its neighbours are (a Rust build predating the field
+  // omits the key). Rust sends a plain `bool`, never an `Option`, so this never arrives as `null`.
+  landedOnOrigin?: boolean;
   // The agent branch has been PUSHED to origin (its remote-tracking ref exists) — drives the "Pushed"
   // stage LIVE even before any PR. Local/offline; reflects a push made from this repo. Optional so a
   // Rust build predating the field deserializes to falsy (see Rust `branch_pushed`).

@@ -51,7 +51,16 @@ export interface BuildSectionMeta {
 // squash/rebase `ws.landed` tree-match, both bump to merged_local and outrank `pushed`). So the
 // copy below must claim only what its stage actually observed; saying "never pushed" there would
 // tell a user their work is at risk when it is sitting safely on the remote.
-
+//
+// `merged_local` NOW MEANS WHAT IT SAYS. It used to also collect a second, unrelated population:
+// work proven landed by PATCH-EQUIVALENCE with the location unknown. Rust's `branch_landed` has four
+// arms and three are origin-scoped, but all four were collapsed into one `ws.landed` boolean, so
+// deriveLiveStage could not tell them apart and parked every one of them here as the cautious
+// choice. For the repo's most common shipping shape — a squash/rebase re-land under a different sha
+// — that made this heading assert the OPPOSITE of the truth in both halves: the work was on ORIGIN
+// main and had never been on LOCAL main. Rust now carries which arm proved it (`landedOnOrigin`),
+// an origin-scoped proof reads the full `merged`, and the only rows left here are ones whose proof
+// really was local. Bead `sparkle-e3lxt7`.
 export const BUILD_SECTIONS: readonly BuildSectionMeta[] = [
   {
     // THE ROW THAT HOLDS NOTHING — split out of `local_uncommitted` (sparkle-biezi).

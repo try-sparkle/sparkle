@@ -50,6 +50,10 @@ const WS_DEFAULTS: Required<WorkflowState> = {
   inParent: false,
   aheadOfBase: 0,
   landed: false,
+  // False at the baseline exactly like `landed`, and false throughout the Rust walk too — even at
+  // its origin-pushed step, where local ancestry wins the tie and `inOriginMain` carries the remote
+  // fact instead. See `landedOnOrigin` in branchStatus.ts (bead `sparkle-e3lxt7`).
+  landedOnOrigin: false,
   pushed: false,
   shipped: false,
   hasRemote: true,

@@ -3293,6 +3293,24 @@ pub struct WorkflowState {
     /// those are). The frontend gates this on `committedSeen` so a no-op branch — which also trivially
     /// adds nothing — can't claim it landed.
     landed: bool,
+    /// Did the arm that proved `landed` prove it against `origin/<default>` — i.e. is the work on the
+    /// REMOTE integration branch? See [`LandedScope`] for why this must be carried separately.
+    ///
+    /// WITHOUT IT THE FRONTEND CANNOT TELL THE TWO APART, and the repo's most common shipping shape is
+    /// the one it got wrong: work re-lands under a DIFFERENT sha (squash/rebase), so `in_local_main`
+    /// and `in_origin_main` are BOTH false and `landed` is true via the ORIGIN-scoped `cherry_empty`
+    /// arm. `workflowStage.ts` settled that at `merged_local`, whose documented meaning ("seen on
+    /// LOCAL main, not yet seen on ORIGIN main") is false in both halves. Bead `sparkle-e3lxt7`.
+    ///
+    /// A plain `bool`, deliberately NOT an `Option<bool>`: serde emits `Option::None` as an explicit
+    /// `null`, and a hand-written TS `field?: T` does not include `null` (see `AGENTS.md`), so an
+    /// `Option` here would describe a shape the wire cannot produce. This key is ALWAYS present; the
+    /// TS side's `?` covers only an older Rust build that omits it entirely.
+    ///
+    /// Strictly narrower than `landed` — false whenever `landed` is false, and false for a
+    /// LOCAL-scoped proof. It never widens the ladder on its own: the frontend still gates it behind
+    /// the same `committedSeen` no-op-branch guard as `landed`.
+    landed_on_origin: bool,
     /// The agent branch has been PUSHED to `origin` — its remote-tracking ref
     /// (`refs/remotes/origin/sparkle/agent-<id>`) exists. git creates/updates that ref on push, so
     /// this is a pure LOCAL lookup: offline-safe, no fetch, reflects a push made from THIS repo (the
@@ -3441,11 +3459,115 @@ fn cherry_empty(root: &str, target: &str, branch: &str) -> bool {
 /// against a check that rarely differs in practice (a local-only landing without ever touching
 /// origin is the rare case) wasn't worth the extra probe on every still-unlanded agent, every poll.
 fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
+    branch_landed_scope(root, target, branch, tip).is_landed()
+}
+
+/// WHICH ref proved the branch landed — the fact the collapsed `bool` used to throw away.
+///
+/// `branch_landed` answers "is this work in the integration branch" with one boolean, but THREE of
+/// its four arms are explicitly ORIGIN-scoped: ancestry in `origin/<target>`, a merge-tree no-op
+/// against `origin/<target>`, and `cherry_empty` — which is checked against `origin/<target>` ONLY.
+/// Collapsing them left the frontend unable to tell "landed on this laptop's `main`" from "landed on
+/// the REMOTE `main`", so `workflowStage.ts` settled every patch-equivalent landing at the cautious
+/// `merged_local` — a label `buildSections.ts` documents as "seen on LOCAL main, not yet seen on
+/// ORIGIN main".
+///
+/// FOR THIS REPO'S MOST COMMON SHIPPING SHAPE THAT ASSERTION IS FALSE IN BOTH HALVES. Work re-lands
+/// under a DIFFERENT sha constantly here (the repo squashes and rebases), and a squash/rebase
+/// re-land puts the work on `origin/<default>` and NOWHERE on local `main` — so `in_local_main` is
+/// false too, and the row was filed under a heading claiming the opposite of the truth. Patch
+/// equivalence is the NORMAL path to shipped here, not the uncertain fallback (bead `sparkle-e3lxt7`).
+///
+/// SAME FOUR ARMS, BUT NO LONGER THE SAME ORDER — and this paragraph used to claim it was. The arms
+/// are unchanged and each still short-circuits, but the EQUIVALENCE group is now asked
+/// origin-before-local (see below), so the cost claim has to be stated rather than assumed:
+///
+///   * A branch landed on ORIGIN — the case this repo actually ships — is answered by the FIRST
+///     equivalence arm, so it is equal or cheaper than before.
+///   * A branch still genuinely unlanded pays the same three equivalence arms, just reordered.
+///   * A LOCAL-ONLY landing is the one that pays more: it now runs `merge_adds_nothing(origin)`
+///     (a `merge-tree --write-tree` plus its `rev-parse ^{tree}`) AND `cherry_empty(origin)` (a
+///     `rev-list --count --min-parents=2` guard plus a full `git cherry`) before reaching the local
+///     arm — up to FOUR extra subprocesses, on the function this file documents as the most
+///     expensive item on the 15s status poll. It is bounded to the transient window between a local
+///     merge and a push (the `merged_local` state itself) and is memoized by `branch_landed_memo`,
+///     but it is not free and must not be described as free.
+///
+/// The "only genuinely-unlanded branches pay for the expensive arms" property on `branch_landed` is
+/// otherwise preserved: nothing here runs for a branch answered by ancestry.
+///
+/// ORDER MATTERS, AND IT IS NOT THE OBVIOUS ONE. The arms fall into two groups that must be ranked
+/// on DIFFERENT principles, and conflating them reintroduced the founder's bug in its commonest form
+/// (caught by roborev before this shipped):
+///
+///   1. ANCESTRY (`ref_contains`) — local first. A branch in BOTH reports `Local`, and that loses
+///      nothing, because `in_local_main` and `in_origin_main` are computed separately by the caller
+///      from the same `ref_contains` and the frontend ORs them. The local answer is genuinely
+///      carried elsewhere, so preferring it here costs nothing.
+///   2. EQUIVALENCE (`merge_adds_nothing` / `cherry_empty`) — ORIGIN first. The same reasoning does
+///      NOT transfer, and this is the trap: when a TREE-equality arm fires, the tip is an ancestor
+///      of nothing, so `in_local_main` is FALSE. Nothing else carries the local fact — and nothing
+///      carries the origin fact either. Had local equivalence been asked first, then the moment
+///      local `main` caught up to origin (routine — `main`'s ref is shared across every worktree and
+///      advances on every pull and land), a squash/rebase re-land would match LOCALLY first and
+///      report `Local`, so the row would settle right back at `merged_local`. The bug this function
+///      exists to fix would reproduce exactly whenever local `main` was current.
+///
+/// Its COST is stated in the bullet list above, in subprocesses — the unit the rest of this file
+/// uses (see `branch_landed_memo`). A second cost paragraph used to sit here and understated it as
+/// "two extra probes"; roborev caught the contradiction.
+///
+/// `branch_landed`'s answer is UNCHANGED by the reordering: the landed set is the union of all arms
+/// either way, so the destructive close-agent branch delete sees identical behaviour.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LandedScope {
+    /// No arm fired — not landed anywhere we can see.
+    No,
+    /// Proven against a LOCAL ref only. Says NOTHING about the remote.
+    Local,
+    /// Proven against `origin/<target>` — the work is on the REMOTE integration branch. This is the
+    /// arm that must read `merged`, not `merged_local`.
+    Origin,
+}
+
+impl LandedScope {
+    /// Did any arm fire? Exactly the old collapsed boolean.
+    fn is_landed(self) -> bool {
+        self != LandedScope::No
+    }
+
+    /// Was the proof ORIGIN-scoped? Only `Origin` may claim the work reached the remote.
+    fn is_origin(self) -> bool {
+        self == LandedScope::Origin
+    }
+}
+
+/// See [`LandedScope`]. The same four arms as the old `||` chain, each still short-circuiting — but
+/// the EQUIVALENCE group is ranked origin-before-local, which the `||` chain was not. That reorder is
+/// the correctness fix, not a tidy-up: read [`LandedScope`] before restoring the old order.
+fn branch_landed_scope(root: &str, target: &str, branch: &str, tip: &str) -> LandedScope {
     let origin_ref = format!("origin/{target}");
-    (!tip.is_empty() && (ref_contains(root, target, tip) || ref_contains(root, &origin_ref, tip)))
-        || merge_adds_nothing(root, target, branch)
-        || merge_adds_nothing(root, &origin_ref, branch)
-        || cherry_empty(root, &origin_ref, branch)
+    if !tip.is_empty() {
+        if ref_contains(root, target, tip) {
+            return LandedScope::Local;
+        }
+        if ref_contains(root, &origin_ref, tip) {
+            return LandedScope::Origin;
+        }
+    }
+    // ORIGIN equivalence BEFORE local equivalence — see the doc comment. A local tree match must not
+    // be allowed to answer the origin question, or a re-land reads `Local` the moment local `main`
+    // catches up and the row settles back at `merged_local`.
+    if merge_adds_nothing(root, &origin_ref, branch) {
+        return LandedScope::Origin;
+    }
+    if cherry_empty(root, &origin_ref, branch) {
+        return LandedScope::Origin;
+    }
+    if merge_adds_nothing(root, target, branch) {
+        return LandedScope::Local;
+    }
+    LandedScope::No
 }
 
 /// One memoized [`branch_landed`] answer, plus the inputs that answer is only valid for.
@@ -3457,7 +3579,10 @@ fn branch_landed(root: &str, target: &str, branch: &str, tip: &str) -> bool {
 struct LandedMemo {
     tip: String,
     target_tips: String,
-    landed: bool,
+    /// The full [`LandedScope`], not just "did any arm fire". Caching the collapsed boolean here
+    /// would re-throw away the origin/local distinction one layer below the wire — which is the
+    /// whole defect (bead `sparkle-e3lxt7`), and the memo is what the poll path actually reads.
+    scope: LandedScope,
 }
 
 /// Per-branch memo of the last [`branch_landed`] answer (bead `sparkle-4kh8w`).
@@ -3505,29 +3630,42 @@ fn branch_landed_memo(
     tip: &str,
     target_tips: Option<&str>,
 ) -> bool {
+    branch_landed_scope_memo(root, target, branch, tip, target_tips).is_landed()
+}
+
+/// [`branch_landed_scope`], memoized on `(tip, target_tips)` — see [`landed_cache`]. This is the
+/// real memo; [`branch_landed_memo`] is the boolean projection of it, kept so the close-agent safe
+/// branch delete and every other landed-or-not caller are unchanged.
+fn branch_landed_scope_memo(
+    root: &str,
+    target: &str,
+    branch: &str,
+    tip: &str,
+    target_tips: Option<&str>,
+) -> LandedScope {
     let Some(target_tips) = target_tips else {
-        return branch_landed(root, target, branch, tip);
+        return branch_landed_scope(root, target, branch, tip);
     };
     let key = format!("{root}\u{1}{target}\u{1}{branch}");
     if let Ok(cache) = landed_cache().lock() {
         if let Some(prev) = cache.get(&key) {
             if prev.tip == tip && prev.target_tips == target_tips {
-                return prev.landed;
+                return prev.scope;
             }
         }
     }
-    let landed = branch_landed(root, target, branch, tip);
+    let scope = branch_landed_scope(root, target, branch, tip);
     if let Ok(mut cache) = landed_cache().lock() {
         cache.insert(
             key,
             LandedMemo {
                 tip: tip.to_string(),
                 target_tips: target_tips.to_string(),
-                landed,
+                scope,
             },
         );
     }
-    landed
+    scope
 }
 
 /// Commits reachable from `branch` but not from `base` — i.e. what `branch` authored on top of it.
@@ -3688,6 +3826,43 @@ fn tip_in_release(root: &str, tip: &str) -> bool {
 /// state is lowercased ("open"/"merged"/"closed"). Any failure — gh not installed, not authed, no
 /// network, no remote, no matching PR, unparsable output — yields all-None and never errors. Fast
 /// path: callers should only invoke this when an `origin` remote exists.
+/// Choose WHICH of a branch's pull requests speaks for it. Rank: **OPEN, then MERGED, then newest.**
+///
+/// `gh pr list` orders newest-first and the caller asks for `--state all`, so the first row is simply
+/// the most recently opened PR. That is the wrong pick whenever a branch has more than one: a NEWER
+/// CLOSED PR SHADOWS AN OLDER MERGED ONE, and the whole point of this probe is to answer "did this
+/// branch's work ship". A closed PR is the ABSENCE of that answer; a merged PR IS the answer, and it
+/// cannot be un-merged by a later PR being closed. So merged beats closed regardless of age.
+///
+/// BUT MERGED MUST NOT BEAT **OPEN**, and this is the subtle half (roborev caught it here before it
+/// shipped). This probe is BRANCH-scoped, not tip-scoped: unlike its sibling `decode_commit_pulls` —
+/// which ranks merged first legitimately, because it asks "is THIS SHA in a merged PR" — a merged PR
+/// on a BRANCH says nothing about commits pushed after it. A reused branch is the documented normal
+/// case here (an app-opened PR merges while the agent keeps working; see `pr-for-branch.sh` exit 11),
+/// and preferring merged there would report a finished cycle over live in-flight work: the row would
+/// file under "Merged to Main" with unmerged work outstanding, the CTA would stop offering to merge
+/// the open PR, and — the load-bearing one — `pusherVerifier`'s `prState == "open"` refutation would
+/// be lost, the exact guard that stops an agent waiting on its own PR from being retired.
+///
+/// An OPEN pull request is live work and cannot be superseded by a finished one, so it wins outright.
+///
+/// With neither an open nor a merged PR present, "newest" remains the right tie-break and is what
+/// this always did — so the pick only ever CHANGES in the two shadowing cases above. A row whose
+/// `state` is missing or unparsable matches neither rank and can still be returned as the newest,
+/// preserving the old behaviour rather than dropping the branch's only PR.
+fn pick_pr_row(rows: &[Value]) -> Option<&Value> {
+    let first_with_state = |want: &str| {
+        rows.iter().find(move |r| {
+            r.get("state")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case(want))
+        })
+    };
+    first_with_state("open")
+        .or_else(|| first_with_state("merged"))
+        .or_else(|| rows.first())
+}
+
 fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<String>) {
     let none = (None, None, None);
     if branch.trim().is_empty() {
@@ -3695,7 +3870,28 @@ fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<St
     }
     let mut cmd = Command::new(crate::preflight::gh_program());
     cmd.arg("pr")
-        .args(["list", "--head", branch, "--state", "all", "--limit", "1", "--json", "number,state,url"])
+        .args([
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            // NOT "1". `gh pr list` returns NEWEST FIRST, so a limit of 1 hands back whatever was
+            // opened last — and a branch that was reused, reopened or superseded routinely has a
+            // NEWER CLOSED PR sitting in front of an OLDER MERGED one. That made `pr_state` read
+            // "closed" for demonstrably merged work, so `workflowStage.ts`'s `prState === "merged"`
+            // rung never fired (bead `sparkle-e3lxt7`). Widening the window is only half the fix; the
+            // other half is `pick_pr_row`, which PREFERS a merged PR over whatever is newest.
+            //
+            // 20 is a window, not a guess at a maximum: this is a per-branch query (`--head`), so the
+            // rows are one branch's own PRs, and the fields requested are scalars — unlike the
+            // `statusCheckRollup` queries elsewhere in this file, whose cost is scored by node count,
+            // this does not get meaningfully more expensive with the limit.
+            "--limit",
+            "20",
+            "--json",
+            "number,state,url",
+        ])
         .current_dir(root)
         // Keep gh non-interactive and quiet; never let it block the poll on a prompt or updater.
         .env("GH_PROMPT_DISABLED", "1")
@@ -3712,7 +3908,7 @@ fn probe_pr(root: &str, branch: &str) -> (Option<String>, Option<u64>, Option<St
     let Ok(rows) = serde_json::from_str::<Vec<Value>>(&stdout) else {
         return none;
     };
-    let Some(pr) = rows.first() else {
+    let Some(pr) = pick_pr_row(&rows) else {
         return none; // no PR for this branch
     };
     let state = pr.get("state").and_then(Value::as_str).map(str::to_ascii_lowercase);
@@ -5554,7 +5750,12 @@ fn workflow_state_shared(
     let origin_ref = format!("origin/{default_branch}");
     let in_origin_main = ref_contains(root, &origin_ref, tip);
     let in_parent = ref_contains(root, parent_branch, tip);
-    let landed = branch_landed_memo(root, default_branch, &branch, tip, target_tips);
+    // ONE probe, TWO facts. `branch_landed_scope_memo` runs the identical arms in the identical order
+    // as `branch_landed_memo` (which is now a projection of it), so this costs no extra subprocess —
+    // it just stops discarding WHICH ref proved it. See `LandedScope`.
+    let landed_scope = branch_landed_scope_memo(root, default_branch, &branch, tip, target_tips);
+    let landed = landed_scope.is_landed();
+    let landed_on_origin = landed_scope.is_origin();
     // Live Pushed signal (sparkle-v7d0) — a pure local, offline-safe remote-tracking-ref lookup.
     let pushed = branch_pushed(root, &branch);
     // Commits the agent AUTHORED that aren't yet landed (0 once merged into the integration ref).
@@ -5619,6 +5820,7 @@ fn workflow_state_shared(
         in_parent,
         ahead_of_base,
         landed,
+        landed_on_origin,
         pushed,
         shipped,
         // `has_origin` already folds in the caller's probe gate (see this fn's doc comment), so this
@@ -9582,7 +9784,307 @@ mod tests {
             "branch_landed must report landed via the cherry signal even though ancestry and merge-tree both fail"
         );
 
+        // ── WHAT THIS FIXTURE NOW ALSO PINS (bead `sparkle-e3lxt7`) ─────────────────────────────
+        // The arm that fired is `cherry_empty(origin/main, …)`, which is ORIGIN-scoped. Collapsed to
+        // one boolean, the frontend could not see that and settled this row at `merged_local` — a
+        // label whose documented meaning is "seen on LOCAL main, not yet seen on ORIGIN main", and
+        // BOTH halves of that are false here. The scope must say Origin.
+        assert_eq!(
+            branch_landed_scope(&r, "main", "feature", &tip),
+            LandedScope::Origin,
+            "a patch-equivalent landing proven against origin/main must be ORIGIN-scoped, not Local"
+        );
+        // Non-vacuity: this is the squash/re-land shape, so NEITHER reachability signal is true.
+        // Without these the assertion above could be satisfied by ordinary ancestry.
+        assert!(
+            !ref_contains(&r, "main", &tip),
+            "PRECONDITION: in_local_main must be FALSE — the `merged_local` claim is false too"
+        );
+        assert!(
+            !ref_contains(&r, "origin/main", &tip),
+            "PRECONDITION: in_origin_main must be FALSE — only the cherry arm can carry this row"
+        );
+
         let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// The LOCAL half of the split, so the origin assertion above cannot be satisfied by a scope
+    /// hardwired to `Origin`. A branch merged into LOCAL `main` whose origin has NOT received it must
+    /// report `Local` — and `merged_local` is then the honest, correct label.
+    #[test]
+    fn branch_landed_scope_reports_local_when_only_local_main_has_the_work() {
+        let r = init_repo("scope-local");
+        let origin = unique_root("scope-local-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+        std::fs::write(format!("{r}/feature.txt"), "agent work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "agent work"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+
+        // Land on LOCAL main only. origin/main stays where it was.
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["merge", "--no-ff", "-q", "feature", "-m", "land feature"]).unwrap();
+
+        assert!(ref_contains(&r, "main", &tip), "PRECONDITION: local main has it");
+        assert!(
+            !ref_contains(&r, "origin/main", &tip),
+            "PRECONDITION: origin/main must NOT have it — that is what makes this the Local case"
+        );
+        assert_eq!(
+            branch_landed_scope(&r, "main", "feature", &tip),
+            LandedScope::Local,
+            "work on local main only must be LOCAL-scoped — it must not be allowed to read as merged"
+        );
+        assert!(branch_landed(&r, "main", "feature", &tip), "and the collapsed boolean is unchanged");
+
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// THE REGRESSION roborev CAUGHT BEFORE THIS SHIPPED (Medium): a LOCAL tree-equality match must
+    /// not be allowed to answer the ORIGIN question.
+    ///
+    /// The founder's bug is a squash/rebase re-land, where the tip is an ancestor of nothing. If the
+    /// cheap local `merge_adds_nothing` arm is asked first, then the moment local `main` catches up
+    /// to origin — routine, since `main`'s ref is shared across every worktree and advances on every
+    /// pull and land — the branch matches LOCALLY first and reports `Local`. `landed_on_origin` is
+    /// then false and the row settles right back at `merged_local`: the exact bug, reproduced
+    /// whenever local main is current.
+    ///
+    /// The two other scope fixtures cannot catch this. The cherry one asserts a PRECONDITION that
+    /// local main has DIVERGED (defeating the local arm), and the local-only one has no origin copy
+    /// at all. This one is the case they both exclude: the work is patch-equivalent on BOTH refs,
+    /// and `Origin` must still win.
+    #[test]
+    fn branch_landed_scope_prefers_origin_when_the_work_is_equivalent_on_both_refs() {
+        let r = init_repo("scope-both");
+        let origin = unique_root("scope-both-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+        std::fs::write(format!("{r}/feature.txt"), "agent work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "agent work"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+
+        // Re-land the SAME patch on main under a NEW sha, then push — so origin/main HAS the work.
+        // Local main is left CURRENT with origin (the routine state), which is what arms the trap.
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["cherry-pick", "-x", &tip]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        // PRECONDITIONS. The tip is an ancestor of NEITHER ref (it re-landed under a new sha)…
+        assert!(!ref_contains(&r, "main", &tip), "PRECONDITION: not reachable in local main");
+        assert!(
+            !ref_contains(&r, "origin/main", &tip),
+            "PRECONDITION: not reachable in origin/main either — this is the squash re-land shape"
+        );
+        // …and the LOCAL equivalence arm DOES fire. Without this the test would be vacuous: it is
+        // precisely the arm that used to short-circuit and answer `Local`.
+        assert!(
+            merge_adds_nothing(&r, "main", "feature"),
+            "PRECONDITION: the local tree-equality arm must fire, or this fixture proves nothing"
+        );
+
+        assert_eq!(
+            branch_landed_scope(&r, "main", "feature", &tip),
+            LandedScope::Origin,
+            "work equivalent on BOTH refs must report Origin — a local tree match must never answer \
+             the origin question, or the row settles back at merged_local"
+        );
+
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// THE LOCAL **EQUIVALENCE** ARM'S OWN VERDICT — the coverage hole roborev found after the
+    /// reorder (finding 2 on job 65661).
+    ///
+    /// `branch_landed_scope_reports_local_when_only_local_main_has_the_work` lands its branch with a
+    /// real `merge --no-ff`, so the tip IS an ancestor of `main` and that fixture returns from the
+    /// ANCESTRY arm — it never reaches the local equivalence arm at all. Every other scope fixture
+    /// answers `Origin` or `No`. So the local equivalence arm could be DELETED OUTRIGHT and the whole
+    /// suite would stay green, even though it is the only thing that makes `merged_local` reachable
+    /// for a local squash/rebase landing, and it is a term in the `branch_landed` union that feeds
+    /// the destructive `delete_agent_branch_if_merged_at`.
+    ///
+    /// This is the mirror of the origin-beats-local fixture: the same squash/re-land shape, but the
+    /// patch reaches LOCAL `main` only and is never pushed, so `Local` is the correct answer and the
+    /// origin arms must all decline first.
+    #[test]
+    fn branch_landed_scope_reports_local_for_a_patch_equivalent_landing_on_local_main_only() {
+        let r = init_repo("scope-local-equiv");
+        let origin = unique_root("scope-local-equiv-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+        std::fs::write(format!("{r}/feature.txt"), "agent work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "agent work"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+
+        // Re-land the SAME patch on LOCAL main under a NEW sha. Deliberately NOT pushed, so
+        // origin/main still sits at the original commit and every origin arm must decline.
+        git(&r, &["checkout", "-q", "main"]).unwrap();
+        git(&r, &["cherry-pick", "-x", &tip]).unwrap();
+
+        // PRECONDITIONS — these are what force the answer through the arm under test.
+        assert!(
+            !ref_contains(&r, "main", &tip),
+            "PRECONDITION: the re-landed sha differs, so ANCESTRY must not answer this"
+        );
+        assert!(!ref_contains(&r, "origin/main", &tip), "PRECONDITION: origin has nothing");
+        assert!(
+            !merge_adds_nothing(&r, "origin/main", "feature"),
+            "PRECONDITION: the origin merge-tree arm must decline, or it would answer Origin first"
+        );
+        assert!(
+            !cherry_empty(&r, "origin/main", "feature"),
+            "PRECONDITION: the origin cherry arm must decline too — it is asked before the local one"
+        );
+
+        assert_eq!(
+            branch_landed_scope(&r, "main", "feature", &tip),
+            LandedScope::Local,
+            "a patch-equivalent landing on LOCAL main only must report Local — this is the arm that \
+             makes merged_local reachable, and nothing else in the suite asserts its verdict"
+        );
+        assert!(branch_landed(&r, "main", "feature", &tip), "and it is landed for the union too");
+
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// A genuinely unlanded branch is `No` — the third arm of the tri-state, so neither assertion
+    /// above can pass against a function that never returns `No`.
+    #[test]
+    fn branch_landed_scope_reports_no_for_genuinely_unlanded_work() {
+        let r = init_repo("scope-none");
+        let origin = unique_root("scope-none-origin");
+        let o = origin.to_str().unwrap();
+        git(o, &["init", "--bare", "-q"]).unwrap();
+        git(&r, &["remote", "add", "origin", o]).unwrap();
+        git(&r, &["push", "-q", "origin", "main"]).unwrap();
+
+        git(&r, &["checkout", "-q", "-b", "feature"]).unwrap();
+        std::fs::write(format!("{r}/feature.txt"), "agent work").unwrap();
+        git(&r, &["add", "."]).unwrap();
+        git(&r, &["commit", "-q", "-m", "agent work"]).unwrap();
+        let tip = rev_parse_tip(&r, "feature");
+
+        assert_eq!(
+            branch_landed_scope(&r, "main", "feature", &tip),
+            LandedScope::No,
+            "unlanded work must report No"
+        );
+        assert!(!branch_landed(&r, "main", "feature", &tip));
+
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    /// DEFECT 3 (bead `sparkle-e3lxt7`): `gh pr list` returns NEWEST FIRST, so with `--limit 1` a
+    /// newer CLOSED PR SHADOWS an older MERGED one and `pr_state` reads "closed" for work that
+    /// demonstrably shipped — `workflowStage.ts`'s `prState === "merged"` rung then never fires.
+    ///
+    /// Asserted on the ROW PICK rather than on `probe_pr`, because the pick IS the decision;
+    /// `probe_pr` around it is a `gh` invocation this suite cannot drive. The fixtures are ordered
+    /// the way `gh` orders them — newest first — so a regression to `rows.first()` fails here.
+    #[test]
+    fn pick_pr_row_prefers_a_merged_pr_over_a_newer_closed_one() {
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"number":1889,"state":"CLOSED","url":"u1889"},
+                {"number":1767,"state":"MERGED","url":"u1767"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(1767),
+            "the MERGED PR must win over the newer CLOSED one that used to shadow it"
+        );
+
+        // Order-independence: merged still wins when it is already first.
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"number":1767,"state":"MERGED","url":"u1767"},
+                {"number":1889,"state":"CLOSED","url":"u1889"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(1767)
+        );
+
+        // With NEITHER an open NOR a merged PR, the behaviour is unchanged: newest (first) wins.
+        // Both rows are CLOSED deliberately — an OPEN row here would now be picked by RANK, which is
+        // the roborev fix, not a violation of this case.
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"number":1889,"state":"CLOSED","url":"u1889"},
+                {"number":1767,"state":"CLOSED","url":"u1767"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(1889),
+            "with neither an open nor a merged PR this must still take the newest"
+        );
+
+        // ── AN OPEN PR OUTRANKS A MERGED ONE (roborev, High) ────────────────────────────────
+        // BRANCH-scoped, not tip-scoped: a merged PR on a branch says nothing about commits pushed
+        // AFTER it. Reusing a branch is the documented normal case (an app-opened PR merges while
+        // the agent keeps working), and preferring merged there reports a finished cycle over live
+        // work — losing `pusherVerifier`'s `prState == "open"` refutation, the guard that stops an
+        // agent waiting on its own PR from being retired. Ordered newest-first, as gh returns them.
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"number":2200,"state":"OPEN","url":"u2200"},
+                {"number":1767,"state":"MERGED","url":"u1767"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(2200),
+            "a live OPEN pull request must not be shadowed by an older MERGED one"
+        );
+
+        // …and the same when the merged one is NEWER, so this cannot pass on ordering alone.
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"number":2200,"state":"MERGED","url":"u2200"},
+                {"number":1767,"state":"OPEN","url":"u1767"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(1767),
+            "OPEN wins on RANK, not on recency"
+        );
+
+        // Full ladder in one fixture: open > merged > closed, all three present.
+        let rows: Vec<Value> = serde_json::from_str(
+            r#"[{"number":3,"state":"CLOSED","url":"u3"},
+                {"number":2,"state":"MERGED","url":"u2"},
+                {"number":1,"state":"OPEN","url":"u1"}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(1)
+        );
+
+        // Empty stays None (the caller reads that as "no PR for this branch").
+        assert!(pick_pr_row(&[]).is_none());
+
+        // A row with no `state` at all is still returned as the newest rather than dropped.
+        let rows: Vec<Value> = serde_json::from_str(r#"[{"number":42,"url":"u42"}]"#).unwrap();
+        assert_eq!(
+            pick_pr_row(&rows).and_then(|r| r.get("number")).and_then(Value::as_u64),
+            Some(42)
+        );
     }
 
     /// THE BUG roborev caught before this shipped further: `git cherry` computes patch-ids, which
@@ -16364,6 +16866,7 @@ mod tests {
         in_parent: bool,
         ahead_of_base: u32,
         landed: bool,
+        landed_on_origin: bool,
         pushed: bool,
         shipped: bool,
         has_remote: bool,
@@ -16382,6 +16885,7 @@ mod tests {
                 in_parent: false,
                 ahead_of_base: 0,
                 landed: false,
+                landed_on_origin: false,
                 pushed: false,
                 shipped: false,
                 has_remote: true,
@@ -16411,6 +16915,7 @@ mod tests {
             in_parent,
             ahead_of_base,
             landed,
+            landed_on_origin,
             pushed,
             shipped,
             has_remote,
@@ -16423,6 +16928,12 @@ mod tests {
         assert_eq!(*in_parent, want.in_parent, "{step}: in_parent");
         assert_eq!(*ahead_of_base, want.ahead_of_base, "{step}: ahead_of_base");
         assert_eq!(*landed, want.landed, "{step}: landed");
+        // The origin/local SPLIT of `landed` (bead `sparkle-e3lxt7`) — what decides `merged` vs
+        // `merged_local` in the Build column. Pinned because its correct value across this WHOLE walk
+        // is FALSE, including at step 3 where the tip IS in origin/main: local ancestry is checked
+        // first and wins the tie, and `in_origin_main` carries that fact separately. A regression
+        // that made this merely mirror `in_origin_main` would flip step 3 and fail here.
+        assert_eq!(*landed_on_origin, want.landed_on_origin, "{step}: landed_on_origin");
         assert_eq!(*pushed, want.pushed, "{step}: pushed");
         // No release tag exists in this fixture. Pinned because deriveLiveStage treats `shipped` as
         // the TOP of the ladder — a tip_in_release/is_semver_tag regression reading true here would

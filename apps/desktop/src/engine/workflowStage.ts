@@ -324,12 +324,27 @@ export function deriveLiveStage(input: LiveStageInputs): WorkflowStageId {
     // Build agent: landing on LOCAL main is `merged_local`; only reaching ORIGIN main (or a
     // GitHub-merged PR, which implies origin has it) is the full `merged`. Splitting these is what
     // lets the CTA say "Push to Origin Main" instead of falsely offering Close on unpushed work.
-    // `ws.landed` is the SQUASH/REBASE case — the tip isn't an ancestor but its tree already
-    // matches. It can't distinguish local from origin, so it settles at the cautious `merged_local`.
-    // The committedSeen gate is what keeps a no-op branch (also tree-identical) from reading landed.
+    // `ws.landed` is the SQUASH/REBASE case — the tip isn't an ancestor but its tree already matches.
+    //
+    // `ws.landedOnOrigin` IS THE MISSING HALF OF THAT SIGNAL (bead `sparkle-e3lxt7`). This comment
+    // used to say `ws.landed` "can't distinguish local from origin, so it settles at the cautious
+    // merged_local" — but Rust always knew: three of `branch_landed`'s four arms are explicitly
+    // origin-scoped, and the answer was collapsed to one boolean before it reached the wire. It is
+    // now carried, so an ORIGIN-scoped proof reads the full `merged`.
+    //
+    // This is a correction, not a nicety, because patch-equivalence is the NORMAL path to shipped in
+    // this repo (it squashes and rebases, so work re-lands under a different sha). In that shape
+    // inLocalMain and inOriginMain are BOTH false, so the row landed in `merged_local` — whose
+    // documented meaning in buildSections.ts is "seen on LOCAL main, not yet seen on ORIGIN main" —
+    // while neither half of that was true. Treating the repo's ordinary shipping path as the
+    // uncertain fallback mislabelled most shipped work.
+    //
+    // `merged_local` is now honest by its own definition: only a LOCAL-scoped proof reaches it, and
+    // every local-scoped arm implies the work really is on local main. The committedSeen gate still
+    // keeps a no-op branch (also trivially tree-identical) from reading landed at all.
     if (committedSeen && kind !== "worker") {
       if (ws.inLocalMain || ws.landed) bump("merged_local");
-      if (ws.inOriginMain) bump("merged");
+      if (ws.inOriginMain || ws.landedOnOrigin) bump("merged");
     }
   }
 

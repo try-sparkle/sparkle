@@ -129,8 +129,10 @@ describe("deriveLiveStage — build signals", () => {
   it("squash-merge: tip not an ancestor (landed) but work present → merged_local", () => {
     // The branch's commits still exist on its ref post-squash, so aheadOfBase stays >0 (committedSeen)
     // while inLocalMain/inOriginMain are false. `landed` (tree-identical to main) is the squash signal.
-    // Re-aimed for the split: `landed` cannot distinguish local main from origin main, so it settles
-    // at the cautious merged_local — the CTA then offers Push rather than a premature Close.
+    // A LOCAL-scoped squash proof (`landed` WITHOUT `landedOnOrigin`) settles at merged_local — the
+    // CTA then offers Push rather than a premature Close. This stays merged_local after the
+    // origin/local split (bead `sparkle-e3lxt7`): the split promotes only the ORIGIN-scoped arms, so
+    // this case is the control proving the promotion is not unconditional.
     expect(
       deriveLiveStage({ kind: "build", bs: bs(0), ws: ws({ landed: true, aheadOfBase: 2 }) }),
     ).toBe("merged_local");
@@ -384,6 +386,70 @@ describe("merged_local vs merged", () => {
         prev: "building_saved",
       }),
     ).toBe("merged");
+  });
+
+  // ── THE FOUNDER'S ROW (bead `sparkle-e3lxt7`) ──────────────────────────────────────────────────
+  // An agent showed under "LOCAL: MERGED TO MAIN" with both of its PRs merged and on origin/main.
+  // Its work had re-landed under a DIFFERENT sha — the normal case here, because the repo squashes
+  // and rebases — so neither reachability signal was true and the only thing carrying the row was
+  // Rust's ORIGIN-scoped `cherry_empty` arm. That arm was collapsed into a bare `landed` boolean, so
+  // this boundary could not see it was origin-scoped and settled at the cautious merged_local.
+  it("a SQUASH-RELANDED sha proven on ORIGIN main is merged, not merged_local", () => {
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        // The squash/re-land shape precisely: BOTH reachability signals false — the tip is an
+        // ancestor of nothing — and the proof is patch-equivalence against origin/main.
+        ws: ws({
+          inLocalMain: false,
+          inOriginMain: false,
+          landed: true,
+          landedOnOrigin: true,
+          aheadOfBase: 2,
+        }),
+        prev: "building_saved",
+      }),
+    ).toBe("merged");
+  });
+
+  it("landedOnOrigin does not let a NO-OP branch skip the committedSeen gate", () => {
+    // The promotion must INHERIT `landed`'s no-op guard, not bypass it: a branch that authored
+    // nothing is trivially tree-identical to main and would otherwise claim it shipped.
+    expect(
+      deriveLiveStage({
+        kind: "build",
+        bs: bs(0),
+        ws: ws({ landed: true, landedOnOrigin: true, aheadOfBase: 0 }),
+      }),
+    ).toBe("building_unsaved");
+  });
+
+  it("the founder's row files under a REMOTE build section, not a Local one", () => {
+    // The label was wrong even by its own definition: buildSections documents merged_local as "seen
+    // on LOCAL main, not yet seen on ORIGIN main", and here inLocalMain was false too. Assert the
+    // CAPABILITY the fix protects — which side of the Local/Remote boundary the row files under —
+    // rather than the stage string alone.
+    const relanded = deriveLiveStage({
+      kind: "build",
+      bs: bs(0),
+      ws: ws({ landed: true, landedOnOrigin: true, aheadOfBase: 2 }),
+      prev: "building_saved",
+    });
+    const localOnly = deriveLiveStage({
+      kind: "build",
+      bs: bs(0),
+      ws: ws({ inLocalMain: true, aheadOfBase: 3 }),
+      prev: "building_saved",
+    });
+    expect(relanded).toBe("merged");
+    expect(localOnly).toBe("merged_local");
+    // `true` = holds work, which is the case for both rows here (aheadOfBase > 0).
+    expect(sectionOfRow(relanded, true)).not.toBe(sectionOfRow(localOnly, true));
+    // And name the sides explicitly, so a future re-shuffle of the section list can't make this
+    // pass by moving BOTH rows to the same new place.
+    expect(sectionOfRow(localOnly, true)).toBe("local_merged");
+    expect(sectionOfRow(relanded, true)).toBe("remote_merged");
   });
 
   it("a GitHub-merged PR is merged (origin has it by definition)", () => {
