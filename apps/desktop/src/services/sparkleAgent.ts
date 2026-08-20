@@ -248,6 +248,16 @@ export const AGENT_FEEDBACK_DRAIN_STEP =
   "FIRST drain the agent-feedback inbox (see the AGENT-FEEDBACK INBOX section below) — file new " +
   "beads, enrich/bump recurring ones, and fix the highest-value item — before mining any logs.";
 
+/** The beads label the deployment-pipeline health scan writes into (one bead per non-green
+ *  component, deduped, enriched on recurrence). Exported so the persona and its test name the SAME
+ *  string as `scripts/pipeline-health-scan.sh`. */
+export const PIPELINE_HEALTH_LABEL = "pipeline-health";
+
+/** Header of the deployment-pipeline health section. Exported so the test asserts its
+ *  PRESENCE (consent !== "never") / ABSENCE (chat-only) structurally, surviving a body reword. */
+export const PIPELINE_HEALTH_SCAN_HEADER =
+  "DEPLOYMENT-PIPELINE HEALTH — RUN THE SCAN EVERY PASS, DRIVE RED TO GREEN";
+
 function submitBlockedSection(
   verdict: SubmitVerdict,
   attended: boolean,
@@ -621,6 +631,35 @@ export function sparklePersona(
         ]
       : [];
 
+  // DEPLOYMENT-PIPELINE HEALTH (the founder's ask, filed as a code feature): every pass, run the
+  // deterministic health scan alongside the log/inbox work, and treat a filed RED (blocking) bead as
+  // the pass's highest-priority work to drive back to green. The scan is fail-safe on its own — an
+  // unreadable source is UNKNOWN, never a false red — so this section is about ACTING on what it
+  // files, not re-deriving thresholds here (those live in scripts/lib/pipeline-health.sh, the mirror
+  // of the app's own pipeline_health.rs). Dropped in chat-only "never" mode, like the inbox above.
+  const pipelineHealthSection =
+    consent !== "never"
+      ? [
+          PIPELINE_HEALTH_SCAN_HEADER,
+          "- The deployment pipeline (roborev review, the CI runner pool, the release/DMG runner, the",
+          "  PR reviewer) can degrade SILENTLY — the founder should never be the monitor. Every pass,",
+          "  run the health scan; it is deterministic, bounded, and fail-safe (a source it cannot read",
+          "  is recorded as UNKNOWN, never a fabricated outage):",
+          "    bash scripts/pipeline-health-scan.sh",
+          "  It classifies each component with the SAME thresholds as the app's pipeline-health icon and",
+          `  files-or-ENRICHES exactly one deduped bead (label \`${PIPELINE_HEALTH_LABEL}\`) per non-green`,
+          "  component: blocking→P1, warning→P3, unknown→P4. A persistent issue enriches its one bead",
+          "  (a recurrence comment) rather than spawning a duplicate — so running it every pass is safe.",
+          "- Then DRIVE THE PIPELINE GREEN. A RED (P1, blocking) health bead means a deployment is",
+          "  blocked — it is this pass's highest-priority work, ahead of ordinary log findings:",
+          `    bd list --label ${PIPELINE_HEALTH_LABEL} --status open -p 1`,
+          "  Fix the underlying cause where you can (or, for infrastructure only a human can touch — a",
+          "  sleeping release Mac, an offline runner — say so precisely in chat and via the concierge",
+          "  channel below). Close the bead once the component is green again; leave it open with the",
+          "  latest evidence while it is still degraded.",
+        ]
+      : [];
+
   return [
     "You are the Sparkle Improvement Agent — a built-in agent inside the Sparkle desktop app",
     "whose sole mission is to make Sparkle (the open-source desktop client) better for everyone.",
@@ -635,6 +674,8 @@ export function sparklePersona(
     // The agent-feedback inbox is drained BEFORE the dedupe/log gates — it is the highest-signal
     // input and each mode's step 1 points here. Empty (dropped) in the chat-only "never" mode.
     ...(feedbackInbox.length ? [...feedbackInbox, ""] : []),
+    // The pipeline-health scan runs alongside the inbox/log work and drives RED beads to green.
+    ...(pipelineHealthSection.length ? [...pipelineHealthSection, ""] : []),
     ...dedupeGate,
     "",
     ...scrubGate,

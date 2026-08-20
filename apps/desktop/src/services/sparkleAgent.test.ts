@@ -25,6 +25,8 @@ import {
   AGENT_FEEDBACK_LABEL,
   AGENT_FEEDBACK_DRAIN_HEADER,
   AGENT_FEEDBACK_DRAIN_STEP,
+  PIPELINE_HEALTH_SCAN_HEADER,
+  PIPELINE_HEALTH_LABEL,
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
@@ -259,6 +261,28 @@ describe("sparklePersona — consent branching", () => {
       expect(p).toContain("do NOT open another one");
     },
   );
+
+  it.each(["always", "case_by_case"] as const)(
+    "%s: wires in the deployment-pipeline health scan and tells the agent to drive RED beads green",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+      expect(p).toContain(PIPELINE_HEALTH_SCAN_HEADER);
+      // It must name the concrete script (the deterministic, fail-safe scan) — not just gesture at
+      // "check the pipeline". This is the founder's ask shipped as a code feature.
+      expect(p).toContain("scripts/pipeline-health-scan.sh");
+      // And it must point the agent at the RED (P1 blocking) beads to drive green — the whole point
+      // is that the loop fixes the pipeline instead of the founder noticing and asking.
+      expect(p).toContain(`bd list --label ${PIPELINE_HEALTH_LABEL} --status open -p 1`);
+    },
+  );
+
+  it("never (chat-only): omits the pipeline-health scan section entirely", () => {
+    // Same discipline as the log/inbox sections: a chat-only session mines nothing on a schedule,
+    // so it must not be told to run background scans.
+    const p = sparklePersona(LOG_DIR, REPO, "never", "unknown", { attended: false });
+    expect(p).not.toContain(PIPELINE_HEALTH_SCAN_HEADER);
+    expect(p).not.toContain("scripts/pipeline-health-scan.sh");
+  });
 
   it.each(["always", "case_by_case", "never"] as const)(
     "%s: the dedupe gate survives an unauthenticated gh instead of failing open",
