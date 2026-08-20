@@ -892,6 +892,10 @@ export function Terminal({
     const unregisterViewport = registerViewport(agentId, () => ({
       text: snapshotScreen(term.buffer.active, term.rows),
       alternateBuffer: term.buffer.active.type !== "normal",
+      // Read from the SAME `term` in the same call as the text above, so a force-redraw computes
+      // its nudge from the geometry that actually produced this screen — see TerminalViewport.
+      cols: term.cols,
+      rows: term.rows,
     }));
     // Let the parent move focus into the terminal imperatively (⌘J / composer minimize).
     //

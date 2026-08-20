@@ -114,13 +114,117 @@ const ERROR_PATTERNS: RegExp[] = [
 // Retune point, like screenClassifier's markers: this tracks a Claude Code TUI detail that drifts.
 // Add a fixture in TODAY's shape whenever it moves, or a green suite will again say nothing.
 
-/** The rotating glyphs Claude leads its transient status line with. Kept in step with
- *  engine/composerOcclusion.ts's SPINNER_GLYPH — the two answer the same question about the same
- *  line, and letting them drift apart is how one of them silently stops matching. */
-const SPINNER_GLYPH = /^\s*[✻✽✢✶✳·*∗+]\s/;
+/** ══ THE ONE PLACE CLAUDE'S SPINNER GLYPHS ARE WRITTEN DOWN — `✻✽✢✶✳∗·` ══════════════════════════
+ *  ESCAPED, not literal, because `components/glyphIcons.test.ts` ratchets glyph-as-icon sites and
+ *  its `isRegexLiteral` hatch only covers a whole `= /…/;` on ONE line. These are bytes we RECOGNIZE
+ *  in a PTY, never bytes we render, so no react-icon could replace them — but escaping is cheaper
+ *  than teaching the scanner a third exemption. Same precedent as
+ *  `engine/claudeCodeScreen.STATUS_GLYPHS`.
+ *
+ *  ══ EVERY OTHER GLYPH CLASS IN THIS FILE IS DERIVED FROM IT (roborev 66000) ═══════════════════
+ *  There were FOUR independently-typed copies of this set — the two regexes here, the escaped
+ *  string, and a list in the test — with nothing asserting any two agreed, under a comment merely
+ *  ASKING that they be "kept in step". This module exists BECAUSE Claude Code rotates its glyph set
+ *  (2.1.218 → 2.1.237 is the whole premise), so the next rotation adds a glyph to the greppable
+ *  literal classes and the escaped one silently does not carry it — after which a bare frame on that
+ *  beat is rejected by both arms, which is the false gray this file exists to close, with a green
+ *  suite because the test's own list was copied from the same edit that forgot it.
+ *
+ *  Deriving makes that unrepresentable: there is one set, and adding a beat is one edit. */
+export const SPINNER_GLYPH_CLASS = "\\u273b\\u273d\\u2722\\u2736\\u2733\\u2217\\u00b7";
+
+/** The ASCII fallbacks `SPINNER_GLYPH` tolerates and `SPINNER_BARE_FRAME` refuses. They are the
+ *  characters ordinary output starts lines with (a markdown bullet, a diff line), which is why the
+ *  bare-frame arm — the one with no parenthetical to corroborate it — must not accept them. */
+const SPINNER_ASCII_FALLBACKS = "*+";
+
+/** The rotating glyphs Claude leads its transient status line with. DERIVED from
+ *  {@link SPINNER_GLYPH_CLASS} — see there for why there is only one list. Kept in step with
+ *  engine/composerOcclusion.ts's SPINNER_GLYPH, which is still its own copy. */
+const SPINNER_GLYPH = new RegExp(`^\\s*[${SPINNER_GLYPH_CLASS}${SPINNER_ASCII_FALLBACKS}]\\s`);
 
 /** The parenthetical the status line carries: an elapsed clock ("(12s", "(40m 17s", "(3m"). */
 const SPINNER_ELAPSED = /\(\s*(?:\d+\s*h\s*)?(?:\d+\s*m\s*)?\d+\s*s\b|\(\s*\d+\s*m\b/;
+
+/** ══ THE 2.1.237 SHAPE: A GLYPH AND A PHRASE, WITH NO PARENTHETICAL AT ALL ══════════════════════
+ *  Captured verbatim from a live session (replayed through `@xterm/headless`, sampling the grid at
+ *  byte intervals — the spinner redraws in place, so naive line-splitting yields only fragments):
+ *
+ *      ✶ Schlepping…            no clock at all
+ *      ✽ Enchanting…
+ *      ✻ Crunched for 2s        elapsed, but NOT parenthesised
+ *
+ *  None of them carry a parenthetical or a token counter, so `SPINNER_ELAPSED` and the counter both
+ *  miss, and `esc to interrupt` has moved to the persistent footer (which is deliberately not
+ *  counted — see the header). Every frame of an ordinary turn was therefore read as NOT working,
+ *  which is the FALSE GRAY the header describes: `idle` recorded a couple of seconds into every
+ *  turn, the CTA gate opened over live work, and in-motion suppression lost.
+ *
+ *  ══ WHY THIS IS ITS OWN PATTERN AND NOT A LOOSER TAIL — THE FALSE-GREEN TRAP ══════════════════
+ *  The obvious fix is to accept a bare `for <N>s` tail alongside the parenthesised one. That is the
+ *  dangerous change, and the suite pins it: `SPINNER_GLYPH` accepts `*` and `+`, so ordinary agent
+ *  output — a markdown bullet, a diff line — matches. `* run the suite for 30s` would then pin that
+ *  agent GREEN FOREVER, and the header is explicit that false green is the worse direction because
+ *  it hides a real question behind a healthy-looking dot.
+ *
+ *  Four things keep this narrow, and all four are load-bearing:
+ *
+ *   1. ITS OWN GLYPH CLASS, WITHOUT THE ASCII FALLBACKS. `*` and `+` are excluded here even though
+ *      `SPINNER_GLYPH` allows them — they are the characters ordinary output starts lines with.
+ *
+ *      `·` IS ADMITTED, and an earlier cut of this pattern wrongly excluded it (roborev 65910,
+ *      Medium). The stated reason was that it is "not one of Claude's own rotating glyphs" — which
+ *      the sibling module this file says it is kept in step with flatly contradicts:
+ *      `composerOcclusion` lists `·` in its own `SPINNER_GLYPH` and quotes the leading-`·` status
+ *      line verbatim (`"· Thinking… (esc to interrupt)"`), and `SPINNER_GLYPH` above carries it
+ *      too. Excluding it left a bare frame drawn on the `·` beat of the rotation rejected by BOTH
+ *      arms — the very false gray this pattern exists to close, still open for a slice of frames,
+ *      saved only by `SPINNER_GRACE_MS` happening to catch a different beat within two seconds.
+ *      That is luck about chunk timing, not a guarantee.
+ *   2. A SINGLE CAPITALISED WORD. This is what pays for admitting `·`, and the word-boundary half
+ *      is load-bearing — an initial capital ALONE was tried and was not enough (roborev 65949).
+ *
+ *      The counterexample is not hypothetical, it is documented in this repo: `screenClassifier`
+ *      records that Claude Code's picker footer WRAPS at Ink widths 44-58, stranding `· Esc to
+ *      cancel` (and `· Esc to close`, in the captured fixtures) as a line of its own. Glyph `·`,
+ *      space, capital `E`, no digits, line ends — it satisfied every other clause, so
+ *      `isSpinnerFrame` returned TRUE and `ingest` set `working` on a chunk whose only content is
+ *      the footer of a dialog WAITING ON THE HUMAN. That is the false green the header calls the
+ *      more dangerous one, arriving through the exact class of line the `·` ban had kept out. The
+ *      capital rule was tuned against `· item one` — only the lower-case half of the population.
+ *
+ *      Forbidding an interior space closes it, and costs nothing real: every captured frame is one
+ *      word ("Schlepping", "Crunched", "Enchanting", "Baked", "Thinking"), while a key hint is a
+ *      phrase by nature. A leading digit is still rejected for free.
+ *   3. A MANDATORY TAIL — an ellipsis, an elapsed clock, or both. Both were OPTIONAL in an earlier
+ *      cut, which left `^<glyph> Word$` matching (roborev 65998): `· Verified`, `· Done`,
+ *      `· Fixed` — ordinary one-word bullets in agent output — each made `hasSpinnerFrame` report a
+ *      spinner and `ingest` set `working` on a chunk that is FINISHED OUTPUT, not live work. The
+ *      single-word rule closed the wrapped footer and left this open one step down, so the
+ *      tightening looked total while it was partial.
+ *
+ *      It costs nothing against the evidence: every captured frame carries one — the ellipsis
+ *      ("✶ Schlepping…", "· Thinking…") or the clock ("✻ Crunched for 2s", "✽ Baked for 2m 24s").
+ *      Nothing in the corpus ever needed a bare word to match.
+ *   4. IT ANCHORS THE WHOLE FRAME. Not "contains", but "this line IS a status line": glyph, one
+ *      capitalised word, a REQUIRED ellipsis and/or `for <elapsed>` (rule 3), end. Prose that merely
+ *      mentions a duration cannot satisfy it because the line has to END there — `✻ Crunched for 2s, then it failed` is
+ *      rejected on the trailing clause alone, and the suite pins exactly that, with controls that
+ *      SURVIVE the glyph class so the anchor is what has to do the work.
+ *
+ *  The phrase is bounded (`{1,40}`) for the same backtracking reason the token pattern above
+ *  documents. */
+
+/** The elapsed tail: `for 2s`, `for 2m 24s`, `for 1h 3m 9s`. */
+const SPINNER_FOR_ELAPSED =
+  "[ \\t]+for[ \\t]+(?:\\d{1,3}\\s*h[ \\t]*)?(?:\\d{1,3}\\s*m[ \\t]*)?\\d{1,3}\\s*s";
+
+const SPINNER_BARE_FRAME = new RegExp(
+  `^\\s*[${SPINNER_GLYPH_CLASS}][ \\t]+[A-Z][A-Za-z'\u2019-]{1,40}` +
+    // AT LEAST ONE TAIL IS MANDATORY — see rule 3 above.
+    `(?:(?:\\u2026|\\.\\.\\.)(?:${SPINNER_FOR_ELAPSED})?|${SPINNER_FOR_ELAPSED})` +
+    `[ \\t]*$`,
+);
 
 /** Accepted tails for a glyph-led frame. The token counter is the strongest of these — it only
  *  climbs while the model is generating — and `esc to interrupt` is the legacy shape.
@@ -157,6 +261,12 @@ const WORKING_PATTERNS: RegExp[] = [
  *  FIRST line happens to start with "* " (a markdown bullet, a diff line) would otherwise license
  *  every tail match anywhere in it. `hasSpinnerFrame` does the splitting for you. */
 export function isSpinnerFrame(frame: string): boolean {
+  // THE 2.1.237 ARM STANDS ALONE, and that is deliberate. It is not one more entry in
+  // `WORKING_PATTERNS`, because those are TAILS evaluated on a `SPINNER_GLYPH`-led frame — and
+  // `SPINNER_GLYPH` accepts `*` and `+`, which is exactly the door this shape must not come through
+  // (`* run the suite for 30s`). `SPINNER_BARE_FRAME` carries its own, narrower glyph class and
+  // anchors the entire line, so it is self-sufficient and cannot be widened by the looser gate.
+  if (SPINNER_BARE_FRAME.test(frame)) return true;
   return SPINNER_GLYPH.test(frame) && WORKING_PATTERNS.some((re) => re.test(frame));
 }
 

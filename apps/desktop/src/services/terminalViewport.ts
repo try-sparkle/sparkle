@@ -22,6 +22,30 @@ export interface TerminalViewport {
   /** True when xterm's alternate screen buffer is active: `vim`, `less`, `htop`, `lazygit`.
    *  A full-screen app reads pasted text as COMMANDS, not as input. */
   alternateBuffer: boolean;
+  /** The terminal's current geometry, read in the SAME provider call as the text above.
+   *
+   *  HERE rather than in a second registry because `services/forceRedraw` needs the size that
+   *  belongs to the screen it just read: a redraw computes its nudge from `cols` and restores to
+   *  it, and a size sampled a moment later can belong to a pane the user has since dragged — which
+   *  would leave the terminal at a width it never had. The header's rule about `text` and
+   *  `alternateBuffer` describing ONE INSTANT is the same rule, extended to the one other fact a
+   *  caller needs.
+   *
+   *  ══ OPTIONAL, AND ABSENCE IS A REFUSAL — NEVER A DEFAULT ═══════════════════════════════════
+   *  The live provider (`components/Terminal`) always supplies both. They are optional only so the
+   *  ~20 existing fixtures that build a viewport to exercise a WRITE GUARD — which has never cared
+   *  about geometry — do not all have to declare a size they never read. Requiring them was tried
+   *  and reverted: it spread churn across a dozen unrelated suites and, worse, several of those
+   *  helpers infer their own literal types, so the "fix" was to annotate test scaffolding that has
+   *  nothing to do with this feature.
+   *
+   *  WHAT MAKES THAT SAFE is that no consumer may substitute a value. `forceAgentRedraw` REFUSES
+   *  with `no-geometry` when either is absent rather than assuming 80x24 — guessing would resize a
+   *  live terminal to a size nobody chose, which is worse than not redrawing at all. That refusal
+   *  is pinned by its own test, so this is an explicit dead end rather than the silent
+   *  defaulted-seam hole (bead sparkle-lgbwf) that a fallback value would create. */
+  cols?: number;
+  rows?: number;
 }
 
 const providers = new Map<string, () => TerminalViewport>();

@@ -91,6 +91,7 @@ export const CONCIERGE_EVENT_KINDS = [
   "research_completed",
   "pr_checks_concluded",
   "build_failed",
+  "screen_unrecognized",
 ] as const;
 
 export type ConciergeEventKind = (typeof CONCIERGE_EVENT_KINDS)[number];
@@ -139,6 +140,10 @@ export const CONCIERGE_EVENT_WIRING: Record<ConciergeEventKind, "wired" | "named
   // build surfaces as an agent's status going `errored`, which is already carried by `agent_status`.
   // A separate kind that nothing distinguishes would be a second, worse spelling of that.
   build_failed: "named",
+  // engine/screenReadability, via the concierge feed's per-tick readability check. Edge-triggered
+  // per agent (see `noteScreenReadability`) — a permanently unreadable pane must not mint an event
+  // on every tick, which would evict everything else from the ring.
+  screen_unrecognized: "wired",
 };
 
 /** Every kind something actually emits today. */
@@ -247,6 +252,37 @@ export interface BuildFailedEvent {
   detail: string;
 }
 
+/**
+ * THE DETECTOR FAILED TO RECOGNISE A LIVE AGENT'S SCREEN — the regression alarm for lexical rot.
+ *
+ * ══ WHY THIS KIND EXISTS ════════════════════════════════════════════════════════════════════════
+ * `engine/claudeCodeScreen` recognises Claude Code by markers that Claude Code can change without
+ * telling anyone. When they rot, EVERY consequence is fail-CLOSED: the write guard refuses, the
+ * picker cannot be read, and the row still shows "Needs you" over a pane with nothing in it. It
+ * rotted exactly that way at 2.1.237 — three of five permission modes went unrecognised — and
+ * nothing anywhere said so. It surfaced only because the founder lost a night to it.
+ *
+ * So the failure has to ANNOUNCE ITSELF. This is that announcement.
+ *
+ * ══ NO SCREEN TEXT — PROPERTY 4 IS NOT WAIVED FOR DIAGNOSTICS ═══════════════════════════════════
+ * The obvious payload is the unrecognised screen, and it is exactly what this log forbids: these
+ * records are handed to a model and may be quoted back, and a terminal screen is user data. What
+ * travels instead is the DETECTOR'S OWN VERDICT — how many independent marker families the screen
+ * scored, and whether it had a composer box. That is not a lesser substitute; it IS the diagnosis.
+ * The 2.1.237 rot reads as `families: 1, composerBox: true` — "this is a live Claude Code TUI whose
+ * chrome we no longer recognise" — which names the family to re-capture. Confirming it is then a
+ * `capturedScreens.fixture.ts` capture, which is where screen text is allowed to live.
+ */
+export interface ScreenUnrecognizedEvent {
+  kind: "screen_unrecognized";
+  agentId: string;
+  /** How many independent marker families the screen scored (`claudeCodeMarkerFamilies`). */
+  families: number;
+  /** Whether the live-TUI composer box was present. `true` with a low family count is the signature
+   *  of lexical rot specifically, as opposed to a genuine `vim`/`less`, which scores neither. */
+  composerBox: boolean;
+}
+
 /** The payload union, discriminated on `kind`. */
 export type ConciergeEventPayload =
   | AgentStatusEvent
@@ -256,7 +292,8 @@ export type ConciergeEventPayload =
   | ApprovalResolvedEvent
   | ResearchCompletedEvent
   | PrChecksConcludedEvent
-  | BuildFailedEvent;
+  | BuildFailedEvent
+  | ScreenUnrecognizedEvent;
 
 /** One recorded event: the payload plus the envelope that makes it drainable. */
 export type ConciergeEvent = ConciergeEventPayload & {

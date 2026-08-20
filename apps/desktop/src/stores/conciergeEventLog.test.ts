@@ -419,7 +419,7 @@ describe("the wiring table is the truth, not decoration", () => {
     expect(Object.keys(CONCIERGE_EVENT_WIRING).sort()).toEqual([...CONCIERGE_EVENT_KINDS].sort());
   });
 
-  it("names exactly the six kinds something emits today", () => {
+  it("names exactly the seven kinds something emits today", () => {
     expect([...WIRED_EVENT_KINDS]).toEqual([
       "agent_status",
       "agent_spawned",
@@ -430,6 +430,32 @@ describe("the wiring table is the truth, not decoration", () => {
       // first time a task is seen terminal — the channel by which a FAILED or CANCELLED task
       // reaches the concierge at all, since the turn-start preamble is `done`-only.
       "research_completed",
+      // engine/screenReadability, via the nudge builder's per-tick readability check. THE
+      // REGRESSION ALARM for `claudeCodeScreen`'s markers: when they rot, every consequence is
+      // fail-CLOSED (the write guard refuses, the picker goes blind, the row stays red) so nothing
+      // surfaces the failure — it rotted exactly that way at Claude Code 2.1.237 and was found only
+      // because the founder lost a night to it. Edge-triggered per agent, so a permanently
+      // unreadable pane cannot evict the ring.
+      "screen_unrecognized",
+    ]);
+  });
+
+  it("carries the detector's VERDICT and no screen text", () => {
+    // Property 4 again, at the newest kind. The obvious payload — the unrecognised screen — is
+    // exactly what this log forbids, since these records are handed to a model and may be quoted
+    // back. The family count IS the diagnosis: `families: 1, composerBox: true` reads as "a live
+    // Claude Code TUI whose chrome we no longer recognise", which names the family to re-capture.
+    const e = recordConciergeEvent(
+      { kind: "screen_unrecognized", agentId: "a1", families: 1, composerBox: true },
+      NOW,
+    );
+    expect(Object.keys(e).sort()).toEqual([
+      "agentId",
+      "at",
+      "composerBox",
+      "families",
+      "kind",
+      "seq",
     ]);
   });
 

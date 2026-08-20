@@ -157,25 +157,48 @@ describe("pinnedBlockerShowsButton — tier 4, the last resort", () => {
   });
 });
 
-describe("pinnedBlockerRowActivation — what the row itself does once the button is gone", () => {
-  it("opens the agent when the button is showing — the row's ordinary behaviour", () => {
+// ── THE ROW NEVER APPROVES. AT ANY WIDTH. (founder, 2026-08-20 — REVERSING HIS EARLIER RULE) ────
+// These three cases asserted the opposite until 2026-08-20: with the button hidden, the row fired
+// the approval, on the founder's own bar — "only if the entire row remains clickable and lands on
+// the same approval". Asked again with the hazard named, he reversed it, and the assertions moved
+// with the decision.
+//
+// THE HAZARD: below the button threshold the row carries NO visible affordance, and clicking a row
+// is how a human INVESTIGATES it. That gesture fired a one-tap relay into a live terminal, approving
+// a question the human had by definition not read — the pane was shut; opening it was the point of
+// the click. A destructive action on an investigative gesture, at exactly the width where the human
+// can see the least.
+//
+// WHY ALL FOUR COMBINATIONS, not just the one that changed: the property under test is now
+// "activation does not depend on width OR on which action the blocker carries". A test that only
+// pinned `(false, "approve")` would go green again the moment someone reintroduced a width branch
+// that happened to spare that one input.
+describe("pinnedBlockerRowActivation — the row opens the agent, and never approves", () => {
+  it("opens the agent when the button is showing", () => {
     expect(pinnedBlockerRowActivation(true, "approve")).toEqual({ kind: "open" });
   });
 
-  it("fires the SAME action the button would have, once the button is hidden", () => {
-    // The founder's own bar for ever removing the button at all: "only if the entire row remains
-    // clickable and lands on the same approval." A block you can see but cannot act on is worse
-    // than a cramped row.
-    expect(pinnedBlockerRowActivation(false, "approve")).toEqual({
-      kind: "action",
-      actionId: "approve",
-    });
+  it("opens the agent when the button is HIDDEN — it must not fire the approval", () => {
+    expect(pinnedBlockerRowActivation(false, "approve")).toEqual({ kind: "open" });
   });
 
-  it("falls back to opening the agent when there is no action to fire at all", () => {
-    // A row with no actions never showed a button either, so this is not a new dead end — it is
-    // the same fallback the button's own absence already implied.
+  it("opens the agent when the button is hidden and there is no action at all", () => {
     expect(pinnedBlockerRowActivation(false, undefined)).toEqual({ kind: "open" });
+  });
+
+  it("opens the agent when the button is showing and there is no action at all", () => {
+    expect(pinnedBlockerRowActivation(true, undefined)).toEqual({ kind: "open" });
+  });
+
+  // THE INVARIANT ITSELF, stated once rather than inferred from the four cases above: no input
+  // this function accepts may ever produce an approval. A future width tier cannot reintroduce one
+  // without turning this red.
+  it("never returns an action for ANY combination of inputs", () => {
+    for (const showButton of [true, false]) {
+      for (const actionId of ["approve", "relay-approve-b", undefined]) {
+        expect(pinnedBlockerRowActivation(showButton, actionId).kind).toBe("open");
+      }
+    }
   });
 });
 
@@ -421,22 +444,23 @@ describe("PinnedBlockers attaches its width observer on the idle → blocked tra
     expect(onNudgeAction).not.toHaveBeenCalled();
   });
 
-  it("at a delivered width below the button threshold, the button hides and the row's OWN click fires ITS OWN approval", () => {
+  it("at a delivered width below the button threshold, the button hides and the row's OWN click OPENS — never approves", () => {
     (globalThis as { ResizeObserver: unknown }).ResizeObserver = RecordingResizeObserver;
     const { onNudgeClick, onNudgeAction } = renderPinned([blocker("a"), blocker("b")]);
     deliver(live()[0]!, PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX - 1);
 
+    // THE MEASUREMENT IS LOAD-BEARING, and it is what makes this different from the pure-function
+    // test above. jsdom never lays out, so every other case in this suite sits at the unmeasured
+    // (roomy) default and never reaches the narrow branch at all. Delivering a real width through
+    // the RecordingResizeObserver is the only way to prove the COMPONENT is wired to the reversed
+    // rule rather than merely that the function returns "open" when asked directly.
     expect(screen.queryByTestId(PINNED_BLOCKER_ACTION_TESTID)).toBeNull();
     fireEvent.click(rowByAgentId("b"));
-    // The founder's own bar for ever hiding the button at all: the row must land the SAME
-    // approval, never merely open the agent — a visible-but-un-actable block is worse than a
-    // cramped row. "relay-approve-b" (row b's OWN action id, not row a's) is what proves this
-    // fired for the row that was actually clicked.
-    expect(onNudgeAction).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "b" }),
-      "relay-approve-b",
-    );
-    expect(onNudgeClick).not.toHaveBeenCalled();
+    // REVERSED 2026-08-20 (founder). This asserted the row fired `relay-approve-b`. It must now
+    // open, and — the half that actually protects him — it must fire NO action at all: an
+    // investigative click at a width where nothing is visible cannot press a button he never read.
+    expect(onNudgeClick).toHaveBeenCalledWith(expect.objectContaining({ id: "b" }));
+    expect(onNudgeAction).not.toHaveBeenCalled();
   });
 
   // ── THE PILL IS A CARVE-OUT, NEVER A SECOND APPROVAL PATH (roborev 64058 → …→ 64112) ───────────
@@ -618,20 +642,22 @@ describe("PinnedBlockers attaches its width observer on the idle → blocked tra
   // OLD behavior an update. The row is `role="button"` with the same aria-label at every width
   // before this fix, so a screen-reader user got no cue that activating it now fires an
   // irreversible relay instead of merely opening the agent.
-  it("the accessible name announces the approval once the button is gone, and Enter fires it", () => {
+  it("the accessible name stays the plain form once the button is gone, and Enter OPENS rather than approving", () => {
     (globalThis as { ResizeObserver: unknown }).ResizeObserver = RecordingResizeObserver;
     const { onNudgeClick, onNudgeAction } = renderPinned([blocker("a")]);
     deliver(live()[0]!, PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX - 1);
 
     const row = rowByAgentId("a");
-    expect(row.getAttribute("aria-label")).toBe("BLOCKED: Agent a in sparkle — activate to Approve");
+    // REVERSED 2026-08-20 (founder). This asserted "— activate to Approve". The row no longer
+    // approves at any width, so the warning is retired with the behaviour it warned about; leaving
+    // it would narrate a relay that cannot happen.
+    expect(row.getAttribute("aria-label")).toBe("BLOCKED: Agent a in sparkle");
 
+    // KEYBOARD, NOT CLICK — the sibling case above covers the pointer. A screen-reader user
+    // activating this row must be no more able to fire a blind approval than a sighted one.
     fireEvent.keyDown(row, { key: "Enter" });
-    expect(onNudgeAction).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "a" }),
-      "relay-approve-a",
-    );
-    expect(onNudgeClick).not.toHaveBeenCalled();
+    expect(onNudgeClick).toHaveBeenCalledWith(expect.objectContaining({ id: "a" }));
+    expect(onNudgeAction).not.toHaveBeenCalled();
   });
 
   it("the accessible name stays the plain form at a roomy width", () => {

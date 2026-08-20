@@ -89,6 +89,18 @@ export const NUDGE_DISMISS_ACTION = "dismiss";
  *  {@link NUDGE_DISMISS_ACTION}: a property of the alarm, not of the agent's work. */
 export const NUDGE_MUTE_ACTION = "mute";
 
+/** The action id the FORCE REDRAW control fires — make this agent's terminal repaint so the app can
+ *  read it again. Same category as the two above: a property of the ALARM (specifically, of the
+ *  app's ability to see the thing it is alarming about) rather than of the agent's work, which is
+ *  why it is a control on the row rather than an entry in `nudge.actions`.
+ *
+ *  IT IS OFFERED ON EVERY BLOCKER, not only on ones already known to be unreadable. The state it
+ *  rescues is precisely the one the app cannot detect reliably — the founder's report was a pane
+ *  that rendered nothing while the row insisted it needed him — so gating the remedy on detecting
+ *  that state would withhold it exactly when detection is what failed. It is also cheap and safe to
+ *  press on a healthy pane: see `services/forceRedraw`, which writes NO bytes to the child. */
+export const NUDGE_REDRAW_ACTION = "redraw";
+
 /** The word the line leads with. The founder's, literally, and a CONSTANT rather than
  *  `bandLabel(nudge.band)` — every surfaced card is `needs_you` (that IS the surfacing gate), and
  *  reading a label through a mapping that has exactly one live entry only invites a second alarm

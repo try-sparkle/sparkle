@@ -50,7 +50,17 @@ import { setPinFromSwitch } from "./accountStore";
 // re-spawning it (see the rationale at accountSwitch.ts's `isStickyAccountKey` branch). A TOTAL
 // mock drops every export it does not name, so the new call was a load-time
 // `No "clearPin" export is defined` for this whole file.
-vi.mock("./accountStore", () => ({
+//
+// ══ SO IT SPREADS THE REAL MODULE AND OVERRIDES ONLY THE PIN WRITERS ══════════════════════════
+// Both sides of this merge fixed the same crash; this keeps main's account of WHY it happened and
+// the more durable shape. A total factory means every future `accountStore` call added anywhere in
+// `moveAgent`'s path breaks this suite — and because `pull_request` runs test the branch MERGED
+// WITH main, breaks it for every open PR in the repo. That has now happened TWICE on this one
+// factory (the `setPinFromSwitch` rename, then `clearPin`), which is the recurrence the comment
+// above records. The stub only needs to keep localStorage out of the pin writes, which does not
+// require replacing the module wholesale, so a third occurrence is a no-op here instead.
+vi.mock("./accountStore", async () => ({
+  ...(await vi.importActual<typeof import("./accountStore")>("./accountStore")),
   setPin: vi.fn(),
   setPinFromSwitch: vi.fn(),
   clearPin: vi.fn(),

@@ -97,7 +97,10 @@ import { ConciergeSuggestions } from "./Concierge/ConciergeSuggestions";
 // The two ALARM controls the card draws (Mute, [x]). Imported rather than re-spelled: the card
 // fires them and this file handles them, and a literal on each side is a silent no-op waiting to
 // happen — the handler would simply never match.
-import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION } from "./Concierge/NudgeCard";
+import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION, NUDGE_REDRAW_ACTION } from "./Concierge/NudgeCard";
+import { forceAgentRedraw } from "../services/forceRedraw";
+import { observeFeedReadability, REAL_FLEET_READABILITY } from "../engine/screenReadability";
+import { accountedAgents } from "../services/conciergeFeed";
 import { PINNED_CLEAR_ACTION } from "./Concierge/PinnedBlockers";
 import type { ConciergeAgent, ConciergeFeed } from "../useConciergeFeed";
 // The column-one population selectors now live beside `accountedUnmerged` in the module that already
@@ -689,11 +692,13 @@ export function ConciergeHost({
       // The PRE-digest populations, deliberately: digesting can withdraw a card while the agent is
       // still red, and releasing too readily only costs a receipt-suppression that should have
       // ended anyway. Under-releasing is the failure that lasts forever.
-      const loud = new Set(
-        [...surfacedAgents(feed), ...nestedRowlessAgents(feed), ...strandedAgents(feed)].map(
-          (a) => a.id,
-        ),
-      );
+      // `accountedAgents` IS the triple (roborev 65956). `surfacedAgents`/`unrepresentedAgents`
+      // partition it on `topLevel`, and `nestedRowlessAgents`/`strandedAgents` partition the latter
+      // on `parentRowId` — so spelling the union out was a second derivation of a named set, equal
+      // only by accident. A filter added to any sub-population would narrow THIS set while the
+      // readability sweep (which resolves `accountedAgents` internally) stayed wide, re-creating
+      // roborev 60209 for workers with no comment left that is true.
+      const loud = new Set(accountedAgents(feed).map((a) => a.id));
       const known = new Set(allAgents(feed).map((a) => a.id));
       // Gone from the fleet goes too — its chip would name an agent nobody can open.
       const next = prev.filter((a) => known.has(a.id) && !loud.has(a.id));
@@ -6954,6 +6959,22 @@ export function ConciergeHost({
           // the card's own click and the refusal copy both point at, so the button is not a third
           // behaviour, just the one that is reachable in a single tap.
           revealAgentById(a.id, a.name);
+        } else if (actionId === NUDGE_REDRAW_ACTION) {
+          // FORCE THIS AGENT'S TERMINAL TO REPAINT. The founder's ask, verbatim: "we specifically
+          // need to get it to re render or whatever is required so I can actually do something."
+          //
+          // NOTHING IS TYPED. `forceAgentRedraw` changes the PTY window size and changes it back,
+          // which delivers SIGWINCH and makes a full-screen TUI re-emit its screen. It is the only
+          // repaint trigger that is safe here: every keystroke that would do it is a WRITE into a
+          // terminal the app has just refused to write to, and `esc` would DECLINE whatever is on
+          // screen. Verified against Claude Code 2.1.237 before shipping — a one-column round trip
+          // emitted a complete frame in every permission mode.
+          //
+          // FIRE AND FORGET, deliberately. The recovery is observed through the ordinary viewport
+          // read on the next tick — the same path that classified the pane as unreadable in the
+          // first place — so there is no second source of truth about whether it worked, and a slow
+          // repaint cannot leave this handler holding the UI.
+          void forceAgentRedraw(a.id);
         } else if (actionId === NUDGE_MUTE_ACTION) {
           useSparklePrefsStore.getState().setInterruptPreference(a.id, "mute");
         } else if (actionId === NUDGE_DISMISS_ACTION) {
@@ -7123,6 +7144,19 @@ export function ConciergeHost({
     // more become a single line. Without this, eight P0s and nineteen P1s meant twenty-seven cards
     // stacked above the compose box — the chat pushed off screen, and column one reduced to an
     // unreadable copy of column two.
+    // ══ THE READABILITY ALARM SWEEPS EVERY CARD-CAPABLE POPULATION, *BEFORE* DIGESTING ═══════════
+    // Order is load-bearing (roborev 65876, Medium). `buildDigest` emits a card only for a bucket of
+    // ONE — two or more agents sharing a project+band become a single group line — so an alarm
+    // raised from inside `agentToNudge` fires with one blocked agent per project and goes SILENT
+    // with two. That is inverted against the saturated fleet that produced the founder's report.
+    //
+    // THE POPULATION IS NOT CHOSEN HERE, deliberately (roborev 65893 → 65897 → 65920). It regressed
+    // three times as a caller's argument — per-card, then `surfacedAgents` (topLevel-filtered, so
+    // blind ROWLESS and STRANDED workers stopped alarming: exactly "a blocked worker under an absent
+    // orchestrator", the saturated-fleet case this exists for). `observeFeedReadability` resolves
+    // `accountedAgents` internally and the list form is module-private, so there is no narrow set to
+    // pass by mistake.
+    observeFeedReadability(feed, REAL_FLEET_READABILITY);
     const { cards, groups } = buildDigest(surfacedAgents(feed));
     // Rowless agents go through the SAME rule, as the `rowless` variant — one card each is how the
     // wall came back (a fleet with several blocked workers under absent or in-motion orchestrators
@@ -7151,7 +7185,11 @@ export function ConciergeHost({
     // "RESOLVED after …" card the moment its PR merged — a receipt for something that was never an
     // alarm.
     const cardAgents = [...cards, ...rowless.cards, ...strandedAgents(feed)];
-    const nudges = cardAgents.map(agentToNudge);
+    // ARROW, NOT A POINT-FREE `.map(agentToNudge)` — `agentToNudge` now takes an optional second
+    // parameter (its readability seam), and `Array.map` passes the INDEX there. Point-free would
+    // hand it `0`, `1`, `2`… as its deps object, and every card after the first would throw on
+    // `viewportFor`. TypeScript rejects the point-free form outright, which is what caught this.
+    const nudges = cardAgents.map((a) => agentToNudge(a));
     // ── RESOLVED CARDS ──────────────────────────────────────────────────────────────────────────
     // A card whose agent has left the red band does not vanish; it stays here, greyed, saying how
     // long the block lasted (founder 2026-08-06, bead `sparkle-9adzg`). See `engine/resolvedNudges`

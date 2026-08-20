@@ -138,6 +138,22 @@ export interface ConciergeNudge {
   agentName: string;
   /** What Sparkle says about it, with the recommendation. */
   text: string;
+  /** THE SHORT FORM, for surfaces that already draw the agent and project themselves.
+   *
+   *  ══ WHY THIS IS NOT JUST `text` ═════════════════════════════════════════════════════════════
+   *  `text` is written for `NudgeCard`, which renders a standalone sentence and nothing else — so it
+   *  names the agent and the project inside itself ("Approve? — Kraken Auth in sparkle."). The
+   *  PINNED STRIP already draws an `AgentPill` and an "in {project}" span, so rendering `text` there
+   *  produces "BLOCKED: @Kraken Auth in sparkle — Approve? — Kraken Auth in sparkle." — the name and
+   *  project twice each, in a row whose scarcest resource is width.
+   *
+   *  This carries only the part the strip is missing: WHAT IS WANTED. "Approve?", "Needs you",
+   *  "Can't read screen — try Force redraw." The founder's complaint was exactly that the strip
+   *  never said this ("there's nothing that it says it needs from me"), and it is the one fact the
+   *  surrounding chrome cannot supply.
+   *
+   *  Optional so a nudge from another builder still renders; the strip simply omits the clause. */
+  reason?: string;
   actions: ConciergeNudgeAction[];
 }
 

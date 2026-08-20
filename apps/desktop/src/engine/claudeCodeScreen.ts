@@ -80,6 +80,49 @@ const BUSY_STATUS: RegExp[] = [
  *  does not count. These are structural: Claude draws them in the left gutter. */
 const TOOL_GLYPH: RegExp[] = [/^\s*⏺\s/m, /^\s*⎿\s/m];
 
+/** The status glyphs Claude Code opens its chrome bars with.
+ *
+ *  DECLARED HERE, ABOVE FAMILY C, because `PERMISSION_MODE_BAR` below needs it. It used to sit
+ *  between families C and D, next to its other consumer (`CHROME_BAR_OPENS`); moving it up is a
+ *  pure relocation — the value is unchanged and both consumers still read this one definition. */
+const STATUS_GLYPHS = "\\u26a0\\u23f8\\u23f5\\u23f4\\u25b6\\u25c6\\u25cf\\u2713\\u2717\\u273b\\u273d\\u2722";
+
+/** ══ THE PERMISSION-MODE BAR, MATCHED BY SHAPE RATHER THAN BY MODE NAME (2026-08-20) ════════════
+ *  Claude Code draws the active permission mode as the bottom-most chrome line:
+ *
+ *      ⏸ manual mode on · ? for shortcuts · ← for agents
+ *      ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+ *      ⏸ plan mode on (shift+tab to cycle) · ← for agents
+ *      ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents
+ *
+ *  ══ WHY THIS REPLACED TWO LITERALS, AND WHAT THAT COST ════════════════════════════════════════
+ *  Family C named exactly two of those modes — `bypass permissions on` and `manual mode on`. Claude
+ *  Code has since added plan, accept-edits and auto, and NONE of them matched. Plan's bar drops
+ *  `? for shortcuts` too, so family C scored ZERO: a live agent in plan or accept-edits mode showed
+ *  the composer box and nothing else, which is 1 against a threshold of 2. Every consequence is
+ *  fail-CLOSED — `terminalWriteRefusal` answers `alternate-screen`, the picker cannot be read, and
+ *  the row still renders "Needs you" over a pane the founder sees nothing in. That is the bug this
+ *  pattern exists to end, and it rotted SILENTLY because the two surviving literals are the two
+ *  modes most sessions run in.
+ *
+ *  ══ WHY THE GLYPH IS REQUIRED, AND WHY THAT KEEPS IT SAFE ═════════════════════════════════════
+ *  The mode WORDS alone would be far too weak — "plan mode on" is ordinary English. What makes this
+ *  Claude Code's own chrome is that a STATUS GLYPH sits immediately before the phrase, with nothing
+ *  but the mode's own lowercase words between glyph and `on`. Prose does not open a sentence with
+ *  `⏵⏵`. The words themselves are left unenumerated on purpose: a sixth permission mode gets the
+ *  same glyph and the same trailing `on`, so it is recognised the day it ships rather than the day
+ *  someone notices a fleet has gone dark.
+ *
+ *  BOUNDED QUANTIFIER, deliberately, for the reason `statusEngine`'s token pattern records at
+ *  length: `[a-z ]+` before a literal is a backtracking trap on a long lowercase run, and this
+ *  pattern is run over whole screens on a hot path. `{1,28}` is comfortably past the longest real
+ *  mode phrase (`bypass permissions`, 18) and bounds the work at each start position.
+ *
+ *  IT IS NOT ANCHORED, matching every other entry in `CHROME_BAR` — `CHROME_BAR_OPENS` re-anchors
+ *  the whole list by wrapping each source in `^…`, so a `^` here would produce `^…^…` and silently
+ *  never match, quietly weakening the narrow-composer arm instead of strengthening it. */
+const PERMISSION_MODE_BAR = new RegExp(`[${STATUS_GLYPHS}][${STATUS_GLYPHS}]?\\s+[a-z][a-z ]{1,28}\\son\\b`, "i");
+
 /** ══ FAMILY C — THE PERSISTENT CHROME BARS ══════════════════════════════════════════════════════
  *  The always-on footer lines. Every entry here is pinned by `NON_PICKER_HINT_LINES_2_1_220` in the
  *  captured fixtures as REAL Claude Code chrome — that list exists to keep the picker matcher from
@@ -87,8 +130,9 @@ const TOOL_GLYPH: RegExp[] = [/^\s*⏺\s/m, /^\s*⎿\s/m];
  *  draws". Reused rather than re-derived for that reason. */
 const CHROME_BAR: RegExp[] = [
   /\?\s+for shortcuts\b/i,
-  /\bbypass permissions on\b/i,
-  /\bmanual mode on\b/i,
+  // The two mode literals that used to live here — `bypass permissions on` and `manual mode on` —
+  // are subsumed by this one structural pattern, which also covers the three modes they missed.
+  PERMISSION_MODE_BAR,
   /\btranscript saving is off\b/i,
   /\bclaude is using your computer\b/i,
   // ── THE PASTE HINT, WHICH REPLACES THE BAR ABOVE RATHER THAN JOINING IT ──────────────────────
@@ -141,7 +185,9 @@ const CHROME_BAR: RegExp[] = [
  *  change as its byte-for-byte `nudge_gate.rs` port, as that drift test requires (roborev 64564).
  *  This note said "NOT fixed here" for one commit and was left standing after the fix, which is the
  *  same stale-justification defect the reviews above charged this branch with (roborev 64577). */
-const STATUS_GLYPHS = "\\u26a0\\u23f8\\u23f5\\u23f4\\u25b6\\u25c6\\u25cf\\u2713\\u2717\\u273b\\u273d\\u2722";
+// `STATUS_GLYPHS` now lives above FAMILY C, where `PERMISSION_MODE_BAR` needs it. Same value, one
+// definition — this comment marks where it used to be so its `⏵`/`⏴` provenance note above still
+// reads in place.
 
 const CHROME_BAR_OPENS: readonly RegExp[] = CHROME_BAR.map(
   (re) => new RegExp(`^[\\s${STATUS_GLYPHS}]*(?:${re.source})`, re.flags),

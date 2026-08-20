@@ -35,11 +35,11 @@
 //     chip is what closes that: the host keeps a snapshot of what was acknowledged and renders it
 //     quietly here until the agent leaves the fleet or goes red again.
 import { useCallback, useRef, useState, type CSSProperties } from "react";
-import { FiBellOff, FiX } from "react-icons/fi";
+import { FiBellOff, FiRefreshCw, FiX } from "react-icons/fi";
 import { C, FONT_WEIGHT } from "../../theme/colors";
 import { RADIUS, TYPE } from "../../theme/scale";
 import { AgentPill } from "./AgentPill";
-import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION } from "./NudgeCard";
+import { NUDGE_DISMISS_ACTION, NUDGE_MUTE_ACTION, NUDGE_REDRAW_ACTION } from "./NudgeCard";
 import type { ConciergeNudge } from "./types";
 
 /** How a test finds the pinned zone. */
@@ -52,6 +52,12 @@ export const PINNED_BLOCKER_CHIP_TESTID = "concierge-pinned-blocker-chip";
 export const PINNED_BLOCKER_LABEL_TESTID = "concierge-pinned-blocker-label";
 /** The action button (Approve/Open) — how a test/probe finds it to check whether it is showing. */
 export const PINNED_BLOCKER_ACTION_TESTID = "concierge-pinned-blocker-action";
+/** The row's REASON sentence — what this blocker actually wants. See its render site for why a row
+ *  without it is the concealment `docs/never-hide-actionable-rows.md` forbids. */
+export const PINNED_BLOCKER_REASON_TESTID = "concierge-pinned-blocker-reason";
+/** The Force-redraw control — see its render site, and `services/forceRedraw` for why a resize
+ *  round-trip is the only repaint trigger that is safe on a screen the app refuses to type into. */
+export const PINNED_BLOCKER_REDRAW_TESTID = "concierge-pinned-blocker-redraw";
 /** Clear an acknowledged chip off the strip. The LAST removal gesture, and the only one that takes
  *  a blocker off this surface on purpose — see the header for why [x] is not it. */
 export const PINNED_CLEAR_ACTION = "pinned-clear";
@@ -132,22 +138,39 @@ export function pinnedBlockerShowsButton(columnWidth: number): boolean {
   return columnWidth === 0 || columnWidth >= PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX;
 }
 
-/** What the ROW ITSELF does when activated (clicked, or Enter/Space on it) — tier 4's wiring.
- *  A PURE FUNCTION rather than inline in the click handler, so this is testable without a real
- *  ResizeObserver: jsdom never lays out, so it never fires one, which means a rendered PinnedBlockers
- *  in a jsdom test is permanently stuck reading `columnWidth` as its unmeasured (roomy) default —
- *  the very state this decision only diverges from below `PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX`.
+/** What the ROW ITSELF does when activated (clicked, or Enter/Space on it): it OPENS THE AGENT.
+ *  Always. At every width, with or without a visible button.
  *
- *  With the button hidden, the row is the ONLY remaining affordance, so it must land the exact same
- *  approval the button would have — never fall back to merely opening the agent, which is what the
- *  founder's "only if the entire row remains clickable and lands on the same approval" bars. Falls
- *  back to "open" only when there is no action to fire at all (an empty `actions` array), which is
- *  already true of the button's own presence today — a row with no actions never showed one. */
+ *  ══ THIS REVERSES AN EARLIER RULE, ON THE FOUNDER'S EXPLICIT INSTRUCTION (2026-08-20) ══════════
+ *  It used to fire the APPROVAL when the button was hidden (below
+ *  `PINNED_BLOCKER_HIDE_BUTTON_MAX_COLUMN_PX`), citing the founder's own earlier words: "only if
+ *  the entire row remains clickable and lands on the same approval". Asked again, with that quote
+ *  put back to him and the hazard named, he reversed it. So the quote is retired rather than
+ *  contradicted in silence — it is preserved here because a file that simply dropped it would look
+ *  like it had never been told.
+ *
+ *  WHY IT WAS WRONG: at a narrow column the button is invisible, so the row carries no visible
+ *  affordance at all — and clicking a row is the gesture a human makes to INVESTIGATE it. That
+ *  gesture then fired an irreversible one-tap relay into a live terminal, approving whatever the
+ *  agent happened to be asking, which the human had by definition not read (the pane was not open;
+ *  that is what they were clicking to do). A destructive action triggered by an investigative
+ *  gesture is backwards, and it is worst precisely where the human has the least information.
+ *
+ *  THE APPROVAL IS NOT LOST, it is relocated to where it can only be pressed deliberately: open the
+ *  agent, read the question, answer it there. Below the button threshold there is now no one-tap
+ *  approve, and that is the intended trade — see the founder's answer, which chose exactly this over
+ *  keeping the button at all widths.
+ *
+ *  THE SIGNATURE IS KEPT rather than inlined at the call site. Both parameters are now unused by the
+ *  decision, and that is the point: the row's behaviour must not silently re-acquire a dependence on
+ *  width or on which action a blocker happens to carry. A pure function with its own unit test is
+ *  what makes "the row never approves" a property something can assert, and jsdom cannot assert it
+ *  through rendering — it never lays out, so it never fires the ResizeObserver that drives
+ *  `columnWidth`, leaving a rendered instance permanently stuck at the roomy default. */
 export function pinnedBlockerRowActivation(
-  showButton: boolean,
-  primaryActionId: string | undefined,
+  _showButton: boolean,
+  _primaryActionId: string | undefined,
 ): { kind: "action"; actionId: string } | { kind: "open" } {
-  if (!showButton && primaryActionId !== undefined) return { kind: "action", actionId: primaryActionId };
   return { kind: "open" };
 }
 
@@ -329,16 +352,19 @@ export function PinnedBlockers({
           data-agent-id={b.id}
           role="button"
           tabIndex={0}
-          // TIER 4 CHANGES WHAT ACTIVATING THIS ROW DOES (roborev 64058: "the behavior moved, the
-          // string that narrates it did not"). At every other width, Enter/click opens the agent;
-          // below the button threshold it fires an irreversible Approve relay instead — a
-          // screen-reader user gets no visual cue for that (the missing button is sighted-only),
-          // so the accessible name has to say so.
-          aria-label={
-            activation.kind === "action"
-              ? `${LEAD} ${b.agentName} in ${b.projectName} — activate to ${b.actions[0]?.label ?? "approve"}`
-              : `${LEAD} ${b.agentName} in ${b.projectName}`
-          }
+          // ONE ACCESSIBLE NAME AT EVERY WIDTH, because the row now does ONE thing at every width:
+          // it opens the agent. This used to branch — below the button threshold the row fired an
+          // irreversible Approve relay, and the name had to warn a screen-reader user about a
+          // behaviour change they had no visual cue for (roborev 64058: "the behavior moved, the
+          // string that narrates it did not"). That behaviour is gone (see
+          // `pinnedBlockerRowActivation`), so the warning is gone with it rather than left standing
+          // to describe a relay that no longer happens — which would be the same defect 64058
+          // charged, pointing the other way.
+          //
+          // THE REASON IS DELIBERATELY NOT APPENDED HERE. It is rendered as its own text node inside
+          // the row, so a screen reader reaches it by walking in; repeating it in the name would
+          // read it twice.
+          aria-label={`${LEAD} ${b.agentName} in ${b.projectName}`}
           onClick={rowActivate}
           onKeyDown={(e) => {
             // ONLY THE ROW ITSELF, matching NudgeCard: a keydown on the nested fold button bubbles
@@ -417,6 +443,39 @@ export function PinnedBlockers({
           >
             in {b.projectName}
           </span>
+          {/* ══ THE REASON, IN WORDS. A ROW THAT SAYS "BLOCKED" AND NOTHING ELSE IS CONCEALMENT ══
+              This strip rendered the dot, the word BLOCKED, the agent name, the project and the
+              buttons — and never once said WHAT WAS WANTED. The nudge has always carried that
+              sentence (`engine/conciergeNudges.agentToNudge` builds `text`), but ConciergeHost
+              deliberately routes live blockers here and OUT of the transcript, so `NudgeCard` — the
+              only component that rendered `text` — never saw them. The founder's report is the
+              exact shape of the gap: "You're showing it as blocked ... But there's nothing that it
+              says it needs from me."
+
+              `docs/never-hide-actionable-rows.md` is what this violates. Showing a row while
+              withholding the one fact that makes it actionable is hiding it in the way that matters
+              — the human is told to act and given nothing to act on.
+
+              RENDERED AFTER "in {project}" and BEFORE the buttons, so the sacrifice order in this
+              file's header still holds: it is the last text element, so it is the first to
+              ellipsize as the column narrows, and it never competes with the agent name for width.
+              Empty `text` renders nothing rather than an empty node — `agentToNudge` always fills
+              it, but the type permits "" and a stray separator dangling after the project name
+              would read as a rendering fault. */}
+          {(b.reason ?? "").trim() !== "" && (
+            <span
+              data-testid={PINNED_BLOCKER_REASON_TESTID}
+              style={{
+                color: C.conciergeMuted,
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+                whiteSpace: "nowrap",
+                minWidth: 0,
+              }}
+            >
+              — {b.reason}
+            </span>
+          )}
           {/* EVERY AFFORDANCE THE INLINE CARD CARRIED COMES WITH IT. Moving a surface must not
               quietly drop what could be done from it: Approve is a one-tap relay into a live
               terminal with no other home in the app, and Open is the cloud agent's substitute for
@@ -450,6 +509,41 @@ export function PinnedBlockers({
                 {a.label}
               </button>
             ))}
+          {/* ══ FORCE REDRAW — THE RECOVERY ACTION ON A ROW WHOSE PANE SHOWS NOTHING ═════════════
+              The founder: "we specifically need to get it to re render or whatever is required so I
+              can actually do something." A row can insist it needs him while the pane behind it
+              renders nothing readable; this makes the agent re-emit its current screen so the app
+              can read it again and the question becomes answerable.
+
+              AN ICON, NOT A LABELLED BUTTON, and `marginLeft: "auto"` moved onto it since it is now
+              the first of the trailing control cluster. This strip's scarcest resource is width
+              (see the sacrifice order in the header) and a second labelled button would compete
+              with the agent name at every size. Mute already set the precedent for a control that
+              earns its place at icon width.
+
+              IT WRITES NO BYTES TO THE TERMINAL. `services/forceRedraw` changes the PTY window size
+              and changes it back — SIGWINCH, not a keystroke. That distinction is the whole reason
+              this is safe to offer here: every keystroke that would force a repaint is a WRITE into
+              a terminal the app has just admitted it cannot read, and `esc` — the most tempting —
+              DECLINES whatever is being asked. So this control does not weaken the alternate-screen
+              refusal; it is the thing that makes honouring that refusal survivable.
+
+              OFFERED ON EVERY ROW rather than only on ones detected as unreadable: the failure it
+              rescues IS a detection failure, so gating it on detection would withhold it exactly
+              when detection is what broke. */}
+          <button
+            type="button"
+            data-testid={PINNED_BLOCKER_REDRAW_TESTID}
+            aria-label={`Force ${b.agentName}'s terminal to redraw`}
+            title="Force redraw — make this agent repaint its screen"
+            onClick={(e) => {
+              e.stopPropagation();
+              onNudgeAction(b, NUDGE_REDRAW_ACTION);
+            }}
+            style={{ ...iconButton(), marginLeft: "auto" }}
+          >
+            <FiRefreshCw size={12} />
+          </button>
           {/* MUTE, on the same handle as before. A durable preference about the AGENT rather than
               about this episode, and this strip is now its only call site — dropping it here would
               delete do-not-interrupt from the app. */}
@@ -462,7 +556,11 @@ export function PinnedBlockers({
               e.stopPropagation();
               onNudgeAction(b, NUDGE_MUTE_ACTION);
             }}
-            style={{ ...iconButton(), marginLeft: "auto" }}
+            // NO `marginLeft: "auto"` ANY MORE — the Force-redraw button above is now the first of
+            // the trailing cluster and carries it. Two auto margins in one flex row would put a gap
+            // BETWEEN these icons rather than one gap before them both, spreading the cluster across
+            // the row's free space and stealing exactly the width the agent name ellipsizes into.
+            style={iconButton()}
           >
             <FiBellOff size={12} />
           </button>

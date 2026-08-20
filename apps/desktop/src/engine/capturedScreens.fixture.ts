@@ -426,3 +426,65 @@ export const CLAUDE_COMPOSER_PASTED_TEXT_2_1_231 = [
   "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
   "  paste again to expand",
 ].join("\n");
+
+// ══ CAPTURED FROM CLAUDE CODE 2.1.237 — THE FIVE PERMISSION-MODE CHROME BARS ════════════════════
+// Captured 2026-08-20 by the recipe at the top of this file: a real `claude` pty stream at 120x40,
+// TERM=xterm-256color, one session per `--permission-mode`, replayed through `@xterm/headless` and
+// dumped with `line.translateToString(true)` — the exact surface `snapshotScreen()` hands the
+// classifier. Each slice starts at the first row below the welcome box and is otherwise unedited;
+// the `❯` line's trailing character is a NON-BREAKING SPACE, verbatim, because that is what Ink
+// draws.
+//
+// ══ WHY THESE FIVE, AND WHY THEY ARE THE REGRESSION ═════════════════════════════════════════════
+// `claudeCodeScreen`'s family C matched two mode literals — `bypass permissions on` and `manual mode
+// on`. Both are ALIVE at 2.1.237 (see the two constants below that carry them), which is why this
+// rotted silently: the versions an agent was most likely to be checked against still passed. The
+// three modes Claude Code has ADDED since — plan, accept edits, auto — match nothing, and plan's bar
+// drops `? for shortcuts` as well, so family C scores ZERO on them. A composer box alone is 1, the
+// threshold is 2, and every agent in those modes is refused as an unrecognised full-screen program:
+// `terminalWriteRefusal` answers `alternate-screen`, `read_picker_options` goes blind, and the row
+// renders "Needs you" over a pane with nothing in it.
+//
+// SO THE LESSON IS THE ONE THIS FILE'S HEADER ALREADY STATES, ONE LEVEL UP: a `strings` sweep of the
+// 2.1.237 binary reports ZERO occurrences of `bypass permissions on` and `manual mode on` — both of
+// which this capture proves it draws. The bundle composes those bars from fragments at render time.
+// Only a captured screen is evidence. Re-capture all five when Claude Code's TUI moves.
+export const PLAN_MODE_COMPOSER_2_1_237 = [
+  "                                                                                                      ● high · /effort",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+].join("\n");
+
+export const PLAN_MODE_SETTLED_2_1_237 = [
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏸ plan mode on (shift+tab to cycle) · ← for agents",
+].join("\n");
+
+export const ACCEPT_EDITS_COMPOSER_2_1_237 = [
+  "                                                                                                      ● high · /effort",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ accept edits on (shift+tab to cycle) · ← for agents",
+].join("\n");
+
+export const BYPASS_COMPOSER_2_1_237 = [
+  "                                                                                                      ● high · /effort",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ Try \"edit <filepath> to...\"",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents",
+].join("\n");
+
+export const MANUAL_MODE_COMPOSER_2_1_237 = [
+  "                                                                                                      ● high · /effort",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "❯ ",
+  "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
+  "  ⏸ manual mode on · ? for shortcuts · ← for agents",
+].join("\n");
+
