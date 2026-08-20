@@ -94,6 +94,14 @@ pub struct PipelineHealth {
     /// The folded worst-of, driving the icon glyph and colour.
     pub overall: HealthState,
     pub components: Vec<ComponentHealth>,
+    /// STRUCTURED release-in-progress signal for the fleet CI-budget governor
+    /// (`services/ciBudgetGovernor.ts`), so it never has to parse the human `detail` string.
+    /// `Some(true)` = the `sparkle-release` runner is busy building a DMG right now, so the fleet's
+    /// ships pause to leave the shared pool for the release's base CI; `Some(false)` = ready but
+    /// idle; **`None` = the runners read could not be made** — which the governor treats fail-safe
+    /// (it does NOT release-hold on an unknown, so a transient `gh` hiccup can't freeze the fleet;
+    /// the numeric budget still caps it). camelCase on the wire → `releaseInProgress`.
+    pub release_in_progress: Option<bool>,
 }
 
 /// A component's, or the pipeline's, health. `NotApplicable` is DISTINCT from `Healthy`: a component
@@ -851,8 +859,21 @@ fn roborev_component(root: &str) -> ComponentHealth {
     }
 }
 
-/// Build the CI-runner and release-runner components from ONE runners-endpoint read.
-fn runner_components(gh_program: Option<String>, root: &str) -> Vec<ComponentHealth> {
+/// Is a release being built right now? `Some(true)` when the release runner has a busy VM,
+/// `Some(false)` when it is online but idle, `None` when the pool read failed (UNKNOWN — the
+/// governor must not read this as "no release"). PURE, so the fleet-budget contract is unit-tested
+/// without a network. Note the release runner is `Healthy` in BOTH the busy and idle cases (its
+/// `HealthState` says nothing about in-progress), which is exactly why this boolean exists.
+fn release_in_progress(reading: Option<RunnerPoolReading>) -> Option<bool> {
+    reading.map(|r| r.online_busy > 0)
+}
+
+/// Build the CI-runner and release-runner components from ONE runners-endpoint read, plus the
+/// structured `release_in_progress` signal the fleet CI-budget governor needs.
+fn runner_components(
+    gh_program: Option<String>,
+    root: &str,
+) -> (Vec<ComponentHealth>, Option<bool>) {
     // One network read feeds both pools.
     let json = gh_program.and_then(|program| {
         let mut cmd = Command::new(program);
@@ -871,7 +892,7 @@ fn runner_components(gh_program: Option<String>, root: &str) -> Vec<ComponentHea
     let (ci_state, ci_detail) = classify_ci_pool(ci);
     let (rel_state, rel_detail) = classify_release_runner(release);
 
-    vec![
+    let components = vec![
         ComponentHealth {
             id: "ci_runners".to_string(),
             name: "CI test runners".to_string(),
@@ -884,7 +905,8 @@ fn runner_components(gh_program: Option<String>, root: &str) -> Vec<ComponentHea
             state: rel_state,
             detail: rel_detail,
         },
-    ]
+    ];
+    (components, release_in_progress(release))
 }
 
 /// Build the knightwatch (PR reviewer) component from config.
@@ -952,11 +974,12 @@ pub async fn pipeline_health_probe(root: String) -> Result<PipelineHealth, Strin
         let gh_program = crate::preflight::cached_gh_path();
         let mut components = Vec::new();
         components.push(roborev_component(&root));
-        components.extend(runner_components(gh_program.clone(), &root));
+        let (runner_comps, release_in_progress) = runner_components(gh_program.clone(), &root);
+        components.extend(runner_comps);
         components.push(release_publication_component(gh_program.as_deref(), &root));
         components.push(knightwatch_component(&root));
         let overall = overall_state(&components);
-        Ok(PipelineHealth { overall, components })
+        Ok(PipelineHealth { overall, components, release_in_progress })
     })
     .await
     .map_err(|e| format!("pipeline_health_probe task failed: {e}"))?
@@ -1618,6 +1641,7 @@ mod tests {
         let health = PipelineHealth {
             overall: HealthState::Warning,
             components: vec![comp(HealthState::Blocking)],
+            release_in_progress: Some(true),
         };
         let json = serde_json::to_string(&health).unwrap();
         assert!(json.contains(r#""overall":"warning""#), "{json}");
@@ -1625,6 +1649,31 @@ mod tests {
         // NotApplicable is two words in Rust, one snake_case token on the wire.
         let na = serde_json::to_string(&comp(HealthState::NotApplicable)).unwrap();
         assert!(na.contains(r#""state":"not_applicable""#), "{na}");
+        // The fleet-budget governor's structured signal is present and camelCased.
+        assert!(json.contains(r#""releaseInProgress":true"#), "{json}");
+    }
+
+    /// The release-in-progress signal the fleet CI-budget governor reads: busy VM ⇒ Some(true),
+    /// idle ⇒ Some(false), and — critically — an UNREADABLE pool ⇒ None, never Some(false). A
+    /// runner that is `Healthy` in both the busy and idle cases is exactly why `HealthState` alone
+    /// cannot answer this, and why the governor gets a dedicated boolean.
+    #[test]
+    fn release_in_progress_is_busy_true_idle_false_unknown_none() {
+        assert_eq!(
+            release_in_progress(Some(RunnerPoolReading { online_idle: 0, online_busy: 1 })),
+            Some(true),
+            "a busy release VM means a DMG is building — the fleet must pause"
+        );
+        assert_eq!(
+            release_in_progress(Some(RunnerPoolReading { online_idle: 1, online_busy: 0 })),
+            Some(false),
+            "online but idle is NOT a release in progress"
+        );
+        assert_eq!(
+            release_in_progress(None),
+            None,
+            "an unreadable pool is UNKNOWN, never a false 'no release' — the governor fails safe on it"
+        );
     }
     // ── roborev findings on this component, all Medium, all fixed and pinned here ────────────
 

@@ -45,6 +45,13 @@ export interface ComponentHealth {
 export interface PipelineHealth {
   overall: HealthState;
   components: ComponentHealth[];
+  /** Structured release-in-progress signal for the fleet CI-budget governor
+   *  (`services/ciBudgetGovernor.ts`): `true` = the `sparkle-release` runner is building a DMG now
+   *  (fleet ships pause so its base CI gets the pool), `false` = idle, `null`/absent = the runners
+   *  read could not be made (UNKNOWN — the governor fails safe and does NOT release-hold on it).
+   *  Optional/nullable: a Rust backend predating this field omits it, and a Rust `Option` crosses
+   *  the wire as `null`, so this is `boolean | null | undefined` and all three read as "not known". */
+  releaseInProgress?: boolean | null;
 }
 
 /** The colour band an icon/dot uses for a state. `muted` is for `not_applicable` (nothing to

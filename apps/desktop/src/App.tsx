@@ -56,6 +56,7 @@ import { startFleetWatch } from "./services/fleetWatch";
 import { startBeadMentionWatch } from "./services/beadMentions/beadMentionWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPipelineHealthWatch } from "./stores/pipelineHealthStore";
+import { startCiBudgetGovernor } from "./services/ciBudgetGovernorInit";
 import { startPusher } from "./services/pusherMount";
 import { startAuthRecovery } from "./services/authRecovery";
 import { startSocialSync } from "./services/socialSync";
@@ -165,7 +166,15 @@ function PipelineHealthWatch() {
   const isMain = useIsMainWindow();
   useEffect(() => {
     if (!isMain) return;
-    return startPipelineHealthWatch();
+    const stopHealth = startPipelineHealthWatch();
+    // The fleet CI-budget governor rides the same signal: it reads release-in-progress + CI-pool
+    // saturation off the pipeline-health store and drains its queue on each reading. Main-window
+    // only, and torn down together.
+    const stopGovernor = startCiBudgetGovernor();
+    return () => {
+      stopGovernor();
+      stopHealth();
+    };
   }, [isMain]);
   return null;
 }

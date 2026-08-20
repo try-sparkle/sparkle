@@ -1716,6 +1716,36 @@ pub struct DeliveredConfig {
     pub criteria: Vec<StageCriterion>,
 }
 
+/// The FLEET's global CI-concurrency budget — the systemic version of the manual "pause the fleet".
+///
+/// ~40 build agents each ship their branch (push + open a PR), and each PR fans out a full CI matrix
+/// on ONE shared, hard-capped self-hosted runner pool (`linux-ci`). With no coordination they
+/// collectively saturate it and starve everything downstream — most visibly the release DMG, whose
+/// base-CI run then can't get a runner (see PRD/sparkle/ci-throughput-refactor.md, workstream D).
+/// This caps how many ships may have CI-triggering work IN FLIGHT at once; the rest QUEUE and drain
+/// as slots free, and a release in progress pauses the fleet's ships entirely so its CI gets runners.
+///
+/// MACHINE-WIDE, not per-project — the SAME reasoning as [workers]/[pushers]: a cloned repo does not
+/// get to decide how much of this machine's fleet may hammer the shared pool. A per-project
+/// `[fleet]` is ignored with a warning (build_effective), exactly like [workers].
+///
+/// The governor that reads this lives on the TS side (`services/ciBudgetGovernor.ts`); the
+/// release-in-progress / pool-saturation backpressure it needs comes from `pipeline_health.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FleetConfig {
+    /// Max number of build-agent ships that may have CI-triggering work presumed in flight at once.
+    /// A new ship past this QUEUES until a slot frees. **0 disables the governor** (every ship pushes
+    /// immediately, the pre-governor behaviour) — the opt-out, not "no budget". Default 6: sized just
+    /// under the 8-VM `linux-ci` pool so a fleet burst leaves runner headroom for a release's base CI.
+    pub ci_budget: u32,
+    /// How long, in seconds, one occupied slot is held after its ship pushes — i.e. how long a CI run
+    /// is PRESUMED in flight before the slot auto-frees. A safety drain, not a completion signal (the
+    /// app does not poll each run to completion); the release-priority hold and pool-saturation
+    /// backpressure are the real protections. Default 900 (15 min ≈ a full CI matrix's wall-clock).
+    pub ci_lease_secs: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SparkleConfig {
@@ -1776,6 +1806,9 @@ pub struct SparkleConfig {
     /// What the Builder Index reporter publishes, once `[tools].builder_index` has turned it on.
     /// Machine-wide (see BuilderIndexConfig).
     pub builder_index: BuilderIndexConfig,
+    /// The fleet's global CI-concurrency budget + release priority. Machine-wide (see FleetConfig) —
+    /// a repo does not get to decide how much of this machine's fleet may hammer the shared pool.
+    pub fleet: FleetConfig,
 }
 
 impl Default for SparkleConfig {
@@ -1933,6 +1966,10 @@ impl Default for SparkleConfig {
             // allowlist is already "plugins you installed", so a name only reaches the profile
             // because the user put it on this machine.
             builder_index: BuilderIndexConfig { skills_exclude: Vec::new() },
+            // Governor ON by default, sized just under the 8-VM linux-ci pool so a fleet burst leaves
+            // runner headroom for a release's base CI. `ci_budget = 0` in the global config.toml opts
+            // out. Lease ≈ a full CI matrix's wall-clock (the safety drain, not a completion signal).
+            fleet: FleetConfig { ci_budget: 6, ci_lease_secs: 900 },
         }
     }
 }
@@ -2233,6 +2270,12 @@ struct PartialPublishDestination {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct PartialFleet {
+    ci_budget: Option<u32>,
+    ci_lease_secs: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct PartialFreshness {
     staleness_warn_commits: Option<u32>,
     stale_build_block_commits: Option<u32>,
@@ -2351,6 +2394,7 @@ struct PartialConfig {
     done: Option<PartialDone>,
     delivered: Option<PartialDelivered>,
     builder_index: Option<PartialBuilderIndex>,
+    fleet: Option<PartialFleet>,
 }
 
 /// Parse one layer's TOML text into a partial config. Err carries a human-readable reason —
@@ -2419,6 +2463,16 @@ fn apply_memory(into: &mut MemoryConfig, p: Option<PartialMemory>) {
     }
     if let Some(v) = p.agent_rss_auto_kill {
         into.agent_rss_auto_kill = v;
+    }
+}
+
+fn apply_fleet(into: &mut FleetConfig, p: Option<PartialFleet>) {
+    let Some(p) = p else { return };
+    if let Some(v) = p.ci_budget {
+        into.ci_budget = v;
+    }
+    if let Some(v) = p.ci_lease_secs {
+        into.ci_lease_secs = v;
     }
 }
 
@@ -4215,6 +4269,7 @@ fn build_effective(
                 // Global-only like [babysit]/[pushers], so its warnings cannot interleave with a
                 // repo layer's — the project layer only ever reports that it was ignored.
                 warnings.extend(apply_builder_index(&mut cfg.builder_index, p.builder_index));
+                apply_fleet(&mut cfg.fleet, p.fleet);
                 apply_done(&mut cfg.done, p.done);
                 apply_delivered(&mut cfg.delivered, p.delivered);
             }
@@ -4274,6 +4329,16 @@ fn build_effective(
                         "[builder_index] in a per-project .sparkle/config.toml is ignored — what \
                          this machine publishes about you is machine-wide, not something a repo \
                          gets to set; put it in the global config.toml"
+                            .to_string(),
+                    );
+                }
+                if p.fleet.is_some() {
+                    // Same rule and reason as [workers]: the fleet's CI budget protects one SHARED
+                    // runner pool, so a cloned repo must not be able to raise (or disable) the cap for
+                    // every other project's agents pushing against the same pool.
+                    warnings.push(
+                        "[fleet] in a per-project .sparkle/config.toml is ignored — it is a \
+                         machine-wide setting; set it in the global config.toml"
                             .to_string(),
                     );
                 }
@@ -7367,6 +7432,31 @@ quit_app = 42
             warns.iter().any(|w| w.contains("[memory]") && w.contains("ignored")),
             "the ignoring must be visible, not silent: {warns:?}"
         );
+    }
+
+    #[test]
+    fn project_fleet_is_ignored_with_warning() {
+        // Same rule as [workers]: the fleet's CI budget protects ONE shared runner pool, so a cloned
+        // repo must not be able to raise (or disable) the cap for every other project's agents.
+        let (cfg, warns, _) =
+            effective(None, Some("[fleet]\nci_budget = 99\nci_lease_secs = 1\n"));
+        assert_eq!(
+            cfg.fleet,
+            FleetConfig { ci_budget: 6, ci_lease_secs: 900 },
+            "a project layer must not move the machine-wide fleet budget"
+        );
+        assert!(
+            warns.iter().any(|w| w.contains("[fleet]") && w.contains("ignored")),
+            "the ignoring must be visible, not silent: {warns:?}"
+        );
+    }
+
+    #[test]
+    fn global_fleet_applies_budget_and_lease() {
+        // The GLOBAL layer is where [fleet] is honored — deleting `apply_fleet(&mut cfg.fleet, …)`
+        // would leave the knob permanently at its default with no test failing without this.
+        let (cfg, _, _) = effective(Some("[fleet]\nci_budget = 3\nci_lease_secs = 120\n"), None);
+        assert_eq!(cfg.fleet, FleetConfig { ci_budget: 3, ci_lease_secs: 120 });
     }
 
     #[test]

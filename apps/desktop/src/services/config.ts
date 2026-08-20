@@ -356,6 +356,24 @@ export interface SparkleConfig {
    *  default fall back to the shipped ones (`enabled: true`, `idle_grace_min: 10`,
    *  `agent_eagerness: "visual"`) rather than treating an absent section as disabled. */
   preview?: PreviewConfig;
+  /** The fleet's global CI-concurrency budget + release priority (`services/ciBudgetGovernor.ts`).
+   *  Machine-wide, like `workers`. Optional for the same back-compat reason as `builder_index?`
+   *  above: a payload from a Rust backend predating `[fleet]` omits it — in which case the governor
+   *  is left DISABLED (the singleton ships at budget 0), i.e. the old-backend fallback is "no
+   *  throttle", never a silent throttle the user cannot see. The current backend always sends it. */
+  fleet?: FleetConfig;
+}
+/** The `[fleet]` table as Rust's `FleetConfig` serializes it (`config.rs`), field for field.
+ *  Machine-wide: a per-project `[fleet]` is ignored with a warning, because the budget protects one
+ *  SHARED runner pool that every project's agents push against. */
+export interface FleetConfig {
+  /** Max build-agent ships that may have CI-triggering work presumed in flight at once; a new ship
+   *  past this QUEUES until a slot frees. `0` disables the governor (every ship pushes immediately —
+   *  the opt-out, not "no budget"). */
+  ci_budget: number;
+  /** How long, in seconds, an occupied slot is held after its ship pushes — the presumed CI-run
+   *  window and the governor's safety drain (the app does not poll each run to completion). */
+  ci_lease_secs: number;
 }
 /** The `[builder_index]` table as Rust serializes it. Machine-wide; ignored in a per-project file —
  *  and here that is a boundary, not tidiness: a repo must not be able to change what its owner's

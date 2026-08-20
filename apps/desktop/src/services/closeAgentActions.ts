@@ -11,6 +11,7 @@ import {
 } from "./branchStatus";
 import { closeBead, markBeadDelivered, recordBeadMergeSha, deleteBead } from "./beads";
 import { removeAgentWorkspace } from "./worktree";
+import { ciBudgetGovernor } from "./ciBudgetGovernor";
 
 export interface ShipParams {
   root: string;
@@ -53,7 +54,37 @@ export type ShipOutcome =
  *  they are REPORTED in the returned {@link ShipOutcome}, so a caller can say what really happened
  *  instead of assuming. Only a push failure still throws. Does NOT tear down the agent — the caller
  *  does that after. */
-export async function shipAgent(p: ShipParams): Promise<ShipOutcome> {
+// A ship that is HELD by the CI budget can block for the whole hold window, during which the row and
+// its Ship affordance stay put — so a user (or the concierge, which just re-issues the tool) can fire
+// a SECOND ship for the same agent. Both would drain later, both call push + openAgentPr, and the
+// second gets "a PR already exists" → a spurious `pushed-no-pr` for work that did ship (roborev
+// 65809/65810). Dedupe by agentId: a second ship while one is in flight returns the SAME promise.
+const inFlightShips = new Map<string, Promise<ShipOutcome>>();
+
+export function shipAgent(p: ShipParams): Promise<ShipOutcome> {
+  const existing = inFlightShips.get(p.agentId);
+  if (existing) return existing;
+  // FLEET CI BUDGET (workstream D): a ship's PR open is the app-orchestration event that fires CI on
+  // the shared pool, so it runs under the global governor. While the fleet is over budget or a
+  // release DMG is building, this AWAITS a slot — the ship QUEUES rather than pushing — and drains as
+  // slots free. `triggersCi = outcome.prOpened`: a slot is leased only when a PR actually opened (CI
+  // triggers on `pull_request`, NOT on a bare branch push), so a hard `gh` failure or a no-remote
+  // local land — neither of which fires CI — frees its slot at once instead of holding a phantom one
+  // for the whole lease. The governor is a pass-through until startup configures `[fleet]`, so an
+  // unconfigured build behaves exactly as before.
+  const promise = ciBudgetGovernor
+    .run(
+      () => shipAgentWork(p),
+      (outcome) => outcome.prOpened,
+    )
+    .finally(() => {
+      inFlightShips.delete(p.agentId);
+    });
+  inFlightShips.set(p.agentId, promise);
+  return promise;
+}
+
+async function shipAgentWork(p: ShipParams): Promise<ShipOutcome> {
   const pushed = await pushAgentBranch(p.root, p.agentId);
   if (pushed === "no-remote") {
     const r = await landAgentBranch(p.root, p.agentId, p.targetBranch, false);
