@@ -21,7 +21,9 @@
 //                              because it likewise sits OUTSIDE the padded scroll container
 //   • the title              — `AGENT_NAME_FONT_SIZE`, `rowTitleWeight`, NEUTRAL ink (`C.cream`).
 //                              Colour lives in the disc, on every row in this column.
-//   • the `+N`               — `C.muted` / 12px / lineHeight 1, the collapsed orchestrator's badge
+//   • the badge             — `C.muted` / 12px / lineHeight 1, the collapsed orchestrator's badge.
+//                              Its WORDING is this row's own (`2 active now · 9 in the last hour`,
+//                              see below); its ink and metrics are borrowed like everything else.
 //   • the child indent       — `DEPTH_INDENT`, fed to the SAME `rowBoxFor`, so a task's disc lands
 //                              where this row's TITLE begins, exactly as a worker's does
 //   • the elapsed reading    — `ElapsedTimer` on the shared `useRowClock`
@@ -52,6 +54,19 @@
 // suppresses. `hydrated` is what separates that from "we have not looked yet": before the first
 // `listResearch()` lands, the row shows NO badge at all rather than claiming zero.
 //
+// ══ THE GAUGE IS NO LONGER SPELLED `+N`, AND THAT IS THE SAME ARGUMENT ═════════════════════════
+//
+// Founder, 2026-08-20: *"instead of plus two, it could say something like '2 active now'"*. `+2`
+// said how many without ever saying how many WHAT — running, queued, finished-and-unread all read
+// identically — which is the one-signal-many-meanings failure this row's other two numbers were
+// each added to end. It now reads `2 active now`, and "active" is chosen over "running" because the
+// gauge is `liveTasks` = `queued` + `running`: a queued task has been dispatched and has not
+// started, so "running" would claim something false about it. The tooltip carries the exact
+// membership — see `badgeTitle`.
+//
+// The zero rule above is UNCHANGED by the rewording: `0 active now` is still rendered, still for the
+// reason stated, and `hydrated` still separates it from having not looked.
+//
 // ══ THE THIRD NUMBER: THE QUEUE, WHICH IS NOT A RESEARCH FACT AT ALL ═══════════════════════════
 //
 // Bead `sparkle-zx9knz`. The founder had SIXTEEN messages queued to the concierge while this row
@@ -74,10 +89,19 @@ import type { PairSide } from "../engine/rowGeometry";
 import { ActiveFillets, rowBoxFor } from "./rowAnatomy";
 import { StatusDot } from "./StatusDot";
 import { AGENT_NAME_FONT_SIZE, rowTitleWeight } from "./FittedAgentName";
+import {
+  conciergeBadgeTier,
+  conciergeLiveLabel,
+  conciergeQueueLabel,
+  conciergeRecentLabel,
+  conciergeTitleFloor,
+} from "./rowWidthThresholds";
 import { useRowClock, ElapsedTimer } from "./rowClock";
 import type { AgentTabStatus } from "../types";
 import {
   groupTasks,
+  RECENT_RESEARCH_WINDOW_LABEL,
+  RECENT_RESEARCH_WINDOW_SHORT_LABEL,
   refreshResearch,
   RESEARCH_POLL_INTERVAL_MS,
   useResearchStore,
@@ -244,7 +268,7 @@ export function spanOf(task: ResearchTask): { since: number; until: number | nul
  *     would put the fail-open answer at the front of a display built to end a silence.
  *   • `0` is a real, measured empty queue, and it is suppressed for exactly the reason `recentCount`
  *     is: it is the ordinary state of every single send, so a permanent `· 0 queued` would be a
- *     second zero saying what `+0` already says.
+ *     second zero saying what `0 active now` already says.
  *
  * The two therefore render identically and mean different things. That is deliberate; do not
  * "simplify" it into a truthiness test, because the day this row grows a treatment for one of them
@@ -261,9 +285,9 @@ function showsQueue(queuedCount: number | undefined): queuedCount is number {
  * explaining them. {@link badgeTitle} is where the explanation lives.
  */
 function badgeAria(liveCount: number, recentCount: number, queuedCount: number | undefined): string {
-  const parts = [`${liveCount} running`];
+  const parts = [`${liveCount} active now`];
   if (showsQueue(queuedCount)) parts.push(`${queuedCount} queued`);
-  if (recentCount > 0) parts.push(`${recentCount} recently`);
+  if (recentCount > 0) parts.push(`${recentCount} in ${RECENT_RESEARCH_WINDOW_LABEL}`);
   return parts.join(", ");
 }
 
@@ -273,15 +297,30 @@ function badgeAria(liveCount: number, recentCount: number, queuedCount: number |
  * The queue clause is worded against the field's actual definition: `ConciergeQueueDepth.waiting`
  * EXCLUDES the turn in flight ("Messages waiting BEHIND the running turn"), so "waiting behind the
  * concierge's current turn" is true of it and "messages outstanding" would not be.
+ *
+ * ══ THE TOOLTIP CARRIES THE PRECISION THE ROW HAS NO WIDTH FOR ═════════════════════════════════
+ *
+ * The visible gauge reads `N active now`, which is the founder's own wording and is honest: the
+ * number is `liveTasks` = `queued` + `running`, and "active" covers both. It is not, however,
+ * EXACT — a queued task has been dispatched and has not started — and "running" would have been the
+ * worse trade, since it claims something about a queued task that is false. So the row says the
+ * true-and-short thing and the tooltip says the whole thing. The alternative, splitting the gauge
+ * into `1 running · 1 starting`, was rejected: this badge already carries a `queued` segment meaning
+ * something else entirely (the concierge's MESSAGE queue), and two different "queued"s on one line
+ * is the one-signal-many-meanings failure the third number was added to end.
  */
 function badgeTitle(liveCount: number, recentCount: number, queuedCount: number | undefined): string {
-  const parts = [`${liveCount} research ${liveCount === 1 ? "agent" : "agents"} running`];
+  const parts = [
+    `${liveCount} research ${liveCount === 1 ? "agent" : "agents"} active now (running or queued)`,
+  ];
   if (showsQueue(queuedCount)) {
     parts.push(
       `${queuedCount} ${queuedCount === 1 ? "message" : "messages"} waiting behind the concierge's current turn`,
     );
   }
-  if (recentCount > 0) parts.push(`${recentCount} dispatched in the last 12 hours`);
+  if (recentCount > 0) {
+    parts.push(`${recentCount} dispatched in ${RECENT_RESEARCH_WINDOW_LABEL}`);
+  }
   return parts.join(" · ");
 }
 
@@ -299,6 +338,7 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   dotRing,
   dotLabel,
   liveCount,
+  columnWidth,
   recentCount,
   queuedCount,
   hydrated,
@@ -317,6 +357,15 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   /** Queued + running. Straight from the store's `liveTasks` selector via the caller — NOT counted
    *  again in here, so the badge and the disc can never tell different stories. */
   liveCount: number;
+  /**
+   * The measured width of the sidebar column, or 0 before it has been measured.
+   *
+   * Picks the badge's phrasing — see {@link conciergeBadgeTier}. The shrink rules below keep the
+   * badge from OVERFLOWING; this keeps it from being ELLIPSIZED, which at the default 220px column
+   * ate the `in the last hour` phrase this change exists to show. Same prop and same "component
+   * measures, `rowWidthThresholds` decides" split as `AgentRow`'s stage chip.
+   */
+  columnWidth?: number;
   /**
    * How many were dispatched in the last {@link RECENT_RESEARCH_WINDOW_MS} — every status.
    *
@@ -347,6 +396,10 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   paneSide: PairSide;
   jointOpen: boolean;
 }) {
+  // `showsQueue` is passed in, not inferred: the queue segment costs about a tier's worth of width
+  // and the ladder's budgets were measured without it, so the tier has to know whether it is there.
+  const tier = conciergeBadgeTier(columnWidth ?? 0, showsQueue(queuedCount));
+  const titleFloor = conciergeTitleFloor(columnWidth ?? 0);
   const [expanded, setExpanded] = useState(false);
   const byId = useResearchStore((s) => s.byId);
   const openTaskId = useResearchStore((s) => s.openTaskId);
@@ -373,8 +426,11 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
   // group that rendered none of them. *"I wanna be able to see the recent ones as well as the active
   // ones."*
   //
-  // `groupTasks` is the union of the two sets, bounded by the same 12h window the badge already uses
-  // — so the label and the click are computed from one another and cannot drift again. Retired rows
+  // `groupTasks` is the union of the two sets, bounded by the same window the badge already uses
+  // (`RECENT_RESEARCH_WINDOW_MS`, one hour since 2026-08-20) — so the label and the click are
+  // computed from one another and cannot drift again. That coupling is why narrowing the window
+  // narrowed BOTH in one edit: a badge counting an hour over a list showing twelve would have been
+  // the same defect as the dead click above, pointing the other way. Retired rows
   // are drawn as history (hollow disc, muted title; see `livenessOfResearch`) rather than hidden, and
   // they are still kept out of every rollup — see `researchRollupStatuses`.
   //
@@ -519,7 +575,15 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
             <span
               style={{
                 flex: "0 1 auto",
-                minWidth: 0,
+                // A FLOOR, NOT ZERO. Yielding first is right; yielding EVERYTHING is not. With
+                // `minWidth: 0` the proportional split takes the title to nothing at narrow widths
+                // and the row renders as an anonymous strip of numbers — hard to pick out of a
+                // column of rows. See CONCIERGE_TITLE_FLOOR_PX, which is deliberately SMALL: a
+                // large floor buys no name the shrink ratio was not already leaving, and costs the
+                // counts the pixels they need.
+                minWidth: titleFloor,
+                // Yields its width to the badge first — see the badge's `flexShrink` note below.
+                flexShrink: 100,
                 // Neutral, like every other row title in this column.
                 color: C.cream,
                 fontSize: AGENT_NAME_FONT_SIZE,
@@ -537,23 +601,77 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
               <span
                 aria-label={badgeAria(liveCount, recentCount, queuedCount)}
                 title={badgeTitle(liveCount, recentCount, queuedCount)}
-                style={{ flex: "0 0 auto", color: C.muted, fontSize: 12, lineHeight: 1 }}
+                style={{
+                  // ══ THE BADGE MUST DEGRADE VISIBLY, NOT BE CLIPPED SILENTLY ═══════════════
+                  //
+                  // It was `flex: "0 0 auto"` — un-shrinkable — back when it read `+0` and was ~16px
+                  // wide. Naming the period made it ~200px, and the Build column DEFAULTS to
+                  // `BUILD_COLUMN_DEFAULT_WIDTH` (220) and drags down to 50: after `LIST_PAD_X` ×2,
+                  // `DOT_SLOT_W` and the gap, roughly 172px is left for title + badge. An
+                  // un-shrinkable badge therefore overflowed the row and was cut by the list's own
+                  // `overflowX: "hidden"` — with NO ellipsis, because the clip happened on an
+                  // ancestor. What got cut is the TAIL, which is exactly the `in the last hour`
+                  // phrase this whole change exists to show. Silently.
+                  //
+                  // `minWidth: 0` is what makes the shrink actually possible (a flex item's
+                  // automatic minimum size is its content, so `flex-shrink` alone does nothing
+                  // here), and the ellipsis is what makes the loss legible: a reader who sees `…`
+                  // knows to widen the column, where a hard cut just looks like the row's copy.
+                  // ── SHRINK ORDER IS EXPLICIT, NOT LEFT TO FLEX-BASIS ──────────────────────
+                  // The `1` in this shorthand is the badge's shrink factor, against the title's
+                  // `flexShrink: 100` above — do not "tidy" it back to `0 0 auto`. Flex distributes
+                  // shrinkage in proportion to each item's base size, so with EQUAL factors the
+                  // badge — the LONGER of the two — would give up the most, which is precisely
+                  // backwards. The title is the row's identity and can be named from position
+                  // alone; the numbers are the reason the row exists and are recoverable no other
+                  // way. So the title absorbs essentially all the shrink first, and the badge only
+                  // starts losing characters once the title has none left to give.
+                  //
+                  // ⚠️ THIS DECLARATION RESTATES THE CSS DEFAULT (`0 1 auto`), so NO test can tell
+                  // its presence from its absence and mutation-check reports it uncaught — which is
+                  // CORRECT here, not a vacuous test. Deleting it does not bring the bug back;
+                  // writing `0 0 auto` does. It is kept as an explicit marker of that, since this
+                  // span carried exactly that value until the badge outgrew it. The assertion in
+                  // the test is therefore on the PROPERTY ("not un-shrinkable"), never on the
+                  // declaration — pinning the literal would fail on a harmless deletion. The
+                  // neighbouring `minWidth` / `overflow` / `textOverflow` lines are NOT defaults
+                  // and are each caught.
+                  flex: "0 1 auto",
+                  minWidth: 0,
+                  overflow: "hidden",
+                  textOverflow: "ellipsis",
+                  whiteSpace: "nowrap",
+                  color: C.muted,
+                  fontSize: 12,
+                  lineHeight: 1,
+                }}
               >
                 {/* ── WHY A SECOND NUMBER, AND WHY IT IS CONDITIONAL ──────────────────────────
-                    `+{liveCount}` is a live gauge and is rendered even at zero (see the header).
-                    That is honest and, alone, unreadable: it falls to `+0` minutes after every
-                    burst, so "delegating, just finished" and "has never delegated" look identical
-                    — and the founder read the second off a row that meant the first, with 28
-                    dispatched tasks on disk.
+                    `{liveCount} active now` is a live gauge and is rendered even at zero (see the
+                    header). That is honest and, alone, unreadable: it falls to `0 active now`
+                    minutes after every burst, so "delegating, just finished" and "has never
+                    delegated" look identical — and the founder read the second off a row that meant
+                    the first, with 28 dispatched tasks on disk.
 
                     The recent count is SUPPRESSED at zero rather than rendered as `· 0`, which is
-                    the opposite of the rule above it and deliberately so: `+0` is a measurement of
-                    something that is always measurable, while `· 0` would add a second zero saying
-                    the same thing twice. When it is absent, `+0` means what it has always meant.
+                    the opposite of the rule above it and deliberately so: the gauge is a
+                    measurement of something that is always measurable, while `· 0` would add a
+                    second zero saying the same thing twice. When it is absent, `0 active now` means
+                    what it has always meant.
+
+                    ── AND WHY THE WINDOW IS NAMED, NOT IMPLIED ────────────────────────────────
+                    It read `· 62 recently` until 2026-08-20, and the founder could not interpret
+                    it: *"It'd be helpful to know in what time period."* An hour, a day, or since
+                    install all render as "recently", so the number carried no information at all.
+                    The phrase comes from `RECENT_RESEARCH_WINDOW_LABEL`, DERIVED from the window
+                    the selector enforces — never typed here — so the row cannot come to state a
+                    period it is not counting over, which would be strictly worse than the
+                    ambiguity it replaced.
 
                     ── AND WHY A THIRD, IN THE MIDDLE ──────────────────────────────────────────
                     NOW, then WAITING, then ALREADY BEEN THROUGH — the founder's own reading order,
-                    and the only one in which `+0 · 16 queued · 12 recently` is a sentence. The
+                    and the only one in which `0 active now · 16 queued · 12 in the last hour` is a
+                    sentence. The
                     queue segment sits between the two research numbers because it is the thing
                     they are both about: `+0` is how much of that queue is being worked right now
                     and `12 recently` is how much of it has already had a pass.
@@ -570,9 +688,25 @@ export const ConciergeAgentsRow = memo(function ConciergeAgentsRow({
                     actual complaint"* (stores/conciergeQueueStore). A diagnosis on a number that
                     cannot support it is worse than three honest numbers, and a fourth grammar is
                     exactly the per-row dialect SparkleAgentRow's header argues against. */}
-                +{liveCount}
-                {showsQueue(queuedCount) && ` · ${queuedCount} queued`}
-                {recentCount > 0 && ` · ${recentCount} recently`}
+                {/* ── THE WORDS SHORTEN WITH THE COLUMN; THE UNIT NEVER DOES ────────────────
+                    Shrinking the badge (below) stops it overflowing, but the failure it degrades
+                    into is an ELLIPSIS — and what an ellipsis eats first is the TAIL, which is
+                    exactly the `in the last hour` phrase. Measured: the full string is 192px and
+                    the badge's budget at the default 220px column is ~147px, so the unabbreviated
+                    form renders `… 63 in th…` at the width the app BOOTS at.
+
+                    So the phrasing steps down instead — see `conciergeBadgeTier`. Every tier still
+                    names the hour; only the words around it shorten. `badgeAria` and `badgeTitle`
+                    are NOT on this ladder and always speak the full sentence. */}
+                {conciergeLiveLabel(liveCount, tier)}
+                {showsQueue(queuedCount) && ` · ${conciergeQueueLabel(queuedCount, tier)}`}
+                {recentCount > 0 &&
+                  ` · ${conciergeRecentLabel(
+                    recentCount,
+                    tier,
+                    RECENT_RESEARCH_WINDOW_LABEL,
+                    RECENT_RESEARCH_WINDOW_SHORT_LABEL,
+                  )}`}
               </span>
             )}
           </div>

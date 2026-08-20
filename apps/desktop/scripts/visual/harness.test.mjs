@@ -44,6 +44,15 @@ import {
 } from "./seam-probe.mjs";
 import { crop } from "./crop.mjs";
 import {
+  BADGE_INTACT_MIN_COLUMN_PX,
+  BASELINE_COLUMN_OVERFLOW_PX,
+  EXPECTED_ACTIVE,
+  EXPECTED_RECENT,
+  TITLE_FLOOR_MIN_COLUMN_PX,
+  parseArgs as conciergeArgs,
+  verdictFor as conciergeVerdict,
+} from "./concierge-header-probe.mjs";
+import {
   DEFAULT_WIDTHS,
   EDGE_TOLERANCE,
   HYBRID_MIN_WIDTH,
@@ -2797,5 +2806,113 @@ describe("the quote-surface probe's verdict logic", () => {
       expect(parseThemes("")).toBeNull();
       expect(parseThemes(true)).toBeNull();
     });
+  });
+});
+
+// ══ concierge-header-probe — THE GRADING RULES, WITHOUT A BROWSER ══════════════════════════════
+//
+// `verdictFor` is documented as pure "so the rules are unit-testable without a browser", and it was
+// imported by nothing — unlike its sibling probes, which are exercised here. That left every
+// grading rule in it covered by exactly one thing: a manual, non-CI run of the probe itself. A rule
+// that has never been run against a string it was written to reject is not a rule yet.
+describe("concierge-header-probe verdictFor", () => {
+  const ok = (r, name) => r.checks.find((c) => c.name.startsWith(name))?.ok;
+  const names = (r) => r.checks.map((c) => c.name);
+
+  /** A measurement of a healthy badge at `width`. Overrides splice in the case under test. */
+  const measured = (width, over = {}) => ({
+    found: true,
+    badge: true,
+    rowText: `Concierge Agents2 active now · 63 in the last hour`,
+    badgeText: `${EXPECTED_ACTIVE} active now · ${EXPECTED_RECENT} in the last hour`,
+    badgeAria: `${EXPECTED_ACTIVE} active now, ${EXPECTED_RECENT} in the last hour`,
+    badgeTitle: "",
+    badgeNeedW: 190,
+    badgeHaveW: 200,
+    badgeScrollW: 190,
+    badgeClientW: 200,
+    badgeRight: 500,
+    colRight: 520,
+    colWidth: width,
+    titleClipped: false,
+    titleW: 40,
+    colScrollW: width + BASELINE_COLUMN_OVERFLOW_PX,
+    colClientW: width,
+    ...over,
+  });
+
+  it("passes a healthy wide badge on every rule", () => {
+    const r = conciergeVerdict(420, measured(420));
+    expect(r.checks.every((c) => c.ok)).toBe(true);
+    expect(r.checks.length).toBeGreaterThan(5);
+  });
+
+  // THE RULE THE WHOLE BEAD RESTS ON: a label that lost its window must not grade green. This is
+  // the ellipsized full form — the exact string the default column rendered before the ladder.
+  it("fails a badge whose window was ellipsized away", () => {
+    const r = conciergeVerdict(220, measured(220, { badgeText: "2 active now · 63 in th…" }));
+    expect(ok(r, "window is named")).toBe(false);
+  });
+
+  // …and the counter-case, so "window is named" is not satisfied by any string containing a digit.
+  it("accepts every abbreviated form that still names the window", () => {
+    for (const text of ["2 active now · 63 last hr", "2 · 63 last hr", "2 active · 63 last 6h"]) {
+      expect(ok(conciergeVerdict(220, measured(220, { badgeText: text })), "window is named")).toBe(true);
+    }
+  });
+
+  // CLIPPING IS GRADED FROM `need` VS `have`, never from scrollWidth — which collapses onto
+  // clientWidth once the element carries overflow:hidden + ellipsis, making that test vacuous.
+  it("fails a clipped badge even when scrollWidth equals clientWidth", () => {
+    const r = conciergeVerdict(220, measured(220, { badgeNeedW: 240, badgeHaveW: 200 }));
+    expect(ok(r, "numbers intact")).toBe(false);
+  });
+
+  it("waives the clipping rule below the floor, and says it waived it", () => {
+    const r = conciergeVerdict(120, measured(120, { badgeNeedW: 240, badgeHaveW: 47 }));
+    expect(ok(r, "numbers intact")).toBe(true);
+    expect(names(r).some((n) => n.includes("WAIVED"))).toBe(true);
+  });
+
+  // A TITLE SQUEEZED TO NOTHING is a real defect above the cutoff and expected below it. Measured,
+  // never read from textContent, which CSS ellipsis does not change.
+  it("fails a nameless row above the floor cutoff and waives it below", () => {
+    expect(ok(conciergeVerdict(300, measured(300, { titleW: 0 })), "row keeps a visible name")).toBe(false);
+    const low = conciergeVerdict(TITLE_FLOOR_MIN_COLUMN_PX - 1, measured(TITLE_FLOOR_MIN_COLUMN_PX - 1, { titleW: 0 }));
+    expect(names(low).some((n) => n.includes("visible name (WAIVED"))).toBe(true);
+  });
+
+  // The count must be BOUNDED, not merely relabelled: the fixture seeds two dispatches outside the
+  // window, so a badge reading 65 is a regression however well-worded it is.
+  it("fails a count that includes the out-of-window dispatches", () => {
+    const r = conciergeVerdict(420, measured(420, { badgeText: "2 active now · 65 in the last hour" }));
+    expect(ok(r, "count is bounded")).toBe(false);
+  });
+
+  it("fails a live gauge that calls a queued task running", () => {
+    const r = conciergeVerdict(420, measured(420, { badgeText: "2 running · 63 in the last hour" }));
+    expect(ok(r, "live gauge does not say")).toBe(false);
+  });
+
+  // Column overflow is graded as a DELTA against a baseline that predates this row, so the probe
+  // cannot go red for a defect it did not cause — nor green for one it did.
+  it("passes the pre-existing column overflow and fails anything beyond it", () => {
+    expect(ok(conciergeVerdict(220, measured(220)), "column does not scroll")).toBe(true);
+    const worse = measured(220, { colScrollW: 220 + BASELINE_COLUMN_OVERFLOW_PX + 30 });
+    expect(ok(conciergeVerdict(220, worse), "column does not scroll")).toBe(false);
+  });
+
+  it("grades a missing row and a missing badge instead of throwing", () => {
+    expect(conciergeVerdict(220, { found: false }).checks[0].ok).toBe(false);
+    expect(conciergeVerdict(220, { found: true, badge: false, rowText: "x" }).checks[0].ok).toBe(false);
+  });
+
+  it("parses its own flags", () => {
+    expect(conciergeArgs(["--json", "--widths=1,2"]).widths).toBe("1,2");
+    expect(conciergeArgs(["--json"]).json).toBe(true);
+  });
+
+  it("keeps the waiver floor below the width the app boots at", () => {
+    expect(BADGE_INTACT_MIN_COLUMN_PX).toBeLessThan(220);
   });
 });

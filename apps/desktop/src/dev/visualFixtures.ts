@@ -47,6 +47,9 @@ import { useBeadsStore } from "../stores/beadsStore";
 import { bucketBeads, type Bead } from "../services/beads";
 import { useDictationStore } from "../stores/dictationStore";
 import { useInboxStore } from "../stores/inboxStore";
+import { useConciergeQueueStore } from "../stores/conciergeQueueStore";
+import { useResearchStore } from "../services/research/store";
+import type { ResearchTask } from "../services/research/types";
 // THE APP'S OWN KEYS AND FLOOR, imported rather than re-spelled. `engine/columnResize` is a true
 // leaf (no imports at all), so this costs nothing at module scope and keeps this file — and its
 // node-environment test — clear of the Workspace graph. See `visualConciergeWidth` for why a
@@ -257,6 +260,39 @@ export const VISUAL_INBOX_PARAM = "inbox";
 export function visualInboxRequested(search: string): boolean {
   const v = new URLSearchParams(search).get(VISUAL_INBOX_PARAM);
   return v === "1" || v === "true";
+}
+
+/** The query parameter that seeds the Concierge Agents row: `?research=1`. */
+export const VISUAL_RESEARCH_PARAM = "research";
+
+/**
+ * Does the capture want the CONCIERGE AGENTS row populated?
+ *
+ * GATED, exactly like {@link visualInboxRequested}, and for the same reason: an unconditional seed
+ * would put a research badge on every existing baseline and score as a diff on captures that have
+ * nothing to do with this row. It is opt-in per probe.
+ */
+export function visualResearchRequested(search: string): boolean {
+  const v = new URLSearchParams(search).get(VISUAL_RESEARCH_PARAM);
+  return v === "1" || v === "true";
+}
+
+/**
+ * How deep a concierge turn queue the capture wants, via `?queue=16`. `0`/absent seeds none.
+ *
+ * SEPARATE FROM `?research=1` ON PURPOSE. The queue segment sits BETWEEN the two research numbers
+ * and is suppressed at zero, so a fixture that always seeded it could only ever measure the
+ * three-segment badge, and one that never seeded it could only measure the two-segment badge. The
+ * first version of the width ladder was calibrated entirely on the second, which is how a budget
+ * shipped that the row's own documented common case blows through. The probe now sweeps both.
+ */
+/** A stable identity for the fixture's published queue depth; the store keys depth by owner. */
+const VISUAL_QUEUE_OWNER = {};
+
+export function visualQueueDepth(search: string): number {
+  const raw = new URLSearchParams(search).get("queue");
+  const n = raw === null ? 0 : Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 /** The query parameter that opens a SECOND project tab: `?projects=2`. */
@@ -1239,6 +1275,90 @@ export function applyVisualFixtures(
   // The offline banner is real UI that pushes the whole workspace down, and a headless browser
   // with no reachable probe endpoint always shows it. The mock has no such banner, so leaving it
   // in would score as a layout-wide diff on every surface. Forced online.
+  // ══ THE CONCIERGE AGENTS HEADER — `· 2 active now · 63 in the last hour` ═══════════════════
+  //
+  // Seeds the two numbers the header renders, at the counts from the founder's own screenshot, so a
+  // probe can read the REAL string in REAL Chrome at a REAL column width. jsdom cannot answer the
+  // question this fixture exists for — whether the header clips mid-word when the column is dragged
+  // narrow — because it never lays out and never applies `text-overflow`.
+  //
+  // TIMESTAMPS ARE OFFSETS FROM `FIXTURE_NOW`, which the harness's FROZEN_CLOCK pins `Date.now()` to.
+  // The recent count is a SLIDING ONE-HOUR window (`RECENT_RESEARCH_WINDOW_MS`), so a wall-clock
+  // `createdAt` would fall out of the window between capture and compare and make the baseline
+  // unstable — the same reasoning the inbox fixture states for its own 12h boundary.
+  //
+  // 63 INSIDE THE HOUR AND 2 OUTSIDE IT. The two stragglers are not padding: they are what makes the
+  // capture prove the window is BOUNDED rather than merely relabelled. A probe reading "65 in the
+  // last hour" is looking at a regression, not at a rounding difference.
+  if (visualResearchRequested(search)) {
+    const spread = (i: number, total: number, spanMs: number) =>
+      FIXTURE_NOW - Math.round(((i + 1) / (total + 1)) * spanMs);
+    const task = (
+      id: string,
+      createdAt: number,
+      status: ResearchTask["status"],
+    ): ResearchTask => ({
+      id,
+      question: `What changed in the deployment pipeline? (${id})`,
+      depth: "quick",
+      projectId: FIXTURE_PROJECT_ID,
+      projectRoot: "/repo",
+      status,
+      createdAt,
+      startedAt: status === "queued" ? null : createdAt + 500,
+      finishedAt: status === "queued" || status === "running" ? null : createdAt + 90_000,
+      findings: status === "done" ? "A finding." : null,
+      error: status === "failed" ? "A failure." : null,
+      // Terminal + claimed = RETIRED, which the badge still counts and the group still draws as
+      // history. Left unclaimed on the live pair, which cannot be retired anyway.
+      readAt: status === "queued" || status === "running" ? null : createdAt + 120_000,
+    });
+    // 2 live (one running, one queued — the pair that makes "active now" the honest word, since
+    // "running" would overclaim for the queued one) + 61 finished inside the hour = 63.
+    const inWindow: ResearchTask[] = [
+      task("rsh_live_run", FIXTURE_NOW - 4 * MINUTE, "running"),
+      task("rsh_live_q", FIXTURE_NOW - 2 * MINUTE, "queued"),
+      ...Array.from({ length: 61 }, (_, i) =>
+        task(`rsh_done_${i}`, spread(i, 61, 58 * MINUTE), i % 7 === 0 ? "failed" : "done"),
+      ),
+    ];
+    // Outside the hour: counted by NOTHING, and drawn by nothing either (both are retired).
+    const outOfWindow: ResearchTask[] = [
+      task("rsh_old_1", FIXTURE_NOW - 90 * MINUTE, "done"),
+      task("rsh_old_2", FIXTURE_NOW - 5 * HOUR, "done"),
+    ];
+    useResearchStore.setState({
+      byId: Object.fromEntries([...inWindow, ...outOfWindow].map((t) => [t.id, t])),
+      hydrated: true,
+    });
+  }
+
+  // The concierge's own turn queue — the badge's MIDDLE segment. See {@link visualQueueDepth}.
+  //
+  // ⚠️ THIS SEED IS OVERWRITTEN ON MOUNT, and the row therefore shows no queue segment.
+  //
+  // `applyVisualFixtures` runs BEFORE `createRoot` (main.tsx), so this publish lands first — then
+  // `ConciergeHost` mounts and its `useEffect(..., [turnQueue])` calls
+  // `publishConciergeQueue(owner, queueDepthOf(turnQueue))`, which the store defines as
+  // unconditional last-write-wins. The fixture's reading is replaced by `{waiting: 0, ...}`, so
+  // `AgentSidebar` reads `0` — NOT `undefined` — and `showsQueue(0)` is false.
+  //
+  // AN EARLIER COMMENT HERE BLAMED THE SUBSCRIPTION, which was wrong and is worth recording as
+  // wrong: it sent the next reader after a hook bug that does not exist, when the cause is a
+  // publisher that clobbers the seed. Publishing on a delay does not fix it either — the host's
+  // effect runs after mount and wins whenever it fires.
+  //
+  // Fixing it means seeding through a path the host cannot overwrite (seed its `turnQueue`, or skip
+  // its mount publish under the visual flag). Until then the probe does NOT sweep the queued case,
+  // and the three-segment badge is covered by the render tests in `ConciergeAgentsRow.test.tsx`,
+  // which assert the exact rendered string including the tier step-down. Tracked as a bead.
+  const queueDepth = visualQueueDepth(search);
+  if (queueDepth > 0) {
+    useConciergeQueueStore
+      .getState()
+      .publish(VISUAL_QUEUE_OWNER, { waiting: queueDepth, running: true, oldestAt: FIXTURE_NOW - MINUTE });
+  }
+
   useConnectionStore.setState({ isOnline: true, browserOnline: true, probeOk: true });
 
   // ── A NARROWED CONCIERGE, FOR THE SURFACES THAT NEED ONE ────────────────────────────────────

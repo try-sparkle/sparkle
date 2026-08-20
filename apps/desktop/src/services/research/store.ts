@@ -169,12 +169,92 @@ export function liveTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
 /**
  * How far back "recently" reaches for the row's second number.
  *
- * TWELVE HOURS, not a calendar day. A calendar boundary makes the number reset at midnight while the
- * founder is still in the same working session — the reading would drop to zero for a reason that has
- * nothing to do with the concierge's behaviour, which is the exact misreading the second number
- * exists to prevent.
+ * ONE HOUR, at the founder's direction (2026-08-20): *"I think we can do in the last hour, let's
+ * say. So how many were there in the last hour?"*
+ *
+ * ══ THIS WAS TWELVE HOURS, AND CHANGING IT CHANGED THE NUMBER HE READS ═════════════════════════
+ *
+ * Recorded because the old value was not arbitrary and its argument still stands on its own terms:
+ * twelve hours rather than a calendar day, so the reading cannot reset at midnight mid-session for
+ * a reason that has nothing to do with the concierge. One hour keeps that property — it is a
+ * SLIDING span, not a boundary — and buys the thing twelve hours could not: a number whose period
+ * is short enough to state on the row and short enough to mean "right now-ish" when it is read.
+ *
+ * The cost was measured against his own 219 records at the moment of the change rather than
+ * estimated: 47 dispatched in the last 12h versus 9 in the last hour. His work is bursty (nine of
+ * those nine landed inside 46 minutes, then nothing until the 5h mark), so the two windows disagree
+ * by roughly 5× and the badge he had been reading as "62 recently" now reports a single digit. That
+ * is the intended effect and not a regression: a smaller number that states its period beats a
+ * larger one that does not.
+ *
+ * ══ IT ALSO NARROWS WHAT THE CLICK OPENS, AND THAT IS THE POINT ════════════════════════════════
+ *
+ * {@link groupTasks} defaults to this same constant, so the badge and the expanded list move
+ * together in one edit. That coupling is deliberate and load-bearing — see `groupTasks` for the bug
+ * it exists to prevent (a header promising fifteen rows onto a group that rendered none). Narrowing
+ * the label alone would have re-opened exactly that drift in the opposite direction.
  */
-export const RECENT_RESEARCH_WINDOW_MS = 12 * 60 * 60_000;
+export const RECENT_RESEARCH_WINDOW_MS = 60 * 60_000;
+
+/**
+ * The window above, in the words the row prints — DERIVED, never typed a second time.
+ *
+ * ══ WHY THIS IS A FUNCTION AND NOT A STRING LITERAL AT THE CALL SITE ═══════════════════════════
+ *
+ * The whole complaint this change answers is that `62 recently` never said over what period, so the
+ * number was uninterpretable. A hardcoded `"in the last hour"` beside a constant nobody re-reads
+ * re-creates that failure one edit later and SILENTLY: change the window to six hours and the row
+ * goes on claiming an hour, which is strictly worse than saying nothing, because a stated period is
+ * believed. This repo treats user-facing copy as code for that reason — a string describing the old
+ * behaviour is a bug, not a typo.
+ *
+ * So the arithmetic and the words have ONE source. The label cannot describe a window the selector
+ * is not enforcing, because it is computed from the selector's own bound.
+ *
+ * Phrasing is deliberately the natural-language form ("the last hour", not "the last 1 hours"):
+ * this lands mid-sentence in a badge a human scans, not in a log line.
+ */
+export function recentWindowLabel(windowMs: number): string {
+  const minutes = Math.round(windowMs / 60_000);
+  if (minutes === 1) return "the last minute";
+  if (minutes < 60) return `the last ${minutes} minutes`;
+  const hours = minutes / 60;
+  if (hours === 1) return "the last hour";
+  if (Number.isInteger(hours)) return `the last ${hours} hours`;
+  return `the last ${minutes} minutes`;
+}
+
+/** {@link recentWindowLabel} applied to the window the row actually enforces. The row renders THIS. */
+export const RECENT_RESEARCH_WINDOW_LABEL = recentWindowLabel(RECENT_RESEARCH_WINDOW_MS);
+
+/**
+ * The SAME window, abbreviated for a narrow sidebar column — `last hr`, `last 6h`, `last 20m`.
+ *
+ * ══ WHY THE SHORT FORM MUST BE DERIVED TOO ═════════════════════════════════════════════════════
+ *
+ * {@link recentWindowLabel} exists because a hardcoded period beside a constant nobody re-reads
+ * goes stale silently, and *"a stated period is believed"*. An abbreviation is a stated period. The
+ * first version of the width ladder derived only the FULL tier and hardcoded `"last hr"` for the
+ * three narrow ones — which put the untethered string on `BUILD_COLUMN_DEFAULT_WIDTH` (220), the
+ * width the app BOOTS at. Change the window to six hours and the aria label and the wide badge
+ * would correctly read "the last 6 hours" while the badge most people actually see said `last hr`:
+ * the exact failure the derivation was built to prevent, on the most-viewed surface, with the unit
+ * tests and the geometry probe both green.
+ *
+ * So both spellings come from the one bound. Sub-hour windows keep minutes (`last 20m`) rather than
+ * rounding to an hour they do not enforce.
+ */
+export function recentWindowShortLabel(windowMs: number): string {
+  const minutes = Math.round(windowMs / 60_000);
+  if (minutes < 60) return `last ${minutes}m`;
+  const hours = minutes / 60;
+  if (hours === 1) return "last hr";
+  if (Number.isInteger(hours)) return `last ${hours}h`;
+  return `last ${minutes}m`;
+}
+
+/** {@link recentWindowShortLabel} applied to the enforced window. The narrow tiers render THIS. */
+export const RECENT_RESEARCH_WINDOW_SHORT_LABEL = recentWindowShortLabel(RECENT_RESEARCH_WINDOW_MS);
 
 /**
  * Tasks dispatched inside {@link RECENT_RESEARCH_WINDOW_MS} — the row's `· N recently`.
@@ -247,8 +327,9 @@ export function visibleTasks(tasks: readonly ResearchTask[]): ResearchTask[] {
  *
  * ══ WHY A UNION AND NOT SIMPLY `recentTasks` ══════════════════════════════════════════════════
  *
- * `recentTasks` is bounded by a 12h dispatch window, and a task can outlive it: a `deep` run started
- * fourteen hours ago and still going is live work the founder must be able to reach. Rendering only
+ * `recentTasks` is bounded by a dispatch window ({@link RECENT_RESEARCH_WINDOW_MS}, one hour today),
+ * and a task can outlive it: a `deep` run started two hours ago and still going is live work the
+ * founder must be able to reach. Rendering only
  * the recent set would tear its row out from under him while it was running. `visibleTasks` has no
  * window and always carries it, so the union is "everything still happening, plus everything that
  * happened recently" — each half covering the other's blind spot.

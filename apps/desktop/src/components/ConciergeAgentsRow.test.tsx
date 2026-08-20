@@ -79,6 +79,7 @@ vi.mock("./rowAnatomy", async (orig) => {
 
 import { AGENT_STATUS } from "@sparkle/ui";
 import { AgentSidebar } from "./AgentSidebar";
+import { CONCIERGE_TITLE_FLOOR_PX } from "./rowWidthThresholds";
 import {
   ConciergeAgentsRow,
   CONCIERGE_AGENTS_HINT,
@@ -98,6 +99,9 @@ import { allBandsVisible } from "../engine/buildSections";
 import {
   _resetResearchStoreForTests,
   groupTasks,
+  RECENT_RESEARCH_WINDOW_LABEL,
+  RECENT_RESEARCH_WINDOW_SHORT_LABEL,
+  RECENT_RESEARCH_WINDOW_MS,
   RESEARCH_POLL_INTERVAL_MS,
   useResearchStore,
 } from "../services/research/store";
@@ -194,20 +198,27 @@ afterEach(cleanup);
 
 // ── 1. THE ROW ITSELF ──────────────────────────────────────────────────────────────────────────
 describe("Concierge Agents — one row, always present", () => {
-  it("renders +0 and no children when there are no tasks", () => {
+  it("renders `0 active now` and no children when there are no tasks", () => {
     seedResearch([]);
     render(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain("+0");
+    expect(row().textContent).toContain("0 active now");
     expect(childRows()).toHaveLength(0);
   });
 
-  // "+0" is a claim ("nothing is running"); before the first listing lands the row has no basis for
-  // it. `hydrated` is the difference, and without this test the badge could be hardcoded on.
+  // "0 active now" is a claim ("nothing is running"); before the first listing lands the row has no
+  // basis for it. `hydrated` is the difference, and without this test the badge could be hardcoded on.
+  //
+  // ⚠️ THE ABSENCE ASSERTION NAMES THE BADGE'S OWN WORDS, and must keep naming them. It used to read
+  // `not.toContain("+")`, which was load-bearing while the gauge rendered as `+0` — and the moment
+  // the copy became "0 active now" that assertion went VACUOUS: no `+` is printed anywhere on the
+  // row any more, so it passes against a component that renders the badge unconditionally. That is
+  // the vacuous-test shape AGENTS.md names first (an assertion already true before the change), and
+  // it would have shipped green.
   it("shows no badge at all before the first listing lands", () => {
     seedResearch([], false);
     render(<AgentSidebar project={seed()} />);
     expect(row().textContent).toContain(CONCIERGE_AGENTS_TITLE);
-    expect(row().textContent).not.toContain("+");
+    expect(row().textContent).not.toContain("active now");
   });
 
   // The store is a cache and the disk is the truth: the concierge that dispatched a task has usually
@@ -237,9 +248,9 @@ describe("Concierge Agents — +[n] counts only queued + running", () => {
   it("counts the live tasks, not the terminal ones", () => {
     seedResearch(FIXTURE);
     render(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain(`+${LIVE_IN_FIXTURE}`);
+    expect(row().textContent).toContain(`${LIVE_IN_FIXTURE} active now`);
     // …and it is genuinely a subset: the total would read differently.
-    expect(row().textContent).not.toContain(`+${TASKS_IN_FIXTURE}`);
+    expect(row().textContent).not.toContain(`${TASKS_IN_FIXTURE} active now`);
   });
 
   // The disc reads from the SAME live set the badge does. Green while anything is live, gray when
@@ -254,7 +265,7 @@ describe("Concierge Agents — +[n] counts only queued + running", () => {
     // Every live task gone → the row goes calm and the badge goes to zero, together.
     act(() => seedResearch(FIXTURE.filter((t) => t.status !== "queued" && t.status !== "running")));
     rerender(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain("+0");
+    expect(row().textContent).toContain("0 active now");
     expect(disc().style.background).not.toBe(busy);
   });
 });
@@ -614,7 +625,7 @@ describe("Concierge Agents — memo contract", () => {
       ]);
     });
     expect(rowRenders.n).toBeGreaterThan(before);
-    expect(row().textContent).toContain(`+${LIVE_IN_FIXTURE + 1}`);
+    expect(row().textContent).toContain(`${LIVE_IN_FIXTURE + 1} active now`);
   });
 });
 
@@ -679,8 +690,14 @@ describe("ConciergeAgentsRow — a borrowed colour draws a ring", () => {
 // The second number is what separates them. These tests are written against the DISPLAYED TEXT
 // rather than the selector, because the selector was never the broken part.
 describe("Concierge Agents — a recent count, so +0 is readable", () => {
-  const HOUR = 60 * 60_000;
-  /** A task in a terminal state, dispatched `agoMs` ago — invisible to `+[n]` by construction. */
+  // ONE TICK OF AGE, SIZED AS A FRACTION OF THE WINDOW — not a literal hour. None of these tests is
+  // about how big the window is; they are about what the second number MEANS. Written in literal
+  // hours they broke as a body when the window moved 12h → 1h, which is noise that hides whether the
+  // real invariants still hold. `AGO`, `2 * AGO` and `3 * AGO` are all comfortably inside the
+  // window; `14 * AGO` and `40 * AGO` are outside it, which is what those call sites mean by
+  // "ancient" and "a long runner". Relative ages cannot go stale on the next change either.
+  const AGO = RECENT_RESEARCH_WINDOW_MS / 8;
+  /** A task in a terminal state, dispatched `agoMs` ago — invisible to the live count by construction. */
   const finished = (id: string, agoMs: number): ResearchTask => ({
     ...DONE_WITH_FINDINGS,
     id,
@@ -688,30 +705,30 @@ describe("Concierge Agents — a recent count, so +0 is readable", () => {
   });
 
   it("shows +0 alongside the recent count when a burst has finished", () => {
-    seedResearch([finished("rsh_r1", HOUR), finished("rsh_r2", 2 * HOUR), finished("rsh_r3", 3 * HOUR)]);
+    seedResearch([finished("rsh_r1", AGO), finished("rsh_r2", 2 * AGO), finished("rsh_r3", 3 * AGO)]);
     render(<AgentSidebar project={seed()} />);
-    // Both halves. `+0` is still the honest live reading and is NOT suppressed…
-    expect(row().textContent).toContain("+0");
+    // Both halves. `0 active now` is still the honest live reading and is NOT suppressed…
+    expect(row().textContent).toContain("0 active now");
     // …and the second number is what stops it reading as "this has never happened".
-    expect(row().textContent).toContain("3 recently");
+    expect(row().textContent).toContain("3 in the last hour");
   });
 
   // THE COUNTER-CASE. Without it, a row that appended "N recently" unconditionally would pass the
   // test above — and re-create the same unreadable display in the opposite direction.
-  it("shows NOTHING but +0 when nothing has been dispatched recently", () => {
-    seedResearch([finished("rsh_old", 40 * HOUR)]);
+  it("shows NOTHING but the live count when nothing has been dispatched recently", () => {
+    seedResearch([finished("rsh_old", 40 * AGO)]);
     render(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain("+0");
-    expect(row().textContent).not.toContain("recently");
+    expect(row().textContent).toContain("0 active now");
+    expect(row().textContent).not.toContain("in the last");
   });
 
   // A FAILED pass is still a delegation. Counting only successes would restate the same false zero
   // in a narrower window — and failures are common enough on this path to matter (a real burst on
   // 2026-08-12 was roughly half `failed`).
   it("counts a failed dispatch, because the question is whether it DELEGATED", () => {
-    seedResearch([{ ...DONE_WITH_FINDINGS, id: "rsh_f", status: "failed", createdAt: Date.now() - HOUR }]);
+    seedResearch([{ ...DONE_WITH_FINDINGS, id: "rsh_f", status: "failed", createdAt: Date.now() - AGO }]);
     render(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain("1 recently");
+    expect(row().textContent).toContain("1 in the last hour");
   });
 
   // The live gauge keeps working alongside it — a running task must still be in BOTH numbers, or
@@ -719,16 +736,156 @@ describe("Concierge Agents — a recent count, so +0 is readable", () => {
   it("still counts live work in +[n], and counts it as recent too", () => {
     seedResearch([{ ...RUNNING, id: "rsh_live", createdAt: Date.now() - 60_000 }]);
     render(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain("+1");
-    expect(row().textContent).toContain("1 recently");
+    expect(row().textContent).toContain("1 active now");
+    expect(row().textContent).toContain("1 in the last hour");
   });
 
   // Before the first listing lands the row has no basis for EITHER number. Same rule as `+0`.
   it("shows no badge at all before the first listing lands", () => {
-    seedResearch([finished("rsh_r1", HOUR)], false);
+    seedResearch([finished("rsh_r1", AGO)], false);
     render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).not.toContain("in the last");
+    expect(row().textContent).not.toContain("active now");
+  });
+});
+
+// ══ BOTH NUMBERS SAY WHAT THEY ARE — THE FOUNDER COULD NOT INTERPRET EITHER ═════════════════════
+//
+// Founder, 2026-08-20, reading `Concierge Agents +2 · 63 recently`: *"the fact that it tells me they
+// were 62 recently. It'd be helpful to know in what time period. I think we can do in the last hour,
+// let's say. … instead of plus two, it could say something like '2 active now'"*.
+//
+// TWO SEPARATE AMBIGUITIES, and each needs its own assertion because a fix for one passes a test
+// written for the other:
+//
+//   • `63 recently` never said over WHAT PERIOD. An hour, a day, since install — all read the same,
+//     so the number carried no information at all.
+//   • `+2` never said what the 2 WERE. Running? Queued? Finished and unread?
+//
+// ⚠️ EVERY TEST HERE ASSERTS THE OLD FORM IS GONE, not merely that the new one is present. A badge
+// that appended the new wording while keeping the old — or that printed the period in a tooltip
+// nobody hovers — satisfies a `toContain` and leaves the row exactly as unreadable as he found it.
+describe("Concierge Agents — the badge names its period and its population", () => {
+  const AGO = RECENT_RESEARCH_WINDOW_MS / 8;
+  const finished = (id: string, agoMs: number): ResearchTask => ({
+    ...DONE_WITH_FINDINGS,
+    id,
+    createdAt: Date.now() - agoMs,
+  });
+
+  // THE EXACT STRING, in the shape he was looking at: a live gauge and a recent count together.
+  // Exact rather than `toContain` because that is what catches a segment appended beside the old
+  // one, a reordering, and a separator change — none of which a containment test can see.
+  it("renders the founder's row as a labelled sentence, with no bare `+N` and no bare `recently`", () => {
+    seedResearch([
+      { ...RUNNING, id: "rsh_a", createdAt: Date.now() - AGO },
+      { ...RUNNING, id: "rsh_b", createdAt: Date.now() - AGO },
+      finished("rsh_c", 2 * AGO),
+    ]);
+    render(<AgentSidebar project={seed()} />);
+
+    const badge = Array.from(row().querySelectorAll("span")).find((n) =>
+      n.textContent?.includes("active now"),
+    )!;
+    expect(badge.textContent).toBe("2 active now · 3 in the last hour");
+
+    // THE TWO FORMS HE COMPLAINED ABOUT, asserted absent from the whole row — not just the badge —
+    // so neither can survive somewhere else on the line.
+    expect(row().textContent).not.toContain("+2");
     expect(row().textContent).not.toContain("recently");
-    expect(row().textContent).not.toContain("+");
+  });
+
+  // ══ THE WINDOW THE ROW STATES IS THE WINDOW THE ROW ENFORCES ══════════════════════════════════
+  //
+  // The failure mode of this whole change is a row that names a period it is not counting over —
+  // strictly worse than the ambiguity it replaced, because a stated period is believed. The label is
+  // DERIVED from `RECENT_RESEARCH_WINDOW_MS` for that reason, and this is what makes a hand-typed
+  // literal fail: the phrase the row prints is compared against the constant's own words, and the
+  // arithmetic is exercised at the exact boundary in the same test.
+  it("states the period it counts over, and counts over the period it states", () => {
+    // One task a hair INSIDE the window and one a hair OUTSIDE it. Both are dispatched, both are
+    // terminal, and the only thing separating them is the bound the label claims.
+    seedResearch([
+      finished("rsh_in", RECENT_RESEARCH_WINDOW_MS - 60_000),
+      finished("rsh_out", RECENT_RESEARCH_WINDOW_MS + 60_000),
+    ]);
+    render(<AgentSidebar project={seed()} />);
+
+    // The count is bounded: two on disk, one inside the window.
+    expect(row().textContent).toContain(`1 in ${RECENT_RESEARCH_WINDOW_LABEL}`);
+    expect(row().textContent).not.toContain("2 in ");
+    // …and the words are the constant's own, so a literal that drifts from it fails here.
+    expect(row().textContent).toContain("in the last hour");
+    expect(RECENT_RESEARCH_WINDOW_LABEL).toBe("the last hour");
+  });
+
+  // ══ THE BADGE GREW ~10× AND MUST NOT BE CLIPPED SILENTLY ══════════════════════════════════════
+  //
+  // roborev, on this change: naming the period took the badge from `+0` (~16px) to
+  // `0 active now · 16 queued · 12 in the last hour` (~260px), while the Build column DEFAULTS to
+  // 220px and drags to 50. Un-shrinkable, it overflowed and was cut by the list's own
+  // `overflowX: "hidden"` — no ellipsis, because the clip happens on an ancestor — and what got cut
+  // was the TAIL, i.e. the period label this change exists to add. Silently.
+  //
+  // ⚠️ WHAT THIS TEST CAN AND CANNOT DO. jsdom performs NO LAYOUT (see docs/jsdom-test-caveats.md),
+  // so no assertion here can observe an actual overflow, a real ellipsis, or a measured width — and
+  // a test written as though it could would be pure theatre. What IS real and worth pinning is the
+  // POLICY: the badge is shrinkable at all, it degrades with an ellipsis rather than a hard cut, and
+  // the title yields its width FIRST. Those are the three properties that were wrong, and each is a
+  // property of the element rather than of the layout. The old `flex: "0 0 auto"` fails all three.
+  it("lets the badge shrink with an ellipsis, and makes the title yield its width first", () => {
+    render(
+      <ConciergeAgentsRow
+        status={"stopped" as AgentTabStatus}
+        liveCount={0}
+        recentCount={12}
+        queuedCount={16}
+        hydrated
+        paneSide="left"
+        jointOpen={false}
+      />,
+    );
+    const badge = Array.from(row().querySelectorAll("span")).find((n) =>
+      n.textContent?.includes("active now"),
+    )! as HTMLElement;
+    const title = Array.from(row().querySelectorAll("span")).find(
+      (n) => n.textContent === CONCIERGE_AGENTS_TITLE,
+    )! as HTMLElement;
+
+    // (1) SHRINKABLE AT ALL. `flex: 0 0 auto` — the state this fixes — parses to flexShrink "0".
+    expect(badge.style.flexShrink).not.toBe("0");
+    // (2) AND ACTUALLY ABLE TO. A flex item's automatic minimum size is its CONTENT, so a shrink
+    //     factor without `minWidth: 0` does nothing at all — the two are one mechanism, not two.
+    //     ("0" rather than "0px": React writes a unitless numeric style through verbatim.)
+    expect(badge.style.minWidth).toBe("0");
+    // (3) DEGRADES LEGIBLY. An ellipsis tells the reader to widen the column; an ancestor's clip
+    //     just looks like the row's copy ends there.
+    expect(badge.style.textOverflow).toBe("ellipsis");
+    expect(badge.style.overflow).toBe("hidden");
+
+    // (4) ORDER. The title is recoverable from position; the numbers are not recoverable at all, so
+    //     the title gives up its width first. Compared as numbers rather than pinned to literals —
+    //     the invariant is the RELATION, and pinning 100-vs-1 would fail on a harmless retune.
+    expect(Number(title.style.flexShrink)).toBeGreaterThan(Number(badge.style.flexShrink));
+  });
+
+  // "ACTIVE NOW" MUST COVER WHAT IT CLAIMS. The gauge counts `queued` + `running`, so a queued task
+  // — dispatched, not yet started — is inside the number the row calls "active now". Asserted with
+  // BOTH kinds mounted at once, per AGENTS.md's rule for a label that picks among populations:
+  // asserting only the running side passes a gauge that silently dropped the queued one.
+  it("counts a queued task as active now, alongside a running one", () => {
+    seedResearch([
+      { ...RUNNING, id: "rsh_run", createdAt: Date.now() - AGO },
+      { ...RUNNING, id: "rsh_q", status: "queued", createdAt: Date.now() - AGO },
+    ]);
+    render(<AgentSidebar project={seed()} />);
+    expect(row().textContent).toContain("2 active now");
+    // The tooltip is where the precision that will not fit on the row lives — so the row can say
+    // "active now" honestly without the reader having to guess which two states that spans.
+    const badge = Array.from(row().querySelectorAll("span")).find((n) =>
+      n.textContent?.includes("active now"),
+    )!;
+    expect(badge.getAttribute("title")).toContain("active now (running or queued)");
   });
 });
 
@@ -755,10 +912,10 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
     paneSide: "left" as const,
     jointOpen: false,
   };
-  /** The badge span — the one span in the header row whose text starts with the `+` gauge. */
+  /** The badge span — the one span in the header row carrying the live gauge's own words. */
   const badge = () =>
     Array.from(row().querySelectorAll("span")).find((s) =>
-      s.textContent?.startsWith("+"),
+      s.textContent?.includes("active now"),
     ) as HTMLElement;
 
   // ── THE COLLISION ITSELF ─────────────────────────────────────────────────────────────────────
@@ -774,10 +931,10 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
     expect(deep).toContain("16 queued");
     expect(empty).not.toContain("queued");
     // Neither number the row already had is disturbed by the new one.
-    expect(deep).toContain("+0");
-    expect(empty).toContain("+0");
-    expect(deep).toContain("12 recently");
-    expect(empty).toContain("12 recently");
+    expect(deep).toContain("0 active now");
+    expect(empty).toContain("0 active now");
+    expect(deep).toContain("12 in the last hour");
+    expect(empty).toContain("12 in the last hour");
   });
 
   // The founder's ACTUAL reading, which was not `+0` but `+2`. A fix keyed on `liveCount === 0`
@@ -787,7 +944,7 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
     const deep = badge().textContent;
     rerender(<ConciergeAgentsRow {...baseProps} liveCount={2} queuedCount={0} />);
     expect(deep).not.toBe(badge().textContent);
-    expect(deep).toContain("+2");
+    expect(deep).toContain("2 active now");
     expect(deep).toContain("16 queued");
   });
 
@@ -808,9 +965,11 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
       aria: badge().getAttribute("aria-label"),
     };
     // The pre-change rendering, spelled out rather than compared to itself.
-    expect(notLooked.text).toBe("+0 · 12 recently");
-    expect(notLooked.title).toBe("0 research agents running · 12 dispatched in the last 12 hours");
-    expect(notLooked.aria).toBe("0 running, 12 recently");
+    expect(notLooked.text).toBe("0 active now · 12 in the last hour");
+    expect(notLooked.title).toBe(
+      "0 research agents active now (running or queued) · 12 dispatched in the last hour",
+    );
+    expect(notLooked.aria).toBe("0 active now, 12 in the last hour");
 
     rerender(<ConciergeAgentsRow {...baseProps} queuedCount={0} />);
     expect(badge().textContent).toBe(notLooked.text);
@@ -827,9 +986,11 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
     // Worded against `ConciergeQueueDepth.waiting`, which EXCLUDES the turn in flight — so
     // "waiting behind the concierge's current turn", never "16 messages outstanding".
     expect(badge().getAttribute("title")).toBe(
-      "0 research agents running · 16 messages waiting behind the concierge's current turn · 12 dispatched in the last 12 hours",
+      "0 research agents active now (running or queued) · 16 messages waiting behind the concierge's current turn · 12 dispatched in the last hour",
     );
-    expect(badge().getAttribute("aria-label")).toBe("0 running, 16 queued, 12 recently");
+    expect(badge().getAttribute("aria-label")).toBe(
+      "0 active now, 16 queued, 12 in the last hour",
+    );
 
     rerender(<ConciergeAgentsRow {...baseProps} queuedCount={0} />);
     expect(badge().getAttribute("title")).not.toContain("waiting");
@@ -856,16 +1017,16 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
   // missing, and if the order changes.
   it("reports the bead's state in three numbers and invents no fourth word for it", () => {
     render(<ConciergeAgentsRow {...baseProps} liveCount={0} recentCount={12} queuedCount={16} />);
-    expect(badge().textContent).toBe("+0 · 16 queued · 12 recently");
+    expect(badge().textContent).toBe("0 active now · 16 queued · 12 in the last hour");
   });
 
   // NOW, then WAITING, then ALREADY BEEN THROUGH. Pinned because the segments are only a sentence
   // in that order, and nothing else would catch a reordering.
-  it("orders the segments live · queued · recently", () => {
+  it("orders the segments live · queued · recent-window", () => {
     render(<ConciergeAgentsRow {...baseProps} liveCount={3} recentCount={7} queuedCount={5} />);
     const t = badge().textContent!;
-    expect(t.indexOf("+3")).toBeLessThan(t.indexOf("5 queued"));
-    expect(t.indexOf("5 queued")).toBeLessThan(t.indexOf("7 recently"));
+    expect(t.indexOf("3 active now")).toBeLessThan(t.indexOf("5 queued"));
+    expect(t.indexOf("5 queued")).toBeLessThan(t.indexOf("7 in the last hour"));
   });
 
   // The queue segment lives INSIDE the `hydrated` gate, which is a choice: one badge, one grammar,
@@ -874,7 +1035,7 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
   it("says nothing about the queue before the first research listing lands", () => {
     render(<ConciergeAgentsRow {...baseProps} hydrated={false} queuedCount={16} />);
     expect(row().textContent).not.toContain("queued");
-    expect(row().textContent).not.toContain("+");
+    expect(row().textContent).not.toContain("active now");
   });
 
   // ── THE WIRING: THE SIDEBAR READS THE PUBLISHED STORE, NOT A SECOND COUNTER ──────────────────
@@ -894,7 +1055,7 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
     // …and the reading is not sticky: a window whose host has gone reads WE DID NOT LOOK.
     act(() => useConciergeQueueStore.getState().clearFor(owner));
     expect(row().textContent).not.toContain("queued");
-    expect(row().textContent).toContain("+0");
+    expect(row().textContent).toContain("0 active now");
   });
 });
 
@@ -911,7 +1072,8 @@ describe("Concierge Agents — a queue depth, so +0 is not two different facts",
 // but retired tasks — a fixture containing a live task would render a non-empty group under the bug
 // as well, and prove nothing at all.
 describe("Concierge Agents — the recent ones as well as the active ones", () => {
-  const HOUR = 60 * 60_000;
+  /** A fraction of the recent window — see the note on `AGO` in the recent-count block above. */
+  const AGO = RECENT_RESEARCH_WINDOW_MS / 8;
   /** A RETIRED task: terminal AND claimed (`readAt` stamped), dispatched `agoMs` ago. */
   const retired = (id: string, agoMs: number, status: ResearchTask["status"] = "done"): ResearchTask => ({
     ...DONE_WITH_FINDINGS,
@@ -960,12 +1122,12 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
 
   // ── THE BUG ITSELF ───────────────────────────────────────────────────────────────────────────
   it("opens onto a NON-empty group when every task in the window is retired", () => {
-    seedResearch([retired("r1", HOUR), retired("r2", 2 * HOUR, "failed"), retired("r3", 3 * HOUR, "cancelled")]);
+    seedResearch([retired("r1", AGO), retired("r2", 2 * AGO, "failed"), retired("r3", 3 * AGO, "cancelled")]);
     render(<AgentSidebar project={seed()} />);
 
     // The header the founder was reading: nothing live, three dispatched recently.
-    expect(row().textContent).toContain("+0");
-    expect(row().textContent).toContain("3 recently");
+    expect(row().textContent).toContain("0 active now");
+    expect(row().textContent).toContain("3 in the last hour");
     expect(childRows()).toHaveLength(0);
 
     fireEvent.click(row());
@@ -982,9 +1144,9 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // `· N recently` says, that many rows (at least) are behind the click. Stated over a MIXED store
   // so it cannot be satisfied by a group that renders everything the store has ever held.
   it("shows at least as many rows as the badge promises", () => {
-    seedResearch([live("l1", 60_000), retired("r1", HOUR), retired("r2", 2 * HOUR)]);
+    seedResearch([live("l1", 60_000), retired("r1", AGO), retired("r2", 2 * AGO)]);
     render(<AgentSidebar project={seed()} />);
-    expect(row().textContent).toContain("3 recently");
+    expect(row().textContent).toContain("3 in the last hour");
     fireEvent.click(row());
     expect(childRows().length).toBeGreaterThanOrEqual(3);
   });
@@ -996,7 +1158,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // the retired side passes a `dotVariantFor` that ignores its argument and rings EVERY row, which
   // is the regression that would make the live rows unreadable.
   it("draws the retired row hollow-and-muted and the live row filled-and-cream, side by side", () => {
-    seedResearch([live("l1", 60_000), retired("r1", HOUR)]);
+    seedResearch([live("l1", 60_000), retired("r1", AGO)]);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
 
@@ -1027,7 +1189,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // A FAILED retired run must not flatten into the same ink as a DONE one — the second reason the
   // treatment travels on FILL rather than on hue. Both mounted, both hollow, different colours.
   it("keeps the outcome readable across two retired rows", () => {
-    seedResearch([retired("ok", HOUR, "done"), retired("bad", 2 * HOUR, "failed")]);
+    seedResearch([retired("ok", AGO, "done"), retired("bad", 2 * AGO, "failed")]);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
     const ok = discIn(rowFor("ok"));
@@ -1043,7 +1205,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // The window is the label's 12h window and nothing else. The PAIRED positive is what stops this
   // passing against a group that renders no retired rows at all.
   it("does not render a retired task from outside the 12h window", () => {
-    seedResearch([retired("recent", HOUR), retired("ancient", 40 * HOUR)]);
+    seedResearch([retired("recent", AGO), retired("ancient", 40 * AGO)]);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
     expect(childRows().map((r) => r.getAttribute("data-task-id"))).toEqual(["recent"]);
@@ -1053,10 +1215,10 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // The other half of the union: a long `deep` run older than the window is still LIVE work, and
   // tearing its row out mid-run would be a worse bug than the one being fixed.
   it("still renders a LIVE task older than the window", () => {
-    seedResearch([live("long", 14 * HOUR)]);
+    seedResearch([live("long", 14 * AGO)]);
     render(<AgentSidebar project={seed()} />);
     // Outside the dispatch window, so the badge does not count it…
-    expect(row().textContent).not.toContain("recently");
+    expect(row().textContent).not.toContain("in the last");
     fireEvent.click(row());
     // …and it is on screen anyway, because it has not finished.
     expect(childRows().map((r) => r.getAttribute("data-task-id"))).toEqual(["long"]);
@@ -1076,14 +1238,14 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
     const badgeBefore = row().textContent;
     const discBefore = headerDisc().style.background;
     const labelBefore = headerDisc().getAttribute("title");
-    expect(badgeBefore).toContain("+1");
+    expect(badgeBefore).toContain("1 active now");
 
     act(() =>
       seedResearch([
         live("l1", 60_000),
-        retired("r1", HOUR, "failed"),
-        retired("r2", 2 * HOUR, "cancelled"),
-        retired("r3", 3 * HOUR, "done"),
+        retired("r1", AGO, "failed"),
+        retired("r2", 2 * AGO, "cancelled"),
+        retired("r3", 3 * AGO, "done"),
       ]),
     );
     rerender(<AgentSidebar project={seed()} />);
@@ -1093,8 +1255,8 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
     expect(childRows()).toHaveLength(4);
     // …and the header still reports one live agent, in the same ink, with the same tooltip. A
     // retired `failed` task feeding the rollup would turn this disc red.
-    expect(row().textContent).toContain("+1");
-    expect(row().textContent).not.toContain("+4");
+    expect(row().textContent).toContain("1 active now");
+    expect(row().textContent).not.toContain("4 active now");
     expect(headerDisc().style.background).toBe(discBefore);
     expect(headerDisc().getAttribute("title")).toBe(labelBefore);
   });
@@ -1105,7 +1267,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // measured, as a surviving mutant. This one drives the function directly with the very population
   // the expanded group now renders: a live task and a RETIRED FAILED one, together.
   it("keeps a retired FAILED task out of the rollup even when handed one", () => {
-    const tasks = [live("l1", 60_000), retired("bad", HOUR, "failed")];
+    const tasks = [live("l1", 60_000), retired("bad", AGO, "failed")];
     // Both are rows the founder can see…
     expect(groupTasks(tasks, Date.now()).map((t) => t.id).sort()).toEqual(["bad", "l1"]);
     // …and only the live one reaches the disc. `errored` here is the red that can never be cleared:
@@ -1119,7 +1281,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // The whole request is to READ a finished run — its question and its findings. A retired row that
   // is inert text is a failed fix, so the routing is asserted on the retired row specifically.
   it("routes a click on a RETIRED row into the main pane", () => {
-    seedResearch([live("l1", 60_000), retired("r1", HOUR)]);
+    seedResearch([live("l1", 60_000), retired("r1", AGO)]);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
     expect(useResearchStore.getState().openTaskId).toBeNull();
@@ -1137,7 +1299,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // that has since been claimed now opens onto its row instead of silently doing nothing. The
   // guard is still a guard — the stale-id test above proves an unknown id opens nothing.
   it("expands the group for a pill naming a retired task", () => {
-    seedResearch([retired("r1", HOUR)]);
+    seedResearch([retired("r1", AGO)]);
     render(<AgentSidebar project={seed()} />);
     expect(row().getAttribute("aria-expanded")).toBe("false");
 
@@ -1160,8 +1322,8 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // Stated as the DIFFERENCE between the two facts, because that is the whole content of the bug:
   // the row treats this task as live, and the rollup must still not count it.
   it("keeps a terminal-but-unclaimed task out of the rollup, though the row treats it as live", () => {
-    const owedFailed = unclaimed("u_failed", HOUR, "failed");
-    const owedDone = unclaimed("u_done", HOUR, "done");
+    const owedFailed = unclaimed("u_failed", AGO, "failed");
+    const owedDone = unclaimed("u_done", AGO, "done");
 
     // The row-treatment half: these are LIVE, so they draw filled and cream.
     expect(livenessOfResearch(owedFailed)).toBe("live");
@@ -1194,21 +1356,21 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
     // founder put the run in and it retires exactly like the other two, so a mapping that special-
     // cased any single status would still have to answer all six of these.
     expect(livenessOfResearch(live("l", 60_000))).toBe("live");
-    expect(livenessOfResearch(unclaimed("u_done", HOUR, "done"))).toBe("live");
-    expect(livenessOfResearch(unclaimed("u_failed", HOUR, "failed"))).toBe("live");
-    expect(livenessOfResearch(unclaimed("u_cancelled", HOUR, "cancelled"))).toBe("live");
-    expect(livenessOfResearch(retired("r", HOUR, "done"))).toBe("retired");
-    expect(livenessOfResearch(retired("rf", HOUR, "failed"))).toBe("retired");
+    expect(livenessOfResearch(unclaimed("u_done", AGO, "done"))).toBe("live");
+    expect(livenessOfResearch(unclaimed("u_failed", AGO, "failed"))).toBe("live");
+    expect(livenessOfResearch(unclaimed("u_cancelled", AGO, "cancelled"))).toBe("live");
+    expect(livenessOfResearch(retired("r", AGO, "done"))).toBe("retired");
+    expect(livenessOfResearch(retired("rf", AGO, "failed"))).toBe("retired");
     // THE SIXTH, and the one that was missing while the comment above claimed six. `readAt` is
     // stamped for EVERY terminal status and `cancelled` is terminal, so claimed-and-cancelled is a
     // real production shape. Without it, a mapping reading `isRetired(task) && status !== "cancelled"`
     // passes the whole suite and leaves a run the founder himself cancelled drawn as work in flight.
-    expect(livenessOfResearch(retired("rc", HOUR, "cancelled"))).toBe("retired");
+    expect(livenessOfResearch(retired("rc", AGO, "cancelled"))).toBe("retired");
 
     // THE DISCRIMINATOR, stated as a difference rather than as two absolutes: a `done` task is
     // terminal either way, so what separates the two rows is ONLY whether it has been claimed.
-    expect(livenessOfResearch(unclaimed("u2", HOUR, "done"))).not.toBe(
-      livenessOfResearch(retired("r2", HOUR, "done")),
+    expect(livenessOfResearch(unclaimed("u2", AGO, "done"))).not.toBe(
+      livenessOfResearch(retired("r2", AGO, "done")),
     );
   });
 
@@ -1217,7 +1379,7 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
   // one: filled disc, cream title. If it dims, the founder loses the visual cue on the single row
   // that still owes him something.
   it("draws a terminal-but-unclaimed row filled-and-cream, beside a live one and a retired one", () => {
-    seedResearch([live("l1", 60_000), unclaimed("u1", HOUR), retired("r1", 2 * HOUR)]);
+    seedResearch([live("l1", 60_000), unclaimed("u1", AGO), retired("r1", 2 * AGO)]);
     render(<AgentSidebar project={seed()} />);
     fireEvent.click(row());
 
@@ -1250,5 +1412,124 @@ describe("Concierge Agents — the recent ones as well as the active ones", () =
     expect(titleIn(unclaimedRow, "Unclaimed u1").style.color).not.toBe(
       titleIn(retiredRow, "Retired r1").style.color,
     );
+  });
+});
+
+// ══ THE WIDTH LADDER, AT THE RENDER SITE ═══════════════════════════════════════════════════════
+//
+// `rowWidthThresholds.concierge.test.ts` pins the DECISION functions. This pins that the component
+// actually CALLS them — a separate fact, and the one that was untested.
+//
+// It is the defaulted-seam shape AGENTS.md warns about: `columnWidth ?? 0` resolves to the `full`
+// tier, and every other test in this file renders without the prop. So deleting
+// `columnWidth={columnWidth}` at the `AgentSidebar` call site, or reverting the render back to
+// literals, left the whole jsdom suite AND the thresholds suite green — only the manual, non-CI
+// probe would have caught it. Choosing which STRING to render needs no layout engine, so this gap
+// was never a jsdom limitation; it was a missing test.
+describe("Concierge Agents — the badge's phrasing follows the column width", () => {
+  const props = {
+    status: "stopped" as AgentTabStatus,
+    liveCount: 2,
+    recentCount: 63,
+    hydrated: true,
+    paneSide: "left" as const,
+    jointOpen: false,
+  };
+  const badge = () =>
+    Array.from(row().querySelectorAll("span")).find((s) =>
+      (s.getAttribute("aria-label") ?? "").includes("active now"),
+    ) as HTMLElement;
+
+  it("spells the window out at a wide column", () => {
+    render(<ConciergeAgentsRow {...props} columnWidth={420} />);
+    expect(badge().textContent).toBe(`2 active now · 63 in ${RECENT_RESEARCH_WINDOW_LABEL}`);
+  });
+
+  it("abbreviates the window at the width the app boots at", () => {
+    render(<ConciergeAgentsRow {...props} columnWidth={220} />);
+    // The unit survives; the words around it shrink.
+    expect(badge().textContent).toBe(`2 active · 63 ${RECENT_RESEARCH_WINDOW_SHORT_LABEL}`);
+    expect(badge().textContent).toContain(RECENT_RESEARCH_WINDOW_SHORT_LABEL);
+  });
+
+  it("drops the live gauge's word, never the window, at the narrowest columns", () => {
+    render(<ConciergeAgentsRow {...props} columnWidth={160} />);
+    expect(badge().textContent).toBe(`2 · 63 ${RECENT_RESEARCH_WINDOW_SHORT_LABEL}`);
+  });
+
+  // AN UNMEASURED WIDTH TAKES THE FULL FORM — the fail-open direction, matching `stageChipShows`.
+  // Rendering without the prop at all must be identical to rendering it wide.
+  it("renders the full form when the width has not been measured", () => {
+    const { unmount } = render(<ConciergeAgentsRow {...props} />);
+    const unmeasured = badge().textContent;
+    unmount();
+    render(<ConciergeAgentsRow {...props} columnWidth={420} />);
+    expect(unmeasured).toBe(badge().textContent);
+  });
+
+  // ── THE QUEUE SEGMENT IS ON THE LADDER TOO ─────────────────────────────────────────────────
+  //
+  // It used to be the one segment that never shortened, so it pushed the windowed count off the
+  // end of a badge that is a single nowrap span. The row's own header quotes this state as
+  // ordinary. Both halves are asserted: the word abbreviates, AND the tier steps down so the
+  // three-segment string still fits the budget the ladder documents.
+  // A QUEUE COSTS WIDTH, NOT A RUNG. On a WIDE column the queue simply fits and the spelled-out
+  // window survives — an earlier version shifted the ladder down unconditionally, which dropped the
+  // full phrase on a 1000px column with hundreds of pixels to spare.
+  it("keeps the full phrasing when a wide column can afford the queue too", () => {
+    render(<ConciergeAgentsRow {...props} columnWidth={420} queuedCount={16} />);
+    const t = badge().textContent!;
+    expect(t).toContain("16 queued");
+    expect(t).toContain(`in ${RECENT_RESEARCH_WINDOW_LABEL}`);
+  });
+
+  // …and where the column CANNOT afford it, the badge steps down and the unit still survives —
+  // which is the whole reason the queue segment was put on the ladder.
+  it("steps down, keeping the window, when the column cannot afford the queue", () => {
+    const { unmount } = render(<ConciergeAgentsRow {...props} columnWidth={330} />);
+    expect(badge().textContent).toContain(`in ${RECENT_RESEARCH_WINDOW_LABEL}`);
+    unmount();
+    render(<ConciergeAgentsRow {...props} columnWidth={330} queuedCount={16} />);
+    const withQueue = badge().textContent!;
+    expect(withQueue).toContain("16");
+    expect(withQueue).not.toContain(`in ${RECENT_RESEARCH_WINDOW_LABEL}`);
+    expect(withQueue).toContain(RECENT_RESEARCH_WINDOW_SHORT_LABEL);
+  });
+
+  it("abbreviates the queue's word at a narrow column, keeping its number", () => {
+    render(<ConciergeAgentsRow {...props} columnWidth={220} queuedCount={16} />);
+    const t = badge().textContent!;
+    expect(t).toContain("16 q");
+    expect(t).not.toContain("16 queued");
+    // …and the unit is STILL there, which is the point of stepping the tier down.
+    expect(t).toContain(RECENT_RESEARCH_WINDOW_SHORT_LABEL);
+  });
+
+  // THE ARIA LABEL IS NOT ON THE LADDER. A screen reader has no column to run out of, and `63 last
+  // hr` read aloud is worse than the sentence it abbreviates. Asserted at the NARROWEST width, the
+  // only place where a tier leaking into the copy would show.
+  it("speaks the full sentence at every width", () => {
+    for (const w of [420, 220, 160]) {
+      const { unmount } = render(<ConciergeAgentsRow {...props} columnWidth={w} />);
+      expect(badge().getAttribute("aria-label")).toBe(
+        `2 active now, 63 in ${RECENT_RESEARCH_WINDOW_LABEL}`,
+      );
+      unmount();
+    }
+  });
+
+  // The title's floor is released below the cutoff so the numbers take the row. Asserted on the
+  // STYLE rather than on a measured width, which jsdom cannot give.
+  it("releases the title's floor only below the cutoff", () => {
+    const title = () =>
+      Array.from(row().querySelectorAll("span")).find(
+        (s) => (s.textContent ?? "").trim() === CONCIERGE_AGENTS_TITLE,
+      ) as HTMLElement;
+    const { unmount } = render(<ConciergeAgentsRow {...props} columnWidth={220} />);
+    expect(title().style.minWidth).toBe(`${CONCIERGE_TITLE_FLOOR_PX}px`);
+    unmount();
+    render(<ConciergeAgentsRow {...props} columnWidth={160} />);
+    // jsdom serializes a zero length as bare "0", not "0px" — assert the RELEASE, not the spelling.
+    expect(["0", "0px"]).toContain(title().style.minWidth);
   });
 });

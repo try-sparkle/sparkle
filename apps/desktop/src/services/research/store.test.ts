@@ -22,6 +22,8 @@ import {
   groupTasks,
   liveTasks,
   recentTasks,
+  recentWindowLabel,
+  RECENT_RESEARCH_WINDOW_LABEL,
   RECENT_RESEARCH_WINDOW_MS,
   markResearchRead,
   refreshResearch,
@@ -381,22 +383,27 @@ describe("setOpenTask — the open GESTURE bumps a seq the reveal keys on", () =
 // what `liveTasks` would have said.
 describe("recentTasks — has the concierge been delegating at all", () => {
   const NOW = 1_800_000_000_000;
-  const HOUR = 60 * 60_000;
+  // AGES ARE EXPRESSED AS FRACTIONS OF THE WINDOW, not in literal hours. These tests are about what
+  // the selector MEANS — counts finished work, counts every status, newest-first — and none of them
+  // is about the window's size. Written in hours they broke as a body when the window moved 12h → 1h
+  // (bead: the founder's "62 recently" said over what period?), which is noise that hides whether
+  // the real invariants still hold. Relative ages cannot go stale on the next change either.
+  const WIN = RECENT_RESEARCH_WINDOW_MS;
   const at = (id: string, agoMs: number, status = "done") =>
     ({ ...FIXTURE[0]!, id, status, createdAt: NOW - agoMs }) as (typeof FIXTURE)[number];
 
   it("counts finished work that `liveTasks` cannot see — the whole point", () => {
-    const tasks = [at("a", HOUR), at("b", 2 * HOUR), at("c", 3 * HOUR)];
+    const tasks = [at("a", WIN / 4), at("b", WIN / 2), at("c", (WIN * 3) / 4)];
     expect(liveTasks(tasks)).toHaveLength(0);
     expect(recentTasks(tasks, NOW)).toHaveLength(3);
   });
 
   it("counts EVERY terminal status, because a failure is still a delegation", () => {
     const tasks = [
-      at("a", HOUR, "done"),
-      at("b", HOUR, "failed"),
-      at("c", HOUR, "cancelled"),
-      at("d", HOUR, "running"),
+      at("a", WIN / 2, "done"),
+      at("b", WIN / 2, "failed"),
+      at("c", WIN / 2, "cancelled"),
+      at("d", WIN / 2, "running"),
     ];
     expect(recentTasks(tasks, NOW)).toHaveLength(4);
   });
@@ -416,15 +423,64 @@ describe("recentTasks — has the concierge been delegating at all", () => {
   });
 
   it("is newest-first, like every other selector here", () => {
-    const out = recentTasks([at("old", 3 * HOUR), at("new", HOUR)], NOW);
+    const out = recentTasks([at("old", (WIN * 3) / 4), at("new", WIN / 4)], NOW);
     expect(out.map((t) => t.id)).toEqual(["new", "old"]);
   });
 
-  // THE VALUE, not just the boundary — a calendar day would reset the number at midnight while the
-  // founder is in the same working session, re-creating the false zero for a reason that has
-  // nothing to do with the concierge.
-  it("looks back twelve hours, not a calendar day", () => {
-    expect(RECENT_RESEARCH_WINDOW_MS).toBe(12 * 60 * 60_000);
+  // THE VALUE, not just the boundary. An EXACT-VALUE ratchet on purpose: this number is what the
+  // row's label claims out loud, so it must never move as a side effect of something else. Changing
+  // it is a decision about what the founder reads, and it should cost a deliberate edit here.
+  //
+  // ONE HOUR at his direction (2026-08-20). A calendar day was rejected long before that and stays
+  // rejected: a boundary makes the number reset at midnight mid-session for a reason that has
+  // nothing to do with the concierge. One hour is a SLIDING span, so it keeps that property.
+  it("looks back one hour — the period the badge states out loud", () => {
+    expect(RECENT_RESEARCH_WINDOW_MS).toBe(60 * 60_000);
+  });
+
+  // ══ THE ANTI-DRIFT ASSERTION — the reason the label is derived and not typed ═════════════════
+  //
+  // The original complaint was that `62 recently` never said over WHAT PERIOD. The failure mode of
+  // the fix is subtler and worse: a row that states a period it is not enforcing, because a literal
+  // "in the last hour" sat beside a constant someone later changed. A stated period is BELIEVED, so
+  // a wrong one is worse than none.
+  //
+  // These two lines are what make that unrepresentable. The boundary is asserted at the exact
+  // millisecond, and the words are asserted to be computed FROM that same bound — so the copy
+  // cannot describe a window the selector does not enforce.
+  it("states the period it actually enforces", () => {
+    expect(recentTasks([at("in", RECENT_RESEARCH_WINDOW_MS)], NOW)).toHaveLength(1);
+    expect(recentTasks([at("out", RECENT_RESEARCH_WINDOW_MS + 1)], NOW)).toHaveLength(0);
+    expect(RECENT_RESEARCH_WINDOW_LABEL).toBe(recentWindowLabel(RECENT_RESEARCH_WINDOW_MS));
+    expect(RECENT_RESEARCH_WINDOW_LABEL).toBe("the last hour");
+  });
+});
+
+// ══ recentWindowLabel — THE WORDS, DERIVED FROM THE ARITHMETIC ═══════════════════════════════════
+//
+// Small and pure, and tested at more than the one value in use, because the whole point of deriving
+// the phrase is that it stays true if the window moves. A helper only ever exercised at its current
+// input is a constant wearing a function's clothes.
+describe("recentWindowLabel — a window that says its own name", () => {
+  it("names the hour the row uses today", () => {
+    expect(recentWindowLabel(60 * 60_000)).toBe("the last hour");
+  });
+
+  // THE VALUE THIS REPLACED. If the window ever goes back, the copy follows it with no edit — which
+  // is the property being bought, so it is asserted rather than assumed.
+  it("follows the window back up to twelve hours without a copy change", () => {
+    expect(recentWindowLabel(12 * 60 * 60_000)).toBe("the last 12 hours");
+  });
+
+  it("handles sub-hour windows, singular and plural", () => {
+    expect(recentWindowLabel(30 * 60_000)).toBe("the last 30 minutes");
+    expect(recentWindowLabel(60_000)).toBe("the last minute");
+  });
+
+  // NEVER "the last 1.5 hours" — a non-integer hour count falls back to minutes rather than
+  // rendering a decimal into a badge a human scans.
+  it("falls back to minutes rather than printing a fractional hour", () => {
+    expect(recentWindowLabel(90 * 60_000)).toBe("the last 90 minutes");
   });
 });
 
@@ -437,7 +493,8 @@ describe("recentTasks — has the concierge been delegating at all", () => {
 // never in either selector; it was in the two of them being different answers to one question.
 describe("groupTasks — the live rows AND the recently-finished ones", () => {
   const NOW = 1_800_000_000_000;
-  const HOUR = 60 * 60_000;
+  /** Ages relative to the window, for the reason given in `recentTasks` above. */
+  const WIN = RECENT_RESEARCH_WINDOW_MS;
   /** A task `agoMs` old. `readAt` non-null on a terminal status is what RETIRES it (isRetired). */
   const at = (
     id: string,
@@ -450,7 +507,10 @@ describe("groupTasks — the live rows AND the recently-finished ones", () => {
   // window: `visibleTasks` is empty (the group had no rows to draw) and `groupTasks` is not. Seeding
   // a live task here would make this pass against the very bug it exists to catch.
   it("renders a store of ONLY retired tasks — the exact dead click", () => {
-    const retired = [at("a", HOUR, "done", NOW - HOUR), at("b", 2 * HOUR, "failed", NOW - HOUR)];
+    const retired = [
+      at("a", WIN / 4, "done", NOW - WIN / 4),
+      at("b", WIN / 2, "failed", NOW - WIN / 4),
+    ];
     expect(visibleTasks(retired)).toHaveLength(0);
     expect(recentTasks(retired, NOW)).toHaveLength(2);
     expect(groupTasks(retired, NOW).map((t) => t.id)).toEqual(["a", "b"]);
@@ -461,10 +521,10 @@ describe("groupTasks — the live rows AND the recently-finished ones", () => {
   // everything" — the out-of-window retired task below proves the set is genuinely bounded.
   it("contains every task the `· N recently` badge counts", () => {
     const tasks = [
-      at("live_recent", HOUR, "running"),
-      at("retired_recent", 2 * HOUR, "done", NOW - HOUR),
-      at("owed_recent", 3 * HOUR, "done"),
-      at("retired_old", 30 * HOUR, "cancelled", NOW - 29 * HOUR),
+      at("live_recent", WIN / 4, "running"),
+      at("retired_recent", WIN / 2, "done", NOW - WIN / 4),
+      at("owed_recent", (WIN * 3) / 4, "done"),
+      at("retired_old", 30 * WIN, "cancelled", NOW - 29 * WIN),
     ];
     const badge = recentTasks(tasks, NOW);
     const group = groupTasks(tasks, NOW);
@@ -478,7 +538,7 @@ describe("groupTasks — the live rows AND the recently-finished ones", () => {
   // fourteen hours ago and still going is live work the founder must be able to reach. Bounding the
   // group by the dispatch window alone would tear its row out from under him mid-run.
   it("keeps a LIVE task that is older than the window, which `recentTasks` alone would drop", () => {
-    const tasks = [at("long_runner", 14 * HOUR, "running")];
+    const tasks = [at("long_runner", 14 * WIN, "running")];
     expect(recentTasks(tasks, NOW)).toHaveLength(0);
     expect(groupTasks(tasks, NOW).map((t) => t.id)).toEqual(["long_runner"]);
   });
@@ -486,7 +546,7 @@ describe("groupTasks — the live rows AND the recently-finished ones", () => {
   // A task inside the window that is NOT retired is in both input sets. One row, not two — a
   // duplicate here is a duplicate React key as well as a duplicate row.
   it("dedupes a task that both selectors return", () => {
-    const tasks = [at("both", HOUR, "running"), at("both_terminal", 2 * HOUR, "failed")];
+    const tasks = [at("both", WIN / 4, "running"), at("both_terminal", WIN / 2, "failed")];
     expect(visibleTasks(tasks)).toHaveLength(2);
     expect(recentTasks(tasks, NOW)).toHaveLength(2);
     const group = groupTasks(tasks, NOW);
@@ -496,9 +556,9 @@ describe("groupTasks — the live rows AND the recently-finished ones", () => {
 
   it("is newest-first, through the store's one sort", () => {
     const tasks = [
-      at("old_retired", 5 * HOUR, "done", NOW - HOUR),
-      at("mid_live", 3 * HOUR, "running"),
-      at("new_retired", HOUR, "cancelled", NOW - 10),
+      at("old_retired", (WIN * 3) / 4, "done", NOW - WIN / 4),
+      at("mid_live", WIN / 2, "running"),
+      at("new_retired", WIN / 4, "cancelled", NOW - 10),
     ];
     expect(groupTasks(tasks, NOW).map((t) => t.id)).toEqual([
       "new_retired",
@@ -509,7 +569,7 @@ describe("groupTasks — the live rows AND the recently-finished ones", () => {
 
   // The window is the label's window. A second bound here is how the two would drift apart again,
   // so the default is asserted to BE `RECENT_RESEARCH_WINDOW_MS` at its exact boundary.
-  it("bounds retired rows by the same 12h window the label uses", () => {
+  it("bounds retired rows by the same window the label states", () => {
     const inside = at("in", RECENT_RESEARCH_WINDOW_MS, "done", NOW - 1);
     const outside = at("out", RECENT_RESEARCH_WINDOW_MS + 1, "done", NOW - 1);
     expect(groupTasks([inside, outside], NOW).map((t) => t.id)).toEqual(["in"]);

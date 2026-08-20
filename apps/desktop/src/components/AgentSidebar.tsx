@@ -3666,6 +3666,7 @@ export function AgentSidebar({
             (conciergeRollup === "red" || conciergeRollup === "orange")
           }
           liveCount={conciergeLive.length}
+          columnWidth={columnWidth}
           recentCount={conciergeRecent.length}
           // `undefined` when no concierge is mounted in this window — WE DID NOT LOOK, which the
           // row renders as no queue segment at all rather than as an empty queue.

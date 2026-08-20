@@ -34,7 +34,8 @@
     "test": "bash ../../scripts/vitest-run.sh",
     "test:coverage": "vitest run --coverage",
     "tauri": "tauri",
-    "tauri:build:fresh": "cargo clean -p sparkle --manifest-path src-tauri/Cargo.toml && tauri build"
+    "tauri:build:fresh": "cargo clean -p sparkle --manifest-path src-tauri/Cargo.toml && tauri build",
+    "visual:concierge-header": "node scripts/visual/concierge-header-probe.mjs"
   },
   "dependencies": {
     "@sparkle/core": "workspace:*",

@@ -110,3 +110,208 @@ export function noticeClusterCollapses(columnWidthPx: number, markCount: number)
   if (!(columnWidthPx > 0)) return false;
   return markCount > 1 && columnWidthPx < NOTICE_CLUSTER_MIN_COLUMN_PX;
 }
+
+/**
+ * ══ THE CONCIERGE AGENTS BADGE'S WIDTH LADDER — bead `sparkle-8f4pj7` ═════════════════════════
+ *
+ * EVERY NUMBER BELOW IS MEASURED, none are chosen. `scripts/visual/concierge-header-probe.mjs`
+ * reads the badge's real width in real Chrome at the row's real 12px face:
+ *
+ *     "· 2 active now · 63 in the last hour"   192px
+ *     "· 2 active now · 63 last hr"            143px
+ *     "· 2 active · 63 last hr"                116px
+ *     "· 2 · 63 last hr"                        79px
+ *
+ * …against a budget of `column - 56px` (row padding 28 + dot slot 24 + gap 4) minus whatever the
+ * title keeps ({@link CONCIERGE_TITLE_FLOOR_PX}). So the full phrase needs a ~300px column, and at
+ * `BUILD_COLUMN_DEFAULT_WIDTH` (220) — the width the app BOOTS at — it does not fit at all: it
+ * renders `· 2 active now · 63 in th…`, a label that has ellipsized away its own window. That is
+ * precisely the unreadable count this bead exists to remove, so shipping one phrase at every width
+ * was not an option.
+ *
+ * ══ WHAT MAY BE SHED, AND IN WHICH ORDER ══════════════════════════════════════════════════════
+ *
+ * The founder's ranking, applied top-down as the column narrows:
+ *
+ *   1. the TITLE's spelling      — "Concierge Agents" is a constant string he already knows
+ *   2. the recent count's WORDS  — "in the last hour" → "last hr"; the UNIT survives both
+ *   3. the live gauge's word     — "2 active now" → "2 active" → "2"
+ *
+ * THE UNIT IS NEVER SHED. `· N recently` — a count with no stated window — is the exact defect
+ * being removed, so an abbreviation that dropped the hour would re-create it at the widths he is
+ * most likely to be looking at. `63/hr` was rejected for a subtler version of the same fault: it
+ * reads as a RATE (63 per hour) rather than a count inside a one-hour window.
+ *
+ * The ARIA label is not on this ladder at all — see `badgeAria`, which always speaks the full
+ * sentence. A screen reader has no column to run out of.
+ *
+ * ══ EVERY THRESHOLD SITS 5px BELOW ITS ROUND NUMBER, DELIBERATELY ═════════════════════════════
+ *
+ * These are compared against the MEASURED column width, and a column configured to 220 measures
+ * **219** (`clientWidth` excludes the border). A threshold written as a round `220` therefore fires
+ * on the wrong side at exactly the width the app boots at — which is not a hypothetical: the title
+ * floor was written as 220, released itself at the default width, and the row rendered as `Co…`
+ * with no name on it. That is the bug the floor exists to prevent, reintroduced by an off-by-one.
+ *
+ * So each threshold is set below the round width a human would drag to, giving every common
+ * setting a side of the boundary it stays on. The exact values carry HEADROOM as well: the probe
+ * measured the full tier 2px short at a 300px column and the short tier 2px short at 260px, because
+ * the title's `flexShrink: 100` yields less than a larger factor would and the badge gets what is
+ * left. A tier boundary sitting within a couple of pixels of its own fit is a tier that ellipsizes
+ * on the next font tweak, so each was raised until the probe passed with room. `concierge-header-probe` sweeps the round widths and
+ * reports the phrasing at each, which is what catches this if the arithmetic ever drifts again.
+ */
+export const CONCIERGE_BADGE_FULL_MIN_COLUMN_PX = 330;
+
+/** Below {@link CONCIERGE_BADGE_FULL_MIN_COLUMN_PX}: `· 2 active now · 63 last hr` (143px). */
+export const CONCIERGE_BADGE_SHORT_MIN_COLUMN_PX = 270;
+
+/** Below that: `· 2 active · 63 last hr` (116px) — the tier the DEFAULT 220px column lands on. */
+export const CONCIERGE_BADGE_TERSE_MIN_COLUMN_PX = 215;
+
+/**
+ * How much room the title keeps before the badge starts yielding, in px — and the width below
+ * which it keeps none.
+ *
+ * WITHOUT A FLOOR THE TITLE VANISHED ENTIRELY. The title is weighted to yield first (rule 1 above),
+ * and unbounded that means flexbox takes ALL of it: measured at 220px, the row rendered
+ * `· 2 active now · 63 in th…` with no name on it at all. A row with no name is hard to pick out of
+ * a column of rows, so "yields first" is not "yields everything".
+ *
+ * ══ SMALL ON PURPOSE — A BIG FLOOR IS WHAT CLIPS THE NUMBERS ══════════════════════════════════
+ *
+ * This was 46px (`Conci…`) first, and it made things WORSE, which is the counter-intuitive part
+ * worth writing down. The 1000:1 shrink weighting already leaves the title a sliver on its own:
+ * flexbox distributes the overflow in proportion, so at a 220px column the title lands near 31px
+ * — `Con…`, a name — WITHOUT any floor at all, and the badge still gets every pixel it asked for.
+ * A 46px floor does not add a name that was missing; it takes 15px the badge needed and clips the
+ * numbers, which is the outcome the founder ranked last.
+ *
+ * So the floor's job is only to stop the title reaching ZERO in the corner cases where the
+ * proportional split would take it there. 28px is about `Co…` — enough that the row is never
+ * anonymous, small enough that it never outbids a count.
+ *
+ * IT IS RELEASED BELOW {@link CONCIERGE_TITLE_FLOOR_MIN_COLUMN_PX}, which is not an exception to
+ * the rule but the rule reaching its limit: at 199px the floor and the shortest badge together
+ * exceed the whole row, so holding the floor would clip the numbers to buy a name nobody dragged
+ * the column that narrow to read.
+ */
+export const CONCIERGE_TITLE_FLOOR_PX = 28;
+
+/** At or above this column width the title keeps {@link CONCIERGE_TITLE_FLOOR_PX}; below it, none. */
+export const CONCIERGE_TITLE_FLOOR_MIN_COLUMN_PX = 195;
+
+/** The title's floor at a given column width. 0 means "give the numbers everything". */
+export function conciergeTitleFloor(columnWidthPx: number): number {
+  if (!(columnWidthPx > 0)) return CONCIERGE_TITLE_FLOOR_PX;
+  return columnWidthPx >= CONCIERGE_TITLE_FLOOR_MIN_COLUMN_PX ? CONCIERGE_TITLE_FLOOR_PX : 0;
+}
+
+/** Which phrasing the Concierge Agents badge uses at this COLUMN width. */
+export type ConciergeBadgeTier = "full" | "short" | "terse" | "micro";
+
+/**
+ * Pick the badge's phrasing for a column width.
+ *
+ * Pure and exported for the reason {@link stageChipShows} states for itself: jsdom has no layout
+ * engine, so a test that rendered the row and measured would read 0 for every width and pass
+ * vacuously. The component measures; this decides, and `concierge-header-probe` checks the decision
+ * against real pixels.
+ *
+ * 0 IS "NOT MEASURED YET" AND TAKES THE FULL FORM, matching `stageChipShows`. Booting into an
+ * abbreviated form and expanding a frame later is a visible flicker — and the fail-open direction
+ * is the honest one, since the full phrase is the one that states its window in words.
+ */
+export function conciergeBadgeTier(columnWidthPx: number, hasQueue: boolean = false): ConciergeBadgeTier {
+  if (!(columnWidthPx > 0)) return "full";
+  // A PIXEL ALLOWANCE, NOT A RUNG SHIFT. The first version of this simply stepped the ladder down
+  // one whenever a queue existed, which made `full` UNREACHABLE at any width: a 1000px column with
+  // a queue dropped the spelled-out window with hundreds of pixels to spare — the exact opposite of
+  // the fail-open rule this function documents above. The underlying fact is a fixed WIDTH cost
+  // (measured: 66-74px spelled out, 31px abbreviated), so it is charged as width.
+  const allowance = hasQueue ? CONCIERGE_QUEUE_SEGMENT_PX : 0;
+  const terseAllowance = hasQueue ? CONCIERGE_QUEUE_SEGMENT_TERSE_PX : 0;
+  const tier =
+    columnWidthPx >= CONCIERGE_BADGE_FULL_MIN_COLUMN_PX + allowance
+      ? "full"
+      : columnWidthPx >= CONCIERGE_BADGE_SHORT_MIN_COLUMN_PX + allowance
+        ? "short"
+        : // The queue segment ABBREVIATES at the two narrow tiers, so it costs less there — which
+          // is why the allowance is not one number. Evaluating top-down keeps this non-circular:
+          // each rung already knows which spelling of the segment it would render.
+          columnWidthPx >= CONCIERGE_BADGE_TERSE_MIN_COLUMN_PX + terseAllowance
+          ? "terse"
+          : "micro";
+  // ══ THE THIRD SEGMENT THE BUDGETS WERE NOT MEASURED WITH ═════════════════════════════════════
+  //
+  // Every width above was calibrated against the TWO-segment badge (live + recent). The queue
+  // segment sits BETWEEN them and is suppressed at zero, so it is invisible to a fixture that
+  // seeds no queue — which is exactly how the first version of this ladder shipped a budget that
+  // the row's own documented common case (`0 active now · 16 queued · 12 in the last hour`)
+  // blows straight through. The badge is one nowrap span, so the ellipsis eats the TAIL: the
+  // windowed count. That is the one thing this whole change exists to keep on screen.
+  //
+  // So a queue present raises every threshold by what the segment actually costs — see
+  // {@link CONCIERGE_QUEUE_SEGMENT_PX}. A wide column keeps the full phrase; only the crowded
+  // widths step down.
+  return tier;
+}
+
+/**
+ * What the spelled-out queue segment costs the badge, in px — ` · 123 queued`, measured in the
+ * row's own 12px face. The three-digit form on purpose: a budget calibrated on `16` is wrong the
+ * first time a queue reaches a hundred, and this is a ceiling, not an average.
+ */
+export const CONCIERGE_QUEUE_SEGMENT_PX = 74;
+
+/** The same segment abbreviated — ` · 16 q`, measured the same way. */
+export const CONCIERGE_QUEUE_SEGMENT_TERSE_PX = 31;
+
+/**
+ * The words for the queue segment at each tier.
+ *
+ * ON THE LADDER LIKE EVERYTHING ELSE. It used to be the one segment that never shortened, which
+ * made it the segment that pushed the windowed count off the end of the badge. `queued` → `q` at
+ * the two narrow tiers; the number itself is never abbreviated, because a truncated COUNT is a
+ * wrong count rather than a terse one.
+ */
+export function conciergeQueueLabel(n: number, tier: ConciergeBadgeTier): string {
+  return tier === "full" || tier === "short" ? `${n} queued` : `${n} q`;
+}
+
+/**
+ * The words for the recent count at each tier.
+ *
+ * EVERY TIER NAMES THE WINDOW — that is the invariant, not any particular string. An abbreviation
+ * may shed words but never the unit, or it becomes the `· N recently` this bead removed.
+ *
+ * BOTH SPELLINGS ARE PASSED IN, AND BOTH ARE REQUIRED — no defaults. They come from
+ * `RECENT_RESEARCH_WINDOW_LABEL` / `RECENT_RESEARCH_WINDOW_SHORT_LABEL`, which are derived from the
+ * bound `recentTasks` actually enforces. An earlier version defaulted them to literals, which put a
+ * hardcoded `"last hr"` on the tier the DEFAULT column width lands on: change the window and that
+ * badge would state a period nothing enforces, believed, with every test green. A required
+ * parameter makes that unrepresentable rather than merely discouraged.
+ */
+export function conciergeRecentLabel(
+  n: number,
+  tier: ConciergeBadgeTier,
+  /** The spelled-out window, from the store's `RECENT_RESEARCH_WINDOW_LABEL`. */
+  windowLabel: string,
+  /** The abbreviated window, from the store's `RECENT_RESEARCH_WINDOW_SHORT_LABEL`. */
+  shortWindowLabel: string,
+): string {
+  return tier === "full" ? `${n} in ${windowLabel}` : `${n} ${shortWindowLabel}`;
+}
+
+/**
+ * The words for the live gauge at each tier.
+ *
+ * "ACTIVE", NEVER "RUNNING", wherever it still has a word: the gauge counts `queued` + `running`
+ * (`phaseOf`), so "running" overclaims for a dispatched-but-unstarted task — which is what the aria
+ * label used to say. `micro` drops to the bare number, the last thing shed and only below 200px,
+ * because the recent count's UNIT outranks it.
+ */
+export function conciergeLiveLabel(n: number, tier: ConciergeBadgeTier): string {
+  if (tier === "micro") return `${n}`;
+  return tier === "terse" ? `${n} active` : `${n} active now`;
+}
