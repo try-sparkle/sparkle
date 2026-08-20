@@ -27,6 +27,7 @@ import {
   AGENT_FEEDBACK_DRAIN_STEP,
   PIPELINE_HEALTH_SCAN_HEADER,
   PIPELINE_HEALTH_LABEL,
+  NEVER_IDLE_HEADER,
   sparklePersona,
   sparkleMissionPrompt,
   sparkleChatOnlyMissionPrompt,
@@ -282,6 +283,38 @@ describe("sparklePersona — consent branching", () => {
     const p = sparklePersona(LOG_DIR, REPO, "never", "unknown", { attended: false });
     expect(p).not.toContain(PIPELINE_HEALTH_SCAN_HEADER);
     expect(p).not.toContain("scripts/pipeline-health-scan.sh");
+  });
+
+  it.each(["always", "case_by_case"] as const)(
+    "%s: carries the standing never-idle INTAKE→PULL contract, ahead of the per-pass mechanics",
+    (mode) => {
+      const p = sparklePersona(LOG_DIR, REPO, mode, "unknown", { attended: false });
+      expect(p).toContain(NEVER_IDLE_HEADER);
+      // The contract must name the escape hatch explicitly — "nothing needs the founder" is a thing
+      // to SAY, then advance the backlog, not a licence to go quiet. This is the founder's ask.
+      expect(p).toContain("never be idle");
+      // INTAKE, not pull-only: the loop must scan surfaces nobody reads and FILE beads, or it just
+      // drains the cheap end of an existing list. Pin the two halves and a named surface.
+      expect(p).toContain("INTAKE");
+      expect(p).toContain("ci-autoscale.log");
+      expect(p).toContain("GCP quota");
+      // And "advanced a concrete item" is the end-of-turn bar the enforcement half keys off.
+      expect(p).toContain("ADVANCED A CONCRETE ITEM");
+      // It is a STANDING contract, so it precedes the WHAT YOU WORK ON / WHAT YOU DO mechanics
+      // rather than trailing them as a footnote. Ordering carries the "load-bearing" intent.
+      expect(p.indexOf(NEVER_IDLE_HEADER)).toBeLessThan(p.indexOf("WHAT YOU WORK ON"));
+      expect(p.indexOf(NEVER_IDLE_HEADER)).toBeLessThan(p.indexOf("WHAT YOU DO"));
+    },
+  );
+
+  it("never (chat-only): drops the never-idle contract entirely", () => {
+    // A chat-only session is barred from mining backlog, so a directive telling it to scan surfaces
+    // and pull `bd ready` on its own would contradict the consent it is under. Dropped exactly like
+    // the pipeline/inbox/log sections.
+    const p = sparklePersona(LOG_DIR, REPO, "never", "unknown", { attended: false });
+    expect(p).not.toContain(NEVER_IDLE_HEADER);
+    expect(p).not.toContain("never be idle");
+    expect(p).not.toContain("ci-autoscale.log");
   });
 
   it.each(["always", "case_by_case", "never"] as const)(

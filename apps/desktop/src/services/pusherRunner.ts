@@ -176,6 +176,17 @@ export interface PusherRunnerDeps {
   verifyClaims(claims: readonly PusherClaim[]): Promise<ClaimVerdicts>;
   /** Structured record of every decision, sent or refused. */
   record(entry: PusherLogEntry): void;
+  /**
+   * THE NEVER-IDLE WATCHER, scoped to the Improve Sparkle agent — see `services/improveNudge`.
+   *
+   * Optional so the runner stays generic and its own tests need not supply it: when bound (by
+   * `pusherMount`), the sweep invokes it ONCE per tick, after the enabled gate and BEFORE the
+   * owned-projects early return, so an idle Improve Sparkle agent is nudged even in a window that
+   * happens to own no build partners this cycle. It owns its own decision, its concrete-advance
+   * clock, its cadence and its inert-until-armed gate; the sweep just gives it the tick. Never throws
+   * (the sweep guards it).
+   */
+  nudgeImproveAgent?(): Promise<unknown>;
 }
 
 /**
@@ -262,6 +273,19 @@ export async function sweepPushers(
   // challenge anyway, but doing the sweep to reach that answer would spend a store read and an IPC
   // call per interval, forever, on a feature the user switched off.
   if (!policy.enabled) return state;
+
+  // THE NEVER-IDLE WATCHER runs on the Pusher's tick, before the build-partner walk — it is about
+  // the Improve Sparkle agent, not a build partner, so it must not be gated out by a sweep that owns
+  // no build snapshots this cycle. Its own decision handles ownership, cadence, the concrete-advance
+  // clock and the inert-until-armed gate; here it only needs the tick. Guarded so a failure never
+  // takes the sweep down.
+  if (deps.nudgeImproveAgent !== undefined) {
+    try {
+      await deps.nudgeImproveAgent();
+    } catch (e) {
+      log.warn("pusher", "never-idle nudge failed", { error: String(e) });
+    }
+  }
 
   const owned = deps.snapshots().filter((s) => deps.ownsProject(s.projectId));
   if (owned.length === 0) return state;

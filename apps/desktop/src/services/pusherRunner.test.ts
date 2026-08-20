@@ -1049,3 +1049,47 @@ describe("conflicting PRs reach the report through the sweep", () => {
     expect(sent.filter((s) => s.text.includes("#1091"))).toHaveLength(1);
   });
 });
+
+// ── The never-idle watcher rides the Pusher's tick (services/improveNudge owns the decision). ─────
+// These prove only the WIRING — that the sweep invokes the hook, on the right gate — not the nudge
+// rule, which is pinned in improveNudge.test.ts.
+describe("the never-idle watcher rides the pusher tick", () => {
+  it("invokes the hook once per sweep, even when no build partner is owned this cycle", async () => {
+    let calls = 0;
+    // No owned snapshots: the sweep returns early for the partner walk, but the watcher must still
+    // run — it is about the Improve Sparkle agent, not a build partner.
+    const { deps } = fakeDeps({
+      snapshots: () => [],
+      nudgeImproveAgent: async () => {
+        calls += 1;
+      },
+    });
+    await sweepTimes(deps, 3);
+    expect(calls).toBe(3);
+  });
+
+  it("does NOT invoke the hook when the Pusher is disabled", async () => {
+    let calls = 0;
+    const { deps } = fakeDeps({
+      policy: () => ({ ...resolvePusherPolicy({}), enabled: false }),
+      nudgeImproveAgent: async () => {
+        calls += 1;
+      },
+    });
+    await sweepTimes(deps, 2);
+    expect(calls).toBe(0);
+  });
+
+  it("a throwing watcher never takes the partner sweep down", async () => {
+    const { deps, sent } = fakeDeps({
+      nudgeImproveAgent: async () => {
+        throw new Error("boom");
+      },
+    });
+    // The ordinary expired-goal challenge still lands on the second sweep — the watcher's failure is
+    // swallowed and the partner path is untouched.
+    await sweepTimes(deps, 2);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.agentId).toBe("a");
+  });
+});

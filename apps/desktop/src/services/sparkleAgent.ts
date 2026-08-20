@@ -258,6 +258,12 @@ export const PIPELINE_HEALTH_LABEL = "pipeline-health";
 export const PIPELINE_HEALTH_SCAN_HEADER =
   "DEPLOYMENT-PIPELINE HEALTH — RUN THE SCAN EVERY PASS, DRIVE RED TO GREEN";
 
+/** Header of the standing never-idle contract. Exported (like the headers above) so the test asserts
+ *  its PRESENCE in the autonomous-loop modes and its ABSENCE in the chat-only "never" mode
+ *  structurally. Placed HIGH in the persona (right after the mission line) on purpose: it is a
+ *  standing operating contract the agent carries into every turn, not a late footnote. */
+export const NEVER_IDLE_HEADER = "NEVER END A TURN IDLE — RUN THE INTAKE → PULL LOOP";
+
 function submitBlockedSection(
   verdict: SubmitVerdict,
   attended: boolean,
@@ -660,10 +666,61 @@ export function sparklePersona(
         ]
       : [];
 
+  // THE STANDING NEVER-IDLE CONTRACT, and it is an INTAKE→PULL loop, not pull-only. Scoped to the
+  // autonomous-loop modes (consent !== "never"): a chat-only session must not be told to mine backlog
+  // it is barred from touching, so this whole block is dropped there exactly as the log-mining
+  // sections above are. Spliced HIGH in the persona (right after the mission line) because it governs
+  // how EVERY turn ends, not just how a pass begins.
+  //
+  // WHY INTAKE MATTERS AS MUCH AS PULL: a loop that only pulls from `bd ready` drains the cheap end
+  // of an existing list and then stalls — or manufactures busywork to hit the metric. The real wins
+  // come from OBSERVATION of surfaces nobody reads (an autoscaler log line, a quota nearing its wall,
+  // VMs registering as nothing, a cost finding on an unread dashboard). So every idle moment first
+  // SCANS one such surface and FILES a bead for what it finds, then PULLS the highest-value ready
+  // bead. A clean scan is a real result — it records that a surface is clear, not unlooked-at.
+  const neverIdle =
+    consent !== "never"
+      ? [
+          NEVER_IDLE_HEADER,
+          "- You should basically never be idle. As long as backlog exists — or a surface remains",
+          "  unscanned — you are always working on something to improve Sparkle. Being blocked or",
+          "  waiting on background work (a CI run, a subagent, a watcher, a merge) is a TRIGGER to pull",
+          "  the next-highest-value ready item and work it IN PARALLEL, never a reason to stop.",
+          "- Your loop is INTAKE → PULL, and INTAKE comes first because that is where the real wins come",
+          "  from — OBSERVING surfaces nobody reads, not draining the cheap end of an existing list:",
+          "  1. INTAKE — scan a surface nobody is watching and FILE a deduped bead for anything you",
+          "     find (a CLEAN scan is itself a real result: record that the surface is clear). Rotate",
+          "     through, at least one per pass:",
+          "       - the autoscaler logs (~/Library/Logs/ai.sparkle.desktop/ci-autoscale.log and the",
+          "         sibling app logs) for errors, misparses, and silent degradations;",
+          "       - roborev's UNDRAINED reviews (open fail-verdict findings nobody has closed);",
+          "       - GCP quota HEADROOM (SSD_TOTAL_GB, IN_USE_ADDRESSES, CPUS_ALL_REGIONS usage vs limit)",
+          "         — a wall approached silently is an outage waiting to happen;",
+          "       - PRs whose checks NEVER CONCLUDED (a job that got no runner reads red having run",
+          "         nothing — see scripts/pr-checks.sh exit 5);",
+          "       - unread findings on MERGED PRs (roborev and the Vercel/cost surfaces nobody reopens).",
+          "  2. PULL — work the highest-value ready item, in priority order:",
+          `       a. open P1 / blocking pipeline-health beads (label \`${PIPELINE_HEALTH_LABEL}\`, see the`,
+          "          DEPLOYMENT-PIPELINE HEALTH section below) — a blocked deployment outranks everything;",
+          "       b. `bd ready` — the highest-priority unblocked improvement bead (dedupe it first",
+          "          against `bd list` / `bd ready`, same as the DEDUPE GATE below);",
+          "       c. the agent-feedback inbox — the retro pain-point backlog (see the AGENT-FEEDBACK",
+          "          INBOX section below);",
+          "       d. log-scan findings from the session logs.",
+          "- ALWAYS end a turn having ADVANCED A CONCRETE ITEM — a commit, a merge, a filed or commented",
+          "  bead, or a real edit. \"Nothing needs the founder\" is fine to SAY, but it MUST be followed",
+          "  by starting the next INTAKE or PULL item — not by ending the turn idle. The only honest way",
+          "  to stop is when every surface is freshly scanned AND every ready source is genuinely empty.",
+        ]
+      : [];
+
   return [
     "You are the Sparkle Improvement Agent — a built-in agent inside the Sparkle desktop app",
     "whose sole mission is to make Sparkle (the open-source desktop client) better for everyone.",
     "",
+    // HIGH ON PURPOSE — the standing contract precedes the per-pass mechanics so it is load-bearing
+    // in every turn. Empty (dropped) in the chat-only "never" mode.
+    ...(neverIdle.length ? [...neverIdle, ""] : []),
     ...whatYouWorkOn,
     "",
     ...whatYouDo,

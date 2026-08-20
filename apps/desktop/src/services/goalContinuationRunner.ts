@@ -764,8 +764,10 @@ function markContinued(agentId: string, now: number): void {
 }
 
 /** This window's Tauri label, or the single-window default when there is no Tauri (tests, the
- *  browser preview). Never throws — an unanswerable question must not take the sweep down. */
-function currentWindowLabel(): string {
+ *  browser preview). Never throws — an unanswerable question must not take the sweep down.
+ *  Exported so `pusherMount` resolves THIS window's Improve Sparkle id the same way the ownership
+ *  election does, rather than guessing an arbitrary roster match. */
+export function currentWindowLabel(): string {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return APP_WINDOW_LABEL;
   try {
     // Lazy require-shaped access so the module graph doesn't pull Tauri into a non-Tauri context.

@@ -53,10 +53,18 @@ import { useRuntimeStore } from "../stores/runtimeStore";
 import { useConflictStore } from "../stores/conflictStore";
 import { useSettingsStore } from "../stores/settingsStore";
 import { quotaBlockForAgent, lastFailureForAgent } from "../engine/engineRegistry";
+import { useBeadsStore } from "../stores/beadsStore";
+import {
+  ensureSparkleRepo,
+  PIPELINE_HEALTH_LABEL,
+  sparkleAgentIdFor,
+  SPARKLE_PROJECT_ID,
+} from "./sparkleAgent";
+import { sweepImproveNudge, type ImproveNudgeDeps } from "./improveNudge";
 import { getConfig, onConfigChanged, type BabysitConfigPayload } from "./config";
 import { startConflictFlags } from "./conflictFlags";
 import { startBabysitDispatcher } from "./babysitDispatcher";
-import { ownsProjectInThisWindow } from "./goalContinuationRunner";
+import { currentWindowLabel, ownsProjectInThisWindow } from "./goalContinuationRunner";
 import { notifyConcierge } from "./conciergeNotifier";
 import { IMPROVEMENT_INTERVAL_MS } from "./improvementPass";
 import {
@@ -225,6 +233,85 @@ function duties(): readonly StandingDuty[] {
   });
 }
 
+/**
+ * SHIPS-INERT ARM for the never-idle watcher (AGENTS.md "A hook that WRITES ships inert").
+ *
+ * A nudge auto-resumes the Improve Sparkle agent's next turn — a write — so the feature is dormant
+ * until a human explicitly arms it. This is the in-app analogue of `scripts/arm-hook.sh`: a build
+ * ships with `armed === false`, and the founder flips `VITE_SPARKLE_NEVER_IDLE=1` to enable it after
+ * reviewing the operating-contract change. Guarded so a context without `import.meta.env` (a bare
+ * unit test) reads as UNARMED — the fail-closed direction.
+ */
+function neverIdleArmed(): boolean {
+  try {
+    return (import.meta.env?.VITE_SPARKLE_NEVER_IDLE as string | undefined) === "1";
+  } catch {
+    return false;
+  }
+}
+
+/** Live count of the Improve Sparkle project's ready work — the board's `backlog` column (open,
+ *  unblocked, non-stalled, telemetry-filtered) and, counted separately, its open P1 pipeline-health
+ *  beads (so a blocked-but-open P1 still says "there is work"). Both read from the 5s beads poll's
+ *  cached snapshot — no `bd` shell call on this 60s tick, which is what keeps the watcher cheap. */
+function improveReadyBacklog(): { ready: number; p1PipelineHealth: number } {
+  const snap = useBeadsStore.getState().byProject[SPARKLE_PROJECT_ID];
+  if (snap === undefined) return { ready: 0, p1PipelineHealth: 0 };
+  const p1PipelineHealth = snap.beads.filter(
+    (b) => b.status === "open" && b.priority === 1 && b.labels.includes(PIPELINE_HEALTH_LABEL),
+  ).length;
+  return { ready: snap.board.backlog.length, p1PipelineHealth };
+}
+
+/**
+ * The improve agent's advance fingerprint — keyed off the ONE signal reliably populated for this
+ * agent: its own pane `status` (written by `SparkleAgentPane`'s `onStatus`). It MOVES whenever the
+ * agent's own turn re-opens (`idle` ↔ `working`), so a run of the SAME resting status across the whole
+ * interval reads as "did not advance", and an agent whose own turn is doing the work shows `working`
+ * and is never judged idle — the concierge's correction (children-exist must not read as busy).
+ *
+ * ── HONEST LIMITS OF THIS v1 SIGNAL, stated because the reviews are right about them (roborev 66034) ─
+ * This is a COARSE PROXY, not a true concrete-advance detector, in two ways a follow-up should close
+ * with a cumulative BRANCH-STATUS signal (commit count + edit count, polled from the worktree):
+ *   • At the decision instant the pane is by definition resting (the decision only reaches the advance
+ *     check when `paneStatus ∈ RESTING`), so `advancedRecently` degenerates to "the pane has been at
+ *     the same rest for the interval" — it does not measure a commit or an edit directly.
+ *   • It samples a LEVEL on the ~60s tick, so a whole working turn that opens and closes between two
+ *     ticks is invisible. An agent doing a run of sub-minute turns could read as flat.
+ * The consequence is a possible SPURIOUS nudge (a low-harm inbox message, rate-limited to 10 min) for
+ * an agent doing very short turns — never a missed one. That residual is acceptable for a v1 that
+ * SHIPS INERT behind the arming gate and is reviewed before it is switched on; it is not acceptable as
+ * a permanent design, hence the branch-status follow-up.
+ *
+ * `undefined` status → `null` (UNREADABLE → the watcher does not judge idle), the fail-safe direction.
+ */
+function improveAdvanceFingerprint(agentId: string): string | null {
+  return useRuntimeStore.getState().status[agentId] ?? null;
+}
+
+/**
+ * The never-idle watcher's evidence, bound to the live stores. Resolves THIS window's own Improve
+ * Sparkle id the same way the ownership election does (`sparkleAgentIdFor(currentWindowLabel())`) and
+ * uses that ONE id for the pane read, the advance read AND the send — so the agent whose idleness is
+ * judged is the agent that is nudged (roborev 66020/66021), and the message lands in the inbox that
+ * agent actually drains (`SPARKLE_INBOX_AGENT` is the pane's own id).
+ */
+export function buildImproveNudgeDeps(): ImproveNudgeDeps {
+  const improveAgentId = (): string => sparkleAgentIdFor(currentWindowLabel());
+  return {
+    now: () => Date.now(),
+    armed: neverIdleArmed,
+    ownsProject: () => ownsProjectInThisWindow(SPARKLE_PROJECT_ID),
+    consentIsNever: () => useSettingsStore.getState().sparkleImprovementConsent === "never",
+    paneStatus: () => useRuntimeStore.getState().status[improveAgentId()],
+    advanceFingerprint: () => improveAdvanceFingerprint(improveAgentId()),
+    readyBacklog: improveReadyBacklog,
+    // Reuses `sendVerified`, so the nudge is confirmed to land exactly like a Pusher challenge, and it
+    // does NOT append `BLOCKER_ASK` (that is the challenge path's job).
+    send: (text) => sendVerified(improveAgentId(), text),
+  };
+}
+
 /** Everything the sweep can tell us, bound to the live stores. */
 export function buildPusherDeps(): PusherRunnerDeps {
   return {
@@ -312,6 +399,10 @@ export function buildPusherDeps(): PusherRunnerDeps {
     // sweep is about to say something, so the quiet path stays IPC-free.
     verifyClaims: makePusherVerifier(verifierDeps()),
     record: recordDecision,
+    // THE NEVER-IDLE WATCHER, riding the Pusher's tick. Rebuilds its deps each call so it reads the
+    // live stores fresh, exactly like `snapshots()`/`duties()` above. Scoped to the Improve Sparkle
+    // agent — no ordinary build agent's nudge behaviour is touched.
+    nudgeImproveAgent: () => sweepImproveNudge(buildImproveNudgeDeps()),
   };
 }
 
@@ -407,6 +498,37 @@ export function startPusher(): () => void {
   // Ticking at the floor is what lets a config change take effect without a restart — a timer built
   // from a policy that had not loaded yet would be stuck at the default for the life of the window.
   const stopRunner = startPusherRunner(buildPusherDeps(), MIN_TICK_MS);
+
+  // THE BACKLOG FEED FOR THE NEVER-IDLE WATCHER. Nothing else polls the sparkle-self beads into
+  // `beadsStore` — it is a synthetic project id with no BoardView — so without this the watcher's
+  // `readyBacklog()` would read an empty snapshot forever and never fire (roborev 66020). A `passive`
+  // poll (the same kind EpicsColumn claims) reads the board on the slow cadence without the board
+  // watchers.
+  //
+  // GATED EXACTLY LIKE THE NUDGE ITSELF, and this is not optional (roborev 66034): `ensureSparkleRepo`
+  // can `git clone` the OSS repo on a fresh machine, and a `bd` poll writes to the single-writer Dolt
+  // store the improve agent is concurrently using. Neither may happen on a build where the feature is
+  // dormant, nor from a window that does not own the project (`startPusher` is per-window). So the
+  // poll starts ONLY when armed, not chat-only, and this window owns sparkle-self — the same three
+  // gates `decideImproveNudge` refuses on — and it re-checks them once the async repo resolve returns.
+  let stopSparkleBeadsPoll: (() => void) | undefined;
+  const backlogFeedWanted = (): boolean =>
+    neverIdleArmed() &&
+    useSettingsStore.getState().sparkleImprovementConsent !== "never" &&
+    ownsProjectInThisWindow(SPARKLE_PROJECT_ID);
+  if (backlogFeedWanted()) {
+    void ensureSparkleRepo()
+      .then((ws) => {
+        if (stopped || !backlogFeedWanted()) return;
+        useBeadsStore.getState().startPolling(SPARKLE_PROJECT_ID, ws.repoPath, undefined, "passive");
+        stopSparkleBeadsPoll = () => useBeadsStore.getState().stopPolling(SPARKLE_PROJECT_ID, "passive");
+      })
+      .catch((e) =>
+        log.warn("pusher", "sparkle beads poll failed to start; never-idle backlog stays empty", {
+          error: String(e),
+        }),
+      );
+  }
 
   // THE EVIDENCE FEED FOR `pr-conflicting`, started here because the Pusher is its only consumer.
   // Best-effort in the same way the config read is: a probe that cannot start leaves the store at
@@ -567,6 +689,7 @@ export function startPusher(): () => void {
   return () => {
     stopped = true;
     stopRunner();
+    stopSparkleBeadsPoll?.();
     stopConflicts?.();
     stopBabysit?.();
     babysitUnlisten?.();
