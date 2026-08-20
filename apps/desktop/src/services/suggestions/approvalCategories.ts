@@ -139,3 +139,77 @@ export const RESUME_RULE_LABEL: Record<ResumeRule, string> = {
   summary: "Resume from summary",
   full: "Resume full session",
 };
+
+// --- Plan exit (a THIRD sibling of the six categories, with its own value domain) --------------
+// `[approvals].plan` lives in the same TOML table and rides the same per-project override
+// machinery, but — like `resume` — it is NOT an ApprovalCategory: its values are
+// "ask" | "auto" | "manual", not "always"/"never".
+//
+// THE PROMPT IT ANSWERS. When a Claude Code agent finishes writing a plan it stops on:
+//
+//     Claude has written up a plan and is ready to execute. Would you like to proceed?
+//       1. Yes, and use auto mode
+//       2. Yes, manually approve edits
+//       3. Tell Claude what to change
+//
+// and waits. `classifyApproval` refuses it BY CONSTRUCTION — `looksLikePermission` demands a plain
+// "Yes" AND a "No", and this dialog has neither (every affirmative is a "Yes, and …" continuation).
+// That refusal is correct and stays: a blind Approve press on a continuation option is exactly the
+// hazard `optionText`'s comment records. So the answer is not to loosen the classifier but to give
+// this ONE question its own detector and its own rule — matched by its QUESTION TEXT, never by
+// option number, since "1." labels identical menus across completely different questions.
+//
+// WHY IT DEFAULTS ON, unlike `resume`. An unanswered plan prompt is not a neutral pause: the agent
+// has already done the thinking and simply sits, indefinitely, until a human presses a key. That
+// blocked a real PR for hours with a complete and correct diagnosis already on screen. The cost of
+// the default being wrong is small and self-correcting (the agent executes a plan it just wrote,
+// under the same approval rules everything else runs under); the cost of no default is a stalled
+// fleet. Opting out is one key — `plan = "ask"` — or the [ai].auto_approve master switch.
+
+/** How to answer Claude Code's plan-exit prompt. "auto" = pick "Yes, and use auto mode" (default);
+ *  "manual" = pick "Yes, manually approve edits"; "ask" = surface it and let the human decide. */
+export type PlanRule = "ask" | "auto" | "manual";
+
+/** The default when the key is absent or unrecognized: proceed into auto mode. See the note above
+ *  for why this sibling defaults ON where `resume` defaults to "ask".
+ *
+ *  ONE INTERACTION WORTH KNOWING, because "auto mode" is not scoped to this one prompt: Claude Code
+ *  keeps it for the rest of the session, so it stops emitting edit prompts entirely. Under Sparkle's
+ *  own shipped config that changes nothing — every `[approvals]` category already ships `"always"`,
+ *  so those prompts were being auto-answered anyway. It DOES matter if you have set a category to
+ *  `"never"` to get its prompts back: auto mode would remove them again. `plan = "manual"` is the
+ *  setting for that — it ends the stall just as well and leaves your per-category rules in force. */
+export const DEFAULT_PLAN_RULE: PlanRule = "auto";
+
+/** Narrow an arbitrary value (config / older backend) to a valid {@link PlanRule}, else the
+ *  default. Junk degrades to the DOCUMENTED default rather than to the strictest value, the same
+ *  contract `asResumeRule` and `asConciergeAnswers` keep. */
+export function asPlanRule(v: unknown): PlanRule {
+  return v === "ask" || v === "auto" || v === "manual" ? v : DEFAULT_PLAN_RULE;
+}
+
+/**
+ * The complaint to surface when `[approvals].plan` holds a value this key does not accept, or null
+ * when there is nothing to say.
+ *
+ * Same reasoning as {@link resumeRuleComplaint}: `plan` is a SIBLING of the categories with a
+ * DIFFERENT value domain, so writing the value that works for every neighbouring key
+ * (`plan = "always"`) silently narrows to the default with nothing anywhere saying so. Absent/empty
+ * is not a complaint — that is the documented default, not a mistake.
+ */
+export function planRuleComplaint(v: unknown): string | null {
+  if (v === undefined || v === null || v === "") return null;
+  if (v === "ask" || v === "auto" || v === "manual") return null;
+  return (
+    `[approvals].plan = ${JSON.stringify(v)} is not a valid value and was ignored ` +
+    `(falling back to "${DEFAULT_PLAN_RULE}"). Unlike the permission categories, plan does not ` +
+    `take "always"/"never" — use "auto", "manual", or "ask".`
+  );
+}
+
+/** The one friendly label per plan choice, as it reads in the approvals pane. */
+export const PLAN_RULE_LABEL: Record<PlanRule, string> = {
+  ask: "Ask me each time",
+  auto: "Proceed in auto mode",
+  manual: "Proceed, approve edits",
+};

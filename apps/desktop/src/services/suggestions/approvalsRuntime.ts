@@ -17,14 +17,19 @@ import { notePromptAnswerOutcome } from "../../engine/blockedPromptGrace";
 import { classifyApproval, headerRegion } from "./approvalClassifier";
 import { mcpAutoAnswerable, mcpToolFromPrompt, isDeniedTool } from "./mcpToolPolicy";
 import { detectResumePrompt, pickerSignature } from "./heuristics";
+import { detectPlanPrompt } from "./planPrompt";
+import { routeUnclassifiedPrompt } from "./conciergeEscalation";
 import { handOffToConcierge } from "./conciergeHandoff";
 import {
   toApprovalMap,
   asResumeRule,
   resumeRuleComplaint,
+  asPlanRule,
+  planRuleComplaint,
   type ApprovalCategory,
   type ApprovalRule,
   type ResumeRule,
+  type PlanRule,
 } from "./approvalCategories";
 import { log } from "../../logger";
 
@@ -93,7 +98,11 @@ function declineOrHandOff(agentId: string, scrollback: string): null {
  * what changes is that the rejection now has somewhere to go. BOTH arms are attached deliberately —
  * a `.then(ok)` alone would turn every dead-PTY auto-approve into an unhandled rejection.
  */
-function typeAutoAnswer(agentId: string, keystroke: string, what: "auto-approve" | "auto-resume") {
+function typeAutoAnswer(
+  agentId: string,
+  keystroke: string,
+  what: "auto-approve" | "auto-resume" | "auto-plan",
+) {
   // Chained: the option keystroke carries its own CR (see pty.writePtyChainedStrict).
   void writePtyChainedStrict(agentId, keystroke).then(
     () => {
@@ -261,6 +270,135 @@ export function maybeAutoResume(
   return rule;
 }
 
+/**
+ * What {@link maybeAutoPlan} did with the screen it was handed.
+ *
+ * `"asked"` IS THE LOAD-BEARING VALUE, and it is why this is not just `PlanRule | null`. Returning a
+ * bare null for "I recognised the plan prompt and deliberately did not press it" let the caller fall
+ * through to {@link maybeAutoApprove}, which cannot classify this dialog and therefore hands it to
+ * the CONCIERGE — so `plan = "ask"`, whose whole promise is "ask me", ended with the prompt answered
+ * by something else. `"asked"` means CLAIMED: this module has decided the screen's fate (surfaced it,
+ * or routed it to the founder) and the caller must not offer it to another answerer.
+ */
+export type PlanOutcome = Exclude<PlanRule, "ask"> | "asked";
+
+/**
+ * Decide whether to auto-answer Claude Code's PLAN-EXIT prompt (if any) currently in `scrollback`,
+ * and if so type the chosen affirmative's keystroke into the PTY exactly once per picker instance.
+ *
+ * Returns the mode it answered with ("auto" | "manual"), `"asked"` when it recognised the prompt and
+ * deliberately left it for a human (see {@link PlanOutcome}), or null when this is not the plan-exit
+ * prompt at all and the caller should carry on as before.
+ *
+ * ── WHY THIS PATH EXISTS AT ALL ───────────────────────────────────────────────────────────────
+ * An agent that has finished writing a plan STOPS on this dialog and waits for a keypress. Nothing
+ * in Sparkle answered it: {@link maybeAutoApprove}'s classifier refuses it by construction (no plain
+ * "Yes", no "No" — every affirmative is a "Yes, and …" continuation) and that refusal is correct,
+ * because pressing a continuation blind is the exact hazard `approvalClassifier.optionText` records.
+ * The result was an agent sitting indefinitely with a complete, correct plan on screen until a human
+ * walked over and pressed 1 — which blocked a real PR for hours.
+ *
+ * So this is the same SIBLING shape as {@link maybeAutoResume}: one question, recognised by its own
+ * QUESTION TEXT (never by option number — "1." labels identical menus across unrelated questions),
+ * with its own `[approvals].plan` rule and its own value domain. The approval classifier is left
+ * exactly as strict as it was.
+ *
+ * ── THE ESCALATION GATE IS NOT OPTIONAL, AND IT RUNS BEFORE THE PRESS ─────────────────────────
+ * Plan dialogs ALREADY had a governance path: `handOffToConcierge` → `routeUnclassifiedPrompt`
+ * applies the founder's boundary (bead `sparkle-iwhzt`, his words: "spend, credentials, and product
+ * direction stay with you; everything else I approve") over the dialog's question AND its option
+ * labels. A local regex that presses first would make those classes unreachable for exactly the
+ * dialog they were written for — a plan is the densest statement of intent an agent ever puts on
+ * screen, so it is the LAST place to press without reading. `routeUnclassifiedPrompt` is called
+ * rather than re-implemented so the gate reads the same text the router would have, by construction.
+ *
+ * ── WHY PLAN-*MODE* AGENTS ARE NOT EXEMPT ─────────────────────────────────────────────────────
+ * An agent deliberately spawned with `--permission-mode plan` to produce a plan for a human to read
+ * is a real case, and it was considered and rejected as an exemption (founder's call). Two reasons.
+ * First, this dialog is not where a plan gets READ: the plan is already written into the transcript
+ * above it, and it stays there whichever option is pressed — the only thing the prompt decides is
+ * whether the agent now sits idle or starts working. Second, an exemption would have to be keyed on
+ * spawn-time intent that this module cannot see from the scrollback, so it would be a guess about a
+ * human's purpose enforced by a regex. The honest control is the rule itself: `plan = "ask"` at
+ * global or project scope, which is one visible setting rather than an invisible special case.
+ *
+ * SECURITY: the keystroke comes ONLY from the local heuristic detector (detectPlanPrompt), never
+ * from the AI/learned suggestion tier — preserving the raw-keystroke trust boundary.
+ */
+export function maybeAutoPlan(
+  agentId: string,
+  scrollback: string,
+  handled: Set<string>,
+): PlanOutcome | null {
+  const detected = detectPlanPrompt(scrollback);
+  // No report — the exact parallel of `!classification` / `!detected` above: a screen that is not
+  // the plan-exit prompt is not a decision about anything.
+  if (!detected) return null;
+  // THE RULE IS READ BEFORE THE MASTER TOGGLE, and the order is load-bearing. An explicit
+  // `plan = "ask"` is a statement about WHO decides, and it must hold whichever way the blind
+  // presser is switched — checking the toggle first meant that turning OFF the more conservative
+  // switch let the screen fall through to `maybeAutoApprove` → the concierge, which then answered
+  // the prompt the opt-out promised to surface. The identical leak this path exists to close,
+  // reached from the cautious direction.
+  const root = projectRootForAgent(agentId);
+  const rule = effectivePlanRule(root);
+  if (rule === "ask") {
+    // CLAIMED, and deliberately `declined` rather than `declineOrHandOff`. An explicit "ask me" is a
+    // statement about WHO decides, not merely about who presses — routing it onward would let the
+    // concierge answer the prompt the founder just said he wanted to see, which is the opposite of
+    // what the settings row promises.
+    declined(agentId);
+    return "asked";
+  }
+  // Gated on the SAME master toggle as auto-approve — a sub-option of it, so it must never PRESS
+  // while the parent is off. NOT claimed, deliberately: switching off the blind presser says nothing
+  // about whether the concierge may READ this prompt and answer it (that is `concierge_answers`), so
+  // an unset/auto/manual rule leaves the screen to `maybeAutoApprove`'s existing hand-off exactly as
+  // it was before this path existed.
+  //
+  // `declineOrHandOff`, NOT a bare `declined`. Reporting a decline and THEN letting the caller hand
+  // off is the one combination `declineOrHandOff`'s own doc forbids, and both of its outcomes are
+  // wrong: a feed rebuild between the two writes latches the sticky `gaveUp` and interrupts the
+  // founder for a prompt the concierge accepted, and no rebuild means the later `escalated`
+  // overwrites the `declined` in the last-wins ledger so the report never happens at all. The
+  // hand-off is de-duped per picker signature, so `maybeAutoApprove`'s second attempt is a no-op
+  // re-stamp and `declined` fires only when the hand-off genuinely refuses.
+  if (!aiFeatureVisibleNow("autoApprove")) return declineOrHandOff(agentId, scrollback);
+  // THE FOUNDER'S BOUNDARY, over the same text the router sweeps. A plan that touches spend,
+  // credentials or product direction goes to him even under `plan = "auto"`.
+  const verdict = routeUnclassifiedPrompt(scrollback);
+  if (verdict.route === "founder") {
+    log.info("approvals", "plan prompt escalated rather than auto-answered", {
+      agentId,
+      reason: verdict.reason,
+      founderClass: verdict.reason === "founder-only" ? verdict.founderClass : undefined,
+    });
+    // The hand-off re-runs the same routing and delivers it to him; `declined` is its fallback.
+    declineOrHandOff(agentId, scrollback);
+    return "asked";
+  }
+  const option = rule === "auto" ? detected.autoOption : detected.manualOption;
+  // The option this rule needs is not on THIS build's dialog. Fail safe exactly as the detector
+  // does: surface the prompt rather than pressing the other affirmative, which would silently give
+  // the opposite of what the rule asked for.
+  if (!option) {
+    log.info("approvals", "plan prompt recognised but the rule's option is absent", {
+      agentId,
+      mode: rule,
+    });
+    declineOrHandOff(agentId, scrollback);
+    return "asked";
+  }
+  const sig = pickerSignature(scrollback);
+  // Already answered THIS picker instance: keep buttons suppressed, but never re-send the keystroke
+  // — and never re-report it either (see the same early return in maybeAutoApprove).
+  if (handled.has(sig)) return rule;
+  handled.add(sig);
+  typeAutoAnswer(agentId, option, "auto-plan");
+  log.info("approvals", "auto-answered plan prompt", { agentId, mode: rule });
+  return rule;
+}
+
 /** The project root path that owns `agentId`, or null if it can't be resolved. */
 export function projectRootForAgent(agentId: string): string | null {
   const project = useProjectStore
@@ -296,6 +434,16 @@ export function effectiveResumeRule(root: string | null): ResumeRule {
   return proj ?? global;
 }
 
+/** Effective plan-exit rule for a project (imperative). Project override beats global; when the
+ *  project's value hasn't loaded (or there's no project) the global mirror answers. Always resolves
+ *  to a concrete rule ("auto" is the default), never undefined. */
+export function effectivePlanRule(root: string | null): PlanRule {
+  const global = useSettingsStore.getState().planRule;
+  if (!root) return global;
+  const proj = useApprovalsStore.getState().planByRoot[root];
+  return proj ?? global;
+}
+
 /**
  * Load and keep fresh the effective approval rules for `root` in approvalsStore. Mounted once per
  * project context (the composer). Re-pulls on every `config-changed` (a global OR project write
@@ -317,6 +465,10 @@ export function useSyncProjectApprovals(root: string | null): void {
           const complaint = resumeRuleComplaint(eff.config.approvals?.resume);
           if (complaint) log.warn("approvals", complaint, { root });
           useApprovalsStore.getState().setResumeForRoot(root, asResumeRule(eff.config.approvals?.resume));
+          // The plan sibling rides the same pull, for the same reason and with the same complaint.
+          const planComplaint = planRuleComplaint(eff.config.approvals?.plan);
+          if (planComplaint) log.warn("approvals", planComplaint, { root });
+          useApprovalsStore.getState().setPlanForRoot(root, asPlanRule(eff.config.approvals?.plan));
         })
         .catch((e) => log.debug("approvals", "getConfig failed", { root, e: String(e) }));
     void pull();

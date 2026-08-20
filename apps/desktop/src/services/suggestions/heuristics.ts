@@ -345,7 +345,10 @@ export function genericMenuWindow(scrollback: string): string[] {
   return tail(scrollback);
 }
 
-function parsePickerOptions(scrollback: string): { n: number; label: string }[] {
+/** The picker's `{ n, label }` rows in ascending order, or `[]` when there is no valid picker.
+ *  EXPORTED for `./planPrompt`, which reads the plan-exit dialog's affirmatives by LABEL and must
+ *  see exactly the rows this parser produced — a second parse is the drift a shared one prevents. */
+export function parsePickerOptions(scrollback: string): { n: number; label: string }[] {
   return parsePickerOptionsWithBounds(scrollback).opts;
 }
 

@@ -15,15 +15,18 @@ import {
   setApprovalRule,
   removeApprovalRuleEverywhere,
   setResumeRule,
+  setPlanRule,
 } from "../services/configActions";
 import {
   APPROVAL_CATEGORIES,
   approvalCategoryLabel,
   DEFAULT_RESUME_RULE,
   RESUME_RULE_LABEL,
+  PLAN_RULE_LABEL,
   type ApprovalCategory,
   type ApprovalRule,
   type ResumeRule,
+  type PlanRule,
 } from "../services/suggestions/approvalCategories";
 
 // The ⋯ Settings → "Auto-approve" pane. Lists every category with its current effective rule + the
@@ -78,6 +81,20 @@ function resumeStatusText(effective: ResumeRule, scope: Scope): string {
     : `Auto-resuming the full session ${where}`;
 }
 
+/** The three plan-exit choices, in the order the row lists them. "ask" is listed FIRST like the
+ *  resume row even though it is not this key's default — the column is the opt-out, and putting it
+ *  where the eye already looks for it matters more than mirroring the default's position. */
+const PLAN_CHOICES: readonly PlanRule[] = ["ask", "auto", "manual"] as const;
+
+/** Human-readable status for the plan row given the effective rule + the scope it came from. */
+function planStatusText(effective: PlanRule, scope: Scope): string {
+  if (effective === "ask") return "Asks you before an agent starts executing its plan";
+  const where = scope === "project" ? "in this project" : "in all projects";
+  return effective === "auto"
+    ? `Proceeding in auto mode ${where}`
+    : `Proceeding with edits approved one by one ${where}`;
+}
+
 export function ApprovalsMenu() {
   const projectId = useCurrentProjectId();
   const projectRoot = useProjectStore(
@@ -90,6 +107,9 @@ export function ApprovalsMenu() {
   // Session-resume sibling: its own global mirror + per-project effective value.
   const globalResume = useSettingsStore((s) => s.resumeRule);
   const projResume = useApprovalsStore((s) => (projectRoot ? s.resumeByRoot[projectRoot] : undefined));
+  // Plan-exit sibling: same shape again (own global mirror + per-project effective value).
+  const globalPlan = useSettingsStore((s) => s.planRule);
+  const projPlan = useApprovalsStore((s) => (projectRoot ? s.planByRoot[projectRoot] : undefined));
   // VISIBLE gate (flag only): show the pane content regardless of credits, but tell the user when
   // the master toggle is off so a rule they set here won't fire.
   const featureOn = useAiFeatureVisible("autoApprove");
@@ -197,6 +217,41 @@ export function ApprovalsMenu() {
           </div>
         );
       })()}
+      {(() => {
+        // Plan-exit row. The switch that decides whether an agent which has just finished writing a
+        // plan starts working, or sits on "Would you like to proceed?" until a human presses a key.
+        // Ships ON ("auto") — see DEFAULT_PLAN_RULE for why this sibling defaults the opposite way
+        // to Session resume — so this row is where you turn it OFF, globally or for one project.
+        const effProjPlan: PlanRule = projPlan ?? globalPlan;
+        const overriding = projPlan !== undefined && projPlan !== globalPlan;
+        const scope: Scope = overriding ? "project" : effProjPlan !== "ask" ? "global" : null;
+        return (
+          <div key="__plan" style={{ ...row, borderBottom: "none", paddingBottom: 0 }}>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, minWidth: 0, flex: 1 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+                <span style={{ color: C.cream, fontWeight: FONT_WEIGHT.semibold, fontSize: 13 }}>
+                  Start executing a plan
+                </span>
+                <span style={{ color: C.muted, fontSize: 12 }}>
+                  {planStatusText(effProjPlan, scope)}
+                </span>
+              </div>
+              <PlanScopeGroup
+                label="All projects"
+                active={globalPlan}
+                onChoose={(rule) => void setPlanRule(rule, "global", projectRoot)}
+              />
+              <PlanScopeGroup
+                label="This project"
+                active={effProjPlan}
+                disabled={!projectRoot}
+                disabledTitle={projectRoot ? undefined : "No project in focus"}
+                onChoose={(rule) => void setPlanRule(rule, "project", projectRoot)}
+              />
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -230,6 +285,44 @@ function ResumeScopeGroup({
             onClick={() => onChoose(rule)}
           >
             {rule === DEFAULT_RESUME_RULE ? "Ask each time" : RESUME_RULE_LABEL[rule]}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** One scope's three-way plan-exit choice (Ask / Auto / Manual). Mirrors {@link ResumeScopeGroup};
+ *  kept as its own component rather than generalized because the two rows have different value
+ *  domains and different defaults, and folding them would make each read as the other's special
+ *  case. */
+function PlanScopeGroup({
+  label,
+  active,
+  disabled,
+  disabledTitle,
+  onChoose,
+}: {
+  label: string;
+  active: PlanRule;
+  disabled?: boolean;
+  disabledTitle?: string;
+  onChoose: (rule: PlanRule) => void;
+}) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+      <span style={{ color: C.muted, fontSize: 12, minWidth: 78 }}>{label}</span>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        {PLAN_CHOICES.map((rule) => (
+          <button
+            key={rule}
+            type="button"
+            style={btn(!disabled && active === rule)}
+            disabled={disabled}
+            title={disabled ? disabledTitle : undefined}
+            onClick={() => onChoose(rule)}
+          >
+            {PLAN_RULE_LABEL[rule]}
           </button>
         ))}
       </div>

@@ -28,7 +28,11 @@ vi.mock("../aiGate", () => ({ useAiFeature: () => true }));
 
 vi.mock("../relayClient", () => ({ pushSuggestions: (p: unknown) => h.pushSuggestions(p) }));
 
-vi.mock("./approvalsRuntime", () => ({ maybeAutoApprove: () => null, maybeAutoResume: () => null }));
+vi.mock("./approvalsRuntime", () => ({
+  maybeAutoApprove: () => null,
+  maybeAutoResume: () => null,
+  maybeAutoPlan: () => null,
+}));
 
 import { useSuggestions , resetSuggestionMemory } from "./useSuggestions";
 import { useRuntimeStore } from "../../stores/runtimeStore";

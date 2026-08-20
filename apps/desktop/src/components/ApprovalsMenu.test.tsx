@@ -9,10 +9,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Config writers → spies (the real ones invoke Tauri).
 const setResumeRule = vi.fn();
+const setPlanRule = vi.fn();
 const setApprovalRule = vi.fn();
 const removeApprovalRuleEverywhere = vi.fn();
 vi.mock("../services/configActions", () => ({
   setResumeRule: (...a: unknown[]) => setResumeRule(...a),
+  setPlanRule: (...a: unknown[]) => setPlanRule(...a),
   setApprovalRule: (...a: unknown[]) => setApprovalRule(...a),
   removeApprovalRuleEverywhere: (...a: unknown[]) => removeApprovalRuleEverywhere(...a),
 }));
@@ -34,9 +36,10 @@ const ROOT = "/repo";
 
 beforeEach(() => {
   setResumeRule.mockClear();
+  setPlanRule.mockClear();
   currentProjectId = null;
-  useSettingsStore.setState({ approvals: {}, resumeRule: "ask" });
-  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {} });
+  useSettingsStore.setState({ approvals: {}, resumeRule: "ask", planRule: "auto" });
+  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {}, planByRoot: {} });
   useProjectStore.setState({ projects: [] });
 });
 afterEach(() => cleanup());
@@ -101,5 +104,63 @@ describe("ApprovalsMenu — Session resume row", () => {
     // The all-projects "Resume from summary" is highlighted (teal background) when it's the effective rule.
     const active = summaryButtons()[0]!;
     expect(active.style.background).not.toBe("transparent");
+  });
+});
+
+// The row that makes the plan-exit auto-answer VISIBLE and turn-off-able — the founder's explicit
+// constraint on the feature ("governed by a setting the founder can see and turn off"). These cases
+// are what would fail if the behaviour shipped with no surface for it.
+describe("ApprovalsMenu — Start executing a plan row", () => {
+  /** Both scope groups carry an "Ask me each time" button; [0] = all-projects, [1] = this-project. */
+  const askButtons = () => screen.getAllByRole("button", { name: "Ask me each time" });
+
+  it("renders the three plan choices in both scope groups", () => {
+    render(<ApprovalsMenu />);
+    expect(screen.getByText("Start executing a plan")).toBeTruthy();
+    expect(askButtons().length).toBe(2);
+    expect(screen.getAllByRole("button", { name: "Proceed in auto mode" }).length).toBe(2);
+    expect(screen.getAllByRole("button", { name: "Proceed, approve edits" }).length).toBe(2);
+  });
+
+  it("shows the shipped default as ON, so the pane never implies the feature is off", () => {
+    render(<ApprovalsMenu />);
+    expect(screen.getByText(/Proceeding in auto mode in all projects/)).toBeTruthy();
+  });
+
+  it("the opt-out writes global scope; the per-project opt-out writes project scope", () => {
+    currentProjectId = "p1";
+    useProjectStore.setState({
+      projects: [{ id: "p1", name: "repo", rootPath: ROOT, agents: [] }] as never,
+    });
+    render(<ApprovalsMenu />);
+
+    fireEvent.click(askButtons()[0]!); // all projects
+    expect(setPlanRule).toHaveBeenCalledWith("ask", "global", ROOT);
+
+    fireEvent.click(askButtons()[1]!); // this project
+    expect(setPlanRule).toHaveBeenCalledWith("ask", "project", ROOT);
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Proceed, approve edits" })[0]!);
+    expect(setPlanRule).toHaveBeenCalledWith("manual", "global", ROOT);
+  });
+
+  it("disables the this-project plan buttons when no project is in focus", () => {
+    currentProjectId = null;
+    render(<ApprovalsMenu />);
+    const [allProjects, thisProject] = askButtons() as [HTMLButtonElement, HTMLButtonElement];
+    expect(allProjects.disabled).toBe(false);
+    expect(thisProject.disabled).toBe(true);
+    expect(thisProject.getAttribute("title")).toBe("No project in focus");
+  });
+
+  it("reflects a project override over the global rule", () => {
+    currentProjectId = "p1";
+    useProjectStore.setState({
+      projects: [{ id: "p1", name: "repo", rootPath: ROOT, agents: [] }] as never,
+    });
+    useSettingsStore.setState({ planRule: "auto" });
+    useApprovalsStore.setState({ planByRoot: { [ROOT]: "ask" } });
+    render(<ApprovalsMenu />);
+    expect(screen.getByText(/Asks you before an agent starts executing its plan/)).toBeTruthy();
   });
 });

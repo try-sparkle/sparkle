@@ -97,8 +97,8 @@ beforeEach(() => {
   logWarn.mockClear();
   aiFeatureVisibleNow.mockReturnValue(true);
   useProjectStore.setState({ projects: [] });
-  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {} });
-  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask" });
+  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {}, planByRoot: {} });
+  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask", planRule: "auto" });
 });
 
 // ── THE PAIR ─────────────────────────────────────────────────────────────────────────────────────

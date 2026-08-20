@@ -171,6 +171,23 @@ pub struct ApprovalsConfig {
     /// from summary"), or `"full"` (auto-pick "Resume full session"). Any unrecognized value is
     /// treated as "ask". Project [approvals].resume overrides the global value, like the categories.
     pub resume: Option<String>,
+    /// The SECOND value-domain sibling: how to answer Claude Code's PLAN-EXIT prompt — "Claude has
+    /// written up a plan and is ready to execute. Would you like to proceed?" — when
+    /// [ai].auto_approve is on. One of `"auto"` (default — pick "Yes, and use auto mode"),
+    /// `"manual"` (pick "Yes, manually approve edits"), or `"ask"` (surface it). Any unrecognized
+    /// value is treated as the default. Project [approvals].plan overrides the global value.
+    ///
+    /// NOTE THE DEFAULT RUNS THE OTHER WAY TO `resume` DIRECTLY ABOVE, deliberately. A resume mode
+    /// left unanswered costs nothing; a plan prompt left unanswered costs an agent that has already
+    /// finished thinking and now sits idle until a human presses a key — which is the exact stall
+    /// this key was added to end.
+    ///
+    /// "auto" is not scoped to the one prompt: Claude Code keeps auto mode for the rest of the
+    /// session and stops emitting edit prompts. Under the shipped config that changes nothing (every
+    /// category above already defaults to "always", so those prompts were auto-answered anyway), but
+    /// if you set a category to "never" to get its prompts back, use `plan = "manual"` — it ends the
+    /// stall just as well and leaves your per-category rules in force.
+    pub plan: Option<String>,
     /// May a prompt the local classifier declines to answer be handed to the CONCIERGE, which reads
     /// it and answers? Default true (see `impl Default`). Project [approvals].concierge_answers
     /// overrides the global value, exactly like the categories and `resume`.
@@ -213,6 +230,10 @@ impl Default for ApprovalsConfig {
             // resume mode has a real cost (a full resume can burn a big slice of usage limits), so
             // Sparkle stays hands-off until the user opts into "summary" or "full".
             resume: Some("ask".to_string()),
+            // The plan-exit prompt defaults to ANSWERED ("auto"). See the field doc above: an
+            // unanswered plan prompt is not a neutral pause, it is a finished agent stalling on a
+            // keypress. Opting out is one key — `plan = "ask"` — or the [ai].auto_approve switch.
+            plan: Some("auto".to_string()),
             // Concierge routing defaults ON. The problem this exists to solve, in the founder's own
             // framing, is prompts landing on HIM that something else should have answered — so the
             // safe default is that the concierge is ASKED, not that it is skipped. Note this is the
@@ -2028,6 +2049,7 @@ struct PartialApprovals {
     fetch: Option<String>,
     other: Option<String>,
     resume: Option<String>,
+    plan: Option<String>,
     /// `Option` HERE, unlike the bare `bool` on `ApprovalsConfig`, because this struct answers a
     /// different question: not "what is the value" but "did THIS layer say anything?" — which is
     /// exactly what lets an absent project key fall through to the global one.
@@ -2563,6 +2585,9 @@ fn apply_approvals(into: &mut ApprovalsConfig, p: Option<PartialApprovals>) {
     }
     if let Some(v) = p.resume {
         into.resume = Some(v);
+    }
+    if let Some(v) = p.plan {
+        into.plan = Some(v);
     }
     // Same per-key rule as the categories: only a layer that actually wrote the key overrides, so a
     // project may turn concierge routing off (or back on) without disturbing the global value.
@@ -4770,7 +4795,13 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # The `resume` key is a SIBLING with its own value domain (not "always"/"never"): how to answer
 # Claude Code's session-resume prompt. "ask" (default) surfaces it; "summary" auto-picks "Resume
 # from summary"; "full" auto-picks "Resume full session". Only fires while [ai].auto_approve is on.
-# The `concierge_answers` key is a second SIBLING, and it is NOT the same switch as
+# The `plan` key is a second SIBLING with its own value domain: how to answer Claude Code's
+# "written up a plan and is ready to execute — proceed?" prompt, the one an agent stops on the
+# moment it finishes planning. "auto" (DEFAULT) picks "Yes, and use auto mode"; "manual" picks
+# "Yes, manually approve edits"; "ask" surfaces it and waits for you. It defaults ON — unlike
+# `resume` — because an unanswered plan prompt stalls an agent that has already done the thinking.
+# Only fires while [ai].auto_approve is on.
+# The `concierge_answers` key is a third SIBLING, and it is NOT the same switch as
 # [ai].auto_approve above: auto_approve lets a purely local REGEX press buttons with nobody reading
 # them, while this lets the CONCIERGE — a reasoning agent that reads the question first — answer the
 # prompts that classifier declines. Two switches so turning off the blind presser doesn't also
@@ -4780,6 +4811,9 @@ composer        = true   # use the AI-enhanced composer; off = a plain terminal 
 # bash   = "never"     # opt bash back out — go back to confirming every command yourself
 # fetch  = "never"     # or turn any other category back to ask-each-time
 # resume = "summary"   # auto-resume from summary on every restart (or "full", or "ask")
+# plan   = "manual"    # start the plan, but keep approving edits one by one (auto mode is
+#                      # session-wide: it stops Claude Code emitting edit prompts at all)
+# plan   = "ask"       # stop auto-starting plans — ask me before an agent executes one
 # concierge_answers = false   # never route an unclassified prompt to the concierge — always ask me
 
 # --- Which GitHub orgs are YOURS (per-machine; ignored in a project file) ----------------
@@ -8669,6 +8703,55 @@ quit_app = 42
         let (cfg, _, _) = effective(Some(p), Some("[approvals]\nbash = \"never\"\n"));
         assert!(
             !cfg.approvals.concierge_answers,
+            "an unmentioned key keeps the global value rather than reverting to the built-in default"
+        );
+    }
+
+    #[test]
+    fn approvals_plan_defaults_to_auto() {
+        // THE DEFAULT THAT ENDS THE STALL. A finished agent sits on Claude Code's "ready to
+        // execute — proceed?" dialog until someone presses a key; shipping this OFF would leave the
+        // feature inert for everyone who never finds the setting. Asserts the VALUE, not that the
+        // config merely parsed.
+        let (cfg, _, _) = effective(None, None);
+        assert_eq!(
+            cfg.approvals.plan.as_deref(),
+            Some("auto"),
+            "plan defaults to auto — an unanswered plan prompt is a stalled agent, not a safe pause"
+        );
+        // Its neighbour in the SAME table defaults the OTHER way, deliberately (an unanswered
+        // resume prompt costs nothing). If someone ever unifies these, this line goes red.
+        assert_eq!(
+            cfg.approvals.resume.as_deref(),
+            Some("ask"),
+            "the resume sibling keeps its opposite default"
+        );
+    }
+
+    #[test]
+    fn approvals_plan_can_be_turned_off() {
+        // The founder-visible opt-out named in the field doc: one key restores the prompt.
+        let (cfg, _, _) = effective(Some("[approvals]\nplan = \"ask\"\n"), None);
+        assert_eq!(cfg.approvals.plan.as_deref(), Some("ask"), "an explicit ask beats the default");
+        // Turning it off must not disturb its neighbours in the same table.
+        assert_eq!(cfg.approvals.bash.as_deref(), Some("always"), "a sibling category is untouched");
+        assert!(cfg.approvals.concierge_answers, "the concierge sibling is untouched");
+    }
+
+    #[test]
+    fn approvals_plan_project_overrides_global() {
+        // Per-key layering, exactly like the categories, `resume` and `concierge_answers`.
+        let g = "[approvals]\nplan = \"ask\"\n";
+        let p = "[approvals]\nplan = \"manual\"\n";
+        let (cfg, _, _) = effective(Some(g), Some(p));
+        assert_eq!(cfg.approvals.plan.as_deref(), Some("manual"), "project beats global");
+
+        // A project file that mentions the table but NOT this key leaves the global value standing
+        // — the assertion that fails if the merge ever replaced the table wholesale.
+        let (cfg, _, _) = effective(Some(g), Some("[approvals]\nbash = \"never\"\n"));
+        assert_eq!(
+            cfg.approvals.plan.as_deref(),
+            Some("ask"),
             "an unmentioned key keeps the global value rather than reverting to the built-in default"
         );
     }

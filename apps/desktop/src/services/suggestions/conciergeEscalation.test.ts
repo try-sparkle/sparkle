@@ -502,3 +502,65 @@ describe("plan arm — `should` alone is not an ask (the framing rule's own edge
     ).toMatchObject({ route: "founder", founderClass: "credentials" });
   });
 });
+
+// ── The 2.1.237 plan-exit dialog is a PLAN dialog to this router too ────────────────────────────
+// `isPlanModeDialog` keys on the option TRIPLE, whose third member is a "No, keep planning". Claude
+// Code 2.1.237's plan-exit prompt does not have one — its third option is "Tell Claude what to
+// change" — so every dialog `detectPlanPrompt` recognises was falling through to the GENERAL
+// five-class sweep. That is not a near-miss: the plan arm exists precisely because `destructive` and
+// `legal` must not escalate a plan, and because the mention-vs-decision rule has to run. And since
+// this dialog draws no top border, the swept region is ten lines of the plan the agent just printed
+// — so "delete the dead helper" sent a routine plan to the founder and the agent sat there.
+describe("routeUnclassifiedPrompt — the 2.1.237 plan-exit dialog", () => {
+  const dialog = (prose: string) =>
+    [
+      `⏺ ${prose}`,
+      "",
+      "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+      "❯ 1. Yes, and use auto mode",
+      "  2. Yes, manually approve edits",
+      "  3. Tell Claude what to change",
+      "",
+      "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    ].join("\n");
+
+  it("takes the PLAN arm: a destructive-class word in the plan does not escalate", () => {
+    expect(routeUnclassifiedPrompt(dialog("Step 1: delete the dead helper and its test."))).toMatchObject(
+      { route: "concierge" },
+    );
+  });
+
+  it("takes the PLAN arm: a credential term merely MENTIONED does not escalate", () => {
+    expect(routeUnclassifiedPrompt(dialog("Step 1: refactor the token bucket in the relay."))).toMatchObject(
+      { route: "concierge" },
+    );
+  });
+
+  it("still escalates a plan that DECIDES something in the founder's classes", () => {
+    expect(
+      routeUnclassifiedPrompt(dialog("Should we raise the pricing on the paid tier to cover the spend?")),
+    ).toMatchObject({ route: "founder", reason: "founder-only" });
+  });
+});
+
+// The rename case, which is the one most likely to happen next: Claude Code has already shipped
+// three phrasings of the "proceed in auto mode" option. The router must still take the PLAN arm when
+// it cannot recognise a single affirmative, because "is this a plan?" and "can I answer it?" are
+// different questions — keying the arm off answerability would put a genuine plan back on the
+// general five-class sweep, where a `destructive` word in the plan prose escalates it.
+describe("routeUnclassifiedPrompt — a plan-exit dialog whose affirmatives were RENAMED", () => {
+  const renamed = [
+    "⏺ Step 1: delete the dead helper and its test.",
+    "",
+    "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+    "❯ 1. Yes, proceed automatically",
+    "  2. Yes, review each edit",
+    "  3. Tell Claude what to change",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+
+  it("still takes the PLAN arm even though no affirmative label is recognised", () => {
+    expect(routeUnclassifiedPrompt(renamed)).toMatchObject({ route: "concierge" });
+  });
+});

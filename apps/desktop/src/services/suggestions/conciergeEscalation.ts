@@ -18,6 +18,7 @@
 //   (b) the founder-only deny-list below, which is his explicitly chosen set of decisions that must
 //       still reach a human even though a machine could form an opinion about them.
 import { detectClaudeCodePicker, MENU_LINE } from "./heuristics";
+import { isPlanExitDialog } from "./planPrompt";
 // The SAME dialog-text extractor `select_picker_option`'s fingerprint uses — see the call site.
 import { pickerQuestionBlock } from "../pickerFingerprint";
 import type { SuggestionButton } from "./types";
@@ -298,7 +299,26 @@ export function routeUnclassifiedPrompt(scrollback: string): EscalationVerdict {
   // A PLAN dialog gets the founder's three classes and the mention-vs-decision rule; every other
   // picker keeps the full five-class sweep unchanged. See the plan arm's own comment for why
   // `destructive` must stay in the general list and out of this one.
-  const cls = isPlanModeDialog(options) ? planEscalationClass(region) : founderOnlyClass(region);
+  // TWO WAYS TO RECOGNISE A PLAN, and the second is not redundant — it is the shape this arm was
+  // written for. `isPlanModeDialog` keys on the option TRIPLE ("…auto-accept" / "…manually approve"
+  // plus a "No, keep planning"), and Claude Code 2.1.237's plan-exit dialog does not have the third:
+  // its options are "Yes, and use auto mode" / "Yes, manually approve edits" / "Tell Claude what to
+  // change". So every plan-exit prompt fell through to the GENERAL five-class sweep, which is
+  // exactly what the plan arm's own comment says must not happen to a plan — `destructive` and
+  // `legal` escalate on ordinary engineering prose, and the mention-vs-decision rule never runs. And
+  // because the dialog draws no top border, `pickerQuestionBlock` falls back to a fixed window, so
+  // that sweep reads ten lines of the plan the agent just printed: "delete the dead helper" or
+  // "check the license header" would send a routine plan to the founder.
+  //
+  // Keying the fallback off `detectPlanPrompt` — the detector `approvalsRuntime.maybeAutoPlan` uses
+  // — makes the two modules unable to disagree about what a plan dialog is, which is the same
+  // shared-definition rule that put `pickerQuestionBlock` here in the first place.
+  // The QUESTION-level predicate, not `detectPlanPrompt`. That one is an ANSWERABILITY test — it
+  // returns null when the question matches but no option LABEL does — and answerability is not the
+  // question this router is asking. Keying off it meant a rename of the affirmative (which Claude
+  // Code has already done three times) would put a genuine plan back on the general sweep.
+  const isPlan = isPlanModeDialog(options) || isPlanExitDialog(scrollback);
+  const cls = isPlan ? planEscalationClass(region) : founderOnlyClass(region);
   if (cls) return { route: "founder", reason: "founder-only", founderClass: cls };
 
   return { route: "concierge", question, options };

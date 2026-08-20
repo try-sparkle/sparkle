@@ -54,7 +54,7 @@
 //     ahead of the category branch, so it applies to this path by construction — which is the thing
 //     standing between "answer prompts I did not read" and real harm.
 import { useRuntimeStore } from "../../stores/runtimeStore";
-import { maybeAutoApprove } from "./approvalsRuntime";
+import { maybeAutoApprove, maybeAutoPlan } from "./approvalsRuntime";
 import { approvalScreenFor } from "./approvalScreen";
 import { handledSigsFor } from "./handledSigs";
 import { log } from "../../logger";
@@ -148,6 +148,26 @@ function decide(agentId: string, textAtSchedule: string): void {
   if (read.text !== textAtSchedule) {
     // Still painting (or new output arrived). Start the settle over on what it says now.
     schedule(agentId);
+    return;
+  }
+  // THE PLAN-EXIT PROMPT IS ANSWERED HERE TOO, and this is the call site that matters most for it.
+  // The prompt lands precisely when an agent has finished thinking and nobody is looking at its
+  // pane — the founder's report was an agent sitting on it for hours — so wiring it only into the
+  // mounted, selected-agent hook would mean the answer waits for a click. It runs BEFORE
+  // `maybeAutoApprove` for the same reason as in `useSuggestions`: that function hands screens it
+  // cannot classify to the concierge, and this dialog is one of those by construction.
+  const plan = maybeAutoPlan(agentId, read.text, handledSigsFor(agentId));
+  if (plan) {
+    // `"asked"` is a claim, not an answer: the plan path recognised the dialog and deliberately left
+    // it for a human (an explicit `plan = "ask"`, or the founder-only escalation). Either way this
+    // screen's fate is decided, so the fall-through to `maybeAutoApprove` — whose unclassified arm
+    // would hand it to the concierge — must not happen. Hence the return covers both cases and the
+    // log says which one it was.
+    log.info("approvals", plan === "asked" ? "plan prompt left for a human" : "auto-answered plan prompt off-pane", {
+      agentId,
+      mode: plan,
+      source: read.source,
+    });
     return;
   }
   const category = maybeAutoApprove(agentId, read.text, handledSigsFor(agentId));

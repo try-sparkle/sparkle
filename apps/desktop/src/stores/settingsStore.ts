@@ -27,13 +27,16 @@ import type { PolicyDecision, ToolPolicyOverrides } from "../services/conciergeT
 import {
   toApprovalMap,
   asResumeRule,
+  asPlanRule,
   asConciergeAnswers,
   DEFAULT_RESUME_RULE,
+  DEFAULT_PLAN_RULE,
   DEFAULT_CONCIERGE_ANSWERS,
   type ApprovalCategory,
   type ApprovalMap,
   type ApprovalRule,
   type ResumeRule,
+  type PlanRule,
 } from "../services/suggestions/approvalCategories";
 
 // --- Status-change notifications -------------------------------------------------------------
@@ -619,6 +622,12 @@ interface SettingsState {
    *  Per-project overrides live in approvalsStore; this is the all-projects layer / the effective
    *  value when no project is in context. Config-mirrored, NOT persisted. */
   resumeRule: ResumeRule;
+  /** GLOBAL (all-projects) plan-exit rule, mirrored from config.toml's `[approvals].plan`. The
+   *  second SIBLING of `approvals` with its own value domain ("ask"/"auto"/"manual"). Decides how
+   *  Claude Code's "written up a plan … ready to execute" prompt is answered — the prompt that
+   *  otherwise stalls a finished agent until a human presses a key. Defaults to "auto" (see
+   *  DEFAULT_PLAN_RULE). Config-mirrored, NOT persisted. */
+  planRule: PlanRule;
   /** GLOBAL (all-projects) concierge-routing flag, mirrored from config.toml's
    *  `[approvals].concierge_answers`. The second SIBLING of `approvals` with its own value domain
    *  (a plain boolean, not "always"/"never"): may a prompt the local classifier declines to answer
@@ -906,6 +915,8 @@ interface SettingsState {
   /** Optimistically set the GLOBAL session-resume rule (configActions persists to
    *  [approvals].resume). Mirrors setGlobalApproval but for the resume sibling. */
   setGlobalResume: (rule: ResumeRule) => void;
+  /** Optimistically set the GLOBAL plan-exit rule (configActions persists to [approvals].plan). */
+  setGlobalPlan: (rule: PlanRule) => void;
   /** Bulk-set every AI feature (the All / Off segments). */
   setAllAiFeatures: (on: boolean) => void;
   /** Optimistically toggle one [tools] flag; configActions persists it to config.toml. */
@@ -983,6 +994,7 @@ export const useSettingsStore = create<SettingsState>()(
       conciergeOwnOrgs: [],
       conciergeProjectPolicy: {},
       resumeRule: DEFAULT_RESUME_RULE,
+      planRule: DEFAULT_PLAN_RULE,
       conciergeAnswers: DEFAULT_CONCIERGE_ANSWERS,
       autoApplyUpdates: true,
       windowSpanMode: "safe",
@@ -1079,6 +1091,7 @@ export const useSettingsStore = create<SettingsState>()(
         }),
       replaceConciergeToolPolicies: (next) => set({ conciergeToolPolicy: { ...next } }),
       setGlobalResume: (rule) => set({ resumeRule: asResumeRule(rule) }),
+      setGlobalPlan: (rule) => set({ planRule: asPlanRule(rule) }),
       setToolEnabled: (key, on) => set({ [TOOL_FIELD[key]]: on } as Partial<SettingsState>),
       setPluginEnabled: (key, on) =>
         set((s) => ({ pluginsEnabled: { ...s.pluginsEnabled, [key]: on } })),
@@ -1311,6 +1324,10 @@ export const useSettingsStore = create<SettingsState>()(
           // GLOBAL session-resume rule (sibling of approvals; own value domain). Coerced so an
           // absent/unknown value degrades to "ask".
           resumeRule: asResumeRule(config.approvals?.resume),
+          // GLOBAL plan-exit rule (the other value-domain sibling). Coerced so an absent value — an
+          // older backend predating the key — degrades to the ON default rather than to "ask",
+          // which would re-introduce the stall this key exists to end.
+          planRule: asPlanRule(config.approvals?.plan),
           // GLOBAL concierge-routing flag (the other sibling of approvals; a plain boolean). Coerced
           // so an absent value — an older backend predating the key — degrades to the ON default
           // rather than silently disabling routing.

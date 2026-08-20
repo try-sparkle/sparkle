@@ -62,6 +62,10 @@ export interface ApprovalsConfig {
    *  (default "ask"). Governs how the Claude Code session-resume prompt is auto-answered while
    *  [ai].auto_approve is on. Optional so callers guard: a Rust backend predating it omits it. */
   resume?: string | null;
+  /** Plan-exit rule. NOT an "always"/"never" category — one of "ask" | "auto" | "manual"
+   *  (default "auto"). Governs how Claude Code's "ready to execute … proceed?" prompt is
+   *  auto-answered while [ai].auto_approve is on. */
+  plan?: string | null;
   /** May a prompt the local classifier declines to answer be handed to the concierge, which reads
    *  it and answers? Default true. A SEPARATE switch from [ai].auto_approve, which is about a local
    *  regex pressing buttons unread — see approvalCategories.ts.

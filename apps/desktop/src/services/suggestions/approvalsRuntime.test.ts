@@ -21,9 +21,16 @@ vi.mock("../aiGate", () => ({ aiFeatureVisibleNow: (key: string) => aiFeatureVis
 import {
   maybeAutoApprove,
   maybeAutoResume,
+  maybeAutoPlan,
   effectiveResumeRule,
+  effectivePlanRule,
   pickerSignature,
 } from "./approvalsRuntime";
+import {
+  PLAN_EXIT_PROMPT,
+  PLAN_EXIT_PROMPT_STICKY,
+  PLAN_ARTIFACT_PROMPT,
+} from "./planPrompt.fixture";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useApprovalsStore } from "../../stores/approvalsStore";
 import { useProjectStore } from "../../stores/projectStore";
@@ -72,8 +79,8 @@ beforeEach(() => {
   aiFeatureVisibleNow.mockReturnValue(true);
   // No project in context → effectiveApprovalRule falls back to the global settings mirror.
   useProjectStore.setState({ projects: [] });
-  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {} });
-  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask" });
+  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {}, planByRoot: {} });
+  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask", planRule: "auto" });
 });
 
 describe("maybeAutoApprove", () => {
@@ -345,5 +352,159 @@ describe("maybeAutoApprove — the pending prompt decides, not an earlier one", 
     ].join("\n");
     expect(maybeAutoApprove("a1", DENIED_ABOVE_ALLOWED, new Set())).toBe("mcp");
     expect(writePty).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── The PLAN-EXIT prompt ────────────────────────────────────────────────────────────────────────
+// Every case asserts the KEYSTROKE reaching the PTY, not that a detector matched: the subject is an
+// irreversible press on a dialog nobody is watching, so anything short of the write would be an
+// assertion about a precondition. (AGENTS.md, "Tests must assert the SIDE EFFECT".)
+describe("maybeAutoPlan", () => {
+  it("presses the auto-mode option under the shipped default rule", () => {
+    // No setState here on purpose: this is what an out-of-the-box install does, and the ONLY thing
+    // that ends the stall the feature exists to fix.
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBe("auto");
+    expect(writePty).toHaveBeenCalledTimes(1);
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+  });
+
+  it("presses the manual-approve option when the rule is 'manual'", () => {
+    useSettingsStore.setState({ planRule: "manual" });
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBe("manual");
+    expect(writePty).toHaveBeenCalledWith("a1", "2\n"); // the OTHER digit
+  });
+
+  it("CLAIMS the screen when the rule is 'ask', so nothing else answers it", () => {
+    // Not merely "did not press": the value has to be `"asked"`, because a bare null sends the
+    // caller on to `maybeAutoApprove`, which cannot classify this dialog and hands it to the
+    // CONCIERGE — answering the prompt the founder just said he wanted to see. That is the whole
+    // difference between an opt-out and a detour.
+    useSettingsStore.setState({ planRule: "ask" });
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBe("asked");
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("does not press anything when the master toggle is off", () => {
+    aiFeatureVisibleNow.mockReturnValue(false);
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("STILL claims the screen for plan='ask' when the master toggle is off", () => {
+    // The order of these two checks is the whole test. Reading the toggle first meant that turning
+    // OFF the more conservative switch dropped the screen through to `maybeAutoApprove` → the
+    // concierge, which answered the prompt the opt-out promised to surface — the same leak, reached
+    // from the cautious direction.
+    useSettingsStore.setState({ planRule: "ask" });
+    aiFeatureVisibleNow.mockReturnValue(false);
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBe("asked");
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("surfaces the prompt rather than pressing the OTHER affirmative when its option is absent", () => {
+    // The sticky screen carries no ordinary auto-mode option. Under `plan = "auto"` the honest
+    // answer is to ask, NOT to fall back to "manually approve edits" — a fallback would quietly
+    // deliver the opposite of the rule, and would also be one keypress from rewriting the session's
+    // default permission mode.
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT_STICKY, new Set())).toBe("asked");
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("never answers Claude Code's other plan question (review as an artifact)", () => {
+    expect(maybeAutoPlan("a1", PLAN_ARTIFACT_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("never answers an ordinary permission picker (that is maybeAutoApprove's job)", () => {
+    expect(maybeAutoPlan("a1", BASH_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("answers a plan picker instance exactly once (signature de-dupe)", () => {
+    const handled = new Set<string>();
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, handled)).toBe("auto");
+    expect(writePty).toHaveBeenCalledTimes(1);
+    // A re-rendered copy of the SAME picker hashes identically → never a second press.
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, handled)).toBe("auto");
+    expect(writePty).toHaveBeenCalledTimes(1);
+    expect(handled.has(pickerSignature(PLAN_EXIT_PROMPT))).toBe(true);
+  });
+
+  it("escalates a plan that touches the founder's boundary instead of pressing it", () => {
+    // The governance path plan dialogs already had (bead sparkle-iwhzt, the founder's words: "spend,
+    // credentials, and product direction stay with you"). A local regex that pressed first would
+    // make those classes unreachable for the densest statement of intent an agent ever puts on
+    // screen. Under the shipped `plan = "auto"`, this must still NOT be pressed.
+    const spendPlan = PLAN_EXIT_PROMPT.replace(
+      "I've written up the plan above.",
+      "The plan upgrades our subscription and raises the monthly budget.",
+    );
+    expect(maybeAutoPlan("a1", spendPlan, new Set())).toBe("asked");
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("still presses an ordinary engineering plan — the gate is a filter, not a blanket", () => {
+    // The paired case. One test proving a prompt was NOT answered is ambiguous on its own: it passes
+    // just as well if the whole path is inert. This is the same fixture minus the founder-only term.
+    expect(maybeAutoPlan("a1", PLAN_EXIT_PROMPT, new Set())).toBe("auto");
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+  });
+
+  // ── THE CASES THAT TELL THE TWO ESCALATION ARMS APART ────────────────────────────────────────
+  // A plan dialog gets the PLAN arm (three classes + the mention-vs-decision rule), not the general
+  // five-class sweep. The distinction is invisible to a "subscription … budget" fixture, which
+  // escalates under both — so these use words that escalate under the general sweep ONLY. They are
+  // the cases that go red if `routeUnclassifiedPrompt` stops recognising this dialog as a plan, and
+  // the failure they guard against is the feature going inert on ordinary engineering prose: the
+  // plan-exit dialog draws no top border, so the swept region is ten lines of the plan itself.
+  const planSaying = (line: string) => PLAN_EXIT_PROMPT.replace("I've written up the plan above.", line);
+
+  it("presses a plan whose prose carries a DESTRUCTIVE-class word (general sweep only)", () => {
+    // `destructive` is deliberately absent from the plan arm — see conciergeEscalation's plan-arm
+    // comment. Under the general sweep this plan would be escalated and the agent would sit.
+    expect(maybeAutoPlan("a1", planSaying("Step 1: delete the dead helper and its test."), new Set())).toBe(
+      "auto",
+    );
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+  });
+
+  it("presses a plan that MENTIONS a credential term without deciding anything about it", () => {
+    // The mention-vs-decision rule, which only runs on the plan arm. "the token bucket" is prose
+    // about an implementation, not a question about credentials.
+    expect(maybeAutoPlan("a1", planSaying("Step 1: refactor the token bucket in the relay."), new Set())).toBe(
+      "auto",
+    );
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
+  });
+
+  it("is NOT exempt for a plan-mode agent — there is no exemption, only the rule", () => {
+    // The decision recorded in `maybeAutoPlan`'s doc comment, made executable: nothing about how an
+    // agent was spawned reaches this module, and the only thing that changes the answer is the rule
+    // itself. If someone later adds a spawn-mode carve-out, this case goes red.
+    useProjectStore.setState({
+      projects: [
+        {
+          id: "p1",
+          name: "p",
+          rootPath: "/repo",
+          agents: [{ id: "planner" } as never],
+        } as never,
+      ],
+    });
+    expect(maybeAutoPlan("planner", PLAN_EXIT_PROMPT, new Set())).toBe("auto");
+    expect(writePty).toHaveBeenCalledWith("planner", "1\n");
+  });
+});
+
+describe("effectivePlanRule", () => {
+  it("defaults to auto with no project and nothing configured", () => {
+    expect(effectivePlanRule(null)).toBe("auto");
+  });
+
+  it("lets a project override the global rule", () => {
+    useSettingsStore.setState({ planRule: "auto" });
+    useApprovalsStore.setState({ planByRoot: { "/repo": "ask" } });
+    expect(effectivePlanRule("/repo")).toBe("ask");
+    expect(effectivePlanRule("/other")).toBe("auto"); // unloaded project falls back to global
   });
 });

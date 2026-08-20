@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
 vi.mock("./approvalsRuntime", () => ({
   maybeAutoApprove: h.maybeAutoApprove,
   maybeAutoResume: vi.fn(() => null),
+  maybeAutoPlan: vi.fn(() => null),
   useSyncProjectApprovals: () => {},
 }));
 vi.mock("../terminalScrollback", () => ({ getAgentScrollback: () => h.scrollback }));

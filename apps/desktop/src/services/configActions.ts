@@ -40,9 +40,11 @@ import {
 import { useApprovalsStore } from "../stores/approvalsStore";
 import {
   DEFAULT_RESUME_RULE,
+  DEFAULT_PLAN_RULE,
   type ApprovalCategory,
   type ApprovalRule,
   type ResumeRule,
+  type PlanRule,
 } from "./suggestions/approvalCategories";
 import { categoriesForPreset, type AutoApprovePreset } from "./autoApprovePreset";
 import { CLAUDE_LOGIN_COMMAND } from "./claudeSpawn";
@@ -235,6 +237,48 @@ export async function setResumeRule(
     await setConfigValue(RESUME_PATH, rule);
   } catch (e) {
     console.warn("config write failed (resume global)", e);
+  }
+}
+
+/** The dotted config path for the plan-exit rule (same key in both the global + project files).
+ *  The second value-domain SIBLING of the approval categories under the same `[approvals]` table. */
+const PLAN_PATH = "approvals.plan";
+
+/**
+ * Set the plan-exit rule at the given scope.
+ *
+ * Same shape as {@link setResumeRule}, with the DEFAULT on the other end of the range: `plan`
+ * defaults to "auto" (answer the prompt), so the value a project may need to pin explicitly is
+ * whichever one differs from the global — including "auto" itself when the global has been set to
+ * "ask". Writing the default only clears the key when the global is ALSO the default; otherwise it
+ * is persisted, or a project could never opt back IN to auto-answering under a global "ask".
+ */
+export async function setPlanRule(
+  rule: PlanRule,
+  scope: ApprovalScope,
+  projectRoot: string | null,
+): Promise<void> {
+  if (scope === "project" && projectRoot) {
+    useApprovalsStore.getState().setProjectPlan(projectRoot, rule);
+    const globalRule = useSettingsStore.getState().planRule;
+    try {
+      if (rule === DEFAULT_PLAN_RULE && globalRule === DEFAULT_PLAN_RULE) {
+        // Nothing to override — drop the project key so we don't litter config with the default.
+        await unsetProjectConfigValue(projectRoot, PLAN_PATH);
+      } else {
+        await setProjectConfigValue(projectRoot, PLAN_PATH, rule);
+      }
+    } catch (e) {
+      console.warn("config write failed (plan project)", e);
+    }
+    return;
+  }
+  useSettingsStore.getState().setGlobalPlan(rule);
+  try {
+    if (rule === DEFAULT_PLAN_RULE) await unsetConfigValue(PLAN_PATH);
+    else await setConfigValue(PLAN_PATH, rule);
+  } catch (e) {
+    console.warn("config write failed (plan global)", e);
   }
 }
 

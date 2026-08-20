@@ -51,6 +51,7 @@ import {
   resetRetractionLedgerForTests,
   windowRetractionLedger,
 } from "../../engine/movementRetraction";
+import { PLAN_EXIT_PROMPT } from "./planPrompt.fixture";
 
 const AGENT = "a1";
 const FOOTER = "Enter to select · ↑/↓ to navigate · Esc to cancel";
@@ -127,8 +128,14 @@ beforeEach(() => {
   // No project in context → the effective rule falls back to the global settings mirror. `bash =
   // "always"` is the founder's actual config.
   useProjectStore.setState({ projects: [] });
-  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {} });
-  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask" });
+  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {}, planByRoot: {} });
+  useSettingsStore.setState({
+    approvals: { bash: "always" },
+    resumeRule: "ask",
+    // The shipped default, stated rather than inherited: these cases are about what an
+    // out-of-the-box install does on a pane nobody is watching.
+    planRule: "auto",
+  });
 });
 
 afterEach(() => {
@@ -485,4 +492,59 @@ describe("the prompt must be on the VISIBLE viewport, not merely in history (spa
 // drifts; this is what stops it.
 it("settles on the same window the mounted hook does", () => {
   expect(SETTLE_MS).toBe(SETTLE_TICK_MS);
+});
+
+// ── The PLAN-EXIT prompt, off-pane ──────────────────────────────────────────────────────────────
+// THE CASE THE WHOLE FEATURE EXISTS FOR. An agent that has just finished writing a plan is by
+// definition an agent nobody is looking at — the founder's report was one sitting on this dialog for
+// hours with a complete diagnosis on screen. Wiring the answer only into the mounted, selected-agent
+// hook would mean it waits for a click, so it is asserted HERE, through the unattended watch, as the
+// actual keystroke on the PTY.
+describe("the plan-exit prompt is answered on a pane nobody has opened", () => {
+  it("types the auto-mode keystroke for an agent with NO mounted terminal", () => {
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(PLAN_EXIT_PROMPT);
+    expect(writePty).not.toHaveBeenCalled(); // the screen has to hold still first
+
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledTimes(1);
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n"); // "Yes, and use auto mode"
+  });
+
+  it("types the manual keystroke when the rule says manual", () => {
+    useSettingsStore.setState({ planRule: "manual" });
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(PLAN_EXIT_PROMPT);
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledWith(AGENT, "2\n"); // the OTHER digit
+  });
+
+  it("presses NOTHING when the founder has turned the rule off", () => {
+    useSettingsStore.setState({ planRule: "ask" });
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(PLAN_EXIT_PROMPT);
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("answers a given plan picker exactly once, however many store ticks arrive", () => {
+    mountViewport(() => PLAN_EXIT_PROMPT);
+    stopWatch = startAutoApproveWatch();
+
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    vi.advanceTimersByTime(SETTLE_MS);
+    expect(writePty).toHaveBeenCalledTimes(1);
+
+    for (let i = 0; i < 5; i++) {
+      useRuntimeStore.getState().setAttentionScreen(AGENT, PLAN_EXIT_PROMPT);
+      vi.advanceTimersByTime(SETTLE_MS);
+    }
+    expect(writePty).toHaveBeenCalledTimes(1);
+  });
 });

@@ -90,6 +90,7 @@ import { useApprovalsStore } from "../../stores/approvalsStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { resetPromptGraceLedgerForTests } from "../../engine/blockedPromptGrace";
 import { resetRetractionLedgerForTests } from "../../engine/movementRetraction";
+import { PLAN_EXIT_PROMPT } from "./planPrompt.fixture";
 
 const AGENT = "a1";
 
@@ -141,9 +142,9 @@ beforeEach(() => {
   resetAutoApproveWatchForTests();
   useRuntimeStore.setState({ status: {}, attentionScreen: {}, attentionScreenAt: {} });
   useProjectStore.setState({ projects: [] });
-  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {} });
-  // The founder's actual config: bash auto-approves.
-  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask" });
+  useApprovalsStore.setState({ byRoot: {}, resumeByRoot: {}, planByRoot: {} });
+  // The founder's actual config: bash auto-approves, and plan-exit ships answered.
+  useSettingsStore.setState({ approvals: { bash: "always" }, resumeRule: "ask", planRule: "auto" });
 });
 afterEach(() => {
   unregister?.();
@@ -219,6 +220,50 @@ describe("opening a pane is no longer what answers a pending permission prompt",
 
     expect(keystrokes()).toBe(1);
     expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
+  });
+});
+
+// The plan-exit prompt runs on BOTH call sites — the unattended watch (pinned in
+// `autoApproveWatch.test.ts`) and the mounted hook below. Covering only one would be the shape
+// AGENTS.md warns about: a fix wired into two sites, verified at one, shipping with the hole intact
+// at the other. This is the mounted half, with the real `approvalsRuntime` doing the deciding and
+// the assertion on the keystroke that reaches the PTY.
+describe("the mounted hook answers the plan-exit prompt too", () => {
+  it("types the auto-mode keystroke for the selected agent, with no watch running", async () => {
+    // NO WATCH — so the only thing that can emit here is the hook's own wiring.
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    unregister = registerScrollback(AGENT, () => PLAN_EXIT_PROMPT);
+    renderHook(() => useSuggestions(AGENT, true));
+    await settle();
+
+    expect(keystrokes()).toBe(1);
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n"); // "Yes, and use auto mode"
+  });
+
+  it("types NOTHING when the founder has set the rule to ask", async () => {
+    useSettingsStore.setState({ planRule: "ask" });
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    unregister = registerScrollback(AGENT, () => PLAN_EXIT_PROMPT);
+    renderHook(() => useSuggestions(AGENT, true));
+    await settle();
+
+    expect(keystrokes()).toBe(0);
+  });
+
+  it("does not answer a second time when the watch already answered it", async () => {
+    // The same non-double-answer contract the bash case above pins, for this prompt: the watch
+    // presses first, then the founder opens the pane on the still-visible dialog.
+    stopWatch = startAutoApproveWatch();
+    useRuntimeStore.getState().setAttentionScreen(AGENT, PLAN_EXIT_PROMPT);
+    useRuntimeStore.getState().setStatus(AGENT, "approval");
+    vi.advanceTimersByTime(SETTLE_MS);
+    expect(keystrokes()).toBe(1);
+
+    unregister = registerScrollback(AGENT, () => PLAN_EXIT_PROMPT);
+    renderHook(() => useSuggestions(AGENT, true));
+    await settle();
+
+    expect(keystrokes()).toBe(1);
   });
 });
 

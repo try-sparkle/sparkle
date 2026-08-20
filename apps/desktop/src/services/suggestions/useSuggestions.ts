@@ -13,7 +13,7 @@ import { pushSuggestions } from "../relayClient";
 import { deriveCta } from "../../engine/agentCta";
 import { isInMotion } from "../../engine/inMotion";
 import { resolveStage } from "../../engine/workflowStage";
-import { maybeAutoApprove, maybeAutoResume } from "./approvalsRuntime";
+import { maybeAutoApprove, maybeAutoResume, maybeAutoPlan } from "./approvalsRuntime";
 // The de-dupe registry, shared with `./autoApproveWatch` — see that module's header for why the
 // off-pane answerer and this hook must read one set and not two.
 import { clearHandledSignatures, handledSigsFor, resetHandledSignatures } from "./handledSigs";
@@ -625,7 +625,23 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
       // depending on a render that the batched approval→working→approval transition skips
       // (roborev 53286).
       if (!isLive()) return;
-      const autoCat = maybeAutoApprove(agentId, scrollback, handledSigs.current);
+      // The plan path runs here too, and for a reason that is easy to miss: only NON-auto-answered
+      // results are memoized, so the screen that reaches this branch under `plan = "ask"` is exactly
+      // a plan prompt the founder asked to see. Without the same claim, the memo hit would hand it
+      // to `maybeAutoApprove` → the concierge, and the opt-out would leak on the second sighting.
+      const memoPlan = maybeAutoPlan(agentId, scrollback, handledSigs.current);
+      if (memoPlan === "auto" || memoPlan === "manual") {
+        lastHash.current = nextHash;
+        setDismissed(new Set());
+        setAutoApproved(null);
+        setButtons([]);
+        setQuestionPending(false);
+        retire();
+        log.debug("suggestions", "auto-answered plan prompt (memo)", { agentId, mode: memoPlan });
+        return;
+      }
+      const autoCat =
+        memoPlan === null ? maybeAutoApprove(agentId, scrollback, handledSigs.current) : null;
       lastHash.current = nextHash;
       // Unlike the success path below, this branch deliberately does NOT clear `fail`. It can't be
       // stale here: only a SUCCEEDED compute is ever memoized, so a hash present in the memo is by
@@ -751,6 +767,19 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         // the next microtask would see a freshly-emptied set and auto-answer a SECOND time
         // (roborev 53203). Checking the live status makes the watcher's timing irrelevant.
         const live = isLive();
+        // The plan-exit prompt goes FIRST, ahead of both siblings. `maybeAutoApprove` hands every
+        // screen it cannot classify to the concierge, and this dialog is one of those by
+        // construction — so answering it here is what stops a prompt with a standing rule behind it
+        // from being escalated as though nobody could decide it.
+        const autoPlan = live ? maybeAutoPlan(agentId, scrollback, handledSigs.current) : null;
+        if (autoPlan === "auto" || autoPlan === "manual") {
+          setAutoApproved(null); // not a category note; just suppress the pills for this prompt
+          setButtons([]);
+          setQuestionPending(false); // answered on the user's behalf — nothing is pending
+          retire();
+          log.debug("suggestions", "auto-answered plan prompt", { agentId, mode: autoPlan });
+          return;
+        }
         const autoResume = live ? maybeAutoResume(agentId, scrollback, handledSigs.current) : null;
         if (autoResume) {
           setAutoApproved(null); // not a category note; just suppress the pills for this prompt
@@ -760,7 +789,11 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
           log.debug("suggestions", "auto-resumed", { agentId, mode: autoResume });
           return;
         }
-        const autoCat = live ? maybeAutoApprove(agentId, scrollback, handledSigs.current) : null;
+        // `autoPlan === "asked"` means the plan path CLAIMED this screen and left it for a human —
+        // so it must not be offered to `maybeAutoApprove`, whose unclassified arm would hand it to
+        // the concierge and answer the very prompt `plan = "ask"` promised to surface.
+        const autoCat =
+          live && autoPlan === null ? maybeAutoApprove(agentId, scrollback, handledSigs.current) : null;
         if (autoCat) {
           setAutoApproved(autoCat);
           setButtons([]);
