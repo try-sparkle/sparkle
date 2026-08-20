@@ -99,10 +99,23 @@ vi.mock("./DefineStageModal", () => ({
 
 // Keep the real beads helpers (bucketBeads, childrenOf, labels) but stub the bd-write wrappers the
 // Start button / badge chips call, so no Tauri invoke happens.
+// COUNTS CARD RENDERS. `isEpicIndexed` is called UNCONDITIONALLY in the body of `Card`, so its
+// call count is the number of cards that rendered. (The first probe tried was
+// `openChildCountIndexed`, which sits behind `beadIsEpic ? ... : 0` and therefore counted zero for
+// a board of plain tasks -- a probe that silently measures nothing is the same failure as the
+// vacuous test it was meant to prevent, so it is worth naming.) The other two call sites in this
+// file -- `StartControls` and `DetailOverlay` -- render only for a backlog/planning EPIC and for an
+// open overlay respectively, and this describe block has neither.
+const cardRenders = { count: 0 };
+
 vi.mock("../services/beads", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/beads")>();
   return {
     ...actual,
+    isEpicIndexed: (...a: Parameters<typeof actual.isEpicIndexed>) => {
+      cardRenders.count++;
+      return actual.isEpicIndexed(...a);
+    },
     claimBead: vi.fn().mockResolvedValue(undefined),
     labelBead: vi.fn().mockResolvedValue(undefined),
     // The confirm-first "Mark as …" control drives these — stub so no Tauri/`bd` invoke happens.
@@ -133,7 +146,7 @@ vi.mock("../services/beadsCommands", async (importOriginal) => {
   };
 });
 
-import { BoardView, boardScrollDelta } from "./BoardView";
+import { BoardView, boardScrollDelta, sameDeliveryUpdate } from "./BoardView";
 import { sendToBuild } from "../services/sendToBuild";
 import { bucketBeads, claimBead, labelBead, closeBead, markBeadDelivered } from "../services/beads";
 import { useCriteriaStore } from "../services/criteriaStore";
@@ -256,6 +269,159 @@ beforeEach(() => {
 // would pass just as well if the cap had been applied to EVERY column, which would hide live work
 // in Backlog — the failure mode that makes a cap worse than the stall. The pair is the assertion:
 // terminal is capped, live is not.
+// ══ (3)+(4) MEMOISED CARDS, AND THE STABLE STATE THAT MAKES THE MEMO BITE ═════════════════════
+//
+// These two are ONE change, not two, and the tests say so. `React.memo` on `Card` is worthless
+// while `BoardView` hands its children a new object identity every render — a memo that misses
+// every time costs a props comparison per card and skips nothing. So the delivery monitor's tick
+// must stop minting fresh state, AND the cards must be memoised; either alone measures as no
+// improvement at all.
+describe("BoardView — cards are memoised against unrelated re-renders", () => {
+  const N = 40;
+
+  function cardsBoard(): Board {
+    return {
+      backlog: Array.from({ length: N }, (_, i) => bead({ id: `p1-m${i}`, title: `Card ${i}` })),
+      blocked: [],
+      inProgress: [],
+      done: [],
+      delivered: [],
+      archived: [],
+    };
+  }
+
+  /** Drive the monitor callback BoardView registered, the way the real timer would. */
+  const tick = async (update: unknown) => {
+    await waitFor(() => expect(startDeliveryMonitor).toHaveBeenCalled());
+    const cb = startDeliveryMonitor.mock.calls.at(-1)?.[1] as ((u: unknown) => void) | undefined;
+    if (cb === undefined) throw new Error("delivery monitor was never started");
+    act(() => cb(update));
+  };
+
+  const chip = (status: string) => ({ signals: [], detectable: true, status });
+
+  beforeEach(() => {
+    snapshot = { beads: [], board: cardsBoard(), loadedAt: Date.now() };
+    // The monitor only starts once "delivered" is a DEFINED stage — otherwise the effect stops it
+    // and this whole describe would drive a callback that was never registered.
+    defineDelivered();
+  });
+
+  // ── MEASURED RELATIVE TO THE MOUNT, NOT AGAINST A HARDCODED N ────────────────────────────────
+  // `isEpicIndexed` is called once per card BY `Card` — but not ONLY by `Card`. `main` has since
+  // dropped the column+type gate so `StartControls` mounts on every card, and it resolves through
+  // the same index, so the per-card call count is now 3 and is free to change again. Pinning the
+  // mount to `N` made this assert an implementation detail of unrelated components: it broke at
+  // `expected 120 to be 40` on a merge that touched none of this.
+  //
+  // What the memo actually claims is a RATIO, and the ratio is what is asserted now: an unrelated
+  // re-render costs ZERO card work, and a real change costs the SAME work the mount did. Both are
+  // exact, neither cares how many resolver calls one card makes.
+  it("does not re-render a single card when only the delivery chip changes", async () => {
+    render(<BoardView project={project} side="right" />);
+    const mountCost = cardRenders.count;
+    expect(mountCost).toBeGreaterThan(0); // the mount really did render cards
+
+    cardRenders.count = 0;
+    await tick(chip("Release v1 detected"));
+
+    // BoardView itself re-rendered -- the chip text is new -- but NO card's props changed, so every
+    // one of them skipped. Before the memo this was the full `mountCost`.
+    expect(cardRenders.count).toBe(0);
+  });
+
+  it("PAIRED: a snapshot that actually changes the cards still re-renders them", () => {
+    const { rerender } = render(<BoardView project={project} side="right" />);
+    const mountCost = cardRenders.count;
+    expect(mountCost).toBeGreaterThan(0);
+    cardRenders.count = 0;
+
+    // The half that proves the memo is not simply frozen. A test that only asserted "0 renders"
+    // would pass just as happily against a card that can never update again, which is a far worse
+    // bug than the stall this fixes.
+    snapshot = { beads: [], board: cardsBoard(), loadedAt: Date.now() + 1 };
+    rerender(<BoardView project={project} side="right" />);
+    // The SAME cost as the mount: every card re-rendered, none skipped.
+    expect(cardRenders.count).toBe(mountCost);
+  });
+
+  // NOTE ON WHAT IS *NOT* TESTED HERE, because a test that was here got this wrong. An
+  // "identical tick does not re-render a card" assertion looks like it guards the idle re-render,
+  // and it is VACUOUS: with `Card` memoised, an identical tick and a fresh-but-equal tick both
+  // produce zero card renders, so it passes with the state bail-out DELETED (mutation-checked --
+  // it did). The card probe cannot see that fix at all; the bail-out's effect is on BoardView's own
+  // render and on `inReleaseByBead`, one level above what this probe measures. The comparator is
+  // therefore tested directly, below.
+  it("keeps rendering the chip correctly across repeated ticks", async () => {
+    render(<BoardView project={project} side="right" />);
+    await tick(chip("Release v1 detected"));
+    await tick(chip("Release v1 detected"));
+    expect(screen.getByText("Release v1 detected")).toBeTruthy();
+    await tick(chip("Release v2 detected"));
+    expect(screen.getByText("Release v2 detected")).toBeTruthy();
+  });
+});
+
+// ══ (4) THE COMPARATOR THAT STOPS THE 90-SECOND IDLE RE-RENDER ════════════════════════════════
+//
+// The delivery monitor fires on a timer and always hands back a FRESH object, so `setDelivery(u)`
+// changed React state on every tick whether or not the delivery picture had moved -- an untouched
+// board rebuilding `inReleaseByBead` and re-deriving every downstream prop, forever.
+//
+// This is tested as a PURE FUNCTION rather than through the component on purpose: see the note in
+// the describe above. Through the component the fix is invisible, because the card memo already
+// absorbs the difference.
+describe("sameDeliveryUpdate", () => {
+  const sig = (beadId: string, inRelease: boolean, tags: string[] = []) => ({
+    beadId,
+    inRelease,
+    tags,
+  });
+  const upd = (status: string, detectable: boolean, signals: ReturnType<typeof sig>[]) => ({
+    status,
+    detectable,
+    signals,
+  });
+
+  it("treats two DISTINCT but equal updates as the same", () => {
+    const a = upd("Release v1", true, [sig("b1", true, ["v1"]), sig("b2", false)]);
+    const b = upd("Release v1", true, [sig("b1", true, ["v1"]), sig("b2", false)]);
+    expect(a).not.toBe(b); // genuinely different objects, or this proves nothing
+    expect(sameDeliveryUpdate(a, b)).toBe(true);
+  });
+
+  it("null handling is exact", () => {
+    expect(sameDeliveryUpdate(null, null)).toBe(true);
+    expect(sameDeliveryUpdate(null, upd("x", true, []))).toBe(false);
+    expect(sameDeliveryUpdate(upd("x", true, []), null)).toBe(false);
+  });
+
+  // EVERY FIELD, one at a time. A comparator that misses a field does not merely fail to optimise
+  // — it PINS STALE STATE, and the UI silently stops updating. That is a worse bug than the
+  // re-render it was written to prevent, so each field gets its own case rather than a single
+  // "different objects differ" assertion that a partial implementation would also satisfy.
+  it("notices a changed status", () => {
+    expect(sameDeliveryUpdate(upd("v1", true, []), upd("v2", true, []))).toBe(false);
+  });
+
+  it("notices a changed detectable", () => {
+    expect(sameDeliveryUpdate(upd("v1", true, []), upd("v1", false, []))).toBe(false);
+  });
+
+  it("notices an added or removed signal", () => {
+    expect(sameDeliveryUpdate(upd("v1", true, []), upd("v1", true, [sig("b1", true)]))).toBe(false);
+    expect(sameDeliveryUpdate(upd("v1", true, [sig("b1", true)]), upd("v1", true, []))).toBe(false);
+  });
+
+  it("notices a changed beadId, inRelease, or tag", () => {
+    const base = upd("v1", true, [sig("b1", true, ["t1"])]);
+    expect(sameDeliveryUpdate(base, upd("v1", true, [sig("b2", true, ["t1"])]))).toBe(false);
+    expect(sameDeliveryUpdate(base, upd("v1", true, [sig("b1", false, ["t1"])]))).toBe(false);
+    expect(sameDeliveryUpdate(base, upd("v1", true, [sig("b1", true, ["t2"])]))).toBe(false);
+    expect(sameDeliveryUpdate(base, upd("v1", true, [sig("b1", true, [])]))).toBe(false);
+  });
+});
+
 describe("BoardView — terminal columns are render-capped", () => {
   const CAP = 50;
   // > CAP * 3, so the paging assertions below still have cards left to reveal on the third page.

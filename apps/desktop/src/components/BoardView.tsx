@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { C, FONT_WEIGHT, MODAL_SHADOW, SCRIM } from "../theme/colors";
 import { PILL, RADIUS } from "../theme/scale";
 import { TAG } from "./labelTreatment";
@@ -140,6 +140,38 @@ const TERMINAL_COLUMNS: ReadonlySet<EpicLadderKey> = new Set<EpicLadderKey>([
   "delivered",
   "archived",
 ]);
+
+/**
+ * Does this monitor tick say the same thing as the one we are already holding?
+ *
+ * The delivery monitor fires on a timer and always hands back a FRESH object, so without this the
+ * board took a new `delivery` identity every tick and re-rendered itself and every card on an idle
+ * screen. Compared by VALUE, and deliberately field-by-field rather than by JSON round-trip: this
+ * runs on every tick, and a stringify of the whole signal list allocates far more than the walk it
+ * replaces.
+ *
+ * `tags` is compared too. It is not read by anything the board renders TODAY, which is exactly why
+ * it must be here: treating it as irrelevant would make this function quietly lossy the moment a
+ * caller starts reading it, and a stale tag list is the kind of bug that presents as "the UI just
+ * stopped updating" long after this line was written.
+ */
+export function sameDeliveryUpdate(
+  a: DeliveryMonitorUpdate | null,
+  b: DeliveryMonitorUpdate | null,
+): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  if (a.detectable !== b.detectable || a.status !== b.status) return false;
+  if (a.signals.length !== b.signals.length) return false;
+  for (let i = 0; i < a.signals.length; i++) {
+    const x = a.signals[i]!;
+    const y = b.signals[i]!;
+    if (x.beadId !== y.beadId || x.inRelease !== y.inRelease) return false;
+    if (x.tags.length !== y.tags.length) return false;
+    for (let t = 0; t < x.tags.length; t++) if (x.tags[t] !== y.tags[t]) return false;
+  }
+  return true;
+}
 
 const DESC_PREVIEW = 120;
 
@@ -313,6 +345,11 @@ export function BoardView({
   const [defs, setDefs] = useState<StageDefs>({});
   // Latest delivery-monitor tick (drives the Delivered header chip + per-card `in_release`).
   const [delivery, setDelivery] = useState<DeliveryMonitorUpdate | null>(null);
+  // STABLE ACROSS RENDERS, and load-bearing rather than tidy: this reaches every card, so as an
+  // inline `(b) => setSelectedId(b.id)` it was a new function identity on every render and
+  // `React.memo` on `Card` would have missed 100% of the time — a memo that never hits is worse
+  // than none, because it costs a props comparison per card and buys nothing.
+  const handleOpen = useCallback((b: Bead) => setSelectedId(b.id), []);
 
   // Load the definitions once per project, then live-refresh on any config write/edit. The modal's
   // save fires `config-changed`, so the board picks up a fresh definition without a manual poll.
@@ -367,7 +404,20 @@ export function BoardView({
         mergeSha: mergeShaOf(x),
       }));
     };
-    startDeliveryMonitor(project.rootPath, (u) => setDelivery(u), getBeads);
+    // KEEP THE OLD OBJECT WHEN THE TICK SAYS THE SAME THING. The monitor fires on a timer and
+    // hands us a FRESH object every time, so `setDelivery(u)` changed React state on every tick
+    // whether or not anything about the delivery picture moved. That is the 90-second idle
+    // re-render: an untouched board rebuilt `inReleaseByBead`, re-derived `deliveryChip`, and
+    // re-rendered every card, forever, with nobody looking at it.
+    //
+    // It is also what makes memoising the cards WORTHLESS on its own — a new `delivery` identity
+    // invalidates every derived prop below, so `React.memo` on `Card` would miss on every tick no
+    // matter how stable the rest of the props are. The two fixes only work together.
+    startDeliveryMonitor(
+      project.rootPath,
+      (u) => setDelivery((prev) => (sameDeliveryUpdate(prev, u) ? prev : u)),
+      getBeads,
+    );
     return () => stopDeliveryMonitor();
   }, [project.rootPath, deliveredDefined]);
 
@@ -378,11 +428,19 @@ export function BoardView({
     return m;
   }, [delivery]);
 
-  const deliveryChip: DeliveryChip | undefined = delivery
-    ? // We render our own FiCheck/FiAlertTriangle icon, so strip ANY leading glyph/symbol/space the
-      // monitor prepends (⚠/✓ today, but robust to any future marker) to avoid a doubled indicator.
-      { detectable: delivery.detectable, label: delivery.status.replace(/^[^\p{L}\p{N}]+/u, "") }
-    : undefined;
+  // MEMOISED, because this is a prop that reaches every card. As a bare object literal it minted a
+  // new identity on every render of this component — so even with `delivery` held stable above, any
+  // unrelated re-render here would still invalidate `React.memo` on every `Card` beneath it.
+  const deliveryChip: DeliveryChip | undefined = useMemo(
+    () =>
+      delivery
+        ? // We render our own FiCheck/FiAlertTriangle icon, so strip ANY leading glyph/symbol/space
+          // the monitor prepends (⚠/✓ today, but robust to any future marker) to avoid a doubled
+          // indicator.
+          { detectable: delivery.detectable, label: delivery.status.replace(/^[^\p{L}\p{N}]+/u, "") }
+        : undefined,
+    [delivery],
+  );
 
   // One-shot board-focus handoff (spec §8): the sidebar epic pill sets boardFocusBeadId before
   // switching here; once the bead is present in a snapshot, open its DetailOverlay and clear the
@@ -873,7 +931,7 @@ export function BoardView({
               deliveryChip={deliveryChip}
               inReleaseByBead={inReleaseByBead}
               onDefine={setDefineStage}
-              onOpen={(b) => setSelectedId(b.id)}
+              onOpen={handleOpen}
               // Archived stays the one COLLAPSED column (a header + count, no cards). The CAP is
               // wider than that: every terminal column gets it, because Done is where the volume
               // actually is. See TERMINAL_RENDER_CAP.
@@ -1263,7 +1321,21 @@ function ParentEpicLine({ epic, onOpen }: { epic: Bead; onOpen: (b: Bead) => voi
   );
 }
 
-function Card({
+/**
+ * ONE BOARD CARD — MEMOISED, and the memo is the point of this component's shape.
+ *
+ * The board mounts one of these per bead: 6,644 of them on the founder's store. Unmemoised, ANY
+ * state change anywhere in `BoardView` — a delivery tick, a hover, opening the detail overlay —
+ * re-rendered every one of them, and each card re-runs the epic resolvers and rebuilds its subtree.
+ * That is the Plan->Build stall and the idle re-render, and it is why `onOpen` is a `useCallback`
+ * and `delivery` is held at a stable identity: a memo whose props change identity every render is
+ * strictly worse than no memo, because it pays a comparison per card and never skips.
+ *
+ * Default shallow comparison is correct here — every prop is either a primitive, a value from the
+ * snapshot (stable per poll), or the stable `handleOpen`. Do not hand it a custom comparator to
+ * paper over a prop that ought to be stable; fix the prop.
+ */
+const Card = memo(function Card({
   bead,
   allBeads,
   agents,
@@ -1487,7 +1559,7 @@ function Card({
       )}
     </div>
   );
-}
+});
 
 /**
  * The card's inline "Build It" (spec §7) — claim the bead (→ in_progress) and hand it to the Build
