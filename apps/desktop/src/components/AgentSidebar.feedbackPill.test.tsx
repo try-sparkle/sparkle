@@ -46,7 +46,7 @@ function mkAgent(id: string, name: string, over: Partial<AgentTab> = {}): AgentT
 }
 
 function bead(partial: Partial<Bead> & { id: string; title: string }): Bead {
-  return { description: "", status: "open", labels: [], parent: null, ...partial };
+  return { description: "", status: "open", labels: [], parent: null, commentCount: 0, ...partial };
 }
 
 const emptyBoard: Board = { backlog: [], blocked: [], inProgress: [], done: [], delivered: [], archived: [] };

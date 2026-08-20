@@ -1164,6 +1164,7 @@ export function applyVisualFixtures(
     status: "open",
     labels: ["agent-feedback", `agent:${agentId}`],
     priority: 2,
+    commentCount: 0,
   });
   // TWELVE ON ONE ROW, AND THAT COUNT IS THE POINT — it makes the pill TWO DIGITS.
   // The compact pill exists because "FEEDBACK 18" is ~70px, and an earlier version of this fixture

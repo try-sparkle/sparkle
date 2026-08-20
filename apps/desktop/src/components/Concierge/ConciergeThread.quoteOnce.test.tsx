@@ -454,6 +454,7 @@ describe("the marker that makes a pill's whole subtree foreign", () => {
             priority: 0,
             labels: [],
             parent: null,
+            commentCount: 0,
           },
           projectId: "p1",
         },

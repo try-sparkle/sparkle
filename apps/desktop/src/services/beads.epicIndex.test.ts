@@ -68,6 +68,7 @@ const mk = (id: string, extra: Partial<Bead> = {}): Bead => ({
   status: "open",
   labels: [],
   parent: null,
+  commentCount: 0,
   ...extra,
 });
 

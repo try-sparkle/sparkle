@@ -239,6 +239,15 @@ export const COMPARED_BEAD_FIELDS = [
   "parent",
   "createdAt",
   "updatedAt",
+  // A COMMENT COUNT IS A REAL CHANGE. Everything else here is a field a reader can see rendered on
+  // a card, so the temptation is to read this one as bookkeeping the board does not draw and leave
+  // it out — which is exactly what made a bead gaining a comment a literal no-op for this store.
+  // Nothing else here can stand in for it: a comment changes no title, status, label or parent, and
+  // relying on `updated_at` to move would make the signal depend on a bd-side behaviour we do not
+  // control. So without this entry the poll that first sees the comment is discarded by the
+  // short-circuit below and the new count never reaches any subscriber. It is one scalar compare
+  // per bead, so the duty-cycle argument this list exists for is unaffected.
+  "commentCount",
 ] as const;
 
 /** Every board column, exhaustively. The `Record<BoardColumn, true>` literal is the tie: adding a
@@ -271,6 +280,7 @@ function sameBead(a: Bead, b: Bead): boolean {
     a.parent === b.parent &&
     a.createdAt === b.createdAt &&
     a.updatedAt === b.updatedAt &&
+    a.commentCount === b.commentCount &&
     sameLabels(a.labels, b.labels)
   );
 }

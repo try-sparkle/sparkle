@@ -440,6 +440,7 @@ const BEAD_FIXTURE: Bead[] = Array.from({ length: BEAD_COUNT }, (_, i) => ({
   priority: 1,
   labels: [],
   parent: null,
+  commentCount: 0,
 }));
 
 /** A draft with an OPEN bead query at the caret — the only state in which the picker asks for bead

@@ -53,6 +53,7 @@ import { startEpicSweepRunner } from "./services/epicSweepRunner";
 import { startResurrectionRunner } from "./services/resurrectionRunner";
 import { startAutoApproveWatch } from "./services/suggestions/autoApproveWatch";
 import { startFleetWatch } from "./services/fleetWatch";
+import { startBeadMentionWatch } from "./services/beadMentions/beadMentionWatch";
 import { startInboxWatch } from "./stores/inboxStore";
 import { startPipelineHealthWatch } from "./stores/pipelineHealthStore";
 import { startPusher } from "./services/pusherMount";
@@ -218,6 +219,38 @@ function AutoApproveWatch() {
   useEffect(() => {
     if (!isMain) return;
     return startAutoApproveWatch();
+  }, [isMain]);
+  return null;
+}
+
+// Turns an `@agent` in a BEAD COMMENT into a doorbell in that agent's inbox (bead sparkle-jb809e).
+//
+// WHY THIS MOUNT IS THE DELIVERABLE. A bead comment is the sanctioned cross-agent channel, but
+// posting one wakes nobody: during a CI P0 an agent posted a stand-down comment on another agent's
+// bead, that agent never saw it and worked a superseded plan, and the FOUNDER hand-relayed it. Two
+// earlier attempts at a mention channel are already on main and have never run — `mention.rs`'s four
+// Tauri commands have zero frontend callers, and the compose UI's components are mounted by nothing.
+// A watcher with no mount is the same dead code a third time, so this line is the feature.
+//
+// MAIN WINDOW ONLY, and — like <AutoApproveWatch/> above rather than like <InboxWatch/> — that is
+// CORRECTNESS, not cost: this WRITES. It queues inbox messages and posts bead comments, so a second
+// window would mean two doorbells and two comments for one mention. Deferred to idle with the rest
+// of the boot burst; it adds no `bd` call of its own, riding the board poll's own comment counts.
+// Paints no UI.
+function BeadMentionWatch() {
+  const isMain = useIsMainWindow();
+  useEffect(() => {
+    if (!isMain) return;
+    let stop: (() => void) | undefined;
+    let cancelled = false;
+    onIdle(() => {
+      if (cancelled) return;
+      stop = startBeadMentionWatch();
+    });
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
   }, [isMain]);
   return null;
 }
@@ -622,6 +655,7 @@ export function App() {
       <RosterPublisher />
       <FleetWatch />
       <InboxWatch />
+      <BeadMentionWatch />
       <PipelineHealthWatch />
       <LimitSync />
       <AutoApproveWatch />

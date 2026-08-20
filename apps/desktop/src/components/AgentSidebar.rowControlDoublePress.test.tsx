@@ -75,7 +75,7 @@ function mkAgent(): AgentTab {
 }
 
 function bead(partial: Partial<Bead> & { id: string; title: string }): Bead {
-  return { description: "", status: "open", labels: [], parent: null, ...partial };
+  return { description: "", status: "open", labels: [], parent: null, commentCount: 0, ...partial };
 }
 
 const PROJECT: Project = {

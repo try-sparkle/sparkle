@@ -17,6 +17,7 @@ const bead = (over: Partial<Bead> & Pick<Bead, "id">): Bead => ({
   description: "",
   status: "open",
   labels: [],
+  commentCount: 0,
   ...over,
 });
 

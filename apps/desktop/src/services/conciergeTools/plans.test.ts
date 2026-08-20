@@ -74,6 +74,7 @@ function bead(id: string, over: Partial<import("../beads").Bead> = {}): import("
     status: "open",
     labels: [],
     parent: null,
+    commentCount: 0,
     ...over,
   };
 }

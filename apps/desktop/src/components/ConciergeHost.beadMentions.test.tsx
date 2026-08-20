@@ -128,6 +128,7 @@ function bead(over: Partial<Bead> & { id: string; title: string }): Bead {
     priority: 1,
     labels: [],
     parent: null,
+    commentCount: 0,
     ...over,
   };
 }

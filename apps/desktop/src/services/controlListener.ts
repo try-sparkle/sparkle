@@ -65,6 +65,7 @@ import { useUiStore, type ThemePref } from "../stores/uiStore";
 import type { StatusBand } from "../engine/buildSections";
 import { rollupDotAccessor } from "../engine/workerRollup";
 import { agentDisplayName } from "../engine/agentDisplayName";
+import { resolveAgentMention } from "./agentMentionResolve";
 import {
   sparkleAgentIdFor,
   SPARKLE_AGENT_DISPLAY_NAME,
@@ -3368,23 +3369,28 @@ async function handleSendPeerMessage(req: ControlRequest): Promise<Record<string
       useProjectStore.getState().projects.find((p) => p.id === callerProjectId)?.agents ?? [];
 
     // Exact id first, then a UNIQUE display-name match — the same name the roster prints, so a name
-    // read from get_state({ scope: "project" }) always resolves here.
-    let target = siblings.find((a) => a.id === to);
-    if (!target) {
-      const byName = siblings.filter((a) => agentDisplayName(a) === to);
-      if (byName.length > 1) {
-        return peerRefusal(
-          "ambiguous_target",
-          `"${to}" matches ${byName.length} agents in your project (${byName
-            .map((a) => a.id)
-            .join(", ")}) — address one of those ids directly`,
-        );
-      }
-      target = byName[0];
+    // read from get_state({ scope: "project" }) always resolves here. The RULE lives in
+    // `agentMentionResolve` because a second feature (an @mention in a bead comment that doorbells
+    // the mentioned agent) has to mean the same thing by "@Rust Half"; what stays here is the
+    // candidate list and the refusal vocabulary, which are this op's alone.
+    const resolved = resolveAgentMention(
+      siblings.map((a) => ({ id: a.id, name: agentDisplayName(a) })),
+      to,
+    );
+    if (resolved.kind === "ambiguous") {
+      return peerRefusal(
+        "ambiguous_target",
+        `"${to}" matches ${resolved.ids.length} agents in your project ` +
+          `(${resolved.ids.join(", ")}) — address one of those ids directly`,
+      );
     }
-    if (!target) return peerRefusal("not_in_project", NO_SUCH_PEER);
-    targetId = target.id;
-    targetName = agentDisplayName(target);
+    // `unknown` COLLAPSES INTO `not_in_project`, deliberately. The resolver was handed this
+    // project's agents and nothing else, so it cannot distinguish "no such agent" from "exists, but
+    // elsewhere" — and NO_SUCH_PEER must keep merging the two, or sweeping ids through this op reads
+    // back which ones exist in other projects. There is nothing here for a new variant to leak.
+    if (resolved.kind !== "ok") return peerRefusal("not_in_project", NO_SUCH_PEER);
+    targetId = resolved.id;
+    targetName = resolved.name;
   }
 
   if (targetId === req.callerAgentId) {

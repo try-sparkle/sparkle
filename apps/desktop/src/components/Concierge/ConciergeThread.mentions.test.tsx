@@ -119,6 +119,7 @@ const BEAD: Bead = {
   priority: 1,
   labels: [],
   parent: null,
+  commentCount: 0,
 };
 
 function ctx(beads: Bead[]): BeadPillContextValue {

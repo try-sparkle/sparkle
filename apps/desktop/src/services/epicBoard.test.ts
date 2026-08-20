@@ -16,7 +16,16 @@ const bead = (
   status: BeadStatus,
   parent: string | null = null,
   extra: Partial<Bead> = {},
-): Bead => ({ id, title: id, description: "", status, labels: [], parent, ...extra });
+): Bead => ({
+  id,
+  title: id,
+  description: "",
+  status,
+  labels: [],
+  parent,
+  commentCount: 0,
+  ...extra,
+});
 
 const idsIn = (b: ReturnType<typeof bucketEpics>): Record<string, string[]> =>
   Object.fromEntries(EPIC_LADDER.map((k) => [k, b[k].map((x) => x.id)]));

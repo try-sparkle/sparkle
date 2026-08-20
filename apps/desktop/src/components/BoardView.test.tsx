@@ -191,6 +191,7 @@ function bead(partial: Partial<Bead> & { id: string; title: string }): Bead {
     status: "open",
     labels: [],
     parent: null,
+    commentCount: 0,
     ...partial,
   };
 }

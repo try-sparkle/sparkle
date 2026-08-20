@@ -31,6 +31,7 @@ function bead(over: Partial<Bead> & { id: string }): Bead {
     priority: 0,
     labels: [],
     parent: null,
+    commentCount: 0,
     ...over,
   };
 }

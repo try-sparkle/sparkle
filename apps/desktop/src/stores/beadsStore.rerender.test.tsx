@@ -42,7 +42,15 @@ const ROWS = 60;
 const POLLS = 6;
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
-  return { title: "", description: "", status: "open", labels: [], parent: null, ...partial };
+  return {
+    title: "",
+    description: "",
+    status: "open",
+    labels: [],
+    parent: null,
+    commentCount: 0,
+    ...partial,
+  };
 }
 
 /** A backlog roughly the size of this repo's real one (~900 beads as of 2026-07). */

@@ -41,7 +41,15 @@ import {
 import { useSettingsStore } from "./settingsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
-  return { title: "", description: "", status: "open", labels: [], parent: null, ...partial };
+  return {
+    title: "",
+    description: "",
+    status: "open",
+    labels: [],
+    parent: null,
+    commentCount: 0,
+    ...partial,
+  };
 }
 
 /** A bead with EVERY optional field populated — the fixture the field-coverage guard reads. */
@@ -57,6 +65,9 @@ function fullBead(): Required<Bead> {
     parent: "sparkle-parent",
     createdAt: "2026-01-01T00:00:00Z",
     updatedAt: "2026-01-02T00:00:00Z",
+    // Non-zero on purpose: this fixture is the "every field populated" one, and a 0 here would let
+    // a comparator that never reads the field agree with one that does.
+    commentCount: 2,
   };
 }
 
@@ -193,6 +204,13 @@ describe("per-field change detection", () => {
     ["createdAt", { createdAt: "2027-01-01T00:00:00Z" }],
     ["updatedAt", { updatedAt: "2027-01-02T00:00:00Z" }],
     ["labels", { labels: ["x", "z"] }],
+    // THE LOAD-BEARING ONE. A comment landing on a bead moves NO other compared field — not the
+    // title, not the status, not the labels — so before `commentCount` joined the comparison this
+    // exact case was the one shape the short-circuit below swallowed: two snapshots differing only
+    // here compared as equal, the store kept the old array identity, and no subscriber ever saw the
+    // new count. It is the cheap "this bead gained a comment" trigger, and it has to survive the
+    // duty-cycle optimisation to be one.
+    ["commentCount", { commentCount: 3 }],
   ];
 
   for (const [field, patch] of mutations) {
@@ -233,6 +251,19 @@ describe("snapshotUnchanged (the comparator itself)", () => {
 
     const longer = mk([bead({ id: "a" }), bead({ id: "b" })]);
     expect(snapshotUnchanged(prev, longer.beads, longer.board)).toBe(false);
+  });
+
+  it("reports a comment-count-only difference as CHANGED", () => {
+    // The comparator half of the load-bearing case in the table above, asserted directly rather
+    // than through `refresh`, so the failure points at `sameBead` instead of at store plumbing.
+    // Identical in every other field — the arrays are equal-length and every id matches, so the
+    // board compare passes too and `commentCount` is the ONLY thing that can produce `false`.
+    const prev = mk([bead({ id: "a", commentCount: 2 })]);
+    const gained = mk([bead({ id: "a", commentCount: 3 })]);
+    expect(snapshotUnchanged(prev, gained.beads, gained.board)).toBe(false);
+    // …and the same count is still equal, so this is a change detector and not a churn source.
+    const same = mk([bead({ id: "a", commentCount: 2 })]);
+    expect(snapshotUnchanged(prev, same.beads, same.board)).toBe(true);
   });
 
   it("is false when only a board column differs, with identical beads", () => {

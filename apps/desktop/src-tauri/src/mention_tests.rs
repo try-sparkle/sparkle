@@ -190,6 +190,151 @@ fn a_sparkle_mention_lands_in_the_concierge_inbox_and_arms_the_wake() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// EVERY HANDLE THE BEAD-COMMENT ROUTER CAN EMIT LANDS IN THE RECIPIENT'S OWN INBOX.
+///
+/// This is the end-to-end claim the TypeScript side CANNOT make. `beadMentionWatch` drives the real
+/// adapter, but its assertions stop at the Tauri boundary: the recipient lives on the far side of a
+/// mocked `invoke`, so those tests prove the send left with the right handle and nothing about what
+/// arrived. Here the doorbell is read back through the recipient's OWN readers, so "the recipient can
+/// observe it" is asserted rather than assumed.
+///
+/// BOTH READERS, because the two recipients do not share one. `@improve`'s pass drains via the
+/// `pending` path; the concierge is drained READ-ONLY through `inbox_peek` → [`inbox::entries_of`].
+/// Asserting only through `pending` would prove the concierge's doorbell is readable by a SIBLING
+/// path — the same honest-but-wrong claim this test was written to retire.
+///
+/// WHAT THIS TEST DOES NOT COVER, stated because the obvious assumption is wrong: the one thing
+/// `entries_of` filters that `pending` does not is `refuse_escape` on the MESSAGE ID, and the id
+/// here is supplied by the test, not by `mention_send`. So these rows cannot notice a change to the
+/// production id generator — against any id this test can produce, the `entries_of` assertions
+/// restate the `pending` ones. That gap is covered separately by
+/// [`the_production_doorbell_id_is_readable_by_the_concierges_reader`], which exercises the real
+/// generator against the real filter.
+///
+/// The inputs are the exact strings `specialTargets.ts::wireHandleFor` produces (`improve`,
+/// `sparkle`) plus the `concierge` alias, driven through `resolve_handle` the way `mention_send`
+/// does. That is the join nothing else covers: TS picks the handle, Rust maps it to an inbox id, and
+/// a mismatch between those two tables would strand every reserved mention with both suites green —
+/// which is exactly how the raw-token bug shipped, twice.
+#[test]
+fn every_reserved_handle_puts_a_doorbell_in_the_right_recipient_inbox() {
+    for (handle, expected_inbox, other_inbox) in [
+        ("improve", "__sparkle_self__", crate::concierge_inbox::CONCIERGE_INBOX_ID),
+        ("sparkle", crate::concierge_inbox::CONCIERGE_INBOX_ID, "__sparkle_self__"),
+        ("concierge", crate::concierge_inbox::CONCIERGE_INBOX_ID, "__sparkle_self__"),
+    ] {
+        let base = tmp(&format!("recipient-{handle}"));
+        let spawner = RecordingSpawner::launched();
+        let threads = FakeThreadStore::default();
+
+        // Resolved the way `mention_send` resolves it — not by naming the variant directly, or the
+        // handle table would not be under test at all.
+        let target = resolve_handle(handle)
+            .unwrap_or_else(|| panic!("{handle:?} must resolve — the TS adapter emits it"));
+
+        let out = route_mention(
+            &base,
+            target,
+            "sparkle-jb809e",
+            "the message is the bead comment above",
+            "DROdio",
+            Provenance::Own,
+            true, // the body is already on the thread: this is the bead-comment path
+            6,
+            DEFAULT_ACK_DEADLINE_MS,
+            1_000,
+            format!("doorbell-{handle}"),
+            &spawner,
+            &threads,
+        )
+        .unwrap();
+
+        // OBSERVED BY THE RECIPIENT: read from its own inbox, through BOTH readers a recipient
+        // actually drains with — `pending` (the improve pass) and `entries_of` (the concierge's
+        // read-only `inbox_peek`). See the note above for why one of them is not enough.
+        let queued = crate::inbox::pending(&base, expected_inbox, 1_000);
+        let peeked = crate::inbox::entries_of(&base, expected_inbox, 1_000);
+        assert_eq!(
+            queued.len(),
+            1,
+            "@{handle} must leave exactly one doorbell in {expected_inbox} (pending)"
+        );
+        assert_eq!(
+            peeked.len(),
+            1,
+            "@{handle}'s doorbell must also be visible to the reader the concierge drains with \
+             (entries_of) — a doorbell only `pending` can see is not observable by that recipient"
+        );
+        for text in [&queued[0].text, &peeked[0].text] {
+            assert!(
+                text.contains("sparkle-jb809e"),
+                "@{handle}'s doorbell must point at the bead it came from"
+            );
+            // Rule 1 holds on the recipient side too — the inbox carries no body.
+            assert!(
+                !text.contains("the message is the bead comment above"),
+                "@{handle}'s doorbell must not carry the message body"
+            );
+        }
+        // And it went to exactly ONE recipient, by either reader.
+        assert!(
+            crate::inbox::pending(&base, other_inbox, 1_000).is_empty(),
+            "@{handle} must not doorbell {other_inbox} (pending)"
+        );
+        assert!(
+            crate::inbox::entries_of(&base, other_inbox, 1_000).is_empty(),
+            "@{handle} must not doorbell {other_inbox} (entries_of)"
+        );
+        assert!(out.doorbelled, "@{handle} must report a doorbell");
+        // `bodyOnThread` is what the bead-comment path passes: nothing is re-posted to the thread.
+        assert!(
+            threads.posts().is_empty(),
+            "@{handle} must not re-post a body that is already the bead comment"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+/// The id `mention_send` actually generates must survive the filter the concierge's reader applies.
+///
+/// THE GAP THIS EXISTS FOR. `entries_of` — the concierge's only drain path, via `inbox_peek` —
+/// discards any record whose id `validate_agent_id` rejects (`refuse_escape`, on the id, not the
+/// agent). `pending` does not. So a doorbell id containing `/`, `\`, `..` or NUL would be enqueued,
+/// acknowledged by the sender, visible to `pending`, and INVISIBLE to the recipient that matters —
+/// a silent non-delivery of exactly the kind this whole feature exists to remove.
+///
+/// The reserved-handle test above cannot catch it: it supplies its own id. This one takes the id
+/// from the production generator `route_mention` is handed (`inbox::uuid_v4`) and asserts the
+/// concierge's reader returns it.
+#[test]
+fn the_production_doorbell_id_is_readable_by_the_concierges_reader() {
+    let base = tmp("doorbell-id");
+    let id = crate::inbox::uuid_v4();
+
+    crate::inbox::enqueue(
+        &base,
+        crate::concierge_inbox::CONCIERGE_INBOX_ID,
+        "[@mention doorbell] go read bead sparkle-jb809e",
+        crate::inbox::Severity::Act,
+        "improve",
+        1_000,
+        id.clone(),
+    )
+    .expect("the doorbell must persist");
+
+    let peeked = crate::inbox::entries_of(&base, crate::concierge_inbox::CONCIERGE_INBOX_ID, 1_000);
+    assert_eq!(
+        peeked.len(),
+        1,
+        "a doorbell carrying the PRODUCTION id must be visible to the reader the concierge drains \
+         with — an id that reader discards is a silent non-delivery"
+    );
+    assert_eq!(peeked[0].id, id, "and it must be the same record, by id");
+
+    std::fs::remove_dir_all(&base).ok();
+}
+
 // ── rule 1: beads is the message, the inbox is only a doorbell ────────────────────────────────
 
 #[test]

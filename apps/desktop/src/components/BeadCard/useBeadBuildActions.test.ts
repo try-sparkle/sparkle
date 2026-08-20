@@ -61,6 +61,7 @@ function bead(over: Partial<Bead> & { id: string }): Bead {
     status: "open",
     labels: [],
     parent: null,
+    commentCount: 0,
     ...over,
   };
 }

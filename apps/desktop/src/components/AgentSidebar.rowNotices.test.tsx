@@ -188,6 +188,7 @@ function seed(
     status: "open" as const,
     labels: ["agent:a1"],
     parent: null,
+    commentCount: 0,
   }));
   useBeadsStore.setState({
     byProject: { p1: { beads, board: EMPTY_BOARD, loadedAt: Date.now() } },

@@ -29,6 +29,29 @@ export interface Bead {
    */
   createdAt?: string;
   updatedAt?: string;
+  /**
+   * How many comments bd has recorded on this bead. `0` when bd does not say.
+   *
+   * Also always on the wire and simply dropped: `bd list --all --limit 0 --json` — the ONE bulk
+   * call the board already makes every poll — emits `comment_count` per row, and the Rust side
+   * already parses it (`beads_cmd.rs` `BeadSummary::comment_count`). Carrying it costs nothing:
+   * a per-bead `bd show` is ~0.9s and a cold `bd list` can be 45s under fleet load, so anything
+   * that wants "did this bead gain a comment" as a cheap trigger has to read it from here.
+   *
+   * OPTIONAL, and that is a deliberate reversal of the first cut. Making it required is the more
+   * precise model — a comment count has a meaningful zero, so "bd omitted it" and "no comments" are
+   * the same fact — but `Bead` is CONSTRUCTED BY HAND in dozens of test fixtures across the tree,
+   * and a required field forces every one of them to be edited. That cost is not one-time: it lands
+   * on every branch in flight and every branch opened afterwards. It was measured within hours —
+   * ~30 fixtures touched, a shared-file overlap against five unrelated open PRs, and then a CI
+   * typecheck failure caused entirely by four NEW fixtures that landed on the default branch while
+   * this work was in review, none of which had any reason to know about this field.
+   *
+   * `normalizeBead` always populates it, so every bead that came from `bd` carries a real number;
+   * only hand-built fixtures can omit it, and for them `0` is the correct reading. Readers use
+   * `?? 0` — one line at the single consumer, against an edit in every fixture forever.
+   */
+  commentCount?: number;
 }
 
 // bd's JSON is loosely typed and the key names vary by version (status vs state,
@@ -38,6 +61,10 @@ type RawBead = Record<string, unknown>;
 
 function asString(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
+}
+
+function asNumber(v: unknown): number | undefined {
+  return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
 
 function normalizeStatus(v: unknown): BeadStatus {
@@ -77,6 +104,10 @@ export function normalizeBead(raw: RawBead): Bead {
     // camelCase build must not silently produce a board where every date filter matches nothing.
     createdAt: asString(raw.created_at) ?? asString(raw.createdAt),
     updatedAt: asString(raw.updated_at) ?? asString(raw.updatedAt),
+    // Both key spellings for the same reason as the timestamps above. `0` for missing OR
+    // non-numeric: bd's own value is an integer, and a string "3" from some other producer is a
+    // shape we did not agree to read, not a number to coerce.
+    commentCount: asNumber(raw.comment_count) ?? asNumber(raw.commentCount) ?? 0,
   };
 }
 

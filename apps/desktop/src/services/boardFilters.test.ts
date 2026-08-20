@@ -20,6 +20,7 @@ function bead(partial: Partial<Bead> = {}): Bead {
     parent: null,
     createdAt: hoursAgo(1),
     updatedAt: hoursAgo(1),
+    commentCount: 0,
     ...partial,
   };
 }

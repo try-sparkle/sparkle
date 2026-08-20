@@ -46,7 +46,15 @@ import {
 import { useSettingsStore } from "./settingsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
-  return { title: "", description: "", status: "open", labels: [], parent: null, ...partial };
+  return {
+    title: "",
+    description: "",
+    status: "open",
+    labels: [],
+    parent: null,
+    commentCount: 0,
+    ...partial,
+  };
 }
 
 /** How many `bd list` processes the poll has launched. */

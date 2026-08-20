@@ -20,6 +20,7 @@ const bead = (id: string, status: BeadStatus, parent: string | null = null, titl
   status,
   labels: [],
   parent,
+  commentCount: 0,
 });
 
 const worker = (

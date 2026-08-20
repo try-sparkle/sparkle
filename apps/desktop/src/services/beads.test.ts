@@ -43,6 +43,7 @@ function bead(partial: Partial<Bead> & { id: string }): Bead {
     status: "open",
     labels: [],
     parent: null,
+    commentCount: 0,
     ...partial,
   };
 }
@@ -90,6 +91,7 @@ describe("listBeads", () => {
         priority: 1,
         labels: ["a", "b"],
         parent: "sparkle-0",
+        commentCount: 0,
       },
       {
         id: "sparkle-2",
@@ -100,6 +102,7 @@ describe("listBeads", () => {
         priority: undefined,
         labels: [],
         parent: null,
+        commentCount: 0,
       },
     ]);
   });
@@ -139,6 +142,44 @@ describe("listBeads", () => {
     // string would parse to NaN down a different branch.
     expect(none?.createdAt).toBeUndefined();
     expect(none?.updatedAt).toBeUndefined();
+  });
+
+  // ── THE COMMENT COUNT WAS ALWAYS ON THE WIRE TOO ────────────────────────────────────────────
+  // `bd list --all --limit 0 --json` emits `comment_count` per row and the Rust side already parses
+  // it (`beads_cmd.rs` `BeadSummary::comment_count`); `normalizeBead` was the only thing dropping
+  // it. That matters because it is the ONLY cheap way to notice a bead gained a comment — the
+  // bulk poll is already paid for, while a per-bead `bd show` is ~0.9s and a cold list can be 45s.
+  // MUTATION TARGET: deleting the `comment_count` read makes this read 0 and fails here.
+  it("carries comment_count through as commentCount", async () => {
+    invokeMock.mockResolvedValue(
+      JSON.stringify([{ id: "sparkle-1", title: "First", status: "open", comment_count: 3 }]),
+    );
+    const [b] = await listBeads("/proj");
+    expect(b?.commentCount).toBe(3);
+  });
+
+  it("also reads the camelCase spelling of comment_count", async () => {
+    invokeMock.mockResolvedValue(
+      JSON.stringify([{ id: "a", title: "camel", status: "open", commentCount: 3 }]),
+    );
+    const [b] = await listBeads("/proj");
+    expect(b?.commentCount).toBe(3);
+  });
+
+  it("defaults commentCount to 0 when bd omits it or sends a non-number", async () => {
+    // 0, never undefined: the field is required precisely so no reader has to write `?? 0`, and a
+    // string "3" is a shape we did not agree to read rather than a number to coerce.
+    invokeMock.mockResolvedValue(
+      JSON.stringify([
+        { id: "a", title: "absent", status: "open" },
+        { id: "b", title: "string", status: "open", comment_count: "3" },
+        { id: "c", title: "null", status: "open", comment_count: null },
+      ]),
+    );
+    const [absent, str, nul] = await listBeads("/proj");
+    expect(absent?.commentCount).toBe(0);
+    expect(str?.commentCount).toBe(0);
+    expect(nul?.commentCount).toBe(0);
   });
 
   it("throws a clear error on non-array JSON", async () => {
@@ -548,7 +589,16 @@ const idxBead = (
   status: Bead["status"],
   parent: string | null = null,
   extra: Partial<Bead> = {},
-): Bead => ({ id, title: id, description: "", status, labels: [], parent, ...extra });
+): Bead => ({
+  id,
+  title: id,
+  description: "",
+  status,
+  labels: [],
+  parent,
+  commentCount: 0,
+  ...extra,
+});
 
 // ══ THE INDEX MUST BE `childrenOf` / `isEpic`, EXACTLY ════════════════════════════════════════
 //

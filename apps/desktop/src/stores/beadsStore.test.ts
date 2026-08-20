@@ -27,7 +27,15 @@ import { useBeadsStore, BEADS_STALE_REFRESH_MS, __resetBeadsRefreshInFlightForTe
 import { useSettingsStore } from "./settingsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
-  return { title: "", description: "", status: "open", labels: [], parent: null, ...partial };
+  return {
+    title: "",
+    description: "",
+    status: "open",
+    labels: [],
+    parent: null,
+    commentCount: 0,
+    ...partial,
+  };
 }
 
 beforeEach(() => {

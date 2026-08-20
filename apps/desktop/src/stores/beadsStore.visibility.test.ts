@@ -16,7 +16,15 @@ vi.mock("../services/beads", async (importOriginal) => {
 import { useBeadsStore } from "./beadsStore";
 
 function bead(partial: Partial<Bead> & { id: string }): Bead {
-  return { title: "", description: "", status: "open", labels: [], parent: null, ...partial };
+  return {
+    title: "",
+    description: "",
+    status: "open",
+    labels: [],
+    parent: null,
+    commentCount: 0,
+    ...partial,
+  };
 }
 
 // jsdom's visibilityState is read-only; override the getter so we can drive it from a test.
