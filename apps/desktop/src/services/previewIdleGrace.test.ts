@@ -475,4 +475,52 @@ describe("previewIdleGrace — a stop that settles after teardown changes nothin
         expect(stopPreviewForAgent).not.toHaveBeenCalled();
       });
   });
+
+  it("does not clear a LIVE stop's entry when an OLDER stop resolves", () => {
+    // THE RESOLVE DIRECTION — the half the reject row above cannot reach (roborev 65711).
+    //
+    // That row drives a settle into a world whose `stopping` map is EMPTY, so it exercises the
+    // early return and nothing more: delete the `.then` guard entirely and it stays green, because
+    // an unconditional `stopping.delete` on an empty map is a no-op. The defect the guard exists
+    // for needs a SECOND stop for the SAME agent to be registered before the stale settle lands,
+    // which only this row constructs.
+    //
+    // Two separately-controllable promises: the first belongs to the world that gets torn down,
+    // the second to the world that replaces it. The second NEVER settles, so the only thing that
+    // can touch `stopping` after the teardown is the first one's `.then`.
+    let resolveFirst!: (v: unknown) => void;
+    const first = new Promise((res) => {
+      resolveFirst = res;
+    });
+    const second = new Promise(() => {});
+    vi.mocked(stopPreviewForAgent)
+      .mockReset()
+      .mockReturnValueOnce(first as never)
+      .mockReturnValueOnce(second as never);
+
+    seed("ag1");
+    reconcilePreviewIdleGrace();
+    vi.advanceTimersByTime(GRACE);
+    expect(stopPreviewForAgent).toHaveBeenCalledTimes(1); // S1 in flight, token 1 registered
+
+    // The world goes away while S1 is still in flight, and a new one starts with the entry still
+    // `serving` — already past its window, so the reconcile arms a deadline that fires at once.
+    resetPreviewIdleGraceStateForTests();
+    setPreviewIdleGraceMinutesForTests(GRACE / MIN);
+    reconcilePreviewIdleGrace();
+    vi.advanceTimersByTime(0);
+    expect(stopPreviewForAgent).toHaveBeenCalledTimes(2); // S2 in flight, token 2 registered
+
+    // …and only NOW does the old stop resolve. Unconditionally deleting here evicts token 2, so
+    // the reconcile below sees a live entry with no pending timer and nothing marking it as
+    // already on its way out — and issues a THIRD stop for an agent that is already being stopped.
+    resolveFirst(null);
+    return Promise.resolve()
+      .then(() => Promise.resolve())
+      .then(() => {
+        reconcilePreviewIdleGrace();
+        vi.advanceTimersByTime(0);
+        expect(stopPreviewForAgent).toHaveBeenCalledTimes(2);
+      });
+  });
 });
