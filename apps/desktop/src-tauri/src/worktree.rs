@@ -581,9 +581,9 @@ impl Captured {
     /// The clause to append to a failure message built from STDERR when that text may be short.
     /// Empty when stderr is known whole, so call sites can push it unconditionally.
     ///
-    /// Both lenient call sites build their user-facing error from the captured stderr, which is
-    /// where `gh` and `claude` put the reason — so a lost tail turns "why the merge was declined"
-    /// into a bare `gh pr merge #N failed`, with nothing saying why it's empty.
+    /// The lenient call sites build their user-facing error from the captured stderr, which is
+    /// where `gh`, `claude` and `brew` put the reason — so a lost tail turns "why the merge was
+    /// declined" into a bare `gh pr merge #N failed`, with nothing saying why it's empty.
     pub(crate) fn truncation_note(&self) -> &'static str {
         // Ordered by what actually happened to STDERR, then the one cause that hits both streams.
         // Testing a collapsed "did anything go wrong" bit first was wrong twice: a stdout read

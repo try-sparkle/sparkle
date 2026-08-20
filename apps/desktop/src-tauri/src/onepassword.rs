@@ -2069,9 +2069,41 @@ pub async fn op_refresh() -> OpStatus {
     .unwrap_or_else(|_| OpStatus::cli_missing(Some("the 1Password probe didn't finish".into())))
 }
 
+/// Did the install happen? Decided by the child's EXIT STATUS alone — a capped or incomplete drain
+/// is a fact about our reading of the output, never about whether Homebrew did the work. Split out
+/// of [`op_install`] so that decision is assertable without a Homebrew on the machine: a test that
+/// only drove the command would have to install a cask to reach this branch.
+fn install_verdict(captured: &crate::worktree::Captured) -> Result<(), String> {
+    let out = &captured.output;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(format!(
+        "Homebrew couldn't install the 1Password CLI: {}{}",
+        // Homebrew's stdout is install chatter, never document contents.
+        sanitize_op_error(
+            &String::from_utf8_lossy(&out.stderr),
+            &String::from_utf8_lossy(&out.stdout),
+            true
+        ),
+        // A genuine failure whose reason we only partly read still says so.
+        captured.truncation_note()
+    ))
+}
+
 /// `brew install --cask 1password-cli`, then re-probe. A missing Homebrew returns [`NO_BREW`] — a
 /// displayable message the pane can pair with a link to 1Password's own installer — rather than a
 /// generic failure that leaves the user with a dead button.
+///
+/// LENIENT capture, because this is a MUTATING call. The strict
+/// [`crate::worktree::output_with_timeout`] turns a capped or incomplete drain into an `Err`
+/// *before* the exit status is ever consulted — and a `brew install --cask` is exactly the shape
+/// that trips it: the cask's own installer spawns helpers that inherit these pipes and can hold
+/// them open past the drain grace. The cask would then be installed and working while the user was
+/// told the install failed, and — the damaging half — the `?` would skip
+/// [`invalidate_op_path_cache`], leaving the "not installed" path cached so the pane kept saying so
+/// afterwards. The install having happened is decided by `status.success()`; a short capture is a
+/// fact about our reading, not about the install.
 #[tauri::command]
 pub async fn op_install() -> Result<OpStatus, String> {
     tauri::async_runtime::spawn_blocking(|| {
@@ -2081,19 +2113,9 @@ pub async fn op_install() -> Result<OpStatus, String> {
         cmd.env("HOMEBREW_NO_AUTO_UPDATE", "1");
         cmd.env("HOMEBREW_NO_ANALYTICS", "1");
         cmd.env("NONINTERACTIVE", "1");
-        let out = crate::worktree::output_with_timeout(cmd, BREW_TIMEOUT)
+        let captured = crate::worktree::output_with_timeout_lenient(cmd, BREW_TIMEOUT)
             .map_err(|e| format!("Homebrew {e}"))?;
-        if !out.status.success() {
-            return Err(format!(
-                "Homebrew couldn't install the 1Password CLI: {}",
-                // Homebrew's stdout is install chatter, never document contents.
-                sanitize_op_error(
-                    &String::from_utf8_lossy(&out.stderr),
-                    &String::from_utf8_lossy(&out.stdout),
-                    true
-                )
-            ));
-        }
+        install_verdict(&captured)?;
         invalidate_op_path_cache();
         Ok(op_status_now())
     })
@@ -2232,6 +2254,58 @@ pub async fn op_seed_worktree(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// A MUTATING call whose child exited 0 but whose output we could NOT capture whole must read
+    /// as INSTALLED. `brew install --cask` is chatty enough to overrun the per-stream capture cap,
+    /// and the strict capture turns that into an `Err` *before* the exit status is consulted — so a
+    /// working CLI was reported as a failed install and [`invalidate_op_path_cache`] never ran.
+    ///
+    /// Driven through the real [`crate::worktree::output_with_timeout_lenient`], not a hand-built
+    /// `Captured`: the point is that this shape actually arrives from a real child. The capping is
+    /// asserted as a PRECONDITION — without it the child's drain completes and the test would pass
+    /// against the very strict behaviour it exists to rule out.
+    #[cfg(unix)]
+    #[test]
+    fn a_successful_install_we_could_not_read_whole_is_not_reported_as_failure() {
+        // Comfortably past the per-stream cap under either build's value, then exit 0.
+        let script = "i=0; while [ $i -lt 6000 ]; do printf '%01000d\\n' 0; i=$((i+1)); done; exit 0";
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        let captured = crate::worktree::output_with_timeout_lenient(cmd, Duration::from_secs(60))
+            .expect("the lenient capture returns Ok");
+
+        assert!(captured.output.status.success(), "the child itself exited 0 — the install HAPPENED");
+        assert!(
+            captured.stdout_capped && !captured.drain_complete,
+            "precondition: the capture must really be incomplete, or this proves nothing"
+        );
+
+        assert_eq!(
+            install_verdict(&captured),
+            Ok(()),
+            "an install that HAPPENED must not be failed for how completely we read its chatter"
+        );
+    }
+
+    /// The other half of the pair, and the reason the test above is not just "always return Ok":
+    /// a child that exits NON-ZERO is still a failed install, and its message still reaches the
+    /// user. One direction alone would pass against an `install_verdict` that ignored the status.
+    #[cfg(unix)]
+    #[test]
+    fn a_nonzero_install_is_still_a_failure_and_still_explains_itself() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("echo 'Error: Cask 1password-cli is unavailable' >&2; exit 1");
+        let captured = crate::worktree::output_with_timeout_lenient(cmd, Duration::from_secs(30))
+            .expect("the lenient capture returns Ok");
+        assert!(!captured.output.status.success(), "the child exited non-zero");
+
+        let err = install_verdict(&captured).expect_err("a non-zero brew is a failed install");
+        assert!(
+            err.contains("Homebrew couldn't install the 1Password CLI"),
+            "the user-facing prefix survives: {err}"
+        );
+        assert!(err.contains("unavailable"), "the reason from stderr reaches the user: {err}");
+    }
 
     /// Write an executable fake `op` into `dir` whose body is `body` (POSIX sh). The script appends
     /// each argument, one per line, to `<dir>/argv.log` followed by a `--` separator, so a test can
