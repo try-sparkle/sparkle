@@ -27,6 +27,7 @@ vi.mock("../analytics", () => ({ capture: vi.fn() }));
 import { useDictationStore } from "../stores/dictationStore";
 import { useAutoSend, notifyManualSend, AUTO_SEND_TICK_MS } from "./useAutoSend";
 import { resetAutoSendTelemetry } from "./autoSendTelemetry";
+import { NO_COMPOSE_INTERACTION } from "./composeInteraction";
 
 /** A clean sentence — `high`, so the threshold is 1s and tests stay short. */
 const DONE = "Deploy the staging branch.";
@@ -58,6 +59,9 @@ function setup(overrides: Partial<Props> = {}) {
     // Nothing has been pasted, dropped or uploaded — the ordinary case every pre-existing row below
     // assumes. The reset rows bump it explicitly.
     draftGrewSeq: 0,
+    // Nobody has touched the compose window — the ordinary case every pre-existing row below
+    // assumes. The typing/caret pause rows bump it explicitly.
+    composeInteraction: NO_COMPOSE_INTERACTION,
     interim: "",
     targetName: "Concierge",
     onFire,

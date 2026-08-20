@@ -202,6 +202,7 @@ export function ConciergeColumn({
   onComposedText,
   onMentionComposing,
   onPasted,
+  onComposeInteraction,
   registerSubmit,
   onOpenAgent,
   onSeeAgentHistory,
@@ -1146,6 +1147,7 @@ export function ConciergeColumn({
           onComposedText={onComposedText}
           onMentionComposing={onMentionComposing}
           onPasted={onPasted}
+          onComposeInteraction={onComposeInteraction}
           registerSubmit={registerSubmit}
         />
       )}

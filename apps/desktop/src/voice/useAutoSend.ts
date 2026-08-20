@@ -54,6 +54,7 @@ import {
   noteSpeechEnd,
   noteSpeechResumed,
   noteTranscript,
+  noteHandEdit,
   pauseCountdown,
   restartCountdown,
   remainingFraction,
@@ -62,7 +63,12 @@ import {
   setArmed as setArmedState,
   type AutoSendState,
 } from "./autoSendTimer";
-import { sweepThresholdMs } from "./sendMode";
+import { settleThresholdMs } from "./sendMode";
+import {
+  TYPING_SETTLE_MS,
+  interactionInFlight,
+  type ComposeInteraction,
+} from "./composeInteraction";
 import {
   noteManualSendDuringCountdown,
   noteUserSend,
@@ -221,6 +227,33 @@ export interface UseAutoSendArgs {
    * prop makes a feature inert with a fully green suite, and there is exactly one caller.
    */
   draftGrewSeq: number;
+  /**
+   * The compose window was USED — a keystroke, a caret move, a name picked off the `@`-list. One
+   * bump per gesture; `edited` says whether that gesture changed the draft's text.
+   *
+   * ── THIS IS THE FOUNDER'S ORIGINAL REPORT, AND IT IS THE CLASS FIX ───────────────────────────
+   * *"when I start by talking, and then I start typing in the compose window, it's not pausing the
+   * auto send … It should pause the auto send and then reevaluate it."* Typing was the one
+   * deliberate action the countdown could not see: `composingMention` covers only an unfinished
+   * `@`-address, and `draftGrewSeq` covers only a gesture that PUT something in the box. Ordinary
+   * characters landed in neither, so the clock ran on underneath him and fired mid-sentence.
+   *
+   * ── WHY IT DOES NOT REPLACE `composingMention` / `attachPickerOpen` ──────────────────────────
+   * Those are STATES with two observable edges; this is a stream of INSTANTS that has to be given a
+   * duration ({@link TYPING_SETTLE_MS}). They are different shapes of evidence about the same rule,
+   * so they stay separate terms and meet in ONE predicate — voice/composeInteraction's
+   * `interactionInFlight` — rather than being OR'd afresh at each call site.
+   *
+   * ── WHY IT CANNOT BE DERIVED FROM `composedText` ─────────────────────────────────────────────
+   * The same reason `draftGrewSeq` cannot, and it is the module header's central rule: a committed
+   * dictation chunk changes `composedText` too, and those must move the threshold WITHOUT touching
+   * the clock. Text is what some gestures leave behind; the gesture is the fact. A caret move
+   * changes no text at all and must still pause.
+   *
+   * REQUIRED, not optional-defaulting, for the reason stated on `composingMention`: an omitted prop
+   * makes a feature inert with a fully green suite, and there is exactly one caller.
+   */
+  composeInteraction: ComposeInteraction;
   /** Live uncommitted transcript; non-empty means the user is speaking into THIS box right now. */
   interim: string;
   /** Who this send would reach. The rail's only label, and the mis-route safety net. */
@@ -261,6 +294,7 @@ export function useAutoSend({
   composingMention,
   attachPickerOpen,
   draftGrewSeq,
+  composeInteraction,
   interim,
   targetName,
   onFire,
@@ -397,14 +431,53 @@ export function useAutoSend({
   // Both directions run through one effect rather than an edge check, because both reducers are
   // idempotent no-ops when they do not apply — and an edge check is what would leave the composer
   // WEDGED (paused with no way back) the first time a state change slipped past its comparison.
+  //
+  // THREE TERMS NOW, STILL ONE RULE — and the third is why they moved into a predicate of their own
+  // (bead sparkle-wfwypy). Typing is the gesture the founder reported FIRST and the one the
+  // countdown could not see: ordinary characters are neither an `@`-address nor something PUT in
+  // the box, so they fell through both existing terms and the clock ran on underneath him.
+  //
+  // The terms are no longer OR'd here. `interactionInFlight` (voice/composeInteraction) owns the
+  // rule, and a fourth trigger is a term in THAT file rather than another `||` in this line — which
+  // is what stops the list of special cases from growing one report at a time.
+  const gestureSeen = useRef(composeInteraction.seq);
+  const [lastGestureAt, setLastGestureAt] = useState<number | null>(null);
+
+  // ── (2b-i) A GESTURE LANDED — stamp it, and remember if it CHANGED the draft ─────────────────
+  // Guarded on the previous seq, like `draftGrewSeq` below and for the same reason: this is an
+  // instant, not a state, so re-running it on an unrelated re-render would hold the pause open
+  // forever. The ref starts at the seq the hook mounted with, so a remount is not a fresh gesture.
+  //
+  // `noteHandEdit` is applied HERE rather than in the predicate effect because it is a fact about
+  // the DRAFT that outlives the pause: it floors the threshold on the way out, for every countdown
+  // this message ever runs, until the message leaves the box. See TYPED_EDIT_MIN_THRESHOLD_MS.
+  useEffect(() => {
+    if (composeInteraction.seq === gestureSeen.current) return;
+    gestureSeen.current = composeInteraction.seq;
+    if (composeInteraction.edited) apply(noteHandEdit(stateRef.current));
+    setLastGestureAt(Date.now());
+  }, [composeInteraction.seq, composeInteraction.edited, apply]);
+
+  // ── (2b-ii) …AND IT SETTLES ─────────────────────────────────────────────────────────────────
+  // The timer is re-armed from scratch on every stamp (the cleanup clears the previous one), so a
+  // burst of typing is ONE unbroken pause rather than a strobe — a pause that lifted between two
+  // characters would re-anchor the clock on each of them, and `resumeCountdown` grants a FULL fresh
+  // threshold every time, so a fast typist would push the deadline out indefinitely.
+  useEffect(() => {
+    if (lastGestureAt === null) return;
+    const t = setTimeout(() => setLastGestureAt(null), TYPING_SETTLE_MS);
+    return () => clearTimeout(t);
+  }, [lastGestureAt]);
+
+  // ── (2b-iii) THE ONE QUESTION ───────────────────────────────────────────────────────────────
   useEffect(() => {
     const now = Date.now();
     apply(
-      composingMention || attachPickerOpen
+      interactionInFlight({ composingMention, attachPickerOpen, lastGestureAt }, now)
         ? pauseCountdown(stateRef.current, now)
         : resumeCountdown(stateRef.current, now),
     );
-  }, [composingMention, attachPickerOpen, armed, apply]);
+  }, [composingMention, attachPickerOpen, lastGestureAt, armed, apply]);
 
   // ── (2c) SOMETHING WAS PUT IN THE BOX — start the clock OVER ────────────────────────────────
   // The other half of the founder's countdown complaint (sparkle-3kqg2v): *"reset the countdown if
@@ -631,7 +704,7 @@ export function useAutoSend({
         }
         const sample = {
           tier: s.tier,
-          thresholdMs: sweepThresholdMs(s.tier),
+          thresholdMs: settleThresholdMs(s.tier, s.handEdited),
           elapsedSilenceMs: elapsedMs(s, now),
           keptTalkingAfterReeval: reeval.current.keptTalking,
           graceApplied: reeval.current.graceApplied,

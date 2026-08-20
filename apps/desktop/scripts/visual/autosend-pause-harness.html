@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Auto-send pause — typing halts the countdown</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: var(--c-concierge-surface, #212f4e);
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      A REAL-BROWSER PAGE for bead sparkle-wfwypy: the founder dictates, the countdown starts, he
+      starts typing — and the countdown must visibly HALT rather than run on and send mid-edit.
+
+      Why a harness rather than the full app shell: starting a real countdown needs a real
+      speech-end from the dictation engine, which needs a microphone and a live Deepgram session.
+      This page drives the SAME dictation store the engine writes to, so everything below it — the
+      hook, the reducer, the shared predicate, the rail's fill — is the shipped code path on a real
+      clock. What it does not exercise is the audio capture above the store.
+    -->
+    <div id="root"></div>
+    <script type="module" src="./autosend-pause-harness.jsx"></script>
+  </body>
+</html>

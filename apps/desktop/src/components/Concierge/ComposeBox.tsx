@@ -134,6 +134,10 @@ import { TextPillModal } from "../composer/TextPillModal";
 import { QuoteChip } from "./QuoteChip";
 import type { ComposeQuote } from "./composeQuote";
 import { useVoicePlaceholder } from "../../voice/useVoicePlaceholder";
+import {
+  isCaretGestureKey,
+  type ComposeInteractionKind,
+} from "../../voice/composeInteraction";
 import { useDictationStore } from "../../stores/dictationStore";
 import {
   focusQuietly,
@@ -633,6 +637,7 @@ export function ComposeBox({
   onComposedText,
   onMentionComposing,
   onPasted,
+  onComposeInteraction,
   registerSubmit,
   quote = null,
   onRemoveQuote,
@@ -800,6 +805,18 @@ export function ComposeBox({
    * `draftGrewSeq`). Optional like every other seam here — a box mounted without the rail never asks.
    */
   onPasted?: () => void;
+  /**
+   * The user USED this box — a keystroke, a caret gesture, a name picked off the `@`-list. Feeds
+   * the ONE predicate that freezes the auto-send countdown while an action is in flight
+   * (voice/composeInteraction, bead sparkle-wfwypy).
+   *
+   * Reported from the GESTURE, never from the resulting text or selection: dictation writes to this
+   * box programmatically while the user's hands are nowhere near it, and a machine-driven edit that
+   * read as a human one would pause the countdown on transcription lag. See `isCaretGestureKey`.
+   *
+   * Optional like every other rail seam here — a box mounted without the rail never asks.
+   */
+  onComposeInteraction?: (kind: ComposeInteractionKind) => void;
   /**
    * Hand the host this box's submit, so the auto-send rail can fire the SAME path the button does.
    *
@@ -1257,13 +1274,16 @@ export function ComposeBox({
       // rule, shared with the picker's own disabled styling so the list cannot offer a row this
       // refuses.
       if (!mentionRowIsChoosable(agent)) return;
+      // Reported explicitly because `applyEdit` writes the textarea programmatically — no `onChange`
+      // fires, so the funnel above cannot see the one gesture that is unambiguously deliberate.
+      onComposeInteraction?.("mention");
       applyEdit(insertMention(text, pending.anchor, caret, agent));
       // NOT dismissed — the inserted literal ends in a space, so `mentionQuery` no longer sees an
       // open query and the picker closes on its own. Marking it dismissed would additionally
       // suppress a fresh `@` typed at the same offset later in the session.
       setSelected(0);
     },
-    [pending, applyEdit, text, caret],
+    [pending, applyEdit, text, caret, onComposeInteraction],
   );
 
   // ── A long paste collapses into a pill instead of flooding the box ───────────────────────────
@@ -2214,9 +2234,18 @@ export function ComposeBox({
               // That is what lets the host tell "this box was emptied by hand" (which retires the
               // dictated-origin latch) from "a segment just landed in it".
               onTextEdit?.(e.target.value);
+              // …and the auto-send countdown freezes while he is doing it. THE founder's report:
+              // *"if I start to type … it should pause the auto send and then reevaluate it."*
+              // Every text-changing gesture funnels through this one DOM handler — characters,
+              // backspace, cut, undo/redo, an IME commit, a paste — so one call covers all of them.
+              onComposeInteraction?.("edit");
             }}
             onKeyDown={(e) => {
               ownVoice();
+              // Caret and selection gestures only — the keys that TYPE report through `onChange`
+              // above, where the edit itself is. Reporting both here would double-count every
+              // character, which is harmless for the pause but would make the gesture count lie.
+              if (isCaretGestureKey(e)) onComposeInteraction?.("caret");
               onKeyDown(e);
             }}
             // A long paste becomes a pill above the box rather than flooding it (see onPaste). A
@@ -2240,7 +2269,13 @@ export function ComposeBox({
             // …and a pointer press, because a click on an already-focused box fires no focus event,
             // and this box IS often already focused — the composeFocusSeq effect above puts the
             // caret here on every requestComposeFocus (roborev 54239).
-            onPointerDown={ownVoice}
+            onPointerDown={() => {
+              // A press INSIDE the box is the user aiming at the draft — placing a caret, starting
+              // a drag-select. Distinct from mere focus, which the founder deliberately left out:
+              // a click that happens to focus the box is still a deliberate press on the message.
+              onComposeInteraction?.("caret");
+              ownVoice();
+            }}
             style={{
               flex: 1,
               // `resize: none` stays: the browser's own corner grip resizes only the textarea, which

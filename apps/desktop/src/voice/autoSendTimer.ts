@@ -52,11 +52,11 @@
 
 import { confidence, type Confidence } from "./confidence";
 // THE FLOOR IS APPLIED HERE, at the one place the deadline is computed, rather than being a number
-// the tray happens to respect. `sweepThresholdMs` is the ladder's rung for a tier, never faster than
+// the tray happens to respect. `settleThresholdMs` is the ladder's rung for a tier, never faster than
 // SWEEP_FLOOR_MS. Importing `thresholdMs` directly instead would leave the floor as a promise no
 // code kept: the ladder's fastest rung is 1s today, so the two agree until someone retunes it —
 // and a retune below a second is exactly the case the floor exists for.
-import { sweepThresholdMs } from "./sendMode";
+import { settleThresholdMs } from "./sendMode";
 
 export type { Confidence };
 
@@ -128,6 +128,15 @@ export interface AutoSendState {
    * which is the same surprise send from one moment later.
    */
   pausedAt: number | null;
+  /**
+   * The user has TYPED INTO this draft — it is no longer purely dictated. Floors the threshold at
+   * {@link TYPED_EDIT_MIN_THRESHOLD_MS}; see that constant for why the speech ladder is not honest
+   * about a hand-edited message.
+   *
+   * A PROPERTY OF THE DRAFT, so it outlives the keystroke that set it and every pause/resume cycle
+   * after it. Cleared only when the draft itself goes: a send, a manual send, or a disarm.
+   */
+  handEdited: boolean;
 }
 
 /**
@@ -141,6 +150,15 @@ function clockAt(state: AutoSendState, now: number): number {
   return state.pausedAt ?? now;
 }
 
+/**
+ * The threshold THIS state is measured against. One helper for the same reason as {@link clockAt}:
+ * a reader that reaches for the bare ladder instead un-floors one of deadline/fill/telemetry while
+ * the others stay floored, and the rail then disagrees with itself about when it will fire.
+ */
+export function thresholdFor(state: AutoSendState): number {
+  return settleThresholdMs(state.tier, state.handEdited);
+}
+
 /** A fresh, disarmed rail. */
 export function initialState(): AutoSendState {
   return {
@@ -150,12 +168,22 @@ export function initialState(): AutoSendState {
     silenceStartedAt: null,
     fireNoEarlierThan: null,
     pausedAt: null,
+    handEdited: false,
   };
 }
 
 /** Turn the rail on (`listening`) or off. Off clears every clock — an armed-later rail starts fresh. */
 export function setArmed(state: AutoSendState, armed: boolean): AutoSendState {
-  if (!armed) return { ...initialState(), transcript: state.transcript, tier: state.tier };
+  // `handEdited` rides along with the transcript, and for the same reason: both describe the DRAFT
+  // still sitting in the box, which a tray move does not touch. Dropping it here would hand the
+  // express lane back to a hand-edited message the moment the tray left Speak and returned.
+  if (!armed)
+    return {
+      ...initialState(),
+      transcript: state.transcript,
+      tier: state.tier,
+      handEdited: state.handEdited,
+    };
   if (state.phase !== "disarmed") return state;
   return { ...state, phase: "listening", silenceStartedAt: null, fireNoEarlierThan: null };
 }
@@ -186,7 +214,7 @@ export function noteTranscript(
   // the pause, and `remainingMs` can only be delayed by it.
   const elapsed = clockAt(next, now) - next.silenceStartedAt;
   // The grace window only exists while the threshold is genuinely behind the elapsed time.
-  if (elapsed < sweepThresholdMs(tier)) next.fireNoEarlierThan = null;
+  if (elapsed < settleThresholdMs(tier, next.handEdited)) next.fireNoEarlierThan = null;
   else if (state.fireNoEarlierThan === null) next.fireNoEarlierThan = now + THRESHOLD_DROP_GRACE_MS;
   return next;
 }
@@ -331,6 +359,29 @@ export function restartCountdown(state: AutoSendState, now: number): AutoSendSta
 }
 
 /**
+ * The user TYPED into the draft (bead sparkle-wfwypy). Mark it hand-edited — for good, until the
+ * message leaves the box.
+ *
+ * ── WHAT THIS DOES *NOT* DO, AND WHY THAT IS THE POINT ─────────────────────────────────────────
+ * It does not pause and it does not re-anchor. Those are {@link pauseCountdown} and
+ * {@link resumeCountdown}, driven by the SHARED INTERACTION PREDICATE (voice/composeInteraction),
+ * which is what actually freezes the clock while the keys are moving. This records the one thing
+ * that outlives the gesture: that the threshold on the way out must be floored, because the speech
+ * ladder is no longer judging speech. See {@link TYPED_EDIT_MIN_THRESHOLD_MS}.
+ *
+ * ── UNCONDITIONAL, UNLIKE ITS NEIGHBOURS ───────────────────────────────────────────────────────
+ * `restartCountdown` above is a deliberate no-op while `listening`, because there is no clock to
+ * reset and starting one would be a send nobody asked for. This is the opposite: it starts nothing
+ * and can only ever LENGTHEN a later countdown, so recording it before the clock exists is both
+ * safe and necessary — the user types into an idle box, THEN dictates a tail onto it, and the
+ * message that eventually counts down is still one he had his hands in.
+ */
+export function noteHandEdit(state: AutoSendState): AutoSendState {
+  if (state.handEdited) return state;
+  return { ...state, handEdited: true };
+}
+
+/**
  * How long until the send fires, floored at 0. `Infinity` when nothing is counting.
  *
  * A PURE function of `silenceStartedAt` and the CURRENT tier — which is exactly what "move the
@@ -341,7 +392,7 @@ export function restartCountdown(state: AutoSendState, now: number): AutoSendSta
 export function remainingMs(state: AutoSendState, now: number): number {
   if (state.phase !== "counting" || state.silenceStartedAt === null) return Infinity;
   const at = clockAt(state, now);
-  const byThreshold = state.silenceStartedAt + sweepThresholdMs(state.tier) - at;
+  const byThreshold = state.silenceStartedAt + thresholdFor(state) - at;
   const byGrace = state.fireNoEarlierThan === null ? -Infinity : state.fireNoEarlierThan - at;
   // The grace window can only DELAY. A drop-guard that had expired must not pull the deadline in
   // ahead of the threshold.
@@ -358,7 +409,7 @@ export function remainingMs(state: AutoSendState, now: number): number {
  */
 export function remainingFraction(state: AutoSendState, now: number): number {
   if (state.phase !== "counting" || state.silenceStartedAt === null) return 1;
-  const total = sweepThresholdMs(state.tier);
+  const total = thresholdFor(state);
   if (total <= 0) return 0;
   // Frozen while paused, so the fill visibly STOPS rather than draining behind a countdown that
   // cannot fire — the picture and the deadline are one fact (see SendModeTray).
@@ -427,6 +478,8 @@ export function evaluate(state: AutoSendState, now: number): AutoSendDecision {
       tier: confidence(""),
       silenceStartedAt: null,
       fireNoEarlierThan: null,
+      // The hand-edited draft left the box with the message. The NEXT one starts purely dictated.
+      handEdited: false,
     },
   };
 }
@@ -474,6 +527,7 @@ export function noteManualSend(state: AutoSendState): AutoSendState {
     tier: confidence(""),
     silenceStartedAt: null,
     fireNoEarlierThan: null,
+    handEdited: false,
   };
 }
 

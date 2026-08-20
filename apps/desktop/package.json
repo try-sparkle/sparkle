@@ -25,6 +25,7 @@
     "visual:tab-seam": "node scripts/visual/tab-seam-probe.mjs",
     "visual:tab-column": "node scripts/visual/tab-column-probe.mjs",
     "visual:quote-surface": "node scripts/visual/quote-surface-probe.mjs",
+    "visual:autosend-pause": "node scripts/visual/autosend-pause-probe.mjs",
     "visual:prose-row-wrap": "node scripts/visual/prose-row-wrap-probe.mjs",
     "visual:reply-quote": "node scripts/visual/reply-quote-shot.mjs",
     "visual": "pnpm visual:capture && pnpm visual:compare",

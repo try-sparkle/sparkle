@@ -372,6 +372,11 @@ import { describePaths } from "../services/logSafePaths";
 import { log } from "../logger";
 import { useConciergeDictation } from "../useConciergeDictation";
 import { useAutoSend, notifyManualSend } from "../voice/useAutoSend";
+import {
+  NO_COMPOSE_INTERACTION,
+  noteComposeInteraction,
+  type ComposeInteractionKind,
+} from "../voice/composeInteraction";
 import { useSendMode } from "../voice/useSendMode";
 import { useSparklePrefsStore } from "../stores/sparklePrefsStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -1758,6 +1763,16 @@ export function ConciergeHost({
   const onPasted = useCallback(() => setPastedSeq((n) => n + 1), []);
   const draftGrewSeq = pastedSeq + stagedSeq;
 
+  // …and EVERY OTHER deliberate use of the compose window, which freezes the countdown while it is
+  // in flight (bead sparkle-wfwypy). One counter for all of them: the rule lives in
+  // voice/composeInteraction, and this is only the wire that carries the gestures to it.
+  const [composeInteraction, setComposeInteraction] = useState(NO_COMPOSE_INTERACTION);
+  const onComposeInteraction = useCallback(
+    (kind: ComposeInteractionKind) =>
+      setComposeInteraction((prev) => noteComposeInteraction(prev, kind)),
+    [],
+  );
+
   // The compose box hands us its own submit, so an expired countdown fires the SAME path the button
   // does — clearing the box, resolving mentions, restoring the draft on failure. Sending the text
   // from out here instead would leave the words sitting in the textarea behind the message.
@@ -1922,6 +1937,11 @@ export function ConciergeHost({
     // picker come from the attachment controller. Both are counts of GESTURES, not of content —
     // see `draftGrewSeq` above and useAutoSend's arg of the same name.
     draftGrewSeq,
+    // THE ONE HE REPORTED FIRST, and the class the other two are instances of (sparkle-wfwypy):
+    // *"when I start by talking, and then I start typing in the compose window, it's not pausing
+    // the auto send … It should pause the auto send and then reevaluate it."* Typing, caret
+    // gestures and mention picks all arrive here; `interactionInFlight` decides what they mean.
+    composeInteraction,
     interim: dictation.interim,
     // THE MIS-ROUTE SAFETY NET: the rail's only label is where this send would land, so the
     // countdown is also the moment you can notice you are about to dictate into the wrong agent.
@@ -7128,6 +7148,7 @@ export function ConciergeHost({
         // to sending mid-name with a green suite — which is why the hook's own arg is required.
         onMentionComposing={onMentionComposing}
         onPasted={onPasted}
+        onComposeInteraction={onComposeInteraction}
         registerSubmit={registerSubmit}
         // A `sparkle-agent:` pill in one of the concierge's own replies was clicked. The SAME
         // reveal the notifications and the command palette use — `openProjectTab` opens the owning

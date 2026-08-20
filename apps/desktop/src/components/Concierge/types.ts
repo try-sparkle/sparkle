@@ -541,6 +541,7 @@ import type { ConciergeRecapMessage } from "../../services/conciergeRecap";
 // TYPE ONLY — this directory stays store-free; the union is defined beside the function that
 // produces it so both sides of the seam cannot drift.
 import type { RevealOutcome } from "../../services/agentReveal";
+import type { ComposeInteractionKind } from "../../voice/composeInteraction";
 
 /** A turn that failed, said in the user's terms with the machine's own words attached.
  *
@@ -1005,6 +1006,8 @@ export interface ConciergeColumnProps {
   /** The user pasted into the box, so the countdown must start over from full (sparkle-3kqg2v).
    *  A conduit like the rest: the box sees the gesture, the host owns the clock. */
   onPasted?: () => void;
+  /** Forwarded to ComposeBox — see its `onComposeInteraction`. Feeds the auto-send pause predicate. */
+  onComposeInteraction?: (kind: ComposeInteractionKind) => void;
   /** Receives the compose box's submit, so an expired countdown fires the SAME path the button
    *  does — clearing the box and resolving mentions exactly as a manual send would.
    *  Must be referentially stable.

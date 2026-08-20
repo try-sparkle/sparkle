@@ -28,7 +28,7 @@
 
 import type { FocusOwner } from "./dictationFocus";
 import type { MicIntent } from "../components/MicButton";
-import { thresholdMs, type Confidence } from "./confidence";
+import { CONFIDENCE_THRESHOLD_MS, thresholdMs, type Confidence } from "./confidence";
 
 /** Where the tray is parked. Ordered LEFT → RIGHT exactly as the control draws them, because
  *  {@link stepSendMode} walks this array — the reading order and the arrow-key order are the same
@@ -348,6 +348,43 @@ export const SWEEP_FLOOR_MS = 1_000;
  *  faster than {@link SWEEP_FLOOR_MS}. */
 export function sweepThresholdMs(tier: Confidence): number {
   return Math.max(SWEEP_FLOOR_MS, thresholdMs(tier));
+}
+
+/**
+ * The floor under a countdown measured against a draft the user TYPED INTO, in milliseconds.
+ *
+ * ── WHY A HAND-EDITED DRAFT IS NOT JUDGED ON THE SPEECH LADDER ─────────────────────────────────
+ * `CONFIDENCE_THRESHOLD_MS` reads a transcript the way a listener reads SPEECH: terminal
+ * punctuation from the engine means "that was a sentence" (`high`, ~1.2s), a dangling conjunction
+ * means "there is more coming" (`verylow`, 12s). Those signals are earned by Deepgram's own
+ * segmentation, and they are honest about a stream of words nobody is touching.
+ *
+ * They are NOT honest about a draft somebody is editing by hand. A typed sentence ending in `.`
+ * scores `high` the instant the period lands — so a literal reading of the ladder would fire ~1.2s
+ * after the last keystroke, which is the founder's original report arriving one gesture later:
+ * *"if I start to type … it should pause the auto send."* Pausing while the keys are moving and
+ * then racing away the moment they stop is a pause in name only.
+ *
+ * So a hand-edited draft never scores below this. Note it is a FLOOR, not a replacement: a draft
+ * ending in "…send it to" still earns its full `verylow` 12s, because the ladder is right about
+ * that and being right in the cautious direction is the whole asymmetry the ladder is built on.
+ *
+ * Pinned to the ladder's `normal` rung rather than written as a literal, so a retune of
+ * {@link CONFIDENCE_PACE} carries here instead of silently leaving this constant behind.
+ */
+export const TYPED_EDIT_MIN_THRESHOLD_MS = CONFIDENCE_THRESHOLD_MS.normal;
+
+/**
+ * The threshold a countdown ACTUALLY runs against — the one authority, so the deadline, the fill,
+ * and the tuning sample cannot disagree about the same clock.
+ *
+ * `handEdited` is a property of the DRAFT, not of the gesture that set it: once the user has typed
+ * into a message it stays hand-edited until the message leaves the box, so a later dictated chunk
+ * that happens to score `high` cannot claw the express lane back.
+ */
+export function settleThresholdMs(tier: Confidence, handEdited: boolean): number {
+  const base = sweepThresholdMs(tier);
+  return handEdited ? Math.max(base, TYPED_EDIT_MIN_THRESHOLD_MS) : base;
 }
 
 /**
