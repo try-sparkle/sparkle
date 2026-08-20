@@ -42,6 +42,7 @@ import { FONT_UI, TYPE } from "../theme/scale";
 import { ZOOM_COLUMN_ATTR, zoomColumnFor } from "../engine/columnZoom";
 import { PAIR_COLUMN_ATTR } from "../engine/pairColumns";
 import { ColumnPullTab, HEADER_H, TAB_TOP } from "./ColumnPullTab";
+import { EpicGoalRowForEpic } from "./EpicGoalRow";
 import { HeaderLink } from "./HeaderLink";
 import { EpicInlineCard } from "./EpicInlineCard";
 import { EPICS_COLUMN_Z } from "./layers";
@@ -620,6 +621,7 @@ function EpicRow({
       >
         {epicDisplayTitle(epic.title)}
       </span>
+      <EpicGoalRowForEpic epicId={epic.id} beads={allBeads} />
       {total > 0 && (
         <span data-testid="epic-row-children" style={{ flex: "0 0 auto", color: C.muted }}>
           {open}/{total}

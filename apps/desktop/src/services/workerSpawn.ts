@@ -1,7 +1,11 @@
 // Programmatically spawn a worker agent under a build agent: register the tab, cut its worktree
 // from the parent's local branch, and persist the worktree. The PTY launch happens when the
 // worker tab opens (AgentPane), driven by the worker persona + the stored task.
+import { GOAL_MAX_LEN } from "@sparkle/core";
 import { useProjectStore } from "../stores/projectStore";
+import { useBeadsStore } from "../stores/beadsStore";
+import { hasEpicGoalText } from "../engine/epicGoal";
+import { epicIdForAgent } from "./epicLadder";
 import { type WorktreeInfo, type KillReason, killPty } from "../pty";
 import { prepareWorkerWorkspace, removeAgentWorkspace, writeWorkerManifest } from "./worktree";
 import { useRuntimeStore } from "../stores/runtimeStore";
@@ -22,6 +26,51 @@ export interface SpawnedWorker {
   worktree: string;
 }
 
+/** The clause that joins a worker's task to the objective it serves. Split out so the template's
+ *  fixed cost is measured, not guessed, when the epic-goal half is truncated below. */
+const LADDER_JOINER = " is complete and its result demonstrably serves the epic goal: ";
+
+/**
+ * A deterministic laddering goal for a worker the orchestrator dispatched WITHOUT one, or null.
+ *
+ * ── WHY A TEMPLATE AND NOT A MODEL CALL ──────────────────────────────────────────────────────
+ * The good narrowing already happens upstream: `spawn_worker` requires a `goal` and
+ * `@sparkle/core`'s `validateWorkerGoal` refuses the spawn without one, so on the ordinary path a
+ * model with full context on this exact slice has already written the criterion. This is the
+ * SALVAGE path for the one case that bypasses it — the recorded `goalOverride` — and there is
+ * nothing here to reason about: no task context beyond a bead id, and a click path that must not
+ * grow a network round trip. A fixed sentence naming both ends of the ladder is honest about being
+ * a fallback; a generated one would be a second, worse copy of a judgement already made better.
+ *
+ * Null for every shape with nothing to ladder to: no bead, no board snapshot yet, a bead outside
+ * any epic, an epic with no goal, and a goal record left by a FAILED generation (`hasEpicGoalText`
+ * rejects the empty text those carry). Null leaves the worker exactly as it is today — goalless,
+ * which is what the override asked for.
+ */
+export function ladderGoalFor(projectId: string, beadId: string | undefined): string | null {
+  const beads = useBeadsStore.getState().byProject[projectId]?.beads ?? [];
+  // One shared answer to "which epic does this agent's work ladder up to" — `epicLadder`'s own
+  // header records why a second derivation of that edge is not allowed to exist. It answers null
+  // for a missing `beadId` itself, so there is deliberately NO guard for that here: a second copy
+  // would be an inert line no test could ever catch regressing (mutation-check, cause 4).
+  const epicId = epicIdForAgent({ id: "", beadId }, beads);
+  if (epicId === null) return null;
+  const project = useProjectStore.getState().projects.find((p) => p.id === projectId);
+  const goal = project?.epicGoals?.[epicId];
+  if (!hasEpicGoalText(goal)) return null;
+
+  // TRUNCATE THE EPIC-GOAL HALF, NEVER THE TASK HALF. `GOAL_MAX_LEN` is a real cap — the goal gate
+  // refuses longer prose as a status update — and the bead id is the half that makes this goal
+  // checkable at all. Losing the tail of a long objective costs a reader some context; losing the
+  // bead id costs them the ability to tell which task this criterion is about.
+  const head = `${beadId}${LADDER_JOINER}`;
+  const room = GOAL_MAX_LEN - head.length;
+  // A bead id long enough to crowd the objective down to a stub would produce a goal that names a
+  // parent nobody can recognize — worse than the goalless worker this is salvaging.
+  if (room < 20) return null;
+  return head + (goal.text.length <= room ? goal.text : `${goal.text.slice(0, room - 1).trimEnd()}…`);
+}
+
 export async function spawnWorker(args: {
   projectId: string;
   parentAgentId: string;
@@ -32,7 +81,8 @@ export async function spawnWorker(args: {
    *  dies between spawn and that call is a goalless worker, and a goalless worker cannot be told
    *  apart from one that merely stopped (which is what engine/goalContinuation needs to decide
    *  whether to restart it). Absent only under a recorded override — see
-   *  mcp-orchestrator/src/goalGate.ts for what is and is not enforced. */
+   *  mcp-orchestrator/src/goalGate.ts for what is and is not enforced. A blank one under a
+   *  goal-bearing epic falls back to {@link ladderGoalFor}; a supplied one is never overwritten. */
   goal?: string;
 }): Promise<SpawnedWorker> {
   const store = useProjectStore.getState();
@@ -92,7 +142,14 @@ export async function spawnWorker(args: {
   // goalless worker the dispatch gate exists to prevent, created by the gate's own success path.
   // Guarded on non-blank because `setAgentGoal` treats an empty string as CLEAR the goal (and
   // agentGoal.newGoal throws on it), so a blank must not reach it.
-  const goal = args.goal?.trim();
+  //
+  // THE LADDER FALLBACK. A blank goal here means the orchestrator used `spawn_worker`'s recorded
+  // `goalOverride` escape hatch, which leaves the worker with NO goal at all. That is the right
+  // outcome for work with genuinely no criterion — but not for a worker under an epic that HAS a
+  // stated goal: there, "nothing this task does is checkable" is contradicted by the epic itself,
+  // and the worker still ends up in the goalless population the dispatch gate was built to shrink.
+  // So it gets a deterministic template naming its task and the objective that task serves.
+  const goal = args.goal?.trim() || ladderGoalFor(args.projectId, args.beadId);
   if (goal) useProjectStore.getState().setAgentGoal(args.projectId, workerId, goal);
 
   // Fail-closed rollback (sparkle-a670): drop the orphan tab and — when the worktree was already

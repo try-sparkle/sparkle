@@ -37,6 +37,13 @@ import {
   resetGoalRetries,
   unraiseGoal,
 } from "../engine/agentGoal";
+import {
+  failedEpicGoal,
+  mayAutoGenerate,
+  newEpicGoal,
+  type EpicGoal,
+  type EpicGoalSource,
+} from "../engine/epicGoal";
 import { isDefaultModel } from "../services/models";
 import { clearPin } from "../services/accountStore";
 import { clearBrief } from "../services/agentBrief";
@@ -165,6 +172,42 @@ export interface ProjectState {
    *  the project from every future backfill sweep. Idempotent: a write that changes nothing is
    *  dropped too. */
   setProjectRepoKey: (id: string, repoKey: string | null) => void;
+  /**
+   * Write an EPIC's goal (bead `sparkle-wab4lm`). Empty text CLEARS the record.
+   *
+   * ⚠️ `source` IS AN AUTHORITY STATEMENT, NOT A LABEL. `"human"` stamps `humanEditedAt`, which is a
+   * PERMANENT latch: `engine/epicGoal.mayAutoGenerate` refuses forever after, so the machine can
+   * never silently overwrite wording a person chose. Pass `"human"` for a direct edit AND for the
+   * concierge acting on an instruction ("change the goal on X to Y") — that IS the person's wording
+   * relayed. Pass `"auto"` only from the generator.
+   *
+   * Refuses text that fails `epicGoalTextRejection` by writing NOTHING, rather than storing a goal
+   * nobody could act on — same rule as `newGoal`, one layer up.
+   */
+  setEpicGoal: (
+    projectId: string,
+    epicId: string,
+    text: string,
+    source: EpicGoalSource,
+    verify?: GoalVerify,
+  ) => void;
+  /** Mark an epic's goal met, or un-mark it. Nothing in the app calls this on its own: the founder's
+   *  standing preference is notify, do not block, so `rollUpEpicGoal.readyToClose` paints a notice
+   *  and a HUMAN decides. */
+  setEpicGoalMet: (projectId: string, epicId: string, met: boolean) => void;
+  /** Record that generation could not produce a usable goal. Leaves NO text — an empty field is
+   *  honest, a hallucinated objective is worse than nothing — and never erases the human latch. */
+  noteEpicGoalFailure: (projectId: string, epicId: string, reason: string) => void;
+  /** May the machine generate for this epic right now? Reads the latch. `force` is the explicit
+   *  human ask and is the only thing that beats it. */
+  mayGenerateEpicGoal: (projectId: string, epicId: string, force?: boolean) => boolean;
+  /** Stamp an agent goal as a COPY of an epic goal taken at `epicGoalSetAt`.
+   *
+   *  Separate from `setAgentGoal` deliberately: that function is the app's most heavily guarded
+   *  write (actor authority, goal debt, verify replacement rules) and this is a pure annotation
+   *  that must not be able to disturb any of them. It is also a no-op when the agent has no goal,
+   *  so it can never manufacture one. */
+  markAgentGoalFromEpic: (projectId: string, agentId: string, epicGoalSetAt: number) => void;
   /** Bump lastOpenedAt only (for Recent ordering) without claiming the shared
    *  selectedProjectId — multi-window: each window owns its own current project. */
   touchProjectOpened: (id: string) => void;
@@ -1342,6 +1385,108 @@ export const useProjectStore = create<ProjectState>()(
         })),
 
       setSelectedProject: (id) => set({ selectedProjectId: id }),
+
+      markAgentGoalFromEpic: (projectId, agentId, epicGoalSetAt) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) =>
+            mapAgent(p, agentId, (a) =>
+              a.goal === undefined ? a : { ...a, goal: { ...a.goal, fromEpicGoalAt: epicGoalSetAt } },
+            ),
+          ),
+        })),
+
+      setEpicGoal: (projectId, epicId, text, source, verify) =>
+        set((s) => {
+          const trimmed = text.trim();
+          // EMPTY CLEARS — but the human LATCH survives the clear. Dropping the whole record would
+          // drop `humanEditedAt`, making clear-then-wait a one-gesture path back to the machine
+          // rewriting his wording. The latch records "a person has had an opinion about this",
+          // which is a fact about the person and not about the text currently on screen.
+          if (trimmed === "") {
+            return {
+              projects: mapProject(s.projects, projectId, (p) => {
+                const prior = p.epicGoals?.[epicId];
+                const rest = { ...(p.epicGoals ?? {}) };
+                // ⚠️ A CLEAR THAT CLEARS NOTHING MUST NOT LATCH (roborev 65853). Stamping the latch
+                // on `source === "human"` alone meant clearing an epic that never had a goal — a
+                // model blanking the argument, a UI clear on an empty field — wrote a record whose
+                // ONLY effect was `humanEditedAt`. Auto-generation then skipped that epic forever,
+                // with nothing on screen to explain why, and the latch is documented as having no
+                // exit but an explicit `force`. So it is not self-healing: a no-op gesture
+                // permanently disabled the feature for that epic.
+                //
+                // `prior !== undefined` is the whole guard. Clearing a goal that EXISTS is a real
+                // opinion and still latches; clearing nothing is not an opinion about anything.
+                const latch =
+                  source === "human" && prior !== undefined ? Date.now() : prior?.humanEditedAt;
+                if (latch === undefined) delete rest[epicId];
+                else rest[epicId] = { text: "", setAt: Date.now(), source: "auto", humanEditedAt: latch };
+                return { ...p, epicGoals: rest };
+              }),
+            };
+          }
+          let built: EpicGoal;
+          try {
+            built = newEpicGoal(trimmed, Date.now(), source, verify);
+          } catch {
+            // Unusable text writes NOTHING rather than storing a goal nobody could act on. The
+            // caller-facing refusal lives in the concierge tool and the UI, which can say why; this
+            // store is the substrate all of them share, so the floor belongs here too.
+            return s;
+          }
+          return {
+            projects: mapProject(s.projects, projectId, (p) => {
+              const prior = p.epicGoals?.[epicId];
+              return {
+                ...p,
+                epicGoals: {
+                  ...(p.epicGoals ?? {}),
+                  // A prior human edit is carried forward even when the machine is writing now, so
+                  // an explicit regenerate cannot launder the latch away.
+                  ...{
+                    [epicId]:
+                      prior?.humanEditedAt !== undefined && built.humanEditedAt === undefined
+                        ? { ...built, humanEditedAt: prior.humanEditedAt }
+                        : built,
+                  },
+                },
+              };
+            }),
+          };
+        }),
+
+      setEpicGoalMet: (projectId, epicId, met) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => {
+            const prior = p.epicGoals?.[epicId];
+            if (!prior) return p;
+            const { metAt: _prior, ...rest } = prior;
+            return {
+              ...p,
+              epicGoals: {
+                ...(p.epicGoals ?? {}),
+                [epicId]: met ? { ...rest, metAt: Date.now() } : rest,
+              },
+            };
+          }),
+        })),
+
+      noteEpicGoalFailure: (projectId, epicId, reason) =>
+        set((s) => ({
+          projects: mapProject(s.projects, projectId, (p) => ({
+            ...p,
+            epicGoals: {
+              ...(p.epicGoals ?? {}),
+              [epicId]: failedEpicGoal(Date.now(), reason, p.epicGoals?.[epicId]),
+            },
+          })),
+        })),
+
+      mayGenerateEpicGoal: (projectId, epicId, force = false) =>
+        mayAutoGenerate(
+          get().projects.find((p) => p.id === projectId)?.epicGoals?.[epicId],
+          force,
+        ),
 
       setProjectRepoKey: (id, repoKey) =>
         set((s) => {

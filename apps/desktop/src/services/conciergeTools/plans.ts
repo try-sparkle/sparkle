@@ -43,7 +43,9 @@ import {
 import { epicStatus, epicChildViews, orchestratorNameForEpic } from "../planView";
 import { columnFor } from "../beads";
 import { sendToBuild, AtCapacityError } from "../sendToBuild";
+import { epicGoalGenDeps, requestEpicGoal } from "../epicGoalGen";
 import { useProjectStore } from "../../stores/projectStore";
+import { log } from "../../logger";
 import type { AgentTab } from "../../types";
 
 // ---------------------------------------------------------------------------------------------
@@ -55,6 +57,11 @@ export const PLANS_OPS = [
   "get_plan",
   "create_plan",
   "promote_plan_to_build",
+  // Goals on epics (bead `sparkle-wab4lm`). Ops on the PLANS domain rather than a domain of their
+  // own because a plan IS an epic bead: the founder says "change the goal on <epic> to X", and the
+  // thing he names is what `list_plans` already lists. The bodies live in ./planGoals.
+  "set_plan_goal",
+  "generate_plan_goal",
 ] as const;
 
 export type PlansOp = (typeof PLANS_OPS)[number];
@@ -76,6 +83,14 @@ export const PLANS_RISK: Record<PlansOp, PlansRisk> = {
   get_plan: "read-only",
   create_plan: "routine",
   promote_plan_to_build: "routine",
+  // `routine`, not `disruptive`: setting a goal writes one field in the app's own store and is
+  // undone by setting it again. It is NOT read-only — it stamps the permanent human latch that
+  // stops auto-regeneration, which is a real and deliberate consequence.
+  set_plan_goal: "routine",
+  // Same class, and it SPENDS: it is a paid model call. Bounded to one epic per call, refused by
+  // the AI gate and by the in-flight dedupe, and it can never overwrite a human's wording without
+  // that person having asked for exactly this.
+  generate_plan_goal: "routine",
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -355,6 +370,7 @@ async function alreadyFiledId(projectPath: string, title: string): Promise<strin
  */
 export async function createPlan(
   projectPath: string,
+  projectId: string,
   title: string,
   body: string,
 ): Promise<PlansResult<CreatedPlan>> {
@@ -390,6 +406,26 @@ export async function createPlan(
           "second is worse than waiting, because nothing removes a duplicate epic.",
       );
     }
+    // FIRE-AND-FORGET (bead `sparkle-wab4lm`). The epic now exists and is confirmed; filling its
+    // GOAL is a paid AI call of several seconds, and the founder's constraint is explicit — do not
+    // put a call of that latency synchronously on the epic-creation path; generate async and fill
+    // the field when it lands. So: `void`, never awaited, and its own `.catch` so nothing it does
+    // can reject into this function and turn a successful create into a refusal. `requestEpicGoal`
+    // gates itself on the human latch and the master AI gate, so this line spends nothing when
+    // either says no.
+    //
+    // `projectId` is a PARAMETER, not reverse-derived from the path (roborev 65858). The first cut
+    // looked the project up by `p.rootPath === projectPath` and skipped generation silently on a
+    // miss — no goal, no failure record, no diagnostic, which is the silent-inert shape. It was
+    // also an exact-string compare, the idiom `conciergeTools/workspace.ts` documents as retired
+    // for being strictly weaker than the repo's normalizer (case-folding, NFC, linked worktrees).
+    // The route already holds the id (`withProject(ctx, a.projectId, (p) => …)`), and this module's
+    // own siblings `listPlans`/`getPlan` already take it, so there was nothing to derive.
+    void requestEpicGoal(epicGoalGenDeps, {
+      projectId,
+      projectPath,
+      epicId: created.id,
+    }).catch((e) => log.error("plans", `epic-goal generation crashed for ${created.id}`, e));
     return ok("create_plan", { id: created.id, title, outcome: "created" });
   } catch (e) {
     return refuseCreate(e);

@@ -4,7 +4,7 @@
 // and without a document it can only ever answer "nothing is held" — which would make the
 // attention-hold cases at the bottom of this file vacuous by construction. Everything else here is
 // store-level and indifferent to the environment.
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 // Mock the two stores so we can assert the exact store calls sendToBuild makes without spinning up
 // real zustand state. beadsProtocol (from ./buildAgent) is left REAL so the seed prompt genuinely
@@ -14,10 +14,21 @@ const appendPromptMock = vi.fn();
 const setAgentEpicIdMock = vi.fn();
 const setAgentBeadIdMock = vi.fn();
 const selectAgentMock = vi.fn();
+const setAgentGoalMock = vi.fn();
+const markAgentGoalFromEpicMock = vi.fn();
 let projects: Array<{
   id: string;
   rootPath?: string;
-  agents: Array<{ id: string; kind: string; epicId?: string }>;
+  // `goal` and `epicGoals` are the two fields the epic-goal ladder reads. Typed loosely on purpose —
+  // these fixtures assert on the STRING the handoff produces, not on the store's own shape.
+  agents: Array<{
+    id: string;
+    kind: string;
+    epicId?: string;
+    /** `setAt` and `fromEpicGoalAt` are read by the re-sync rule (roborev 65868/65882). */
+    goal?: { text: string; setAt?: number; fromEpicGoalAt?: number; verify?: unknown };
+  }>;
+  epicGoals?: Record<string, { text: string; setAt: number; source: string }>;
 }> = [];
 
 // `labelBead` is how an epic-mode handoff stamps the epic sweep's durable watch marker. Mocked at
@@ -37,6 +48,8 @@ vi.mock("../stores/projectStore", () => ({
       appendPrompt: appendPromptMock,
       setAgentEpicId: setAgentEpicIdMock,
       setAgentBeadId: setAgentBeadIdMock,
+      setAgentGoal: setAgentGoalMock,
+      markAgentGoalFromEpic: markAgentGoalFromEpicMock,
       selectAgent: selectAgentMock,
     }),
   },
@@ -133,6 +146,11 @@ import {
 // it. Mocking `./agentBrief` would reproduce the original bug's blind spot: the old suite asserted
 // `appendPrompt` was called, which was true while every fresh orchestrator launched with no prompt.
 import { briefForLaunch, briefRecord, hasUndeliveredBrief, resetAgentBriefs } from "./agentBrief";
+// LEFT REAL, like `beadsProtocol` above it: the byte-identity cases below compose the expected seed
+// from the same function production uses, so they pin what THIS module contributes without
+// re-typing 30 lines of protocol prose that has its own byte-identity test in buildAgent.test.ts.
+import { beadsProtocol } from "./buildAgent";
+import { useBeadsStore } from "../stores/beadsStore";
 
 describe("sendToBuild", () => {
   beforeEach(() => {
@@ -1201,5 +1219,368 @@ describe("sendToBuild — the seed is DELIVERABLE as the launch's positional pro
     // Held rather than dropped: a LATER fresh launch of this agent (session gone, "Start again")
     // then comes up with its mission instead of blank.
     expect(hasUndeliveredBrief("orch-1")).toBe(true);
+  });
+});
+
+// ══ THE LADDER (bead sparkle-wab4lm) ═══════════════════════════════════════════════════════════
+//
+// The founder's requirement, in his words: "when build agents are dispatched specific tasks that
+// have been created against that epic, those agents have the right flavor of that goal for the
+// piece that they are working on."
+//
+// The narrowing itself is ALREADY done by a model with full context on the slice — `spawn_worker`
+// requires a `goal` and `validateWorkerGoal` refuses the spawn without one. The only thing missing
+// was that that model had never been told what the epic is FOR. So this is a prompt change, not a
+// dispatch-time model call, and every assertion below is on the PRODUCED STRING: asserting that a
+// goal was looked up would pass just as well for a handoff that looked it up and said nothing.
+//
+// EVERY EARLIER GATE IS SEEDED. `prepareHandoff` throws at an unknown project and at capacity long
+// before it reaches the goal, so the absence cases below would pass for reasons unrelated to the
+// rule if either were left to chance — the trap AGENTS.md names first. Each absence case is paired
+// with a presence case on the identical setup.
+describe("sendToBuild — epic goal laddering", () => {
+  const EPIC_GOAL = "Every agent dispatched under an epic carries a slice of that epic's goal";
+  const goalRecord = (text: string, over: Record<string, unknown> = {}) => ({
+    text,
+    setAt: 1,
+    source: "human",
+    ...over,
+  });
+
+  beforeEach(() => {
+    addAgentMock.mockReset();
+    appendPromptMock.mockReset();
+    appendPromptMock.mockReturnValue("prompt-id");
+    setAgentEpicIdMock.mockReset();
+    setAgentBeadIdMock.mockReset();
+    setAgentGoalMock.mockReset();
+    markAgentGoalFromEpicMock.mockReset();
+    labelBeadMock.mockClear();
+    capacityMock.mockReturnValue({ atCapacity: false, used: 1, limit: 8, live: 1, basis: "test" });
+    useBeadsStore.setState({ byProject: {} });
+    projects = [];
+    resetAgentBriefs();
+  });
+
+  afterEach(() => {
+    // Module-scoped, like every other store here: a snapshot left behind would silently change what
+    // a later suite's task-mode handoff resolves as its parent epic.
+    useBeadsStore.setState({ byProject: {} });
+  });
+
+  const seed = () => appendPromptMock.mock.calls[0]![2] as string;
+
+  it("EPIC MODE: states the epic's goal and the laddering rule", () => {
+    projects = [
+      { id: "proj1", rootPath: "/repo", agents: [], epicGoals: { "epic-42": goalRecord(EPIC_GOAL) } },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: "PRD/feature.md" });
+
+    // The goal VERBATIM — the founder's standing constraint is that his wording is never reworded
+    // under him, and a paraphrase in the one place the orchestrator reads it is exactly that.
+    expect(seed()).toContain(EPIC_GOAL);
+    // …and the instruction that makes it a LADDER rather than a quote. Both halves, because the
+    // quote alone is a decoration and the rule alone has no parent to narrow from.
+    expect(seed()).toMatch(/NARROWED SLICE/);
+    expect(seed()).toMatch(/spawn_worker/);
+    expect(seed()).toMatch(/never a restatement of that\s+sentence/);
+  });
+
+  it("EPIC MODE, NO GOAL: the seed is byte-identical to what it produced before this feature", () => {
+    // THE REGRESSION GUARD. Most epics have no goal, so this is the COMMON path — a feature that
+    // silently reworded every brief already in flight would be a regression wearing a feature's
+    // clothes. Compared against the literal, not against a `not.toContain`: a stray blank line or a
+    // reordered clause breaks byte equality and breaks no phrase assertion.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: "PRD/feature.md" });
+
+    expect(seed()).toBe(
+      [
+        "Build epic epic-42.",
+        "",
+        "First, read the PRD at PRD/feature.md to understand the goal, constraints, and acceptance",
+        "criteria. Then execute the epic's child tasks: decompose them across isolated worker agents,",
+        "integrating each worker's branch into your build branch sequentially.",
+        "",
+        "Follow the beads protocol below to keep the work graph in sync as you go:",
+        "",
+        beadsProtocol({ epicId: "epic-42" }),
+      ].join("\n"),
+    );
+  });
+
+  it("TASK MODE: states the PARENT epic's goal, resolved through parentEpicOf", () => {
+    // `args.epicId` names a TASK here (the field is misnamed on the args type), so the objective has
+    // to be resolved UP the membership edge. `task-1` carries an explicit `parent`, which is the
+    // edge `beads.parentEpicOf` reads from the child side.
+    projects = [
+      { id: "proj1", rootPath: "/repo", agents: [], epicGoals: { "epic-1": goalRecord(EPIC_GOAL) } },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+    useBeadsStore.setState({
+      byProject: {
+        proj1: {
+          beads: [
+            { id: "epic-1", title: "E", description: "", status: "open", type: "epic", labels: [] },
+            { id: "task-1", title: "T", description: "", status: "open", parent: "epic-1", labels: [] },
+          ] as never,
+          board: null as never,
+          loadedAt: 1,
+        },
+      },
+    });
+
+    sendToBuild({ projectId: "proj1", epicId: "task-1", prdPath: null, mode: "task" });
+
+    expect(seed()).toContain(EPIC_GOAL);
+    expect(seed()).toContain("THIS TASK LADDERS UP TO EPIC epic-1");
+    expect(seed()).toMatch(/NARROWED SLICE/);
+    // The goal on the epic reaches the prompt; the TASK id must not be labelled an epic goal, which
+    // is why the beads-protocol addendum below it is left un-goaled in this mode.
+    expect(seed()).not.toContain("The goal of epic task-1");
+  });
+
+  it("TASK MODE whose parent epic has NO goal: byte-identical to today's task prompt", () => {
+    // The paired absence, on the SAME bead graph as the case above — only the epic's goal is gone.
+    // So a failure here can only mean the rule fired with no parent objective, not that some
+    // earlier gate swallowed the handoff.
+    projects = [{ id: "proj1", rootPath: "/repo", agents: [] }];
+    addAgentMock.mockReturnValue("build-new");
+    useBeadsStore.setState({
+      byProject: {
+        proj1: {
+          beads: [
+            { id: "epic-1", title: "E", description: "", status: "open", type: "epic", labels: [] },
+            { id: "task-1", title: "T", description: "", status: "open", parent: "epic-1", labels: [] },
+          ] as never,
+          board: null as never,
+          loadedAt: 1,
+        },
+      },
+    });
+
+    sendToBuild({ projectId: "proj1", epicId: "task-1", prdPath: null, mode: "task" });
+
+    expect(seed()).toBe(
+      [
+        "Build bead task-1 (a single task).",
+        "",
+        "Run `bd show task-1` to read it, then implement it on ONE isolated worker",
+        "branch, verify it, and integrate that branch. Do not fan out into children — this is a single",
+        "unit of work, not an epic.",
+        "",
+        "Follow the beads protocol below to keep the work graph in sync as you go:",
+        "",
+        beadsProtocol({ epicId: "task-1" }),
+      ].join("\n"),
+    );
+  });
+
+  it("TASK MODE with no board snapshot yet: degrades to today's prompt rather than guessing", () => {
+    // The beads store is polled, so a handoff can land before the first successful read. An empty
+    // snapshot must read as "no parent epic", never as an error and never as a stale one.
+    projects = [
+      { id: "proj1", rootPath: "/repo", agents: [], epicGoals: { "epic-1": goalRecord(EPIC_GOAL) } },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "task-1", prdPath: null, mode: "task" });
+
+    expect(seed()).not.toContain(EPIC_GOAL);
+    expect(seed()).not.toMatch(/NARROWED SLICE/);
+  });
+
+  // ── THE ORCHESTRATOR'S OWN GOAL ─────────────────────────────────────────────────────────────
+  it("sets the orchestrator's own goal to the epic goal, as the AGENT actor", () => {
+    projects = [
+      { id: "proj1", rootPath: "/repo", agents: [], epicGoals: { "epic-42": goalRecord(EPIC_GOAL) } },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    // `"agent"`, NOT the `"human"` default. Every route into this function is machine-driven (a
+    // click handler, the concierge's tool layer, the epic sweep's timer), and `setAgentGoal`'s own
+    // docstring says `"human"` releases stashed goal debt — which would let a handoff launder an
+    // escalation and refill the retry budget.
+    // The sixth argument is the CHECK, and it is not optional here (roborev 65868). Passing none
+    // left the copy self-markable — `canSelfMarkMet(undefined)` is true — so an orchestrator could
+    // declare the EPIC's objective achieved on its own word and stop being auto-continued. An epic
+    // goal that states no check still falls back to `human` rather than to nothing: an epic
+    // objective is not one agent's to close, written down or not.
+    // The sixth argument is the CHECK, and it is `undefined` when the epic goal states none
+    // (roborev 65882). Manufacturing `{kind:"human"}` here was WORSE than dropping it: `newGoal`
+    // records any verify it is handed as `verifyStated: true`, so a check nobody chose became
+    // caller-chosen and BINDING — re-creating sparkle-vfkqz (sticky, undischargeable, escalates
+    // forever) and firing `agentStall`'s red `human-verified-goal` cause for a sign-off nobody
+    // asked for. Whether the EPIC is achieved is answered by the bead-counted rollup, which no
+    // agent's claim can move, so a self-markable orchestrator goal is not a hole.
+    expect(setAgentGoalMock).toHaveBeenCalledWith(
+      "proj1",
+      "build-new",
+      EPIC_GOAL,
+      undefined,
+      "agent",
+    );
+  });
+
+  it("NEVER copies the epic goal's check, even one the concierge stated", () => {
+    // roborev 65892 settled this. `source: "human"` does not mean a PERSON chose the check: no
+    // human-facing surface can attach one to an epic goal at all — the row calls `setEpicGoal` with
+    // no verify — and the sole writer of human+verify is the concierge tool, where `verify` is a
+    // MODEL-AUTHORED argument. So the label separates generator-model from concierge-model, never
+    // model from person, and binding an agent to a model's suggestion is exactly the two paid-for
+    // bugs (sticky via chargeGoalDebt's owedBinds; red via agentStall.chosenHere).
+    projects = [
+      {
+        id: "proj1",
+        rootPath: "/repo",
+        agents: [],
+        epicGoals: {
+          "epic-42": goalRecord(EPIC_GOAL, { verify: { kind: "command", cmd: "pnpm verify" } }),
+        },
+      },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    // FIVE arguments — no sixth.
+    expect(setAgentGoalMock).toHaveBeenCalledWith(
+      "proj1",
+      "build-new",
+      EPIC_GOAL,
+      undefined,
+      "agent",
+    );
+    expect(markAgentGoalFromEpicMock).toHaveBeenCalledWith("proj1", "build-new", 1);
+  });
+
+  it("a goal that has since GAINED a check is not re-armed by an unchanged epic goal", () => {
+    // roborev 65892. While the ladder still reported a filtered check, `checkChanged` compared that
+    // filtered value against the agent goal's ACTUAL one — and those diverge by construction, since
+    // `chargeGoalDebt` and a concierge `set_agent_goal` can both put a check on the orchestrator's
+    // goal that the ladder never wrote. The comparison was then permanently unequal, making `stale`
+    // true on every later epic-goal write, whose ONLY effect is that `setAgentGoal`'s
+    // unchanged-text branch strips `metAt` — reverting a met orchestrator to unmet and re-entering
+    // auto-continue. No check travels now, so the asymmetry cannot arise; this pins that.
+    projects = [
+      {
+        id: "proj1",
+        rootPath: "/repo",
+        agents: [
+          {
+            id: "build1",
+            kind: "build",
+            epicId: "epic-42",
+            goal: { text: EPIC_GOAL, setAt: 1, fromEpicGoalAt: 1, verify: { kind: "human" } },
+          },
+        ],
+        epicGoals: { "epic-42": goalRecord(EPIC_GOAL, { setAt: 50 }) },
+      },
+    ];
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    expect(setAgentGoalMock).not.toHaveBeenCalled();
+  });
+
+  it("an epic goal RE-SAVED with identical text is not stale — a no-op must not un-mark met", () => {
+    // roborev 65882. `setEpicGoal` re-stamps `setAt` on every write, so re-saving the same sentence
+    // would call `setAgentGoal` with byte-identical text — which takes its unchanged-text branch and
+    // STRIPS `metAt`. An orchestrator whose goal was legitimately met would silently revert to unmet
+    // and re-enter auto-continue because someone re-saved a field they had not changed.
+    projects = [
+      {
+        id: "proj1",
+        rootPath: "/repo",
+        agents: [
+          { id: "build1", kind: "build", epicId: "epic-42", goal: { text: EPIC_GOAL, setAt: 1, fromEpicGoalAt: 1 } },
+        ],
+        epicGoals: { "epic-42": goalRecord(EPIC_GOAL, { setAt: 50 }) },
+      },
+    ];
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    expect(setAgentGoalMock).not.toHaveBeenCalled();
+  });
+
+  it("…but a goal set AFTER the epic goal is left alone — it may be a deliberate rewording", () => {
+    // The paired direction, and the reason the rule is safe. `setAgentGoal` re-stamps `setAt` on
+    // every set, so an agent goal newer than the epic goal is one somebody chose after the epic
+    // goal was last written. Without this the re-sync would silently overwrite it.
+    projects = [
+      {
+        id: "proj1",
+        rootPath: "/repo",
+        agents: [
+          {
+            id: "build1",
+            kind: "build",
+            epicId: "epic-42",
+            goal: { text: "a reworded objective", setAt: 9, fromEpicGoalAt: 9 },
+          },
+        ],
+        epicGoals: { "epic-42": goalRecord(EPIC_GOAL, { setAt: 2 }) },
+      },
+    ];
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    expect(setAgentGoalMock).not.toHaveBeenCalled();
+  });
+
+  it("does NOT set it in TASK mode — a parent epic's goal is not this orchestrator's to meet", () => {
+    // The paired absence for the actor case. An epic goal is achieved by the whole epic; handing it
+    // to an orchestrator building ONE task gives it an objective it can never mark met, which is the
+    // "cannot be told apart from one that stopped" failure this whole feature exists to avoid. The
+    // prompt still STATES that parent goal in task mode — reading it and being judged by it are
+    // different things, which is why only this assertion is negative.
+    projects = [
+      { id: "proj1", rootPath: "/repo", agents: [], epicGoals: { "epic-1": goalRecord(EPIC_GOAL) } },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+    useBeadsStore.setState({
+      byProject: {
+        proj1: {
+          beads: [
+            { id: "epic-1", title: "E", description: "", status: "open", type: "epic", labels: [] },
+            { id: "task-1", title: "T", description: "", status: "open", parent: "epic-1", labels: [] },
+          ] as never,
+          board: null as never,
+          loadedAt: 1,
+        },
+      },
+    });
+
+    sendToBuild({ projectId: "proj1", epicId: "task-1", prdPath: null, mode: "task" });
+
+    expect(setAgentGoalMock).not.toHaveBeenCalled();
+    expect(seed()).toContain(EPIC_GOAL); // …and the prompt DID state it
+  });
+
+  it("ignores a goal record left behind by a FAILED generation", () => {
+    // `hasEpicGoalText` is the guard: a failed generation writes a record with EMPTY text and a
+    // reason, deliberately, so a failed attempt can be told apart from an untried one. Reading that
+    // record's presence instead of its text would paint an empty "verbatim:" line into the brief.
+    projects = [
+      {
+        id: "proj1",
+        rootPath: "/repo",
+        agents: [],
+        epicGoals: { "epic-42": { text: "", setAt: 1, source: "auto" } },
+      },
+    ];
+    addAgentMock.mockReturnValue("build-new");
+
+    sendToBuild({ projectId: "proj1", epicId: "epic-42", prdPath: null });
+
+    expect(setAgentGoalMock).not.toHaveBeenCalled();
+    expect(seed()).not.toMatch(/NARROWED SLICE/);
   });
 });

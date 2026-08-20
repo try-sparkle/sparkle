@@ -406,6 +406,8 @@ const PLANS_PHRASES: Record<PlansOp, OpPhrase> = {
   get_plan: phrase("Looking at a plan", "Looked at a plan"),
   create_plan: phrase("Writing up a plan", "Wrote up a plan"),
   promote_plan_to_build: phrase("Handing a plan to a build agent", "Handed a plan to a build agent"),
+  set_plan_goal: phrase("Setting a plan's goal", "Set a plan's goal"),
+  generate_plan_goal: phrase("Writing a goal for a plan", "Wrote a goal for a plan"),
 };
 
 const DIFF_PHRASES: Record<DiffOp, OpPhrase> = {

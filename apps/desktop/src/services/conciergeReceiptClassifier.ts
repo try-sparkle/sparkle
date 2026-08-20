@@ -287,12 +287,16 @@ const APPROVALS_RULES: Record<ApprovalsOp, OpRule> = {
 };
 
 /** Plans. `create_plan` writes a file the human can open in the Plans view; `promote_plan_to_build`
- *  hands it off. Neither is one of the six, and `filed` belongs to beads. */
+ *  hands it off. Neither is one of the six, and `filed` belongs to beads. The two goal ops write a
+ *  field on an epic that is visible on the epic itself, which is the same shape — not one of the
+ *  six either. */
 const PLANS_RULES: Record<PlansOp, OpRule> = {
   list_plans: null,
   get_plan: null,
   create_plan: null,
   promote_plan_to_build: null,
+  set_plan_goal: null,
+  generate_plan_goal: null,
 };
 
 /** Diff — read-only. */

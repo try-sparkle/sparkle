@@ -527,7 +527,28 @@ export function workerMission(task: string, taskId: string): string {
  *  linked by `beadId`. Status transitions (in_progress / closed / delivered) are written
  *  PROGRAMMATICALLY by the app from real lifecycle events (see runtimeStore.syncBeadLifecycle), so
  *  the agent no longer runs them by hand. Tone/format mirror the orchestration persona. */
-export function beadsProtocol(opts: { epicId: string }): string {
+export function beadsProtocol(opts: {
+  epicId: string;
+  /**
+   * The epic's goal, VERBATIM — the sentence the whole epic is judged by (engine/epicGoal).
+   *
+   * ── WHY THIS IS A STRING IN A PROMPT AND NOT A MODEL CALL ──────────────────────────────────
+   * The founder's requirement is that a worker's goal be "the right flavor of that goal for the
+   * piece it is working on" — a NARROWED SLICE that ladders up. The narrowing is already being
+   * done, by a model, with full context on the slice: `spawn_worker` takes a mandatory `goal` and
+   * `@sparkle/core`'s `validateWorkerGoal` REFUSES a spawn without one. So the orchestrator is
+   * already writing a per-task criterion on every dispatch. The ONE thing missing was that it had
+   * never been told what the epic is FOR, so nothing tied the slice to the whole. Adding a second
+   * model call on the dispatch path would re-derive, at latency and cost, a judgement the
+   * orchestrator is already making — this paragraph just gives that judgement its parent.
+   *
+   * Absent leaves every byte of this prompt exactly as it was, because most epics have no goal and
+   * a feature that silently reworded every existing brief would be a regression rather than a
+   * feature.
+   */
+  epicGoal?: string;
+}): string {
+  const epicGoal = opts.epicGoal?.trim();
   return [
     "BEADS PROTOCOL — THE WORK GRAPH IS THE SOURCE OF TRUTH",
     `- Your work is defined by beads epic ${opts.epicId} and its child tasks. Do not invent scope`,
@@ -556,7 +577,46 @@ export function beadsProtocol(opts: { epicId: string }): string {
     "  wait until its blockers are closed.",
     "- The integration rules above still hold: NEVER touch `main` directly, and merge each worker's",
     "  branch into YOUR build branch sequentially, one at a time.",
+    // APPENDED, never interleaved: every line above is byte-identical for a goal-less epic, which is
+    // what makes this additive rather than a rewrite of every brief already in flight.
+    ...(epicGoal ? ["", ...epicGoalLadderLines(opts.epicId, epicGoal)] : []),
   ].join("\n");
+}
+
+/**
+ * The laddering paragraph: the epic goal verbatim, then the rule that binds every `spawn_worker`
+ * goal to it.
+ *
+ * The two failure shapes it names are not hypothetical — they are the two ways a per-task goal can
+ * be present, pass `validateWorkerGoal`, and still be useless:
+ *
+ *   RESTATING THE EPIC GOAL. No single task achieves an epic, so a worker carrying the epic's own
+ *   sentence can never meet it — and a worker that can never mark its goal met cannot be told apart
+ *   from one that stalled, which is the exact condition `goalGate`'s header says strands work.
+ *
+ *   RESTATING THE TASK. `task` is what to DO and `goal` is what will be TRUE when it is done. A goal
+ *   that echoes the task carries no new checkable fact; `validateWorkerGoal` already refuses the
+ *   literal echo, but a light paraphrase clears that check while carrying nothing either.
+ */
+function epicGoalLadderLines(epicId: string, goal: string): string[] {
+  return [
+    "THE EPIC'S GOAL — EVERY WORKER'S GOAL MUST LADDER UP TO IT",
+    `- The goal of epic ${epicId}, verbatim:`,
+    `    ${goal}`,
+    "- That sentence is what the WHOLE epic is judged by, and it is YOUR objective, not any one",
+    "  worker's. No single task achieves it.",
+    "- So the `goal` you pass to EVERY `spawn_worker` call must be a NARROWED SLICE of it: the",
+    "  observable end state for that ONE task, checkable by someone other than the worker, and",
+    "  stated so that its being true is demonstrably in service of the sentence above.",
+    "- The two ways to get this wrong, and they are the only two:",
+    "    • RESTATING THE EPIC GOAL. A worker whose goal is the epic's goal can never meet it — no",
+    "      one task does — so it can never be told apart from a worker that merely stopped.",
+    "    • RESTATING THE TASK. \"Implement <the task>\" is what to DO, not what will be TRUE when it",
+    "      is done, so nobody but that worker can check it.",
+    "- The shape that works: name the concrete end state this one task leaves behind, then the",
+    "  clause that ties it to the parent — \"<observable end state>, which is what the epic goal",
+    "  needs from this slice\".",
+  ];
 }
 
 /** System prompt that turns a plain `claude` session into the master ORCHESTRATOR (the Build

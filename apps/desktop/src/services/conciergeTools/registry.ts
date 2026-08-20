@@ -220,6 +220,8 @@ import {
   type PlansOp,
   type PlansResult,
 } from "./plans";
+import { generatePlanGoal, setPlanGoal } from "./planGoals";
+import type { GoalVerify } from "@sparkle/core";
 import {
   DIFF_OPS,
   DIFF_RISK,
@@ -2058,6 +2060,27 @@ const createPlanArgs = z
 
 /** Promotion is a WRITE that starts an agent, so it names its project explicitly — same rule as the
  *  board's writes, and for the same reason (the call that runs must be the call that was asked for). */
+/** Setting a goal is a WRITE that stamps a permanent latch, so it names its project explicitly —
+ *  same rule as the board's writes and `promote_plan_to_build`: the call that runs must be the call
+ *  that was asked for. */
+const planGoalArgs = z
+  .object({
+    projectId: projectIdArg,
+    epicId: z.string().min(1, "a plan id is required"),
+    /** The goal text. An EMPTY string CLEARS the goal — the documented take-back. */
+    goal: z.string(),
+    /** How the goal is checked. `landed` is accepted and narrowed to `human`: an epic is not a
+     *  branch, so ancestry could never answer it. */
+    verify: z
+      .object({ kind: z.enum(["command", "landed", "human"]), cmd: z.string().optional() })
+      .optional(),
+  })
+  .strict();
+
+const planGoalGenArgs = z
+  .object({ projectId: projectIdArg, epicId: z.string().min(1, "a plan id is required") })
+  .strict();
+
 const promoteArgs = z
   .object({
     projectId: projectIdArg,
@@ -2189,7 +2212,40 @@ const PLANS_ROUTES: Record<PlansOp, Handler> = {
   ),
   create_plan: route(createPlanArgs, (a, ctx) =>
     withProject(ctx, a.projectId, async (p) =>
-      fromPlans(ctx, await createPlan(p.rootPath, a.title, a.body ?? "")),
+      fromPlans(ctx, await createPlan(p.rootPath, p.id, a.title, a.body ?? "")),
+    ),
+  ),
+  set_plan_goal: route(planGoalArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromPlans(
+        ctx,
+        await setPlanGoal(
+          "set_plan_goal",
+          PLANS_RISK.set_plan_goal,
+          p.rootPath,
+          p.id,
+          a.epicId,
+          a.goal,
+          // Passed through UNVALIDATED on purpose: `setPlanGoal` runs `parseGoalVerify` and
+          // returns a refusal the concierge can relay. Validating in the zod schema too would
+          // give the model a schema error with no remedy sentence attached.
+          a.verify as GoalVerify | undefined,
+        ),
+      ),
+    ),
+  ),
+  generate_plan_goal: route(planGoalGenArgs, (a, ctx) =>
+    withProject(ctx, a.projectId, async (p) =>
+      fromPlans(
+        ctx,
+        await generatePlanGoal(
+          "generate_plan_goal",
+          PLANS_RISK.generate_plan_goal,
+          p.rootPath,
+          p.id,
+          a.epicId,
+        ),
+      ),
     ),
   ),
   promote_plan_to_build: route(promoteArgs, (a, ctx) =>

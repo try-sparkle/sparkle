@@ -3,6 +3,7 @@
 // PTY handles) is NOT stored here — see stores/runtimeStore.ts.
 import type { AgentTabStatus } from "@sparkle/ui";
 import type { AgentGoal, GoalDebt } from "./engine/agentGoal";
+import type { EpicGoal } from "./engine/epicGoal";
 
 export type { AgentGoal, GoalDebt };
 
@@ -233,6 +234,22 @@ export interface Project {
    *  later sweep still gets to ask (projectStore.setProjectRepoKey). Absent falls back to path
    *  identity, which is exactly the dedupe the app already had. */
   repoKey?: string | null;
+  /** GOALS ON EPICS, keyed by the epic bead's id (bead `sparkle-wab4lm`).
+   *
+   *  Here rather than on the bead because there IS no bd write path for a description — `BeadPatch`
+   *  carries status/priority/assignee in both TS and Rust — and manufacturing one means rewriting a
+   *  shared Dolt store that has no diff and no revert. This is also where `AgentTab.goal` already
+   *  lives, which is what the founder's "same machinery" means concretely.
+   *
+   *  Optional, so every persisted project predating the field reads as "no epic goals" without a
+   *  store migration — the same shape as `cloudProjectId` and `chiefProjectIds` above.
+   *
+   *  ⚠️ KEYS ARE NEVER GARBAGE-COLLECTED AGAINST THE BEAD STORE, deliberately. A bead the poll
+   *  cannot currently see is not a bead that was deleted: `bd` is a shared Dolt DB reached over a
+   *  single-writer lock, and a poll that failed, timed out, or ran while another worktree held the
+   *  lock returns fewer beads, not a smaller truth. Pruning on that reading would silently destroy
+   *  goal text the founder typed. An orphaned key costs a few hundred bytes. */
+  epicGoals?: Record<string, EpicGoal>;
 }
 
 export type { AgentTabStatus };

@@ -4,6 +4,9 @@
 // the PTY launch); and seeds it with a first prompt that points at the epic + PRD and tells it to
 // execute the epic's children following the beads protocol.
 import { useProjectStore } from "../stores/projectStore";
+import { useBeadsStore } from "../stores/beadsStore";
+import { hasEpicGoalText } from "../engine/epicGoal";
+import { parentEpicOf } from "./beads";
 import { beadsProtocol } from "./buildAgent";
 import { landInAgent } from "./landInAgent";
 import { attentionHold } from "../engine/attentionGuard";
@@ -171,11 +174,92 @@ export interface SendToBuildArgs {
   humanAuthored?: boolean;
 }
 
+/**
+ * The epic goal this handoff ladders up to — the epic it belongs to, and that epic's goal text.
+ *
+ * TWO MODES, TWO DIFFERENT QUESTIONS, which is the whole reason this is a function rather than one
+ * store read at the call site:
+ *
+ *   `mode: "epic"` — `args.epicId` IS the epic, and its goal is the ORCHESTRATOR'S OWN objective.
+ *   `mode: "task"` — `args.epicId` names a TASK bead (the field is misnamed; see `SendToBuildArgs`).
+ *     Its goal is the PARENT epic's, resolved through `beads.parentEpicOf`, and it is the objective
+ *     this one task LADDERS UP TO rather than one anybody here is expected to meet.
+ *
+ * Returns null for every shape that has no goal to state — an unknown project, a task with no
+ * parent epic, an epic nobody has written a goal for, and a goal record left behind by a FAILED
+ * generation (`hasEpicGoalText` rejects the empty text those carry). Null is what keeps the seed
+ * prompt byte-identical to what it produced before this feature existed, which is not a nicety: a
+ * change that silently reworded every brief in flight would be a regression, not a feature.
+ *
+ * Reads the board snapshot the app already polls rather than shelling out to `bd`. `prepareHandoff`
+ * is synchronous and on the click path — see the `labelBead` note below for why a `bd` round trip
+ * does not belong here — and a snapshot that has not loaded yet degrades to "no goal", which is the
+ * same no-op as an epic that has none.
+ */
+function epicGoalLadder(
+  args: Pick<SendToBuildArgs, "projectId" | "epicId" | "mode">,
+): { epicId: string; text: string; setAt: number } | null {
+  let epicId: string | null = args.epicId;
+  if (args.mode === "task") {
+    const beads = useBeadsStore.getState().byProject[args.projectId]?.beads ?? [];
+    const bead = beads.find((b) => b.id === args.epicId);
+    epicId = bead ? (parentEpicOf(beads, bead)?.id ?? null) : null;
+  }
+  if (epicId === null) return null;
+  // NO `if (!project) return null` guard, deliberately: both callers run AFTER `prepareHandoff`'s
+  // own unknown-project throw, so it is unreachable — an inert line no test could catch regressing
+  // (mutation-check, cause 4). Optional chaining covers the shape without pretending to a check.
+  const goal = useProjectStore.getState().projects.find((p) => p.id === args.projectId)
+    ?.epicGoals?.[epicId];
+  if (!hasEpicGoalText(goal)) return null;
+  return { epicId, text: goal.text, setAt: goal.setAt };
+}
+
+/** The parent-objective paragraph for a SINGLE-TASK handoff. A separate function, not an inline
+ *  spread, so the conditional that includes it is one mutable line — a multi-line `...(x ? [ … ]
+ *  : [])` cannot be judged by `scripts/mutation-check.sh` at all, which is how a whole branch ends
+ *  up unverified while the check reports the change as covered. */
+function taskLadderLines(ladder: { epicId: string; text: string }): string[] {
+  return [
+    "",
+    `THIS TASK LADDERS UP TO EPIC ${ladder.epicId}, whose goal, verbatim, is:`,
+    `  ${ladder.text}`,
+    "",
+    "This one task does NOT achieve that on its own, so the `goal` you pass to `spawn_worker`",
+    "must not restate it. Give the worker a NARROWED SLICE: the observable end state THIS",
+    "task leaves behind, checkable by someone other than the worker, and stated so that its",
+    "being true is demonstrably in service of the sentence above. A goal that merely",
+    "restates the task is not one either — the task is what to DO, the goal is what will be",
+    "TRUE when it is done.",
+  ];
+}
+
+/** The orchestrator's OWN objective, for an epic handoff. Split out for the same reason as
+ *  {@link taskLadderLines}. */
+function epicLadderLines(ladder: { epicId: string; text: string }): string[] {
+  return [
+    "",
+    "THE GOAL OF THIS EPIC — your own objective, verbatim:",
+    `  ${ladder.text}`,
+    "",
+    "That is what the whole epic is judged by. Fan it OUT rather than handing it down: every",
+    "worker you spawn gets a goal that is a NARROWED SLICE of it — the observable end state for",
+    "that one task, demonstrably in service of the sentence above — never a restatement of that",
+    "sentence, and never merely a restatement of the task.",
+  ];
+}
+
 /** Build the orchestrator's seed prompt. For an epic: point at the spec (the PRD when there is one,
  *  else the epic bead's own description) and tell it to fan the epic's children out across workers.
  *  For a single task: tell it to build THAT one bead on one isolated worker branch — no fan-out.
- *  Both keep the beads protocol addendum so the work graph stays in sync. */
-function buildSeedPrompt(args: SendToBuildArgs): string {
+ *  Both keep the beads protocol addendum so the work graph stays in sync.
+ *
+ *  `ladder` is the epic goal in force (see {@link epicGoalLadder}); null reproduces the exact prompt
+ *  this function produced before epic goals existed. */
+function buildSeedPrompt(
+  args: SendToBuildArgs,
+  ladder: { epicId: string; text: string } | null = null,
+): string {
   if (args.mode === "task") {
     const spec = args.prdPath
       ? `read the PRD at ${args.prdPath} for surrounding context, then`
@@ -186,6 +270,11 @@ function buildSeedPrompt(args: SendToBuildArgs): string {
       `Run \`bd show ${args.epicId}\` to read it, ${spec} implement it on ONE isolated worker`,
       "branch, verify it, and integrate that branch. Do not fan out into children — this is a single",
       "unit of work, not an epic.",
+      // THE PARENT OBJECTIVE, stated here and NOT handed to `beadsProtocol`. In this mode the id
+      // below is a TASK, so `beadsProtocol({ epicId: args.epicId })` is already calling a task an
+      // epic; feeding it the epic goal too would print "the goal of epic <task-id>", attaching the
+      // parent's objective to the wrong bead in the one place the orchestrator is told to read it.
+      ...(ladder ? taskLadderLines(ladder) : []),
       "",
       "Follow the beads protocol below to keep the work graph in sync as you go:",
       "",
@@ -201,10 +290,14 @@ function buildSeedPrompt(args: SendToBuildArgs): string {
     spec,
     "criteria. Then execute the epic's child tasks: decompose them across isolated worker agents,",
     "integrating each worker's branch into your build branch sequentially.",
+    // THE ORCHESTRATOR'S OWN OBJECTIVE. Stated up here as well as inside the beads protocol below
+    // because they are two different instructions to the same reader: this one says what YOU are
+    // judged by, the protocol's says what every worker you spawn must be judged by.
+    ...(ladder ? epicLadderLines(ladder) : []),
     "",
     "Follow the beads protocol below to keep the work graph in sync as you go:",
     "",
-    beadsProtocol({ epicId: args.epicId }),
+    beadsProtocol({ epicId: args.epicId, ...(ladder ? { epicGoal: ladder.text } : {}) }),
   ].join("\n");
 }
 
@@ -304,6 +397,87 @@ function prepareHandoff(args: SendToBuildArgs): PreparedHandoff {
   // the auto-beads already use — and because the orchestrator now HAS a bead, syncBeadLifecycle's
   // `create` gate is satisfied, so no redundant `sparkle-auto` duplicate is minted for it either.
   store.setAgentBeadId(args.projectId, agentId, args.epicId);
+
+  // ── AND THE ORCHESTRATOR'S OWN GOAL IS THE EPIC'S GOAL ──────────────────────────────────────
+  //
+  // The prompt above TELLS it the objective; this makes the objective READABLE — by engine/agentStall
+  // (is this idle row done or stalled?), by engine/goalContinuation, and by the human reading the
+  // row. Without it an orchestrator driving a goal-bearing epic is, to every one of those readers,
+  // a goalless agent.
+  //
+  // THREE GUARDS, each closing a specific way this could do harm:
+  //
+  //   EPIC MODE ONLY. In "task" mode `args.epicId` is a TASK, and the goal `epicGoalLadder` finds is
+  //   its PARENT epic's — an objective no single task achieves. Writing it here would hand this
+  //   orchestrator a goal it can never meet, which is precisely the "cannot be told apart from one
+  //   that stopped" failure the whole feature exists to avoid. The prompt still STATES that parent
+  //   goal in task mode, because reading it and being judged by it are different things.
+  //
+  //   ONLY WHEN THE AGENT HAS NO GOAL YET. A reused orchestrator may have reworded its objective, or
+  //   a human may have written one; a handoff must not overwrite either. `existing` is the same row
+  //   the reuse branch above found — a freshly `addAgent`ed one has no goal by construction.
+  //
+  //   `actor: "agent"`, NOT the `"human"` default. This is a machine-driven write (the board's Start
+  //   button, the concierge's tool layer, and the epic sweep's timer all reach here), and
+  //   `setAgentGoal`'s own docstring says `"human"` "starts genuinely new text on a clean budget and
+  //   releases any stashed debt". Passing it would let a machine handoff launder an escalation and
+  //   refill the retry budget — the exact bound `SendToBuildArgs.humanAuthored` exists to protect one
+  //   layer up. `"agent"` carries `totalContinues` and any escalation forward, which is the
+  //   conservative direction and the only correct one for a caller that is not a person typing.
+  //
+  //   ── THE EPIC GOAL'S CHECK DOES NOT TRAVEL, AND THAT IS SETTLED ────────────────────────────
+  //   Three review rounds tried to carry it and each produced a worse bug than the one it fixed
+  //   (roborev 65868 → 65882 → 65890 → 65892):
+  //     • Passing nothing left the copy self-markable — the original complaint.
+  //     • Falling back to `{kind:"human"}` was worse: `newGoal` records ANY verify it is handed as
+  //       `verifyStated: true`, so a check nobody chose became caller-chosen and BINDING —
+  //       re-creating sparkle-vfkqz (sticky, undischargeable, escalates forever) and firing
+  //       `agentStall`'s red `human-verified-goal` cause.
+  //     • Copying only a "stated" check did not help: `newEpicGoal` stamps `verifyStated` for the
+  //       GENERATOR's model-written check too, which is the default path.
+  //     • Copying only `source: "human"` checks did not help either, and this is the one that
+  //       settles it: NO human-facing surface can attach a check to an epic goal at all. The row
+  //       calls `setEpicGoal(…, "human")` with no verify. The sole writer of human+verify is the
+  //       concierge tool, where `verify` is a MODEL-AUTHORED tool argument. So `source` separates
+  //       generator-model from concierge-model — never model from person.
+  //
+  //   There is therefore no check here that a PERSON chose, and binding an agent to a model's
+  //   suggestion is exactly what the two paid-for bugs above are. So none travels.
+  //
+  //   THAT IS NOT A HOLE. Whether the EPIC is achieved is answered by `engine/epicGoalRollup`, over
+  //   CHILD BEADS, which no agent's claim can move; an orchestrator marking its own goal met is a
+  //   fact about that agent, and `engine/epicContinuation` is what notices an epic with nobody on
+  //   it. If a human-chosen check is ever wanted here, the fix is to record provenance the concierge
+  //   cannot stamp for itself — not to guess from a label.
+  //
+  //   ── AND A STALE COPY IS RE-SYNCED, BUT ONLY IF IT IS A COPY (roborev 65882) ────────────────
+  //   `services/epicLadder`'s header rejects freezing the epic goal into children because a copied
+  //   string goes stale. This write is the one place a copy is unavoidable, so it must be
+  //   refreshable — but `AgentGoal` records no AUTHOR, so `setAt` alone cannot tell a stale ladder
+  //   copy from the objective a human deliberately wrote for this orchestrator. Keyed on `setAt`
+  //   alone it destroyed the second, on a path that includes the epic sweep's TIMER.
+  //   `fromEpicGoalAt` is the marker this code stamps at copy time; a goal without one is never
+  //   re-synced.
+  //
+  //   IDENTICAL TEXT IS NOT STALE. `setEpicGoal` re-stamps `setAt` on EVERY write, so re-saving the
+  //   same sentence would call `setAgentGoal` with byte-identical text — which takes its
+  //   unchanged-text branch and STRIPS `metAt`, reverting a met orchestrator to unmet and
+  //   re-entering auto-continue because someone re-saved a field they had not changed.
+  if ((args.mode ?? "epic") === "epic") {
+    const ladder = epicGoalLadder(args);
+    const prior = existing?.goal;
+    const copied = prior?.fromEpicGoalAt;
+    // Each rule on its OWN line: mutation-check cannot judge a line whose mutant does not parse.
+    const textChanged = ladder !== null && ladder.text.trim() !== (prior?.text.trim() ?? "");
+    const newer = ladder !== null && copied !== undefined && ladder.setAt > copied;
+    const stale = newer && textChanged;
+    if (ladder && (prior === undefined || stale)) {
+      store.setAgentGoal(args.projectId, agentId, ladder.text, undefined, "agent");
+      // The annotation is a SEPARATE call so it cannot disturb `setAgentGoal`'s guards. It is what
+      // makes the next handoff able to tell this copy from a goal a person wrote.
+      store.markAgentGoalFromEpic(args.projectId, agentId, ladder.setAt);
+    }
+  }
 
   // …and record the handoff ON THE BEAD, which is what puts the epic in the epic sweep's watch set
   // and KEEPS it there. The two `store.set…` calls above are the same fact written to a tab, and a
@@ -423,7 +597,7 @@ function seedDraft(args: SendToBuildArgs, agentId: string): void {
   // string: the record's `promptId` rides the brief precisely so the pane completes the row we
   // wrote rather than writing a second one, and a store row missing the findings the argv carries
   // would make the jump-to-prompt show a mission the orchestrator never received.
-  const prompt = advisorBriefFor(args.epicId, buildSeedPrompt(args));
+  const prompt = advisorBriefFor(args.epicId, buildSeedPrompt(args, epicGoalLadder(args)));
   const humanAuthored = args.humanAuthored ?? true;
   // BOOKKEEPING FIRST, so its `promptId` can ride the brief. Authorship is forwarded rather than
   // defaulted — see `SendToBuildArgs.humanAuthored` for why it is load-bearing on the REUSE path.

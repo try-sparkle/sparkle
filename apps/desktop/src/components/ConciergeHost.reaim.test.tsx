@@ -80,7 +80,16 @@ vi.mock("../services/suggestions/engine", () => ({
   computeSuggestions: (...a: unknown[]) => h.computeSuggestions(...a),
   SuggestionOfflineError,
 }));
-vi.mock("../services/anthropic", () => ({ AiUnavailableError, AiUnreachableError }));
+// `structuredJson` joined this list when the Epics column began mounting `EpicGoalRow`, which
+// reaches `services/epicGoalGen` for its Generate affordance (bead `sparkle-wab4lm`). A TOTAL mock
+// drops every export it does not name, so the new edge turned into a load-time
+// `No "structuredJson" export is defined` for this whole file — a mocking artefact, exactly like
+// the `SNAPSHOT_MAX_LINES` one the note below records, and nothing to do with re-aiming.
+vi.mock("../services/anthropic", () => ({
+  AiUnavailableError,
+  AiUnreachableError,
+  structuredJson: vi.fn(),
+}));
 // PARTIAL mock, via importOriginal. This file only needs `getAgentScrollback` stubbed, but a
 // wholesale replacement drops every other export — and the column's approval card now reaches the
 // tool registry (Concierge/ConciergeApprovals → services/conciergeApprovalResume), which reads

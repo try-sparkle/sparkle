@@ -61,6 +61,10 @@ const { useProjectStore } = await import("../../stores/projectStore");
 const { AtCapacityError } = await import("../sendToBuild");
 
 const ROOT = "/repo";
+/** `createPlan` takes the project id as a PARAMETER now (roborev 65858) rather than reverse-deriving
+ *  it from the path, so these tests name one. Nothing in this file depends on it matching a seeded
+ *  project — the goal generation it feeds is stubbed out at the module boundary. */
+const PLANS_TEST_PROJECT_ID = "p-plans-test";
 
 function bead(id: string, over: Partial<import("../beads").Bead> = {}): import("../beads").Bead {
   return {
@@ -255,7 +259,7 @@ describe("create_plan", () => {
   // and the suite was green (roborev 55131). So: pin the type, then round-trip the created id back
   // through list_plans and require it to show up.
   it("files an EPIC — and the result is visible as a plan", async () => {
-    const r = await createPlan(ROOT, "Ship auth", "the body");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body");
     expect(beadsCreate).toHaveBeenCalledWith(ROOT, {
       title: "Ship auth",
       description: "the body",
@@ -286,7 +290,7 @@ describe("create_plan", () => {
   // the store for the row before reporting. Asserting the seam is not ceremony — it is the entire
   // change, and it is invisible in the result shape.
   it("goes through the CONFIRMING create, never the unverified one", async () => {
-    await createPlan(ROOT, "Ship auth", "the body");
+    await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body");
     expect(beadsCreate).toHaveBeenCalledTimes(1);
     expect(createBeadFull).not.toHaveBeenCalled();
   });
@@ -300,7 +304,7 @@ describe("create_plan", () => {
       omittedIds: [],
       limit: 50,
     });
-    const r = await createPlan(ROOT, "Ship auth", "the body");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body");
     // The SIDE EFFECT, not the reply: nothing may be written on this path.
     expect(beadsCreate).not.toHaveBeenCalled();
     expect(r.ok && r.data).toEqual({
@@ -311,7 +315,7 @@ describe("create_plan", () => {
   });
 
   it("asks only about OPEN, TYPED epics — a matching task must not suppress a real epic", async () => {
-    await createPlan(ROOT, "Ship auth", "");
+    await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
     expect(beadsQuery).toHaveBeenCalledWith(ROOT, {
       issueType: "epic",
       titleContains: "Ship auth",
@@ -330,14 +334,14 @@ describe("create_plan", () => {
       omittedIds: [],
       limit: 50,
     });
-    const r = await createPlan(ROOT, "Ship auth", "");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
     expect(beadsCreate).toHaveBeenCalledTimes(1);
     expect(r.ok && r.data.outcome).toBe("created");
   });
 
   it("FAILS OPEN when the dedupe read itself errors — an unreadable store is not a duplicate", async () => {
     beadsQuery.mockRejectedValue({ kind: "storeBusy", message: "locked", exitCode: null });
-    const r = await createPlan(ROOT, "Ship auth", "");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
     expect(beadsCreate).toHaveBeenCalledTimes(1);
     expect(r.ok && r.data.outcome).toBe("created");
   });
@@ -351,7 +355,7 @@ describe("create_plan", () => {
     vi.useFakeTimers();
     try {
       beadsQuery.mockReturnValue(new Promise(() => {})); // never settles
-      const pending = createPlan(ROOT, "Ship auth", "the body");
+      const pending = createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body");
       await vi.advanceTimersByTimeAsync(CREATE_PLAN_DEDUPE_BUDGET_MS + 1);
       const r = await pending;
       expect(beadsCreate).toHaveBeenCalledTimes(1);
@@ -374,7 +378,7 @@ describe("create_plan", () => {
     vi.useFakeTimers();
     try {
       beadsCreate.mockReturnValue(new Promise(() => {})); // never settles
-      const pending = createPlan(ROOT, "Ship auth", "the body");
+      const pending = createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body");
       await vi.advanceTimersByTimeAsync(CREATE_PLAN_TOTAL_BUDGET_MS + 1);
       const r = await pending;
       expect(r.ok).toBe(false);
@@ -404,7 +408,7 @@ describe("create_plan", () => {
       beadsQuery.mockReturnValue(new Promise(() => {})); // dedupe hangs, then fails open on expiry
       beadsCreate.mockReturnValue(new Promise(() => {})); // create never answers either
       let settled = false;
-      const pending = createPlan(ROOT, "Ship auth", "the body").then((r) => {
+      const pending = createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body").then((r) => {
         settled = true;
         return r;
       });
@@ -457,7 +461,7 @@ describe("create_plan", () => {
     try {
       let settle: (v: unknown) => void = () => {};
       beadsCreate.mockReturnValue(new Promise((res) => (settle = res)));
-      const pending = createPlan(ROOT, "Ship auth", "the body");
+      const pending = createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "the body");
       await vi.advanceTimersByTimeAsync(CREATE_PLAN_TOTAL_BUDGET_MS - 1_000);
       settle({ id: "sparkle-plan", title: "Ship auth" });
       const r = await pending;
@@ -479,7 +483,7 @@ describe("create_plan", () => {
       message: `bd reported creating sparkle-x, but sparkle-x does not read back — ${WRITE_DROPPED_MARKER}, so nothing was filed`,
       exitCode: 0,
     });
-    const r = await createPlan(ROOT, "Ship auth", "");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toBe("not-created");
@@ -489,7 +493,7 @@ describe("create_plan", () => {
 
   it("says UNKNOWN for a timeout — the create may have landed after we stopped waiting", async () => {
     beadsCreate.mockRejectedValue({ kind: "timeout", message: "bd timed out", exitCode: null });
-    const r = await createPlan(ROOT, "Ship auth", "");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.reason).toBe("outcome-unknown");
@@ -505,7 +509,7 @@ describe("create_plan", () => {
       message: "no beads database found",
       exitCode: 1,
     });
-    const r = await createPlan(ROOT, "Ship auth", "");
+    const r = await createPlan(ROOT, PLANS_TEST_PROJECT_ID, "Ship auth", "");
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("beads-unavailable");
   });

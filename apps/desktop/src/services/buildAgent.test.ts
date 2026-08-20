@@ -818,6 +818,65 @@ describe("beadsProtocol", () => {
   });
 });
 
+// ══ THE LADDER (bead sparkle-wab4lm) ═══════════════════════════════════════════════════════════
+// The founder's requirement: "the specific goals for each build agent should ladder up to achieve
+// the overall goal of the Epic." The narrowing itself is already done by a model — `spawn_worker`
+// REQUIRES a `goal` and `validateWorkerGoal` refuses the spawn without one — so what this paragraph
+// adds is the parent that narrowing was missing. These assertions are on the PRODUCED STRING, not
+// on a lookup having been called: an assertion that "the epic goal was read" would pass just as
+// well for a prompt that read it and then said nothing.
+describe("beadsProtocol — epic goal laddering", () => {
+  const GOAL = "Every dispatched agent carries a slice of its epic's goal and tests are green";
+  // The SAME call minus the goal — the byte-identical baseline every case below is measured
+  // against. Local to this describe rather than borrowed from the one above, so a change there can
+  // never quietly move what "identical" means here.
+  const bare = beadsProtocol({ epicId: "epic-42" });
+  const withGoal = beadsProtocol({ epicId: "epic-42", epicGoal: GOAL });
+
+  it("states the epic goal VERBATIM", () => {
+    // Verbatim, not paraphrased: the founder's second constraint on this whole feature is that a
+    // goal he wrote is never silently reworded under him.
+    expect(withGoal).toContain(GOAL);
+  });
+
+  it("tells the orchestrator every spawn_worker goal must be a NARROWED SLICE of it", () => {
+    expect(withGoal).toMatch(/NARROWED SLICE/);
+    expect(withGoal).toMatch(/spawn_worker/);
+    expect(withGoal).toMatch(/observable end state/i);
+  });
+
+  it("names BOTH failure shapes — restating the epic goal, and restating the task", () => {
+    // Both, because each alone is half a rule. A worker told only "don't echo the epic" writes the
+    // task back; one told only "don't echo the task" writes the epic back. Either produces a goal
+    // that passes `validateWorkerGoal` and is still uncheckable or unmeetable.
+    expect(withGoal).toMatch(/RESTATING THE EPIC GOAL/);
+    expect(withGoal).toMatch(/RESTATING THE TASK/);
+    expect(withGoal).toMatch(/never be told apart from a worker that merely stopped/);
+  });
+
+  it("is BYTE-IDENTICAL to today's prompt when the epic has no goal", () => {
+    // THE REGRESSION GUARD, and the reason it is stated as byte equality rather than as a
+    // `not.toContain`. Most epics have no goal, so the absent case is the COMMON one; a feature that
+    // reworded every brief already in flight would be a regression wearing a feature's clothes.
+    // Pinned on the LAST pre-existing line, which is what makes this an assertion about bytes
+    // rather than about a phrase: an appended paragraph, a trailing blank line, or an interleaved
+    // one all break `endsWith`, and none of them break a `not.toContain`.
+    expect(bare.endsWith("  branch into YOUR build branch sequentially, one at a time.")).toBe(true);
+    expect(bare).not.toMatch(/NARROWED SLICE/);
+    expect(bare).not.toContain(GOAL);
+    // …and the paired positive, so "identical" cannot be satisfied by a function that ignores the
+    // option entirely. Same epic id, same call shape — only the goal differs.
+    expect(withGoal).not.toBe(bare);
+    expect(withGoal.startsWith(bare)).toBe(true);
+  });
+
+  it("treats a whitespace-only goal as no goal", () => {
+    // `hasEpicGoalText` guards the store side; this is the same rule at the prompt boundary, so a
+    // caller that hands through a blank string cannot paint an empty "verbatim:" line.
+    expect(beadsProtocol({ epicId: "epic-42", epicGoal: "   " })).toBe(bare);
+  });
+});
+
 // ══ CHIEF PROJECT SELECTION (bead sparkle-8rr0c, roborev 63041) ═════════════════════════════════
 // Same standing as the other pins in this file, and the same caveat: this is PROSE, not a mechanism.
 // The mechanism is `services/chiefScope.ts` — `resolveChiefProject` refuses rather than guessing, and

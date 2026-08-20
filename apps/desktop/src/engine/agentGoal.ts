@@ -206,6 +206,23 @@ export interface AgentGoal {
    *  @see engine/agentStall.ts — `chosenHere`, and its "TERM 3 IS A RELEVANCE JUDGEMENT" block
    *  @see services/controlListener.ts — the original reader, the refusal's `chosenHere` evidence */
   verifyInherited?: boolean;
+  /** The `setAt` of the EPIC GOAL this goal was COPIED from, when it was copied by
+   *  `services/sendToBuild`'s ladder rather than chosen by anyone (bead `sparkle-wab4lm`).
+   *
+   *  ⚠️ IT IS THE ONLY THING THAT MAKES A RE-SYNC SAFE (roborev 65882). An epic goal that is edited
+   *  after an orchestrator was handed it leaves that orchestrator being judged against a sentence
+   *  the epic no longer states — so the copy has to be refreshable. But `AgentGoal` records no
+   *  AUTHOR, so a timestamp comparison alone cannot tell "a stale ladder copy" from "the objective a
+   *  human deliberately wrote for this orchestrator", and the first cut of that re-sync silently
+   *  destroyed the second: a human sets the goal at T1, the epic goal is edited at T2, and the next
+   *  dispatch — which includes the epic sweep's TIMER, with no human gesture behind it at all —
+   *  overwrote their wording.
+   *
+   *  Absent therefore means "this code did not write it", and a goal with no marker is NEVER
+   *  re-synced. That is the fail-closed direction: the cost of not refreshing a copy is a stale
+   *  sentence a person can see and fix, and the cost of refreshing a non-copy is losing what they
+   *  wrote — which is the failure this whole feature is trying not to commit. */
+  fromEpicGoalAt?: number;
 }
 
 /** Where a goal is in its life. `none` is the absence of a goal, kept in the union so every

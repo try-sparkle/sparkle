@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { GOAL_MAX_LEN } from "@sparkle/core";
 import { useAuthStore } from "../stores/authStore";
 import { useSettingsStore } from "../stores/settingsStore";
 
@@ -23,7 +24,8 @@ vi.mock("./worktree", async (orig) => ({
 import { useProjectStore } from "../stores/projectStore";
 import { useRuntimeStore } from "../stores/runtimeStore";
 import { useStaleBuildStore } from "./staleBuildService";
-import { spawnWorker, spinDownWorker } from "./workerSpawn";
+import { useBeadsStore } from "../stores/beadsStore";
+import { spawnWorker, spinDownWorker, ladderGoalFor } from "./workerSpawn";
 import { __resetTracesForTest, openTraceKinds } from "../perfTrace";
 
 describe("spawnWorker", () => {
@@ -729,5 +731,179 @@ describe("spinDownWorker", () => {
     const agents = useProjectStore.getState().projects.find((p) => p.id === projectId)!.agents;
     expect(agents.some((a) => a.id === workerId)).toBe(false); // tab removed despite failures
     warnSpy.mockRestore();
+  });
+});
+
+// ══ THE LADDER FALLBACK (bead sparkle-wab4lm) ══════════════════════════════════════════════════
+//
+// A blank `goal` here means the orchestrator used `spawn_worker`'s recorded `goalOverride` escape
+// hatch. That is the right answer for work with genuinely no criterion — but under an epic that HAS
+// a stated goal it is a contradiction, and it leaves the worker in exactly the goalless population
+// the dispatch gate exists to shrink. So the spawn writes a deterministic template naming the task
+// and the objective it serves.
+//
+// EVERY EARLIER GATE IS SEEDED IN `ladderSetup` — a real project, a parent with a branch, a cleared
+// stale-build store and a mocked worktree cut. A missing one of those throws BEFORE the goal block
+// runs, so an absence assertion would pass for a reason that has nothing to do with the rule under
+// test (AGENTS.md, "an earlier guard short-circuits the path"). Every absence case below is paired
+// with a presence case on the SAME setup, which is what pins the cause rather than the outcome.
+describe("spawnWorker — epic goal laddering", () => {
+  const EPIC_GOAL = "Every agent dispatched under an epic carries a slice of that epic's goal";
+  // `type: "epic"` is what `beads.isEpic` reads structurally, and `parent` is the membership edge
+  // `parentEpicOf` resolves from the child side.
+  const BEADS = [
+    { id: "epic-1", title: "The epic", description: "", status: "open", type: "epic", labels: [] },
+    { id: "task-1", title: "A task", description: "", status: "open", parent: "epic-1", labels: [] },
+    { id: "loose-1", title: "Orphan", description: "", status: "open", labels: [] },
+  ];
+
+  function ladderSetup(withEpicGoal: boolean): { projectId: string; buildId: string } {
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    useBeadsStore.setState({
+      byProject: { [projectId]: { beads: BEADS as never, board: null as never, loadedAt: 1 } },
+    });
+    if (withEpicGoal) {
+      useProjectStore.getState().setEpicGoal(projectId, "epic-1", EPIC_GOAL, "human");
+    }
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" })
+        : Promise.resolve(undefined),
+    );
+    return { projectId, buildId };
+  }
+
+  const goalOf = (projectId: string, workerId: string) =>
+    useProjectStore
+      .getState()
+      .projects.find((p) => p.id === projectId)!
+      .agents.find((a) => a.id === workerId)!.goal;
+
+  beforeEach(() => {
+    useProjectStore.setState({ projects: [], selectedProjectId: null });
+    useBeadsStore.setState({ byProject: {} });
+    invokeMock.mockReset();
+    removeWsMock.mockReset();
+    removeWsMock.mockResolvedValue(undefined);
+    useAuthStore.setState({ me: null });
+    useStaleBuildStore.getState().clear();
+  });
+
+  afterEach(() => {
+    // The beads store is MODULE-scoped, so a snapshot left here would be visible to every later
+    // suite in this file and silently change what their spawns resolve.
+    useBeadsStore.setState({ byProject: {} });
+  });
+
+  it("writes a laddering goal when the orchestrator supplied none and the epic HAS one", async () => {
+    const { projectId, buildId } = ladderSetup(true);
+
+    const { workerId } = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "wire the dispatch path",
+      beadId: "task-1",
+      // The override shape: no goal at all.
+    });
+
+    const goal = goalOf(projectId, workerId);
+    // BOTH ENDS OF THE LADDER, asserted on the persisted string. The task half is what makes the
+    // criterion checkable at all; the epic half is the whole point of the feature.
+    expect(goal?.text).toContain("task-1");
+    expect(goal?.text).toContain(EPIC_GOAL);
+    expect(goal?.text.length).toBeLessThanOrEqual(GOAL_MAX_LEN);
+  });
+
+  it("does NOT overwrite a goal the orchestrator DID supply", async () => {
+    // Same epic, same goal-bearing setup as above — the only difference is that a goal was stated.
+    // Overwriting it would replace a criterion a model wrote with full context on this slice with a
+    // template that has none, which is strictly worse than the thing it salvages.
+    const { projectId, buildId } = ladderSetup(true);
+    const stated = "the dispatch path passes sendToBuild.test.ts and typecheck is clean";
+
+    const { workerId } = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "wire the dispatch path",
+      beadId: "task-1",
+      goal: stated,
+    });
+
+    expect(goalOf(projectId, workerId)?.text).toBe(stated);
+    expect(goalOf(projectId, workerId)?.text).not.toContain(EPIC_GOAL);
+  });
+
+  it("leaves a worker under a GOAL-LESS epic exactly as it is today", async () => {
+    // The paired absence. Identical bead graph and identical spawn — only the epic's goal is
+    // missing — so a failure here can only mean the rule fired without a parent objective to
+    // ladder to, not that some earlier gate swallowed the spawn.
+    const { projectId, buildId } = ladderSetup(false);
+
+    const { workerId } = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "wire the dispatch path",
+      beadId: "task-1",
+    });
+
+    expect(goalOf(projectId, workerId)).toBeUndefined();
+  });
+
+  it("leaves a worker whose bead belongs to NO epic alone, even when other epics have goals", async () => {
+    const { projectId, buildId } = ladderSetup(true);
+
+    const { workerId } = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "spike the crash",
+      beadId: "loose-1",
+    });
+
+    expect(goalOf(projectId, workerId)).toBeUndefined();
+  });
+
+  it("truncates the EPIC-GOAL half to fit GOAL_MAX_LEN and never the task half", async () => {
+    // The cap is real — `validateWorkerGoal` refuses longer prose as a status update — so a template
+    // that ignored it would mint goals the gate itself would reject. Which half gives is the part
+    // that matters: losing the tail of an objective costs a reader context, losing the bead id costs
+    // them the ability to tell which task the criterion is about.
+    const long = "x".repeat(GOAL_MAX_LEN - 4) + " END";
+    const store = useProjectStore.getState();
+    const projectId = store.addProject("Demo", "/tmp/demo");
+    const buildId = store.addAgent(projectId, { kind: "build" })!;
+    store.setAgentWorktree(projectId, buildId, "/wt/build", "sparkle/agent-build1");
+    useBeadsStore.setState({
+      byProject: { [projectId]: { beads: BEADS as never, board: null as never, loadedAt: 1 } },
+    });
+    useProjectStore.getState().setEpicGoal(projectId, "epic-1", long, "human");
+    invokeMock.mockImplementation((cmd: string) =>
+      cmd === "create_worker_worktree"
+        ? Promise.resolve({ path: "/wt/worker", branch: "sparkle/agent-w" })
+        : Promise.resolve(undefined),
+    );
+
+    const { workerId } = await spawnWorker({
+      projectId,
+      parentAgentId: buildId,
+      task: "wire the dispatch path",
+      beadId: "task-1",
+    });
+
+    const text = goalOf(projectId, workerId)!.text;
+    expect(text.length).toBeLessThanOrEqual(GOAL_MAX_LEN);
+    expect(text.startsWith("task-1")).toBe(true); // the task half survives WHOLE
+    expect(text.endsWith("…")).toBe(true); // …and the epic half is what gave
+    expect(text).not.toContain("END"); // the tail that was dropped
+  });
+
+  it("ladderGoalFor answers null for a worker with no bead at all", () => {
+    // The `goalOverride` path outside an epic — the population this must NOT touch, since a
+    // placeholder there would make an unverifiable worker look verifiable.
+    const { projectId } = ladderSetup(true);
+    expect(ladderGoalFor(projectId, undefined)).toBeNull();
+    expect(ladderGoalFor(projectId, "task-1")).not.toBeNull();
   });
 });
