@@ -45,6 +45,13 @@ import { ColumnPullTab, HEADER_H, TAB_TOP } from "./ColumnPullTab";
 import { EpicGoalRowForEpic } from "./EpicGoalRow";
 import { HeaderLink } from "./HeaderLink";
 import { EpicInlineCard } from "./EpicInlineCard";
+// REUSED, never re-derived. This is the same read-only chip the board cards wear
+// (`BoardView`), split out of the editable `PriorityPill` precisely for the "hundreds on
+// screen" case — a plain span with no state, no listeners and no portal. Two different-looking
+// priority treatments in one app is the class of defect this import exists to avoid, and it
+// matters more than usual here: `sparkle-hhb5re` makes priority the board's primary sort key,
+// so the chip and the ordering are read together and must agree.
+import { BeadPriorityChip } from "./BeadCard/BeadPriorityChip";
 import { EPICS_COLUMN_Z } from "./layers";
 import { useColumnZoom } from "../hooks/useZoomColumn";
 import { useWindowWidth } from "../hooks/useWindowWidth";
@@ -621,6 +628,37 @@ function EpicRow({
       >
         {epicDisplayTitle(epic.title)}
       </span>
+      {/* THE FOUNDER'S PLACEMENT: name, then the priority chiclet, then the count ("to the right of
+          the epic name, before the count like, the 9/10"). Nothing else in the row moves.
+
+          A CHICLET, NOT A CAPSULE. `BeadPriorityChip` is built on `tag()` at `RADIUS.sm` — a
+          near-square corner, and the 999-radius capsule is the thing this codebase purged. Do not
+          override the radius to round it off.
+
+          THE LITERAL IS SPELLED AROUND ON PURPOSE. `labelTreatment.test.ts` ratchets the tree-wide
+          count of that literal and skips comment lines by testing whether the line STARTS with
+          `//`, `/*` or `*` — which a JSX block comment's continuation lines do not. So writing the
+          literal in prose here counts as a USE and reddens the ratchet on an unrelated PR, which is
+          exactly what it did on this one.
+
+          IT SITS INSIDE THE ROW'S `alignItems: "baseline"`, which is correct rather than tolerated:
+          an inline-flex box takes the baseline of its first line, so the chip's "P2" sits on the
+          same baseline as the title beside it. Its 6px dot is centred within the chip, not against
+          the row, so it does not drag the alignment.
+
+          IT IS `flex: "0 0 auto"`, so its ~28px comes permanently out of the title's width — the
+          title is already ellipsised at `flex: 1` in a 280px column, so a long epic name truncates
+          slightly sooner. That is the trade the founder asked for. */}
+      <BeadPriorityChip priority={epic.priority} testId="epic-row-priority" />
+      {/* ── BOTH SIDES OF A MERGE, AND THE ORDER IS THE FOUNDER'S ────────────────────────────────
+          `main` added `EpicGoalRowForEpic` (PR #2244, epic-goal laddering) at exactly this
+          insertion point while this branch was adding the chiclet. Neither replaces the other, so
+          both are kept.
+
+          THE CHICLET GOES FIRST because the founder placed it against the NAME, not against the
+          count: "a little priority chicklet pill to the right of the epic name, before the count
+          like, the 9/10". Putting the goal row first would satisfy "before the count" while
+          breaking "to the right of the epic name", which is the half that names an anchor. */}
       <EpicGoalRowForEpic epicId={epic.id} beads={allBeads} />
       {total > 0 && (
         <span data-testid="epic-row-children" style={{ flex: "0 0 auto", color: C.muted }}>
