@@ -365,7 +365,7 @@ fn now_ms() -> i64 {
 }
 
 /// Reject anything that is not a plain id before it reaches a path join.
-fn validate_agent_id(agent_id: &str) -> Result<(), String> {
+pub(crate) fn validate_agent_id(agent_id: &str) -> Result<(), String> {
     if agent_id.is_empty()
         || agent_id.contains('/')
         || agent_id.contains('\\')

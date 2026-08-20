@@ -120,7 +120,7 @@ fn an_improve_mention_spawns_a_scoped_responder() {
         6,
         DEFAULT_ACK_DEADLINE_MS,
         1_000,
-        "m1".to_string(),
+        DoorbellId::for_test("m1"),
         &spawner,
         &threads,
     )
@@ -146,7 +146,7 @@ fn a_busy_responder_still_delivers_the_doorbell() {
     let threads = FakeThreadStore::default();
     let out = route_mention(
         &base, MentionTarget::Improve, "sparkle-1", "x", "sparkle", Provenance::Own,
-        false, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, "m1".to_string(), &spawner, &threads,
+        false, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, DoorbellId::for_test("m1"), &spawner, &threads,
     )
     .unwrap();
     assert_eq!(spawner.count(), 1);
@@ -174,7 +174,7 @@ fn a_sparkle_mention_lands_in_the_concierge_inbox_and_arms_the_wake() {
         6,
         DEFAULT_ACK_DEADLINE_MS,
         2_000,
-        "m2".to_string(),
+        DoorbellId::for_test("m2"),
         &spawner,
         &threads,
     )
@@ -243,7 +243,7 @@ fn every_reserved_handle_puts_a_doorbell_in_the_right_recipient_inbox() {
             6,
             DEFAULT_ACK_DEADLINE_MS,
             1_000,
-            format!("doorbell-{handle}"),
+            DoorbellId::for_test(&format!("doorbell-{handle}")),
             &spawner,
             &threads,
         )
@@ -296,32 +296,52 @@ fn every_reserved_handle_puts_a_doorbell_in_the_right_recipient_inbox() {
     }
 }
 
-/// The id `mention_send` actually generates must survive the filter the concierge's reader applies.
+/// A doorbell carrying the PRODUCTION id must be readable by the concierge's own reader — asserted
+/// by driving `route_mention`, not by re-implementing its enqueue.
 ///
-/// THE GAP THIS EXISTS FOR. `entries_of` — the concierge's only drain path, via `inbox_peek` —
-/// discards any record whose id `validate_agent_id` rejects (`refuse_escape`, on the id, not the
-/// agent). `pending` does not. So a doorbell id containing `/`, `\`, `..` or NUL would be enqueued,
-/// acknowledged by the sender, visible to `pending`, and INVISIBLE to the recipient that matters —
-/// a silent non-delivery of exactly the kind this whole feature exists to remove.
+/// THE HAZARD. `entries_of` — the concierge's only drain path, via `inbox_peek` — discards any
+/// record whose id `validate_agent_id` rejects (`refuse_escape`, on the ID, not the agent).
+/// `pending` does not. So a doorbell id containing `/`, `\`, `..` or NUL would be enqueued,
+/// acknowledged to the sender, visible to `pending`, and INVISIBLE to the recipient that matters:
+/// a silent non-delivery of exactly the kind this feature exists to remove.
 ///
-/// The reserved-handle test above cannot catch it: it supplies its own id. This one takes the id
-/// from the production generator `route_mention` is handed (`inbox::uuid_v4`) and asserts the
-/// concierge's reader returns it.
+/// THE HAZARD HAS TWO LEGS, and an earlier cut of this test asserted neither. It called `uuid_v4()`
+/// and then hand-replicated the enqueue, so what it really pinned was
+/// `validate_agent_id(uuid_v4())` plus an `enqueue`→`entries_of` round trip. Change how production
+/// picks or forwards the id and it stayed green, because it kept minting and enqueuing its own:
+///
+///   (a) `mention_send` SELECTS `inbox::uuid_v4()` for the doorbell id — pinned by
+///       [`mention_send_uses_the_uuid_generator_for_the_doorbell_id`], since `mention_send` takes an
+///       `AppHandle` and no unit test can drive it;
+///   (b) `route_mention` FORWARDS that value to `inbox::enqueue` verbatim — pinned here, by handing
+///       `route_mention` a production-generated id and reading the result back through the
+///       concierge's reader. Add a prefix on the way to `enqueue` and this goes red.
 #[test]
-fn the_production_doorbell_id_is_readable_by_the_concierges_reader() {
+fn a_production_id_doorbell_is_readable_by_the_concierges_reader() {
     let base = tmp("doorbell-id");
-    let id = crate::inbox::uuid_v4();
+    let spawner = NeverSpawner; // the concierge path must not spawn
+    let threads = FakeThreadStore::default();
+    // The PRODUCTION constructor — the ONLY one `mention_send` can use, because `DoorbellId` has
+    // no other public way to be built. Minting here is minting exactly what production mints.
+    let doorbell = DoorbellId::mint();
+    let expected = doorbell.clone().into_inner();
 
-    crate::inbox::enqueue(
+    route_mention(
         &base,
-        crate::concierge_inbox::CONCIERGE_INBOX_ID,
-        "[@mention doorbell] go read bead sparkle-jb809e",
-        crate::inbox::Severity::Act,
+        MentionTarget::Sparkle,
+        "sparkle-jb809e",
+        "the message is the bead comment above",
         "improve",
+        Provenance::Own,
+        true,
+        6,
+        DEFAULT_ACK_DEADLINE_MS,
         1_000,
-        id.clone(),
+        doorbell,
+        &spawner,
+        &threads,
     )
-    .expect("the doorbell must persist");
+    .expect("the doorbell must route");
 
     let peeked = crate::inbox::entries_of(&base, crate::concierge_inbox::CONCIERGE_INBOX_ID, 1_000);
     assert_eq!(
@@ -330,9 +350,48 @@ fn the_production_doorbell_id_is_readable_by_the_concierges_reader() {
         "a doorbell carrying the PRODUCTION id must be visible to the reader the concierge drains \
          with — an id that reader discards is a silent non-delivery"
     );
-    assert_eq!(peeked[0].id, id, "and it must be the same record, by id");
+    assert_eq!(
+        peeked[0].id, expected,
+        "route_mention must forward the id to enqueue VERBATIM — a prefix or a derived id would be \
+         discarded by entries_of while `pending` still showed it"
+    );
 
     std::fs::remove_dir_all(&base).ok();
+}
+
+/// Leg (a) — that production cannot supply anything BUT a minted id — is enforced by the TYPE, not
+/// by this test. `route_mention` takes a [`DoorbellId`], whose only non-test constructor is
+/// `DoorbellId::mint()`, so handing it `thread_for_task.clone()` (the mis-wire the previous grep
+/// could not see, one transposition away among four `String` arguments) is a COMPILE error.
+///
+/// The grep it replaces asserted only that the mint STATEMENT appeared somewhere in `mention.rs` —
+/// satisfied by a doc comment quoting the rule, unbounded past the end of the function, and red on a
+/// cosmetic rewrap. This asserts the property that actually matters and cannot drift: whatever
+/// production mints, `entries_of` must be able to read back.
+#[test]
+fn a_minted_doorbell_id_is_legal_AND_fresh() {
+    // TWO PROPERTIES, and dropping the second is how the grep this replaced was briefly stronger.
+    //
+    // LEGAL: it must pass the filter `entries_of` applies, or the concierge can never read it.
+    // FRESH: it must differ every time. `entries_of` joins acks by MESSAGE ID
+    // (`acked: HashSet<&str>` keyed on `m.id`), so two doorbells sharing an id mean one agent's ACK
+    // marks the OTHER as delivered — the same silent false-delivery this whole change exists to
+    // close, in the "legal but not unique" direction. Asserting validity alone is satisfied by any
+    // constant: a `thread_ref`-derived id like "sparkle-1" is a perfectly legal agent id.
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let id = DoorbellId::mint().into_inner();
+        assert!(
+            crate::inbox::validate_agent_id(&id).is_ok(),
+            "every minted doorbell id must pass the filter `entries_of` applies — one that does not \
+             is a doorbell the concierge can never read"
+        );
+        assert!(
+            seen.insert(id.clone()),
+            "minted doorbell ids must be unique: {id} was drawn twice, and `entries_of` joins acks \
+             by message id, so a collision lets one agent's ACK mark another's doorbell delivered"
+        );
+    }
 }
 
 // ── rule 1: beads is the message, the inbox is only a doorbell ────────────────────────────────
@@ -346,7 +405,7 @@ fn content_goes_to_the_bead_and_the_doorbell_carries_no_body() {
 
     route_mention(
         &base, MentionTarget::Improve, "sparkle-9", secret_body, "sparkle",
-        Provenance::Own, false, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, "m1".to_string(),
+        Provenance::Own, false, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, DoorbellId::for_test("m1"),
         &spawner, &threads,
     )
     .unwrap();
@@ -388,7 +447,7 @@ fn a_mention_already_on_the_thread_is_not_double_posted() {
     let threads = FakeThreadStore::default();
     let out = route_mention(
         &base, MentionTarget::Improve, "sparkle-3", "already here", "sparkle",
-        Provenance::Own, true, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, "m1".to_string(),
+        Provenance::Own, true, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, DoorbellId::for_test("m1"),
         &spawner, &threads,
     )
     .unwrap();
@@ -428,7 +487,7 @@ fn round_cap_halts_the_loop_at_n() {
         let out = route_mention(
             &base, MentionTarget::Improve, "sparkle-loop", "again", "sparkle",
             Provenance::Own, false, cap, DEFAULT_ACK_DEADLINE_MS, 1_000 + r as i64,
-            format!("m{r}"), &spawner, &threads,
+            DoorbellId::for_test(&format!("m{r}")), &spawner, &threads,
         )
         .unwrap();
         assert_eq!(out.round, r, "round should advance");
@@ -442,7 +501,7 @@ fn round_cap_halts_the_loop_at_n() {
     let out = route_mention(
         &base, MentionTarget::Improve, "sparkle-loop", "one too many", "sparkle",
         Provenance::Own, false, cap, DEFAULT_ACK_DEADLINE_MS, 9_999,
-        "mX".to_string(), &spawner, &threads,
+        DoorbellId::for_test("mX"), &spawner, &threads,
     )
     .unwrap();
     assert!(out.capped, "past the cap the exchange must be capped");
@@ -531,7 +590,7 @@ fn an_empty_body_is_refused() {
     let threads = FakeThreadStore::default();
     let err = route_mention(
         &base, MentionTarget::Improve, "sparkle-1", "   ", "sparkle", Provenance::Own,
-        false, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, "m1".to_string(), &spawner, &threads,
+        false, 6, DEFAULT_ACK_DEADLINE_MS, 1_000, DoorbellId::for_test("m1"), &spawner, &threads,
     )
     .unwrap_err();
     assert!(err.contains("empty"), "got: {err}");

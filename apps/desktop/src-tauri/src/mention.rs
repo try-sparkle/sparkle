@@ -339,6 +339,49 @@ impl ThreadStore for BdThreadStore {
     }
 }
 
+/// The doorbell's inbox message id. See [`doorbell_id::DoorbellId`].
+pub use doorbell_id::DoorbellId;
+
+/// A PRIVATE MODULE, and that is the whole mechanism — not decoration.
+///
+/// A tuple struct's field is private to its MODULE, not its file. `DoorbellId(String)` declared
+/// beside `mention_send` therefore left `DoorbellId(thread_for_task.clone())` compiling cleanly at
+/// exactly the call site the newtype exists to protect — and that derive-then-wrap form is what a
+/// future edit reaching for a "readable" or deterministic id would actually write. Only the
+/// transposition form was a type error. Putting the type in its own module makes the field
+/// unreachable from `mention_send`, so BOTH forms are compile errors.
+mod doorbell_id {
+    /// The doorbell's inbox message id — a newtype so no other string can take its place.
+    ///
+    /// WHY THIS IS A TYPE AND NOT A TEST. `entries_of` — the concierge's only drain path — discards
+    /// any record whose id `validate_agent_id` rejects, while `pending` does not. So an id derived
+    /// from `thread_ref`, the sender handle, or anything else that can carry `/`, `\`, `..` or NUL
+    /// is enqueued, acknowledged to the sender, visible to `pending`, and INVISIBLE to the recipient
+    /// that matters: a silent non-delivery. `route_mention` takes thirteen positional arguments,
+    /// four of them strings, so that mis-wire was one transposition away — and no test could rule it
+    /// out, because a source grep proves only that the mint statement EXISTS and a test that drives
+    /// `route_mention` supplies its own id.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DoorbellId(String);
+
+    impl DoorbellId {
+        /// The ONLY way production can make one: a fresh uuid, which `validate_agent_id` always
+        /// accepts and which is unique per call — see the uniqueness note on `inbox::enqueue`'s
+        /// ack join, where two doorbells sharing an id would let one ACK mark the other delivered.
+        pub fn mint() -> Self {
+            DoorbellId(crate::inbox::uuid_v4())
+        }
+        /// Tests may pin a readable id. `#[cfg(test)]`, so no production path can reach it.
+        #[cfg(test)]
+        pub fn for_test(id: &str) -> Self {
+            DoorbellId(id.to_string())
+        }
+        pub(crate) fn into_inner(self) -> String {
+            self.0
+        }
+    }
+}
+
 /// A request to wake `@improve` by spawning a scoped one-shot responder.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ResponderRequest {
@@ -416,7 +459,7 @@ pub fn route_mention<S: ResponderSpawner, T: ThreadStore>(
     max_rounds: u32,
     ack_deadline_ms: i64,
     now: i64,
-    doorbell_id: String,
+    doorbell_id: DoorbellId,
     spawner: &S,
     threads: &T,
 ) -> Result<MentionOutcome, String> {
@@ -475,7 +518,7 @@ pub fn route_mention<S: ResponderSpawner, T: ThreadStore>(
         inbox::Severity::Act,
         &from,
         now,
-        doorbell_id,
+        doorbell_id.into_inner(),
     )?;
 
     // 3. Record the ACK deadline. `mention_status` reports overdue past this — treat as UNDELIVERED.
@@ -835,7 +878,7 @@ pub async fn mention_send(
     let cap = max_rounds.unwrap_or(DEFAULT_MAX_MENTION_ROUNDS);
     let deadline = ack_deadline_ms.unwrap_or(DEFAULT_ACK_DEADLINE_MS);
     let now = now_ms();
-    let doorbell_id = crate::inbox::uuid_v4();
+    let doorbell_id = DoorbellId::mint();
 
     // Resolve the claude path here — Rust resolves it itself, no frontend round-trip. Absent claude
     // just means `@improve` cannot be woken by a spawn; the doorbell is still durable and the hourly
