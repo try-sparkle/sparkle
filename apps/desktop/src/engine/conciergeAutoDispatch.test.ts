@@ -95,6 +95,47 @@ describe("the founder's rule: fire when agents are FEWER than waiting messages",
     expect(decideAutoDispatch(obs({ waiting, liveResearch: 9 })).action).toBe("none");
   });
 
+  // ══ THE SECOND TICK, AFTER DISPATCH-AND-CONTINUE MOVED PROMPTS OUT OF `waiting` ═══════════════
+  //
+  // roborev 65829 (HIGH). `liveResearch` counts the workers on DELEGATED prompts too, but those
+  // prompts have left `waiting`. Comparing the two is no longer apples-to-apples, and the skew is
+  // always toward "covered" — so the tail of a backlog is declared served by children researching
+  // other questions, is never fanned out, and is answered serially. Silently.
+  //
+  // These rows are written from the worked example in that finding and FAIL against the arithmetic
+  // as it was: `4 >= 1` returned `served`.
+  describe("delegated prompts are still outstanding", () => {
+    it("keeps dispatching the uncovered remainder after a tick delegated four", () => {
+      // Tick 1 dispatched 4 of 5; they moved to `delegated`, so one waiter is left and four workers
+      // are live. The 5th has nobody coming for it.
+      const waiting = [waiter("w5", OLD)];
+      const d = decideAutoDispatch(obs({ waiting, liveResearch: 4, delegated: 4 }));
+      expect(d.action).toBe("dispatch");
+      if (d.action !== "dispatch") throw new Error("expected a dispatch");
+      expect(d.entries.map((e) => e.bubbleId)).toEqual(["w5"]);
+    });
+
+    it("still reports served once the live workers cover waiting AND delegated", () => {
+      // The all-clear must still exist, or the fix would just dispatch forever.
+      const waiting = [waiter("w5", OLD)];
+      expect(decideAutoDispatch(obs({ waiting, liveResearch: 5, delegated: 4 }))).toEqual({
+        action: "none",
+        reason: "served",
+      });
+    });
+
+    it("treats an absent `delegated` exactly as before", () => {
+      // The field is optional so an un-updated caller cannot be compiled into a wrong answer; this
+      // pins that the default really is the old behaviour rather than a new one.
+      const waiting = [waiter("w1", OLD), waiter("w2", OLD), waiter("w3", OLD)];
+      expect(decideAutoDispatch(obs({ waiting, liveResearch: 3 }))).toEqual({
+        action: "none",
+        reason: "served",
+      });
+      expect(decideAutoDispatch(obs({ waiting, liveResearch: 2 })).action).toBe("dispatch");
+    });
+  });
+
   it("says nothing at all when the queue is empty", () => {
     expect(decideAutoDispatch(obs({ waiting: [] }))).toEqual({
       action: "none",

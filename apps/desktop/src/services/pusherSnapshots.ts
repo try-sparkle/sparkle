@@ -388,10 +388,12 @@ export function buildConciergeQueue(): ConciergeQueue | undefined {
   // HYDRATION FIRST, then the count — never the count alone. See the header.
   if (!useResearchStore.getState().hydrated) return undefined;
   return {
-    // `queued` IS `waiting` — the messages stacked BEHIND the running turn, never the one in
-    // flight. That is the number the founder reads off his own screen as "6th in line", and it is
-    // the one the condition compares against the live agent count.
-    queued: depth.waiting,
+    // `queued` is everything OWED behind the running turn — waiting PLUS delegated. A delegated
+    // prompt (handed to a research worker by dispatch-and-continue) is still outstanding; counting
+    // only `waiting` would let the fan-out blind the very `queue-unfanned` detector it feeds, reading
+    // an empty queue while N questions are being worked. When each owed prompt has a live worker,
+    // `queueUnfanned`'s own `liveAgents >= queued` guard correctly reads that as served.
+    queued: depth.waiting + (depth.delegated ?? 0),
     liveAgents: liveTasks(allTasksNow()).length,
     oldestAt: depth.oldestAt,
   };

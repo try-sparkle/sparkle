@@ -59,7 +59,7 @@
 import { create } from "zustand";
 
 import type { TurnQueueState } from "../engine/conciergeTurnQueue";
-import { waitingCount } from "../engine/conciergeTurnQueue";
+import { waitingCount, delegatedCount, oldestOutstandingAt } from "../engine/conciergeTurnQueue";
 
 /**
  * What a mounted concierge publishes about its turn queue.
@@ -72,8 +72,21 @@ import { waitingCount } from "../engine/conciergeTurnQueue";
  * belongs.
  */
 export interface ConciergeQueueDepth {
-  /** Messages waiting BEHIND the running turn. Never includes the one in flight. */
+  /** Messages waiting BEHIND the running turn. Never includes the one in flight or the delegated. */
   waiting: number;
+  /**
+   * Messages HANDED TO A RESEARCH WORKER — owed and being researched in parallel, not yet answered.
+   *
+   * Separate from `waiting` so a reader can tell "stacked behind the concierge" from "being worked by
+   * a worker", but it still counts as OUTSTANDING: `buildConciergeQueue` sums the two into the
+   * `queue-unfanned` count precisely so dispatch-and-continue does not blind the detector it feeds
+   * (a delegated prompt is served-by-worker, not gone). See `engine/conciergeTurnQueue.delegated`.
+   *
+   * OPTIONAL, and absent is read as 0 everywhere: `queueDepthOf` always sets it, but a hand-written
+   * or older payload that omits it must read as "no delegated work", never `NaN` — the same
+   * forgiving-read discipline the `oldestAt` docstring records.
+   */
+  delegated?: number;
   /** Is a turn in flight right now? */
   running: boolean;
   /**
@@ -96,14 +109,14 @@ export interface ConciergeQueueDepth {
  * twice, never two derivations" rule `ConciergeAgentsRow` records for its own `+[n]`.
  */
 export function queueDepthOf(s: TurnQueueState): ConciergeQueueDepth {
-  // `waiting[0]` IS the oldest: `enqueue` appends and `turnFinished` shifts from the front, and the
-  // cap drops from the front too — so the array is in send order and index 0 has waited longest.
-  // Read from the entry rather than tracked separately, so the age and the count can never describe
-  // different queues.
+  // `oldestAt` spans waiting AND delegated (`oldestOutstandingAt`): a prompt handed to a worker three
+  // minutes ago is still owed and still old, so the `queue-unfanned` age must see it — otherwise
+  // dispatch-and-continue would reset the clock the detector reads by moving prompts out of `waiting`.
   return {
     waiting: waitingCount(s),
+    delegated: delegatedCount(s),
     running: s.running !== null,
-    oldestAt: s.waiting[0]?.enqueuedAt ?? null,
+    oldestAt: oldestOutstandingAt(s),
   };
 }
 

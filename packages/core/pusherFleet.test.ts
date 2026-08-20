@@ -818,12 +818,19 @@ describe("queue-unfanned", () => {
   // said both.
   it("tells the reader what fanning out actually does, and does not promise it drains the queue", () => {
     const [c] = fire();
-    expect(c!.text).toContain("does NOT dequeue anything");
-    expect(c!.text).toContain("turn queue advances only as each turn finishes");
-    // The reader is told the alert clearing is not the same as being answered — without this the
-    // remedy is still, in effect, "make the alarm stop".
-    expect(c!.text).toContain("work started rather than as questions answered");
-    // THE RETIRED CLAIM, pinned as absent. Both halves of it.
+    // DISPATCH-AND-CONTINUE (beads sparkle-3c83a/8lwi8): dispatching now MOVES a prompt out of the
+    // serial line and it returns, with findings, when its worker finishes — so the copy no longer says
+    // "does NOT dequeue anything / advances only as each turn finishes", which became false.
+    expect(c!.text).toContain("moves a prompt OUT of the serial line");
+    // "with whatever it found" — not an unconditional "with findings": redelivery also fires for a
+    // pass that failed or returned nothing, so the remedy must not promise findings (roborev 65716).
+    expect(c!.text).toContain("comes back, with whatever it found, when its worker finishes");
+    // The reported depth still counts a handed-off prompt — so the alert clearing means work STARTED,
+    // not questions answered; without this the remedy is still, in effect, "make the alarm stop".
+    expect(c!.text).toContain("work started, not as questions answered");
+    // THE RETIRED CLAIMS, pinned as absent — the old timing must not survive anywhere in the text.
+    expect(c!.text).not.toContain("does NOT dequeue anything");
+    expect(c!.text).not.toContain("advances only as each turn finishes");
     expect(c!.text).not.toContain("does not drain itself");
     expect(c!.text).not.toContain("depth only falls once one is started");
     expect(citable(c!.text, c!.measured)).toBe(true);

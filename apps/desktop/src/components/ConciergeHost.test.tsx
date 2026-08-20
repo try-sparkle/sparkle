@@ -106,7 +106,10 @@ vi.mock("../services/openProjectTab", () => ({
 // "a failing ask queue does not take the history write with it" drive the production wiring end to
 // end and spy on the store's sink instead of on a mock.
 vi.mock("../services/conciergeAskQueue", () => ({
-  captureAsksFrom: vi.fn(async () => ({ filed: [], bumped: [], reasked: [], dropped: 0 })),
+  // `dropped` is the withheld ASK RECORDS, not a count (packages/core AskCapture). Leaving this as
+  // `0` would still typecheck through the untyped mock and make `out.dropped.length` undefined, so
+  // the dropped-ask notice branch could never be taken and its tests would pass vacuously.
+  captureAsksFrom: vi.fn(async () => ({ filed: [], bumped: [], reasked: [], dropped: [] })),
   openAsksNow: vi.fn(() => []),
   startAskQueue: vi.fn(() => () => {}),
 }));
@@ -252,6 +255,7 @@ vi.mock("../services/conciergeTools/research", async (orig) => ({
 // copy here would turn a wording tweak into a red test for a non-bug (roborev 53044).
 import { ConciergeHost, TRIAL_SPENT_TEXT } from "./ConciergeHost";
 import { captureAsksFrom } from "../services/conciergeAskQueue";
+import type { AskRecord } from "@sparkle/core";
 import { useHistoryStore } from "../stores/historyStore";
 import {
   _resetConciergeActivityForTests,
@@ -443,6 +447,24 @@ function routeToAgent() {
 async function settle() {
   await flush();
   await elapseCountdowns();
+}
+
+/**
+ * Put the RUNNING turn past the point where a related follow-on may be merged into it.
+ *
+ * ══ WHY EVERY QUEUEING ROW NEEDS THIS NOW (bead sparkle-agx4d8) ════════════════════════════════
+ * A related send that arrives while the running turn has produced NOTHING is folded into it and
+ * re-dispatched, so the founder's follow-up is answered together with the message it completes.
+ * That is the feature, and it means "send twice and expect a queue" is no longer true on its own:
+ * with an inert brain mock nothing has been produced, so the second send legitimately merges.
+ *
+ * One observed tool call is the smallest thing that makes the running turn ineligible — and it is
+ * also the REALISTIC precondition these rows always meant: a turn that is genuinely being worked.
+ * Merging from there would kill real work, which is the 2026-07-29 defect the queue exists to
+ * prevent, so the rows keep guarding exactly what they were written to guard.
+ */
+function turnStartedWorking() {
+  act(() => void noteConciergeToolCall("workspace", "list_projects", {}));
 }
 
 /**
@@ -795,20 +817,22 @@ describe("ConciergeHost", () => {
   // them failing must not swallow the other. Grouped under a single guard, a throw from the
   // `dropped` post skips every `reasked` line below it — concealment produced by the disclosure.
   //
-  // THE DROPPED POST HAS TO ACTUALLY FAIL (roborev 61987). A resolved `{dropped: 2}` posts both
-  // notices happily, so asserting the re-ask line proves only that the happy path renders — green
-  // against the grouped shape this row exists to forbid. `dropped` is therefore a value that passes
-  // the `> 0` gate via `valueOf` and then THROWS from `toString`, which is where the notice's
-  // `String(out.dropped)` reads it: the failure lands inside the `dropped` guard and nowhere else.
+  // THE DROPPED POST HAS TO ACTUALLY FAIL (roborev 61987). A resolved happy `dropped` posts both
+  // notices, so asserting the re-ask line proves only that the happy path renders — green against
+  // the grouped shape this row exists to forbid. `dropped` is therefore ONE record that passes the
+  // `.length > 0` gate and then THROWS when its `sentence` is read, which is where the notice
+  // renders it: the failure lands inside the `dropped` guard and nowhere else.
   it("a failing dropped-ask notice does not swallow the re-ask notices", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      const explodingCount = {
-        valueOf: () => 2,
-        toString: () => {
-          throw new TypeError("the count cannot be rendered");
+      const explodingAsk = {
+        key: "ask-boom",
+        turnId: "t",
+        at: 1,
+        get sentence(): string {
+          throw new TypeError("the ask cannot be rendered");
         },
-      } as unknown as number;
+      } as unknown as AskRecord;
       vi.mocked(captureAsksFrom).mockResolvedValueOnce({
         filed: [],
         bumped: [],
@@ -824,7 +848,7 @@ describe("ConciergeHost", () => {
             },
           },
         ],
-        dropped: explodingCount,
+        dropped: [explodingAsk],
       });
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -878,7 +902,7 @@ describe("ConciergeHost", () => {
             ask: { key: "ask-2", sentence: "build ten homepage designs", turnId: "t", at: 2 },
           },
         ],
-        dropped: 0,
+        dropped: [],
       });
       h.feed = feedWith("approval");
       render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
@@ -1288,6 +1312,7 @@ describe("ConciergeHost", () => {
     const afterFirst = h.startConciergeTurn.mock.calls.length;
     expect(afterFirst).toBeGreaterThan(0);
 
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -1326,7 +1351,7 @@ describe("ConciergeHost", () => {
     // there is no age to report — and a stale timestamp here would age forever and make an empty
     // queue look permanently abandoned to `queueUnfanned`.
     await settle();
-    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 0, running: false, oldestAt: null });
+    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 0, delegated: 0, running: false, oldestAt: null });
 
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
     fireEvent.click(screen.getByText("Send"));
@@ -1336,10 +1361,12 @@ describe("ConciergeHost", () => {
     // is not what "nothing is taking my queue" is about.
     expect(useConciergeQueueStore.getState().depth).toEqual({
       waiting: 0,
+      delegated: 0,
       running: true,
       oldestAt: null,
     });
 
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -1349,6 +1376,7 @@ describe("ConciergeHost", () => {
     // THE STATE HE IS ACTUALLY LOOKING AT: messages stacking up behind one running turn.
     expect(useConciergeQueueStore.getState().depth).toEqual({
       waiting: 2,
+      delegated: 0,
       running: true,
       // A NUMBER, and specifically the FIRST waiter's — with two waiting, `oldestAt` is what
       // separates "this queue formed a moment ago" from "the founder has been waiting", and it is
@@ -1358,9 +1386,18 @@ describe("ConciergeHost", () => {
 
     // ...and it comes back down as the queue drains, so a report cannot keep quoting a backlog that
     // has cleared.
+    //
+    // TO **ZERO**, NOT ONE, and that is the absorption feature rather than a lost message: the drain
+    // takes the whole RELATED run in one turn (bead sparkle-agx4d8), so both waiters are answered
+    // together instead of one being promoted and the other left queued. `running` stays true because
+    // that combined turn is now in flight, and the row below proves nothing was dropped on the way.
     act(() => h.brain.done?.({ id: "1", text: "answered" }));
     await settle();
-    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 1, running: true, oldestAt: expect.any(Number) });
+    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 0, delegated: 0, running: true, oldestAt: null });
+    // NOTHING WAS LOST — the turn that just started carries BOTH queued questions.
+    const drained = String(h.startConciergeTurn.mock.calls.at(-1)?.[0]);
+    expect(drained).toContain("second question");
+    expect(drained).toContain("third question");
   });
 
   /**
@@ -1464,10 +1501,11 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "first question" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "second question" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
-    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 1, running: true, oldestAt: expect.any(Number) });
+    expect(useConciergeQueueStore.getState().depth).toEqual({ waiting: 1, delegated: 0, running: true, oldestAt: expect.any(Number) });
 
     view.unmount();
     expect(useConciergeQueueStore.getState().depth).toBeUndefined();
@@ -1539,6 +1577,7 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "first" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "second" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -1574,6 +1613,7 @@ describe("ConciergeHost", () => {
 
     // The NEXT dispatch rejects — no error event follows it.
     h.startConciergeTurn.mockRejectedValueOnce(new Error("ai enhancements are off"));
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "second" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -1604,6 +1644,7 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "question A" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "question B" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -1634,7 +1675,11 @@ describe("ConciergeHost", () => {
     render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
     // One running turn, then fill the queue past the cap.
     for (let n = 0; n <= MAX_QUEUED_TURNS + 1; n += 1) {
-      fireEvent.change(screen.getByRole("textbox"), { target: { value: `q${n}` } });
+      // EACH ONE ANNOUNCES A NEW TOPIC, so none is absorbed into the run ahead of it and the queue
+      // really reaches its cap (bead sparkle-agx4d8). These sends are a synchronous burst with no
+      // settle between them, so the liveness-based guard the other rows use cannot apply here —
+      // dispatch resets it. The eviction assertions below still read the `qN` text.
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: `Separately, q${n}` } });
       fireEvent.click(screen.getByText("Send"));
     }
     await settle();
@@ -1711,6 +1756,7 @@ describe("ConciergeHost", () => {
     fireEvent.click(screen.getByText("Send"));
     await settle();
     for (const t of ["second", "third"]) {
+      turnStartedWorking();
       fireEvent.change(screen.getByRole("textbox"), { target: { value: t } });
       fireEvent.click(screen.getByText("Send"));
     }
@@ -1756,6 +1802,7 @@ describe("ConciergeHost", () => {
     fireEvent.click(screen.getByText("Send"));
     await settle();
     for (const t of ["second", "third"]) {
+      turnStartedWorking();
       fireEvent.change(screen.getByRole("textbox"), { target: { value: t } });
       fireEvent.click(screen.getByText("Send"));
     }
@@ -1813,6 +1860,7 @@ describe("ConciergeHost", () => {
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "M1" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: "M2" } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -4174,6 +4222,10 @@ describe("ConciergeHost — the app DISPATCHES research when the queue outruns t
     fireEvent.change(screen.getByRole("textbox"), { target: { value: RUNNING_MSG } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
+    // A must be genuinely WORKING, or B — which is a related question — is merged into it rather
+    // than queued behind it, and there is no waiter for this suite to reason about. See
+    // `turnStartedWorking`.
+    turnStartedWorking();
     fireEvent.change(screen.getByRole("textbox"), { target: { value: WAITING_MSG } });
     fireEvent.click(screen.getByText("Send"));
     await settle();
@@ -4268,5 +4320,271 @@ describe("ConciergeHost — the app DISPATCHES research when the queue outruns t
       vi.useRealTimers();
       notifySpy.mockRestore();
     }
+  });
+
+  // ══ DISPATCH-AND-CONTINUE: THE HAND-OFF ADVANCES THE QUEUE (bead sparkle-otqqq) ═══════════════
+  // The wiring test for the whole feature: dispatching a waiting prompt to a worker must DEQUEUE it,
+  // so the published depth drops on DISPATCH (not on the worker's completion) and the concierge is
+  // free to read the next prompt. Observed on the app-wide `conciergeQueueStore`, which the host
+  // republishes whenever the turn-queue state moves — the same store the Pusher reads.
+  //
+  // NOT VACUOUS: the worker never "finishes" here (`dispatchResearchTask` only ACKS the dispatch; the
+  // research store stays empty, so nothing is redelivered), so a `waiting` that drops to 0 can only be
+  // the advance-on-dispatch, never a turn completing. And the obligation is PRESERVED: the prompt moves
+  // to `delegated` (still owed, still counted for `queue-unfanned`), it is not deleted. MUTATION GUARD:
+  // neutralize `dequeueDispatched` (ConciergeHost.tsx tick) or revert to advance-on-turnFinished and B
+  // stays in `waiting` — `waiting` holds at 1 / `delegated` at 0 and this reds.
+  it("hands the waiting prompt to a worker on dispatch — it leaves `waiting` for `delegated` immediately (obligation kept), not on completion", async () => {
+    vi.useFakeTimers();
+    const notifySpy = vi.spyOn(conciergeNotifierModule, "notifyConcierge");
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      useConciergeQueueStore.getState()._resetForTests();
+      // The mock POPULATES the store with a LIVE task, exactly as the real dispatch does — so the
+      // fail-safe redelivery (which returns a prompt whose worker has VANISHED) correctly does not
+      // fire here: the worker is live, so the prompt stays delegated.
+      vi.mocked(dispatchResearchTask).mockImplementation(async (input) => {
+        useResearchStore.setState(
+          (s: never) =>
+            ({
+              byId: {
+                ...(s as { byId: Record<string, unknown> }).byId,
+                live1: { id: "live1", status: "running", question: input.question },
+              },
+            }) as never,
+        );
+        return OK_DISPATCH;
+      });
+      useResearchStore.setState({ byId: {}, hydrated: true } as never);
+      seedSelectedProject();
+      routeToAgent();
+      h.feed = feedWith("approval");
+      view = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+      await sendRunningThenWaiting();
+
+      // Before the floor: A runs, B waits — the depth the founder sees is 1 waiting, 0 delegated.
+      expect(useConciergeQueueStore.getState().depth).toEqual({
+        waiting: 1,
+        delegated: 0,
+        running: true,
+        oldestAt: expect.any(Number),
+      });
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+
+      // THE SIDE EFFECT: the worker took B, so B left the WAITING line immediately — its worker is
+      // still RUNNING (not terminal), so it is not gone and not redelivered: it moved to `delegated`,
+      // still owed, so `oldestAt` still reports a number (the fan-out has not blinded the queue-unfanned
+      // detector). A still holds the running slot; the concierge's own turn is untouched.
+      expect(dispatchResearchTask).toHaveBeenCalledTimes(1);
+      expect(useConciergeQueueStore.getState().depth).toEqual({
+        waiting: 0,
+        delegated: 1,
+        running: true,
+        oldestAt: expect.any(Number),
+      });
+    } finally {
+      view?.unmount();
+      vi.useRealTimers();
+      notifySpy.mockRestore();
+    }
+  });
+
+  // ══ THE `told` GATE — DO NOT HAND OFF IF THE CONCIERGE WASN'T TOLD (roborev, review 65667/65683) ══
+  // `notifyConcierge` returns whether the notice was accepted. If it was refused, the concierge does
+  // not know research is running, so the prompt must STAY in `waiting` (answered the ordinary way) —
+  // never moved to `delegated`, which would hide it from a concierge that never heard about it.
+  it("does NOT hand off (nothing moves to delegated) when the notice was refused", async () => {
+    vi.useFakeTimers();
+    const notifySpy = vi
+      .spyOn(conciergeNotifierModule, "notifyConcierge")
+      .mockReturnValue(false); // the concierge could not be told
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      useConciergeQueueStore.getState()._resetForTests();
+      vi.mocked(dispatchResearchTask).mockResolvedValue(OK_DISPATCH);
+      useResearchStore.setState({ byId: {}, hydrated: true } as never);
+      seedSelectedProject();
+      routeToAgent();
+      h.feed = feedWith("approval");
+      view = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+      await sendRunningThenWaiting();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+
+      // The worker WAS dispatched (pre-warming still happens), but because the concierge was not told,
+      // the prompt stayed in `waiting` — nothing moved to `delegated`.
+      expect(dispatchResearchTask).toHaveBeenCalledTimes(1);
+      expect(useConciergeQueueStore.getState().depth).toEqual({
+        waiting: 1,
+        delegated: 0,
+        running: true,
+        oldestAt: expect.any(Number),
+      });
+    } finally {
+      view?.unmount();
+      vi.useRealTimers();
+      notifySpy.mockRestore();
+    }
+  });
+
+  // ══ THE DELIVERY GUARANTEE, WIRED — a delegated prompt comes BACK once its worker terminates ══════
+  // Drives the real research subscription + tick: hand off the waiter, then flip its research task to
+  // a terminal state, advance past the grace window, and assert the prompt RETURNS to `waiting` so the
+  // concierge answers it. This is the wiring the pure `redeliverReadyIds` tests cannot cover.
+  it("redelivers a delegated prompt to `waiting` once its worker reaches a terminal state", async () => {
+    vi.useFakeTimers();
+    const notifySpy = vi.spyOn(conciergeNotifierModule, "notifyConcierge");
+    let view: ReturnType<typeof render> | undefined;
+    try {
+      useConciergeQueueStore.getState()._resetForTests();
+      // Dispatch creates a LIVE task (as the real app does), keyed by the question text.
+      vi.mocked(dispatchResearchTask).mockImplementation(async (input) => {
+        useResearchStore.setState(
+          (s: never) =>
+            ({
+              byId: {
+                ...(s as { byId: Record<string, unknown> }).byId,
+                t1: { id: "t1", status: "running", question: input.question },
+              },
+            }) as never,
+        );
+        return OK_DISPATCH;
+      });
+      useResearchStore.setState({ byId: {}, hydrated: true } as never);
+      seedSelectedProject();
+      routeToAgent();
+      h.feed = feedWith("approval");
+      view = render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+      await sendRunningThenWaiting();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+      // Handed off, worker running: B is delegated (not redelivered while its worker is live).
+      expect(useConciergeQueueStore.getState().depth).toMatchObject({ waiting: 0, delegated: 1 });
+
+      // B's worker FINISHES — flip its task to a terminal state, then advance past the grace window.
+      await act(async () => {
+        useResearchStore.setState({
+          byId: { t1: { id: "t1", status: "done", question: WAITING_MSG, finishedAt: Date.now() } },
+          hydrated: true,
+        } as never);
+        // Enough to cross the redelivery grace window, but under the re-dispatch cooldown (60s from
+        // the finish) — so we observe the redelivery cleanly before the ramp could hand it off again.
+        await vi.advanceTimersByTimeAsync(30_000);
+      });
+
+      // DELIVERED BACK: with no LIVE pass matching, B returned to `waiting` (it will be answered, with
+      // the pre-warmed findings) — nothing is left owed-but-invisible.
+      expect(useConciergeQueueStore.getState().depth).toMatchObject({ waiting: 1, delegated: 0 });
+    } finally {
+      view?.unmount();
+      vi.useRealTimers();
+      notifySpy.mockRestore();
+    }
+  });
+});
+
+// ══ ABSORBING A FOLLOW-ON INTO THE TURN IN FLIGHT (bead sparkle-agx4d8) ═════════════════════════
+//
+// THE DEFECT, verbatim: *"I often will send a message right after the one that I just sent that has
+// more context… before you respond to any message, I want you to just take a look at the message
+// that follows it, make a determination of whether or not it is related or different."*
+//
+// These are mounted-host rows rather than reducer rows on purpose: the reducer's own suite already
+// pins the walk, and what can only break HERE is the wiring — whether the second message actually
+// reaches the prompt, and whether the gates that keep a merge safe are really consulted.
+describe("a related follow-on is answered together with the message it completes", () => {
+  const promptsSent = () => h.startConciergeTurn.mock.calls.map((c) => String(c[0]));
+  const lastPrompt = () => promptsSent()[promptsSent().length - 1] ?? "";
+
+  const send = async (text: string) => {
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: text } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+  };
+
+  it("MERGES a follow-on that arrives before the turn has done anything", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+    await send("can you look at the release");
+    // Opens with a continuation marker, so the judge calls it related.
+    await send("and also the failing test");
+
+    // The SIDE EFFECT that matters: the last prompt carries BOTH messages, so one answer covers the
+    // question and the context that completed it. Asserting the call count instead would pass even
+    // if the second dispatch had dropped the first message from the prompt.
+    expect(lastPrompt()).toContain("can you look at the release");
+    expect(lastPrompt()).toContain("and also the failing test");
+    expect(lastPrompt()).toContain("answer ALL of them in a single reply");
+  });
+
+  it("does NOT merge once the turn has started doing work — it queues instead", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+    await send("can you look at the release");
+    // One tool call is real work. Merging re-dispatches, and `concierge.rs` kills the child it
+    // evicts — so from here a merge would throw that work away. This is the gate that makes
+    // superseding safe, and it is deliberately STRICTER than the orphan check, which asks only
+    // whether the USER was answered and would still say "nothing lost" here.
+    act(() => void noteConciergeToolCall("workspace", "list_projects", {}));
+    const before = promptsSent().length;
+
+    await send("and also the failing test");
+
+    // No new dispatch: the follow-on waited its turn rather than killing work already done.
+    expect(promptsSent().length).toBe(before);
+  });
+
+  it("does NOT merge a substantially different message", async () => {
+    _resetConciergeActivityForTests();
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+
+    await send("can you look at the release");
+    const before = promptsSent().length;
+
+    // An explicit topic shift. The walk exists to stop AT one of these, so it must not be absorbed
+    // even though every other gate (no output yet, sent seconds ago) would allow it.
+    await send("Separately, what is the status of the mobile build?");
+
+    expect(promptsSent().length).toBe(before);
+  });
+});
+
+describe("the dropped-ask notice names what it withheld", () => {
+  it("lists the withheld asks instead of telling him to say them again", async () => {
+    // THE DEFECT: the notice used to read "…didn't make the list — say them again and I'll pick them
+    // up", making the founder reconstruct from memory what the app was holding in a variable. The
+    // records are returned now, so the remedy is to show them.
+    vi.mocked(captureAsksFrom).mockResolvedValueOnce({
+      filed: [],
+      bumped: [],
+      reasked: [],
+      dropped: [
+        { key: "ask-9", sentence: "rebuild the onboarding flow", turnId: "t", at: 1 },
+        { key: "ask-10", sentence: "check the billing webhook", turnId: "t", at: 2 },
+      ],
+    });
+    h.feed = feedWith("approval");
+    render(<ConciergeHost feed={h.feed as ConciergeFeed} />);
+    fireEvent.change(screen.getByRole("textbox"), { target: { value: "lots of asks" } });
+    fireEvent.click(screen.getByText("Send"));
+    await settle();
+
+    // Both sentences, by name. A count-only notice reds this.
+    expect(inThread(/rebuild the onboarding flow/)).toBeTruthy();
+    expect(inThread(/check the billing webhook/)).toBeTruthy();
+    expect(queryInThread(/say them again/)).toBeNull();
   });
 });

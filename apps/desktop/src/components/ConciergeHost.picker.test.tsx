@@ -29,6 +29,7 @@
 // The real `attachedPayload` runs in these rows — a stubbed one would let the prefix silently stop
 // being applied and every assertion here would still pass.
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { noteConciergeToolCall } from "../services/conciergeActivity";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({
@@ -274,6 +275,12 @@ describe("ConciergeHost — a terse answer, a live picker on screen, and files s
     await attachImage();
     await send("Yes");
     h.answersLivePicker.mockReturnValue(false); // the picker is answered and gone
+    // ONE OBSERVED TOOL CALL, so the running turn is genuinely WORKING and this send QUEUES rather
+    // than being absorbed into it (bead sparkle-agx4d8). That matters here for a reason specific to
+    // this row: a merged run is ONE turn, so the first message's attachment belongs in its prompt —
+    // correctly — and "the NEXT message" would no longer be a next message at all. Keeping them two
+    // turns is what makes the question this row asks meaningful.
+    act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "ag1" }));
     await send("now look at this");
     // The second send QUEUES now (sparkle-t8wsj), so end the first turn to let it dispatch. What
     // this case is about — that the attachment does not ride along on the NEXT message — is

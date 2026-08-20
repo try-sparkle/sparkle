@@ -553,7 +553,11 @@ describe("the linter's block path — a blocked reply is re-prompted, once", () 
     render(<ConciergeHost feed={feed()} />);
     await flush();
     await send("first question");
-    await send("second question while the first is running");
+    // AN EXPLICIT TOPIC SHIFT, so it really QUEUES (bead sparkle-agx4d8). A related follow-on that
+    // arrives before the running turn has produced anything is now MERGED into it and re-dispatched,
+    // which would leave nothing waiting and make this row assert its precondition away rather than
+    // the behaviour it names. Announcing a new topic is the shape that still queues.
+    await send("Separately, what about the mobile build?");
     await done({ id: "1", sessionId: "s", text: OFFER, toolCalls: [] });
 
     expect(correctionPrompts(), "no correction while someone is waiting").toHaveLength(0);

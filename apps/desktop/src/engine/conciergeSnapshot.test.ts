@@ -114,3 +114,66 @@ describe("continuity composes with open asks rather than replacing them", () => 
     expect(buildSnapshot(CALM, "hi", [ASK], "")).toBe(buildSnapshot(CALM, "hi", [ASK]));
   });
 });
+
+// ══ A TURN ANSWERS A RUN OF HIS MESSAGES (bead sparkle-agx4d8) ══════════════════════════════════
+//
+// The founder *"often will send a message right after the one that I just sent that has more
+// context"*. `engine/conciergeTurnQueue` folds those into one turn; this is where they have to
+// reach the model. A prompt carrying only the first would answer the question he had already
+// completed — which is the defect — and one carrying them with no instruction reliably gets the
+// LAST one answered and the rest read as background, which is the same defect from the other end.
+describe("the user's words, as one message or as an absorbed run", () => {
+  it("renders a single message byte-identically to a bare string", () => {
+    // Load-bearing, not cosmetic: a run of one is the overwhelmingly common case and
+    // `claude_oneshot` caches on prompt text, so any reword here would miss every warm cache entry
+    // and change behaviour on turns this feature never meant to touch.
+    const asString = buildSnapshot(CALM, "ship the release");
+    const asRun = buildSnapshot(CALM, ["ship the release"]);
+    expect(asRun).toBe(asString);
+    expect(asString).toContain("The user says: ship the release");
+    // A single message must NOT acquire the multi-message instruction.
+    expect(asString).not.toContain("arrived together");
+  });
+
+  it("carries EVERY message of a run, not just the first or the last", () => {
+    const out = buildSnapshot(CALM, [
+      "can you look at the release",
+      "and also the failing test",
+      "it's the timezone one",
+    ]);
+    expect(out).toContain("The user says: can you look at the release");
+    expect(out).toContain("and also the failing test");
+    expect(out).toContain("it's the timezone one");
+  });
+
+  it("tells the brain to answer ALL of them in one reply", () => {
+    // Without this the model answers one and treats the others as context — the same failure the
+    // absorption exists to remove, only from the other end.
+    const out = buildSnapshot(CALM, ["first thing", "second thing"]);
+    expect(out).toContain("answer ALL of them in a single reply");
+    expect(out).toContain("Those 2 messages arrived together");
+  });
+
+  it("keeps his words LAST, ahead of only the standing instruction", () => {
+    // buildSnapshot's ordering rule: the brain reads the last thing hardest, and the last thing
+    // must be what it was just asked. Absorbing several messages must not push them above the
+    // roster or the open-ask block.
+    const out = buildSnapshot(CALM, ["alpha", "omega"]);
+    const lastMessage = out.indexOf("omega");
+    const state = out.indexOf("All projects are calm right now.");
+    expect(state).toBeGreaterThanOrEqual(0);
+    expect(lastMessage).toBeGreaterThan(state);
+    expect(out.trimEnd().endsWith("Reply briefly and recommend the next action.")).toBe(true);
+  });
+
+  it("never renders `undefined` for an empty or blank run", () => {
+    // A run cannot be empty coming from the queue (it is a non-empty tuple), but a caller passing
+    // [] or [""] must degrade to the ordinary empty form rather than putting the string
+    // "undefined" in the prompt.
+    for (const empty of [[], [""], ["   "]]) {
+      const out = buildSnapshot(CALM, empty);
+      expect(out).not.toContain("undefined");
+      expect(out).toContain("The user says:");
+    }
+  });
+});

@@ -97,6 +97,20 @@ export interface ContinuityInput {
    * property that a first turn's prompt is byte-identical to what it was before continuity existed.
    */
   excludeId?: string | null;
+
+  /**
+   * The same exclusion, for a turn that answers SEVERAL of his messages at once.
+   *
+   * A turn is no longer one message: `engine/conciergeTurnQueue` absorbs a run of related sends into
+   * one prompt (the founder *"often will send a message right after the one that I just sent that
+   * has more context"*). Every one of those bubbles is already in the thread, so excluding only the
+   * head leaves messages 2..N appearing TWICE — once in the replayed thread and again under "The
+   * user says:" — which is exactly the defect {@link excludeId} was added to prevent, reintroduced
+   * for every message but the first.
+   *
+   * Applied IN ADDITION to `excludeId`, so an existing caller passing only that is unaffected.
+   */
+  excludeIds?: readonly string[] | null;
 }
 
 /**
@@ -106,11 +120,18 @@ export interface ContinuityInput {
  * prompt byte-identical to what it was before this module existed, so the change cannot be blamed
  * for a regression on the one path that has no history to carry.
  */
-export function buildContinuityBlock({ chat, summary, excludeId }: ContinuityInput): string {
+export function buildContinuityBlock({
+  chat,
+  summary,
+  excludeId,
+  excludeIds,
+}: ContinuityInput): string {
+  const skip = new Set<string>(excludeIds ?? []);
+  if (excludeId) skip.add(excludeId);
   const lines: string[] = [];
   for (const m of chat) {
     if (!isSpeaker(m)) continue;
-    if (excludeId && m.id === excludeId) continue;
+    if (skip.has(m.id)) continue;
     const line = renderLine(m);
     if (line) lines.push(line);
   }

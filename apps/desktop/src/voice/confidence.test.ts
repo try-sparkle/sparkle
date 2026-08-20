@@ -6,6 +6,7 @@ import {
   CONFIDENCE_THRESHOLD_MS,
   LONG_UTTERANCE_WORDS,
   type Confidence,
+  endsMidThought,
 } from "./confidence";
 
 /**
@@ -161,5 +162,52 @@ describe("thresholds", () => {
     // accumulated clock, so a sentence that keeps trailing off waits indefinitely by construction
     // rather than by a special case. See autoSendTimer.
     expect(thresholdMs("verylow")).toBe(10_000 * CONFIDENCE_PACE);
+  });
+});
+
+/**
+ * `endsMidThought` — the one rule this module SHARES across layers.
+ *
+ * Exported so `engine/conciergeRelatedness` can ask the same question without a second copy of the
+ * regex. These cases assert the VERDICT for its own sake, not through `confidence()`: the concierge
+ * never reads a tier, so a change that kept the tier table green while breaking the predicate would
+ * silently break the caller that matters.
+ */
+describe("endsMidThought", () => {
+  it("is true for a long utterance with no terminal punctuation", () => {
+    expect(
+      endsMidThought("hold the deploy until the migration has finished running"),
+    ).toBe(true);
+  });
+
+  it("is false once terminal punctuation lands, however long", () => {
+    expect(
+      endsMidThought("hold the deploy until the migration has finished running."),
+    ).toBe(false);
+    expect(endsMidThought("go through every migration file and check them all?")).toBe(false);
+  });
+
+  it("is false for a SHORT unpunctuated utterance — a terse instruction is a whole thought", () => {
+    expect(endsMidThought("ship it")).toBe(false);
+    expect(endsMidThought("run the tests and push it")).toBe(false); // exactly LONG_UTTERANCE_WORDS
+  });
+
+  it("turns over at exactly LONG_UTTERANCE_WORDS words", () => {
+    const words = (n: number) => Array.from({ length: n }, () => "word").join(" ");
+    expect(endsMidThought(words(LONG_UTTERANCE_WORDS))).toBe(false);
+    expect(endsMidThought(words(LONG_UTTERANCE_WORDS + 1))).toBe(true);
+  });
+
+  it("is false for empty input — there is no thought to be mid of", () => {
+    expect(endsMidThought("")).toBe(false);
+    expect(endsMidThought("   ")).toBe(false);
+  });
+
+  it("agrees with the tier `confidence()` derives from the same condition", () => {
+    // The refactor's no-behaviour-change claim, asserted rather than assumed: whenever the
+    // predicate is true and nothing worse fires first, the tier is `low`.
+    const cut = "go through the migration files and check that every one of them applies";
+    expect(endsMidThought(cut)).toBe(true);
+    expect(confidence(cut)).toBe("low");
   });
 });

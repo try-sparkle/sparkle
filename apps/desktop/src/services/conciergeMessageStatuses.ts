@@ -131,8 +131,17 @@ export function useConciergeMessageStatuses(
     queue.waiting.forEach((q, i) => {
       waiting[q.bubbleId] = { text: waitingLine(i + 1) };
     });
+    // DELEGATED MESSAGES — handed to a research worker by dispatch-and-continue. They left the waiting
+    // line (they no longer block the concierge's serial turn) but they are still OWED and still on
+    // screen, so they get a status of their own rather than the blank a vanished message would show.
+    // No queue position (they are not in line) and no icon (a hand-off is not an observed tool call);
+    // `redeliverDelegated` returns them to `waiting` to be answered once their worker finishes.
+    queue.delegated.forEach((q) => {
+      waiting[q.bubbleId] = { text: "Handed to a research agent" };
+    });
 
-    if (!awaitingId || !typing) return queue.waiting.length ? waiting : NONE;
+    const hasQueued = queue.waiting.length > 0 || queue.delegated.length > 0;
+    if (!awaitingId || !typing) return hasQueued ? waiting : NONE;
     const fresh = latest && latest.seq > floor ? latest : null;
     const line = fresh ? conciergeActivityLine(fresh) : null;
     // NO ACTIVITY, NO CLAIM — the rule the column-level indicator degrades by, kept identical here.
@@ -148,7 +157,7 @@ export function useConciergeMessageStatuses(
     // your message" from the frame after dispatch. The only window such a fallback could fill is the
     // single pre-commit frame that module already weighs and accepts ("the cost is one frame of bare
     // pulse"), and a phrase that renders for one frame is noise rather than a status.
-    if (!line) return queue.waiting.length ? waiting : NONE;
+    if (!line) return hasQueued ? waiting : NONE;
     // LIVE: this one is actually running, so its ink is the age ladder the founder asked for.
     //
     // THE GLYPH TRAVELS WITH THE PHRASE (sparkle-9ciay). *"I like how on the left side it gives me a
@@ -167,9 +176,24 @@ export function useConciergeMessageStatuses(
     // bubble `text` alone while the rail yields its words does not move that pill, it DELETES it:
     // `text` embeds the name "as it stood when the call was recorded", so a renamed agent would go
     // stale under the bubble and the click would be gone. Carried, the pill simply changes parent.
-    return {
-      ...waiting,
-      [awaitingId]: { text: line.text, icon: line.icon, agentRef: line.agentRef, live: true },
+    // ══ THE LIVE LINE GOES ON EVERY MESSAGE THE TURN IS ANSWERING ══════════════════════════════
+    // A turn can answer a RUN of his messages (engine/conciergeTurnQueue's RunningRun), and only its
+    // HEAD owns `awaitingId`. Attaching the line to the head alone leaves the follow-ups with no
+    // status at all — not "waiting" (they are not in line), not "working", just blank — which on
+    // screen is indistinguishable from being ignored. That is the exact symptom absorbing them was
+    // meant to remove, so it must not be reintroduced by the status layer.
+    //
+    // Every entry gets the SAME line rather than a synthesised one, because there is one turn and
+    // one observed activity; inventing a per-message phrase would be a claim about work nobody
+    // observed. Keyed off the queue's own run, so a bubble that is not part of it is untouched.
+    const live: ConciergeMessageStatusText = {
+      text: line.text,
+      icon: line.icon,
+      agentRef: line.agentRef,
+      live: true,
     };
+    const answering: Record<string, ConciergeMessageStatusText> = {};
+    for (const q of queue.running?.entries ?? []) answering[q.bubbleId] = live;
+    return { ...waiting, ...answering, [awaitingId]: live };
   }, [awaitingId, typing, latest, floor, queue]);
 }

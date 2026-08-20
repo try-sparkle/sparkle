@@ -640,6 +640,13 @@ describe("the queue is spoken, through the column's one announcer", () => {
     // noise on the overwhelmingly common path.
     expect(announcer()).not.toMatch(/Queued/);
 
+    // THE RUNNING TURN MUST BE WORKING for the sends below to QUEUE (bead sparkle-agx4d8). A related
+    // follow-on arriving before the turn has produced anything is now merged into it and
+    // re-dispatched, so without this there is no queue to report and the row would assert its own
+    // precondition away. One observed tool call is the smallest thing that makes the turn ineligible,
+    // and it is the realistic state this row always meant: a turn genuinely being worked.
+    act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "ag1" }));
+
     await send("the second question");
     expect(announcer()).toContain("Queued — Next up");
 
@@ -667,6 +674,10 @@ describe("the queue is spoken, through the column's one announcer", () => {
     // This one DISPATCHES, so it is the running turn and never a waiter — the cap is about the
     // queue behind it.
     await send("the running question");
+    // …and it is WORKING, so every send below queues rather than being absorbed into it. Without
+    // this the first MAX_ABSORBED_RUN-1 waiters fold into the running turn and every position below
+    // shifts by that much (bead sparkle-agx4d8).
+    act(() => noteConciergeToolCall("terminal", "read_agent_terminal", { agentId: "ag1" }));
     // Fill the queue to exactly the cap, so the next send is the one that evicts.
     for (let n = 0; n < MAX_QUEUED_TURNS; n += 1) await send(`waiter ${n}`);
     expect(announcer()).not.toMatch(/dropped/i);

@@ -43,7 +43,7 @@ import { accountedAgents, type ConciergeFeed } from "../services/conciergeFeed";
  */
 export function buildSnapshot(
   feed: ConciergeFeed,
-  userText: string,
+  userText: string | readonly string[],
   openAsks: readonly OpenAsk[] = [],
   continuity = "",
 ): string {
@@ -68,8 +68,44 @@ export function buildSnapshot(
   // reply must be consistent with (BEFORE his message, not after), the thread is the conversation
   // that context sits in, and his own words close the prompt — the turn stays about what he just
   // said while what he is still owed remains in view.
+  const said = renderUserSaid(userText);
   const asksBlock = renderOpenAsks(openAsks);
   const preamble = asksBlock === null ? state : `${state}\n\n${asksBlock}`;
   const thread = continuity ? `\n\n${continuity}` : "";
-  return `${preamble}${thread}\n\nThe user says: ${userText}\n\nReply briefly and recommend the next action.`;
+  return `${preamble}${thread}\n\n${said}\n\nReply briefly and recommend the next action.`;
+}
+
+/**
+ * His words, as one message or as an absorbed RUN of them.
+ *
+ * ══ THE DEFECT ═════════════════════════════════════════════════════════════════════════════════
+ * The founder: *"I often will send a message right after the one that I just sent that has more
+ * context… so that everything that I'm saying can be queued together in your response."* When
+ * `engine/conciergeTurnQueue` folds several of his messages into one turn, this is where they have
+ * to arrive — a prompt carrying only the first would answer the question he had already corrected.
+ *
+ * ══ WHY THE SINGLE-MESSAGE FORM IS BYTE-IDENTICAL ══════════════════════════════════════════════
+ * One message renders exactly the string it always did, down to the byte. That is deliberate: a run
+ * of one is the overwhelmingly common case, and `claude_oneshot` caches on the prompt text, so a
+ * cosmetic reword of the common path would miss every warm cache entry and change the model's
+ * behaviour on turns this feature never meant to touch.
+ *
+ * ══ WHY THE CLOSING INSTRUCTION ════════════════════════════════════════════════════════════════
+ * Multiple messages are not self-evidently ONE question. Without a line saying so the model
+ * reliably answers the last one and treats the rest as background — which is the same failure as
+ * answering the first alone, only from the other end. It goes AFTER the messages and before the
+ * standing "Reply briefly" close, so the last thing read is still what to do.
+ */
+function renderUserSaid(userText: string | readonly string[]): string {
+  const texts = (typeof userText === "string" ? [userText] : userText).filter((t) => t.trim() !== "");
+  // An empty run cannot reach here from the queue (a run is a non-empty tuple), but a caller passing
+  // `[]` or `[""]` must not silently produce `The user says: undefined`.
+  if (texts.length === 0) return `The user says: `;
+  if (texts.length === 1) return `The user says: ${texts[0]}`;
+  const rest = texts.slice(1).map((t) => `Then, before you replied, he added: ${t}`);
+  return (
+    `The user says: ${texts[0]}\n\n${rest.join("\n\n")}\n\n` +
+    `Those ${texts.length} messages arrived together, as one thought — answer ALL of them in a ` +
+    `single reply, not just the first or the last.`
+  );
 }

@@ -193,8 +193,12 @@ export interface AskCaptureOutcome {
   bumped: Array<{ beadId: string; to: number }>;
   /** He asked again for something already closed — a disagreement worth surfacing. */
   reasked: Array<{ closedBeadId: string; beadId: string | null; ask: AskRecord }>;
-  /** Asks the per-message cap withheld. Never silently discarded — see `MAX_ASKS_PER_TURN`. */
-  dropped: number;
+  /**
+   * The asks the cap withheld — the RECORDS, not a count. Never silently discarded, and never
+   * merely counted either: the caller names them back to the founder, so he does not have to
+   * reconstruct from memory what this app is still holding in a variable. See `MAX_ASKS_PER_MESSAGE`.
+   */
+  dropped: readonly AskRecord[];
 }
 
 /**
@@ -207,13 +211,19 @@ export interface AskCaptureOutcome {
 export async function captureAsksFrom(
   text: string,
   turnId: string,
+  cap?: number,
 ): Promise<AskCaptureOutcome> {
-  const empty: AskCaptureOutcome = { filed: [], bumped: [], reasked: [], dropped: 0 };
+  const empty: AskCaptureOutcome = { filed: [], bumped: [], reasked: [], dropped: [] };
   const d = deps;
   if (d === null) return empty;
 
   try {
-    const { asks, dropped } = asksIn(text, turnId, d.now());
+    // `cap` SCALES WITH THE RUN. A turn can answer several of his messages at once
+    // (engine/conciergeTurnQueue), and they are captured in ONE call — `captureAsksFrom` reads the
+    // whole board and then writes to it, so calling it per message would interleave N read-then-write
+    // cycles and let two messages carrying the same ask each mint a bead. The cap is per MESSAGE, so
+    // the caller passes MAX_ASKS_PER_MESSAGE × runLength and absorbing costs him no asks.
+    const { asks, dropped } = asksIn(text, turnId, d.now(), cap);
     if (asks.length === 0) return { ...empty, dropped };
 
     const { rows, anyRead } = await readAllAskBeads(d);

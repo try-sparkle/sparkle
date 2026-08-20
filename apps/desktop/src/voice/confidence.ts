@@ -141,6 +141,27 @@ function words(transcript: string): string[] {
 }
 
 /**
+ * Does this text stop before its thought lands?
+ *
+ * The exact check `confidence()` makes below for its `low` tier — no terminal punctuation anywhere,
+ * and long enough that the absence stops reading as a terse complete instruction ("ship it") and
+ * starts reading as someone cut off mid-sentence. Exported so the rule lives in ONE place: the
+ * concierge's run-absorption judge (`engine/conciergeRelatedness`) asks the same question of a
+ * message the founder already sent, and a second copy of the regex at that layer would drift from
+ * this one on the first edit to either.
+ *
+ * `confidence()` calls it too rather than re-deriving the condition inline — same inputs, same
+ * answer, so the tier table is unchanged; it just costs one extra pass over the words.
+ *
+ * NOT a claim about the SPEAKER's intent, only about the TEXT: a long unpunctuated sentence reads
+ * as unfinished whether it was truncated by a transcriber, a keystroke, or a change of mind. Every
+ * caller wants it that way — all of them are deciding whether MORE is coming.
+ */
+export function endsMidThought(text: string): boolean {
+  return !TERMINAL_PUNCTUATION.test(text.trim()) && words(text).length > LONG_UTTERANCE_WORDS;
+}
+
+/**
  * How finished does this transcript sound?
  *
  * Ordered worst-first: the strongest "keep waiting" signal wins, because the tiers are not
@@ -178,8 +199,9 @@ export function confidence(transcript: string): Confidence {
   if (TRAILING_FILLERS.has(last)) return "low";
 
   // A long utterance that `smart_format` could not punctuate anywhere. Short ones are exempt: "ship
-  // it" is a whole instruction and gets no mark from any punctuator.
-  if (!hasTerminal && w.length > LONG_UTTERANCE_WORDS) return "low";
+  // it" is a whole instruction and gets no mark from any punctuator. Delegated to `endsMidThought`
+  // above — same condition, one definition, so the concierge's copy of this question cannot drift.
+  if (endsMidThought(transcript)) return "low";
 
   // ── high — a clean, closed sentence ─────────────────────────────────────────────────────────
   // A fully-formed question (opener + "?") is explicitly high per PRD §4: it is the one shape where

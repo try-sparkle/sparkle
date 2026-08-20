@@ -95,6 +95,7 @@ describe("the depth is the REDUCER's answer, not a second count", () => {
     // being worked on, and its age is not what "nothing is taking my queue" is about.
     expect(queueDepthOf(second.next)).toEqual({
       waiting: 1,
+      delegated: 0,
       running: true,
       oldestAt: 1_700_000_060_000,
     });
@@ -104,6 +105,7 @@ describe("the depth is the REDUCER's answer, not a second count", () => {
     const first = enqueue(EMPTY_TURN_QUEUE, { bubbleId: "b1", text: "one", enqueuedAt: 1_700_000_000_000 });
     expect(queueDepthOf(turnFinished(first.next).next)).toEqual({
       waiting: 0,
+      delegated: 0,
       running: false,
       // NULL, NOT THE LAST STAMP WE SAW. Nothing is waiting, so there is no age to report — and a
       // stale timestamp here would age forever and make an empty queue look permanently abandoned.

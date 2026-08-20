@@ -88,26 +88,42 @@ export interface AskRecord {
 export const MIN_ASK_WORDS = 4;
 
 /**
- * The most asks one message may produce.
+ * The most asks ONE MESSAGE may produce.
  *
- * A cap is needed — a long paste can contain dozens of imperative sentences and turning each into a
- * bead would bury the queue. But a SILENT cap is exactly the concealment `docs/never-hide-actionable-rows.md`
- * forbids, so {@link asksIn} never drops quietly: see {@link AskCapture.dropped}.
+ * The unit is the MESSAGE, and saying so in the name is the whole point of it: this used to be
+ * called `MAX_ASKS_PER_TURN`, which states the wrong unit, and once several of the founder's
+ * messages are absorbed into a single turn the two stop being the same number. A per-turn reading of
+ * a per-message cap silently throws away everything he said after the first message's worth — the
+ * exact failure this file exists to prevent, wearing the name of a safeguard. A caller folding
+ * several messages together scales the cap itself (`MAX_ASKS_PER_MESSAGE * runLength`) via
+ * {@link asksIn}'s `cap` parameter, rather than re-interpreting this constant.
+ *
+ * A cap is needed at all because a long paste can contain dozens of imperative sentences and turning
+ * each into a bead would bury the queue. But a SILENT cap is exactly the concealment
+ * `docs/never-hide-actionable-rows.md` forbids, so {@link asksIn} never drops quietly: it hands the
+ * withheld records back, see {@link AskCapture.dropped}.
  */
-export const MAX_ASKS_PER_TURN = 4;
+export const MAX_ASKS_PER_MESSAGE = 8;
 
 /** What one message yielded, including what the cap withheld. */
 export interface AskCapture {
-  /** The asks to file, in the order they were said. At most {@link MAX_ASKS_PER_TURN}. */
+  /** The asks to file, in the order they were said. At most {@link MAX_ASKS_PER_MESSAGE}. */
   asks: AskRecord[];
   /**
-   * How many further asks the cap withheld — NEVER silently discarded.
+   * The asks the cap WITHHELD — the records themselves, in the order he said them.
    *
-   * The caller must surface this. A queue that says "3 asks" while holding back a fourth reports a
-   * count that sounds complete while concealing work, which is the precise failure mode
-   * `docs/never-hide-actionable-rows.md` was written about.
+   * This is a `readonly AskRecord[]` and not a count, and the difference is what the caller can DO
+   * with it. A cap must never be silent (`docs/never-hide-actionable-rows.md`), but a bare number is
+   * not enough to act on: "1 more ask withheld" leaves the founder to guess which of the things he
+   * just said was thrown away, so the only remedy the notice could offer him was *say it again and
+   * I'll pick it up* — asking the person the queue exists to relieve to do the queue's job. With the
+   * records in hand the caller can NAME what it held back, in his own verbatim words, and he can
+   * decide rather than repeat himself.
+   *
+   * Empty array when nothing was withheld — never `undefined`, so `capture.dropped.length` is always
+   * safe.
    */
-  dropped: number;
+  dropped: readonly AskRecord[];
 }
 
 /**
@@ -520,7 +536,7 @@ export interface OpenAsk {
  * Every row here is work the founder is owed, so `docs/never-hide-actionable-rows.md` binds
  * directly: caps and "+N more" apply only to rows carrying no action, and if the block gets long
  * that is correct. The whole defect being closed is a request going unseen; a cap here would
- * reintroduce it wearing the justification of brevity. {@link MAX_ASKS_PER_TURN} bounds how many
+ * reintroduce it wearing the justification of brevity. {@link MAX_ASKS_PER_MESSAGE} bounds how many
  * asks one MESSAGE may mint — it does not bound how many open asks may be shown.
  */
 export function renderOpenAsks(asks: readonly OpenAsk[]): string | null {
@@ -541,8 +557,27 @@ export function renderOpenAsks(asks: readonly OpenAsk[]): string | null {
  * Duplicates WITHIN a message collapse by {@link askKey}, so a founder who restates the same request
  * twice in one breath produces one ask. Duplicates ACROSS messages are the caller's job — that is
  * the same key, and re-asking is meant to find the existing bead rather than mint a new one.
+ *
+ * `cap` exists because a caller may hand this SEVERAL of his messages at once, absorbed into one
+ * turn. The cap is per MESSAGE (see {@link MAX_ASKS_PER_MESSAGE}), so a caller folding `runLength`
+ * messages together passes `MAX_ASKS_PER_MESSAGE * runLength` and the bound scales with how much was
+ * folded, instead of quietly shrinking to a fraction of itself.
+ *
+ * A nonsensical `cap` — NaN, non-finite, zero or negative — falls back to
+ * {@link MAX_ASKS_PER_MESSAGE} rather than being honoured. `slice(0, NaN)` returns NOTHING and
+ * `slice(0, -1)` drops the last ask, so an arithmetic slip in a caller (`8 * runLength` with
+ * `runLength` undefined) would discard real asks with no error and no trace — the precise failure
+ * this whole file is a defence against. Falling back is loud in the only way that matters: nothing
+ * is lost.
+ *
+ * PURE — no clock, no store, no I/O.
  */
-export function asksIn(text: string, turnId: string, at: number): AskCapture {
+export function asksIn(
+  text: string,
+  turnId: string,
+  at: number,
+  cap: number = MAX_ASKS_PER_MESSAGE,
+): AskCapture {
   const seen = new Set<string>();
   const found: AskRecord[] = [];
 
@@ -554,8 +589,11 @@ export function asksIn(text: string, turnId: string, at: number): AskCapture {
     found.push({ key, sentence, turnId, at });
   }
 
+  const limit = Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : MAX_ASKS_PER_MESSAGE;
+
   return {
-    asks: found.slice(0, MAX_ASKS_PER_TURN),
-    dropped: Math.max(0, found.length - MAX_ASKS_PER_TURN),
+    asks: found.slice(0, limit),
+    // The records, not a count — the caller has to be able to NAME these. See AskCapture.dropped.
+    dropped: found.slice(limit),
   };
 }

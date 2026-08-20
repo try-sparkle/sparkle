@@ -214,8 +214,16 @@ describe("the condition actually reaches the founder", () => {
     // — dispatching dequeues nothing and raises `liveAgents` to parity, so obeying it silenced this
     // very condition with every message unanswered (roborev 63598). Asserted end-to-end here, not
     // just in `pusherFleet.test.ts`, because this is the surface the founder actually reads.
-    expect(report!.text).toContain("does NOT dequeue anything");
-    expect(report!.text).toContain("work started rather than as questions answered");
+    //
+    // THEY MOVED A SECOND TIME, with dispatch-and-continue (beads sparkle-3c83a/8lwi8). Dispatching
+    // now MOVES a prompt out of the serial line and returns it when its worker finishes, so "does
+    // NOT dequeue anything" became false in its turn and was retired. `packages/core/pusherFleet.test`
+    // pins the new wording AND pins the old claims as absent; this row asserted the retired fragment
+    // and so contradicted its own sibling — the two could not both pass. Kept end-to-end here,
+    // because this is the surface the founder actually reads.
+    expect(report!.text).toContain("moves a prompt OUT of the serial line");
+    expect(report!.text).toContain("work started, not as questions answered");
+    expect(report!.text).not.toContain("does NOT dequeue anything");
     expect(report!.text).not.toContain("The queue does not drain itself");
     // It goes to the CONCIERGE, not to a build agent: this is the one class of condition no partner
     // can act on, and `reportRecipient` names the concierge for exactly that reason.

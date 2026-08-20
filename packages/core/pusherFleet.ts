@@ -1089,20 +1089,23 @@ function queueCondition(reading: {
     // This used to say the queue "does not drain itself while nothing is running: a queued message
     // waits for a concierge agent to exist, so the depth only falls once one is started", and then
     // told the reader to fan them out. Both halves were wrong in the same direction, and together
-    // they were worse than silence:
+    // they were worse than silence.
     //
-    //   • MECHANICALLY FALSE. The concierge's turn queue advances on `turnFinished` and on nothing
-    //     else. Dispatching research does not dequeue a single message — it never has.
-    //   • SELF-DEFEATING UNDER THE NEW RULE. Fanning out raises `liveAgents` without lowering
-    //     `queued`, so following this instruction takes the reading to parity and CLEARS the
-    //     condition while every one of the queued messages is still unanswered. The one action the
-    //     text recommended was the one action that muted it without helping.
+    // SINCE DISPATCH-AND-CONTINUE (beads sparkle-3c83a/8lwi8) the timing changed again, so this block
+    // is updated with it (AGENTS.md: a remedy is an instruction the reader follows, and the comment
+    // is the authority on why the copy reads as it does):
     //
-    // That is the class AGENTS.md names: a remedy is an instruction the reader will follow, so it
-    // needs the same analysis as the code path it stands in for. The text now says what dispatching
-    // actually buys — the concierge answers from findings instead of reading serially, so turns end
-    // sooner and the queue drains at `turnFinished` — and says plainly that it is not a fix on its
-    // own, so a reader who takes the advice is not surprised when the depth does not move.
+    //   • Dispatching research NOW advances the turn queue: `conciergeTurnQueue.dequeueDispatched`
+    //     moves a handed-off prompt out of `waiting` into `delegated`, and `redeliverDelegated` brings
+    //     it back when its worker finishes. So it is no longer true that "the queue advances on
+    //     `turnFinished` and on nothing else".
+    //   • But `queued` here counts waiting PLUS delegated (see `buildConciergeQueue`), so fanning out
+    //     still does not lower it — it raises `liveAgents` toward parity. Following the advice clears
+    //     the condition because each outstanding prompt then has an agent, NOT because any is answered.
+    //
+    // The text below says what dispatching actually buys — the prompt leaves the serial line and comes
+    // back, with whatever it found, when its worker finishes — and says plainly the alert clearing means work
+    // started, not questions answered, so a reader who takes the advice is not surprised.
     //
     // NO NEW DIGITS. `citable` checks every number in this text against `measured`, and a
     // `fabricated-citation` refusal is total — it mutes the WHOLE batched report, not this
@@ -1110,12 +1113,12 @@ function queueCondition(reading: {
     text:
       `${queued} ${plural} queued and ${liveAgents} concierge agents are running. The oldest has ` +
       `been waiting ${h}h ${m}m. Nothing is errored and no goal is escalated — there are fewer ` +
-      `agents working than there are messages waiting.\n` +
-      `Dispatching research does NOT dequeue anything: the turn queue advances only as each turn ` +
-      `finishes. What it buys is that the concierge answers from findings instead of reading files ` +
-      `serially, so turns end sooner and the queue drains faster. Fan them out for that reason — ` +
-      `and note that doing so clears this alert by itself, because the agent count catches up with ` +
-      `the depth, so treat the alert going quiet as work started rather than as questions answered.`,
+      `agents working than there are messages outstanding.\n` +
+      `Dispatching research now moves a prompt OUT of the serial line: it stops blocking the ` +
+      `concierge and comes back, with whatever it found, when its worker finishes, so the concierge answers ` +
+      `from findings instead of reading files serially. The reported depth still counts a handed-off ` +
+      `prompt, so fanning them out clears this alert only because each one then has an agent — treat ` +
+      `the alert going quiet as work started, not as questions answered.`,
   };
 }
 

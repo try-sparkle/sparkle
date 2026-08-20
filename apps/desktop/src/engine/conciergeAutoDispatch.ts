@@ -219,6 +219,31 @@ export interface AutoDispatchObservation {
    */
   liveResearch: number;
   /**
+   * Prompts already handed to a worker and still owed — `TurnQueueState.delegated.length`.
+   *
+   * ══ WHY THE `served` TEST CANNOT USE `waiting.length` ANY MORE (roborev 65829) ═══════════════
+   * Before dispatch-and-continue, a dispatched prompt STAYED in `waiting`, so `liveResearch` and
+   * `waiting.length` counted the same population and comparing them was apples to apples. Now the
+   * hand-off MOVES the prompt to `delegated` while its worker keeps inflating `liveResearch`, so
+   * the comparison is systematically skewed toward "covered".
+   *
+   * Worked example, with the shipped constants: 5 prompts stack behind the running turn. Tick 1
+   * dispatches 4 (`AUTO_DISPATCH_MAX_PER_TICK`), which move to `delegated` → `waiting` is 1 and
+   * `liveResearch` is 4. Tick 2 evaluates `4 >= 1` and answers `served` — declaring the 5th prompt
+   * covered by four workers researching four OTHER questions. It is never fanned out and is
+   * answered serially, silently, at the tail of every backlog: the exact defect this feature
+   * exists to remove.
+   *
+   * `buildConciergeQueue` and `queueCondition` were both already changed to count `waiting +
+   * delegated` "precisely so dispatch-and-continue does not blind the detector it feeds". This is
+   * the same correction for the decider, which makes the same comparison against the same two
+   * numbers and was missed.
+   *
+   * OPTIONAL, defaulting to 0, so a caller that has not been updated behaves exactly as before
+   * rather than failing to compile into a wrong answer.
+   */
+  delegated?: number;
+  /**
    * Has the research store been read at least once?
    *
    * `false` means WE DID NOT LOOK, and it must not be read as "no agents are running" — that is the
@@ -486,6 +511,12 @@ function excludeReason(
  * worst case is a wasted slot and a finding the concierge ignores. It is NEVER a wrong write, which
  * is the property that makes acting-without-asking acceptable here at all. If that ever stops being
  * true — if research gains write powers — this rule must be revisited in the same change.
+ *
+ * AND THE INSTRUCTION IS STILL CARRIED OUT. Under dispatch-and-continue the dispatched prompt is
+ * MOVED to `delegated` (`conciergeTurnQueue.dequeueDispatched`), not deleted, and `redeliverDelegated`
+ * returns it to `waiting` when its worker terminates — so the concierge still receives the instruction
+ * and acts on it, with the read-only findings as context. Advancing the queue defers the instruction
+ * behind fresher input; it never drops it.
  */
 export function decideAutoDispatch(obs: AutoDispatchObservation): AutoDispatchDecision {
   // BEFORE ANYTHING ELSE, EVEN THE EMPTY-QUEUE CHECK. When every account is OAuth-expired a research
@@ -499,7 +530,11 @@ export function decideAutoDispatch(obs: AutoDispatchObservation): AutoDispatchDe
   // most acute possible version of the very condition being detected — and this mechanism spends
   // money when it fires, so it fails closed.
   if (!obs.researchHydrated) return { action: "none", reason: "not-looked" };
-  if (obs.liveResearch >= obs.waiting.length) return { action: "none", reason: "served" };
+  // OUTSTANDING, not waiting — see `AutoDispatchObservation.delegated`. `liveResearch` counts the
+  // workers on delegated prompts too, so comparing it against `waiting` alone declares the tail of a
+  // backlog served by children working on other questions.
+  const outstanding = obs.waiting.length + (obs.delegated ?? 0);
+  if (obs.liveResearch >= outstanding) return { action: "none", reason: "served" };
 
   // BEFORE THE PER-WAITER LOOP. A full pool is a fact about the runner, not about any one message,
   // so reporting it as (say) "cooling" would name a rule that had nothing to do with the refusal.
@@ -528,7 +563,10 @@ export function decideAutoDispatch(obs: AutoDispatchObservation): AutoDispatchDe
     return { action: "none", reason: oldestExcluded ?? "all-dispatched" };
   }
 
-  const deficit = obs.waiting.length - obs.liveResearch;
+  // Also measured against OUTSTANDING, for the same reason: a deficit computed from `waiting` alone
+  // shrinks by one for every prompt the previous tick delegated, so the batch starves as it drains.
+  // `entries` is still selected from `obs.waiting` only — a delegated prompt already has a worker.
+  const deficit = outstanding - obs.liveResearch;
   const budget = Math.min(deficit, headroom, AUTO_DISPATCH_MAX_PER_TICK);
   const entries = eligible.slice(0, budget);
 
@@ -579,10 +617,12 @@ export function autoDispatchNotice(
     .join(", ");
   return (
     `[sparkle-auto-dispatch] ${queued} ${msgs} ${wasWere} waiting behind your turn with only ${live} ` +
-    `concierge ${agents} working, so Sparkle dispatched ${n === 1 ? "a research agent" : `${n} research agents`} ` +
-    `itself, for the ${n === 1 ? "oldest one" : "oldest ones"}: ${heads}. ` +
-    `${n === 1 ? "Its findings" : "Their findings"} will reach you at the start of a later turn. ` +
-    `Do NOT start reading files to answer ${n === 1 ? "that question" : "those questions"} — ` +
+    `concierge ${agents} working, so Sparkle handed ${n === 1 ? "the oldest one" : "the oldest ones"} ` +
+    `to ${n === 1 ? "a research agent" : `${n} research agents`} so ${n === 1 ? "it does" : "they do"} ` +
+    `not block you: ${heads}. ${n === 1 ? "It left" : "They left"} your queue and ` +
+    `${n === 1 ? "will come" : "will each come"} back for you to answer once ` +
+    `${n === 1 ? "its worker" : "each worker"} finishes, with whatever it found. ` +
+    `Do NOT start reading files to answer ${n === 1 ? "that question" : "those questions"} now — ` +
     `${n === 1 ? "it is" : "they are"} already being researched. Reach for sparkle_research yourself ` +
     `on the next one and this will not need to happen.`
   );

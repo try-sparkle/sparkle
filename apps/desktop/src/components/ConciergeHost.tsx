@@ -126,6 +126,7 @@ import { maybeRefreshThreadSummary } from "../services/conciergeThreadSummary";
 // have to be remembered. See services/conciergeHistoryCapture.ts.
 import { startConciergeHistoryCapture } from "../services/conciergeHistoryCapture";
 import { captureAsksFrom, openAsksNow, startAskQueue } from "../services/conciergeAskQueue";
+import { MAX_ASKS_PER_MESSAGE } from "@sparkle/core";
 import { createResearchDrain, withResearchPreamble } from "../services/research/drain";
 import {
   buildMemoryPreamble,
@@ -149,15 +150,29 @@ import { useConciergeMessageStatuses, waitingLine } from "../services/conciergeM
 import {
   clearQueue,
   waitingCount,
+  outstandingCount,
   EMPTY_TURN_QUEUE,
   // ALIASED: this file already has an `enqueue` — the send SERIALIZER, which orders network
   // round-trips within one send. This one queues whole TURNS. Different jobs, and a shadowed name
   // here would silently route sends into the wrong one.
   enqueue as enqueueTurn,
   turnFinished,
+  // DISPATCH-AND-CONTINUE (beads sparkle-3c83a/8lwi8): a waiting prompt handed to a research worker
+  // MOVES to `delegated` (stops blocking the serial session, stays owed); `redeliverDelegated` brings
+  // it back to `waiting` when its worker terminates, so the concierge always delivers an answer.
+  dequeueDispatched,
+  redeliverDelegated,
+  redeliverReadyIds,
+  // ABSORPTION (bead sparkle-agx4d8): a turn answers a RUN of his messages, not one. `turnFinished`
+  // absorbs the related run already queued; `mergeIntoRunning` folds a follow-on into a turn that is
+  // in flight but has not spoken yet.
+  mergeIntoRunning,
+  runTexts,
   type QueuedTurn,
+  type RunningRun,
   type TurnQueueState,
 } from "../engine/conciergeTurnQueue";
+import { isRelated, MAX_SUPERSEDE_GAP_MS } from "../engine/conciergeRelatedness";
 import { useConciergeTurnFloor } from "../services/conciergeTurnFloor";
 import {
   onConciergeDelta,
@@ -178,6 +193,7 @@ import {
 } from "../services/conciergeActivity";
 import {
   clearConciergeLiveness,
+  conciergeDidNothingYet,
   conciergeSawAnswerText,
   noteConciergeFailed,
   noteConciergeProgress,
@@ -784,7 +800,7 @@ export function ConciergeHost({
   const queueOwnerRef = useRef<object>({});
   /** `dispatchTurn` through a ref: the send path calls it above its definition, and the turn-ended
    *  handlers call it from effects that must not re-subscribe when it changes identity. */
-  const dispatchTurnRef = useRef<(entry: QueuedTurn) => void>(() => {});
+  const dispatchTurnRef = useRef<(run: RunningRun) => void>(() => {});
   /** `drainQueue` through a ref, for the same reason `dispatchTurn` is: the brain subscription
    *  effect must keep its minimal dep array — re-subscribing mid-turn would drop the events still
    *  arriving for it — and `dispatchTurn` is defined below its own callers. */
@@ -808,6 +824,24 @@ export function ConciergeHost({
    * required, and the ordering is asserted by a test rather than left to this comment.
    */
   const neverSentRef = useRef<Set<string>>(new Set());
+  /**
+   * The messages the turn now in flight is answering, oldest first.
+   *
+   * A ref rather than state because the relay-gate origin effect reads it on the same commit that
+   * sets `awaitingId`, and because nothing renders from it. Empty until the first dispatch.
+   */
+  const runEntriesRef = useRef<readonly QueuedTurn[]>([]);
+  /**
+   * Bubbles whose asks have already been filed, so a re-dispatch does not file them twice.
+   *
+   * A MERGE RE-DISPATCHES THE WHOLE RUN (see `askSparkle`), and ask capture happens at dispatch. So
+   * without this, folding a follow-on into a running turn would hand `captureAsksFrom` message 1
+   * for the second time. `planAsks` would correctly decline to mint a duplicate bead — and would
+   * instead record it as a RE-ASK, bumping the `ask-seen-<n>` counter. That counter is the
+   * escalation signal for "he has had to ask for this repeatedly", so inflating it on our own
+   * re-dispatch would manufacture evidence of a recurrence that never happened.
+   */
+  const askedBubblesRef = useRef<Set<string>>(new Set());
 
   /**
    * The running turn ended — release the slot and start the next waiter, if any.
@@ -817,9 +851,16 @@ export function ConciergeHost({
    * tear down and re-establish the brain subscriptions on every render.
    */
   const drainQueue = useCallback(() => {
-    const outcome = turnFinished(turnQueueRef.current);
+    // ABSORB, don't promote one. Everything the walk considers is ALREADY queued, so this costs no
+    // waiting and no latency — it only decides how many of his messages one prompt answers. The
+    // judge is local and pure (engine/conciergeRelatedness) and fails toward absorbing, and the walk
+    // is bounded independently of it, so a judge that answers "related" to everything still stops.
+    const outcome = turnFinished(turnQueueRef.current, isRelated);
     turnQueueRef.current = outcome.next;
     setTurnQueue(outcome.next);
+    // Nothing followed: the run that just ended is over, so drop it rather than leaving the ref
+    // describing a turn nobody is awaiting. `dispatchTurn` overwrites it on the other branch.
+    if (!outcome.dispatch) runEntriesRef.current = [];
     if (outcome.dispatch) dispatchTurnRef.current(outcome.dispatch);
   }, []);
 
@@ -919,6 +960,31 @@ export function ConciergeHost({
 
       const research = useResearchStore.getState();
       const tasks = allResearchTasks();
+
+      // ══ REDELIVERY FIRST — THE DELIVERY GUARANTEE, ON A PERIODIC CLOCK (beads sparkle-3c83a/8lwi8) ══
+      // A delegated prompt comes back to `waiting` (so the concierge answers it) once, past the grace
+      // window, NO LIVE pass matches its text — which covers a worker that finished, was reaped from the
+      // store, or vanished. Run here, on the 15s tick, because it needs a CLOCK: a reaped/vanished task
+      // produces no store event, so a subscription alone would never re-evaluate it. `redeliverReadyIds`
+      // is fail-safe (keyed on the ABSENCE of a live pass), so a task disappearing can never strand its
+      // prompt. There is deliberately NO wall-clock backstop: a task that is genuinely still live stays
+      // delegated ("it takes as long as it takes") — owed and visible, not pulled back with no findings.
+      // The research subscription below redelivers too, for faster reaction to a store change; both call
+      // the one decider.
+      {
+        const ready = redeliverReadyIds(
+          turnQueueRef.current,
+          tasks.map((t) => ({ question: t.question, live: isLivePhase(t.status) })),
+          now,
+        );
+        if (ready.length > 0) {
+          const next = redeliverDelegated(turnQueueRef.current, ready);
+          turnQueueRef.current = next;
+          setTurnQueue(next);
+          if (next.running === null && next.waiting.length > 0) drainQueueRef.current();
+        }
+      }
+
       const waiting = turnQueueRef.current.waiting;
       const decision = decideAutoDispatch({
         waiting,
@@ -926,6 +992,9 @@ export function ConciergeHost({
         // reading off the "Concierge Agents" row. A private count here is how the two come to
         // disagree about whether anything is running.
         liveResearch: liveTasks(tasks).length,
+        // Delegated prompts are still OWED and their workers are counted in `liveResearch`, so the
+        // decider needs both halves or it reads the backlog's tail as already served (roborev 65829).
+        delegated: turnQueueRef.current.delegated.length,
         researchHydrated: research.hydrated,
         // DERIVED FROM THE STORE, never remembered — see the effect's header. The mapping is the
         // whole reason the decider takes `ResearchPassRecord` rather than `ResearchTask`: it keeps
@@ -995,13 +1064,47 @@ export function ConciergeHost({
         // ONE NOTICE PER TICK, covering everything that actually went out — and none at all when
         // nothing did, so the concierge is never told about work that does not exist.
         if (sent.length > 0) {
-          notifyConcierge(autoDispatchNotice(sent, decision.queued, decision.live));
+          // TELL THE CONCIERGE FIRST, AND ONLY HAND OFF IF IT HEARD. `notifyConcierge` returns whether
+          // the notice was actually accepted (`conciergeNotifier`: "an unverified push is a failed
+          // push"). If nobody was listening or the scheduler refused it, the concierge does not know
+          // research is running — so we must NOT move the prompt out of its way. Left in `waiting`, the
+          // prompt is answered the ordinary serial way with the pre-warmed findings, and a later tick
+          // can still hand it off; `dispatchStateFor` already prevents a second metered child.
+          const told = notifyConcierge(autoDispatchNotice(sent, decision.queued, decision.live));
           log.warn(
             "concierge",
             `auto-dispatched research for ${sent.length} queued message${sent.length === 1 ? "" : "s"}: ` +
               `${decision.queued} waiting, ${decision.live} live, oldest waited ` +
-              `${Math.round(decision.waitedMs / 1000)}s`,
+              `${Math.round(decision.waitedMs / 1000)}s${told ? "" : " (notice REFUSED — kept queued)"}`,
           );
+          if (told) {
+            // ══ DISPATCH-AND-CONTINUE: THE HAND-OFF ADVANCES THE QUEUE (beads sparkle-3c83a/8lwi8) ══
+            // The whole point, and the defect this closes: until now a dispatched message KEPT WAITING
+            // (`conciergeAutoDispatch`'s header names it) — the worker pre-warmed an answer but dequeued
+            // nothing, so the depth never dropped and the concierge ground through 24–36 stacked prompts
+            // one serial turn at a time. Handing the heavy lifting to a worker advances the queue: the
+            // sent messages MOVE from `waiting` to `delegated` now, on dispatch, not on completion. They
+            // stop blocking the concierge's serial session so it reads the next prompt at once — but they
+            // are NOT deleted: `delegated` is still owed and still counted, and `redeliverDelegated` (in
+            // the research subscription below) brings each one back to `waiting` the instant its worker
+            // terminates, so the concierge always delivers an answer. Nothing is lost.
+            //
+            // BY BUBBLE ID, off the LIVE ref, never the `waiting` snapshot read at the top of this tick:
+            // the tick awaited a bridge round-trip per dispatch, and a concurrent `turnFinished` may have
+            // promoted a waiter to `running` meanwhile. `dequeueDispatched` moves only from `waiting` and
+            // is idempotent, so a prompt that raced into `running` is left for the concierge to answer.
+            //
+            // BOUNDED CONCURRENCY comes for free: `sent` is only what the decider chose, and the decider
+            // already caps its batch at the research pool's headroom (MAX_CONCURRENT_RESEARCH) and
+            // AUTO_DISPATCH_MAX_PER_TICK — so we never hand off more than the pool can actually run.
+            const advanced = dequeueDispatched(
+              turnQueueRef.current,
+              sent.map((e) => e.bubbleId),
+              Date.now(),
+            );
+            turnQueueRef.current = advanced;
+            setTurnQueue(advanced);
+          }
         }
       } finally {
         inFlight = false;
@@ -2757,8 +2860,10 @@ export function ConciergeHost({
       // Nobody is waiting on a push, so it does not get to spend a turn on a rewrite.
       if (isProactiveTurn(id)) return false;
       // See the header: a queued user turn will dispatch on this handler's drain and kill the
-      // correction child, so the correction would be paid for and never arrive.
-      if (turnQueueRef.current.waiting.length > 0) return false;
+      // correction child, so the correction would be paid for and never arrive. OUTSTANDING, not just
+      // `waiting`: a delegated prompt is redelivered to `waiting` the instant its worker finishes and
+      // then dispatches the same way, so it is a latent superseding turn too (dispatch-and-continue).
+      if (outstandingCount(turnQueueRef.current) > 0) return false;
       return true;
     };
 
@@ -2959,10 +3064,13 @@ export function ConciergeHost({
       // the waiting the ladder exists to prevent.
       //
       // The queue depth is what makes it hair-trigger: 6 calls normally, 2 when messages are
-      // stacked up behind this turn (the founder's own threshold choice).
+      // stacked up behind this turn (the founder's own threshold choice). OUTSTANDING, not just
+      // `waiting`: a prompt handed to a worker is still owed and will return to be answered, so the
+      // backlog it represents should keep the ladder hair-trigger rather than relaxing it to 6 exactly
+      // when the queue is deepest (dispatch-and-continue).
       const fold = noteDelegationToolCall(delegationRef.current, e, {
         turnId: e.id,
-        queuedCount: waitingCount(turnQueueRef.current),
+        queuedCount: outstandingCount(turnQueueRef.current),
       });
       delegationRef.current = fold.state;
       if (fold.decision.action === "nudge") {
@@ -3619,6 +3727,32 @@ export function ConciergeHost({
       const tasks = Object.values(s.byId);
       researchDrain.observe(tasks);
       schedulerRef.current?.observeResearch(tasks);
+      // ══ DISPATCH-AND-CONTINUE DELIVERY GUARANTEE (beads sparkle-3c83a/8lwi8) ═════════════════════
+      // A prompt handed to a research worker moved to `delegated` (it stopped blocking the concierge's
+      // serial session). It is still OWED — and this is where it gets ANSWERED: `redeliverReadyIds`
+      // returns a delegated prompt to `waiting` once, past the grace window, NO LIVE pass matches its
+      // text (covers a worker that finished, was reaped, or vanished). Fail-safe by construction — a
+      // disappearing task cannot strand it. The concierge then produces a reply with the pre-warmed
+      // findings riding that turn via `researchDrain.peek()`. This subscription reacts to store CHANGES
+      // for speed; the auto-dispatch tick runs the SAME decider on a clock, so a reaped/vanished task
+      // with no store event is still caught. A task still genuinely live stays delegated (no wall-clock
+      // backstop, by design). Both share `redeliverReadyIds`.
+      if (turnQueueRef.current.delegated.length > 0) {
+        const ready = redeliverReadyIds(
+          turnQueueRef.current,
+          tasks.map((t) => ({ question: t.question, live: isLivePhase(t.status) })),
+          Date.now(),
+        );
+        if (ready.length > 0) {
+          const next = redeliverDelegated(turnQueueRef.current, ready);
+          turnQueueRef.current = next;
+          setTurnQueue(next);
+          // If the concierge is IDLE, a redelivered prompt would otherwise sit in `waiting` with
+          // nothing to promote it — start it now, exactly as a finishing turn would. When the
+          // concierge is busy, `turnFinished` drains it in order as the running turn completes.
+          if (next.running === null && next.waiting.length > 0) drainQueueRef.current();
+        }
+      }
     });
     return unsubscribe;
   }, []);
@@ -4351,15 +4485,33 @@ export function ConciergeHost({
   // this one, so on the commit that adds the bubble and sets `awaitingId` they are already current —
   // and keeping this effect's dep list at `[awaitingId]` is what makes it fire exactly once per
   // turn rather than on every keystroke that reshapes the thread.
+  //
+  // ══ THE ORIGIN IS THE WHOLE RUN, AND THAT IS A SAFETY PROPERTY ═══════════════════════════════
+  // A turn can answer several of his messages (engine/conciergeTurnQueue's RunningRun). `relayGate`
+  // reads this origin and is deliberately FAIL-OPEN — `carriesFounderWords` returning false ALLOWS
+  // the relay. So an origin carrying only the head's text makes the gate fail open on the founder's
+  // own words from messages 2..N, which is precisely the ruling that module exists to make. The
+  // mirror image is just as wrong: an `@agent` named in message 3 would be missing from
+  // `mentionedAgentIds`, refusing a relay that should have been allowed.
+  //
+  // `sendSeq` IS A DEPENDENCY, not decoration: when a follow-up is MERGED into the running turn the
+  // head bubble does not change, so `awaitingId` alone would not re-fire this and the origin would
+  // silently keep the pre-merge text. `sendSeq` moves on every dispatch, merges included.
   useEffect(() => {
-    const bubble = awaitingId
-      ? chatRef.current.find((m) => m.id === awaitingId && m.kind === "you")
-      : undefined;
+    // GATED ON `awaitingId`, which is what "there is a turn to have an origin for" means here.
+    // `runEntriesRef` is a ref and outlives the turn that set it, so reading it unconditionally
+    // would hand `relayGate` a finished turn's messages as the CURRENT origin.
+    const runIds = runEntriesRef.current.map((q) => q.bubbleId);
+    const ids = awaitingId ? (runIds.length > 0 ? runIds : [awaitingId]) : [];
+    const bubbles = ids
+      .map((id) => chatRef.current.find((m) => m.id === id && m.kind === "you"))
+      .filter((m): m is Extract<ConciergeMessage, { kind: "you" }> => m?.kind === "you");
+    const bubble = bubbles.length > 0 ? bubbles[0] : undefined;
     setConciergeTurnOrigin(
       awaitingId,
       bubble?.kind === "you"
         ? {
-            text: bubble.text,
+            text: bubbles.map((b) => b.text).join("\n\n"),
             // `mentions` is only the `@`-picker's resolved list; `namedAgentIds` widens it to agents
             // he named in prose. Deliberately generous — see Concierge/namedAgents: every id here can
             // only ALLOW a relay, never cause a badge.
@@ -4369,16 +4521,18 @@ export function ConciergeHost({
             // relay lookup by construction (the same property that makes `isBeadMentionId` the safety
             // predicate) — so it can allow nothing. Filtering would cost an allocation over ~2,200
             // rows per turn to remove entries that already do nothing.
-            mentionedAgentIds: namedAgentIds(
-              bubble.text,
-              bubble.mentions,
-              mentionAgentsRef.current,
-            ),
+            mentionedAgentIds: [
+              ...new Set(
+                bubbles.flatMap((b) =>
+                  namedAgentIds(b.text, b.mentions, mentionAgentsRef.current),
+                ),
+              ),
+            ],
           }
         : undefined,
     );
     return () => setConciergeTurnOrigin(null);
-  }, [awaitingId]);
+  }, [awaitingId, sendSeq]);
 
   /** Start a Sparkle chat turn for `text`. Never fails visibly, so it reports no outcome.
    *
@@ -4455,8 +4609,32 @@ export function ConciergeHost({
       reportClaudeAuthFailed();
       return;
     }
+    // ══ DECIDED BEFORE THE ORPHAN STAMP, DELIBERATELY ══════════════════════════════════════════
+    // The stamp below marks the awaited bubble "unanswered". When this send is about to be MERGED
+    // into that very turn, the bubble is about to be answered — stamping it would put a "never got
+    // an answer" mark on a message whose answer is one dispatch away. So the decision is taken here
+    // and the stamp is skipped for it. The four gates are documented at the merge itself, below.
+    const sentAt = Date.now();
+    const runningNow = turnQueueRef.current.running;
+    const lastOfRun = runningNow ? (runningNow.entries[runningNow.entries.length - 1] ?? null) : null;
+    const willMerge =
+      // ONLY A REAL USER BUBBLE MAY MERGE. `askSparkle` is also the entry point for SYNTHETIC sends
+      // the app makes on its own — the relay follow-up and the transcript replay — which arrive with
+      // no `bubbleId` and get a `pending-` placeholder. Folding one of those into the founder's run
+      // would put text he never wrote under "The user says", and would supersede a live turn on the
+      // app's own initiative. Their placeholders are also minted from the clock, so two in the same
+      // millisecond collide; today that is harmless because they dispatch immediately, and it stays
+      // harmless only while they never enter a run.
+      bubbleId != null &&
+      lastOfRun !== null &&
+      // NOTHING AT ALL, not merely "no answer text". `conciergeSawAnswerText` is the ORPHAN test and
+      // is too permissive here: a turn three tool calls deep has still answered nothing, and merging
+      // on that basis would kill work the concierge really did. See `conciergeDidNothingYet`.
+      conciergeDidNothingYet() &&
+      sentAt - lastOfRun.enqueuedAt <= MAX_SUPERSEDE_GAP_MS &&
+      isRelated(runTexts(runningNow), text, sentAt - lastOfRun.enqueuedAt);
     const orphan = awaitingBubbleRef.current;
-    if (orphan && !conciergeSawAnswerText()) {
+    if (orphan && !willMerge && !conciergeSawAnswerText()) {
       setChat((prev) =>
         prev.map((m) =>
           m.kind === "you" && m.id === orphan && m.receipt
@@ -4490,10 +4668,45 @@ export function ConciergeHost({
     // because `conciergeTurnQueue` is pure and reads no clock; the Pusher's `queue-unfanned`
     // condition and `conciergeAutoDispatch` both measure the age from this one field.
     const queued: QueuedTurn = {
-      bubbleId: bubbleId ?? `pending-${Date.now()}`,
+      bubbleId: bubbleId ?? `pending-${sentAt}`,
       text,
-      enqueuedAt: Date.now(),
+      // The SAME instant the merge decision above was taken against, not a second `Date.now()`:
+      // two reads straddling a tick would let the gate pass on one value and the reducer bound on
+      // another.
+      enqueuedAt: sentAt,
     };
+    // ══ FOLD A FOLLOW-ON INTO THE TURN ALREADY IN FLIGHT ═══════════════════════════════════════
+    // The founder: *"I often will send a message right after the one that I just sent that has more
+    // context… so that everything that I'm saying can be queued together in your response."* If that
+    // follow-up is related AND the running turn has not written a word yet, answering them together
+    // is strictly better than answering the first alone and the second later.
+    //
+    // FIVE GATES — computed as `willMerge` above the orphan stamp, and every one must hold:
+    //   1. this is a REAL user bubble, not one of the app's own synthetic sends;
+    //   2. a turn is actually running;
+    //   3. that turn has produced NOTHING AT ALL — `conciergeDidNothingYet()`, which is strictly
+    //      tighter than the `conciergeSawAnswerText()` the orphan stamp uses. That distinction is
+    //      the whole safety argument: this queue exists BECAUSE superseding killed 149 of 378 turns
+    //      on 2026-07-29, and the only kill that destroys nothing is one where nothing has happened
+    //      yet. A turn several tool calls deep has answered nobody but has done real work, so it is
+    //      not eligible even though the orphan test would say it was;
+    //   4. the send arrived within MAX_SUPERSEDE_GAP_MS — a merge costs a partial turn, so it is
+    //      worth it for a follow-up he is still speaking, not for one an hour later;
+    //   5. the judge says related, and the run is within its bounds (the reducer enforces those and
+    //      returns a null dispatch when it refuses, so a refusal falls through to the ordinary
+    //      enqueue below and the send is never lost).
+    if (willMerge) {
+      const merged = mergeIntoRunning(turnQueueRef.current, queued);
+      if (merged.dispatch) {
+        turnQueueRef.current = merged.next;
+        setTurnQueue(merged.next);
+        // Re-dispatching supersedes the in-flight child in `concierge.rs` by design — it installs one
+        // turn and kills the one it evicts. That is the behaviour this queue normally prevents, and
+        // it is correct HERE precisely because gate 2 proved there is no answer to lose.
+        dispatchTurnRef.current(merged.dispatch);
+        return;
+      }
+    }
     const outcome = enqueueTurn(turnQueueRef.current, queued);
     turnQueueRef.current = outcome.next;
     setTurnQueue(outcome.next);
@@ -4589,7 +4802,14 @@ export function ConciergeHost({
    * QUEUED message would describe a turn that has not started, and `retireThroughRef` in particular
    * would silence the turn that is still legitimately streaming.
    */
-  const dispatchTurn = useCallback((entry: QueuedTurn) => {
+  const dispatchTurn = useCallback((run: RunningRun) => {
+    // A turn answers a RUN of his messages now, not one. `entry` stays the HEAD — it owns the awaited
+    // bubble, the receipt and the retirement floor — but everything that describes WHAT IS BEING
+    // ANSWERED must read `entries`, or messages 2..N are dispatched and then treated as if they had
+    // never been sent. See engine/conciergeTurnQueue's RunningRun for why this is a typed wrapper.
+    const entries = run.entries;
+    const entry = entries[0];
+    runEntriesRef.current = entries;
     // ══ A NEW TURN ENDS ANY HELD REPLY FIRST (the linter's block path) ═════════════════════════
     // `concierge.rs` installs one turn and KILLS the child it evicts, so a correction turn in
     // flight is about to die without ever emitting a terminal event. Settling here renders the held
@@ -4597,7 +4817,10 @@ export function ConciergeHost({
     // can arrive, so the thread does not grow an answer above the question it was answering.
     settleLintHoldRef.current("the user sent again");
     // Its turn is starting, so it HAS been sent — a reply may legitimately claim it from here.
-    neverSentRef.current.delete(entry.bubbleId);
+    // EVERY message in the run, not just the head: `pendingAnchors` filters anchors by this set, so a
+    // bubble left in it gets no "Answered below" marker and renders exactly as if it had been
+    // ignored — the founder-visible symptom this whole feature exists to remove.
+    for (const q of entries) neverSentRef.current.delete(q.bubbleId);
     const bubbleId = entry.bubbleId.startsWith("pending-") ? null : entry.bubbleId;
     awaitingBubbleRef.current = bubbleId;
     setAwaitingId(bubbleId);
@@ -4648,35 +4871,66 @@ export function ConciergeHost({
     // it would guard only the synchronous shape while the reachable failure here is a rejection.
     // The guard lives at this call site, not only inside each module (roborev 61903), because that
     // is the invariant — nothing between here and `startConciergeTurn` may take the send down.
-    bookkeep("ask capture", () =>
-      captureAsksFrom(entry.text, String(latestTurnRef.current)).then((out) => {
-        // A CAP THAT SAYS NOTHING IS CONCEALMENT (docs/never-hide-actionable-rows.md). `asksIn`
-        // bounds one message to MAX_ASKS_PER_TURN so a long paste cannot bury the queue, and reports
-        // what it withheld precisely so the bound stays visible.
-        //
-        // EACH NOTICE IS GUARDED SEPARATELY (roborev 61961), for the reason the notices exist at
-        // all: they are the disclosures that keep the cap and the disagreement from being concealed,
-        // so one of them failing must not silently swallow the others. Grouped, a throw from the
-        // `dropped` post would skip every `reasked` line below it — concealment produced by the code
-        // whose whole job is to prevent it.
-        if (out.dropped > 0) {
-          bookkeep("dropped-ask notice", () =>
-            postSparkle(
-              line`That message had more asks than I file at once, so ${plain(String(out.dropped))} of them didn't make the list — say them again and I'll pick them up.`,
-            ),
-          );
-        }
-        // He asked for something we already marked done. Neither a silent re-open nor a duplicate:
-        // two parties disagree about whether the work happened, and that is his call to make.
-        for (const r of out.reasked) {
-          bookkeep("re-ask notice", () =>
-            postSparkle(
-              line`You've asked for ${plain(oneLine(r.ask.sentence))} again — ${plain(r.closedBeadId)} was already closed. I've filed it fresh rather than assume either of us was right.`,
-            ),
-          );
-        }
-      }),
-    );
+    // ONLY THE MESSAGES NOT ALREADY FILED — see `askedBubblesRef`. On a merge this run was dispatched
+    // once already, so its earlier messages have been through capture and re-filing them would read
+    // as him re-asking.
+    const fresh = entries.filter((q) => !askedBubblesRef.current.has(q.bubbleId));
+    for (const q of fresh) askedBubblesRef.current.add(q.bubbleId);
+    // ══ ONE CAPTURE FOR THE WHOLE RUN — NEVER ONE PER MESSAGE ══════════════════════════════════
+    // `captureAsksFrom` READS the whole bead board and then WRITES to it. Firing it once per absorbed
+    // message would interleave N read-then-write cycles against one board, so two messages carrying
+    // the same ask would both read "no such bead" and both create one — the duplicate `planAsks`
+    // exists to prevent — and would fan out N `bd` subprocesses per turn on top. Joining the run into
+    // one call keeps a single read, a single dedupe pass and a single write.
+    //
+    // The cap SCALES with the run, so absorbing messages can never cost him asks: `asksIn` bounds one
+    // MESSAGE to MAX_ASKS_PER_MESSAGE, and a run of N messages is entitled to N times that.
+    if (fresh.length > 0) {
+      bookkeep("ask capture", () =>
+        captureAsksFrom(
+          fresh.map((q) => q.text).join("\n\n"),
+          String(latestTurnRef.current),
+          MAX_ASKS_PER_MESSAGE * fresh.length,
+        ).then((out) => {
+          // A CAP THAT SAYS NOTHING IS CONCEALMENT (docs/never-hide-actionable-rows.md). `asksIn`
+          // bounds one message to MAX_ASKS_PER_MESSAGE so a long paste cannot bury the queue, and
+          // returns what it withheld precisely so the bound stays visible AND actionable.
+          //
+          // EACH NOTICE IS GUARDED SEPARATELY (roborev 61961), for the reason the notices exist at
+          // all: they are the disclosures that keep the cap and the disagreement from being concealed,
+          // so one of them failing must not silently swallow the others. Grouped, a throw from the
+          // `dropped` post would skip every `reasked` line below it — concealment produced by the code
+          // whose whole job is to prevent it.
+          // NAMED, NOT COUNTED. This used to say "say them again and I'll pick them up", which makes
+          // the founder reconstruct from memory what the app is still holding in a variable — the
+          // disclosure existed but was not actionable. `asksIn` now returns the withheld records, so
+          // the remedy is to show them.
+          if (out.dropped.length > 0) {
+            // RENDERED INSIDE THE GUARD, not above it. `bookkeep` isolates each notice so one
+            // failing cannot swallow the others (roborev 61961) — but a throw from building the
+            // TEXT would land outside this unit, be logged as the enclosing "ask capture" failure,
+            // and skip every re-ask notice below. That is the concealment this structure exists to
+            // prevent, produced one line further up.
+            bookkeep("dropped-ask notice", () =>
+              postSparkle(
+                line`That was more asks than I file at once, so these didn't make the list: ${plain(
+                  out.dropped.map((a) => oneLine(a.sentence)).join("; "),
+                )}. Say the word and I'll file them.`,
+              ),
+            );
+          }
+          // He asked for something we already marked done. Neither a silent re-open nor a duplicate:
+          // two parties disagree about whether the work happened, and that is his call to make.
+          for (const r of out.reasked) {
+            bookkeep("re-ask notice", () =>
+              postSparkle(
+                line`You've asked for ${plain(oneLine(r.ask.sentence))} again — ${plain(r.closedBeadId)} was already closed. I've filed it fresh rather than assume either of us was right.`,
+              ),
+            );
+          }
+        }),
+      );
+    }
     // NO `bookkeep("history capture", …)` HERE, deliberately (sparkle-yd1ud × sparkle-s7rfc). His
     // raw message is indexed — never the composed prompt, which would bury one sentence of his under
     // a roster dump every search would match — but by the thread-store subscriber, which sees the
@@ -4721,7 +4975,9 @@ export function ConciergeHost({
       // This turn's own bubble is ALREADY in the thread (it is appended at send, and the snapshot is
       // built here at dispatch), so exclude it — otherwise the message being asked appears twice in
       // its own prompt.
-      excludeId: entry.bubbleId,
+      // EVERY bubble in the run — see ContinuityInput.excludeIds. Excluding only the head would put
+      // messages 2..N in the prompt twice.
+      excludeIds: entries.map((q) => q.bubbleId),
     });
     // Fire-and-forget, AFTER the block above is built so this turn is never delayed by it and never
     // sees a half-written summary. Resolves false and keeps the old summary on any failure.
@@ -4747,7 +5003,12 @@ export function ConciergeHost({
           research.preamble,
           withNoticeSection(
             owedNotices,
-            buildSnapshot(feedRef.current, entry.text, openAsksNow(), continuity),
+            buildSnapshot(
+              feedRef.current,
+              entries.map((q) => q.text),
+              openAsksNow(),
+              continuity,
+            ),
           ),
         ),
       ),
@@ -4845,13 +5106,26 @@ export function ConciergeHost({
           drainQueueRef.current();
           return;
         }
-        const stranded = [entry, ...turnQueueRef.current.waiting];
+        // DELEGATED BUBBLES ARE STRANDED TOO — `clearQueue` below wipes `delegated` as well as
+        // `waiting`, so a prompt handed to a worker must be marked `refused` here or it renders
+        // identically to a delivered message (the silent loss roborev 58241-M4 exists to prevent,
+        // which the new `delegated` state would otherwise reintroduce). Their worker's finding is now
+        // orphaned — AI enhancements are off (sticky), so no turn will ever answer them either.
+        // THE WHOLE RUN, not just its head. Messages absorbed into this turn are not in `waiting`
+        // any more, so a head-only list leaves them neither marked `refused` nor cleared — they
+        // render as delivered messages that were never sent, which is the exact silent loss the
+        // marks below exist to prevent.
+        const stranded = [
+          ...entries,
+          ...turnQueueRef.current.waiting,
+          ...turnQueueRef.current.delegated,
+        ];
         for (const q of stranded) neverSentRef.current.add(q.bubbleId);
         // EACH STRANDED BUBBLE IS MARKED (roborev 58241-M4, corrected by 58517-M2). `clearQueue`
-        // erases their "Waiting its turn" line, so without a mark they render identically to a
-        // delivered message and the only trace is one failure bubble that scrolls away. `refused`
-        // rather than `unanswered`, because only `refused` is rendered — see the evicted-message
-        // stamp above for the full reasoning.
+        // erases their "Waiting its turn" / "Handed to a research agent" line, so without a mark they
+        // render identically to a delivered message and the only trace is one failure bubble that
+        // scrolls away. `refused` rather than `unanswered`, because only `refused` is rendered — see
+        // the evicted-message stamp above for the full reasoning.
         const strandedIds = new Set(stranded.map((q) => q.bubbleId));
         setChat((prev) =>
           prev.map((m) =>

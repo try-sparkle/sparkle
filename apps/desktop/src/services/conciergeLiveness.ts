@@ -100,6 +100,29 @@ export function conciergeSawAnswerText(): boolean {
   return useConciergeLivenessStore.getState().sawText;
 }
 
+/**
+ * Has the turn currently being awaited produced NOTHING AT ALL — no assistant text and no tool
+ * output?
+ *
+ * ══ WHY THIS IS A THIRD QUESTION, NOT A REPHRASING OF THE OTHER TWO ════════════════════════════
+ * Read by the host to decide whether a related follow-on may be MERGED into the turn in flight
+ * (bead sparkle-agx4d8). Merging re-dispatches, and `concierge.rs` kills the child it evicts, so the
+ * only safe moment is one where the kill destroys nothing.
+ *
+ * `conciergeSawAnswerText` is deliberately NOT that test. It asks whether the USER was answered,
+ * and a turn that has run three tool calls without replying yet still answers `false` — so merging
+ * on it would throw away real work the concierge had already done. That is a smaller version of the
+ * 2026-07-29 defect (149 of 378 turns killed mid-flight), and this queue exists to end it, so the
+ * merge gate must be strictly tighter than the orphan test rather than sharing it.
+ *
+ * `sawOutput` is set by the FIRST sign of life of any kind, which makes "nothing yet" exactly the
+ * window where a supersede is free.
+ */
+export function conciergeDidNothingYet(): boolean {
+  const s = useConciergeLivenessStore.getState();
+  return !s.sawOutput && !s.sawText;
+}
+
 /** What a component needs to render the signal. */
 export interface ConciergeLivenessReading {
   /** The colour step: `waiting` gray, `slow` yellow, `stalled` red. */

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   type AskBead,
-  MAX_ASKS_PER_TURN,
+  MAX_ASKS_PER_MESSAGE,
   MIN_ASK_WORDS,
   askBeadBody,
   askKey,
@@ -134,16 +134,68 @@ describe("multi-ask messages", () => {
     expect(asks).toHaveLength(1);
   });
 
-  it("caps the asks per turn but reports what it withheld, never silently", () => {
-    const many = Array.from(
-      { length: MAX_ASKS_PER_TURN + 3 },
+  it("caps the asks per message but RETURNS what it withheld, never silently", () => {
+    const sentences = Array.from(
+      { length: MAX_ASKS_PER_MESSAGE + 3 },
       (_, i) => `build the number ${i} widget`,
-    ).join("\n");
-    const { asks, dropped } = asksIn(many, T, AT);
-    expect(asks).toHaveLength(MAX_ASKS_PER_TURN);
-    // The count is the disclosure. A cap that reported 0 here would be the concealment
-    // docs/never-hide-actionable-rows.md forbids.
-    expect(dropped).toBe(3);
+    );
+    const { asks, dropped } = asksIn(sentences.join("\n"), T, AT);
+
+    expect(asks.map((a) => a.sentence)).toEqual(sentences.slice(0, MAX_ASKS_PER_MESSAGE));
+    // THE RECORDS, not a count. This is the assertion that proves the feature: a length check alone
+    // would pass against a stub that returned three empty objects, and the whole point of the change
+    // is that the caller can NAME to the founder what was held back rather than ask him to repeat it.
+    expect(dropped.map((a) => a.sentence)).toEqual(sentences.slice(MAX_ASKS_PER_MESSAGE));
+    // And they are real AskRecords, carrying the same identity the kept ones do.
+    expect(dropped[0]?.key).toBe(askKey(sentences[MAX_ASKS_PER_MESSAGE]!));
+    expect(dropped[0]?.turnId).toBe(T);
+    expect(dropped[0]?.at).toBe(AT);
+  });
+
+  it("honours an explicit cap, so absorbed messages scale the bound with them", () => {
+    // The caller passes `MAX_ASKS_PER_MESSAGE * runLength` when several of his messages were folded
+    // into one turn. A cap of 2 stands in for that arithmetic.
+    const sentences = Array.from({ length: 5 }, (_, i) => `build the number ${i} widget`);
+    const { asks, dropped } = asksIn(sentences.join("\n"), T, AT, 2);
+    expect(asks.map((a) => a.sentence)).toEqual(sentences.slice(0, 2));
+    expect(dropped.map((a) => a.sentence)).toEqual(sentences.slice(2));
+  });
+
+  it("scales with the number of absorbed messages rather than shrinking to one message's worth", () => {
+    const sentences = Array.from({ length: 12 }, (_, i) => `build the number ${i} widget`);
+    // Two messages absorbed into one turn: the cap is per MESSAGE, so it doubles.
+    const { asks, dropped } = asksIn(sentences.join("\n"), T, AT, MAX_ASKS_PER_MESSAGE * 2);
+    expect(asks).toHaveLength(12);
+    expect(dropped).toEqual([]);
+  });
+
+  it.each([
+    ["zero", 0],
+    ["negative", -1],
+    ["NaN", Number.NaN],
+    ["Infinity", Number.POSITIVE_INFINITY],
+    ["-Infinity", Number.NEGATIVE_INFINITY],
+  ])("falls back to the per-message cap for a %s cap rather than discarding asks", (_name, cap) => {
+    // A caller's arithmetic slip must never silently throw work away: slice(0, NaN) keeps NOTHING and
+    // slice(0, -1) drops the last one, both without an error.
+    const sentences = Array.from({ length: 5 }, (_, i) => `build the number ${i} widget`);
+    const { asks, dropped } = asksIn(sentences.join("\n"), T, AT, cap);
+    expect(asks.map((a) => a.sentence)).toEqual(sentences);
+    expect(dropped).toEqual([]);
+  });
+
+  it("returns an EMPTY ARRAY, never undefined, when nothing was withheld", () => {
+    const out = asksIn("build ten homepage designs", T, AT);
+    // A caller reading out.dropped.length must not throw on the ordinary path.
+    expect(out.dropped).toEqual([]);
+    expect(out.dropped.length).toBe(0);
+  });
+
+  it("caps at EIGHT asks per message", () => {
+    // Asserted as a literal on purpose, unlike every other test here: the value was raised from 4
+    // because batching several of his messages into one turn made the old bound bite, and a silent
+    // re-lowering would restore the failure with the whole suite still green.
+    expect(MAX_ASKS_PER_MESSAGE).toBe(8);
   });
 });
 
