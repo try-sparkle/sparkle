@@ -398,7 +398,9 @@ fn build_close_args(id: &str, reason: &str) -> Vec<String> {
 /// starting with `-` is otherwise parsed as an option (bd 1.0.5 answers `"- a bullet"` with
 /// `unknown shorthand flag: ' '`). `comment` has no `--text=` flag, so we use the argument
 /// terminator instead — everything after `--` is a positional, verified against bd 1.0.5.
-fn build_comment_args(id: &str, text: &str) -> Vec<String> {
+/// `pub(crate)` so `bead_dup` records a fold through THIS assembly rather than growing a second
+/// one — the `--` terminator above is the whole reason a hand-rolled copy would be a bug.
+pub(crate) fn build_comment_args(id: &str, text: &str) -> Vec<String> {
     vec!["comment".into(), "--".into(), id.to_string(), text.to_string()]
 }
 
@@ -1032,6 +1034,21 @@ fn create_bead(project_path: &str, bead: &NewBead, env: ChildEnv<'_>) -> Result<
     if let Some(p) = bead.parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         require_id(p)?;
     }
+    // File-time duplicate detection, gated by `bead_dup`'s ARGV-LEVEL SKIP LIST. A fold returns the
+    // EXISTING bead's row — `bd show --json` and `bd create --json` emit the same object, so
+    // `normalize_bead` handles it unchanged and the caller sees a `BeadSummary` either way. Every
+    // uncertainty inside `fold_or_create` answers `None` and falls through to the create below.
+    if let Some(row) = crate::bead_dup::fold_or_create(
+        project_path,
+        &bead.title,
+        bead.description.as_deref().unwrap_or(""),
+        bead.labels.as_deref().unwrap_or(""),
+        bead.issue_type.as_deref().unwrap_or(""),
+        bead.parent.as_deref().unwrap_or(""),
+        env,
+    ) {
+        return Ok(normalize_bead(&row));
+    }
     let rows = parse_bead_rows(&bd_stdout(project_path, &build_create_args(bead), env)?)?;
     let created = rows
         .into_iter()
@@ -1131,7 +1148,10 @@ pub async fn beads_comment(
 }
 
 #[cfg(test)]
-mod tests {
+// `pub(crate)` so `notes.rs`'s tests reuse `TempWorkspace` instead of standing up a SECOND
+// throwaway-bd harness. The two roborev guards in its doc are easy to get subtly wrong twice, and
+// a temp repo missing them orphans review rows for a directory deleted seconds later.
+pub(crate) mod tests {
     use super::*;
 
     /// A two-row fixture in bd's real `list --json` shape (captured from `bd list --json` against
@@ -2055,7 +2075,7 @@ mod tests {
     // ── Round trip against a real, throwaway bd workspace ────────────────────────────────────
 
     /// Locate bd, or None when it is not installed (the round-trip test then skips).
-    fn bd_for_integration() -> Option<String> {
+    pub(crate) fn bd_for_integration() -> Option<String> {
         cached_bd_path()
     }
 
@@ -2078,15 +2098,15 @@ mod tests {
     /// `ChildEnv` precisely so this test does not have to reach for `std::env::set_var` — a
     /// process-wide mutation that races every other test on the parallel runner, never gets
     /// restored, and is `unsafe` under the 2024 edition).
-    const TEST_GIT_ENV: ChildEnv<'static> =
+    pub(crate) const TEST_GIT_ENV: ChildEnv<'static> =
         &[("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1"), ("BEADS_ACTOR", "sparkle-test")];
 
-    struct TempWorkspace {
-        dir: std::path::PathBuf,
+    pub(crate) struct TempWorkspace {
+        pub(crate) dir: std::path::PathBuf,
     }
 
     impl TempWorkspace {
-        fn new(tag: &str) -> Option<Self> {
+        pub(crate) fn new(tag: &str) -> Option<Self> {
             let bd = bd_for_integration()?;
             let dir = std::env::temp_dir()
                 .join(format!("sparkle-test-beads-{tag}-{}", std::process::id()));
@@ -2102,7 +2122,7 @@ mod tests {
             }
         }
 
-        fn bd(&self, bd: &str, args: &[&str]) -> Option<std::process::Output> {
+        pub(crate) fn bd(&self, bd: &str, args: &[&str]) -> Option<std::process::Output> {
             Command::new(bd)
                 .args(args)
                 .current_dir(&self.dir)
@@ -2254,5 +2274,178 @@ mod tests {
                 e.message
             );
         }
+    }
+
+    // ── THE FOLD, END TO END, AGAINST A REAL bd ──────────────────────────────────────────────
+    //
+    // These drive the PRODUCTION `create_bead` body with a fake scanner, and they assert the SIDE
+    // EFFECT — that no second bead was filed and the existing one was commented. Both halves are
+    // FALSE against the pre-change code, which always creates: the count would be 2 and the comment
+    // thread empty. Asserting only "an id came back" would pass either way.
+
+    /// A child env is `&[(&str, &str)]`, so the pairs must outlive the call. Returns TEST_GIT_ENV
+    /// plus the scanner override.
+    #[cfg(unix)]
+    fn scan_env<'a>(scanner: &'a str) -> Vec<(&'a str, &'a str)> {
+        let mut v: Vec<(&str, &str)> = TEST_GIT_ENV.to_vec();
+        v.push((crate::bead_dup::SCANNER_ENV_VAR, scanner));
+        v
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_duplicate_create_folds_onto_the_existing_bead_instead_of_filing_a_second() {
+        let Some(ws) = TempWorkspace::new("fold") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let path = ws.dir.to_string_lossy().to_string();
+        let title = "Deepgram relay probe reports a false production outage over HTTP/2";
+
+        // The bead the scanner will claim as the duplicate — filed through the same production fn,
+        // with no scanner configured, so this first call MUST create.
+        let first = create_bead(
+            &path,
+            &NewBead { title: title.into(), description: Some("first report".into()), ..Default::default() },
+            TEST_GIT_ENV,
+        )
+        .expect("first create ran");
+
+        let scanner = crate::bead_dup::write_fake_scanner(
+            &ws.dir,
+            "fake-dup-open.sh",
+            10,
+            &format!(r#"{{"id":"{}","status":"open","priority":1,"title":"x"}}"#, first.id),
+        );
+        let env = scan_env(scanner.to_str().unwrap());
+
+        let folded = create_bead(
+            &path,
+            &NewBead {
+                title: title.into(),
+                description: Some("the same finding, worded differently".into()),
+                ..Default::default()
+            },
+            &env,
+        )
+        .expect("second create ran");
+
+        // (1) It handed back the EXISTING bead, not a new one.
+        assert_eq!(folded.id, first.id, "the fold must return the matched bead's row");
+
+        // (2) NO SECOND BEAD EXISTS. This is the assertion the whole feature is for, and it is the
+        //     one that is false against today's code.
+        let page = query_beads(&path, &BeadQuery::default(), TEST_GIT_ENV).expect("bd list ran");
+        let matching: Vec<_> = page.beads.iter().filter(|b| b.title == title).collect();
+        assert_eq!(matching.len(), 1, "a second bead was filed: {matching:?}");
+
+        // (3) The sighting was RECORDED on the existing bead — a fold that writes nothing loses the
+        //     report entirely, which is worse than the duplicate it avoided.
+        let detail = detail_bead(&path, &first.id, TEST_GIT_ENV).expect("bd show ran");
+        assert!(
+            detail.comments.iter().any(|c| c.text.contains("Duplicate folded by Sparkle")),
+            "the fold must comment on the matched bead, got {:?}",
+            detail.comments
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_scanner_verdict_of_no_duplicate_still_creates() {
+        let Some(ws) = TempWorkspace::new("nodup") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let path = ws.dir.to_string_lossy().to_string();
+        // Exit 0 = no duplicate, and exit 3 = could not tell. Contract §3: BOTH create. Exit 3 is
+        // the one that matters — the safety direction here is inverted versus every other guard in
+        // this repo, because falsely claiming a duplicate LOSES a finding.
+        for (code, tag) in [(0, "clean"), (3, "unknown")] {
+            let scanner = crate::bead_dup::write_fake_scanner(
+                &ws.dir,
+                &format!("fake-scan-{tag}.sh"),
+                code,
+                r#"{"id":null}"#,
+            );
+            let env = scan_env(scanner.to_str().unwrap());
+            let title = format!("Scanner verdict {tag} must still file the pending report");
+            let made = create_bead(
+                &path,
+                &NewBead { title: title.clone(), ..Default::default() },
+                &env,
+            )
+            .expect("create ran");
+            let detail = detail_bead(&path, &made.id, TEST_GIT_ENV).expect("bd show ran");
+            assert_eq!(detail.bead.title, title, "exit {code} must create a NEW bead");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stale_scanner_answer_creates_rather_than_commenting_into_the_void() {
+        let Some(ws) = TempWorkspace::new("stale") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let path = ws.dir.to_string_lossy().to_string();
+        // The scanner reads a cached TSV with a 900s TTL, so the bead it names may be gone. Without
+        // the `bd show` re-verify this would comment on nothing and drop the report.
+        let scanner = crate::bead_dup::write_fake_scanner(
+            &ws.dir,
+            "fake-stale.sh",
+            10,
+            r#"{"id":"sparkle-doesnotexist","status":"open","title":"x"}"#,
+        );
+        let env = scan_env(scanner.to_str().unwrap());
+        let title = "A stale index entry must not swallow the incoming report";
+        let made = create_bead(&path, &NewBead { title: title.into(), ..Default::default() }, &env)
+            .expect("create ran");
+        let detail = detail_bead(&path, &made.id, TEST_GIT_ENV).expect("bd show ran");
+        assert_eq!(detail.bead.title, title, "an unverifiable match must fall through to a create");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_auto_labelled_create_is_never_folded_even_when_the_scanner_says_duplicate() {
+        let Some(ws) = TempWorkspace::new("autolabel") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let path = ws.dir.to_string_lossy().to_string();
+        // THE CATASTROPHIC CASE, end to end: `buildAgentSpawn.ts` files one of these per Build agent
+        // and binds the id with `setAgentBeadId`. A fold here puts two live agents on ONE bead.
+        // The scanner is rigged to say "duplicate" so this can only pass on the SKIP LIST — a score
+        // threshold could never save it, since these beads are genuinely identical.
+        let first = create_bead(
+            &path,
+            &NewBead {
+                title: "Wire the duplicate scanner into the create paths".into(),
+                labels: Some(crate::bead_dup::AUTO_LABEL.into()),
+                ..Default::default()
+            },
+            TEST_GIT_ENV,
+        )
+        .expect("first create ran");
+        let scanner = crate::bead_dup::write_fake_scanner(
+            &ws.dir,
+            "fake-always-dup.sh",
+            10,
+            &format!(r#"{{"id":"{}","status":"open","title":"x"}}"#, first.id),
+        );
+        let env = scan_env(scanner.to_str().unwrap());
+        let second = create_bead(
+            &path,
+            &NewBead {
+                title: "Wire the duplicate scanner into the create paths".into(),
+                labels: Some(crate::bead_dup::AUTO_LABEL.into()),
+                ..Default::default()
+            },
+            &env,
+        )
+        .expect("second create ran");
+        assert_ne!(
+            second.id, first.id,
+            "a sparkle-auto create was FOLDED — two Build agents would share one bead id"
+        );
     }
 }

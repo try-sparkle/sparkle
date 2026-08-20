@@ -18,6 +18,10 @@ mod auto_send_tuner;
 /// The durable one-driver-per-PR lease behind auto-dispatch of `/babysit-pr` (bead sparkle-5gxom).
 /// NOT `pr_claims` — that is explicitly a courtesy, not a lock. See the module docs.
 mod babysit_lease;
+/// File-time duplicate detection for the app's own `bd create` paths, and — the part that matters —
+/// the ARGV-LEVEL SKIP LIST that keeps it away from the auto-filed beads a fold would corrupt.
+/// See `docs/bead-dedupe-contract.md` §6 and the module docs.
+mod bead_dup;
 mod beads_cmd;
 /// Recovering the paths of a drag whose Tauri event carried none — wry reads only the deprecated
 /// `NSFilenamesPboardType`, so a modern-only drag source drops silently. See the module docs.
@@ -995,6 +999,7 @@ pub fn run() {
             notes::create_bead_full,
             notes::bead_dep_add,
             notes::bead_label,
+            notes::bead_priority,
             notes::bead_comment,
             notes::delete_bead,
             notes::concierge_memory_remember,

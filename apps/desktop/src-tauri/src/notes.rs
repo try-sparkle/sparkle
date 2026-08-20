@@ -474,19 +474,83 @@ pub async fn create_bead(
     title: String,
     body: String,
     labels: Option<String>,
+    priority: Option<i64>,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut args: Vec<&str> = vec!["create", &title, "-d", &body, "--json"];
-        let labels = labels.as_deref().map(str::trim).filter(|s| !s.is_empty());
-        if let Some(l) = labels {
-            args.push("-l");
-            args.push(l);
-        }
-        let output = run_bd(&project_path, &args)?;
-        select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
+        create_bead_inner(
+            &project_path,
+            &title,
+            &body,
+            labels.as_deref(),
+            priority,
+            beads_cmd::NO_EXTRA_ENV,
+        )
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
+}
+
+/// Sync core of [`create_bead`]; a plain fn so the async command offloads it via `spawn_blocking`
+/// and a test can drive the PRODUCTION path (the fold included) without a Tauri runtime.
+///
+/// `env` is the injection seam and it is the one the call already had: `bead_dup::fold_or_create`
+/// reads `SPARKLE_BEAD_DUP_SCAN` out of this slice before the process environment, so a test points
+/// the real resolution at a fake scanner instead of overriding a defaulted `deps` parameter — which
+/// would leave the line that supplies the real value covered by nothing.
+///
+/// The title rides `--title=<t>`, NOT the positional `bd create <title>` slot. A positional operand
+/// is the one place bd's parser cannot tell content from a flag: it rejects a title starting with
+/// `-` outright, and a plain markdown bullet ("- fix the thing") is enough to trigger it. The `=`
+/// form binds the value inside a single argv token, so no leading dash can be re-read as an option.
+/// `beads_cmd::build_create_args` already did this; this path was the one still exposed.
+fn create_bead_inner(
+    project_path: &str,
+    title: &str,
+    body: &str,
+    labels: Option<&str>,
+    priority: Option<i64>,
+    env: beads_cmd::ChildEnv<'_>,
+) -> Result<String, String> {
+    let labels = labels.map(str::trim).filter(|s| !s.is_empty());
+    // Duplicate detection runs BEFORE the create and is gated by `bead_dup`'s skip list — see that
+    // module's note on why an unconditional fold corrupts agent↔bead bindings. `None` (which is
+    // every uncertainty, not just "no match") falls through to the create below.
+    if let Some(row) = crate::bead_dup::fold_or_create(
+        project_path,
+        title,
+        body,
+        labels.unwrap_or(""),
+        "",
+        "",
+        env,
+    ) {
+        return Ok(row.to_string());
+    }
+    let priority = priority.map(bd_priority_arg).transpose()?;
+    let title_arg = format!("--title={}", title.trim());
+    let mut args: Vec<&str> = vec!["create", &title_arg, "-d", body, "--json"];
+    if let Some(l) = labels {
+        args.push("-l");
+        args.push(l);
+    }
+    if let Some(p) = priority.as_deref() {
+        args.push("-p");
+        args.push(p);
+    }
+    let output = run_bd_env(project_path, &args, env)?;
+    select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
+}
+
+/// bd's `-p` value for a caller-supplied priority, or an error naming the range.
+///
+/// Validated HERE as well as in the concierge registry's zod schema because this command is reached
+/// from more than that one route, and bd's own rejection of an out-of-range value surfaces as an
+/// opaque non-zero exit rather than something the caller can act on.
+fn bd_priority_arg(p: i64) -> Result<String, String> {
+    if !(0..=4).contains(&p) {
+        return Err(format!("invalid priority: {p} (expected 0-4)"));
+    }
+    Ok(p.to_string())
 }
 
 /// Decide what to return from `create_bead` given bd's process result. Extracted as a pure
@@ -770,7 +834,9 @@ fn build_create_bead_args(
     let issue_type = if issue_type.trim().is_empty() { "task" } else { issue_type };
     let mut args: Vec<String> = vec![
         "create".to_string(),
-        title.to_string(),
+        // `--title=<t>`, never the positional slot — see `create_bead_inner` for why bd's parser
+        // cannot tell a `-`-leading positional operand from a flag.
+        format!("--title={}", title.trim()),
         "-d".to_string(),
         body.to_string(),
         "-t".to_string(),
@@ -808,13 +874,46 @@ pub async fn create_bead_full(
     labels: String,
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let args = build_create_bead_args(&title, &body, &issue_type, &parent, &deps, &labels);
-        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        let output = run_bd(&project_path, &arg_refs)?;
-        select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
+        create_bead_full_inner(
+            &project_path,
+            &title,
+            &body,
+            &issue_type,
+            &parent,
+            &deps,
+            &labels,
+            beads_cmd::NO_EXTRA_ENV,
+        )
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
+}
+
+/// Sync core of [`create_bead_full`]. See [`create_bead_inner`] for why `env` is the seam.
+///
+/// This is the path `buildAgentSpawn.ts` and `tasks.ts::createChildTasks` reach, which is exactly
+/// why the fold's skip list matters more here than anywhere: those callers pass `sparkle-auto` and
+/// a non-empty `parent` respectively, and both are refused a scan outright.
+#[allow(clippy::too_many_arguments)]
+fn create_bead_full_inner(
+    project_path: &str,
+    title: &str,
+    body: &str,
+    issue_type: &str,
+    parent: &str,
+    deps: &str,
+    labels: &str,
+    env: beads_cmd::ChildEnv<'_>,
+) -> Result<String, String> {
+    if let Some(row) =
+        crate::bead_dup::fold_or_create(project_path, title, body, labels, issue_type, parent, env)
+    {
+        return Ok(row.to_string());
+    }
+    let args = build_create_bead_args(title, body, issue_type, parent, deps, labels);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let output = run_bd_env(project_path, &arg_refs, env)?;
+    select_bd_result(output.success, output.stdout.trim(), output.stderr.trim())
 }
 
 /// Add a dependency: `bd dep add <blocked> <blocker>` — `blocked_id` depends on (is blocked by)
@@ -870,6 +969,35 @@ pub async fn bead_close(project_path: String, id: String) -> Result<String, Stri
     })
     .await
     .map_err(|e| format!("bd task failed: {e}"))?
+}
+
+/// Set a bead's priority: `bd update <id> -p <0-4>`.
+///
+/// THE MISSING HALF OF THE PRIORITY SEAM. Priority could not be set at filing time from anywhere in
+/// the app, and it could not be changed afterwards either — the board's `update_item` reached only
+/// status and labels — so a triage rubric had nothing to write through and every bead sat at bd's
+/// default forever. `bd update -p` rather than the `bd priority` subcommand because that is the argv
+/// shape `beads_cmd::build_update_args` already uses and the round-trip test already covers.
+/// Sync core of [`bead_priority`]; a plain fn so the async command offloads it via `spawn_blocking`
+/// and the tests can drive the id/range guards directly.
+fn bead_priority_inner(project_path: String, id: String, priority: i64) -> Result<String, String> {
+    if !valid_bead_id(&id) {
+        return Err(format!("invalid bead id: {id}"));
+    }
+    let p = bd_priority_arg(priority)?;
+    let output = run_bd(&project_path, &["update", &id, "-p", &p])?;
+    select_bd_action(output.success, output.stdout.trim(), output.stderr.trim())
+}
+
+#[tauri::command]
+pub async fn bead_priority(
+    project_path: String,
+    id: String,
+    priority: i64,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || bead_priority_inner(project_path, id, priority))
+        .await
+        .map_err(|e| format!("bd task failed: {e}"))?
 }
 
 /// Add or remove a label on a bead: `bd label add|remove "$2" "$3"`. `action` is validated to be
@@ -1320,7 +1448,7 @@ mod tests {
         let args = build_create_bead_args("My Title", "body text", "", "", "", "");
         assert_eq!(
             args,
-            vec!["create", "My Title", "-d", "body text", "-t", "task", "--json"]
+            vec!["create", "--title=My Title", "-d", "body text", "-t", "task", "--json"]
         );
     }
 
@@ -1339,7 +1467,7 @@ mod tests {
             args,
             vec![
                 "create",
-                "Title",
+                "--title=Title",
                 "-d",
                 "Body",
                 "-t",
@@ -1361,7 +1489,7 @@ mod tests {
         let args = build_create_bead_args("T", "B", "task", "", "", "docs");
         assert_eq!(
             args,
-            vec!["create", "T", "-d", "B", "-t", "task", "-l", "docs", "--json"]
+            vec!["create", "--title=T", "-d", "B", "-t", "task", "-l", "docs", "--json"]
         );
     }
 
@@ -1371,8 +1499,34 @@ mod tests {
         // so it can never break out — the direct-exec equivalent of the old positional-arg scheme.
         let args = build_create_bead_args("'; rm -rf / #", "b", "", "", "", "");
         assert_eq!(args[0], "create");
-        assert_eq!(args[1], "'; rm -rf / #");
+        assert_eq!(args[1], "--title='; rm -rf / #");
         assert!(args.contains(&"--json".to_string()));
+    }
+
+    /// THE POSITIONAL-TITLE HAZARD, on the path that still had it.
+    ///
+    /// `bd` rejects a positional title beginning with `-` outright — a plain markdown bullet is
+    /// enough — and its own error names `--title=` as the way to mean it. `beads_cmd` was already on
+    /// the safe form; these two were not. Asserting the `=` FORM specifically matters: a
+    /// separate-token `--title <t>` would still let a `-`-leading value be re-read as an option.
+    #[test]
+    fn both_notes_create_paths_bind_the_title_inside_one_argv_token() {
+        let args = build_create_bead_args("- fix the thing", "b", "", "", "", "");
+        assert_eq!(args[1], "--title=- fix the thing");
+        assert!(
+            !args.iter().any(|a| a == "--title"),
+            "a separate-token --title still exposes a dash-leading value: {args:?}"
+        );
+    }
+
+    #[test]
+    fn bd_priority_arg_accepts_bds_range_and_refuses_anything_else() {
+        for p in 0..=4 {
+            assert_eq!(bd_priority_arg(p).unwrap(), p.to_string());
+        }
+        for p in [-1, 5, 99] {
+            assert!(bd_priority_arg(p).is_err(), "priority {p} must be refused");
+        }
     }
 
     #[test]
@@ -2182,5 +2336,175 @@ mod tests {
             !src.contains("const BD_TIMEOUT"),
             "this module must not declare its own bd timeout — the two would drift apart"
         );
+    }
+
+    // ── THE BOARD'S CREATE PATHS, END TO END, AGAINST A REAL bd ──────────────────────────────
+    //
+    // These drive `create_bead_inner` / `create_bead_full_inner` — the PRODUCTION bodies the Tauri
+    // commands delegate to — with a fake scanner supplied through the SAME `ChildEnv` the call
+    // already carries. No defaulted `deps` parameter: the line that resolves the real scanner is
+    // the line these exercise.
+    //
+    // The workspace harness is `beads_cmd`'s, reused rather than re-created: its two roborev guards
+    // are easy to get subtly wrong twice, and an unguarded temp repo orphans review rows.
+
+    #[cfg(unix)]
+    fn scan_env<'a>(scanner: &'a str) -> Vec<(&'a str, &'a str)> {
+        let mut v: Vec<(&str, &str)> = crate::beads_cmd::tests::TEST_GIT_ENV.to_vec();
+        v.push((crate::bead_dup::SCANNER_ENV_VAR, scanner));
+        v
+    }
+
+    /// The ids currently in the workspace, read straight from bd rather than through any code under
+    /// test — so "no second bead was filed" is measured, not inferred.
+    #[cfg(unix)]
+    fn bead_ids(ws: &crate::beads_cmd::tests::TempWorkspace, bd: &str) -> Vec<String> {
+        let out = ws.bd(bd, &["list", "--status", "all", "--json", "--limit", "0"]).expect("bd list");
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+        v.as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| r.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_bead_inner_folds_onto_the_match_instead_of_filing_a_second_bead() {
+        let Some(ws) = crate::beads_cmd::tests::TempWorkspace::new("notes-fold") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let Some(bd) = cached_bd_path() else { return };
+        let path = ws.dir.to_string_lossy().to_string();
+        let title = "The staleness hook fires once and never re-asks mid session";
+
+        let first = create_bead_inner(&path, title, "first report", None, None, beads_cmd::NO_EXTRA_ENV)
+            .expect("first create ran");
+        let first_id = crate::bead_dup::tests::id_of(&first);
+        let before = bead_ids(&ws, &bd);
+        assert_eq!(before.len(), 1, "the first call must CREATE: {before:?}");
+
+        let scanner = crate::bead_dup::write_fake_scanner(
+            &ws.dir,
+            "notes-fold.sh",
+            10,
+            &format!(r#"{{"id":"{first_id}","status":"open","title":"x"}}"#),
+        );
+        let env = scan_env(scanner.to_str().unwrap());
+        let folded =
+            create_bead_inner(&path, title, "the same thing, said differently", None, None, &env)
+                .expect("second create ran");
+
+        // (1) The caller was handed the EXISTING bead's row — same JSON shape `bd create` emits, so
+        //     `parseCreatedBeadId` on the TS side reads it unchanged.
+        assert_eq!(crate::bead_dup::tests::id_of(&folded), first_id);
+        // (2) NO SECOND BEAD. False against the pre-change code, which always creates.
+        assert_eq!(bead_ids(&ws, &bd), before, "a second bead was filed");
+        // (3) The sighting was recorded, so the report is not simply dropped.
+        let shown = ws.bd(&bd, &["show", &first_id, "--json", "--include-comments"]).expect("bd show");
+        let text = String::from_utf8_lossy(&shown.stdout);
+        assert!(text.contains("Duplicate folded by Sparkle"), "no fold comment on the match: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_bead_full_inner_never_folds_a_parented_child() {
+        let Some(ws) = crate::beads_cmd::tests::TempWorkspace::new("notes-parent") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let Some(bd) = cached_bd_path() else { return };
+        let path = ws.dir.to_string_lossy().to_string();
+
+        // The epic the children hang off.
+        let epic = create_bead_full_inner(
+            &path,
+            "Decompose the duplicate detection work into shippable pieces",
+            "",
+            "epic",
+            "",
+            "",
+            "",
+            beads_cmd::NO_EXTRA_ENV,
+        )
+        .expect("epic create ran");
+        let epic_id = crate::bead_dup::tests::id_of(&epic);
+
+        // A scanner rigged to call EVERYTHING a duplicate of the epic. Only the skip list can save
+        // these; a score threshold never could, since decomposition siblings are near-identical.
+        let scanner = crate::bead_dup::write_fake_scanner(
+            &ws.dir,
+            "notes-always-dup.sh",
+            10,
+            &format!(r#"{{"id":"{epic_id}","status":"open","title":"x"}}"#),
+        );
+        let env = scan_env(scanner.to_str().unwrap());
+
+        let mut ids = Vec::new();
+        for child in ["Wire the scanner resolution and its bounds", "Wire the priority seam through the board"] {
+            let row = create_bead_full_inner(&path, child, "", "task", &epic_id, "", "", &env)
+                .expect("child create ran");
+            ids.push(crate::bead_dup::tests::id_of(&row));
+        }
+        assert_ne!(ids[0], ids[1], "two decomposition siblings collapsed onto one bead");
+        assert!(!ids.contains(&epic_id), "a child was folded onto its own epic");
+        assert_eq!(bead_ids(&ws, &bd).len(), 3, "every child must be filed in its own right");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_priority_supplied_at_filing_time_reaches_the_bead() {
+        let Some(ws) = crate::beads_cmd::tests::TempWorkspace::new("notes-priority") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let Some(bd) = cached_bd_path() else { return };
+        let path = ws.dir.to_string_lossy().to_string();
+        // Priority 0 specifically — bd's HIGHEST, and the value a truthiness test would drop.
+        let row = create_bead_inner(
+            &path,
+            "A finding urgent enough to be filed at the top of the queue",
+            "b",
+            None,
+            Some(0),
+            beads_cmd::NO_EXTRA_ENV,
+        )
+        .expect("create ran");
+        let id = crate::bead_dup::tests::id_of(&row);
+        let shown = ws.bd(&bd, &["show", &id, "--json"]).expect("bd show");
+        let v: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("show json");
+        let got = v.get("priority").or_else(|| v.get(0).and_then(|r| r.get("priority")));
+        assert_eq!(got.and_then(|p| p.as_i64()), Some(0), "priority did not reach bd: {v}");
+
+        // …and the update half: `bead_priority_inner` moves it afterwards.
+        bead_priority_inner(path.clone(), id.clone(), 3).expect("bd update -p ran");
+        let shown = ws.bd(&bd, &["show", &id, "--json"]).expect("bd show");
+        let v: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("show json");
+        let got = v.get("priority").or_else(|| v.get(0).and_then(|r| r.get("priority")));
+        assert_eq!(got.and_then(|p| p.as_i64()), Some(3), "priority was not updated: {v}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dash_leading_title_survives_the_notes_create_path() {
+        let Some(ws) = crate::beads_cmd::tests::TempWorkspace::new("notes-dash") else {
+            eprintln!("SKIP: bd not installed or could not init a workspace");
+            return;
+        };
+        let Some(bd) = cached_bd_path() else { return };
+        let path = ws.dir.to_string_lossy().to_string();
+        // bd REJECTS this in the positional slot, which is what this path used to use.
+        let title = "- a bullet-leading title bd would reject positionally";
+        let row = create_bead_inner(&path, title, "b", None, None, beads_cmd::NO_EXTRA_ENV)
+            .expect("create ran");
+        let id = crate::bead_dup::tests::id_of(&row);
+        let shown = ws.bd(&bd, &["show", &id, "--json"]).expect("bd show");
+        let v: serde_json::Value = serde_json::from_slice(&shown.stdout).expect("show json");
+        let got = v.get("title").or_else(|| v.get(0).and_then(|r| r.get("title")));
+        assert_eq!(got.and_then(|t| t.as_str()), Some(title));
     }
 }

@@ -28,6 +28,7 @@ import {
   claimBead,
   closeBead,
   labelBead,
+  setBeadPriority,
   deleteBead,
   bucketBeads,
   columnFor,
@@ -225,12 +226,25 @@ export async function blockedItems(projectPath: string): Promise<BoardResult<Boa
 // Writes
 // ---------------------------------------------------------------------------------------------
 
+/**
+ * File a work item.
+ *
+ * `priority` is bd's 0-4 (0 = highest) and is OPTIONAL — omitting it leaves bd's default, which is
+ * what every existing caller gets. It is here because filing was the one place priority could not
+ * be expressed at all, so nothing that decides how urgent a finding is had anywhere to write it.
+ *
+ * `number | null | undefined` for the reason `services/beads.ts::createBead` documents: the value
+ * crosses into a Rust `Option<i64>`, and that shape travels as an explicit `null`.
+ */
 export async function createItem(
   projectPath: string,
   title: string,
   body: string,
+  priority?: number | null,
 ): Promise<BoardResult<{ id: string }>> {
-  const created = await attempt("create_item", () => createBead(projectPath, title, body));
+  const created = await attempt("create_item", () =>
+    createBead(projectPath, title, body, undefined, priority),
+  );
   if (!created.ok) return created;
   if (!created.data) {
     return refuse(
@@ -248,6 +262,9 @@ export interface UpdateItemInput {
   status?: "in_progress" | "closed";
   addLabels?: readonly string[];
   removeLabels?: readonly string[];
+  /** bd's 0-4, 0 = highest. Until this existed `update_item` could change status and labels only,
+   *  so a priority set wrongly at filing time could never be corrected from here. */
+  priority?: number | null;
 }
 
 /**
@@ -278,6 +295,12 @@ export async function updateItem(
   for (const label of input.removeLabels ?? []) {
     work.push(labelBead(projectPath, "remove", id, label));
     applied.push(`-${label}`);
+  }
+  // `!= null` deliberately, not a truthiness test: priority 0 is bd's HIGHEST and would be dropped
+  // by `if (input.priority)`, which is the one value a triage pass most wants to write.
+  if (input.priority != null) {
+    work.push(setBeadPriority(projectPath, id, input.priority));
+    applied.push(`priority=${input.priority}`);
   }
 
   const results = await Promise.allSettled(work);

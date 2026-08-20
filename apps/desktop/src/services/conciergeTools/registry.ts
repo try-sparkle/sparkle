@@ -1700,9 +1700,14 @@ const boardItem = boardScope.extend({ id: z.string().min(1, "an item id is requi
 const boardWriteScope = z.object({ projectId: projectIdArg }).strict();
 const boardWriteItem = boardWriteScope.extend({ id: z.string().min(1, "an item id is required") });
 
+/** bd's priority scale: 0-4, 0 = HIGHEST. Validated here (and again in Rust) so an out-of-range
+ *  value is a `bad-args` error naming the range rather than an opaque non-zero bd exit. */
+const beadPriority = z.number().int().min(0, "priority is 0-4 (0 = highest)").max(4);
+
 const createItemArgs = boardWriteScope.extend({
   title: z.string().min(1, "a title is required"),
   body: z.string().optional(),
+  priority: beadPriority.optional(),
 });
 
 /** At least one field must actually change — `.refine` rather than all-optional, so an empty update
@@ -1712,10 +1717,17 @@ const updateItemArgs = boardWriteItem
     status: z.enum(["in_progress", "closed"]).optional(),
     addLabels: z.array(z.string().min(1)).optional(),
     removeLabels: z.array(z.string().min(1)).optional(),
+    priority: beadPriority.optional(),
   })
   .refine(
-    (a) => a.status !== undefined || a.addLabels?.length || a.removeLabels?.length,
-    "nothing to update — pass `status`, `addLabels`, or `removeLabels`",
+    (a) =>
+      a.status !== undefined ||
+      a.addLabels?.length ||
+      a.removeLabels?.length ||
+      // `!== undefined`, not truthiness: priority 0 is bd's HIGHEST and must not read as "nothing
+      // to update".
+      a.priority !== undefined,
+    "nothing to update — pass `status`, `priority`, `addLabels`, or `removeLabels`",
   );
 
 /** Resolve the board's project: the named one, or the selected one when the name is omitted. */
@@ -1755,7 +1767,7 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
   // The writes resolve through `withProject` — no store fallback. See boardWriteScope.
   create_item: route(createItemArgs, (a, ctx) =>
     withProject(ctx, a.projectId, async (p) =>
-      fromBoard(ctx, await createItem(p.rootPath, a.title, a.body ?? "")),
+      fromBoard(ctx, await createItem(p.rootPath, a.title, a.body ?? "", a.priority)),
     ),
   ),
   update_item: route(updateItemArgs, (a, ctx) =>
@@ -1766,6 +1778,7 @@ const BOARD_ROUTES: Record<BoardOp, Handler> = {
           status: a.status,
           addLabels: a.addLabels,
           removeLabels: a.removeLabels,
+          priority: a.priority,
         }),
       ),
     ),

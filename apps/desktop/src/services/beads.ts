@@ -188,15 +188,47 @@ export function parseCreatedBeadId(raw: string): string | null {
 
 /** Create a bead for a deliverable agent and return its new id, or null if bd failed. `labels` is a
  *  comma-separated list; auto-created agent beads pass {@link AUTO_LABEL} so the board can tell them
- *  apart from human-filed backlog. */
+ *  apart from human-filed backlog.
+ *
+ *  `priority` (bd's 0-4, 0 = highest) is OPTIONAL, so every existing caller is unaffected. It exists
+ *  because priority could not be set at FILING time from anywhere in the app — a triage rubric had
+ *  nothing to write through, and every bead the app files landed at bd's default.
+ *
+ *  Typed `number | null | undefined` rather than `number?`: the Rust side takes an `Option<i64>`,
+ *  and a Rust `Option` crosses this wire as an explicit `null`, never as an absent key. A signature
+ *  that admits only `undefined` describes a shape the bridge does not produce — which is how an
+ *  all-or-nothing parser ends up discarding a whole payload silently.
+ *
+ *  NOTE the id this returns can be an EXISTING bead's. The Rust create path folds a create it is
+ *  confident duplicates an open bead (see `src-tauri/src/bead_dup.rs`) and hands back that bead's
+ *  row, which is the same JSON shape `bd create` emits. Callers that bind the id to something — an
+ *  agent, a plan child — are exactly the ones the fold's skip list refuses to touch. */
 export async function createBead(
   projectPath: string,
   title: string,
   body: string,
   labels?: string,
+  priority?: number | null,
 ): Promise<string | null> {
-  const raw = await invoke<string>("create_bead", { projectPath, title, body, labels });
+  const raw = await invoke<string>("create_bead", {
+    projectPath,
+    title,
+    body,
+    labels,
+    priority: priority ?? null,
+  });
   return parseCreatedBeadId(raw);
+}
+
+/** `bd update <id> -p <0-4>` — set a bead's priority (0 = highest). The other half of the priority
+ *  seam: filing can set one now, and this changes it afterwards. Rejected on the Rust side when out
+ *  of range, so an invalid value is an error rather than an opaque bd exit. */
+export async function setBeadPriority(
+  projectPath: string,
+  id: string,
+  priority: number,
+): Promise<void> {
+  await invoke("bead_priority", { projectPath, id, priority });
 }
 
 /** `bd update <id> --claim` — mark a bead in_progress (also assigns it). */

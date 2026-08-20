@@ -13,6 +13,7 @@ const createBead = vi.fn();
 const claimBead = vi.fn();
 const closeBead = vi.fn();
 const labelBead = vi.fn();
+const setBeadPriority = vi.fn();
 const deleteBead = vi.fn();
 
 vi.mock("../beads", async (importOriginal) => {
@@ -28,6 +29,7 @@ vi.mock("../beads", async (importOriginal) => {
     claimBead: (...a: unknown[]) => claimBead(...a),
     closeBead: (...a: unknown[]) => closeBead(...a),
     labelBead: (...a: unknown[]) => labelBead(...a),
+    setBeadPriority: (...a: unknown[]) => setBeadPriority(...a),
     deleteBead: (...a: unknown[]) => deleteBead(...a),
   };
 });
@@ -67,6 +69,7 @@ beforeEach(() => {
   claimBead.mockResolvedValue(undefined);
   closeBead.mockResolvedValue(undefined);
   labelBead.mockResolvedValue(undefined);
+  setBeadPriority.mockResolvedValue(undefined);
   deleteBead.mockResolvedValue(undefined);
 });
 
@@ -187,8 +190,24 @@ describe("a project without beads is a supported state, not a failure", () => {
 describe("writes", () => {
   it("create_item returns the new id", async () => {
     const r = await createItem(ROOT, "a task", "body");
-    expect(createBead).toHaveBeenCalledWith(ROOT, "a task", "body");
+    // No labels, no priority — the shape every existing caller gets, unchanged.
+    expect(createBead).toHaveBeenCalledWith(ROOT, "a task", "body", undefined, undefined);
     expect(r.ok && r.data).toEqual({ id: "" });
+  });
+
+  // THE PRIORITY SEAM AT FILING TIME. Before this, priority could not be expressed at create at
+  // all, so a triage rubric had nothing to write through — this assertion is false against that
+  // code, which passed three arguments and no fourth or fifth.
+  it("create_item forwards a priority through to the bd create", async () => {
+    await createItem(ROOT, "a task", "body", 2);
+    expect(createBead).toHaveBeenCalledWith(ROOT, "a task", "body", undefined, 2);
+  });
+
+  // Priority 0 is bd's HIGHEST and is the value a truthiness test silently drops — which would make
+  // the seam useless for exactly the findings it exists to raise.
+  it("create_item forwards priority 0 rather than treating it as absent", async () => {
+    await createItem(ROOT, "urgent", "body", 0);
+    expect(createBead).toHaveBeenCalledWith(ROOT, "urgent", "body", undefined, 0);
   });
 
   // `bd create` returning something unparseable must not read as a success with no id — the caller
@@ -209,6 +228,24 @@ describe("writes", () => {
     expect(closeBead).toHaveBeenCalledWith(ROOT, "x");
     expect(labelBead).toHaveBeenCalledWith(ROOT, "add", "x", "shipped");
     expect(done.ok && done.data.applied).toEqual(["status=closed", "+shipped"]);
+  });
+
+  // THE OTHER HALF OF THE SEAM: until this existed `update_item` could change status and labels
+  // only, so a priority set wrongly at filing time could never be corrected from the board.
+  it("update_item sets a priority, including the highest one", async () => {
+    const bumped = await updateItem(ROOT, "x", { priority: 1 });
+    expect(setBeadPriority).toHaveBeenCalledWith(ROOT, "x", 1);
+    expect(bumped.ok && bumped.data.applied).toEqual(["priority=1"]);
+
+    setBeadPriority.mockClear();
+    const top = await updateItem(ROOT, "x", { priority: 0 });
+    expect(setBeadPriority).toHaveBeenCalledWith(ROOT, "x", 0);
+    expect(top.ok && top.data.applied).toEqual(["priority=0"]);
+  });
+
+  it("update_item leaves priority alone when none was asked for", async () => {
+    await updateItem(ROOT, "x", { status: "closed" });
+    expect(setBeadPriority).not.toHaveBeenCalled();
   });
 
   // The reason updateItem uses allSettled: a failing label must not cancel the status change that
