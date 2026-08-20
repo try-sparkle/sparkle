@@ -241,6 +241,8 @@ import {
   type ConciergeActionReceipt,
 } from "./conciergeReceipts";
 import type { ConciergeToolReply } from "./conciergeTools/registry";
+import { auditLandedClaims } from "@sparkle/core/testing/landedClaim";
+
 
 
 // The concierge's AI-enhancements gate (bead sparkle-4562) is a real precondition for a turn and
@@ -1517,7 +1519,94 @@ describe("controlListener", () => {
       fire({ reqId: "sgV5", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
       await flush();
       expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      // …and this is the population that SHOULD be told to go land something: two commits the base
+      // does not have. The pair below asserts the other side, where that instruction is wrong.
+      expect(String((lastReply() as { error?: string }).error)).toMatch(/open a PR and merge it/i);
       expect(goalOf(callerId)!.metAt).toBeUndefined();
+    });
+
+    it("REFUSES a landed-kind goal that is holding NOTHING BACK without telling it to open a PR", async () => {
+      // THE LANDED-THEN-PARKED SHAPE, driven through the real op rather than asserted on the copy
+      // helper — the wiring is the part that was missing, and a `goalVerify` unit test cannot see it.
+      // The branch here is clean with `ahead: 0` and carries NO merge watermark, which is exactly
+      // what an agent reads after its work merged and its worktree was parked or moved onto another
+      // branch. `landed` is still `false`, so the goal still does not close; what changes is that
+      // the refusal stops asserting a git verdict git contradicts, and stops sending the agent to
+      // open a rival PR for work already on origin/main.
+      //
+      // ⚠️ THIS FIXTURE IS ALSO A NEVER-COMMITTED AGENT (roborev 65742) — byte-identical, because
+      // nothing window-local separates them. That is precisely why the copy under test speaks
+      // conditionally instead of claiming a merge; the case below pins the other half of that.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the retro-drain fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 191,
+        dirty: false,
+        filesChanged: 0,
+        insertions: 0,
+        deletions: 0,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV5b", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      // THE GATE DOES NOT MOVE. "I am holding nothing back" is not ancestry, so this still refuses.
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+      const err = String((lastReply() as { error?: string }).error);
+      expect(err).not.toMatch(/Land it \(open a PR and merge it\)/i);
+      expect(err).not.toMatch(/git says it is not on origin\/main/i);
+      // The exit for the landed half, named: prove it by ancestry, then have the concierge close it.
+      expect(err).toMatch(/merge-base --is-ancestor/);
+      expect(err).toMatch(/concierge/i);
+      // …and the exit for the not-landed half, in the same breath, since neither the app nor this
+      // test can tell which agent is reading it.
+      expect(err).toMatch(/commit it and land it/i);
+    });
+
+    it("gives an agent holding ONLY UNCOMMITTED EDITS the same conditional copy, not a merge claim", async () => {
+      // roborev 65742's third population. `dirty: true, ahead: 0` resolves to `building_unsaved`,
+      // which `hasUnmergedCommittedWork` reads as FALSE — so this agent reaches the same arm as the
+      // parked one while having merged nothing whatsoever. A sentence claiming its work might
+      // already be on origin/main would be affirmatively wrong here and would discourage the one
+      // correct action, so the copy must keep the commit-first instruction it shares with the
+      // never-committed case.
+      useProjectStore
+        .getState()
+        .setAgentGoal(projectId, callerId, "the parser fix is merged to origin/main", undefined, "agent", {
+          kind: "landed",
+        });
+      useRuntimeStore.getState().setBranchStatus(callerId, {
+        ahead: 0,
+        behind: 0,
+        dirty: true,
+        filesChanged: 4,
+        insertions: 120,
+        deletions: 3,
+        worktreeOnBranch: true,
+      });
+      fire({ reqId: "sgV5c", op: "set_agent_goal_met", callerAgentId: callerId, payload: { met: true } });
+      await flush();
+      expect(lastReply()).toMatchObject({ ok: false, code: "goal_not_self_markable" });
+      expect(goalOf(callerId)!.metAt).toBeUndefined();
+      const err = String((lastReply() as { error?: string }).error);
+      expect(err).toMatch(/commit it and land it/i);
+      // …and it must name the door this reader can open ITSELF, scoped to its own clause so a
+      // self-close path named only inside the landed-conditional branch cannot satisfy it
+      // (roborev 65745, then 65749).
+      const commitClause = err.split(/(?<=[.;])\s+/).find((t) => /commit it and land it/i.test(t));
+      expect(commitClause, err).toBeDefined();
+      expect(commitClause!).toMatch(/mark this met again/i);
+      expect(commitClause!).not.toMatch(/concierge/i);
+      // And no claim that the work is on main may stand unconditionally — the SAME rule object the
+      // core suite uses, imported rather than restated, so widening it there cannot leave this layer
+      // (the one that drives the real op, and so the one agents actually read) on the old predicate.
+      const audit = auditLandedClaims(err);
+      expect(audit.candidates.length, `no landed-claim sentence found in: ${err}`).toBeGreaterThan(0);
+      expect(audit.violations, "an unconditional landed claim").toEqual([]);
     });
 
     it("still REFUSES a HUMAN-kind goal even when the branch is on origin main", async () => {

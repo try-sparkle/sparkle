@@ -281,7 +281,10 @@ function sampleOfKind(kind: GoalVerifyKind): GoalVerify {
  * close a real goal. Add a field to {@link GoalVerifyEvidence} and it must be answered here too, or
  * the question stops meaning "given the best possible evidence".
  */
-const OMNISCIENT_EVIDENCE: GoalVerifyEvidence = { landed: true };
+// `unlandedWork: false` is this bit's most-favourable value, not a typo: the question it answers is
+// "is the branch holding work back", so NO is the reading that could never stand in the way of a
+// close. Answering it keeps the counterfactual honest even though `canSelfMarkMet` ignores it.
+const OMNISCIENT_EVIDENCE: GoalVerifyEvidence = { landed: true, unlandedWork: false };
 
 /**
  * Could the AGENT ITSELF ever close a goal carrying this kind of check, given the best evidence?
@@ -376,6 +379,26 @@ export function mayReplaceVerify(
 export interface GoalVerifyEvidence {
   /** Is this agent's work on origin/main? Computed from branch reachability — never agent-supplied. */
   landed?: boolean | undefined;
+  /**
+   * Does this agent hold COMMITTED WORK that is not on origin/main? Same provenance as `landed` —
+   * read from the branch's ahead-count, never agent-supplied.
+   *
+   * ── WHY `landed: false` ALONE CANNOT PICK THE RIGHT SENTENCE ─────────────────────────────────
+   * `landed` is computed as a positive test (a merge watermark, minus a new-work veto), so its
+   * `false` covers agents that need OPPOSITE next actions:
+   *   1. `unlandedWork: true` — the agent is holding commits main does not have. "Land it" is right.
+   *   2. `unlandedWork: false` — nothing is being held back. This is the AMBIGUOUS one, and it is
+   *      ambiguous all the way down: it is what an agent reads whose work MERGED and whose worktree
+   *      was then parked or moved onto another branch (the watermark belongs to the branch it left),
+   *      AND what an agent that has committed nothing at all reads, AND what an agent holding only
+   *      uncommitted edits reads. Window-local state cannot separate them — only git can, which is
+   *      why the copy for this arm asks the agent to run the ancestry check rather than telling it
+   *      what happened.
+   * Read ONLY by {@link selfMarkRefusal}, never by {@link canSelfMarkMet}: it decides what to TELL
+   * the agent, never whether the goal may close. `undefined` ("not looked up") keeps the original
+   * sentence, so a caller that does not compute it is unaffected.
+   */
+  unlandedWork?: boolean | undefined;
   /**
    * Did a caller EVER choose this check — for this goal or an earlier one it was carried from?
    *
@@ -477,6 +500,38 @@ export function selfMarkRefusal(verify: GoalVerify, evidence?: GoalVerifyEvidenc
     // worse than no refusal: the agent stops looking for the door that exists. So each arm below
     // names the ACTION that will close the goal by itself.
     case "landed":
+      // ── A BRANCH HOLDING NOTHING BACK MUST NOT BE TOLD WHAT GIT SAID ───────────────────────────
+      // `landed: false` is a POSITIVE test failing, not git's no. With `unlandedWork: false` the
+      // honest reading is "nothing has been observed reaching origin/main, and nothing is
+      // outstanding" — which is simultaneously what a landed-then-parked agent looks like (its merge
+      // watermark belongs to the branch its worktree left), what an agent that committed nothing
+      // looks like, and what an agent holding only uncommitted edits looks like. Window-local state
+      // cannot tell those apart, so this arm must not claim ANY of them: the previous copy asserted
+      // the work was unlanded and offered exactly one action, opening a PR — which for a
+      // landed-then-parked agent duplicates merged work (the rival PR `scripts/pr-for-branch.sh`
+      // exists to prevent, reached by obeying the refusal). Measured: an agent whose fix WAS an
+      // ancestor of origin/main was told git said otherwise, across repeated auto-continues.
+      //
+      // So it states what is known, names BOTH branches conditionally, and hands the one check that
+      // settles it to the party that can run it. EACH branch also names the action that CLOSES the
+      // goal — self-close for the not-yet-committed reader, the concierge for the landed one — per
+      // this case's own contract; the first cut dropped the self-close half, which is the sparkle-vfkqz
+      // failure (an agent left escalating because the copy named no door it could open itself). `=== false` on both bits, never truthiness:
+      // `unlandedWork: undefined` means nobody looked, and must keep the original copy rather than
+      // manufacture advice out of a missing reading.
+      if (evidence?.landed === false && evidence?.unlandedWork === false) {
+        return (
+          "This goal is verified by the work being on origin/main. Nothing has been observed " +
+          "reaching origin/main for this branch, and it is holding no unlanded commits either — so " +
+          "this is NOT git saying your work is unlanded, and which of the two it is depends on facts " +
+          "only you can check. If you have not committed the work yet, commit it and land it, then " +
+          "mark this met again; no human is needed once the branch is reachable from origin/main. " +
+          "If you believe it is ALREADY on origin/main — it merged and this worktree was then " +
+          "parked or moved onto another branch, which reads exactly like this — run `git merge-base " +
+          "--is-ancestor <sha> origin/main`; if it IS an ancestor, say so and ask the concierge to " +
+          "close this goal rather than opening a second PR for work already merged."
+        );
+      }
       if (evidence?.landed === false) {
         return (
           "This goal is verified by the work being on origin/main, and git says it is not on " +

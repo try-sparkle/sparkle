@@ -120,7 +120,13 @@ import { reportControlOp } from "./selfReportObservability";
 import { livenessOf } from "./agentLiveness";
 // The one assembly of goal + stall + thrash, shared with conciergeTools/terminal.getAgentStatus so
 // the roster sweep and the single-agent read cannot disagree about who is stalled.
-import { goalReading, landedEvidenceFor, stallReadingFor, thrashReadingFor } from "./agentGoalReading";
+import {
+  goalReading,
+  landedEvidenceFor,
+  stallEvidenceFor,
+  stallReadingFor,
+  thrashReadingFor,
+} from "./agentGoalReading";
 // CALM FIRST, THEN ROLL UP — applied to the raw status map before any bucketing, so a row's own
 // status, its rollup dot and its stall verdict cannot disagree about a never-briefed agent.
 import { withNewAgentCalm } from "../engine/newAgentAttention";
@@ -1738,12 +1744,30 @@ function handleSetGoalMet(req: ControlRequest): Record<string, unknown> {
   // ancestry has some bearing there — it does not, and `canSelfMarkMet` ignores it for every other
   // kind precisely so a landed branch can never launder a human sign-off.
   const goal = found.agent.goal;
+  // Read ONCE, and only for the kind that consumes it: `stallEvidenceFor` is cheap (already-polled
+  // store state) but it is not free, and reading it for a `human` goal would suggest the branch has
+  // some bearing there — it does not.
+  const unlandedWork =
+    goal.verify?.kind === "landed" ? stallEvidenceFor(targetId).hasUnlandedWork : undefined;
   // `stated` always rides along: `selfMarkRefusal` uses it to decide WHAT TO TELL the agent (whether
   // to mention the concierge take-back), never whether the goal may close — `canSelfMarkMet` reads
   // only `landed`. Passing it is what stops the refusal asking the agent a question it cannot answer
   // (roborev 57819). `landed` is still gathered only for the kind that consumes it.
   const evidence: GoalVerifyEvidence = {
-    ...(goal.verify?.kind === "landed" ? { landed: landedEvidenceFor(targetId) } : {}),
+    // BOTH BITS, or the split arm in `selfMarkRefusal` is unreachable. `landed` decides whether the
+    // goal may CLOSE; `unlandedWork` decides which of its two `false` populations the agent is in —
+    // holding commits main lacks ("land it"), or holding nothing at all, which is what a
+    // landed-then-parked branch reads like and must never be told to open a second PR. Same reader
+    // the stall surface uses, so there is no second answer to "is this branch holding work back".
+    ...(goal.verify?.kind === "landed"
+      ? {
+          landed: landedEvidenceFor(targetId),
+          // SPREAD-WHEN-KNOWN, the shape the rest of this evidence uses: a key present with the
+          // value `undefined` reads as a supplied answer, and here that would be a claim the branch
+          // holds nothing back when nobody looked.
+          ...(unlandedWork === undefined ? {} : { unlandedWork }),
+        }
+      : {}),
     // TWO BITS, because there are three populations and the refusal says something different to
     // each (roborev 57825, then 57827): `stated` = a caller ever chose this check; `chosenHere` =
     // they chose it for THIS goal rather than one it was carried from. Sent unconditionally — the

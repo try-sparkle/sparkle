@@ -7,6 +7,8 @@
 // `.claude/commands/goal.md` in the same commit said the opposite). These tests pin the RULE. The
 // commit that wires it is what makes the gate real; until then this is a rule with no enforcer.
 import { describe, it, expect } from "vitest";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   parseGoalVerify,
   agentClosableKind,
@@ -18,8 +20,10 @@ import {
   describeGoalVerify,
   GOAL_VERIFY_KINDS,
   type GoalVerify,
+  type GoalVerifyEvidence,
   type VerifyVerdict,
 } from "./goalVerify";
+import { auditLandedClaims } from "./testing/landedClaim";
 
 function rejected(v: VerifyVerdict): Extract<VerifyVerdict, { ok: false }> {
   if (v.ok) throw new Error(`expected a rejection, got ${JSON.stringify(v)}`);
@@ -156,6 +160,90 @@ describe("canSelfMarkMet — the self-report gate", () => {
     expect(notLanded).not.toEqual(unread);
   });
 
+  it("does NOT assert a git verdict for a branch holding NOTHING BACK, and does not send it to open a PR", () => {
+    // THE BUG THIS PINS. `landed: false` is a positive test FAILING, not git's no — so it is also
+    // what an agent reads whose work MERGED and whose worktree was then parked or moved onto another
+    // branch: the merge watermark belongs to the branch it left, and the branch it is on holds
+    // nothing back. The old single sentence told that agent "git says it is not on origin/main yet …
+    // Land it (open a PR and merge it)" — a false statement of fact, and an instruction to duplicate
+    // work already on main.
+    const nothingHeld = selfMarkRefusal({ kind: "landed" }, { landed: false, unlandedWork: false });
+    const holding = selfMarkRefusal({ kind: "landed" }, { landed: false, unlandedWork: true });
+
+    // The ACTION each one produces is what matters, so assert on that rather than on wording: only a
+    // branch that IS holding commits may be sent, unconditionally, to open a PR.
+    expect(holding).toMatch(/open a PR and merge it/i);
+    expect(nothingHeld).not.toMatch(/Land it \(open a PR and merge it\)/i);
+    // …and it must not restate the claim git can contradict.
+    expect(nothingHeld).not.toMatch(/git says it is not on origin\/main/i);
+    expect(nothingHeld).toMatch(/NOT git saying your work is unlanded/i);
+    // It hands over the one check that settles it, and names the exit for the case where it IS
+    // landed: the concierge, the surface that can close a goal its claimant may not.
+    expect(nothingHeld).toMatch(/merge-base --is-ancestor/);
+    expect(nothingHeld).toMatch(/concierge/i);
+    expect(nothingHeld).not.toEqual(holding);
+  });
+
+  it("speaks CONDITIONALLY, because `unlandedWork: false` is three populations and only git separates them", () => {
+    // roborev 65742, and the reason this arm states nothing about what happened. `unlandedWork:
+    // false` is ALSO what an agent that committed nothing reads, and what an agent holding only
+    // uncommitted edits reads — `landedEvidenceFor`'s own docstring says as much. A sentence that
+    // told any of them "your work may already have merged" would be affirmatively wrong for two of
+    // three, would discourage the one correct action (commit it and land it), and would route a
+    // no-op agent at the concierge — the single surface that bypasses the gate.
+    const msg = selfMarkRefusal({ kind: "landed" }, { landed: false, unlandedWork: false });
+    // Both branches present, each behind its own condition. The never-committed agent must find its
+    // instruction here too, not only the landed-then-parked one.
+    expect(msg).toMatch(/If you have not committed the work yet, commit it and land it/i);
+    expect(msg).toMatch(/If you believe it is ALREADY on origin\/main/i);
+
+    // No claim that the work is on main may stand unconditionally. The rule has ONE owner
+    // (`@sparkle/core/testing/landedClaim`) so this layer and the desktop layer cannot drift apart —
+    // duplicating it verbatim is how the weaker predicate ends up running at the layer that reaches
+    // agents (roborev 65753).
+    const audit = auditLandedClaims(msg);
+    // Not a decoration: an empty candidate set means the audit examined nothing, which is the
+    // vacuity this guard exists to remove.
+    expect(audit.candidates.length, `no landed-claim sentence found in: ${msg}`).toBeGreaterThan(0);
+    expect(audit.violations, "an unconditional landed claim").toEqual([]);
+
+    // BOTH branches must name a door the reader can open (this case's own contract, and the
+    // sparkle-vfkqz failure when it was omitted) — and the assertion is SCOPED TO THE CLAUSE
+    // (roborev 65749). A message-wide `toMatch(/mark this met again/)` is satisfied by a self-close
+    // path named only inside the landed-conditional clause, which leaves the commit-first reader
+    // with no door again while every assertion still passes.
+    const commitClause = msg
+      .split(/(?<=[.;])\s+/)
+      .find((t) => /commit it and land it/i.test(t));
+    expect(commitClause, msg).toBeDefined();
+    expect(commitClause!, "the commit-first branch names no self-close path").toMatch(
+      /mark this met again/i,
+    );
+    // …and that door must be ITS OWN, not the landed branch's concierge instruction bleeding in.
+    expect(commitClause!).not.toMatch(/concierge/i);
+    // The landed branch keeps its own exit.
+    expect(msg).toMatch(/concierge/i);
+  });
+
+  it("keeps the original sentence when the ahead-count was NOT looked up", () => {
+    // `undefined` is "nobody looked", never "holding nothing" — the same discipline `landed` itself
+    // is built on. A missing reading must not manufacture the parked advice, so the copy an existing
+    // caller gets is unchanged until it supplies the bit.
+    const unread = selfMarkRefusal({ kind: "landed" }, { landed: false });
+    expect(unread).toMatch(/open a PR and merge it/i);
+    expect(unread).toEqual(selfMarkRefusal({ kind: "landed" }, { landed: false, unlandedWork: undefined }));
+  });
+
+  it("the ahead-count NEVER unlocks the latch — it only picks the sentence", () => {
+    // The gate is the half that must not move. `unlandedWork: false` is exactly the shape of the
+    // agent the new copy speaks to, and it must still be REFUSED: "I am holding nothing back" is not
+    // ancestry, and letting it close a goal would be the self-report the whole mechanism replaces.
+    expect(canSelfMarkMet({ kind: "landed" }, { landed: false, unlandedWork: false })).toBe(false);
+    expect(canSelfMarkMet({ kind: "landed" }, { unlandedWork: false })).toBe(false);
+    // …and it cannot subtract from a genuine ancestry YES either.
+    expect(canSelfMarkMet({ kind: "landed" }, { landed: true, unlandedWork: true })).toBe(true);
+  });
+
   it("the HUMAN refusal has THREE arms — one per provenance population", () => {
     // roborev 57827, resolved by 57832. The arms differ in what each may honestly SAY, not in
     // whether the exit exists: chosen-here → nothing extra (a caller bound itself to THIS work);
@@ -259,6 +347,211 @@ describe("canSelfMarkMet — the self-report gate", () => {
   });
 });
 
+describe("the DOCS that quote these refusals — pinned to the strings actually returned", () => {
+  // roborev 65746. `.claude/commands/goal.md` and the sparkle-control SKILL row both quote the
+  // `landed` refusals verbatim, and nothing tied those quotes to `selfMarkRefusal`'s output — which
+  // is how the SKILL row went on enumerating TWO arms after a third existed. That staleness is not
+  // cosmetic: an agent reading a two-way list falls back to the only negative branch offered ("go
+  // merge it") and opens the rival PR this whole change exists to prevent.
+  //
+  // Scoped to the ONE section / ONE row that makes the promise, never a body-wide grep, so a
+  // narrative "an earlier version said…" line elsewhere cannot satisfy it.
+  const repoFile = (rel: string): string =>
+    readFileSync(fileURLToPath(new URL(`../../${rel}`, import.meta.url)), "utf8");
+
+  const between = (haystack: string, from: string, to: string): string => {
+    const start = haystack.indexOf(from);
+    expect(start, `missing section start: ${from}`).toBeGreaterThanOrEqual(0);
+    const end = haystack.indexOf(to, start);
+    expect(end, `missing section end: ${to}`).toBeGreaterThan(start);
+    // Normalised, because a markdown quote is WRAPPED: the same sentence arrives as
+    // "…and it is holding no unlanded\n    commits either". Collapsing whitespace (and folding the
+    // typographic apostrophe) compares the words the doc promises, not its line breaks.
+    return haystack
+      .slice(start, end)
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/\s+/g, " ")
+      .toLowerCase();
+  };
+
+  // Each fragment, and the evidence shape whose refusal must contain it. Asserted from BOTH ends:
+  // the code really returns it, and the doc really quotes it.
+  //
+  // ⚠️ A HAND-MAINTAINED LIST CANNOT SEE A NEW ARM (roborev 65752) — and a new undocumented arm is
+  // exactly the drift that happened (the third arm shipped; the SKILL row kept enumerating two, for
+  // two commits). A literal list only catches re-wording and deletion. So the list is COVERAGE-
+  // CHECKED against the code below: every distinct string the `landed` case can return must be
+  // claimed by some fragment here, which reds the moment a fourth branch is added and left unlisted.
+  const ARMS: Array<{ fragment: string; evidence: GoalVerifyEvidence }> = [
+    { fragment: "git says it is not on origin/main yet", evidence: { landed: false, unlandedWork: true } },
+    {
+      fragment: "nothing has been observed reaching origin/main",
+      evidence: { landed: false, unlandedWork: false },
+    },
+    {
+      fragment: "it is holding no unlanded commits either",
+      evidence: { landed: false, unlandedWork: false },
+    },
+    { fragment: "your branch's git state has not been read yet", evidence: {} },
+  ];
+
+  // Every evidence shape that reaches the `landed` case, so the distinct outputs below are the
+  // code's own answer to "how many arms are there" rather than this file's opinion of it.
+  //
+  // ⚠️ THE INPUTS ARE HAND-MAINTAINED, so the case below ALSO derives the field names the code
+  // branches on and asserts this list exercises each (roborev 65756). Without that, an arm keyed on
+  // a NEW evidence field is reached by none of these shapes, the distinct outputs are unchanged, and
+  // everything stays green — which is the incident this file cites: the third arm arrived in the
+  // same commit as the `unlandedWork` field it reads, so a matrix written the day before could not
+  // have seen it.
+  const LANDED_EVIDENCE: Array<GoalVerifyEvidence | undefined> = [
+    { landed: false, unlandedWork: true },
+    { landed: false, unlandedWork: false },
+    { landed: false },
+    { landed: undefined, unlandedWork: false },
+    // `landed: true` never reaches a refusal arm in production (the goal simply closes), but it is
+    // the OTHER SIDE of a field the arms branch on, and the varies-each-field check below counts
+    // only DEFINED values — so without it that check cannot tell "both sides covered" from "one
+    // side plus absence", which is exactly how its first cut was silenceable.
+    { landed: true, unlandedWork: true },
+    {},
+    undefined,
+  ];
+
+  it("the evidence matrix exercises every field the landed case actually branches on", () => {
+    // Read from the SOURCE, not from this file's memory of it. `evidence?.<name>` inside the
+    // `case "landed":` body is exactly the set of questions the arms ask; a new one means a new arm
+    // this matrix cannot reach, and that must fail here rather than pass silently downstream.
+    const source = repoFile("packages/core/goalVerify.ts");
+    const start = source.indexOf('case "landed":');
+    const end = source.indexOf('case "human":', start);
+    expect(start, "the landed case moved").toBeGreaterThanOrEqual(0);
+    expect(end, "the human case moved").toBeGreaterThan(start);
+    // Optional-chained AND plain member reads. A field pulled through a local alias
+    // (`const ev = evidence ?? {}`) still escapes this — said plainly rather than pretended away;
+    // the coverage case below is the backstop for whatever this derivation misses.
+    const fields = new Set(
+      [...source.slice(start, end).matchAll(/evidence\s*\??\.\s*(\w+)/g)].map((m) => m[1]!),
+    );
+    expect(fields.size, "the landed arms read no evidence at all?").toBeGreaterThan(0);
+
+    // VARIED, NOT MERELY PRESENT (roborev 65759). "this field is a key somewhere" is silenceable
+    // without ever reaching the new arm: add `dirtyTree: false` and it goes green while the
+    // `dirtyTree === true` branch stays unreachable, so the coverage case sees no new output and the
+    // docs quietly enumerate three arms out of four. And DEFINED values only — counting `undefined`
+    // reads "one side plus absence" as two sides, which is the same hole one layer down.
+    for (const field of fields) {
+      const values = new Set(
+        LANDED_EVIDENCE.map((ev) => (ev === undefined ? undefined : ev[field as keyof typeof ev]))
+          .filter((v) => v !== undefined)
+          .map((v) => JSON.stringify(v)),
+      );
+      expect(
+        values.size,
+        `the landed case branches on \`${field}\`, and LANDED_EVIDENCE never varies it — add shapes ` +
+          "covering BOTH sides, or the arm it keys is never reached",
+      ).toBeGreaterThan(1);
+    }
+  });
+
+  it("the fragment list COVERS every distinct refusal the landed case can return", () => {
+    // This is the assertion that makes the two doc cases meaningful. Without it they pin only the
+    // arms someone remembered to list — so a new branch returns a string no fragment names, both
+    // doc cases stay green, and the docs go stale exactly as they did before.
+    const distinct = [...new Set(LANDED_EVIDENCE.map((ev) => selfMarkRefusal({ kind: "landed" }, ev)))];
+    expect(distinct.length).toBeGreaterThan(1);
+
+    // EVERY ARM MUST BE REACHED, not merely every field varied (roborev 65762). Per-field variation
+    // is necessary and not sufficient: an arm keyed on a CONJUNCTION can stay unreached while both of
+    // its fields vary across shapes that never satisfy it together, and then `distinct` is short by
+    // one string and no fragment is ever demanded for it. Counting the `return`s in the case body is
+    // the check that closes that: one distinct output per arm, or something is unreachable.
+    const source = repoFile("packages/core/goalVerify.ts");
+    const landedStart = source.indexOf('case "landed":');
+    const landedEnd = source.indexOf('case "human":', landedStart);
+    const arms = [...source.slice(landedStart, landedEnd).matchAll(/\n\s*return\b/g)].length;
+    expect(
+      distinct.length,
+      `the landed case has ${arms} arms but LANDED_EVIDENCE reaches only ${distinct.length} of them — ` +
+        "add the shape that satisfies the missing one",
+    ).toBe(arms);
+    for (const out of distinct) {
+      const claimed = ARMS.some(({ fragment }) => out.toLowerCase().includes(fragment));
+      expect(claimed, `no ARMS fragment claims this refusal — list it and quote it in the docs:\n${out}`).toBe(
+        true,
+      );
+    }
+    // …and no fragment may name an arm the code no longer returns, or the doc cases would be
+    // demanding a quote of a string that does not exist.
+    for (const { fragment } of ARMS) {
+      const returned = distinct.some((out) => out.toLowerCase().includes(fragment));
+      expect(returned, `orphaned fragment, no refusal returns it: ${fragment}`).toBe(true);
+    }
+  });
+
+  it("every arm the code returns is quoted in the /goal guide", () => {
+    const section = between(
+      repoFile(".claude/commands/goal.md"),
+      "**`landed` you CAN mark met",
+      "- **Do not go quiet after a refusal",
+    );
+    for (const { fragment, evidence } of ARMS) {
+      expect(selfMarkRefusal({ kind: "landed" }, evidence).toLowerCase(), fragment).toContain(fragment);
+      expect(section, fragment).toContain(fragment);
+    }
+  });
+
+  it("…and in the sparkle-control SKILL row an agent reads at call time", () => {
+    // The MCP tool contract is what an agent has in front of it the moment it calls
+    // `set_agent_goal_met`, so it is at least as load-bearing as the /goal guide.
+    const row = between(
+      repoFile(".agents/skills/sparkle-control/SKILL.md"),
+      "| `set_agent_goal_met`",
+      "| `send_peer_message`",
+    );
+    for (const { fragment } of ARMS) {
+      expect(row, fragment).toContain(fragment);
+    }
+
+    // PRESENCE IS NOT THE INVARIANT — the PAIRING is (roborev 65752). A compressed row that keeps
+    // all three quotes but re-attaches "(go merge it)" as the blanket reading of a refusal passes a
+    // presence-only check, and that reading is what sends a landed-then-parked agent to open a rival
+    // PR. So: any mention of merging as the general answer must sit inside the "never infer" clause…
+    // PRESENCE FIRST (roborev 65756): a filter over `go merge it` sentences is satisfied by DELETING
+    // the caution — a row that says "a `landed` refusal means the work is not on main — land it."
+    // yields an empty filter and passes. So require the caution to exist, and to arrive before the
+    // first arm quote, where it governs the reading of all of them.
+    expect(row, "the row carries no `never infer` caution").toContain("never infer");
+    // Anchored on the FIRST QUOTE IN THE ROW, not on this file's array order (roborev 65759):
+    // `ARMS` order is independent of the row's, so anchoring on `ARMS[0]` lets a row that leads with
+    // a different arm put the caution after an arm it is supposed to govern and still pass.
+    const firstQuoteAt = Math.min(
+      ...ARMS.map(({ fragment }) => row.indexOf(fragment)).filter((i) => i >= 0),
+    );
+    // `Math.min()` of an empty list is Infinity, which sails past a `>= 0` guard (roborev 65762) —
+    // so the guard has to be finiteness, not sign.
+    expect(Number.isFinite(firstQuoteAt), "no arm quote found in the row").toBe(true);
+    expect(
+      row.indexOf("never infer"),
+      "the caution arrives after an arm it is supposed to govern",
+    ).toBeLessThan(firstQuoteAt);
+    // …and where merging IS mentioned as a general reading, the caution must LEAD it — co-occurrence
+    // is satisfied by "a refusal means go merge it, but never infer more than that."
+    for (const sentence of row.split(/(?<=[.;])\s+/).filter((t) => t.includes("go merge it"))) {
+      expect(sentence, sentence).toMatch(/never infer[^.;]{0,40}go merge it/);
+    }
+    // …and the arm that must NOT be answered by merging has to carry its own next move, between its
+    // own quote and the next one.
+    const from = row.indexOf("nothing has been observed reaching origin/main");
+    const to = row.indexOf("your branch's git state has not been read yet", from);
+    expect(to, "the two quotes are out of order or missing").toBeGreaterThan(from);
+    const arm = row.slice(from, to);
+    expect(arm, "the parked arm names no ancestry check").toContain("merge-base --is-ancestor");
+    expect(arm, "the parked arm names no concierge exit").toContain("concierge");
+    expect(arm, "the parked arm tells the agent to merge").not.toMatch(/go merge it|merge them/);
+  });
+});
+
 describe("inferGoalVerify — reading the check out of the goal's own words", () => {
   it("infers `landed` from goal text a git ancestry check can answer", () => {
     // The concierge writes goals in exactly this shape, which is the whole reason inference is
@@ -347,7 +640,9 @@ describe("agentClosableKind / verifyStrength / mayReplaceVerify — the debt rul
   const sample = (kind: (typeof GOAL_VERIFY_KINDS)[number]): GoalVerify =>
     kind === "command" ? { kind, cmd: "npm test" } : ({ kind } as GoalVerify);
   // Every question a caller could answer, set to YES — "the most anyone could ever know".
-  const OMNISCIENT = { landed: true };
+  // `unlandedWork: false` is the most-favourable value for a "is it holding work back" question,
+  // which is what "the most anyone could ever know" means for this bit.
+  const OMNISCIENT = { landed: true, unlandedWork: false };
 
   it("AGREES WITH canSelfMarkMet FOR EVERY KIND — the coupling, actually enforced", () => {
     // The docstring used to claim these "cannot drift" while `agentClosableKind` restated
