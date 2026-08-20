@@ -13,7 +13,10 @@ import {
   stallChipFor,
   stallInputsFor,
   thrashChipLabel,
+  STALL_CAUSE_LABEL,
 } from "./rowAttention";
+import { escalationFor } from "../engine/stallEscalation";
+import type { StallCause, StallReport } from "../engine/agentStall";
 import { stallReport } from "../engine/agentStall";
 import {
   newGoal,
@@ -572,5 +575,79 @@ describe("stallInputsFor threads the human block", () => {
     // harmless today but makes `"humanBlock" in input` lie, and this surface's whole discipline is
     // that "not looked up" and "false" stay distinguishable.
     expect("humanBlock" in stallInputsFor("idle", NOW, undefined, {})).toBe(false);
+  });
+});
+
+
+// ── THE CHIP MUST NOT CONTRADICT THE DOT (roborev 65642) ──────────────────────────────────────────
+//
+// `stallChipFor` used to take `report.causes[0]` on this docblock's own claim that the engine emits
+// most-actionable-first. It does not: `stallReport` pushes `escalated-goal` (amber) before
+// `abandoned-goal` (red), and since the 2026-08-18 demotion it pushes `human-verified-goal` (amber)
+// before every red cause. Both combinations are REACHABLE — every red goal cause requires an
+// escalated goal by construction — so a row drew the RED dot beside the calm chip "awaiting your
+// sign-off +2".
+//
+// The partition is DERIVED FROM THE ENGINE, not restated here, for the reason `agentNotices.test`
+// gives about its own twin of this loop: a guard tested against a copy of its own mechanism proves
+// nothing about the mechanism. And EVERY candidate is exercised — the domain is `satisfies`-pinned,
+// so a newly added `StallCause` is a type error here rather than a silently unexercised one.
+describe("stallChipFor — a red cause always heads the chip", () => {
+  const ALL = Object.keys({
+    "blocked-on-human": 0,
+    "rearms-exhausted": 0,
+    "human-verified-goal": 0,
+    "abandoned-goal": 0,
+    "unmet-goal": 0,
+    "open-pr": 0,
+    "unlanded-work": 0,
+    "uncommitted-changes": 0,
+    "escalated-goal": 0,
+    "expired-goal": 0,
+  } satisfies Record<StallCause, number>) as StallCause[];
+  const isRed = (c: StallCause) =>
+    escalationFor({ verdict: "stalled", causes: [c], detail: "" }) === "blocked";
+  const chipOf = (causes: StallCause[]): StallReport => ({ verdict: "stalled", causes, detail: "" });
+
+  it("names the RED cause, never the amber one beside it — in BOTH input orders", () => {
+    const red = ALL.filter(isRed);
+    const notRed = ALL.filter((c) => !isRed(c));
+    // Non-trivial in both directions, or the loop below asserts nothing.
+    expect(red.length).toBeGreaterThan(0);
+    expect(notRed.length).toBeGreaterThan(0);
+
+    for (const r of red) {
+      for (const n of notRed) {
+        // The amber cause is fed FIRST on purpose in the first case — that is the shape the engine
+        // actually produces, and the shape that used to win.
+        expect(stallChipFor(chipOf([n, r]))?.text).toBe(`${STALL_CAUSE_LABEL[r]} +1`);
+        expect(stallChipFor(chipOf([r, n]))?.text).toBe(`${STALL_CAUSE_LABEL[r]} +1`);
+      }
+    }
+  });
+
+  it("the exact row this branch created: an awaiting-sign-off goal that is ALSO abandoned", () => {
+    // `human-verified-goal` went amber on 2026-08-18 while still being pushed first, so this row —
+    // red by `abandoned-goal` — is the one that rendered "awaiting your sign-off +1" under a red dot.
+    const chip = stallChipFor(chipOf(["human-verified-goal", "abandoned-goal"]));
+    expect(chip?.text).toBe("gave up, work stranded +1");
+    expect(chip?.ariaLabel).toBe("Stalled — gave up, work stranded +1");
+    // …and the amber phrasing must not be what leads it.
+    expect(chip?.text).not.toContain("sign-off");
+  });
+
+  it("and the PRE-EXISTING one it did not create: escalated pushed ahead of abandoned", () => {
+    // Not a regression of this branch — `escalated-goal` (rank 8, amber) has been pushed before
+    // `abandoned-goal` (rank 1, red) all along, and every abandoned row carries both because
+    // `abandonGoal` writes through `escalateGoal`. Ranking the head fixes this instance too.
+    expect(stallChipFor(chipOf(["escalated-goal", "abandoned-goal"]))?.text).toBe(
+      "gave up, work stranded +1",
+    );
+  });
+
+  it("a single amber cause still names itself — the rank does not invent a red one", () => {
+    // THE PAIRED NEGATIVE. If the head selection were broken toward red generally, this would fail.
+    expect(stallChipFor(chipOf(["human-verified-goal"]))?.text).toBe("awaiting your sign-off");
+    expect(stallChipFor(chipOf(["escalated-goal", "unmet-goal"]))?.text).toBe("goal unmet +1");
   });
 });

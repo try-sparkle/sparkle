@@ -148,6 +148,44 @@ describe("agentNotices", () => {
     expect(ids).toEqual(["stall:unlanded-work", "stall:escalated-goal"]);
   });
 
+  it("NO stall explainer makes an absolute claim about the rest of the row", () => {
+    // roborev 65642 — the generalisation of the test above, which greps ONE key and so could not
+    // catch the same defect re-appearing on a different cause. It did: the rewritten
+    // `stall:human-verified-goal` copy read "Nothing is blocking the agent", which is false on a row
+    // that also carries `blocked-on-human` or `abandoned-goal` — both reachable alongside it, since
+    // every one of these causes requires an escalated goal. The table is keyed on ONE cause and
+    // `agentNotices` emits one notice per cause, so no explainer may speak for the row.
+    //
+    // EVERY cause is checked, and the domain is `satisfies`-pinned so a newly added `StallCause`
+    // fails here rather than shipping an unchecked sentence.
+    const ALL = Object.keys({
+      "blocked-on-human": 0,
+      "rearms-exhausted": 0,
+      "human-verified-goal": 0,
+      "abandoned-goal": 0,
+      "unmet-goal": 0,
+      "open-pr": 0,
+      "unlanded-work": 0,
+      "uncommitted-changes": 0,
+      "escalated-goal": 0,
+      "expired-goal": 0,
+    } satisfies Record<StallCause, number>) as StallCause[];
+    // Absolute negatives about the AGENT or the ROW. "the goal is not blocked on anything but your
+    // review-close" is fine — it is scoped to the goal, which is the one thing this key does know.
+    const ABSOLUTE =
+      /nothing is (outstanding|blocking the agent|owed|left)|nothing else is (outstanding|owed)|the agent is not blocked/i;
+    for (const c of ALL) {
+      const text = NOTICE_EXPLAINER[`stall:${c}`] ?? "";
+      // Non-vacuous: every cause must actually HAVE an explainer, or the loop proves nothing.
+      expect(text.length).toBeGreaterThan(0);
+      expect(text).not.toMatch(ABSOLUTE);
+    }
+    // …and the guard really can fire — the sentence that was shipped must be caught by it.
+    expect("Nothing is blocking the agent; it is simply awaiting your review-close.").toMatch(
+      ABSOLUTE,
+    );
+  });
+
   it("marks an escalated goal with its own glyph, not the ordinary alert", () => {
     // Auto-continue has given up: nothing is coming for this agent at all. A reader scanning forty
     // rows must be able to tell that from an agent that merely owes a merge.

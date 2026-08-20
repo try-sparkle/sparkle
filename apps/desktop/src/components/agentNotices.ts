@@ -48,7 +48,7 @@
 // from that bead's own engine work; this module only needs the class, the glyph and the ordering.
 import type { StallCause, StallReport } from "../engine/agentStall";
 import type { ThrashReport } from "../engine/agentThrash";
-import { STALL_CAUSE_LABEL, THRASH_VERDICT_LABEL } from "./rowAttention";
+import { STALL_CAUSE_LABEL, STALL_CAUSE_RANK, THRASH_VERDICT_LABEL } from "./rowAttention";
 import type { GoalBadge } from "./rowAttention";
 
 /**
@@ -165,13 +165,11 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
   // The tier is not knowable from here — `escalationFor` folds ALL causes together, and this table
   // sees one at a time — so the text stays TIER-AGNOSTIC and points at the row's other marks, which
   // are ordered work-first (STALL_CAUSE_RANK) precisely so they can carry that answer.
-  // THE ONE RED STALL CAUSE. Its explainer may say what the tier-agnostic ones below must not: that
-  // this row is addressed to HIM. It is the only cause where that sentence is safe, because both
-  // halves of the condition are checked before it is raised (engine/agentStall).
-  // THE SECOND RED STALL CAUSE, and like the sign-off below it may say the row is addressed to HIM —
-  // for the strongest reason on this table: the agent said so when asked. It names the MECHANISM
-  // because "says who" is the reader's first question, and because the phrase used to arrive as
-  // unbacked prose in an escalation sentence (bead filed 2026-08-18).
+  // A RED STALL CAUSE, and it may say the row is addressed to HIM for the strongest reason on this
+  // table: the agent said so when asked. (The sign-off cause below also addresses him, but it is
+  // AMBER since 2026-08-18 — done, not stuck.) It names the MECHANISM because "says who" is the
+  // reader's first question, and because the phrase used to arrive as unbacked prose in an
+  // escalation sentence (bead filed 2026-08-18).
   "stall:blocked-on-human":
     "Sparkle asked this agent what is blocking it — it can answer CI, another agent, a quota wall, " +
     "or nothing at all — and it answered that a PERSON is. That is why this row is red rather than " +
@@ -184,10 +182,22 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "Auto-continue gave up on this agent's goal, and the concierge has already used every re-arm it " +
     "is allowed — so nothing may restart it again. The row's own label has said 'this one is yours' " +
     "in this state for a while; it now carries the colour to match.",
+  // ADDRESSED TO HIM, BUT CALMLY (2026-08-18). Its explainer may say what the tier-agnostic ones
+  // below must not — that this GOAL is his to close — because both halves of the condition are
+  // checked before it is raised (engine/agentStall). The cause is AMBER now, not red, so the copy
+  // says "awaiting your review-close" rather than "go unstick it".
+  //
+  // ⚠️ IT STILL MAY NOT SPEAK FOR THE REST OF THE ROW, and the first draft did (roborev 65642, the
+  // same defect class as 59924). It ended "Nothing is blocking the agent" — an absolute claim, from
+  // a table that sees ONE cause at a time and cannot know the row also carries `blocked-on-human`
+  // or `abandoned-goal`. On such a row this pill told him nothing was blocking the agent while the
+  // pill beside it said a person was. Scope every claim to the GOAL, and point at the other marks
+  // for everything else, exactly as the tier-agnostic explainers below do.
   "stall:human-verified-goal":
-    "This agent's goal can only be closed by a person — the check on it is a sign-off or a command, " +
-    "neither of which any agent may mark met itself — and nothing is coming to retry it. That makes " +
-    "you the only one who can clear this row: decide whether the goal is met.",
+    "This agent's GOAL can only be closed by a person — the check on it is a sign-off or a command, " +
+    "neither of which any agent may mark met itself — and nothing is coming to retry it. The goal " +
+    "itself is not blocked on anything but your review-close; the other marks on this row say what " +
+    "else is outstanding. When you get to it, decide whether the goal is met.",
   "stall:escalated-goal":
     "Auto-continue has given up on this agent's goal and handed it back. Nothing is coming for it " +
     "— no retry is scheduled and no other agent is watching it. The other marks on this row say " +
@@ -266,59 +276,6 @@ export const NOTICE_EXPLAINER: Record<string, string> = {
     "message itself: a peer agent carries no human authority, the concierge speaks for you.",
 };
 
-/** Warning-class ordering: worst first, so a row's single glyph and a pill row's first pill both
- *  lead with the thing most worth doing something about.
- *
- *  ⚠️ THE WORK CAUSES COME FIRST, AND THIS WAS INVERTED UNTIL 2026-08-06. `escalated-goal` used to
- *  head the list, on the reasoning that "nothing is coming for that agent at all". That ranked it
- *  above `unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes` — and once
- *  `escalated-goal` moved to the amber `lapsed` tier (engine/stallEscalation LIFECYCLE), the list
- *  led with the one cause that needs NOTHING from the human and buried the ones that do. A row
- *  holding uncommitted files would have shown "auto-continue gave up" as its single glyph.
- *
- *  So the order now mirrors `withStallAttention`'s: everything in `OUTSTANDING` (red — work that
- *  exists and nothing is coming to finish) sorts ahead of every cause that is NOT red. Relative
- *  order WITHIN the red group is unchanged. A cause that stops being red must move down here in the
- *  same change, or this list starts leading with the quiet one again — `agentNotices.test.ts`
- *  derives that partition from `escalationFor` rather than restating it, so a membership change in
- *  the engine fails there instead of silently invalidating this.
- *
- *  ⚠️ THIS GOVERNS PILL ORDER. The row's collapsed GLYPH and its click target are chosen by
- *  {@link GLYPH_RANK}, which overrides input order — reordering this map alone does NOT reach them,
- *  and that gap is what roborev 59949 caught. Both are fixed; keep them in step. */
-const STALL_CAUSE_RANK: Record<StallCause, number> = {
-  // RED — `stallEscalation.OUTSTANDING`: the founder is the only actor who can clear it.
-  //
-  // FIRST OF ALL, ahead of the sign-off below, and the tie-break is provenance: every other cause on
-  // this list is something the app INFERRED about the agent, while this is the agent's own answer to
-  // a direct question about what is blocking it. An assertion beats an inference, so it leads.
-  "blocked-on-human": 0,
-  "human-verified-goal": 1,
-  // Also RED. Below the sign-off because it is the less immediate of the two: a sign-off is a
-  // question already put to him, while an abandoned branch is a disposition he can take at his
-  // leisure. Everything below shifted down to make room rather than being re-ranked — their relative
-  // order is a genuine actionability ordering and this change has no opinion about it.
-  "abandoned-goal": 2,
-  // RED, and LAST of the red group: it says only that nothing may retry the goal again, which is a
-  // weaker call to action than a stated question or a stranded branch. It rides alongside
-  // `escalated-goal` (which stays amber and stays at the bottom), so without a rank of its own the
-  // row's single glyph would have led with the quiet member of the pair.
-  "rearms-exhausted": 3,
-  // NEVER RED. The four below are `stallEscalation.LIFECYCLE` → the amber `lapsed` status; they were
-  // in the RED group until 2026-08-07 and moved together (see OUTSTANDING for who clears each). Their
-  // relative order is unchanged — it is a genuine actionability ordering among things somebody else
-  // will do, and `uncommitted-changes` stays last of them for the same reason it always did.
-  "unmet-goal": 4,
-  "open-pr": 5,
-  "unlanded-work": 6,
-  "uncommitted-changes": 7,
-  // `escalated-goal` is LIFECYCLE too, and sorts BELOW the work causes: it says our retry budget ran
-  // out, which is the quietest thing on this list. `expired-goal` is in NEITHER engine set → calm
-  // gray. Do not "keep them in step" by adding expiry to LIFECYCLE; that module's own ⚠️ block
-  // explains at length why it must stay out.
-  "escalated-goal": 8,
-  "expired-goal": 9,
-};
 
 // NO THRASH RANK HERE, deliberately (roborev 58710/58721). A `ThrashReport` carries exactly ONE
 // verdict, so `agentNotices` can only ever emit one thrash notice and there is nothing to order.
@@ -638,7 +595,8 @@ const CLASS_A11Y: Record<NoticeClass, (n: number, labels: string) => string> = {
  *
  * `escalated` is now the QUIETEST warning glyph, which is what its tier means: `alert` marks work
  * that exists and nothing is coming to finish; `escalated` marks our own retry budget running out.
- * Keep this ordering consistent with `STALL_CAUSE_RANK` above and with
+ * Keep this ordering consistent with `rowAttention.STALL_CAUSE_RANK` — which is where that map
+ * lives since roborev 65642; it was in THIS file, above, until then — and with
  * `engine/stallEscalation`'s OUTSTANDING-before-LIFECYCLE test order.
  */
 const GLYPH_RANK: Record<NoticeGlyph, number> = {

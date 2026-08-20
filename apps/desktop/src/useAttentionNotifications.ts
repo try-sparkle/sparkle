@@ -357,9 +357,11 @@ function composeRollup(
   //
   // LAST, so it filters the map that is actually rendered rather than an intermediate nobody paints.
   //
-  // IT CANNOT SWALLOW THE STALL ESCALATION, which is the one red it must not touch.
-  // `withStallAttention` escalates `human-verified-goal` to `blocked` — a goal whose stated check no
-  // agent may ever discharge, i.e. the one cause where the founder genuinely IS the only actor. That
+  // IT CANNOT SWALLOW THE STALL ESCALATION, which is the red it must not touch.
+  // `withStallAttention` escalates `stallEscalation.OUTSTANDING` to `blocked` — the causes where the
+  // founder genuinely IS the only actor AND the work is stuck (`blocked-on-human`,
+  // `rearms-exhausted`, `abandoned-goal`). (`human-verified-goal` also passes through, but it is
+  // AMBER `lapsed` since 2026-08-18 — awaiting a review-close is not a blocker.) That
   // runs downstream of this, in AgentSidebar, and only ever on `idle`/`unmerged` rows
   // (stallEscalation.ESCALATABLE), which are never in the `needs_you` band this pass looks at. The
   // two operate on disjoint inputs by construction rather than by agreement.

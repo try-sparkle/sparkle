@@ -47,23 +47,28 @@ function resting(over: Partial<StallInput> = {}): StallInput {
 }
 
 /**
- * A resting row that only the FOUNDER can clear — the fixture for every case about the RED tier.
+ * A resting row that only the FOUNDER can clear AND whose work is stuck — the fixture for every case
+ * about the RED tier.
  *
- * Both halves of `human-verified-goal` (engine/agentStall): auto-continue has stopped (`escalatedAt`)
- * AND the goal's stated check is one no agent may ever discharge (`{kind:"human"}`).
+ * `abandoned-goal` (engine/agentStall): auto-continue gave up (`escalatedAt`) AND git positively
+ * showed committed work nobody landed with no PR (`abandonedAt`). Nobody is coming for the branch, so
+ * the disposition — land it or drop it — is his.
  *
- * ⚠️ WHY SO MANY CASES BELOW NEEDED IT ON 2026-08-07. They were written against an ordinary unmet
- * goal or a dirty worktree back when those painted red, and they are not ABOUT the tier at all —
- * they cover liveness refusal, dismissal, the episode counter and cross-fleet selectivity. Rewriting
- * their expectation to `lapsed` would have kept them green while quietly deleting the only coverage
- * the red path has in those mechanisms. Swapping the FIXTURE keeps each test testing what it was
- * written to test.
+ * ⚠️ IT USED TO BE `human-verified-goal`, AND THE FIXTURE MOVED ON 2026-08-18. That cause was the red
+ * anchor from 2026-08-07, but the founder refined the rule: an agent merely awaiting his review-close
+ * is done, not stuck, so it is amber now (see stallEscalation.OUTSTANDING). The sole surviving red
+ * cause is `abandoned-goal`, so the red-tier fixture is one of those. Every case below covers a
+ * mechanism (liveness refusal, dismissal, the episode counter, cross-fleet selectivity), not the tier
+ * itself — swapping the FIXTURE keeps each testing what it was written to test, exactly as the
+ * 2026-08-07 rename of this same helper did.
  */
 function founderOnly(over: Partial<StallInput> = {}): StallInput {
   return resting({
     goal: {
-      ...newGoal("sign off on the launch copy", T0, undefined, { kind: "human" }),
+      ...newGoal("finish and land the migration", T0),
       escalatedAt: T0 + 1,
+      abandonedAt: T0 + 1,
+      abandonedEvidence: "2 commits on the branch, no PR, not in origin/main",
     },
     ...over,
   });
@@ -99,14 +104,28 @@ describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
       resting({ goal: { ...newGoal("hard", T0), escalatedAt: T0 + 1 } }),
       "lapsed",
     ],
-    // …and the one that IS his. Auto-continue has stopped AND the goal's stated check is one no
-    // agent may ever discharge, so nobody but the founder can clear this row.
+    // A goal only a person can close, with the agent DONE and awaiting his review-close. AMBER since
+    // 2026-08-18: it must leave calm (it still owes a sign-off) but must not wear the red dot, because
+    // the agent is not stuck — it needs nothing to proceed.
     [
-      "a goal only a person can close, with no retry coming",
+      "a goal awaiting the founder's review-close",
       resting({
         goal: {
           ...newGoal("approve the copy", T0, undefined, { kind: "human" }),
           escalatedAt: T0 + 1,
+        },
+      }),
+      "lapsed",
+    ],
+    // …and the one that IS his AND is stuck: auto-continue gave up holding committed work nobody
+    // landed with no PR carrying it, so the disposition call is his and nothing else can move it.
+    [
+      "a goal it abandoned holding unlanded work",
+      resting({
+        goal: {
+          ...newGoal("finish and land the migration", T0),
+          escalatedAt: T0 + 1,
+          abandonedAt: T0 + 1,
         },
       }),
       "blocked",
@@ -158,16 +177,17 @@ describe("THE FOUNDER'S ACCEPTANCE TEST — gray is a terminal state", () => {
 
   it("…and RED still reaches the rows that ARE his, so the tier is not dead", () => {
     // The other direction, and the reason the change above is safe: making rows less red must not
-    // make the red tier unreachable. A goal only a person can close, with no retry coming, still
-    // paints the loudest colour the app has.
+    // make the red tier unreachable. A goal it gave up on while holding unlanded work nobody is coming
+    // for — genuinely stuck, and his to dispose of — still paints the loudest colour the app has.
     const out = withStallAttention(
       AGENTS,
       { a: "idle" },
       reportFor(
         resting({
           goal: {
-            ...newGoal("sign off on the launch copy", T0, undefined, { kind: "human" }),
+            ...newGoal("finish and land the migration", T0),
             escalatedAt: T0 + 1,
+            abandonedAt: T0 + 1,
           },
         }),
       ),
@@ -354,16 +374,17 @@ describe("a DEAD process, shaped the way production presents it", () => {
   // saying "needs you to unstick it" about an agent with no PTY. The earlier test could not see it
   // because it passed the PRE-overlay status, which the real pipeline never presents here.
   //
-  // The goal is the FOUNDER-ONLY one so the "while the process is alive" control below still lands
-  // on RED. The liveness refusal itself runs BEFORE the tier split (`withStallAttention` continues
-  // on a dead process without ever calling `escalationFor`), so it covers both tiers either way —
-  // but the loudest colour is the one worth pinning against a dead PTY.
+  // The goal is the FOUNDER-ONLY (abandoned, stuck) one so the "while the process is alive" control
+  // below still lands on RED. The liveness refusal itself runs BEFORE the tier split
+  // (`withStallAttention` continues on a dead process without ever calling `escalationFor`), so it
+  // covers both tiers either way — but the loudest colour is the one worth pinning against a dead PTY.
   const deadUnmergedRow: StallInput = {
     status: "unmerged", // what withUnmergedWork wrote over `stopped`
     now: T0,
     goal: {
-      ...newGoal("never finished", T0, undefined, { kind: "human" }),
+      ...newGoal("never finished", T0),
       escalatedAt: T0 + 1,
+      abandonedAt: T0 + 1,
     },
     hasOpenPr: false,
     hasUncommittedChanges: true,

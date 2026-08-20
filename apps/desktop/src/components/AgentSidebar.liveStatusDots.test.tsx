@@ -46,6 +46,7 @@ import { useUiStore } from "../stores/uiStore";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { WorkflowStageId } from "../engine/workflowStage";
 import { dotInk, expectedDotColor, filterOn } from "./statusDotTestUtils";
+import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
 
 function mkAgent(id: string, name: string): AgentTab {
   return {
@@ -68,7 +69,15 @@ function seed(): Project {
   const project: Project = {
     id: "p1", name: "Demo", rootPath: "/tmp/demo", defaultBranch: "main",
     createdAt: new Date(0).toISOString(), selectedAgentId: null,
-    agents: [mkAgent("a1", "Unlanded"), mkAgent("a2", "Finished"), mkAgent("a3", "Running")],
+    // `a4` "Blocked" spans the RED tier so the same render exercises all three founder-facing colors:
+    // green=working, gray=idle/done, red=genuinely-blocked. See the "full dot taxonomy is coherent"
+    // block below.
+    agents: [
+      mkAgent("a1", "Unlanded"),
+      mkAgent("a2", "Finished"),
+      mkAgent("a3", "Running"),
+      mkAgent("a4", "Blocked"),
+    ],
   };
   useProjectStore.setState({ projects: [project] } as never);
   useRuntimeStore.setState({
@@ -76,10 +85,12 @@ function seed(): Project {
     // `building_saved` is the committed-but-unlanded stage withUnmergedWork escalates on; `merged`
     // is past it.
     workflowStage: {
-      a1: "building_saved", a2: "merged", a3: "merged",
+      a1: "building_saved", a2: "merged", a3: "merged", a4: "merged",
     } as Record<string, WorkflowStageId>,
-    status: { a1: "idle", a2: "idle", a3: "working" } as Record<string, AgentTabStatus>,
-    openAgentIds: ["a1", "a2", "a3"],
+    status: {
+      a1: "idle", a2: "idle", a3: "working", a4: "blocked",
+    } as Record<string, AgentTabStatus>,
+    openAgentIds: ["a1", "a2", "a3", "a4"],
     open: vi.fn(),
     pollBranchStatus: vi.fn(() => Promise.resolve()),
   } as never);
@@ -229,5 +240,54 @@ describe("a blocked-on-human flag arriving after mount turns the dot RED", () =>
     render(<AgentSidebar project={project} />);
     await raise([founderFlag("a1", "blocked-on-ci")]);
     expect(dotInk(dotOfRow("Quiet")!)).not.toBe(expectedDotColor("blocked"));
+  });
+});
+
+// ── THE FULL DOT TAXONOMY IS COHERENT: green = working, gray = idle, red = blocked ────────────────
+//
+// The founder's 2026-08-18 rule for the whole disc, not just the red case this PR started with:
+//   • GREEN  — the agent is ACTIVELY WORKING (a turn is running / tools in flight).
+//   • GRAY   — idle / not working (including "done and quiet"); the terminal, shipped state.
+//   • RED    — genuinely blocked; only a human can unblock it.
+// This block asserts all three at the DERIVED DOT (the rendered disc — the side effect, not any
+// intermediate) in ONE render, so a change that recolours one tier or collapses two together fails
+// here. GREEN is keyed off the agent's status being `working` (the `running` band); that status is in
+// turn set by statusEngine when it sees Claude's live spinner frame (`isSpinnerFrame`). This test pins
+// the RENDER mapping status→colour; whether statusEngine correctly reports `working` for a quiet-but-
+// live turn is a separate concern owned by that engine and its spinner fixtures.
+describe("AgentSidebar — the disc colour matches the founder's three-tier rule", () => {
+  it("working→GREEN, idle→GRAY, blocked→RED, and the three are distinct", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+
+    const working = screen.getByTitle(AGENT_STATUS.working.label);
+    // A blocked row's disc hovers as its ASK ("Needs unsticking"), not "Blocked" — the row overrides
+    // the dot label with the founder-ask (AgentRow, `dotLabel ?? FOUNDER_ASK_LABEL[...]`). The COLOUR
+    // is still the red `blocked` tier, which is what this test is about.
+    const blocked = screen.getByTitle(FOUNDER_ASK_LABEL.unstick);
+    // The "Finished" row (a2) is the only plain `idle` row in the seed (a1 escalates to `unmerged`,
+    // a3 is `working`, a4 is `blocked`), so its title is unique.
+    const idle = screen.getByTitle(AGENT_STATUS.idle.label);
+
+    // GREEN — actively working.
+    expect(dotInk(working)).toBe(expectedDotColor("working"));
+    // GRAY — idle is the calm tier, NOT green and NOT red.
+    expect(dotInk(idle)).toBe(expectedDotColor("idle"));
+    expect(dotInk(idle)).not.toBe(expectedDotColor("working"));
+    expect(dotInk(idle)).not.toBe(expectedDotColor("blocked"));
+    // RED — genuinely blocked.
+    expect(dotInk(blocked)).toBe(expectedDotColor("blocked"));
+
+    // The three tiers are mutually distinct — the whole point of a colour code. If any two collapse,
+    // the founder cannot tell "running" from "idle" from "needs me" at a glance.
+    const inks = new Set([dotInk(working), dotInk(idle), dotInk(blocked)]);
+    expect(inks.size).toBe(3);
+  });
+
+  it("no filter dims the working OR the blocked disc — live signal and alarm both survive", () => {
+    const project = seed();
+    render(<AgentSidebar project={project} />);
+    expect(filterOn(rowFor("Running"))).toBe("");
+    expect(filterOn(rowFor("Blocked"))).toBe("");
   });
 });

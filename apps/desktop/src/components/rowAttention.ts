@@ -136,22 +136,90 @@ export const STALL_CAUSE_LABEL: Record<StallCause, string> = {
   // human" on purpose: the wire token is machine vocabulary, and the row is read by the person it
   // names. This is the label that finally matches the red dot the founder expected.
   "blocked-on-human": "blocked on you",
-  // THE ONLY LABEL THAT ADDRESSES THE READER. Every other phrase here names a state; this one names
-  // an action, because it is the one cause where he is the only actor who can clear it.
-  "human-verified-goal": "needs your sign-off",
   // Names what RAN OUT rather than what happened, because "stuck again" is already carried by the
   // goal badge beside it and the fact worth three words here is that nothing may retry it now.
   "rearms-exhausted": "no re-arms left",
-  // The second label that addresses the reader, and for the same reason: nothing else can clear it.
-  // "abandoned" rather than "expired" deliberately — the clock is not the fact worth three words
-  // here, the stranded branch is.
+  // ADDRESSES THE READER ABOUT A STUCK ROW — a red cause. "abandoned" rather than "expired"
+  // deliberately: the clock is not the fact worth three words here, the stranded branch nobody is
+  // coming for is, and that is the disposition only he can make.
   "abandoned-goal": "gave up, work stranded",
+  // ADDRESSES THE READER, but CALMLY (2026-08-18). The work is done and only his review-close is
+  // left, so this names a task he does at his leisure — "awaiting", not "needs" — because the cause
+  // is amber "awaiting review-close", not the red "a human is blocking this" it used to be.
+  "human-verified-goal": "awaiting your sign-off",
   "escalated-goal": "auto-continue gave up",
   "unmet-goal": "goal unmet",
   "expired-goal": "goal expired",
   "open-pr": "PR unmerged",
   "unlanded-work": "work not landed",
   "uncommitted-changes": "uncommitted changes",
+};
+
+/** Warning-class ordering: worst first, so a row's single glyph and a pill row's first pill both
+ *  lead with the thing most worth doing something about.
+ *
+ *  ⚠️ THE WORK CAUSES COME FIRST, AND THIS WAS INVERTED UNTIL 2026-08-06. `escalated-goal` used to
+ *  head the list, on the reasoning that "nothing is coming for that agent at all". That ranked it
+ *  above `unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes` — and once
+ *  `escalated-goal` moved to the amber `lapsed` tier (engine/stallEscalation LIFECYCLE), the list
+ *  led with the one cause that needs NOTHING from the human and buried the ones that do. A row
+ *  holding uncommitted files would have shown "auto-continue gave up" as its single glyph.
+ *
+ *  So the order now mirrors `withStallAttention`'s: everything in `OUTSTANDING` (red — work that
+ *  exists and nothing is coming to finish) sorts ahead of every cause that is NOT red. Relative
+ *  order WITHIN the red group is unchanged. A cause that stops being red must move down here in the
+ *  same change, or this list starts leading with the quiet one again — `agentNotices.test.ts`
+ *  derives that partition from `escalationFor` rather than restating it, so a membership change in
+ *  the engine fails there instead of silently invalidating this.
+ *
+ *  ⚠️ THIS GOVERNS PILL ORDER. The row's collapsed GLYPH and its click target are chosen by
+ *  `agentNotices.GLYPH_RANK`, which overrides input order — reordering this map alone does NOT
+ *  reach them, and that gap is what roborev 59949 caught. Both are fixed; keep them in step.
+ *
+ *  ⚠️ IT LIVES HERE, NOT IN `agentNotices`, SINCE roborev 65642. It governs THREE surfaces, not
+ *  one: the composer's pill order, the row's collapsed glyph, and — added by that finding —
+ *  {@link stallChipFor}'s head. The chip used to take `report.causes[0]` on the docblock's word
+ *  that the engine emits most-actionable-first, and the engine does not: `stallReport` pushes
+ *  `escalated-goal` (amber) before `abandoned-goal` (red), and after the 2026-08-18 demotion it
+ *  pushed `human-verified-goal` (amber) before both. So a genuinely stuck row rendered a RED dot
+ *  beside the calm chip "awaiting your sign-off +2" — the colour-vs-copy split this whole branch
+ *  exists to close, inverted. Ranking the chip head fixes it at the reader rather than asking
+ *  every future `causes.push` to remember an ordering nothing checks. */
+export const STALL_CAUSE_RANK: Record<StallCause, number> = {
+  // RED — `stallEscalation.OUTSTANDING`: the founder is the only actor who can clear it AND the
+  // agent is genuinely stuck. All three red causes lead, ahead of every amber one.
+  //
+  // FIRST OF ALL, and the tie-break is provenance: every other cause on this list is something the
+  // app INFERRED about the agent, while this is the agent's own answer to a direct question about
+  // what is blocking it. An assertion beats an inference, so it leads.
+  "blocked-on-human": 0,
+  // Also RED. Below the agent's own answer because it is an inference, above `rearms-exhausted`
+  // because a stranded branch is a stronger call to action than a spent retry budget.
+  "abandoned-goal": 1,
+  // RED, and LAST of the red group: it says only that nothing may retry the goal again, which is a
+  // weaker call to action than a stated question or a stranded branch. It rides alongside
+  // `escalated-goal` (which stays amber and stays at the bottom), so without a rank of its own the
+  // row's single glyph would have led with the quiet member of the pair.
+  "rearms-exhausted": 2,
+  // NEVER RED SINCE 2026-08-18. `human-verified-goal` moved to the amber `lapsed` tier: an agent
+  // awaiting the founder's review-close is done, not stuck, so it sorts BELOW every red cause — it
+  // used to lead this whole list. It still ranks above the plain lifecycle causes below because it
+  // names a task addressed to HIM (his sign-off) rather than work another actor finishes.
+  "human-verified-goal": 3,
+  // NEVER RED. The four below are `stallEscalation.LIFECYCLE` → the amber `lapsed` status; they were
+  // in the RED group until 2026-08-07 and moved together (see OUTSTANDING for who clears each). Their
+  // relative order is unchanged — it is a genuine actionability ordering among things somebody else
+  // will do, and `uncommitted-changes` stays last of them for the same reason it always did.
+  "unmet-goal": 4,
+  "open-pr": 5,
+  "unlanded-work": 6,
+  "uncommitted-changes": 7,
+  // `escalated-goal` is LIFECYCLE too, and sorts BELOW the work causes: it says our retry budget ran
+  // out, which is the quietest thing on this list. `expired-goal` is in NEITHER engine set → calm
+  // gray. Do not "keep them in step" by adding expiry to LIFECYCLE; that module's own ⚠️ block
+  // explains at length why it must stay out.
+  "escalated-goal": 8,
+  "expired-goal": 9,
 };
 
 /** What a stalled row renders. `text` is the VISIBLE reading and it is the CAUSE, not the word
@@ -179,12 +247,30 @@ export interface StallChip {
  * tier which is already loud, and `unknown` is the one that matters: it renders NOTHING, because a
  * row we failed to look at is not a row to raise an alarm about.
  *
- * `causes` is ordered most-actionable-first by the engine, so the head is the right thing to name.
+ * THE HEAD IS CHOSEN BY {@link STALL_CAUSE_RANK}, NOT BY INSERTION ORDER (roborev 65642). This
+ * docblock used to say "`causes` is ordered most-actionable-first by the engine, so the head is the
+ * right thing to name" — and the engine does not do that. `agentStall.stallReport` pushes
+ * `escalated-goal` (amber) before `abandoned-goal` (red), and after the 2026-08-18 demotion it also
+ * pushes `human-verified-goal` (amber) before both red causes. Both are reachable together on one
+ * row, because every red goal cause requires an ESCALATED goal by construction. The result was a
+ * row wearing the RED dot beside the calm chip "awaiting your sign-off +2" — the colour saying
+ * "come and unstick this" and the words saying "no rush" about the same agent, which is the exact
+ * split the red-dot work exists to close.
+ *
+ * Ranking here rather than re-ordering the pushes is deliberate: it fixes the reader once, instead
+ * of asking every future `causes.push` to remember an ordering nothing enforces.
+ *
  * The "+N" is not decoration either — it tells the reader the tooltip holds more than the headline.
  */
 export function stallChipFor(report: StallReport, bs?: BranchStatus | undefined): StallChip | null {
   if (report.verdict !== "stalled") return null;
-  const first = report.causes[0];
+  // Worst-first by rank, with insertion order as the tie-break (the ranks are distinct today, so the
+  // tie-break never fires — it is there so a future duplicate rank degrades to the old behaviour
+  // rather than to an unstable sort).
+  const first = report.causes.reduce<StallCause | undefined>(
+    (best, c) => (best === undefined || STALL_CAUSE_RANK[c] < STALL_CAUSE_RANK[best] ? c : best),
+    undefined,
+  );
   if (first === undefined) return null;
   const more = report.causes.length - 1;
   const label = first === "uncommitted-changes" ? uncommittedLabel(bs) : STALL_CAUSE_LABEL[first];

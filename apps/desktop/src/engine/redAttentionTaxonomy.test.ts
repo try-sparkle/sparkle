@@ -268,23 +268,43 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
     expect(bandOfStatus("lapsed")).not.toBe("needs_you");
   });
 
-  // ── RED: the causes where NO other actor can proceed ───────────────────────────────────────────
+  // ── NOT RED SINCE 2026-08-18: awaiting a review-close is done, not stuck ─────────────────────────
 
-  it("a goal only a PERSON may close, with no retry coming → RED", () => {
-    // The one stall cause that survives the rule. `human-verified-goal` means both halves at once:
-    // auto-continue has stopped (escalated or expired — nothing is coming to retry it) AND the
-    // goal's stated check is one no agent may ever discharge (`core.agentClosableKind` says
-    // `command`/`human` are un-closable by the claimant, whatever evidence turns up). So the work
-    // is as finished as it will get and the goal cannot close until he acts. That is the founder's
-    // "a decision the agent has explicitly escalated as his call", and nothing else can move it.
-    expect(escalationFor(report(["human-verified-goal"]))).toBe("blocked");
+  it("a goal only a PERSON may close, with no retry coming → AMBER, not red", () => {
+    // THIS ASSERTED `blocked` FROM 2026-08-07 UNTIL 2026-08-18, and the founder refined the rule that
+    // made it red. `human-verified-goal` means: auto-continue has stopped AND the goal's stated check
+    // is one no agent may ever discharge (`core.agentClosableKind` says `command`/`human` are
+    // un-closable by the claimant). So the work is as finished as it will get and only he can CLOSE
+    // it — but the agent is not blocked: it self-reports not-blocked, "no command or permission is
+    // needed from me". A red dot is the thing he PHYSICALLY chases, so it must mean STUCK, not
+    // "awaiting your review-close". This row is done and awaiting his sign-off, so it is amber.
+    expect(escalationFor(report(["human-verified-goal"]))).toBe("lapsed");
+    expect(isRedStatus("lapsed")).toBe(false);
+    // …and it lands in the `done` band, OFF the "N agents need you" count and out of the red dot.
+    expect(bandOfStatus("lapsed")).not.toBe("needs_you");
+    expect(bandOfStatus("lapsed")).toBe("done");
+  });
+
+  // ── RED: the one cause where NO other actor can proceed AND the work is stuck ────────────────────
+
+  it("a goal it gave up on holding UNLANDED work nobody is coming for → RED", () => {
+    // The sole surviving red stall cause. `abandoned-goal` means auto-continue spent its whole re-arm
+    // budget AND git shows committed work the default branch does not contain, with no PR carrying it.
+    // Sparkle has stopped, the agent will not restart itself, and nobody is coming for the branch — so
+    // what is left is a disposition call (land it or drop it) on someone's unfinished work, which is
+    // genuinely stuck and genuinely his. That is what a red dot must mean.
+    expect(escalationFor(report(["abandoned-goal"]))).toBe("blocked");
     expect(isRedStatus("blocked")).toBe(true);
+    expect(bandOfStatus("blocked")).toBe("needs_you");
   });
 
   it("RED still outranks AMBER when both are true — the safety ordering", () => {
     // DO NOT REGRESS THE OPPOSITE FAILURE. `OUTSTANDING` is tested FIRST, so a row that owes the
-    // founder a verdict stays red no matter how much self-resolvable bookkeeping sits beside it.
+    // founder a STUCK-work verdict stays red no matter how much self-resolvable (or merely
+    // awaiting-review) bookkeeping sits beside it — `human-verified-goal` included, now that it is
+    // amber. `abandoned-goal` is the red anchor.
     for (const c of [
+      "human-verified-goal",
       "escalated-goal",
       "expired-goal",
       "unmet-goal",
@@ -292,15 +312,18 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
       "unlanded-work",
       "uncommitted-changes",
     ] as const) {
-      expect(escalationFor(report(["human-verified-goal", c]))).toBe("blocked");
+      expect(escalationFor(report(["abandoned-goal", c]))).toBe("blocked");
       // …and in the other input order, so it is the SET that decides and not the array head.
-      expect(escalationFor(report([c, "human-verified-goal"]))).toBe("blocked");
+      expect(escalationFor(report([c, "abandoned-goal"]))).toBe("blocked");
       // EVERY red cause outranks, not just the one this loop was written for. `blocked-on-human` is
       // the case the founder actually hit — it coexists with `escalated-goal` on the same row by
       // construction, since the nudger flags agents whose goals auto-continue has handed back — so if
-      // the ordering only held for `human-verified-goal` the fix would not reach his row at all.
-      expect(escalationFor(report(["blocked-on-human", c]))).toBe("blocked");
-      expect(escalationFor(report([c, "blocked-on-human"]))).toBe("blocked");
+      // the ordering only held for one anchor the fix would not reach his row at all. Both input
+      // orders, so it is the SET that decides and not the array head.
+      for (const red of ["blocked-on-human", "rearms-exhausted"] as const) {
+        expect(escalationFor(report([red, c]))).toBe("blocked");
+        expect(escalationFor(report([c, red]))).toBe("blocked");
+      }
     }
   });
 
@@ -334,14 +357,23 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
       // the 2026-08-06 demotion cleared. Demotion trigger, stated so it is not rediscovered as a
       // false red: the day a machine actor can answer a `blocked-on-human` row on his behalf.
       "blocked-on-human": "blocked",
-      "human-verified-goal": "blocked",
-      // RED, and the argument is who can clear it: nobody but him. Sparkle has stopped (the re-arm
-      // budget is spent and the goal is escalated, so nothing retries it), the agent will not restart
-      // itself, and no PR is carrying the work — so what is left is a disposition call on an
-      // unfinished branch. It is reachable ONLY through `goalExpiry.decideExpiry`, which clears seven
-      // gates first and discharges a clean-and-landed agent three rules earlier, so a finished agent
-      // cannot wear it. Demotion trigger, stated so it is not rediscovered as a false red: the day
-      // the concierge auto-lands abandoned branches, this becomes "lapsed".
+      // AMBER since 2026-08-18 (was "blocked"). Awaiting the founder's review-close is done, not
+      // stuck: the agent needs nothing to proceed, so it must not wear the red dot he physically
+      // chases. It is surfaced — the cause is raised, the "awaiting your sign-off" chip renders — just
+      // in the amber `lapsed` tier that bands into `done`, off the "N need you" count.
+      //
+      // ⚠️ IT IS NOT THE SAME QUESTION AS `blocked-on-human` above, which stays red. That one is the
+      // AGENT saying a person is blocking it; this one is the GOAL RECORD saying only a person may
+      // close it. An agent in this state self-reports not-blocked, which is exactly why it is amber.
+      "human-verified-goal": "lapsed",
+      // RED, and the argument is who can clear it AND that the work is stuck: nobody but him. Sparkle
+      // has stopped (the re-arm budget is spent and the goal is escalated, so nothing retries it), the
+      // agent will not restart itself, and no PR is carrying the work — so what is left is a
+      // disposition call on an unfinished branch. It is reachable ONLY through
+      // `goalExpiry.decideExpiry`, which clears seven gates first and discharges a clean-and-landed
+      // agent three rules earlier, so a finished agent cannot wear it. Demotion trigger, stated so it
+      // is not rediscovered as a false red: the day the concierge auto-lands abandoned branches, this
+      // becomes "lapsed".
       "abandoned-goal": "blocked",
       // RED, and strictly NARROWER than `escalated-goal` below, which stays amber: this fires only
       // once the concierge has spent every re-arm it is allowed, so the machine actor that would
@@ -371,11 +403,13 @@ describe("AMBER lifecycle vs RED needs-you — red is reserved for the human", (
   });
 });
 
-// ── The PRODUCER half: the red cause must be UNREACHABLE unless the founder really is the only one ─
+// ── The PRODUCER half: the cause must be UNREACHABLE unless a human really is the only closer ──────
 //
-// `escalationFor` above decides what a cause MEANS. This block pins what actually raises it, because
-// a red tier is only as honest as its producer: route a common condition into `human-verified-goal`
-// and the false red comes straight back wearing a better name.
+// `escalationFor` above decides what a cause MEANS (amber, since 2026-08-18). This block pins what
+// actually raises it, because the "awaiting your sign-off" chip is only as honest as its producer:
+// route a common condition into `human-verified-goal` and every ordinary work goal grows a sign-off
+// chip nobody asked for. The provenance guards below are unchanged by the tier move — they still
+// keep the cause narrow — only what the cause COLOURS to changed (amber `lapsed`, not red `blocked`).
 describe("human-verified-goal — raised only when no other actor can close the goal", () => {
   const T0 = 1_700_000_000_000;
   const quiet = (goal: AgentGoal, now = T0 + 1): StallInput => ({
@@ -388,7 +422,7 @@ describe("human-verified-goal — raised only when no other actor can close the 
   });
   const causesOf = (goal: AgentGoal, now?: number) => stallReport(quiet(goal, now)).causes;
 
-  it("escalated + a CALLER-STATED human sign-off → raised, and the row is RED", () => {
+  it("escalated + a CALLER-STATED human sign-off → raised, and the row is AMBER (awaiting review-close)", () => {
     const goal = escalateGoal(newGoal("approve the copy", T0, undefined, { kind: "human" }), T0, "budget spent");
     // `newGoal` is never handed a fallback, so a `verify` reaching it is stated by construction.
     // Asserted rather than assumed: the whole cause turns on this flag being true here and false in
@@ -396,7 +430,10 @@ describe("human-verified-goal — raised only when no other actor can close the 
     // into one another and the guard would be untested in both directions.
     expect(goal.verifyStated).toBe(true);
     expect(causesOf(goal)).toContain("human-verified-goal");
-    expect(escalationFor(stallReport(quiet(goal)))).toBe("blocked");
+    // Raised — so the chip renders — but AMBER, not the red it was until 2026-08-18: the agent is done
+    // and awaiting his review-close, not stuck.
+    expect(escalationFor(stallReport(quiet(goal)))).toBe("lapsed");
+    expect(isRedStatus("lapsed")).toBe(false);
   });
 
   it("escalated + a command check → raised too: no executor runs it, so a PERSON closes it", () => {
@@ -511,7 +548,8 @@ describe("human-verified-goal — raised only when no other actor can close the 
     );
     expect(chosenHere.verifyInherited).toBe(undefined);
     expect(causesOf(chosenHere)).toContain("human-verified-goal");
-    expect(escalationFor(stallReport(quiet(chosenHere)))).toBe("blocked");
+    // Raised (chip present), amber tier since 2026-08-18.
+    expect(escalationFor(stallReport(quiet(chosenHere)))).toBe("lapsed");
   });
 
   it("a LEGACY check with no provenance flag → NOT raised: quiet when unsure", () => {
@@ -735,5 +773,108 @@ describe("blocked-on-human is gated on a resting status", () => {
       expect(at(s).verdict).toBe("active");
       expect(at(s).causes).toEqual([]);
     }
+  });
+});
+
+// ── THE FOUNDER'S 2026-08-18 RULE, END TO END: red = STUCK, not "awaiting your review-close" ───────
+//
+// The red dot is the signal the founder PHYSICALLY acts on — he goes and checks every one — so it
+// must mean the agent is stuck and only he can unblock it. This block drives the full production chain
+// `stallReport → escalationFor → bandOfStatus` (the founder-visible DOT is the band, not any
+// intermediate) and asserts the classification directly. One negative (the row to calm) and a matched
+// set of positives (the reds that must not weaken) — the pairing is the point, so a change that calms
+// the negative by emptying the red tier fails on the positives.
+describe("verify:human awaiting review-close is NOT red; genuine blockers stay red (band-level)", () => {
+  const T0 = 1_700_000_000_000;
+  // The final status a resting agent presents, exactly as the sidebar composes it.
+  const finalStatus = (input: StallInput): AgentTabStatus =>
+    escalationFor(stallReport(input)) ?? input.status;
+  // …and the band that drives the row's dot and the "N agents need you" count.
+  const finalBand = (input: StallInput) => bandOfStatus(finalStatus(input));
+  const restingIdle = (goal: AgentGoal | undefined): StallInput => ({
+    status: "idle",
+    now: T0 + 1,
+    goal,
+    hasOpenPr: false,
+    hasUnlandedWork: false,
+    hasUncommittedChanges: false,
+  });
+
+  it("work complete + verify:human + self-reported not-blocked → DONE band, never needs_you", () => {
+    // The exact false-alarm row: the agent finished, its `{kind:"human"}` check was chosen for THIS
+    // goal, auto-continue then spent its budget asking "is it done?" and escalated — but the agent
+    // needs nothing, it is awaiting the founder's review-close. Assert the BAND (the dot), not the
+    // status name: it must be `done`, off the red count.
+    const goal = escalateGoal(
+      newGoal("approve the launch copy", T0, undefined, { kind: "human" }),
+      T0,
+      "budget spent",
+    );
+    expect(goal.verifyStated).toBe(true);
+    expect(goal.verifyInherited).toBe(undefined); // chosen HERE, so the cause is raised
+    expect(stallReport(restingIdle(goal)).causes).toContain("human-verified-goal");
+    expect(finalStatus(restingIdle(goal))).toBe("lapsed");
+    expect(finalBand(restingIdle(goal))).toBe("done");
+    expect(finalBand(restingIdle(goal))).not.toBe("needs_you");
+  });
+
+  it("…and it is still SURFACED — the chip cause is raised, so he can find and close it", () => {
+    // Not red is not the same as not shown. The affordance survives: the row leaves calm gray and
+    // carries the raised cause the "awaiting your sign-off" chip is built from.
+    const goal = escalateGoal(
+      newGoal("approve the launch copy", T0, undefined, { kind: "human" }),
+      T0,
+      "budget spent",
+    );
+    const report = stallReport(restingIdle(goal));
+    expect(report.verdict).toBe("stalled");
+    expect(report.causes).toContain("human-verified-goal");
+    expect(finalStatus(restingIdle(goal))).not.toBe("idle"); // left calm gray, into amber
+  });
+
+  // ── PAIRED POSITIVES: every genuine blocker MUST stay in needs_you (red) ────────────────────────
+
+  it("gave up on UNLANDED work nobody is coming for → needs_you (red), the disposition is his", () => {
+    // A stranded branch with no PR: auto-continue spent its budget AND git shows committed work the
+    // default branch lacks. The agent cannot proceed and only he can dispose of it — genuinely stuck.
+    const goal = {
+      ...newGoal("finish and land the migration", T0),
+      escalatedAt: T0 + 1,
+      abandonedAt: T0 + 1,
+      abandonedEvidence: "2 commits on the branch, no PR, not in origin/main",
+    };
+    const input = restingIdle(goal);
+    expect(stallReport(input).causes).toContain("abandoned-goal");
+    expect(finalStatus(input)).toBe("blocked");
+    expect(finalBand(input)).toBe("needs_you");
+  });
+
+  it("errored / auth-wall / blocked-on-human / a live question all band needs_you", () => {
+    // The genuinely-red PTY statuses `statusEngine` derives (a crash, a sign-in wall surfaced as
+    // errored, an approval prompt, a question that halts the turn). They never pass through the stall
+    // surface (`stallReport` answers `active` outside idle/unmerged), so they are untouched by the
+    // amber change and must stay red. Asserted as the BAND, the thing the dot reads.
+    for (const s of ["errored", "waiting", "approval", "blocked"] as const) {
+      expect(bandOfStatus(s)).toBe("needs_you");
+      expect(isRedStatus(s)).toBe(true);
+    }
+  });
+
+  it("the negative and the positives really differ — the split is non-vacuous", () => {
+    // If a refactor ever collapsed `lapsed` and `blocked` into one band this would catch it: the
+    // awaiting-review row and the stuck-work row must land in DIFFERENT bands.
+    const awaitingReview = escalateGoal(
+      newGoal("approve the launch copy", T0, undefined, { kind: "human" }),
+      T0,
+      "budget spent",
+    );
+    const stranded = {
+      ...newGoal("finish and land the migration", T0),
+      escalatedAt: T0 + 1,
+      abandonedAt: T0 + 1,
+    };
+    expect(finalBand(restingIdle(awaitingReview))).not.toBe(
+      finalBand(restingIdle(stranded)),
+    );
   });
 });

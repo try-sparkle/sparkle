@@ -53,6 +53,7 @@ import type { AgentGoal } from "../engine/agentGoal";
 import type { AgentTab, AgentTabStatus, Project } from "../types";
 import type { BranchStatus, WorkflowState } from "../services/branchStatus";
 import { openAgentCard } from "../testing/rowGestures";
+import { FOUNDER_ASK_LABEL } from "../engine/founderAsk";
 
 const CLEAN_BS: BranchStatus = {
   ahead: 0,
@@ -310,6 +311,29 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     // is amber now, and simply rewriting the expectations to `lapsed` would have kept the test green
     // while deleting the only end-to-end coverage the red acknowledge path has. The amber tier's own
     // dismissal cycle is covered in engine/stallEscalation.test.ts, so both survive.
+    //
+    // ⚠️ AND IT GAINED `abandonedAt` ON 2026-08-19, FOR EXACTLY THE SAME REASON ONE TIER ON. The
+    // 2026-08-18 rule ("red means the agent is STUCK, not awaiting your review-close") moved
+    // `human-verified-goal` to the amber tier, so the sign-off check above stopped being enough to
+    // reach red — and the warning this comment already carries applied to itself: rewriting these
+    // expectations to `lapsed` would once again have kept the test green while deleting the red
+    // acknowledge path's only end-to-end coverage. `abandonedAt` restores it through a cause that
+    // IS still red (`stallEscalation.OUTSTANDING`), and it fits this fixture rather than being
+    // bolted on: the row already models committed work nobody landed, which is what abandonment
+    // means.
+    //
+    // The `{kind:"human"}` check is KEPT, and TWO tests below are what make keeping it mean
+    // something. An earlier draft of this comment claimed THIS test "doubles as the end-to-end case"
+    // for `stallChipFor`'s ranked head — it does not and cannot (roborev 65642/65656): the stall
+    // chip is card-only (`AgentRow`: "RETAINED BUT NO LONGER RENDERED ON THE COLLAPSED ROW"), this
+    // test renders collapsed rows, and it asserts nothing about chip text, so reverting the ranked
+    // head leaves it green. That is precisely the unbacked coverage claim this file's other ⚠️
+    // blocks exist to prevent, and it is worse than no comment: a future agent trimming the fixture
+    // reads it as protection that is not there. So the coverage was WRITTEN instead of claimed —
+    //   • "…records no red at all" pins the DEMOTION end to end: the same row minus `abandonedAt`
+    //     must record no red episode. Put the cause back in OUTSTANDING and it goes red.
+    //   • "the card's stall chip names the RED cause" opens the card and reads the chip, which is
+    //     the surface `stallChipFor`'s head actually reaches.
     render(
       <AgentSidebar
         project={seed({
@@ -320,6 +344,8 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
             stalled: {
               ...newGoal("sign off on the launch copy", Date.now(), undefined, { kind: "human" }),
               escalatedAt: Date.now(),
+              abandonedAt: Date.now(),
+              abandonedEvidence: "3 commits on the branch, no PR, not in origin/main",
             },
           },
         })}
@@ -344,11 +370,163 @@ describe("GRAY IS A TERMINAL STATE — the founder's rule, end to end through th
     //    "Needs merge". ACKNOWLEDGING IS NOT RESOLVING: the chip naming the outstanding work is still
     //    there, so the row still does not read as finished.
     const after = rowFor("Stalled One");
-    expect(within(after).queryByTitle(AGENT_STATUS.blocked.label)).toBeNull();
+    // BY THE ASK, for the reason spelled out in the paired negative below: a build row's disc never
+    // carries `AGENT_STATUS.blocked.label`, so asserting THAT absence passes on a red row too. This
+    // line predates roborev 65672 and had the same dead lookup; it is the one that has to fail if a
+    // dismissal ever stops de-escalating the row.
+    expect(within(after).queryByTitle(FOUNDER_ASK_LABEL.unstick)).toBeNull();
     expect(within(after).getByTitle(AGENT_STATUS.unmerged.label)).toBeTruthy();
     expect(within(after).getByTestId("row-notice-glyph")).toBeTruthy();
     // 4. …and Re-enable is offered, so the dismissal is undoable from the UI.
     expect(alertControlKind(alertOf(), "blocked")).toBe("reenable");
+  });
+
+  it("…and the SAME row WITHOUT the abandonment records no red at all — the 2026-08-18 demotion", () => {
+    // THE PAIRED NEGATIVE for the fixture above, and the end-to-end half of the demotion.
+    //
+    // Identical seed, one field removed: no `abandonedAt`. What is left is an escalated goal whose
+    // stated check only a person can discharge — the state that was RED from 2026-08-07 until
+    // 2026-08-18 and is AMBER now, because an agent awaiting the founder's review-close is done, not
+    // stuck. So the episode recorder must see `lapsed` and write no RED episode.
+    //
+    // ⚠️ IT DOES STILL OFFER A DISMISS CONTROL, and an earlier draft of this comment said the
+    // opposite (roborev 65672). `alertDismissal.DISMISSIBLE` has included the amber `lapsed` since
+    // 2026-08-06, so `alertControlKind` returns "dismiss" here — which is correct and worth pinning
+    // rather than explaining away: the demotion moved the row's TIER, it did not take away its
+    // acknowledge affordance. Left as prose, that claim invites someone to either add a red
+    // assertion or narrow `DISMISSIBLE` to match it, silently deleting the amber acknowledge path.
+    // So it is asserted below instead of described.
+    //
+    // It is the assertion that keeps the test above honest in the other direction too: with both
+    // fields the row is red, with only the sign-off it is not, so the red demonstrably comes from
+    // the abandonment rather than from the fixture happening to be red for some unrelated reason.
+    //
+    // ⚠️ WHAT IT GRIPS, STATED EXACTLY, because two of the three edits you might make to the tier
+    // sets have to be distinguished and only one of them is what this pair is named for:
+    //   • `human-verified-goal` back in `OUTSTANDING` → the `lastRed`/ask assertions fire. This is
+    //     the regression the pair exists for, verified by hand: re-adding it reds THIS test and
+    //     nothing else in the file.
+    //   • `human-verified-goal` out of LIFECYCLE (or out of BOTH sets) → STILL AMBER, and this pair
+    //     stays green. That is over-determination in the FIXTURE, not a hole: `escalated-goal` is in
+    //     LIFECYCLE too and an escalated goal always raises it, so this row cannot reach gray under
+    //     any single edit. It is the founder's real row, not a minimal one. `mutation-check` on that
+    //     membership line therefore FLAGs against this file, correctly — the tier's own membership
+    //     is pinned as data in `engine/redAttentionTaxonomy.test.ts`, which is where a check of it
+    //     belongs. Do not manufacture a gray assertion here to satisfy the checker; the two attempts
+    //     that did (`idle`, then `unmerged`) were both unable to fail.
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { stalled: "idle" },
+          branchStatus: { stalled: { ...CLEAN_BS, ahead: 3 } },
+          workflowState: { stalled: BARE_WS },
+          goals: {
+            stalled: {
+              ...newGoal("sign off on the launch copy", Date.now(), undefined, { kind: "human" }),
+              escalatedAt: Date.now(),
+            },
+          },
+        })}
+      />,
+    );
+    const project = () => useProjectStore.getState().projects[0]!;
+    const alertOf = () => project().agents.find((a) => a.id === "stalled")?.alert;
+
+    // The episode recorded is the AMBER one, not the red one. Asserted as an equality rather than a
+    // `not.toBe("blocked")` so it also fails if the row went calm and recorded nothing — "not red"
+    // and "not surfaced at all" are different outcomes and only one of them is the demotion.
+    expect(alertOf()?.lastRed).toBe("lapsed");
+    // …and the amber row is still acknowledgeable — the tier moved, the affordance did not.
+    expect(alertControlKind(alertOf(), "lapsed")).toBe("dismiss");
+    // …and the row is AMBER rather than calm, because not-red is not the same as silenced: the cause
+    // is still raised, so the row keeps its own band, its label and its mark.
+    //
+    // ⚠️ ORDER IS LOAD-BEARING HERE, and that is the whole of roborev 65695. `StatusDot` renders
+    // exactly ONE title — `label ?? AGENT_STATUS[status].label` — so on this row the amber label and
+    // the red ask are mutually exclusive: whichever is present, the other is absent. Written
+    // positive-first, `getByTitle(lapsed)` THROWS in every world the absence could have caught, so
+    // the absence never executed and was an assertion that could not fail. Absence FIRST fixes that
+    // without weakening anything: in the regression this pair is named for it is the line that
+    // fires, and it names the red ask in the failure message, which is the more legible red.
+    const row = rowFor("Stalled One");
+    // RED IS QUERIED BY THE ASK, never by `AGENT_STATUS.blocked.label` (roborev 65672). `AgentRow`
+    // renders a build row's disc as `dotLabel ?? FOUNDER_ASK_LABEL[ask]` and `askFor("blocked")` is
+    // "unstick", so a red row's disc title is "Needs unsticking" and the status label appears
+    // NOWHERE on a build row in either tier — asserting ITS absence could not fail either.
+    expect(within(row).queryByTitle(FOUNDER_ASK_LABEL.unstick)).toBeNull();
+    // …and then the positive, which is what rules out every OTHER band — gray, unlabelled, or a
+    // future one — since `getBy` throws on a miss. Absence alone would pass on a row with no dot to
+    // paint at all; this is the line that stops that.
+    expect(within(row).getByTitle(AGENT_STATUS.lapsed.label)).toBeTruthy();
+    // NO GRAY-ABSENCE LINE HERE, and its removal is the finding rather than an omission (roborev
+    // 65682). It read `queryByTitle(AGENT_STATUS.idle.label)).toBeNull()` under a comment claiming
+    // it was "live where the red one was not". It was not: `ahead: 3` + `BARE_WS` makes
+    // `unmergedAttention.withUnmergedWork` rewrite the resting `idle` to `unmerged` before the stall
+    // overlay runs, so `idle` never appears on this row in any world. Rewriting it to `unmerged` did
+    // not help either — `escalated-goal` is in LIFECYCLE too and an escalated goal always raises it,
+    // so the row is amber even with `human-verified-goal` removed from BOTH tiers, and gray is
+    // unreachable on this fixture under any single edit. A third dead assertion with a better
+    // comment on it is still a dead assertion.
+    //
+    // The positive `getByTitle(AGENT_STATUS.lapsed.label)` above already covers what that line was
+    // reaching for: it is a `getBy`, so it THROWS if the row is anything other than amber — red,
+    // gray, or unlabelled. Gray needs no line of its own; the tier the row could plausibly be
+    // mistaken for is RED, and the ask query is the one that names it.
+    expect(within(row).getByTestId("row-notice-glyph")).toBeTruthy();
+  });
+
+  it("the card's stall chip names the RED cause, not the amber one beside it", () => {
+    // THE END-TO-END CASE FOR THE RANKED CHIP HEAD (roborev 65642), on the surface that can actually
+    // observe it. `rowAttention.test.ts` pins the selection as a unit; this drives the real sidebar,
+    // opens the real card, and reads the real chip — so a revert to `report.causes[0]` fails here.
+    //
+    // THE FIXTURE IS THE MIXED SHAPE, and every part of it is load-bearing: `{kind:"human"}` raises
+    // the AMBER `human-verified-goal`, `abandonedAt` raises the RED `abandoned-goal`, the escalation
+    // raises the amber `escalated-goal`, and `ahead: 3` raises the amber `unlanded-work`. The engine
+    // pushes `human-verified-goal` FIRST of those, so insertion order puts the calmest phrase on
+    // the head of a row the dot paints RED — the colour-vs-copy split this whole change exists to
+    // close, inverted.
+    render(
+      <AgentSidebar
+        project={seed({
+          status: { stalled: "idle" },
+          branchStatus: { stalled: { ...CLEAN_BS, ahead: 3 } },
+          workflowState: { stalled: BARE_WS },
+          goals: {
+            stalled: {
+              ...newGoal("sign off on the launch copy", Date.now(), undefined, { kind: "human" }),
+              escalatedAt: Date.now(),
+              abandonedAt: Date.now(),
+              abandonedEvidence: "3 commits on the branch, no PR, not in origin/main",
+            },
+          },
+        })}
+      />,
+    );
+    const row = rowFor("Stalled One");
+    // The dot is RED — established first, because the whole finding is that the WORDS disagreed
+    // with THIS. Without it the chip assertion below is just a string check.
+    //
+    // FOUND BY ITS ASK, NOT BY `AGENT_STATUS.blocked.label`: a blocked row's disc hovers as the
+    // founder-ask ("Needs unsticking"), because `AgentRow` overrides the dot label with
+    // `dotLabel ?? FOUNDER_ASK_LABEL[...]`. The COLOUR is still the red `blocked` tier, which is
+    // what this line is about — the same lookup `AgentSidebar.liveStatusDots.test.tsx` uses.
+    expect(within(row).getByTitle(FOUNDER_ASK_LABEL.unstick)).toBeTruthy();
+
+    openAgentCard(row);
+    const chip = within(screen.getByTestId("agent-hover-card")).getByTestId("row-stall");
+    // BOTH directions on the same mounted element: the red cause's phrase leads, and the amber
+    // cause's phrase is not what it leads with. Either alone is half the evidence — "contains the
+    // red phrase" passes on a chip listing everything, and "lacks the amber phrase" passes on a
+    // chip that lost the amber cause entirely.
+    expect(chip.textContent).toContain("gave up, work stranded");
+    expect(chip.textContent).not.toContain("sign-off");
+    // …and the amber causes are still COUNTED, so the fix reordered the head rather than dropping
+    // the rest. Four causes on this row — `human-verified-goal`, `escalated-goal` and
+    // `unlanded-work` (the branch is 3 ahead) beside the red `abandoned-goal` — so the head carries
+    // "+3". Asserted as an exact count rather than "more than zero": a head that swallowed the
+    // others would still leave a "+N" if N were merely non-empty.
+    expect(chip.textContent).toContain("+3");
   });
 
   it("leaves a genuinely finished row gray — gray still means something", () => {

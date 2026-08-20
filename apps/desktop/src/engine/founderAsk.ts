@@ -115,8 +115,11 @@ export function askFor({ status }: FounderAskInput): FounderAsk | null {
   // waiting on him and the agent cannot proceed one step without an answer.
   if (status === "waiting") return "answer";
   if (status === "approval") return "approve";
-  // Something is wrong. `errored` is a crash; `blocked` is the stall escalation's red tier, which
-  // since the OUTSTANDING narrowing means a goal only a person can close. Both are "go look".
+  // Something is wrong. `errored` is a crash; `blocked` is the stall escalation's red tier, whose
+  // members are all "the agent is STUCK and only he can unblock it" — it said a person is blocking
+  // it, the concierge has no re-arms left, or it gave up holding work nobody landed. Both arms are
+  // "go look". (An agent merely awaiting his review-close is amber `lapsed`, not `blocked`: since
+  // 2026-08-18 that is calm, because it is done rather than stuck.)
   if (status === "errored" || status === "blocked") return "unstick";
   // Everything else is calm and asks nothing. That includes a retirement-ready row: its
   // recommendation is carried by `retirementReadiness`'s informational pill, deliberately outside

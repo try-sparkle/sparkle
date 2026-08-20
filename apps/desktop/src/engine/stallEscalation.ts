@@ -165,13 +165,19 @@ export function grayFloorFor(
 export const LAPSED_STATUS: AgentTabStatus = "lapsed";
 
 /**
- * The causes that mean "THE FOUNDER IS THE ONLY ACTOR WHO CAN UNBLOCK THIS".
+ * The causes that mean "THE FOUNDER IS THE ONLY ACTOR WHO CAN UNBLOCK THIS, AND THE WORK IS STUCK".
  *
  * Kept as an explicit set rather than "any cause at all" so that adding a new cause to `agentStall`
  * forces a decision here about whether it belongs in the red tier, instead of silently recolouring
  * rows.
  *
- * ══ ONE MEMBER, AND THE TEST IS A QUESTION WITH AN ANSWER (2026-08-07) ═══════════════════════════
+ * ══ THE TEST IS A QUESTION WITH AN ANSWER, AND IT HAS TWO HALVES ════════════════════════════════
+ * Membership requires BOTH: only the founder can clear it, AND the agent is genuinely stuck. The
+ * members below — `blocked-on-human`, `rearms-exhausted`, `abandoned-goal` — each satisfy both.
+ * `human-verified-goal` was the founder's red cause from 2026-08-07 until 2026-08-18, when he
+ * refined the rule (see the `human-verified-goal` block further down): "only I can close it" is not
+ * enough on its own — the WORK also has to be stuck. An agent awaiting his review-close is done, not
+ * stuck, so it is amber now. What follows is the derivation that established the first half.
  * This set used to read `unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes`, on the
  * rule "work that EXISTS and that nothing is coming to finish". That rule turned out to be the wrong
  * question, and the founder answered it directly after triaging red rows that needed nothing from him
@@ -201,10 +207,28 @@ export const LAPSED_STATUS: AgentTabStatus = "lapsed";
  *     goalContinuation/turn-end authority, and painting the row red neither fixes that nor tells
  *     him anything he can act on.
  *
- * All four are lifecycle bookkeeping, so all four moved to {@link LIFECYCLE}. What is left is the one
- * cause where the answer is genuinely "nobody but him": `human-verified-goal` — auto-continue has
- * stopped AND the goal's stated check is one no agent may ever discharge. See its derivation in
- * `agentStall`.
+ * All four are lifecycle bookkeeping, so all four moved to {@link LIFECYCLE}. What is left is the set
+ * of causes where the answer is genuinely "nobody but him AND the work is STUCK". `abandoned-goal` is
+ * the archetype — auto-continue has stopped AND git shows committed work nobody landed with no PR
+ * carrying it, so the only thing left is a disposition call on an unfinished branch. See its
+ * derivation in `agentStall`; `blocked-on-human` and `rearms-exhausted` joined it on 2026-08-18 and
+ * carry their own derivations in the set below.
+ *
+ * ══ `human-verified-goal` LEFT THIS TIER ON 2026-08-18 — "AWAITING REVIEW-CLOSE" IS NOT "STUCK" ═══
+ * It was the founder's own red cause on 2026-08-07 ("a decision the agent has explicitly escalated as
+ * his call"), and he refined that instruction on 2026-08-18: a red dot is the signal he PHYSICALLY
+ * acts on — he goes and checks every one — so red must mean the agent is STUCK and only he can
+ * unblock it. An agent whose work is COMPLETE and is merely awaiting his verification/close is not
+ * stuck: it self-reports not-blocked, "no command or permission is needed from me". The GOAL is
+ * human-closeable, but the AGENT needs nothing to proceed — there is nothing to unblock, only a
+ * review-close to do eventually. Painting that red trains him to expect a blocker and find a finished
+ * agent, which is exactly how a red dot stops meaning anything.
+ *
+ * So it moved to {@link LIFECYCLE} (amber `lapsed`), which bands into `done` — off the `needs_you`
+ * count and out of the alarm colour. It is NOT silenced: the cause is still raised (agentStall), the
+ * row still carries the "awaiting your sign-off" chip and its own detail, so he can still find and
+ * close it. The boundary is exactly "the AGENT needs nothing from me but the GOAL is human-closeable"
+ * (amber) versus "the agent CANNOT proceed without me" (red). `redAttentionTaxonomy.test.ts` pins it.
  *
  * THE COST OF GETTING THIS WRONG IS NOT THE CLICKS. It is that a red row stops meaning anything, and
  * a genuine blocker then hides among the false ones. That is why the bar for membership here is the
@@ -270,9 +294,11 @@ const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
   // from silence, a clock or a retry budget, which is what keeps it from re-reddening the population
   // the 2026-08-06 demotion cleared. `escalated-goal` below is untouched and still amber.
   //
-  // ⚠️ IT DOES NOT REPLACE `human-verified-goal`, and the two are different questions. That cause
-  // reads the GOAL RECORD: a stated check no agent may discharge. This one reads the AGENT: it says
-  // it is stuck on a person, whatever its goal says. Either alone is a real founder blocker.
+  // ⚠️ IT IS NOT A REPLACEMENT FOR `human-verified-goal` — the two ask different questions, and only
+  // this one is red. That cause reads the GOAL RECORD: a stated check no agent may discharge, which
+  // says the goal is his to CLOSE, not that the agent is stuck (it left this tier the same day; see
+  // the block below). This one reads the AGENT: it says it is stuck on a person, whatever its goal
+  // says. That is a blocker on its own, and it is the distinction the whole tier now turns on.
   //
   // ⚠️ WHY THE STALE RULE DOES NOT VETO IT (the founder's second instruction, same day: a stale
   // escalation must never be red). Staleness is a property of `goal.escalationReason` — a frozen
@@ -289,7 +315,10 @@ const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
   // cause — it fires only AFTER the concierge tried and ran out — so the machine actor this tier
   // asks about has demonstrably been exhausted rather than merely assumed absent.
   "rearms-exhausted",
-  "human-verified-goal",
+  // ── `human-verified-goal` IS DELIBERATELY ABSENT (LEFT 2026-08-18) ──────────────────────────────
+  // It sat here from 2026-08-07 and moved to {@link LIFECYCLE}. Do not add it back to "fix" a report
+  // that an awaiting-sign-off row is not red: that is the fix. The derivation is in this docblock
+  // and its own comment in LIFECYCLE; `redAttentionTaxonomy.test.ts` pins the absence by name.
   // ── `abandoned-goal` IS THE "OWN CHANGE WITH ITS OWN EVIDENCE" THE EXPIRY ARGUMENT INVITES ──────
   // The block above ends "If expiry ever needs to be louder, that is its own change with its own
   // evidence." This is it, and it is NOT a promotion of `expired-goal` — that cause is untouched and
@@ -317,8 +346,8 @@ const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
 /**
  * The causes ANOTHER ACTOR CAN CLEAR — the concierge, the agent itself, CI, or auto-continue.
  *
- * Amber. Not calm (the work is real and a reader should see it) and not red (it is not addressed to
- * the founder). This is where every cause lands that is not the single red one above.
+ * Amber. Not calm (the work is real and a reader should see it) and not red (the agent is not stuck
+ * on him). This is where every cause lands that is not in the red set above.
  *
  * ── IT WAS ONE MEMBER UNTIL 2026-08-07 ───────────────────────────────────────────────────────────
  * It held only `escalated-goal`, and the distinction drawn was "a fact about the WORK" (red) versus
@@ -359,10 +388,25 @@ const OUTSTANDING: ReadonlySet<StallCause> = new Set<StallCause>([
  * stays RED, on the strength of the WORK" — which stopped being true when the work causes moved
  * here. Same ordering, same guarantee; what changed is which cause is doing the outranking.)
  *
- * The same ordering is mirrored one component out, in `components/agentNotices.STALL_CAUSE_RANK`,
- * so the row's single glyph leads with a work cause too. Keep the two in step.
+ * The same ordering is mirrored one component out, in `components/rowAttention.STALL_CAUSE_RANK`,
+ * so the row's single glyph leads with a work cause too. Keep the two in step. (It lived in
+ * `components/agentNotices` until roborev 65642 moved it beside `STALL_CAUSE_LABEL`, because a
+ * third reader — `rowAttention.stallChipFor` — needed it and the other direction was an import
+ * cycle. Following this pointer to a file with no such map is what invites a local copy of the
+ * partition, which is the drift `agentNotices.test.ts` documents at length.)
  */
 const LIFECYCLE: ReadonlySet<StallCause> = new Set<StallCause>([
+  // ── `human-verified-goal` JOINED HERE 2026-08-18 — "awaiting your review-close", not "stuck" ────
+  // The founder's refined rule (see {@link OUTSTANDING}): a red dot means the agent is STUCK and only
+  // he can unblock it, because he physically checks every one. An agent whose work is done and is only
+  // awaiting his verification/close needs nothing to proceed — the GOAL is human-closeable, but the
+  // AGENT is not blocked. So it is amber, not red: it bands into `done` (off the `needs_you` count),
+  // while the raised cause keeps its "awaiting your sign-off" chip so he can still find and close it.
+  //
+  // It is NOT calm gray, and that is deliberate: gray is the terminal "shipped" state, and this row
+  // still owes a review-close. Amber "the machinery stopped, someone acts next" is the honest read —
+  // the someone here is him, at his leisure, not a blocker he must clear now.
+  "human-verified-goal",
   "escalated-goal",
   "unmet-goal",
   "open-pr",
@@ -460,10 +504,10 @@ export function withStallAttention<T extends MotionAgent & { id: string; alert?:
     // made the whole fix unreachable for orchestrators, silently — the row would stay amber with
     // nothing to indicate the signal had been dropped.
     //
-    // NARROW ON PURPOSE: it is this ONE cause, not the whole red tier. `human-verified-goal` and
-    // `abandoned-goal` are still derived facts about the goal record, so a working subtree is still
-    // a good reason to hold off on them, and `roborev 55423/55434`'s protection is untouched for
-    // every cause it was written about.
+    // NARROW ON PURPOSE: it is this ONE cause, not the whole red tier. `abandoned-goal` (red) and
+    // `human-verified-goal` (amber since 2026-08-18) are still DERIVED facts about the goal record,
+    // so a working subtree is still a good reason to hold off on them, and `roborev 55423/55434`'s
+    // protection is untouched for every cause it was written about.
     const report = reportOf(a.id);
     const saidHumanBlocked = report?.causes.includes("blocked-on-human") === true;
     if (!saidHumanBlocked && isInMotion(a.id, agents, statusMap)) continue;

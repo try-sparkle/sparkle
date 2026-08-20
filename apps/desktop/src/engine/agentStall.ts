@@ -252,11 +252,15 @@ export function stallReport(input: StallInput): StallReport {
   // simultaneously calls `working` would put a contradiction into the roster to buy nothing.
   if (input.humanBlock !== undefined) causes.push("blocked-on-human");
   const goalState = goalStateOf(goal, now);
-  // FIRST, because it is the only cause in this file that means "a human is required" — see the
-  // corrected paragraph further down, which said no such cause existed until 2026-08-07.
+  // NEXT AFTER THE AGENT'S OWN ANSWER, because it is the cause that identifies "the goal can only be
+  // closed by a person" — the "awaiting your review-close" state. It led this list until the agent's
+  // own `blocked-on-human` answer was added above it. Its TIER moved on 2026-08-18 as well: it is
+  // AMBER now, not red (see stallEscalation.LIFECYCLE), because an agent awaiting the founder's
+  // sign-off is DONE, not stuck. The detection below is unchanged; only what the cause MEANS to the
+  // colour tier changed.
   //
-  // ── THE ONE CAUSE THAT SURVIVES "RED = THE FOUNDER IS THE ONLY ACTOR" ────────────────────────────
-  // Both halves must hold, and each on its own is a false alarm the founder has already triaged:
+  // ── THE CAUSE THAT IDENTIFIES "AWAITING A HUMAN CLOSE" ───────────────────────────────────────────
+  // Both halves must hold, and each on its own is a false signal the founder has already triaged:
   //
   //   1. AUTO-CONTINUE EXPLICITLY HANDED IT BACK — `escalated`, and ONLY that.
   //      • NOT `unmet`: the agent still has work left, so his verdict is not owed yet. Firing there
@@ -423,10 +427,13 @@ export function stallReport(input: StallInput): StallReport {
   // reached by the WORK causes (`unmet-goal` / `open-pr` / `unlanded-work` / `uncommitted-changes`)".
   // Every one of those WORK causes has since moved to the amber tier — the concierge lands a stranded
   // branch, the agent commits its own worktree, CI clears a PR, auto-continue drives an unmet goal —
-  // so none of them is red any more. What replaced them is `human-verified-goal` above, which is
-  // exactly the cause that paragraph said did not exist: it means a human is required, on its own,
-  // and it is the only member of `OUTSTANDING`. The statuses `statusEngine` derives from the PTY
-  // (waiting / approval / errored) are still red and still never pass through here.
+  // so none of them is red any more. `human-verified-goal` above was briefly the red replacement
+  // (2026-08-07) but joined the amber tier on 2026-08-18: an agent awaiting the founder's review-close
+  // is DONE, not stuck, so it must not wear the "a human is blocking this" colour. What `OUTSTANDING`
+  // holds now is the causes where the agent is genuinely STUCK and he is the only actor —
+  // `blocked-on-human` (it said so when asked), `rearms-exhausted` (no machine may restart it) and
+  // `abandoned-goal` (it gave up holding work nobody landed). The statuses `statusEngine` derives
+  // from the PTY (waiting / approval / errored) are still red and still never pass through here.
   if (goalState === "expired") causes.push("expired-goal");
   if (hasOpenPr === true) causes.push("open-pr");
   // FOLDED INTO `open-pr` WHENEVER BOTH HOLD. An agent with an open PR has unlanded commits by
@@ -511,8 +518,9 @@ function stalledDetail(causes: StallCause[], goal: AgentGoal | undefined): strin
       case "rearms-exhausted":
         return "the concierge has no re-arms left for its goal, so nothing may restart it again";
       case "human-verified-goal":
-        // Names the PERSON explicitly, because this is the one sentence on the surface that is
-        // asking for something. Every other cause here describes work someone else will do.
+        // Names the PERSON explicitly, because it is one of the few sentences on this surface that
+        // asks HIM for something. It asks CALMLY, though: since 2026-08-18 the cause is amber, so
+        // the sentence describes a review-close he owes at his leisure, not a blocker to clear now.
         return (
           `its goal can only be closed by a person and nothing is coming to retry it` +
           `${goal?.text ? ` ("${goal.text}")` : ""}`

@@ -191,15 +191,17 @@ export interface AgentGoal {
    *  ⚠️ IT HAS A SECOND READER SINCE 2026-08-07, AND THIS DOCSTRING USED TO DENY IT (roborev 60339).
    *  It said "this decides only what the refusal TELLS the agent. Nothing about enforcement reads
    *  it." That is no longer true: `engine/agentStall`'s `chosenHere` reads this flag to decide
-   *  whether the `human-verified-goal` cause fires, and that cause is the ONLY member of
-   *  `stallEscalation.OUTSTANDING` — i.e. the only thing that paints a row RED.
+   *  whether the `human-verified-goal` cause fires. From 2026-08-07 to 2026-08-18 that cause was the
+   *  ONLY member of `stallEscalation.OUTSTANDING` and this flag gated a RED dot; on 2026-08-18 the
+   *  cause moved to the AMBER `lapsed` tier (an agent awaiting a review-close is done, not stuck), so
+   *  widening this flag now only changes whether the row shows the distinct "awaiting your sign-off"
+   *  chip versus the generic "auto-continue gave up" one — both amber, both surfaced.
    *
-   *  The two readers have opposite tolerances, so know which you are affecting: the refusal copy is
-   *  cosmetic, the attention tier is a user-visible alarm. WIDENING THIS FLAG SUPPRESSES THE RED
-   *  CAUSE. Stamping it `true` on a population that does not have it today — legacy/absent
-   *  provenance, say, so the refusal copy can always name the take-back exit — would silently switch
-   *  `human-verified-goal` off for that whole population, and nothing in THIS module's suite would
-   *  catch it. `engine/redAttentionTaxonomy.test.ts` is where that contract is pinned.
+   *  So the stakes are lower than they were, but keep the flag honest anyway: stamping it `true` on a
+   *  population that does not have it today — legacy/absent provenance, say — would switch
+   *  `human-verified-goal` off for that whole population and drop its chip, and nothing in THIS
+   *  module's suite would catch it. `engine/redAttentionTaxonomy.test.ts` is where that contract is
+   *  pinned.
    *
    *  @see engine/agentStall.ts — `chosenHere`, and its "TERM 3 IS A RELEVANCE JUDGEMENT" block
    *  @see services/controlListener.ts — the original reader, the refusal's `chosenHere` evidence */
@@ -700,8 +702,9 @@ export interface GoalDebt {
    *
    *  ⚠️ NOT read by the CLOSE gate (`canSelfMarkMet` never sees it) — but this line used to say
    *  "read only by the refusal copy", and that is no longer true (roborev 60339).
-   *  `engine/agentStall` reads it to decide whether the red `human-verified-goal` cause fires, so
-   *  widening it suppresses the loudest signal in the app. The full warning is on
+   *  `engine/agentStall` reads it to decide whether the `human-verified-goal` cause fires. That cause
+   *  is AMBER since 2026-08-18 (it was RED before), so widening this no longer suppresses a red dot —
+   *  it drops the "awaiting your sign-off" chip. The full warning is on
    *  {@link AgentGoal.verifyInherited}; read it before changing who gets this flag. */
   verifyInherited?: boolean;
 }
