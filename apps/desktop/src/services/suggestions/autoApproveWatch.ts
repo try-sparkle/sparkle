@@ -1,4 +1,4 @@
-// ANSWER A PERMISSION PROMPT WHEN IT APPEARS, NOT WHEN THE PANE IS CLICKED.
+// ANSWER AN ANSWERABLE PROMPT WHEN IT APPEARS, NOT WHEN THE PANE IS CLICKED.
 //
 // ── THE REPORT (founder, P0) ────────────────────────────────────────────────────────────────────
 // *"clicking an agent pane auto-runs a waiting bash command — a click may be silently answering
@@ -30,6 +30,40 @@
 // lazily per project (`Workspace`), so such an agent has no process in this window and therefore no
 // prompt to answer.
 //
+// ── THREE ANSWERERS RIDE THIS PATH, AND THE COUNT KEEPS BEING THE BUG ──────────────────────────
+// `maybeAutoPlan` (the plan-exit dialog, `[approvals].plan`), `maybeAutoResume` (the session-resume
+// picker, `[approvals].resume`) and `maybeAutoApprove` (permission prompts, per-category rules), in
+// that order — see `decide()` for why the order between the first two is a convention while being
+// ahead of the third is not.
+//
+// THE SAME OMISSION HAPPENED TWICE, WHICH IS WHY THIS PARAGRAPH EXISTS. The 2026-08-12 decision
+// above ("let the auto-approver see agents whose pane is not open") was implemented for permission
+// prompts alone. The plan-exit work later added its answerer here — and walked straight past the
+// resume sibling, which still had the ONE `useSuggestions` call site it started with, inside a hook
+// the concierge mounts for the SELECTED AGENT ONLY.
+//
+// IT IS INVISIBLE IN THE WORST WAY. Every other layer of each feature is correct — detector,
+// per-project rule resolution, keystroke, unit tests — so the reachability hole presents as
+// "configured and silently inert", never as broken: nothing logged, nothing red, no failing test.
+// A reader checking whether auto-resume works finds a complete, well-tested implementation and
+// concludes that it does. So when you add a FOURTH answerer, the question to ask is not "does my
+// detector work" but "which of the two call sites did I wire it into" — the answer must be both,
+// plus the memo-hit fast path in `useSuggestions`, which is a third place that is easy to miss
+// because it looks like a cache read rather than a decision point.
+//
+// WHY THE RESUME MISS COST MORE THAN THE OTHERS. This prompt appears on RESTART, and restarts arrive
+// in BURSTS. One measured night: every agent's PTY child died inside 150ms and 21 were respawned
+// over 80 seconds, all 21 showing the picker, ZERO auto-answered — six pressed by hand, and one
+// agent sat red for 35 minutes on a prompt nothing in the app could type into. A per-pane click is
+// not a recovery path for a fleet-wide event, which is the same argument the header above already
+// makes for permission prompts.
+//
+// IT IS STILL THE USER'S RULE THAT DECIDES. `maybeAutoResume` returns null for the default "ask",
+// so an unconfigured install types nothing here — this widens WHERE a configured rule is honoured,
+// never WHAT is authorised. `conciergeHandoff`'s exclusion of resume from the CONCIERGE tier is
+// untouched and still correct: that tier answers prompts with no rule behind them, and this one
+// answers only prompts that have one.
+//
 // ── THE FOUR CONSTRAINTS, AND WHERE EACH ONE LIVES ──────────────────────────────────────────────
 //  1. STALENESS IS THE MAIN HAZARD. Answering off a stale snapshot types a digit into whatever
 //     replaced the prompt. `approvalScreen.approvalScreenFor` is the single gate: its tier (a) reads
@@ -54,7 +88,7 @@
 //     ahead of the category branch, so it applies to this path by construction — which is the thing
 //     standing between "answer prompts I did not read" and real harm.
 import { useRuntimeStore } from "../../stores/runtimeStore";
-import { maybeAutoApprove, maybeAutoPlan } from "./approvalsRuntime";
+import { maybeAutoApprove, maybeAutoPlan, maybeAutoResume } from "./approvalsRuntime";
 import { approvalScreenFor } from "./approvalScreen";
 import { handledSigsFor } from "./handledSigs";
 import { log } from "../../logger";
@@ -168,6 +202,38 @@ function decide(agentId: string, textAtSchedule: string): void {
       mode: plan,
       source: read.source,
     });
+    return;
+  }
+  // THE RESUME SIBLING, AND IT WAS LEFT BEHIND TWICE. The 2026-08-12 decoupling in this module's
+  // header was applied to `maybeAutoApprove`; the plan-exit work above then added a THIRD answerer
+  // to this same function — and `maybeAutoResume` still had the ONE call site it started with,
+  // inside a hook the concierge mounts for the SELECTED AGENT ONLY. Every other layer of auto-resume
+  // was already correct (the detector, the per-project rule resolution, the keystroke, their tests),
+  // so a configured `resume = "summary"` presented as silently inert rather than as broken: nothing
+  // logged, nothing red, and the founder pressing pickers by hand.
+  //
+  // WHY IT COSTS MORE THAN THE OTHER TWO. This prompt appears on RESTART, and restarts arrive in
+  // BURSTS. One measured night every agent's PTY child died inside 150ms and 21 were respawned over
+  // 80 seconds, all 21 showing the picker, ZERO auto-answered — six pressed by hand, one agent red
+  // for 35 minutes on a prompt nothing in the app could type into. A per-pane click is not a
+  // recovery path for a fleet-wide event, which is the argument this module was built on.
+  //
+  // ORDER: after the plan arm and before `maybeAutoApprove`, matching `useSuggestions` exactly. The
+  // first two can never both claim a screen (a resume picker has no Yes/No pair and is not the
+  // plan dialog), so the order between them is a reading convention rather than a correctness one;
+  // being ahead of `maybeAutoApprove` is NOT — its unclassified arm hands screens to the concierge.
+  //
+  // IT IS NOT A SECOND AUTHORISATION. `maybeAutoResume` re-reads `[approvals].resume` for this
+  // agent's project on every call and returns null for the default "ask", so an unset rule types
+  // nothing here just as it types nothing on-pane. This widens WHERE a configured rule is honoured,
+  // never WHAT is authorised.
+  const resumeMode = maybeAutoResume(agentId, read.text, handledSigsFor(agentId));
+  if (resumeMode) {
+    // Same audit line, same reason as the two around it: what only this call site knows is WHERE the
+    // screen came from, which is the first question anyone reviewing an unwatched write asks. `mode`
+    // is load-bearing the way `tool` is on the approve arm — "summary" and "full" have very
+    // different costs, so a bare "auto-resumed" cannot answer the question that follows a usage spike.
+    log.info("approvals", "auto-resumed off-pane", { agentId, mode: resumeMode, source: read.source });
     return;
   }
   const category = maybeAutoApprove(agentId, read.text, handledSigsFor(agentId));

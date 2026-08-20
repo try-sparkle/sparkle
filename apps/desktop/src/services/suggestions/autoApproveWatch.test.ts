@@ -548,3 +548,162 @@ describe("the plan-exit prompt is answered on a pane nobody has opened", () => {
     expect(writePty).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── AND THE RESUME SIBLING, WHICH WAS LEFT BEHIND TWICE ─────────────────────────────────────────
+// The 2026-08-12 decoupling ("answer the prompt when it appears, not when the pane is clicked") was
+// applied to `maybeAutoApprove`. The plan-exit work above then added a THIRD answerer to the same
+// `decide()` — and `maybeAutoResume` still had the ONE call site it started with, inside a hook the
+// concierge mounts for the SELECTED agent only. So a configured `[approvals].resume` was honoured
+// for exactly one agent at a time and silently inert for the rest of the fleet.
+//
+// WHY THAT IS EXPENSIVE RATHER THAN MERELY UNTIDY. This prompt appears on RESTART, and restarts
+// arrive in BURSTS. One measured night: every agent's PTY child died inside 150ms and 21 were
+// respawned over 80 seconds, every one showing the picker. ZERO were auto-answered — six were
+// pressed by hand, and one agent sat red for 35 minutes on a prompt nothing in the app could type
+// into. A per-agent click is not a recovery path for a fleet-wide event, which is the argument this
+// whole module rests on.
+//
+// THE PAIRING IS THE PROOF, and it is why each write case has a no-write twin. A single "it typed
+// the digit" test cannot tell honouring the user's rule apart from typing at any resume picker it
+// sees — and this path types into a pane nobody is watching, so that distinction IS the safety
+// property. Same agent, same picker, same entry point, same settle: only the CONFIGURED RULE differs.
+describe("the session-resume picker is answered off-pane too, per the configured rule", () => {
+  // The real Claude Code session-resume picker. Its footer differs from the permission-prompt one,
+  // and it has no Yes/No pair — which is exactly why `classifyApproval` ignores it and it needs its
+  // own detector rather than a looser classifier.
+  const RESUME_FOOTER = "Enter to confirm · Esc to cancel";
+  const RESUME_PROMPT = [
+    "This session is 6h 54m old and 196.3k tokens.",
+    "Resuming the full session will consume a substantial portion of your usage limits.",
+    "❯ 1. Resume from summary (recommended)",
+    "  2. Resume full session as-is",
+    "  3. Don't ask me again",
+    "",
+    RESUME_FOOTER,
+  ].join("\n");
+
+  // THE CASE THAT FAILS AGAINST THE OLD CODE, in the population that matters: nothing is mounted for
+  // this agent. No terminal, so no viewport; no suggestions hook, because it is not the selected
+  // agent. The screen comes from the ask-capture `Terminal` wrote as the agent went red — tier (b),
+  // the same source the permission and plan arms already read.
+  it("types the SUMMARY digit for an unselected agent with no mounted terminal", () => {
+    useSettingsStore.setState({ resumeRule: "summary" });
+    stopWatch = startAutoApproveWatch();
+
+    // `waiting`, not `approval`: `statusEngine`'s band formula picks `approval` only when a
+    // DANGEROUS action was seen that turn, and a resume picker carries none — so it lands on
+    // `waiting`, which is what the agent stuck for 35 minutes was actually reading.
+    agentAsks(RESUME_PROMPT, "waiting");
+    expect(writePty).not.toHaveBeenCalled(); // the screen must hold still first
+
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledTimes(1);
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n"); // option 1 = "Resume from summary"
+  });
+
+  // PAIRED with the case above, identical in every respect except `resumeRule`, which is left at its
+  // default. Nothing is typed — the founder has not authorised this answer, so the picker stays his.
+  // Without this case the write above would prove only that the watch RUNS, not that it OBEYS.
+  it("…and types NOTHING for the same picker when the rule is unset", () => {
+    useSettingsStore.setState({ resumeRule: "ask" }); // the default: hands off
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(RESUME_PROMPT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  // "Honour whatever is configured" was the founder's explicit call over "off-pane answers summary
+  // only". `full` is the expensive answer, so it gets its own case rather than riding on the summary
+  // one: the two rules must select DIFFERENT options, and a suite that only ever sees `1\n` cannot
+  // tell a rule being READ from a digit being hard-coded.
+  it("types the FULL-session digit when the rule says full", () => {
+    useSettingsStore.setState({ resumeRule: "full" });
+    stopWatch = startAutoApproveWatch();
+
+    agentAsks(RESUME_PROMPT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledWith(AGENT, "2\n"); // option 2 = "Resume full session as-is"
+  });
+
+  // The population originally measured for the permission path: the pane IS mounted (its project has
+  // been visited) but is not selected, so no suggestions hook reads it. Answered off the LIVE
+  // viewport, with no capture involved at all.
+  it("answers a MOUNTED but unselected agent off its live viewport", () => {
+    useSettingsStore.setState({ resumeRule: "summary" });
+    mountViewport(() => RESUME_PROMPT);
+    stopWatch = startAutoApproveWatch();
+
+    useRuntimeStore.getState().setStatus(AGENT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
+  });
+
+  // The same de-dupe discipline the other two arms have: a picker that sits on screen through many
+  // store ticks is answered ONCE. `handledSigs` is shared with the mounted hook, so a later click on
+  // this pane re-reads a signature this module already handled and types nothing more.
+  it("answers a given resume picker exactly once, however many store ticks arrive", () => {
+    useSettingsStore.setState({ resumeRule: "summary" });
+    mountViewport(() => RESUME_PROMPT);
+    stopWatch = startAutoApproveWatch();
+
+    useRuntimeStore.getState().setStatus(AGENT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+    expect(writePty).toHaveBeenCalledTimes(1);
+
+    for (let i = 0; i < 5; i++) {
+      useRuntimeStore.getState().setAttentionScreen(AGENT, RESUME_PROMPT);
+      vi.advanceTimersByTime(SETTLE_MS);
+    }
+    expect(writePty).toHaveBeenCalledTimes(1);
+  });
+
+  // The staleness discipline is the SAME gate, not a parallel one — `approvalScreenFor` is called
+  // once and all three answerers read its result. Asserted anyway, because "subject to the same
+  // staleness discipline" is a claim about this arm, and a claim about a shared gate is still one
+  // that can regress (someone could read the raw capture for the resume path).
+  it("refuses a resume capture older than the age ceiling", () => {
+    useSettingsStore.setState({ resumeRule: "summary" });
+    useRuntimeStore.getState().setAttentionScreen(AGENT, RESUME_PROMPT);
+    vi.advanceTimersByTime(CAPTURE_MAX_AGE_MS + 1000);
+
+    stopWatch = startAutoApproveWatch();
+    useRuntimeStore.getState().setStatus(AGENT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  // PAIRED with the ceiling case: same agent, same picker, same rule — only the capture's AGE differs.
+  it("…and answers the same picker when the capture is fresh", () => {
+    useSettingsStore.setState({ resumeRule: "summary" });
+    useRuntimeStore.getState().setAttentionScreen(AGENT, RESUME_PROMPT);
+    vi.advanceTimersByTime(CAPTURE_MAX_AGE_MS - 5_000);
+
+    stopWatch = startAutoApproveWatch();
+    useRuntimeStore.getState().setStatus(AGENT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).toHaveBeenCalledWith(AGENT, "1\n");
+  });
+
+  // The master toggle is a SUB-OPTION relationship, not two independent switches: turning off
+  // auto-approve must silence this too. The gate lives inside `maybeAutoResume`, but this is a NEW
+  // caller of it, and a new caller is exactly where an ordering mistake would put the write ahead of
+  // the gate.
+  it("stays silent while the auto-approve master toggle is off", () => {
+    useSettingsStore.setState({ resumeRule: "summary" });
+    aiFeatureVisibleNow.mockReturnValue(false);
+    mountViewport(() => RESUME_PROMPT);
+    stopWatch = startAutoApproveWatch();
+
+    useRuntimeStore.getState().setStatus(AGENT, "waiting");
+    vi.advanceTimersByTime(SETTLE_MS);
+
+    expect(writePty).not.toHaveBeenCalled();
+  });
+});

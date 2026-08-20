@@ -640,14 +640,41 @@ export function useSuggestions(agentId: string, composerEmpty: boolean) {
         log.debug("suggestions", "auto-answered plan prompt (memo)", { agentId, mode: memoPlan });
         return;
       }
+      // …AND SO DOES THE RESUME PATH, for the mirror of that reason — but the mechanism is NOT the
+      // one it looks like, and getting it wrong is how this comment first shipped (roborev 65801).
+      // A screen that WAS auto-resumed never reaches here at all: the async arm returns before
+      // `rememberComputed`, so only NON-auto-answered screens are memoized. What reaches this branch
+      // is therefore a resume picker the founder was SHOWN — because the rule was `ask`, the master
+      // toggle was off, or the agent was not live when it settled. The gate can then OPEN between
+      // two sightings, and without this call the return visit serves cached pills to a prompt the
+      // now-configured rule says to answer. The failure is invisible: the memo hit renders perfectly
+      // good buttons, so nothing looks broken.
+      //
+      // ORDER matches the async path below — plan, resume, approve. The first two cannot both claim
+      // a screen, but being ahead of `maybeAutoApprove` matters: its unclassified arm hands the
+      // screen to the concierge.
+      const autoResume = maybeAutoResume(agentId, scrollback, handledSigs.current);
+      // `memoPlan === "asked"` means the plan path CLAIMED this screen for a human, and a resume
+      // answer is not `maybeAutoApprove`'s to give either — so the approve arm runs only when
+      // neither sibling has spoken for the screen.
       const autoCat =
-        memoPlan === null ? maybeAutoApprove(agentId, scrollback, handledSigs.current) : null;
+        memoPlan === null && !autoResume
+          ? maybeAutoApprove(agentId, scrollback, handledSigs.current)
+          : null;
       lastHash.current = nextHash;
       // Unlike the success path below, this branch deliberately does NOT clear `fail`. It can't be
       // stale here: only a SUCCEEDED compute is ever memoized, so a hash present in the memo is by
       // construction not the hash we're currently failing on. Clearing it would read as though the
       // two paths guard the same thing — and would throw away a budget this path never spent.
       setDismissed(new Set());
+      if (autoResume) {
+        setAutoApproved(null); // not a category note; just suppress the pills for this prompt
+        setButtons([]);
+        setQuestionPending(false); // answered on the user's behalf — nothing is pending
+        retire();
+        log.debug("suggestions", "auto-resumed", { agentId, mode: autoResume });
+        return;
+      }
       if (autoCat) {
         setAutoApproved(autoCat);
         setButtons([]);
