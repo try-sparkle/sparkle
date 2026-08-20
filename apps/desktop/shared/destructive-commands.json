@@ -135,7 +135,6 @@
     { "command": "git clean -fdx --exclude --dry-run", "why": "the detached value is the literal string `--dry-run`" },
     { "command": "git clean -fdx --dry-run", "why": "there is NO dry-run exemption — this is the shape the four bypasses above disguise themselves as, and exempting it is what makes them reachable" },
     { "command": "git clean -fdx -n", "why": "the short dry-run spelling, refused for the same reason" },
-    { "command": "git clean -fd -- -x", "why": "a PATHSPEC literally named `-x`, refused because the scan has no flag/pathspec boundary. Identical to origin/main, so not a regression — pinned so the behaviour is recorded rather than rediscovered, and as the second case a future dry-run exemption must handle." },
     {
       "command": "git clean -fdxe'*.n'",
       "why": "an exclude PATTERN containing `n` is not the -n flag: the cluster scan stops at `e`, so this is a real -x clean and stays refused"

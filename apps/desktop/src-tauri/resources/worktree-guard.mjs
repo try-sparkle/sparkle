@@ -1927,6 +1927,13 @@ function judgeSegment(tokens, depth) {
           // that grows with every flag git adds — on the one code path whose whole job is to stop a
           // credential deletion. A refused dry run costs one sentence to a human (the refusal
           // message says to ask rather than rephrase); a missed real clean costs the credentials.
+          // KNOWN CURRENT BEHAVIOUR, deliberately NOT pinned in the corpus: with no flag/pathspec
+          // boundary, a PATHSPEC literally named `-x`/`-X` is refused too (`git clean -fd -- -x`).
+          // That is a harmless false refusal, identical to what shipped before, and a future `--`
+          // boundary would — and should — allow it. It is recorded here rather than in
+          // destructive-commands.json because `mustBlock` is a CONTRACT ("must be refused"), and
+          // putting a harmless command there would make the correct future fix read as a
+          // regression against it. See roborev 66282.
           // If the dry run is ever worth exempting it needs its own change, with the detached-value
           // case handled and pinned. `destructiveCommands.test.ts` pins all four bypass spellings.
           const removesIgnored = git.args.some((a) => {
