@@ -2740,3 +2740,158 @@ describe("BoardView — the bead card's Chat button follows onBeadChat, nothing 
     expect(within(main).getByTestId("board-bead-card")).toBeTruthy();
   });
 });
+
+// ══ THE STATUS CHIP SAYS THE STAGE THE CARD IS SITTING IN (bead sparkle-az6di8) ═══════════════
+//
+// The founder, verbatim: *"I want them to have the actual status. So instead of saying open, it
+// should say something like 'Being Built'."* The chip used to print bd's wire status, which can
+// only ever be one of three words and puts backlog, blocked and planned-but-unstarted all under
+// `open` — a card reading `open` beneath a header reading `Being built` contradicts the thing next
+// to it.
+//
+// ── WHY THESE ROWS DRIVE THE BOARD RATHER THAN CALLING `stageLabel` ──────────────────────────
+// The label is threaded from the bucketing that PLACED the card (`placedIn`), and a unit test of
+// the label function alone would pass with that thread cut — the fallback re-derives a column from
+// the bead and produces the same word for the ordinary cases. So every row below opens a real
+// card on a real board, and the two that matter (blocked, and the epic ladder's Planning) are
+// chosen because THE FALLBACK CANNOT PRODUCE THEM: blockedness is a dependency fact no bead
+// carries, and Planning is a roll-up of an epic's children. If `placedIn` stops being passed,
+// those two go red while the rest stay green.
+describe("BoardView — the bead card's status chip is the board stage, not the wire status", () => {
+  const meta = () => screen.getByTestId("board-bead-card-meta").textContent ?? "";
+
+  /** The CARD bearing this title, ignoring the "Part of Epic: <name>" back-link a child card also
+   *  carries — a bare `getByText` matches both and throws. Same scoping the plan-kinds describe
+   *  above uses, and it is needed here for exactly one row (the epic on the task board, where its
+   *  child is visible beside it). */
+  const openCard = (title: string) => {
+    const node = screen
+      .queryAllByText(title)
+      .find((n) => n.closest('[data-testid="part-of-epic"]') === null);
+    if (node === undefined) throw new Error(`no card titled ${title}`);
+    fireEvent.click(node);
+  };
+
+  it("says 'Being built' — not 'open', not 'in progress' — for a card in that column", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Doing now")); // the sole inProgress card
+    // THE FOUNDER'S OWN PHRASE, and byte-for-byte the column header above it.
+    expect(meta()).toContain("Being built");
+    expect(meta()).not.toContain("in progress");
+    expect(meta()).not.toContain("in_progress");
+    expect(meta()).not.toContain("open");
+  });
+
+  it("says 'Backlog' for an open card in Backlog", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Backlog two"));
+    expect(meta()).toContain("Backlog");
+    expect(meta()).not.toContain("open");
+  });
+
+  it("says 'Done' for a closed card, and 'Shipped' for a delivered one", () => {
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Finished"));
+    expect(meta()).toContain("Done");
+    expect(meta()).not.toContain("closed");
+    fireEvent.keyDown(window, { key: "Escape" });
+    fireEvent.click(screen.getByText("Delivered task"));
+    expect(meta()).toContain("Shipped");
+    expect(meta()).not.toContain("closed");
+  });
+
+  // ── THE ROW THE FALLBACK CANNOT PASS ────────────────────────────────────────────────────────
+  // This bead's own `status` is plain `open` and it carries no label saying otherwise — bd's answer
+  // to "is it blocked" is a DEPENDENCY, which `columnFor` can only see when handed the blocked set
+  // the board was bucketed with. So a chip that re-derived from the bead would read "Backlog" here.
+  // Reading the placement back off the board is what makes it read "Blocked", and it is what makes
+  // the chip agree with the header the reader just clicked through.
+  it("says 'Blocked' for a bead the BOARD placed in Blocked, though its own status is open", () => {
+    const blocked = bead({ id: "p1-z1", title: "Waiting on a dep" });
+    snapshot = {
+      beads: [],
+      board: { ...board, backlog: [], blocked: [blocked] },
+      loadedAt: Date.now(),
+    };
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Waiting on a dep"));
+    expect(meta()).toContain("Blocked");
+    expect(meta()).not.toContain("Backlog");
+    expect(meta()).not.toContain("open");
+  });
+
+  // ── THE OTHER ROW THE FALLBACK CANNOT PASS: THE CHIP FOLLOWS THE MODE ───────────────────────
+  // The rule is "whatever bucketing placed this card", NOT "always columnFor". In Epics-only mode
+  // the seven-rung ladder places the card, and an open epic whose children are all open is placed
+  // in PLANNING by the child roll-up — a fact about its children that nothing on the epic bead
+  // itself records. The same epic in the default (task) view sits in Backlog and correctly says so,
+  // which is why both halves are asserted: one alone would pass for a chip wired to either rule.
+  it("mirrors the EPIC LADDER's rung in Epics-only mode — 'Planning', not 'Backlog'", () => {
+    const beads: Bead[] = [
+      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
+    ];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+    useUiStore.setState({
+      planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: false, epics: true } },
+    });
+    render(<BoardView project={project} side="right" />);
+    fireEvent.click(screen.getByText("Parent rollup"));
+    expect(meta()).toContain("Planning");
+    expect(meta()).not.toContain("Backlog");
+    expect(meta()).not.toContain("open");
+    useUiStore.setState({
+      planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: true, epics: true } },
+    });
+  });
+
+  it("says 'Backlog' for that SAME epic on the task board — the chip follows the mode", () => {
+    const beads: Bead[] = [
+      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
+    ];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+    useUiStore.setState({
+      planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: true, epics: true } },
+    });
+    render(<BoardView project={project} side="right" />);
+    openCard("Parent rollup");
+    expect(meta()).toContain("Backlog");
+    expect(meta()).not.toContain("Planning");
+  });
+
+  // ── ONE VOCABULARY, BOTH BOARDS (the second defect this change closes) ──────────────────────
+  // The epic ladder used to label this column "Building" while the task board labelled it "Being
+  // built" — the same column, two names, so a reader who toggled Epics watched a stage rename
+  // itself. Both headers now read from `epicBoard.STAGE_LABELS`. Asserted by RENDERING both modes
+  // and comparing what is on screen, rather than by comparing two constants: the constants are the
+  // implementation, and a third hand-written list could reintroduce the drift without touching them.
+  it("names the in-progress column identically on the task board and the epic ladder", () => {
+    const beads: Bead[] = [
+      bead({ id: "p1-epic", title: "Parent rollup" }),
+      bead({ id: "p1-epic.1", title: "Epic child", parent: "p1-epic" }),
+    ];
+    snapshot = { beads, board: bucketBeads(beads), loadedAt: Date.now() };
+
+    useUiStore.setState({
+      planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: true, epics: true } },
+    });
+    const tasks = render(<BoardView project={project} side="right" />);
+    const taskBoardLabel = screen.getByTestId("lane-label-inProgress").textContent ?? "";
+    tasks.unmount();
+
+    useUiStore.setState({
+      planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: false, epics: true } },
+    });
+    render(<BoardView project={project} side="right" />);
+    const ladderLabel = screen.getByTestId("lane-label-inProgress").textContent ?? "";
+
+    expect(ladderLabel).toContain("Being built");
+    expect(ladderLabel).not.toContain("Building");
+    // The identity itself — the thing that was false before this change.
+    expect(ladderLabel).toBe(taskBoardLabel);
+    useUiStore.setState({
+      planKindsBySide: { left: { tasks: true, epics: true }, right: { tasks: true, epics: true } },
+    });
+  });
+});

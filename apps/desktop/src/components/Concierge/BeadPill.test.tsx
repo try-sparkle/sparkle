@@ -49,7 +49,7 @@ import { useProjectStore } from "../../stores/projectStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
 import { useComposeHandoffStore } from "../../stores/composeHandoffStore";
-import type { Bead } from "../../services/beads";
+import { bucketBeads, type Bead } from "../../services/beads";
 import type { ConciergeMessage } from "./types";
 import type { Project } from "../../types";
 
@@ -214,9 +214,12 @@ describe("BeadPill — the card opens in place", () => {
     expect(c).not.toBeNull();
     expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe("Clickable bead ids");
     const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
-    // "in progress", never the wire value.
-    expect(meta).toContain("in progress");
+    // THE STAGE THE CARD SITS IN, never a bd wire value (bead sparkle-az6di8). An in_progress bead
+    // is in the board's "Being built" column, so that is what the chip says — the founder's own
+    // phrase and the exact string the column header above it uses.
+    expect(meta).toContain("Being built");
     expect(meta).not.toContain("in_progress");
+    expect(meta).not.toContain("in progress");
     expect(meta).toContain("P1");
     expect(meta).toContain("feature");
   });
@@ -362,10 +365,12 @@ describe("BeadPill — re-reads CURRENT state, never a snapshot", () => {
   it("an ALREADY-OPEN card repaints when the bead closes underneath it", () => {
     mountHosted("recorded on sparkle-t6wje");
     fireEvent.click(pills()[0]!);
-    expect(screen.getByTestId("concierge-bead-card-meta").textContent).toContain("open");
+    // The STAGE, not the wire status — an open, unblocked bead sits in Backlog and a closed one in
+    // Done. The repaint requirement this row guards is unchanged; only the vocabulary is.
+    expect(screen.getByTestId("concierge-bead-card-meta").textContent).toContain("Backlog");
     seed([bead({ id: "sparkle-t6wje", status: "closed", title: "renamed since" })]);
     const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
-    expect(meta).toContain("closed");
+    expect(meta).toContain("Done");
     expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe("renamed since");
   });
 
@@ -525,8 +530,8 @@ describe("BeadPill — a bead in a project the founder is not looking at", () =>
     fireEvent.click(pills()[0]!);
     const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
     expect(meta).not.toContain("in sparkle");
-    // It still says everything it said before.
-    expect(meta).toContain("open");
+    // It still says everything it said before — the status chip included, now as the board stage.
+    expect(meta).toContain("Backlog");
   });
 
   // ── WHAT THE WIDER `byProject` BROKE, AND HAD TO BE FIXED WITH IT ─────────────────────────────
@@ -1080,5 +1085,101 @@ describe("BeadPill — the concierge card offers a chat about its own bead", () 
     const { writable } = mountBoth();
     fireEvent.click(within(writable).getByTestId("concierge-bead-card-chat"));
     expect(screen.queryAllByTestId("concierge-bead-card").length).toBeGreaterThan(0);
+  });
+});
+
+// ══ THE PILL AND ITS CARD SAY THE BOARD STAGE, NOT bd's WIRE STATUS (bead sparkle-az6di8) ══════
+//
+// The founder, verbatim: *"instead of saying open, it should say something like 'Being Built'."*
+//
+// ── WHY THESE ROWS SEED A REAL BOARD ────────────────────────────────────────────────────────
+// The concierge has no board of its own, so it reads the placement out of the beads store's
+// snapshot (`ResolvedBead.placedIn`). Every OTHER row in this file seeds `board: {} as never`, so
+// they all exercise the FALLBACK — which re-derives the column from the bead and happens to give
+// the same word for the ordinary cases. That makes the production path untested by construction
+// unless something drives it, which is what the blocked row below is for: blockedness is a
+// dependency fact no bead carries, so the fallback CANNOT produce "Blocked". Cut the `placedIn`
+// thread and that row goes red while its neighbours stay green.
+describe("BeadPill — the status word is the board stage", () => {
+  const PROJECT: Project = {
+    id: "p1",
+    name: "sparkle",
+    rootPath: "/tmp/sparkle",
+    defaultBranch: "main",
+    createdAt: "2026-01-01T00:00:00.000Z",
+    agents: [],
+    selectedAgentId: null,
+  };
+
+  /** Seed the store with a REAL bucketed board, the way a poll leaves it. */
+  function seedBoard(beads: Bead[], blocked?: ReadonlySet<string>) {
+    act(() => {
+      useBeadsStore.setState({
+        byProject: { p1: { beads, board: bucketBeads(beads, blocked), loadedAt: 1 } },
+      });
+    });
+  }
+
+  beforeEach(() => {
+    act(() => {
+      useSettingsStore.setState({ beadsEnabled: true });
+      useProjectStore.setState({ projects: [PROJECT], selectedProjectId: "p1" });
+      useUiStore.setState({ boardFocusBeadId: null, pairAssignment: {} });
+    });
+  });
+
+  function mountHosted(text: string) {
+    return render(
+      <BeadPillHost>
+        <Markdown text={text} />
+      </BeadPillHost>,
+    );
+  }
+
+  const meta = () => screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
+
+  it("says 'Being built' for an in-progress bead, in the card AND in the pill's tooltip", () => {
+    seedBoard([bead({ id: "sparkle-t6wje", status: "in_progress" })]);
+    mountHosted("recorded on sparkle-t6wje");
+    // THE TOOLTIP AND THE CARD ARE ASSERTED TOGETHER. They are two readers of one value, and the
+    // whole reason `beadStatus` is a shared module is that a bead must not say one thing in a
+    // sentence and another in the card that sentence opens.
+    expect(pills()[0]!.getAttribute("title")).toContain("Being built");
+    fireEvent.click(pills()[0]!);
+    expect(meta()).toContain("Being built");
+    expect(meta()).not.toContain("in progress");
+    expect(meta()).not.toContain("open");
+  });
+
+  // ── THE ROW THE FALLBACK CANNOT PASS ────────────────────────────────────────────────────────
+  it("says 'Blocked' for a bead the STORE's board placed in Blocked, though its status is open", () => {
+    seedBoard([bead({ id: "sparkle-t6wje", status: "open" })], new Set(["sparkle-t6wje"]));
+    mountHosted("recorded on sparkle-t6wje");
+    expect(pills()[0]!.getAttribute("title")).toContain("Blocked");
+    fireEvent.click(pills()[0]!);
+    expect(meta()).toContain("Blocked");
+    // Not the answer a re-derivation from the bead alone would give.
+    expect(meta()).not.toContain("Backlog");
+    expect(meta()).not.toContain("open");
+  });
+
+  // ── THE WIRE STATUS MUST KEEP FLOWING THROUGH UNCHANGED ─────────────────────────────────────
+  // Only the LABEL changed. `data-bead-status` is the raw value, read by tests and by anything
+  // keying on bd's own vocabulary, and re-labelling the chip must not touch it.
+  it("leaves the raw data-bead-status attribute alone", () => {
+    seedBoard([bead({ id: "sparkle-t6wje", status: "open" })], new Set(["sparkle-t6wje"]));
+    mountHosted("recorded on sparkle-t6wje");
+    expect(pills()[0]!.getAttribute("data-bead-status")).toBe("open");
+  });
+
+  // A surface with no board behind it — a support modal, an agent's own reply, a fixture — still
+  // gets a STAGE word. The fallback deliberately does not revert to `open`, or the defect would
+  // survive on exactly the surfaces nobody is watching.
+  it("falls back to a stage word, never to 'open', when no board is loaded", () => {
+    mountMarkdown(ctx([bead({ id: "sparkle-t6wje", status: "open" })]), "see sparkle-t6wje");
+    expect(pills()[0]!.getAttribute("title")).toContain("Backlog");
+    fireEvent.click(pills()[0]!);
+    expect(meta()).toContain("Backlog");
+    expect(meta()).not.toContain("open");
   });
 });

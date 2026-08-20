@@ -32,11 +32,12 @@ import { FONT_MONO, FONT_UI, RADIUS, TYPE } from "../../theme/scale";
 import { severityOf, type Bead } from "../../services/beads";
 import type { BeadComment } from "../../services/beadsCommands";
 import type { WorkflowStageId } from "../../engine/workflowStage";
+import type { EpicLadderKey } from "../../services/epicBoard";
 import { PriorityPill } from "./PriorityPill";
 import { BeadSeverityBadge } from "./BeadSeverityBadge";
 import { CommentThread } from "./CommentThread";
 import { StageLine } from "./StageLine";
-import { statusDot, statusLabel } from "./beadStatus";
+import { stageLabel, statusDot } from "./beadStatus";
 
 /**
  * Which surface is drawing the card.
@@ -76,6 +77,19 @@ export interface BeadCardProps {
   chrome: BeadCardChrome;
   /** The unified Think→Plan→Build stage — `beadStage(status, delivered, workerStages)`. */
   stage: WorkflowStageId;
+  /**
+   * WHICH BUCKET PLACED THIS CARD, from `epicBoard.ladderKeyOf` against the board the surface is
+   * showing. It is the whole content of the status chip — see `beadStatus.stageLabel`.
+   *
+   * A SECOND AXIS FROM `stage` ABOVE, not a duplicate of it, and the two are deliberately both on
+   * the card. `stage` is the Think→Plan→Build workflow line (the word beside the blue rule); this
+   * is where the card SITS on the board. An epic can be "Planned" on the workflow line while
+   * sitting in the Backlog column, and collapsing them would make one of those facts unsayable.
+   *
+   * Optional because a surface with no board behind it genuinely has no answer — see the fallback
+   * note on `stageLabel`, which is a stage word either way and never the wire status.
+   */
+  placedIn?: EpicLadderKey | null;
   /** Names of the workers bound to this bead. Empty renders no row. */
   workers: string[];
   /** The DOM id, so a disclosure trigger can point `aria-controls` at the card. */
@@ -146,6 +160,7 @@ export function BeadCard({
   bead,
   chrome,
   stage,
+  placedIn,
   workers,
   id,
   projectName,
@@ -224,7 +239,7 @@ export function BeadCard({
   meta.push(
     <span key="status" style={{ ...rowStyle, gap: 5 }}>
       <span style={{ ...statusDot(bead.status), display: "inline-block" }} aria-hidden />
-      {statusLabel(bead.status)}
+      {stageLabel(bead, placedIn)}
     </span>,
   );
   if (onSetPriority !== undefined) {

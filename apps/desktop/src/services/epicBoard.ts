@@ -22,38 +22,82 @@ import { rollupEpicStatus } from "./planView";
 /** A column of the epic ladder.
  *
  *  The keys deliberately REUSE the Board snapshot's vocabulary wherever one already exists —
- *  `inProgress` renders as "Building", `delivered` as "Shipped" — so `BoardView`'s `Column`, its
+ *  `inProgress` renders as "Being built", `delivered` as "Shipped" — so `BoardView`'s `Column`, its
  *  `data-testid`s and its definable-stage wiring keep working with no widening. `planning` is the
  *  one genuinely new key, because the board has never had a bucket for it. */
 export type EpicLadderKey = BoardColumn | "planning";
 
-/** The founder's ladder, in his reading order. The ORDER ITSELF is the array below, and the reason
- *  for it is the comment inside it — deliberately NOT restated here. This doc used to carry its own
- *  copy of the sequence plus a rationale for it, which is the shape that silently went stale the
- *  first time the order changed: an IDE surfaces this block on hover, so a reader got a confident
- *  argument for an order the code no longer had, and a stated reason to "restore" it. The pinned
- *  test asserts the array, never a comment, so nothing would have flagged the drift. */
-export const EPIC_LADDER_COLUMNS = [
+/**
+ * THE ONE PLACE A STAGE IS PUT INTO WORDS. Every surface that names a stage — the task board's
+ * column headers, the epic ladder's column headers, and the status chip on a bead card — reads it
+ * from here.
+ *
+ * ══ WHY ONE RECORD AND NOT A LABEL PER LIST ════════════════════════════════════════════════════
+ * There used to be two hand-written lists and they had already drifted: this file called
+ * `inProgress` "Building" while `BoardView`'s `COLUMNS` called the SAME column "Being built". A
+ * reader who switched the Epics toggle watched a card change its stage name without changing its
+ * stage. That is not a wording nit — the whole point of the status chip is that a card and the
+ * column holding it agree, and two vocabularies make agreement impossible to state.
+ *
+ * "Being built" wins over "Building" because it is the founder's own phrase for this column and it
+ * is what the task board — the default view, the one he is looking at — has always said.
+ *
+ * The KEYS are the wire vocabulary (`inProgress`, `delivered`) and deliberately stay that way; see
+ * {@link EpicLadderKey}. Only the values are read by a human.
+ */
+export const STAGE_LABELS: Record<EpicLadderKey, string> = {
+  backlog: "Backlog",
+  blocked: "Blocked",
+  planning: "Planning",
+  inProgress: "Being built",
+  done: "Done",
+  delivered: "Shipped",
+  archived: "Archived",
+};
+
+/** The founder's ladder. The ORDER ITSELF is the array below and the reason for it is the comment
+ *  inside it — deliberately NOT restated here. This doc used to carry its own copy of the sequence
+ *  plus a rationale, which is the shape that silently went stale the first time the order changed:
+ *  an IDE surfaces this block on hover, so a reader got a confident argument for an order the code
+ *  no longer had, and a stated reason to "restore" it. The pinned test asserts the array, never a
+ *  comment, so nothing would have flagged the drift.
+ *
+ *  ══ WHY THE ODD `Object.keys(… satisfies Record<…>)` SHAPE ══════════════════════════════════
+ *  EXHAUSTIVENESS, at compile time. Written as a plain `readonly EpicLadderKey[]` literal this
+ *  list could silently OMIT a rung — the type is satisfied by any subset — while `STAGE_LABELS`,
+ *  `emptyEpicBoard` and `EpicBoard` (all `Record<EpicLadderKey, …>`) would refuse to compile until
+ *  the new rung was added to them. The omission would then be invisible in three places at once:
+ *  the ladder never renders that column, {@link ladderKeyOf} returns `null` for every bead sitting
+ *  in it, and `BeadPill`'s placement index never indexes them — so those cards' chips fall back to
+ *  `columnFor` and print a stage that has no header on screen. The `satisfies` clause makes adding
+ *  a key to {@link EpicLadderKey} a compile error HERE too. Same idiom as `beadsStore`'s
+ *  `BOARD_COLUMNS`, for the same reason.
+ *
+ *  `Object.keys` preserves the literal's insertion order for string keys, so the sequence written
+ *  below IS the rendered order — the exhaustiveness check costs nothing in expressiveness. */
+export const EPIC_LADDER: readonly EpicLadderKey[] = Object.keys({
   // PLANNING SITS BEFORE BLOCKED, on the founder's instruction: "let's put Planning to the left of
   // Blocked so it should be Backlog, Planning, Blocked, Building, Done, Shipped, Archive."
   //
-  // It also reads better as a LADDER, which is what this list is: Backlog → Planning → Building is
-  // the path work actually travels, and Blocked is not a rung on it — it is a state work falls into
-  // from any rung. Putting it between the first two rungs interrupted the only sequence here that
-  // means anything.
-  { key: "backlog", label: "Backlog" },
-  { key: "planning", label: "Planning" },
-  { key: "blocked", label: "Blocked" },
-  { key: "inProgress", label: "Building" },
-  { key: "done", label: "Done" },
-  { key: "delivered", label: "Shipped" },
-  { key: "archived", label: "Archived" },
-] as const satisfies readonly { key: EpicLadderKey; label: string }[];
+  // It also reads better as a LADDER, which is what this list is: Backlog → Planning → Being built
+  // is the path work actually travels, and Blocked is not a rung on it — it is a state work falls
+  // into from any rung. Putting it between the first two rungs interrupted the only sequence here
+  // that means anything.
+  backlog: true,
+  planning: true,
+  blocked: true,
+  inProgress: true,
+  done: true,
+  delivered: true,
+  archived: true,
+} satisfies Record<EpicLadderKey, true>) as EpicLadderKey[];
 
-/** The ladder's keys alone, DERIVED from the labelled list above rather than written out a second
- *  time — two hand-maintained copies of one order is how a column ends up rendered in one place and
- *  bucketed in another. */
-export const EPIC_LADDER: readonly EpicLadderKey[] = EPIC_LADDER_COLUMNS.map((c) => c.key);
+/** The ladder as RENDERED — its order from {@link EPIC_LADDER}, its words from
+ *  {@link STAGE_LABELS}. Derived rather than written out a second time: two hand-maintained copies
+ *  of one order is how a column ends up rendered in one place and bucketed in another, and two
+ *  copies of one LABEL is the drift `STAGE_LABELS` was extracted to end. */
+export const EPIC_LADDER_COLUMNS: readonly { key: EpicLadderKey; label: string }[] =
+  EPIC_LADDER.map((key) => ({ key, label: STAGE_LABELS[key] }));
 
 export type EpicBoard = Record<EpicLadderKey, Bead[]>;
 
@@ -157,6 +201,33 @@ export function tasksOnly(board: Board, allBeads: readonly Bead[]): Board {
  *  render a Planning column to put anything in. */
 export function withPlanning(board: Board): EpicBoard {
   return { ...board, planning: [] };
+}
+
+/**
+ * WHICH BUCKET ALREADY HOLDS THIS BEAD — the question a card's status chip asks.
+ *
+ * ══ WHY IT READS THE BOARD RATHER THAN RE-DERIVING FROM THE BEAD ═══════════════════════════════
+ * The chip has to say the stage the card is SITTING IN, and "sitting in" is a fact about the
+ * bucketing that placed it, not about the bead. Re-running `columnFor` here would answer a
+ * different question and would be WRONG in exactly the mode that matters: an open epic in Epics
+ * mode was placed by `openEpicStage`'s child roll-up, which `columnFor` cannot see and would call
+ * "Backlog" while the card sits under the Planning header. Reading the placement back off the
+ * board makes card and header agree by construction — there is no second rule to keep in step.
+ *
+ * Takes a `Board` OR an `EpicBoard`: the store keeps the plain six-column board and the view keeps
+ * the widened one, and both are legitimate answers to "where is this card". A column the given
+ * board does not have is simply skipped, so a partial fixture degrades to `null` rather than
+ * throwing.
+ *
+ * Returns `null` when nothing holds it — a bead filtered off the board, or a surface whose snapshot
+ * has not loaded. The caller decides what to say then; see `BeadCard/beadStatus.stageLabel`.
+ */
+export function ladderKeyOf(board: Board | EpicBoard, beadId: string): EpicLadderKey | null {
+  for (const key of EPIC_LADDER) {
+    const column = (board as Partial<EpicBoard>)[key];
+    if (column?.some((b) => b.id === beadId) === true) return key;
+  }
+  return null;
 }
 
 /** BOTH KINDS ON: epics rise to the top of every column, tasks keep their order beneath them.

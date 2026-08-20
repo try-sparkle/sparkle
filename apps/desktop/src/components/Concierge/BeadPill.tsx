@@ -59,7 +59,8 @@ import { useProjectStore } from "../../stores/projectStore";
 import { useRuntimeStore } from "../../stores/runtimeStore";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useUiStore } from "../../stores/uiStore";
-import { DELIVERED_LABEL, type Bead } from "../../services/beads";
+import { DELIVERED_LABEL, type Bead, type Board } from "../../services/beads";
+import { EPIC_LADDER, type EpicLadderKey } from "../../services/epicBoard";
 import { beadStage, workersForBead } from "../../services/planView";
 import { dispatchBeadChat } from "../../services/beadChat";
 import type { WorkflowStageId } from "../../engine/workflowStage";
@@ -67,7 +68,7 @@ import type { AgentTab } from "../../types";
 import { BeadCard } from "../BeadCard/BeadCard";
 import { setBeadPriority } from "../BeadCard/beadPriority";
 import { beadCardMenuIsOpen } from "../BeadCard/PriorityPill";
-import { statusDot, statusLabel } from "../BeadCard/beadStatus";
+import { stageLabel, statusDot } from "../BeadCard/beadStatus";
 import { useBeadBuildActions } from "../BeadCard/useBeadBuildActions";
 
 /** A resolved bead, and WHICH PROJECT'S board holds it. The project id is not decoration: the
@@ -76,6 +77,22 @@ import { useBeadBuildActions } from "../BeadCard/useBeadBuildActions";
 export interface ResolvedBead {
   bead: Bead;
   projectId: string;
+  /**
+   * WHICH BOARD COLUMN THAT PROJECT'S SNAPSHOT PUTS THE BEAD IN — the status chip's whole content,
+   * and the pill tooltip's.
+   *
+   * ══ WHY IT IS INDEXED HERE AND NOT LOOKED UP AT THE POINT OF USE ═══════════════════════════
+   * Two readers need it — the pill's `title` and the card the pill opens — and this component's
+   * founding rule is that those two can never say different things about one bead (see
+   * `BeadCard/beadStatus`). Deriving it twice is two chances to drift. Indexing it once also keeps
+   * it O(n): `ladderKeyOf` scans a board, so calling it per bead while building this map would be
+   * quadratic on a store with thousands of beads.
+   *
+   * OPTIONAL, and absent is a real state rather than an oversight: a `BeadPillProvider` handed a
+   * fixture supplies no board, and a snapshot mid-load has none yet. `stageLabel` falls back to
+   * deriving the column from the bead — still a stage word, never bd's `open`.
+   */
+  placedIn?: EpicLadderKey | null;
   /**
    * The project's checkout root — the path every WRITE needs.
    *
@@ -487,7 +504,7 @@ export function BeadPillHost({ children }: { children: ReactNode }) {
  * makes the winner a property of WHOSE BEAD IT IS rather than of which `bd` call returned first.
  */
 function indexBeads(
-  byProject: Record<string, { beads: Bead[] } | undefined>,
+  byProject: Record<string, { beads: Bead[]; board?: Board } | undefined>,
   /** The projects that are registered but NOT selected. Doubles as the membership test that keeps
    *  a removed project's cached snapshot out of the index, and as the source of `projectName`. */
   foreign: readonly ForeignProject[],
@@ -518,8 +535,36 @@ function indexBeads(
     // than a path that happens to be "" — which would render write controls that fail on every use.
     const root = roots.get(projectId);
     const rootPath = root === undefined || root === "" ? undefined : root;
+    // ONE PASS OVER THE BOARD PER PROJECT, not one `ladderKeyOf` scan per bead — see
+    // `ResolvedBead.placedIn`. A snapshot with no board yet yields an empty map and every bead
+    // falls back, which is the loading state rather than an error.
+    const placement = placementIndex(byProject[projectId]?.board);
     for (const bead of byProject[projectId]?.beads ?? []) {
-      if (!out.has(bead.id)) out.set(bead.id, { bead, projectId, projectName, rootPath });
+      if (!out.has(bead.id))
+        out.set(bead.id, {
+          bead,
+          projectId,
+          projectName,
+          rootPath,
+          placedIn: placement.get(bead.id) ?? null,
+        });
+    }
+  }
+  return out;
+}
+
+/** Every bead in one project's board, mapped to the column holding it. Built once per project so
+ *  the index above stays linear; see `ResolvedBead.placedIn`. A `board` that is absent or partial
+ *  (a fixture, a snapshot still loading) simply contributes nothing. */
+function placementIndex(board: Board | undefined): ReadonlyMap<string, EpicLadderKey> {
+  const out = new Map<string, EpicLadderKey>();
+  if (board === undefined) return out;
+  // WALKS THE COLUMNS, never `ladderKeyOf` per bead — that function scans a whole board to answer
+  // for one id, so calling it in a loop over the same board is quadratic. This is the inverted
+  // form of the same fact: one visit per bead, total.
+  for (const key of EPIC_LADDER) {
+    for (const bead of (board as Partial<Record<EpicLadderKey, Bead[]>>)[key] ?? []) {
+      if (!out.has(bead.id)) out.set(bead.id, key);
     }
   }
   return out;
@@ -750,7 +795,10 @@ export function BeadPill({ beadId }: { beadId: string }) {
         // it because that one is a RETRY, which can never collapse.)
         aria-expanded={open}
         aria-controls={cardId}
-        title={`${bead.id} · ${bead.title || "untitled"} — ${statusLabel(bead.status)}`}
+        // The STAGE, the same word the card below it shows — not bd's wire status. The pill and
+        // the card it opens must never name one bead's state two ways; that is the whole reason
+        // `beadStatus` is a shared module.
+        title={`${bead.id} · ${bead.title || "untitled"} — ${stageLabel(bead, resolved.placedIn)}`}
         // Toggles against what is CURRENTLY SHOWN, not against the override — otherwise the first
         // click on an auto-expanded card would write `true` (it reads `null` and negates it), and
         // the founder's collapse gesture would leave the card open. `autoOpen` is captured from
@@ -861,7 +909,7 @@ function ConciergeBeadCard({
   notice?: string;
   noticeKey: number;
 }) {
-  const { bead, projectId, projectName, rootPath } = resolved;
+  const { bead, projectId, projectName, rootPath, placedIn } = resolved;
   // The bead's OWN project's agents, which is not necessarily the selected one — a concierge answer
   // is cross-project by construction, and a worker on another project's bead still belongs on the
   // card for that bead.
@@ -887,6 +935,9 @@ function ConciergeBeadCard({
       chrome="concierge"
       bead={bead}
       stage={stage}
+      // From the index rather than re-derived here — the pill's tooltip reads the SAME value, and
+      // the two must not be able to disagree. See `ResolvedBead.placedIn`.
+      placedIn={placedIn}
       workers={workersForBead(agents, bead.id)}
       projectName={projectName}
       // THE FOUNDER CHOSE TO KEEP 180px. It was reconsidered at 90 and he said no: a card that

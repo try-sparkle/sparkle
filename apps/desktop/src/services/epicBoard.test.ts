@@ -1,5 +1,14 @@
 import { describe, it, expect } from "vitest";
-import { EPIC_LADDER, bucketEpics, tasksOnly, type EpicLadderKey } from "./epicBoard";
+import {
+  EPIC_LADDER,
+  STAGE_LABELS,
+  bucketEpics,
+  emptyEpicBoard,
+  ladderKeyOf,
+  tasksOnly,
+  withPlanning,
+  type EpicLadderKey,
+} from "./epicBoard";
 import { bucketBeads, epicIndexOf, type Bead, type BeadStatus, type Board } from "./beads";
 
 const bead = (
@@ -23,7 +32,7 @@ const only = (b: ReturnType<typeof bucketEpics>, key: EpicLadderKey, ids: string
 
 describe("EPIC_LADDER", () => {
   // The founder's ladder, verbatim and in his reading order:
-  // Backlog > Planning > Blocked > Building > Done > Shipped > Archived.
+  // Backlog > Planning > Blocked > Being built > Done > Shipped > Archived.
   //
   // PLANNING MOVED LEFT OF BLOCKED on his instruction ("let's put Planning to the left of Blocked").
   // The earlier order had it third; this is the second spelling of the same list and the reason the
@@ -208,5 +217,87 @@ describe("bucketEpics / tasksOnly read the CACHED index", () => {
     // ...and neither added another full pass. A single reverted line costs N more reads, so this
     // bar sits well below the failure it is written to catch.
     expect(stats.reads - primed).toBeLessThan(N);
+  });
+});
+
+// ══ ONE VOCABULARY FOR A STAGE (bead sparkle-az6di8) ══════════════════════════════════════════
+// This file used to spell the ladder's labels inline while `BoardView` spelled its own copy, and
+// the two had drifted: `inProgress` was "Building" here and "Being built" there — the same column
+// with two names, which a reader saw as a stage renaming itself when they toggled Epics. The
+// end-to-end proof (both headers rendered, then compared) lives in BoardView.test.tsx; these rows
+// pin the source of truth those headers read from.
+describe("STAGE_LABELS — the one place a stage is put into words", () => {
+  it("covers every ladder rung, so no column can fall back to its wire key", () => {
+    for (const key of EPIC_LADDER) {
+      expect(STAGE_LABELS[key], key).toBeTruthy();
+      // The label is for a human. A value that equalled the key would mean a column rendering
+      // `inProgress` at the reader, which is the class of bug this record exists to end.
+      expect(STAGE_LABELS[key]).not.toBe(key);
+    }
+  });
+
+  it("labels the in-progress rung 'Being built' — the founder's phrase — and never 'Building'", () => {
+    expect(STAGE_LABELS.inProgress).toBe("Being built");
+    expect(Object.values(STAGE_LABELS)).not.toContain("Building");
+  });
+
+  // ── THE ROW THAT ACTUALLY BITES: `EPIC_LADDER` MUST COVER EVERY RUNG ────────────────────────
+  // `EPIC_LADDER_COLUMNS` is derived from `EPIC_LADDER` + `STAGE_LABELS`, so asserting that it
+  // equals its own two sources proves nothing — it restates the implementation and survives any
+  // mutation of it (roborev 65866). The invariant that IS load-bearing is the one neither the type
+  // system nor the row above can state: `EPIC_LADDER` is an ARRAY of `EpicLadderKey`, satisfied by
+  // any subset, while every `Record<EpicLadderKey, …>` beside it is forced complete. So an eighth
+  // rung added to the type compiles everywhere except here — and then the ladder never renders
+  // that column, `ladderKeyOf` answers null for every bead in it, and `BeadPill`'s placement index
+  // skips them, so those chips fall back to `columnFor` and print a stage with no header on
+  // screen. Three silent failures from one omission. The `satisfies` clause in `epicBoard.ts` now
+  // makes it a compile error too; this is the runtime half, and it survives someone rewriting that
+  // list as a plain literal.
+  it("covers EVERY key of STAGE_LABELS — a rung missing from the order list is silent otherwise", () => {
+    expect([...EPIC_LADDER].sort()).toEqual(Object.keys(STAGE_LABELS).sort());
+    // …and every key the BOARD itself has, which is what `ladderKeyOf` walks.
+    expect([...EPIC_LADDER].sort()).toEqual(Object.keys(emptyEpicBoard()).sort());
+    // No duplicates: a repeated key would satisfy both sets above while rendering twice.
+    expect(new Set(EPIC_LADDER).size).toBe(EPIC_LADDER.length);
+  });
+});
+
+// ══ `ladderKeyOf` — WHICH BUCKET ALREADY HOLDS A BEAD ═════════════════════════════════════════
+// The status chip's whole input. It reads the placement back off the board rather than re-deriving
+// it, which is the only way the chip can agree with the header above it in BOTH modes.
+describe("ladderKeyOf", () => {
+  const beads = [
+    bead("e1", "open"),
+    bead("e1.1", "open", "e1"), // all children open → the epic rolls up to Planning
+    bead("t1", "in_progress"),
+    bead("t2", "closed"),
+  ];
+
+  it("answers with the LADDER rung on an epic board — Planning, which no bead records", () => {
+    const board = bucketEpics(bucketBeads(beads), beads);
+    // The epic's own status is plain `open`; only its children put it in Planning. A chip that
+    // re-derived from the bead could never reach this answer.
+    expect(ladderKeyOf(board, "e1")).toBe("planning");
+  });
+
+  it("answers with the board COLUMN on a task board — the same bead, a different bucketing", () => {
+    expect(ladderKeyOf(withPlanning(bucketBeads(beads)), "e1")).toBe("backlog");
+    expect(ladderKeyOf(withPlanning(bucketBeads(beads)), "t1")).toBe("inProgress");
+    expect(ladderKeyOf(withPlanning(bucketBeads(beads)), "t2")).toBe("done");
+  });
+
+  it("takes a plain six-column Board too — the shape the beads store keeps", () => {
+    // Bucketed WITH a blocked set — `e1.1` is a plain OPEN bead carrying nothing that says so, and
+    // blockedness is a dependency fact bd answers separately. This is the answer `columnFor` can
+    // only give when handed that set, i.e. the one a chip re-derived from the bead would lose.
+    const board: Board = bucketBeads(beads, new Set(["e1.1"]));
+    expect(ladderKeyOf(board, "e1.1")).toBe("blocked");
+    expect(ladderKeyOf(board, "e1")).toBe("backlog");
+  });
+
+  it("returns null for a bead no column holds, rather than throwing", () => {
+    expect(ladderKeyOf(withPlanning(bucketBeads(beads)), "nope")).toBeNull();
+    // A partial fixture (a test double, a snapshot mid-load) degrades the same way.
+    expect(ladderKeyOf({} as unknown as Board, "t1")).toBeNull();
   });
 });

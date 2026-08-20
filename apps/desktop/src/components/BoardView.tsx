@@ -18,13 +18,16 @@ import {
   DELIVERED_LABEL,
   type Bead,
   type Board,
+  type BoardColumn,
 } from "../services/beads";
 import { DECOMPOSE_FAILED_LABEL, DECOMPOSING_LABEL } from "../services/epicDecompose";
 import {
   EPIC_LADDER_COLUMNS,
   PLAN_KINDS,
+  STAGE_LABELS,
   bucketEpics,
   emptyEpicBoard,
+  ladderKeyOf,
   tasksOnly,
   withPlanning,
   epicsFirst,
@@ -111,17 +114,23 @@ interface StageDefs {
 // the founder's store, 60% of the whole DB, mounted as live cards behind a board the user is
 // trying to click. The cap is now wired to the TERMINAL columns (Done, Shipped, Archived), which
 // is what it was always for: they are resting places, not worklists.
-const COLUMNS: {
-  key: "backlog" | "blocked" | "inProgress" | "done" | "delivered" | "archived";
-  label: string;
-}[] = [
-  { key: "backlog", label: "Backlog" },
-  { key: "blocked", label: "Blocked" },
-  { key: "inProgress", label: "Being built" },
-  { key: "done", label: "Done" },
-  { key: "delivered", label: "Shipped" },
-  { key: "archived", label: "Archived" },
+//
+// THE WORDS COME FROM `epicBoard.STAGE_LABELS`, not from here. They used to be written out inline,
+// and the epic ladder wrote its own copy — which drifted: this list said "Being built" while the
+// ladder said "Building" for the SAME column. One record now feeds both lists and the status chip
+// on every bead card, so a card and the header above it cannot name the same stage differently.
+const COLUMN_KEYS: readonly BoardColumn[] = [
+  "backlog",
+  "blocked",
+  "inProgress",
+  "done",
+  "delivered",
+  "archived",
 ];
+const COLUMNS: readonly { key: BoardColumn; label: string }[] = COLUMN_KEYS.map((key) => ({
+  key,
+  label: STAGE_LABELS[key],
+}));
 
 /** How many cards a TERMINAL column (Done, Shipped, Archived) renders at once — the rest are a
  *  "+N more" count, never DOM nodes, until the user asks for another page. The bucketing still
@@ -949,6 +958,11 @@ export function BoardView({
       {selectedBead && (
         <DetailOverlay
           bead={selectedBead}
+          // THE BUCKET THAT PLACED THE CARD, read back off the board this view is actually
+          // rendering — so the chip says "Being built" under the Being built header and "Planning"
+          // under Planning in Epics mode, with no second rule to keep in step. Re-deriving it from
+          // the bead would be wrong for exactly the epic case (see `ladderKeyOf`).
+          placedIn={viewBoard === null ? null : ladderKeyOf(viewBoard, selectedBead.id)}
           projectId={project.id}
           allBeads={allBeads}
           agents={agents}
@@ -1880,6 +1894,7 @@ function EpicChildRow({
 
 function DetailOverlay({
   bead,
+  placedIn,
   projectId,
   allBeads,
   agents,
@@ -1888,6 +1903,10 @@ function DetailOverlay({
   onBeadChat,
 }: {
   bead: Bead;
+  /** Which column of the board behind this overlay holds the bead — the status chip's whole
+   *  content. Threaded from `BoardView` rather than re-derived so the chip and the header the
+   *  reader just clicked through cannot disagree. */
+  placedIn: EpicLadderKey | null;
   projectId: string;
   allBeads: Bead[];
   agents: AgentTab[];
@@ -2046,6 +2065,7 @@ function DetailOverlay({
           bead={bead}
           chrome="board"
           stage={stage}
+          placedIn={placedIn}
           workers={workers}
           // NO `descMaxHeight` — the panel above is already the scroller (`maxHeight: 100%` +
           // `overflowY: auto`). Capping the description again would put a second scrollbar inside

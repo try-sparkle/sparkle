@@ -145,7 +145,10 @@ describe("expanded by default — the card is there without a click", () => {
     );
     expect(screen.getByTestId("concierge-bead-card-id").textContent).toContain("sparkle-qogah");
     const meta = screen.getByTestId("concierge-bead-card-meta").textContent ?? "";
-    expect(meta).toContain("open");
+    // THE BOARD STAGE, not bd's wire status (bead sparkle-az6di8). This bead is open and unblocked,
+    // so it sits in Backlog and the chip says so; `open` is a wire value and never words on screen.
+    expect(meta).toContain("Backlog");
+    expect(meta).not.toContain("open");
     expect(meta).toContain("P0");
     expect(meta).toContain("task");
     expect(screen.getByTestId("concierge-bead-card-stage")).not.toBeNull();
@@ -180,8 +183,11 @@ describe("expanded by default — the card is there without a click", () => {
     expect(screen.getByTestId("concierge-bead-card-title").textContent).toBe(
       "Never hide a row that needs action",
     );
+    // Same axis as the row above: an in_progress bead sits in the board's "Being built" column, so
+    // that is the chip's word. The point of THIS row is the withheld Build It — the meta assertion
+    // is here to prove the rest of the card still rendered, and it has to speak the same vocabulary.
     expect(screen.getByTestId("concierge-bead-card-meta").textContent ?? "").toContain(
-      "in progress",
+      "Being built",
     );
     expect(screen.queryByTestId("concierge-bead-card-build-it")).toBeNull();
   });
