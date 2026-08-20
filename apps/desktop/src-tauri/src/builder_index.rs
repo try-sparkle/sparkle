@@ -47,7 +47,7 @@
 //! reporter/usage.ts, reporter/merge.ts), not guessed:
 //!   POST {SERVER_URL}/api/usage
 //!   Authorization: Bearer <api key>          Content-Type: application/json
-//!   { username, team, client_id, client_version, report_days,
+//!   { username, team?, client_id, client_version, report_days,
 //!     data: [ { date: "YYYY-MM-DD",
 //!               modelBreakdowns: [ { modelName, inputTokens, outputTokens,
 //!                                    cacheCreationTokens, cacheReadTokens, totalTokens,
@@ -161,11 +161,41 @@
 //! until the community launch agent is turned down, which is the user's launch agent to change and
 //! not something this module does silently.
 //!
-//! TEAM. The leaderboard groups by team, and this module used to hardcode [`DEFAULT_TEAM`]
-//! ("default") into every payload — so a user whose profile and tkmx-client rows all read `"Chief"`
-//! had their Sparkle-native history filed under a team that does not exist. The team now comes from
-//! [`BuilderIndexState::team`] (hand-edited in the state file; no UI), falling back to
-//! [`DEFAULT_TEAM`] for the users who genuinely have none.
+//! TEAM. The leaderboard groups by team, and this module used to hardcode `"default"` into every
+//! payload — so a user whose profile and tkmx-client rows all read `"Chief"` had their
+//! Sparkle-native history filed under a team that does not exist. The team now comes from
+//! [`BuilderIndexState::team`] (hand-edited in the state file; no UI), and when it is unset the
+//! key is OMITTED ENTIRELY rather than defaulted.
+//!
+//! That omission is the whole point, and it took three recurrences to learn: replacing the
+//! hardcode with a fallback moved the bug rather than fixing it. `team` is a field the server
+//! takes as an ASSERTION — a sent value overwrites what it already holds — so a machine that was
+//! never told its team was still overwriting the founder's `"Chief"` with `"default"` on every
+//! two-hourly cycle, silently regrouping his leaderboard row while reporting looked perfectly
+//! healthy. A machine with no team configured has nothing to assert and must say nothing.
+//! This is the same rule the prose paragraph below states, applied to the one identity field that
+//! was exempt from it; see `an_unset_team_is_omitted_from_the_payload_not_defaulted`.
+//!
+//! ONE ASSUMPTION HERE IS UNVERIFIED, AND IT IS RECORDED RATHER THAN HIDDEN (roborev 65650,
+//! bead `sparkle-1zf88u`). `team` is not only a profile field: the live `GET /api/user/:username`
+//! shows it stored PER USAGE ROW (`usage[].team` — 119 rows on the measured profile, split between
+//! `"Chief"` and the `"default"` this change exists to stop writing). `POST /api/usage` upserts by
+//! `(client_id, date)`, so for a row that does not exist yet there is no prior value to "leave
+//! alone", and what the server does with an omitted `team` on an INSERT is not documented and was
+//! not tested: it may inherit the profile's team, or it may file the row ungrouped.
+//!
+//! It was not tested because testing it means POSTing to the founder's live profile, which is
+//! explicitly out of scope — a correction there is his call and is undone within two hours by the
+//! reference client anyway. Note also that `live_report_roundtrip` (the only test that touches a
+//! real server) is `#[ignore]` and refuses to run against production at all.
+//!
+//! The change is still the right one under EITHER server behaviour, which is why it ships: the
+//! leaderboard groups by the PROFILE's team, and omission provably stops an unconfigured machine
+//! from overwriting that — the measured bug. The worst case for the row-level field is that an
+//! unconfigured machine's rows are ungrouped instead of grouped under a team that does not exist,
+//! which is not worse than what it replaces. If a row-level regression does appear, the narrower
+//! fix is to keep sending a CONFIGURED team (already the behaviour) and revisit only the
+//! unconfigured case — not to restore the default.
 //!
 //! Profile prose (`tools`, `projects`, `communities`, `about`, `hn_username`, `demo_video_url`)
 //! is deliberately NOT sent. The reference client posts those from its `.env` on every run, so a
@@ -222,11 +252,11 @@ fn client_version() -> String {
     BUILDER_INDEX_PROTOCOL_VERSION.to_string()
 }
 
-/// tkmx groups profiles by team; the reference client defaults to "default" when unset.
-///
-/// This is the fallback for a user who has no team, NOT this machine's team — see
-/// [`BuilderIndexState::team`], which is what the payload is actually built from.
-const DEFAULT_TEAM: &str = "default";
+// NOTE: there is deliberately NO `DEFAULT_TEAM` constant any more. The reference client defaults
+// to "default" when its own team is unset; Sparkle must NOT, because sending that value overwrites
+// a team the server already holds. An unset team is OMITTED — see [`BuilderIndexState::team`] and
+// the TEAM paragraph in the module header. Do not reintroduce a fallback constant here: a constant
+// naming a default is how the fallback got written back in after the first fix.
 
 /// Keychain ACCOUNT for the tkmx API key. A distinct account under Sparkle's existing keychain
 /// service — never the desktop-token or trial-device-token item. Read in-process via `keyring`
@@ -278,13 +308,18 @@ pub struct BuilderIndexState {
     pub last_status: Option<String>,
     /// Trailing window per report. 0 / absent means [`DEFAULT_REPORT_DAYS`].
     pub report_days: u32,
-    /// The tkmx team reports are filed under. Empty / absent means [`DEFAULT_TEAM`].
+    /// The tkmx team reports are filed under. Empty / absent means SEND NOTHING — never a default.
     ///
     /// The leaderboard GROUPS BY team, so reporting under the wrong one files a machine's history
     /// beside nobody — this user's tkmx-client rows and profile are all `"Chief"`, and Sparkle was
     /// hardcoding `"default"`, a team that does not exist for them. There is deliberately NO UI:
     /// the value is set by editing this file, so a mis-typed team can't be produced by a stray
-    /// click, and the fallback stays correct for the users who genuinely have no team.
+    /// click.
+    ///
+    /// An empty value is NOT "the user has no team, send the generic one" — it is "this machine
+    /// was never told", and those are different claims. Only the second is true, and the server
+    /// cannot tell them apart because a sent `team` overwrites whatever it holds. So unset means
+    /// omitted; see [`BuilderIndexState::team`].
     ///
     /// The struct-level `#[serde(default)]` above is what lets a state file written before this
     /// field existed keep deserializing (it supplies `String::default()` for every absent key), so
@@ -300,14 +335,18 @@ impl BuilderIndexState {
         }
     }
 
-    /// The team this machine reports under: the stored value, or [`DEFAULT_TEAM`] when unset.
+    /// The team this machine reports under, or `None` when it was never configured.
+    ///
+    /// `None` means the `team` key is OMITTED from the payload — not sent as a default. See the
+    /// field doc above and the module header's TEAM paragraph for why a default is actively
+    /// harmful here rather than merely imprecise.
     ///
     /// Trimmed the way `username` is at the payload boundary — a hand-edited JSON file is the only
     /// way this gets set, and `"Chief "` and `"Chief"` are different groups to the server.
-    fn team(&self) -> &str {
+    fn team(&self) -> Option<&str> {
         match self.team.trim() {
-            "" => DEFAULT_TEAM,
-            t => t,
+            "" => None,
+            t => Some(t),
         }
     }
 }
@@ -603,7 +642,11 @@ pub struct DailyUsage {
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ReportBody {
     pub username: String,
-    pub team: String,
+    /// The team this row is filed under. OMITTED — never sent as `"default"` — when this machine
+    /// has no team configured, because the server treats a sent value as an assertion and would
+    /// overwrite a team it already holds. See [`BuilderIndexState::team`] and the module header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
     pub client_id: String,
     pub client_version: String,
     pub report_days: u32,
@@ -1325,9 +1368,12 @@ fn dry_run_over(args: &DryRunArgs, app_data: Option<&Path>, roots: &[PathBuf]) -
         "client_version_that_would_be_sent": client_version(),
         // RESOLVED, not raw: the leaderboard groups by team, and the whole failure this field
         // exists to make visible is a stored value that never reaches the wire. Printing
-        // `state.team` would show the setting; this shows what a report would actually carry,
-        // including the `DEFAULT_TEAM` fallback when nothing is set.
-        "team_that_would_be_sent": state.map_or(DEFAULT_TEAM, BuilderIndexState::team),
+        // `state.team` would show the setting; this shows what a report would actually carry.
+        //
+        // JSON `null` means the key is OMITTED from the payload — nothing will be sent and the
+        // server's existing team is left alone. That is a materially different outcome from
+        // sending `"default"`, so it must not render as a string that looks like a team name.
+        "team_that_would_be_sent": state.and_then(BuilderIndexState::team),
         "client_id": state.map(|s| s.client_id.clone()),
         "username": state.map(|s| s.username.clone()),
         "app_data": app_data.map(|p| p.display().to_string()),
@@ -1558,7 +1604,7 @@ fn build_report_body(
 ) -> ReportBody {
     ReportBody {
         username: state.username.trim().to_string(),
-        team: state.team().to_string(),
+        team: state.team().map(str::to_string),
         client_id,
         client_version: client_version(),
         report_days: window,
@@ -2321,7 +2367,7 @@ mod tests {
         // profile.
         let body = ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc123".into(),
             client_version: "sparkle-desktop/0.0.0".into(),
             report_days: 7,
@@ -2385,7 +2431,7 @@ mod tests {
         );
         let body = ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc123".into(),
             client_version: client_version(),
             report_days: 7,
@@ -2460,7 +2506,7 @@ mod tests {
         // profile the user filled in from tkmx-client. Omitting the keys leaves them alone.
         let body = ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc".into(),
             client_version: "v".into(),
             report_days: 7,
@@ -2536,7 +2582,7 @@ mod tests {
     // ── team: the field the leaderboard GROUPS BY ─────────────────────────────────────────
 
     #[test]
-    fn the_posted_team_comes_from_state_and_falls_back_only_when_unset() {
+    fn the_posted_team_comes_from_state_and_is_omitted_when_unset() {
         // Driven through `build_report_body` — the same function `report_once_sync` posts the
         // return value of — rather than a hand-built `ReportBody`, which would assert only that a
         // struct field can hold a string.
@@ -2558,12 +2604,14 @@ mod tests {
         // The measured bug: this user's profile and every one of their tkmx-client rows read
         // "Chief", the leaderboard groups by team, and Sparkle hardcoded "default" — filing a
         // consolidated history under a team that does not exist.
-        assert_eq!(body("Chief").team, "Chief");
+        assert_eq!(body("Chief").team.as_deref(), Some("Chief"));
         // Hand-edited JSON is the only way this is set, and "Chief " is its own group server-side.
-        assert_eq!(body("  Chief  ").team, "Chief");
-        // Users who genuinely have no team keep the reference client's default.
-        assert_eq!(body("").team, DEFAULT_TEAM);
-        assert_eq!(body("   ").team, DEFAULT_TEAM);
+        assert_eq!(body("  Chief  ").team.as_deref(), Some("Chief"));
+        // A machine with no team configured asserts NOTHING — it does not fall back to a generic
+        // team name, which would overwrite whatever the server already holds. See
+        // `an_unset_team_is_omitted_from_the_payload_not_defaulted` for the serialized proof.
+        assert_eq!(body("").team, None);
+        assert_eq!(body("   ").team, None);
 
         // ...and it survives serialization, which is the only form the server ever sees.
         let v: serde_json::Value =
@@ -2574,6 +2622,38 @@ mod tests {
         assert_eq!(v["username"], "someone");
         assert_eq!(v["client_id"], "abc123");
         assert_eq!(v["report_days"], 7);
+    }
+
+    #[test]
+    fn an_unset_team_is_omitted_from_the_payload_not_defaulted() {
+        // THE MEASURED BUG, third recurrence: a machine with no team configured was sending
+        // `team: "default"`, and the server takes a sent value as an assertion — so one unconfigured
+        // machine silently REGROUPED the founder's leaderboard row away from "Chief". Omitting the
+        // key leaves whatever the server already holds untouched, exactly as the profile-prose
+        // fields do (`profile_prose_fields_are_omitted_not_blanked`).
+        //
+        // Asserted on the SERIALIZED body, never on the struct: `Option<String>` holding `None` is
+        // a fact about a field, and only the JSON proves what actually leaves the machine.
+        let v = |team: &str| {
+            v_of(&build_report_body(
+                &BuilderIndexState { team: team.into(), ..Default::default() },
+                "abc123".into(),
+                7,
+                vec![],
+                None,
+                None,
+            ))
+        };
+
+        assert!(v("").get("team").is_none(), "an unset team must not reach the wire at all");
+        assert!(
+            v("   ").get("team").is_none(),
+            "whitespace is unset too — it would otherwise assert a team named \" \""
+        );
+        // A configured team is still sent, still trimmed: "Chief " and "Chief" are different
+        // groups server-side, so the trimming is load-bearing rather than cosmetic.
+        assert_eq!(v("Chief")["team"], "Chief");
+        assert_eq!(v("  Chief  ")["team"], "Chief");
     }
 
     #[test]
@@ -2604,7 +2684,7 @@ mod tests {
         assert_eq!(loaded.last_status.as_deref(), Some("Reported 3 row(s) across 2 day(s)."));
         assert_eq!(loaded.report_days, 14);
         assert_eq!(loaded.team, "", "an absent key stays empty — never a guess");
-        assert_eq!(loaded.team(), DEFAULT_TEAM);
+        assert_eq!(loaded.team(), None, "...and an empty setting sends nothing at all");
 
         // Round-trip: rewriting the file keeps every field and adds the new one as an empty string
         // rather than dropping it, so the user has something to edit.
@@ -2638,7 +2718,7 @@ mod tests {
     fn payload_with_skills(skills: Option<Vec<String>>) -> serde_json::Value {
         v_of(&ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc".into(),
             client_version: "v".into(),
             report_days: 7,
@@ -2885,7 +2965,7 @@ mod tests {
         // a null is a value.
         let json = v_of(&ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc".into(),
             client_version: "v".into(),
             report_days: 7,
@@ -3649,8 +3729,13 @@ mod tests {
         assert_eq!(v["team_that_would_be_sent"], "Chief", "resolved, not the raw setting");
         assert_eq!(v["client_version_that_would_be_sent"], client_version());
 
-        // Unset resolves to the fallback here too, so the two answers can never disagree.
-        assert_eq!(read(&BuilderIndexState::default())["team_that_would_be_sent"], DEFAULT_TEAM);
+        // Unset renders as JSON null — "the key will be OMITTED" — here too, so the dry run and
+        // the real payload can never disagree. A string like "default" would read to a human as a
+        // team that will be sent, which is the exact misreading this whole change removes.
+        assert!(
+            read(&BuilderIndexState::default())["team_that_would_be_sent"].is_null(),
+            "an unset team must dry-run as null, not as a team name"
+        );
     }
 
     #[test]
@@ -3954,7 +4039,7 @@ mod tests {
         // And the omission reaches the wire as an ABSENT key, not a null.
         let body = ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc".into(),
             client_version: "v".into(),
             report_days: 7,
@@ -4074,7 +4159,7 @@ mod tests {
     fn an_omitted_session_stats_key_is_absent_not_null() {
         let body = ReportBody {
             username: "someone".into(),
-            team: "default".into(),
+            team: Some("default".into()),
             client_id: "abc".into(),
             client_version: "v".into(),
             report_days: 7,
@@ -4199,7 +4284,13 @@ mod tests {
             "TKMX_SERVER_URL is set to {raw:?} but was REJECTED (an override must be https or \
              loopback, and only a debug build honours it), so this would have posted to production"
         );
-        let team = std::env::var("TKMX_TEAM").unwrap_or_else(|_| DEFAULT_TEAM.to_string());
+        // Unset (or blank) TKMX_TEAM means OMIT the key, matching production: this helper posts a
+        // real row, so defaulting here would overwrite the target profile's team exactly the way
+        // the production bug did.
+        let team = std::env::var("TKMX_TEAM")
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
 
         let machine = read_machine_id().expect("machine id");
         let app_data = std::env::var_os("TKMX_APP_DATA").map(PathBuf::from);
