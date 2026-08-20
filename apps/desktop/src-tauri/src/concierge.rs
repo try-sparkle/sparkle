@@ -36,7 +36,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde::Serialize;
 use serde_json::Value;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::claude_chat::{
     cached_login_shell_path, capture_result_status, capture_tool_uses_with, clamp_live_tool_input,
@@ -1887,18 +1887,42 @@ pub async fn concierge_proactive_turn(
     Ok(started_id)
 }
 
+/// Kill+reap a turn already TAKEN out of the slot — the whole process group, so nothing it spawned
+/// survives. The blocking half of the cancel: `libc::kill(-pid, SIGKILL)` + `child.wait()`, which
+/// is why the async command below hands it to `spawn_blocking`. A plain fn taking the owned turn so
+/// the test suite can drive the real kill directly (mirrors `move_project_inner` /
+/// `assert_workspace_integrity_inner`). A no-op when the slot was already empty.
+fn cancel_in_flight_inner(taken: Option<ConciergeTurn>) {
+    if let Some(mut turn) = taken {
+        tracing::info!("concierge_cancel: killing in-flight turn (group) off-main");
+        kill_turn_group(&mut turn.child);
+    }
+}
+
 /// Cancel the in-flight concierge turn — the whole process group, so nothing it spawned keeps
 /// running. A no-op if none is in flight. The reader thread finds the slot token changed (entry
 /// gone) on EOF and stays silent, so no late done/error races the cancel.
+///
+/// `async` + `spawn_blocking` (mirroring `concierge_turn`, see its doc at the top): the kill AND —
+/// critically — the `child.wait()` reap run OFF the Tauri main thread, so cancelling a large queued
+/// teardown (up to `MAX_QUEUED_TURNS` children) can't freeze the UI. This used to be a SYNC command
+/// doing the kill+wait inline on the caller's (main) thread — the load-bearing hang of
+/// sparkle-edad2. The floor rises synchronously and immediately (`retire_issued_turns`), before the
+/// offload, so a cancelled turn goes quiet at once; and the slot lock is released (the guard
+/// dropped) inside the take block BEFORE the await, never held across it.
 #[tauri::command]
-pub fn concierge_cancel(manager: State<ConciergeManager>) -> Result<(), String> {
+pub async fn concierge_cancel(app: AppHandle) -> Result<(), String> {
     // Same floor as a send: a cancelled turn must go quiet immediately, not merely lose the slot.
+    // Kept synchronous and ahead of the offload so the silence does not wait on the reap.
     retire_issued_turns();
-    let turn = lock_turn(&manager.turn).take();
-    if let Some(mut turn) = turn {
-        tracing::info!("concierge_cancel: killing in-flight turn (group)");
-        kill_turn_group(&mut turn.child);
-    }
+    let taken = {
+        let manager = app.state::<ConciergeManager>();
+        let taken = lock_turn(&manager.turn).take();
+        taken // bound so the MutexGuard temporary drops HERE, before `manager` — the slot lock
+    }; // is not held across the await below.
+    tauri::async_runtime::spawn_blocking(move || cancel_in_flight_inner(taken))
+        .await
+        .map_err(|e| format!("concierge_cancel task failed: {e}"))?;
     Ok(())
 }
 
@@ -3486,5 +3510,88 @@ just the nearest test, because you are touching shared code.";
         capture_result_status(&ev, &mut subtype, &mut is_error, &mut detail);
         let m = failure_detail("", Some(1), subtype.as_deref(), is_error, detail.as_deref());
         assert_eq!(m, "Error: --resume requires a valid session ID or session title.");
+    }
+
+    /// Spawn a real long-lived child in ITS OWN process group (as `spawn_turn` does with
+    /// `process_group(0)`), wrap it as an in-flight turn, and return the pid alongside.
+    #[cfg(unix)]
+    fn spawn_group_child() -> (ConciergeTurn, i32) {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("sleep");
+        cmd.arg("120");
+        cmd.process_group(0);
+        let child = cmd.spawn().expect("spawn sleep child");
+        let pid = child.id() as i32;
+        // Signal 0 probes liveness without delivering anything: 0 = alive.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the child must be running before we cancel it"
+        );
+        (ConciergeTurn { child, token: 1 }, pid)
+    }
+
+    /// After the reap, the pid no longer names a live process: signal 0 fails with ESRCH.
+    #[cfg(unix)]
+    fn assert_process_gone(pid: i32) {
+        let rc = unsafe { libc::kill(pid, 0) };
+        assert_eq!(rc, -1, "the child must be dead after cancel (kill 0 should fail)");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH),
+            "the failure must be ESRCH (no such process), i.e. it was killed AND reaped"
+        );
+    }
+
+    /// The load-bearing side effect (sparkle-edad2): cancelling an in-flight turn TERMINATES its
+    /// process group. Asserts the OUTPUT — the child is dead and reaped — not the precondition.
+    /// Mutation target: delete the `libc::kill(-pid, SIGKILL)` in `kill_process_group` and the
+    /// `sleep` survives, so `assert_process_gone` fails.
+    #[cfg(unix)]
+    #[test]
+    fn cancel_in_flight_inner_kills_and_reaps_the_process_group() {
+        let (turn, pid) = spawn_group_child();
+        cancel_in_flight_inner(Some(turn));
+        assert_process_gone(pid);
+    }
+
+    /// The FULL async command path — take-under-lock (dropping the guard) then offload the kill to
+    /// `spawn_blocking`, awaited from an async context — still terminates the process. This is what
+    /// makes the fix non-vacuous: the kill happens OFF the caller's thread (in the blocking pool),
+    /// the slot lock is released before the await, and the slot ends empty. Drives the exact shape
+    /// of `concierge_cancel` without needing an `AppHandle` for `State`.
+    #[cfg(unix)]
+    #[test]
+    fn concierge_cancel_offloads_the_kill_and_empties_the_slot() {
+        let (turn, pid) = spawn_group_child();
+        let slot: Mutex<Option<ConciergeTurn>> = Mutex::new(Some(turn));
+
+        // Mirror the command exactly: take the child out under the lock — the guard is a temporary
+        // dropped at the end of THIS statement, so the lock is not held across the await below.
+        let taken = lock_turn(&slot).take();
+        assert!(taken.is_some(), "the slot held an in-flight turn to take");
+
+        tauri::async_runtime::block_on(async move {
+            tauri::async_runtime::spawn_blocking(move || cancel_in_flight_inner(taken))
+                .await
+                .expect("the kill task must not panic");
+        });
+
+        assert!(
+            lock_turn(&slot).is_none(),
+            "the slot must be empty after cancel — the turn was taken out"
+        );
+        assert_process_gone(pid);
+    }
+
+    /// Cancelling with an empty slot is a clean no-op, on both the sync core and the async offload.
+    #[test]
+    fn cancel_of_empty_slot_is_a_noop() {
+        cancel_in_flight_inner(None);
+        tauri::async_runtime::block_on(async {
+            tauri::async_runtime::spawn_blocking(|| cancel_in_flight_inner(None))
+                .await
+                .expect("no-op cancel must not panic");
+        });
     }
 }
