@@ -35,6 +35,7 @@ import shlex
 import shutil
 import sqlite3
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -605,6 +606,41 @@ def scope_to_branch_commits(cwd: str, branch: str, jobs: list[dict]) -> list[dic
     return kept
 
 
+# `roborev list` is bounded so a wedged daemon can't hang a git hook forever. The
+# bound was 5s, which is a statement about the CLI's LATENCY — and that latency
+# grows with the size of the local review store, not with anything the pushing
+# branch did. Measured on a 762MB store, the identical query took 5.1-5.9s every
+# time, so the bound expired on every call. That is the worst possible shape for
+# this particular timeout: `_list_jobs` maps a timeout to `None`, the push gate
+# DENIES on `None` (correctly — see the docstring below), and the operator gets a
+# blanket refusal to push anything, from a daemon that is perfectly healthy and
+# would have answered a second later.
+#
+# So 30s, and an env override. The default is chosen to sit far above the growth
+# curve rather than just above the last measurement; the override exists because
+# the failure it guards against is total (no pushes at all, from any branch) and
+# a hard-coded constant leaves an operator hitting it with nothing to turn. A
+# hook that hangs 30s on a genuinely wedged daemon is an annoyance; a hook that
+# denies every push is a stop-work.
+#
+# Junk in the env var falls back to the default rather than raising: this is read
+# at import time inside a git hook, where an exception is a broken hook and a
+# mistyped number should never be able to cause one.
+_LIST_TIMEOUT_DEFAULT_SECS = 30.0
+LIST_TIMEOUT_ENV = "ROBOREV_HOOK_LIST_TIMEOUT_SECS"
+
+
+def _resolve_list_timeout() -> float:
+    raw = os.environ.get(LIST_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _LIST_TIMEOUT_DEFAULT_SECS
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        return _LIST_TIMEOUT_DEFAULT_SECS
+    return val if val > 0 else _LIST_TIMEOUT_DEFAULT_SECS
+
+
 def _list_jobs(roborev: str, repo_root: str, branch: str) -> list[dict] | None:
     """Full job list for this repo+branch via the public `roborev list` CLI.
     Repo+branch scoping is delegated to `--repo`/`--branch` (verified to filter
@@ -626,11 +662,25 @@ def _list_jobs(roborev: str, repo_root: str, branch: str) -> list[dict] | None:
     failure, so it maps to `[]` — otherwise the gate would deny every push in any
     repo roborev hasn't reviewed yet (the daemon is fine; there's simply nothing
     to find)."""
+    timeout_secs = _resolve_list_timeout()
     try:
         r = subprocess.run(
             [roborev, "list", "--json", "--repo", repo_root, "--branch", branch],
-            cwd=repo_root, capture_output=True, text=True, timeout=5,
+            cwd=repo_root, capture_output=True, text=True, timeout=timeout_secs,
         )
+    except subprocess.TimeoutExpired:
+        # NAME the bound. A timeout here reaches the operator as a flat "couldn't
+        # determine review state" denial, which reads as a broken daemon and sends
+        # them looking in the wrong place — the store is simply large enough that
+        # the query outruns the bound. Printing the knob turns a stop-work into a
+        # one-line fix. stderr, so it can never contaminate a hook's JSON stdout.
+        print(
+            f"roborev hook: `roborev list` exceeded {timeout_secs:g}s and was killed; "
+            f"treating review state as UNKNOWN (fail-closed). If this repeats, the local "
+            f"review store is likely large — raise the bound with {LIST_TIMEOUT_ENV}=<seconds>.",
+            file=sys.stderr,
+        )
+        return None
     except (subprocess.SubprocessError, OSError):
         return None
     if r.returncode != 0:
