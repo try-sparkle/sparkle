@@ -230,6 +230,14 @@ describe("selecting a build row patches the cable", () => {
     render(<AgentSidebar project={EMPTY} />);
     arriveInBuild();
     expect(useCableStore.getState().wired).toBe("left");
+    // AND THE GRIP ON THE GUARD THIS CASE NAMES (roborev job 65713). The cable assertion above is
+    // the user-facing claim, but it cannot fail: `selectAndWire` returns on a falsy id at its own
+    // `if (!id) return;` — BEFORE `patchCable` — so deleting `if (first !== undefined)` leaves the
+    // cable on "left" either way and the case goes green against the very line it says it pins.
+    // `selectAgent` runs EARLIER than that guard, though, so a null seat is observable there: drop
+    // the effect's check and `undefined` is written into the selection. This is the assertion that
+    // reds.
+    expect(useProjectStore.getState().projects[0]!.selectedAgentId).toBeNull();
   });
 
   it("docks a floating concierge, so wired and floating cannot both be true", () => {

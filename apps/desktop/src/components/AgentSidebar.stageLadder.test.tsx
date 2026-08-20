@@ -672,8 +672,59 @@ describe("AgentSidebar — a worker row can be selected in Build mode", () => {
     });
     rerender(<AgentSidebar project={proj()} />);
 
+    // THE PREMISE, ASSERTED (roborev job 65669). Without this the case is non-vacuous only by
+    // accident of the bead seeding still resolving. If it ever silently stops — a store snapshot
+    // shape change, `descendantsOf`, the `p1` key, or the `as never` casts that suppress every type
+    // check on `mkBead` — `epicAgentIds` becomes an EMPTY set, `renderedRowIds` empties with it,
+    // `first` is undefined, nothing is written, and the assertion below passes with the carve-out
+    // DELETED. Pinning that the narrowing is actually live is what stops that regression reading as
+    // a pass.
     arriveInBuild(rerender);
 
+    // ASSERTED AFTER THE TRANSITION, not before it: the suite starts in Plan, where this column
+    // renders no build rows at all, so a premise checked earlier would fail for a reason that has
+    // nothing to do with the narrowing. Here it pins the state the effect actually saw.
+    expect(screen.getByText("Alpha")).toBeTruthy();
+    expect(screen.queryByText("Bravo")).toBeNull();
+
     expect(proj().selectedAgentId).toBe("b1");
+  });
+
+  // THE OTHER HALF OF THAT CARVE-OUT, and the reason it asks existence rather than membership.
+  // `!epicAgentIds.has(selected)` is equally true for a live agent the filter is HIDING and for an
+  // id naming no agent at all — and only the first deserves to be left alone. A dangling selection
+  // under an epic focus must still be repaired, because the effect fires only on a mode CHANGE:
+  // nothing re-triggers it when the focus is later cleared, so a column left pointing at nothing
+  // stays that way until the user clicks a row by hand.
+  it("re-seats a STALE selection even while an epic focus hides other rows", () => {
+    const a = mkAgent("a1", "Alpha", { beadId: "e1.1" } as Partial<AgentTab>);
+    const b = mkAgent("b1", "Bravo", { beadId: "z9.1" } as Partial<AgentTab>);
+    seed([a, b]);
+    setStages({ a1: "building_saved", b1: "building_saved" });
+    useRuntimeStore.setState({ openAgentIds: ["a1", "b1"] } as never);
+    useBeadsStore.setState({
+      byProject: { p1: { beads: [mkBead("e1"), mkBead("e1.1"), mkBead("z9.1")] } },
+    } as never);
+
+    // Names no agent in the project — the case the membership test could not tell apart from a
+    // merely-hidden one.
+    act(() => {
+      useProjectStore.setState({
+        projects: [{ ...proj(), selectedAgentId: "ghost" }],
+      } as never);
+    });
+    const { rerender } = render(<AgentSidebar project={proj()} />);
+
+    act(() => {
+      useUiStore.setState({ epicFocusBySide: { left: "e1", right: "e1" } } as never);
+    });
+    rerender(<AgentSidebar project={proj()} />);
+
+    arriveInBuild(rerender);
+
+    expect(screen.getByText("Alpha")).toBeTruthy();
+    expect(screen.queryByText("Bravo")).toBeNull();
+
+    expect(proj().selectedAgentId).toBe("a1");
   });
 });

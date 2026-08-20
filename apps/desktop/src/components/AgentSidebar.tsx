@@ -2610,13 +2610,22 @@ export function AgentSidebar({
     // the cable, and pressing Clear afterwards would restore a column showing a DIFFERENT terminal
     // than the user left. Leaving the selection intact is what makes Clear restore the very
     // terminal they were reading.
-    if (epicAgentIds && selected && !epicAgentIds.has(selected)) return;
+    //
+    // ASK VALIDITY, NOT MEMBERSHIP (roborev job 65669). `!epicAgentIds.has(selected)` is true for
+    // TWO different states, and only one of them is the one this paragraph argues for: a live agent
+    // the filter is hiding, and an id that names no agent at all. Keyed on membership alone, a
+    // stale `selectedAgentId` under an epic focus took this same early return and was never
+    // repaired — and because the effect fires only on a mode CHANGE, clearing the focus afterwards
+    // did not re-trigger it either, so the column sat pointing at nothing until the user clicked a
+    // row by hand. Existence is what separates them, so it is what gets asked.
+    const stillExists = selected != null && agentsById.has(selected);
+    if (epicAgentIds && stillExists && !epicAgentIds.has(selected)) return;
     if (selected && renderedRowIds.includes(selected)) return;
     const first = renderedRowIds[0];
     if (first !== undefined) selectAndWireRef.current(first);
     // `selectAndWire` is read through a ref: it is rebuilt every render, so listing it would make
     // this effect re-run on every paint for a rule that only cares about a mode change.
-  }, [mode, paneCoversMe, project, renderedRowIds, epicAgentIds]);
+  }, [mode, paneCoversMe, project, renderedRowIds, epicAgentIds, agentsById]);
   // The selected row if it is on screen, else the first row. Never null while any row renders, so
   // the column can't become unreachable by keyboard just because selection points at a filtered-out
   // or folded-away agent.
