@@ -329,3 +329,64 @@ describe("useBeadBuildActions — the batch checks the ceiling on every iteratio
     expect(claimBead).toHaveBeenCalledTimes(2);
   });
 });
+
+describe("the epic index is beads.ts's, not a second private copy", () => {
+  // ══ THE ASSERTION IS THE DIVERGENCE, NOT THE CALL COUNT ══════════════════════════════════════
+  // This hook used to keep its OWN `WeakMap<readonly Bead[], EpicIndex>` over `buildEpicIndex`,
+  // beside the one `beads.ts` exports as `epicIndexOf` and that `Card`/`DetailOverlay` resolve
+  // through. Two builds per snapshot is the cheap half of that bug. The half that changes an
+  // ANSWER is staleness: `beads.ts` stores `beads.length` next to its index and rebuilds when it
+  // moves; the private copy had no such guard, so an in-place `push` left this hook answering from
+  // an index the card beside it had already replaced (roborev 65768).
+  //
+  // So the test mutates ONE array in place — same identity, new length — and asserts the hook's
+  // verdict MOVES. Against the private WeakMap it cannot: the index is looked up by identity, the
+  // identity did not change, and `buildIt` stays null forever. A "was buildEpicIndex called once"
+  // spy would not catch it, because both caches are hit exactly once each and the wrong answer is
+  // the one that survives.
+  it("re-reads an in-place push, so it cannot disagree with the card beside it", () => {
+    // An epic whose only child is CLOSED: `isStartable` refuses it — `rollupEpicStatus` says
+    // "done", i.e. finished work whose epic bead nobody closed. Build It must be withheld.
+    const e = bead({ id: "e9", type: "epic" });
+    const doneKid = bead({ id: "e9.1", parent: "e9", status: "closed" });
+    const all = [e, doneKid];
+
+    const r = renderHook(
+      ({ list }) => useBeadBuildActions({ bead: e, projectId: "p1", allBeads: list }),
+      { initialProps: { list: all as Bead[] } },
+    );
+    expect(r.result.current.buildIt).toBeNull();
+
+    // A NEW open child arrives by in-place push — the same array object, length 2 -> 3. The epic is
+    // no longer finished, so Build It must come back.
+    all.push(bead({ id: "e9.2", parent: "e9", status: "open" }));
+    r.rerender({ list: all });
+
+    expect(r.result.current.buildIt).not.toBeNull();
+  });
+
+  // THE SIBLING CACHE, asserted separately because `buildIt` cannot see it. `prdEpicsByPath` was
+  // the other identity-only WeakMap in this file, and the fix above did not reach it — so the same
+  // in-place push left `startable` fresh and `prdEpics` assembled from the RETIRED index, one
+  // scope down from the bug that was just closed (roborev 65775). `prdEpics` is the observable:
+  // it is what `buildAllPrd` iterates and what the card counts in "Build all N epics in this PRD".
+  it("regroups PRD epics on an in-place push too, so buildAllPrd cannot under-count", () => {
+    const a = bead({ id: "pa", type: "epic", description: PRD });
+    const all = [a];
+
+    const r = renderHook(
+      ({ list }) => useBeadBuildActions({ bead: a, projectId: "p1", allBeads: list }),
+      { initialProps: { list: all as Bead[] } },
+    );
+    // One epic in its own PRD is not a batch — `buildAllPrd` needs more than one.
+    expect(r.result.current.prdEpics).toHaveLength(1);
+    expect(r.result.current.buildAllPrd).toBeNull();
+
+    // A SECOND epic on the same PRD arrives by in-place push — same array object, length 1 -> 2.
+    all.push(bead({ id: "pb", type: "epic", description: PRD }));
+    r.rerender({ list: all });
+
+    expect(r.result.current.prdEpics).toHaveLength(2);
+    expect(r.result.current.buildAllPrd).not.toBeNull();
+  });
+});

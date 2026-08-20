@@ -24,8 +24,8 @@
 //     orchestrator behind it. It stops cleanly and says how far it got.
 import { useCallback, useMemo } from "react";
 import {
-  buildEpicIndex,
   claimBead,
+  epicIndexOf,
   isEpic,
   isEpicIndexed,
   STALLED_LABEL,
@@ -109,26 +109,53 @@ export interface BeadBuildActions {
  * snapshot's array identity across a poll that changed nothing (`snapshotUnchanged`), so keying a
  * WeakMap on it builds ONE Set per real change and every card after that reads it in O(1).
  */
-/**
- * `buildEpicIndex`, cached on the bead list's identity — the same trick as {@link blockedIdsOf} and
- * for the same reason: every board card mounts this hook, and building the index per card would put
- * the O(n) walk back once per card. `beadsStore` hands out a stable `beads` array across a poll
- * that changed nothing, so this builds ONE index per real change.
+/*
+ * ══ THE EPIC INDEX IS `beads.ts`'s, NOT A SECOND COPY ════════════════════════════════════════════
+ * This file used to keep its OWN `WeakMap<readonly Bead[], EpicIndex>` over `buildEpicIndex`. That
+ * was correct in isolation and wrong once `main` deleted the column+type gate on the `StartControls`
+ * render site: the hook now mounts on EVERY card, beside `Card`/`DetailOverlay`, which resolve the
+ * same questions through `beads.ts`'s `epicIndexOf`. Two caches keyed on the SAME `allBeads` array
+ * meant two full O(n) builds per snapshot — 6-13 ms each on the founder's 7,364-bead store, on the
+ * exact render path the index exists to make cheap. `beads.ts` says so at the export verbatim
+ * (roborev 65596), and this is the caller it was warning about.
+ *
+ * Worse than the double build, the two disagreed on STALENESS: `beads.ts` stores `beads.length`
+ * beside the index and rebuilds when it moves, this one did not — so an in-place `push` left the
+ * hook's `isStartable`/`prdEpicsByPath` answering from a stale index while the card beside it
+ * answered from a fresh one. That is the silent-merge shape AGENTS.md warns about: git took both
+ * sides cleanly and left a caller reading the retired source (roborev 65768).
+ *
+ * So: import `epicIndexOf` and use it everywhere. One build per snapshot, and one staleness
+ * contract for the EPIC INDEX across all three Build It surfaces. `buildEpicIndex` stays public for
+ * callers that genuinely want a fresh, uncached build — this is not one of them.
+ *
+ * That sentence used to say "across all three Build It surfaces" without the qualifier, and it was
+ * false inside this very file: `prdEpicsByPath` cached on the bead ARRAY, unguarded, so the same
+ * in-place push the fix handles left `startable` fresh and `prdEpics` stale — the identical
+ * disagreement one scope down (roborev 65775). It is keyed on the INDEX now; see there. The one
+ * remaining identity-only cache is {@link blockedIdsOf}, and it is keyed on a DIFFERENT array (the
+ * store's `board.blocked` lane, not `allBeads`), so `epicIndexOf`'s guard could not cover it
+ * anyway — it relies on the fresh-array-per-snapshot contract `beadsStore` actually keeps.
  */
-const EPIC_INDEX = new WeakMap<readonly Bead[], EpicIndex>();
-function epicIndexFor(beads: readonly Bead[]): EpicIndex {
-  const hit = EPIC_INDEX.get(beads);
-  if (hit) return hit;
-  const index = buildEpicIndex(beads);
-  EPIC_INDEX.set(beads, index);
-  return index;
-}
 
 /**
- * Epics grouped by the PRD their body links, cached on the bead list's identity.
+ * Epics grouped by the PRD their body links, cached on the {@link EpicIndex} `epicIndexOf` hands
+ * back for this snapshot — NOT on the bead array.
+ *
+ * ══ KEYED ON THE INDEX SO THE STALENESS CONTRACT COMES FOR FREE ══════════════════════════════
+ * This was a `WeakMap<readonly Bead[], …>` with no length guard, which made it the sibling of the
+ * bug one scope up: an in-place `push` keeps the array's identity, so `startable` re-read a rebuilt
+ * index and offered Build It on the pushed epic while this map answered from the RETIRED one —
+ * `prdEpics` omitting it, and `buildAllPrd` collapsing to `null` or under-counting "Build all N
+ * epics in this PRD" (roborev 65775).
+ *
+ * Keying on the index object rather than duplicating its `{ value, length }` guard means there is
+ * exactly ONE place that decides when a snapshot is stale. A rebuilt index is a new object, so this
+ * map misses and regroups; an unchanged one is the same object, so it hits. The derived cache
+ * cannot drift from its source because it is no longer deciding anything.
  *
  * ══ CACHING THE INDEX WAS ONLY HALF THE FIX ══════════════════════════════════════════════════
- * Sharing {@link epicIndexFor} removed the per-card `isEpic` walk, but the `filter` that consumed
+ * Sharing {@link epicIndexOf} removed the per-card `isEpic` walk, but the `filter` that consumed
  * it was still O(backlog) PER CARD — and it ran `parsePrdRef`, a multiline regex, over every bead's
  * full description. On a Backlog column that renders all ~1,600 cards that is
  * `cards_with_a_PRD_link × 2,100` regex executions on every `allBeads` identity change: the exact
@@ -141,11 +168,11 @@ function epicIndexFor(beads: readonly Bead[]): EpicIndex {
  * blocked lane as well as the bead list, and the group it filters is a handful of epics rather than
  * the whole store.
  */
-const PRD_EPICS = new WeakMap<readonly Bead[], ReadonlyMap<string, Bead[]>>();
+const PRD_EPICS = new WeakMap<EpicIndex, ReadonlyMap<string, Bead[]>>();
 function prdEpicsByPath(beads: readonly Bead[]): ReadonlyMap<string, Bead[]> {
-  const hit = PRD_EPICS.get(beads);
+  const index = epicIndexOf(beads);
+  const hit = PRD_EPICS.get(index);
   if (hit) return hit;
-  const index = epicIndexFor(beads);
   const out = new Map<string, Bead[]>();
   for (const b of beads) {
     if (!isEpicIndexed(index, b)) continue;
@@ -155,7 +182,7 @@ function prdEpicsByPath(beads: readonly Bead[]): ReadonlyMap<string, Bead[]> {
     if (bucket) bucket.push(b);
     else out.set(path, [b]);
   }
-  PRD_EPICS.set(beads, out);
+  PRD_EPICS.set(index, out);
   return out;
 }
 
@@ -285,7 +312,7 @@ export function useBeadBuildActions({
     // one press on a DIFFERENT epic's card (roborev 65607).
     const group = byPath.get(prdPath);
     if (!group) return NO_EPICS;
-    return group.filter((b) => isStartable(b, epicIndexFor(allBeads), blockedIds));
+    return group.filter((b) => isStartable(b, epicIndexOf(allBeads), blockedIds));
   }, [byPath, allBeads, prdPath, blockedIds]);
 
   // ══ THE GATE IS THE BEAD'S OWN STATE, NOT THE COLUMN IT IS DRAWN IN ══════════════════════════
@@ -314,7 +341,7 @@ export function useBeadBuildActions({
   // the pressed bead left `buildAllPrd` claiming every sibling in `prdEpics` regardless — one press
   // reopening a CLOSED epic to `in_progress` with an orchestrator against finished work
   // (roborev 65607).
-  const startable = isStartable(bead, epicIndexFor(allBeads), blockedIds);
+  const startable = isStartable(bead, epicIndexOf(allBeads), blockedIds);
 
   const buildOne = useCallback(
     async (mode: "epic" | "task") => {

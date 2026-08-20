@@ -72,7 +72,10 @@ export type EpicStatus = "unplanned" | "planning" | "in_progress" | "done";
  * `every(open)`, so the empty case must be answered before it or `planning` would swallow it and
  * the sweeper would spawn agents against epics that hold no plan.
  */
-export function rollupEpicStatus(childStatuses: Bead["status"][]): EpicStatus {
+// `readonly`, because the caller now passes a bucket straight out of the shared `EpicIndex` and
+// that bucket must not be mutable at any point in the chain. This function only reads, so widening
+// the parameter costs nothing and removes the need for a cast at the call site (roborev 65662).
+export function rollupEpicStatus(childStatuses: readonly Bead["status"][]): EpicStatus {
   if (childStatuses.length === 0) return "unplanned";
   if (childStatuses.every((s) => s === "closed")) return "done";
   if (childStatuses.every((s) => s === "open")) return "planning";

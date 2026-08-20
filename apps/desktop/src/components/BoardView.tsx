@@ -4,11 +4,12 @@ import { PILL, RADIUS } from "../theme/scale";
 import { TAG } from "./labelTreatment";
 import type { Project } from "../types";
 import {
-  childrenOf,
-  isEpic,
+  epicIndexOf,
+  isEpicIndexed,
+  childrenOfIndexed,
+  openChildCountIndexed,
+  parentEpicOfIndexed,
   epicDisplayTitle,
-  openChildCount,
-  parentEpicOf,
   labelBead,
   STALLED_LABEL,
   SWEEP_NO_AUTO_LABEL,
@@ -1209,15 +1210,21 @@ function Card({
   // Keying either off `type === "epic"` is the mistake this codebase already made three times: // epic-guard-ok — this line only NAMES the anti-pattern in prose; it is not a condition.
   // several real parents are typed `feature`/`bug`/`task` and one of them has 19 children, so a
   // type check would leave every one of those children unlabelled.
-  const beadIsEpic = isEpic(allBeads, bead);
+  // INDEX-BACKED, and the reason is the whole point of this change: each of these four resolvers
+  // used to walk the ENTIRE store, once per card. On the founder's 7,331-bead store that is four
+  // 7,331-element scans x 6,644 cards on every render of the board — the 5-30s stall on show/hide
+  // and Plan->Build. `epicIndexOf` is cached on array IDENTITY, so the first card pays the single
+  // O(n) build and every other card is an O(1) map read.
+  const epicIndex = epicIndexOf(allBeads);
+  const beadIsEpic = isEpicIndexed(epicIndex, bead);
   // Only asked for a TASK. An epic that is itself nested would otherwise wear both the pill and a
   // parent line, which is more chrome than the card can carry.
-  const parentEpic = beadIsEpic ? null : parentEpicOf(allBeads, bead);
+  const parentEpic = beadIsEpic ? null : parentEpicOfIndexed(epicIndex, bead);
   // PER-CARD AND DELIBERATELY NOT PERSISTED — same contract as the Tasks/Epics kind toggles.
   // Collapsed is the default because a board of auto-expanded epics is unreadable.
   const [childrenOpen, setChildrenOpen] = useState(false);
-  const openKids = beadIsEpic ? openChildCount(allBeads, bead.id) : 0;
-  const hasKids = beadIsEpic && childrenOf(allBeads, bead.id).length > 0;
+  const openKids = beadIsEpic ? openChildCountIndexed(epicIndex, bead.id) : 0;
+  const hasKids = beadIsEpic && childrenOfIndexed(epicIndex, bead.id).length > 0;
 
   return (
     // The card's visual shell is a div so the interactive Start button can live BESIDE the
@@ -1418,14 +1425,14 @@ function StartControls({
   // `mode` — and it is NULL once the bead has been started or closed, which is what makes this
   // card agree with the overlay and the concierge without knowing their rules.
   const { buildIt } = useBeadBuildActions({ bead, projectId: project.id, allBeads });
-  const beadIsEpic = isEpic(allBeads, bead);
+  const beadIsEpic = isEpicIndexed(epicIndexOf(allBeads), bead);
   const isDecomposing = bead.labels.includes(DECOMPOSING_LABEL);
   const isFailed = bead.labels.includes(DECOMPOSE_FAILED_LABEL);
   // AN EPIC-ONLY GATE, and it has to be — a childless EPIC has nothing to fan out to, so Build It
   // waits for decompose. A bug, task or feature IS the unit of work and never has children, so
   // asking it the same question would disable the button on every single non-epic bead: the exact
   // bug this change exists to fix, re-created one line below the fix.
-  const noChildren = beadIsEpic && childrenOf(allBeads, bead.id).length === 0;
+  const noChildren = beadIsEpic && childrenOfIndexed(epicIndexOf(allBeads), bead.id).length === 0;
   const startDisabled = isDecomposing || noChildren || busy;
   const isStalled = bead.labels.includes(STALLED_LABEL);
 
@@ -1710,7 +1717,7 @@ function DetailOverlay({
   /** Swap the overlay to another bead — a child row, so the epic↔task walk works here too. */
   onOpen: (b: Bead) => void;
 }) {
-  const beadIsEpic = isEpic(allBeads, bead);
+  const beadIsEpic = isEpicIndexed(epicIndexOf(allBeads), bead);
   const workers = workersForBead(agents, bead.id);
   // The project's checkout root — every WRITE is addressed by PATH. Looked up here because the
   // overlay only receives a projectId.

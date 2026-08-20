@@ -59,7 +59,13 @@ import {
   readStoredEpicsWidth,
 } from "../engine/columnResize";
 import { EPIC_LADDER_COLUMNS, bucketEpics, type EpicLadderKey } from "../services/epicBoard";
-import { childrenOf, epicDisplayTitle, openChildCount, type Bead } from "../services/beads";
+import {
+  childrenOfIndexed,
+  epicDisplayTitle,
+  epicIndexOf,
+  openChildCountIndexed,
+  type Bead,
+} from "../services/beads";
 
 /** How much room the ladder leaves for the pull tab on the seam side. The rail is 6px and the grip
  *  chiclet overhangs it slightly, so 10 clears both without eating a readable amount of a 280px
@@ -437,10 +443,14 @@ function EpicRow({
   selected: boolean;
   onSelect: () => void;
 }) {
-  // `childrenOf` and `openChildCount` are the resolver's, never a local re-derivation of the
-  // parent-child edge — see this file's header and scripts/lib/epic-membership-guard.sh.
-  const total = childrenOf(allBeads, epic.id).length;
-  const open = openChildCount(allBeads, epic.id);
+  // Still the RESOLVER's edge, never a local re-derivation — see this file's header and
+  // scripts/lib/epic-membership-guard.sh. Only the lookup changed: these are the indexed reads of
+  // the same rule, so one epic row costs two map reads instead of two whole-store scans. The row
+  // renders once per epic, so on the founder's store this was the difference between 2 x 7,331
+  // comparisons per row and 2.
+  const epicIndex = epicIndexOf(allBeads);
+  const total = childrenOfIndexed(epicIndex, epic.id).length;
+  const open = openChildCountIndexed(epicIndex, epic.id);
   return (
     <button
       data-testid="epic-row"

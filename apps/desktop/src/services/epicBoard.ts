@@ -10,7 +10,7 @@
 // Shipped, Archived) are derived HERE, at the view layer, from the board bucket the epic bead
 // already sits in. The sweeper is untouched by anything in this file.
 import {
-  buildEpicIndex,
+  epicIndexOf,
   isEpicIndexed,
   type Bead,
   type Board,
@@ -115,7 +115,11 @@ function openEpicStage(index: EpicIndex, epicId: string): EpicLadderKey {
  */
 export function bucketEpics(board: Board, allBeads: readonly Bead[]): EpicBoard {
   const out = emptyEpicBoard();
-  const index = buildEpicIndex(allBeads); // ONE walk of the store, not one per bead — see EpicIndex
+  // CACHED, not `buildEpicIndex`. Both are one walk instead of one per bead, but this receives the
+  // SAME `allBeads` identity every Card and EpicRow resolves through, so a direct uncached build
+  // here pays a second full O(n) walk of a store the cache already holds -- 6-13 ms on the
+  // founder's store, on the render path this index exists to make cheap (roborev 65662).
+  const index = epicIndexOf(allBeads);
   const keep = (b: Bead) => isEpicIndexed(index, b);
   out.archived = board.archived.filter(keep);
   out.delivered = board.delivered.filter(keep);
@@ -137,7 +141,7 @@ export function bucketEpics(board: Board, allBeads: readonly Bead[]): EpicBoard 
  *  rather than left implied, because the failure it guards against is silent — a bead dropped by
  *  both halves is simply gone from the app, with a green suite and nothing on screen to notice. */
 export function tasksOnly(board: Board, allBeads: readonly Bead[]): Board {
-  const index = buildEpicIndex(allBeads);
+  const index = epicIndexOf(allBeads); // cached — see the note in `bucketEpics`
   return mapBoard(board, (b) => !isEpicIndexed(index, b));
 }
 

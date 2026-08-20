@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { EPIC_LADDER, bucketEpics, tasksOnly, type EpicLadderKey } from "./epicBoard";
-import { bucketBeads, type Bead, type BeadStatus, type Board } from "./beads";
+import { bucketBeads, epicIndexOf, type Bead, type BeadStatus, type Board } from "./beads";
 
 const bead = (
   id: string,
@@ -137,5 +137,70 @@ describe("tasksOnly + bucketEpics — the two halves the Tasks and Epics modes r
     const epics = flat(e as unknown as Record<string, Bead[]>);
     expect([...tasks, ...epics].sort()).toEqual(["e", "e.1", "t"]);
     expect(tasks.filter((id) => epics.includes(id))).toEqual([]);
+  });
+});
+
+// ══ THE CACHE IS ACTUALLY USED — pinned by a READ COUNT, not by output equality ════════════════
+//
+// `bucketEpics`/`tasksOnly` used to call the UNCACHED `buildEpicIndex(allBeads)` directly, on the
+// same `allBeads` identity every Card and EpicRow already resolves through `epicIndexOf` — so the
+// Plan board paid a second full O(n) walk on every render (roborev 65662).
+//
+// OUTPUT EQUALITY CANNOT GUARD THIS. Both spellings return identical data, so every other test in
+// this file stays green if the two lines are reverted; the only symptom is silent duplicated work
+// (roborev 65714). What distinguishes them is how many times the STORE ARRAY is read, so that is
+// what this counts — the same Proxy technique as the complexity block in `beads.epicIndex.test.ts`.
+describe("bucketEpics / tasksOnly read the CACHED index", () => {
+  const N = 400;
+
+  const counted = (store: Bead[]) => {
+    const stats = { reads: 0 };
+    const proxy = new Proxy(store, {
+      get(target, prop, recv) {
+        if (typeof prop === "string" && prop.length > 0 && /^\d+$/.test(prop)) stats.reads++;
+        return Reflect.get(target, prop, recv);
+      },
+    }) as Bead[];
+    return { proxy, stats };
+  };
+
+  const store = (): Bead[] => {
+    const out: Bead[] = [];
+    for (let e = 0; e < 8; e++) out.push(bead(`e${e}`, "open"));
+    for (let i = 0; out.length < N; i++) out.push(bead(`t${i}`, "open", `e${i % 8}`));
+    return out;
+  };
+
+  it("does not re-walk the store once the index is primed", () => {
+    // THE BOARD IS BUILT FROM A SEPARATE ARRAY, not from the proxy. An earlier version wrote
+    // `bucketBeads([...proxy])` with the comment "a COPY, so bucketing is not charged" -- which was
+    // false: array spread goes through the ITERATOR PROTOCOL, issuing Get(target, "0"), Get(target,
+    // "1"), ... so every element hit the trap and ~N reads were charged before priming ever ran.
+    // That made the `primed > 0` guard below unfalsifiable -- it would have passed against an
+    // `epicIndexOf` that read nothing at all, which is the exact shape this suite exists to catch
+    // (roborev 65724).
+    const beads = store();
+    const board = bucketBeads(store());
+    const { proxy, stats } = counted(beads);
+
+    const beforePrime = stats.reads;
+    epicIndexOf(proxy);
+    // The priming walk really happened, measured around the call ALONE.
+    expect(stats.reads - beforePrime).toBeGreaterThanOrEqual(N);
+    const primed = stats.reads;
+
+    const epics = bucketEpics(board, proxy);
+    const tasks = tasksOnly(board, proxy);
+
+    // POSITIVE GUARD FIRST: both did real work. Without it the read-delta assertion below is
+    // satisfied trivially by an early bail -- an empty board, a rejecting predicate, a `return
+    // emptyEpicBoard()` -- and the test stays green while measuring nothing. Every sibling
+    // read-count test carries this pair for the same reason.
+    expect(EPIC_LADDER.reduce((n, k) => n + epics[k].length, 0)).toBeGreaterThan(0);
+    expect(tasks.backlog.length).toBeGreaterThan(0);
+
+    // ...and neither added another full pass. A single reverted line costs N more reads, so this
+    // bar sits well below the failure it is written to catch.
+    expect(stats.reads - primed).toBeLessThan(N);
   });
 });

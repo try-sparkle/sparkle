@@ -52,8 +52,13 @@ function normalizeLabels(v: unknown): string[] {
   return [];
 }
 
-/** Normalize one loosely-typed bd row into a Bead. Tolerant of missing/renamed keys. */
-function normalizeBead(raw: RawBead): Bead {
+/** Normalize one loosely-typed bd row into a Bead. Tolerant of missing/renamed keys.
+ *
+ *  Exported for `scripts/bench/board-perf.mts`, which replays the board's real resolution cost over
+ *  a real `bd list --json` dump. The point of that bench is that it measures THIS file rather than a
+ *  re-implementation of it, so it has to normalize rows the way the app does — a hand-rolled
+ *  equivalent in the script would drift and quietly stop measuring the shipped path. */
+export function normalizeBead(raw: RawBead): Bead {
   const id = asString(raw.id) ?? asString(raw.issue_id) ?? "";
   const type = asString(raw.issue_type) ?? asString(raw.type);
   const priorityRaw = raw.priority;
@@ -588,6 +593,75 @@ export function bucketBeads(beads: Bead[], blocked?: ReadonlySet<string>): Board
 // again. Three call sites, three conditions. That is HOW the drift happened, so the fix is not
 // "pick one" but "have one place that can be picked".
 
+// ── THE FOUR LEGACY SIGNATURES ARE INDEX-BACKED — the cache that makes that free ───────────────
+//
+// `childrenOf` used to be a full `Array.prototype.filter` with a string `===` and a `startsWith`
+// per bead, and `isEpic` / `openChildCount` / `parentEpicOf` all built on it — `parentEpicOf`
+// calling `isEpic` INSIDE a loop, over a `beads.find` that is itself a scan. At 7,364 beads /
+// 11.6 MB that is quadratic on the render path, and it was measured as such against the founder's
+// real store: `beads.filter((b) => isEpic(beads, b))` took 3.4-4.0 SECONDS and 53.7M comparisons to
+// find 43 epics, and a renderer hang dump put the WebContent main thread at 450/451 samples inside
+// ONE microtask checkpoint with `JSC::stringProtoFuncStartsWith` and `operationCompareStringEq` as
+// its heaviest named leaves — literally these two operations.
+//
+// The docstring on {@link EpicIndex} used to say "every call site was bounded by a render cap".
+// That premise is FALSE: ~10 call sites ask these questions of the WHOLE store
+// (`epicSweepRunner`, `conciergeTools/plans`, `conciergeTools/board`, `planView`, `epicFocus`,
+// `epicDecompose`), and BoardView asks six of them per card across 6,644 cards.
+//
+// So the four keep their EXACT exported signatures and resolve an {@link EpicIndex} internally,
+// keyed on the ARRAY IDENTITY. Every call site above is fixed with zero edits to any of them.
+//
+// ── STALENESS: WHAT THIS GUARD CATCHES AND WHAT IT DOES NOT ────────────────────────────────────
+// A `WeakMap` keyed on identity goes stale if an array is MUTATED IN PLACE, because a `push` keeps
+// the same identity. Storing the array's `length` alongside the index catches every mutation that
+// CHANGES THE LENGTH (push/pop/splice, the realistic accidents) and rebuilds.
+//
+// It does NOT catch an in-place field edit at constant length — `beads[3].parent = "x"`, or a
+// `splice` that removes one bead and inserts another. Nothing cheap can: detecting that needs a
+// per-element scan, which is the cost this whole cache exists to remove. The CONTRACT is therefore
+// that callers pass a FRESH ARRAY PER SNAPSHOT. `beadsStore` does — it maps a new array on each
+// poll — and every other caller here builds its array from a fresh `listBeads`. Do not start
+// mutating a bead in place inside an array you also hand to these functions.
+const NO_CHILDREN: readonly Bead[] = Object.freeze([]);
+
+interface CachedEpicIndex {
+  index: EpicIndex;
+  /** The `beads.length` the index was built from — see the staleness note above. */
+  length: number;
+}
+
+const epicIndexCache = new WeakMap<readonly Bead[], CachedEpicIndex>();
+
+/**
+ * The {@link EpicIndex} for this exact array, built once and reused.
+ *
+ * EXPORTED as {@link epicIndexOf} because callers OUTSIDE this file hold the same `allBeads` array
+ * the per-card resolvers key on, and a direct `buildEpicIndex(allBeads)` there bypasses this cache
+ * and pays a second full O(n) walk of a store the cache already holds — 6-13 ms on the founder's
+ * 7,364-bead store, on exactly the render path this index exists to make cheap (roborev 65596).
+ * `buildEpicIndex` stays public and UNCACHED for callers that genuinely want a fresh build.
+ */
+function epicIndexFor(beads: readonly Bead[]): EpicIndex {
+  const cached = epicIndexCache.get(beads);
+  if (cached !== undefined && cached.length === beads.length) return cached.index;
+  const index = buildEpicIndex(beads);
+  epicIndexCache.set(beads, { index, length: beads.length });
+  return index;
+}
+
+/**
+ * The CACHED {@link EpicIndex} for `beads` — the same one {@link childrenOf} and {@link isEpic}
+ * resolve through, so a caller that already triggered one of those pays nothing here.
+ *
+ * Prefer this over {@link buildEpicIndex} whenever you are handed an array someone else also reads.
+ * The cache is keyed on ARRAY IDENTITY with a length guard, so the contract is the one documented
+ * at the cache: pass the snapshot array, do not mutate it in place at constant length.
+ */
+export function epicIndexOf(beads: readonly Bead[]): EpicIndex {
+  return epicIndexFor(beads);
+}
+
 /** Filter to an epic's children — either an explicit parent link or an id prefixed by
  *  the epic id (bd's hierarchical id convention, e.g. "sparkle-hiju.4"). The epic itself
  *  is excluded.
@@ -596,8 +670,15 @@ export function bucketBeads(beads: Bead[], blocked?: ReadonlySet<string>): Board
  *  reparented later (`bd update <id> --parent <epic>`) keeps its flat id and is matched by the
  *  `parent` half. Membership therefore does not depend on how the child was named. */
 export function childrenOf(beads: readonly Bead[], epicId: string): Bead[] {
-  const prefix = `${epicId}.`;
-  return beads.filter((b) => b.id !== epicId && (b.parent === epicId || b.id.startsWith(prefix)));
+  // A COPY, not the index's own bucket. The published return type is a mutable `Bead[]` and has
+  // been since this function was a `filter`, so a caller is entitled to sort or splice it; handing
+  // out the bucket would let one caller corrupt every later reader of the same snapshot. Auditing
+  // the eleven call sites today (BoardView x2, EpicsColumn, epicFocus, epicSweepRunner x2,
+  // planView x2, epicDecompose, conciergeTools/plans, conciergeTools/board) finds none that mutate
+  // — but that is a fact about today's callers, not a property of the signature, so the copy stays.
+  // It is O(children), not O(store), which is the entire win: a leaf bead copies nothing.
+  const kids = epicIndexFor(beads).childrenByParent.get(epicId);
+  return kids === undefined ? [] : kids.slice();
 }
 
 /**
@@ -619,7 +700,10 @@ export function childrenOf(beads: readonly Bead[], epicId: string): Bead[] {
  * plain array are both callable without either side copying.
  */
 export function isEpic(beads: readonly Bead[], bead: Pick<Bead, "id" | "type">): boolean {
-  return isTypedEpic(bead) || childrenOf(beads, bead.id).length > 0;
+  // Reads `childrenByParent` directly rather than going through `childrenOf`, which would allocate
+  // a copy per call purely to ask whether it is empty — and this is the predicate the whole-store
+  // sweeps run per bead.
+  return isTypedEpic(bead) || epicIndexFor(beads).childrenByParent.has(bead.id);
 }
 
 /**
@@ -665,7 +749,7 @@ export function epicDisplayTitle(title: string): string {
  * would be the fourth competing definition of what an epic contains.
  */
 export function openChildCount(beads: readonly Bead[], epicId: string): number {
-  return childrenOf(beads, epicId).filter((b) => b.status !== "closed").length;
+  return openChildCountIndexed(epicIndexFor(beads), epicId);
 }
 
 /**
@@ -683,16 +767,7 @@ export function openChildCount(beads: readonly Bead[], epicId: string): number {
  * card as part of something that is not an epic.
  */
 export function parentEpicOf(beads: readonly Bead[], bead: Pick<Bead, "id" | "parent">): Bead | null {
-  const candidates: string[] = [];
-  if (bead.parent) candidates.push(bead.parent);
-  const parts = bead.id.split(".");
-  for (let i = parts.length - 1; i > 0; i--) candidates.push(parts.slice(0, i).join("."));
-  for (const id of candidates) {
-    if (id === bead.id) continue;
-    const found = beads.find((b) => b.id === id);
-    if (found && isEpic(beads, found)) return found;
-  }
-  return null;
+  return parentEpicOfIndexed(epicIndexFor(beads), bead);
 }
 
 /**
@@ -706,10 +781,16 @@ export function parentEpicOf(beads: readonly Bead[], bead: Pick<Bead, "id" | "pa
  * single answer to "what is an epic", which is the whole property the guard exists to hold.
  *
  * ── WHY IT EXISTS AT ALL ──────────────────────────────────────────────────────────────────────
- * `isEpic` is O(store) because `childrenOf` scans, which is fine per RENDERED card — every call
- * site was bounded by a render cap — and quadratic the moment something asks it of every bead in a
- * snapshot. The Plan board's Epics mode is the first such caller (~6,900 beads, including a
- * ~1,800-bead archived pile), so it walks once through here instead of once per bead.
+ * `isEpic` USED to be O(store) because `childrenOf` scanned. The claim this docstring used to make
+ * — "every call site was bounded by a render cap" — was FALSE by the time the store reached 7,364
+ * beads: ~10 call sites ask these questions of the whole store, and BoardView asks six of them per
+ * card across 6,644 cards. `beads.filter((b) => isEpic(beads, b))` measured at 3.4-4.0 SECONDS.
+ *
+ * That is fixed at the source now: {@link childrenOf}, {@link isEpic}, {@link openChildCount} and
+ * {@link parentEpicOf} are themselves index-backed (see the cache note above them), so this index
+ * is no longer an opt-in fast path a caller has to remember — it is what all of them run on. The
+ * `*Indexed` entry points below stay for callers that already hold an index and want to skip even
+ * the WeakMap lookup, and for the Plan board's Epics mode, which was the first whole-store caller.
  *
  * ── THE PART THAT LOOKS WRONG AND IS NOT ──────────────────────────────────────────────────────
  * `childrenOf` matches the `parent` field OR the dotted-id prefix, and the dotted half is not just
@@ -719,24 +800,68 @@ export function parentEpicOf(beads: readonly Bead[], bead: Pick<Bead, "id" | "pa
  * flight. `seen` dedupes the case where the parent field and a dotted prefix name the same id,
  * because `childrenOf` is a filter and counts each bead once.
  *
- * Only prefixes that EXIST as beads are recorded: nothing asks about an id that is not a bead.
+ * ── THE EXISTENCE FILTER APPLIES TO TWO OF THE FOUR FIELDS, DELIBERATELY ─────────────────────
+ * `hasChildren` and `statusesByParent` record only a parent id that EXISTS as a bead
+ * (`byId.has(...)`). `childrenOf` has no such requirement — it matches a dotted prefix whether or
+ * not a bead with that id exists — so the two rules are NOT the same rule, and collapsing them
+ * either way would change an answer somewhere.
+ *
+ * Resolution: `childrenByParent` is UNFILTERED, so `childrenOfIndexed` is byte-for-byte the old
+ * `childrenOf` for EVERY id, including one that is not a bead (`childrenOfIndexed(idx, "orphan")`
+ * still returns `orphan.7`). `hasChildren` / `statusesByParent` keep the filter they shipped with,
+ * because `epicBoard.ts` and {@link isEpicIndexed} only ever ask them about a bead's OWN id.
+ *
+ * The two halves therefore agree exactly on every id that IS a bead, and differ only on ids that
+ * are not — where only the unfiltered half is ever consulted. That is a provable equivalence, not
+ * an assumption: for an existing `p`, `childrenOf(beads, p)` is non-empty iff some `b` has
+ * `b.parent === p` (with `b.id !== p`, which is the same test as `b.parent !== b.id`) or `b.id`
+ * starts with `p + "."` (which holds iff some dot-boundary prefix of `b.id` equals `p`) — exactly
+ * the two conditions under which `link` fires. `beads.test.ts` pins it against the ORIGINAL naive
+ * bodies over a few-thousand-bead differential fixture, including the non-existent-prefix case.
  *
  * `beads.test.ts` cross-checks this against `childrenOf`/`isEpic` bead-by-bead rather than
  * restating the rules, so the two cannot drift into disagreeing.
  */
+/**
+ * READ-ONLY THROUGHOUT, and that is a safety property rather than a style preference.
+ *
+ * This object is held in a module-level WeakMap keyed on the snapshot array, so it is SHARED by
+ * every reader of that snapshot for as long as the array lives. `childrenOfIndexed` hands back a
+ * bucket by reference (the zero-copy read that makes it O(1)), so a single `sort()` or `push()` on
+ * a returned array would not merely affect that caller — it would permanently corrupt child order
+ * and counts for the entire render tree until the array identity changed.
+ *
+ * The old `childrenOf` bounded that blast radius with a defensive `.slice()` per call. The index
+ * cannot afford the copy, so the guarantee moves into the TYPE: with `ReadonlyMap`/`readonly`,
+ * `index.childrenByParent.get(id)!.push(x)` no longer compiles. `buildEpicIndex` builds into local
+ * mutable maps and widens only at the `return`, so the construction stays ordinary code
+ * (roborev 65662).
+ */
 export interface EpicIndex {
-  /** Ids that at least one other bead points at — the structural half of {@link isEpic}. */
-  hasChildren: Set<string>;
-  /** Each id's children's statuses, in input order, ready for a roll-up. */
-  statusesByParent: Map<string, BeadStatus[]>;
+  /** Ids that at least one other bead points at — the structural half of {@link isEpic}.
+   *  EXISTENCE-FILTERED: only ids that are themselves beads. See the note above. */
+  hasChildren: ReadonlySet<string>;
+  /** Each id's children's statuses, in input order, ready for a roll-up. EXISTENCE-FILTERED. */
+  statusesByParent: ReadonlyMap<string, readonly BeadStatus[]>;
+  /** Each id's children, SAME membership edge and SAME order as {@link childrenOf}. NOT existence
+   *  filtered — an id that is not a bead can still have dotted children, and `childrenOf` returns
+   *  them. Buckets are never empty: one is created only when a child is pushed into it. */
+  childrenByParent: ReadonlyMap<string, readonly Bead[]>;
+  /** id -> bead, FIRST occurrence wins — matching the `beads.find` that {@link parentEpicOf}
+   *  replaced, which returns the first match when a snapshot carries a duplicate id. */
+  byId: ReadonlyMap<string, Bead>;
 }
 
 export function buildEpicIndex(beads: readonly Bead[]): EpicIndex {
   const hasChildren = new Set<string>();
   const statusesByParent = new Map<string, BeadStatus[]>();
-  const ids = new Set<string>();
-  for (const b of beads) ids.add(b.id);
+  const childrenByParent = new Map<string, Bead[]>();
+  const byId = new Map<string, Bead>();
+  // First occurrence wins, so `byId` answers exactly what `beads.find((b) => b.id === id)` did.
+  // It doubles as the existence set the `link` half filters on.
+  for (const b of beads) if (!byId.has(b.id)) byId.set(b.id, b);
 
+  /** The EXISTENCE-FILTERED half — `hasChildren` + `statusesByParent`. */
   const link = (parentId: string, child: Bead) => {
     hasChildren.add(parentId);
     const bucket = statusesByParent.get(parentId);
@@ -744,21 +869,100 @@ export function buildEpicIndex(beads: readonly Bead[]): EpicIndex {
     else statusesByParent.set(parentId, [child.status]);
   };
 
+  /** The UNFILTERED half — `childrenByParent`, which must equal `childrenOf` for every id. */
+  const linkChild = (parentId: string, child: Bead) => {
+    const bucket = childrenByParent.get(parentId);
+    if (bucket) bucket.push(child);
+    else childrenByParent.set(parentId, [child]);
+  };
+
   for (const b of beads) {
+    // `!= null` rather than truthy, because `childrenOf(beads, "")` DOES match a bead whose parent
+    // is the empty string (`b.parent === epicId`).
+    const parent = b.parent;
+    // `b.parent !== b.id` is `childrenOf`'s `b.id !== epicId` seen from this side: when
+    // `b.parent === epicId`, the two tests are the same test.
+    const parentEdge = parent != null && parent !== b.id;
+    if (parentEdge) linkChild(parent, b);
+
     const seen = new Set<string>();
-    if (b.parent && b.parent !== b.id && ids.has(b.parent)) {
-      link(b.parent, b);
-      seen.add(b.parent);
+    // BOTH HALVES USE THE SAME `parentEdge` TEST, and the only difference between them is the
+    // EXISTENCE filter (`byId.has`). This half used to test `b.parent` for TRUTHINESS while the
+    // half above tested `!= null`, and that one-word difference was a real divergence rather than a
+    // stylistic one (roborev 65596): `normalizeBead` yields `id: ""` for a row with a missing or
+    // empty id and preserves `parent: ""`, so a store holding an empty-id bead plus any bead
+    // parented to `""` gave `childrenByParent.has("") === true` and `hasChildren.has("") === false`.
+    // That is observable through an EXPORTED function: `parentEpicOf` resolves epic-ness through
+    // `hasChildren` now where it used to go through the unfiltered `childrenOf`, so for a bead whose
+    // id begins with `.` (its candidate prefix is `""`) it would return null where it once returned
+    // the `""` bead — a behaviour change in a commit that claims none. Sharing the test makes the
+    // "these two agree on every id that IS a bead" equivalence actually total, which is what
+    // `parentEpicOfIndexed` is justified by.
+    if (parentEdge && byId.has(parent)) {
+      link(parent, b);
+      seen.add(parent);
     }
     for (let dot = b.id.indexOf("."); dot !== -1; dot = b.id.indexOf(".", dot + 1)) {
       const prefix = b.id.slice(0, dot);
-      if (!seen.has(prefix) && ids.has(prefix)) {
+      // Prefixes are strictly increasing in length, so they cannot collide with each other; the
+      // only double-link `childrenOf` (a filter, one row per bead) would disagree with is the
+      // parent edge naming the same id.
+      if (!(parentEdge && prefix === parent)) linkChild(prefix, b);
+      if (!seen.has(prefix) && byId.has(prefix)) {
         link(prefix, b);
         seen.add(prefix);
       }
     }
   }
-  return { hasChildren, statusesByParent };
+  return { hasChildren, statusesByParent, childrenByParent, byId };
+}
+
+/**
+ * {@link childrenOf}'s answer, read from an {@link EpicIndex} instead of re-scanning — same
+ * membership edge, same order, same answer for an id that is not a bead.
+ *
+ * Returns a SHARED FROZEN empty array for an id with no children rather than allocating one per
+ * call: this is asked once per rendered card and most beads are leaves. `readonly` in the return
+ * type is what makes that safe — unlike {@link childrenOf}, a caller may not mutate this.
+ */
+export function childrenOfIndexed(index: EpicIndex, epicId: string): readonly Bead[] {
+  return index.childrenByParent.get(epicId) ?? NO_CHILDREN;
+}
+
+/** {@link openChildCount}'s answer, read from an {@link EpicIndex}. Counts rather than filtering,
+ *  so nothing is allocated. */
+export function openChildCountIndexed(index: EpicIndex, epicId: string): number {
+  const kids = index.childrenByParent.get(epicId);
+  if (kids === undefined) return 0;
+  let open = 0;
+  for (const k of kids) if (k.status !== "closed") open += 1;
+  return open;
+}
+
+/**
+ * {@link parentEpicOf}'s answer, read from an {@link EpicIndex}.
+ *
+ * Identical resolution order — explicit `parent` first, then id prefixes NEAREST FIRST — with the
+ * `beads.find` replaced by {@link EpicIndex.byId} and the inner `isEpic` by {@link isEpicIndexed}.
+ * That substitution is exact and not merely close: `byId` resolves only ids that ARE beads, and on
+ * a bead's own id `hasChildren` and `childrenByParent` agree by construction (see the note on
+ * {@link EpicIndex}), so the existence filter can never make a candidate that the old code accepted
+ * be skipped here.
+ */
+export function parentEpicOfIndexed(
+  index: EpicIndex,
+  bead: Pick<Bead, "id" | "parent">,
+): Bead | null {
+  const candidates: string[] = [];
+  if (bead.parent) candidates.push(bead.parent);
+  const parts = bead.id.split(".");
+  for (let i = parts.length - 1; i > 0; i--) candidates.push(parts.slice(0, i).join("."));
+  for (const id of candidates) {
+    if (id === bead.id) continue;
+    const found = index.byId.get(id);
+    if (found && isEpicIndexed(index, found)) return found;
+  }
+  return null;
 }
 
 /** {@link isEpic}'s answer, read from an {@link EpicIndex} instead of re-scanning. Same union, same
