@@ -86,12 +86,19 @@ describe("CloudAuthPane", () => {
     );
   });
 
-  it("labels the subscription option honestly (opt-in, may be declined by the server)", async () => {
+  it("labels the subscription option honestly (opt-in, save will be refused, ToS reason named)", async () => {
     render(<CloudAuthPane />);
     const label = screen.getByLabelText(/subscription token \(opt-in\)/i).closest("label")!;
     expect(label.textContent).toMatch(/claude setup-token/i);
-    expect(label.textContent).toMatch(/Anthropic has not confirmed/i);
-    expect(label.textContent).toMatch(/may decline/i);
+    // The two disclosures a user needs BEFORE pasting a credential: (a) that saving will be
+    // REFUSED, and (b) why. Both are asserted as properties — any wording that still says "we
+    // won't store it" and still names the terms passes — because pinning the sentence is exactly
+    // how the old copy ("Anthropic has not confirmed") stayed green while going factually stale.
+    // Deliberately NOT matching a contraction or an apostrophe: a typographic pass turning
+    // don't into don’t must not red a test whose disclosure is fully intact.
+    expect(label.textContent).toMatch(/won.?t store|will not store|may decline|not enabled/i);
+    expect(label.textContent).toMatch(/terms/i);
+    expect(label.textContent).toMatch(/permit|prohibit|not allow/i);
     // …and BYOK is the recommended default (nothing pre-selects the ToS-sensitive path).
     expect((screen.getByLabelText(/API key \(recommended\)/i) as HTMLInputElement).checked).toBe(true);
   });

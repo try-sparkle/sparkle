@@ -16,9 +16,12 @@ import { SECTION_LABEL } from "./labelTreatment";
 //      renders, restores or round-trips the value. The input is a password field, its value lives
 //      in local state only, and a successful save clears it immediately.
 //   2. THE SUBSCRIPTION OPTION IS LABELED HONESTLY. `claude setup-token` mints a 1-year OAuth token
-//      from a Pro/Max subscription, but there is no explicit Anthropic ToS sanction for a
-//      third-party product storing customer subscription tokens (spec §"the subscription question")
-//      — so BYOK is the default, the subscription path is opt-in, and the server may refuse it
+//      from a Pro/Max subscription, but Anthropic's Feb-2026 authentication policy does not permit a
+//      third-party product to store customer subscription tokens and route requests on their behalf
+//      — consumer OAuth tokens have been rejected outside first-party clients since 2026-01-09, and
+//      "each user brings their own token" is the design that was blocked, not a mitigation. Team and
+//      Enterprise plans do not change this. So BYOK is the default, the subscription path is opt-in
+//      (kept only in case Anthropic sanctions it commercially), and the server may refuse it
 //      outright (403 `subscription_auth_disabled` when SPARKLE_ENABLE_SUBSCRIPTION_AUTH is off).
 //      That refusal renders as a plain sentence naming the method that IS available, not a crash
 //      and not a vague "unavailable".
@@ -127,7 +130,7 @@ export function CloudAuthPane() {
               checked={draftMethod === "subscription"}
               onSelect={() => setDraftMethod("subscription")}
               title="Claude subscription token (opt-in)"
-              blurb="Run `claude setup-token` locally and paste the token. Anthropic has not confirmed that a third-party product may store subscription tokens, so this path is off by default and the server may decline to save it."
+              blurb="Run `claude setup-token` locally and paste the token. Sparkle's server won't store one yet, because Anthropic's terms don't currently permit third-party products to hold subscription tokens."
             />
           </div>
 
