@@ -97,3 +97,63 @@ export const STALE_PLAN_QUESTION_OVER_ANOTHER_PICKER = [
   "",
   FOOTER,
 ].join("\n");
+
+/** THE COMMON STALE CASE, and the one a shape-only corroboration could not see: the agent's very
+ *  next act after a plan is answered is to run a command, so the ordinary bash permission prompt is
+ *  drawn while the plan question is still inside `pickerQuestionBlock`'s ten-line fallback window.
+ *  Its options are `Yes` / `Yes, and don't ask again…` / `No, and tell Claude…` — which satisfies
+ *  "≥1 yes, ≥1 not-yes" exactly. Nothing here may be classified as a plan: doing so both takes the
+ *  prompt away from `maybeAutoApprove` (so `bash = "always"` silently stops working) and swaps the
+ *  five-class sweep for the plan arm, which does not escalate `rm -rf`. */
+export const STALE_PLAN_QUESTION_OVER_BASH_PROMPT = [
+  "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "⏺ Starting step 1.",
+  "",
+  "Bash command",
+  "  rm -rf build/",
+  "Do you want to proceed?",
+  "❯ 1. Yes",
+  "  2. Yes, and don't ask again for rm commands",
+  "  3. No, and tell Claude what to do differently",
+  "",
+  FOOTER,
+].join("\n");
+
+/** The barest version of the same hazard: a plain Yes/No confirm under a stale plan question. */
+export const STALE_PLAN_QUESTION_OVER_YES_NO = [
+  "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "⏺ Starting step 1.",
+  "",
+  "Force push over origin/main?",
+  "❯ 1. Yes",
+  "  2. No",
+  "",
+  FOOTER,
+].join("\n");
+
+/** The stale case that ONLY the last-question rule can exclude: the picker below has an affirmative
+ *  and no plain refusal — a plan-shaped option set — but its own ask is a different question. Being
+ *  present in the fallback window is cheap; being the dialog's LAST question is not. */
+export const STALE_PLAN_QUESTION_OVER_PLAN_SHAPED_PICKER = [
+  "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "⏺ Starting step 1.",
+  "",
+  "Should I use the cached build?",
+  "❯ 1. Yes, use the cache",
+  "  2. Tell Claude what to change",
+  "",
+  FOOTER,
+].join("\n");
+
+/** Claude Code's OLDER plan shape, whose way out is a plain "No, keep planning". Deliberately NOT
+ *  matched here — `conciergeEscalation.isPlanModeDialog` is the predicate written for that option
+ *  triple, and it still recognises it in the router. Pinning the exclusion keeps the plain-refusal
+ *  rule honest: it is what stops an ordinary permission prompt being read as a plan. */
+export const PLAN_EXIT_PROMPT_OLD_SHAPE = [
+  "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+  "❯ 1. Yes, and auto-accept edits",
+  "  2. Yes, and manually approve edits",
+  "  3. No, keep planning",
+  "",
+  FOOTER,
+].join("\n");

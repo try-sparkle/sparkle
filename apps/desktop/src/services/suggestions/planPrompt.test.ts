@@ -5,6 +5,10 @@ import {
   PLAN_EXIT_PROMPT,
   PLAN_EXIT_PROMPT_RENAMED,
   STALE_PLAN_QUESTION_OVER_ANOTHER_PICKER,
+  STALE_PLAN_QUESTION_OVER_BASH_PROMPT,
+  STALE_PLAN_QUESTION_OVER_YES_NO,
+  STALE_PLAN_QUESTION_OVER_PLAN_SHAPED_PICKER,
+  PLAN_EXIT_PROMPT_OLD_SHAPE,
   PLAN_EXIT_PROMPT_WRAPPED,
   PLAN_EXIT_PROMPT_STICKY,
   PLAN_ARTIFACT_PROMPT,
@@ -93,5 +97,35 @@ describe("isPlanExitDialog", () => {
     expect(isPlanExitDialog(PLAN_EXIT_PROMPT)).toBe(true);
     expect(isPlanExitDialog(PLAN_ARTIFACT_PROMPT)).toBe(false);
     expect(isPlanExitDialog(BASH_PERMISSION_PROMPT)).toBe(false);
+  });
+});
+
+// The stale-question cases a SHAPE-ONLY corroboration could not see. "≥1 yes, ≥1 not-yes" is
+// precisely the ordinary bash permission prompt, and a bash prompt is the very next thing an agent
+// draws after its plan is answered — so the common sequence, not an exotic one.
+describe("isPlanExitDialog — a stale plan question over a PERMISSION prompt", () => {
+  it("refuses the ordinary bash prompt (which satisfies the option-shape test exactly)", () => {
+    expect(isPlanExitDialog(STALE_PLAN_QUESTION_OVER_BASH_PROMPT)).toBe(false);
+  });
+
+  it("refuses a bare Yes/No confirm", () => {
+    expect(isPlanExitDialog(STALE_PLAN_QUESTION_OVER_YES_NO)).toBe(false);
+  });
+});
+
+// The two corroborations are separate rules, and each needs a case only IT can decide — otherwise
+// one of them is dead weight that a future edit removes with the suite still green.
+describe("isPlanExitDialog — each corroboration carries its own case", () => {
+  it("the LAST-QUESTION rule: a plan-shaped picker asking something else is not a plan", () => {
+    // Affirmative present, no plain refusal — the option test alone says yes. Only the position of
+    // the plan question in the block distinguishes it.
+    expect(isPlanExitDialog(STALE_PLAN_QUESTION_OVER_PLAN_SHAPED_PICKER)).toBe(false);
+  });
+
+  it("the PLAIN-REFUSAL rule: the older 'No, keep planning' shape is left to the router", () => {
+    // Its last question IS the plan question, so only the refusal rule decides it. The exclusion is
+    // deliberate: `conciergeEscalation.isPlanModeDialog` is the predicate written for that triple
+    // and still recognises it, so nothing is lost at the router.
+    expect(isPlanExitDialog(PLAN_EXIT_PROMPT_OLD_SHAPE)).toBe(false);
   });
 });

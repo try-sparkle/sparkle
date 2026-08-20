@@ -591,3 +591,27 @@ describe("routeUnclassifiedPrompt — a stale plan question above an UNRELATED p
     });
   });
 });
+
+// The same stale-question hazard at the router: an ordinary permission prompt inheriting the plan
+// question must keep the five-class sweep, or an `rm -rf` confirm is routed to the concierge — which
+// presses — because the plan arm deliberately does not escalate `destructive`.
+describe("routeUnclassifiedPrompt — a stale plan question over a DESTRUCTIVE confirm", () => {
+  const stale = [
+    "Claude has written up a plan and is ready to execute. Would you like to proceed?",
+    "⏺ Starting step 1.",
+    "",
+    "Force push over origin/main?",
+    "❯ 1. Yes, force push",
+    "  2. Open a PR instead",
+    "",
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+  ].join("\n");
+
+  it("keeps the general sweep, so the irreversible option still reaches the founder", () => {
+    expect(routeUnclassifiedPrompt(stale)).toMatchObject({
+      route: "founder",
+      reason: "founder-only",
+      founderClass: "destructive",
+    });
+  });
+});

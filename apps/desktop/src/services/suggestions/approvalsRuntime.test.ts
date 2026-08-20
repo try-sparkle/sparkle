@@ -30,6 +30,7 @@ import {
   PLAN_EXIT_PROMPT,
   PLAN_EXIT_PROMPT_STICKY,
   PLAN_ARTIFACT_PROMPT,
+  STALE_PLAN_QUESTION_OVER_BASH_PROMPT,
 } from "./planPrompt.fixture";
 import { useSettingsStore } from "../../stores/settingsStore";
 import { useApprovalsStore } from "../../stores/approvalsStore";
@@ -506,5 +507,24 @@ describe("effectivePlanRule", () => {
     useApprovalsStore.setState({ planByRoot: { "/repo": "ask" } });
     expect(effectivePlanRule("/repo")).toBe("ask");
     expect(effectivePlanRule("/other")).toBe("auto"); // unloaded project falls back to global
+  });
+});
+
+// ── The regression a claimed screen would cause ────────────────────────────────────────────────
+// `maybeAutoPlan` runs BEFORE `maybeAutoApprove` and its claim suppresses it, so anything the plan
+// path wrongly recognises stops being auto-approved. The screen at risk is the most ordinary one
+// there is: the bash prompt an agent draws immediately after its plan is answered, while the plan
+// question is still inside the borderless fallback window.
+describe("a bash prompt under a stale plan question is NOT the plan path's business", () => {
+  it("maybeAutoPlan declines to claim it", () => {
+    expect(maybeAutoPlan("a1", STALE_PLAN_QUESTION_OVER_BASH_PROMPT, new Set())).toBeNull();
+    expect(writePty).not.toHaveBeenCalled();
+  });
+
+  it("…so maybeAutoApprove still auto-answers it under bash = 'always'", () => {
+    // The assertion with teeth: not that the plan path stayed quiet, but that the prompt still gets
+    // answered by the path that owns it. A claim here would silently switch `bash = "always"` off.
+    expect(maybeAutoApprove("a1", STALE_PLAN_QUESTION_OVER_BASH_PROMPT, new Set())).toBe("bash");
+    expect(writePty).toHaveBeenCalledWith("a1", "1\n");
   });
 });

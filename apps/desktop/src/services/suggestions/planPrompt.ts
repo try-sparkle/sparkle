@@ -68,6 +68,24 @@ export function normalizePromptText(s: string): string {
  *  specific because pressing the wrong affirmative is the whole hazard. */
 const PLAN_AFFIRMATIVE_SHAPE = /^\s*yes\b/i;
 
+/** A plain refusal — the ordinary Yes/No permission-prompt shape. The plan-exit dialog has none:
+ *  its way out is "Tell Claude what to change". See {@link isPlanExitDialog}. */
+const PLAIN_NO_OPTION = /^\s*no\b/i;
+
+/** The LAST `?`-terminated sentence in a normalized block, or the whole block when it has none.
+ *
+ *  A stale question inherited from the fallback window is always followed by what the agent printed
+ *  next and then by the current dialog's own ask, so being present is cheap and being LAST is not.
+ *  Taking the final segment is deliberately tolerant of wrapping (the block is already collapsed to
+ *  one line) and of prose above that happens to contain a question mark. */
+function lastQuestion(normalized: string): string {
+  const parts = normalized.split("?");
+  // The text after the final "?" is trailing prose, not a question — drop it and take the segment
+  // that ENDS at that "?" (re-appended so a caller's regex can still anchor on it if it wants to).
+  const idx = parts.length >= 2 ? parts.length - 2 : 0;
+  return `${parts[idx] ?? ""}?`;
+}
+
 /** The dialog's own text, border- and wrap-normalized, or "" when there is no picker to read. */
 function planHeader(scrollback: string): string {
   // `true` for the yes/no half would be the wrong block: this dialog HAS option rows. The block
@@ -100,20 +118,33 @@ function planHeader(scrollback: string): string {
  * escalate `destructive` or `legal`, so the roborev-63621 shape — a neutral header over "Force push
  * over origin/main" / "Open a PR instead" — would go to the concierge instead of the founder.
  *
- * So the question is corroborated by THIS picker's own OPTION SHAPE, the rule `isPlanModeDialog`'s
- * doc states: a plan-exit dialog offers at least one affirmative and at least one way out that is
- * not one. That is deliberately shape, not wording — the whole point of the split is to survive a
- * rename — and it is what the stale-question case cannot fake, because the options belong to the
- * picker actually on screen.
+ * So the question is corroborated TWICE, and the first corroboration is the one that matters:
+ *
+ *   1. THE PLAN QUESTION MUST BE THE DIALOG'S LAST QUESTION. A stale question is by definition
+ *      followed by whatever the agent printed next and then by the CURRENT dialog's own ask, so the
+ *      final `?`-terminated sentence before the option rows belongs to the picker on screen. That is
+ *      what the fallback window cannot fake: it can put an old question INTO the block, but it
+ *      cannot make it the last one.
+ *   2. …AND THE OPTIONS MUST NOT BE A PERMISSION PROMPT. A plain `No, …` refusal is the ordinary
+ *      Yes/No permission shape, which the plan-exit dialog does not have (its way out is "Tell
+ *      Claude what to change"). This is defence in depth rather than the primary test — the first
+ *      corroboration already excludes it — and it is why a shape-only rule was not enough: "≥1 yes,
+ *      ≥1 not-yes" is EXACTLY the bash prompt (`Yes` / `Yes, and don't ask again for rm commands` /
+ *      `No, and tell Claude what to do differently`), so the very next thing an agent draws after a
+ *      plan is answered would have satisfied it.
+ *
+ * Both are shape, not wording, so the rename case above still passes. The cost is that the OLDER
+ * plan shape whose way out is "No, keep planning" is excluded here — `isPlanModeDialog` still
+ * recognises that one in the router by its option triple, which is the predicate written for it.
  */
 export function isPlanExitDialog(scrollback: string): boolean {
   const header = planHeader(scrollback);
   if (header.length === 0 || !PLAN_QUESTION.test(header)) return false;
+  if (!PLAN_QUESTION.test(lastQuestion(header))) return false;
   const opts = parsePickerOptions(scrollback);
   if (opts.length < 2) return false;
-  const affirmative = opts.some((o) => PLAN_AFFIRMATIVE_SHAPE.test(o.label));
-  const wayOut = opts.some((o) => !PLAN_AFFIRMATIVE_SHAPE.test(o.label));
-  return affirmative && wayOut;
+  if (opts.some((o) => PLAIN_NO_OPTION.test(o.label))) return false;
+  return opts.some((o) => PLAN_AFFIRMATIVE_SHAPE.test(o.label));
 }
 
 /** Detect Claude Code's plan-exit prompt. Returns the keystroke for each affirmative it could find
