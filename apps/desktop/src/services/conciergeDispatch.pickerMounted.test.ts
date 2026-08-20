@@ -1,17 +1,16 @@
-// A MOUNTED SEND MADE WHILE A PICKER IS LIVE IS HELD, NOT BOUNCED (bead sparkle-9gsjqm).
+// A MOUNTED SEND MADE WHILE A PICKER IS LIVE IS DELIVERED, NOT BOUNCED AND NOT HELD
+// (beads sparkle-9gsjqm, sparkle-93wnu3).
 //
 // THE FOUNDER'S RECURRING P0: text he types into a mounted build-agent pane does not reach that
-// agent. `ConciergeHost` declares a mounted send HOLDABLE and deliberately falls through to
-// `dispatchConciergeAnswer` rather than refusing it, promising in a comment that "the actual hold
-// happens a few lines down… via `holdForScreenClear`". Three of the dispatcher's refusal arms kept
-// that promise; the three inside the PICKER block did not — they returned their refusal with no
-// hold attempt at all. `neverPickerAnswer` is true for every mounted composer send, so a message
-// typed while a picker happened to be on screen took `addressed-at-picker` and came straight back.
+// agent. `neverPickerAnswer` is true for every mounted composer send, so a message typed while a
+// picker happened to be on screen took `addressed-at-picker` and came straight back. An earlier fix
+// made those arms HOLD instead, which only moved the loss later — the hold's release condition is a
+// predicate that can be permanently wrong about the screen, and the message was dropped at
+// MAX_AGE_MS. Asked directly (2026-08-20), the founder chose "Never hold — just send it".
 //
-// WHAT THESE ROWS ASSERT IS THE SIDE EFFECT. `path: "queued"` on its own would be satisfied by a
-// version that accepted the words and dropped them — the same bug in a friendlier status code — so
-// the load-bearing row drives the real flush and pins that `submitPrompt` was called with the
-// founder's text. The refusing rows pin that NOTHING reached the PTY by either primitive.
+// WHAT THESE ROWS ASSERT IS THE SIDE EFFECT — that `submitPrompt` was called with his exact text,
+// never merely that some friendly status came back. The refusing rows pin that NOTHING reached the
+// PTY by either primitive, so a guard that let everything through cannot pass this file.
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { SuggestionButton } from "./suggestions/types";
 
@@ -32,9 +31,8 @@ vi.mock("./terminalViewport", () => ({ getAgentViewport: vi.fn(() => null) }));
 import { submitPrompt, writePtyChainedStrict } from "../pty";
 import { detectTerminalPrompts } from "./suggestions/heuristics";
 import { getAgentViewport } from "./terminalViewport";
-import { dispatchConciergeAnswer, flushScreenHeldSends } from "./conciergeDispatch";
+import { dispatchConciergeAnswer } from "./conciergeDispatch";
 import { conciergeToolAuthority } from "./dispatchAuthority";
-import { resetScreenHeldSends } from "./screenHoldQueue";
 
 const AGENT = "agent-1";
 const TYPED = "when you're done, rebase onto main and push";
@@ -72,25 +70,19 @@ function atALivePicker(options: SuggestionButton[] = OPTIONS): void {
   vi.mocked(detectTerminalPrompts).mockReturnValue(options);
 }
 
-/** The picker is gone; an ordinary shell prompt is all that is left. */
-function pickerCleared(): void {
-  vi.mocked(getAgentViewport).mockReturnValue({ text: "$ ", alternateBuffer: false });
-  vi.mocked(detectTerminalPrompts).mockReturnValue([]);
-}
-
 function expectNothingWritten(): void {
   expect(submitPrompt).not.toHaveBeenCalled();
   expect(writePtyChainedStrict).not.toHaveBeenCalled();
 }
 
 /** The founder's mounted composer send, field for field as ConciergeHost builds it: a `mount`
- *  authority, `holdForScreenClear` on (`mentionAim?.via === "mount"`), `neverPickerAnswer` on
+ *  authority, `mountedSend` on (`mentionAim?.via === "mount"`), `neverPickerAnswer` on
  *  (`!!mentionAim && addressable`), and a genuine user prompt. */
 const MOUNTED = {
   authority: { kind: "mount", agentId: AGENT } as const,
   userPrompt: true,
   neverPickerAnswer: true,
-  holdForScreenClear: true,
+  mountedSend: true,
 };
 
 /** The concierge's own tool layer, through the one gate that can mint the arm. */
@@ -99,93 +91,69 @@ const TOOL_CALL = conciergeToolAuthority("call-1", { tier: "allow" })!;
 beforeEach(() => {
   vi.mocked(getAgentViewport).mockReturnValue(null);
   vi.mocked(detectTerminalPrompts).mockReturnValue([]);
-  resetScreenHeldSends();
 });
 afterEach(() => {
   vi.clearAllMocks();
 });
 
 describe("a mounted send at a live picker", () => {
-  it("is queued rather than refused, and writes nothing yet", async () => {
+  it("is delivered rather than refused or queued", async () => {
     atALivePicker();
     const r = await dispatchConciergeAnswer(AGENT, TYPED, MOUNTED);
     expect(r.ok).toBe(true);
-    expect(r.path).toBe("queued");
-    expect(r.heldReason).toBe("screen");
-    expectNothingWritten();
-  });
-
-  // THE ROW THAT MATTERS. Queueing with nothing to drain it reproduces the founder's bug exactly —
-  // his words accepted and never delivered — so this drives the real flush (what
-  // hooks/useScreenHoldDrain calls once its poll sees the screen clear) and asserts the write.
-  it("reaches the agent once the picker clears and the queue is flushed", async () => {
-    atALivePicker();
-    const held = await dispatchConciergeAnswer(AGENT, TYPED, MOUNTED);
-    expect(held.path).toBe("queued");
-    expectNothingWritten();
-
-    pickerCleared();
-    const [flushed] = await flushScreenHeldSends(AGENT);
-    expect(flushed?.ok).toBe(true);
-    expect(flushed?.path).toBe("free-text");
+    expect(r.path).toBe("free-text");
     expect(submitPrompt).toHaveBeenCalledWith(AGENT, TYPED, expect.anything());
   });
 
-  // THE HELD MESSAGE IS DELIVERED AS A MESSAGE, NEVER COLLAPSED INTO A KEYSTROKE. Holding at a
-  // picker would be worse than the refusal it replaces if the flush pressed a button with it: the
-  // founder's rule is that his text is delivered to THAT agent, not that it answers a question he
-  // never read. `writePtyChainedStrict` is the keystroke primitive; `submitPrompt` is the prompt one.
-  it("is delivered as a prompt, not as a picker keystroke", async () => {
+  // DELIVERED AS A MESSAGE, NEVER COLLAPSED INTO A KEYSTROKE — the standing rule for an addressed
+  // send (roborev 54569/55400), and a mounted send is an addressed send. Pressing a button the
+  // human never read is the least recoverable thing this path can do. `writePtyChainedStrict` is
+  // the keystroke primitive; `submitPrompt` is the prompt one. This row uses a word that WOULD have
+  // matched an option, and a terse one that WOULD have been pressed, so a version that answered the
+  // menu on his behalf goes red here.
+  it("is delivered as a prompt, not as a picker keystroke, even when it matches an option", async () => {
     atALivePicker();
+    // A whole-phrase yes: matches `YES_WORDS` and is terse, so it is exactly what the picker path
+    // would have collapsed to `y\r`.
     await dispatchConciergeAnswer(AGENT, "yes", MOUNTED);
-    pickerCleared();
-    await flushScreenHeldSends(AGENT);
+    // A bare ordinal: `matchAnswerToOption` resolves it by 1-based ON-SCREEN POSITION, which is the
+    // most dangerous collapse of the three (it presses a row of a menu the founder may not have
+    // been reading).
+    await dispatchConciergeAnswer(AGENT, "1", MOUNTED);
     expect(submitPrompt).toHaveBeenCalledWith(AGENT, "yes", expect.anything());
+    expect(submitPrompt).toHaveBeenCalledWith(AGENT, "1", expect.anything());
     expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
-  // ── THE OTHER TWO PICKER ARMS TAKE THE SAME ROUTE ──────────────────────────────────────────
-  // `addressed-at-picker` above is the arm the founder's own send hits. These two are the arms a
-  // hold-permitted caller reaches when it has NOT declared the text a non-answer: the rule is
-  // per-arm, and a per-arm rule that only three of six arms implement is how this defect happened
-  // in the first place. Each row also keeps its own `holdForScreenClear` call site honest under
-  // mutation — one shared row would go green with the other two sites still returning a refusal.
-  it("holds a non-matching answer instead of reporting it ambiguous", async () => {
+  // ── AND IT IS THE BLOCK THAT IS SKIPPED, NOT ONE ARM OF IT ─────────────────────────────────
+  // The exemption is on the block, so the other two refusals inside it (`ambiguous-picker`, twice)
+  // are unreachable for a mounted send as well. These rows drive text that WOULD have taken each of
+  // them and pin that it is delivered instead — a rule implemented at only some arms is how this
+  // defect happened in the first place.
+  it("delivers a non-matching answer instead of reporting it ambiguous", async () => {
     atALivePicker();
-    const r = await dispatchConciergeAnswer(AGENT, "neither of those, actually", {
-      ...MOUNTED,
-      neverPickerAnswer: false,
-    });
-    expect(r.path).toBe("queued");
-    expectNothingWritten();
-
-    pickerCleared();
-    await flushScreenHeldSends(AGENT);
+    const r = await dispatchConciergeAnswer(AGENT, "neither of those, actually", MOUNTED);
+    expect(r.path).toBe("free-text");
     expect(submitPrompt).toHaveBeenCalledWith(AGENT, "neither of those, actually", expect.anything());
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 
-  it("holds a matching-but-not-terse user prompt instead of reporting it ambiguous", async () => {
+  it("delivers a matching-but-not-terse user prompt instead of reporting it ambiguous", async () => {
     atALivePicker(PUNCTUATED_OPTIONS);
     // MATCHES option 1 exactly (the label, verbatim) and is still not terse — see
     // PUNCTUATED_OPTIONS for why that combination exists and why nothing else reaches this arm.
-    const r = await dispatchConciergeAnswer(AGENT, "Keep going?", {
-      ...MOUNTED,
-      neverPickerAnswer: false,
-    });
-    expect(r.path).toBe("queued");
-    expectNothingWritten();
-
-    pickerCleared();
-    await flushScreenHeldSends(AGENT);
+    const r = await dispatchConciergeAnswer(AGENT, "Keep going?", MOUNTED);
+    expect(r.path).toBe("free-text");
     expect(submitPrompt).toHaveBeenCalledWith(AGENT, "Keep going?", expect.anything());
+    expect(writePtyChainedStrict).not.toHaveBeenCalled();
   });
 });
 
 // ══ AND THE GUARD IS NOT WEAKENED FOR ANYONE ELSE ═══════════════════════════════════════════════
-// The hold exists for ONE caller — the founder, mounted and watching the pane he typed into. A
+// The exemption is for ONE caller — the founder, mounted and watching the pane he typed into. A
 // MODEL guessing at a screen it cannot see, or an auto-resume firing every 15s, cannot take a bad
 // write back, so they keep the refusal verbatim. These rows fail the moment someone "simplifies"
-// the three new call sites into an unconditional hold.
+// `mountedHumanSend` into an unconditional exemption.
 describe("a machine caller at the same picker is still refused", () => {
   it("refuses the concierge's own send_to_agent_terminal", async () => {
     atALivePicker();
@@ -200,11 +168,6 @@ describe("a machine caller at the same picker is still refused", () => {
     expect(r.ok).toBe(false);
     expect(r.path).toBe("addressed-at-picker");
     expectNothingWritten();
-    // And nothing was smuggled into the queue to be delivered by a later poll tick, which is the
-    // way a "refusal" could still turn into the write this row exists to prevent.
-    pickerCleared();
-    expect(await flushScreenHeldSends(AGENT)).toEqual([]);
-    expectNothingWritten();
   });
 
   it("refuses the goal auto-resume", async () => {
@@ -215,9 +178,6 @@ describe("a machine caller at the same picker is still refused", () => {
     });
     expect(r.ok).toBe(false);
     expect(r.path).toBe("addressed-at-picker");
-    expectNothingWritten();
-    pickerCleared();
-    expect(await flushScreenHeldSends(AGENT)).toEqual([]);
     expectNothingWritten();
   });
 
@@ -232,8 +192,6 @@ describe("a machine caller at the same picker is still refused", () => {
     expect(r.ok).toBe(false);
     expect(r.path).toBe("ambiguous-picker");
     expectNothingWritten();
-    pickerCleared();
-    expect(await flushScreenHeldSends(AGENT)).toEqual([]);
   });
 
   it("refuses a non-terse machine answer as ambiguous rather than holding it", async () => {
@@ -245,7 +203,5 @@ describe("a machine caller at the same picker is still refused", () => {
     expect(r.ok).toBe(false);
     expect(r.path).toBe("ambiguous-picker");
     expectNothingWritten();
-    pickerCleared();
-    expect(await flushScreenHeldSends(AGENT)).toEqual([]);
   });
 });

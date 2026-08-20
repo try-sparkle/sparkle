@@ -1,3 +1,6 @@
+// ⚠️ INERT SINCE bead sparkle-93wnu3 — see services/screenHoldQueue's banner. Nothing enqueues a
+// screen hold any more, so this poll never finds anything; it is removed in the follow-up change.
+//
 // DELIVERS A MOUNTED SEND THAT WAS HELD BECAUSE THE SCREEN WAS BUSY (bead sparkle-tbsvf, reopened).
 //
 // services/conciergeDispatch's `holdForScreenClear` queues a mounted send instead of refusing it

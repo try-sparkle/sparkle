@@ -1,3 +1,17 @@
+// ⚠️ INERT SINCE bead sparkle-93wnu3 — NOTHING ENQUEUES HERE ANY MORE, AND NOTHING SHOULD.
+//
+// The only producer was the MOUNTED send, and a mounted send is now DELIVERED rather than held:
+// see `services/conciergeDispatch`'s `mountedHumanSend`. This module and its drain are removed in
+// the follow-up change; they are kept for one commit so the behavioural fix lands on its own and
+// can be reverted on its own.
+//
+// DO NOT ADD A NEW PRODUCER. The defect this queue caused is structural, not a tuning mistake: its
+// release condition was the SAME predicate that caused the hold (hooks/useScreenHoldDrain re-ran
+// `terminalWriteRefusal`), so a screen the predicate is WRONG about never clears — the founder's
+// message waited out MAX_AGE_MS and was dropped, fifteen minutes after he was told it would arrive.
+// Any future "wait for the screen" feature needs a release condition INDEPENDENT of the one that
+// blocked the write, plus a way for the human to force it through.
+
 // Sends waiting for a MOUNTED agent's screen to clear (bead sparkle-tbsvf, reopened).
 //
 // A SEPARATE queue from services/pendingSends, deliberately — the two share almost the same shape

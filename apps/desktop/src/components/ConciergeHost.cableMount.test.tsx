@@ -409,29 +409,9 @@ describe("ConciergeHost — a mounted send follows the CABLE, never the surface"
   });
 
   // ══ (e) A HELD MOUNTED SEND THAT AGES OUT HANDS THE WORDS BACK ═══════════════════════════════
-  // A screen hold is created by exactly one caller — a MOUNTED send — so a dropped one is the
-  // founder's mounted message. It used to be QUOTED into a Sparkle chat line with only the
-  // attachments restored, which is this same conversion arriving by the slow road: the copy told him
-  // to send it again while the words existed nowhere he could send them from.
-  it("restores the draft when a held mounted send expires", async () => {
-    render(<ConciergeHost feed={FEED} promptTarget={null} />);
-    mountCableAt("left", "ag1");
-    expect(box().value).toBe("");
-
-    await act(async () => {
-      h.deferredOutcome?.({
-        ok: false,
-        agentId: "ag1",
-        path: "expired",
-        heldReason: "screen",
-        sent: "the thing I asked for",
-        display: "the thing I asked for",
-      });
-      await Promise.resolve();
-    });
-
-    expect(box().value).toContain("the thing I asked for");
-  });
+  // (The row that stood here restored the draft when a held mounted send EXPIRED. There is no
+  // mounted screen hold any more — bead sparkle-93wnu3 — so nothing can produce that outcome, and
+  // a row driving a hand-built one would be green against any behaviour at all.)
 
   // ══ AND THE ESCAPE HATCH IS UNTOUCHED ════════════════════════════════════════════════════════
   // Deriving the mount from the cable must not weaken the one documented way OUT of a mount, which

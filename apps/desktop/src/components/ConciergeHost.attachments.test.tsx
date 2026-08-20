@@ -283,7 +283,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
       // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
       neverPickerAnswer: false,
       // FALSE too — the routed path, never a mounted send.
-      holdForScreenClear: false,
+      mountedSend: false,
     });
   });
 
@@ -377,7 +377,7 @@ describe("ConciergeHost — attachments reach the dispatched prompt", () => {
       // picker-keystroke path it always had (services/conciergeDispatch neverPickerAnswer).
       neverPickerAnswer: false,
       // FALSE too — the routed path, never a mounted send.
-      holdForScreenClear: false,
+      mountedSend: false,
     });
   });
 });

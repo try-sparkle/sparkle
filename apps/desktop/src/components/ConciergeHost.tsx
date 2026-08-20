@@ -1550,9 +1550,9 @@ export function ConciergeHost({
   // outliving the cable it was about. The pin changes on every mount, re-mount and unbind, which is
   // exactly the set of moments a mounted notice stops being true.
   const { mountedNotice, noteMounted } = useMountedNotice(routableMountedAgentId);
-  // Delivers a mounted send held by `holdForScreenClear` (services/conciergeDispatch) the moment
-  // that agent's screen clears — see hooks/useScreenHoldDrain for why this has to poll and why it
-  // is NOT scoped to the current mount (a hold can outlive the mount that created it).
+  // INERT SINCE bead sparkle-93wnu3 — a mounted send is now DELIVERED rather than held, so nothing
+  // enqueues a screen hold and this drain has nothing to find. Kept for one change so the
+  // behavioural fix lands on its own; removed in the follow-up along with the queue itself.
   useScreenHoldDrain();
 
   // Gated on the NAME rather than on the row, because a name is what this needs and the roster is
@@ -3944,19 +3944,21 @@ export function ConciergeHost({
        *  (roborev 54569). REQUIRED, so a future call site has to decide rather than inherit a
        *  default that is wrong for it. */
       neverPickerAnswer: boolean,
-      /** Ask the dispatcher to HOLD rather than refuse when the only problem is the screen — see
-       *  conciergeDispatch's `holdForScreenClear` for who may set this. TRUE for exactly one
-       *  caller: a MOUNTED send (bead sparkle-tbsvf, reopened). Every other caller of this
-       *  function — a redirect, a recommended-action pill — leaves it false and keeps the
-       *  outright refusal, because none of them is the founder looking straight at the pane. */
-      holdForScreenClear: boolean,
+      /** The founder is LOOKING AT this pane — he mounted it and typed into it, so the dispatcher's
+       *  screen refusals do not apply and the text is delivered whatever the screen shows. See
+       *  conciergeDispatch's `mountedSend` for who may set this and for why an earlier "hold it
+       *  until the screen clears" reading of the same rule lost his messages. TRUE for exactly one
+       *  caller: a MOUNTED send (beads sparkle-tbsvf, sparkle-93wnu3). Every other caller of this
+       *  function — a redirect, a recommended-action pill — leaves it false and keeps the outright
+       *  refusal, because none of them is the founder looking straight at the pane. */
+      mountedSend: boolean,
     ): Promise<boolean> => {
       try {
         const r = await dispatchConciergeAnswer(target.agentId, text, {
           authority,
           userPrompt: true,
           neverPickerAnswer,
-          holdForScreenClear,
+          mountedSend,
           ...renderings,
         });
         // As in `approve`, `ok` gates the held branch: an ok:false queued result must not be
@@ -3966,24 +3968,27 @@ export function ConciergeHost({
           // Held, not delivered: keep the files with the promise, so a hold that never lands can
           // give them back instead of quietly costing the user the picking (roborev 51594).
           holdAttachments(target.agentId, staged);
-          // TWO REASONS SHARE ONE PATH (`"queued"`) — see conciergeDispatch's `heldReason` doc.
-          // "still starting up" is a factual claim that is FALSE for a screen hold: the agent is
-          // running, its screen just isn't safe to write to right now. Telling the founder his
-          // own pane "is still starting up" while he's looking straight at it reads as the app
-          // not knowing what it's showing him.
-          if (r.heldReason === "screen") {
-            // ONE STRING, both surfaces — a mounted send only ever shows one of the two, so there
-            // is no reader who could catch them disagreeing, which is exactly how they drifted
-            // apart the first time this was written (fixed before it shipped).
-            const holdText = `${target.name}'s screen is busy right now — I'll send that the moment it clears.`;
-            postSparkle(line`${ref(asAgent(target))}'s screen is busy right now — I'll send that the moment it clears.`);
-            // Mounted, the thread this just posted to is off screen (roborev 57360) — see
-            // MountedNotice's header. Without this the founder sees NOTHING happen: no refusal
-            // (the whole point of the hold), and no confirmation either.
-            if (displayMountedRef.current) noteMounted(holdText, "info");
-          } else {
-            postSparkle(line`${ref(asAgent(target))} is still starting up — I'll send that the moment it's ready.`);
-          }
+          // ONE REASON REACHES THIS PATH NOW: the PTY isn't up yet. The SCREEN hold that used to
+          // share it is gone — a mounted send is delivered rather than queued (bead sparkle-93wnu3,
+          // conciergeDispatch's `mountedHumanSend`), so nothing can produce `heldReason: "screen"`.
+          //
+          // ITS COPY WENT WITH IT, deliberately and in the same change (roborev 65708, Medium):
+          // "<Agent>'s screen is busy right now — I'll send that the moment it clears" was a
+          // user-facing PROMISE on a path that can no longer be taken, and that promise is the
+          // exact sentence the founder reported for months. A string outliving the behaviour it
+          // describes is what AGENTS.md means by "user-facing copy is code".
+          //
+          // THE MOUNTED NOTICE STAYS, and moves onto this arm rather than dying with the screen
+          // one. Mounted, the thread this just posted to is off screen (roborev 57360) — see
+          // MountedNotice's header — so without it the founder sees NOTHING happen. That was true
+          // of the screen hold and is just as true of this one; deleting the branch that carried
+          // the call would have taken the startup hold's only visible surface with it.
+          //
+          // ONE STRING, both surfaces, so they cannot drift apart — which is exactly how they did
+          // the first time this was written.
+          const holdText = `${target.name} is still starting up — I'll send that the moment it's ready.`;
+          postSparkle(line`${ref(asAgent(target))} is still starting up — I'll send that the moment it's ready.`);
+          if (displayMountedRef.current) noteMounted(holdText, "info");
           return true;
         }
         // `matchedLabel` is OPTIONAL on the result, so interpolating it unguarded would render the
@@ -4082,29 +4087,6 @@ export function ConciergeHost({
           shown && (shouldPasteAsPill(shown) || flattened.length > OUTCOME_QUOTE_CHARS)
             ? collapseText(nextId("pill"), shown)
             : undefined;
-        // ══ A DROPPED SCREEN HOLD GIVES THE WORDS BACK, NOT ONLY THE FILES (bead sparkle-9gsjqm) ══
-        // The three arms below quoted the founder's own text into a Sparkle chat line and restored
-        // only `restoreAttachments(held)` — so a mounted send that aged out ENDED UP AS A CONCIERGE
-        // MESSAGE, which is this bead's defect arriving by the slow road, and the copy told him to
-        // "send it again" while the words themselves existed nowhere he could send them from.
-        //
-        // SCOPED TO `heldReason === "screen"`, which is precisely the mounted holds: only a MOUNTED
-        // send passes `holdForScreenClear` (see `promptAgent`'s parameter), so a screen hold is by
-        // construction his mounted message. The startup holds beside it are reached from other call
-        // sites and keep their existing behaviour.
-        //
-        // The DISPLAY rendering, never `r.sent` — that is the wire payload and carries the
-        // attachments' temp paths (roborev 46925). The files came back a few lines up, so the two
-        // halves of the message are restored together rather than one without the other.
-        if (
-          r.heldReason === "screen" &&
-          shown &&
-          (r.path === "expired" || r.path === "abandoned" || r.path === "queue-full")
-        )
-          // `null`: a held send's quote was staged in a draft that is long gone, and `restoreDraft`
-          // treats null as "this send carried no quote" rather than writing the slot (see its note on
-          // why an unconditional `restore(null)` would wipe a quote staged for the NEXT message).
-          restoreDraft(shown, null);
         // Each non-delivery says what actually happened; a wrong reason is its own small lie
         // (roborev 46485-M — `abandoned` used to be reported as "the terminal closed", which is
         // false when the spawn failed and no terminal ever opened).
@@ -4113,25 +4095,15 @@ export function ConciergeHost({
         // specific claim, and letting any future path fall into it (say abandonPendingSends grows
         // an `agent-failed` emit) is how 46485-M happened the first time. An unknown path gets a
         // reason it can always stand behind (roborev 53162).
-        // A SCREEN hold gets its own wording for `expired`/`abandoned`: the agent DID come up —
-        // the wait was on its screen, not its PTY — so "never came up" / "Send it again once it's
-        // running" would tell the founder something false about the agent he was just looking at
-        // (roborev 64236's Medium; AGENTS.md's "user-facing copy is code"). `heldReason` is what
-        // lets this branch tell the two holds apart; every other path is worded identically either
-        // way, since a delivered message or a dead PTY reads the same regardless of why it waited.
-        if (r.heldReason === "screen" && r.path === "expired")
-          postSparkle(line`${who}'s screen never cleared, so I dropped the message I was holding${plain(quoted)}. Send it again.`, collapsed);
-        else if (r.heldReason === "screen" && r.path === "abandoned")
-          postSparkle(line`${who} closed while I was waiting for its screen to clear, so I dropped the message I was holding${plain(quoted)}.`, collapsed);
-        // `queue-full` DOES reach this listener now (roborev 64289's Medium — the catch-all's own
-        // comment below says any path that starts to must get its own arm rather than the bare
-        // line, and this is exactly that): a screen hold's own cap can be exceeded while its flush
-        // is still deciding what to re-queue. A truthful, distinct remedy — "still busy, already
-        // holding as much as I can" — rather than the generic "didn't take the message", which
-        // would read as a mystery refusal for an agent the founder can see is up and mounted.
-        else if (r.heldReason === "screen" && r.path === "queue-full")
-          postSparkle(line`${who}'s screen is still busy and I'm already holding as much as I can for it, so I dropped the message${plain(quoted)}. Send it again.`, collapsed);
-        else if (r.ok) postSparkle(line`${who} is up — I sent your message${plain(quoted)}.`, collapsed);
+        //
+        // ══ THE SCREEN-HOLD ARMS ARE GONE, WITH THE HOLD (bead sparkle-93wnu3, roborev 65708) ═══
+        // Three arms here were keyed to `heldReason === "screen"` and said his message had been
+        // "dropped" because a screen "never cleared" — plus a `restoreDraft` that handed the words
+        // back after the drop. Nothing can produce a screen hold any more (a mounted send is
+        // DELIVERED — see conciergeDispatch's `mountedHumanSend`), so all of it described a path
+        // that cannot be taken. The remaining arms are the PTY-not-ready hold's, whose wording is
+        // about an agent that had not come up yet and is still exactly right for it.
+        if (r.ok) postSparkle(line`${who} is up — I sent your message${plain(quoted)}.`, collapsed);
         else if (r.path === "expired") postSparkle(line`${who} never came up, so I dropped the message I was holding${plain(quoted)}. Send it again when it's running.`, collapsed);
         else if (r.path === "abandoned") postSparkle(line`${who} couldn't take the message I was holding${plain(quoted)}. Send it again once it's running.`, collapsed);
         else if (r.path === "pty-gone") postSparkle(line`${who}'s terminal closed before I could send the message I was holding${plain(quoted)}.`, collapsed);
@@ -5016,7 +4988,7 @@ export function ConciergeHost({
       // His decision, verbatim from today's interview: *the concierge must NOT answer a mounted send.*
       // So a mount refuses here, visibly, and hands the words back — it does not get quietly re-aimed
       // at the brain. (HOLDING it until the screen clears is the answer when the SCREEN is the only
-      // problem; that path is `holdForScreenClear`, further down, and it is unchanged.)
+      // problem; that path is `mountedSend`, further down, which DELIVERS the words.)
       //
       // Structured exactly like the screen refusal below it, for the reason roborev 57360 made both
       // of those instants identical: retract when the words are demonstrably back in the box, and post
@@ -5104,20 +5076,21 @@ export function ConciergeHost({
       // stops a mount and not an address.
       if (addressable && aim) {
         const blocked = terminalWriteBlocked(aim.agentId, mentionAim.via);
-        // ══ A MOUNTED SEND HOLDS, RATHER THAN BOUNCES, WHEN THE SCREEN MAY CLEAR ═══════════════
-        // (bead sparkle-tbsvf, reopened.) The refusal below is right for a MODEL or an
+        // ══ A MOUNTED SEND IS DELIVERED, NOT BOUNCED, ON A SCREEN VERDICT ══════════════════════
+        // (beads sparkle-tbsvf, sparkle-93wnu3.) The refusal below is right for a MODEL or an
         // auto-resume guessing at a screen it cannot see — it cannot take a bad write back, so
         // refusing outright is the only safe direction. It is wrong for the founder himself,
         // mounted and looking straight at this pane: refusing him left "file a bead" as his only
         // channel to an agent whose pane was open in front of him. `no-viewport` is excluded on
-        // purpose and stays fatal for a mount (see terminalWriteBlocked) — there is no screen to
-        // wait on clearing. The actual hold happens a few lines down, inside
-        // dispatchConciergeAnswer via `holdForScreenClear`; skipping the refusal here just lets
-        // the send fall through to it instead of bouncing before it gets the chance.
-        const holdable =
+        // purpose and stays fatal for a mount (see terminalWriteBlocked) — that is not "the screen
+        // is busy", it is "there is no screen here to look at", and writing blind is the one thing
+        // the founder's own rule does not cover. The delivery happens a few lines down, inside
+        // dispatchConciergeAnswer via `mountedSend`; skipping the refusal here just lets the send
+        // fall through to it instead of bouncing before it gets the chance.
+        const founderIsWatching =
           mentionAim.via === "mount" &&
           (blocked === "alternate-screen" || blocked === "awaiting-input");
-        if (blocked && !holdable) {
+        if (blocked && !founderIsWatching) {
           postSparkle(terminalRefusalLine(asAgent(aim), blocked));
           // AND on the surface a mounted column can actually show (roborev 57360) — the line above
           // goes to a thread the mount replaces. ONLY while the thread is actually replaced
@@ -5269,15 +5242,15 @@ export function ConciergeHost({
             const blocked = mentionAim
               ? terminalWriteBlocked(aim.agentId, mentionAim.via)
               : null;
-            // Same carve-out as the pre-arm check above — see its comment. `holdForScreenClear`
-            // (passed to `promptAgent` below) is what actually decides to hold rather than refuse,
+            // Same carve-out as the pre-arm check above — see its comment. `mountedSend` (passed to
+            // `promptAgent` below) is what actually decides to deliver rather than refuse,
             // re-reading the screen fresh at that instant rather than trusting this possibly-stale
             // `blocked` read.
-            const holdable =
+            const founderIsWatching =
               !!mentionAim &&
               mentionAim.via === "mount" &&
               (blocked === "alternate-screen" || blocked === "awaiting-input");
-            if (blocked && !holdable) {
+            if (blocked && !founderIsWatching) {
               postSparkle(terminalRefusalLine(asAgent(aim), blocked));
               if (displayMountedRef.current)
                 noteMounted(terminalRefusalText(aim.name, blocked), "warn");
@@ -5315,9 +5288,9 @@ export function ConciergeHost({
               // An ADDRESSED message is a message. Without this the dispatcher would still match
               // it against a live picker and press a button (roborev 54569).
               !!mentionAim && addressable,
-              // HOLD rather than refuse when the screen is the only problem — see promptAgent's
+              // DELIVER rather than refuse when the screen is the only problem — see promptAgent's
               // own doc. True for exactly the same predicate that let this send fall through the
-              // two guards above instead of bouncing (bead sparkle-tbsvf, reopened).
+              // two guards above instead of bouncing (beads sparkle-tbsvf, sparkle-93wnu3).
               mentionAim?.via === "mount",
             );
             // A FAILED delivery gets no receipt: promptAgent has already said what went wrong in

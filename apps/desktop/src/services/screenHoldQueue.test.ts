@@ -40,7 +40,7 @@ describe("screenHoldQueue", () => {
   // ══ INSERTS BY `at`, NOT APPEND-ONLY (roborev 64268's Medium) ═══════════════════════════════
   // `flushScreenHeldSends` re-queues still-due entries through this same function AFTER an
   // `await submitPrompt` — and a genuinely NEW message can be queued during that same window by a
-  // separate `holdForScreenClear` call. A plain append would put the new arrival ahead of the
+  // separate `mountedSend` call. A plain append would put the new arrival ahead of the
   // older re-queued ones (they land after the await, the new one during it), delivering a
   // follow-up before the message it follows. Queuing out of `at` order here is exactly that
   // interleaving, collapsed to a unit test that needs no await at all.

@@ -105,7 +105,6 @@ import { aiFeatureNow } from "./aiGate";
 import { queuePendingSend, takePendingSends } from "./pendingSends";
 import {
   abandonAllScreenHeldSends,
-  queueScreenHeldSend,
   reinstateScreenHeldSends,
   screenHoldGeneration,
   sweepExpiredScreenHolds,
@@ -177,10 +176,17 @@ export interface ConciergeDispatchResult {
    *  refusals — "ambiguous-picker" and "addressed-at-picker" — since the second was split out of
    *  the first and carries the same options (roborev 54665/54673). */
   options?: SuggestionButton[];
-  /** Present, and always `"screen"`, on a `"queued"` result produced by `holdForScreenClear`
-   *  rather than by the PTY-not-ready hold a few lines above. The two share one queue and one
-   *  `"queued"` path (see its own doc), but the founder-facing wording differs — "the screen is
-   *  busy" is not "it's still starting up" — so a caller that wants the right one reads this. */
+  /** Present, and always `"screen"`, on an outcome belonging to the SCREEN hold rather than to the
+   *  PTY-not-ready hold a few lines above. The two share one `"queued"` path, but the
+   *  founder-facing wording differs — "the screen is busy" is not "it's still starting up" — so a
+   *  caller that wants the right one reads this.
+   *
+   *  ⚠️ NOTHING ENQUEUES A SCREEN HOLD ANY MORE (bead sparkle-93wnu3). The only producer was the
+   *  mounted send, and a mounted send is now DELIVERED — see {@link mountedHumanSend}. The queue,
+   *  its drain and this field are inert; they are removed in the follow-up, and are kept for one
+   *  change so the behavioural fix lands on its own and can be reverted on its own. Do not add a
+   *  new producer: a hold whose release depends on the same predicate that caused it is how the
+   *  founder's message came to be dropped fifteen minutes after he was promised it would arrive. */
   heldReason?: "screen";
 }
 
@@ -282,35 +288,45 @@ export interface ConciergeDispatchOptions {
    */
   pickerPress?: { fingerprint: string };
   /**
-   * HOLD RATHER THAN REFUSE, when the only reason this write would be refused is the SCREEN
-   * (`alternate-screen` or the `blocked-prompt` arms) — never for `unauthorized`, `trial-spent`,
-   * `pty-gone`, or any refusal that has nothing to do with what's on screen right now.
+   * THE HUMAN IS LOOKING AT THIS SCREEN — the send came from a pane he MOUNTED and typed into.
+   * A send so marked is DELIVERED: none of the screen refusals apply to it.
    *
-   * ══ THIS FLAG IS NO LONGER THE GUARD — READ `mayHoldForScreenClear` ═══════════════════════════
-   * It used to be, and the paragraph below still explains WHY the scoping matters. What changed
-   * (roborev 64466): the human/machine half is now read from the validated AUTHORITY, so a
-   * machine-authored caller that sets this flag is refused anyway, and a `mount` authority holds
+   * ══ THE FOUNDER'S RULE, AND WHY "HOLD" WAS THE WRONG READING OF IT (bead sparkle-93wnu3) ══════
+   * The rule has not changed since bead sparkle-tbsvf: *"The alt-screen refusal stays for
+   * PROGRAMMATIC senders (the concierge writing via MCP). It must NEVER apply to the human typing
+   * into a pane he deliberately mounted."* This flag used to be spelled `holdForScreenClear` and
+   * implemented that rule as QUEUE-INSTEAD-OF-REFUSE. Holding IS applying it, and the queue made
+   * the failure worse rather than better:
+   *
+   *   • The hold's release condition is the SAME predicate that caused it (hooks/useScreenHoldDrain
+   *     re-ran `terminalWriteRefusal`), so a screen the predicate is WRONG about never clears —
+   *     the message waits out MAX_AGE_MS and is then dropped. Measured: `__sparkle_self__`, whose
+   *     pane the founder had open in front of him, told him "screen is busy right now — I'll send
+   *     that the moment it clears" and delivered nothing.
+   *   • CLAUDE CODE HOLDS THE ALTERNATE BUFFER AT ALL TIMES on v2.1.237 — captured from a real PTY
+   *     at a bare idle prompt, `buffer.active.type === "alternate"` (see
+   *     `capturedScreens.fixture.ts` for the capture recipe). So EVERY agent in this app sits
+   *     permanently on the "prove you are Claude Code or be refused" branch, and one
+   *     false negative from a content heuristic makes that pane unreachable rather than merely
+   *     inconvenient.
+   *
+   * Asked directly (2026-08-20) whether a mounted send may ever be held, the founder chose
+   * *"Never hold — just send it: a mounted send is delivered immediately, always. You are looking
+   * at the pane; your eyes are the guard."* That is what this flag now means.
+   *
+   * SET BY EXACTLY ONE CALLER: ConciergeHost's MOUNTED composer send. The scoping is the whole
+   * safety argument, not an implementation detail — the screen refusals exist because a write that
+   * lands wrong on `vim` or a credential field cannot be taken back, and that is exactly as true
+   * for a MODEL guessing at a screen it cannot see (`send_to_agent_terminal`) or an auto-resume
+   * firing every 15s as it ever was. Neither may set this.
+   *
+   * ══ AND IT IS NOT THE GUARD BY ITSELF — READ {@link mountedHumanSend} ══════════════════════════
+   * The human/machine half is read from the validated AUTHORITY, which a flag cannot spoof, so a
+   * machine-authored caller that sets this is refused anyway and a `mount` authority is exempt
    * WITHOUT it. The flag survives for the human authorities that are not `mount` — chiefly the
    * mounted send that went through a COUNTDOWN and therefore arrives as `{kind: "countdown"}`.
-   * Treat the sentence below as the rationale, not as the enforcement.
-   *
-   * SET BY EXACTLY ONE CALLER (bead sparkle-tbsvf, reopened): ConciergeHost's MOUNTED composer
-   * send. That scoping is the whole safety argument, not an implementation detail. The three
-   * screen refusals above exist because a write that lands wrong on `vim`/a credential field
-   * can't be taken back — which is exactly as true for a MODEL guessing at a screen it can't see
-   * (`send_to_agent_terminal`) or an auto-resume firing every 15s as it ever was, so neither may
-   * set this. It is true in a DIFFERENT way for the founder himself, mounted and looking straight
-   * at the pane he just typed into: he is not guessing that the screen will clear, he is watching
-   * it. Refusing him outright left "file a bead" as his only channel to an agent whose pane was
-   * open in front of him.
-   *
-   * Reuses the SAME hold-queue/flush pair as the "PTY isn't up yet" case a few lines down
-   * (services/pendingSends + flushPendingSends) — a `"queued"` result either way, so every
-   * existing reader of that path (receipts, onDeferredSendOutcome) already knows what to do with
-   * it. `heldReason: "screen"` on the result is the one thing that's new, and it exists only so
-   * the founder-facing copy can tell the two apart.
    */
-  holdForScreenClear?: boolean;
+  mountedSend?: boolean;
 }
 
 // WHOLE-PHRASE anchored (roborev 46311): the entire trimmed answer must be a member of the
@@ -646,31 +662,20 @@ function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatch
  * the prompt, so the grace window's ceiling is the honest backstop.
  */
 /**
- * `opts.holdForScreenClear`'s implementation — see that field for who may set it and why. A
- * SEPARATE queue from the PTY-not-ready hold below (services/screenHoldQueue, not pendingSends) —
- * see that module's header for why the two must not share one TTL. Reports anything the queue's
- * own prune drops the same way the PTY-not-ready hold does: promised sends don't vanish silently
- * just because a later one crowded them out (roborev 53015's reasoning, reused rather than
- * re-derived).
+ * IS THIS THE HUMAN TYPING INTO A PANE HE MOUNTED? — the founder's refusal scope, made structural.
  *
- * Returns null — "fall through to your own refusal" — when holding wasn't requested or this
- * agent's hold queue is already full of live entries.
- */
-/**
- * MAY THIS SEND BE HELD RATHER THAN REFUSED? — the founder's refusal scope, made structural.
+ * A `true` here means the SCREEN REFUSALS DO NOT APPLY to this send. It is delivered, whatever the
+ * screen looks like. See {@link ConciergeDispatchOptions.mountedSend} for the rule in the founder's
+ * own words, for the measurement that killed the queue-instead-of-refuse compromise, and for why
+ * "hold it until the screen clears" was never what he asked for.
  *
- * ══ THE RULE, IN HIS WORDS (bead sparkle-tbsvf) ═════════════════════════════════════════════════
- * *"The alt-screen refusal stays for PROGRAMMATIC senders (the concierge writing via MCP). It must
- * NEVER apply to the human typing into a pane he deliberately mounted."*
- *
- * ══ WHY THIS IS NOT JUST `opts.holdForScreenClear` ══════════════════════════════════════════════
- * That flag is a BOOLEAN THE CALLER PASSES, and its own doc already states the rule it cannot
- * enforce: "neither [`send_to_agent_terminal`] nor an auto-resume may set this". Nothing stopped
- * them. The options bag is plain data, so a tool call that set `holdForScreenClear: true` — by
- * design, by a copied call site, or by an object rebuilt off the wire — bought itself the founder's
- * treatment on a screen it cannot see. That is the same "each new caller arrives unguarded" failure
- * this module's screen guard was hoisted here to end, and a convention in a docstring is not a
- * guard.
+ * ══ WHY THIS IS NOT JUST `opts.mountedSend` ═════════════════════════════════════════════════════
+ * That flag is a BOOLEAN THE CALLER PASSES, and its own doc states the rule it cannot enforce:
+ * "neither [`send_to_agent_terminal`] nor an auto-resume may set this". Nothing stopped them. The
+ * options bag is plain data, so a tool call that set it — by design, by a copied call site, or by an
+ * object rebuilt off the wire — would buy itself the founder's exemption on a screen it cannot see.
+ * That is the same "each new caller arrives unguarded" failure this module's screen guard was
+ * hoisted here to end, and a convention in a docstring is not a guard.
  *
  * So the human/machine half is read from the AUTHORITY, which is validated at the top of
  * `routeConciergeAnswer` and cannot be spoofed by a flag: `isHumanAuthored` is a `Record` over the
@@ -680,10 +685,9 @@ function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatch
  *
  * ══ AND WHY THE FLAG IS STILL READ ══════════════════════════════════════════════════════════════
  * Being human-authored is necessary, not sufficient. Most human authorities are a BUTTON PRESS at a
- * live prompt (`approval`, `nudge-approve`, `suggestion`), and holding one of those would answer a
- * dialog minutes later, after the screen it was read against is gone — the precise hazard
- * `verifiedPickerPress` re-derives a fingerprint to prevent. Those keep the refusal, which loses
- * the user nothing: the words are restored to the box either way.
+ * live prompt (`approval`, `nudge-approve`, `suggestion`) made from the concierge column rather than
+ * from a mounted terminal, and the person clicking one of those is NOT looking at that agent's
+ * screen. Those keep the refusal, which loses them nothing: the words are restored to the box.
  *
  * `mount` is exempt from needing the flag at all, because it IS the founder's case: he typed into a
  * terminal he had patched a cable into and is watching.
@@ -693,8 +697,8 @@ function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatch
  * more than the code does, and the gap is a SHIPPED path: a mounted send made while presence is AWAY
  * — an explicit `setAway()`, an unfocused window, an idle voice session — does not dispatch
  * immediately. It ARMS an intent and dispatches at expiry as `{kind: "countdown"}`, even though
- * `mentionAim.via` is still `"mount"`. That send holds on the FLAG, which ConciergeHost passes from
- * the very same `via === "mount"` test (see its `promptAgent` call).
+ * `mentionAim.via` is still `"mount"`. That send is exempt on the FLAG, which ConciergeHost passes
+ * from the very same `via === "mount"` test (see its `promptAgent` call).
  *
  * So, precisely: the `mount` AUTHORITY needs no flag; a mounted send that goes through the countdown
  * still does. Do NOT read the exemption as making that argument redundant and drop it — that
@@ -706,46 +710,11 @@ function reportAnswerOutcome(result: ConciergeDispatchResult): ConciergeDispatch
  * `authority.kind === "mount"` — every immediate mounted row stays green under that, because on
  * that path the authority IS `mount` (roborev 64476).
  */
-function mayHoldForScreenClear(opts: ConciergeDispatchOptions): boolean {
-  // The machine half, first and unconditionally: a programmatic sender never holds, flag or no flag.
+function mountedHumanSend(opts: ConciergeDispatchOptions): boolean {
+  // The machine half, first and unconditionally: a programmatic sender is never exempt, flag or no
+  // flag.
   if (!isHumanAuthored(opts.authority)) return false;
-  return opts.authority.kind === "mount" || opts.holdForScreenClear === true;
-}
-
-function holdForScreenClear(
-  agentId: string,
-  text: string,
-  opts: ConciergeDispatchOptions,
-): ConciergeDispatchResult | null {
-  if (!mayHoldForScreenClear(opts)) return null;
-  const display = opts.display ?? text;
-  const queued = queueScreenHeldSend(
-    {
-      agentId,
-      text,
-      userPrompt: opts.userPrompt === true,
-      // Same argument as the PTY-not-ready hold: the entry carries the answer rather than letting
-      // the flush re-derive one, because the unsafe default (`appendPrompt`'s `humanAuthored: true`)
-      // would release an agent's goal debt for a hold a machine-authored caller queued.
-      humanAuthored: isHumanAuthored(opts.authority),
-      display: opts.display,
-      namingBasis: opts.namingBasis,
-    },
-    (dropped) => {
-      for (const e of dropped) {
-        emitOutcome({
-          ok: false,
-          path: "expired",
-          agentId,
-          sent: e.text,
-          display: e.display ?? e.text,
-          heldReason: "screen",
-        });
-      }
-    },
-  );
-  if (!queued) return { ok: false, path: "queue-full", agentId };
-  return { ok: true, path: "queued", agentId, sent: text, display, heldReason: "screen" };
+  return opts.authority.kind === "mount" || opts.mountedSend === true;
 }
 
 export async function dispatchConciergeAnswer(
@@ -859,9 +828,18 @@ async function routeConciergeAnswer(
     opts.pickerPress.fingerprint !== "" &&
     pickerOptions.length > 0 &&
     pickerFingerprint(agentId, pickerOptions) === opts.pickerPress.fingerprint;
-  if (screen?.alternateBuffer && !claudeCodeHoldsTheBuffer && !verifiedPickerPress) {
-    const held = holdForScreenClear(agentId, text, opts);
-    if (held) return held;
+  // ══ …AND NOT AT ALL WHEN THE HUMAN IS LOOKING AT IT (bead sparkle-93wnu3) ═════════════════════
+  // `mountedHumanSend` is the founder typing into a pane he mounted. He can see whether that pane
+  // is `vim`; the heuristic above only GUESSES, and on a fleet where Claude Code holds the
+  // alternate buffer at all times (measured on v2.1.237, at a bare idle prompt) a single false
+  // negative made his own pane permanently unreachable. His rule, verbatim: the alt-screen refusal
+  // "must NEVER apply to the human typing into a pane he deliberately mounted."
+  if (
+    screen?.alternateBuffer &&
+    !claudeCodeHoldsTheBuffer &&
+    !verifiedPickerPress &&
+    !mountedHumanSend(opts)
+  ) {
     log.warn("concierge", "refused a write into a full-screen app", { agentId });
     return { ok: false, path: "alternate-screen", agentId };
   }
@@ -966,11 +944,10 @@ async function routeConciergeAnswer(
     viewportOptions.length === 2 && viewportOptions.every((o) => /^[yn]\n?$/.test(o.value));
   if (
     screen &&
+    !mountedHumanSend(opts) &&
     (screenIsCredentialField(screen.text) ||
       (!viewportOffersYesNo && screenIsYesNoPrompt(screen.text)))
   ) {
-    const held = holdForScreenClear(agentId, text, opts);
-    if (held) return held;
     log.warn("concierge", "refused a write into a credential prompt", { agentId });
     return { ok: false, path: "blocked-prompt", agentId };
   }
@@ -990,9 +967,12 @@ async function routeConciergeAnswer(
   // up, so a match means this function has just read the same live menu. FREE TEXT still takes the
   // refusal — `pickerPress` is reachable only from `selectPickerOption`, never from the
   // model-facing `send_to_agent_terminal`, which is what keeps prose off this screen.
-  if (claudeCodeHoldsTheBuffer && !verifiedPickerPress && screenBlocksWrite(screen.text)) {
-    const held = holdForScreenClear(agentId, text, opts);
-    if (held) return held;
+  if (
+    claudeCodeHoldsTheBuffer &&
+    !verifiedPickerPress &&
+    !mountedHumanSend(opts) &&
+    screenBlocksWrite(screen.text)
+  ) {
     log.warn("concierge", "refused a write into a blocked prompt on a Claude Code screen", {
       agentId,
     });
@@ -1019,32 +999,37 @@ async function routeConciergeAnswer(
   // cloud agent has no counterpart for.
   if (isCloudAgent(agentId)) return deliverCloudPrompt(agentId, text, opts, options);
 
-  if (options.length > 0) {
-    // ══ A LIVE PICKER IS A SCREEN REFUSAL TOO, SO IT OFFERS THE HOLD FIRST (bead sparkle-9gsjqm) ══
-    // THE FOUNDER'S BUG, reported more than once: text typed into a MOUNTED pane does not reach the
-    // agent. ConciergeHost declares a mounted send HOLDABLE and deliberately falls through to this
-    // function rather than bouncing it, with a comment promising "the actual hold happens a few
-    // lines down, inside dispatchConciergeAnswer via `holdForScreenClear`". The three refusal arms
-    // ABOVE keep that promise. The three arms in THIS block did not: they returned their refusal
-    // with no hold attempt at all, and `neverPickerAnswer` is TRUE for every mounted composer send
-    // (see ConciergeHost's `!!mentionAim && addressable`). So a mounted send made while a picker
-    // happened to be on screen took `addressed-at-picker` and BOUNCED — the one remaining way a
-    // send the host had already declared holdable still came back refused.
-    //
-    // THE HOLD IS ATTEMPTED, NOT ASSUMED, and the refusal below is unchanged for everyone else.
-    // `holdForScreenClear` returns null unless the caller may hold (see its own doc and
-    // `ConciergeDispatchOptions.holdForScreenClear` for why that is exactly one caller — the
-    // founder, mounted and looking at the pane), so a `concierge-tool` send or the goal auto-resume
-    // still takes the refusal verbatim. Calling the FUNCTION rather than re-reading
-    // `opts.holdForScreenClear` here is deliberate: the gate lives in one place, so a change to who
-    // may hold lands at every arm at once instead of at the three that remembered to ask.
-    //
-    // WHY HOLDING IS RIGHT FOR A PICKER AT ALL. A live picker owns the agent's stdin — that is why
-    // this block refuses rather than writing free text — but "owns stdin RIGHT NOW" is the same
-    // temporary fact `alternate-screen` and `blocked-prompt` describe, and the founder's rule for
-    // all three is identical: hold the words and deliver them the moment the screen clears, at THAT
-    // agent. The picker still is not answered by them — a held send is delivered later, through
-    // `flushScreenHeldSends`' `submitPrompt`, never collapsed into a keystroke.
+  // ══ A LIVE PICKER DOES NOT SILENCE THE FOUNDER (beads sparkle-9gsjqm, sparkle-93wnu3) ═════════
+  // THE FOUNDER'S BUG, reported more than once: text typed into a MOUNTED pane does not reach the
+  // agent. `neverPickerAnswer` is TRUE for every mounted composer send (see ConciergeHost's
+  // `!!mentionAim && addressable`), so a mounted send made while a picker happened to be on screen
+  // took `addressed-at-picker` and BOUNCED. An earlier fix made those three arms HOLD instead of
+  // refuse, which only moved the loss later: the hold's release condition is a predicate that can be
+  // permanently wrong about the screen, and the message was dropped at MAX_AGE_MS.
+  //
+  // So a MOUNTED SEND SKIPS THIS BLOCK ENTIRELY and reaches `submitPrompt` below as ordinary free
+  // text — which is the one thing the block's arms were all trying to avoid doing BLINDLY, and the
+  // founder is not blind: he mounted the pane and is looking at it.
+  //
+  // ══ AND IT IS ALWAYS FREE TEXT, NEVER A KEYSTROKE — DELIBERATELY ══════════════════════════════
+  // A first cut of this carved out "…unless the text is an unambiguous terse answer to the menu",
+  // so a mounted `"1"` would still press option 1. That carve-out was UNREACHABLE and its test was
+  // vacuous (roborev 65708, Medium): it required `!opts.neverPickerAnswer`, and the only caller
+  // that can mark a send `mounted` sets `neverPickerAnswer` from the very same `via === "mount"`
+  // condition — so the two can never disagree, and the test had to hand-build a combination no
+  // caller produces.
+  //
+  // Reinstating it would need the CALL SITE to decide, and that is the wrong answer anyway: the
+  // standing rule for an addressed send is that AN ADDRESSED MESSAGE IS A MESSAGE, NOT A KEYSTROKE
+  // (roborev 54569/55400), precisely because pressing a button the human never read is the least
+  // recoverable thing this path can do. A mounted send is an addressed send. Answering a menu
+  // deliberately still has its own surfaces — the Approve relay and the suggestion pills, both of
+  // which carry a re-derived fingerprint (`verifiedPickerPress`) that free text cannot acquire.
+  //
+  // Nothing changes for anyone else. `mountedHumanSend` is false for a `concierge-tool` send, the
+  // goal auto-resume, and every button press made from the concierge column, so all of them take
+  // the refusals below verbatim.
+  if (options.length > 0 && !mountedHumanSend(opts)) {
     // ══ THE DECLARED DISPOSITION IS CHECKED FIRST, BEFORE THE MATCH ═════════════════════════════
     // `neverPickerAnswer` says this text may never become a keystroke "however well it matches an
     // option on the agent's screen" — so whether it happens to match is irrelevant to it, and
@@ -1061,17 +1046,11 @@ async function routeConciergeAnswer(
     // message; open it and pick" — which under the old order they could reach only by matching,
     // i.e. by removing the file, which the copy never told them.
     if (opts.neverPickerAnswer) {
-      const held = holdForScreenClear(agentId, text, opts);
-      if (held) return held;
       return { ok: false, path: "addressed-at-picker", agentId, options };
     }
     const match = matchAnswerToOption(text, options);
     if (!match) {
       // A picker is on screen but the answer doesn't map to an option — do NOT guess a keystroke.
-      // A caller permitted to hold gets the hold instead of the refusal, exactly as the two arms
-      // around it do: the message is not an answer to this menu, so it waits for the menu to go.
-      const held = holdForScreenClear(agentId, text, opts);
-      if (held) return held;
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }
     // A USER-authored prompt that merely STARTS with a yes/no word is an instruction, not a picker
@@ -1090,10 +1069,6 @@ async function routeConciergeAnswer(
     // just the option is either what the user already did or not what they were trying to do at
     // all. Sharing the line sent them round a loop with no stated exit.)
     if (opts.userPrompt && !isTerseAnswer(text, options)) {
-      // Same hold-before-refusing rule as the two arms above — a sentence is not a keystroke, so it
-      // waits for the picker rather than being thrown back at a caller that may hold.
-      const held = holdForScreenClear(agentId, text, opts);
-      if (held) return held;
       return { ok: false, path: "ambiguous-picker", agentId, options };
     }
     const sent = frameSubmit(match.value);
@@ -1370,7 +1345,12 @@ export async function flushPendingSends(agentId: string): Promise<ConciergeDispa
 }
 
 /**
- * Deliver everything `holdForScreenClear` queued for `agentId` (see services/screenHoldQueue).
+ * Deliver everything queued for `agentId` in the SCREEN-hold queue (services/screenHoldQueue).
+ *
+ * ⚠️ INERT SINCE bead sparkle-93wnu3 — nothing enqueues a screen hold any more (see
+ * `ConciergeDispatchResult.heldReason`). Kept for one change so the behavioural fix lands alone;
+ * removed in the follow-up.
+ *
  * The mirror of `flushPendingSends` above, and it shares that function's shape deliberately — same
  * outcome broadcast, same expired-vs-due split — but reads the SEPARATE screen-hold queue with its
  * own, longer TTL, and every outcome it emits carries `heldReason: "screen"` (see that field's doc)

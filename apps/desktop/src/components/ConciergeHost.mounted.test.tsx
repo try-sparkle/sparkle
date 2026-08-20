@@ -1010,44 +1010,41 @@ describe("ConciergeHost — a busy Claude Code takes the message", () => {
 });
 
 describe("ConciergeHost — a terminal that must not receive free text refuses", () => {
-  // ══ A MOUNTED SEND HOLDS RATHER THAN REFUSES (bead sparkle-tbsvf, reopened) ═══════════════════
+  // ══ A MOUNTED SEND IS DELIVERED, NOT REFUSED (beads sparkle-tbsvf, sparkle-93wnu3) ════════════
   // This used to be the refusal row for exactly this screen. It is not any more: the founder is
   // mounted and looking straight at this pane, so the send now falls through to the dispatcher
-  // with `holdForScreenClear: true` instead of bouncing before it ever gets there — see
-  // services/conciergeDispatch's `holdForScreenClear` and the row below asserting the notice.
-  // `conciergeDispatch.altScreen.test.ts` is where the QUEUE-AND-DELIVER mechanism itself is
-  // proven; this file's job is only the WIRING — that the host stops refusing and asks to hold.
-  it("holds rather than refuses when a full-screen app owns the terminal", async () => {
+  // with `mountedSend: true` instead of bouncing before it ever gets there — see
+  // services/conciergeDispatch's `mountedSend`. `conciergeDispatch.altScreen.test.ts` is where the
+  // DELIVERY itself is proven; this file's job is only the WIRING — that the host stops refusing
+  // and passes the flag.
+  it("passes the flag rather than refusing when a full-screen app owns the terminal", async () => {
     mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
     await send("move the button 5px left");
     await elapse();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
     expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
-      holdForScreenClear: true,
+      mountedSend: true,
     });
-    // NOT the refusal copy — a held send is not a refusal, and telling the founder his own screen
-    // "has a full-screen app open" while he's looking straight at it is the exact false claim
-    // this change removes.
+    // NOT the refusal copy — telling the founder his own screen "has a full-screen app open" while
+    // he's looking straight at it is the exact false claim this change removes.
     expect(screen.queryByTestId(MOUNTED_NOTICE_TESTID)?.textContent ?? "").not.toContain(
       "full-screen app",
     );
   });
 
-  // The mounted notice shows the HOLD copy, not the old refusal copy, when the dispatcher reports
-  // back that it queued the send for the screen — proving `promptAgent`'s branch on `heldReason`.
-  it("tells the founder it will send once the screen clears", async () => {
+  // AND THE MOUNTED NOTICE SAYS NOTHING FALSE. There is no "screen is busy" promise any more —
+  // that copy went with the hold it described (bead sparkle-93wnu3) — so the row that used to pin
+  // it now pins its ABSENCE: neither the refusal wording nor the retired hold wording may appear
+  // for a send that is on its way to the agent.
+  it("shows the founder no refusal and no busy-screen promise", async () => {
     mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
-    h.dispatchConciergeAnswer.mockResolvedValue({
-      ok: true,
-      path: "queued",
-      heldReason: "screen",
-    });
     await send("move the button 5px left");
     await elapse();
-    await waitFor(() => expect(notice().textContent).toContain("busy"));
-    expect(notice().textContent ?? "").not.toContain("full-screen app");
+    const noticeText = screen.queryByTestId(MOUNTED_NOTICE_TESTID)?.textContent ?? "";
+    expect(noticeText).not.toContain("full-screen app");
+    expect(noticeText).not.toContain("busy");
   });
 
   // ══ A REFUSED SEND LEAVES NO BUBBLE (bead sparkle-k5kit part 2) ═══════════════════════════════
@@ -1083,22 +1080,23 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
   // *"If a refused terminal write falls through to the concierge, the message silently changes
   // destination"* — the one failure mode composerRoute's header calls unrecoverable. He addressed the
   // AGENT; re-aiming his words without telling him is the harm. A HELD write must not open that door
-  // either: it goes to the agent's own hold queue and NOWHERE else — Sparkle is never asked.
+  // either: it goes to that agent's own terminal and NOWHERE else — Sparkle is never asked.
   it("does not reach the concierge instead", async () => {
     mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
     await send("move the button 5px left");
     await elapse();
     expect(h.startConciergeTurn).not.toHaveBeenCalled();
-    // It reaches the AGENT's own dispatcher, to be held — never Sparkle's turn.
+    // It reaches the AGENT's own dispatcher, to be delivered — never Sparkle's turn.
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
     expect(h.dispatchConciergeAnswer.mock.calls[0]![0]).toBe(MOUNTED.agentId);
   });
 
-  // Same hold as the full-screen-app row above, for the OTHER screen-only refusal
+  // Same exemption as the full-screen-app row above, for the OTHER screen-only refusal
   // (`terminalWriteBlocked`'s `awaiting-input`) — a credential prompt is just as much something
-  // the founder is looking straight at as a full-screen app is.
-  it("holds rather than refuses at a credential prompt", async () => {
+  // the founder is looking straight at as a full-screen app is. See the dispatch-layer suite for
+  // why he chose this over a password-field carve-out, and what he accepted with it.
+  it("passes the flag rather than refusing at a credential prompt", async () => {
     mount();
     h.viewport.mockReturnValue({
       text: "$ sudo -v\n[sudo] password for founder:",
@@ -1108,7 +1106,7 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await elapse();
     expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1);
     expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
-      holdForScreenClear: true,
+      mountedSend: true,
     });
     expect(screen.queryByTestId(MOUNTED_NOTICE_TESTID)?.textContent ?? "").not.toContain(
       "waiting on something on screen",
@@ -1176,12 +1174,12 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await waitFor(() => expect(box().value).toBe("@Kraken Auth ship the DMG"));
   });
 
-  // ══ THE IMMEDIATE MOUNTED PATH STILL HOLDS, WITH NO COUNTDOWN IN BETWEEN ═══════════════════════
+  // ══ THE IMMEDIATE MOUNTED PATH IS EXEMPT TOO, WITH NO COUNTDOWN IN BETWEEN ════════════════════
   // A mount dispatches on submit (no countdown), so unlike the addressed row above there is no
   // window between a submit-time check and a post-write one — this is both, on the same tick. What
-  // this row pins is that the hold still happens on that immediate path: `holdForScreenClear` isn't
-  // something only the addressed/countdown path reaches.
-  it("holds an immediate mounted send when the screen is in a full-screen app", async () => {
+  // this row pins is that the exemption reaches that immediate path: `mountedSend` isn't something
+  // only the addressed/countdown path carries.
+  it("passes the flag on an immediate mounted send when the screen is in a full-screen app", async () => {
     mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
     await send("move the button 5px left");
@@ -1190,7 +1188,7 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     expect(armedIntents()).toHaveLength(0);
     await waitFor(() => expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1));
     expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
-      holdForScreenClear: true,
+      mountedSend: true,
     });
   });
 
@@ -1215,13 +1213,13 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
   //
   // A mounted send made while AWAY is the one that breaks: it arms, and at expiry it dispatches as
   // `{kind: "countdown"}` with `mentionAim.via` still "mount". Under a narrowed call site the flag
-  // goes false, `mayHoldForScreenClear` returns false, and the founder's message is refused outright
+  // goes false, `mountedHumanSend` returns false, and the founder's message is refused outright
   // — the original bug, restored, with the whole suite green. The dispatch-layer row cannot see
   // this: it pins that the DISPATCHER honours the flag, not that this call site still passes it.
   //
   // So this row runs the countdown to EXPIRY and asserts the pair together: the countdown authority
   // AND the flag. `authority.kind === "mount"` cannot satisfy it.
-  it("still asks for the hold when a mounted send dispatches after counting down while AWAY", async () => {
+  it("still passes the flag when a mounted send dispatches after counting down while AWAY", async () => {
     usePresenceStore.getState().setAway();
     mount();
     // Routine text, for the reason the block below gives: a destructive sample would be held by the
@@ -1234,7 +1232,7 @@ describe("ConciergeHost — a terminal that must not receive free text refuses",
     await waitFor(() => expect(h.dispatchConciergeAnswer).toHaveBeenCalledTimes(1));
     expect(h.dispatchConciergeAnswer.mock.calls[0]![2]).toMatchObject({
       authority: { kind: "countdown", intentId: expect.any(String) },
-      holdForScreenClear: true,
+      mountedSend: true,
     });
   });
 
@@ -1715,12 +1713,13 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
   // A HOLD REPEATS. The founder retypes while the same full-screen app is still open, so the second
   // hold notice is the common case — and a row keyed on text alone renders it as no change at all.
   // The `seq` bump is what makes an identical repeat a distinct write; this is the row that proves
-  // it. (Was "an identical REFUSAL" before bead sparkle-tbsvf's reopening — a mounted send now holds
-  // instead, but the identical-repeat property is the same one either way.)
-  it("re-renders an identical hold notice rather than swallowing the repeat", async () => {
+  // it. (Was "an identical REFUSAL", then an identical HOLD; the mounted screen hold is gone as of
+  // bead sparkle-93wnu3, so the notice this drives is the PTY-not-ready one — a shape the
+  // dispatcher can still return. The identical-repeat property is the same one either way.)
+  it("re-renders an identical notice rather than swallowing the repeat", async () => {
     mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
-    h.dispatchConciergeAnswer.mockResolvedValue({ ok: true, path: "queued", heldReason: "screen" });
+    h.dispatchConciergeAnswer.mockResolvedValue({ ok: true, path: "queued" });
     await send("move the button 5px left");
     await elapse();
     // NODE IDENTITY, NOT TEXT — the text is identical by construction, which is the whole point. The
@@ -1731,7 +1730,7 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
     await send("move the button 5px left");
     await elapse();
     await waitFor(() => expect(notice()).not.toBe(firstNode));
-    expect(notice().textContent).toContain("busy");
+    expect(notice().textContent).toContain("starting up");
   });
 
   // A NOTICE MUST NOT OUTLIVE THE MOUNT IT DESCRIBES. Left standing after an unmount it asserts a
@@ -1739,10 +1738,10 @@ describe("ConciergeHost — a mounted column can still say what happened", () =>
   it("clears when the cable is unplugged", async () => {
     const view = mount();
     h.viewport.mockReturnValue({ text: "~\n~\n:", alternateBuffer: true });
-    h.dispatchConciergeAnswer.mockResolvedValue({ ok: true, path: "queued", heldReason: "screen" });
+    h.dispatchConciergeAnswer.mockResolvedValue({ ok: true, path: "queued" });
     await send("move the button 5px left");
     await elapse();
-    await waitFor(() => expect(notice().textContent).toContain("busy"));
+    await waitFor(() => expect(notice().textContent).toContain("starting up"));
     h.wired.mockReturnValue("off");
     // THE UNPLUG ITSELF — the real `unbind`, which is what Escape and click-away both call. Flipping
     // the drawing stub alone no longer unmounts anything, which is the whole point of the fix.
